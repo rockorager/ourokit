@@ -14,13 +14,36 @@ now proves stable native identity, per-window resource scopes, transactional
 snapshot validation, and callback-free platform event queuing. A reusable
 multi-window Wayring host connects that model to independently configured,
 rendered, resized, and closed xdg-toplevels.
+The first headless UI kernel adds logical box constraints, typed Box/Flex/Stack
+render objects, cached allocation-free layout, ordered scene construction, and
+hit testing. A separate keyed instance layer now reconciles normalized typed
+snapshots into scoped render objects, and a bounded pointer router targets
+instances without callbacks. Mounted build owners provide scoped component
+lifecycle and direct dirty scheduling. A provisional constructor-specific Lua
+bridge proves non-yielding component builds into typed normalized descriptors;
+the generated public constructor syntax and event dispatch remain intentionally
+unfrozen. A minimal Lua signal primitive tracks per-build-owner dependencies
+transactionally, rejects writes during builds, and wakes only subscribed dirty
+work without entering Lua. The isolated VM now supports independently waiting,
+scope-owned coroutine tasks in growable stable-address slabs, with direct
+scheduler and `io_uring` completion routing. The Wayland example loads its root
+build function into that VM, invokes routed pointer handlers as scoped task-phase
+coroutines, and presents signal-driven descriptors through the same mounted
+render path. The shared text layer now uses pinned HarfBuzz for real OpenType
+run shaping and pinned uucode Unicode data for grapheme boundaries. The design
+system requests generic `sans-serif`, and native Linux builds use Fontconfig's
+configured primary and fallback faces. Pinned font fixtures keep shaping tests
+deterministic without putting shaping or measurement in a renderer.
 
 ## Requirements
 
 - Linux 5.10 or newer with `io_uring`
 - Zig 0.16.0 exactly (Wayring's current minimum and target)
 - Python 3 for deterministic token validation/generation
-- A C toolchain is not required separately; Zig compiles embedded Lua
+- Fontconfig development files for native Linux font discovery
+- FreeType development files for native software text rasterization
+- A C/C++ toolchain is not required separately; Zig compiles embedded Lua and
+  HarfBuzz
 
 ## Build and test
 
@@ -33,7 +56,32 @@ zig build tokens
 
 The default build installs `zig-out/lib/libourokit.a`. `zig build test` includes
 real kernel `io_uring` timeout/cancel tests, deterministic pixel tests, and the
-Lua coroutine/timer safe-point integration test.
+Lua coroutine/timer safe-point integration test. It also covers logical
+constraints, Flex/Stack layout, invalidation caching, scene lowering, and hit
+testing without a compositor, plus keyed reconciliation, safe retirement, and
+transactional pointer routing. Signal tests cover equal-write suppression,
+dynamic dependency replacement, failed-build rollback, build-time write
+rejection, and owner disposal. Text tests fetch pinned Inter and Noto Sans
+Arabic fixtures and verify HarfBuzz shaping plus Unicode grapheme segmentation.
+Fallback tests verify configured-order face selection, grapheme-safe boundaries,
+visible unresolved glyphs, stable font handles, and Fontconfig variable-instance
+translation. The growable font cache tests deduplication, stable addresses across
+growth, reference ownership, source replacement, and stale-handle rejection. A
+separate immutable shaped-run cache verifies complete request identity, fallback
+output, retained candidate lifetimes, stable growth, and stale shape handles.
+The normal library build does not embed either font.
+
+Native Linux builds enable Fontconfig by default. Minimal/headless builds and
+cross-compilation can omit that system capability with `-Dfontconfig=false`;
+deterministic shaping and rendering tests remain available.
+
+Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
+by default for cross targets. The first benchmark-oriented Lua text surface is
+`ouro.label(id, parent, text, size, color)`: it correctly shapes one LTR Latin
+label through HarfBuzz, lays it out from shaping metrics, and rasterizes through
+a backend-owned FreeType glyph cache. A basic button is composed from
+`ouro.padded_box` plus `ouro.label`; Button is not a renderer primitive. Full
+bidi, script itemization, wrapping, and editing are explicitly deferred.
 
 After editing canonical token JSON:
 
@@ -51,6 +99,19 @@ To run the reproducible software-renderer comparison against pinned Pixman
 ```sh
 zig build bench-renderers -Doptimize=ReleaseFast
 ```
+
+The optional end-to-end application benchmark compares one matched clickable
+Label/Button window against GTK 4 and Qt 6 under Wayland. GTK/Qt development
+packages are required only for this benchmark; normal Ourokit builds do not
+link either toolkit:
+
+```sh
+ZIG=/path/to/zig-0.16.0 tools/application-benchmark/build.sh
+tools/application-benchmark/run.py --iterations 20 --output results.json
+```
+
+See [the benchmark protocol](tools/application-benchmark/README.md) before
+interpreting startup or memory results.
 
 ## Wayland development
 
@@ -80,6 +141,13 @@ and shared-memory presentation path.
 
 - [Architecture](ARCHITECTURE.md)
 - [Design system](docs/design-system.md)
+- [Text shaping](docs/text.md)
 - [Rendering](docs/rendering.md)
 - [Runtime, tasks, Lua, and io_uring](docs/runtime.md)
 - [Application model](docs/application-model.md)
+
+Instance-adjacent typed pointer bindings now replace proof-wide global event
+dispatch. The provisional `ouro.on_pointer(instance_id, function)` build API
+uses explicit Lua registry lifetime and task-phase scoped coroutine dispatch;
+render objects and platform callbacks remain callback-free. This spelling is
+not stable and is intended to be replaced by generated component bindings.

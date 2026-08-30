@@ -12,6 +12,24 @@
             .url = "https://www.lua.org/ftp/lua-5.5.1.tar.gz",
             .hash = "N-V-__8AAPqeFQDipy0CdI6MKBmwYYarybBTO3IIJPrSzH_w",
         },
+        .harfbuzz = .{
+            .url = "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/14.3.1.tar.gz",
+            .hash = "N-V-__8AAAyZAAbcFxC0gXXD8qgZlnG0BNcf56NUo8V2I3Ss",
+        },
+        .uucode = .{
+            .url = "https://github.com/jacobsandlund/uucode/archive/61e54266895f833b307de81a0e3038cf1f1bebd4.tar.gz",
+            .hash = "uucode-0.2.0-ZZjBPh-6VADBlunHbwABTPng0DH6uJqd4CvvtjZ19tny",
+        },
+        .inter = .{
+            .url = "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip",
+            .hash = "N-V-__8AAAv-sAOXPycbcfSerQ5vsDx3k-PZC5fy2p9ScNi8",
+            .lazy = true,
+        },
+        .noto_sans_arabic = .{
+            .url = "https://github.com/notofonts/arabic/releases/download/NotoSansArabic-v2.013/NotoSansArabic-v2.013.zip",
+            .hash = "N-V-__8AABNJLQIhZ5ble53miuJIXH1vvcYYzt4_PPoiRAwp",
+            .lazy = true,
+        },
         .wayland = .{
             .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
             .hash = "N-V-__8AAA46JQABKU7sa-6xGUAN44uFsYSUS_w79UVuu7qo",

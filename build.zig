@@ -62,12 +62,28 @@ const pixman_sources = &.{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const enable_fontconfig = b.option(
+        bool,
+        "fontconfig",
+        "Enable native Linux font discovery through system Fontconfig",
+    ) orelse (target.query.isNative() and target.result.os.tag == .linux);
+    const enable_freetype = b.option(
+        bool,
+        "freetype",
+        "Enable software glyph rasterization through system FreeType",
+    ) orelse (target.query.isNative() and target.result.os.tag == .linux);
     const wayring = b.dependency("wayring", .{
         .target = target,
         .optimize = optimize,
     });
     const wayring_host = b.dependency("wayring", .{});
     const lua = b.dependency("lua", .{});
+    const harfbuzz = b.dependency("harfbuzz", .{});
+    const uucode = b.dependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{ "grapheme_break", "script" }),
+    });
     const wayland_protocol = addWaylandProtocol(b, target, optimize, wayring, wayring_host);
 
     const ourokit = b.addModule("ourokit", .{
@@ -77,9 +93,23 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "wayring", .module = wayring.module("wayring") },
             .{ .name = "wayland_protocol", .module = wayland_protocol },
+            .{ .name = "uucode", .module = uucode.module("uucode") },
         },
     });
     addLua(ourokit, lua);
+    addHarfBuzz(ourokit, harfbuzz);
+    const ourokit_options = b.addOptions();
+    ourokit_options.addOption(bool, "fontconfig", enable_fontconfig);
+    ourokit_options.addOption(bool, "freetype", enable_freetype);
+    ourokit.addOptions("ourokit_build_options", ourokit_options);
+    if (enable_fontconfig) {
+        ourokit.linkSystemLibrary("fontconfig", .{});
+        ourokit.link_libc = true;
+    }
+    if (enable_freetype) {
+        ourokit.linkSystemLibrary("freetype2", .{});
+        ourokit.link_libc = true;
+    }
 
     const library = b.addLibrary(.{
         .name = "ourokit",
@@ -99,6 +129,17 @@ pub fn build(b: *std.Build) void {
     addWaylandExample(b, target, optimize, ourokit);
     addRendererBenchmark(b, target, optimize, ourokit);
 
+    const test_font = b.lazyDependency("inter", .{}) orelse return;
+    ourokit.addAnonymousImport("ourokit_test_font", .{
+        .root_source_file = test_font.path("InterVariable.ttf"),
+    });
+    ourokit.addAnonymousImport("ourokit_test_font_static", .{
+        .root_source_file = test_font.path("extras/ttf/Inter-Regular.ttf"),
+    });
+    const arabic_test_font = b.lazyDependency("noto_sans_arabic", .{}) orelse return;
+    ourokit.addAnonymousImport("ourokit_arabic_test_font", .{
+        .root_source_file = arabic_test_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
+    });
     const tests = b.addTest(.{ .root_module = ourokit });
     const run_tests = b.addRunArtifact(tests);
     run_tests.step.dependOn(&token_check.step);
@@ -204,6 +245,16 @@ fn addWaylandExample(
     if (b.args) |args| run.addArgs(args);
     const run_step = b.step("run-wayland-example", "Open the software-rendered Wayland example");
     run_step.dependOn(&run.step);
+
+    const install_benchmark = b.addInstallArtifact(example, .{
+        .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
+        .dest_sub_path = "ourokit",
+    });
+    const benchmark_step = b.step(
+        "build-application-benchmark",
+        "Build the Ourokit application used by the GTK/Qt comparison",
+    );
+    benchmark_step.dependOn(&install_benchmark.step);
 }
 
 fn addWaylandProtocol(
@@ -236,4 +287,14 @@ fn addLua(module: *std.Build.Module, lua: *std.Build.Dependency) void {
     });
     module.addIncludePath(lua.path("src"));
     module.link_libc = true;
+}
+
+fn addHarfBuzz(module: *std.Build.Module, harfbuzz: *std.Build.Dependency) void {
+    module.addCSourceFiles(.{
+        .root = harfbuzz.path(""),
+        .files = &.{"src/harfbuzz.cc"},
+        .flags = &.{ "-std=c++17", "-DHB_NO_FEATURES_H" },
+    });
+    module.addIncludePath(harfbuzz.path("src"));
+    module.link_libcpp = true;
 }

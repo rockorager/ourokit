@@ -18,6 +18,7 @@
     { "name": "ouro.foundation.workflow_icon.small", "type": "dimension", "value": 16 },
     { "name": "ouro.foundation.workflow_icon.medium", "type": "dimension", "value": 20 },
     { "name": "ouro.foundation.workflow_icon.large", "type": "dimension", "value": 24 },
+    { "name": "ouro.foundation.typography.family", "type": "font_family", "value": "sans-serif" },
     { "name": "ouro.foundation.typography.body", "type": "font_size", "value": 14 },
     { "name": "ouro.foundation.typography.label", "type": "font_size", "value": 12 },
     { "name": "ouro.foundation.typography.heading", "type": "font_size", "value": 18 },

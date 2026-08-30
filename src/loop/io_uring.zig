@@ -106,6 +106,10 @@ pub const Loop = struct {
         return self.ring.submit();
     }
 
+    pub fn operationCapacity(self: *const Loop) usize {
+        return self.slots.len;
+    }
+
     pub fn wait(self: *Loop) !linux.io_uring_cqe {
         return self.ring.copy_cqe();
     }

@@ -15,7 +15,7 @@ OUTPUT = ROOT / "src" / "design" / "generated" / "tokens.zig"
 NAME = re.compile(r"^ouro\.(?:foundation|semantic)\.[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+$")
 REF = re.compile(r"^\{(ouro\..+)\}$")
 HEX = re.compile(r"^#[0-9a-fA-F]{8}$")
-TYPES = {"dimension", "font_size", "color"}
+TYPES = {"dimension", "font_size", "font_family", "color"}
 
 
 def load(name: str) -> list[dict]:
@@ -38,8 +38,11 @@ def load(name: str) -> list[dict]:
         if token["type"] in {"dimension", "font_size"}:
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name}: {token_name} requires a non-negative number")
-        elif not isinstance(value, str) or not (HEX.fullmatch(value) or REF.fullmatch(value)):
-            raise ValueError(f"{name}: {token_name} requires #RRGGBBAA or a reference")
+        elif token["type"] == "color":
+            if not isinstance(value, str) or not (HEX.fullmatch(value) or REF.fullmatch(value)):
+                raise ValueError(f"{name}: {token_name} requires #RRGGBBAA or a reference")
+        elif not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"{name}: {token_name} requires a non-empty font family")
     return document["tokens"]
 
 
@@ -89,6 +92,8 @@ def generate() -> str:
         if token["type"] == "color":
             value = color_literal(token["value"], all_values)
             lines.append(f"    pub const {name}: Color = {value};")
+        elif token["type"] == "font_family":
+            lines.append(f"    pub const {name}: []const u8 = {json.dumps(token['value'])};")
         else:
             lines.append(f"    pub const {name}: f32 = {float(token['value']):.1f};")
     lines.extend(["};", "", "pub const Theme = struct {"])

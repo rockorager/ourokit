@@ -15,11 +15,11 @@
         "additionalProperties": false,
         "properties": {
           "name": { "type": "string", "pattern": "^ouro\\.[a-z][a-z0-9]*(\\.[a-z][a-z0-9_]*)+$" },
-          "type": { "enum": ["dimension", "font_size", "color"] },
+          "type": { "enum": ["dimension", "font_size", "font_family", "color"] },
           "value": {
             "oneOf": [
               { "type": "number" },
-              { "type": "string", "pattern": "^(#[0-9a-fA-F]{8}|\\{ouro\\..+\\})$" }
+              { "type": "string", "minLength": 1 }
             ]
           }
         }

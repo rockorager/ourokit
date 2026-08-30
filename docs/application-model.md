@@ -2,9 +2,10 @@
 
 `app` is a small coordinator, not an implementation home. It owns the process
 lifetime and orders sibling loop/task/Lua/platform/UI/renderer modules. The
-reusable turn coordinator fixes that order in one implementation; current
-named no-op UI hooks make the safe-point contract visible without pretending
-that retained UI exists.
+reusable turn coordinator fixes that order in one implementation. The retained
+UI and Wayland example now exercise reconciliation, layout/scene construction,
+and frame submission as distinct phases; the general `App` host hooks remain
+the integration seam rather than absorbing those implementations.
 
 ## Declarative windows
 
@@ -66,14 +67,99 @@ TextInput, and Canvas only when their distinct behavior is demonstrated) owns
 layout, paint, clip, and hit testing. Scenes are immutable backend-neutral
 output.
 
-Padding, theme, keyed identity, focus, shortcuts, and stateful components are
-instance/widget policy, not render-object variants. There will be no universal
-generic node and no permanent arbitrary table parser based on repeated string
-`type` dispatch.
+The implemented headless render-tree kernel starts with Box, Flex, Stack, and a
+narrow single-line Label backed by an immutable shaped-run handle.
+It uses one-way minimum/maximum box constraints and logical `f32` geometry.
+Parents position children after each child chooses a finite constrained size.
+Flex factors and stack offsets are typed edge metadata, not wrapper nodes. The
+fixed-capacity tree allocates nothing during layout, caches unchanged constraint
+results, separates paint-only from layout invalidation, builds ordered display
+lists, and performs reverse-order hit testing without Wayland or Lua.
+
+Above it, the implemented instance reconciler consumes parent-before-child
+typed descriptor snapshots with stable numeric semantic IDs. It validates the
+whole snapshot and capacity before mutation, preserves instance identity and
+state revisions across updates/reordering, and uses preallocated hash indices
+for linear reconciliation and constant-time identity lookup. Identical
+snapshots compare retained child topology without detaching edges, leaving
+layout and paint caches untouched. Each instance owns a hierarchical resource
+scope. Removed instances become retiring tombstones and queue cancellation;
+their identity is recycled only after a later task safe point drains their
+scopes.
+
+The language-neutral per-window frame state coalesces layout and paint
+invalidation across turns. Layout must complete before scene construction, and
+a dirty scene cannot be submitted. Scene revisions become submitted revisions
+only after a backend accepts the frame. Repeated same-size Wayland configure
+events may reuse an immutable display list without rerunning reconciliation or
+layout, while the adapter's frame callback continues to throttle presentation.
+
+A bounded reconciliation queue separates state invalidation from snapshot
+production. Task or platform phases only mark a generation-checked window
+owner dirty. Marks deduplicate without allocation, including while an older
+revision is being reconciled. Only the reconciliation phase consumes work and
+constructs typed descriptors; successful completion records the applied
+revision, while failure can explicitly retain the work for retry. Window
+removal unregisters the owner and removes queued stale work.
+
+Mounted components now have a separate language-neutral build-owner registry.
+A build owner has keyed identity, parent/child ownership, a component scope,
+and requested/building/built revisions, but no render-object fields. New owners
+queue an initial build; later invalidation targets the owner directly instead
+of searching the retained tree. Stabilization is bounded by passes rather than
+total component count, so many independent dirty components remain one pass
+while state writes during builds schedule subsequent passes. Descriptor
+reconciliation must succeed before the build revision commits. Retiring a
+component recursively removes pending descendant work and queues its scope for
+safe-point cancellation.
+
+The initial signal primitive is deliberately narrower than a general reactive
+runtime. Lua owns each signal value. A bounded native edge table associates
+generation-checked signals with reads made by the currently building owner.
+Dependencies remain provisional until normalized descriptor reconciliation
+succeeds; rollback leaves the prior set intact. Changed writes only dirty
+subscribed owners. A state-only build-owner sink queues the owning window unless
+that window is already reconciling, where bounded local stabilization handles
+the mark. Neither path enters Lua. Disposal removes subscriptions before owner
+retirement. Computed signals and effects are not implemented yet.
+
+The pointer router consumes the callback-free Wayland event data, hit-tests the
+last completed render layout, and queues generation-checked instance targets.
+Hover enter/leave transitions and motion/button/axis events use a bounded ring
+queue. Queue overflow cannot partially change hover state. Application code
+observes this data only from the task phase. The current proof resolves an
+active target's instance-owned typed pointer binding and scope, then spawns its
+registry-referenced Lua function as an independently yieldable coroutine task.
+Bindings use generation-checked instance handles; stale targets are dropped.
+The constructor-specific `ouro.on_pointer(instance_id, function)` spelling and
+compact event argument ABI are explicitly provisional pending generated
+component bindings. Build references commit only after descriptor reconciliation
+succeeds; rollback, replacement, removal, and window teardown release them.
+
+Padding is Box layout policy rather than a wrapper render object. Theme, keyed
+identity, focus, shortcuts, and stateful components are instance/widget policy,
+not render-object variants. There will be no universal generic node and no
+permanent arbitrary table parser based on repeated string `type` dispatch.
 
 The eventual component schema should generate Lua constructors, compact Zig
-bindings/decoding, Lua language-server types, documentation, and cross-language
-validation. The initial milestone deliberately does not freeze that ABI.
+bindings/decoding into this normalized snapshot, Lua language-server types,
+documentation, and cross-language validation. Numeric IDs and the current
+descriptor spelling prove the native contract but do not freeze the public Lua
+ABI. A provisional constructor-specific bridge now proves this route end to
+end: a protected non-yielding mounted Lua build emits Box/Stack/Label descriptors
+directly into bounded native storage, which the existing transactional
+reconciler validates. It has no generic string `type` parser and is not the
+final ergonomic constructor surface. The Wayland example now exercises this
+actual Lua-build path for both windows, passing generated semantic design colors
+as typed arguments rather than mirroring token defaults in Lua. Both mounted
+window owners also read one shared signal, proving dependency identity across
+separate per-window registries sharing one VM.
+
+For the benchmark slice, `ouro.padded_box` plus `ouro.label` composes a basic
+button visual while `ouro.on_pointer` contributes behavior to the Box instance.
+Button is not a render object. The Label constructor rejects scripts outside
+its explicitly supported LTR Latin/Common/Inherited run until paragraph
+itemization exists.
 
 Commands live in an authoritative registry independent of the retained render
 tree. Entries need stable semantic IDs plus revisioned invocation handles,
@@ -81,6 +167,6 @@ scope, title/category/aliases, enabled state and reason, state, argument schema,
 shortcut, and destructive/reversible metadata. Contextual widget commands may
 register there, but external enumeration never walks render objects.
 
-Headless software rendering and deterministic scene logging are available now.
-Semantic snapshots and a future design-system gallery will exercise the same
-UI/scene path without Wayland or Vulkan once retained UI exists.
+Headless retained layout, software glyph rendering, and deterministic scene
+logging are available now. Semantic snapshots and a future design-system
+gallery will exercise the same UI/scene path without Wayland or Vulkan.

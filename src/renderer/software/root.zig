@@ -3,6 +3,18 @@ const Color = @import("../../core/color.zig").Color;
 const PremultipliedSrgba8 = @import("../../core/color.zig").PremultipliedSrgba8;
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
+const text = @import("../../text/root.zig");
+const build_options = @import("ourokit_build_options");
+
+pub const has_freetype = build_options.freetype;
+pub const GlyphCache = if (has_freetype)
+    @import("glyph_cache.zig").GlyphCache
+else
+    struct {};
+const GlyphBitmap = if (has_freetype)
+    @import("glyph_cache.zig").GlyphBitmap
+else
+    struct {};
 
 /// Both formats store premultiplied, encoded-sRGB channels. The names describe
 /// byte order, not the scene color representation.
@@ -29,20 +41,45 @@ pub const Target = struct {
 const max_clip_depth = 64;
 
 pub fn render(list: scene.DisplayList, target: Target) !void {
+    return renderInternal(list, target, null, null);
+}
+
+pub fn renderText(
+    list: scene.DisplayList,
+    target: Target,
+    glyphs: *GlyphCache,
+    shapes: *const text.ShapeCache,
+) !void {
+    if (!has_freetype) return error.FreeTypeDisabled;
+    return renderInternal(list, target, glyphs, shapes);
+}
+
+fn renderInternal(
+    list: scene.DisplayList,
+    target: Target,
+    glyphs: ?*GlyphCache,
+    shapes: ?*const text.ShapeCache,
+) !void {
     try target.validate();
     try list.validate();
     switch (list.damage) {
-        .full => try renderRegion(list.commands, target, targetBounds(target)),
+        .full => try renderRegion(list.commands, target, targetBounds(target), glyphs, shapes),
         .regions => |regions| {
             for (regions) |region| {
                 const clipped = RectI.intersect(region, targetBounds(target));
-                if (!clipped.isEmpty()) try renderRegion(list.commands, target, clipped);
+                if (!clipped.isEmpty()) try renderRegion(list.commands, target, clipped, glyphs, shapes);
             }
         },
     }
 }
 
-fn renderRegion(commands: []const scene.Command, target: Target, damage: RectI) !void {
+fn renderRegion(
+    commands: []const scene.Command,
+    target: Target,
+    damage: RectI,
+    glyphs: ?*GlyphCache,
+    shapes: ?*const text.ShapeCache,
+) !void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
@@ -60,7 +97,94 @@ fn renderRegion(commands: []const scene.Command, target: Target, damage: RectI) 
             rectangle.color,
             rectangle.blend,
         ),
+        .glyph_run => |run| {
+            if (!has_freetype) return error.FreeTypeDisabled;
+            try drawGlyphRun(
+                run,
+                target,
+                clips[depth],
+                glyphs orelse return error.TextResourcesRequired,
+                shapes orelse return error.TextResourcesRequired,
+            );
+        },
     };
+}
+
+fn drawGlyphRun(
+    command: scene.GlyphRun,
+    target: Target,
+    clip: RectI,
+    cache: *GlyphCache,
+    shapes: *const text.ShapeCache,
+) !void {
+    const shaped = try shapes.get(command.shape);
+    var pen = command.origin;
+    for (shaped.spans) |span| {
+        for (span.run.glyphs) |glyph| {
+            const bitmap = try cache.get(
+                span.font,
+                glyph.id,
+                shaped.logical_size * command.scale,
+            );
+            const left: i32 = @intFromFloat(@round(pen.x + glyph.offset.x * command.scale));
+            const baseline: i32 = @intFromFloat(@round(pen.y - glyph.offset.y * command.scale));
+            drawMask(
+                target,
+                clip,
+                left + bitmap.left,
+                baseline - bitmap.top,
+                bitmap,
+                command.color,
+            );
+            pen.x += glyph.advance.x * command.scale;
+            pen.y -= glyph.advance.y * command.scale;
+        }
+    }
+}
+
+fn drawMask(
+    target: Target,
+    clip: RectI,
+    x: i32,
+    y: i32,
+    bitmap: *const GlyphBitmap,
+    color: Color,
+) void {
+    const bounds = RectI.intersect(clip, .{
+        .x = x,
+        .y = y,
+        .width = bitmap.width,
+        .height = bitmap.height,
+    });
+    if (bounds.isEmpty()) return;
+    const source_color = color.premultiplied();
+    const source_x: usize = @intCast(bounds.x - x);
+    const source_y: usize = @intCast(bounds.y - y);
+    const width: usize = bounds.width;
+    const height: usize = bounds.height;
+    for (0..height) |row| {
+        for (0..width) |column| {
+            const coverage = bitmap.pixels[(source_y + row) * bitmap.width + source_x + column];
+            if (coverage == 0) continue;
+            const source: PremultipliedSrgba8 = .{
+                .r = multiply(source_color.r, coverage),
+                .g = multiply(source_color.g, coverage),
+                .b = multiply(source_color.b, coverage),
+                .a = multiply(source_color.a, coverage),
+            };
+            const destination_offset = (@as(usize, @intCast(bounds.y)) + row) * target.stride +
+                (@as(usize, @intCast(bounds.x)) + column) * 4;
+            const destination = readPixel(
+                target.format,
+                target.pixels[destination_offset..][0..4],
+            );
+            writePixel(
+                target.format,
+                target.pixels[destination_offset..][0..4],
+                sourceOver(source, destination),
+            );
+        }
+    }
 }
 
 fn fill(target: Target, bounds: RectI, color: Color, blend: scene.BlendMode) void {
@@ -220,4 +344,71 @@ test "BGRA storage, target validation, and clip balance are explicit" {
             .pop_clip,
         },
     }, .{ .pixels = &pixel, .width = 1, .height = 1, .stride = 4, .format = .rgba8_unorm }));
+}
+
+test "HarfBuzz glyph runs rasterize deterministically through backend cache" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    const font_bytes = @embedFile("ourokit_test_font_static");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
+        .bytes = font_bytes,
+    });
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    const shape = try shapes.acquire(.{
+        .spec = .{
+            .paragraph = "Benchmark",
+            .direction = .left_to_right,
+            .script = .latin,
+            .language = "en",
+            .logical_size = 18,
+        },
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    try fonts.release(font);
+    var glyphs = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer glyphs.deinit();
+
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(240, 240, 240, 255) },
+        .{ .glyph_run = .{
+            .shape = shape,
+            .origin = .{ .x = 4, .y = 24 },
+            .scale = 1,
+            .color = Color.rgba(20, 40, 80, 255),
+        } },
+    };
+    var first = [_]u8{0} ** (160 * 36 * 4);
+    var second = [_]u8{0xaa} ** first.len;
+    const target: Target = .{
+        .pixels = &first,
+        .width = 160,
+        .height = 36,
+        .stride = 160 * 4,
+        .format = .rgba8_unorm,
+    };
+    try renderText(.{ .commands = &commands }, target, &glyphs, &shapes);
+    var second_target = target;
+    second_target.pixels = &second;
+    try renderText(.{ .commands = &commands }, second_target, &glyphs, &shapes);
+    try std.testing.expectEqualSlices(u8, &first, &second);
+    var changed_pixels: usize = 0;
+    for (0..first.len / 4) |index| {
+        const pixel = first[index * 4 ..][0..4];
+        try std.testing.expectEqual(@as(u8, 255), pixel[3]);
+        if (!std.mem.eql(u8, pixel, &.{ 240, 240, 240, 255 })) changed_pixels += 1;
+    }
+    try std.testing.expect(changed_pixels > 200);
+    try std.testing.expectError(
+        error.TextResourcesRequired,
+        render(.{ .commands = &commands }, target),
+    );
+    try std.testing.expectError(
+        error.ResourceLeaseRequired,
+        scene.Frame.init(std.testing.allocator, &commands, .full),
+    );
+    try shapes.release(shape);
 }

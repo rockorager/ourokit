@@ -3,6 +3,53 @@ pub const SizeU = struct {
     height: u32,
 };
 
+/// Logical UI geometry. Layout remains independent of output scale and pixel
+/// format; scene construction lowers these values into device coordinates.
+pub const PointF = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+
+    pub fn add(a: PointF, b: PointF) PointF {
+        return .{ .x = a.x + b.x, .y = a.y + b.y };
+    }
+};
+
+pub const SizeF = struct {
+    width: f32,
+    height: f32,
+};
+
+pub const RectF = struct {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+
+    pub fn contains(self: RectF, point: PointF) bool {
+        return point.x >= self.x and point.y >= self.y and
+            point.x < self.x + self.width and point.y < self.y + self.height;
+    }
+};
+
+pub const Insets = struct {
+    left: f32 = 0,
+    top: f32 = 0,
+    right: f32 = 0,
+    bottom: f32 = 0,
+
+    pub fn all(value: f32) Insets {
+        return .{ .left = value, .top = value, .right = value, .bottom = value };
+    }
+
+    pub fn horizontal(self: Insets) f32 {
+        return self.left + self.right;
+    }
+
+    pub fn vertical(self: Insets) f32 {
+        return self.top + self.bottom;
+    }
+};
+
 /// Integer device-pixel rectangle. Negative origins are valid and clipped by
 /// raster backends; width and height are always non-negative.
 pub const RectI = struct {
@@ -53,4 +100,11 @@ test "rectangle intersection handles disjoint and overflowing extents" {
         .{ .x = std.math.maxInt(i32), .y = 0, .width = 100, .height = 1 },
         .{ .x = 0, .y = 0, .width = 1, .height = 1 },
     ).isEmpty());
+}
+
+test "logical rectangles use half-open hit-test bounds" {
+    const rect: RectF = .{ .x = 2, .y = 3, .width = 4, .height = 5 };
+    try std.testing.expect(rect.contains(.{ .x = 2, .y = 3 }));
+    try std.testing.expect(rect.contains(.{ .x = 5.999, .y = 7.999 }));
+    try std.testing.expect(!rect.contains(.{ .x = 6, .y = 4 }));
 }

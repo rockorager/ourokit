@@ -1,12 +1,10 @@
 const Handle = @import("../core/handle.zig").Handle;
+const PointF = @import("../core/geometry.zig").PointF;
 const ScopeHandle = @import("../task/scheduler.zig").ScopeHandle;
 
 pub const WindowHandle = Handle;
 
-pub const LogicalPosition = struct {
-    x: f32,
-    y: f32,
-};
+pub const LogicalPosition = PointF;
 
 pub const PointerButtonState = enum {
     released,

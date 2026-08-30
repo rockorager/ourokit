@@ -41,6 +41,22 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
                 @tagName(rectangle.blend),
             },
         ),
+        .glyph_run => |run| try append(
+            output,
+            &used,
+            "glyph_run shape={d}:{d} baseline=({d},{d}) scale={d} rgba({d},{d},{d},{d})\n",
+            .{
+                run.shape.slot,
+                run.shape.generation,
+                run.origin.x,
+                run.origin.y,
+                run.scale,
+                run.color.r,
+                run.color.g,
+                run.color.b,
+                run.color.a,
+            },
+        ),
     };
     return output[0..used];
 }

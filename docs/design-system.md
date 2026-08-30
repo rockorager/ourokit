@@ -20,4 +20,9 @@ generated from the same source rather than manually mirrored.
 Spectrum 2 informed category selection but was not imported wholesale. Exact
 source/version/license and exclusions are recorded in
 `design/provenance/spectrum-2.md`. Ourokit uses no Adobe marks or Adobe Clean.
-Component schemas and constructor generation remain future work.
+The canonical typography family is generic `sans-serif`; on Linux the text
+service resolves it through Fontconfig so user and system configuration remain
+authoritative. Pinned Inter and Noto files are deterministic shaping fixtures,
+not production defaults; their source and license provenance are recorded under
+`design/provenance`. Component schemas and constructor generation remain future
+work.

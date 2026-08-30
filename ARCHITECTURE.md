@@ -24,7 +24,7 @@ src/
   loop/                    raw io_uring ownership and operations
   task/                    language-neutral tasks, scopes, resources
   design/                  generated token API
-  text/                    future discovery, shaping, metrics, breaking
+  text/                    shaping, metrics, Unicode boundaries; future paragraphs
   ui/
     widget/                future Lua-facing declarations
     instance/              identity, lifecycle, reconciliation, state
@@ -122,6 +122,14 @@ resource kind, owner scope, and cancel/destroy lifecycle hooks. This avoids an
 application object with one array and teardown loop per subsystem. Context
 pointers may live inside that private registry but are never kernel identities.
 
+Semantic pointer handlers live in a language-neutral registry adjacent to the
+instance tree, keyed by generation-checked instance handles and opaque handler
+IDs. Render objects never own callbacks. The provisional Lua build bridge stages
+`ouro.on_pointer(instance_id, function)` registry references and commits them
+only after typed descriptor reconciliation; replacement, rollback, removal, and
+window teardown release references. Routed events resolve and spawn handlers
+only at the task safe point, so yielding handlers retain structured scope.
+
 ## Wayring integration
 
 Pinned Wayring commit `700b194fff32adc619c6ebdae5199223f87f9fc0`
@@ -198,9 +206,157 @@ tables; component schemas should eventually generate Lua constructors, compact
 Zig decoding, language-server types, documentation, and validation tests. That
 generator is not part of milestone one, and no permanent widget ABI is frozen.
 
+Layout uses one-way Flutter-style box constraints in logical `f32` units. A
+parent passes minimum/maximum width and height, each child returns one finite
+constrained size, and the parent assigns its offset. This is not a general
+equation solver. Box, Flex, and Stack are the first typed render objects; flex
+factors and stack positions live as parent data on child edges, while padding
+is Box policy rather than another wrapper object. Flex performs bounded passes
+and rejects flex children on an unbounded main axis.
+
+The render tree uses fixed-capacity generation-checked slots and intrusive
+ordered child links. Layout performs no allocation. Constraint results are
+cached per node; layout-affecting changes propagate dirtiness to ancestors,
+while paint-only changes do not trigger layout. Scene painting preserves child
+order, and hit testing traverses that order front-to-back. This render-tree
+identity remains distinct from the future instance tree's semantic/keyed
+identity and component lifecycle.
+
+Instance reconciliation compares retained topology in linear time before
+touching edges, so an unchanged normalized snapshot leaves both layout and
+paint clean. Reorders and typed parent-data changes rebuild topology while
+retaining instance and render-object identities.
+
+Per-window frame state is renderer- and platform-neutral. Layout invalidation
+dominates paint invalidation, repeated requests coalesce, and a display list is
+not eligible for submission while a newer mutation remains dirty. Scene and
+submitted revisions separate building from backend acceptance. An unchanged
+platform configure can request another submission of the current scene without
+forcing reconciliation or layout. Wayland frame callbacks only throttle the
+adapter; they do not create another event loop or directly enter UI code.
+
+Task and platform state mark window owners in a fixed-capacity reconciliation
+queue; they do not produce or decode widget snapshots immediately. Repeated
+marks coalesce while retaining monotonically changing requested revisions. The
+reconciliation phase alone takes work and builds normalized descriptors. A
+mark arriving while work is in progress schedules the newer revision for a
+later pass, and removed generation-checked owners cannot leave stale work.
+
+Mounted build owners are component lifecycle nodes, not render objects. They
+have keyed generation-checked identity, hierarchical resource scopes, direct
+dirty revisions, and no drawing or layout state. Initial and state-driven
+builds enter a bounded stabilization cycle; independent dirty siblings build in
+one pass, while writes caused by a build queue a later pass. Exceeding the pass
+limit is an error rather than an unbounded reactive loop. A build revision is
+committed only after its normalized descriptor output reconciles successfully.
+Recursive retirement removes queued builds immediately and defers scope
+cancellation to the task safe point.
+
+Lua signals use that owner boundary rather than introducing an effects runtime.
+Lua retains each arbitrary signal value; native state stores only
+generation-checked signal identity and bounded signal-to-build-owner edges.
+Reads during a protected build collect a provisional dependency set, which
+replaces the prior set only after descriptor reconciliation succeeds. Changed
+writes mark subscribed owners and use a state-only sink to wake their owning
+window queue; neither operation resumes Lua or builds inline. Writes from a
+build transaction are rejected. Owner disposal removes subscriptions before
+its stable registry address can be released. Effects and computed signals
+remain deferred.
+
+The instance layer now accepts a compact flat snapshot of typed descriptors.
+Semantic IDs are stable within a window, parents precede children, and typed
+parent data is validated before mutation. Preallocated open-addressed indices
+make validation, keyed lookup, render-to-instance lookup, and reconciliation
+linear rather than repeatedly scanning arbitrary Lua tables. Retained IDs keep
+generation-checked instance/render identities and component-state revisions;
+reordering only rebuilds intrusive render edges. Reparenting a retained ID is
+currently rejected because its hierarchical ownership scope is immutable.
+
+Every instance owns a child scope. Omission detaches its render object and
+queues scope cancellation, but leaves a generation tombstone until the task
+safe point drains resources and child scopes. Capacity therefore explicitly
+accounts for retiring instances instead of freeing identity while completions
+can still arrive.
+
+Pointer translation remains state-only. During platform-event translation, a
+per-window router hit-tests the last completed layout, maps render identity to
+instance identity, synthesizes hover transitions, and appends targeted data to
+a bounded O(1) ring queue. Motion overflow is transactional: neither hover
+state nor a partial transition changes. No routing operation invokes Lua or a
+widget callback.
+
 Text discovery, shaping, line breaking, measurement, and positioned glyph-run
-construction belong in `text`, above renderers. Both backends consume the same
-glyph sequence. Atlas storage and rasterization remain backend-owned.
+construction belong in `text`, above renderers. The first real slice embeds
+HarfBuzz 14.3.1 without FreeType, GLib, or ICU integration and shapes an
+explicitly itemized UTF-8 run. Native discovery separately links the system
+Fontconfig package and its platform dependencies. The shaping contract requires
+logical-order paragraph context, byte range, direction, ISO 15924 script, BCP
+47 language, face, and logical size; it never asks HarfBuzz to guess bidi or
+fallback. Output contains
+paragraph-relative clusters, glyph IDs, advances, offsets, font metrics, and
+unsafe-break flags in logical `f32` units.
+
+The canonical design family is generic `sans-serif`. Native Linux builds enable
+a focused Fontconfig discovery capability by default; minimal/headless and cross
+builds may disable it. One application-owned database holds an explicit
+configuration snapshot. Queries apply config and default substitutions, then
+retain `FcFontSort`'s configured, coverage-trimmed order as owned face metadata:
+family, file, complete face/named-instance index, variable status, variations,
+and copied charset coverage. Fontconfig data does not cross into UI, scenes, or
+renderers. Configuration replacement and cache invalidation occur only at an
+application safe point.
+
+uucode at pinned commit `61e54266895f833b307de81a0e3038cf1f1bebd4`
+supplies Unicode 17 data and extended-grapheme iteration. Its documented
+isolated-emoji-modifier tailoring is retained rather than represented as exact
+default UAX #29 behavior. Grapheme boundaries are for cursoring/selection and
+remain distinct from HarfBuzz clusters.
+
+This is a correct itemized-run shaper, not yet a complete paragraph engine.
+uucode does not implement UAX #9 bidi, UAX #14 line breaking, UAX #15
+normalization, or script-extensions/itemization. Those remain explicit work;
+shaping mixed text as one guessed run would be incorrect. Fontconfig provides
+candidate order and a coverage prefilter, not a shaping algorithm. The fallback
+planner first shapes the entire itemized run with each cache-owned candidate.
+If no face succeeds, it selects by actual HarfBuzz `.notdef` output at extended
+grapheme boundaries, merges adjacent equal-face selections, and reshapes each
+span with full paragraph context. This preserves combining/emoji sequences and
+Arabic joining context across necessary face boundaries. Unresolved graphemes
+remain visible through the primary face and are reported. Output retains only
+generation-checked font handles, never allocated font pointers. Tests use pinned
+Inter and Noto Sans Arabic fixtures to prove shaping independent of host fonts.
+Both backends will consume the same positioned glyph sequence. Atlas storage,
+hinting, and rasterization remain backend-owned.
+
+The application-owned font cache never opens files or blocks. Ouro's I/O layer
+supplies bytes for a Fontconfig face identity. Cache keys include file, complete
+index, variations, and a caller-derived source revision so replacing a file does
+not silently reuse stale font data. Faces live in growable stable-address slabs;
+growth cannot move a HarfBuzz font while fallback probing holds a pointer.
+Acquisition deduplicates loaded identities and increments a reference count.
+Generation-checked handles resolve in O(1), final release destroys the face and
+invalidates every stale copy, and cache teardown is the owning application
+scope's destruction path. The current linear dedupe scan is deliberately on the
+cold font-load path; it can gain an index only if measurements justify one.
+
+Fallback-shaped itemized runs are immutable and application-cached separately
+from faces. A collision-safe hash key includes complete paragraph bytes,
+normalized byte range, direction, script, language, exact logical size, ordered
+font handles, and the Fontconfig configuration revision. Entries occupy
+growable stable-address slabs behind dedicated generation-checked shape handles.
+They retain every candidate face until final release, so cached span font
+identities cannot become stale when the requesting layout releases its own font
+references. Font cache teardown follows shape-cache teardown. Refreshing the
+Fontconfig snapshot and revision is future safe-point orchestration, not a
+renderer concern.
+
+The benchmark-oriented first Label is intentionally narrower than a paragraph:
+one valid LTR run containing only Latin, Common, and Inherited script values.
+uucode enforces that boundary, so unsupported scripts fail rather than inheriting
+incorrect properties. Label owns no font or rasterizer state; it retains a shape
+handle, uses shaping metrics for one-way layout, and emits a baseline glyph-run
+command. Button is Box + Label composition with behavior in the instance layer,
+not another core render object.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,
@@ -215,6 +371,20 @@ caller-provided dimensions and stride. Scene colors remain straight-alpha sRGB;
 the backend owns conversion and deterministic source/source-over composition.
 Tests cover clipping, damage, alpha, format, row padding, clear, rectangles, and
 reusable conformance fixtures.
+
+Native software text rendering optionally links system FreeType. Backend-owned
+face entries retain FontCache handles and preserve face/named-instance identity
+plus variable-axis assignments. Glyph masks are cached by font generation,
+glyph ID, and device size, then blended through the same premultiplied path.
+FreeType objects and mask storage do not cross into scene or UI types. Builds
+without text rasterization use `-Dfreetype=false`; cross builds disable it by
+default. Eviction and LCD/subpixel policy await benchmark evidence.
+
+UI layout never sees pixel formats or stride. Scene construction lowers logical
+rectangles using an explicit output scale into renderer-neutral device-space
+commands. Conservative floor/ceil edge snapping is the current contract;
+subpixel coverage remains open until software and Vulkan implementations can
+share tested semantics.
 
 Frame-owned immutable command and damage storage can outlive the scene-building
 stack for worker or asynchronous backend use. Borrowed display-list views are
@@ -262,14 +432,34 @@ It never calls `luaL_openlibs`. The only initial global is the Ouro-owned table
 containing `sleep`; the proof test verifies `print`, `package`, and `coroutine`
 are absent.
 
+Mounted UI builds may install constructor-specific Ouro functions into that
+same table. They append compact typed descriptors only while a build owner is
+actively reconciling; calls outside that phase fail. Build callbacks execute
+under protected, non-yielding calls, and their descriptor storage is bounded
+and borrowed only until the next build. The current positional spelling is a
+pipeline proof, not the public ABI: schema-generated constructors and bindings
+will replace it without introducing generic string `type` dispatch.
+
+`ouro.signal(initial)` is the first reactive primitive. Calling its userdata
+reads the value and `signal:set(value)` changes it. Dependency tracking belongs
+to the active mounted build owner and commits transactionally with that owner's
+descriptors; raw-equal writes are suppressed.
+
+The isolated VM owns growable stable-address slabs of generation-checked
+coroutines. Growth occurs only during task creation; existing slots do not move
+and resume/completion paths do not allocate.
+Each Lua task maps directly to its language-neutral scheduler slot and pending
+`io_uring` operation slot, and carries its application/window/widget scope.
 `ouro.sleep` yields with `lua_yieldk`; its continuation runs only after the task
-phase explicitly resumes the coroutine. A Zig frame is not retained across the
-yield. A future bundle loader will be pure Ouro functionality, not Lua package
-`require`.
+phase explicitly resumes that coroutine. A Zig frame is not retained across
+the yield. Coroutines are explicitly anchored in the Lua registry and pass
+through `lua_closethread` on completion, error, or cancellation before their
+anchor is released. A future bundle loader will be pure Ouro functionality,
+not Lua package `require`.
 
 ## First-milestone non-goals and open questions
 
-Non-goals: complete widgets, text shaping/font discovery, command palette,
+Non-goals: complete widgets, complete paragraph layout/font discovery, command palette,
 accessibility protocols, Vulkan implementation, bundle manifests/packing,
 installation/package management, native `.so` extensions, broad Lua standard
 libraries, network/filesystem APIs, permissions/sandboxing, and full Spectrum
@@ -283,6 +473,8 @@ Open questions intentionally left unfrozen:
   declaration, including the eventual default for the last window;
 - frame resource leases for future image and glyph references;
 - renderer-neutral image/glyph resource identity and cache eviction;
+- full bidi/script-itemization/line-breaking policy, Fontconfig refresh
+  orchestration, and exact default versus tailored grapheme behavior;
 - transform, subpixel rasterization, layer, and color-managed surface semantics;
 - Vulkan external-memory, dma-buf presentation, and synchronization contract
   after a real Wayring-native prototype;

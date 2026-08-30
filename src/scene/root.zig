@@ -1,12 +1,21 @@
 const std = @import("std");
 const Color = @import("../core/color.zig").Color;
+const PointF = @import("../core/geometry.zig").PointF;
 const RectI = @import("../core/geometry.zig").RectI;
+const ShapeHandle = @import("../text/shape_cache.zig").ShapeHandle;
 
 pub const BlendMode = enum {
     /// Replace destination pixels with the premultiplied source.
     source,
     /// Premultiplied Porter-Duff source-over in encoded sRGB channels.
     source_over,
+};
+
+pub const GlyphRun = struct {
+    shape: ShapeHandle,
+    origin: PointF,
+    scale: f32,
+    color: Color,
 };
 
 /// Renderer-neutral, value-only painting vocabulary. Clip commands are
@@ -20,6 +29,9 @@ pub const Command = union(enum) {
         color: Color,
         blend: BlendMode = .source_over,
     },
+    /// One immutable, already-shaped itemized run. `origin` is the device-space
+    /// baseline and `scale` converts the run's logical positions to pixels.
+    glyph_run: GlyphRun,
 };
 
 pub const Damage = union(enum) {
@@ -49,6 +61,13 @@ pub const DisplayList = struct {
                 depth -= 1;
             },
             .solid_rectangle => {},
+            .glyph_run => |run| {
+                if (run.shape.generation == 0 or
+                    !std.math.isFinite(run.origin.x) or
+                    !std.math.isFinite(run.origin.y) or
+                    !std.math.isFinite(run.scale) or run.scale <= 0)
+                    return error.InvalidGlyphRun;
+            },
         };
         if (depth != 0) return error.UnbalancedClipStack;
         switch (self.damage) {
@@ -78,6 +97,8 @@ pub const Frame = struct {
         damage: Damage,
     ) !Frame {
         try (DisplayList{ .commands = commands, .damage = damage }).validate();
+        for (commands) |command| if (command == .glyph_run)
+            return error.ResourceLeaseRequired;
         const owned_commands = try allocator.dupe(Command, commands);
         errdefer allocator.free(owned_commands);
         const full_damage = damage == .full;

@@ -30,6 +30,7 @@ pub const foundation = struct {
     pub const spacing_4: f32 = 16.0;
     pub const spacing_6: f32 = 24.0;
     pub const typography_body: f32 = 14.0;
+    pub const typography_family: []const u8 = "sans-serif";
     pub const typography_heading: f32 = 18.0;
     pub const typography_label: f32 = 12.0;
     pub const workflow_icon_large: f32 = 24.0;

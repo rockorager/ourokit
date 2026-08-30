@@ -21,6 +21,10 @@ isolation remain deliberately uncommitted until equivalent software and Vulkan
 prototypes validate their semantics.
 
 The scene has no Lua, Wayland, `wl_shm`, stride, pixel format, or Vulkan state.
+UI layout uses logical floating-point geometry above this contract. The
+headless scene builder applies output scale and conservatively rounds logical
+edges outward into device-space display-list rectangles. Pixel formats and row
+layout remain backend-only. Subpixel coverage is still deliberately unfrozen.
 
 ## Software backend
 
@@ -61,8 +65,11 @@ sequence:
 Configure/resize creates correctly sized buffers; old buffers stay alive until
 released. Frame callbacks gate submission rather than driving a second loop.
 Pool replacement and protocol-object destruction happen after complete event
-dispatch, preserving the platform safe-point invariant. More precise partial
-damage history and frame scheduling remain production work.
+dispatch, preserving the platform safe-point invariant. Platform-neutral frame
+state now coalesces layout/paint invalidation and tracks built versus submitted
+scene revisions; Wayland's pending-redraw and callback state only determine
+when that prepared scene may acquire a buffer. More precise partial-damage
+history remains production work.
 
 `platform.wayland.Host.acquireFrame` returns a generation-checked synchronous
 borrow of one BGRA shared-memory slot. Rendering must finish with `present` or
@@ -88,5 +95,19 @@ synchronization, release ordering, and fallback policy must be proven by a real
 prototype before its target/resource interface is frozen. No fake backend or
 software-shaped vtable is present now.
 
-Text will be shaped above both renderers into common positioned glyph runs.
-Each backend may own atlas/image caching and rasterization details.
+Text is shaped above both renderers by the shared HarfBuzz-backed `text` module.
+The scene will receive common positioned glyph runs; each backend may own
+atlas/image caching, hinting, and rasterization details. Neither backend exposes
+a `measureText` operation, chooses fonts, performs bidi, or reshapes strings.
+
+The initial software text path consumes renderer-neutral glyph-run commands
+that reference immutable shaped-run handles. Its optional FreeType integration
+owns retained faces and grayscale glyph masks below the scene boundary. The
+retained Label obtains metrics from text shaping; Box + Label composes a button.
+Full paragraph processing remains deferred, and non-Latin input is rejected by
+the narrow label constructor rather than shaped with guessed properties.
+
+Asynchronous `scene.Frame` copies currently reject glyph commands until frame
+resource leases can retain shaped/font handles. The synchronous Wayland and
+benchmark path may consume a borrowed display list while its owning UI/text
+scope remains alive.

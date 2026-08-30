@@ -1,5 +1,10 @@
 pub const tokens = @import("generated/tokens.zig");
 
+test "canonical typography delegates generic sans-serif to platform discovery" {
+    const std = @import("std");
+    try std.testing.expectEqualStrings("sans-serif", tokens.foundation.typography_family);
+}
+
 test "semantic tokens are consumable by renderer-neutral scenes" {
     const std = @import("std");
     const scene = @import("../scene/root.zig");

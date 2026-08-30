@@ -91,16 +91,16 @@ pub const Scheduler = struct {
     }
 
     pub fn createTask(self: *Scheduler, scope: ScopeHandle) !TaskHandle {
-        if ((try self.scopeSlot(scope)).cancellation_requested) return error.ScopeCanceled;
+        if (!(try self.scopeAcceptsNew(scope))) return error.ScopeCanceled;
         for (self.tasks, 0..) |*slot, index| if (slot.state == .free) {
-            slot.generation +%= 1;
-            if (slot.generation == 0) slot.generation = 1;
-            slot.state = .runnable;
-            slot.scope = scope;
-            slot.cancellation_requested = false;
-            return .{ .slot = @intCast(index), .generation = slot.generation };
+            return activateTask(slot, index, scope);
         };
-        return error.TaskCapacityExceeded;
+        const old_len = self.tasks.len;
+        const new_len = std.math.mul(usize, old_len, 2) catch return error.TaskCapacityExceeded;
+        if (new_len > std.math.maxInt(u32)) return error.TaskCapacityExceeded;
+        self.tasks = try self.allocator.realloc(self.tasks, new_len);
+        @memset(self.tasks[old_len..], .{});
+        return activateTask(&self.tasks[old_len], old_len, scope);
     }
 
     /// Called only by the task phase to obtain execution permission.
@@ -134,13 +134,21 @@ pub const Scheduler = struct {
         slot.cancellation_requested = false;
     }
 
+    /// Rolls back a task that has been created but not granted execution.
+    pub fn discardRunnableTask(self: *Scheduler, handle: TaskHandle) !void {
+        const slot = try self.taskSlot(handle);
+        if (slot.state != .runnable) return error.InvalidTaskTransition;
+        slot.state = .free;
+        slot.scope = .invalid;
+        slot.cancellation_requested = false;
+    }
+
     pub fn queueScopeCancellation(self: *Scheduler, scope: ScopeHandle) !void {
         (try self.scopeSlot(scope)).cancellation_queued = true;
     }
 
     pub fn createScope(self: *Scheduler, parent: ScopeHandle) !ScopeHandle {
-        const parent_slot = try self.scopeSlot(parent);
-        if (parent_slot.cancellation_requested) return error.ScopeCanceled;
+        if (!(try self.scopeAcceptsNew(parent))) return error.ScopeCanceled;
         for (self.scopes, 0..) |*slot, index| if (!slot.active) {
             slot.generation +%= 1;
             if (slot.generation == 0) slot.generation = 1;
@@ -213,7 +221,7 @@ pub const Scheduler = struct {
         context: *anyopaque,
         lifecycle: *const ResourceLifecycle,
     ) !ResourceHandle {
-        if ((try self.scopeSlot(owner)).cancellation_requested) return error.ScopeCanceled;
+        if (!(try self.scopeAcceptsNew(owner))) return error.ScopeCanceled;
         for (self.resources, 0..) |*slot, index| if (!slot.active) {
             slot.generation +%= 1;
             if (slot.generation == 0) slot.generation = 1;
@@ -240,6 +248,22 @@ pub const Scheduler = struct {
         lifecycle.destroy(context);
     }
 
+    pub fn availableScopeCapacity(self: *const Scheduler) usize {
+        var count: usize = 0;
+        for (self.scopes) |scope| if (!scope.active) {
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn taskCapacity(self: *const Scheduler) usize {
+        return self.tasks.len;
+    }
+
+    pub fn scopeAcceptsResources(self: *Scheduler, handle: ScopeHandle) !bool {
+        return self.scopeAcceptsNew(handle);
+    }
+
     fn scopeSlot(self: *Scheduler, handle: ScopeHandle) !*ScopeSlot {
         if (handle.slot >= self.scopes.len) return error.StaleScope;
         const slot = &self.scopes[handle.slot];
@@ -263,10 +287,29 @@ pub const Scheduler = struct {
             current = slot.parent;
         }
     }
+
+    fn scopeAcceptsNew(self: *Scheduler, handle: ScopeHandle) !bool {
+        var current = handle;
+        while (true) {
+            const slot = try self.scopeSlot(current);
+            if (slot.cancellation_queued or slot.cancellation_requested) return false;
+            if (same(current, self.application_scope)) return true;
+            current = slot.parent;
+        }
+    }
 };
 
 fn same(a: Handle, b: Handle) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn activateTask(slot: *TaskSlot, index: usize, scope: ScopeHandle) TaskHandle {
+    slot.generation +%= 1;
+    if (slot.generation == 0) slot.generation = 1;
+    slot.state = .runnable;
+    slot.scope = scope;
+    slot.cancellation_requested = false;
+    return .{ .slot = @intCast(index), .generation = slot.generation };
 }
 
 test "completion and cancellation only make tasks runnable until task phase" {
@@ -360,6 +403,20 @@ test "scope cancellation cascades without running task or resource code early" {
     );
     try scheduler.complete(task);
     try scheduler.destroyResource(resource_handle);
+    try scheduler.destroyScope(widget);
+    try scheduler.destroyScope(window);
+}
+
+test "queued ancestor cancellation rejects new descendants before the safe point" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 2, 1);
+    defer scheduler.deinit();
+    const window = try scheduler.createScope(scheduler.application_scope);
+    const widget = try scheduler.createScope(window);
+    try scheduler.queueScopeCancellation(window);
+    try std.testing.expectError(error.ScopeCanceled, scheduler.createScope(widget));
+    try std.testing.expectError(error.ScopeCanceled, scheduler.createTask(widget));
+    try scheduler.applyQueuedCancellations();
     try scheduler.destroyScope(widget);
     try scheduler.destroyScope(window);
 }
