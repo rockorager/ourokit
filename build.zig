@@ -100,6 +100,7 @@ pub fn build(b: *std.Build) void {
     addLua(ourokit, lua);
     addHarfBuzz(ourokit, harfbuzz);
     addSheenBidi(ourokit, sheenbidi);
+    addVulkan(b, ourokit);
     const ourokit_options = b.addOptions();
     ourokit_options.addOption(bool, "fontconfig", enable_fontconfig);
     ourokit_options.addOption(bool, "freetype", enable_freetype);
@@ -184,6 +185,23 @@ fn addParagraphBenchmark(
     const run = b.addRunArtifact(benchmark);
     const step = b.step("bench-paragraph", "Benchmark headless paragraph bidi analysis");
     step.dependOn(&run.step);
+}
+
+fn addVulkan(b: *std.Build, module: *std.Build.Module) void {
+    const fill = compileShader(b, "src/renderer/vulkan/fill.comp", "ourokit-vulkan-fill.spv");
+    const solid_vertex = compileShader(b, "src/renderer/vulkan/solid.vert", "ourokit-vulkan-solid-vertex.spv");
+    const solid_fragment = compileShader(b, "src/renderer/vulkan/solid.frag", "ourokit-vulkan-solid-fragment.spv");
+    module.addAnonymousImport("ourokit_vulkan_fill", .{ .root_source_file = fill });
+    module.addAnonymousImport("ourokit_vulkan_solid_vertex", .{ .root_source_file = solid_vertex });
+    module.addAnonymousImport("ourokit_vulkan_solid_fragment", .{ .root_source_file = solid_fragment });
+    module.linkSystemLibrary("vulkan", .{});
+}
+
+fn compileShader(b: *std.Build, source: []const u8, output: []const u8) std.Build.LazyPath {
+    const compile = b.addSystemCommand(&.{ "glslc", "-O" });
+    compile.addFileArg(b.path(source));
+    compile.addArg("-o");
+    return compile.addOutputFileArg(output);
 }
 
 fn addRendererBenchmark(
@@ -299,6 +317,21 @@ fn addWaylandExample(
     const run_step = b.step("run-wayland-example", "Open the software-rendered Wayland example");
     run_step.dependOn(&run.step);
 
+    const vulkan_example = b.addExecutable(.{
+        .name = "ourokit-wayland-vulkan-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/vulkan_wayland.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+        }),
+    });
+    const run_vulkan = b.addRunArtifact(vulkan_example);
+    run_vulkan.addArg("--vulkan");
+    if (b.args) |args| run_vulkan.addArgs(args);
+    const run_vulkan_step = b.step("run-wayland-vulkan-example", "Open the Vulkan dma-buf Wayland example");
+    run_vulkan_step.dependOn(&run_vulkan.step);
+
     const install_benchmark = b.addInstallArtifact(example, .{
         .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
         .dest_sub_path = "ourokit",
@@ -337,6 +370,9 @@ fn addWaylandProtocol(
     const generate = b.addRunArtifact(scanner);
     generate.addFileArg(wayland.path("protocol/wayland.xml"));
     generate.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
+    generate.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
+    generate.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));
+    generate.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
     const generated = generate.addOutputFileArg("ourokit-wayland-protocol.zig");
     return b.createModule(.{
         .root_source_file = generated,

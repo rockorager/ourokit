@@ -44,6 +44,7 @@ deterministic without putting shaping or measurement in a renderer.
 - Python 3 for deterministic token validation/generation
 - Fontconfig development files for native Linux font discovery
 - FreeType development files for native software text rasterization
+- Vulkan loader and headers, plus `glslc` for the Vulkan backend shaders
 - A C/C++ toolchain is not required separately; Zig compiles embedded Lua and
   HarfBuzz
 
@@ -57,8 +58,9 @@ zig build tokens
 ```
 
 The default build installs `zig-out/lib/libourokit.a`. `zig build test` includes
-real kernel `io_uring` timeout/cancel tests, deterministic pixel tests, and the
-Lua coroutine/timer safe-point integration test. It also covers logical
+real kernel `io_uring` timeout/cancel tests, deterministic software and Vulkan
+pixel tests, and the Lua coroutine/timer safe-point integration test. It also
+covers logical
 constraints, Flex/Stack layout, invalidation caching, scene lowering, and hit
 testing without a compositor, plus keyed reconciliation, safe retirement, and
 transactional pointer routing. Signal tests cover equal-write suppression,
@@ -150,6 +152,18 @@ Run any declarative application directly through the reusable host:
 zig build run-app -- path/to/application.lua
 ```
 
+Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
+presenter with:
+
+```sh
+zig build run-wayland-vulkan-example
+```
+
+The Vulkan example uses linux-dmabuf v4 device/modifier feedback, direct
+rendering, and linux-drm-syncobj timelines when advertised. It falls back to
+shared memory when the compositor and Vulkan device have no common renderable
+ARGB8888 modifier.
+
 Close the window normally to exit. CI or a headless compositor can use
 `zig build run-wayland-example -- --exit-after-first-frame`. Exercise
 independent multi-window lifetime with:
@@ -158,11 +172,12 @@ independent multi-window lifetime with:
 zig build run-wayland-example -- --two-windows
 ```
 
-The Wayland and xdg-shell XML archives are pinned Zig build dependencies used
-to generate protocol code; no system libwayland is linked. See
+The Wayland, xdg-shell, linux-dmabuf, presentation-time, and drm-syncobj XML
+archives are pinned Zig build dependencies used to generate protocol code; no
+system libwayland is linked. See
 [ARCHITECTURE.md](ARCHITECTURE.md) and
 [docs/rendering.md](docs/rendering.md) for the verified integration contract
-and shared-memory presentation path.
+and shared-memory/dma-buf presentation paths.
 
 ## Documentation
 

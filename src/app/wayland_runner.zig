@@ -229,11 +229,18 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
             const handle = window_set.handleForId(window.declaration.id).?;
             if (runtimes[index].wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
                 const list = try runtimes[index].displayList();
+                const software_target = switch (frame_buffer.target) {
+                    .software => |target| target,
+                    .vulkan => {
+                        try host.discardFrame(frame_buffer);
+                        return error.UnexpectedVulkanFrame;
+                    },
+                };
                 renderer.software.renderText(list, .{
-                    .pixels = frame_buffer.pixels,
+                    .pixels = software_target.pixels,
                     .width = frame_buffer.width,
                     .height = frame_buffer.height,
-                    .stride = frame_buffer.stride,
+                    .stride = software_target.stride,
                     .format = .bgra8_unorm,
                 }, &glyphs, &shapes) catch |err| {
                     try host.discardFrame(frame_buffer);

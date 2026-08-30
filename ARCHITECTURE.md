@@ -485,8 +485,9 @@ not Lua package `require`.
 
 ## First-milestone non-goals and open questions
 
-Non-goals: complete widgets, complete paragraph layout/font discovery, command palette,
-accessibility protocols, Vulkan implementation, bundle manifests/packing,
+Non-goals: complete widgets, complete paragraph layout/font discovery, command
+palette, accessibility protocols, advanced Vulkan dma-buf negotiation, bundle
+manifests/packing,
 installation/package management, native `.so` extensions, broad Lua standard
 libraries, network/filesystem APIs, permissions/sandboxing, and full Spectrum
 coverage.
@@ -502,7 +503,6 @@ Open questions intentionally left unfrozen:
 - full bidi/script-itemization/line-breaking policy, Fontconfig refresh
   orchestration, and exact default versus tailored grapheme behavior;
 - transform, subpixel rasterization, layer, and color-managed surface semantics;
-- Vulkan external-memory, dma-buf presentation, and synchronization contract
-  after a real Wayring-native prototype;
+- Vulkan device-loss recovery and richer damage-region coalescing;
 - scope close semantics for multiple asynchronous resource kinds;
 - versioned application bundle and native-extension ABI.

@@ -3,7 +3,10 @@ const wayring = @import("wayring");
 const protocol = @import("wayland_protocol");
 const OuroLoop = @import("../../loop/io_uring.zig").Loop;
 const platform_window = @import("../window.zig");
+const RectI = @import("../../core/geometry.zig").RectI;
+const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
+const Vulkan = @import("../../renderer/vulkan/root.zig");
 
 const linux = std.os.linux;
 const posix = std.posix;
@@ -16,10 +19,14 @@ const Driver = wayring.client.Driver(protocol);
 const Roundtrip = wayring.client.Roundtrip(protocol, *Host);
 
 const buffer_count = 3;
+const presentation_feedback_capacity = 8;
 
 pub const Config = struct {
     app_id: []const u8,
     window_capacity: usize = 8,
+    /// Prefer Vulkan linux-dmabuf presentation when compositor feedback and
+    /// the selected Vulkan device share a renderable ARGB8888 modifier.
+    vulkan: ?*Vulkan = null,
     reactor: wayring.io_uring.Config = .{
         .buffer_group_id = 1,
         .receive_buffer_size = 16 * 1024,
@@ -30,24 +37,65 @@ pub const Config = struct {
         .transmit_block_size = 4096,
         .transmit_block_count = 16,
         .descriptor_count = 16,
-        .send_descriptor_capacity = 4,
+        .send_descriptor_capacity = 32,
     },
 };
 
 pub const Frame = struct {
-    pixels: []u8,
+    target: union(enum) {
+        software: struct {
+            pixels: []u8,
+            stride: usize,
+        },
+        vulkan: *Vulkan.DmabufTarget,
+    },
     width: u32,
     height: u32,
-    stride: usize,
     window: WindowHandle,
     pool_generation: u32,
     slot: u8,
+    damage_regions: [1]RectI = undefined,
+    damage_count: u8 = 0,
+    requested_damage: DamageSummary = .full,
+    damage_prepared: bool = false,
+
+    pub fn damage(self: *const Frame) scene.Damage {
+        return if (self.damage_count == 0)
+            .{ .regions = &.{} }
+        else if (self.damage_regions[0].x == 0 and self.damage_regions[0].y == 0 and
+            self.damage_regions[0].width == self.width and self.damage_regions[0].height == self.height)
+            .full
+        else
+            .{ .regions = self.damage_regions[0..self.damage_count] };
+    }
 };
+
+pub const PresentationBackend = enum { shared_memory, vulkan_dmabuf };
+
+pub const PresentationTiming = struct {
+    clock_id: u32,
+    seconds: u64,
+    nanoseconds: u32,
+    refresh_nanoseconds: u32,
+    sequence: u64,
+    vsync: bool,
+    hardware_clock: bool,
+    hardware_completion: bool,
+    zero_copy: bool,
+};
+
+const drm_format_argb8888: u32 = (@as(u32, 'A')) |
+    (@as(u32, 'R') << 8) |
+    (@as(u32, '2') << 16) |
+    (@as(u32, '4') << 24);
+const drm_format_modifier_linear: u64 = 0;
+const dmabuf_table_entry_size = 16;
 
 const BufferSlot = struct {
     handle: ?Handle = null,
     busy: bool = false,
     acquired: bool = false,
+    last_present_serial: u64 = 0,
 };
 
 const ShmBuffers = struct {
@@ -168,6 +216,248 @@ const ShmBuffers = struct {
     }
 };
 
+const DmabufSlot = struct {
+    handle: ?Handle = null,
+    timeline: ?Handle = null,
+    target: ?Vulkan.DmabufTarget = null,
+    busy: bool = false,
+    acquired: bool = false,
+    last_present_serial: u64 = 0,
+};
+
+pub const DamageSummary = union(enum) {
+    none,
+    full,
+    bounds: RectI,
+};
+
+fn summarizeDamage(damage: scene.Damage, frame_bounds: RectI) DamageSummary {
+    return switch (damage) {
+        .full => .full,
+        .regions => |regions| blk: {
+            var result: DamageSummary = .none;
+            for (regions) |region| {
+                const clipped = RectI.intersect(region, frame_bounds);
+                if (!clipped.isEmpty()) result = unionDamage(result, .{ .bounds = clipped }, frame_bounds);
+            }
+            break :blk result;
+        },
+    };
+}
+
+fn unionDamage(a: DamageSummary, b: DamageSummary, frame_bounds: RectI) DamageSummary {
+    if (a == .full or b == .full) return .full;
+    if (a == .none) return b;
+    if (b == .none) return a;
+    const a_bounds = a.bounds;
+    const b_bounds = b.bounds;
+    const left = @min(a_bounds.x, b_bounds.x);
+    const top = @min(a_bounds.y, b_bounds.y);
+    const right = @max(@as(i64, a_bounds.x) + a_bounds.width, @as(i64, b_bounds.x) + b_bounds.width);
+    const bottom = @max(@as(i64, a_bounds.y) + a_bounds.height, @as(i64, b_bounds.y) + b_bounds.height);
+    const bounds: RectI = .{
+        .x = left,
+        .y = top,
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+    return if (bounds.x == frame_bounds.x and bounds.y == frame_bounds.y and
+        bounds.width == frame_bounds.width and bounds.height == frame_bounds.height)
+        .full
+    else
+        .{ .bounds = bounds };
+}
+
+const DamageRecord = struct {
+    serial: u64 = 0,
+    damage: DamageSummary = .none,
+};
+
+const DamageHistory = struct {
+    serial: u64 = 0,
+    records: [buffer_count]DamageRecord = [_]DamageRecord{.{}} ** buffer_count,
+
+    fn expand(
+        self: *const DamageHistory,
+        last_present_serial: u64,
+        requested: DamageSummary,
+        frame_bounds: RectI,
+    ) DamageSummary {
+        if (requested == .full or last_present_serial == 0 or last_present_serial > self.serial)
+            return .full;
+        if (self.serial - last_present_serial > self.records.len) return .full;
+        var result = requested;
+        var serial = last_present_serial + 1;
+        while (serial <= self.serial) : (serial += 1) {
+            const record = self.records[serial % self.records.len];
+            if (record.serial != serial) return .full;
+            result = unionDamage(result, record.damage, frame_bounds);
+            if (result == .full) return .full;
+        }
+        return result;
+    }
+
+    fn commit(self: *DamageHistory, requested: DamageSummary) u64 {
+        self.serial +%= 1;
+        if (self.serial == 0) self.serial = 1;
+        self.records[self.serial % self.records.len] = .{ .serial = self.serial, .damage = requested };
+        return self.serial;
+    }
+};
+
+const DmabufBuffers = struct {
+    slots: [buffer_count]DmabufSlot = [_]DmabufSlot{.{}} ** buffer_count,
+    width: u32 = 0,
+    height: u32 = 0,
+    generation: u32 = 0,
+
+    fn matches(self: *const DmabufBuffers, width: u32, height: u32) bool {
+        return self.slots[0].target != null and self.width == width and self.height == height;
+    }
+
+    fn anyBusy(self: *const DmabufBuffers) bool {
+        for (self.slots) |slot| if (slot.busy or slot.acquired or
+            (slot.target != null and slot.target.?.gpu_pending)) return true;
+        return false;
+    }
+
+    fn slotForId(self: *DmabufBuffers, id: u32) ?*DmabufSlot {
+        for (&self.slots) |*slot| if (slot.handle != null and slot.handle.?.id == id) return slot;
+        return null;
+    }
+
+    fn containsId(self: *const DmabufBuffers, id: u32) bool {
+        for (self.slots) |slot| if (slot.handle != null and slot.handle.?.id == id) return true;
+        return false;
+    }
+
+    fn create(
+        self: *DmabufBuffers,
+        renderer: *Vulkan,
+        objects: *wayring.objects.ClientObjects,
+        transmit: *wayring.tx.Queue,
+        dmabuf: Handle,
+        sync_manager: ?Handle,
+        modifier: u64,
+        width: u32,
+        height: u32,
+        generation: u32,
+    ) !void {
+        std.debug.assert(self.slots[0].target == null);
+        if (width > std.math.maxInt(i32) or height > std.math.maxInt(i32))
+            return error.BufferPoolTooLarge;
+        var initialized: usize = 0;
+        errdefer for (self.slots[0..initialized]) |*slot| {
+            if (slot.target) |*target| target.deinit(renderer);
+            slot.* = .{};
+        };
+        for (&self.slots) |*slot| {
+            slot.target = try Vulkan.DmabufTarget.init(renderer, width, height, modifier);
+            initialized += 1;
+            const target = &slot.target.?;
+            if (sync_manager) |manager| {
+                const fd = try target.exportSyncobjFd(renderer);
+                var fd_owned = true;
+                errdefer {
+                    if (fd_owned) _ = linux.close(fd);
+                }
+                slot.timeline = (try protocol.wp_linux_drm_syncobj_manager_v1.construct_import_timeline(
+                    objects,
+                    transmit,
+                    manager,
+                    .{ .fd = fd },
+                )).id;
+                fd_owned = false;
+            }
+            const params = (try protocol.zwp_linux_dmabuf_v1.construct_create_params(
+                objects,
+                transmit,
+                dmabuf,
+                .{},
+            )).params_id;
+            for (target.planes[0..target.plane_count], 0..) |plane, plane_index| {
+                const fd = try target.exportFd(renderer);
+                var fd_owned = true;
+                errdefer {
+                    if (fd_owned) _ = linux.close(fd);
+                }
+                wayring.client.sendRequest(
+                    protocol.zwp_linux_buffer_params_v1,
+                    objects,
+                    transmit,
+                    params,
+                    .{ .add = .{
+                        .fd = fd,
+                        .plane_idx = @intCast(plane_index),
+                        .offset = plane.offset,
+                        .stride = plane.stride,
+                        .modifier_hi = @truncate(target.modifier >> 32),
+                        .modifier_lo = @truncate(target.modifier),
+                    } },
+                ) catch |err| {
+                    _ = linux.close(fd);
+                    fd_owned = false;
+                    return err;
+                };
+                fd_owned = false;
+            }
+            slot.handle = (try protocol.zwp_linux_buffer_params_v1.construct_create_immed(
+                objects,
+                transmit,
+                params,
+                .{
+                    .width = @intCast(width),
+                    .height = @intCast(height),
+                    .format = drm_format_argb8888,
+                    .flags = .fromInt(0),
+                },
+            )).buffer_id;
+            try wayring.client.sendRequest(
+                protocol.zwp_linux_buffer_params_v1,
+                objects,
+                transmit,
+                params,
+                .{ .destroy = .{} },
+            );
+        }
+        self.width = width;
+        self.height = height;
+        self.generation = generation;
+    }
+
+    fn destroy(
+        self: *DmabufBuffers,
+        renderer: *Vulkan,
+        objects: *wayring.objects.ClientObjects,
+        transmit: *wayring.tx.Queue,
+    ) !void {
+        std.debug.assert(!self.anyBusy());
+        for (&self.slots) |*slot| {
+            if (slot.handle) |handle|
+                try wayring.client.sendRequest(protocol.wl_buffer, objects, transmit, handle, .{ .destroy = .{} });
+            if (slot.timeline) |timeline|
+                try wayring.client.sendRequest(
+                    protocol.wp_linux_drm_syncobj_timeline_v1,
+                    objects,
+                    transmit,
+                    timeline,
+                    .{ .destroy = .{} },
+                );
+            if (slot.target) |*target| target.deinit(renderer);
+            slot.* = .{};
+        }
+        const generation = self.generation;
+        self.* = .{ .generation = generation };
+    }
+
+    fn releaseLocal(self: *DmabufBuffers, renderer: *Vulkan) void {
+        for (&self.slots) |*slot| {
+            if (slot.target) |*target| target.deinit(renderer);
+            slot.* = .{};
+        }
+    }
+};
+
 const WindowState = enum { free, open, closing, surfaces_destroyed };
 
 const Window = struct {
@@ -178,8 +468,13 @@ const Window = struct {
     xdg_surface: ?Handle = null,
     toplevel: ?Handle = null,
     frame_callback: ?Handle = null,
+    presentation_feedbacks: [presentation_feedback_capacity]?Handle = [_]?Handle{null} ** presentation_feedback_capacity,
+    sync_surface: ?Handle = null,
+    last_presentation: ?PresentationTiming = null,
     buffers: ShmBuffers = .{},
     retired_buffers: ShmBuffers = .{},
+    dmabuf_buffers: DmabufBuffers = .{},
+    retired_dmabuf_buffers: DmabufBuffers = .{},
     width: u32 = 0,
     height: u32 = 0,
     pending_width: u32 = 0,
@@ -188,13 +483,47 @@ const Window = struct {
     pending_redraw: bool = false,
     frames_presented: usize = 0,
     next_pool_generation: u32 = 1,
+    damage_history: DamageHistory = .{},
 
     fn ownsObject(self: *const Window, object_id: u32) bool {
         return (self.surface != null and self.surface.?.id == object_id) or
             (self.xdg_surface != null and self.xdg_surface.?.id == object_id) or
             (self.toplevel != null and self.toplevel.?.id == object_id) or
             (self.frame_callback != null and self.frame_callback.?.id == object_id) or
-            self.buffers.containsId(object_id) or self.retired_buffers.containsId(object_id);
+            self.ownsPresentationFeedback(object_id) or
+            (self.sync_surface != null and self.sync_surface.?.id == object_id) or
+            self.buffers.containsId(object_id) or self.retired_buffers.containsId(object_id) or
+            self.dmabuf_buffers.containsId(object_id) or self.retired_dmabuf_buffers.containsId(object_id);
+    }
+
+    fn ownsPresentationFeedback(self: *const Window, object_id: u32) bool {
+        for (self.presentation_feedbacks) |feedback|
+            if (feedback != null and feedback.?.id == object_id) return true;
+        return false;
+    }
+
+    fn addPresentationFeedback(self: *Window, feedback: Handle) bool {
+        for (&self.presentation_feedbacks) |*candidate| if (candidate.* == null) {
+            candidate.* = feedback;
+            return true;
+        };
+        return false;
+    }
+
+    fn canAddPresentationFeedback(self: *const Window) bool {
+        for (self.presentation_feedbacks) |feedback| if (feedback == null) return true;
+        return false;
+    }
+
+    fn presentationFeedbackFor(self: *Window, object_id: u32) ?*?Handle {
+        for (&self.presentation_feedbacks) |*feedback|
+            if (feedback.* != null and feedback.*.?.id == object_id) return feedback;
+        return null;
+    }
+
+    fn hasPresentationFeedback(self: *const Window) bool {
+        for (self.presentation_feedbacks) |feedback| if (feedback != null) return true;
+        return false;
     }
 };
 
@@ -203,12 +532,23 @@ pub const Host = struct {
     loop: *OuroLoop,
     sink: platform_window.EventSink,
     app_id: []u8,
+    vulkan: ?*Vulkan,
     adapter: Adapter,
     connection: Connection,
     driver: Driver,
     registry: Handle,
     compositor: ?Handle = null,
     shm: ?Handle = null,
+    dmabuf: ?Handle = null,
+    dmabuf_version: u32 = 0,
+    dmabuf_feedback: ?Handle = null,
+    dmabuf_format_table: ?[]align(std.heap.page_size_min) u8 = null,
+    dmabuf_modifier: ?u64 = null,
+    dmabuf_tranche_device_matches: bool = false,
+    dmabuf_linear_argb8888: bool = false,
+    presentation: ?Handle = null,
+    presentation_clock_id: ?u32 = null,
+    sync_manager: ?Handle = null,
     wm_base: ?Handle = null,
     seat: ?Handle = null,
     seat_global_name: ?u32 = null,
@@ -241,6 +581,7 @@ pub const Host = struct {
         self.loop = loop;
         self.sink = sink;
         self.app_id = app_id;
+        self.vulkan = config.vulkan;
         self.windows = windows;
         self.disconnect_started = false;
         self.transport_lost = false;
@@ -248,6 +589,16 @@ pub const Host = struct {
         self.failure = null;
         self.compositor = null;
         self.shm = null;
+        self.dmabuf = null;
+        self.dmabuf_version = 0;
+        self.dmabuf_feedback = null;
+        self.dmabuf_format_table = null;
+        self.dmabuf_modifier = null;
+        self.dmabuf_tranche_device_matches = false;
+        self.dmabuf_linear_argb8888 = false;
+        self.presentation = null;
+        self.presentation_clock_id = null;
+        self.sync_manager = null;
         self.wm_base = null;
         self.seat = null;
         self.seat_global_name = null;
@@ -265,7 +616,7 @@ pub const Host = struct {
             .{
                 .received_fd_budget = 4,
                 .transmit_byte_budget = 128 * 1024,
-                .transmit_fd_budget = 4,
+                .transmit_fd_budget = 32,
             },
             .{ .max_objects = 64 + config.window_capacity * 16, .max_client_ids = 48 + config.window_capacity * 16 },
         );
@@ -294,6 +645,23 @@ pub const Host = struct {
             try self.dispatch(try self.loop.wait(), self);
             try self.flush();
         }
+        if (self.dmabuf != null) {
+            if (self.dmabuf_version >= 4) {
+                self.dmabuf_feedback = (try protocol.zwp_linux_dmabuf_v1.construct_get_default_feedback(
+                    &self.connection.objects,
+                    try self.queue(),
+                    self.dmabuf.?,
+                    .{},
+                )).id;
+            }
+            var dmabuf_roundtrip = Roundtrip.init(&self.connection, self);
+            _ = try dmabuf_roundtrip.begin();
+            try self.flush();
+            while (!dmabuf_roundtrip.settled()) {
+                try self.dispatch(try self.loop.wait(), &dmabuf_roundtrip);
+                try self.flushRoundtrip(&dmabuf_roundtrip);
+            }
+        }
         if (self.failure) |failure| return failure;
         if (self.compositor == null or self.shm == null or self.wm_base == null)
             return error.RequiredWaylandGlobalMissing;
@@ -311,12 +679,14 @@ pub const Host = struct {
             try self.dispatch(try self.loop.wait(), self);
         }
         try self.connection.deinit(self.allocator);
+        self.releaseDmabufFormatTable();
     }
 
     pub fn deinit(self: *Host) void {
         std.debug.assert(self.quiescent());
         for (self.windows) |window| std.debug.assert(window.state == .free);
         self.connection.deinit(self.allocator) catch unreachable;
+        self.releaseDmabufFormatTable();
         self.adapter.deinit(self.allocator);
         self.allocator.free(self.windows);
         self.allocator.free(self.app_id);
@@ -365,24 +735,44 @@ pub const Host = struct {
         window.pending_redraw = true;
     }
 
-    /// Borrows one persistent shared-memory slot for synchronous rendering in
-    /// the frame-submission phase. Call `present` or `discard` before returning
-    /// to completion dispatch.
+    /// Borrows one persistent presentation slot during frame submission. CPU
+    /// access or Vulkan queue submission must finish with `present` or
+    /// `discardFrame` before completion dispatch resumes; Vulkan execution may
+    /// continue under the slot's GPU/compositor completion gates.
     pub fn acquireFrame(self: *Host, handle: WindowHandle) !?Frame {
         const window = try self.windowFor(handle);
         if (window.state != .open or !window.configured or !window.pending_redraw or
             window.frame_callback != null) return null;
         try self.prepareBuffers(window);
+        if (self.usingDmabuf()) {
+            if (!window.dmabuf_buffers.matches(window.width, window.height)) return null;
+            for (&window.dmabuf_buffers.slots, 0..) |*slot, index| {
+                if (slot.busy or slot.acquired) continue;
+                if (!try slot.target.?.ready(self.vulkan.?)) continue;
+                slot.acquired = true;
+                return .{
+                    .target = .{ .vulkan = &slot.target.? },
+                    .width = window.width,
+                    .height = window.height,
+                    .window = handle,
+                    .pool_generation = window.dmabuf_buffers.generation,
+                    .slot = @intCast(index),
+                };
+            }
+            return null;
+        }
         if (!window.buffers.matches(window.width, window.height)) return null;
         for (&window.buffers.slots, 0..) |*slot, index| {
             if (slot.busy or slot.acquired) continue;
             slot.acquired = true;
             const start = index * window.buffers.slot_size;
             return .{
-                .pixels = window.buffers.mapping.?[start..][0..window.buffers.slot_size],
+                .target = .{ .software = .{
+                    .pixels = window.buffers.mapping.?[start..][0..window.buffers.slot_size],
+                    .stride = window.buffers.stride,
+                } },
                 .width = window.width,
                 .height = window.height,
-                .stride = window.buffers.stride,
                 .window = handle,
                 .pool_generation = window.buffers.generation,
                 .slot = @intCast(index),
@@ -391,48 +781,171 @@ pub const Host = struct {
         return null;
     }
 
+    /// Expands current scene damage by the changes committed since this slot
+    /// was last presented. Render `frame.damage()` rather than the original
+    /// damage, while `present` reports only the current change to Wayland.
+    pub fn prepareFrameDamage(self: *Host, frame: *Frame, requested: scene.Damage) !void {
+        const window = try self.windowFor(frame.window);
+        const slot_serial = switch (frame.target) {
+            .software => blk: {
+                const slot = try self.shmFrameSlot(frame.*);
+                if (!slot.acquired) return error.StaleFrame;
+                break :blk slot.last_present_serial;
+            },
+            .vulkan => blk: {
+                const slot = try self.dmabufFrameSlot(frame.*);
+                if (!slot.acquired) return error.StaleFrame;
+                break :blk slot.last_present_serial;
+            },
+        };
+        const bounds: RectI = .{ .x = 0, .y = 0, .width = frame.width, .height = frame.height };
+        const current = if (window.damage_history.serial == 0)
+            DamageSummary.full
+        else
+            summarizeDamage(requested, bounds);
+        const expanded = window.damage_history.expand(slot_serial, current, bounds);
+        frame.requested_damage = current;
+        frame.damage_prepared = true;
+        switch (expanded) {
+            .none => frame.damage_count = 0,
+            .full => {
+                frame.damage_regions[0] = bounds;
+                frame.damage_count = 1;
+            },
+            .bounds => |region| {
+                frame.damage_regions[0] = region;
+                frame.damage_count = 1;
+            },
+        }
+    }
+
     pub fn discardFrame(self: *Host, frame: Frame) !void {
-        const slot = try self.frameSlot(frame);
-        if (!slot.acquired) return error.StaleFrame;
-        slot.acquired = false;
+        switch (frame.target) {
+            .software => {
+                const slot = try self.shmFrameSlot(frame);
+                if (!slot.acquired) return error.StaleFrame;
+                slot.acquired = false;
+            },
+            .vulkan => {
+                const slot = try self.dmabufFrameSlot(frame);
+                if (!slot.acquired) return error.StaleFrame;
+                try slot.target.?.wait(self.vulkan.?);
+                slot.acquired = false;
+            },
+        }
     }
 
     pub fn present(self: *Host, frame: Frame) !void {
         const window = try self.windowFor(frame.window);
         if (window.state != .open) return error.WindowClosing;
-        const slot = try self.frameSlot(frame);
-        if (!slot.acquired or slot.busy) return error.StaleFrame;
+        const buffer = switch (frame.target) {
+            .software => blk: {
+                const slot = try self.shmFrameSlot(frame);
+                if (!slot.acquired or slot.busy) return error.StaleFrame;
+                break :blk slot.handle.?;
+            },
+            .vulkan => |target| blk: {
+                const slot = try self.dmabufFrameSlot(frame);
+                if (!slot.acquired or slot.busy or &slot.target.? != target) return error.StaleFrame;
+                break :blk slot.handle.?;
+            },
+        };
         const transmit = try self.queue();
         const objects = &self.connection.objects;
+        switch (frame.target) {
+            .software => {},
+            .vulkan => {
+                const slot = try self.dmabufFrameSlot(frame);
+                if (window.sync_surface) |surface_sync| {
+                    const timeline = slot.timeline orelse return error.MissingExplicitSyncTimeline;
+                    const points = slot.target.?.syncPoints();
+                    try wayring.client.sendRequest(
+                        protocol.wp_linux_drm_syncobj_surface_v1,
+                        objects,
+                        transmit,
+                        surface_sync,
+                        .{ .set_acquire_point = .{
+                            .timeline = timeline.id,
+                            .point_hi = @truncate(points.acquire >> 32),
+                            .point_lo = @truncate(points.acquire),
+                        } },
+                    );
+                    try wayring.client.sendRequest(
+                        protocol.wp_linux_drm_syncobj_surface_v1,
+                        objects,
+                        transmit,
+                        surface_sync,
+                        .{ .set_release_point = .{
+                            .timeline = timeline.id,
+                            .point_hi = @truncate(points.release >> 32),
+                            .point_lo = @truncate(points.release),
+                        } },
+                    );
+                }
+            },
+        }
         try wayring.client.sendRequest(
             protocol.wl_surface,
             objects,
             transmit,
             window.surface.?,
-            .{ .attach = .{ .buffer = slot.handle.?.id, .x = 0, .y = 0 } },
+            .{ .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 } },
         );
-        try wayring.client.sendRequest(
-            protocol.wl_surface,
-            objects,
-            transmit,
-            window.surface.?,
-            .{ .damage = .{ .x = 0, .y = 0, .width = @intCast(frame.width), .height = @intCast(frame.height) } },
-        );
+        try self.sendSurfaceDamage(window.surface.?, if (frame.damage_prepared) frame.requested_damage else .full);
         window.frame_callback = (try protocol.wl_surface.construct_frame(
             objects,
             transmit,
             window.surface.?,
             .{},
         )).callback;
+        if (self.presentation != null and window.canAddPresentationFeedback()) {
+            const feedback = (try protocol.wp_presentation.construct_feedback(
+                objects,
+                transmit,
+                self.presentation.?,
+                .{ .surface = window.surface.?.id },
+            )).callback;
+            std.debug.assert(window.addPresentationFeedback(feedback));
+        }
         try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, window.surface.?, .{ .commit = .{} });
-        slot.acquired = false;
-        slot.busy = true;
+        switch (frame.target) {
+            .software => {
+                const slot = try self.shmFrameSlot(frame);
+                slot.acquired = false;
+                slot.busy = true;
+                slot.last_present_serial = window.damage_history.commit(
+                    if (frame.damage_prepared) frame.requested_damage else .full,
+                );
+            },
+            .vulkan => {
+                const slot = try self.dmabufFrameSlot(frame);
+                slot.acquired = false;
+                slot.busy = true;
+                slot.last_present_serial = window.damage_history.commit(
+                    if (frame.damage_prepared) frame.requested_damage else .full,
+                );
+            },
+        }
         window.pending_redraw = false;
         _ = try self.driver.schedule();
     }
 
     pub fn framesPresented(self: *Host, handle: WindowHandle) !usize {
         return (try self.windowFor(handle)).frames_presented;
+    }
+
+    pub fn takePresentationTiming(self: *Host, handle: WindowHandle) !?PresentationTiming {
+        const window = try self.windowFor(handle);
+        defer window.last_presentation = null;
+        return window.last_presentation;
+    }
+
+    pub fn presentationBackend(self: *const Host) PresentationBackend {
+        return if (self.usingDmabuf()) .vulkan_dmabuf else .shared_memory;
+    }
+
+    pub fn explicitSyncEnabled(self: *const Host) bool {
+        return self.usingDmabuf() and self.sync_manager != null;
     }
 
     fn dispatch(self: *Host, completion: std.os.linux.io_uring_cqe, handler: anytype) !void {
@@ -463,6 +976,31 @@ pub const Host = struct {
         return &(try self.connection.actor()).transmit;
     }
 
+    fn sendSurfaceDamage(self: *Host, surface: Handle, damage: DamageSummary) !void {
+        const region = switch (damage) {
+            .none => return,
+            .full => RectI{
+                .x = 0,
+                .y = 0,
+                .width = std.math.maxInt(i32),
+                .height = std.math.maxInt(i32),
+            },
+            .bounds => |bounds| bounds,
+        };
+        try wayring.client.sendRequest(
+            protocol.wl_surface,
+            &self.connection.objects,
+            try self.queue(),
+            surface,
+            .{ .damage_buffer = .{
+                .x = region.x,
+                .y = region.y,
+                .width = @intCast(region.width),
+                .height = @intCast(region.height),
+            } },
+        );
+    }
+
     fn windowFor(self: *Host, handle: WindowHandle) !*Window {
         for (self.windows) |*window|
             if (window.state != .free and sameWindow(window.handle, handle)) return window;
@@ -482,14 +1020,22 @@ pub const Host = struct {
         return error.UnknownWindowSurface;
     }
 
-    fn frameSlot(self: *Host, frame: Frame) !*BufferSlot {
+    fn shmFrameSlot(self: *Host, frame: Frame) !*BufferSlot {
         const window = try self.windowFor(frame.window);
         if (window.buffers.generation != frame.pool_generation or frame.slot >= buffer_count)
             return error.StaleFrame;
         return &window.buffers.slots[frame.slot];
     }
 
+    fn dmabufFrameSlot(self: *Host, frame: Frame) !*DmabufSlot {
+        const window = try self.windowFor(frame.window);
+        if (window.dmabuf_buffers.generation != frame.pool_generation or frame.slot >= buffer_count)
+            return error.StaleFrame;
+        return &window.dmabuf_buffers.slots[frame.slot];
+    }
+
     fn prepareBuffers(self: *Host, window: *Window) !void {
+        if (self.usingDmabuf()) return self.prepareDmabufBuffers(window);
         const objects = &self.connection.objects;
         const transmit = try self.queue();
         if (window.retired_buffers.mapping != null and !window.retired_buffers.anyBusy())
@@ -517,9 +1063,55 @@ pub const Host = struct {
         _ = try self.driver.schedule();
     }
 
+    fn prepareDmabufBuffers(self: *Host, window: *Window) !void {
+        const renderer = self.vulkan.?;
+        const objects = &self.connection.objects;
+        const transmit = try self.queue();
+        if (window.retired_dmabuf_buffers.slots[0].target != null and
+            !window.retired_dmabuf_buffers.anyBusy())
+            try window.retired_dmabuf_buffers.destroy(renderer, objects, transmit);
+        if (window.dmabuf_buffers.matches(window.width, window.height)) return;
+        if (window.retired_dmabuf_buffers.slots[0].target != null) return;
+        if (window.dmabuf_buffers.slots[0].target != null) {
+            if (window.dmabuf_buffers.anyBusy()) {
+                window.retired_dmabuf_buffers = window.dmabuf_buffers;
+                window.dmabuf_buffers = .{};
+            } else {
+                try window.dmabuf_buffers.destroy(renderer, objects, transmit);
+            }
+        }
+        window.next_pool_generation +%= 1;
+        if (window.next_pool_generation == 0) window.next_pool_generation = 1;
+        try window.dmabuf_buffers.create(
+            renderer,
+            objects,
+            transmit,
+            self.dmabuf.?,
+            self.sync_manager,
+            self.selectedDmabufModifier().?,
+            window.width,
+            window.height,
+            window.next_pool_generation,
+        );
+        _ = try self.driver.schedule();
+    }
+
+    fn usingDmabuf(self: *const Host) bool {
+        return self.vulkan != null and self.vulkan.?.supportsDmabuf() and
+            self.dmabuf != null and self.selectedDmabufModifier() != null;
+    }
+
+    fn selectedDmabufModifier(self: *const Host) ?u64 {
+        if (self.dmabuf_version >= 4) return self.dmabuf_modifier;
+        return if (self.dmabuf_linear_argb8888 and self.vulkan.?.supportsDmabufModifier(drm_format_modifier_linear))
+            drm_format_modifier_linear
+        else
+            null;
+    }
+
     fn maintainWindows(self: *Host) !void {
         for (self.windows) |*window| {
-            if (window.state == .closing and window.frame_callback == null)
+            if (window.state == .closing and window.frame_callback == null and !window.hasPresentationFeedback())
                 try self.destroySurfaces(window);
             if (window.state != .surfaces_destroyed) continue;
             const objects = &self.connection.objects;
@@ -528,7 +1120,16 @@ pub const Host = struct {
                 try window.buffers.destroy(objects, transmit);
             if (window.retired_buffers.mapping != null and !window.retired_buffers.anyBusy())
                 try window.retired_buffers.destroy(objects, transmit);
-            if (window.buffers.mapping != null or window.retired_buffers.mapping != null) continue;
+            if (self.vulkan) |renderer| {
+                if (window.dmabuf_buffers.slots[0].target != null and !window.dmabuf_buffers.anyBusy())
+                    try window.dmabuf_buffers.destroy(renderer, objects, transmit);
+                if (window.retired_dmabuf_buffers.slots[0].target != null and
+                    !window.retired_dmabuf_buffers.anyBusy())
+                    try window.retired_dmabuf_buffers.destroy(renderer, objects, transmit);
+            }
+            if (window.buffers.mapping != null or window.retired_buffers.mapping != null or
+                window.dmabuf_buffers.slots[0].target != null or
+                window.retired_dmabuf_buffers.slots[0].target != null) continue;
             const handle = window.handle;
             const next_pool_generation = window.next_pool_generation;
             window.* = .{ .next_pool_generation = next_pool_generation };
@@ -537,15 +1138,25 @@ pub const Host = struct {
     }
 
     fn abandonWindows(self: *Host) !void {
+        self.releaseDmabufFormatTable();
         for (self.windows) |*window| {
             if (window.state == .free) continue;
             window.buffers.releaseLocal();
             window.retired_buffers.releaseLocal();
+            if (self.vulkan) |renderer| {
+                window.dmabuf_buffers.releaseLocal(renderer);
+                window.retired_dmabuf_buffers.releaseLocal(renderer);
+            }
             const handle = window.handle;
             const next_pool_generation = window.next_pool_generation;
             window.* = .{ .next_pool_generation = next_pool_generation };
             try self.sink.closed(handle);
         }
+    }
+
+    fn releaseDmabufFormatTable(self: *Host) void {
+        if (self.dmabuf_format_table) |mapping| posix.munmap(mapping);
+        self.dmabuf_format_table = null;
     }
 
     fn destroySurfaces(self: *Host, window: *Window) !void {
@@ -559,13 +1170,24 @@ pub const Host = struct {
             try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, handle, .{ .destroy = .{} });
         if (window.xdg_surface) |handle|
             try wayring.client.sendRequest(protocol.xdg_surface, objects, transmit, handle, .{ .destroy = .{} });
+        if (window.sync_surface) |handle|
+            try wayring.client.sendRequest(
+                protocol.wp_linux_drm_syncobj_surface_v1,
+                objects,
+                transmit,
+                handle,
+                .{ .destroy = .{} },
+            );
         if (window.surface) |handle|
             try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, handle, .{ .destroy = .{} });
         window.toplevel = null;
         window.xdg_surface = null;
+        window.sync_surface = null;
         window.surface = null;
         for (&window.buffers.slots) |*slot| slot.acquired = false;
         for (&window.retired_buffers.slots) |*slot| slot.acquired = false;
+        for (&window.dmabuf_buffers.slots) |*slot| slot.acquired = false;
+        for (&window.retired_dmabuf_buffers.slots) |*slot| slot.acquired = false;
         window.state = .surfaces_destroyed;
         _ = try self.driver.schedule();
     }
@@ -603,6 +1225,15 @@ pub const Host = struct {
             xdg_surface,
             .{},
         )).id;
+        const sync_surface = if (self.sync_manager) |manager|
+            (try protocol.wp_linux_drm_syncobj_manager_v1.construct_get_surface(
+                objects,
+                transmit,
+                manager,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
         try wayring.client.sendRequest(
             protocol.xdg_toplevel,
             objects,
@@ -625,6 +1256,7 @@ pub const Host = struct {
             .surface = surface,
             .xdg_surface = xdg_surface,
             .toplevel = toplevel,
+            .sync_surface = sync_surface,
             .width = declaration.initial_width,
             .height = declaration.initial_height,
             .pending_width = declaration.initial_width,
@@ -719,6 +1351,8 @@ pub const Host = struct {
                         window.xdg_surface.?,
                         .{ .ack_configure = .{ .serial = configure.serial } },
                     );
+                    if (window.width != window.pending_width or window.height != window.pending_height)
+                        window.damage_history = .{};
                     window.width = window.pending_width;
                     window.height = window.pending_height;
                     window.configured = true;
@@ -728,18 +1362,129 @@ pub const Host = struct {
             }
         } else if (interface == &protocol.wl_buffer.info) {
             const window = try self.windowForObject(message.header.object_id);
-            const slot = window.buffers.slotForId(message.header.object_id) orelse
-                window.retired_buffers.slotForId(message.header.object_id) orelse
-                return error.UnknownBuffer;
-            _ = try wayring.client.decodeEvent(protocol.wl_buffer, objects, slot.handle.?, message, fds);
-            slot.busy = false;
+            if (window.buffers.slotForId(message.header.object_id) orelse
+                window.retired_buffers.slotForId(message.header.object_id)) |slot|
+            {
+                _ = try wayring.client.decodeEvent(protocol.wl_buffer, objects, slot.handle.?, message, fds);
+                slot.busy = false;
+            } else if (window.dmabuf_buffers.slotForId(message.header.object_id) orelse
+                window.retired_dmabuf_buffers.slotForId(message.header.object_id)) |slot|
+            {
+                _ = try wayring.client.decodeEvent(protocol.wl_buffer, objects, slot.handle.?, message, fds);
+                try slot.target.?.wait(self.vulkan.?);
+                slot.busy = false;
+            } else return error.UnknownBuffer;
         } else if (interface == &protocol.wl_callback.info) {
             const window = try self.windowForObject(message.header.object_id);
             _ = try wayring.client.decodeEvent(protocol.wl_callback, objects, window.frame_callback.?, message, fds);
             window.frame_callback = null;
             window.frames_presented += 1;
+        } else if (interface == &protocol.wp_presentation.info) {
+            const presentation_event = try wayring.client.decodeEvent(
+                protocol.wp_presentation,
+                objects,
+                self.presentation.?,
+                message,
+                fds,
+            );
+            self.presentation_clock_id = presentation_event.clock_id.clk_id;
+        } else if (interface == &protocol.wp_presentation_feedback.info) {
+            const window = try self.windowForObject(message.header.object_id);
+            const feedback = window.presentationFeedbackFor(message.header.object_id) orelse
+                return error.UnknownPresentationFeedback;
+            switch (try wayring.client.decodeEvent(
+                protocol.wp_presentation_feedback,
+                objects,
+                feedback.*.?,
+                message,
+                fds,
+            )) {
+                .sync_output => {},
+                .discarded => feedback.* = null,
+                .presented => |presented| {
+                    const flags = presented.flags;
+                    window.last_presentation = .{
+                        .clock_id = self.presentation_clock_id orelse 0,
+                        .seconds = (@as(u64, presented.tv_sec_hi) << 32) | presented.tv_sec_lo,
+                        .nanoseconds = presented.tv_nsec,
+                        .refresh_nanoseconds = presented.refresh,
+                        .sequence = (@as(u64, presented.seq_hi) << 32) | presented.seq_lo,
+                        .vsync = flags.contains(protocol.wp_presentation_feedback.kind.vsync),
+                        .hardware_clock = flags.contains(protocol.wp_presentation_feedback.kind.hw_clock),
+                        .hardware_completion = flags.contains(protocol.wp_presentation_feedback.kind.hw_completion),
+                        .zero_copy = flags.contains(protocol.wp_presentation_feedback.kind.zero_copy),
+                    };
+                    feedback.* = null;
+                },
+            }
         } else if (interface == &protocol.wl_shm.info) {
             _ = try wayring.client.decodeEvent(protocol.wl_shm, objects, self.shm.?, message, fds);
+        } else if (interface == &protocol.zwp_linux_dmabuf_v1.info) {
+            switch (try wayring.client.decodeEvent(protocol.zwp_linux_dmabuf_v1, objects, self.dmabuf.?, message, fds)) {
+                .modifier => |modifier| {
+                    const value = (@as(u64, modifier.modifier_hi) << 32) | modifier.modifier_lo;
+                    if (modifier.format == drm_format_argb8888 and value == drm_format_modifier_linear)
+                        self.dmabuf_linear_argb8888 = true;
+                },
+                .format => {},
+            }
+        } else if (interface == &protocol.zwp_linux_dmabuf_feedback_v1.info) {
+            switch (try wayring.client.decodeEvent(
+                protocol.zwp_linux_dmabuf_feedback_v1,
+                objects,
+                self.dmabuf_feedback.?,
+                message,
+                fds,
+            )) {
+                .format_table => |table| {
+                    if (self.dmabuf_format_table) |mapping| posix.munmap(mapping);
+                    if (table.size == 0 or table.size % dmabuf_table_entry_size != 0) {
+                        _ = linux.close(table.fd);
+                        return error.InvalidDmabufFormatTable;
+                    }
+                    self.dmabuf_format_table = posix.mmap(
+                        null,
+                        table.size,
+                        .{ .READ = true },
+                        .{ .TYPE = .PRIVATE },
+                        table.fd,
+                        0,
+                    ) catch |err| {
+                        _ = linux.close(table.fd);
+                        return err;
+                    };
+                    _ = linux.close(table.fd);
+                },
+                .main_device => {},
+                .tranche_target_device => |tranche| {
+                    self.dmabuf_tranche_device_matches = self.vulkan.?.matchesDrmDevice(tranche.device);
+                },
+                .tranche_formats => |formats| {
+                    if (self.dmabuf_modifier == null and self.dmabuf_tranche_device_matches) {
+                        const table = self.dmabuf_format_table orelse return error.MissingDmabufFormatTable;
+                        if (formats.indices.len % 2 != 0) return error.InvalidDmabufFormatIndices;
+                        var offset: usize = 0;
+                        while (offset < formats.indices.len) : (offset += 2) {
+                            const index = std.mem.readInt(u16, formats.indices[offset..][0..2], .little);
+                            const entry_offset = @as(usize, index) * dmabuf_table_entry_size;
+                            if (entry_offset + dmabuf_table_entry_size > table.len)
+                                return error.InvalidDmabufFormatIndex;
+                            const format = std.mem.readInt(u32, table[entry_offset..][0..4], .little);
+                            const modifier = std.mem.readInt(u64, table[entry_offset + 8 ..][0..8], .little);
+                            if (format == drm_format_argb8888 and self.vulkan.?.supportsDmabufModifier(modifier)) {
+                                self.dmabuf_modifier = modifier;
+                                break;
+                            }
+                        }
+                    }
+                },
+                .tranche_flags => {},
+                .tranche_done => self.dmabuf_tranche_device_matches = false,
+                .done => {
+                    if (self.dmabuf_format_table) |mapping| posix.munmap(mapping);
+                    self.dmabuf_format_table = null;
+                },
+            }
         } else if (interface == &protocol.wl_surface.info) {
             const window = try self.windowForObject(message.header.object_id);
             _ = try wayring.client.decodeEvent(protocol.wl_surface, objects, window.surface.?, message, fds);
@@ -770,6 +1515,42 @@ pub const Host = struct {
                 1,
                 null,
             );
+        } else if (std.mem.eql(u8, global.interface, protocol.wp_presentation.info.name)) {
+            self.presentation = try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.wp_presentation.info,
+                @min(global.version, 2),
+                null,
+            );
+        } else if (self.vulkan != null and
+            std.mem.eql(u8, global.interface, protocol.wp_linux_drm_syncobj_manager_v1.info.name))
+        {
+            self.sync_manager = try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.wp_linux_drm_syncobj_manager_v1.info,
+                1,
+                null,
+            );
+        } else if (self.vulkan != null and self.dmabuf == null and
+            std.mem.eql(u8, global.interface, protocol.zwp_linux_dmabuf_v1.info.name))
+        {
+            const version = @min(global.version, 4);
+            self.dmabuf = try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.zwp_linux_dmabuf_v1.info,
+                version,
+                null,
+            );
+            self.dmabuf_version = version;
         } else if (std.mem.eql(u8, global.interface, protocol.xdg_wm_base.info.name)) {
             self.wm_base = try Core.bind(
                 objects,
@@ -966,4 +1747,20 @@ test "Wayland host frame tokens retain generation-checked window identity" {
     try std.testing.expect(@hasDecl(Host, "nativeHost"));
     try std.testing.expect(@hasDecl(Host, "acquireFrame"));
     try std.testing.expect(@hasDecl(Host, "present"));
+}
+
+test "damage history expands a stale slot and falls back when age is unknown" {
+    const bounds: RectI = .{ .x = 0, .y = 0, .width = 100, .height = 80 };
+    var history: DamageHistory = .{};
+    try std.testing.expect(history.expand(0, .{ .bounds = .{ .x = 1, .y = 1, .width = 2, .height = 2 } }, bounds) == .full);
+
+    const first = history.commit(.{ .bounds = .{ .x = 0, .y = 10, .width = 10, .height = 10 } });
+    _ = history.commit(.{ .bounds = .{ .x = 20, .y = 10, .width = 10, .height = 10 } });
+    const expanded = history.expand(first, .{ .bounds = .{ .x = 40, .y = 10, .width = 10, .height = 10 } }, bounds);
+    try std.testing.expectEqual(RectI{ .x = 20, .y = 10, .width = 30, .height = 10 }, expanded.bounds);
+
+    _ = history.commit(.none);
+    _ = history.commit(.none);
+    _ = history.commit(.none);
+    try std.testing.expect(history.expand(first, .none, bounds) == .full);
 }
