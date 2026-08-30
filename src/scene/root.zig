@@ -11,6 +11,8 @@ pub const BlendMode = enum {
     source_over,
 };
 
+pub const max_clip_depth = 64;
+
 pub const GlyphRun = struct {
     shape: ShapeHandle,
     origin: PointF,
@@ -82,6 +84,46 @@ pub const DisplayList = struct {
     }
 };
 
+/// Returns whether the next non-empty draw completely replaces `bounds`.
+/// Renderers use this while walking a display list to avoid issuing work whose
+/// result cannot contribute to the frame. Restricting the lookahead to the
+/// next draw keeps the pass linear; chains of covering draws are still culled.
+pub fn occludedByNextDraw(
+    remaining: []const Command,
+    active_clips: []const RectI,
+    bounds: RectI,
+) bool {
+    if (bounds.isEmpty()) return true;
+    std.debug.assert(active_clips.len > 0 and active_clips.len <= max_clip_depth + 1);
+    var clips: [max_clip_depth + 1]RectI = undefined;
+    @memcpy(clips[0..active_clips.len], active_clips);
+    var depth = active_clips.len - 1;
+    for (remaining) |command| switch (command) {
+        .clear => return contains(clips[0], bounds),
+        .push_clip_rect => |clip| {
+            if (depth == max_clip_depth) return false;
+            depth += 1;
+            clips[depth] = RectI.intersect(clips[depth - 1], clip);
+        },
+        .pop_clip => depth -= 1,
+        .solid_rectangle => |rectangle| {
+            const covered = RectI.intersect(rectangle.bounds, clips[depth]);
+            if (covered.isEmpty()) continue;
+            return (rectangle.blend == .source or rectangle.color.a == 255) and
+                contains(covered, bounds);
+        },
+        .glyph_run => if (!clips[depth].isEmpty()) return false,
+    };
+    return false;
+}
+
+fn contains(outer: RectI, inner: RectI) bool {
+    return @as(i64, outer.x) <= inner.x and
+        @as(i64, outer.y) <= inner.y and
+        @as(i64, outer.x) + outer.width >= @as(i64, inner.x) + inner.width and
+        @as(i64, outer.y) + outer.height >= @as(i64, inner.y) + inner.height;
+}
+
 /// Frame-owned immutable scene storage. The command and damage copies remain
 /// valid across worker-thread rendering or asynchronous backend submission
 /// until the frame is explicitly released.
@@ -138,4 +180,42 @@ test "owned frame isolates asynchronous scene lifetime" {
     const list = frame.displayList();
     try std.testing.expectEqual(@as(u8, 1), list.commands[0].clear.r);
     try std.testing.expectEqual(@as(i32, 1), list.damage.regions[0].x);
+}
+
+test "opaque next draw occludes covered work through clips" {
+    const root = RectI{ .x = 0, .y = 0, .width = 100, .height = 100 };
+    const commands = [_]Command{
+        .{ .push_clip_rect = .{ .x = 10, .y = 10, .width = 20, .height = 20 } },
+        .{ .solid_rectangle = .{
+            .bounds = .{ .x = 0, .y = 0, .width = 50, .height = 50 },
+            .color = Color.rgba(1, 2, 3, 255),
+        } },
+        .pop_clip,
+    };
+    try std.testing.expect(occludedByNextDraw(
+        &commands,
+        &.{root},
+        .{ .x = 12, .y = 12, .width = 10, .height = 10 },
+    ));
+    try std.testing.expect(!occludedByNextDraw(
+        &commands,
+        &.{root},
+        .{ .x = 5, .y = 5, .width = 20, .height = 20 },
+    ));
+}
+
+test "translucent source-over does not occlude previous work" {
+    const root = RectI{ .x = 0, .y = 0, .width = 10, .height = 10 };
+    const source_over = [_]Command{.{ .solid_rectangle = .{
+        .bounds = root,
+        .color = Color.rgba(1, 2, 3, 254),
+    } }};
+    try std.testing.expect(!occludedByNextDraw(&source_over, &.{root}, root));
+
+    const source = [_]Command{.{ .solid_rectangle = .{
+        .bounds = root,
+        .color = Color.rgba(1, 2, 3, 0),
+        .blend = .source,
+    } }};
+    try std.testing.expect(occludedByNextDraw(&source, &.{root}, root));
 }

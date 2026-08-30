@@ -38,7 +38,7 @@ pub const Target = struct {
     }
 };
 
-const max_clip_depth = 64;
+const max_clip_depth = scene.max_clip_depth;
 
 pub fn render(list: scene.DisplayList, target: Target) !void {
     return renderInternal(list, target, null, null);
@@ -83,21 +83,22 @@ fn renderRegion(
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
-    for (commands) |command| switch (command) {
-        .clear => |color| fill(target, damage, color, .source),
+    for (commands, 0..) |command, index| switch (command) {
+        .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
+            fill(target, damage, color, .source),
         .push_clip_rect => |clip| {
             if (depth == max_clip_depth) return error.ClipStackOverflow;
             depth += 1;
             clips[depth] = RectI.intersect(clips[depth - 1], clip);
         },
         .pop_clip => depth -= 1,
-        .solid_rectangle => |rectangle| fill(
-            target,
-            RectI.intersect(rectangle.bounds, clips[depth]),
-            rectangle.color,
-            rectangle.blend,
-        ),
+        .solid_rectangle => |rectangle| {
+            const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
+            if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
+                fill(target, bounds, rectangle.color, rectangle.blend);
+        },
         .glyph_run => |run| {
+            if (scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;
             if (!has_freetype) return error.FreeTypeDisabled;
             try drawGlyphRun(
                 run,
@@ -314,6 +315,30 @@ test "damage preserves pixels outside non-overlapping regions" {
             .{ .x = 1, .y = 0, .width = 2, .height = 1 },
         } },
     }, .{ .pixels = &pixels, .width = 3, .height = 1, .stride = 12, .format = .rgba8_unorm }));
+}
+
+test "fully covered draw is not executed" {
+    var pixel = [_]u8{0} ** 4;
+    const commands = [_]scene.Command{
+        .{ .glyph_run = .{
+            .shape = .{ .slot = 0, .generation = 1 },
+            .origin = .{},
+            .scale = 1,
+            .color = Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .solid_rectangle = .{
+            .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .color = Color.rgba(10, 20, 30, 255),
+        } },
+    };
+    try render(.{ .commands = &commands }, .{
+        .pixels = &pixel,
+        .width = 1,
+        .height = 1,
+        .stride = 4,
+        .format = .rgba8_unorm,
+    });
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 255 }, &pixel);
 }
 
 test "BGRA storage, target validation, and clip balance are explicit" {

@@ -20,6 +20,12 @@ applied twice. Transforms, subpixel edge coverage, path clipping, and layer
 isolation remain deliberately uncommitted until equivalent software and Vulkan
 prototypes validate their semantics.
 
+Both backends avoid issuing a draw when the next non-empty draw completely
+replaces its clipped pixels. Opaque source-over rectangles, all source-mode
+rectangles, and clears provide coverage; translucent source-over draws do not.
+The linear lookahead also culls chains of covered draws without allocating an
+occlusion region or changing display-list paint order.
+
 The scene has no Lua, Wayland, `wl_shm`, stride, pixel format, or Vulkan state.
 UI layout uses logical floating-point geometry above this contract. The
 headless scene builder applies output scale and conservatively rounds logical

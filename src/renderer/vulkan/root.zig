@@ -16,7 +16,7 @@ const c = @cImport({
     @cInclude("vulkan/vulkan.h");
 });
 
-const max_clip_depth = 64;
+const max_clip_depth = scene.max_clip_depth;
 const local_size = 64;
 const dmabuf_extensions = [_][*:0]const u8{
     c.VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
@@ -1229,19 +1229,19 @@ fn renderPresentationRegion(self: *Renderer, commands: []const scene.Command, ta
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
-    for (commands) |command| switch (command) {
-        .clear => |color| self.presentationFill(target, damage, color, .source),
+    for (commands, 0..) |command, index| switch (command) {
+        .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
+            self.presentationFill(target, damage, color, .source),
         .push_clip_rect => |clip| {
             depth += 1;
             clips[depth] = RectI.intersect(clips[depth - 1], clip);
         },
         .pop_clip => depth -= 1,
-        .solid_rectangle => |rectangle| self.presentationFill(
-            target,
-            RectI.intersect(rectangle.bounds, clips[depth]),
-            rectangle.color,
-            rectangle.blend,
-        ),
+        .solid_rectangle => |rectangle| {
+            const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
+            if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
+                self.presentationFill(target, bounds, rectangle.color, rectangle.blend);
+        },
         .glyph_run => unreachable,
     };
 }
@@ -1319,19 +1319,19 @@ fn renderRegion(self: *Renderer, commands: []const scene.Command, target: *const
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
-    for (commands) |command| switch (command) {
-        .clear => |color| self.fill(target, damage, color, .source),
+    for (commands, 0..) |command, index| switch (command) {
+        .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
+            self.fill(target, damage, color, .source),
         .push_clip_rect => |clip| {
             depth += 1;
             clips[depth] = RectI.intersect(clips[depth - 1], clip);
         },
         .pop_clip => depth -= 1,
-        .solid_rectangle => |rectangle| self.fill(
-            target,
-            RectI.intersect(rectangle.bounds, clips[depth]),
-            rectangle.color,
-            rectangle.blend,
-        ),
+        .solid_rectangle => |rectangle| {
+            const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
+            if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
+                self.fill(target, bounds, rectangle.color, rectangle.blend);
+        },
         .glyph_run => unreachable,
     };
 }
