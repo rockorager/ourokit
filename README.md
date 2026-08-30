@@ -41,6 +41,13 @@ zig build tokens
 Generated code under `src/design/generated` is checked in and marked as
 generated. Do not edit it directly.
 
+To run the reproducible software-renderer comparison against pinned Pixman
+0.46.4 (fetched only for this optional step):
+
+```sh
+zig build bench-renderers -Doptimize=ReleaseFast
+```
+
 ## Wayland development
 
 Wayring is pinned as a Zig package and wrapped by `src/platform/wayland`.

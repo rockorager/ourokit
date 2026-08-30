@@ -24,6 +24,41 @@ const lua_sources = &.{
     "src/lauxlib.c",
 };
 
+const pixman_sources = &.{
+    "pixman/pixman.c",
+    "pixman/pixman-access.c",
+    "pixman/pixman-access-accessors.c",
+    "pixman/pixman-arm.c",
+    "pixman/pixman-bits-image.c",
+    "pixman/pixman-combine32.c",
+    "pixman/pixman-combine-float.c",
+    "pixman/pixman-conical-gradient.c",
+    "pixman/pixman-edge.c",
+    "pixman/pixman-edge-accessors.c",
+    "pixman/pixman-fast-path.c",
+    "pixman/pixman-filter.c",
+    "pixman/pixman-glyph.c",
+    "pixman/pixman-general.c",
+    "pixman/pixman-gradient-walker.c",
+    "pixman/pixman-image.c",
+    "pixman/pixman-implementation.c",
+    "pixman/pixman-linear-gradient.c",
+    "pixman/pixman-matrix.c",
+    "pixman/pixman-mips.c",
+    "pixman/pixman-noop.c",
+    "pixman/pixman-ppc.c",
+    "pixman/pixman-radial-gradient.c",
+    "pixman/pixman-region16.c",
+    "pixman/pixman-region32.c",
+    "pixman/pixman-region64f.c",
+    "pixman/pixman-riscv.c",
+    "pixman/pixman-solid-fill.c",
+    "pixman/pixman-timer.c",
+    "pixman/pixman-trap.c",
+    "pixman/pixman-utils.c",
+    "pixman/pixman-x86.c",
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -57,12 +92,92 @@ pub fn build(b: *std.Build) void {
     generate_step.dependOn(&token_generate.step);
 
     addWaylandExample(b, target, optimize, ourokit, wayring);
+    addRendererBenchmark(b, target, optimize, ourokit);
 
     const tests = b.addTest(.{ .root_module = ourokit });
     const run_tests = b.addRunArtifact(tests);
     run_tests.step.dependOn(&token_check.step);
     const test_step = b.step("test", "Run all deterministic and integration tests");
     test_step.dependOn(&run_tests.step);
+}
+
+fn addRendererBenchmark(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ourokit: *std.Build.Module,
+) void {
+    if (target.result.os.tag != .linux or
+        (target.result.cpu.arch != .x86_64 and target.result.cpu.arch != .aarch64)) return;
+    const pixman = b.lazyDependency("pixman", .{}) orelse return;
+    const pixman_module = b.createModule(.{ .target = target, .optimize = optimize });
+    pixman_module.addIncludePath(pixman.path("pixman"));
+    pixman_module.addIncludePath(b.path("tools/rendering"));
+    const common_flags = [_][]const u8{
+        "-std=c99",
+        "-DHAVE_CONFIG_H",
+        "-fno-strict-aliasing",
+        "-fvisibility=hidden",
+        "-ftrapping-math",
+    };
+    pixman_module.addCSourceFiles(.{
+        .root = pixman.path(""),
+        .files = pixman_sources,
+        .flags = switch (target.result.cpu.arch) {
+            .x86_64 => &(common_flags ++ [_][]const u8{ "-DUSE_X86_MMX=1", "-DUSE_SSE2=1", "-DUSE_SSSE3=1" }),
+            .aarch64 => &(common_flags ++ [_][]const u8{"-DUSE_ARM_A64_NEON=1"}),
+            else => &common_flags,
+        },
+    });
+    switch (target.result.cpu.arch) {
+        .x86_64 => {
+            pixman_module.addCSourceFiles(.{
+                .root = pixman.path("pixman"),
+                .files = &.{"pixman-mmx.c"},
+                .flags = &(common_flags ++ [_][]const u8{ "-DUSE_X86_MMX=1", "-DUSE_SSE2=1", "-DUSE_SSSE3=1", "-mmmx", "-Winline" }),
+            });
+            pixman_module.addCSourceFiles(.{
+                .root = pixman.path("pixman"),
+                .files = &.{"pixman-sse2.c"},
+                .flags = &(common_flags ++ [_][]const u8{ "-DUSE_X86_MMX=1", "-DUSE_SSE2=1", "-DUSE_SSSE3=1", "-msse2", "-Winline" }),
+            });
+            pixman_module.addCSourceFiles(.{
+                .root = pixman.path("pixman"),
+                .files = &.{"pixman-ssse3.c"},
+                .flags = &(common_flags ++ [_][]const u8{ "-DUSE_X86_MMX=1", "-DUSE_SSE2=1", "-DUSE_SSSE3=1", "-mssse3", "-Winline" }),
+            });
+        },
+        .aarch64 => pixman_module.addCSourceFiles(.{
+            .root = pixman.path("pixman"),
+            .files = &.{
+                "pixman-arm-neon.c",
+                "pixman-arma64-neon-asm.S",
+                "pixman-arma64-neon-asm-bilinear.S",
+            },
+            .flags = &(common_flags ++ [_][]const u8{"-DUSE_ARM_A64_NEON=1"}),
+        }),
+        else => {},
+    }
+    pixman_module.link_libc = true;
+    pixman_module.linkSystemLibrary("m", .{});
+    const pixman_library = b.addLibrary(.{ .name = "ourokit-benchmark-pixman", .root_module = pixman_module });
+
+    const benchmark_module = b.createModule(.{
+        .root_source_file = b.path("tools/rendering/benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+    });
+    benchmark_module.addIncludePath(pixman.path("pixman"));
+    benchmark_module.addIncludePath(b.path("tools/rendering"));
+    benchmark_module.linkLibrary(pixman_library);
+    benchmark_module.link_libc = true;
+    const benchmark = b.addExecutable(.{ .name = "ourokit-renderer-benchmark", .root_module = benchmark_module });
+    const build_step = b.step("build-renderer-benchmark", "Build the Ourokit/Pixman comparison without running it");
+    build_step.dependOn(&benchmark.step);
+    const run = b.addRunArtifact(benchmark);
+    const step = b.step("bench-renderers", "Compare Ourokit direct rendering with pinned Pixman");
+    step.dependOn(&run.step);
 }
 
 fn addWaylandExample(

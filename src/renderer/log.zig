@@ -3,15 +3,32 @@ const scene = @import("../scene/root.zig");
 
 /// Deterministic headless scene logging. Returns the used prefix of `output`.
 pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
+    try list.validate();
     var used: usize = 0;
+    switch (list.damage) {
+        .full => try append(output, &used, "damage full\n", .{}),
+        .regions => |regions| for (regions) |region| try append(
+            output,
+            &used,
+            "damage x={d} y={d} width={d} height={d}\n",
+            .{ region.x, region.y, region.width, region.height },
+        ),
+    }
     for (list.commands) |command| switch (command) {
         .clear => |color| try append(output, &used, "clear rgba({d},{d},{d},{d})\n", .{
             color.r, color.g, color.b, color.a,
         }),
+        .push_clip_rect => |clip| try append(
+            output,
+            &used,
+            "push_clip_rect x={d} y={d} width={d} height={d}\n",
+            .{ clip.x, clip.y, clip.width, clip.height },
+        ),
+        .pop_clip => try append(output, &used, "pop_clip\n", .{}),
         .solid_rectangle => |rectangle| try append(
             output,
             &used,
-            "solid_rectangle x={d} y={d} width={d} height={d} rgba({d},{d},{d},{d})\n",
+            "solid_rectangle x={d} y={d} width={d} height={d} rgba({d},{d},{d},{d}) blend={s}\n",
             .{
                 rectangle.bounds.x,
                 rectangle.bounds.y,
@@ -21,6 +38,7 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
                 rectangle.color.g,
                 rectangle.color.b,
                 rectangle.color.a,
+                @tagName(rectangle.blend),
             },
         ),
     };
@@ -44,8 +62,9 @@ test "scene log is deterministic and ordered" {
     var output: [160]u8 = undefined;
     const actual = try render(.{ .commands = &commands }, &output);
     try std.testing.expectEqualStrings(
-        "clear rgba(1,2,3,255)\n" ++
-            "solid_rectangle x=-2 y=4 width=8 height=16 rgba(9,10,11,12)\n",
+        "damage full\n" ++
+            "clear rgba(1,2,3,255)\n" ++
+            "solid_rectangle x=-2 y=4 width=8 height=16 rgba(9,10,11,12) blend=source_over\n",
         actual,
     );
 }

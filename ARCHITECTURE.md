@@ -179,8 +179,23 @@ destructive/reversible metadata. Widgets may contribute contextual entries.
 ## Rendering backends
 
 The current software backend consumes the same display list contract intended
-for Vulkan and writes explicit RGBA/BGRA bytes into caller-provided dimensions
-and stride. Tests cover clipping, format, row padding, clear, and rectangles.
+for Vulkan and writes premultiplied encoded-sRGB RGBA/BGRA bytes into
+caller-provided dimensions and stride. Scene colors remain straight-alpha sRGB;
+the backend owns conversion and deterministic source/source-over composition.
+Tests cover clipping, damage, alpha, format, row padding, clear, rectangles, and
+reusable conformance fixtures.
+
+Frame-owned immutable command and damage storage can outlive the scene-building
+stack for worker or asynchronous backend use. Borrowed display-list views are
+only synchronous conveniences. Rectangular clip and non-overlapping damage
+semantics are established; transforms, subpixel coverage, paths, layers, and
+advanced color spaces remain open until both real backends validate them.
+
+Ourokit owns software lowering. Direct paths remain for clear and opaque
+rectangles. Pinned Pixman is an optional benchmark dependency and the selected
+private engine for future masks, transformed images, gradients, regions, and
+complex composition. Pixman types never enter scene, UI, or platform APIs, and
+default headless builds do not fetch or link it.
 
 The Vulkan peer will own instance/device/queue selection, command buffers,
 images, synchronization, pipeline/cache state, and Wayland swapchain resources.
@@ -216,8 +231,9 @@ coverage.
 Open questions intentionally left unfrozen:
 
 - exact normalized Lua descriptor and generated-constructor ABI;
-- immutable scene ownership strategy beyond borrowed milestone batches;
+- frame resource leases for future image and glyph references;
 - renderer-neutral image/glyph resource identity and cache eviction;
+- transform, subpixel rasterization, layer, and color-managed surface semantics;
 - Vulkan frame/swapchain contract after a real prototype;
 - scope close semantics for multiple asynchronous resource kinds;
 - versioned application bundle and native-extension ABI.

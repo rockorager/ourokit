@@ -22,6 +22,11 @@
             .hash = "N-V-__8AAOTNEADZkChhsSciYizE4kIbZsozjDZXVeG5R_uY",
             .lazy = true,
         },
+        .pixman = .{
+            .url = "https://cairographics.org/releases/pixman-0.46.4.tar.xz",
+            .hash = "N-V-__8AAFGFLwDqH3MBb66PDaioYrGihvXKTS3FzQVque04",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

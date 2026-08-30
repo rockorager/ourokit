@@ -59,7 +59,8 @@ pub fn main(init: std.process.Init) !void {
         .connection = &connection,
         .exit_after_first_frame = exit_after_first_frame,
     };
-    defer handler.releaseMapping();
+    defer handler.buffers.releaseLocal();
+    defer handler.retired_buffers.releaseLocal();
     const actor = try connection.actor();
     handler.registry = try Core.getRegistry(&connection.objects, &actor.transmit, null);
 
@@ -87,6 +88,11 @@ pub fn main(init: std.process.Init) !void {
         if (adapter.route(completion) == null) return error.InvalidCompletion;
         const progress = try driver.dispatch(&.{completion}, &handler);
         try submitPrepared(&loop, progress);
+
+        if (!handler.shutdown_requested and try handler.prepareFrame()) {
+            _ = try driver.schedule();
+            try submitPrepared(&loop, try driver.prepare(&handler));
+        }
 
         // Object destruction is a dispatch safe point: retiring protocol
         // handles inside an event callback could invalidate later events in
@@ -119,6 +125,124 @@ fn submitPrepared(loop: *ourokit.loop.Loop, progress: Driver.Progress) !void {
     if (progress.prepared != 0 or progress.pending) _ = try loop.submit();
 }
 
+const buffer_count = 3;
+
+const BufferSlot = struct {
+    handle: ?Handle = null,
+    busy: bool = false,
+};
+
+const ShmBuffers = struct {
+    mapping: ?[]align(std.heap.page_size_min) u8 = null,
+    slots: [buffer_count]BufferSlot = [_]BufferSlot{.{}} ** buffer_count,
+    width: i32 = 0,
+    height: i32 = 0,
+    stride: usize = 0,
+    slot_size: usize = 0,
+
+    fn matches(self: *const ShmBuffers, width: i32, height: i32) bool {
+        return self.mapping != null and self.width == width and self.height == height;
+    }
+
+    fn anyBusy(self: *const ShmBuffers) bool {
+        for (self.slots) |slot| if (slot.busy) return true;
+        return false;
+    }
+
+    fn slotForId(self: *ShmBuffers, id: u32) ?*BufferSlot {
+        for (&self.slots) |*slot| if (slot.handle != null and slot.handle.?.id == id) return slot;
+        return null;
+    }
+
+    fn create(
+        self: *ShmBuffers,
+        objects: *wayring.objects.ClientObjects,
+        transmit: *wayring.tx.Queue,
+        shm: Handle,
+        width: i32,
+        height: i32,
+    ) !void {
+        std.debug.assert(self.mapping == null);
+        const width_u32: u32 = @intCast(width);
+        const height_u32: u32 = @intCast(height);
+        const stride = try std.math.mul(usize, width_u32, 4);
+        const slot_size = try std.math.mul(usize, stride, height_u32);
+        const total_size = try std.math.mul(usize, slot_size, buffer_count);
+        if (total_size > std.math.maxInt(i32)) return error.BufferPoolTooLarge;
+
+        const fd = try posix.memfd_create("ourokit-wayland", linux.MFD.CLOEXEC);
+        var fd_owned = true;
+        errdefer {
+            if (fd_owned) _ = linux.close(fd);
+        }
+        if (linux.errno(linux.ftruncate(fd, @intCast(total_size))) != .SUCCESS)
+            return error.TruncateFailed;
+        const mapping = try posix.mmap(
+            null,
+            total_size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        errdefer posix.munmap(mapping);
+
+        const pool = (try protocol.wl_shm.construct_create_pool(
+            objects,
+            transmit,
+            shm,
+            .{ .fd = fd, .size = @intCast(total_size) },
+        )).id;
+        fd_owned = false;
+        var slots = [_]BufferSlot{.{}} ** buffer_count;
+        for (&slots, 0..) |*slot, index| {
+            slot.handle = (try protocol.wl_shm_pool.construct_create_buffer(
+                objects,
+                transmit,
+                pool,
+                .{
+                    .offset = @intCast(index * slot_size),
+                    .width = width,
+                    .height = height,
+                    .stride = @intCast(stride),
+                    .format = protocol.wl_shm.format.argb8888,
+                },
+            )).id;
+        }
+        try wayring.client.sendRequest(protocol.wl_shm_pool, objects, transmit, pool, .{ .destroy = .{} });
+        self.* = .{
+            .mapping = mapping,
+            .slots = slots,
+            .width = width,
+            .height = height,
+            .stride = stride,
+            .slot_size = slot_size,
+        };
+    }
+
+    fn destroy(
+        self: *ShmBuffers,
+        objects: *wayring.objects.ClientObjects,
+        transmit: *wayring.tx.Queue,
+    ) !void {
+        for (&self.slots) |*slot| {
+            if (slot.handle) |handle|
+                try wayring.client.sendRequest(protocol.wl_buffer, objects, transmit, handle, .{ .destroy = .{} });
+            slot.* = .{};
+        }
+        self.releaseLocal();
+        self.width = 0;
+        self.height = 0;
+        self.stride = 0;
+        self.slot_size = 0;
+    }
+
+    fn releaseLocal(self: *ShmBuffers) void {
+        if (self.mapping) |mapping| posix.munmap(mapping);
+        self.mapping = null;
+    }
+};
+
 const Handler = struct {
     connection: *Connection,
     registry: Handle = undefined,
@@ -129,8 +253,8 @@ const Handler = struct {
     xdg_surface: ?Handle = null,
     toplevel: ?Handle = null,
     frame_callback: ?Handle = null,
-    buffer: ?Handle = null,
-    mapping: ?[]align(std.heap.page_size_min) u8 = null,
+    buffers: ShmBuffers = .{},
+    retired_buffers: ShmBuffers = .{},
     width: i32 = 640,
     height: i32 = 480,
     pending_redraw: bool = false,
@@ -235,23 +359,14 @@ const Handler = struct {
                     );
                     handler.configured = true;
                     handler.pending_redraw = true;
-                    if (handler.buffer == null) try handler.renderFrame();
                 },
             }
         } else if (interface == &protocol.wl_buffer.info) {
-            _ = try wayring.client.decodeEvent(protocol.wl_buffer, objects, handler.buffer.?, message, fds);
-            try wayring.client.sendRequest(
-                protocol.wl_buffer,
-                objects,
-                try handler.queue(),
-                handler.buffer.?,
-                .{ .destroy = .{} },
-            );
-            handler.buffer = null;
-            handler.releaseMapping();
-            if (!handler.shutdown_requested and handler.pending_redraw) {
-                try handler.renderFrame();
-            }
+            const slot = handler.buffers.slotForId(message.header.object_id) orelse
+                handler.retired_buffers.slotForId(message.header.object_id) orelse
+                return error.UnknownBuffer;
+            _ = try wayring.client.decodeEvent(protocol.wl_buffer, objects, slot.handle.?, message, fds);
+            slot.busy = false;
         } else if (interface == &protocol.wl_callback.info) {
             _ = try wayring.client.decodeEvent(protocol.wl_callback, objects, handler.frame_callback.?, message, fds);
             handler.frame_callback = null;
@@ -301,32 +416,35 @@ const Handler = struct {
         }
     }
 
-    fn renderFrame(handler: *Handler) !void {
-        if (!handler.configured or handler.buffer != null or handler.width <= 0 or handler.height <= 0)
-            return;
+    fn prepareFrame(handler: *Handler) !bool {
+        const objects = &handler.connection.objects;
+        const transmit = try handler.queue();
+        var queued = false;
+        if (handler.retired_buffers.mapping != null and !handler.retired_buffers.anyBusy()) {
+            try handler.retired_buffers.destroy(objects, transmit);
+            queued = true;
+        }
+        if (!handler.configured or !handler.pending_redraw or handler.width <= 0 or handler.height <= 0)
+            return queued;
+        if (!handler.buffers.matches(handler.width, handler.height)) {
+            if (handler.retired_buffers.mapping != null) return queued;
+            handler.retired_buffers = handler.buffers;
+            handler.buffers = .{};
+            try handler.buffers.create(objects, transmit, handler.shm.?, handler.width, handler.height);
+            queued = true;
+        }
+        if (handler.frame_callback != null) return queued;
+
+        var slot_index: ?usize = null;
+        for (&handler.buffers.slots, 0..) |*slot, index| {
+            if (!slot.busy) {
+                slot_index = index;
+                break;
+            }
+        }
+        const index = slot_index orelse return queued;
         const width: u32 = @intCast(handler.width);
         const height: u32 = @intCast(handler.height);
-        const stride = try std.math.mul(usize, width, 4);
-        const size = try std.math.mul(usize, stride, height);
-        if (size > std.math.maxInt(i32)) return error.BufferTooLarge;
-
-        const fd = try posix.memfd_create("ourokit-wayland", linux.MFD.CLOEXEC);
-        var fd_owned = true;
-        errdefer {
-            if (fd_owned) _ = linux.close(fd);
-        }
-        if (linux.errno(linux.ftruncate(fd, @intCast(size))) != .SUCCESS)
-            return error.TruncateFailed;
-        const mapping = try posix.mmap(
-            null,
-            size,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED },
-            fd,
-            0,
-        );
-        errdefer posix.munmap(mapping);
-
         const theme = ourokit.design.tokens.light;
         const commands = [_]ourokit.scene.Command{
             .{ .clear = theme.surface_base },
@@ -340,42 +458,23 @@ const Handler = struct {
                 .color = theme.accent_default,
             } },
         };
+        const start = index * handler.buffers.slot_size;
+        const pixels = handler.buffers.mapping.?[start..][0..handler.buffers.slot_size];
         try ourokit.renderer.software.render(.{ .commands = &commands }, .{
-            .pixels = mapping,
+            .pixels = pixels,
             .width = width,
             .height = height,
-            .stride = stride,
+            .stride = handler.buffers.stride,
             .format = .bgra8_unorm,
         });
 
-        const objects = &handler.connection.objects;
-        const transmit = try handler.queue();
-        const pool = (try protocol.wl_shm.construct_create_pool(
-            objects,
-            transmit,
-            handler.shm.?,
-            .{ .fd = fd, .size = @intCast(size) },
-        )).id;
-        fd_owned = false;
-        const buffer = (try protocol.wl_shm_pool.construct_create_buffer(
-            objects,
-            transmit,
-            pool,
-            .{
-                .offset = 0,
-                .width = handler.width,
-                .height = handler.height,
-                .stride = @intCast(stride),
-                .format = protocol.wl_shm.format.argb8888,
-            },
-        )).id;
-        try wayring.client.sendRequest(protocol.wl_shm_pool, objects, transmit, pool, .{ .destroy = .{} });
+        const slot = &handler.buffers.slots[index];
         try wayring.client.sendRequest(
             protocol.wl_surface,
             objects,
             transmit,
             handler.surface.?,
-            .{ .attach = .{ .buffer = buffer.id, .x = 0, .y = 0 } },
+            .{ .attach = .{ .buffer = slot.handle.?.id, .x = 0, .y = 0 } },
         );
         try wayring.client.sendRequest(
             protocol.wl_surface,
@@ -391,9 +490,9 @@ const Handler = struct {
             .{},
         )).callback;
         try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, handler.surface.?, .{ .commit = .{} });
-        handler.mapping = mapping;
-        handler.buffer = buffer;
+        slot.busy = true;
         handler.pending_redraw = false;
+        return true;
     }
 
     fn requestShutdown(handler: *Handler) void {
@@ -404,6 +503,8 @@ const Handler = struct {
         if (handler.protocol_objects_destroyed) return;
         const objects = &handler.connection.objects;
         const transmit = try handler.queue();
+        try handler.buffers.destroy(objects, transmit);
+        try handler.retired_buffers.destroy(objects, transmit);
         if (handler.toplevel) |handle|
             try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, handle, .{ .destroy = .{} });
         if (handler.xdg_surface) |handle|
@@ -414,11 +515,6 @@ const Handler = struct {
             try wayring.client.sendRequest(protocol.xdg_wm_base, objects, transmit, handle, .{ .destroy = .{} });
         handler.protocol_objects_destroyed = true;
         handler.shutdown_ready = true;
-    }
-
-    fn releaseMapping(handler: *Handler) void {
-        if (handler.mapping) |mapping| posix.munmap(mapping);
-        handler.mapping = null;
     }
 
     pub fn eventError(
