@@ -1,8 +1,8 @@
 # Ourokit
 
 Ourokit is a Linux application platform: an Ouro-owned design system, typed UI
-and render-object architecture, renderer-neutral scenes, software and future
-Vulkan backends, Wayland integration through Wayring, an embedded Lua 5.5
+and render-object architecture, renderer-neutral scenes, software and Vulkan
+backends, Wayland integration through Wayring, an embedded Lua 5.5
 application environment, and one raw `io_uring` event loop owned by Ourokit.
 
 This repository is at first-milestone scope. It currently proves canonical
@@ -20,6 +20,7 @@ rendered, resized, and closed xdg-toplevels.
 - Linux 5.10 or newer with `io_uring`
 - Zig 0.16.0 exactly (Wayring's current minimum and target)
 - Python 3 for deterministic token validation/generation
+- Vulkan loader and headers, plus `glslc` for the Vulkan shader
 - A C toolchain is not required separately; Zig compiles embedded Lua
 
 ## Build and test
@@ -32,8 +33,8 @@ zig build tokens
 ```
 
 The default build installs `zig-out/lib/libourokit.a`. `zig build test` includes
-real kernel `io_uring` timeout/cancel tests, deterministic pixel tests, and the
-Lua coroutine/timer safe-point integration test.
+real kernel `io_uring` timeout/cancel tests, deterministic software and Vulkan
+pixel tests, and the Lua coroutine/timer safe-point integration test.
 
 After editing canonical token JSON:
 

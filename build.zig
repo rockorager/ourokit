@@ -80,6 +80,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     addLua(ourokit, lua);
+    addVulkan(b, ourokit);
 
     const library = b.addLibrary(.{
         .name = "ourokit",
@@ -104,6 +105,15 @@ pub fn build(b: *std.Build) void {
     run_tests.step.dependOn(&token_check.step);
     const test_step = b.step("test", "Run all deterministic and integration tests");
     test_step.dependOn(&run_tests.step);
+}
+
+fn addVulkan(b: *std.Build, module: *std.Build.Module) void {
+    const compile = b.addSystemCommand(&.{ "glslc", "-O" });
+    compile.addFileArg(b.path("src/renderer/vulkan/fill.comp"));
+    compile.addArg("-o");
+    const spirv = compile.addOutputFileArg("ourokit-vulkan-fill.spv");
+    module.addAnonymousImport("ourokit_vulkan_fill", .{ .root_source_file = spirv });
+    module.linkSystemLibrary("vulkan", .{});
 }
 
 fn addRendererBenchmark(

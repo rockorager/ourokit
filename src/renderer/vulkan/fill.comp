@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer Target {
+    uint pixels[];
+};
+
+layout(push_constant) uniform Push {
+    uint target_width;
+    int left;
+    int top;
+    int right;
+    int bottom;
+    uint source;
+    uint source_over;
+};
+
+uint channel(uint pixel, uint shift) {
+    return (pixel >> shift) & 255u;
+}
+
+uint sourceOver(uint source, uint destination) {
+    uint inverse_alpha = 255u - channel(source, 24u);
+    uint result = 0u;
+    for (uint shift = 0u; shift <= 24u; shift += 8u) {
+        uint value = channel(source, shift) +
+            (channel(destination, shift) * inverse_alpha + 127u) / 255u;
+        result |= min(value, 255u) << shift;
+    }
+    return result;
+}
+
+void main() {
+    uint width = uint(right - left);
+    uint index = gl_GlobalInvocationID.x;
+    uint count = width * uint(bottom - top);
+    if (index >= count) return;
+
+    uint x = uint(left) + index % width;
+    uint y = uint(top) + index / width;
+    uint offset = y * target_width + x;
+    pixels[offset] = source_over != 0u
+        ? sourceOver(source, pixels[offset])
+        : source;
+}

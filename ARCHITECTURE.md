@@ -37,7 +37,7 @@ src/
   scene/                   immutable renderer-neutral display lists
   renderer/
     software/
-    vulkan/                future real Vulkan backend
+    vulkan/                headless Vulkan compute backend
   platform/wayland/        sole Wayring containment boundary
   lua/                     isolated VM and coroutine adapter
   bundle/                  future pure-Lua bundle/module loader
@@ -228,10 +228,12 @@ private engine for future masks, transformed images, gradients, regions, and
 complex composition. Pixman types never enter scene, UI, or platform APIs, and
 default headless builds do not fetch or link it.
 
-The Vulkan peer will own instance/device/queue selection, command buffers,
-exportable images and memory, synchronization, and pipeline/cache state.
-Renderer-neutral resource IDs and caching will live below scene; widgets and
-render objects never hold Vulkan handles.
+The Vulkan peer owns instance/device/queue selection, command buffers,
+synchronization, and pipeline state. Its first backend-specific target uses
+host-visible Vulkan storage for deterministic headless conformance. Exportable
+images and memory, renderer-neutral resource IDs, and caching will live below
+scene as presentation and scene vocabularies grow; widgets and render objects
+never hold Vulkan handles.
 
 Ourokit cannot use the conventional `VK_KHR_wayland_surface` path without
 libwayland: Vulkan requires ABI `wl_display*` and `wl_surface*` objects, while
@@ -247,8 +249,8 @@ owns image/memory/queue lifetime; the Wayland presenter owns protocol objects
 and surface commits; a shared frame lease prevents either side from recycling
 resources before compositor release and GPU completion. Explicit-sync protocol
 selection, fallback behavior, multi-plane formats, modifier policy, and device
-matching remain prototype questions. No Vulkan placeholder pretends this path
-has already been validated.
+matching remain presentation-prototype questions. The headless renderer does
+not pretend that this dma-buf path has already been validated.
 
 Headless development remains first-class: deterministic software buffers and
 scene logging exist now; semantic snapshots and a design-system gallery are
@@ -270,7 +272,7 @@ yield. A future bundle loader will be pure Ouro functionality, not Lua package
 ## First-milestone non-goals and open questions
 
 Non-goals: complete widgets, text shaping/font discovery, command palette,
-accessibility protocols, Vulkan implementation, bundle manifests/packing,
+accessibility protocols, Vulkan dma-buf presentation, bundle manifests/packing,
 installation/package management, native `.so` extensions, broad Lua standard
 libraries, network/filesystem APIs, permissions/sandboxing, and full Spectrum
 coverage.

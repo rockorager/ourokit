@@ -71,22 +71,29 @@ stale frame from targeting a replacement resize pool. Each toplevel owns its
 own current and retired pools, frame throttle, configure state, and close
 lifecycle; closing one window never disconnects the others.
 
-## Vulkan boundary
+## Vulkan backend and presentation boundary
 
-The future Vulkan backend is a peer of software and consumes equivalent scenes.
-It owns Vulkan instance/device/queue, command pools/buffers, exportable images
-and memory, pipelines, synchronization, and descriptor/cache state. It must
-handle device/surface loss and frames in flight without leaking those states
-upward.
+The first Vulkan backend is a peer of software and consumes equivalent scenes.
+It owns a Vulkan instance/device/compute queue, pipeline, command resources,
+synchronization, and host-visible storage targets. It lowers clear, solid
+rectangle, rectangular clip, damage, source, and source-over operations with
+the same integer color arithmetic as software. Its synchronous headless target
+and explicit readback make backend conformance testable without a window
+system. Renderer calls are currently serialized and wait for GPU completion.
+
+Exportable images and memory, frames in flight, device-loss recovery, and
+descriptor/cache state belong in this backend as presentation and scene
+vocabularies grow; they do not leak upward.
 
 It will not use `VK_KHR_wayland_surface`: that API requires libwayland
 `wl_display*` and `wl_surface*` objects, which Wayring handles are not. The
-planned Ouro-owned presenter exports Vulkan images as dma-bufs and uses
+planned Ouro-owned presenter will export Vulkan images as dma-bufs and use
 Wayring-generated linux-dmabuf protocols to create and commit `wl_buffer`
 objects. Format/modifier feedback, GPU/compositor device matching, explicit
 synchronization, release ordering, and fallback policy must be proven by a real
-prototype before its target/resource interface is frozen. No fake backend or
-software-shaped vtable is present now.
+presentation prototype before its target/resource interface is frozen. The
+current Vulkan `Target` is intentionally backend-specific rather than a
+software-shaped renderer vtable.
 
 Text will be shaped above both renderers into common positioned glyph runs.
 Each backend may own atlas/image caching and rasterization details.
