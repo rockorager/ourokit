@@ -1,7 +1,14 @@
 # Application benchmark
 
-This benchmark compares three small Wayland applications with the same useful
-surface: one 480×320 window and one 160×44 clickable, text-labelled control.
+This benchmark compares three small Wayland applications using either of two
+matched profiles:
+
+- `button` (default): one 480×320 window and one 160×44 clickable,
+  text-labelled control;
+- `settings`: one 560×360 window with a heading, a counter label, and a row of
+  160×40 Increment and disabled controls. Increment updates the counter in all
+  three applications.
+
 Ourokit uses its Lua instance/reconciliation path, HarfBuzz shaping, FreeType
 software glyph cache, display list, Wayring adapter, and shared raw `io_uring`.
 GTK 4 uses `GtkApplication`/`GtkButton`; Qt 6 uses
@@ -17,6 +24,8 @@ Run under Sway (a nested or headless compositor is fine):
 
 ```sh
 tools/application-benchmark/run.py --iterations 20 --output results.json
+tools/application-benchmark/run.py --profile settings --iterations 20 \
+  --output settings-results.json
 ```
 
 The harness randomizes application order in each round. Startup is process
@@ -31,8 +40,9 @@ store, matching Ourokit's current CPU-only backend rather than comparing it to
 a GPU renderer. On a minimal compositor, run the harness inside
 `dbus-run-session` so the desktop toolkits see a normal session bus.
 
-The controls have matched dimensions and behavior, not matched pixels. GTK and
-Qt include mature native theme/style machinery; Ourokit currently draws a
+The controls have matched dimensions and behavior within each profile, not
+matched pixels. GTK and Qt include mature native theme/style machinery;
+Ourokit currently draws a
 minimal token-colored Box/Label composition. Dynamic library pages are counted
 in RSS but mostly discounted by PSS and private-memory figures, so retain all
 three columns. This first harness deliberately does not claim event latency:

@@ -264,11 +264,25 @@ fn addWaylandExample(
         .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
         .dest_sub_path = "ourokit",
     });
+    const settings_benchmark = b.addExecutable(.{
+        .name = "ourokit-settings-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/settings.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+        }),
+    });
+    const install_settings_benchmark = b.addInstallArtifact(settings_benchmark, .{
+        .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
+        .dest_sub_path = "ourokit-settings",
+    });
     const benchmark_step = b.step(
         "build-application-benchmark",
         "Build the Ourokit application used by the GTK/Qt comparison",
     );
     benchmark_step.dependOn(&install_benchmark.step);
+    benchmark_step.dependOn(&install_settings_benchmark.step);
 }
 
 fn addWaylandProtocol(

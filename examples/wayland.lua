@@ -1,7 +1,7 @@
 local clicked = ouro.signal(false)
 
 return ouro.app {
-  id = "dev.ourokit.example",
+  id = "dev.ourokit.benchmark.ourokit",
   windows = {
     ouro.window {
       id = "main",
@@ -9,11 +9,18 @@ return ouro.app {
       width = 480,
       height = 320,
       content = function()
-        ouro.button {
-          key = "benchmark",
-          label = clicked() and "Clicked" or "Benchmark",
-          on_press = function()
-            clicked:set(not clicked())
+        ouro.column {
+          key = "content",
+          children = function()
+            ouro.button {
+              key = "benchmark",
+              label = clicked() and "Clicked" or "Benchmark",
+              width = 160,
+              height = 44,
+              on_press = function()
+                clicked:set(not clicked())
+              end,
+            }
           end,
         }
       end,

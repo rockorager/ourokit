@@ -24,11 +24,17 @@ return ouro.app {
       width = 480,
       height = 320,
       content = function()
-        ouro.button {
-          key = "run",
-          label = clicked() and "Clicked" or "Run",
-          on_press = function()
-            clicked:set(not clicked())
+        ouro.column {
+          key = "content",
+          children = function()
+            ouro.label { key = "title", text = "Example" }
+            ouro.button {
+              key = "run",
+              label = clicked() and "Clicked" or "Run",
+              on_press = function()
+                clicked:set(not clicked())
+              end,
+            }
           end,
         }
       end,
@@ -164,11 +170,13 @@ ABI. A provisional constructor-specific bridge now proves this route end to
 end: a protected non-yielding mounted Lua build emits Box/Stack/Label descriptors
 directly into bounded native storage, which the existing transactional
 reconciler validates. It has no generic string `type` parser and is not the
-final generated constructor surface. The first ergonomic `ouro.button` decoder
-normalizes one declaration directly into typed Box and Label descriptors and a
-press-only instance binding. Its visual defaults come only from generated
-design tokens, with no Lua theme mirror. The Wayland example exercises this
-actual Lua-build path for both windows. Both mounted
+final generated constructor surface. The first ergonomic constructors maintain
+a bounded native parent stack: `ouro.row` and `ouro.column` normalize to Flex,
+`ouro.label` normalizes to Label, and `ouro.button` normalizes to Box plus Label.
+Applications provide stable local keys but no numeric IDs or parent links.
+Their visual defaults come only from generated design tokens, with no Lua theme
+mirror. The Wayland example exercises this actual Lua-build path for both
+windows. Both mounted
 window owners also read one shared signal, proving dependency identity across
 separate per-window registries sharing one VM.
 
@@ -176,7 +184,12 @@ For the benchmark slice, `ouro.button` owns composition and input policy while
 emitting only Box and Label render objects. Button is not a render object. Its
 stable string key is normalized into domain-separated semantic IDs; duplicate
 or colliding IDs are rejected by snapshot validation rather than silently
-aliasing instances. The Label constructor rejects scripts outside
+aliasing instances. A language-neutral widget registry retains enabled,
+hovered, pressed, and armed state across reconciliation. Pointer presses capture
+their target; release always reaches the captured Button, but activation occurs
+only for a left-button release inside that same enabled Button. CQE and Wayland
+dispatch still only enqueue state; callbacks spawn Lua tasks during the task
+phase. The Label constructor rejects scripts outside
 its explicitly supported LTR Latin/Common/Inherited run until paragraph
 itemization exists.
 
@@ -186,6 +199,10 @@ scope, title/category/aliases, enabled state and reason, state, argument schema,
 shortcut, and destructive/reversible metadata. Contextual widget commands may
 register there, but external enumeration never walks render objects.
 
-Headless retained layout, software glyph rendering, and deterministic scene
-logging are available now. Semantic snapshots and a future design-system
-gallery will exercise the same UI/scene path without Wayland or Vulkan.
+Headless retained layout, software glyph rendering, deterministic scene
+logging, Button interaction state tests, and semantic snapshots are available
+now. The semantic snapshot is a validated, allocation-free-after-init retained
+tree of groups, labels, and Buttons. Lua text is copied into an inactive buffer
+before another Lua API call can collect it, and the buffer becomes visible only
+when the surrounding build transaction commits. A future design-system gallery
+will expand this path without requiring Wayland or Vulkan.

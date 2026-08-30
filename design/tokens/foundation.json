@@ -29,6 +29,8 @@
     { "name": "ouro.foundation.palette.gray_900", "type": "color", "value": "#202024ff" },
     { "name": "ouro.foundation.palette.black", "type": "color", "value": "#101012ff" },
     { "name": "ouro.foundation.palette.blue_500", "type": "color", "value": "#246bdbff" },
+    { "name": "ouro.foundation.palette.blue_600", "type": "color", "value": "#1d5dbfff" },
+    { "name": "ouro.foundation.palette.blue_700", "type": "color", "value": "#174a99ff" },
     { "name": "ouro.foundation.palette.blue_300", "type": "color", "value": "#72a5f5ff" },
     { "name": "ouro.foundation.palette.blue_100", "type": "color", "value": "#dceaffff" },
     { "name": "ouro.foundation.palette.red_500", "type": "color", "value": "#c93b3bff" },

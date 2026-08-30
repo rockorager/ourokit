@@ -16,6 +16,7 @@ pub const Event = union(enum) {
     },
     pointer: struct {
         target: instance.InstanceHandle,
+        hovered: ?instance.InstanceHandle,
         event: platform_window.PointerEvent,
     },
 };
@@ -32,6 +33,7 @@ pub const Router = struct {
     head: usize = 0,
     count: usize = 0,
     hovered: ?instance.InstanceHandle = null,
+    captured: ?instance.InstanceHandle = null,
 
     pub fn init(
         self: *Router,
@@ -85,13 +87,34 @@ pub const Router = struct {
                 self.transition(target, motion.position, null);
                 if (target) |handle| self.enqueueAssumeCapacity(.{ .pointer = .{
                     .target = handle,
+                    .hovered = target,
                     .event = event,
                 } });
             },
-            else => {
-                const target = self.hovered orelse return;
+            .button => |button| {
+                const target = switch (button.state) {
+                    .pressed => self.hovered orelse return,
+                    .released => self.captured orelse self.hovered orelse return,
+                };
                 try self.ensureSpace(1);
-                self.enqueueAssumeCapacity(.{ .pointer = .{ .target = target, .event = event } });
+                self.enqueueAssumeCapacity(.{ .pointer = .{
+                    .target = target,
+                    .hovered = self.hovered,
+                    .event = event,
+                } });
+                self.captured = switch (button.state) {
+                    .pressed => target,
+                    .released => null,
+                };
+            },
+            else => {
+                const target = self.hovered orelse self.captured orelse return;
+                try self.ensureSpace(1);
+                self.enqueueAssumeCapacity(.{ .pointer = .{
+                    .target = target,
+                    .hovered = self.hovered,
+                    .event = event,
+                } });
             },
         }
     }
@@ -239,6 +262,16 @@ test "pointer routing hit tests front to back and queues hover transitions" {
     try std.testing.expectEqual(back, router.takeEvent().?.pointer.target);
     try router.route(.{ .leave = .{ .window = window, .serial = 12 } });
     try std.testing.expectEqual(back, router.takeEvent().?.hover_leave.target);
+    try router.route(.{ .button = .{
+        .window = window,
+        .serial = 13,
+        .time_ms = 22,
+        .button = 0x110,
+        .state = .released,
+    } });
+    const captured_release = router.takeEvent().?.pointer;
+    try std.testing.expectEqual(back, captured_release.target);
+    try std.testing.expect(captured_release.hovered == null);
     try std.testing.expect(router.takeEvent() == null);
 
     try instances.reconcile(&.{});

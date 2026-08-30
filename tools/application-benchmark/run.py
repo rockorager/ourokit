@@ -93,9 +93,8 @@ def parse_kib(path):
 
 
 def cpu_milliseconds(pid):
-    fields = Path(f"/proc/{pid}/stat").read_text().split()
-    ticks = int(fields[13]) + int(fields[14])
-    return ticks * 1000.0 / os.sysconf("SC_CLK_TCK")
+    runtime_nanoseconds = int(Path(f"/proc/{pid}/schedstat").read_text().split()[0])
+    return runtime_nanoseconds / 1_000_000.0
 
 
 def run_once(name, app, settle_seconds, timeout):
@@ -107,7 +106,7 @@ def run_once(name, app, settle_seconds, timeout):
     environment["QT_QPA_PLATFORM"] = "wayland"
     started = time.perf_counter_ns()
     process = subprocess.Popen(
-        [str(app["binary"])],
+        [str(app["binary"]), *app.get("arguments", [])],
         env=environment,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -150,6 +149,7 @@ def main():
     parser.add_argument("--settle-ms", type=int, default=250)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--profile", choices=("button", "settings"), default="button")
     args = parser.parse_args()
     if args.iterations < 1 or args.warmups < 0 or args.settle_ms < 0:
         parser.error("iteration counts and settle time must be non-negative")
@@ -170,6 +170,23 @@ def main():
             "app_id": "dev.ourokit.benchmark.qt",
         },
     }
+    if args.profile == "settings":
+        apps = {
+            "Ourokit": {
+                "binary": binaries / "ourokit-settings",
+                "app_id": "dev.ourokit.benchmark.settings.ourokit",
+            },
+            "GTK 4": {
+                "binary": binaries / "gtk",
+                "app_id": "dev.ourokit.benchmark.gtk",
+                "arguments": ["--settings"],
+            },
+            "Qt 6": {
+                "binary": binaries / "qt",
+                "app_id": "dev.ourokit.benchmark.qt",
+                "arguments": ["--settings"],
+            },
+        }
     missing = [str(app["binary"]) for app in apps.values() if not app["binary"].is_file()]
     if missing:
         raise RuntimeError("build benchmarks first; missing: " + ", ".join(missing))
@@ -218,6 +235,7 @@ def main():
                 "iterations": args.iterations,
                 "gtk_renderer": "cairo",
                 "qt_platform": "wayland QWidget raster backing store",
+                "profile": args.profile,
             },
             "samples": samples,
         }

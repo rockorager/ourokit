@@ -20,6 +20,6 @@ c++ -O2 -DNDEBUG -Wall -Wextra \
     -o "$out/qt" \
     $(pkg-config --libs Qt6Widgets)
 
-strip "$out/ourokit" "$out/gtk" "$out/qt"
+strip "$out/ourokit" "$out/ourokit-settings" "$out/gtk" "$out/qt"
 
 printf 'Built application benchmarks in %s\n' "$out"

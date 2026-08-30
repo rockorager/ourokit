@@ -16,6 +16,8 @@ pub const foundation = struct {
     pub const palette_blue_100: Color = Color.rgba(220, 234, 255, 255);
     pub const palette_blue_300: Color = Color.rgba(114, 165, 245, 255);
     pub const palette_blue_500: Color = Color.rgba(36, 107, 219, 255);
+    pub const palette_blue_600: Color = Color.rgba(29, 93, 191, 255);
+    pub const palette_blue_700: Color = Color.rgba(23, 74, 153, 255);
     pub const palette_gray_200: Color = Color.rgba(216, 216, 220, 255);
     pub const palette_gray_50: Color = Color.rgba(247, 247, 248, 255);
     pub const palette_gray_600: Color = Color.rgba(96, 96, 105, 255);
@@ -40,6 +42,8 @@ pub const foundation = struct {
 
 pub const Theme = struct {
     accent_default: Color,
+    accent_hovered: Color,
+    accent_pressed: Color,
     border_default: Color,
     content_primary: Color,
     content_secondary: Color,
@@ -54,6 +58,8 @@ pub const Theme = struct {
 
 pub const light: Theme = .{
     .accent_default = Color.rgba(36, 107, 219, 255),
+    .accent_hovered = Color.rgba(29, 93, 191, 255),
+    .accent_pressed = Color.rgba(23, 74, 153, 255),
     .border_default = Color.rgba(216, 216, 220, 255),
     .content_primary = Color.rgba(32, 32, 36, 255),
     .content_secondary = Color.rgba(96, 96, 105, 255),
@@ -68,6 +74,8 @@ pub const light: Theme = .{
 
 pub const dark: Theme = .{
     .accent_default = Color.rgba(114, 165, 245, 255),
+    .accent_hovered = Color.rgba(36, 107, 219, 255),
+    .accent_pressed = Color.rgba(29, 93, 191, 255),
     .border_default = Color.rgba(96, 96, 105, 255),
     .content_primary = Color.rgba(255, 255, 255, 255),
     .content_secondary = Color.rgba(216, 216, 220, 255),

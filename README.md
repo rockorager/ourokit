@@ -80,9 +80,12 @@ Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
 by default for cross targets. The low-level benchmark-oriented Lua text surface
 is `ouro.label(id, parent, text, size, color)`: it correctly shapes one LTR Latin
 label through HarfBuzz, lays it out from shaping metrics, and rasterizes through
-a backend-owned FreeType glyph cache. The application-facing `ouro.button`
-constructor composes a Box and Label using generated design tokens; Button is
-not a renderer primitive. Full
+a backend-owned FreeType glyph cache. The application-facing `ouro.row`,
+`ouro.column`, and `ouro.label` constructors provide nested composition without
+application-managed numeric IDs or parent links. `ouro.button` composes a Box
+and Label using generated design tokens and retains hover, pressed, disabled,
+pointer-capture, and release-inside activation state in the widget layer;
+Button is not a renderer primitive. Full
 bidi, script itemization, wrapping, and editing are explicitly deferred.
 
 After editing canonical token JSON:
@@ -110,6 +113,8 @@ link either toolkit:
 ```sh
 ZIG=/path/to/zig-0.16.0 tools/application-benchmark/build.sh
 tools/application-benchmark/run.py --iterations 20 --output results.json
+tools/application-benchmark/run.py --profile settings --iterations 20 \
+  --output settings-results.json
 ```
 
 See [the benchmark protocol](tools/application-benchmark/README.md) before

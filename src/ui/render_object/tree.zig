@@ -178,6 +178,10 @@ pub const Tree = struct {
             self.markNeedsPaint(handle);
     }
 
+    pub fn objectAt(self: *Tree, handle: NodeHandle) !types.Object {
+        return (try self.slot(handle)).object;
+    }
+
     pub fn layout(self: *Tree, root: NodeHandle, constraints: Constraints) LayoutError!SizeF {
         try constraints.validate();
         const root_slot = try self.slot(root);

@@ -7,6 +7,8 @@
     { "name": "ouro.semantic.content.secondary", "type": "color", "value": "{ouro.foundation.palette.gray_200}" },
     { "name": "ouro.semantic.border.default", "type": "color", "value": "{ouro.foundation.palette.gray_600}" },
     { "name": "ouro.semantic.accent.default", "type": "color", "value": "{ouro.foundation.palette.blue_300}" },
+    { "name": "ouro.semantic.accent.hovered", "type": "color", "value": "{ouro.foundation.palette.blue_500}" },
+    { "name": "ouro.semantic.accent.pressed", "type": "color", "value": "{ouro.foundation.palette.blue_600}" },
     { "name": "ouro.semantic.focus.ring", "type": "color", "value": "{ouro.foundation.palette.blue_300}" },
     { "name": "ouro.semantic.selection.background", "type": "color", "value": "{ouro.foundation.palette.blue_500}" },
     { "name": "ouro.semantic.status.negative", "type": "color", "value": "{ouro.foundation.palette.red_500}" },

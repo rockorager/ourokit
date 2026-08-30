@@ -70,10 +70,13 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
 
     const descriptor_storage = try init.gpa.alloc(ui.instance.Descriptor, options.window.node_capacity);
     defer init.gpa.free(descriptor_storage);
+    const semantic_storage = try init.gpa.alloc(ui.semantics.Descriptor, options.window.node_capacity);
+    defer init.gpa.free(semantic_storage);
     var lua_ui: lua.UiBuild = undefined;
     try lua_ui.init(vm.state, descriptor_storage);
     lua_ui.attachSignals(&signals);
     try lua_ui.attachLabelText(&shapes, &.{primary_font}, 1);
+    try lua_ui.attachSemantics(semantic_storage);
     lua_ui.enableDeclarativeWidgets(design.tokens.light);
 
     var application = try lua.Application.load(init.gpa, vm.state, source);
@@ -212,6 +215,8 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
             configured_sizes[index] = null;
             try dirty.complete(work);
         }
+
+        for (runtimes) |*runtime| if (runtime.ready) try runtime.prepareFrame();
 
         for (application.windows, desired, 0..) |window, present, index| {
             if (!present) continue;

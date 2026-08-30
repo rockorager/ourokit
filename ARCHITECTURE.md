@@ -210,10 +210,12 @@ objects. Ourokit will avoid repeated parsing of arbitrary `{ type = "..." }`
 tables; component schemas should eventually generate Lua constructors, compact
 Zig decoding, language-server types, documentation, and validation tests. That
 generator is not part of milestone one, and no permanent widget ABI is frozen.
-The first constructor-specific `ouro.button` decoder proves the intended seam:
-it consumes one compact declaration and emits Box plus Label descriptors and a
-press binding using generated token values. It does not add a Button render
-object or duplicate theme defaults in Lua.
+The first constructor-specific decoders prove the intended seam. `ouro.row`
+and `ouro.column` emit Flex descriptors, `ouro.label` emits Label, and
+`ouro.button` emits Box plus Label descriptors and a typed widget binding.
+A bounded nested build context derives native identity and parent links from
+stable local keys, so applications never manage numeric IDs. These constructors
+do not add a Button render object or duplicate theme defaults in Lua.
 
 Layout uses one-way Flutter-style box constraints in logical `f32` units. A
 parent passes minimum/maximum width and height, each child returns one finite
@@ -364,8 +366,12 @@ one valid LTR run containing only Latin, Common, and Inherited script values.
 uucode enforces that boundary, so unsupported scripts fail rather than inheriting
 incorrect properties. Label owns no font or rasterizer state; it retains a shape
 handle, uses shaping metrics for one-way layout, and emits a baseline glyph-run
-command. Button is Box + Label composition with behavior in the instance layer,
-not another core render object.
+command. Button is Box + Label composition with behavior in a language-neutral
+widget registry, not another core render object. That registry retains hover,
+pressed, disabled, and pointer-armed state across reconciliation. Pointer
+capture ensures a release reaches the pressed target, while release-inside
+decides activation. Design-generated semantic accent roles supply idle,
+hovered, and pressed colors.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,
@@ -429,9 +435,12 @@ selection, fallback behavior, multi-plane formats, modifier policy, and device
 matching remain prototype questions. No Vulkan placeholder pretends this path
 has already been validated.
 
-Headless development remains first-class: deterministic software buffers and
-scene logging exist now; semantic snapshots and a design-system gallery are
-planned without requiring Wayland or Vulkan.
+Headless development remains first-class: deterministic software buffers,
+scene logging, Button interaction tests, and retained semantic snapshots exist
+now. Semantic groups, labels, and Buttons validate parent ordering, identity,
+required labels, capacity, and disabled state; double buffering keeps the prior
+snapshot visible until a complete build commits. A larger design-system gallery
+remains planned without requiring Wayland or Vulkan.
 
 ## Lua isolation
 

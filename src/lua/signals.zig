@@ -105,7 +105,7 @@ pub const Signals = struct {
 
     /// Atomically replaces dependencies only after the owner's normalized
     /// descriptor output has reconciled successfully.
-    pub fn commit(self: *Signals, owner: OwnerRef, revision: u64) !void {
+    pub fn validateCommit(self: *Signals, owner: OwnerRef, revision: u64) !void {
         try self.expectEvaluation(.awaiting_commit, owner, revision);
         var old_count: usize = 0;
         var free_count: usize = 0;
@@ -114,6 +114,10 @@ pub const Signals = struct {
         }
         if (self.pending_count > free_count + old_count) return error.SubscriptionCapacityExceeded;
         for (self.pending[0..self.pending_count]) |signal| _ = try self.signalSlot(signal);
+    }
+
+    pub fn commit(self: *Signals, owner: OwnerRef, revision: u64) !void {
+        try self.validateCommit(owner, revision);
 
         for (self.edges) |*edge| {
             if (edge.active and sameOwner(edge.owner, owner)) edge.* = .{};

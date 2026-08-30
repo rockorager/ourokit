@@ -1,11 +1,18 @@
 local clicked = ouro.signal(false)
 
 local function content()
-  ouro.button {
-    key = "benchmark",
-    label = clicked() and "Clicked" or "Benchmark",
-    on_press = function()
-      clicked:set(not clicked())
+  ouro.column {
+    key = "content",
+    children = function()
+      ouro.button {
+        key = "benchmark",
+        label = clicked() and "Clicked" or "Benchmark",
+        width = 160,
+        height = 44,
+        on_press = function()
+          clicked:set(not clicked())
+        end,
+      }
     end,
   }
 end

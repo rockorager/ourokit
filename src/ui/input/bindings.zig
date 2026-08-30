@@ -2,7 +2,7 @@ const std = @import("std");
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const HandlerKind = enum { pointer, press };
+pub const HandlerKind = enum { pointer, button };
 
 pub const Handler = struct {
     id: u32,
@@ -131,12 +131,12 @@ test "pointer bindings replace, clean removal, and reject stale generations" {
     try std.testing.expectEqual(@as(?Handler, .{ .id = 10 }), bindings.get(original));
     try std.testing.expectEqual(
         @as(?Handler, .{ .id = 10 }),
-        try bindings.set(owner, original, .{ .id = 11, .kind = .press }),
+        try bindings.set(owner, original, .{ .id = 11, .kind = .button }),
     );
 
     try tree.reconcile(&.{});
     try std.testing.expectEqual(
-        @as(?Handler, .{ .id = 11, .kind = .press }),
+        @as(?Handler, .{ .id = 11, .kind = .button }),
         bindings.takeInactive(&tree),
     );
     try scheduler.applyQueuedCancellations();

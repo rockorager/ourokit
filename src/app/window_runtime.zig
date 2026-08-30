@@ -13,6 +13,7 @@ pub const Config = struct {
     build_pass_capacity: usize = 16,
     input_capacity: usize = 128,
     command_capacity: usize = 512,
+    semantic_text_capacity: usize = 16 * 1024,
 };
 
 /// Retained UI state for one application window. This coordinates sibling UI,
@@ -30,6 +31,8 @@ pub const WindowRuntime = struct {
     root_owner: ui.instance.BuildOwnerHandle = .invalid,
     router: ui.input.Router = undefined,
     pointer_bindings: ui.input.PointerBindings = undefined,
+    buttons: ui.widget.Buttons = undefined,
+    semantics: ui.semantics.Snapshot = undefined,
     surface_color: core.Color = undefined,
     accent_color: core.Color = undefined,
     content_color: core.Color = undefined,
@@ -66,6 +69,10 @@ pub const WindowRuntime = struct {
         errdefer self.router.deinit();
         try self.pointer_bindings.init(allocator, config.node_capacity);
         errdefer self.pointer_bindings.deinit();
+        try self.buttons.init(allocator, config.node_capacity);
+        errdefer self.buttons.deinit();
+        try self.semantics.init(allocator, config.node_capacity, config.semantic_text_capacity);
+        errdefer self.semantics.deinit();
         const commands = try allocator.alloc(scene.Command, config.command_capacity);
         errdefer allocator.free(commands);
         self.root_owner = try self.build_owners.mount(null, 1);
@@ -79,6 +86,8 @@ pub const WindowRuntime = struct {
             .root_owner = self.root_owner,
             .router = self.router,
             .pointer_bindings = self.pointer_bindings,
+            .buttons = self.buttons,
+            .semantics = self.semantics,
             .surface_color = surface,
             .accent_color = accent,
             .content_color = content,
@@ -99,6 +108,8 @@ pub const WindowRuntime = struct {
         if (!self.initialized) return;
         std.debug.assert(self.pointer_bindings.takeAny() == null);
         self.allocator.free(self.commands);
+        self.semantics.deinit();
+        self.buttons.deinit();
         self.pointer_bindings.deinit();
         self.router.deinit();
         self.build_owners.deinit();
@@ -116,6 +127,7 @@ pub const WindowRuntime = struct {
     pub fn clear(self: *WindowRuntime, lua_ui: *lua.UiBuild) !void {
         if (!self.initialized) return;
         lua_ui.clearHandlers(&self.pointer_bindings);
+        self.buttons.clear();
         while (self.router.takeEvent() != null) {}
         if (self.build_owners.isActive(self.root_owner)) {
             try self.signals.disposeOwner(.{
@@ -168,20 +180,53 @@ pub const WindowRuntime = struct {
                 try self.build_owners.retry(work);
                 return err;
             };
-            lua_ui.commitHandlers(&self.pointer_bindings, &self.instances, work.owner) catch |err| {
+            self.semantics.validate(lua_ui.semanticDescriptors()) catch |err| {
+                lua_ui.rollbackHandlers();
+                try lua_ui.rollbackDependencies(&self.build_owners, work);
+                try self.build_owners.retry(work);
+                return err;
+            };
+            lua_ui.validateDependencies(&self.build_owners, work) catch |err| {
+                lua_ui.rollbackHandlers();
+                try lua_ui.rollbackDependencies(&self.build_owners, work);
+                try self.build_owners.retry(work);
+                return err;
+            };
+            self.semantics.stage(lua_ui.semanticDescriptors());
+            self.buttons.removeInactive(&self.instances);
+            lua_ui.commitBindings(
+                &self.pointer_bindings,
+                &self.buttons,
+                &self.instances,
+                work.owner,
+            ) catch |err| {
+                self.semantics.discardStaged();
                 lua_ui.rollbackHandlers();
                 try lua_ui.rollbackDependencies(&self.build_owners, work);
                 try self.build_owners.retry(work);
                 return err;
             };
             lua_ui.commitDependencies(&self.build_owners, work) catch |err| {
+                self.semantics.discardStaged();
                 try lua_ui.rollbackDependencies(&self.build_owners, work);
                 try self.build_owners.retry(work);
                 return err;
             };
+            self.semantics.commitStaged();
+            for (0..self.buttons.slotCount()) |index|
+                if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
             try self.build_owners.complete(work);
         }
-        const root = (try self.instances.rootRenderObject()).?;
+        try self.prepareFrame();
+        self.ready = true;
+    }
+
+    pub fn prepareFrame(self: *WindowRuntime) !void {
+        if (!self.initialized or self.frame_state.size == null) return;
+        const root = (try self.instances.rootRenderObject()) orelse return;
+        const size = self.frame_state.size.?;
+        const width: f32 = @floatFromInt(size.width);
+        const height: f32 = @floatFromInt(size.height);
         if (try self.tree.layoutDirty(root)) {
             self.frame_state.invalidateLayout();
             _ = try self.tree.layout(
@@ -197,7 +242,6 @@ pub const WindowRuntime = struct {
             self.command_count = builder.displayList().commands.len;
             _ = try self.frame_state.sceneBuilt();
         }
-        self.ready = true;
     }
 
     pub fn routePointer(self: *WindowRuntime, event: platform.PointerEvent) !void {
@@ -212,6 +256,7 @@ pub const WindowRuntime = struct {
                 .pointer => |value| value.target,
             };
             if (!self.instances.isActive(target)) continue;
+            const activated_button = try self.updateButtonState(event);
             var bound_target = target;
             var handler = self.pointer_bindings.get(bound_target);
             while (handler == null) {
@@ -219,13 +264,13 @@ pub const WindowRuntime = struct {
                 handler = self.pointer_bindings.get(bound_target);
             }
             const binding = handler orelse continue;
-            if (binding.kind == .press and !isPress(event)) continue;
-            if (binding.kind == .press) {
-                _ = try vm.spawnReference(
-                    try self.instances.scope(bound_target),
-                    @intCast(binding.id),
-                    &.{},
-                );
+            if (binding.kind == .button) {
+                if (activated_button != null and sameHandle(activated_button.?, bound_target))
+                    _ = try vm.spawnReference(
+                        try self.instances.scope(bound_target),
+                        @intCast(binding.id),
+                        &.{},
+                    );
                 continue;
             }
             const values = inputValues(event);
@@ -263,17 +308,69 @@ pub const WindowRuntime = struct {
         if (!self.registered or self.reconciling) return;
         _ = try self.dirty_windows.?.markDirty(self.window);
     }
-};
 
-fn isPress(event: ui.input.Event) bool {
-    return switch (event) {
-        .pointer => |pointer| switch (pointer.event) {
-            .button => |button| button.state == .pressed,
-            else => false,
-        },
-        else => false,
-    };
-}
+    fn updateButtonState(self: *WindowRuntime, event: ui.input.Event) !?ui.instance.InstanceHandle {
+        switch (event) {
+            .hover_enter => |hover| if (try self.buttonAncestor(hover.target)) |button|
+                try self.applyButtonColor(button, self.buttons.setHovered(button, true)),
+            .hover_leave => |hover| if (try self.buttonAncestor(hover.target)) |button|
+                try self.applyButtonColor(button, self.buttons.setHovered(button, false)),
+            .pointer => |pointer| switch (pointer.event) {
+                .button => |button_event| {
+                    if (button_event.button != 0x110) return null;
+                    switch (button_event.state) {
+                        .pressed => {
+                            const button = (try self.buttonAncestor(pointer.target)) orelse return null;
+                            try self.applyButtonUpdate(self.buttons.press(button));
+                        },
+                        .released => {
+                            const hovered = if (pointer.hovered) |target|
+                                try self.buttonAncestor(target)
+                            else
+                                null;
+                            const release = self.buttons.release(hovered);
+                            try self.applyButtonUpdate(release.visual);
+                            return release.activated;
+                        },
+                    }
+                },
+                else => {},
+            },
+        }
+        return null;
+    }
+
+    fn buttonAncestor(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+    ) !?ui.instance.InstanceHandle {
+        var current = target;
+        while (true) {
+            if (self.buttons.contains(current)) return current;
+            current = (try self.instances.parentOf(current)) orelse return null;
+        }
+    }
+
+    fn applyButtonColor(
+        self: *WindowRuntime,
+        button: ui.instance.InstanceHandle,
+        next: ?core.Color,
+    ) !void {
+        const color = next orelse return;
+        const render = try self.instances.renderObject(button);
+        var object = try self.tree.objectAt(render);
+        if (object != .box) return error.ButtonRenderObjectMismatch;
+        if (std.meta.eql(object.box.background, color)) return;
+        object.box.background = color;
+        try self.tree.update(render, object);
+        self.frame_state.invalidatePaint();
+    }
+
+    fn applyButtonUpdate(self: *WindowRuntime, update: ?ui.widget.ButtonVisualUpdate) !void {
+        const value = update orelse return;
+        try self.applyButtonColor(value.target, value.color);
+    }
+};
 
 const InputValues = struct {
     kind: i64,

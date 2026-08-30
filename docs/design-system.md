@@ -5,6 +5,9 @@ and contain a deliberately small desktop-oriented foundation: spacing,
 component heights, radii, borders, focus geometry, workflow icon sizes,
 typography sizes, palette values, and light/dark semantic mappings for surface,
 content, border, accent, focus, selection, and status roles.
+Accent defaults include distinct idle, hovered, and pressed semantic mappings;
+widget policy selects among those pre-resolved values rather than embedding
+interaction colors in Lua or renderer code.
 
 `tools/design/generate_tokens.py` validates document shape, namespace, token
 name grammar, allowed types, non-negative dimensions, color encoding,
