@@ -11,6 +11,14 @@ const builtin = @import("builtin");
 const Color = @import("../../core/color.zig").Color;
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
+const text = @import("../../text/root.zig");
+const build_options = @import("ourokit_build_options");
+
+pub const has_freetype = build_options.freetype;
+const RasterCache = if (has_freetype)
+    @import("../software/glyph_cache.zig").GlyphCache
+else
+    struct {};
 
 const c = @cImport({
     @cInclude("vulkan/vulkan.h");
@@ -49,14 +57,244 @@ drm_render_device: ?u64,
 descriptor_layout: c.VkDescriptorSetLayout,
 pipeline_layout: c.VkPipelineLayout,
 pipeline: c.VkPipeline,
+glyph_pipeline: c.VkPipeline,
+atlas_descriptor_layout: c.VkDescriptorSetLayout,
 presentation_render_pass: c.VkRenderPass,
 presentation_pipeline_layout: c.VkPipelineLayout,
 presentation_pipeline: c.VkPipeline,
+presentation_glyph_pipeline_layout: c.VkPipelineLayout,
+presentation_glyph_pipeline: c.VkPipeline,
 descriptor_pool: c.VkDescriptorPool,
 command_pool: c.VkCommandPool,
 command_buffer: c.VkCommandBuffer,
 fence: c.VkFence,
 max_pixels: u64,
+
+const atlas_width = 2048;
+const atlas_height = 2048;
+const atlas_bytes = atlas_width * atlas_height;
+
+const AtlasKey = extern struct {
+    font_slot: u32,
+    font_generation: u32,
+    glyph: u32,
+    size_26_6: i32,
+};
+
+const AtlasGlyph = struct {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    left: i32,
+    top: i32,
+};
+
+const RealGlyphCache = struct {
+    allocator: std.mem.Allocator,
+    renderer: *Renderer,
+    raster: RasterCache,
+    entries: std.AutoHashMapUnmanaged(AtlasKey, AtlasGlyph) = .empty,
+    buffer: c.VkBuffer,
+    memory: c.VkDeviceMemory,
+    staging_buffer: c.VkBuffer,
+    staging_memory: c.VkDeviceMemory,
+    mapping: *anyopaque,
+    descriptor_pool: c.VkDescriptorPool,
+    descriptor_set: c.VkDescriptorSet,
+    next_x: u32 = 0,
+    next_y: u32 = 0,
+    row_height: u32 = 0,
+    dirty_start: usize = atlas_bytes,
+    dirty_end: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, fonts: *text.FontCache, renderer: *Renderer) !RealGlyphCache {
+        var raster = try RasterCache.init(allocator, fonts);
+        errdefer raster.deinit();
+        var buffer_info: c.VkBufferCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .size = atlas_bytes,
+            .usage = c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = null,
+        };
+        var buffer: c.VkBuffer = undefined;
+        try vk(c.vkCreateBuffer(renderer.device, &buffer_info, null, &buffer), error.CreateAtlasBufferFailed);
+        errdefer c.vkDestroyBuffer(renderer.device, buffer, null);
+        var requirements: c.VkMemoryRequirements = undefined;
+        c.vkGetBufferMemoryRequirements(renderer.device, buffer, &requirements);
+        const memory_type = renderer.findMemoryType(requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) orelse
+            renderer.findMemoryType(requirements.memoryTypeBits, 0) orelse return error.DeviceMemoryUnavailable;
+        var allocate_info: c.VkMemoryAllocateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = null,
+            .allocationSize = requirements.size,
+            .memoryTypeIndex = memory_type,
+        };
+        var memory: c.VkDeviceMemory = undefined;
+        try vk(c.vkAllocateMemory(renderer.device, &allocate_info, null, &memory), error.AllocateAtlasMemoryFailed);
+        errdefer c.vkFreeMemory(renderer.device, memory, null);
+        try vk(c.vkBindBufferMemory(renderer.device, buffer, memory, 0), error.BindAtlasMemoryFailed);
+
+        var staging_info = buffer_info;
+        staging_info.usage = c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        var staging_buffer: c.VkBuffer = undefined;
+        try vk(c.vkCreateBuffer(renderer.device, &staging_info, null, &staging_buffer), error.CreateAtlasBufferFailed);
+        errdefer c.vkDestroyBuffer(renderer.device, staging_buffer, null);
+        var staging_requirements: c.VkMemoryRequirements = undefined;
+        c.vkGetBufferMemoryRequirements(renderer.device, staging_buffer, &staging_requirements);
+        const staging_type = renderer.findMemoryType(
+            staging_requirements.memoryTypeBits,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        ) orelse return error.HostVisibleMemoryUnavailable;
+        allocate_info.allocationSize = staging_requirements.size;
+        allocate_info.memoryTypeIndex = staging_type;
+        var staging_memory: c.VkDeviceMemory = undefined;
+        try vk(c.vkAllocateMemory(renderer.device, &allocate_info, null, &staging_memory), error.AllocateAtlasMemoryFailed);
+        errdefer c.vkFreeMemory(renderer.device, staging_memory, null);
+        try vk(c.vkBindBufferMemory(renderer.device, staging_buffer, staging_memory, 0), error.BindAtlasMemoryFailed);
+        var mapping: ?*anyopaque = null;
+        try vk(c.vkMapMemory(renderer.device, staging_memory, 0, atlas_bytes, 0, &mapping), error.MapAtlasMemoryFailed);
+        errdefer c.vkUnmapMemory(renderer.device, staging_memory);
+        @memset(@as([*]u8, @ptrCast(mapping.?))[0..atlas_bytes], 0);
+
+        var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 };
+        var pool_info: c.VkDescriptorPoolCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        var descriptor_pool: c.VkDescriptorPool = undefined;
+        try vk(c.vkCreateDescriptorPool(renderer.device, &pool_info, null, &descriptor_pool), error.CreateDescriptorPoolFailed);
+        errdefer c.vkDestroyDescriptorPool(renderer.device, descriptor_pool, null);
+        var descriptor_allocate: c.VkDescriptorSetAllocateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = descriptor_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &renderer.atlas_descriptor_layout,
+        };
+        var descriptor_set: c.VkDescriptorSet = undefined;
+        try vk(c.vkAllocateDescriptorSets(renderer.device, &descriptor_allocate, &descriptor_set), error.AllocateDescriptorSetFailed);
+        var descriptor_buffer: c.VkDescriptorBufferInfo = .{ .buffer = buffer, .offset = 0, .range = atlas_bytes };
+        var descriptor_write: c.VkWriteDescriptorSet = .{
+            .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = null,
+            .dstSet = descriptor_set,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pImageInfo = null,
+            .pBufferInfo = &descriptor_buffer,
+            .pTexelBufferView = null,
+        };
+        c.vkUpdateDescriptorSets(renderer.device, 1, &descriptor_write, 0, null);
+        return .{
+            .allocator = allocator,
+            .renderer = renderer,
+            .raster = raster,
+            .buffer = buffer,
+            .memory = memory,
+            .staging_buffer = staging_buffer,
+            .staging_memory = staging_memory,
+            .mapping = mapping.?,
+            .descriptor_pool = descriptor_pool,
+            .descriptor_set = descriptor_set,
+        };
+    }
+
+    pub fn deinit(self: *RealGlyphCache) void {
+        _ = c.vkDeviceWaitIdle(self.renderer.device);
+        self.entries.deinit(self.allocator);
+        c.vkDestroyDescriptorPool(self.renderer.device, self.descriptor_pool, null);
+        c.vkUnmapMemory(self.renderer.device, self.staging_memory);
+        c.vkDestroyBuffer(self.renderer.device, self.staging_buffer, null);
+        c.vkFreeMemory(self.renderer.device, self.staging_memory, null);
+        c.vkDestroyBuffer(self.renderer.device, self.buffer, null);
+        c.vkFreeMemory(self.renderer.device, self.memory, null);
+        self.raster.deinit();
+        self.* = undefined;
+    }
+
+    fn get(self: *RealGlyphCache, handle: text.FontHandle, glyph_id: u32, pixel_size: f32) !AtlasGlyph {
+        if (!std.math.isFinite(pixel_size) or pixel_size <= 0) return error.InvalidGlyphSize;
+        const scaled = pixel_size * 64;
+        if (@as(f64, scaled) > std.math.maxInt(i32)) return error.InvalidGlyphSize;
+        const size_26_6: i32 = @intFromFloat(@round(scaled));
+        const key: AtlasKey = .{
+            .font_slot = handle.slot,
+            .font_generation = handle.generation,
+            .glyph = glyph_id,
+            .size_26_6 = size_26_6,
+        };
+        if (self.entries.get(key)) |entry| return entry;
+        const bitmap = try self.raster.get(handle, glyph_id, pixel_size);
+        var x = self.next_x;
+        var y = self.next_y;
+        if (bitmap.width > atlas_width or bitmap.height > atlas_height) return error.GlyphAtlasFull;
+        if (x + bitmap.width > atlas_width) {
+            x = 0;
+            y += self.row_height;
+            self.row_height = 0;
+        }
+        if (y + bitmap.height > atlas_height) return error.GlyphAtlasFull;
+        const destination: [*]u8 = @ptrCast(self.mapping);
+        for (0..bitmap.height) |row| {
+            const offset = (y + row) * atlas_width + x;
+            @memcpy(destination[offset..][0..bitmap.width], bitmap.pixels[row * bitmap.width ..][0..bitmap.width]);
+            self.dirty_start = @min(self.dirty_start, offset);
+            self.dirty_end = @max(self.dirty_end, offset + bitmap.width);
+        }
+        const entry: AtlasGlyph = .{
+            .x = x,
+            .y = y,
+            .width = bitmap.width,
+            .height = bitmap.height,
+            .left = bitmap.left,
+            .top = bitmap.top,
+        };
+        try self.entries.put(self.allocator, key, entry);
+        self.next_x = x + bitmap.width;
+        self.next_y = y;
+        self.row_height = @max(self.row_height, bitmap.height);
+        return entry;
+    }
+
+    fn recordUpload(self: *const RealGlyphCache, command_buffer_value: c.VkCommandBuffer, destination_stage: c.VkPipelineStageFlags) bool {
+        if (self.dirty_start >= self.dirty_end) return false;
+        const start = self.dirty_start & ~@as(usize, 3);
+        const end = std.mem.alignForward(usize, self.dirty_end, 4);
+        var copy: c.VkBufferCopy = .{ .srcOffset = start, .dstOffset = start, .size = end - start };
+        c.vkCmdCopyBuffer(command_buffer_value, self.staging_buffer, self.buffer, 1, &copy);
+        var barrier: c.VkBufferMemoryBarrier = .{
+            .sType = c.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT,
+            .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .buffer = self.buffer,
+            .offset = start,
+            .size = end - start,
+        };
+        c.vkCmdPipelineBarrier(command_buffer_value, c.VK_PIPELINE_STAGE_TRANSFER_BIT, destination_stage, 0, 0, null, 1, &barrier, 0, null);
+        return true;
+    }
+
+    fn uploaded(self: *RealGlyphCache) void {
+        self.dirty_start = atlas_bytes;
+        self.dirty_end = 0;
+    }
+};
+
+pub const GlyphCache = if (has_freetype) RealGlyphCache else struct {};
 
 pub const PixelFormat = enum {
     rgba8_unorm,
@@ -468,19 +706,44 @@ const Push = extern struct {
     source_over: u32,
 };
 
+const GlyphPush = extern struct {
+    target_width: u32,
+    atlas_width_value: u32,
+    source: u32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    atlas_x: u32,
+    atlas_y: u32,
+};
+
+const PresentationGlyphPush = extern struct {
+    color: [4]f32,
+    target_size: [2]f32,
+    padding: [2]f32 = .{ 0, 0 },
+    bounds: [4]i32,
+    atlas_origin: [2]u32,
+    atlas_width_value: u32,
+};
+
 const PresentationObjects = struct {
     render_pass: c.VkRenderPass,
     layout: c.VkPipelineLayout,
     pipeline: c.VkPipeline,
+    glyph_layout: c.VkPipelineLayout,
+    glyph_pipeline: c.VkPipeline,
 
     fn deinit(self: PresentationObjects, device: c.VkDevice) void {
+        c.vkDestroyPipeline(device, self.glyph_pipeline, null);
+        c.vkDestroyPipelineLayout(device, self.glyph_layout, null);
         c.vkDestroyPipeline(device, self.pipeline, null);
         c.vkDestroyPipelineLayout(device, self.layout, null);
         c.vkDestroyRenderPass(device, self.render_pass, null);
     }
 };
 
-fn createPresentationPipeline(device: c.VkDevice) !PresentationObjects {
+fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSetLayout) !PresentationObjects {
     var attachment: c.VkAttachmentDescription = .{
         .flags = 0,
         .format = c.VK_FORMAT_B8G8R8A8_UNORM,
@@ -670,7 +933,35 @@ fn createPresentationPipeline(device: c.VkDevice) !PresentationObjects {
     };
     var pipeline: c.VkPipeline = undefined;
     try vk(c.vkCreateGraphicsPipelines(device, null, 1, &pipeline_info, null, &pipeline), error.CreatePipelineFailed);
-    return .{ .render_pass = render_pass, .layout = layout, .pipeline = pipeline };
+    errdefer c.vkDestroyPipeline(device, pipeline, null);
+
+    var glyph_push_range: c.VkPushConstantRange = .{
+        .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = @sizeOf(PresentationGlyphPush),
+    };
+    var glyph_layout_info = layout_info;
+    glyph_layout_info.setLayoutCount = 1;
+    glyph_layout_info.pSetLayouts = &atlas_layout;
+    glyph_layout_info.pPushConstantRanges = &glyph_push_range;
+    var glyph_layout: c.VkPipelineLayout = undefined;
+    try vk(c.vkCreatePipelineLayout(device, &glyph_layout_info, null, &glyph_layout), error.CreatePipelineLayoutFailed);
+    errdefer c.vkDestroyPipelineLayout(device, glyph_layout, null);
+    const glyph_fragment_bytes align(@alignOf(u32)) = @embedFile("ourokit_vulkan_glyph_fragment").*;
+    const glyph_fragment = try createShader(device, &glyph_fragment_bytes);
+    defer c.vkDestroyShaderModule(device, glyph_fragment, null);
+    stages[0].module = vertex;
+    stages[1].module = glyph_fragment;
+    pipeline_info.layout = glyph_layout;
+    var glyph_pipeline: c.VkPipeline = undefined;
+    try vk(c.vkCreateGraphicsPipelines(device, null, 1, &pipeline_info, null, &glyph_pipeline), error.CreatePipelineFailed);
+    return .{
+        .render_pass = render_pass,
+        .layout = layout,
+        .pipeline = pipeline,
+        .glyph_layout = glyph_layout,
+        .glyph_pipeline = glyph_pipeline,
+    };
 }
 
 fn createShader(device: c.VkDevice, bytes: []align(@alignOf(u32)) const u8) !c.VkShaderModule {
@@ -783,19 +1074,28 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     else
         null;
 
-    var binding: c.VkDescriptorSetLayoutBinding = .{
-        .binding = 0,
-        .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
-        .pImmutableSamplers = null,
+    var bindings = [_]c.VkDescriptorSetLayoutBinding{
+        .{
+            .binding = 0,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = null,
+        },
+        .{
+            .binding = 1,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = null,
+        },
     };
     var descriptor_layout_info: c.VkDescriptorSetLayoutCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .bindingCount = 1,
-        .pBindings = &binding,
+        .bindingCount = bindings.len,
+        .pBindings = &bindings,
     };
     var descriptor_layout: c.VkDescriptorSetLayout = undefined;
     try vk(c.vkCreateDescriptorSetLayout(device, &descriptor_layout_info, null, &descriptor_layout), error.CreateDescriptorLayoutFailed);
@@ -804,7 +1104,7 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     var push_range: c.VkPushConstantRange = .{
         .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
-        .size = @sizeOf(Push),
+        .size = @max(@sizeOf(Push), @sizeOf(GlyphPush)),
     };
     var pipeline_layout_info: c.VkPipelineLayoutCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -851,10 +1151,36 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     try vk(c.vkCreateComputePipelines(device, null, 1, &pipeline_info, null, &pipeline), error.CreatePipelineFailed);
     errdefer c.vkDestroyPipeline(device, pipeline, null);
 
-    const presentation = try createPresentationPipeline(device);
+    const glyph_shader_bytes align(@alignOf(u32)) = @embedFile("ourokit_vulkan_glyph").*;
+    const glyph_shader = try createShader(device, &glyph_shader_bytes);
+    defer c.vkDestroyShaderModule(device, glyph_shader, null);
+    pipeline_info.stage.module = glyph_shader;
+    var glyph_pipeline: c.VkPipeline = undefined;
+    try vk(c.vkCreateComputePipelines(device, null, 1, &pipeline_info, null, &glyph_pipeline), error.CreatePipelineFailed);
+    errdefer c.vkDestroyPipeline(device, glyph_pipeline, null);
+
+    var atlas_binding: c.VkDescriptorSetLayoutBinding = .{
+        .binding = 0,
+        .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+        .pImmutableSamplers = null,
+    };
+    var atlas_layout_info: c.VkDescriptorSetLayoutCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = null,
+        .flags = 0,
+        .bindingCount = 1,
+        .pBindings = &atlas_binding,
+    };
+    var atlas_descriptor_layout: c.VkDescriptorSetLayout = undefined;
+    try vk(c.vkCreateDescriptorSetLayout(device, &atlas_layout_info, null, &atlas_descriptor_layout), error.CreateDescriptorLayoutFailed);
+    errdefer c.vkDestroyDescriptorSetLayout(device, atlas_descriptor_layout, null);
+
+    const presentation = try createPresentationPipeline(device, atlas_descriptor_layout);
     errdefer presentation.deinit(device);
 
-    var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 };
+    var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
     var descriptor_pool_info: c.VkDescriptorPoolCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = null,
@@ -917,9 +1243,13 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
         .descriptor_layout = descriptor_layout,
         .pipeline_layout = pipeline_layout,
         .pipeline = pipeline,
+        .glyph_pipeline = glyph_pipeline,
+        .atlas_descriptor_layout = atlas_descriptor_layout,
         .presentation_render_pass = presentation.render_pass,
         .presentation_pipeline_layout = presentation.layout,
         .presentation_pipeline = presentation.pipeline,
+        .presentation_glyph_pipeline_layout = presentation.glyph_layout,
+        .presentation_glyph_pipeline = presentation.glyph_pipeline,
         .descriptor_pool = descriptor_pool,
         .command_pool = command_pool,
         .command_buffer = command_buffer,
@@ -936,12 +1266,16 @@ pub fn deinit(self: *Renderer) void {
     c.vkDestroyFence(self.device, self.fence, null);
     c.vkDestroyCommandPool(self.device, self.command_pool, null);
     c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
+    c.vkDestroyPipeline(self.device, self.presentation_glyph_pipeline, null);
+    c.vkDestroyPipelineLayout(self.device, self.presentation_glyph_pipeline_layout, null);
     c.vkDestroyPipeline(self.device, self.presentation_pipeline, null);
     c.vkDestroyPipelineLayout(self.device, self.presentation_pipeline_layout, null);
     c.vkDestroyRenderPass(self.device, self.presentation_render_pass, null);
     c.vkDestroyPipeline(self.device, self.pipeline, null);
+    c.vkDestroyPipeline(self.device, self.glyph_pipeline, null);
     c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
     c.vkDestroyDescriptorSetLayout(self.device, self.descriptor_layout, null);
+    c.vkDestroyDescriptorSetLayout(self.device, self.atlas_descriptor_layout, null);
     c.vkDestroyDevice(self.device, null);
     c.vkDestroyInstance(self.instance, null);
     self.* = undefined;
@@ -989,8 +1323,30 @@ fn modifierPlaneCount(self: *const Renderer, modifier: u64) ?u32 {
 }
 
 pub fn render(self: *Renderer, list: scene.DisplayList, target: *Target) !void {
+    return self.renderInternal(list, target, null, null);
+}
+
+pub fn renderText(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *Target,
+    glyphs: *GlyphCache,
+    shapes: *const text.ShapeCache,
+) !void {
+    if (!has_freetype) return error.FreeTypeDisabled;
+    return self.renderInternal(list, target, glyphs, shapes);
+}
+
+fn renderInternal(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *Target,
+    glyphs: ?*GlyphCache,
+    shapes: ?*const text.ShapeCache,
+) !void {
     try list.validate();
-    try validateClipDepth(list.commands);
+    try validateClipDepth(list.commands, glyphs != null);
+    if (glyphs) |cache| try prepareText(list.commands, cache, shapes orelse return error.TextResourcesRequired);
     try vk(c.vkResetDescriptorPool(self.device, self.descriptor_pool, 0), error.ResetDescriptorPoolFailed);
     var descriptor_allocate_info: c.VkDescriptorSetAllocateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1001,20 +1357,37 @@ pub fn render(self: *Renderer, list: scene.DisplayList, target: *Target) !void {
     };
     var descriptor_set: c.VkDescriptorSet = undefined;
     try vk(c.vkAllocateDescriptorSets(self.device, &descriptor_allocate_info, &descriptor_set), error.AllocateDescriptorSetFailed);
-    var buffer_info: c.VkDescriptorBufferInfo = .{ .buffer = target.buffer, .offset = 0, .range = target.byte_size };
-    var descriptor_write: c.VkWriteDescriptorSet = .{
-        .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .pNext = null,
-        .dstSet = descriptor_set,
-        .dstBinding = 0,
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pImageInfo = null,
-        .pBufferInfo = &buffer_info,
-        .pTexelBufferView = null,
+    var buffer_infos = [_]c.VkDescriptorBufferInfo{
+        .{ .buffer = target.buffer, .offset = 0, .range = target.byte_size },
+        .{ .buffer = if (glyphs) |cache| cache.buffer else target.buffer, .offset = 0, .range = if (glyphs != null) atlas_bytes else target.byte_size },
     };
-    c.vkUpdateDescriptorSets(self.device, 1, &descriptor_write, 0, null);
+    var descriptor_writes = [_]c.VkWriteDescriptorSet{
+        .{
+            .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = null,
+            .dstSet = descriptor_set,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pImageInfo = null,
+            .pBufferInfo = &buffer_infos[0],
+            .pTexelBufferView = null,
+        },
+        .{
+            .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = null,
+            .dstSet = descriptor_set,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pImageInfo = null,
+            .pBufferInfo = &buffer_infos[1],
+            .pTexelBufferView = null,
+        },
+    };
+    c.vkUpdateDescriptorSets(self.device, if (glyphs != null) 2 else 1, &descriptor_writes, 0, null);
 
     try vk(c.vkResetCommandPool(self.device, self.command_pool, 0), error.ResetCommandPoolFailed);
     var begin_info: c.VkCommandBufferBeginInfo = .{
@@ -1024,6 +1397,10 @@ pub fn render(self: *Renderer, list: scene.DisplayList, target: *Target) !void {
         .pInheritanceInfo = null,
     };
     try vk(c.vkBeginCommandBuffer(self.command_buffer, &begin_info), error.BeginCommandBufferFailed);
+    const atlas_uploaded = if (glyphs) |cache|
+        cache.recordUpload(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+    else
+        false;
     c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
     c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor_set, 0, null);
     var host_write_barrier: c.VkMemoryBarrier = .{
@@ -1047,10 +1424,10 @@ pub fn render(self: *Renderer, list: scene.DisplayList, target: *Target) !void {
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderRegion(list.commands, target, bounds),
+        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped);
+            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes);
         },
     }
     var host_barrier: c.VkMemoryBarrier = .{
@@ -1085,6 +1462,7 @@ pub fn render(self: *Renderer, list: scene.DisplayList, target: *Target) !void {
         .pSignalSemaphores = null,
     };
     try vk(c.vkQueueSubmit(self.queue, 1, &submit_info, self.fence), error.QueueSubmitFailed);
+    if (atlas_uploaded) glyphs.?.uploaded();
     try vk(c.vkWaitForFences(self.device, 1, &self.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
 }
 
@@ -1093,8 +1471,30 @@ pub fn render(self: *Renderer, list: scene.DisplayList, target: *Target) !void {
 /// for the GPU. Slot reuse must additionally wait for `ready` and compositor
 /// release.
 pub fn renderDmabuf(self: *Renderer, list: scene.DisplayList, target: *DmabufTarget) !void {
+    return self.renderDmabufInternal(list, target, null, null);
+}
+
+pub fn renderDmabufText(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *DmabufTarget,
+    glyphs: *GlyphCache,
+    shapes: *const text.ShapeCache,
+) !void {
+    if (!has_freetype) return error.FreeTypeDisabled;
+    return self.renderDmabufInternal(list, target, glyphs, shapes);
+}
+
+fn renderDmabufInternal(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *DmabufTarget,
+    glyphs: ?*GlyphCache,
+    shapes: ?*const text.ShapeCache,
+) !void {
     try list.validate();
-    try validateClipDepth(list.commands);
+    try validateClipDepth(list.commands, glyphs != null);
+    if (glyphs) |cache| try prepareText(list.commands, cache, shapes orelse return error.TextResourcesRequired);
     if (!try target.ready(self)) return error.TargetBusy;
     try vk(c.vkResetCommandBuffer(target.command_buffer, 0), error.ResetCommandBufferFailed);
     var begin_info: c.VkCommandBufferBeginInfo = .{
@@ -1104,6 +1504,10 @@ pub fn renderDmabuf(self: *Renderer, list: scene.DisplayList, target: *DmabufTar
         .pInheritanceInfo = null,
     };
     try vk(c.vkBeginCommandBuffer(target.command_buffer, &begin_info), error.BeginCommandBufferFailed);
+    const atlas_uploaded = if (glyphs) |cache|
+        cache.recordUpload(target.command_buffer, c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+    else
+        false;
     var image_barrier: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = null,
@@ -1166,10 +1570,10 @@ pub fn renderDmabuf(self: *Renderer, list: scene.DisplayList, target: *DmabufTar
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderPresentationRegion(list.commands, target, bounds),
+        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped);
+            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes);
         },
     }
     c.vkCmdEndRenderPass(target.command_buffer);
@@ -1217,6 +1621,7 @@ pub fn renderDmabuf(self: *Renderer, list: scene.DisplayList, target: *DmabufTar
         .pSignalSemaphores = if (target.explicit_sync) &target.timeline else null,
     };
     try vk(c.vkQueueSubmit(self.queue, 1, &submit_info, target.fence), error.QueueSubmitFailed);
+    if (atlas_uploaded) glyphs.?.uploaded();
     target.layout = c.VK_IMAGE_LAYOUT_GENERAL;
     target.gpu_pending = true;
     if (target.explicit_sync) {
@@ -1225,7 +1630,14 @@ pub fn renderDmabuf(self: *Renderer, list: scene.DisplayList, target: *DmabufTar
     }
 }
 
-fn renderPresentationRegion(self: *Renderer, commands: []const scene.Command, target: *const DmabufTarget, damage: RectI) void {
+fn renderPresentationRegion(
+    self: *Renderer,
+    commands: []const scene.Command,
+    target: *const DmabufTarget,
+    damage: RectI,
+    glyphs: ?*GlyphCache,
+    shapes: ?*const text.ShapeCache,
+) void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
@@ -1242,7 +1654,13 @@ fn renderPresentationRegion(self: *Renderer, commands: []const scene.Command, ta
             if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
                 self.presentationFill(target, bounds, rectangle.color, rectangle.blend);
         },
-        .glyph_run => unreachable,
+        .glyph_run => |run| self.drawPresentationGlyphRun(
+            run,
+            target,
+            clips[depth],
+            glyphs orelse unreachable,
+            shapes orelse unreachable,
+        ),
     };
 }
 
@@ -1254,6 +1672,7 @@ fn presentationFill(
     blend: scene.BlendMode,
 ) void {
     if (bounds.isEmpty()) return;
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_pipeline);
     const source = color.premultiplied();
     const rectangle: c.VkClearRect = .{
         .rect = .{
@@ -1278,6 +1697,15 @@ fn presentationFill(
         return;
     }
     var scissor = rectangle.rect;
+    var viewport: c.VkViewport = .{
+        .x = @floatFromInt(bounds.x),
+        .y = @floatFromInt(bounds.y),
+        .width = @floatFromInt(bounds.width),
+        .height = @floatFromInt(bounds.height),
+        .minDepth = 0,
+        .maxDepth = 1,
+    };
+    c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
     c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
     const right = @as(i64, bounds.x) + bounds.width;
     const bottom = @as(i64, bounds.y) + bounds.height;
@@ -1302,7 +1730,7 @@ fn presentationFill(
     c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
 }
 
-fn validateClipDepth(commands: []const scene.Command) !void {
+fn validateClipDepth(commands: []const scene.Command, allow_text: bool) !void {
     var depth: usize = 0;
     for (commands) |command| switch (command) {
         .push_clip_rect => {
@@ -1310,12 +1738,19 @@ fn validateClipDepth(commands: []const scene.Command) !void {
             depth += 1;
         },
         .pop_clip => depth -= 1,
-        .glyph_run => return error.UnsupportedCommand,
+        .glyph_run => if (!allow_text) return error.TextResourcesRequired,
         else => {},
     };
 }
 
-fn renderRegion(self: *Renderer, commands: []const scene.Command, target: *const Target, damage: RectI) void {
+fn renderRegion(
+    self: *Renderer,
+    commands: []const scene.Command,
+    target: *const Target,
+    damage: RectI,
+    glyphs: ?*GlyphCache,
+    shapes: ?*const text.ShapeCache,
+) void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
@@ -1332,12 +1767,19 @@ fn renderRegion(self: *Renderer, commands: []const scene.Command, target: *const
             if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
                 self.fill(target, bounds, rectangle.color, rectangle.blend);
         },
-        .glyph_run => unreachable,
+        .glyph_run => |run| self.drawGlyphRun(
+            run,
+            target,
+            clips[depth],
+            glyphs orelse unreachable,
+            shapes orelse unreachable,
+        ),
     };
 }
 
 fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, blend: scene.BlendMode) void {
     if (bounds.isEmpty()) return;
+    c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
     const source = color.premultiplied();
     const push: Push = .{
         .target_width = target.width,
@@ -1372,6 +1814,139 @@ fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, ble
         0,
         null,
     );
+}
+
+fn prepareText(commands: []const scene.Command, glyphs: *GlyphCache, shapes: *const text.ShapeCache) !void {
+    for (commands) |command| switch (command) {
+        .glyph_run => |run| {
+            const shaped = try shapes.get(run.shape);
+            for (shaped.spans) |span| {
+                for (span.run.glyphs) |glyph| {
+                    _ = try glyphs.get(span.font, glyph.id, shaped.logical_size * run.scale);
+                }
+            }
+        },
+        else => {},
+    };
+}
+
+fn drawGlyphRun(
+    self: *Renderer,
+    command: scene.GlyphRun,
+    target: *const Target,
+    clip: RectI,
+    cache: *GlyphCache,
+    shapes: *const text.ShapeCache,
+) void {
+    const shaped = shapes.get(command.shape) catch unreachable;
+    const source_color = command.color.premultiplied();
+    const source = @as(u32, if (target.format == .rgba) source_color.r else source_color.b) |
+        (@as(u32, source_color.g) << 8) |
+        (@as(u32, if (target.format == .rgba) source_color.b else source_color.r) << 16) |
+        (@as(u32, source_color.a) << 24);
+    var pen = command.origin;
+    for (shaped.spans) |span| for (span.run.glyphs) |glyph| {
+        const atlas = cache.get(span.font, glyph.id, shaped.logical_size * command.scale) catch unreachable;
+        const left: i32 = @intFromFloat(@round(pen.x + glyph.offset.x * command.scale));
+        const baseline: i32 = @intFromFloat(@round(pen.y - glyph.offset.y * command.scale));
+        const glyph_bounds: RectI = .{
+            .x = left + atlas.left,
+            .y = baseline - atlas.top,
+            .width = atlas.width,
+            .height = atlas.height,
+        };
+        const bounds = RectI.intersect(clip, glyph_bounds);
+        if (!bounds.isEmpty()) {
+            c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
+            const push: GlyphPush = .{
+                .target_width = target.width,
+                .atlas_width_value = atlas_width,
+                .source = source,
+                .left = bounds.x,
+                .top = bounds.y,
+                .right = @intCast(@as(i64, bounds.x) + bounds.width),
+                .bottom = @intCast(@as(i64, bounds.y) + bounds.height),
+                .atlas_x = atlas.x + @as(u32, @intCast(bounds.x - glyph_bounds.x)),
+                .atlas_y = atlas.y + @as(u32, @intCast(bounds.y - glyph_bounds.y)),
+            };
+            c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
+            const count = @as(u64, bounds.width) * bounds.height;
+            c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+            var barrier: c.VkMemoryBarrier = .{
+                .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = null,
+                .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+            };
+            c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+        }
+        pen.x += glyph.advance.x * command.scale;
+        pen.y -= glyph.advance.y * command.scale;
+    };
+}
+
+fn drawPresentationGlyphRun(
+    self: *Renderer,
+    command: scene.GlyphRun,
+    target: *const DmabufTarget,
+    clip: RectI,
+    cache: *GlyphCache,
+    shapes: *const text.ShapeCache,
+) void {
+    const shaped = shapes.get(command.shape) catch unreachable;
+    const color = command.color.premultiplied();
+    var pen = command.origin;
+    for (shaped.spans) |span| for (span.run.glyphs) |glyph| {
+        const atlas = cache.get(span.font, glyph.id, shaped.logical_size * command.scale) catch unreachable;
+        const left: i32 = @intFromFloat(@round(pen.x + glyph.offset.x * command.scale));
+        const baseline: i32 = @intFromFloat(@round(pen.y - glyph.offset.y * command.scale));
+        const glyph_bounds: RectI = .{
+            .x = left + atlas.left,
+            .y = baseline - atlas.top,
+            .width = atlas.width,
+            .height = atlas.height,
+        };
+        const bounds = RectI.intersect(clip, glyph_bounds);
+        if (!bounds.isEmpty()) {
+            var scissor: c.VkRect2D = .{
+                .offset = .{ .x = bounds.x, .y = bounds.y },
+                .extent = .{ .width = bounds.width, .height = bounds.height },
+            };
+            c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_glyph_pipeline);
+            c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_glyph_pipeline_layout, 0, 1, &cache.descriptor_set, 0, null);
+            var viewport: c.VkViewport = .{
+                .x = @floatFromInt(bounds.x),
+                .y = @floatFromInt(bounds.y),
+                .width = @floatFromInt(bounds.width),
+                .height = @floatFromInt(bounds.height),
+                .minDepth = 0,
+                .maxDepth = 1,
+            };
+            c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
+            c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
+            const push: PresentationGlyphPush = .{
+                .color = .{
+                    @as(f32, @floatFromInt(color.r)) / 255,
+                    @as(f32, @floatFromInt(color.g)) / 255,
+                    @as(f32, @floatFromInt(color.b)) / 255,
+                    @as(f32, @floatFromInt(color.a)) / 255,
+                },
+                .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
+                .bounds = .{
+                    glyph_bounds.x,
+                    glyph_bounds.y,
+                    @intCast(@as(i64, glyph_bounds.x) + glyph_bounds.width),
+                    @intCast(@as(i64, glyph_bounds.y) + glyph_bounds.height),
+                },
+                .atlas_origin = .{ atlas.x, atlas.y },
+                .atlas_width_value = atlas_width,
+            };
+            c.vkCmdPushConstants(target.command_buffer, self.presentation_glyph_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(PresentationGlyphPush), &push);
+            c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
+        }
+        pen.x += glyph.advance.x * command.scale;
+        pen.y -= glyph.advance.y * command.scale;
+    };
 }
 
 fn findMemoryType(self: *const Renderer, bits: u32, required: c.VkMemoryPropertyFlags) ?u32 {
@@ -1518,7 +2093,7 @@ test "Vulkan lowering bounds its clip stack" {
         commands[commands.len - index - 1] = .pop_clip;
     }
     try (scene.DisplayList{ .commands = &commands }).validate();
-    try std.testing.expectError(error.ClipStackOverflow, validateClipDepth(&commands));
+    try std.testing.expectError(error.ClipStackOverflow, validateClipDepth(&commands, false));
 }
 
 test "Vulkan backend renders exact conformance fixtures" {
@@ -1540,6 +2115,69 @@ test "Vulkan backend renders exact conformance fixtures" {
             return err;
         };
     }
+}
+
+test "Vulkan glyph atlas matches exact software text rendering" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    const software = @import("../software/root.zig");
+    const font_bytes = @embedFile("ourokit_test_font_static");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
+        .bytes = font_bytes,
+    });
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    const shape = try shapes.acquire(.{
+        .spec = .{
+            .paragraph = "Vulkan atlas",
+            .direction = .left_to_right,
+            .script = .latin,
+            .language = "en",
+            .logical_size = 18,
+        },
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    defer shapes.release(shape) catch unreachable;
+    try fonts.release(font);
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(240, 240, 240, 255) },
+        .{ .push_clip_rect = .{ .x = 8, .y = 3, .width = 140, .height = 30 } },
+        .{ .glyph_run = .{
+            .shape = shape,
+            .origin = .{ .x = 4, .y = 25 },
+            .scale = 1,
+            .color = Color.rgba(20, 40, 80, 211),
+        } },
+        .pop_clip,
+    };
+    const list: scene.DisplayList = .{ .commands = &commands };
+    var expected = [_]u8{0} ** (160 * 36 * 4);
+    var software_glyphs = try software.GlyphCache.init(std.testing.allocator, &fonts);
+    defer software_glyphs.deinit();
+    try software.renderText(list, .{
+        .pixels = &expected,
+        .width = 160,
+        .height = 36,
+        .stride = 160 * 4,
+        .format = .rgba8_unorm,
+    }, &software_glyphs, &shapes);
+
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var glyphs = try GlyphCache.init(std.testing.allocator, &fonts, &renderer);
+    defer glyphs.deinit();
+    var target = try Target.init(&renderer, 160, 36);
+    defer target.deinit(&renderer);
+    try renderer.renderText(list, &target, &glyphs, &shapes);
+    var actual = [_]u8{0} ** expected.len;
+    try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
 test "Vulkan clipping, damage, and BGRA readback preserve untouched pixels" {

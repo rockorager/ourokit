@@ -14,6 +14,7 @@ const ui = @import("../ui/root.zig");
 
 pub const Options = struct {
     exit_after_first_frame: bool = false,
+    vulkan: bool = false,
     window: WindowRuntimeConfig = .{},
     platform_event_capacity: usize = 256,
     signal_capacity: usize = 256,
@@ -21,8 +22,8 @@ pub const Options = struct {
     dependency_capacity: usize = 256,
 };
 
-/// Runs one declarative Lua application on the production Wayland/software
-/// stack. Applications provide source and policy; this coordinator owns all
+/// Runs one declarative Lua application on the production Wayland stack.
+/// Applications provide source and policy; this coordinator owns all
 /// native services and preserves the explicit event-loop safe points.
 pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
     var loop: io_loop.Loop = undefined;
@@ -67,6 +68,12 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
     defer shapes.deinit();
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
+    var vulkan_renderer: renderer.vulkan = undefined;
+    if (options.vulkan) vulkan_renderer = try renderer.vulkan.init(init.gpa);
+    defer if (options.vulkan) vulkan_renderer.deinit();
+    var vulkan_glyphs: renderer.vulkan.GlyphCache = undefined;
+    if (options.vulkan) vulkan_glyphs = try renderer.vulkan.GlyphCache.init(init.gpa, &fonts, &vulkan_renderer);
+    defer if (options.vulkan) vulkan_glyphs.deinit();
 
     const descriptor_storage = try init.gpa.alloc(ui.instance.Descriptor, options.window.node_capacity);
     defer init.gpa.free(descriptor_storage);
@@ -90,7 +97,11 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
         &loop,
         init.minimal.environ,
         window_set.eventSink(),
-        .{ .app_id = application.id, .window_capacity = window_count },
+        .{
+            .app_id = application.id,
+            .window_capacity = window_count,
+            .vulkan = if (options.vulkan) &vulkan_renderer else null,
+        },
     );
     defer host.deinit();
     try window_set.init(
@@ -229,20 +240,16 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
             const handle = window_set.handleForId(window.declaration.id).?;
             if (runtimes[index].wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
                 const list = try runtimes[index].displayList();
-                const software_target = switch (frame_buffer.target) {
-                    .software => |target| target,
-                    .vulkan => {
-                        try host.discardFrame(frame_buffer);
-                        return error.UnexpectedVulkanFrame;
-                    },
-                };
-                renderer.software.renderText(list, .{
-                    .pixels = software_target.pixels,
-                    .width = frame_buffer.width,
-                    .height = frame_buffer.height,
-                    .stride = software_target.stride,
-                    .format = .bgra8_unorm,
-                }, &glyphs, &shapes) catch |err| {
+                (switch (frame_buffer.target) {
+                    .software => |target| renderer.software.renderText(list, .{
+                        .pixels = target.pixels,
+                        .width = frame_buffer.width,
+                        .height = frame_buffer.height,
+                        .stride = target.stride,
+                        .format = .bgra8_unorm,
+                    }, &glyphs, &shapes),
+                    .vulkan => |target| vulkan_renderer.renderDmabufText(list, target, &vulkan_glyphs, &shapes),
+                }) catch |err| {
                     try host.discardFrame(frame_buffer);
                     return err;
                 };

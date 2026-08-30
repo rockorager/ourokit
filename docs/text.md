@@ -148,13 +148,16 @@ and emits a renderer-neutral glyph-run scene command with a baseline and output
 scale. A button remains composition: a padded Box containing a Label, with
 pointer/focus/command behavior owned by the instance layer.
 
-The software backend owns FreeType faces and grayscale glyph masks keyed by
-font generation, glyph ID, and exact 26.6 device size. Cached faces retain their
-font handles, use the exact collection/named-instance index selected for
-HarfBuzz, and apply the same variable-axis assignments. Glyph masks are blended
-as premultiplied source-over without exposing FreeType, masks, stride, or pixel
-formats to text, scenes, or render objects. The current cache is application-
-lifetime and intentionally has no eviction policy until benchmark data exists.
+Each renderer owns FreeType faces and grayscale glyph masks keyed by font
+generation, glyph ID, and exact 26.6 device size. Cached faces retain their font
+handles, use the exact collection/named-instance index selected for HarfBuzz,
+and apply the same variable-axis assignments. The Vulkan backend additionally
+packs masks into an application-lifetime atlas, stages cache misses into device-
+local storage, reads that atlas from compute for exact headless output, and
+blends atlas quads directly into dma-buf presentation images. Glyph masks are
+blended as premultiplied source-over without exposing FreeType, masks, stride,
+Vulkan resources, or pixel formats to text, scenes, or render objects. Cache
+eviction remains deferred until benchmark data establishes a budget.
 
 Borrowed display lists can render glyph handles synchronously. Owned async
 `scene.Frame` construction currently rejects glyph commands because frame-level

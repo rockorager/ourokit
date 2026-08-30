@@ -3,15 +3,32 @@ const ourokit = @import("ourokit");
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 2) return error.ExpectedApplicationPath;
-    const file = if (std.fs.path.isAbsolute(args[1]))
-        try std.Io.Dir.openFileAbsolute(init.io, args[1], .{})
+    var use_vulkan = false;
+    var exit_after_first_frame = false;
+    var path: ?[]const u8 = null;
+    for (args[1..]) |argument| {
+        if (std.mem.eql(u8, argument, "--vulkan")) {
+            use_vulkan = true;
+        } else if (std.mem.eql(u8, argument, "--exit-after-first-frame")) {
+            exit_after_first_frame = true;
+        } else if (path == null) {
+            path = argument;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    const application_path = path orelse return error.ExpectedApplicationPath;
+    const file = if (std.fs.path.isAbsolute(application_path))
+        try std.Io.Dir.openFileAbsolute(init.io, application_path, .{})
     else
-        try std.Io.Dir.cwd().openFile(init.io, args[1], .{});
+        try std.Io.Dir.cwd().openFile(init.io, application_path, .{});
     defer file.close(init.io);
     var buffer: [8192]u8 = undefined;
     var reader = file.reader(init.io, &buffer);
     const source = try reader.interface.allocRemaining(init.gpa, .limited(16 * 1024 * 1024));
     defer init.gpa.free(source);
-    try ourokit.app.runWayland(init, source, .{});
+    try ourokit.app.runWayland(init, source, .{
+        .exit_after_first_frame = exit_after_first_frame,
+        .vulkan = use_vulkan,
+    });
 }

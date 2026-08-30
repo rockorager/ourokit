@@ -1,0 +1,57 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer Target {
+    uint pixels[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer Atlas {
+    uint masks[];
+};
+
+layout(push_constant) uniform Push {
+    uint target_width;
+    uint atlas_width;
+    uint source;
+    int left;
+    int top;
+    int right;
+    int bottom;
+    uint atlas_x;
+    uint atlas_y;
+};
+
+uint channel(uint pixel, uint shift) {
+    return (pixel >> shift) & 255u;
+}
+
+uint sourceOver(uint source, uint destination) {
+    uint inverse_alpha = 255u - channel(source, 24u);
+    uint result = 0u;
+    for (uint shift = 0u; shift <= 24u; shift += 8u) {
+        uint value = channel(source, shift) +
+            (channel(destination, shift) * inverse_alpha + 127u) / 255u;
+        result |= min(value, 255u) << shift;
+    }
+    return result;
+}
+
+void main() {
+    uint width = uint(right - left);
+    uint index = gl_GlobalInvocationID.x;
+    uint count = width * uint(bottom - top);
+    if (index >= count) return;
+
+    uint x = index % width;
+    uint y = index / width;
+    uint atlas_index = (atlas_y + y) * atlas_width + atlas_x + x;
+    uint coverage = (masks[atlas_index / 4u] >> ((atlas_index % 4u) * 8u)) & 255u;
+    if (coverage == 0u) return;
+    uint covered = 0u;
+    for (uint shift = 0u; shift <= 24u; shift += 8u) {
+        covered |= ((channel(source, shift) * coverage + 127u) / 255u) << shift;
+    }
+    uint target_index = uint(top + int(y)) * target_width + uint(left + int(x));
+    pixels[target_index] = sourceOver(covered, pixels[target_index]);
+}
