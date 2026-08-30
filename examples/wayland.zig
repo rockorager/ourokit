@@ -5,13 +5,19 @@ const ToplevelDeclaration = ourokit.app.windows.ToplevelDeclaration;
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    var exit_after_first_frame = false;
+    var frame_limit: ?usize = null;
     var two_windows = false;
+    var use_vulkan = false;
     for (args[1..]) |argument| {
         if (std.mem.eql(u8, argument, "--exit-after-first-frame")) {
-            exit_after_first_frame = true;
+            frame_limit = 1;
+        } else if (std.mem.startsWith(u8, argument, "--frame-count=")) {
+            frame_limit = try std.fmt.parseInt(usize, argument["--frame-count=".len..], 10);
+            if (frame_limit.? == 0) return error.InvalidFrameCount;
         } else if (std.mem.eql(u8, argument, "--two-windows")) {
             two_windows = true;
+        } else if (std.mem.eql(u8, argument, "--vulkan")) {
+            use_vulkan = true;
         } else {
             return error.UnknownArgument;
         }
@@ -25,6 +31,10 @@ pub fn main(init: std.process.Init) !void {
     try scheduler.init(init.gpa, 8, 1, 0);
     defer scheduler.deinit();
 
+    var vulkan_renderer: ourokit.renderer.vulkan = undefined;
+    if (use_vulkan) vulkan_renderer = try ourokit.renderer.vulkan.init(init.gpa);
+    defer if (use_vulkan) vulkan_renderer.deinit();
+
     // The sink stores only this stable address. Host startup performs registry
     // discovery but cannot emit a window event before WindowSet.init below.
     var windows: ourokit.app.windows.WindowSet = undefined;
@@ -34,14 +44,22 @@ pub fn main(init: std.process.Init) !void {
         &loop,
         init.minimal.environ,
         windows.eventSink(),
-        .{ .app_id = "dev.ourokit.renderer-example", .window_capacity = 2 },
+        .{
+            .app_id = "dev.ourokit.renderer-example",
+            .window_capacity = 2,
+            .vulkan = if (use_vulkan) &vulkan_renderer else null,
+        },
     );
     defer host.deinit();
+    if (use_vulkan and host.presentationBackend() != .vulkan_dmabuf)
+        std.debug.print("linux-dmabuf unavailable; using shared-memory presentation.\n", .{});
+    if (use_vulkan and host.explicitSyncEnabled())
+        std.debug.print("linux-drm-syncobj explicit synchronization enabled.\n", .{});
     try windows.init(init.gpa, &scheduler, host.nativeHost(), 2, 16);
     defer windows.deinit();
 
     const declarations = [_]ToplevelDeclaration{
-        .{ .id = "main", .title = "Ourokit software renderer" },
+        .{ .id = "main", .title = if (use_vulkan) "Ourokit Vulkan renderer" else "Ourokit software renderer" },
         .{
             .id = "secondary",
             .title = "Ourokit second window",
@@ -51,6 +69,8 @@ pub fn main(init: std.process.Init) !void {
     };
     var desired = [_]bool{ true, two_windows };
     var frames_seen = [_]usize{ 0, 0 };
+    var timings_seen = [_]usize{ 0, 0 };
+    var timing_stats = [_]TimingStats{.{}} ** declarations.len;
     var disconnect_started = false;
 
     while (true) {
@@ -91,41 +111,73 @@ pub fn main(init: std.process.Init) !void {
         for (declarations, desired, 0..) |declaration, present, index| {
             if (!present) continue;
             const handle = windows.handleForId(declaration.id).?;
-            if (try host.acquireFrame(handle)) |frame| {
+            frames_seen[index] = @max(frames_seen[index], try host.framesPresented(handle));
+            if (try host.takePresentationTiming(handle)) |timing| {
+                timings_seen[index] += 1;
+                timing_stats[index].add(timing);
+            }
+            if (frame_limit != null and frames_seen[index] >= frame_limit.?) continue;
+            if (try host.acquireFrame(handle)) |acquired| {
+                var frame = acquired;
                 const theme = ourokit.design.tokens.light;
+                const rectangle_width = frame.width / 2;
+                const rectangle_height = frame.height / 2;
+                const travel = frame.width - rectangle_width;
+                const current_x: u32 = @intCast((frames_seen[index] * 13) % @max(travel, 1));
+                const previous_x: u32 = if (frames_seen[index] == 0)
+                    current_x
+                else
+                    @intCast(((frames_seen[index] - 1) * 13) % @max(travel, 1));
+                const damage_left = @min(current_x, previous_x);
+                const damage_right = @max(current_x, previous_x) + rectangle_width;
+                const requested_damage = ourokit.scene.Damage{ .regions = &.{.{
+                    .x = @intCast(damage_left),
+                    .y = @intCast(frame.height / 4),
+                    .width = damage_right - damage_left,
+                    .height = rectangle_height,
+                }} };
                 const commands = [_]ourokit.scene.Command{
                     .{ .clear = theme.surface_base },
                     .{ .solid_rectangle = .{
                         .bounds = .{
-                            .x = @intCast(frame.width / 4),
+                            .x = @intCast(current_x),
                             .y = @intCast(frame.height / 4),
-                            .width = frame.width / 2,
-                            .height = frame.height / 2,
+                            .width = rectangle_width,
+                            .height = rectangle_height,
                         },
                         .color = theme.accent_default,
                     } },
                 };
-                ourokit.renderer.software.render(.{ .commands = &commands }, .{
-                    .pixels = frame.pixels,
-                    .width = frame.width,
-                    .height = frame.height,
-                    .stride = frame.stride,
-                    .format = .bgra8_unorm,
+                try host.prepareFrameDamage(&frame, requested_damage);
+                const list: ourokit.scene.DisplayList = .{ .commands = &commands, .damage = frame.damage() };
+                (switch (frame.target) {
+                    .software => |target| ourokit.renderer.software.render(list, .{
+                        .pixels = target.pixels,
+                        .width = frame.width,
+                        .height = frame.height,
+                        .stride = target.stride,
+                        .format = .bgra8_unorm,
+                    }),
+                    .vulkan => |target| vulkan_renderer.renderDmabuf(list, target),
                 }) catch |err| {
                     try host.discardFrame(frame);
                     return err;
                 };
-                try host.present(frame);
+                host.present(frame) catch |err| {
+                    try host.discardFrame(frame);
+                    return err;
+                };
             }
-            frames_seen[index] = @max(frames_seen[index], try host.framesPresented(handle));
+            if (frame_limit) |limit| if (frames_seen[index] < limit)
+                try host.requestRedraw(handle);
         }
 
-        if (exit_after_first_frame) {
+        if (frame_limit) |limit| {
             var all_presented = true;
             var any_present = false;
             for (desired, frames_seen) |present, count| {
                 any_present = any_present or present;
-                if (present and count == 0) all_presented = false;
+                if (present and count < limit) all_presented = false;
             }
             if (any_present and all_presented) {
                 @memset(&desired, false);
@@ -156,10 +208,51 @@ pub fn main(init: std.process.Init) !void {
 
     const total_frames = frames_seen[0] + frames_seen[1];
     std.debug.print(
-        "Ourokit Wayland example presented {d} frame(s) across {d} window(s) and exited cleanly.\n",
-        .{ total_frames, @as(usize, if (two_windows) 2 else 1) },
+        "Ourokit Wayland example presented {d} frame(s) across {d} window(s), received {d} timing sample(s), and exited cleanly.\n",
+        .{ total_frames, @as(usize, if (two_windows) 2 else 1), timings_seen[0] + timings_seen[1] },
+    );
+    var combined: TimingStats = .{};
+    for (timing_stats) |stats| combined.merge(stats);
+    if (combined.interval_count != 0) std.debug.print(
+        "Presentation intervals: avg {d:.3} ms, min {d:.3} ms, max {d:.3} ms ({d} intervals).\n",
+        .{
+            @as(f64, @floatFromInt(combined.total_nanoseconds)) / @as(f64, @floatFromInt(combined.interval_count)) / 1_000_000,
+            @as(f64, @floatFromInt(combined.minimum_nanoseconds)) / 1_000_000,
+            @as(f64, @floatFromInt(combined.maximum_nanoseconds)) / 1_000_000,
+            combined.interval_count,
+        },
     );
 }
+
+const TimingStats = struct {
+    previous_nanoseconds: ?u128 = null,
+    interval_count: usize = 0,
+    total_nanoseconds: u128 = 0,
+    minimum_nanoseconds: u64 = std.math.maxInt(u64),
+    maximum_nanoseconds: u64 = 0,
+
+    fn add(self: *TimingStats, timing: ourokit.platform.wayland.PresentationTiming) void {
+        const timestamp = @as(u128, timing.seconds) * std.time.ns_per_s + timing.nanoseconds;
+        if (self.previous_nanoseconds) |previous| if (timestamp > previous and
+            timestamp - previous <= std.math.maxInt(u64))
+        {
+            const interval: u64 = @intCast(timestamp - previous);
+            self.interval_count += 1;
+            self.total_nanoseconds += interval;
+            self.minimum_nanoseconds = @min(self.minimum_nanoseconds, interval);
+            self.maximum_nanoseconds = @max(self.maximum_nanoseconds, interval);
+        };
+        self.previous_nanoseconds = timestamp;
+    }
+
+    fn merge(self: *TimingStats, other: TimingStats) void {
+        if (other.interval_count == 0) return;
+        self.interval_count += other.interval_count;
+        self.total_nanoseconds += other.total_nanoseconds;
+        self.minimum_nanoseconds = @min(self.minimum_nanoseconds, other.minimum_nanoseconds);
+        self.maximum_nanoseconds = @max(self.maximum_nanoseconds, other.maximum_nanoseconds);
+    }
+};
 
 fn sameWindow(a: ourokit.platform.window.WindowHandle, b: ourokit.platform.window.WindowHandle) bool {
     return a.slot == b.slot and a.generation == b.generation;

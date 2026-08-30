@@ -63,6 +63,18 @@ on a Wayland desktop with:
 zig build run-wayland-example
 ```
 
+Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
+presenter with:
+
+```sh
+zig build run-wayland-vulkan-example
+```
+
+The Vulkan example uses linux-dmabuf v4 device/modifier feedback, direct
+rendering, and linux-drm-syncobj timelines when advertised. It falls back to
+shared memory when the compositor and Vulkan device have no common renderable
+ARGB8888 modifier.
+
 Close the window normally to exit. CI or a headless compositor can use
 `zig build run-wayland-example -- --exit-after-first-frame`. Exercise
 independent multi-window lifetime with:
@@ -71,11 +83,12 @@ independent multi-window lifetime with:
 zig build run-wayland-example -- --two-windows
 ```
 
-The Wayland and xdg-shell XML archives are pinned Zig build dependencies used
-to generate protocol code; no system libwayland is linked. See
+The Wayland, xdg-shell, linux-dmabuf, presentation-time, and drm-syncobj XML
+archives are pinned Zig build dependencies used to generate protocol code; no
+system libwayland is linked. See
 [ARCHITECTURE.md](ARCHITECTURE.md) and
 [docs/rendering.md](docs/rendering.md) for the verified integration contract
-and shared-memory presentation path.
+and shared-memory/dma-buf presentation paths.
 
 ## Documentation
 

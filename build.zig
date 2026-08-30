@@ -108,12 +108,20 @@ pub fn build(b: *std.Build) void {
 }
 
 fn addVulkan(b: *std.Build, module: *std.Build.Module) void {
-    const compile = b.addSystemCommand(&.{ "glslc", "-O" });
-    compile.addFileArg(b.path("src/renderer/vulkan/fill.comp"));
-    compile.addArg("-o");
-    const spirv = compile.addOutputFileArg("ourokit-vulkan-fill.spv");
-    module.addAnonymousImport("ourokit_vulkan_fill", .{ .root_source_file = spirv });
+    const fill = compileShader(b, "src/renderer/vulkan/fill.comp", "ourokit-vulkan-fill.spv");
+    const solid_vertex = compileShader(b, "src/renderer/vulkan/solid.vert", "ourokit-vulkan-solid-vertex.spv");
+    const solid_fragment = compileShader(b, "src/renderer/vulkan/solid.frag", "ourokit-vulkan-solid-fragment.spv");
+    module.addAnonymousImport("ourokit_vulkan_fill", .{ .root_source_file = fill });
+    module.addAnonymousImport("ourokit_vulkan_solid_vertex", .{ .root_source_file = solid_vertex });
+    module.addAnonymousImport("ourokit_vulkan_solid_fragment", .{ .root_source_file = solid_fragment });
     module.linkSystemLibrary("vulkan", .{});
+}
+
+fn compileShader(b: *std.Build, source: []const u8, output: []const u8) std.Build.LazyPath {
+    const compile = b.addSystemCommand(&.{ "glslc", "-O" });
+    compile.addFileArg(b.path(source));
+    compile.addArg("-o");
+    return compile.addOutputFileArg(output);
 }
 
 fn addRendererBenchmark(
@@ -214,6 +222,11 @@ fn addWaylandExample(
     if (b.args) |args| run.addArgs(args);
     const run_step = b.step("run-wayland-example", "Open the software-rendered Wayland example");
     run_step.dependOn(&run.step);
+    const run_vulkan = b.addRunArtifact(example);
+    run_vulkan.addArg("--vulkan");
+    if (b.args) |args| run_vulkan.addArgs(args);
+    const run_vulkan_step = b.step("run-wayland-vulkan-example", "Open the Vulkan dma-buf Wayland example");
+    run_vulkan_step.dependOn(&run_vulkan.step);
 }
 
 fn addWaylandProtocol(
@@ -229,6 +242,9 @@ fn addWaylandProtocol(
     const generate = b.addRunArtifact(scanner);
     generate.addFileArg(wayland.path("protocol/wayland.xml"));
     generate.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
+    generate.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
+    generate.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));
+    generate.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
     const generated = generate.addOutputFileArg("ourokit-wayland-protocol.zig");
     return b.createModule(.{
         .root_source_file = generated,

@@ -239,18 +239,25 @@ Ourokit cannot use the conventional `VK_KHR_wayland_surface` path without
 libwayland: Vulkan requires ABI `wl_display*` and `wl_surface*` objects, while
 Wayring intentionally provides its own connection and generation-checked
 protocol handles. Those representations are not interchangeable. Wayring
-remains the only Wayland implementation, so the planned Vulkan presenter is an
+remains the only Wayland implementation, so the Vulkan presenter is an
 Ouro-owned dma-buf path rather than a standard Wayland swapchain.
 
-The intended prototype will negotiate DRM formats/modifiers from linux-dmabuf
-feedback, render into Vulkan external-memory images, export their plane FDs,
-and create `wl_buffer` objects through protocols generated for Wayring. Vulkan
-owns image/memory/queue lifetime; the Wayland presenter owns protocol objects
-and surface commits; a shared frame lease prevents either side from recycling
-resources before compositor release and GPU completion. Explicit-sync protocol
-selection, fallback behavior, multi-plane formats, modifier policy, and device
-matching remain presentation-prototype questions. The headless renderer does
-not pretend that this dma-buf path has already been validated.
+The presenter renders directly into exportable BGRA modifier images and creates
+persistent `wl_buffer` objects through protocols generated for Wayring. Vulkan
+owns image, memory, queue submission, timeline, and GPU-completion state. The
+Wayland host owns protocol objects, commits, frame pacing, compositor release,
+and resize retirement. Per-slot coordination permits reuse only after both
+owners finish. The same coordinator records presentation serials and bounded
+damage history for SHM and dma-buf pools, expanding renderer damage by every
+frame a reused slot missed.
+
+Linux-dmabuf v4 feedback matches compositor tranches to the selected Vulkan DRM
+device and renderable modifiers, including multi-plane layouts; v3 can use a
+renderable linear fallback. Linux-drm-syncobj timeline points provide explicit
+acquire/release synchronization when advertised, with dma-buf implicit sync as
+the fallback. `wp_presentation` supplies measured timing independently from
+`wl_surface.frame` pacing. None of these responsibilities require libwayland or
+conventional Vulkan WSI.
 
 Headless development remains first-class: deterministic software buffers and
 scene logging exist now; semantic snapshots and a design-system gallery are
@@ -272,7 +279,7 @@ yield. A future bundle loader will be pure Ouro functionality, not Lua package
 ## First-milestone non-goals and open questions
 
 Non-goals: complete widgets, text shaping/font discovery, command palette,
-accessibility protocols, Vulkan dma-buf presentation, bundle manifests/packing,
+accessibility protocols, advanced Vulkan dma-buf negotiation, bundle manifests/packing,
 installation/package management, native `.so` extensions, broad Lua standard
 libraries, network/filesystem APIs, permissions/sandboxing, and full Spectrum
 coverage.
@@ -286,7 +293,6 @@ Open questions intentionally left unfrozen:
 - frame resource leases for future image and glyph references;
 - renderer-neutral image/glyph resource identity and cache eviction;
 - transform, subpixel rasterization, layer, and color-managed surface semantics;
-- Vulkan external-memory, dma-buf presentation, and synchronization contract
-  after a real Wayring-native prototype;
+- Vulkan device-loss recovery and richer damage-region coalescing;
 - scope close semantics for multiple asynchronous resource kinds;
 - versioned application bundle and native-extension ABI.

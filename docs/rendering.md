@@ -81,19 +81,49 @@ the same integer color arithmetic as software. Its synchronous headless target
 and explicit readback make backend conformance testable without a window
 system. Renderer calls are currently serialized and wait for GPU completion.
 
-Exportable images and memory, frames in flight, device-loss recovery, and
-descriptor/cache state belong in this backend as presentation and scene
-vocabularies grow; they do not leak upward.
+The presentation profile renders directly into exportable
+`B8G8R8A8_UNORM` modifier images with a graphics pipeline and fixed-function
+premultiplied source-over blending. Clear/source writes, integer coverage,
+clipping, channel order, and untouched pixels remain exact. Vulkan does not
+guarantee the reference backend's integer division rounding for fixed-function
+UNORM blending, so each blend-affected channel may differ by one LSB per blend
+step. Software and headless compute remain the exact-byte reference profile.
 
 It will not use `VK_KHR_wayland_surface`: that API requires libwayland
-`wl_display*` and `wl_surface*` objects, which Wayring handles are not. The
-planned Ouro-owned presenter will export Vulkan images as dma-bufs and use
-Wayring-generated linux-dmabuf protocols to create and commit `wl_buffer`
-objects. Format/modifier feedback, GPU/compositor device matching, explicit
-synchronization, release ordering, and fallback policy must be proven by a real
-presentation prototype before its target/resource interface is frozen. The
-current Vulkan `Target` is intentionally backend-specific rather than a
-software-shaped renderer vtable.
+`wl_display*` and `wl_surface*` objects, which Wayring handles are not.
+Ourokit's presenter exports Vulkan images as dma-bufs and uses Wayring-generated
+linux-dmabuf protocols to create and commit persistent `wl_buffer` objects.
+Version 4 feedback supplies ordered modifier tranches and DRM device IDs. The
+host accepts only a tranche targeting the selected Vulkan primary/render node
+and a modifier that is exportable with color-attachment and blend support;
+version 3 falls back to an advertised renderable linear modifier. No common
+choice falls back to `wl_shm`.
+
+Without libwayland there is no Vulkan swapchain or WSI frame scheduler. The
+Wayring host supplies that lifecycle itself: three persistent slots,
+`wl_surface.frame` redraw throttling, `wl_buffer.release` reuse gating, and
+generation-safe resize retirement, all driven by Ourokit's io_uring loop. Each
+slot owns independent command/fence state, so queue submission no longer waits
+on the CPU. Reuse requires both GPU completion and `wl_buffer.release`.
+
+When available, linux-drm-syncobj pairs each slot with an exported Vulkan
+timeline semaphore. Vulkan signals the acquire point, the compositor signals
+the release point, and the next submission waits for that release. Otherwise
+the same ownership transfers use dma-buf implicit synchronization.
+`wl_surface.frame` remains the pacing signal; `wp_presentation` reports the
+compositor's clock ID, presentation timestamp, refresh interval, sequence, and
+hardware/vsync/zero-copy flags through `Host.takePresentationTiming`. Neither
+path uses libwayland or Vulkan Wayland WSI.
+
+The host supplies buffer age for both SHM and dma-buf slots. Each successful
+commit records the current scene damage and the slot's presentation serial.
+Before rendering a reused slot, `prepareFrameDamage` expands current damage by
+all intervening records; new slots and ages older than retained history repaint
+fully. Regions are conservatively coalesced to one bounding rectangle. The
+renderer receives expanded buffer damage while `wl_surface.damage_buffer`
+reports only the current visible change. This prevents stale pixels without
+forcing every rotating buffer to repaint fully. Device-loss recovery, richer
+region coalescing, and larger descriptor/resource caches remain future work.
 
 Text will be shaped above both renderers into common positioned glyph runs.
 Each backend may own atlas/image caching and rasterization details.
