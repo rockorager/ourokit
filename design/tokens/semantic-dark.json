@@ -1,0 +1,16 @@
+{
+  "namespace": "ouro",
+  "tokens": [
+    { "name": "ouro.semantic.surface.base", "type": "color", "value": "{ouro.foundation.palette.black}" },
+    { "name": "ouro.semantic.surface.raised", "type": "color", "value": "{ouro.foundation.palette.gray_900}" },
+    { "name": "ouro.semantic.content.primary", "type": "color", "value": "{ouro.foundation.palette.white}" },
+    { "name": "ouro.semantic.content.secondary", "type": "color", "value": "{ouro.foundation.palette.gray_200}" },
+    { "name": "ouro.semantic.border.default", "type": "color", "value": "{ouro.foundation.palette.gray_600}" },
+    { "name": "ouro.semantic.accent.default", "type": "color", "value": "{ouro.foundation.palette.blue_300}" },
+    { "name": "ouro.semantic.focus.ring", "type": "color", "value": "{ouro.foundation.palette.blue_300}" },
+    { "name": "ouro.semantic.selection.background", "type": "color", "value": "{ouro.foundation.palette.blue_500}" },
+    { "name": "ouro.semantic.status.negative", "type": "color", "value": "{ouro.foundation.palette.red_500}" },
+    { "name": "ouro.semantic.status.positive", "type": "color", "value": "{ouro.foundation.palette.green_500}" },
+    { "name": "ouro.semantic.status.notice", "type": "color", "value": "{ouro.foundation.palette.orange_500}" }
+  ]
+}

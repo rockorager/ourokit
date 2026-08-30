@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ourokit.dev/schemas/design-tokens-v1.json",
+  "title": "Ourokit design token source",
+  "type": "object",
+  "required": ["namespace", "tokens"],
+  "additionalProperties": false,
+  "properties": {
+    "namespace": { "const": "ouro" },
+    "tokens": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "type", "value"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "pattern": "^ouro\\.[a-z][a-z0-9]*(\\.[a-z][a-z0-9_]*)+$" },
+          "type": { "enum": ["dimension", "font_size", "color"] },
+          "value": {
+            "oneOf": [
+              { "type": "number" },
+              { "type": "string", "pattern": "^(#[0-9a-fA-F]{8}|\\{ouro\\..+\\})$" }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,39 @@
+.{
+    .name = .ourokit,
+    .version = "0.1.0",
+    .fingerprint = 0xfcff6af0be23d251, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .wayring = .{
+            .url = "https://github.com/rockorager/wayring/archive/700b194fff32adc619c6ebdae5199223f87f9fc0.tar.gz",
+            .hash = "wayring-0.1.0-N0pph2HsEwAW-8708IpDnSEpqNL-ajkaEZeXzOEjcLrB",
+        },
+        .lua = .{
+            .url = "https://www.lua.org/ftp/lua-5.5.1.tar.gz",
+            .hash = "N-V-__8AAPqeFQDipy0CdI6MKBmwYYarybBTO3IIJPrSzH_w",
+        },
+        .wayland = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
+            .hash = "N-V-__8AAA46JQABKU7sa-6xGUAN44uFsYSUS_w79UVuu7qo",
+            .lazy = true,
+        },
+        .wayland_protocols = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz",
+            .hash = "N-V-__8AAOTNEADZkChhsSciYizE4kIbZsozjDZXVeG5R_uY",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "design",
+        "tools",
+        "tests",
+        "examples",
+        "README.md",
+        "ARCHITECTURE.md",
+        "docs",
+        "LICENSE",
+    },
+}
