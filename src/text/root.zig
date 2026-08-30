@@ -1,6 +1,7 @@
 //! Public text module boundary.
 
 const api = @import("api.zig");
+const paragraph = @import("paragraph.zig");
 const shape_cache = @import("shape_cache.zig");
 
 pub const has_fontconfig = api.has_fontconfig;
@@ -21,10 +22,16 @@ pub const FallbackResult = api.FallbackResult;
 pub const graphemes = api.graphemes;
 pub const supportsSimpleLabel = api.supportsSimpleLabel;
 pub const shapeWithFallback = api.shapeWithFallback;
+pub const BaseDirection = paragraph.BaseDirection;
+pub const BidiRun = paragraph.BidiRun;
+pub const BidiParagraph = paragraph.BidiParagraph;
+pub const BidiAnalysis = paragraph.BidiAnalysis;
+pub const analyzeBidi = paragraph.analyzeBidi;
 pub const ShapeHandle = shape_cache.ShapeHandle;
 pub const ShapeCache = shape_cache.ShapeCache;
 
 test {
     _ = api;
+    _ = paragraph;
     _ = shape_cache;
 }

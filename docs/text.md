@@ -30,6 +30,40 @@ itemization, font fallback, normalization, line breaking, hyphenation, or
 grapheme cursoring. Ourokit will not use `hb_buffer_guess_segment_properties`
 to conceal those missing paragraph stages.
 
+## Paragraph analysis
+
+Pinned SheenBidi 3.0.0 provides Unicode 17 UAX #9 paragraph boundaries,
+embedding levels, isolate handling, and paired-bracket handling.
+It is fetched as a Zig dependency and compiled from its unity source under the
+Apache-2.0 license. Ourokit defines `SB_CONFIG_DISABLE_SCRATCH_MEMORY`: the
+release's native scratch pool is process-global, while paragraph analysis must
+remain safe to call from independent threads.
+
+`text.analyzeBidi` is a pure headless stage. It accepts valid UTF-8 plus explicit
+or P2/P3-derived base direction and returns owned flattened paragraph metadata,
+per-byte levels, and logical level runs whose ranges index the original UTF-8.
+It owns no fonts, Fontconfig state, UI nodes, renderer resources, Wayland
+objects, or Lua state. Invalid UTF-8 is rejected before entering C. Empty input
+has one explicitly defined empty paragraph instead of relying on a dependency
+edge case.
+
+This separation is intentional for testing and profiling. Unit tests exercise
+mixed direction, CRLF paragraph boundaries, explicit direction, malformed
+input, and every caller-owned allocation failure. `zig build bench-paragraph
+-Doptimize=ReleaseFast -Dfontconfig=false -Dfreetype=false` measures bidi
+analysis independently on Latin, mixed-script, isolate, and multi-paragraph
+workloads. Later itemization, shaping, line breaking, and layout stages remain
+separately callable rather than being hidden inside one opaque text API.
+
+These logical runs are not yet a paragraph layout. Script itemization must
+intersect them before HarfBuzz shaping. UAX #14 opportunities and actual line
+boundaries must be resolved before line-specific UAX #9 L1/L2 reordering;
+exposing SheenBidi's visual line runs at this stage would make wrapped text
+incorrect. Ourokit has not selected a line-breaking dependency yet:
+libgrapheme 3.0.0 has Unicode 17 data but known conformance failures, while
+libunibreak 7.0 remains on older Unicode line rules. Neither is accepted merely
+to fill the API.
+
 ## Unicode boundaries
 
 Pinned `jacobsandlund/uucode` supplies Unicode 17 extended-grapheme iteration.

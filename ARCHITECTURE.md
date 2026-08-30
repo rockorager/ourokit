@@ -323,11 +323,19 @@ isolated-emoji-modifier tailoring is retained rather than represented as exact
 default UAX #29 behavior. Grapheme boundaries are for cursoring/selection and
 remain distinct from HarfBuzz clusters.
 
-This is a correct itemized-run shaper, not yet a complete paragraph engine.
-uucode does not implement UAX #9 bidi, UAX #14 line breaking, UAX #15
-normalization, or script-extensions/itemization. Those remain explicit work;
-shaping mixed text as one guessed run would be incorrect. Fontconfig provides
-candidate order and a coverage prefilter, not a shaping algorithm. The fallback
+Pinned SheenBidi 3.0.0 now supplies Unicode 17 UAX #9 paragraph boundaries,
+embedding levels, isolates, and brackets. Its Apache-2.0
+unity source is compiled with process-global scratch memory disabled. The pure
+headless `text.analyzeBidi` stage returns owned, flattened paragraph data and is
+independently unit-tested and benchmarked; it owns no fonts, UI, renderer,
+platform, or Lua state.
+
+This is a correct bidi analyzer and itemized-run shaper foundation, not yet a
+complete paragraph layout engine. uucode does not implement UAX #14 line
+breaking, UAX #15 normalization, or script-extensions/itemization. Those remain
+explicit work; shaping mixed text as one guessed run would be incorrect.
+Fontconfig provides candidate order and a coverage prefilter, not a shaping
+algorithm. The fallback
 planner first shapes the entire itemized run with each cache-owned candidate.
 If no face succeeds, it selects by actual HarfBuzz `.notdef` output at extended
 grapheme boundaries, merges adjacent equal-face selections, and reshapes each

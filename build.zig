@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
     const wayring_host = b.dependency("wayring", .{});
     const lua = b.dependency("lua", .{});
     const harfbuzz = b.dependency("harfbuzz", .{});
+    const sheenbidi = b.dependency("sheenbidi", .{});
     const uucode = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
@@ -98,6 +99,7 @@ pub fn build(b: *std.Build) void {
     });
     addLua(ourokit, lua);
     addHarfBuzz(ourokit, harfbuzz);
+    addSheenBidi(ourokit, sheenbidi);
     const ourokit_options = b.addOptions();
     ourokit_options.addOption(bool, "fontconfig", enable_fontconfig);
     ourokit_options.addOption(bool, "freetype", enable_freetype);
@@ -128,6 +130,7 @@ pub fn build(b: *std.Build) void {
 
     addWaylandExample(b, target, optimize, ourokit);
     addRendererBenchmark(b, target, optimize, ourokit);
+    addParagraphBenchmark(b, target, optimize, ourokit);
 
     const test_font = b.lazyDependency("inter", .{}) orelse return;
     ourokit.addAnonymousImport("ourokit_test_font", .{
@@ -145,6 +148,42 @@ pub fn build(b: *std.Build) void {
     run_tests.step.dependOn(&token_check.step);
     const test_step = b.step("test", "Run all deterministic and integration tests");
     test_step.dependOn(&run_tests.step);
+}
+
+fn addSheenBidi(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
+    module.addIncludePath(dependency.path("Headers"));
+    module.addIncludePath(dependency.path("Source"));
+    module.addCSourceFile(.{
+        .file = dependency.path("Source/SheenBidi.c"),
+        .flags = &.{
+            "-std=c99",
+            "-DSB_CONFIG_UNITY=1",
+            // SheenBidi 3.0.0's native scratch allocator is process-global.
+            // Disable it so paragraph analysis remains thread-safe.
+            "-DSB_CONFIG_DISABLE_SCRATCH_MEMORY=1",
+        },
+    });
+    module.link_libc = true;
+}
+
+fn addParagraphBenchmark(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ourokit: *std.Build.Module,
+) void {
+    const benchmark = b.addExecutable(.{
+        .name = "ourokit-paragraph-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/text/paragraph_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+        }),
+    });
+    const run = b.addRunArtifact(benchmark);
+    const step = b.step("bench-paragraph", "Benchmark headless paragraph bidi analysis");
+    step.dependOn(&run.step);
 }
 
 fn addRendererBenchmark(

@@ -16,6 +16,10 @@
             .url = "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/14.3.1.tar.gz",
             .hash = "N-V-__8AAAyZAAbcFxC0gXXD8qgZlnG0BNcf56NUo8V2I3Ss",
         },
+        .sheenbidi = .{
+            .url = "https://github.com/Tehreer/SheenBidi/archive/refs/tags/v3.0.0.tar.gz",
+            .hash = "N-V-__8AAIgBOAH6cmnBI9dBvLckCCTjAdqq4CChOBleYvO_",
+        },
         .uucode = .{
             .url = "https://github.com/jacobsandlund/uucode/archive/61e54266895f833b307de81a0e3038cf1f1bebd4.tar.gz",
             .hash = "uucode-0.2.0-ZZjBPh-6VADBlunHbwABTPng0DH6uJqd4CvvtjZ19tny",

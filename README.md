@@ -30,8 +30,9 @@ scope-owned coroutine tasks in growable stable-address slabs, with direct
 scheduler and `io_uring` completion routing. A reusable native host loads a
 declarative Lua application, owns all native services, invokes button handlers
 as scoped task-phase coroutines, and presents signal-driven descriptors through
-the same mounted render path. The shared text layer now uses pinned HarfBuzz for real OpenType
-run shaping and pinned uucode Unicode data for grapheme boundaries. The design
+the same mounted render path. The shared text layer uses pinned HarfBuzz for
+real OpenType run shaping, pinned SheenBidi for Unicode 17 paragraph bidi, and
+pinned uucode Unicode data for grapheme boundaries. The design
 system requests generic `sans-serif`, and native Linux builds use Fontconfig's
 configured primary and fallback faces. Pinned font fixtures keep shaping tests
 deterministic without putting shaping or measurement in a renderer.
@@ -103,6 +104,14 @@ To run the reproducible software-renderer comparison against pinned Pixman
 
 ```sh
 zig build bench-renderers -Doptimize=ReleaseFast
+```
+
+To profile pure headless paragraph bidi analysis independently from fonts, UI,
+rendering, and Wayland:
+
+```sh
+zig build bench-paragraph -Doptimize=ReleaseFast \
+  -Dfontconfig=false -Dfreetype=false
 ```
 
 The optional end-to-end application benchmark compares one matched clickable
