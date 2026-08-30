@@ -4,6 +4,7 @@ pub const Value = std.json.Value;
 
 pub const Config = struct {
     max_message_bytes: usize = 1024 * 1024,
+    max_outbound_message_bytes: usize = 1024 * 1024,
     max_pending_calls: usize = 32,
     max_events: usize = 32,
     max_transmits: usize = 32,
@@ -96,7 +97,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, bytes: []const u8) !Request {
         else => return error.InvalidEnvelope,
     };
     const method = try requiredString(object.get("method"));
-    if (method.len == 0) return error.InvalidMethod;
+    if (!isQualifiedName(method)) return error.InvalidMethod;
     return .{
         .document = document,
         .method = method,
@@ -122,6 +123,7 @@ pub fn parseReply(allocator: std.mem.Allocator, bytes: []const u8) !Reply {
         else => return error.InvalidEnvelope,
     };
     const error_name = try optionalString(object.get("error"));
+    if (error_name) |name| if (!isQualifiedName(name)) return error.InvalidErrorName;
     const continues = try optionalBool(object.get("continues"));
     if (error_name != null and continues) return error.ErrorCannotContinue;
     return .{
@@ -133,7 +135,7 @@ pub fn parseReply(allocator: std.mem.Allocator, bytes: []const u8) !Reply {
 }
 
 pub fn serializeCall(allocator: std.mem.Allocator, call: OutgoingCall) !Transmit {
-    if (call.method.len == 0) return error.InvalidMethod;
+    if (!isQualifiedName(call.method)) return error.InvalidMethod;
     if ((call.oneway and (call.more or call.upgrade)) or (call.more and call.upgrade))
         return error.IncompatibleCallFlags;
     try validateParameters(call.parameters);
@@ -173,7 +175,7 @@ pub fn serializeReply(
     after_send: AfterSend,
 ) !Transmit {
     try validateParameters(parameters);
-    if (error_name) |name| if (name.len == 0) return error.InvalidErrorName;
+    if (error_name) |name| if (!isQualifiedName(name)) return error.InvalidErrorName;
     if (error_name != null and continues) return error.ErrorCannotContinue;
 
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -239,6 +241,27 @@ fn optionalParameters(value: ?Value) !?Value {
     };
 }
 
+/// Checks a fully-qualified Varlink method, error, or type name. The prefix is
+/// an interface name and the final component is an uppercase member name.
+pub fn isQualifiedName(name: []const u8) bool {
+    const member_dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const interface = name[0..member_dot];
+    const member = name[member_dot + 1 ..];
+    if (std.mem.indexOfScalar(u8, interface, '.') == null or member.len == 0 or
+        !std.ascii.isUpper(member[0])) return false;
+    for (member[1..]) |byte| if (!std.ascii.isAlphanumeric(byte)) return false;
+
+    var segment_start: usize = 0;
+    for (interface, 0..) |byte, index| {
+        if (byte == '.') {
+            if (index == segment_start) return false;
+            segment_start = index + 1;
+        } else if (!std.ascii.isAlphanumeric(byte) or
+            (index == 0 and !std.ascii.isAlphabetic(byte))) return false;
+    }
+    return segment_start < interface.len;
+}
+
 test "message envelopes round-trip owned JSON and flags" {
     var parameters = std.json.ObjectMap.empty;
     defer parameters.deinit(std.testing.allocator);
@@ -264,7 +287,15 @@ test "message parser rejects malformed envelopes" {
     try std.testing.expectError(error.InvalidEnvelope, parseReply(std.testing.allocator, "[]"));
     try std.testing.expectError(
         error.ParametersMustBeObject,
-        parseRequest(std.testing.allocator, "{\"method\":\"x\",\"parameters\":7}"),
+        parseRequest(std.testing.allocator, "{\"method\":\"org.example.Test\",\"parameters\":7}"),
+    );
+    try std.testing.expectError(
+        error.InvalidMethod,
+        parseRequest(std.testing.allocator, "{\"method\":\"not-qualified\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidErrorName,
+        parseReply(std.testing.allocator, "{\"error\":\"org.example.lowercase\"}"),
     );
     try std.testing.expectError(
         error.ErrorCannotContinue,

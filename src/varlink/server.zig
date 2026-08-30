@@ -6,7 +6,9 @@ const Queue = @import("queue.zig").Queue;
 const State = enum {
     active,
     upgrade_requested,
+    upgrade_requested_closed,
     upgraded,
+    closed,
     failed,
 };
 
@@ -49,11 +51,13 @@ pub const Server = struct {
     events: Queue(Event),
     transmits: Queue(message.Transmit),
     next_call: u64 = 1,
+    max_outbound_message_bytes: usize,
     state: State = .active,
 
     pub fn init(allocator: std.mem.Allocator, config: message.Config) !Server {
         if (config.max_pending_calls == 0 or config.max_buffered_replies == 0 or
-            config.max_events == 0 or config.max_transmits == 0)
+            config.max_events == 0 or config.max_transmits == 0 or
+            config.max_outbound_message_bytes == 0)
             return error.InvalidCapacity;
         var decoder = try Decoder.init(allocator, config.max_message_bytes);
         errdefer decoder.deinit();
@@ -77,6 +81,7 @@ pub const Server = struct {
             .buffered = buffered,
             .events = events,
             .transmits = transmits,
+            .max_outbound_message_bytes = config.max_outbound_message_bytes,
         };
     }
 
@@ -160,6 +165,21 @@ pub const Server = struct {
         return transmit;
     }
 
+    /// Marks EOF on the Varlink byte stream. The transport adapter owns
+    /// cancellation of any tasks represented by pending call handles.
+    pub fn endInput(self: *Server) !void {
+        if (self.state != .active and self.state != .upgrade_requested)
+            return error.ConnectionNotReceiving;
+        if (self.decoder.hasPartialFrame()) {
+            self.state = .failed;
+            return error.TruncatedMessage;
+        }
+        self.state = if (self.state == .upgrade_requested)
+            .upgrade_requested_closed
+        else
+            .closed;
+    }
+
     pub fn isUpgraded(self: *const Server) bool {
         return self.state == .upgraded;
     }
@@ -210,6 +230,8 @@ pub const Server = struct {
             if (accepts_upgrade) .upgrade else .none,
         );
         errdefer transmit.deinit();
+        if (transmit.bytes.len - 1 > self.max_outbound_message_bytes)
+            return error.MessageTooLarge;
         self.buffered.appendAssumeCapacity(.{
             .call = call,
             .transmit = transmit,
@@ -229,7 +251,12 @@ pub const Server = struct {
             if (!reply.final) continue;
             _ = self.pending.orderedRemove(0);
             if (head.upgrade) {
-                self.state = if (reply.accepts_upgrade) .upgraded else .active;
+                self.state = if (reply.accepts_upgrade)
+                    .upgraded
+                else if (self.state == .upgrade_requested_closed)
+                    .closed
+                else
+                    .active;
                 return;
             }
         }
@@ -315,4 +342,19 @@ test "server stops framing at an upgrade and marks its confirmation" {
     try std.testing.expectEqual(message.AfterSend.upgrade, transmit.after_send);
     transmit.deinit();
     event.deinit();
+}
+
+test "server rejection after EOF does not reopen input" {
+    var server = try Server.init(std.testing.allocator, .{});
+    defer server.deinit();
+    _ = try server.feed(
+        "{\"method\":\"org.example.Upgrade\",\"upgrade\":true}\x00",
+    );
+    try server.endInput();
+    var event = server.takeEvent().?;
+    defer event.deinit();
+    try server.sendError(event.call.handle, "org.example.Rejected", null);
+    var transmit = server.takeTransmit().?;
+    defer transmit.deinit();
+    try std.testing.expectError(error.ConnectionNotReceiving, server.feed("{}\x00"));
 }

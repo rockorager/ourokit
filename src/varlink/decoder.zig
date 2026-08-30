@@ -30,6 +30,10 @@ pub const Decoder = struct {
     pub fn consumeFrame(self: *Decoder) void {
         self.storage.clearRetainingCapacity();
     }
+
+    pub fn hasPartialFrame(self: *const Decoder) bool {
+        return self.storage.items.len != 0;
+    }
 };
 
 test "decoder preserves fragmented records and enforces its bound" {

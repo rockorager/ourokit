@@ -12,6 +12,7 @@ const PendingCall = struct {
 const State = enum {
     active,
     upgraded,
+    closed,
     failed,
 };
 
@@ -40,11 +41,13 @@ pub const Client = struct {
     transmits: Queue(message.Transmit),
     next_call: u64 = 1,
     upgrade_call: ?message.CallHandle = null,
+    max_outbound_message_bytes: usize,
     state: State = .active,
 
     pub fn init(allocator: std.mem.Allocator, config: message.Config) !Client {
         if (config.max_pending_calls == 0 or config.max_events == 0 or
-            config.max_transmits == 0) return error.InvalidCapacity;
+            config.max_transmits == 0 or config.max_outbound_message_bytes == 0)
+            return error.InvalidCapacity;
         var decoder = try Decoder.init(allocator, config.max_message_bytes);
         errdefer decoder.deinit();
         var pending = try std.array_list.Managed(PendingCall).initCapacity(
@@ -61,6 +64,7 @@ pub const Client = struct {
             .pending = pending,
             .events = events,
             .transmits = transmits,
+            .max_outbound_message_bytes = config.max_outbound_message_bytes,
         };
     }
 
@@ -91,6 +95,8 @@ pub const Client = struct {
 
         var transmit = try message.serializeCall(self.allocator, outgoing);
         errdefer transmit.deinit();
+        if (transmit.bytes.len - 1 > self.max_outbound_message_bytes)
+            return error.MessageTooLarge;
         const handle = self.allocateHandle();
         try self.transmits.push(transmit);
         if (!outgoing.oneway) {
@@ -135,6 +141,17 @@ pub const Client = struct {
 
     pub fn takeTransmit(self: *Client) ?message.Transmit {
         return self.transmits.pop();
+    }
+
+    /// Marks EOF on the Varlink byte stream. Pending calls remain observable
+    /// through `pendingCallCount` so an adapter can fail their owning tasks.
+    pub fn endInput(self: *Client) !void {
+        if (self.state != .active) return error.ConnectionNotActive;
+        if (self.decoder.hasPartialFrame()) {
+            self.state = .failed;
+            return error.TruncatedMessage;
+        }
+        self.state = .closed;
     }
 
     pub fn isUpgraded(self: *const Client) bool {
@@ -244,4 +261,18 @@ test "client applies event backpressure before consuming a delimiter" {
     try std.testing.expectEqual(@as(usize, 1), try client.feed(input[input.len - 1 ..]));
     event = client.takeEvent().?;
     event.deinit();
+}
+
+test "client bounds outbound records and detects truncated input" {
+    var client = try Client.init(std.testing.allocator, .{
+        .max_outbound_message_bytes = 8,
+    });
+    defer client.deinit();
+    try std.testing.expectError(
+        error.MessageTooLarge,
+        client.call(.{ .method = "org.example.TooLarge" }),
+    );
+    try std.testing.expect(client.takeTransmit() == null);
+    try std.testing.expectEqual(@as(usize, 1), try client.feed("{"));
+    try std.testing.expectError(error.TruncatedMessage, client.endInput());
 }

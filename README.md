@@ -75,6 +75,11 @@ separate immutable shaped-run cache verifies complete request identity, fallback
 output, retained candidate lifetimes, stable growth, and stale shape handles.
 The normal library build does not embed either font.
 
+The public `ourokit.varlink` module provides bounded sans-I/O client and server
+state machines, `.varlink` interface parsing and schema validation, standard
+address parsing, and the mandatory `org.varlink.service` implementation. See
+[the Varlink transport and ownership contract](docs/varlink.md).
+
 Native Linux builds enable Fontconfig by default. Minimal/headless builds and
 cross-compilation can omit that system capability with `-Dfontconfig=false`;
 deterministic shaping and rendering tests remain available.
