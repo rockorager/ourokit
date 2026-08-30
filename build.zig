@@ -66,13 +66,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const wayring_host = b.dependency("wayring", .{});
     const lua = b.dependency("lua", .{});
+    const wayland_protocol = addWaylandProtocol(b, target, optimize, wayring, wayring_host);
 
     const ourokit = b.addModule("ourokit", .{
         .root_source_file = b.path("src/ourokit.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "wayring", .module = wayring.module("wayring") }},
+        .imports = &.{
+            .{ .name = "wayring", .module = wayring.module("wayring") },
+            .{ .name = "wayland_protocol", .module = wayland_protocol },
+        },
     });
     addLua(ourokit, lua);
 
@@ -91,7 +96,7 @@ pub fn build(b: *std.Build) void {
     const generate_step = b.step("generate-tokens", "Validate tokens and regenerate Zig data");
     generate_step.dependOn(&token_generate.step);
 
-    addWaylandExample(b, target, optimize, ourokit, wayring);
+    addWaylandExample(b, target, optimize, ourokit);
     addRendererBenchmark(b, target, optimize, ourokit);
 
     const tests = b.addTest(.{ .root_module = ourokit });
@@ -185,39 +190,42 @@ fn addWaylandExample(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     ourokit: *std.Build.Module,
-    wayring: *std.Build.Dependency,
 ) void {
-    const wayland = b.lazyDependency("wayland", .{}) orelse return;
-    const wayland_protocols = b.lazyDependency("wayland_protocols", .{}) orelse return;
-    const scanner = wayring.artifact("wayring-scanner");
-    const generate = b.addRunArtifact(scanner);
-    generate.addFileArg(wayland.path("protocol/wayland.xml"));
-    generate.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
-    const generated = generate.addOutputFileArg("ourokit-wayland-protocol.zig");
-    const protocol = b.createModule(.{
-        .root_source_file = generated,
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "wayring", .module = wayring.module("wayring") }},
-    });
-
     const example = b.addExecutable(.{
         .name = "ourokit-wayland-example",
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples/wayland.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ourokit", .module = ourokit },
-                .{ .name = "wayring", .module = wayring.module("wayring") },
-                .{ .name = "wayland_protocol", .module = protocol },
-            },
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
         }),
     });
     const run = b.addRunArtifact(example);
     if (b.args) |args| run.addArgs(args);
     const run_step = b.step("run-wayland-example", "Open the software-rendered Wayland example");
     run_step.dependOn(&run.step);
+}
+
+fn addWaylandProtocol(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    wayring: *std.Build.Dependency,
+    wayring_host: *std.Build.Dependency,
+) *std.Build.Module {
+    const wayland = b.dependency("wayland", .{});
+    const wayland_protocols = b.dependency("wayland_protocols", .{});
+    const scanner = wayring_host.artifact("wayring-scanner");
+    const generate = b.addRunArtifact(scanner);
+    generate.addFileArg(wayland.path("protocol/wayland.xml"));
+    generate.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
+    const generated = generate.addOutputFileArg("ourokit-wayland-protocol.zig");
+    return b.createModule(.{
+        .root_source_file = generated,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wayring", .module = wayring.module("wayring") }},
+    });
 }
 
 fn addLua(module: *std.Build.Module, lua: *std.Build.Dependency) void {

@@ -23,6 +23,8 @@ const ScopeSlot = struct {
     generation: u32 = 0,
     active: bool = false,
     cancellation_queued: bool = false,
+    cancellation_requested: bool = false,
+    parent: ScopeHandle = .invalid,
 };
 
 const TaskState = enum { free, runnable, running, waiting };
@@ -81,6 +83,7 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler) void {
         for (self.tasks) |task| std.debug.assert(task.state == .free);
         for (self.resources) |resource| std.debug.assert(!resource.active);
+        for (self.scopes[1..]) |scope| std.debug.assert(!scope.active);
         self.allocator.free(self.resources);
         self.allocator.free(self.tasks);
         self.allocator.free(self.scopes);
@@ -88,7 +91,7 @@ pub const Scheduler = struct {
     }
 
     pub fn createTask(self: *Scheduler, scope: ScopeHandle) !TaskHandle {
-        _ = try self.scopeSlot(scope);
+        if ((try self.scopeSlot(scope)).cancellation_requested) return error.ScopeCanceled;
         for (self.tasks, 0..) |*slot, index| if (slot.state == .free) {
             slot.generation +%= 1;
             if (slot.generation == 0) slot.generation = 1;
@@ -135,25 +138,67 @@ pub const Scheduler = struct {
         (try self.scopeSlot(scope)).cancellation_queued = true;
     }
 
+    pub fn createScope(self: *Scheduler, parent: ScopeHandle) !ScopeHandle {
+        const parent_slot = try self.scopeSlot(parent);
+        if (parent_slot.cancellation_requested) return error.ScopeCanceled;
+        for (self.scopes, 0..) |*slot, index| if (!slot.active) {
+            slot.generation +%= 1;
+            if (slot.generation == 0) slot.generation = 1;
+            slot.active = true;
+            slot.cancellation_queued = false;
+            slot.cancellation_requested = false;
+            slot.parent = parent;
+            return .{ .slot = @intCast(index), .generation = slot.generation };
+        };
+        return error.ScopeCapacityExceeded;
+    }
+
+    /// Removes an empty scope after its resources and child scopes have been
+    /// destroyed. Cancellation is normally queued first, but an empty scope
+    /// may also be rolled back after failed resource creation.
+    pub fn destroyScope(self: *Scheduler, handle: ScopeHandle) !void {
+        if (same(handle, self.application_scope)) return error.CannotDestroyApplicationScope;
+        _ = try self.scopeSlot(handle);
+        for (self.tasks) |task|
+            if (task.state != .free and same(task.scope, handle)) return error.ScopeNotEmpty;
+        for (self.resources) |resource|
+            if (resource.active and same(resource.owner, handle)) return error.ScopeNotEmpty;
+        for (self.scopes) |scope|
+            if (scope.active and same(scope.parent, handle)) return error.ScopeNotEmpty;
+        const slot = &self.scopes[handle.slot];
+        slot.active = false;
+        slot.cancellation_queued = false;
+        slot.cancellation_requested = false;
+        slot.parent = .invalid;
+    }
+
     /// The app coordinator calls this at the beginning of the task safe point.
     /// Resource hooks may request kernel cancellation but must not enter Lua.
     pub fn applyQueuedCancellations(self: *Scheduler) !void {
-        for (self.scopes, 0..) |*scope, scope_index| {
+        for (self.scopes, 0..) |scope, scope_index| {
             if (!scope.active or !scope.cancellation_queued) continue;
-            scope.cancellation_queued = false;
-            const handle: ScopeHandle = .{ .slot = @intCast(scope_index), .generation = scope.generation };
-            for (self.tasks) |*task| {
-                if (task.state != .free and same(task.scope, handle)) {
-                    task.cancellation_requested = true;
-                    if (task.state == .waiting) task.state = .runnable;
-                }
+            const root: ScopeHandle = .{ .slot = @intCast(scope_index), .generation = scope.generation };
+            for (self.scopes, 0..) |*candidate, candidate_index| {
+                if (!candidate.active) continue;
+                const handle: ScopeHandle = .{
+                    .slot = @intCast(candidate_index),
+                    .generation = candidate.generation,
+                };
+                if (self.isWithin(handle, root)) candidate.cancellation_requested = true;
             }
-            for (self.resources) |*resource| {
-                if (resource.active and !resource.cancellation_requested and same(resource.owner, handle)) {
-                    resource.cancellation_requested = true;
-                    try resource.lifecycle.?.request_cancel(resource.context.?);
-                }
-            }
+        }
+        for (self.scopes) |*scope| scope.cancellation_queued = false;
+
+        for (self.tasks) |*task| {
+            if (task.state == .free or !(try self.scopeSlot(task.scope)).cancellation_requested) continue;
+            task.cancellation_requested = true;
+            if (task.state == .waiting) task.state = .runnable;
+        }
+        for (self.resources) |*resource| {
+            if (!resource.active or resource.cancellation_requested or
+                !(try self.scopeSlot(resource.owner)).cancellation_requested) continue;
+            resource.cancellation_requested = true;
+            try resource.lifecycle.?.request_cancel(resource.context.?);
         }
     }
 
@@ -168,7 +213,7 @@ pub const Scheduler = struct {
         context: *anyopaque,
         lifecycle: *const ResourceLifecycle,
     ) !ResourceHandle {
-        _ = try self.scopeSlot(owner);
+        if ((try self.scopeSlot(owner)).cancellation_requested) return error.ScopeCanceled;
         for (self.resources, 0..) |*slot, index| if (!slot.active) {
             slot.generation +%= 1;
             if (slot.generation == 0) slot.generation = 1;
@@ -207,6 +252,16 @@ pub const Scheduler = struct {
         const slot = &self.tasks[handle.slot];
         if (slot.state == .free or slot.generation != handle.generation) return error.StaleTask;
         return slot;
+    }
+
+    fn isWithin(self: *Scheduler, candidate: ScopeHandle, root: ScopeHandle) bool {
+        var current = candidate;
+        while (true) {
+            if (same(current, root)) return true;
+            const slot = self.scopeSlot(current) catch return false;
+            if (same(current, self.application_scope)) return false;
+            current = slot.parent;
+        }
     }
 };
 
@@ -261,4 +316,50 @@ test "one scope registry owns heterogeneous resources" {
     try scheduler.destroyResource(window_handle);
     try std.testing.expect(timer.destroyed and window.destroyed);
     try std.testing.expectError(error.StaleResource, scheduler.destroyResource(timer_handle));
+}
+
+test "scope cancellation cascades without running task or resource code early" {
+    const Context = struct {
+        cancel_count: usize = 0,
+
+        fn cancel(pointer: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(pointer));
+            self.cancel_count += 1;
+        }
+        fn destroy(_: *anyopaque) void {}
+    };
+    const lifecycle: ResourceLifecycle = .{
+        .request_cancel = Context.cancel,
+        .destroy = Context.destroy,
+    };
+
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 2, 2);
+    defer scheduler.deinit();
+    const window = try scheduler.createScope(scheduler.application_scope);
+    const widget = try scheduler.createScope(window);
+    const task = try scheduler.createTask(widget);
+    try std.testing.expectEqual(task, scheduler.takeRunnable().?);
+    try scheduler.wait(task);
+    var resource: Context = .{};
+    const resource_handle = try scheduler.registerResource(widget, .operation, &resource, &lifecycle);
+
+    try scheduler.queueScopeCancellation(window);
+    try std.testing.expectEqual(@as(usize, 0), resource.cancel_count);
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    try scheduler.applyQueuedCancellations();
+    try std.testing.expectEqual(@as(usize, 1), resource.cancel_count);
+    try std.testing.expectEqual(task, scheduler.takeRunnable().?);
+    try std.testing.expect(try scheduler.cancellationRequested(task));
+    try std.testing.expectError(error.ScopeCanceled, scheduler.createScope(window));
+    try std.testing.expectError(error.ScopeCanceled, scheduler.createTask(widget));
+    var rejected_resource: Context = .{};
+    try std.testing.expectError(
+        error.ScopeCanceled,
+        scheduler.registerResource(widget, .service, &rejected_resource, &lifecycle),
+    );
+    try scheduler.complete(task);
+    try scheduler.destroyResource(resource_handle);
+    try scheduler.destroyScope(widget);
+    try scheduler.destroyScope(window);
 }

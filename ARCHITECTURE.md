@@ -110,10 +110,14 @@ The invariant is strict: CQE/platform callbacks only update operation state and
 mark tasks runnable. They never call `lua_resume`. Lua executes only after the
 language-neutral scheduler grants a runnable task during the task phase.
 Disposal queues scope cancellation; queued cancellation is applied at that same
-safe point, never synchronously during reconciliation or destruction.
+safe point, never synchronously during reconciliation or destruction. The
+reusable `app.turn.Coordinator` owns this ordering and restores the idle state
+on phase failure, so each application host does not reproduce the sequence.
 
-Tasks and heterogeneous resources register under application, future window,
-or future widget scopes. The common registry stores generation-checked handles,
+Tasks and heterogeneous resources register under application, window, or
+widget scopes. Child scopes now have generation-checked parent links and
+recursive cancellation; canceled scopes reject new tasks, resources, and child
+scopes. The common registry stores generation-checked handles,
 resource kind, owner scope, and cancel/destroy lifecycle hooks. This avoids an
 application object with one array and teardown loop per subsystem. Context
 pointers may live inside that private registry but are never kernel identities.
@@ -146,9 +150,36 @@ Shared-ring constraints:
 Wayring has no libwayland-style prepare/read/dispatch/flush API. Its persistent
 receive represents prepare/read; actor completion plus generated dispatch
 represents event dispatch; queued transmit data plus `prepareSend` represents
-flush. Ourokit's adapter will retain Wayland-specific registry, globals,
-surfaces, configure events, frame callbacks, buffers, and input semantics
-rather than flattening them into a fictional generic window protocol.
+flush. Ourokit's host retains the display connection, registry, required
+globals, per-window surfaces, configure state, frame callbacks, persistent
+shared-memory buffers, and independent close state rather than flattening them
+into a fictional generic window protocol. The host binds `wl_seat` when present
+and translates pointer enter/leave, motion, buttons, scrolling, and frame
+grouping into bounded typed application data. Raw Wayland fixed-point values
+and protocol handles do not cross that boundary. Keyboard support remains a
+separate addition because keymap and compose handling require an explicit XKB
+design rather than raw key events masquerading as text input.
+
+Driver dispatch can prepare SQEs before returning. The host records that fact
+until the application flush phase submits the shared ring; calling `prepare`
+again is not sufficient because it need not report already-prepared work. The
+same rule applies to SQEs returned directly by connection close preparation.
+
+Application window identity and desired-state reconciliation are
+language-neutral. A validated declaration snapshot creates, updates, or closes
+generation-checked native instances through a platform host boundary. Every
+window receives a child resource scope. Protocol callbacks can enqueue bounded
+close/configure data and mark native teardown complete, but cannot invoke Lua
+or reconcile declarations. Closed IDs remain tombstoned until a declaration
+snapshot omits them, preventing stale state from recreating a compositor-closed
+window. The reusable Wayring host implements this boundary for multiple
+toplevels. One window can configure, resize, frame, and close without tearing
+down its siblings or the display connection. Busy current and retired buffer
+generations remain mapped until `wl_buffer.release`; only then are their
+protocol objects and mappings destroyed. On display loss, protocol requests
+are no longer attempted: local mappings are released, native windows are
+reported closed through the same state-only sink, scopes are canceled at the
+next task safe point, and Wayring cancellation CQEs are drained before teardown.
 
 ## UI, text, scene, and commands
 
@@ -198,10 +229,26 @@ complex composition. Pixman types never enter scene, UI, or platform APIs, and
 default headless builds do not fetch or link it.
 
 The Vulkan peer will own instance/device/queue selection, command buffers,
-images, synchronization, pipeline/cache state, and Wayland swapchain resources.
+exportable images and memory, synchronization, and pipeline/cache state.
 Renderer-neutral resource IDs and caching will live below scene; widgets and
-render objects never hold Vulkan handles. No Vulkan placeholder pretends that
-this design has been validated.
+render objects never hold Vulkan handles.
+
+Ourokit cannot use the conventional `VK_KHR_wayland_surface` path without
+libwayland: Vulkan requires ABI `wl_display*` and `wl_surface*` objects, while
+Wayring intentionally provides its own connection and generation-checked
+protocol handles. Those representations are not interchangeable. Wayring
+remains the only Wayland implementation, so the planned Vulkan presenter is an
+Ouro-owned dma-buf path rather than a standard Wayland swapchain.
+
+The intended prototype will negotiate DRM formats/modifiers from linux-dmabuf
+feedback, render into Vulkan external-memory images, export their plane FDs,
+and create `wl_buffer` objects through protocols generated for Wayring. Vulkan
+owns image/memory/queue lifetime; the Wayland presenter owns protocol objects
+and surface commits; a shared frame lease prevents either side from recycling
+resources before compositor release and GPU completion. Explicit-sync protocol
+selection, fallback behavior, multi-plane formats, modifier policy, and device
+matching remain prototype questions. No Vulkan placeholder pretends this path
+has already been validated.
 
 Headless development remains first-class: deterministic software buffers and
 scene logging exist now; semantic snapshots and a design-system gallery are
@@ -230,10 +277,14 @@ coverage.
 
 Open questions intentionally left unfrozen:
 
-- exact normalized Lua descriptor and generated-constructor ABI;
+- exact normalized Lua descriptor and generated-constructor ABI above the
+  established language-neutral window declaration contract;
+- close-policy ergonomics when an application retains a compositor-closed
+  declaration, including the eventual default for the last window;
 - frame resource leases for future image and glyph references;
 - renderer-neutral image/glyph resource identity and cache eviction;
 - transform, subpixel rasterization, layer, and color-managed surface semantics;
-- Vulkan frame/swapchain contract after a real prototype;
+- Vulkan external-memory, dma-buf presentation, and synchronization contract
+  after a real Wayring-native prototype;
 - scope close semantics for multiple asynchronous resource kinds;
 - versioned application bundle and native-extension ABI.

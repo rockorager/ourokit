@@ -15,12 +15,10 @@
         .wayland = .{
             .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
             .hash = "N-V-__8AAA46JQABKU7sa-6xGUAN44uFsYSUS_w79UVuu7qo",
-            .lazy = true,
         },
         .wayland_protocols = .{
             .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz",
             .hash = "N-V-__8AAOTNEADZkChhsSciYizE4kIbZsozjDZXVeG5R_uY",
-            .lazy = true,
         },
         .pixman = .{
             .url = "https://cairographics.org/releases/pixman-0.46.4.tar.xz",

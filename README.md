@@ -9,7 +9,11 @@ This repository is at first-milestone scope. It currently proves canonical
 design-token generation, clear/rectangle scene rendering, generation-safe raw
 `io_uring` timers and cancellation, a zero-standard-library Lua coroutine, and
 safe-point resumption after timer completion. It does not yet provide a widget
-catalog or usable application shell.
+catalog or usable application shell. A headless declarative-window reconciler
+now proves stable native identity, per-window resource scopes, transactional
+snapshot validation, and callback-free platform event queuing. A reusable
+multi-window Wayring host connects that model to independently configured,
+rendered, resized, and closed xdg-toplevels.
 
 ## Requirements
 
@@ -59,7 +63,15 @@ zig build run-wayland-example
 ```
 
 Close the window normally to exit. CI or a headless compositor can use
-`zig build run-wayland-example -- --exit-after-first-frame`. See
+`zig build run-wayland-example -- --exit-after-first-frame`. Exercise
+independent multi-window lifetime with:
+
+```sh
+zig build run-wayland-example -- --two-windows
+```
+
+The Wayland and xdg-shell XML archives are pinned Zig build dependencies used
+to generate protocol code; no system libwayland is linked. See
 [ARCHITECTURE.md](ARCHITECTURE.md) and
 [docs/rendering.md](docs/rendering.md) for the verified integration contract
 and shared-memory presentation path.

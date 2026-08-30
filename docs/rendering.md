@@ -64,14 +64,29 @@ Pool replacement and protocol-object destruction happen after complete event
 dispatch, preserving the platform safe-point invariant. More precise partial
 damage history and frame scheduling remain production work.
 
+`platform.wayland.Host.acquireFrame` returns a generation-checked synchronous
+borrow of one BGRA shared-memory slot. Rendering must finish with `present` or
+`discardFrame` before completion dispatch resumes. The generation prevents a
+stale frame from targeting a replacement resize pool. Each toplevel owns its
+own current and retired pools, frame throttle, configure state, and close
+lifecycle; closing one window never disconnects the others.
+
 ## Vulkan boundary
 
 The future Vulkan backend is a peer of software and consumes equivalent scenes.
-It owns Vulkan instance/device/queue, command pools/buffers, images, pipelines,
-synchronization, descriptor/cache state, and Wayland swapchain integration.
-The backend must handle device/surface loss and frames in flight without
-leaking those states upward. A real prototype will settle its target/resource
-interface; no fake backend or software-shaped vtable is frozen now.
+It owns Vulkan instance/device/queue, command pools/buffers, exportable images
+and memory, pipelines, synchronization, and descriptor/cache state. It must
+handle device/surface loss and frames in flight without leaking those states
+upward.
+
+It will not use `VK_KHR_wayland_surface`: that API requires libwayland
+`wl_display*` and `wl_surface*` objects, which Wayring handles are not. The
+planned Ouro-owned presenter exports Vulkan images as dma-bufs and uses
+Wayring-generated linux-dmabuf protocols to create and commit `wl_buffer`
+objects. Format/modifier feedback, GPU/compositor device matching, explicit
+synchronization, release ordering, and fallback policy must be proven by a real
+prototype before its target/resource interface is frozen. No fake backend or
+software-shaped vtable is present now.
 
 Text will be shaped above both renderers into common positioned glyph runs.
 Each backend may own atlas/image caching and rasterization details.
