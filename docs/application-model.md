@@ -9,26 +9,38 @@ the integration seam rather than absorbing those implementations.
 
 ## Declarative windows
 
-Applications will declare their desired window set rather than imperatively
-owning Wayring objects. The intended Lua experience is approximately:
+Applications declare their desired window set rather than imperatively owning
+Wayring objects. The first working application-facing surface is:
 
 ```lua
-return ouro.app({
+local clicked = ouro.signal(false)
+
+return ouro.app {
   id = "dev.ouro.example",
-  windows = function(context)
-    return {
-      ouro.window({
-        id = "main",
-        title = "Example",
-        content = view(),
-      }),
-    }
-  end,
-})
+  windows = {
+    ouro.window {
+      id = "main",
+      title = "Example",
+      width = 480,
+      height = 320,
+      content = function()
+        ouro.button {
+          key = "run",
+          label = clicked() and "Clicked" or "Run",
+          on_press = function()
+            clicked:set(not clicked())
+          end,
+        }
+      end,
+    },
+  },
+}
 ```
 
-This spelling is illustrative; the cross-language descriptor ABI remains
-unfrozen. The native contract is now explicit in `app/windows.zig`:
+The public surface is deliberately small and its cross-language descriptor ABI
+remains unfrozen. Constructors are specific native decoders, not one generic
+`{ type = "..." }` table parser. The native contract is explicit in
+`app/windows.zig`:
 
 - a complete declaration snapshot is validated before reconciliation;
 - non-empty string IDs provide semantic identity across snapshots;
@@ -45,9 +57,11 @@ unfrozen. The native contract is now explicit in `app/windows.zig`:
 Only mutable native policy is updated in place. Title is the first such field;
 initial dimensions apply at creation. A future layer-shell declaration will be
 a distinct type rather than a mode bit on an interchangeable generic window.
-The concrete reusable multi-window Wayring host now implements this contract.
-The example exercises one or two declarative windows without owning protocol
-objects itself.
+The reusable `app.runWayland` host implements this contract and owns the loop,
+scheduler, isolated VM, font/text caches, retained per-window UI, software
+renderer, and Wayland adapter. The executable example only embeds a Lua source
+file and selects one- or two-window declarations; application code owns no
+native services or protocol objects.
 
 Close requests do not invoke Lua during protocol dispatch or reconciliation.
 They are translated to application input, may mark a Lua task runnable, and
@@ -128,8 +142,9 @@ last completed render layout, and queues generation-checked instance targets.
 Hover enter/leave transitions and motion/button/axis events use a bounded ring
 queue. Queue overflow cannot partially change hover state. Application code
 observes this data only from the task phase. The current proof resolves an
-active target's instance-owned typed pointer binding and scope, then spawns its
-registry-referenced Lua function as an independently yieldable coroutine task.
+active target's instance-owned typed pointer binding, bubbling from a visual
+descendant such as a Label to its owning widget instance and scope, then spawns
+its registry-referenced Lua function as an independently yieldable coroutine task.
 Bindings use generation-checked instance handles; stale targets are dropped.
 The constructor-specific `ouro.on_pointer(instance_id, function)` spelling and
 compact event argument ABI are explicitly provisional pending generated
@@ -149,15 +164,19 @@ ABI. A provisional constructor-specific bridge now proves this route end to
 end: a protected non-yielding mounted Lua build emits Box/Stack/Label descriptors
 directly into bounded native storage, which the existing transactional
 reconciler validates. It has no generic string `type` parser and is not the
-final ergonomic constructor surface. The Wayland example now exercises this
-actual Lua-build path for both windows, passing generated semantic design colors
-as typed arguments rather than mirroring token defaults in Lua. Both mounted
+final generated constructor surface. The first ergonomic `ouro.button` decoder
+normalizes one declaration directly into typed Box and Label descriptors and a
+press-only instance binding. Its visual defaults come only from generated
+design tokens, with no Lua theme mirror. The Wayland example exercises this
+actual Lua-build path for both windows. Both mounted
 window owners also read one shared signal, proving dependency identity across
 separate per-window registries sharing one VM.
 
-For the benchmark slice, `ouro.padded_box` plus `ouro.label` composes a basic
-button visual while `ouro.on_pointer` contributes behavior to the Box instance.
-Button is not a render object. The Label constructor rejects scripts outside
+For the benchmark slice, `ouro.button` owns composition and input policy while
+emitting only Box and Label render objects. Button is not a render object. Its
+stable string key is normalized into domain-separated semantic IDs; duplicate
+or colliding IDs are rejected by snapshot validation rather than silently
+aliasing instances. The Label constructor rejects scripts outside
 its explicitly supported LTR Latin/Common/Inherited run until paragraph
 itemization exists.
 

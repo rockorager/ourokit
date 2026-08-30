@@ -19,7 +19,7 @@ design/
 tools/design/
 src/
   ourokit.zig              library exports
-  main.zig                 future application host executable
+  main.zig                 generic declarative Lua application host
   core/                    dependency-light values and handles
   loop/                    raw io_uring ownership and operations
   task/                    language-neutral tasks, scopes, resources
@@ -41,7 +41,7 @@ src/
   platform/wayland/        sole Wayring containment boundary
   lua/                     isolated VM and coroutine adapter
   bundle/                  future pure-Lua bundle/module loader
-  app/                     small lifecycle/phase coordinator
+  app/                     small lifecycle/phase and per-window coordinator
 examples/                  added only when environment-testable
 tests/                     cross-module tests as needed
 ```
@@ -111,8 +111,11 @@ mark tasks runnable. They never call `lua_resume`. Lua executes only after the
 language-neutral scheduler grants a runnable task during the task phase.
 Disposal queues scope cancellation; queued cancellation is applied at that same
 safe point, never synchronously during reconciliation or destruction. The
-reusable `app.turn.Coordinator` owns this ordering and restores the idle state
-on phase failure, so each application host does not reproduce the sequence.
+reusable `app.turn.Coordinator` defines and tests this ordering for headless
+hosts. The production `app.runWayland` coordinator preserves the same explicit
+phase boundaries while additionally managing dynamic per-window work and
+Wayring shutdown. Neither coordinator contains protocol, renderer, task, or UI
+implementations.
 
 Tasks and heterogeneous resources register under application, window, or
 widget scopes. Child scopes now have generation-checked parent links and
@@ -123,12 +126,14 @@ application object with one array and teardown loop per subsystem. Context
 pointers may live inside that private registry but are never kernel identities.
 
 Semantic pointer handlers live in a language-neutral registry adjacent to the
-instance tree, keyed by generation-checked instance handles and opaque handler
-IDs. Render objects never own callbacks. The provisional Lua build bridge stages
-`ouro.on_pointer(instance_id, function)` registry references and commits them
-only after typed descriptor reconciliation; replacement, rollback, removal, and
-window teardown release references. Routed events resolve and spawn handlers
-only at the task safe point, so yielding handlers retain structured scope.
+instance tree, keyed by generation-checked instance handles and typed handler
+kind plus opaque invocation ID. Render objects never own callbacks. The Lua
+build bridge stages low-level `ouro.on_pointer` and widget-specific
+`ouro.button { on_press = ... }` references and commits them only after typed
+descriptor reconciliation; replacement, rollback, removal, and window teardown
+release references. Routing bubbles visual descendants to the nearest bound
+instance. It spawns handlers only at the task safe point, so yielding handlers
+retain structured scope.
 
 ## Wayring integration
 
@@ -205,6 +210,10 @@ objects. Ourokit will avoid repeated parsing of arbitrary `{ type = "..." }`
 tables; component schemas should eventually generate Lua constructors, compact
 Zig decoding, language-server types, documentation, and validation tests. That
 generator is not part of milestone one, and no permanent widget ABI is frozen.
+The first constructor-specific `ouro.button` decoder proves the intended seam:
+it consumes one compact declaration and emits Box plus Label descriptors and a
+press binding using generated token values. It does not add a Button render
+object or duplicate theme defaults in Lua.
 
 Layout uses one-way Flutter-style box constraints in logical `f32` units. A
 parent passes minimum/maximum width and height, each child returns one finite

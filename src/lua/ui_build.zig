@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
 const Color = @import("../core/color.zig").Color;
+const design = @import("../design/root.zig");
 const Signals = @import("signals.zig").Signals;
 const SignalOwnerRef = @import("signals.zig").OwnerRef;
 const build_owner = @import("../ui/instance/build_owner.zig");
@@ -8,12 +9,21 @@ const instance = @import("../ui/instance/tree.zig");
 const PointerBindings = @import("../ui/input/bindings.zig").PointerBindings;
 const text = @import("../text/root.zig");
 
-const PendingHandler = struct { id: u64, reference: c_int };
+const PendingHandler = struct {
+    id: u64,
+    reference: c_int,
+    kind: @import("../ui/input/bindings.zig").HandlerKind = .pointer,
+};
 
 pub const Argument = union(enum) {
     number: f64,
     integer: i64,
     boolean: bool,
+};
+
+pub const Callback = union(enum) {
+    global: [*:0]const u8,
+    reference: c_int,
 };
 
 pub const ActiveBuildOwner = struct {
@@ -34,6 +44,7 @@ pub const UiBuild = struct {
     label_shapes: ?*text.ShapeCache = null,
     label_candidates: []const text.FontHandle = &.{},
     label_configuration_revision: u64 = 0,
+    widget_theme: ?design.tokens.Theme = null,
     shapes_staged: bool = false,
     pending_handlers: [32]PendingHandler = undefined,
     pending_handler_count: usize = 0,
@@ -55,6 +66,7 @@ pub const UiBuild = struct {
         try self.install("positioned_box", emitPositionedBox);
         try self.install("label", emitLabel);
         try self.install("on_pointer", bindPointer);
+        try self.install("button", emitButton);
     }
 
     /// Executes a non-yielding mounted build callback in the reconciliation
@@ -66,16 +78,42 @@ pub const UiBuild = struct {
         function_name: [*:0]const u8,
         arguments: []const Argument,
     ) ![]const instance.Descriptor {
+        return self.buildCallback(owners, work, .{ .global = function_name }, arguments);
+    }
+
+    pub fn buildCallback(
+        self: *UiBuild,
+        owners: *build_owner.BuildOwners,
+        work: build_owner.BuildWork,
+        callback: Callback,
+        arguments: []const Argument,
+    ) ![]const instance.Descriptor {
         if (self.active_owner != null) return error.LuaBuildReentered;
         self.discardHandlers();
         self.discardShapes();
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
-        if (c.lua_getglobal(self.state, function_name) != c.type_function)
+        const callback_type = switch (callback) {
+            .global => |name| c.lua_getglobal(self.state, name),
+            .reference => |reference| c.lua_rawgeti(self.state, c.registry_index, reference),
+        };
+        if (callback_type != c.type_function)
             return error.LuaBuildFunctionMissing;
         self.count = 0;
         self.active_owner = .{ .owners = owners, .handle = work.owner };
         defer self.active_owner = null;
+        if (self.widget_theme) |theme| {
+            try self.append(.{
+                .id = 1,
+                .parent = null,
+                .object = .{ .box = .{ .background = theme.surface_base } },
+            });
+            try self.append(.{
+                .id = 2,
+                .parent = 1,
+                .object = .{ .stack = .{ .clip = true } },
+            });
+        }
         const signal_owner: SignalOwnerRef = .{ .owners = owners, .handle = work.owner };
         if (self.signals) |signals| try signals.beginEvaluation(signal_owner, work.revision);
         for (arguments) |argument| switch (argument) {
@@ -108,16 +146,17 @@ pub const UiBuild = struct {
             return error.PointerBindingCapacityExceeded;
         for (self.pending_handlers[0..self.pending_handler_count]) |pending|
             if (tree.handleForId(pending.id) == null) return error.PointerHandlerInstanceMissing;
-        while (bindings.takeInactive(tree)) |old| c.luaL_unref(self.state, c.registry_index, @intCast(old));
+        while (bindings.takeInactive(tree)) |old|
+            c.luaL_unref(self.state, c.registry_index, @intCast(old.id));
         while (bindings.takeOwner(owner)) |old|
-            c.luaL_unref(self.state, c.registry_index, @intCast(old));
+            c.luaL_unref(self.state, c.registry_index, @intCast(old.id));
         for (self.pending_handlers[0..self.pending_handler_count]) |pending| {
             const old = try bindings.set(
                 owner,
                 tree.handleForId(pending.id).?,
-                @intCast(pending.reference),
+                .{ .id = @intCast(pending.reference), .kind = pending.kind },
             );
-            if (old) |reference| c.luaL_unref(self.state, c.registry_index, @intCast(reference));
+            if (old) |handler| c.luaL_unref(self.state, c.registry_index, @intCast(handler.id));
         }
         self.pending_handler_count = 0;
         self.discardShapes();
@@ -129,8 +168,8 @@ pub const UiBuild = struct {
     }
 
     pub fn clearHandlers(self: *UiBuild, bindings: *PointerBindings) void {
-        while (bindings.takeAny()) |reference|
-            c.luaL_unref(self.state, c.registry_index, @intCast(reference));
+        while (bindings.takeAny()) |handler|
+            c.luaL_unref(self.state, c.registry_index, @intCast(handler.id));
     }
 
     /// Commits signal dependencies after the typed descriptor snapshot has
@@ -179,6 +218,11 @@ pub const UiBuild = struct {
         self.label_shapes = shapes;
         self.label_candidates = candidates;
         self.label_configuration_revision = configuration_revision;
+    }
+
+    pub fn enableDeclarativeWidgets(self: *UiBuild, theme: design.tokens.Theme) void {
+        std.debug.assert(self.active_owner == null and self.widget_theme == null);
+        self.widget_theme = theme;
     }
 
     fn install(self: *UiBuild, name: [*:0]const u8, function: c.CFunction) !void {
@@ -330,6 +374,79 @@ pub const UiBuild = struct {
         return 0;
     }
 
+    fn emitButton(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.widget_theme orelse return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.button expects one declaration table");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "button key is required");
+        const label = tableString(state, 1, "label") orelse return luaError(state, "button label is required");
+        const x = tableOptionalExtent(state, 1, "x", design.tokens.foundation.spacing_3) orelse
+            return luaError(state, "invalid button x");
+        const y = tableOptionalExtent(state, 1, "y", design.tokens.foundation.spacing_3) orelse
+            return luaError(state, "invalid button y");
+        const width = tableOptionalExtent(state, 1, "width", 160) orelse
+            return luaError(state, "invalid button width");
+        const height = tableOptionalExtent(
+            state,
+            1,
+            "height",
+            design.tokens.foundation.component_height_large,
+        ) orelse return luaError(state, "invalid button height");
+        const button_id = semanticId(key, 0x627574746f6e);
+        const label_id = semanticId(key, 0x6c6162656c);
+        self.append(.{
+            .id = button_id,
+            .parent = 2,
+            .object = .{ .box = .{
+                .width = width,
+                .height = height,
+                .padding = .all(design.tokens.foundation.spacing_3),
+                .background = theme.accent_default,
+            } },
+            .parent_data = .{ .stack = .{ .x = x, .y = y } },
+        }) catch return luaError(state, "cannot append button descriptor");
+
+        const shapes = self.label_shapes orelse return luaError(state, "label text service unavailable");
+        if (!text.supportsSimpleLabel(label))
+            return luaError(state, "button label requires one LTR Latin-script line");
+        const shape = shapes.acquire(.{
+            .spec = .{
+                .paragraph = label,
+                .direction = .left_to_right,
+                .script = .latin,
+                .language = "en",
+                .logical_size = design.tokens.foundation.typography_body,
+            },
+            .candidates = self.label_candidates,
+            .configuration_revision = self.label_configuration_revision,
+        }) catch return luaError(state, "cannot shape button label");
+        self.append(.{
+            .id = label_id,
+            .parent = button_id,
+            .object = .{ .label = .{ .shape = shape, .color = theme.surface_base } },
+        }) catch {
+            shapes.release(shape) catch unreachable;
+            return luaError(state, "cannot append button label descriptor");
+        };
+        self.shapes_staged = true;
+
+        const callback_type = c.lua_getfield(state, 1, "on_press");
+        defer c.lua_settop(state, -2);
+        if (callback_type == c.type_nil) return 0;
+        if (callback_type != c.type_function) return luaError(state, "button on_press must be a function");
+        if (self.pending_handler_count == self.pending_handlers.len)
+            return luaError(state, "pointer handler capacity exceeded");
+        c.lua_pushvalue(state, -1);
+        self.pending_handlers[self.pending_handler_count] = .{
+            .id = button_id,
+            .reference = c.luaL_ref(state, c.registry_index),
+            .kind = .press,
+        };
+        self.pending_handler_count += 1;
+        return 0;
+    }
+
     fn discardHandlers(self: *UiBuild) void {
         for (self.pending_handlers[0..self.pending_handler_count]) |pending|
             c.luaL_unref(self.state, c.registry_index, pending.reference);
@@ -365,6 +482,32 @@ fn string(state: *c.State, index: c_int) ?[]const u8 {
     var length: usize = 0;
     const value = c.lua_tolstring(state, index, &length) orelse return null;
     return value[0..length];
+}
+
+fn tableString(state: *c.State, table: c_int, field: [*:0]const u8) ?[]const u8 {
+    if (c.lua_getfield(state, table, field) != c.type_string) {
+        c.lua_settop(state, -2);
+        return null;
+    }
+    const value = string(state, -1);
+    c.lua_settop(state, -2);
+    return value;
+}
+
+fn tableOptionalExtent(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: f32,
+) ?f32 {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    return requiredExtent(state, -1);
+}
+
+fn semanticId(key: []const u8, domain: u64) u64 {
+    return std.hash.Wyhash.hash(domain, key) | (@as(u64, 1) << 63);
 }
 
 /// Parent zero is the compact root sentinel. Returning a nested optional lets
@@ -558,6 +701,64 @@ test "Lua composed button label flows through layout scene and software glyph ca
     try owners.retire(owner);
     try scheduler.applyQueuedCancellations();
     try instances.collectRetired();
+    try owners.collectRetired();
+    try scheduler.destroyScope(window_scope);
+}
+
+test "declarative button normalizes to typed objects and a press binding" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+    const BuildOwners = build_owner.BuildOwners;
+
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 4);
+    c.lua_setglobal(state, "ouro");
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, window_scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font_static"),
+    });
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    var storage: [4]instance.Descriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    try ui.attachLabelText(&shapes, &.{font}, 1);
+    ui.enableDeclarativeWidgets(design.tokens.light);
+    try execute(state,
+        \\function build()
+        \\  ouro.button {
+        \\    key = "benchmark",
+        \\    label = "Benchmark",
+        \\    on_press = function() end,
+        \\  }
+        \\end
+    );
+    var cycle = owners.beginCycle();
+    const work = (try cycle.take()).?;
+    const descriptors = try ui.build(&owners, work, "build", &.{});
+    try std.testing.expectEqual(@as(usize, 4), descriptors.len);
+    try std.testing.expect(descriptors[0].object == .box);
+    try std.testing.expect(descriptors[1].object == .stack);
+    try std.testing.expect(descriptors[2].object == .box);
+    try std.testing.expect(descriptors[3].object == .label);
+    try std.testing.expectEqual(descriptors[2].id, descriptors[3].parent.?);
+    try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
+    try std.testing.expectEqual(.press, ui.pending_handlers[0].kind);
+    ui.rollbackHandlers();
+    try owners.complete(work);
+    try fonts.release(font);
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
     try owners.collectRetired();
     try scheduler.destroyScope(window_scope);
 }

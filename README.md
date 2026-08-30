@@ -9,7 +9,7 @@ This repository is at first-milestone scope. It currently proves canonical
 design-token generation, clear/rectangle scene rendering, generation-safe raw
 `io_uring` timers and cancellation, a zero-standard-library Lua coroutine, and
 safe-point resumption after timer completion. It does not yet provide a widget
-catalog or usable application shell. A headless declarative-window reconciler
+catalog. A headless declarative-window reconciler
 now proves stable native identity, per-window resource scopes, transactional
 snapshot validation, and callback-free platform event queuing. A reusable
 multi-window Wayring host connects that model to independently configured,
@@ -20,16 +20,17 @@ hit testing. A separate keyed instance layer now reconciles normalized typed
 snapshots into scoped render objects, and a bounded pointer router targets
 instances without callbacks. Mounted build owners provide scoped component
 lifecycle and direct dirty scheduling. A provisional constructor-specific Lua
-bridge proves non-yielding component builds into typed normalized descriptors;
-the generated public constructor syntax and event dispatch remain intentionally
-unfrozen. A minimal Lua signal primitive tracks per-build-owner dependencies
+bridge proves non-yielding component builds into typed normalized descriptors.
+The first ergonomic constructor composes `ouro.button` from Box and Label while
+the eventual generated constructor ABI remains intentionally unfrozen. A
+minimal Lua signal primitive tracks per-build-owner dependencies
 transactionally, rejects writes during builds, and wakes only subscribed dirty
 work without entering Lua. The isolated VM now supports independently waiting,
 scope-owned coroutine tasks in growable stable-address slabs, with direct
-scheduler and `io_uring` completion routing. The Wayland example loads its root
-build function into that VM, invokes routed pointer handlers as scoped task-phase
-coroutines, and presents signal-driven descriptors through the same mounted
-render path. The shared text layer now uses pinned HarfBuzz for real OpenType
+scheduler and `io_uring` completion routing. A reusable native host loads a
+declarative Lua application, owns all native services, invokes button handlers
+as scoped task-phase coroutines, and presents signal-driven descriptors through
+the same mounted render path. The shared text layer now uses pinned HarfBuzz for real OpenType
 run shaping and pinned uucode Unicode data for grapheme boundaries. The design
 system requests generic `sans-serif`, and native Linux builds use Fontconfig's
 configured primary and fallback faces. Pinned font fixtures keep shaping tests
@@ -76,11 +77,12 @@ cross-compilation can omit that system capability with `-Dfontconfig=false`;
 deterministic shaping and rendering tests remain available.
 
 Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
-by default for cross targets. The first benchmark-oriented Lua text surface is
-`ouro.label(id, parent, text, size, color)`: it correctly shapes one LTR Latin
+by default for cross targets. The low-level benchmark-oriented Lua text surface
+is `ouro.label(id, parent, text, size, color)`: it correctly shapes one LTR Latin
 label through HarfBuzz, lays it out from shaping metrics, and rasterizes through
-a backend-owned FreeType glyph cache. A basic button is composed from
-`ouro.padded_box` plus `ouro.label`; Button is not a renderer primitive. Full
+a backend-owned FreeType glyph cache. The application-facing `ouro.button`
+constructor composes a Box and Label using generated design tokens; Button is
+not a renderer primitive. Full
 bidi, script itemization, wrapping, and editing are explicitly deferred.
 
 After editing canonical token JSON:
@@ -121,6 +123,17 @@ on a Wayland desktop with:
 
 ```sh
 zig build run-wayland-example
+```
+
+The executable wrapper is intentionally tiny. Its application is
+`examples/wayland.lua`, which declares the app, window, signal, and button;
+`app.runWayland` owns the ring, scheduler, Lua VM, font/text caches, retained UI,
+software renderer, and Wayland presentation.
+
+Run any declarative application directly through the reusable host:
+
+```sh
+zig build run-app -- path/to/application.lua
 ```
 
 Close the window normally to exit. CI or a headless compositor can use

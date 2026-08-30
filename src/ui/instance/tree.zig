@@ -312,6 +312,11 @@ pub const Tree = struct {
         return (try self.activeSlot(handle)).id;
     }
 
+    pub fn parentOf(self: *Tree, handle: InstanceHandle) !?InstanceHandle {
+        const parent_id = (try self.activeSlot(handle)).parent_id orelse return null;
+        return self.handleForId(parent_id) orelse error.ActiveInstanceParentMissing;
+    }
+
     pub fn stateRevision(self: *Tree, handle: InstanceHandle) !u64 {
         return (try self.activeSlot(handle)).state_revision;
     }

@@ -2,12 +2,17 @@ const std = @import("std");
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const HandlerId = u32;
+pub const HandlerKind = enum { pointer, press };
+
+pub const Handler = struct {
+    id: u32,
+    kind: HandlerKind = .pointer,
+};
 
 const Entry = struct {
     owner: BuildOwnerHandle = .invalid,
     target: instance.InstanceHandle = .invalid,
-    handler: ?HandlerId = null,
+    handler: ?Handler = null,
 };
 
 /// Language-neutral, instance-owned semantic input bindings. Targets are
@@ -27,7 +32,7 @@ pub const PointerBindings = struct {
         self.* = undefined;
     }
 
-    pub fn get(self: *const PointerBindings, target: instance.InstanceHandle) ?HandlerId {
+    pub fn get(self: *const PointerBindings, target: instance.InstanceHandle) ?Handler {
         for (self.entries) |entry| if (same(entry.target, target)) return entry.handler;
         return null;
     }
@@ -36,8 +41,8 @@ pub const PointerBindings = struct {
         self: *PointerBindings,
         owner: BuildOwnerHandle,
         target: instance.InstanceHandle,
-        handler: HandlerId,
-    ) !?HandlerId {
+        handler: Handler,
+    ) !?Handler {
         for (self.entries) |*entry| if (same(entry.target, target)) {
             const old = entry.handler;
             entry.owner = owner;
@@ -60,7 +65,7 @@ pub const PointerBindings = struct {
         return count;
     }
 
-    pub fn takeOwner(self: *PointerBindings, owner: BuildOwnerHandle) ?HandlerId {
+    pub fn takeOwner(self: *PointerBindings, owner: BuildOwnerHandle) ?Handler {
         for (self.entries) |*entry| if (entry.handler != null and same(entry.owner, owner)) {
             const old = entry.handler;
             entry.* = .{};
@@ -69,7 +74,7 @@ pub const PointerBindings = struct {
         return null;
     }
 
-    pub fn remove(self: *PointerBindings, target: instance.InstanceHandle) ?HandlerId {
+    pub fn remove(self: *PointerBindings, target: instance.InstanceHandle) ?Handler {
         for (self.entries) |*entry| if (same(entry.target, target)) {
             const old = entry.handler;
             entry.* = .{};
@@ -78,7 +83,7 @@ pub const PointerBindings = struct {
         return null;
     }
 
-    pub fn takeInactive(self: *PointerBindings, tree: *instance.Tree) ?HandlerId {
+    pub fn takeInactive(self: *PointerBindings, tree: *instance.Tree) ?Handler {
         for (self.entries) |*entry| if (entry.handler != null and !tree.isActive(entry.target)) {
             const old = entry.handler;
             entry.* = .{};
@@ -87,7 +92,7 @@ pub const PointerBindings = struct {
         return null;
     }
 
-    pub fn takeAny(self: *PointerBindings) ?HandlerId {
+    pub fn takeAny(self: *PointerBindings) ?Handler {
         for (self.entries) |*entry| if (entry.handler != null) {
             const old = entry.handler;
             entry.* = .{};
@@ -122,12 +127,18 @@ test "pointer bindings replace, clean removal, and reject stale generations" {
     try tree.reconcile(&.{.{ .id = 1, .parent = null, .object = .{ .box = .{} } }});
     const original = tree.handleForId(1).?;
     const owner: BuildOwnerHandle = .{ .slot = 0, .generation = 1 };
-    try std.testing.expect((try bindings.set(owner, original, 10)) == null);
-    try std.testing.expectEqual(@as(?HandlerId, 10), bindings.get(original));
-    try std.testing.expectEqual(@as(?HandlerId, 10), try bindings.set(owner, original, 11));
+    try std.testing.expect((try bindings.set(owner, original, .{ .id = 10 })) == null);
+    try std.testing.expectEqual(@as(?Handler, .{ .id = 10 }), bindings.get(original));
+    try std.testing.expectEqual(
+        @as(?Handler, .{ .id = 10 }),
+        try bindings.set(owner, original, .{ .id = 11, .kind = .press }),
+    );
 
     try tree.reconcile(&.{});
-    try std.testing.expectEqual(@as(?HandlerId, 11), bindings.takeInactive(&tree));
+    try std.testing.expectEqual(
+        @as(?Handler, .{ .id = 11, .kind = .press }),
+        bindings.takeInactive(&tree),
+    );
     try scheduler.applyQueuedCancellations();
     try tree.collectRetired();
     try tree.reconcile(&.{.{ .id = 1, .parent = null, .object = .{ .box = .{} } }});

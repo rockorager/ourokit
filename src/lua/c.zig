@@ -47,6 +47,7 @@ pub extern fn lua_setglobal(state: *State, name: [*:0]const u8) void;
 pub extern fn lua_getglobal(state: *State, name: [*:0]const u8) c_int;
 pub extern fn lua_getfield(state: *State, index: c_int, key: [*:0]const u8) c_int;
 pub extern fn lua_rawgeti(state: *State, index: c_int, integer: Integer) c_int;
+pub extern fn lua_rawlen(state: *State, index: c_int) usize;
 pub extern fn lua_settop(state: *State, index: c_int) void;
 pub extern fn lua_newuserdatauv(state: *State, size: usize, user_value_count: c_int) ?*anyopaque;
 pub extern fn lua_getiuservalue(state: *State, index: c_int, user_value: c_int) c_int;

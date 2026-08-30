@@ -232,6 +232,20 @@ fn addWaylandExample(
     optimize: std.builtin.OptimizeMode,
     ourokit: *std.Build.Module,
 ) void {
+    const host = b.addExecutable(.{
+        .name = "ourokit-run",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+        }),
+    });
+    const run_host = b.addRunArtifact(host);
+    if (b.args) |args| run_host.addArgs(args);
+    const run_host_step = b.step("run-app", "Run a declarative Lua application");
+    run_host_step.dependOn(&run_host.step);
+
     const example = b.addExecutable(.{
         .name = "ourokit-wayland-example",
         .root_module = b.createModule(.{
