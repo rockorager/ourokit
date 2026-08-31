@@ -53,6 +53,7 @@ deterministic without putting shaping or measurement in a renderer.
 - Python 3 for deterministic token validation/generation
 - Fontconfig development files for native Linux font discovery
 - FreeType development files for native software text rasterization
+- xkbcommon development files for native Wayland keyboard translation
 - Vulkan loader and headers, plus `glslc` (not required with `-Dvulkan=false`)
 - A C/C++ toolchain is not required separately; Zig compiles embedded Lua and
   HarfBuzz
@@ -69,8 +70,9 @@ zig build tokens
 The default build includes both software and Vulkan renderers and installs
 `zig-out/lib/libourokit.a`. Use `-Dvulkan=false` for a software-only build that
 does not require Vulkan or `glslc`. `zig build test` includes Vulkan and
-deterministic software pixel tests, real kernel `io_uring` timeout/cancel tests,
-and the Lua coroutine/timer safe-point integration test. The suite covers
+deterministic software pixel tests, userspace timer-heap tests, real kernel
+`io_uring` alarm/update/cancel tests, and the Lua coroutine/timer safe-point
+integration test. The suite covers
 logical constraints, Flex/Stack layout, invalidation caching, scene lowering,
 and hit testing without a compositor, plus keyed reconciliation, safe
 retirement, and transactional pointer routing. Signal tests cover equal-write
@@ -88,6 +90,29 @@ identity, fallback output, retained candidate lifetimes, stable growth, and
 stale shape handles.
 The normal library build does not embed either font.
 
+## Native UI embedding
+
+The `ourokit_ui` Zig module is the platform-neutral embedding boundary for
+native hosts such as compositors. It exports `core`, `text`, `scene`, `layout`,
+`render_object`, the `software` renderer, and a thin `Surface` owner. `Surface`
+reconciles parent-before-child `Descriptor` snapshots, owns fixed-capacity
+render-object and scene storage, lays out in logical coordinates, lowers a
+display list at an explicit output scale, hit tests by descriptor ID, and
+provides platform-free pointer capture through `pointerPress`, `pointerMotion`,
+and `pointerRelease`.
+
+Text remains explicit: a caller that uses Label render objects must create and
+attach its own paragraph source/layout caches, and text-capable software
+rendering requires caller-owned glyph/font caches. Fontconfig discovery is
+always disabled for `ourokit_ui`; `-Dfreetype=true` only enables explicit glyph
+rasterization. The module does not import Ourokit's Lua runtime, task scheduler,
+application/window host, Wayland client, generated Wayland protocols, or Vulkan
+renderer. A consumer-only smoke test can be run independently with:
+
+```sh
+zig build test-ourokit-ui-consumer
+```
+
 The public `ourokit.varlink` module provides bounded sans-I/O client and server
 state machines, `.varlink` interface parsing and schema validation, standard
 address parsing, and the mandatory `org.varlink.service` implementation. See
@@ -98,19 +123,22 @@ cross-compilation can omit that system capability with `-Dfontconfig=false`;
 deterministic shaping and rendering tests remain available.
 
 Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
-by default for cross targets. The `ouro.label { key, text, size? }` constructor
-shapes one LTR Latin label through HarfBuzz, lays it out from shaping metrics,
-and rasterizes through a backend-owned FreeType glyph cache. `ouro.row`,
-`ouro.column`, and `ouro.label` provide nested composition without
+by default for cross targets. The
+`ouro.label { key, text, size?, alignment?, max_lines?, overflow? }` constructor
+retains width-independent text/style identity, resolves a cached paragraph from
+its current box constraints, and rasterizes through a backend-owned FreeType
+glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
+wrapping; unchanged constraints perform no layout acquisition or allocation.
+`ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.label` provide nested composition without
 application-managed numeric IDs or parent links. `ouro.button` composes a Box
 and Label using generated design tokens and retains hover, pressed, disabled,
 pointer-capture, and release-inside activation state in the widget layer. Its
-Box centers the intrinsic Label within the padded button bounds; this child
-placement remains separate from future multi-line paragraph alignment.
-Button is not a renderer primitive. Full
-paragraph render-object integration and editing remain deferred; the headless
-itemization, shaping, wrapping, and line-bidi stages are established but not yet
-wired into this deliberately narrow Label.
+Box centers the constrained Label within the padded button bounds; this child
+placement remains separate from paragraph alignment. Button is not a renderer
+primitive. Direction-aware alignment, whole-line clipping, and shaped ellipsis
+remain text-layer policy; renderers never inject the ellipsis. Editing and
+selection remain deferred. Software and Vulkan consume the identical positioned
+glyph sequence.
 
 After editing canonical token JSON:
 
@@ -173,10 +201,95 @@ Run any declarative application directly through the reusable host:
 
 ```sh
 zig build run-app -- path/to/application.lua
+# After `zig build`, the installed CLI provides the same host:
+zig-out/bin/ourokit run path/to/application.lua
 ```
 
 The reusable host follows the same renderer default. Pass `--software` to force
 the software renderer.
+
+## Storybook
+
+Storybook catalogs are explicit Lua entry points containing named, isolated
+component states. Open the native interactive catalog browser with:
+
+```sh
+zig-out/bin/ourokit storybook run examples/storybook.lua
+```
+
+The browser is an ordinary Ourokit application: its catalog scrolls through
+the normal pointer input path, selection uses a signal, and the selected story
+is mounted as live content at its declared viewport and color scheme. Force a
+renderer with `--software` or `--vulkan`.
+
+List a catalog for people or tools with:
+
+```sh
+zig-out/bin/ourokit storybook list examples/storybook.lua
+zig-out/bin/ourokit storybook list examples/storybook.lua --json
+```
+
+Render every story through the platform-neutral window runtime and software
+renderer, or select one story by ID:
+
+```sh
+zig-out/bin/ourokit storybook snapshot examples/storybook.lua
+zig-out/bin/ourokit storybook snapshot examples/storybook.lua \
+  --story button/disabled-dark --output .amp/in/artifacts --json
+```
+
+Each story declares a fixed logical viewport, output scale, color scheme, and
+ordinary Ourokit content callback. Snapshots use pinned Inter and Noto Sans
+Arabic fixtures, write PNG files atomically beneath the output directory, and
+report SHA-256 hashes. A fresh Lua VM and retained UI runtime are created for
+each PNG so signals, globals, tasks, and widget state cannot leak between
+stories. Slash-separated story IDs create corresponding output subdirectories;
+unsafe path segments are rejected. See
+[`examples/storybook.lua`](examples/storybook.lua) for the declaration format
+and a catalog of every built-in widget.
+
+Stories can deterministically reach real retained widget states by replaying
+declarative actions against slash-separated widget-key paths:
+
+```lua
+actions = {
+  { type = "hover", target = "content/button" },
+  { type = "pointer_down", target = "content/button" },
+  { type = "click", target = "content/other-button" },
+  { type = "scroll", target = "content/list", delta = 180 },
+}
+```
+
+Playback uses the normal hit tester, pointer router, button policy, callback
+tasks, scroll policy, signals, reconciliation, layout, and paint path. Scroll
+deltas are logical surface units and follow the target scroll widget's declared
+axis. Event timestamps and serials are fixed, and each action settles before
+the next begins. Wall-clock `ouro.sleep` calls fail during playback rather than
+making snapshots timing dependent. The interactive Storybook browser is
+available through `storybook run`; deterministic actions remain a snapshot
+playback contract while the live browser accepts ordinary user input.
+
+Constrained and themed composition use the same nested callback convention as
+rows, columns, and scroll views:
+
+```lua
+ouro.theme {
+  key = "dark-preview",
+  color_scheme = "dark",
+  children = function()
+    ouro.box {
+      key = "viewport",
+      width = 640,
+      height = 480,
+      padding = 12,
+      alignment = "center",
+      children = function()
+        ouro.button { key = "action", label = "Continue" }
+      end,
+    }
+  end,
+}
+```
 
 Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
 presenter with:

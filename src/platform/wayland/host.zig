@@ -7,6 +7,9 @@ const platform_window = @import("../window.zig");
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
+const Repeat = @import("repeat.zig");
+const TextInput = @import("text_input.zig");
+const Xkb = if (build_options.xkbcommon) @import("xkb.zig") else @import("xkb_disabled.zig");
 const Vulkan = if (build_options.vulkan)
     @import("../../renderer/vulkan/root.zig")
 else
@@ -562,10 +565,19 @@ pub const Host = struct {
     fractional_scale_manager: ?Handle = null,
     sync_manager: ?Handle = null,
     wm_base: ?Handle = null,
+    text_input_manager: ?Handle = null,
+    text_input_manager_global_name: ?u32 = null,
+    text_input: ?Handle = null,
+    text_input_active: ?WindowHandle = null,
+    text_input_pending: TextInput.Pending,
     seat: ?Handle = null,
     seat_global_name: ?u32 = null,
     pointer: ?Handle = null,
     pointer_focus: ?WindowHandle = null,
+    keyboard: ?Handle = null,
+    keyboard_focus: ?WindowHandle = null,
+    keyboard_repeat: Repeat.State = .{},
+    xkb: Xkb.Keyboard,
     windows: []Window,
     disconnect_started: bool = false,
     transport_lost: bool = false,
@@ -614,10 +626,21 @@ pub const Host = struct {
         self.fractional_scale_manager = null;
         self.sync_manager = null;
         self.wm_base = null;
+        self.text_input_manager = null;
+        self.text_input_manager_global_name = null;
+        self.text_input = null;
+        self.text_input_active = null;
+        self.text_input_pending = TextInput.Pending.init(allocator);
+        errdefer self.text_input_pending.deinit();
         self.seat = null;
         self.seat_global_name = null;
         self.pointer = null;
         self.pointer_focus = null;
+        self.keyboard = null;
+        self.keyboard_focus = null;
+        self.keyboard_repeat = .{};
+        self.xkb = try Xkb.Keyboard.init();
+        errdefer self.xkb.deinit();
         try self.adapter.init(allocator, loop, config.reactor);
         errdefer self.adapter.deinit(allocator);
 
@@ -632,7 +655,7 @@ pub const Host = struct {
                 .transmit_byte_budget = 128 * 1024,
                 .transmit_fd_budget = 32,
             },
-            .{ .max_objects = 64 + config.window_capacity * 18, .max_client_ids = 48 + config.window_capacity * 18 },
+            .{ .max_objects = 66 + config.window_capacity * 18, .max_client_ids = 50 + config.window_capacity * 18 },
         );
         self.driver = Driver.init(&self.connection);
         self.finishStartup() catch |err| {
@@ -702,6 +725,8 @@ pub const Host = struct {
         self.connection.deinit(self.allocator) catch unreachable;
         self.releaseDmabufFormatTable();
         self.adapter.deinit(self.allocator);
+        self.text_input_pending.deinit();
+        self.xkb.deinit();
         self.allocator.free(self.windows);
         self.allocator.free(self.app_id);
         self.* = undefined;
@@ -969,6 +994,42 @@ pub const Host = struct {
         return self.usingDmabuf() and self.sync_manager != null;
     }
 
+    /// Activates one retained editable target. Keyboard focus alone never
+    /// turns raw key metadata into application text. Calling this for a new
+    /// target performs the full disable/enable transaction required by
+    /// text-input-v3, including moves within one surface.
+    pub fn enableTextInput(self: *Host, handle: WindowHandle, state: platform_window.TextInputState) !void {
+        try state.validate();
+        _ = try self.windowFor(handle);
+        if (self.text_input == null) return error.TextInputProtocolUnavailable;
+        if (self.text_input_pending.focused == null or
+            !sameWindow(self.text_input_pending.focused.?, handle))
+            return error.TextInputSurfaceNotFocused;
+        if (self.text_input_active != null) {
+            try self.sendTextInputRequest(.{ .disable = .{} });
+            try self.commitTextInputState();
+        }
+        try self.sendTextInputRequest(.{ .enable = .{} });
+        try self.sendTextInputState(state);
+        try self.commitTextInputState();
+        self.text_input_active = handle;
+    }
+
+    pub fn updateTextInput(self: *Host, handle: WindowHandle, state: platform_window.TextInputState) !void {
+        try state.validate();
+        if (self.text_input_active == null or !sameWindow(self.text_input_active.?, handle))
+            return error.TextInputNotActive;
+        try self.sendTextInputState(state);
+        try self.commitTextInputState();
+    }
+
+    pub fn disableTextInput(self: *Host, handle: WindowHandle) !void {
+        if (self.text_input_active == null or !sameWindow(self.text_input_active.?, handle)) return;
+        try self.sendTextInputRequest(.{ .disable = .{} });
+        try self.commitTextInputState();
+        self.text_input_active = null;
+    }
+
     fn dispatch(self: *Host, completion: std.os.linux.io_uring_cqe, handler: anytype) !void {
         if (self.adapter.route(completion) == null) return error.InvalidCompletion;
         const progress = try self.driver.dispatch(&.{completion}, handler);
@@ -1164,6 +1225,8 @@ pub const Host = struct {
 
     fn abandonWindows(self: *Host) !void {
         self.releaseDmabufFormatTable();
+        self.text_input_active = null;
+        self.text_input_pending.resetObject();
         for (self.windows) |*window| {
             if (window.state == .free) continue;
             window.buffers.releaseLocal();
@@ -1186,8 +1249,14 @@ pub const Host = struct {
 
     fn destroySurfaces(self: *Host, window: *Window) !void {
         std.debug.assert(window.frame_callback == null);
+        if (self.text_input_active) |active|
+            if (sameWindow(active, window.handle)) try self.disableTextInput(window.handle);
+        _ = self.text_input_pending.leave(window.handle);
         if (self.pointer_focus) |focus| {
             if (sameWindow(focus, window.handle)) self.pointer_focus = null;
+        }
+        if (self.keyboard_focus) |focus| {
+            if (sameWindow(focus, window.handle)) self.keyboard_focus = null;
         }
         const objects = &self.connection.objects;
         const transmit = try self.queue();
@@ -1367,17 +1436,30 @@ pub const Host = struct {
                 .global_remove => |removed| {
                     if (self.seat_global_name != null and self.seat_global_name.? == removed.name)
                         try self.releaseInput();
+                    if (self.text_input_manager_global_name != null and
+                        self.text_input_manager_global_name.? == removed.name)
+                        try self.releaseTextInputManager();
                 },
             }
         } else if (interface == &protocol.wl_seat.info) {
             switch (try wayring.client.decodeEvent(protocol.wl_seat, objects, self.seat.?, message, fds)) {
-                .capabilities => |capabilities| try self.updatePointerCapability(
-                    capabilities.capabilities.contains(protocol.wl_seat.capability.pointer),
-                ),
+                .capabilities => |capabilities| {
+                    try self.updatePointerCapability(
+                        capabilities.capabilities.contains(protocol.wl_seat.capability.pointer),
+                    );
+                    try self.updateKeyboardCapability(
+                        build_options.xkbcommon and
+                            capabilities.capabilities.contains(protocol.wl_seat.capability.keyboard),
+                    );
+                },
                 .name => {},
             }
         } else if (interface == &protocol.wl_pointer.info) {
             try self.pointerEvent(message, fds);
+        } else if (interface == &protocol.wl_keyboard.info) {
+            try self.keyboardEvent(message, fds);
+        } else if (interface == &protocol.zwp_text_input_v3.info) {
+            try self.textInputEvent(message, fds);
         } else if (interface == &protocol.xdg_wm_base.info) {
             switch (try wayring.client.decodeEvent(protocol.xdg_wm_base, objects, self.wm_base.?, message, fds)) {
                 .ping => |ping| try wayring.client.sendRequest(
@@ -1664,6 +1746,20 @@ pub const Host = struct {
                 @min(global.version, 5),
                 null,
             );
+        } else if (std.mem.eql(u8, global.interface, protocol.zwp_text_input_manager_v3.info.name) and
+            self.text_input_manager == null)
+        {
+            self.text_input_manager = try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.zwp_text_input_manager_v3.info,
+                1,
+                null,
+            );
+            self.text_input_manager_global_name = global.name;
+            try self.ensureTextInput();
         } else if (std.mem.eql(u8, global.interface, protocol.wl_seat.info.name) and self.seat == null) {
             self.seat = try Core.bind(
                 objects,
@@ -1675,6 +1771,50 @@ pub const Host = struct {
                 null,
             );
             self.seat_global_name = global.name;
+            try self.ensureTextInput();
+        }
+    }
+
+    fn ensureTextInput(self: *Host) !void {
+        if (self.text_input != null or self.text_input_manager == null or self.seat == null) return;
+        self.text_input_pending.resetObject();
+        self.text_input = (try protocol.zwp_text_input_manager_v3.construct_get_text_input(
+            &self.connection.objects,
+            try self.queue(),
+            self.text_input_manager.?,
+            .{ .seat = self.seat.?.id },
+        )).id;
+        _ = try self.driver.schedule();
+    }
+
+    fn releaseTextInput(self: *Host) !void {
+        const text_input = self.text_input orelse return;
+        try wayring.client.sendRequest(
+            protocol.zwp_text_input_v3,
+            &self.connection.objects,
+            try self.queue(),
+            text_input,
+            .{ .destroy = .{} },
+        );
+        self.text_input = null;
+        self.text_input_active = null;
+        self.text_input_pending.resetObject();
+        _ = try self.driver.schedule();
+    }
+
+    fn releaseTextInputManager(self: *Host) !void {
+        try self.releaseTextInput();
+        if (self.text_input_manager) |manager| {
+            try wayring.client.sendRequest(
+                protocol.zwp_text_input_manager_v3,
+                &self.connection.objects,
+                try self.queue(),
+                manager,
+                .{ .destroy = .{} },
+            );
+            self.text_input_manager = null;
+            self.text_input_manager_global_name = null;
+            _ = try self.driver.schedule();
         }
     }
 
@@ -1707,7 +1847,9 @@ pub const Host = struct {
     }
 
     fn releaseInput(self: *Host) !void {
+        try self.releaseTextInput();
         try self.releasePointer();
+        try self.releaseKeyboard();
         if (self.seat) |seat| {
             try wayring.client.sendRequest(
                 protocol.wl_seat,
@@ -1720,6 +1862,205 @@ pub const Host = struct {
             self.seat_global_name = null;
             _ = try self.driver.schedule();
         }
+    }
+
+    fn updateKeyboardCapability(self: *Host, available: bool) !void {
+        if (available and self.keyboard == null) {
+            self.keyboard = (try protocol.wl_seat.construct_get_keyboard(
+                &self.connection.objects,
+                try self.queue(),
+                self.seat.?,
+                .{},
+            )).id;
+            _ = try self.driver.schedule();
+        } else if (!available and self.keyboard != null) {
+            try self.releaseKeyboard();
+        }
+    }
+
+    fn releaseKeyboard(self: *Host) !void {
+        const keyboard = self.keyboard orelse return;
+        try self.keyboard_repeat.stop(self.loop);
+        try wayring.client.sendRequest(
+            protocol.wl_keyboard,
+            &self.connection.objects,
+            try self.queue(),
+            keyboard,
+            .{ .release = .{} },
+        );
+        self.keyboard = null;
+        self.keyboard_focus = null;
+        _ = try self.driver.schedule();
+    }
+
+    fn keyboardEvent(
+        self: *Host,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !void {
+        const keyboard_event = try wayring.client.decodeEvent(
+            protocol.wl_keyboard,
+            &self.connection.objects,
+            self.keyboard.?,
+            message,
+            fds,
+        );
+        switch (keyboard_event) {
+            .keymap => |keymap| {
+                if (keymap.format.value != protocol.wl_keyboard.keymap_format.xkb_v1.value) {
+                    _ = linux.close(keymap.fd);
+                    return error.UnsupportedKeymapFormat;
+                }
+                try self.xkb.installKeymap(keymap.fd, keymap.size);
+            },
+            .enter => |enter| {
+                const window = try self.windowForSurface(enter.surface);
+                self.keyboard_focus = window.handle;
+                try self.sink.keyboard(.{ .enter = .{
+                    .window = window.handle,
+                    .serial = enter.serial,
+                } });
+            },
+            .leave => |leave| {
+                const window = try self.windowForSurface(leave.surface);
+                try self.keyboard_repeat.stop(self.loop);
+                try self.sink.keyboard(.{ .leave = .{
+                    .window = window.handle,
+                    .serial = leave.serial,
+                } });
+                if (self.keyboard_focus) |focused| {
+                    if (sameWindow(focused, window.handle)) self.keyboard_focus = null;
+                }
+            },
+            .key => |key| {
+                const window = self.keyboard_focus orelse return error.KeyboardWithoutFocus;
+                const state = try keyboardKeyState(key.state);
+                try self.sink.keyboard(.{ .key = .{
+                    .window = window,
+                    .serial = key.serial,
+                    .time_ms = key.time,
+                    .state = state,
+                    .translated = self.xkb.translate(key.key),
+                } });
+                switch (state) {
+                    .pressed => try self.keyboard_repeat.press(
+                        self.loop,
+                        window,
+                        key.serial,
+                        key.time,
+                        key.key,
+                        self.xkb.repeats(key.key),
+                    ),
+                    .released => try self.keyboard_repeat.release(self.loop, key.key),
+                    .repeated => unreachable,
+                }
+            },
+            .modifiers => |modifiers| self.xkb.updateModifiers(
+                modifiers.mods_depressed,
+                modifiers.mods_latched,
+                modifiers.mods_locked,
+                modifiers.group,
+            ),
+            .repeat_info => |info| try self.keyboard_repeat.setInfo(
+                self.loop,
+                info.rate,
+                info.delay,
+            ),
+        }
+    }
+
+    fn textInputEvent(
+        self: *Host,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !void {
+        switch (try wayring.client.decodeEvent(
+            protocol.zwp_text_input_v3,
+            &self.connection.objects,
+            self.text_input.?,
+            message,
+            fds,
+        )) {
+            .enter => |enter| {
+                const window = try self.windowForSurface(enter.surface);
+                self.text_input_active = null;
+                self.text_input_pending.enter(window.handle);
+                try self.sink.textInput(.{ .enter = window.handle });
+            },
+            .leave => |leave| {
+                const window = try self.windowForSurface(leave.surface);
+                self.text_input_active = null;
+                if (self.text_input_pending.leave(window.handle))
+                    try self.sink.textInput(.{ .leave = window.handle });
+            },
+            .preedit_string => |preedit| try self.text_input_pending.setPreedit(
+                preedit.text,
+                preedit.cursor_begin,
+                preedit.cursor_end,
+            ),
+            .commit_string => |commit| try self.text_input_pending.setCommit(commit.text),
+            .delete_surrounding_text => |deletion| self.text_input_pending.setDelete(
+                deletion.before_length,
+                deletion.after_length,
+            ),
+            .done => |done| try self.text_input_pending.finishDone(done.serial, self.sink),
+            else => return error.UnsupportedTextInputEvent,
+        }
+    }
+
+    fn sendTextInputRequest(self: *Host, request: protocol.zwp_text_input_v3.Request) !void {
+        try wayring.client.sendRequest(
+            protocol.zwp_text_input_v3,
+            &self.connection.objects,
+            try self.queue(),
+            self.text_input orelse return error.TextInputProtocolUnavailable,
+            request,
+        );
+    }
+
+    fn sendTextInputState(self: *Host, state: platform_window.TextInputState) !void {
+        if (state.surrounding) |surrounding| try self.sendTextInputRequest(.{ .set_surrounding_text = .{
+            .text = surrounding.text,
+            .cursor = @intCast(surrounding.cursor),
+            .anchor = @intCast(surrounding.anchor),
+        } });
+        try self.sendTextInputRequest(.{ .set_text_change_cause = .{
+            .cause = if (state.change_cause == .input_method)
+                protocol.zwp_text_input_v3.change_cause.input_method
+            else
+                protocol.zwp_text_input_v3.change_cause.other,
+        } });
+        try self.sendTextInputRequest(.{ .set_content_type = .{
+            .hint = protocol.zwp_text_input_v3.content_hint.fromInt(@as(u16, @bitCast(state.content_hints))),
+            .purpose = protocol.zwp_text_input_v3.content_purpose.fromInt(@intFromEnum(state.content_purpose)),
+        } });
+        if (state.cursor_rectangle) |rectangle| try self.sendTextInputRequest(.{ .set_cursor_rectangle = .{
+            .x = rectangle.x,
+            .y = rectangle.y,
+            .width = rectangle.width,
+            .height = rectangle.height,
+        } });
+    }
+
+    fn commitTextInputState(self: *Host) !void {
+        try self.sendTextInputRequest(.{ .commit = .{} });
+        self.text_input_pending.noteCommit();
+        _ = try self.driver.schedule();
+    }
+
+    /// Routes one expired Ouro logical timer. This remains a state-only CQE
+    /// transition: the repeated key is queued for the input safe point.
+    pub fn dispatchTimer(self: *Host, timer: @import("../../loop/io_uring.zig").OperationHandle) !bool {
+        if (!self.keyboard_repeat.owns(timer)) return false;
+        const fire = (try self.keyboard_repeat.fired(self.loop, timer)) orelse return false;
+        try self.sink.keyboard(.{ .key = .{
+            .window = fire.window,
+            .serial = fire.serial,
+            .time_ms = fire.time_ms,
+            .state = .repeated,
+            .translated = self.xkb.translate(fire.keycode),
+        } });
+        return true;
     }
 
     fn pointerEvent(
@@ -1854,6 +2195,13 @@ fn pointerButtonState(value: protocol.wl_pointer.button_state) !platform_window.
     if (value.value == protocol.wl_pointer.button_state.pressed.value) return .pressed;
     if (value.value == protocol.wl_pointer.button_state.released.value) return .released;
     return error.InvalidPointerButtonState;
+}
+
+fn keyboardKeyState(value: protocol.wl_keyboard.key_state) !platform_window.KeyState {
+    if (value.value == protocol.wl_keyboard.key_state.released.value) return .released;
+    if (value.value == protocol.wl_keyboard.key_state.pressed.value) return .pressed;
+    if (value.value == protocol.wl_keyboard.key_state.repeated.value) return .repeated;
+    return error.UnknownKeyboardKeyState;
 }
 
 fn pointerAxis(value: protocol.wl_pointer.axis) !platform_window.PointerAxis {

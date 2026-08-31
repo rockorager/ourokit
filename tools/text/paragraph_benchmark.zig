@@ -2,6 +2,7 @@ const std = @import("std");
 const ourokit = @import("ourokit");
 
 const iterations = 20_000;
+const layout_iterations = 1_000;
 
 const Workload = struct {
     name: []const u8,
@@ -32,6 +33,82 @@ pub fn main(init: std.process.Init) !void {
     for (workloads) |workload| try runGreedy(init.gpa, workload);
     std.debug.print("greedy selection + line bidi:\n", .{});
     for (workloads) |workload| try runGreedyLines(init.gpa, workload);
+    try runCompleteLayouts(init.gpa);
+}
+
+fn runCompleteLayouts(allocator: std.mem.Allocator) !void {
+    var fonts = ourokit.text.FontCache.init(allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{
+        .key = .{ .file = "/benchmarks/Inter-Regular.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_benchmark_font"),
+    });
+    defer fonts.release(latin) catch unreachable;
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/benchmarks/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_benchmark_arabic_font"),
+    });
+    defer fonts.release(arabic) catch unreachable;
+    var paragraphs = ourokit.text.ParagraphCache.init(allocator, &fonts);
+    defer paragraphs.deinit();
+    const text = "Save حفظ this document, review the complete workflow, and continue to the next step.";
+
+    std.debug.print("complete paragraph cache misses:\n", .{});
+    try runCompleteLayout(
+        &paragraphs,
+        text,
+        &.{ latin, arabic },
+        .{},
+        "wrapped",
+    );
+    try runCompleteLayout(
+        &paragraphs,
+        text,
+        &.{ latin, arabic },
+        .{ .max_lines = 2, .overflow = .ellipsis },
+        "ellipsized",
+    );
+    try runCompleteLayout(
+        &paragraphs,
+        text,
+        &.{ latin, arabic },
+        .{ .alignment = .justify },
+        "justified",
+    );
+}
+
+fn runCompleteLayout(
+    paragraphs: *ourokit.text.ParagraphCache,
+    text: []const u8,
+    candidates: []const ourokit.text.FontHandle,
+    style: ourokit.text.ParagraphStyle,
+    name: []const u8,
+) !void {
+    const started = nanoTime();
+    var total_glyphs: usize = 0;
+    for (0..layout_iterations) |_| {
+        const handle = try paragraphs.acquire(.{
+            .utf8 = text,
+            .language = "und",
+            .logical_size = 16,
+            .max_width = 180,
+            .style = style,
+            .candidates = candidates,
+            .configuration_revision = 1,
+        });
+        total_glyphs += (try paragraphs.get(handle)).positioned.glyphs.len;
+        try paragraphs.release(handle);
+    }
+    const elapsed = nanoTime() - started;
+    std.mem.doNotOptimizeAway(total_glyphs);
+    std.debug.print(
+        "{s}: {d:.1} ns/layout ({d} iterations)\n",
+        .{
+            name,
+            @as(f64, @floatFromInt(elapsed)) / layout_iterations,
+            layout_iterations,
+        },
+    );
 }
 
 fn runBidi(allocator: std.mem.Allocator, workload: Workload) !void {

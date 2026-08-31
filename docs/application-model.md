@@ -89,13 +89,14 @@ layout, paint, clip, and hit testing. Scenes are immutable backend-neutral
 output.
 
 The implemented headless render-tree kernel starts with Box, Flex, Stack, and a
-narrow single-line Label backed by an immutable shaped-run handle.
+constraint-aware Label backed by immutable paragraph source and layout handles.
 It uses one-way minimum/maximum box constraints and logical `f32` geometry.
 Parents position children after each child chooses a finite constrained size.
 Flex factors and stack offsets are typed edge metadata, not wrapper nodes. The
-fixed-capacity tree allocates nothing during layout, caches unchanged constraint
-results, separates paint-only from layout invalidation, builds ordered display
-lists, and performs reverse-order hit testing without Wayland or Lua.
+fixed-capacity tree caches unchanged constraint results, allocates paragraph
+work only when Label inputs or width change, separates paint-only from layout
+invalidation, builds ordered display lists, and performs reverse-order hit
+testing without Wayland or Lua.
 
 Above it, the implemented instance reconciler consumes parent-before-child
 typed descriptor snapshots with stable numeric semantic IDs. It validates the
@@ -172,7 +173,8 @@ Box/Stack/Label descriptors directly into bounded native storage, which the
 existing transactional reconciler validates. It has no generic string `type`
 parser or application-facing descriptor escape hatch. The constructors maintain
 a bounded native parent stack: `ouro.row` and `ouro.column` normalize to Flex,
-`ouro.label` normalizes to Label, and `ouro.button` normalizes to Box plus Label.
+`ouro.scroll` normalizes to a single-child Scroll viewport, `ouro.label`
+normalizes to Label, and `ouro.button` normalizes to Box plus Label.
 Applications provide stable local keys but no numeric IDs or parent links.
 Their visual defaults come only from generated design tokens, with no Lua theme
 mirror. The Wayland example exercises this actual Lua-build path for both
@@ -189,9 +191,25 @@ hovered, pressed, and armed state across reconciliation. Pointer presses capture
 their target; release always reaches the captured Button, but activation occurs
 only for a left-button release inside that same enabled Button. CQE and Wayland
 dispatch still only enqueue state; callbacks spawn Lua tasks during the task
-phase. The Label constructor rejects scripts outside
-its explicitly supported LTR Latin/Common/Inherited run until paragraph
-itemization exists.
+phase. Labels pass valid UTF-8 through paragraph itemization, bidi, fallback
+shaping, and width-dependent wrapping.
+
+Instances also retain focusability and deterministic descriptor traversal
+order. A window-local focus manager holds only a generation-checked instance
+handle. Tab and Shift-Tab move through enabled controls with wrapping during the
+input safe point, pointer presses request focus through the same policy, and
+focused Buttons paint the generated semantic focus-ring token without changing
+layout. Enter and Space activation enqueue the existing Button callback task;
+Wayland dispatch never calls Lua directly.
+
+Editable text begins at a separate, platform-neutral model boundary. It owns
+UTF-8 bytes, a directional anchor/extent selection, revisioning, and a cached
+index of uucode UAX #29 extended-grapheme boundaries. Replacement, selection,
+and logical previous/next movement therefore cannot split combining sequences,
+emoji ZWJ sequences, or regional-indicator pairs. The model deliberately does
+not call logical movement “left” or “right”: visual arrow movement requires the
+paragraph layer's future bidi-aware caret map. It also has no Lua, Wayland,
+renderer, shaping-cache, or IME ownership.
 
 Commands live in an authoritative registry independent of the retained render
 tree. Entries need stable semantic IDs plus revisioned invocation handles,

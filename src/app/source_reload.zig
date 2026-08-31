@@ -524,18 +524,6 @@ test "failed candidates preserve active generation and valid source commits" {
     _ = try reload.active().vm.spawnApplication("active_ran = true");
     try reload.beginRetirement();
     while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
-    _ = try loop.submit();
-    var timeout_seen = false;
-    var cancel_seen = false;
-    while (!timeout_seen or !cancel_seen) switch (loop.dispatch(try loop.wait())) {
-        .timeout => |timeout| {
-            try reload.markTimeoutCompleted(timeout.operation);
-            timeout_seen = true;
-        },
-        .timeout_cancel => cancel_seen = true,
-        else => return error.UnexpectedCompletion,
-    };
-    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
     try std.testing.expect(!active.vm.globalBoolean("retired_ran"));
     try std.testing.expect(reload.active().vm.globalBoolean("active_ran"));
     try std.testing.expectEqual(@as(usize, 0), active.vm.activeTaskCount());
@@ -649,8 +637,10 @@ test "application transaction prepares all retained windows before generation sw
     try callbacks.init(std.testing.allocator, 4);
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
-    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
-    defer shapes.deinit();
+    var paragraph_sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer paragraph_sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
 
     const snapshot = try provider.snapshot(std.testing.io, std.testing.allocator);
     const initial = try SourceGeneration.create(
@@ -683,8 +673,10 @@ test "application transaction prepares all retained windows before generation sw
         core.Color.rgba(1, 2, 3, 255),
         core.Color.rgba(4, 5, 6, 255),
         core.Color.rgba(7, 8, 9, 255),
+        core.Color.rgba(10, 11, 12, 255),
         &initial.signals,
-        &shapes,
+        &paragraph_sources,
+        &paragraphs,
         .{ .node_capacity = 4, .command_capacity = 4 },
     );
     const targets = [_]WindowTarget{.{
@@ -793,10 +785,13 @@ test "a later window build failure leaves every retained window on the active ge
         .bytes = @embedFile("ourokit_test_font_static"),
     });
     defer fonts.release(font) catch unreachable;
-    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
-    defer shapes.deinit();
+    var paragraph_sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer paragraph_sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
     const services: source_generation.UiServices = .{
-        .shapes = &shapes,
+        .paragraph_sources = &paragraph_sources,
+        .paragraphs = &paragraphs,
         .primary_font = font,
         .theme = design.tokens.light,
         .callbacks = &callbacks,
@@ -840,8 +835,10 @@ test "a later window build failure leaves every retained window on the active ge
             core.Color.rgba(1, 2, 3, 255),
             core.Color.rgba(4, 5, 6, 255),
             core.Color.rgba(7, 8, 9, 255),
+            core.Color.rgba(10, 11, 12, 255),
             &initial.signals,
-            &shapes,
+            &paragraph_sources,
+            &paragraphs,
             .{ .node_capacity = 8, .command_capacity = 16 },
         );
         try runtime.reconcile(

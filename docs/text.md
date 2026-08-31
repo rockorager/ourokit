@@ -53,6 +53,9 @@ input, and every caller-owned allocation failure. `zig build bench-paragraph
 -Doptimize=ReleaseFast -Dfontconfig=false -Dfreetype=false` measures bidi
 analysis, script analysis, and their combined paragraph itemization on Latin,
 mixed-script, isolate, and multi-paragraph workloads. The same command measures
+complete wrapped and ellipsized paragraph cache misses using pinned Latin and
+Arabic fonts, keeping finalization independently profileable without Wayland or
+a renderer. It also measures
 UAX #14 discovery, shaped-cluster measurement, greedy selection, and selected-
 line bidi independently. Final positioned assembly is likewise a separate,
 headless API with deterministic mixed-script and allocation-failure tests. The
@@ -201,20 +204,56 @@ fonts, and increments the shape-slot generation. `FontCache` therefore outlives
 `ShapeCache` in the application scope. Fontconfig refresh happens at a safe
 point and changes the configuration revision rather than mutating live entries.
 
-## Initial label slice
+`ParagraphCache` applies the complete itemize → fallback-shape → Unicode line-
+break → measure → greedy-select → line-bidi → position pipeline and owns the
+result in separate generation-checked slots. Its key includes the paragraph,
+base direction, language, logical size, finite maximum width, ordered candidate
+fonts, and font-configuration revision. Repeated identical requests deduplicate;
+final release destroys positioned storage and releases every candidate font.
+The cache is width-specific by design: wrapping remains text policy rather than
+a renderer operation.
 
-The first retained text render object is deliberately a single, already-
-itemized label for benchmark UI. Its public constructor accepts only valid
-UTF-8 whose uucode Script values are Latin, Common, or Inherited, and shapes it
-as one LTR Latin run. Other scripts are rejected instead of being assigned a
-false script or direction. The label has not yet been wired to the
-now-established paragraph analyzers.
+## Retained labels
 
-The Label render object stores only a generation-checked `ShapeHandle` and
-color. It takes intrinsic width and line height from the immutable shaped result
-and emits a renderer-neutral glyph-run scene command with a baseline and output
-scale. A button remains composition: a padded Box containing a Label, with
-pointer/focus/command behavior owned by the instance layer.
+`ParagraphSourceCache` owns and deduplicates width-independent UTF-8, base
+direction, language, logical size, ordered fallback fonts, and font-
+configuration revision behind generation-checked handles. A retained Label
+stores only this source identity and color. Its render-tree slot derives a
+width-specific `ParagraphHandle` when text/style or box constraints change,
+releasing the previous layout only after replacement succeeds. The normal
+unchanged-constraint fast path returns before cache acquisition, shaping, or
+allocation.
+
+Label layout uses the positioned paragraph's finite dimensions and emits a
+renderer-neutral paragraph scene command. Lua Labels therefore use the shared
+itemization, fallback, bidi, wrapping, and positioning pipeline rather than a
+guessed single LTR run. A button remains composition: a padded Box containing a
+Label, with pointer/focus/command behavior owned by the instance layer.
+
+Paragraph presentation is also text-owned. Each positioned line stores a
+physical offset resolved from its UAX #9 base level, so `start` and `end` follow
+the line direction while `center` remains physical center. A finite layout width
+is part of paragraph cache identity. Optional `max_lines` truncates only at
+selected line boundaries and records whether content was omitted; Labels clip
+the resulting paragraph to their layout bounds. Lua exposes these as typed
+`alignment = "start" | "end" | "center" | "justify"`, positive `max_lines`, and
+`overflow = "clip" | "ellipsis"` fields. Ellipsis requires `max_lines`. It
+finalizes at the latest fitting UAX #14 opportunity, synthesizes U+2026 at that
+source boundary, and reruns itemization, fallback shaping, wrapping, line bidi,
+and positioning. Synthetic glyphs explicitly map to a zero-length source
+boundary, preserving the source-cluster contract for future selection APIs.
+Contextual reshaping that changes fit retreats to the preceding legal break;
+renderers never inject or position the ellipsis themselves.
+
+Justification is likewise finalized before rendering. Non-final soft-wrapped
+lines distribute remaining width across Unicode line-break class `SP` glyphs
+that have visible content on both physical sides. Positioned glyphs are already
+in left-to-right visual order, so expansion is one linear pass independent of
+logical bidi order; span and line advances include the added width. Final lines,
+mandatory breaks, unbounded paragraphs, and lines without eligible inter-word
+spaces remain start-aligned. Arabic inter-word spacing is supported without
+disturbing joining. Kashida insertion and CJK inter-character expansion require
+separate script-aware policies and are not implied by `justify` yet.
 
 Each renderer owns FreeType faces and grayscale glyph masks keyed by font
 generation, glyph ID, and exact 26.6 device size. Cached faces retain their font
@@ -227,12 +266,12 @@ blended as premultiplied source-over without exposing FreeType, masks, stride,
 Vulkan resources, or pixel formats to text, scenes, or render objects. Cache
 eviction remains deferred until benchmark data establishes a budget.
 
-Borrowed display lists can render glyph handles synchronously. Owned async
-`scene.Frame.initWithShapes` construction copies scene storage and retains every
-referenced shape (which in turn retains its candidate fonts) until frame
-destruction. Plain `Frame.init` still rejects glyph commands rather than
-silently copying unleased handles. Shape and font caches are application-owned
-and must outlive all frames that lease their entries.
+Borrowed display lists can render text handles synchronously. Owned async
+`scene.Frame.initWithResources` construction copies scene storage and retains
+every referenced shape and paragraph layout until frame destruction. Plain
+`Frame.init` rejects text commands rather than silently copying unleased
+handles. Paragraph, shape, and font caches are application-owned and must
+outlive all frames that lease their entries.
 
 ## Work not yet frozen
 
@@ -243,5 +282,6 @@ and must outlive all frames that lease their entries.
 - empty-line metrics and inherited line-style policy;
 - normalization policy (shaping does not imply mutating application text);
 - variable-font axis selection and cache identity;
-- renderer-neutral frame resource leases for direct positioned glyph runs;
+- kashida and CJK inter-character justification, plus optional grapheme-level
+  rather than line-break-level ellipsis refinement;
 - cache eviction, LCD/subpixel policy, and backend glyph-cache budgets.

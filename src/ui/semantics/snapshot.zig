@@ -8,6 +8,7 @@ pub const Descriptor = struct {
     id: u64,
     parent: ?u64,
     role: Role,
+    key: []const u8 = "",
     label: []const u8 = "",
     enabled: bool = true,
 };
@@ -16,6 +17,8 @@ const StoredNode = struct {
     id: u64,
     parent: ?u64,
     role: Role,
+    key_start: usize,
+    key_len: usize,
     label_start: usize,
     label_len: usize,
     enabled: bool,
@@ -25,6 +28,7 @@ pub const Node = struct {
     id: u64,
     parent: ?u64,
     role: Role,
+    key: []const u8,
     label: []const u8,
     enabled: bool,
 };
@@ -82,6 +86,8 @@ pub const Snapshot = struct {
         var text_count: usize = 0;
         for (descriptors) |descriptor| {
             if (descriptor.id == 0) return error.InvalidSemanticId;
+            text_count = std.math.add(usize, text_count, descriptor.key.len) catch
+                return error.SemanticTextCapacityExceeded;
             text_count = std.math.add(usize, text_count, descriptor.label.len) catch
                 return error.SemanticTextCapacityExceeded;
             if (text_count > self.text[0].len) return error.SemanticTextCapacityExceeded;
@@ -100,12 +106,18 @@ pub const Snapshot = struct {
         const next = 1 - self.active;
         var text_count: usize = 0;
         for (descriptors, self.nodes[next][0..descriptors.len]) |descriptor, *stored_node| {
+            const key_start = text_count;
+            @memcpy(self.text[next][text_count..][0..descriptor.key.len], descriptor.key);
+            text_count += descriptor.key.len;
+            const label_start = text_count;
             @memcpy(self.text[next][text_count..][0..descriptor.label.len], descriptor.label);
             stored_node.* = .{
                 .id = descriptor.id,
                 .parent = descriptor.parent,
                 .role = descriptor.role,
-                .label_start = text_count,
+                .key_start = key_start,
+                .key_len = descriptor.key.len,
+                .label_start = label_start,
                 .label_len = descriptor.label.len,
                 .enabled = descriptor.enabled,
             };
@@ -134,16 +146,50 @@ pub const Snapshot = struct {
 
     pub fn node(self: *const Snapshot, index: usize) !Node {
         if (index >= self.node_count) return error.SemanticNodeOutOfBounds;
+        return self.nodeUnchecked(index);
+    }
+
+    /// Resolves slash-separated sibling keys from a semantic root. Raw keys
+    /// are retained specifically so headless tools do not need to duplicate
+    /// the domain-separated ID hashing used by widget constructors.
+    pub fn findPath(self: *const Snapshot, path: []const u8) !Node {
+        if (path.len == 0) return error.InvalidSemanticPath;
+        var parent: ?u64 = null;
+        var selected: ?Node = null;
+        var segments = std.mem.splitScalar(u8, path, '/');
+        while (segments.next()) |segment| {
+            if (segment.len == 0) return error.InvalidSemanticPath;
+            selected = null;
+            for (0..self.node_count) |index| {
+                const candidate = self.nodeUnchecked(index);
+                if (!optionalIdEqual(candidate.parent, parent) or
+                    !std.mem.eql(u8, candidate.key, segment)) continue;
+                if (selected != null) return error.AmbiguousSemanticPath;
+                selected = candidate;
+            }
+            const node_value = selected orelse return error.SemanticPathNotFound;
+            parent = node_value.id;
+        }
+        return selected.?;
+    }
+
+    fn nodeUnchecked(self: *const Snapshot, index: usize) Node {
         const stored = self.nodes[self.active][index];
         return .{
             .id = stored.id,
             .parent = stored.parent,
             .role = stored.role,
+            .key = self.text[self.active][stored.key_start..][0..stored.key_len],
             .label = self.text[self.active][stored.label_start..][0..stored.label_len],
             .enabled = stored.enabled,
         };
     }
 };
+
+fn optionalIdEqual(a: ?u64, b: ?u64) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.? == b.?;
+}
 
 fn indexCapacity(capacity: usize) !usize {
     const target = std.math.mul(usize, capacity, 2) catch return error.CapacityOverflow;
@@ -188,9 +234,9 @@ test "semantic snapshots are deterministic, validated, and replace atomically" {
     try snapshot.init(std.testing.allocator, 3, 64);
     defer snapshot.deinit();
     const initial = [_]Descriptor{
-        .{ .id = 1, .parent = null, .role = .group },
-        .{ .id = 2, .parent = 1, .role = .label, .label = "Settings" },
-        .{ .id = 3, .parent = 1, .role = .button, .label = "Save", .enabled = false },
+        .{ .id = 1, .parent = null, .role = .group, .key = "content" },
+        .{ .id = 2, .parent = 1, .role = .label, .key = "heading", .label = "Settings" },
+        .{ .id = 3, .parent = 1, .role = .button, .key = "save", .label = "Save", .enabled = false },
     };
     try snapshot.validate(&initial);
     snapshot.stage(&initial);
@@ -198,6 +244,9 @@ test "semantic snapshots are deterministic, validated, and replace atomically" {
     snapshot.commitStaged();
     try std.testing.expectEqual(@as(usize, 3), snapshot.count());
     try std.testing.expectEqualStrings("Settings", (try snapshot.node(1)).label);
+    try std.testing.expectEqualStrings("Save", (try snapshot.findPath("content/save")).label);
+    try std.testing.expectError(error.SemanticPathNotFound, snapshot.findPath("content/missing"));
+    try std.testing.expectError(error.InvalidSemanticPath, snapshot.findPath("content//save"));
     try std.testing.expect(!(try snapshot.node(2)).enabled);
     try std.testing.expectError(error.SemanticParentMustPrecedeChild, snapshot.validate(&.{
         .{ .id = 4, .parent = 9, .role = .label, .label = "Invalid" },

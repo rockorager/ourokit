@@ -144,18 +144,19 @@ forcing every rotating buffer to repaint fully. Device-loss recovery, richer
 region coalescing, and larger descriptor/resource caches remain future work.
 
 Text is shaped above both renderers by the shared HarfBuzz-backed `text` module.
-The scene will receive common positioned glyph runs; each backend may own
+The scene receives common positioned glyph runs; each backend may own
 atlas/image caching, hinting, and rasterization details. Neither backend exposes
 a `measureText` operation, chooses fonts, performs bidi, or reshapes strings.
 
-The initial software text path consumes renderer-neutral glyph-run commands
-that reference immutable shaped-run handles. Its optional FreeType integration
-owns retained faces and grayscale glyph masks below the scene boundary. The
-retained Label obtains metrics from text shaping; Box + Label composes a button.
-Full paragraph processing remains deferred, and non-Latin input is rejected by
-the narrow label constructor rather than shaped with guessed properties.
+Retained Labels emit a `paragraph` command referencing an immutable width-
+specific `ParagraphLayout`. That layout already contains line tops, baselines,
+visual-order spans, font handles, glyph IDs, and positions. Software, Vulkan
+compute, and Vulkan dma-buf presentation consume that same sequence; their only
+text work is backend-owned glyph rasterization and caching. The lower-level
+single-run command remains available for focused consumers, and display lists
+may contain both command kinds.
 
-Asynchronous `scene.Frame` copies currently reject glyph commands until frame
-resource leases can retain shaped/font handles. The synchronous Wayland and
-benchmark path may consume a borrowed display list while its owning UI/text
-scope remains alive.
+Asynchronous `scene.Frame.initWithResources` copies scene storage and leases
+all referenced shape and paragraph handles. Plain frame construction rejects
+unleased text commands. Borrowed display lists remain valid only while their
+owning UI/text scope is alive.

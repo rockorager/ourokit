@@ -5,6 +5,7 @@ const build_options = @import("ourokit_build_options");
 
 pub const has_vulkan = build_options.vulkan;
 pub const software = @import("software/root.zig");
+pub const png = @import("png.zig");
 pub const vulkan = if (has_vulkan)
     @import("vulkan/root.zig")
 else
@@ -14,6 +15,7 @@ pub const conformance = @import("conformance.zig");
 
 test {
     _ = @import("software/root.zig");
+    _ = @import("png.zig");
     _ = vulkan;
     _ = @import("log.zig");
     _ = @import("conformance.zig");

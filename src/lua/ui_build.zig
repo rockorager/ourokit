@@ -27,7 +27,7 @@ const PendingButton = struct {
     style: ButtonStyle,
 };
 
-const ParentKind = enum { box, flex, stack };
+const ParentKind = enum { box, flex, stack, scroll };
 const BuildParent = struct { id: u64, kind: ParentKind };
 
 pub const Argument = union(enum) {
@@ -60,16 +60,18 @@ pub const UiBuild = struct {
     signals: ?*Signals = null,
     callbacks: ?*CallbackRegistry = null,
     callback_vm: ?*Vm = null,
-    label_shapes: ?*text.ShapeCache = null,
+    label_sources: ?*text.ParagraphSourceCache = null,
     label_candidates: []const text.FontHandle = &.{},
     label_configuration_revision: u64 = 0,
     widget_theme: ?design.tokens.Theme = null,
+    theme_stack: [32]design.tokens.Theme = undefined,
+    theme_count: usize = 0,
     parent_stack: [32]BuildParent = undefined,
     parent_count: usize = 0,
-    shapes_staged: bool = false,
-    pending_handlers: [32]PendingHandler = undefined,
+    sources_staged: bool = false,
+    pending_handlers: [256]PendingHandler = undefined,
     pending_handler_count: usize = 0,
-    pending_buttons: [32]PendingButton = undefined,
+    pending_buttons: [256]PendingButton = undefined,
     pending_button_count: usize = 0,
 
     pub fn init(
@@ -107,8 +109,11 @@ pub const UiBuild = struct {
         if (api_type != c.type_table) return error.OuroApiMissing;
         try self.install("label", emitLabel);
         try self.install("button", emitButton);
+        try self.install("box", emitBox);
         try self.install("row", emitRow);
         try self.install("column", emitColumn);
+        try self.install("scroll", emitScroll);
+        try self.install("theme", emitTheme);
     }
 
     /// Executes a non-yielding mounted build callback in the reconciliation
@@ -132,7 +137,7 @@ pub const UiBuild = struct {
     ) ![]const instance.Descriptor {
         if (self.active_owner != null) return error.LuaBuildReentered;
         self.discardHandlers();
-        self.discardShapes();
+        self.discardSources();
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
         const callback_type = switch (callback) {
@@ -144,6 +149,7 @@ pub const UiBuild = struct {
         self.count = 0;
         self.semantic_count = 0;
         self.parent_count = 0;
+        self.theme_count = 0;
         self.pending_button_count = 0;
         self.active_owner = .{ .owners = owners, .handle = work.owner };
         defer self.active_owner = null;
@@ -151,7 +157,10 @@ pub const UiBuild = struct {
             try self.append(.{
                 .id = 1,
                 .parent = null,
-                .object = .{ .box = .{ .background = theme.surface_base } },
+                .object = .{ .box = .{
+                    .padding = .all(design.tokens.foundation.spacing_3),
+                    .background = theme.surface_base,
+                } },
             });
             self.parent_stack[0] = .{ .id = 2, .kind = .stack };
             self.parent_count = 1;
@@ -172,7 +181,7 @@ pub const UiBuild = struct {
         if (status != c.ok) {
             self.discardHandlers();
             self.pending_button_count = 0;
-            self.discardShapes();
+            self.discardSources();
             if (self.signals) |signals| try signals.abortEvaluation(signal_owner, work.revision);
             if (status == c.yield) return error.LuaBuildYielded;
             return error.LuaBuildFailed;
@@ -234,13 +243,13 @@ pub const UiBuild = struct {
         buttons.finishOwner(owner);
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
-        self.discardShapes();
+        self.discardSources();
     }
 
     pub fn rollbackHandlers(self: *UiBuild) void {
         self.discardHandlers();
         self.pending_button_count = 0;
-        self.discardShapes();
+        self.discardSources();
     }
 
     /// Transfers one completed build into generation-owned storage so another
@@ -305,10 +314,10 @@ pub const UiBuild = struct {
             .style = source.style,
         };
         prepared.button_count = self.pending_button_count;
-        prepared.owns_shapes = self.shapes_staged;
+        prepared.owns_shapes = self.sources_staged;
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
-        self.shapes_staged = false;
+        self.sources_staged = false;
     }
 
     pub fn clearHandlers(self: *UiBuild, bindings: *PointerBindings) void {
@@ -375,13 +384,13 @@ pub const UiBuild = struct {
 
     pub fn attachLabelText(
         self: *UiBuild,
-        shapes: *text.ShapeCache,
+        sources: *text.ParagraphSourceCache,
         candidates: []const text.FontHandle,
         configuration_revision: u64,
     ) !void {
-        if (self.active_owner != null or self.label_shapes != null or candidates.len == 0)
+        if (self.active_owner != null or self.label_sources != null or candidates.len == 0)
             return error.InvalidLabelTextService;
-        self.label_shapes = shapes;
+        self.label_sources = sources;
         self.label_candidates = candidates;
         self.label_configuration_revision = configuration_revision;
     }
@@ -437,6 +446,22 @@ pub const UiBuild = struct {
         self.parent_count -= 1;
     }
 
+    fn currentTheme(self: *const UiBuild) ?design.tokens.Theme {
+        if (self.theme_count != 0) return self.theme_stack[self.theme_count - 1];
+        return self.widget_theme;
+    }
+
+    fn pushTheme(self: *UiBuild, theme: design.tokens.Theme) !void {
+        if (self.theme_count == self.theme_stack.len) return error.WidgetNestingTooDeep;
+        self.theme_stack[self.theme_count] = theme;
+        self.theme_count += 1;
+    }
+
+    fn popTheme(self: *UiBuild) void {
+        std.debug.assert(self.theme_count != 0);
+        self.theme_count -= 1;
+    }
+
     fn emitLabel(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
@@ -446,7 +471,7 @@ pub const UiBuild = struct {
 
     fn emitButton(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.widget_theme orelse return luaError(state, "declarative widgets unavailable");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.button expects one declaration table");
         const key = tableString(state, 1, "key") orelse return luaError(state, "button key is required");
@@ -481,36 +506,32 @@ pub const UiBuild = struct {
                 .background = if (enabled) style.idle else style.disabled,
                 .corner_radius = design.tokens.foundation.corner_radius_medium,
             } },
+            .focusable = enabled,
             .parent_data = declarativeParentData(self, state, 1) orelse
                 return luaError(state, "invalid button position"),
         }) catch return luaError(state, "cannot append button descriptor");
 
-        const shapes = self.label_shapes orelse return luaError(state, "label text service unavailable");
-        if (!text.supportsSimpleLabel(label))
-            return luaError(state, "button label requires one LTR Latin-script line");
-        const shape = shapes.acquire(.{
-            .spec = .{
-                .paragraph = label,
-                .direction = .left_to_right,
-                .script = .latin,
-                .language = "en",
-                .logical_size = design.tokens.foundation.typography_body,
-            },
+        const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
+        const source = sources.acquire(.{
+            .utf8 = label,
+            .language = "und",
+            .logical_size = design.tokens.foundation.typography_body,
             .candidates = self.label_candidates,
             .configuration_revision = self.label_configuration_revision,
-        }) catch return luaError(state, "cannot shape button label");
+        }) catch return luaError(state, "cannot retain button label");
         self.append(.{
             .id = label_id,
             .parent = button_id,
             .object = .{ .label = .{
-                .shape = shape,
+                .source = source,
                 .color = if (enabled) theme.surface_base else theme.content_secondary,
+                .alignment = .center,
             } },
         }) catch {
-            shapes.release(shape) catch unreachable;
+            sources.release(source) catch unreachable;
             return luaError(state, "cannot append button label descriptor");
         };
-        self.shapes_staged = true;
+        self.sources_staged = true;
         if (self.pending_button_count == self.pending_buttons.len)
             return luaError(state, "button capacity exceeded");
         self.pending_buttons[self.pending_button_count] = .{
@@ -523,6 +544,7 @@ pub const UiBuild = struct {
             .id = button_id,
             .parent = semanticParent(parent),
             .role = .button,
+            .key = key,
             .label = label,
             .enabled = enabled,
         }) catch return luaError(state, "cannot append button semantics");
@@ -544,7 +566,7 @@ pub const UiBuild = struct {
     }
 
     fn emitDeclarativeLabel(self: *UiBuild, state: *c.State) c_int {
-        const theme = self.widget_theme orelse return luaError(state, "declarative widgets unavailable");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const parent = self.currentParent() orelse return luaError(state, "label requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "label key is required");
         const value = tableString(state, 1, "text") orelse return luaError(state, "label text is required");
@@ -554,38 +576,47 @@ pub const UiBuild = struct {
             "size",
             design.tokens.foundation.typography_body,
         ) orelse return luaError(state, "invalid label size");
-        const shapes = self.label_shapes orelse return luaError(state, "label text service unavailable");
-        if (!text.supportsSimpleLabel(value))
-            return luaError(state, "label requires one LTR Latin-script line");
-        const shape = shapes.acquire(.{
-            .spec = .{
-                .paragraph = value,
-                .direction = .left_to_right,
-                .script = .latin,
-                .language = "en",
-                .logical_size = logical_size,
-            },
+        const alignment = tableOptionalParagraphAlignment(state, 1, "alignment", .start) orelse
+            return luaError(state, "invalid label alignment");
+        const max_lines_value = tableOptionalPositiveInteger(state, 1, "max_lines", 0) orelse
+            return luaError(state, "invalid label max_lines");
+        const overflow = tableOptionalParagraphOverflow(state, 1, "overflow", .clip) orelse
+            return luaError(state, "invalid label overflow");
+        if (overflow == .ellipsis and max_lines_value == 0)
+            return luaError(state, "label ellipsis requires max_lines");
+        const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
+        const source = sources.acquire(.{
+            .utf8 = value,
+            .language = "und",
+            .logical_size = logical_size,
             .candidates = self.label_candidates,
             .configuration_revision = self.label_configuration_revision,
-        }) catch return luaError(state, "cannot shape label");
+        }) catch return luaError(state, "cannot retain label text");
         const id = semanticId(key, 0x6c6162656c ^ parent.id);
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .object = .{ .label = .{ .shape = shape, .color = theme.content_primary } },
+            .object = .{ .label = .{
+                .source = source,
+                .color = theme.content_primary,
+                .alignment = alignment,
+                .max_lines = if (max_lines_value == 0) null else max_lines_value,
+                .overflow = overflow,
+            } },
             .parent_data = declarativeParentData(self, state, 1) orelse {
-                shapes.release(shape) catch unreachable;
+                sources.release(source) catch unreachable;
                 return luaError(state, "invalid label position");
             },
         }) catch {
-            shapes.release(shape) catch unreachable;
+            sources.release(source) catch unreachable;
             return luaError(state, "cannot append label descriptor");
         };
-        self.shapes_staged = true;
+        self.sources_staged = true;
         self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
             .role = .label,
+            .key = key,
             .label = value,
         }) catch return luaError(state, "cannot append label semantics");
         return 0;
@@ -599,26 +630,147 @@ pub const UiBuild = struct {
         return emitFlexContainer(state, .vertical);
     }
 
+    fn emitBox(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.box expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "box requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "box key is required");
+        const width = tableOptionalNullableExtent(state, 1, "width") orelse
+            return luaError(state, "invalid box width");
+        const height = tableOptionalNullableExtent(state, 1, "height") orelse
+            return luaError(state, "invalid box height");
+        const padding = tableOptionalExtent(state, 1, "padding", 0) orelse
+            return luaError(state, "invalid box padding");
+        const alignment = tableOptionalBoxAlignment(state, 1) orelse
+            return luaError(state, "invalid box alignment");
+        const id = semanticId(key, 0x626f78 ^ parent.id);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .box = .{
+                .width = width.value,
+                .height = height.value,
+                .padding = .all(padding),
+                .alignment = alignment.value,
+            } },
+            .parent_data = declarativeParentData(self, state, 1) orelse
+                return luaError(state, "invalid box position"),
+        }) catch return luaError(state, "cannot append box descriptor");
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .group,
+            .key = key,
+        }) catch return luaError(state, "cannot append box semantics");
+        return self.emitChildren(state, .{ .id = id, .kind = .box }, "box children function is required");
+    }
+
+    fn emitTheme(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.theme expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "theme requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "theme key is required");
+        const theme = tableTheme(state, 1) orelse return luaError(state, "invalid theme color_scheme");
+        const id = semanticId(key, 0x7468656d65 ^ parent.id);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .box = .{ .background = theme.surface_base } },
+            .parent_data = declarativeParentData(self, state, 1) orelse
+                return luaError(state, "invalid theme position"),
+        }) catch return luaError(state, "cannot append theme descriptor");
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .group,
+            .key = key,
+        }) catch return luaError(state, "cannot append theme semantics");
+        self.pushTheme(theme) catch return luaError(state, "widget nesting is too deep");
+        defer self.popTheme();
+        return self.emitChildren(state, .{ .id = id, .kind = .box }, "theme children function is required");
+    }
+
+    fn emitChildren(
+        self: *UiBuild,
+        state: *c.State,
+        parent: BuildParent,
+        missing_message: [*:0]const u8,
+    ) c_int {
+        if (c.lua_getfield(state, 1, "children") != c.type_function) {
+            c.lua_settop(state, -2);
+            return luaError(state, missing_message);
+        }
+        self.pushParent(parent) catch {
+            c.lua_settop(state, -2);
+            return luaError(state, "widget nesting is too deep");
+        };
+        const status = c.lua_pcallk(state, 0, 0, 0, 0, null);
+        self.popParent();
+        if (status != c.ok) return c.lua_error(state);
+        return 0;
+    }
+
+    fn emitScroll(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.scroll expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "scroll requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "scroll key is required");
+        const axis = tableOptionalAxis(state, 1, "axis", .vertical) orelse
+            return luaError(state, "invalid scroll axis");
+        const id = semanticId(key, 0x7363726f6c6c ^ parent.id);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .scroll = .{ .axis = axis } },
+            .parent_data = declarativeParentData(self, state, 1) orelse
+                return luaError(state, "invalid scroll position"),
+        }) catch return luaError(state, "cannot append scroll descriptor");
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .group,
+            .key = key,
+        }) catch return luaError(state, "cannot append scroll semantics");
+        if (c.lua_getfield(state, 1, "children") != c.type_function) {
+            c.lua_settop(state, -2);
+            return luaError(state, "scroll children function is required");
+        }
+        self.pushParent(.{ .id = id, .kind = .scroll }) catch {
+            c.lua_settop(state, -2);
+            return luaError(state, "widget nesting is too deep");
+        };
+        const status = c.lua_pcallk(state, 0, 0, 0, 0, null);
+        self.popParent();
+        if (status != c.ok) return c.lua_error(state);
+        return 0;
+    }
+
     fn discardHandlers(self: *UiBuild) void {
         for (self.pending_handlers[0..self.pending_handler_count]) |pending|
             c.luaL_unref(self.state, c.registry_index, pending.reference);
         self.pending_handler_count = 0;
     }
 
-    fn discardShapes(self: *UiBuild) void {
-        if (!self.shapes_staged) return;
-        const shapes = self.label_shapes.?;
+    fn discardSources(self: *UiBuild) void {
+        if (!self.sources_staged) return;
+        const sources = self.label_sources.?;
         for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
-            .label => |label| shapes.release(label.shape) catch unreachable,
+            .label => |label| sources.release(label.source) catch unreachable,
             else => {},
         };
-        self.shapes_staged = false;
+        self.sources_staged = false;
     }
 };
 
 fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
     const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-    if (self.widget_theme == null) return luaError(state, "declarative widgets unavailable");
+    if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
     if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
         return luaError(state, "row and column expect one declaration table");
     const parent = self.currentParent() orelse return luaError(state, "container requires a widget parent");
@@ -645,6 +797,7 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         .id = id,
         .parent = semanticParent(parent),
         .role = .group,
+        .key = key,
     }) catch return luaError(state, "cannot append container semantics");
     if (c.lua_getfield(state, 1, "children") != c.type_function) {
         c.lua_settop(state, -2);
@@ -695,6 +848,42 @@ fn tableOptionalExtent(
     return requiredExtent(state, -1);
 }
 
+const OptionalExtent = struct { value: ?f32 };
+
+fn tableOptionalNullableExtent(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+) ?OptionalExtent {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .{ .value = null };
+    return .{ .value = requiredExtent(state, -1) orelse return null };
+}
+
+const OptionalAlignment = struct { value: ?render_types.Alignment };
+
+fn tableOptionalBoxAlignment(state: *c.State, table: c_int) ?OptionalAlignment {
+    const value_type = c.lua_getfield(state, table, "alignment");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .{ .value = null };
+    const value = string(state, -1) orelse return null;
+    if (!std.mem.eql(u8, value, "center")) return null;
+    return .{ .value = .center };
+}
+
+fn tableTheme(state: *c.State, table: c_int) ?design.tokens.Theme {
+    if (c.lua_getfield(state, table, "color_scheme") != c.type_string) {
+        c.lua_settop(state, -2);
+        return null;
+    }
+    defer c.lua_settop(state, -2);
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "light")) return design.tokens.light;
+    if (std.mem.eql(u8, value, "dark")) return design.tokens.dark;
+    return null;
+}
+
 fn tableOptionalBoolean(
     state: *c.State,
     table: c_int,
@@ -708,14 +897,77 @@ fn tableOptionalBoolean(
     return c.lua_toboolean(state, -1) != 0;
 }
 
+fn tableOptionalParagraphAlignment(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: text.ParagraphAlignment,
+) ?text.ParagraphAlignment {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "start")) return .start;
+    if (std.mem.eql(u8, value, "end")) return .end;
+    if (std.mem.eql(u8, value, "center")) return .center;
+    if (std.mem.eql(u8, value, "justify")) return .justify;
+    return null;
+}
+
+fn tableOptionalParagraphOverflow(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: text.ParagraphOverflow,
+) ?text.ParagraphOverflow {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "clip")) return .clip;
+    if (std.mem.eql(u8, value, "ellipsis")) return .ellipsis;
+    return null;
+}
+
+fn tableOptionalAxis(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: render_types.Axis,
+) ?render_types.Axis {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "vertical")) return .vertical;
+    if (std.mem.eql(u8, value, "horizontal")) return .horizontal;
+    return null;
+}
+
+/// A zero default represents an omitted optional positive integer. Explicit
+/// zero and negative values remain invalid.
+fn tableOptionalPositiveInteger(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: u32,
+) ?u32 {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    var is_number: c_int = 0;
+    const value = c.lua_tointegerx(state, -1, &is_number);
+    if (is_number == 0 or value <= 0 or value > std.math.maxInt(u32)) return null;
+    return @intCast(value);
+}
+
 fn declarativeParentData(self: *const UiBuild, state: *c.State, table: c_int) ?render_types.ParentData {
     const parent = self.currentParent() orelse return null;
     return switch (parent.kind) {
-        .box, .flex => .none,
+        .box, .flex, .scroll => .none,
         .stack => stack: {
-            const default = if (parent.id == 2) design.tokens.foundation.spacing_3 else 0;
-            const x = tableOptionalExtent(state, table, "x", default) orelse return null;
-            const y = tableOptionalExtent(state, table, "y", default) orelse return null;
+            const x = tableOptionalExtent(state, table, "x", 0) orelse return null;
+            const y = tableOptionalExtent(state, table, "y", 0) orelse return null;
             break :stack .{ .stack = .{ .x = x, .y = y } };
         },
     };
@@ -760,11 +1012,11 @@ test "Lua UI exposes only declarative constructors without standard libraries" {
     try ui.init(state, &storage);
 
     try std.testing.expectEqual(c.type_table, c.lua_getglobal(state, "ouro"));
-    inline for (.{ "label", "button", "row", "column" }) |name| {
+    inline for (.{ "label", "button", "box", "row", "column", "scroll", "theme" }) |name| {
         try std.testing.expectEqual(c.type_function, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
-    inline for (.{ "box", "padded_box", "stack", "positioned_box", "on_pointer" }) |name| {
+    inline for (.{ "padded_box", "stack", "positioned_box", "on_pointer" }) |name| {
         try std.testing.expectEqual(c.type_nil, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
@@ -794,11 +1046,17 @@ test "declarative Lua label flows through layout scene and software glyph cache"
         .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_test_font_static"),
     });
-    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
-    defer shapes.deinit();
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_arabic_test_font"),
+    });
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
     var renders: RenderTree = undefined;
     try renders.init(std.testing.allocator, 4);
-    renders.attachTextCache(&shapes);
+    renders.attachTextCaches(&sources, &paragraphs);
     defer renders.deinit();
     var instances: instance.Tree = undefined;
     try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 4);
@@ -811,7 +1069,7 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     var semantic_storage: [2]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try ui.attachLabelText(&shapes, &.{font}, 1);
+    try ui.attachLabelText(&sources, &.{ font, arabic }, 1);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
 
@@ -820,7 +1078,14 @@ test "declarative Lua label flows through layout scene and software glyph cache"
         \\  ouro.column {
         \\    key = "content",
         \\    children = function()
-        \\      ouro.label { key = "benchmark", text = "Benchmark", size = 18 }
+        \\      ouro.label {
+        \\        key = "benchmark",
+        \\        text = "Benchmark حفظ",
+        \\        size = 18,
+        \\        alignment = "center",
+        \\        max_lines = 1,
+        \\        overflow = "ellipsis",
+        \\      }
         \\    end,
         \\  }
         \\end
@@ -831,7 +1096,16 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     try instances.reconcile(descriptors);
     ui.rollbackHandlers();
     try owners.complete(work);
-    try std.testing.expectEqual(@as(usize, 1), shapes.count());
+    try std.testing.expectEqual(@as(usize, 1), sources.count());
+    var retained_label: ?render_types.Label = null;
+    for (descriptors) |descriptor| switch (descriptor.object) {
+        .label => |label| retained_label = label,
+        else => {},
+    };
+    const label_descriptor = retained_label.?;
+    try std.testing.expectEqual(text.ParagraphAlignment.center, label_descriptor.alignment);
+    try std.testing.expectEqual(@as(?u32, 1), label_descriptor.max_lines);
+    try std.testing.expectEqual(text.ParagraphOverflow.ellipsis, label_descriptor.overflow);
 
     const root = (try instances.rootRenderObject()).?;
     const size = try renders.layout(root, .{ .max_width = 160, .max_height = 64 });
@@ -839,27 +1113,30 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     var command_storage: [8]scene.Command = undefined;
     var builder = try SceneBuilder.init(&command_storage, 1);
     try renders.buildScene(root, &builder);
-    var found_glyph_run = false;
+    var found_paragraph = false;
     for (builder.displayList().commands) |command| {
-        if (command == .glyph_run) found_glyph_run = true;
+        if (command == .paragraph) found_paragraph = true;
     }
-    try std.testing.expect(found_glyph_run);
+    try std.testing.expect(found_paragraph);
+    try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
 
     var glyphs = try software.GlyphCache.init(std.testing.allocator, &fonts);
     defer glyphs.deinit();
     var pixels = [_]u8{0} ** (160 * 64 * 4);
-    try software.renderText(builder.displayList(), .{
+    try software.renderParagraphs(builder.displayList(), .{
         .pixels = &pixels,
         .width = 160,
         .height = 64,
         .stride = 160 * 4,
         .format = .rgba8_unorm,
-    }, &glyphs, &shapes);
+    }, &glyphs, &paragraphs);
     try std.testing.expect(std.mem.indexOfNone(u8, &pixels, &.{0}) != null);
 
     try instances.reconcile(&.{});
-    try std.testing.expectEqual(@as(usize, 0), shapes.count());
+    try std.testing.expectEqual(@as(usize, 0), sources.count());
+    try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
     try fonts.release(font);
+    try fonts.release(arabic);
     try owners.retire(owner);
     try scheduler.applyQueuedCancellations();
     try instances.collectRetired();
@@ -867,7 +1144,7 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     try scheduler.destroyScope(window_scope);
 }
 
-test "nested declarative widgets normalize to typed objects and a Button binding" {
+test "nested declarative widgets include constrained boxes and scoped themes" {
     const Scheduler = @import("../task/scheduler.zig").Scheduler;
     const BuildOwners = build_owner.BuildOwners;
 
@@ -889,28 +1166,43 @@ test "nested declarative widgets normalize to typed objects and a Button binding
         .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_test_font_static"),
     });
-    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
-    defer shapes.deinit();
-    var storage: [7]instance.Descriptor = undefined;
-    var semantic_storage: [4]SemanticDescriptor = undefined;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var storage: [9]instance.Descriptor = undefined;
+    var semantic_storage: [6]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try ui.attachLabelText(&shapes, &.{font}, 1);
+    try ui.attachLabelText(&sources, &.{font}, 1);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
         \\function build()
-        \\  ouro.column {
-        \\    key = "content",
+        \\  ouro.box {
+        \\    key = "frame",
+        \\    width = 320,
+        \\    height = 200,
+        \\    padding = 8,
+        \\    alignment = "center",
         \\    children = function()
-        \\      ouro.label { key = "title", text = "Controls" }
-        \\      ouro.row {
-        \\        key = "actions",
+        \\      ouro.theme {
+        \\        key = "dark",
+        \\        color_scheme = "dark",
         \\        children = function()
-        \\          ouro.button {
-        \\            key = "benchmark",
-        \\            label = "Benchmark",
-        \\            on_press = function() end,
+        \\          ouro.column {
+        \\            key = "content",
+        \\            children = function()
+        \\              ouro.label { key = "title", text = "Controls" }
+        \\              ouro.row {
+        \\                key = "actions",
+        \\                children = function()
+        \\                  ouro.button {
+        \\                    key = "benchmark",
+        \\                    label = "Benchmark",
+        \\                    on_press = function() end,
+        \\                  }
+        \\                end,
+        \\              }
+        \\            end,
         \\          }
         \\        end,
         \\      }
@@ -921,37 +1213,40 @@ test "nested declarative widgets normalize to typed objects and a Button binding
     var cycle = owners.beginCycle();
     const work = (try cycle.take()).?;
     const descriptors = try ui.build(&owners, work, "build", &.{});
-    try std.testing.expectEqual(@as(usize, 7), descriptors.len);
+    try std.testing.expectEqual(@as(usize, 9), descriptors.len);
     try std.testing.expect(descriptors[0].object == .box);
     try std.testing.expect(descriptors[1].object == .stack);
-    try std.testing.expect(descriptors[2].object == .flex);
-    try std.testing.expect(descriptors[3].object == .label);
-    try std.testing.expect(descriptors[4].object == .flex);
-    try std.testing.expect(descriptors[5].object == .box);
+    try std.testing.expectEqual(@as(?f32, 320), descriptors[2].object.box.width);
+    try std.testing.expectEqual(@as(?f32, 200), descriptors[2].object.box.height);
     try std.testing.expectEqual(
         render_types.Alignment.center,
-        descriptors[5].object.box.alignment.?,
+        descriptors[2].object.box.alignment.?,
     );
-    try std.testing.expect(descriptors[6].object == .label);
-    try std.testing.expectEqual(descriptors[5].id, descriptors[6].parent.?);
+    try std.testing.expectEqual(design.tokens.dark.surface_base, descriptors[3].object.box.background.?);
+    try std.testing.expect(descriptors[4].object == .flex);
+    try std.testing.expect(descriptors[5].object == .label);
+    try std.testing.expect(descriptors[6].object == .flex);
+    try std.testing.expectEqual(design.tokens.dark.accent_default, descriptors[7].object.box.background.?);
+    try std.testing.expect(descriptors[7].focusable);
+    try std.testing.expectEqual(design.tokens.dark.surface_base, descriptors[8].object.label.color);
+    try std.testing.expectEqual(descriptors[7].id, descriptors[8].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
     try std.testing.expectEqual(.button, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_button_count);
-    try std.testing.expectEqual(@as(usize, 4), ui.semanticDescriptors().len);
-    try std.testing.expectEqualStrings("Controls", ui.semanticDescriptors()[1].label);
-    try std.testing.expectEqualStrings("Benchmark", ui.semanticDescriptors()[3].label);
+    try std.testing.expectEqual(@as(usize, 6), ui.semanticDescriptors().len);
+    try std.testing.expectEqualStrings("Controls", ui.semanticDescriptors()[3].label);
+    try std.testing.expectEqualStrings("Benchmark", ui.semanticDescriptors()[5].label);
     var prepared: PreparedBuild = undefined;
-    try prepared.init(std.testing.allocator, state, &shapes, 7, 128);
+    try prepared.init(std.testing.allocator, state, &sources, 9, 128);
     defer prepared.deinit();
     try ui.capturePrepared(&prepared, descriptors);
-    try std.testing.expectEqual(@as(usize, 7), prepared.descriptors().len);
-    try std.testing.expectEqual(@as(usize, 4), prepared.semanticDescriptors().len);
-    try std.testing.expectEqualStrings("Controls", prepared.semanticDescriptors()[1].label);
-    try std.testing.expectEqualStrings("Benchmark", prepared.semanticDescriptors()[3].label);
+    try std.testing.expectEqual(@as(usize, 9), prepared.descriptors().len);
+    try std.testing.expectEqual(@as(usize, 6), prepared.semanticDescriptors().len);
+    try std.testing.expectEqualStrings("Controls", prepared.semanticDescriptors()[3].label);
+    try std.testing.expectEqualStrings("Benchmark", prepared.semanticDescriptors()[5].label);
     try std.testing.expectEqual(@as(usize, 1), prepared.handler_count);
     try std.testing.expectEqual(.button, prepared.handlers[0].kind);
     try std.testing.expectEqual(@as(usize, 1), prepared.button_count);
-    try std.testing.expect(prepared.owns_shapes);
     ui.rollbackHandlers();
     try owners.complete(work);
     try fonts.release(font);

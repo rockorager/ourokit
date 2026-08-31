@@ -21,6 +21,7 @@ pub const Descriptor = struct {
     parent: ?u64,
     object: render_types.Object,
     parent_data: render_types.ParentData = .none,
+    focusable: bool = false,
 };
 
 const State = enum { free, active, retiring };
@@ -34,6 +35,9 @@ const Slot = struct {
     scope: ScopeHandle = .invalid,
     render: ?render_object.NodeHandle = null,
     state_revision: u64 = 0,
+    scroll_offset: f32 = 0,
+    focusable: bool = false,
+    traversal_order: usize = 0,
     reconcile_child: ?render_object.NodeHandle = null,
 };
 
@@ -289,9 +293,21 @@ pub const Tree = struct {
             ) catch unreachable;
         }
 
-        for (descriptors) |descriptor| {
+        for (descriptors, 0..) |descriptor, traversal_order| {
             const slot = self.findActiveById(descriptor.id).?;
-            self.render_tree.update(slot.render.?, descriptor.object) catch unreachable;
+            slot.focusable = descriptor.focusable;
+            slot.traversal_order = traversal_order;
+            const previous = try self.render_tree.objectAt(slot.render.?);
+            try self.render_tree.update(slot.render.?, descriptor.object);
+            if (descriptor.object == .scroll) {
+                if (previous != .scroll) slot.scroll_offset = 0;
+                slot.scroll_offset = try self.render_tree.setScrollOffset(
+                    slot.render.?,
+                    slot.scroll_offset,
+                );
+            } else {
+                slot.scroll_offset = 0;
+            }
             if (topology_changed) if (descriptor.parent) |parent_id| {
                 const parent = self.findActiveById(parent_id).?;
                 self.render_tree.appendChild(
@@ -379,9 +395,88 @@ pub const Tree = struct {
         return true;
     }
 
+    pub fn isFocusable(self: *Tree, handle: InstanceHandle) bool {
+        const slot = self.activeSlot(handle) catch return false;
+        return slot.focusable;
+    }
+
+    pub fn nextFocusable(
+        self: *Tree,
+        current: ?InstanceHandle,
+        reverse: bool,
+    ) !?InstanceHandle {
+        const current_order: usize = if (current) |handle|
+            (try self.activeSlot(handle)).traversal_order
+        else if (reverse)
+            std.math.maxInt(usize)
+        else
+            0;
+        var selected: ?usize = null;
+        var wrapped: ?usize = null;
+        for (self.slots, 0..) |slot, index| {
+            if (slot.state != .active or !slot.focusable) continue;
+            if (wrapped == null or orderBefore(slot.traversal_order, self.slots[wrapped.?].traversal_order, reverse))
+                wrapped = index;
+            const eligible = if (current == null)
+                true
+            else if (reverse)
+                slot.traversal_order < current_order
+            else
+                slot.traversal_order > current_order;
+            if (eligible and (selected == null or
+                orderBefore(slot.traversal_order, self.slots[selected.?].traversal_order, reverse)))
+                selected = index;
+        }
+        const index = selected orelse wrapped orelse return null;
+        return handleFor(self.slots[index], index);
+    }
+
     pub fn bumpStateRevision(self: *Tree, handle: InstanceHandle) !void {
         const slot = try self.activeSlot(handle);
         slot.state_revision +%= 1;
+    }
+
+    /// Scroll state belongs to the retained instance. Render state is updated
+    /// at the input safe point and only invalidates paint.
+    pub fn scrollBy(self: *Tree, handle: InstanceHandle, delta: f32) !bool {
+        if (!std.math.isFinite(delta)) return error.InvalidScrollDelta;
+        const slot = try self.activeSlot(handle);
+        if ((try self.render_tree.objectAt(slot.render.?)) != .scroll)
+            return error.InstanceIsNotScrollable;
+        const previous = slot.scroll_offset;
+        slot.scroll_offset = try self.render_tree.setScrollOffset(slot.render.?, previous + delta);
+        if (slot.scroll_offset == previous) return false;
+        slot.state_revision +%= 1;
+        return true;
+    }
+
+    pub fn scrollOffset(self: *Tree, handle: InstanceHandle) !f32 {
+        return (try self.activeSlot(handle)).scroll_offset;
+    }
+
+    pub fn nearestScroll(
+        self: *Tree,
+        start: InstanceHandle,
+        axis: render_types.Axis,
+    ) !?InstanceHandle {
+        var current: ?InstanceHandle = start;
+        while (current) |handle| {
+            const slot = try self.activeSlot(handle);
+            const object = try self.render_tree.objectAt(slot.render.?);
+            if (object == .scroll and object.scroll.axis == axis) return handle;
+            current = try self.parentOf(handle);
+        }
+        return null;
+    }
+
+    /// Layout may reduce a scroll extent after content changes. Synchronize
+    /// clamped renderer values back into their authoritative instance slots.
+    pub fn syncScrollOffsets(self: *Tree) !void {
+        for (self.slots) |*slot| {
+            if (slot.state != .active) continue;
+            if ((try self.render_tree.objectAt(slot.render.?)) != .scroll) continue;
+            slot.scroll_offset = try self.render_tree.scrollOffset(slot.render.?);
+        }
     }
 
     pub fn activeCount(self: *const Tree) usize {
@@ -514,6 +609,10 @@ fn same(a: Handle, b: Handle) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
+fn orderBefore(a: usize, b: usize, reverse: bool) bool {
+    return if (reverse) a > b else a < b;
+}
+
 test "typed snapshots preserve keyed state and reorder render children" {
     var scheduler: Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 8, 1, 0);
@@ -608,6 +707,40 @@ test "invalid snapshots are transactional and retirement waits for scope drain" 
     try instances.collectRetired();
     try instances.reconcile(&.{.{ .id = 1, .parent = null, .object = .{ .box = .{} } }});
     try std.testing.expect(original.generation != instances.handleForId(1).?.generation);
+
+    try instances.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try instances.collectRetired();
+    try scheduler.destroyScope(window_scope);
+}
+
+test "scroll offset is retained by keyed instance and clamped by layout" {
+    const Constraints = @import("../layout/constraints.zig").Constraints;
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 6, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 2);
+    defer renders.deinit();
+    var instances: Tree = undefined;
+    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 2);
+    defer instances.deinit();
+    const snapshot = [_]Descriptor{
+        .{ .id = 1, .parent = null, .object = .{ .scroll = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .box = .{ .width = 40, .height = 120 } } },
+    };
+    try instances.reconcile(&snapshot);
+    const root = (try instances.rootRenderObject()).?;
+    _ = try renders.layout(root, Constraints.tight(.{ .width = 40, .height = 50 }));
+    const scroll = instances.handleForId(1).?;
+    try std.testing.expect(try instances.scrollBy(scroll, 25));
+    try std.testing.expectEqual(@as(f32, 25), try instances.scrollOffset(scroll));
+    try instances.reconcile(&snapshot);
+    try std.testing.expectEqual(scroll, instances.handleForId(1).?);
+    try std.testing.expectEqual(@as(f32, 25), try instances.scrollOffset(scroll));
+    try std.testing.expect(try instances.scrollBy(scroll, 1000));
+    try std.testing.expectEqual(@as(f32, 70), try instances.scrollOffset(scroll));
 
     try instances.reconcile(&.{});
     try scheduler.applyQueuedCancellations();

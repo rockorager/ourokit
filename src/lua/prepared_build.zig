@@ -31,7 +31,7 @@ pub const Button = struct {
 pub const PreparedBuild = struct {
     allocator: std.mem.Allocator,
     state: *c.State,
-    shapes: ?*text.ShapeCache,
+    shapes: ?*text.ParagraphSourceCache,
     descriptor_storage: []instance.Descriptor,
     descriptor_count: usize = 0,
     semantic_storage: []semantics.Descriptor,
@@ -50,7 +50,7 @@ pub const PreparedBuild = struct {
         self: *PreparedBuild,
         allocator: std.mem.Allocator,
         state: *c.State,
-        shapes: ?*text.ShapeCache,
+        shapes: ?*text.ParagraphSourceCache,
         node_capacity: usize,
         semantic_text_capacity: usize,
     ) !void {
@@ -92,7 +92,7 @@ pub const PreparedBuild = struct {
             c.luaL_unref(self.state, c.registry_index, handler.reference);
         if (self.owns_shapes) for (self.descriptor_storage[0..self.descriptor_count]) |descriptor|
             switch (descriptor.object) {
-                .label => |label| self.shapes.?.release(label.shape) catch unreachable,
+                .label => |label| self.shapes.?.release(label.source) catch unreachable,
                 else => {},
             };
         self.descriptor_count = 0;

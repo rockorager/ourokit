@@ -17,7 +17,8 @@ pub const Config = struct {
 };
 
 pub const UiServices = struct {
-    shapes: *text.ShapeCache,
+    paragraph_sources: *text.ParagraphSourceCache,
+    paragraphs: *text.ParagraphCache,
     primary_font: text.FontHandle,
     theme: design.tokens.Theme,
     callbacks: *lua.CallbackRegistry,
@@ -266,7 +267,7 @@ pub const SourceGeneration = struct {
             self.callbacks = value.callbacks;
             self.ui_build.attachCallbacks(value.callbacks, &self.vm);
             self.font_candidates = .{value.primary_font};
-            self.ui_build.attachLabelText(value.shapes, &self.font_candidates, 1) catch |err| {
+            self.ui_build.attachLabelText(value.paragraph_sources, &self.font_candidates, 1) catch |err| {
                 lua.recordDiagnosticError(
                     diagnostic,
                     allocator,
@@ -356,7 +357,7 @@ pub const SourceGeneration = struct {
             prepared.init(
                 allocator,
                 self.vm.state,
-                if (services) |value| value.shapes else null,
+                if (services) |value| value.paragraph_sources else null,
                 config.node_capacity,
                 config.semantic_text_capacity,
             ) catch |err| {
@@ -426,7 +427,7 @@ pub const SourceGeneration = struct {
             prepared.init(
                 self.allocator,
                 self.vm.state,
-                if (self.services) |value| value.shapes else null,
+                if (self.services) |value| value.paragraph_sources else null,
                 self.config.node_capacity,
                 self.config.semantic_text_capacity,
             ) catch |err| {

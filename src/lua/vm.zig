@@ -62,6 +62,7 @@ pub const Vm = struct {
     scheduler_tasks: []?TaskHandle,
     operation_tasks: []?TaskHandle,
     running: ?TaskHandle = null,
+    sleep_enabled: bool = true,
 
     pub fn init(
         self: *Vm,
@@ -115,6 +116,13 @@ pub const Vm = struct {
         for (self.chunks) |chunk| self.allocator.free(chunk);
         self.allocator.free(self.chunks);
         self.* = undefined;
+    }
+
+    /// Headless deterministic hosts disable wall-clock waits before invoking
+    /// user callbacks. The Lua call then fails synchronously without creating
+    /// an io_uring operation that would make snapshot completion time-based.
+    pub fn disableSleep(self: *Vm) void {
+        self.sleep_enabled = false;
     }
 
     pub fn spawnApplication(self: *Vm, source: []const u8) !TaskHandle {
@@ -299,6 +307,10 @@ pub const Vm = struct {
                 try self.scheduler.wait(scheduler_handle);
                 return .waiting;
             }
+            if (slot.timer_resource_handle) |resource| {
+                try self.scheduler.destroyResource(resource);
+                slot.timer_resource_handle = null;
+            }
             try self.scheduler.complete(scheduler_handle);
             if (self.closeTask(handle) != c.ok) return error.LuaThreadCloseFailed;
             return .canceled;
@@ -346,7 +358,7 @@ pub const Vm = struct {
                             return err;
                         };
                         slot.pending_timeout = operation;
-                        std.debug.assert(operation.slot < self.operation_tasks.len);
+                        try self.ensureOperationMap(operation.slot);
                         std.debug.assert(self.operation_tasks[operation.slot] == null);
                         self.operation_tasks[operation.slot] = handle;
                     },
@@ -565,6 +577,16 @@ pub const Vm = struct {
         @memset(self.scheduler_tasks[old_len..], null);
     }
 
+    fn ensureOperationMap(self: *Vm, slot: u32) !void {
+        if (slot < self.operation_tasks.len) return;
+        var new_len = self.operation_tasks.len;
+        while (slot >= new_len) new_len = std.math.mul(usize, new_len, 2) catch
+            return error.TimerCapacityExceeded;
+        const old_len = self.operation_tasks.len;
+        self.operation_tasks = try self.allocator.realloc(self.operation_tasks, new_len);
+        @memset(self.operation_tasks[old_len..], null);
+    }
+
     fn handleForSchedulerTask(
         self: *Vm,
         scheduler_handle: task.TaskHandle,
@@ -580,6 +602,7 @@ pub const Vm = struct {
         const pointer = c.lua_touserdata(state, c.upvalueIndex(1)) orelse
             return luaError(state, "missing Ouro VM");
         const self: *Vm = @ptrCast(@alignCast(pointer));
+        if (!self.sleep_enabled) return luaError(state, "sleep is unavailable in deterministic playback");
         const handle = self.running orelse return luaError(state, "sleep called outside a task");
         const slot = self.activeSlot(handle) catch return luaError(state, "stale Ouro task");
         if (slot.thread != state) return luaError(state, "wrong Ouro task");
@@ -625,7 +648,10 @@ const TimerResource = struct {
     fn requestCancel(pointer: *anyopaque) !void {
         const resource: *TimerResource = @ptrCast(@alignCast(pointer));
         const slot = try resource.vm.activeSlot(resource.task_handle);
-        try resource.vm.loop.prepareCancel(slot.pending_timeout.?);
+        const operation = slot.pending_timeout orelse return;
+        try resource.vm.loop.prepareCancel(operation);
+        resource.vm.operation_tasks[operation.slot] = null;
+        slot.pending_timeout = null;
     }
 
     fn destroy(_: *anyopaque) void {}

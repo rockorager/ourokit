@@ -7,6 +7,7 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const Constraints = @import("../layout/constraints.zig").Constraints;
 const box_impl = @import("box.zig");
 const flex_impl = @import("flex.zig");
+const scroll_impl = @import("scroll.zig");
 const stack_impl = @import("stack.zig");
 const scene_builder = @import("scene_builder.zig");
 const text = @import("../../text/root.zig");
@@ -22,10 +23,13 @@ pub const LayoutError = error{
     InvalidLayoutSize,
     UnconstrainedLayoutSize,
     FlexInUnboundedAxis,
+    ScrollInUnboundedAxis,
     InvalidParentData,
     LabelHasChildren,
-    TextCacheRequired,
-    StaleShape,
+    ParagraphResourcesRequired,
+    StaleParagraphSource,
+    StaleParagraph,
+    ParagraphLayoutFailed,
 };
 
 const Slot = struct {
@@ -45,14 +49,19 @@ const Slot = struct {
     needs_layout: bool = true,
     needs_paint: bool = true,
     layout_count: usize = 0,
+    paragraph_layout: ?text.ParagraphHandle = null,
+    scroll_offset: f32 = 0,
+    scroll_extent: f32 = 0,
 };
 
-/// Fixed-capacity, allocation-free-during-layout storage for the closed typed
-/// render-object set. This is deliberately not the widget/instance tree.
+/// Fixed-capacity storage for the closed typed render-object set. Unchanged
+/// layout is allocation-free; dirty Labels may populate the paragraph cache.
+/// This is deliberately not the widget/instance tree.
 pub const Tree = struct {
     allocator: std.mem.Allocator,
     slots: []Slot,
-    text_cache: ?*text.ShapeCache = null,
+    paragraph_sources: ?*text.ParagraphSourceCache = null,
+    paragraphs: ?*text.ParagraphCache = null,
 
     pub fn init(self: *Tree, allocator: std.mem.Allocator, capacity: usize) !void {
         if (capacity == 0) return error.InvalidCapacity;
@@ -62,16 +71,24 @@ pub const Tree = struct {
     }
 
     pub fn deinit(self: *Tree) void {
-        for (self.slots) |entry| if (entry.active) self.releaseObject(entry.object);
+        for (self.slots) |*entry| if (entry.active) {
+            self.releaseParagraphLayout(entry);
+            self.releaseObject(entry.object);
+        };
         self.allocator.free(self.slots);
         self.* = undefined;
     }
 
-    /// The shape cache must outlive this tree. Label objects retain their shape
-    /// handles across reconciliation and release them on replacement/teardown.
-    pub fn attachTextCache(self: *Tree, cache: *text.ShapeCache) void {
-        std.debug.assert(self.text_cache == null);
-        self.text_cache = cache;
+    /// Both caches must outlive this tree. Labels retain width-independent
+    /// sources and tree slots retain their current width-specific layouts.
+    pub fn attachTextCaches(
+        self: *Tree,
+        sources: *text.ParagraphSourceCache,
+        paragraphs: *text.ParagraphCache,
+    ) void {
+        std.debug.assert(self.paragraph_sources == null and self.paragraphs == null);
+        self.paragraph_sources = sources;
+        self.paragraphs = paragraphs;
     }
 
     pub fn create(self: *Tree, object: types.Object) !NodeHandle {
@@ -93,6 +110,7 @@ pub const Tree = struct {
         if (target.first_child != null) return error.RenderObjectHasChildren;
         const generation = target.generation;
         try self.detach(handle);
+        self.releaseParagraphLayout(target);
         self.releaseObject(target.object);
         self.slots[handle.slot] = .{ .generation = generation };
     }
@@ -120,8 +138,8 @@ pub const Tree = struct {
     pub fn validateRetain(self: *Tree, object: types.Object) !void {
         switch (object) {
             .label => |label| {
-                const cache = self.text_cache orelse return error.TextCacheRequired;
-                try cache.validateRetain(label.shape);
+                const cache = self.paragraph_sources orelse return error.TextCacheRequired;
+                try cache.validateRetain(label.source);
             },
             else => {},
         }
@@ -142,8 +160,8 @@ pub const Tree = struct {
         const child_slot = try self.slot(child);
         if (child_slot.parent != null) return error.RenderObjectAlreadyAttached;
         try validateParentData(parent_slot.object, data);
-        if (parent_slot.object == .box and parent_slot.first_child != null)
-            return error.BoxAlreadyHasChild;
+        if ((parent_slot.object == .box or parent_slot.object == .scroll) and
+            parent_slot.first_child != null) return error.BoxAlreadyHasChild;
         if (parent_slot.object == .label) return error.LabelHasChildren;
 
         child_slot.parent = parent;
@@ -171,7 +189,7 @@ pub const Tree = struct {
         try validateObject(object);
         const target = try self.slot(handle);
         if (std.meta.eql(target.object, object)) return;
-        if (object == .box and target.first_child != null and
+        if ((object == .box or object == .scroll) and target.first_child != null and
             !same(target.first_child.?, target.last_child.?)) return error.BoxAlreadyHasChild;
         var child = target.first_child;
         while (child) |child_handle| : (child = (try self.slot(child_handle)).next_sibling)
@@ -180,6 +198,7 @@ pub const Tree = struct {
         const affects_layout = layoutPropertiesChanged(target.object, object);
         try self.retainObject(object);
         const previous = target.object;
+        if (sourceChanged(previous, object)) self.releaseParagraphLayout(target);
         target.object = object;
         self.releaseObject(previous);
         if (affects_layout)
@@ -283,6 +302,47 @@ pub const Tree = struct {
         self.markNeedsPaint(handle);
     }
 
+    /// Applies instance-owned scrolling without invalidating layout. Returns
+    /// the clamped offset so the instance remains the authoritative state.
+    pub fn setScrollOffset(self: *Tree, handle: NodeHandle, requested: f32) !f32 {
+        if (!std.math.isFinite(requested)) return error.InvalidScrollOffset;
+        const target = try self.slot(handle);
+        const scroll = switch (target.object) {
+            .scroll => |value| value,
+            else => return error.NotScrollObject,
+        };
+        const offset = std.math.clamp(requested, 0, target.scroll_extent);
+        if (target.scroll_offset == offset) return offset;
+        target.scroll_offset = offset;
+        if (target.first_child) |child|
+            try self.setChildOffset(child, scroll_impl.childOffset(scroll.axis, offset));
+        self.markNeedsPaint(handle);
+        return offset;
+    }
+
+    pub fn scrollOffset(self: *Tree, handle: NodeHandle) !f32 {
+        const target = try self.slot(handle);
+        if (target.object != .scroll) return error.NotScrollObject;
+        return target.scroll_offset;
+    }
+
+    pub fn finishScrollLayout(
+        self: *Tree,
+        handle: NodeHandle,
+        viewport: SizeF,
+        content: SizeF,
+    ) LayoutError!void {
+        const target = try self.slot(handle);
+        const scroll = target.object.scroll;
+        target.scroll_extent = switch (scroll.axis) {
+            .vertical => @max(0, content.height - viewport.height),
+            .horizontal => @max(0, content.width - viewport.width),
+        };
+        target.scroll_offset = @min(target.scroll_offset, target.scroll_extent);
+        if (target.first_child) |child|
+            try self.setChildOffset(child, scroll_impl.childOffset(scroll.axis, target.scroll_offset));
+    }
+
     fn layoutNode(self: *Tree, handle: NodeHandle, constraints: Constraints) LayoutError!SizeF {
         try constraints.validate();
         const current = try self.slot(handle);
@@ -293,7 +353,8 @@ pub const Tree = struct {
             .box => |value| try box_impl.layout(value, self, handle, constraints),
             .flex => |value| try flex_impl.layout(value, self, handle, constraints),
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
-            .label => try self.layoutLabel(object.label, constraints),
+            .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
+            .label => try self.layoutLabel(handle, object.label, constraints),
         };
         if (!validSize(result)) return error.InvalidLayoutSize;
         const constrained = constraints.constrain(result);
@@ -323,6 +384,21 @@ pub const Tree = struct {
         };
         const clips = switch (target.object) {
             .box => |value| paint: {
+                if (value.outline_color) |outline_color| {
+                    const expansion = value.outline_gap + value.outline_width;
+                    try builder.decoratedRectangle(
+                        .{
+                            .x = bounds.x - expansion,
+                            .y = bounds.y - expansion,
+                            .width = bounds.width + expansion * 2,
+                            .height = bounds.height + expansion * 2,
+                        },
+                        null,
+                        outline_color,
+                        value.outline_width,
+                        value.corner_radius + expansion,
+                    );
+                }
                 if (value.border_color != null or value.corner_radius != 0) {
                     try builder.decoratedRectangle(
                         bounds,
@@ -336,14 +412,11 @@ pub const Tree = struct {
             },
             .flex => false,
             .stack => |value| value.clip,
+            .scroll => true,
             .label => |value| paint: {
-                const shaped = try self.shape(value.shape);
+                const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
                 try builder.pushClip(bounds);
-                try builder.glyphRun(
-                    value.shape,
-                    .{ .x = origin.x, .y = origin.y + shaped.metrics.ascender },
-                    value.color,
-                );
+                try builder.paragraph(paragraph_handle, origin, value.color);
                 break :paint true;
             },
         };
@@ -432,24 +505,46 @@ pub const Tree = struct {
         return target;
     }
 
-    fn layoutLabel(self: *Tree, label: types.Label, constraints: Constraints) LayoutError!SizeF {
-        const shaped = try self.shape(label.shape);
-        return constraints.constrain(.{
-            .width = @abs(shaped.advance.x),
-            .height = @max(0, shaped.metrics.ascender - shaped.metrics.descender + shaped.metrics.line_gap),
-        });
-    }
-
-    fn shape(self: *Tree, handle: text.ShapeHandle) LayoutError!*const text.FallbackResult {
-        const cache = self.text_cache orelse return error.TextCacheRequired;
-        return cache.get(handle) catch return error.StaleShape;
+    fn layoutLabel(
+        self: *Tree,
+        handle: NodeHandle,
+        label: types.Label,
+        constraints: Constraints,
+    ) LayoutError!SizeF {
+        const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
+        const paragraphs = self.paragraphs orelse return error.ParagraphResourcesRequired;
+        const source = sources.get(label.source) catch return error.StaleParagraphSource;
+        const layout_handle = paragraphs.acquire(.{
+            .utf8 = source.utf8,
+            .base_direction = source.base_direction,
+            .language = source.language,
+            .logical_size = source.logical_size,
+            .max_width = if (constraints.hasBoundedWidth())
+                constraints.max_width
+            else
+                std.math.floatMax(f32),
+            .candidates = source.candidates,
+            .configuration_revision = source.configuration_revision,
+            .style = .{
+                .alignment = label.alignment,
+                .max_lines = label.max_lines,
+                .overflow = label.overflow,
+            },
+        }) catch return error.ParagraphLayoutFailed;
+        errdefer paragraphs.release(layout_handle) catch unreachable;
+        const paragraph_layout = paragraphs.get(layout_handle) catch return error.StaleParagraph;
+        const result = constraints.constrain(paragraph_layout.size);
+        const target = try self.slot(handle);
+        self.releaseParagraphLayout(target);
+        target.paragraph_layout = layout_handle;
+        return result;
     }
 
     fn retainObject(self: *Tree, object: types.Object) !void {
         switch (object) {
             .label => |label| {
-                const cache = self.text_cache orelse return error.TextCacheRequired;
-                try cache.retain(label.shape);
+                const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
+                try sources.retain(label.source);
             },
             else => {},
         }
@@ -457,9 +552,15 @@ pub const Tree = struct {
 
     fn releaseObject(self: *Tree, object: types.Object) void {
         switch (object) {
-            .label => |label| self.text_cache.?.release(label.shape) catch unreachable,
+            .label => |label| self.paragraph_sources.?.release(label.source) catch unreachable,
             else => {},
         }
+    }
+
+    fn releaseParagraphLayout(self: *Tree, slot_value: *Slot) void {
+        if (slot_value.paragraph_layout) |paragraph_handle|
+            self.paragraphs.?.release(paragraph_handle) catch unreachable;
+        slot_value.paragraph_layout = null;
     }
 };
 
@@ -468,7 +569,12 @@ fn validateObject(object: types.Object) !void {
         .box => |value| try box_impl.validate(value),
         .flex => |value| try flex_impl.validate(value),
         .stack => {},
-        .label => {},
+        .scroll => {},
+        .label => |label| {
+            if (label.max_lines == 0) return error.InvalidMaxLines;
+            if (label.overflow == .ellipsis and label.max_lines == null)
+                return error.EllipsisRequiresMaxLines;
+        },
     }
 }
 
@@ -482,6 +588,7 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
                 return error.InvalidParentData,
             .flex => return error.InvalidParentData,
         },
+        .scroll => if (data != .none) return error.InvalidParentData,
         .label => return error.LabelHasChildren,
     }
 }
@@ -498,7 +605,11 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         },
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
         .stack => false,
-        .label => |old_label| !sameShape(old_label.shape, new.label.shape),
+        .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
+        .label => |old_label| !sameSource(old_label.source, new.label.source) or
+            old_label.alignment != new.label.alignment or
+            old_label.max_lines != new.label.max_lines or
+            old_label.overflow != new.label.overflow,
     };
 }
 
@@ -515,8 +626,17 @@ fn same(a: NodeHandle, b: NodeHandle) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
-fn sameShape(a: text.ShapeHandle, b: text.ShapeHandle) bool {
+fn sameSource(a: text.ParagraphSourceHandle, b: text.ParagraphSourceHandle) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn sameParagraph(a: text.ParagraphHandle, b: text.ParagraphHandle) bool {
+    return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn sourceChanged(old: types.Object, new: types.Object) bool {
+    if (old != .label or new != .label) return old == .label;
+    return !sameSource(old.label.source, new.label.source);
 }
 
 test "flex layout is bounded, cached, and separates paint invalidation" {
@@ -677,6 +797,68 @@ test "box centers an intrinsic child inside its padded content" {
     try std.testing.expectEqual(PointF{ .x = 76, .y = 26 }, try tree.nodeOffset(child));
 }
 
+test "labels cache width-specific mixed-script paragraphs across unchanged layout" {
+    const scene = @import("../../scene/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_arabic_test_font"),
+    });
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const source = try sources.acquire(.{
+        .utf8 = "Save حفظ now and continue",
+        .language = "und",
+        .logical_size = 18,
+        .candidates = &.{ latin, arabic },
+        .configuration_revision = 1,
+    });
+    try fonts.release(latin);
+    try fonts.release(arabic);
+
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    tree.attachTextCaches(&sources, &paragraphs);
+    defer tree.deinit();
+    const label = try tree.create(.{ .label = .{
+        .source = source,
+        .color = Color.rgba(20, 40, 80, 255),
+    } });
+    try sources.release(source);
+
+    const wide_size = try tree.layout(label, .{ .max_width = 180, .max_height = 200 });
+    var commands: [3]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(label, &builder);
+    const wide_layout = builder.displayList().commands[1].paragraph.layout;
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(label));
+    try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
+
+    _ = try tree.layout(label, .{ .max_width = 180, .max_height = 200 });
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(label));
+    try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
+
+    const narrow_size = try tree.layout(label, .{ .max_width = 70, .max_height = 200 });
+    try std.testing.expect(narrow_size.height > wide_size.height);
+    try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(label));
+    try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
+    builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(label, &builder);
+    const narrow_layout = builder.displayList().commands[1].paragraph.layout;
+    try std.testing.expect(!sameParagraph(wide_layout, narrow_layout));
+
+    try tree.destroy(label);
+    try std.testing.expectEqual(@as(usize, 0), sources.count());
+    try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
+}
+
 test "render-object topology rejects cycles and stale generations" {
     var tree: Tree = undefined;
     try tree.init(std.testing.allocator, 2);
@@ -690,4 +872,59 @@ test "render-object topology rejects cycles and stale generations" {
     const replacement = try tree.create(.{ .box = .{} });
     try std.testing.expectEqual(child.slot, replacement.slot);
     try std.testing.expect(child.generation != replacement.generation);
+}
+
+test "box outline is paint-only state" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    defer tree.deinit();
+    const box = try tree.create(.{ .box = .{ .width = 40, .height = 20 } });
+    _ = try tree.layout(box, Constraints.tight(.{ .width = 40, .height = 20 }));
+    var commands: [1]@import("../../scene/root.zig").Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(box, &builder);
+    try tree.update(box, .{ .box = .{
+        .width = 40,
+        .height = 20,
+        .outline_color = Color.rgba(20, 80, 220, 255),
+        .outline_width = 2,
+        .outline_gap = 2,
+    } });
+    try std.testing.expect(!(try tree.layoutDirty(box)));
+    try std.testing.expect(try tree.paintDirty(box));
+}
+
+test "scroll lays out unbounded content and clips paint and hit testing" {
+    const scene = @import("../../scene/root.zig");
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    const scroll = try tree.create(.{ .scroll = .{} });
+    const content = try tree.create(.{ .box = .{
+        .width = 40,
+        .height = 120,
+        .background = Color.rgba(20, 40, 80, 255),
+    } });
+    try tree.appendChild(scroll, content, .none);
+
+    try std.testing.expectEqual(
+        SizeF{ .width = 40, .height = 50 },
+        try tree.layout(scroll, .{ .max_width = 100, .max_height = 50 }),
+    );
+    try std.testing.expectEqual(@as(f32, 30), try tree.setScrollOffset(scroll, 30));
+    try std.testing.expectEqual(PointF{ .y = -30 }, try tree.nodeOffset(content));
+
+    var commands: [3]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(scroll, &builder);
+    try std.testing.expectEqual(@as(usize, 3), builder.displayList().commands.len);
+    try std.testing.expectEqual(
+        @as(scene.Command, .{ .push_clip_rect = .{ .x = 0, .y = 0, .width = 40, .height = 50 } }),
+        builder.displayList().commands[0],
+    );
+    try std.testing.expectEqual(@as(i32, -30), builder.displayList().commands[1].solid_rectangle.bounds.y);
+    try std.testing.expect(builder.displayList().commands[2] == .pop_clip);
+    try std.testing.expectEqual(content, (try tree.hitTest(scroll, .{ .x = 10, .y = 10 })).?);
+    try std.testing.expect((try tree.hitTest(scroll, .{ .x = 10, .y = 60 })) == null);
+    try std.testing.expectEqual(@as(f32, 70), try tree.setScrollOffset(scroll, 500));
 }

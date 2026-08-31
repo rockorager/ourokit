@@ -7,6 +7,8 @@ pub const WindowHandle = platform_window.WindowHandle;
 pub const ToplevelDeclaration = platform_window.ToplevelDeclaration;
 pub const NativeHost = platform_window.NativeHost;
 pub const PointerEvent = platform_window.PointerEvent;
+pub const KeyboardEvent = platform_window.KeyboardEvent;
+pub const TextInputEvent = platform_window.TextInputEvent;
 
 /// Events are data queued by the platform phase. They contain no callback
 /// capable of entering Lua or mutating a retained UI tree.
@@ -18,6 +20,8 @@ pub const Event = union(enum) {
         height: u32,
     },
     pointer: PointerEvent,
+    keyboard: KeyboardEvent,
+    text_input: TextInputEvent,
 };
 
 const State = enum { free, active, closing, closed };
@@ -41,6 +45,7 @@ pub const WindowSet = struct {
     host: NativeHost,
     slots: []Slot,
     events: []Event,
+    event_head: usize = 0,
     event_count: usize = 0,
     change_serial: u64 = 0,
 
@@ -139,14 +144,29 @@ pub const WindowSet = struct {
         try self.enqueue(.{ .pointer = event });
     }
 
+    pub fn enqueueKeyboard(self: *WindowSet, event: KeyboardEvent) !void {
+        _ = try self.slotFor(keyboardWindow(event));
+        try self.enqueue(.{ .keyboard = event });
+    }
+
+    pub fn enqueueTextInput(self: *WindowSet, event: TextInputEvent) !void {
+        _ = try self.slotFor(textInputWindow(event));
+        const owned = try cloneTextInput(self.allocator, event);
+        errdefer freeTextInput(self.allocator, owned);
+        try self.enqueue(.{ .text_input = owned });
+    }
+
     /// Consumed only by the application's platform-event translation phase.
     pub fn takeEvent(self: *WindowSet) ?Event {
         if (self.event_count == 0) return null;
-        const event = self.events[0];
+        const event = self.events[self.event_head];
+        self.event_head = (self.event_head + 1) % self.events.len;
         self.event_count -= 1;
-        if (self.event_count != 0)
-            std.mem.copyForwards(Event, self.events[0..self.event_count], self.events[1..][0..self.event_count]);
         return event;
+    }
+
+    pub fn releaseEvent(self: *WindowSet, event: Event) void {
+        if (event == .text_input) freeTextInput(self.allocator, event.text_input);
     }
 
     pub fn scope(self: *WindowSet, handle: WindowHandle) !ScopeHandle {
@@ -254,7 +274,8 @@ pub const WindowSet = struct {
 
     fn enqueue(self: *WindowSet, event: Event) !void {
         if (self.event_count == self.events.len) return error.PlatformEventCapacityExceeded;
-        self.events[self.event_count] = event;
+        const tail = (self.event_head + self.event_count) % self.events.len;
+        self.events[tail] = event;
         self.event_count += 1;
         self.change_serial +%= 1;
     }
@@ -274,6 +295,16 @@ pub const WindowSet = struct {
         try self.enqueuePointer(event);
     }
 
+    fn sinkKeyboard(context: *anyopaque, event: KeyboardEvent) !void {
+        const self: *WindowSet = @ptrCast(@alignCast(context));
+        try self.enqueueKeyboard(event);
+    }
+
+    fn sinkTextInput(context: *anyopaque, event: TextInputEvent) !void {
+        const self: *WindowSet = @ptrCast(@alignCast(context));
+        try self.enqueueTextInput(event);
+    }
+
     fn sinkClosed(context: *anyopaque, handle: WindowHandle) !void {
         const self: *WindowSet = @ptrCast(@alignCast(context));
         try self.markClosed(handle);
@@ -283,6 +314,8 @@ pub const WindowSet = struct {
         .close_requested = sinkCloseRequested,
         .configured = sinkConfigured,
         .pointer = sinkPointer,
+        .keyboard = sinkKeyboard,
+        .text_input = sinkTextInput,
         .closed = sinkClosed,
     };
 };
@@ -300,6 +333,61 @@ fn pointerWindow(event: PointerEvent) WindowHandle {
         .axis_steps120 => |value| value.window,
         .frame => |window| window,
     };
+}
+
+fn keyboardWindow(event: KeyboardEvent) WindowHandle {
+    return switch (event) {
+        .enter => |value| value.window,
+        .leave => |value| value.window,
+        .key => |value| value.window,
+    };
+}
+
+fn textInputWindow(event: TextInputEvent) WindowHandle {
+    return switch (event) {
+        .enter, .leave => |window| window,
+        .batch => |batch| batch.window,
+    };
+}
+
+fn cloneTextInput(allocator: std.mem.Allocator, event: TextInputEvent) !TextInputEvent {
+    return switch (event) {
+        .enter => |window| .{ .enter = window },
+        .leave => |window| .{ .leave = window },
+        .batch => |batch| blk: {
+            const commit_text = if (batch.commit) |commit|
+                if (commit.text) |text| try allocator.dupe(u8, text) else null
+            else
+                null;
+            errdefer if (commit_text) |text| allocator.free(text);
+            const preedit_text = if (batch.preedit) |preedit|
+                if (preedit.text) |text| try allocator.dupe(u8, text) else null
+            else
+                null;
+            break :blk .{ .batch = .{
+                .window = batch.window,
+                .serial = batch.serial,
+                .serial_matches_state = batch.serial_matches_state,
+                .delete_surrounding = batch.delete_surrounding,
+                .commit = if (batch.commit != null) .{ .text = commit_text } else null,
+                .preedit = if (batch.preedit) |preedit| .{
+                    .text = preedit_text,
+                    .cursor_begin = preedit.cursor_begin,
+                    .cursor_end = preedit.cursor_end,
+                } else null,
+            } };
+        },
+    };
+}
+
+fn freeTextInput(allocator: std.mem.Allocator, event: TextInputEvent) void {
+    switch (event) {
+        .batch => |batch| {
+            if (batch.commit) |commit| if (commit.text) |text| allocator.free(text);
+            if (batch.preedit) |preedit| if (preedit.text) |text| allocator.free(text);
+        },
+        else => {},
+    }
 }
 
 fn validateDeclarations(declarations: []const ToplevelDeclaration) !void {
@@ -501,6 +589,41 @@ test "typed pointer events remain data until platform translation" {
     try std.testing.expectEqual(@as(u32, 42), queued.time_ms);
     try std.testing.expectEqual(@as(f32, 12.5), queued.position.x);
     try std.testing.expectEqual(@as(f32, 8.25), queued.position.y);
+
+    try windows.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try windows.markClosed(handle);
+    try windows.reconcile(&.{});
+}
+
+test "text input batches own protocol strings until safe-point translation" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 2, 1, 0);
+    defer scheduler.deinit();
+    var host: FakeHost = .{};
+    var windows: WindowSet = undefined;
+    try windows.init(std.testing.allocator, &scheduler, host.interface(), 1, 2);
+    defer windows.deinit();
+
+    try windows.reconcile(&.{.{ .id = "main", .title = "Main" }});
+    const handle = host.actions[0].create.handle;
+    var commit = [_]u8{ 'o', 'k' };
+    var preedit = [_]u8{ 'n', 'e', 'w' };
+    try windows.eventSink().textInput(.{ .batch = .{
+        .window = handle,
+        .serial = 4,
+        .serial_matches_state = true,
+        .delete_surrounding = .{ .before_bytes = 1, .after_bytes = 0 },
+        .commit = .{ .text = &commit },
+        .preedit = .{ .text = &preedit, .cursor_begin = 0, .cursor_end = 3 },
+    } });
+    @memset(&commit, 'x');
+    @memset(&preedit, 'x');
+
+    const event = windows.takeEvent().?;
+    defer windows.releaseEvent(event);
+    try std.testing.expectEqualStrings("ok", event.text_input.batch.commit.?.text.?);
+    try std.testing.expectEqualStrings("new", event.text_input.batch.preedit.?.text.?);
 
     try windows.reconcile(&.{});
     try scheduler.applyQueuedCancellations();

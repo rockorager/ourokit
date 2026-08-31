@@ -6,7 +6,10 @@ pub const OperationKind = @import("io_uring.zig").OperationKind;
 pub const OpenHow = @import("io_uring.zig").OpenHow;
 pub const Resolve = @import("io_uring.zig").Resolve;
 pub const Dispatch = @import("io_uring.zig").Dispatch;
+pub const TimerHandle = @import("timer_heap.zig").TimerHandle;
+pub const TimerHeap = @import("timer_heap.zig").TimerHeap;
 
 test {
     _ = @import("io_uring.zig");
+    _ = @import("timer_heap.zig");
 }

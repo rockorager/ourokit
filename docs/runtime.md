@@ -3,15 +3,39 @@
 ## Raw io_uring
 
 `src/loop` owns ring creation, destruction, preparation, submission, waiting,
-CQE dispatch, timers, and cancellation. The first operation directory is
-allocated once and does not move. `user_data` encodes only operation kind,
-24-bit slot, and 32-bit generation. Dispatch validates all fields before slot
-access; stale and foreign completions are explicit outcomes.
+CQE dispatch, timers, and cancellation. Logical timers live in a dynamically
+growing userspace min-heap with generation-checked handles and deterministic
+insertion-order ties. Their handles never enter kernel `user_data`.
 
-Timeout storage lives in its slot until the timeout's terminal CQE. Cancellation
-uses `IORING_OP_TIMEOUT_REMOVE`; the cancel CQE does not release the operation
-slot because the timeout CQE may arrive later. Tests exercise both expiration
+One absolute `IORING_OP_TIMEOUT` tracks the earliest heap deadline regardless
+of logical timer count. `IORING_TIMEOUT_UPDATE` moves that alarm when the root
+changes; removing the final timer cancels it. Alarm, update, removal, and the
+retired cancellation CQE are tracked separately so every legal CQE ordering is
+safe. Logical cancellation invalidates its handle immediately. Tests exercise
+heap ordering/growth/stale handles, one-alarm operation, updates, expiration,
 and cancellation against the real kernel.
+
+Wayland keyboard repeat uses the same heap. The adapter honors compositor
+`repeat_info`, asks xkbcommon whether the held key repeats, cancels on release,
+focus leave, or capability loss, and rearms one logical timer per held key. An
+expired repeat queues a translated `.repeated` key event; it cannot enter Lua or
+mutate retained UI during CQE dispatch. Fractional-millisecond rates retain
+nanosecond cadence rather than accumulating integer-millisecond truncation.
+
+Wayland text composition is a separate channel from keyboard metadata. Ourokit
+binds `zwp_text_input_manager_v3` through generated Wayring code and creates a
+per-seat text-input object, but does not enable it merely because a surface has
+keyboard focus. A retained editable target must explicitly activate it with
+validated UTF-8 surrounding text, byte-indexed cursor/anchor state, content
+hints/purpose, and optional cursor geometry.
+
+Incoming preedit, commit, and surrounding-delete messages borrow Wayring's
+receive storage, so the adapter copies each fragment into bounded host-owned
+storage. Only `done` emits one atomic batch; the window event queue then owns
+another copy until the platform-input safe point. A mismatched `done` serial is
+reported with the edits (which must still be applied) while preventing callers
+from treating compositor state as synchronized. No protocol callback resumes
+Lua or mutates an editable model.
 
 ## Tasks and resources
 
@@ -45,7 +69,7 @@ One isolated `lua.Vm` owns growable stable-address slabs of coroutine tasks. Eac
 task has generation-checked Lua identity, a language-neutral scheduler handle,
 an explicit application/window/widget owner scope, and a Lua registry reference
 that anchors its coroutine without retaining it accidentally on the main stack.
-Direct scheduler-slot and preallocated `io_uring` operation-slot maps route
+Direct scheduler-slot and growable logical-timer maps route
 resumes and completions rather than scanning tasks. Slabs grow only when task
 creation exhausts the free list; existing entries never move, and resume/CQE
 paths do not allocate. Multiple coroutines may wait independently while Lua
@@ -64,16 +88,17 @@ source. The proof async API currently exposes `ouro.sleep(milliseconds)`. Its C
 callback
 uses the VM's current generation-checked task, records the request, and calls
 `lua_yieldk`. After `lua_resume` reports a yield, Zig registers the timer under
-that task's actual owner scope and prepares a real ring timeout. The CQE phase
-validates completion and marks only the corresponding language-neutral task
-runnable; it cannot call Lua. The next task phase calls `lua_resume`, which
+that task's actual owner scope and inserts a generation-checked logical timer.
+The shared heap's one real ring alarm wakes the CQE phase, which drains expired
+handles and marks only the corresponding language-neutral tasks runnable; it
+cannot call Lua. The next task phase calls `lua_resume`, which
 enters the continuation and then application code. No Zig stack frame survives
 across the yield. Normal completion, errors, and cancellation call Lua 5.5's
 `lua_closethread` before releasing the registry reference, ensuring pending
 to-be-closed values unwind and the slot can be safely generation-reused.
 
 Mounted UI builds extend the same Ouro-owned table with the constructor-specific
-`row`, `column`, `label`, and `button` functions. They are available only during
+`row`, `column`, `scroll`, `label`, and `button` functions. They are available only during
 a protected build-owner callback in the reconciliation phase, cannot yield, and
 write directly into a bounded typed descriptor buffer. Applications provide
 stable string keys; numeric descriptor IDs, parent links, generic widget table

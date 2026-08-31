@@ -1,10 +1,12 @@
 //! Final headless assembly of selected lines into positioned glyph spans.
 
 const std = @import("std");
+const uucode = @import("uucode");
 const PointF = @import("../core/geometry.zig").PointF;
 const api = @import("api.zig");
 const line_layout = @import("line_layout.zig");
 const paragraph = @import("paragraph.zig");
+const paragraph_style = @import("paragraph_style.zig");
 const shaped_paragraph = @import("shaped_paragraph.zig");
 
 pub const Glyph = struct {
@@ -15,6 +17,9 @@ pub const Glyph = struct {
     /// downward, unlike HarfBuzz's Y coordinates.
     origin: PointF,
     advance: PointF,
+    /// True for presentation glyphs such as an ellipsis that do not consume a
+    /// source range. Their cluster is the source insertion boundary.
+    synthetic: bool = false,
 };
 
 pub const Span = struct {
@@ -30,6 +35,11 @@ pub const Span = struct {
 pub const Line = struct {
     byte_start: usize,
     byte_len: usize,
+    /// Logical top edge relative to the paragraph origin.
+    top: f32,
+    /// Physical offset from the paragraph's left edge. Start and end are
+    /// resolved from this line's UAX #9 base direction during positioning.
+    left: f32,
     advance: f32,
     ascender: f32,
     descender: f32,
@@ -47,6 +57,10 @@ pub const PositionedLines = struct {
     lines: []Line,
     spans: []Span,
     glyphs: []Glyph,
+    layout_width: f32,
+    truncated: bool,
+    source_byte_len: usize,
+    ellipsis_byte_offset: ?usize,
 
     pub fn deinit(self: *PositionedLines) void {
         self.allocator.free(self.glyphs);
@@ -61,6 +75,16 @@ pub const PositionedLines = struct {
 
     pub fn glyphsFor(self: *const PositionedLines, span: Span) []const Glyph {
         return self.glyphs[span.glyph_start..][0..span.glyph_count];
+    }
+
+    pub fn width(self: *const PositionedLines) f32 {
+        return self.layout_width;
+    }
+
+    pub fn height(self: *const PositionedLines) f32 {
+        if (self.lines.len == 0) return 0;
+        const last = self.lines[self.lines.len - 1];
+        return last.top + @max(0, last.ascender - last.descender + last.line_gap);
     }
 };
 
@@ -91,16 +115,38 @@ pub fn positionLines(
     shaped: *const shaped_paragraph.ShapedParagraphs,
     selected: *const line_layout.GreedyLines,
 ) !PositionedLines {
+    return positionLinesWithStyle(allocator, utf8, shaped, selected, .{}, null);
+}
+
+/// Positions only visible lines and resolves physical line offsets. A finite
+/// available width makes paragraph alignment observable; null preserves the
+/// natural width used by unconstrained measurement.
+pub fn positionLinesWithStyle(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    shaped: *const shaped_paragraph.ShapedParagraphs,
+    selected: *const line_layout.GreedyLines,
+    style: paragraph_style.Style,
+    available_width: ?f32,
+) !PositionedLines {
     if (utf8.len != shaped.text_len) return error.InvalidShaping;
+    if (style.max_lines == 0) return error.InvalidMaxLines;
+    if (available_width) |width|
+        if (!std.math.isFinite(width) or width < 0) return error.InvalidWidth;
+    const visible_count = @min(
+        selected.lines.len,
+        if (style.max_lines) |count| @as(usize, count) else selected.lines.len,
+    );
     var lines: std.ArrayList(Line) = .empty;
     errdefer lines.deinit(allocator);
     var spans: std.ArrayList(Span) = .empty;
     errdefer spans.deinit(allocator);
     var glyphs: std.ArrayList(Glyph) = .empty;
     errdefer glyphs.deinit(allocator);
-    try lines.ensureTotalCapacity(allocator, selected.lines.len);
+    try lines.ensureTotalCapacity(allocator, visible_count);
+    var line_top: f32 = 0;
 
-    for (selected.lines) |selected_line| {
+    for (selected.lines[0..visible_count], 0..) |selected_line, line_index| {
         if (!std.math.isFinite(selected_line.advance) or selected_line.advance < 0)
             return error.InvalidMeasurements;
         var fragments: std.ArrayList(Fragment) = .empty;
@@ -135,11 +181,35 @@ pub fn positionLines(
             return error.ReflowRequired;
         if (changed_advance) return error.InvalidMeasurements;
 
+        if (style.alignment == .justify and
+            line_index + 1 < visible_count and
+            !selected_line.mandatory and
+            available_width != null)
+        {
+            pen_x = justifyLine(
+                utf8,
+                spans.items[line_span_start..],
+                glyphs.items[line_glyph_start..],
+                pen_x,
+                available_width.?,
+            );
+        }
+
         var metrics: api.Metrics = .{ .ascender = 0, .descender = 0, .line_gap = 0 };
         for (fragments.items) |*fragment| mergeMetrics(&metrics, fragment.result().metrics);
+        const line_height = @max(0, metrics.ascender - metrics.descender + metrics.line_gap);
+        if (!std.math.isFinite(line_height) or !std.math.isFinite(line_top))
+            return error.InvalidShaping;
         lines.appendAssumeCapacity(.{
             .byte_start = selected_line.byte_start,
             .byte_len = selected_line.byte_len,
+            .top = line_top,
+            .left = alignmentOffset(
+                style.alignment,
+                available_width orelse pen_x,
+                pen_x,
+                selected_line.base_level,
+            ),
             .advance = pen_x,
             .ascender = metrics.ascender,
             .descender = metrics.descender,
@@ -150,18 +220,88 @@ pub fn positionLines(
             .glyph_start = line_glyph_start,
             .glyph_count = glyphs.items.len - line_glyph_start,
         });
+        line_top += line_height;
     }
 
     const owned_lines = try lines.toOwnedSlice(allocator);
     errdefer allocator.free(owned_lines);
     const owned_spans = try spans.toOwnedSlice(allocator);
     errdefer allocator.free(owned_spans);
+    var natural_width: f32 = 0;
+    for (owned_lines) |line| natural_width = @max(natural_width, line.advance);
     return .{
         .allocator = allocator,
         .lines = owned_lines,
         .spans = owned_spans,
         .glyphs = try glyphs.toOwnedSlice(allocator),
+        .layout_width = available_width orelse natural_width,
+        .truncated = visible_count < selected.lines.len,
+        .source_byte_len = utf8.len,
+        .ellipsis_byte_offset = null,
     };
+}
+
+fn alignmentOffset(
+    alignment: paragraph_style.Alignment,
+    available_width: f32,
+    line_width: f32,
+    base_level: u8,
+) f32 {
+    const remaining = @max(0, available_width - line_width);
+    return switch (alignment) {
+        .start => if (base_level & 1 == 0) 0 else remaining,
+        .end => if (base_level & 1 == 0) remaining else 0,
+        .center => remaining / 2,
+        .justify => 0,
+    };
+}
+
+/// Expands only Unicode line-break class SP glyphs that have visible glyphs on
+/// both physical sides. Glyphs are already assembled in left-to-right visual
+/// order, so this is linear and independent of logical bidi order. Script-
+/// specific kashida and inter-character CJK expansion remain separate policy.
+fn justifyLine(
+    utf8: []const u8,
+    spans: []Span,
+    glyphs: []Glyph,
+    natural_width: f32,
+    available_width: f32,
+) f32 {
+    const extra = @max(0, available_width - natural_width);
+    if (extra == 0 or glyphs.len < 3) return natural_width;
+    var opportunities: usize = 0;
+    for (glyphs[1 .. glyphs.len - 1]) |glyph|
+        if (isExpandableSpace(utf8, glyph)) {
+            opportunities += 1;
+        };
+    if (opportunities == 0) return natural_width;
+
+    const per_opportunity = extra / @as(f32, @floatFromInt(opportunities));
+    var shift: f32 = 0;
+    var physical_index: usize = 0;
+    for (spans) |*span| {
+        var span_expansion: f32 = 0;
+        for (glyphs[span.glyph_start - spans[0].glyph_start ..][0..span.glyph_count]) |*glyph| {
+            glyph.origin.x += shift;
+            if (physical_index != 0 and physical_index + 1 < glyphs.len and
+                isExpandableSpace(utf8, glyph.*))
+            {
+                shift += per_opportunity;
+                span_expansion += per_opportunity;
+            }
+            physical_index += 1;
+        }
+        span.advance += span_expansion;
+    }
+    return natural_width + shift;
+}
+
+fn isExpandableSpace(utf8: []const u8, glyph: Glyph) bool {
+    if (glyph.synthetic or glyph.cluster >= utf8.len) return false;
+    const sequence_len = std.unicode.utf8ByteSequenceLength(utf8[glyph.cluster]) catch return false;
+    if (glyph.cluster + sequence_len > utf8.len) return false;
+    const codepoint = std.unicode.utf8Decode(utf8[glyph.cluster..][0..sequence_len]) catch return false;
+    return uucode.get(.line_break, codepoint) == .sp;
 }
 
 fn buildFragments(
@@ -394,6 +534,70 @@ test "positioned assembly unwinds every caller-owned allocation failure" {
         exerciseAllocationFailure,
         .{&value},
     );
+}
+
+test "paragraph alignment resolves from each line base direction and clips whole lines" {
+    const fixture = @import("positioned_lines_test.zig");
+    var value: fixture.Fixture = undefined;
+    try value.init("one two three four five six", 45);
+    defer value.deinit();
+    try std.testing.expect(value.selected.lines.len > 1);
+
+    var centered = try positionLinesWithStyle(
+        std.testing.allocator,
+        value.utf8,
+        &value.shaped,
+        &value.selected,
+        .{ .alignment = .center, .max_lines = 1 },
+        100,
+    );
+    defer centered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), centered.lines.len);
+    try std.testing.expect(centered.truncated);
+    try std.testing.expectEqual(@as(f32, 100), centered.width());
+    try std.testing.expectApproxEqAbs(
+        (100 - centered.lines[0].advance) / 2,
+        centered.lines[0].left,
+        0.001,
+    );
+
+    value.selected.lines[0].base_level = 1;
+    var rtl_start = try positionLinesWithStyle(
+        std.testing.allocator,
+        value.utf8,
+        &value.shaped,
+        &value.selected,
+        .{ .max_lines = 1 },
+        100,
+    );
+    defer rtl_start.deinit();
+    try std.testing.expectApproxEqAbs(
+        100 - rtl_start.lines[0].advance,
+        rtl_start.lines[0].left,
+        0.001,
+    );
+}
+
+test "inter-word justification expands visual gaps in linear order" {
+    var spans = [_]Span{.{
+        .font = .{ .slot = 1, .generation = 1 },
+        .direction = .left_to_right,
+        .byte_start = 0,
+        .byte_len = 3,
+        .advance = 15,
+        .glyph_start = 0,
+        .glyph_count = 3,
+    }};
+    var glyphs = [_]Glyph{
+        .{ .id = 1, .cluster = 0, .origin = .{ .x = 0 }, .advance = .{ .x = 5 } },
+        .{ .id = 2, .cluster = 1, .origin = .{ .x = 5 }, .advance = .{ .x = 5 } },
+        .{ .id = 3, .cluster = 2, .origin = .{ .x = 10 }, .advance = .{ .x = 5 } },
+    };
+    try std.testing.expectEqual(@as(f32, 25), justifyLine("a b", &spans, &glyphs, 15, 25));
+    try std.testing.expectEqual(@as(f32, 0), glyphs[0].origin.x);
+    try std.testing.expectEqual(@as(f32, 5), glyphs[1].origin.x);
+    try std.testing.expectEqual(@as(f32, 20), glyphs[2].origin.x);
+    try std.testing.expectEqual(@as(f32, 25), spans[0].advance);
 }
 
 fn exerciseAllocationFailure(

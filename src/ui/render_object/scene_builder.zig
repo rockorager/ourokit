@@ -4,6 +4,7 @@ const PointF = @import("../../core/geometry.zig").PointF;
 const RectF = @import("../../core/geometry.zig").RectF;
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
+const ParagraphHandle = @import("../../text/paragraph_cache.zig").ParagraphHandle;
 const ShapeHandle = @import("../../text/shape_cache.zig").ShapeHandle;
 
 /// Allocation-free lowering from logical layout coordinates to the existing
@@ -66,6 +67,20 @@ pub const Builder = struct {
         try self.append(.{ .glyph_run = .{
             .shape = shape,
             .origin = .{ .x = baseline.x * self.scale, .y = baseline.y * self.scale },
+            .scale = self.scale,
+            .color = color,
+        } });
+    }
+
+    pub fn paragraph(
+        self: *Builder,
+        layout: ParagraphHandle,
+        origin: PointF,
+        color: Color,
+    ) !void {
+        try self.append(.{ .paragraph = .{
+            .layout = layout,
+            .origin = .{ .x = origin.x * self.scale, .y = origin.y * self.scale },
             .scale = self.scale,
             .color = color,
         } });

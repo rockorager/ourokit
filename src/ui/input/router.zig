@@ -19,6 +19,7 @@ pub const Event = union(enum) {
         hovered: ?instance.InstanceHandle,
         event: platform_window.PointerEvent,
     },
+    keyboard: platform_window.KeyboardEvent,
 };
 
 /// State-only pointer router. Platform events become bounded instance-targeted
@@ -119,6 +120,12 @@ pub const Router = struct {
         }
     }
 
+    pub fn routeKeyboard(self: *Router, event: platform_window.KeyboardEvent) !void {
+        if (!sameWindow(keyboardWindow(event), self.window)) return error.WrongWindow;
+        try self.ensureSpace(1);
+        self.enqueueAssumeCapacity(.{ .keyboard = event });
+    }
+
     pub fn takeEvent(self: *Router) ?Event {
         if (self.count == 0) return null;
         const event = self.events[self.head];
@@ -180,6 +187,14 @@ fn pointerWindow(event: platform_window.PointerEvent) platform_window.WindowHand
         .axis_steps => |value| value.window,
         .axis_steps120 => |value| value.window,
         .frame => |window| window,
+    };
+}
+
+fn keyboardWindow(event: platform_window.KeyboardEvent) platform_window.WindowHandle {
+    return switch (event) {
+        .enter => |value| value.window,
+        .leave => |value| value.window,
+        .key => |value| value.window,
     };
 }
 

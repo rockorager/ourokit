@@ -77,14 +77,13 @@ pub fn build(b: *std.Build) void {
         "vulkan",
         "Enable the Vulkan renderer and dma-buf presentation",
     ) orelse true;
+    const enable_xkbcommon = b.option(
+        bool,
+        "xkbcommon",
+        "Enable Wayland keyboard translation through system xkbcommon",
+    ) orelse (target.query.isNative() and target.result.os.tag == .linux);
     const unicode_ucd = b.dependency("unicode_ucd", .{});
     const uucode_config = addUucodeConfig(b, unicode_ucd);
-    const wayring = b.dependency("wayring", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const wayring_host = b.dependency("wayring", .{});
-    const lua = b.dependency("lua", .{});
     const harfbuzz = b.dependency("harfbuzz", .{});
     const sheenbidi = b.dependency("sheenbidi", .{});
     const uucode = b.dependency("uucode", .{
@@ -93,6 +92,37 @@ pub fn build(b: *std.Build) void {
         .build_config_path = uucode_config,
     });
     const script_extensions = addScriptExtensions(b, target, optimize, uucode, unicode_ucd);
+
+    const ourokit_ui = b.addModule("ourokit_ui", .{
+        .root_source_file = b.path("src/ourokit_ui.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "uucode", .module = uucode.module("uucode") },
+            .{ .name = "script_extensions", .module = script_extensions },
+        },
+    });
+    addHarfBuzz(ourokit_ui, harfbuzz);
+    addSheenBidi(ourokit_ui, sheenbidi);
+    const ourokit_ui_options = b.addOptions();
+    ourokit_ui_options.addOption(bool, "fontconfig", false);
+    ourokit_ui_options.addOption(bool, "freetype", enable_freetype);
+    ourokit_ui_options.addOption(bool, "vulkan", false);
+    ourokit_ui.addOptions("ourokit_build_options", ourokit_ui_options);
+    ourokit_ui.addAnonymousImport("unicode_line_break_tests", .{
+        .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
+    });
+    if (enable_freetype) {
+        ourokit_ui.linkSystemLibrary("freetype2", .{});
+        ourokit_ui.link_libc = true;
+    }
+
+    const wayring = b.dependency("wayring", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const wayring_host = b.dependency("wayring", .{});
+    const lua = b.dependency("lua", .{});
     const wayland_protocol = addWaylandProtocol(b, target, optimize, wayring, wayring_host);
 
     const ourokit = b.addModule("ourokit", .{
@@ -114,6 +144,7 @@ pub fn build(b: *std.Build) void {
     ourokit_options.addOption(bool, "fontconfig", enable_fontconfig);
     ourokit_options.addOption(bool, "freetype", enable_freetype);
     ourokit_options.addOption(bool, "vulkan", enable_vulkan);
+    ourokit_options.addOption(bool, "xkbcommon", enable_xkbcommon);
     ourokit.addOptions("ourokit_build_options", ourokit_options);
     ourokit.addAnonymousImport("unicode_line_break_tests", .{
         .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
@@ -126,12 +157,22 @@ pub fn build(b: *std.Build) void {
         ourokit.linkSystemLibrary("freetype2", .{});
         ourokit.link_libc = true;
     }
+    if (enable_xkbcommon) ourokit.linkSystemLibrary("xkbcommon", .{});
 
     const library = b.addLibrary(.{
         .name = "ourokit",
         .root_module = ourokit,
     });
     b.installArtifact(library);
+
+    const storybook_font = b.lazyDependency("inter", .{}) orelse return;
+    ourokit.addAnonymousImport("ourokit_storybook_font", .{
+        .root_source_file = storybook_font.path("extras/ttf/Inter-Regular.ttf"),
+    });
+    const storybook_arabic_font = b.lazyDependency("noto_sans_arabic", .{}) orelse return;
+    ourokit.addAnonymousImport("ourokit_storybook_arabic_font", .{
+        .root_source_file = storybook_arabic_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
+    });
 
     const token_check = b.addSystemCommand(&.{ "python3", "tools/design/generate_tokens.py", "--check" });
     const token_step = b.step("tokens", "Validate tokens and check generated Zig data");
@@ -144,24 +185,72 @@ pub fn build(b: *std.Build) void {
 
     addWaylandExample(b, target, optimize, ourokit, enable_vulkan);
     addRendererBenchmark(b, target, optimize, ourokit);
-    addParagraphBenchmark(b, target, optimize, ourokit);
+    addParagraphBenchmark(
+        b,
+        target,
+        optimize,
+        ourokit,
+        storybook_font,
+        storybook_arabic_font,
+    );
 
-    const test_font = b.lazyDependency("inter", .{}) orelse return;
+    const test_font = storybook_font;
     ourokit.addAnonymousImport("ourokit_test_font", .{
         .root_source_file = test_font.path("InterVariable.ttf"),
     });
     ourokit.addAnonymousImport("ourokit_test_font_static", .{
         .root_source_file = test_font.path("extras/ttf/Inter-Regular.ttf"),
     });
-    const arabic_test_font = b.lazyDependency("noto_sans_arabic", .{}) orelse return;
+    const arabic_test_font = storybook_arabic_font;
     ourokit.addAnonymousImport("ourokit_arabic_test_font", .{
         .root_source_file = arabic_test_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
     });
-    const tests = b.addTest(.{ .root_module = ourokit });
+    const test_filters: []const []const u8 = if (b.option(
+        []const u8,
+        "test-filter",
+        "Run only tests whose names contain this text",
+    )) |filter| &.{filter} else &.{};
+    const tests = b.addTest(.{ .root_module = ourokit, .filters = test_filters });
     const run_tests = b.addRunArtifact(tests);
     run_tests.step.dependOn(&token_check.step);
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    const ui_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/native_titlebar.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit_ui", .module = ourokit_ui }},
+        }),
+    });
+    const run_ui_tests = b.addRunArtifact(ui_tests);
     const test_step = b.step("test", "Run all deterministic and integration tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_ui_tests.step);
+
+    const ui_test_step = b.step("test-ourokit-ui", "Run platform-neutral UI integration tests");
+    ui_test_step.dependOn(&run_ui_tests.step);
+
+    const consumer_smoke = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "--build-file",
+        "tests/embedding/build.zig",
+        "test",
+    });
+    consumer_smoke.setCwd(b.path("."));
+    const consumer_smoke_step = b.step(
+        "test-ourokit-ui-consumer",
+        "Build and run an external package importing only ourokit_ui",
+    );
+    consumer_smoke_step.dependOn(&consumer_smoke.step);
 }
 
 fn addUucodeConfig(b: *std.Build, unicode_ucd: *std.Build.Dependency) std.Build.LazyPath {
@@ -212,18 +301,27 @@ fn addParagraphBenchmark(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     ourokit: *std.Build.Module,
+    latin_font: *std.Build.Dependency,
+    arabic_font: *std.Build.Dependency,
 ) void {
+    const module = b.createModule(.{
+        .root_source_file = b.path("tools/text/paragraph_benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+    });
+    module.addAnonymousImport("ourokit_benchmark_font", .{
+        .root_source_file = latin_font.path("extras/ttf/Inter-Regular.ttf"),
+    });
+    module.addAnonymousImport("ourokit_benchmark_arabic_font", .{
+        .root_source_file = arabic_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
+    });
     const benchmark = b.addExecutable(.{
         .name = "ourokit-paragraph-benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/text/paragraph_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
-        }),
+        .root_module = module,
     });
     const run = b.addRunArtifact(benchmark);
-    const step = b.step("bench-paragraph", "Benchmark headless paragraph itemization stages");
+    const step = b.step("bench-paragraph", "Benchmark headless paragraph analysis and layout");
     step.dependOn(&run.step);
 }
 
@@ -335,7 +433,7 @@ fn addWaylandExample(
     enable_vulkan: bool,
 ) void {
     const host = b.addExecutable(.{
-        .name = "ourokit-run",
+        .name = "ourokit",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -343,7 +441,9 @@ fn addWaylandExample(
             .imports = &.{.{ .name = "ourokit", .module = ourokit }},
         }),
     });
+    b.installArtifact(host);
     const run_host = b.addRunArtifact(host);
+    run_host.addArg("run");
     if (b.args) |args| run_host.addArgs(args);
     const run_host_step = b.step("run-app", "Run a declarative Lua application");
     run_host_step.dependOn(&run_host.step);
@@ -422,6 +522,7 @@ fn addWaylandProtocol(
     generate.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));
     generate.addFileArg(wayland_protocols.path("staging/fractional-scale/fractional-scale-v1.xml"));
     generate.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
+    generate.addFileArg(wayland_protocols.path("unstable/text-input/text-input-unstable-v3.xml"));
     const generated = generate.addOutputFileArg("ourokit-wayland-protocol.zig");
     return b.createModule(.{
         .root_source_file = generated,

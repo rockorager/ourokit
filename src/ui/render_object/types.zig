@@ -1,6 +1,7 @@
 const Color = @import("../../core/color.zig").Color;
 const Insets = @import("../../core/geometry.zig").Insets;
-const ShapeHandle = @import("../../text/shape_cache.zig").ShapeHandle;
+const ParagraphSourceHandle = @import("../../text/paragraph_source_cache.zig").ParagraphSourceHandle;
+const paragraph_style = @import("../../text/paragraph_style.zig");
 
 /// Physical alignment within a render object's available axis. Widget policy
 /// resolves direction-sensitive start/end before reaching this layer.
@@ -24,6 +25,9 @@ pub const Box = struct {
     border_color: ?Color = null,
     border_width: f32 = 0,
     corner_radius: f32 = 0,
+    outline_color: ?Color = null,
+    outline_width: f32 = 0,
+    outline_gap: f32 = 0,
     clip: bool = false,
 };
 
@@ -42,11 +46,20 @@ pub const Stack = struct {
     clip: bool = false,
 };
 
-/// A single already-itemized shaped run. Paragraph bidi, wrapping, selection,
-/// and editing intentionally remain outside this benchmark-oriented slice.
+/// A single-child viewport. Offset is retained by the corresponding instance,
+/// not declared widget data, and is applied to this render object separately.
+pub const Scroll = struct {
+    axis: Axis = .vertical,
+};
+
+/// Width-independent paragraph identity. The retained render-tree slot derives
+/// and caches a width-specific positioned layout from current constraints.
 pub const Label = struct {
-    shape: ShapeHandle,
+    source: ParagraphSourceHandle,
     color: Color,
+    alignment: paragraph_style.Alignment = .start,
+    max_lines: ?u32 = null,
+    overflow: paragraph_style.Overflow = .clip,
 };
 
 /// This is a small closed render-object vocabulary, not a generic widget node.
@@ -56,6 +69,7 @@ pub const Object = union(enum) {
     box: Box,
     flex: Flex,
     stack: Stack,
+    scroll: Scroll,
     label: Label,
 };
 

@@ -90,10 +90,11 @@ as backend policy. `core` contains only small values that break real cycles.
 ## Event loop and safe points
 
 Ourokit owns and directly drives one `std.os.linux.IoUring`. Operation identity
-is a slot plus generation encoded into `user_data`; allocated pointers are
-never encoded. Slots retain kernel-referenced timeout storage until terminal
-CQEs. Cancel CQEs and operation CQEs are tracked separately, so either ordering
-is safe. Wayring and all future I/O share this ring.
+is generation checked and allocated pointers are never encoded into
+`user_data`. Logical timers use a userspace min-heap and consume no SQEs of
+their own. One absolute kernel timeout follows the earliest deadline and moves
+through `IORING_TIMEOUT_UPDATE`; cancellation, update, alarm, and retired CQEs
+are tracked independently. Wayring and all future I/O share this ring.
 
 Each application turn has explicit phases:
 
@@ -152,8 +153,8 @@ before passing CQEs to Wayring.
 
 Shared-ring constraints:
 
-- Wayring reserves low `user_data` bytes 1 through 5; Ourokit uses `0xa0` and
-  `0xa1` for first-milestone timeout operations.
+- Wayring reserves low `user_data` bytes 1 through 5; Ourokit uses `0xa0`
+  through `0xa2` for its timer alarm/update/remove namespace.
 - Wayring's provided-buffer group ID must not collide with other users.
 - The ring and Wayring reactor retain stable addresses.
 - SQ capacity and submission ownership are shared.
@@ -169,11 +170,25 @@ flush. Ourokit's host retains the display connection, registry, required
 globals, per-window surfaces, configure state, frame callbacks, persistent
 shared-memory buffers, and independent close state rather than flattening them
 into a fictional generic window protocol. The host binds `wl_seat` when present
-and translates pointer enter/leave, motion, buttons, scrolling, and frame
-grouping into bounded typed application data. Raw Wayland fixed-point values
-and protocol handles do not cross that boundary. Keyboard support remains a
-separate addition because keymap and compose handling require an explicit XKB
-design rather than raw key events masquerading as text input.
+and translates pointer enter/leave, motion, buttons, scrolling, keyboard focus,
+keys, and frame grouping into bounded typed application data. Raw Wayland
+fixed-point values and protocol handles do not cross that boundary. The adapter
+compiles compositor-provided keymaps with xkbcommon and retains raw keycode,
+keysym, logical navigation key, modifiers, and Unicode scalar separately. Text
+composition and committed text use Wayring's generated `text-input-v3`
+bindings; raw key events do not masquerade as committed text. The adapter
+creates one text-input object per seat but leaves it disabled until a retained
+editable target explicitly owns focus. Borrowed protocol strings are copied
+and `preedit_string`, `commit_string`, and `delete_surrounding_text` fragments
+remain pending until `done` queues one owned platform batch. Application state
+can consume that batch only at the input safe point. Enable/disable, surrounding
+text, content purpose/hints, cursor rectangle, and commit serials remain behind
+the platform adapter rather than leaking Wayring objects into UI code.
+
+`wl_keyboard.repeat_info` drives client-side repeat through the shared logical
+timer heap. Xkbcommon decides whether a physical key repeats and retranslates it
+against current modifiers on each expiration. The timer CQE only queues a
+`.repeated` platform event; retained input policy consumes it at the safe point.
 
 Driver dispatch can prepare SQEs before returning. The host records that fact
 until the application flush phase submits the shared ring; calling `prepare`
@@ -213,7 +228,8 @@ tables; component schemas should eventually generate Lua constructors, compact
 Zig decoding, language-server types, documentation, and validation tests. That
 generator is not part of milestone one, and no permanent widget ABI is frozen.
 The first constructor-specific decoders prove the intended seam. `ouro.row`
-and `ouro.column` emit Flex descriptors, `ouro.label` emits Label, and
+and `ouro.column` emit Flex descriptors, `ouro.scroll` emits a single-child
+viewport descriptor with instance-retained offset, `ouro.label` emits Label, and
 `ouro.button` emits Box plus Label descriptors and a typed widget binding.
 A bounded nested build context derives native identity and parent links from
 stable local keys, so applications never manage numeric IDs. These constructors
@@ -374,13 +390,22 @@ touching unsafe boundaries are conservatively reshaped with full paragraph
 context; a changed advance returns `error.ReflowRequired` so stale wrap choices
 cannot reach a renderer. Renderers never perform this text policy.
 
-Positioned paragraph output remains owned by `text` until the scene has direct
-font-resource leases. Owned frames now retain existing `ShapeHandle` commands
-through the application-owned shape cache, making current single-run labels safe
-for asynchronous consumption. The existing one-handle glyph command still
-cannot faithfully represent wrapped mixed-direction, multi-font lines and will
-not be stretched into an accidental paragraph ABI. Direct positioned-span
-leases and Label/render-object lowering are the next integration step.
+Positioned paragraph output is owned by an application-scoped `ParagraphCache`.
+Its width-specific immutable entries live behind generation-checked handles,
+deduplicate complete layout requests, and retain their ordered fallback fonts.
+The scene's paragraph command references one such handle; owned frames lease it
+until rendering completes. Software, Vulkan compute, and Vulkan dma-buf
+presentation consume the same already-positioned visual spans. The existing
+single-run glyph command remains a deliberately narrower shape-cache ABI rather
+than being stretched to represent wrapped mixed-direction lines.
+
+Retained Labels hold a generation-checked `ParagraphSourceHandle` identifying
+width-independent text/style/font inputs. Their render-tree slots own the
+current width-specific `ParagraphHandle`; a text/style or constraint change
+replaces that lease transactionally. Unchanged constraints return through the
+normal layout cache before paragraph lookup, shaping, or allocation. Lua Labels
+can therefore wrap mixed-direction text without moving text policy into Lua or
+either renderer.
 Empty-line metrics remain an open line-style policy rather than inheriting an
 arbitrary fallback face by accident.
 Fontconfig provides candidate order and a coverage prefilter, not a shaping
@@ -418,17 +443,28 @@ references. Font cache teardown follows shape-cache teardown. Refreshing the
 Fontconfig snapshot and revision is future safe-point orchestration, not a
 renderer concern.
 
-The benchmark-oriented first Label is intentionally narrower than a paragraph:
-one valid LTR run containing only Latin, Common, and Inherited script values.
-uucode enforces that boundary, so unsupported scripts fail rather than inheriting
-incorrect properties. Label owns no font or rasterizer state; it retains a shape
-handle, uses shaping metrics for one-way layout, and emits a baseline glyph-run
-command. Button is Box + Label composition with behavior in a language-neutral
-widget registry, not another core render object. That registry retains hover,
-pressed, disabled, and pointer-armed state across reconciliation. Pointer
-capture ensures a release reaches the pressed target, while release-inside
-decides activation. Design-generated semantic accent roles supply idle,
+Label owns no font or rasterizer state. It retains width-independent paragraph
+source identity, derives positioned lines from one-way constraints, and emits a
+paragraph command. Button is Box + Label composition with behavior in a
+language-neutral widget registry, not another core render object. That registry
+retains hover, pressed, disabled, and pointer-armed state across reconciliation.
+Pointer capture ensures a release reaches the pressed target, while release-
+inside decides activation. Design-generated semantic accent roles supply idle,
 hovered, and pressed colors.
+
+The `ui/text_input` boundary now contains a unit-testable editable value and a
+retained input-method session, but not yet a widget or render object. The value
+owns valid UTF-8, directional selection, revisions, and cached uucode
+extended-grapheme boundaries. The session keeps preedit outside committed text,
+applies delete/commit/preedit batches in protocol order, and exposes bounded
+surrounding state through an app-owned platform translator. A separate retained
+registry keys sessions and their content instances by generation-checked
+identity and build-owner lifetime; Lua rebuilds cannot reset edited values, and
+omission disposes composition state deterministically. Cursor movement at this
+layer is named logical previous/next; visual left/right, caret geometry, and
+selection painting wait for paragraph bidi/caret maps. The Wayring-backed
+adapter remains disabled until an actual retained TextInput owns focus. Raw xkb
+events are never application text.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,

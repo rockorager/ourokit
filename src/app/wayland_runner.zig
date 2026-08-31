@@ -26,6 +26,7 @@ pub const Options = struct {
     reload_requests: ?*ReloadRequests = null,
     application_window_capacity: usize = 16,
     window: WindowRuntimeConfig = .{},
+    scope_capacity: usize = 1024,
     platform_event_capacity: usize = 256,
     signal_capacity: usize = 256,
     subscription_capacity: usize = 1024,
@@ -62,6 +63,15 @@ pub fn runSource(
     provider: *const bundle.SourceProvider,
     options: Options,
 ) !void {
+    if (comptime text.has_fontconfig) return runSourceWithFontconfig(init, provider, options);
+    return error.FontconfigDisabled;
+}
+
+fn runSourceWithFontconfig(
+    init: std.process.Init,
+    provider: *const bundle.SourceProvider,
+    options: Options,
+) !void {
     var diagnostic: ?lua.Diagnostic = null;
     defer if (diagnostic) |*value| value.deinit();
     var snapshot = provider.snapshot(init.io, init.gpa) catch |err| {
@@ -78,13 +88,12 @@ pub fn runSource(
     defer if (snapshot_owned) snapshot.deinit();
     const module_root = try provider.openModuleRoot(init.io);
     defer if (module_root) |directory| directory.close(init.io);
-
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 128, 32);
     defer loop.deinit();
 
     var scheduler: task.Scheduler = undefined;
-    try scheduler.init(init.gpa, 32, 8, 8);
+    try scheduler.init(init.gpa, options.scope_capacity, 8, 8);
     defer scheduler.deinit();
 
     var callbacks: lua.CallbackRegistry = undefined;
@@ -104,8 +113,10 @@ pub fn runSource(
     defer fonts.deinit();
     const primary_font = try loadFont(init, &fonts, configured_fonts.faces[0]);
     defer fonts.release(primary_font) catch unreachable;
-    var shapes = text.ShapeCache.init(init.gpa, &fonts);
-    defer shapes.deinit();
+    var paragraph_sources = text.ParagraphSourceCache.init(init.gpa, &fonts);
+    defer paragraph_sources.deinit();
+    var paragraphs = text.ParagraphCache.init(init.gpa, &fonts);
+    defer paragraphs.deinit();
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
     var vulkan_renderer: renderer.vulkan = undefined;
@@ -117,7 +128,8 @@ pub fn runSource(
 
     const theme = design.tokens.light;
     const services: source_generation.UiServices = .{
-        .shapes = &shapes,
+        .paragraph_sources = &paragraph_sources,
+        .paragraphs = &paragraphs,
         .primary_font = primary_font,
         .theme = theme,
         .callbacks = &callbacks,
@@ -236,29 +248,40 @@ pub fn runSource(
                 slot.desired = false;
             }
         }
-        while (window_set.takeEvent()) |event| switch (event) {
-            .close_requested => |handle| {
-                if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
-                    if (slot.desired) {
-                        slot.desired = false;
-                        desired_changed = true;
+        while (window_set.takeEvent()) |event| {
+            defer window_set.releaseEvent(event);
+            switch (event) {
+                .close_requested => |handle| {
+                    if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
+                        if (slot.desired) {
+                            slot.desired = false;
+                            desired_changed = true;
+                        }
                     }
-                }
-            },
-            .configured => |configured| {
-                if (slotForNativeHandle(&window_set, runtime_slots, configured.window)) |slot| {
-                    slot.configured_size = .{
-                        .width = configured.width,
-                        .height = configured.height,
-                    };
-                    if (slot.runtime.registered) _ = try dirty.markDirty(configured.window);
-                }
-            },
-            .pointer => |pointer| {
-                if (slotForNativeHandle(&window_set, runtime_slots, pointerWindow(pointer))) |slot|
-                    if (slot.runtime.ready) try slot.runtime.routePointer(pointer);
-            },
-        };
+                },
+                .configured => |configured| {
+                    if (slotForNativeHandle(&window_set, runtime_slots, configured.window)) |slot| {
+                        slot.configured_size = .{
+                            .width = configured.width,
+                            .height = configured.height,
+                        };
+                        if (slot.runtime.registered) _ = try dirty.markDirty(configured.window);
+                    }
+                },
+                .pointer => |pointer| {
+                    if (slotForNativeHandle(&window_set, runtime_slots, pointerWindow(pointer))) |slot|
+                        if (slot.runtime.ready) try slot.runtime.routePointer(pointer);
+                },
+                .keyboard => |keyboard| {
+                    if (slotForNativeHandle(&window_set, runtime_slots, keyboardWindow(keyboard))) |slot|
+                        if (slot.runtime.ready) try slot.runtime.routeKeyboard(keyboard);
+                },
+                // The protocol path is complete but remains dormant until a
+                // retained TextInput explicitly owns focus. No raw key event
+                // is promoted to committed text as a fallback.
+                .text_input => {},
+            }
+        }
 
         // Task safe point: platform and CQE dispatch only changed state.
         try scheduler.applyQueuedCancellations();
@@ -296,8 +319,10 @@ pub fn runSource(
                     theme.surface_base,
                     theme.accent_default,
                     theme.surface_base,
+                    theme.focus_ring,
                     signals,
-                    &shapes,
+                    &paragraph_sources,
+                    &paragraphs,
                     options.window,
                 );
                 try dirty.register(handle);
@@ -373,14 +398,20 @@ pub fn runSource(
             if (slot.runtime.wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
                 const list = try slot.runtime.displayList();
                 (switch (frame_buffer.target) {
-                    .software => |target| renderer.software.renderText(list, .{
+                    .software => |target| renderer.software.renderTextResources(list, .{
                         .pixels = target.pixels,
                         .width = frame_buffer.width,
                         .height = frame_buffer.height,
                         .stride = target.stride,
                         .format = .bgra8_unorm,
-                    }, &glyphs, &shapes),
-                    .vulkan => |target| vulkan_renderer.renderDmabufText(list, target, &vulkan_glyphs, &shapes),
+                    }, &glyphs, null, &paragraphs),
+                    .vulkan => |target| vulkan_renderer.renderDmabufTextResources(
+                        list,
+                        target,
+                        &vulkan_glyphs,
+                        null,
+                        &paragraphs,
+                    ),
                 }) catch |err| {
                     try host.discardFrame(frame_buffer);
                     return err;
@@ -411,16 +442,19 @@ pub fn runSource(
             disconnect_started = true;
             try host.flush();
         }
-        if (host.quiescent() and window_set.retainedCount() == 0) break;
+        if (host.quiescent() and window_set.retainedCount() == 0 and
+            !loop.hasPendingTimerKernelWork()) break;
         if (desired_changed or window_set.changeSerial() != serial_before_flush) continue;
-        if (host.quiescent()) continue;
+        if (host.quiescent() and !loop.hasPendingTimerKernelWork()) continue;
 
         const completion = try loop.wait();
         switch (loop.dispatch(completion)) {
-            .timeout => |timeout| try source_reload.markTimeoutCompleted(timeout.operation),
-            .timeout_cancel => {},
             .file => |file| try source_reload.markFileCompleted(file),
             .operation_cancel => {},
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
+                if (try host.dispatchTimer(timeout.operation)) continue;
+                try source_reload.markTimeoutCompleted(timeout.operation);
+            },
             .foreign => try host.dispatchOne(completion),
             .stale => return error.StaleCompletion,
         }
@@ -630,6 +664,14 @@ fn pointerWindow(event: platform.window.PointerEvent) platform.window.WindowHand
         .axis_steps => |value| value.window,
         .axis_steps120 => |value| value.window,
         .frame => |window| window,
+    };
+}
+
+fn keyboardWindow(event: platform.window.KeyboardEvent) platform.window.WindowHandle {
+    return switch (event) {
+        .enter => |value| value.window,
+        .leave => |value| value.window,
+        .key => |value| value.window,
     };
 }
 

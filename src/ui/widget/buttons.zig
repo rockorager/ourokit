@@ -165,6 +165,16 @@ pub const Buttons = struct {
         };
     }
 
+    pub fn releaseKeyboard(self: *Buttons) Release {
+        const armed = self.armed orelse return .{};
+        self.armed = null;
+        const next = self.setPressed(armed, false);
+        return .{
+            .visual = if (next) |value| .{ .target = armed, .color = value } else null,
+            .activated = if (self.isEnabled(armed)) armed else null,
+        };
+    }
+
     pub fn currentColor(self: *const Buttons, target: instance.InstanceHandle) Color {
         return color(self.find(target).?.*);
     }
@@ -187,7 +197,7 @@ pub const Buttons = struct {
 
 fn color(entry: Entry) Color {
     if (!entry.enabled) return entry.style.disabled;
-    if (entry.pressed and entry.hovered) return entry.style.pressed;
+    if (entry.pressed) return entry.style.pressed;
     if (entry.hovered) return entry.style.hovered;
     return entry.style.idle;
 }
@@ -223,5 +233,8 @@ test "Button state preserves identity and resolves interaction colors" {
     try std.testing.expectEqual(@as(u8, 2), release.visual.?.color.r);
     _ = buttons.press(target);
     try std.testing.expect(buttons.release(null).activated == null);
+    _ = buttons.press(target);
+    const keyboard_release = buttons.releaseKeyboard();
+    try std.testing.expectEqual(target, keyboard_release.activated.?);
     buttons.clear();
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const frame = @import("frame.zig");
 const core = @import("../core/root.zig");
+const design = @import("../design/root.zig");
 const lua = @import("../lua/root.zig");
 const platform = @import("../platform/window.zig");
 const scene = @import("../scene/root.zig");
@@ -14,6 +15,13 @@ pub const Config = struct {
     input_capacity: usize = 128,
     command_capacity: usize = 512,
     semantic_text_capacity: usize = 16 * 1024,
+};
+
+pub const SemanticTarget = struct {
+    center: core.PointF,
+    role: ui.semantics.Role,
+    enabled: bool,
+    scroll_axis: ?platform.PointerAxis,
 };
 
 /// Retained UI state for one application window. This coordinates sibling UI,
@@ -32,16 +40,20 @@ pub const WindowRuntime = struct {
     router: ui.input.Router = undefined,
     pointer_bindings: ui.input.PointerBindings = undefined,
     buttons: ui.widget.Buttons = undefined,
+    text_inputs: ui.text_input.Registry = undefined,
+    focus: ui.focus.Manager = .{},
     semantics: ui.semantics.Snapshot = undefined,
     surface_color: core.Color = undefined,
     accent_color: core.Color = undefined,
     content_color: core.Color = undefined,
+    focus_color: core.Color = undefined,
     commands: []scene.Command = &.{},
     command_count: usize = 0,
     frame_state: frame.State = .{},
     output_scale: f32 = 1,
     signals: *lua.Signals = undefined,
-    shapes: *text.ShapeCache = undefined,
+    paragraph_sources: *text.ParagraphSourceCache = undefined,
+    paragraphs: *text.ParagraphCache = undefined,
     dirty_windows: ?*ui.instance.ReconcileQueue = null,
     reconciling: bool = false,
 
@@ -54,15 +66,17 @@ pub const WindowRuntime = struct {
         surface: core.Color,
         accent: core.Color,
         content: core.Color,
+        focus_color: core.Color,
         signals: *lua.Signals,
-        shapes: *text.ShapeCache,
+        paragraph_sources: *text.ParagraphSourceCache,
+        paragraphs: *text.ParagraphCache,
         config: Config,
     ) !void {
         if (config.node_capacity < 2 or config.command_capacity == 0)
             return error.InvalidWindowRuntimeCapacity;
         try self.tree.init(allocator, config.node_capacity);
         errdefer self.tree.deinit();
-        self.tree.attachTextCache(shapes);
+        self.tree.attachTextCaches(paragraph_sources, paragraphs);
         try self.instances.init(allocator, scheduler, &self.tree, window_scope, config.node_capacity);
         errdefer self.instances.deinit();
         try self.build_owners.init(allocator, scheduler, window_scope, 1, config.build_pass_capacity);
@@ -73,6 +87,8 @@ pub const WindowRuntime = struct {
         errdefer self.pointer_bindings.deinit();
         try self.buttons.init(allocator, config.node_capacity);
         errdefer self.buttons.deinit();
+        try self.text_inputs.init(allocator, config.node_capacity);
+        errdefer self.text_inputs.deinit();
         try self.semantics.init(allocator, config.node_capacity, config.semantic_text_capacity);
         errdefer self.semantics.deinit();
         const commands = try allocator.alloc(scene.Command, config.command_capacity);
@@ -89,13 +105,17 @@ pub const WindowRuntime = struct {
             .router = self.router,
             .pointer_bindings = self.pointer_bindings,
             .buttons = self.buttons,
+            .text_inputs = self.text_inputs,
+            .focus = .{},
             .semantics = self.semantics,
             .surface_color = surface,
             .accent_color = accent,
             .content_color = content,
+            .focus_color = focus_color,
             .commands = commands,
             .signals = signals,
-            .shapes = shapes,
+            .paragraph_sources = paragraph_sources,
+            .paragraphs = paragraphs,
         };
     }
 
@@ -112,6 +132,7 @@ pub const WindowRuntime = struct {
         std.debug.assert(self.pointer_bindings.takeAny() == null);
         self.allocator.free(self.commands);
         self.semantics.deinit();
+        self.text_inputs.deinit();
         self.buttons.deinit();
         self.pointer_bindings.deinit();
         self.router.deinit();
@@ -131,6 +152,8 @@ pub const WindowRuntime = struct {
         if (!self.initialized) return;
         lua_ui.clearHandlers(&self.pointer_bindings);
         self.buttons.clear();
+        self.text_inputs.clear();
+        self.focus.clear();
         while (self.router.takeEvent() != null) {}
         if (self.build_owners.isActive(self.root_owner)) {
             try self.signals.disposeOwner(.{
@@ -330,6 +353,7 @@ pub const WindowRuntime = struct {
             };
             self.semantics.stage(lua_ui.semanticDescriptors());
             self.buttons.removeInactive(&self.instances);
+            self.text_inputs.removeInactive(&self.instances);
             lua_ui.commitBindings(
                 &self.pointer_bindings,
                 &self.buttons,
@@ -349,6 +373,8 @@ pub const WindowRuntime = struct {
                 return err;
             };
             self.semantics.commitStaged();
+            self.focus.reconcile(&self.instances);
+            try self.applyFocusVisual(null, self.focus.current());
             for (0..self.buttons.slotCount()) |index|
                 if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
             try self.build_owners.complete(work);
@@ -374,6 +400,7 @@ pub const WindowRuntime = struct {
                 root,
                 ui.layout.Constraints.tight(.{ .width = width, .height = height }),
             );
+            try self.instances.syncScrollOffsets();
             try self.frame_state.layoutComplete();
         }
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
@@ -389,15 +416,27 @@ pub const WindowRuntime = struct {
         try self.router.route(event);
     }
 
-    pub fn dispatchInput(self: *WindowRuntime, callbacks: *lua.CallbackRegistry) !void {
+    pub fn routeKeyboard(self: *WindowRuntime, event: platform.KeyboardEvent) !void {
+        try self.router.routeKeyboard(event);
+    }
+
+    /// Dispatches through either the process-wide callback registry used by
+    /// reloadable applications or a directly owned VM used by storybooks.
+    pub fn dispatchInput(self: *WindowRuntime, callback_service: anytype) !void {
         while (self.router.takeEvent()) |event| {
+            if (event == .keyboard) {
+                try self.dispatchKeyboard(event.keyboard, callback_service);
+                continue;
+            }
             const target = switch (event) {
                 .hover_enter => |value| value.target,
                 .hover_leave => |value| value.target,
                 .pointer => |value| value.target,
+                .keyboard => unreachable,
             };
             if (!self.instances.isActive(target)) continue;
             const activated_button = try self.updateButtonState(event);
+            if (try self.applyScrollEvent(target, event)) continue;
             var bound_target = target;
             var handler = self.pointer_bindings.get(bound_target);
             while (handler == null) {
@@ -407,7 +446,8 @@ pub const WindowRuntime = struct {
             const binding = handler orelse continue;
             if (binding.kind == .button) {
                 if (activated_button != null and sameHandle(activated_button.?, bound_target))
-                    _ = try callbacks.spawn(
+                    try self.spawnCallback(
+                        callback_service,
                         binding.id,
                         try self.instances.scope(bound_target),
                         &.{},
@@ -423,7 +463,8 @@ pub const WindowRuntime = struct {
                 .{ .integer = values.value1 },
                 .{ .integer = values.value2 },
             };
-            _ = try callbacks.spawn(
+            try self.spawnCallback(
+                callback_service,
                 binding.id,
                 try self.instances.scope(bound_target),
                 &arguments,
@@ -431,13 +472,147 @@ pub const WindowRuntime = struct {
         }
     }
 
+    fn dispatchKeyboard(self: *WindowRuntime, event: platform.KeyboardEvent, callback_service: anytype) !void {
+        const key = switch (event) {
+            .enter => return,
+            .leave => {
+                try self.applyButtonUpdate(self.buttons.release(null).visual);
+                return;
+            },
+            .key => |value| value,
+        };
+        if (key.translated.logical == .tab and key.state != .released) {
+            try self.applyButtonUpdate(self.buttons.release(null).visual);
+            const previous = self.focus.current();
+            _ = try self.focus.advance(
+                &self.instances,
+                if (key.translated.modifiers.shift) .backward else .forward,
+            );
+            try self.applyFocusVisual(previous, self.focus.current());
+            return;
+        }
+        if (key.translated.logical == .space) switch (key.state) {
+            .pressed => {
+                const focused = self.focus.current() orelse return;
+                if (!self.buttons.contains(focused)) return;
+                try self.applyButtonUpdate(self.buttons.press(focused));
+            },
+            .released => try self.activateButton(callback_service, self.buttons.releaseKeyboard()),
+            .repeated => {},
+        } else if (key.translated.logical == .enter and key.state == .pressed) {
+            const focused = self.focus.current() orelse return;
+            if (!self.buttons.contains(focused) or !self.buttons.isEnabled(focused)) return;
+            try self.spawnButtonCallback(callback_service, focused);
+        }
+    }
+
+    fn activateButton(self: *WindowRuntime, callback_service: anytype, release: ui.widget.ButtonRelease) !void {
+        try self.applyButtonUpdate(release.visual);
+        const activated = release.activated orelse return;
+        try self.spawnButtonCallback(callback_service, activated);
+    }
+
+    fn spawnButtonCallback(
+        self: *WindowRuntime,
+        callback_service: anytype,
+        focused: ui.instance.InstanceHandle,
+    ) !void {
+        const binding = self.pointer_bindings.get(focused) orelse return;
+        if (binding.kind != .button) return;
+        try self.spawnCallback(
+            callback_service,
+            binding.id,
+            try self.instances.scope(focused),
+            &.{},
+        );
+    }
+
+    fn spawnCallback(
+        self: *WindowRuntime,
+        callback_service: anytype,
+        callback: lua.CallbackHandle,
+        scope: task.ScopeHandle,
+        arguments: []const lua.TaskArgument,
+    ) !void {
+        _ = self;
+        const Service = @typeInfo(@TypeOf(callback_service)).pointer.child;
+        if (Service == lua.CallbackRegistry) {
+            _ = try callback_service.spawn(callback, scope, arguments);
+        } else {
+            return error.CallbackServiceUnavailable;
+        }
+    }
+
     pub fn wantsSubmission(self: *const WindowRuntime) bool {
         return self.initialized and self.frame_state.readyForSubmission();
+    }
+
+    fn applyScrollEvent(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        event: ui.input.Event,
+    ) !bool {
+        const axis_event = switch (event) {
+            .pointer => |pointer| switch (pointer.event) {
+                .axis => |axis| axis,
+                else => return false,
+            },
+            else => return false,
+        };
+        const axis: ui.render_object.types.Axis = switch (axis_event.axis) {
+            .vertical => .vertical,
+            .horizontal => .horizontal,
+        };
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |start| {
+            const scroll = (try self.instances.nearestScroll(start, axis)) orelse return false;
+            if (try self.instances.scrollBy(scroll, axis_event.delta)) return true;
+            current = try self.instances.parentOf(scroll);
+        }
+        return false;
     }
 
     pub fn displayList(self: *WindowRuntime) !scene.DisplayList {
         if (!self.frame_state.readyForSubmission()) return error.FrameNotReady;
         return .{ .commands = self.commands[0..self.command_count] };
+    }
+
+    /// Resolves a retained semantic key path into the logical center used by
+    /// deterministic headless input. Geometry is accumulated through the
+    /// actual laid-out instance ancestry, so synthetic events use normal hit
+    /// testing rather than addressing widget state directly.
+    pub fn semanticTarget(self: *WindowRuntime, path: []const u8) !SemanticTarget {
+        if (!self.ready) return error.WindowRuntimeNotReady;
+        const semantic = try self.semantics.findPath(path);
+        const target = self.instances.handleForId(semantic.id) orelse
+            return error.SemanticInstanceMissing;
+        const render = try self.instances.renderObject(target);
+        const scroll_axis: ?platform.PointerAxis = switch (try self.tree.objectAt(render)) {
+            .scroll => |scroll| switch (scroll.axis) {
+                .vertical => .vertical,
+                .horizontal => .horizontal,
+            },
+            else => null,
+        };
+        const size = try self.tree.nodeSize(render);
+        var origin: core.PointF = .{};
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |instance_handle| {
+            origin = core.PointF.add(
+                origin,
+                try self.tree.nodeOffset(try self.instances.renderObject(instance_handle)),
+            );
+            current = try self.instances.parentOf(instance_handle);
+        }
+        return .{
+            .center = .{
+                .x = origin.x + size.width / 2,
+                .y = origin.y + size.height / 2,
+            },
+            .role = semantic.role,
+            .enabled = semantic.enabled,
+            .scroll_axis = scroll_axis,
+        };
     }
 
     pub fn frameSubmitted(self: *WindowRuntime) !void {
@@ -462,6 +637,9 @@ pub const WindowRuntime = struct {
                     switch (button_event.state) {
                         .pressed => {
                             const button = (try self.buttonAncestor(pointer.target)) orelse return null;
+                            const previous = self.focus.current();
+                            _ = try self.focus.request(&self.instances, button);
+                            try self.applyFocusVisual(previous, self.focus.current());
                             try self.applyButtonUpdate(self.buttons.press(button));
                         },
                         .released => {
@@ -477,6 +655,7 @@ pub const WindowRuntime = struct {
                 },
                 else => {},
             },
+            .keyboard => {},
         }
         return null;
     }
@@ -525,7 +704,7 @@ pub const WindowRuntime = struct {
         var tree: ui.render_object.Tree = undefined;
         try tree.init(self.allocator, descriptors.len);
         defer tree.deinit();
-        tree.attachTextCache(self.shapes);
+        tree.attachTextCaches(self.paragraph_sources, self.paragraphs);
         const handles = try self.allocator.alloc(ui.render_object.NodeHandle, descriptors.len);
         defer self.allocator.free(handles);
         for (descriptors, 0..) |descriptor, index| {
@@ -547,7 +726,207 @@ pub const WindowRuntime = struct {
         var builder = try ui.render_object.Builder.init(commands, self.output_scale);
         try tree.buildScene(handles[root_index], &builder);
     }
+
+    fn applyFocusVisual(
+        self: *WindowRuntime,
+        previous: ?ui.instance.InstanceHandle,
+        current: ?ui.instance.InstanceHandle,
+    ) !void {
+        if (previous) |target| if (self.instances.isActive(target))
+            try self.setFocusOutline(target, false);
+        if (current) |target| try self.setFocusOutline(target, true);
+    }
+
+    fn setFocusOutline(self: *WindowRuntime, target: ui.instance.InstanceHandle, visible: bool) !void {
+        const render = try self.instances.renderObject(target);
+        var object = try self.tree.objectAt(render);
+        if (object != .box) return;
+        object.box.outline_color = if (visible) self.focus_color else null;
+        object.box.outline_width = if (visible) design.tokens.foundation.focus_ring_width else 0;
+        object.box.outline_gap = if (visible) design.tokens.foundation.focus_ring_gap else 0;
+        try self.tree.update(render, object);
+    }
 };
+
+test "resize lays out a clean render tree before rebuilding its scene" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+
+    var runtime: WindowRuntime = .{};
+    try runtime.tree.init(std.testing.allocator, 1);
+    try runtime.instances.init(
+        std.testing.allocator,
+        &scheduler,
+        &runtime.tree,
+        window_scope,
+        1,
+    );
+    defer {
+        runtime.instances.reconcile(&.{}) catch unreachable;
+        scheduler.applyQueuedCancellations() catch unreachable;
+        runtime.instances.collectRetired() catch unreachable;
+        runtime.instances.deinit();
+        runtime.tree.deinit();
+        scheduler.destroyScope(window_scope) catch unreachable;
+    }
+    var commands: [1]scene.Command = undefined;
+    runtime.initialized = true;
+    runtime.commands = &commands;
+    try runtime.instances.reconcile(&.{.{
+        .id = 1,
+        .parent = null,
+        .object = .{ .box = .{ .background = core.Color.rgba(1, 2, 3, 255) } },
+    }});
+
+    _ = try runtime.frame_state.configure(.{ .width = 100, .height = 80 });
+    try runtime.prepareFrame(1);
+    try runtime.frameSubmitted();
+    const root = (try runtime.instances.rootRenderObject()).?;
+    const initial_layout_count = try runtime.tree.layoutCount(root);
+    try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
+
+    _ = try runtime.frame_state.configure(.{ .width = 120, .height = 80 });
+    try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
+    try runtime.prepareFrame(1);
+
+    try std.testing.expectEqual(initial_layout_count + 1, try runtime.tree.layoutCount(root));
+    try std.testing.expect(runtime.wantsSubmission());
+}
+
+test "queued pointer axis scrolls retained instance only during input dispatch" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 6, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    const window: platform.WindowHandle = .{ .slot = 2, .generation = 1 };
+    var runtime: WindowRuntime = .{};
+    try runtime.tree.init(std.testing.allocator, 2);
+    try runtime.instances.init(
+        std.testing.allocator,
+        &scheduler,
+        &runtime.tree,
+        window_scope,
+        2,
+    );
+    try runtime.router.init(
+        std.testing.allocator,
+        &runtime.tree,
+        &runtime.instances,
+        window,
+        2,
+    );
+    defer {
+        runtime.router.deinit();
+        runtime.instances.reconcile(&.{}) catch unreachable;
+        scheduler.applyQueuedCancellations() catch unreachable;
+        runtime.instances.collectRetired() catch unreachable;
+        runtime.instances.deinit();
+        runtime.tree.deinit();
+        scheduler.destroyScope(window_scope) catch unreachable;
+    }
+    try runtime.instances.reconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .scroll = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .box = .{ .width = 40, .height = 120 } } },
+    });
+    const root = (try runtime.instances.rootRenderObject()).?;
+    _ = try runtime.tree.layout(
+        root,
+        ui.layout.Constraints.tight(.{ .width = 40, .height = 50 }),
+    );
+    try runtime.routePointer(.{ .enter = .{
+        .window = window,
+        .serial = 1,
+        .position = .{ .x = 10, .y = 10 },
+    } });
+    _ = runtime.router.takeEvent();
+    try runtime.routePointer(.{ .axis = .{
+        .window = window,
+        .time_ms = 2,
+        .axis = .vertical,
+        .delta = 18,
+    } });
+    try std.testing.expectEqual(@as(f32, 0), try runtime.instances.scrollOffset(
+        runtime.instances.handleForId(1).?,
+    ));
+    var unused_vm: lua.Vm = undefined;
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqual(@as(f32, 18), try runtime.instances.scrollOffset(
+        runtime.instances.handleForId(1).?,
+    ));
+    try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
+    try std.testing.expect(try runtime.tree.paintDirty(root));
+}
+
+test "queued Tab navigation updates retained focus at the input safe point" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    const window: platform.WindowHandle = .{ .slot = 3, .generation = 1 };
+    var runtime: WindowRuntime = .{};
+    try runtime.tree.init(std.testing.allocator, 3);
+    try runtime.instances.init(
+        std.testing.allocator,
+        &scheduler,
+        &runtime.tree,
+        window_scope,
+        3,
+    );
+    try runtime.router.init(
+        std.testing.allocator,
+        &runtime.tree,
+        &runtime.instances,
+        window,
+        2,
+    );
+    try runtime.buttons.init(std.testing.allocator, 3);
+    runtime.focus_color = core.Color.rgba(20, 80, 220, 255);
+    defer {
+        runtime.buttons.clear();
+        runtime.buttons.deinit();
+        runtime.router.deinit();
+        runtime.instances.reconcile(&.{}) catch unreachable;
+        scheduler.applyQueuedCancellations() catch unreachable;
+        runtime.instances.collectRetired() catch unreachable;
+        runtime.instances.deinit();
+        runtime.tree.deinit();
+        scheduler.destroyScope(window_scope) catch unreachable;
+    }
+    try runtime.instances.reconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .box = .{} }, .focusable = true },
+        .{ .id = 3, .parent = 1, .object = .{ .box = .{} }, .focusable = true },
+    });
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 1,
+        .time_ms = 2,
+        .state = .pressed,
+        .translated = .{ .keycode = 15, .logical = .tab },
+    } });
+    try std.testing.expect(runtime.focus.current() == null);
+    var unused_vm: lua.Vm = undefined;
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqual(runtime.instances.handleForId(2).?, runtime.focus.current().?);
+    const focused_render = try runtime.instances.renderObject(runtime.focus.current().?);
+    try std.testing.expectEqual(runtime.focus_color, (try runtime.tree.objectAt(focused_render)).box.outline_color.?);
+
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 2,
+        .time_ms = 3,
+        .state = .pressed,
+        .translated = .{
+            .keycode = 15,
+            .logical = .tab,
+            .modifiers = .{ .shift = true },
+        },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqual(runtime.instances.handleForId(3).?, runtime.focus.current().?);
+}
 
 const InputValues = struct {
     kind: i64,
@@ -571,6 +950,7 @@ fn inputValues(event: ui.input.Event) InputValues {
             .axis => |axis| .{ .kind = 5, .value1 = @intFromEnum(axis.axis), .x = axis.delta },
             else => .{ .kind = 6 },
         },
+        .keyboard => .{ .kind = 7 },
     };
 }
 
@@ -635,8 +1015,10 @@ test "candidate source build prepares owned output without changing retained UI"
     );
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
-    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
-    defer shapes.deinit();
+    var paragraph_sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer paragraph_sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
     const window_scope = try scheduler.createScope(scheduler.application_scope);
     var runtime: WindowRuntime = .{};
     try runtime.init(
@@ -647,8 +1029,10 @@ test "candidate source build prepares owned output without changing retained UI"
         core.Color.rgba(1, 2, 3, 255),
         core.Color.rgba(4, 5, 6, 255),
         core.Color.rgba(7, 8, 9, 255),
+        core.Color.rgba(10, 11, 12, 255),
         &active_signals,
-        &shapes,
+        &paragraph_sources,
+        &paragraphs,
         .{ .node_capacity = 4, .command_capacity = 4 },
     );
 
