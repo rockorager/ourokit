@@ -6,6 +6,8 @@ pub const Alignment = enum {
     /// Align to the paragraph direction's trailing edge.
     end,
     center,
+    /// Expand eligible inter-word spaces on non-final soft-wrapped lines.
+    justify,
 };
 
 pub const Overflow = enum {

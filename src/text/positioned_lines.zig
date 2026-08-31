@@ -1,6 +1,7 @@
 //! Final headless assembly of selected lines into positioned glyph spans.
 
 const std = @import("std");
+const uucode = @import("uucode");
 const PointF = @import("../core/geometry.zig").PointF;
 const api = @import("api.zig");
 const line_layout = @import("line_layout.zig");
@@ -145,7 +146,7 @@ pub fn positionLinesWithStyle(
     try lines.ensureTotalCapacity(allocator, visible_count);
     var line_top: f32 = 0;
 
-    for (selected.lines[0..visible_count]) |selected_line| {
+    for (selected.lines[0..visible_count], 0..) |selected_line, line_index| {
         if (!std.math.isFinite(selected_line.advance) or selected_line.advance < 0)
             return error.InvalidMeasurements;
         var fragments: std.ArrayList(Fragment) = .empty;
@@ -179,6 +180,20 @@ pub fn positionLinesWithStyle(
         if (changed_advance and (selected_line.reshape_start or selected_line.reshape_end))
             return error.ReflowRequired;
         if (changed_advance) return error.InvalidMeasurements;
+
+        if (style.alignment == .justify and
+            line_index + 1 < visible_count and
+            !selected_line.mandatory and
+            available_width != null)
+        {
+            pen_x = justifyLine(
+                utf8,
+                spans.items[line_span_start..],
+                glyphs.items[line_glyph_start..],
+                pen_x,
+                available_width.?,
+            );
+        }
 
         var metrics: api.Metrics = .{ .ascender = 0, .descender = 0, .line_gap = 0 };
         for (fragments.items) |*fragment| mergeMetrics(&metrics, fragment.result().metrics);
@@ -237,7 +252,56 @@ fn alignmentOffset(
         .start => if (base_level & 1 == 0) 0 else remaining,
         .end => if (base_level & 1 == 0) remaining else 0,
         .center => remaining / 2,
+        .justify => 0,
     };
+}
+
+/// Expands only Unicode line-break class SP glyphs that have visible glyphs on
+/// both physical sides. Glyphs are already assembled in left-to-right visual
+/// order, so this is linear and independent of logical bidi order. Script-
+/// specific kashida and inter-character CJK expansion remain separate policy.
+fn justifyLine(
+    utf8: []const u8,
+    spans: []Span,
+    glyphs: []Glyph,
+    natural_width: f32,
+    available_width: f32,
+) f32 {
+    const extra = @max(0, available_width - natural_width);
+    if (extra == 0 or glyphs.len < 3) return natural_width;
+    var opportunities: usize = 0;
+    for (glyphs[1 .. glyphs.len - 1]) |glyph|
+        if (isExpandableSpace(utf8, glyph)) {
+            opportunities += 1;
+        };
+    if (opportunities == 0) return natural_width;
+
+    const per_opportunity = extra / @as(f32, @floatFromInt(opportunities));
+    var shift: f32 = 0;
+    var physical_index: usize = 0;
+    for (spans) |*span| {
+        var span_expansion: f32 = 0;
+        for (glyphs[span.glyph_start - spans[0].glyph_start ..][0..span.glyph_count]) |*glyph| {
+            glyph.origin.x += shift;
+            if (physical_index != 0 and physical_index + 1 < glyphs.len and
+                isExpandableSpace(utf8, glyph.*))
+            {
+                shift += per_opportunity;
+                span_expansion += per_opportunity;
+            }
+            physical_index += 1;
+        }
+        span.advance += span_expansion;
+    }
+    return natural_width + shift;
+}
+
+fn isExpandableSpace(utf8: []const u8, glyph: Glyph) bool {
+    if (glyph.synthetic or glyph.cluster >= utf8.len) return false;
+    const sequence_len = std.unicode.utf8ByteSequenceLength(utf8[glyph.cluster]) catch return false;
+    if (glyph.cluster + sequence_len > utf8.len) return false;
+    const codepoint = std.unicode.utf8Decode(utf8[glyph.cluster..][0..sequence_len]) catch return false;
+    return uucode.get(.line_break, codepoint) == .sp;
 }
 
 fn buildFragments(
@@ -512,6 +576,28 @@ test "paragraph alignment resolves from each line base direction and clips whole
         rtl_start.lines[0].left,
         0.001,
     );
+}
+
+test "inter-word justification expands visual gaps in linear order" {
+    var spans = [_]Span{.{
+        .font = .{ .slot = 1, .generation = 1 },
+        .direction = .left_to_right,
+        .byte_start = 0,
+        .byte_len = 3,
+        .advance = 15,
+        .glyph_start = 0,
+        .glyph_count = 3,
+    }};
+    var glyphs = [_]Glyph{
+        .{ .id = 1, .cluster = 0, .origin = .{ .x = 0 }, .advance = .{ .x = 5 } },
+        .{ .id = 2, .cluster = 1, .origin = .{ .x = 5 }, .advance = .{ .x = 5 } },
+        .{ .id = 3, .cluster = 2, .origin = .{ .x = 10 }, .advance = .{ .x = 5 } },
+    };
+    try std.testing.expectEqual(@as(f32, 25), justifyLine("a b", &spans, &glyphs, 15, 25));
+    try std.testing.expectEqual(@as(f32, 0), glyphs[0].origin.x);
+    try std.testing.expectEqual(@as(f32, 5), glyphs[1].origin.x);
+    try std.testing.expectEqual(@as(f32, 20), glyphs[2].origin.x);
+    try std.testing.expectEqual(@as(f32, 25), spans[0].advance);
 }
 
 fn exerciseAllocationFailure(

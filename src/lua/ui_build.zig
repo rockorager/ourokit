@@ -611,6 +611,7 @@ fn tableOptionalParagraphAlignment(
     if (std.mem.eql(u8, value, "start")) return .start;
     if (std.mem.eql(u8, value, "end")) return .end;
     if (std.mem.eql(u8, value, "center")) return .center;
+    if (std.mem.eql(u8, value, "justify")) return .justify;
     return null;
 }
 

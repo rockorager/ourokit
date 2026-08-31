@@ -68,6 +68,13 @@ fn runCompleteLayouts(allocator: std.mem.Allocator) !void {
         .{ .max_lines = 2, .overflow = .ellipsis },
         "ellipsized",
     );
+    try runCompleteLayout(
+        &paragraphs,
+        text,
+        &.{ latin, arabic },
+        .{ .alignment = .justify },
+        "justified",
+    );
 }
 
 fn runCompleteLayout(

@@ -439,6 +439,25 @@ test "ellipsis is shaped in paragraph context and maps to a source boundary" {
     try std.testing.expect(std.math.isFinite(source_x));
     try std.testing.expect(synthetic_x < source_x);
 
+    const justified_handle = try cache.acquire(.{
+        .utf8 = "Save حفظ this document then continue متابعة to the next workflow step",
+        .language = "und",
+        .logical_size = 16,
+        .max_width = 130,
+        .style = .{ .alignment = .justify },
+        .candidates = &.{ latin, arabic },
+        .configuration_revision = 1,
+    });
+    defer cache.release(justified_handle) catch unreachable;
+    const justified = try cache.get(justified_handle);
+    try std.testing.expect(justified.positioned.lines.len > 1);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 130),
+        justified.positioned.lines[0].advance,
+        0.001,
+    );
+    try std.testing.expect(justified.positioned.lines[justified.positioned.lines.len - 1].advance < 130);
+
     try std.testing.expectError(error.EllipsisRequiresMaxLines, cache.acquire(.{
         .utf8 = source,
         .language = "und",

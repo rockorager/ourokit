@@ -236,7 +236,7 @@ the line direction while `center` remains physical center. A finite layout width
 is part of paragraph cache identity. Optional `max_lines` truncates only at
 selected line boundaries and records whether content was omitted; Labels clip
 the resulting paragraph to their layout bounds. Lua exposes these as typed
-`alignment = "start" | "end" | "center"`, positive `max_lines`, and
+`alignment = "start" | "end" | "center" | "justify"`, positive `max_lines`, and
 `overflow = "clip" | "ellipsis"` fields. Ellipsis requires `max_lines`. It
 finalizes at the latest fitting UAX #14 opportunity, synthesizes U+2026 at that
 source boundary, and reruns itemization, fallback shaping, wrapping, line bidi,
@@ -244,6 +244,16 @@ and positioning. Synthetic glyphs explicitly map to a zero-length source
 boundary, preserving the source-cluster contract for future selection APIs.
 Contextual reshaping that changes fit retreats to the preceding legal break;
 renderers never inject or position the ellipsis themselves.
+
+Justification is likewise finalized before rendering. Non-final soft-wrapped
+lines distribute remaining width across Unicode line-break class `SP` glyphs
+that have visible content on both physical sides. Positioned glyphs are already
+in left-to-right visual order, so expansion is one linear pass independent of
+logical bidi order; span and line advances include the added width. Final lines,
+mandatory breaks, unbounded paragraphs, and lines without eligible inter-word
+spaces remain start-aligned. Arabic inter-word spacing is supported without
+disturbing joining. Kashida insertion and CJK inter-character expansion require
+separate script-aware policies and are not implied by `justify` yet.
 
 Each renderer owns FreeType faces and grayscale glyph masks keyed by font
 generation, glyph ID, and exact 26.6 device size. Cached faces retain their font
@@ -272,6 +282,6 @@ outlive all frames that lease their entries.
 - empty-line metrics and inherited line-style policy;
 - normalization policy (shaping does not imply mutating application text);
 - variable-font axis selection and cache identity;
-- justification policy and optional grapheme-level rather than line-break-level
-  ellipsis refinement;
+- kashida and CJK inter-character justification, plus optional grapheme-level
+  rather than line-break-level ellipsis refinement;
 - cache eviction, LCD/subpixel policy, and backend glyph-cache budgets.

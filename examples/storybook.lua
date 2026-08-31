@@ -101,6 +101,11 @@ return ouro.storybook {
               text = "بداية الفقرة العربية",
               alignment = "start",
             }
+            ouro.label {
+              key = "justified",
+              text = "Justified labels expand eligible spaces on every soft-wrapped line except the final line.",
+              alignment = "justify",
+            }
           end,
         }
       end,
