@@ -24,7 +24,7 @@ const PendingButton = struct {
     style: ButtonStyle,
 };
 
-const ParentKind = enum { box, flex, stack };
+const ParentKind = enum { box, flex, stack, scroll };
 const BuildParent = struct { id: u64, kind: ParentKind };
 
 pub const Argument = union(enum) {
@@ -82,6 +82,7 @@ pub const UiBuild = struct {
         try self.install("button", emitButton);
         try self.install("row", emitRow);
         try self.install("column", emitColumn);
+        try self.install("scroll", emitScroll);
     }
 
     /// Executes a non-yielding mounted build callback in the reconciliation
@@ -488,6 +489,43 @@ pub const UiBuild = struct {
         return emitFlexContainer(state, .vertical);
     }
 
+    fn emitScroll(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (self.widget_theme == null) return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.scroll expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "scroll requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "scroll key is required");
+        const axis = tableOptionalAxis(state, 1, "axis", .vertical) orelse
+            return luaError(state, "invalid scroll axis");
+        const id = semanticId(key, 0x7363726f6c6c ^ parent.id);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .scroll = .{ .axis = axis } },
+            .parent_data = declarativeParentData(self, state, 1) orelse
+                return luaError(state, "invalid scroll position"),
+        }) catch return luaError(state, "cannot append scroll descriptor");
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .group,
+            .key = key,
+        }) catch return luaError(state, "cannot append scroll semantics");
+        if (c.lua_getfield(state, 1, "children") != c.type_function) {
+            c.lua_settop(state, -2);
+            return luaError(state, "scroll children function is required");
+        }
+        self.pushParent(.{ .id = id, .kind = .scroll }) catch {
+            c.lua_settop(state, -2);
+            return luaError(state, "widget nesting is too deep");
+        };
+        const status = c.lua_pcallk(state, 0, 0, 0, 0, null);
+        self.popParent();
+        if (status != c.ok) return c.lua_error(state);
+        return 0;
+    }
+
     fn discardHandlers(self: *UiBuild) void {
         for (self.pending_handlers[0..self.pending_handler_count]) |pending|
             c.luaL_unref(self.state, c.registry_index, pending.reference);
@@ -630,6 +668,21 @@ fn tableOptionalParagraphOverflow(
     return null;
 }
 
+fn tableOptionalAxis(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: render_types.Axis,
+) ?render_types.Axis {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "vertical")) return .vertical;
+    if (std.mem.eql(u8, value, "horizontal")) return .horizontal;
+    return null;
+}
+
 /// A zero default represents an omitted optional positive integer. Explicit
 /// zero and negative values remain invalid.
 fn tableOptionalPositiveInteger(
@@ -650,7 +703,7 @@ fn tableOptionalPositiveInteger(
 fn declarativeParentData(self: *const UiBuild, state: *c.State, table: c_int) ?render_types.ParentData {
     const parent = self.currentParent() orelse return null;
     return switch (parent.kind) {
-        .box, .flex => .none,
+        .box, .flex, .scroll => .none,
         .stack => stack: {
             const x = tableOptionalExtent(state, table, "x", 0) orelse return null;
             const y = tableOptionalExtent(state, table, "y", 0) orelse return null;
@@ -698,7 +751,7 @@ test "Lua UI exposes only declarative constructors without standard libraries" {
     try ui.init(state, &storage);
 
     try std.testing.expectEqual(c.type_table, c.lua_getglobal(state, "ouro"));
-    inline for (.{ "label", "button", "row", "column" }) |name| {
+    inline for (.{ "label", "button", "row", "column", "scroll" }) |name| {
         try std.testing.expectEqual(c.type_function, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }

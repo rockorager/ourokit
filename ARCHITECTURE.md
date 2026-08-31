@@ -212,7 +212,8 @@ tables; component schemas should eventually generate Lua constructors, compact
 Zig decoding, language-server types, documentation, and validation tests. That
 generator is not part of milestone one, and no permanent widget ABI is frozen.
 The first constructor-specific decoders prove the intended seam. `ouro.row`
-and `ouro.column` emit Flex descriptors, `ouro.label` emits Label, and
+and `ouro.column` emit Flex descriptors, `ouro.scroll` emits a single-child
+viewport descriptor with instance-retained offset, `ouro.label` emits Label, and
 `ouro.button` emits Box plus Label descriptors and a typed widget binding.
 A bounded nested build context derives native identity and parent links from
 stable local keys, so applications never manage numeric IDs. These constructors

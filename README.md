@@ -104,7 +104,7 @@ retains width-independent text/style identity, resolves a cached paragraph from
 its current box constraints, and rasterizes through a backend-owned FreeType
 glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
 wrapping; unchanged constraints perform no layout acquisition or allocation.
-`ouro.row`, `ouro.column`, and `ouro.label` provide nested composition without
+`ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.label` provide nested composition without
 application-managed numeric IDs or parent links. `ouro.button` composes a Box
 and Label using generated design tokens and retains hover, pressed, disabled,
 pointer-capture, and release-inside activation state in the widget layer. Its

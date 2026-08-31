@@ -7,6 +7,7 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const Constraints = @import("../layout/constraints.zig").Constraints;
 const box_impl = @import("box.zig");
 const flex_impl = @import("flex.zig");
+const scroll_impl = @import("scroll.zig");
 const stack_impl = @import("stack.zig");
 const scene_builder = @import("scene_builder.zig");
 const text = @import("../../text/root.zig");
@@ -22,6 +23,7 @@ pub const LayoutError = error{
     InvalidLayoutSize,
     UnconstrainedLayoutSize,
     FlexInUnboundedAxis,
+    ScrollInUnboundedAxis,
     InvalidParentData,
     LabelHasChildren,
     ParagraphResourcesRequired,
@@ -48,6 +50,8 @@ const Slot = struct {
     needs_paint: bool = true,
     layout_count: usize = 0,
     paragraph_layout: ?text.ParagraphHandle = null,
+    scroll_offset: f32 = 0,
+    scroll_extent: f32 = 0,
 };
 
 /// Fixed-capacity storage for the closed typed render-object set. Unchanged
@@ -146,8 +150,8 @@ pub const Tree = struct {
         const child_slot = try self.slot(child);
         if (child_slot.parent != null) return error.RenderObjectAlreadyAttached;
         try validateParentData(parent_slot.object, data);
-        if (parent_slot.object == .box and parent_slot.first_child != null)
-            return error.BoxAlreadyHasChild;
+        if ((parent_slot.object == .box or parent_slot.object == .scroll) and
+            parent_slot.first_child != null) return error.BoxAlreadyHasChild;
         if (parent_slot.object == .label) return error.LabelHasChildren;
 
         child_slot.parent = parent;
@@ -175,7 +179,7 @@ pub const Tree = struct {
         try validateObject(object);
         const target = try self.slot(handle);
         if (std.meta.eql(target.object, object)) return;
-        if (object == .box and target.first_child != null and
+        if ((object == .box or object == .scroll) and target.first_child != null and
             !same(target.first_child.?, target.last_child.?)) return error.BoxAlreadyHasChild;
         var child = target.first_child;
         while (child) |child_handle| : (child = (try self.slot(child_handle)).next_sibling)
@@ -288,6 +292,47 @@ pub const Tree = struct {
         self.markNeedsPaint(handle);
     }
 
+    /// Applies instance-owned scrolling without invalidating layout. Returns
+    /// the clamped offset so the instance remains the authoritative state.
+    pub fn setScrollOffset(self: *Tree, handle: NodeHandle, requested: f32) !f32 {
+        if (!std.math.isFinite(requested)) return error.InvalidScrollOffset;
+        const target = try self.slot(handle);
+        const scroll = switch (target.object) {
+            .scroll => |value| value,
+            else => return error.NotScrollObject,
+        };
+        const offset = std.math.clamp(requested, 0, target.scroll_extent);
+        if (target.scroll_offset == offset) return offset;
+        target.scroll_offset = offset;
+        if (target.first_child) |child|
+            try self.setChildOffset(child, scroll_impl.childOffset(scroll.axis, offset));
+        self.markNeedsPaint(handle);
+        return offset;
+    }
+
+    pub fn scrollOffset(self: *Tree, handle: NodeHandle) !f32 {
+        const target = try self.slot(handle);
+        if (target.object != .scroll) return error.NotScrollObject;
+        return target.scroll_offset;
+    }
+
+    pub fn finishScrollLayout(
+        self: *Tree,
+        handle: NodeHandle,
+        viewport: SizeF,
+        content: SizeF,
+    ) LayoutError!void {
+        const target = try self.slot(handle);
+        const scroll = target.object.scroll;
+        target.scroll_extent = switch (scroll.axis) {
+            .vertical => @max(0, content.height - viewport.height),
+            .horizontal => @max(0, content.width - viewport.width),
+        };
+        target.scroll_offset = @min(target.scroll_offset, target.scroll_extent);
+        if (target.first_child) |child|
+            try self.setChildOffset(child, scroll_impl.childOffset(scroll.axis, target.scroll_offset));
+    }
+
     fn layoutNode(self: *Tree, handle: NodeHandle, constraints: Constraints) LayoutError!SizeF {
         try constraints.validate();
         const current = try self.slot(handle);
@@ -298,6 +343,7 @@ pub const Tree = struct {
             .box => |value| try box_impl.layout(value, self, handle, constraints),
             .flex => |value| try flex_impl.layout(value, self, handle, constraints),
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
+            .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
             .label => try self.layoutLabel(handle, object.label, constraints),
         };
         if (!validSize(result)) return error.InvalidLayoutSize;
@@ -341,6 +387,7 @@ pub const Tree = struct {
             },
             .flex => false,
             .stack => |value| value.clip,
+            .scroll => true,
             .label => |value| paint: {
                 const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
                 try builder.pushClip(bounds);
@@ -497,6 +544,7 @@ fn validateObject(object: types.Object) !void {
         .box => |value| try box_impl.validate(value),
         .flex => |value| try flex_impl.validate(value),
         .stack => {},
+        .scroll => {},
         .label => |label| {
             if (label.max_lines == 0) return error.InvalidMaxLines;
             if (label.overflow == .ellipsis and label.max_lines == null)
@@ -515,6 +563,7 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
                 return error.InvalidParentData,
             .flex => return error.InvalidParentData,
         },
+        .scroll => if (data != .none) return error.InvalidParentData,
         .label => return error.LabelHasChildren,
     }
 }
@@ -531,6 +580,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         },
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
         .stack => false,
+        .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
         .label => |old_label| !sameSource(old_label.source, new.label.source) or
             old_label.alignment != new.label.alignment or
             old_label.max_lines != new.label.max_lines or
@@ -797,4 +847,39 @@ test "render-object topology rejects cycles and stale generations" {
     const replacement = try tree.create(.{ .box = .{} });
     try std.testing.expectEqual(child.slot, replacement.slot);
     try std.testing.expect(child.generation != replacement.generation);
+}
+
+test "scroll lays out unbounded content and clips paint and hit testing" {
+    const scene = @import("../../scene/root.zig");
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    const scroll = try tree.create(.{ .scroll = .{} });
+    const content = try tree.create(.{ .box = .{
+        .width = 40,
+        .height = 120,
+        .background = Color.rgba(20, 40, 80, 255),
+    } });
+    try tree.appendChild(scroll, content, .none);
+
+    try std.testing.expectEqual(
+        SizeF{ .width = 40, .height = 50 },
+        try tree.layout(scroll, .{ .max_width = 100, .max_height = 50 }),
+    );
+    try std.testing.expectEqual(@as(f32, 30), try tree.setScrollOffset(scroll, 30));
+    try std.testing.expectEqual(PointF{ .y = -30 }, try tree.nodeOffset(content));
+
+    var commands: [3]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(scroll, &builder);
+    try std.testing.expectEqual(@as(usize, 3), builder.displayList().commands.len);
+    try std.testing.expectEqual(
+        @as(scene.Command, .{ .push_clip_rect = .{ .x = 0, .y = 0, .width = 40, .height = 50 } }),
+        builder.displayList().commands[0],
+    );
+    try std.testing.expectEqual(@as(i32, -30), builder.displayList().commands[1].solid_rectangle.bounds.y);
+    try std.testing.expect(builder.displayList().commands[2] == .pop_clip);
+    try std.testing.expectEqual(content, (try tree.hitTest(scroll, .{ .x = 10, .y = 10 })).?);
+    try std.testing.expect((try tree.hitTest(scroll, .{ .x = 10, .y = 60 })) == null);
+    try std.testing.expectEqual(@as(f32, 70), try tree.setScrollOffset(scroll, 500));
 }

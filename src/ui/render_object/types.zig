@@ -43,6 +43,12 @@ pub const Stack = struct {
     clip: bool = false,
 };
 
+/// A single-child viewport. Offset is retained by the corresponding instance,
+/// not declared widget data, and is applied to this render object separately.
+pub const Scroll = struct {
+    axis: Axis = .vertical,
+};
+
 /// Width-independent paragraph identity. The retained render-tree slot derives
 /// and caches a width-specific positioned layout from current constraints.
 pub const Label = struct {
@@ -60,6 +66,7 @@ pub const Object = union(enum) {
     box: Box,
     flex: Flex,
     stack: Stack,
+    scroll: Scroll,
     label: Label,
 };
 

@@ -70,7 +70,7 @@ across the yield. Normal completion, errors, and cancellation call Lua 5.5's
 to-be-closed values unwind and the slot can be safely generation-reused.
 
 Mounted UI builds extend the same Ouro-owned table with the constructor-specific
-`row`, `column`, `label`, and `button` functions. They are available only during
+`row`, `column`, `scroll`, `label`, and `button` functions. They are available only during
 a protected build-owner callback in the reconciliation phase, cannot yield, and
 write directly into a bounded typed descriptor buffer. Applications provide
 stable string keys; numeric descriptor IDs, parent links, generic widget table

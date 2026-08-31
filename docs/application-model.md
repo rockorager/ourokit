@@ -172,7 +172,8 @@ Box/Stack/Label descriptors directly into bounded native storage, which the
 existing transactional reconciler validates. It has no generic string `type`
 parser or application-facing descriptor escape hatch. The constructors maintain
 a bounded native parent stack: `ouro.row` and `ouro.column` normalize to Flex,
-`ouro.label` normalizes to Label, and `ouro.button` normalizes to Box plus Label.
+`ouro.scroll` normalizes to a single-child Scroll viewport, `ouro.label`
+normalizes to Label, and `ouro.button` normalizes to Box plus Label.
 Applications provide stable local keys but no numeric IDs or parent links.
 Their visual defaults come only from generated design tokens, with no Lua theme
 mirror. The Wayland example exercises this actual Lua-build path for both

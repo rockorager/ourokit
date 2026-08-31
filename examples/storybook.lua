@@ -179,6 +179,32 @@ return ouro.storybook {
       end,
     },
     ouro.story {
+      id = "layout/scroll",
+      group = "Layout",
+      name = "Scrollable settings list",
+      viewport = { width = 380, height = 280 },
+      content = function()
+        ouro.scroll {
+          key = "settings-scroll",
+          children = function()
+            ouro.column {
+              key = "settings",
+              gap = 10,
+              children = function()
+                ouro.label { key = "heading", text = "Application settings", size = 18 }
+                for index = 1, 12 do
+                  ouro.button {
+                    key = "setting-" .. index,
+                    label = "Setting " .. index,
+                  }
+                end
+              end,
+            }
+          end,
+        }
+      end,
+    },
+    ouro.story {
       id = "button/default",
       group = "Button",
       name = "Default",

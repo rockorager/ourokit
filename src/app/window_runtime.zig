@@ -246,6 +246,7 @@ pub const WindowRuntime = struct {
                 root,
                 ui.layout.Constraints.tight(.{ .width = width, .height = height }),
             );
+            try self.instances.syncScrollOffsets();
             try self.frame_state.layoutComplete();
         }
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
@@ -270,6 +271,7 @@ pub const WindowRuntime = struct {
             };
             if (!self.instances.isActive(target)) continue;
             const activated_button = try self.updateButtonState(event);
+            if (try self.applyScrollEvent(target, event)) continue;
             var bound_target = target;
             var handler = self.pointer_bindings.get(bound_target);
             while (handler == null) {
@@ -305,6 +307,31 @@ pub const WindowRuntime = struct {
 
     pub fn wantsSubmission(self: *const WindowRuntime) bool {
         return self.initialized and self.frame_state.readyForSubmission();
+    }
+
+    fn applyScrollEvent(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        event: ui.input.Event,
+    ) !bool {
+        const axis_event = switch (event) {
+            .pointer => |pointer| switch (pointer.event) {
+                .axis => |axis| axis,
+                else => return false,
+            },
+            else => return false,
+        };
+        const axis: ui.render_object.types.Axis = switch (axis_event.axis) {
+            .vertical => .vertical,
+            .horizontal => .horizontal,
+        };
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |start| {
+            const scroll = (try self.instances.nearestScroll(start, axis)) orelse return false;
+            if (try self.instances.scrollBy(scroll, axis_event.delta)) return true;
+            current = try self.instances.parentOf(scroll);
+        }
+        return false;
     }
 
     pub fn displayList(self: *WindowRuntime) !scene.DisplayList {
@@ -460,6 +487,70 @@ test "resize lays out a clean render tree before rebuilding its scene" {
 
     try std.testing.expectEqual(initial_layout_count + 1, try runtime.tree.layoutCount(root));
     try std.testing.expect(runtime.wantsSubmission());
+}
+
+test "queued pointer axis scrolls retained instance only during input dispatch" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 6, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    const window: platform.WindowHandle = .{ .slot = 2, .generation = 1 };
+    var runtime: WindowRuntime = .{};
+    try runtime.tree.init(std.testing.allocator, 2);
+    try runtime.instances.init(
+        std.testing.allocator,
+        &scheduler,
+        &runtime.tree,
+        window_scope,
+        2,
+    );
+    try runtime.router.init(
+        std.testing.allocator,
+        &runtime.tree,
+        &runtime.instances,
+        window,
+        2,
+    );
+    defer {
+        runtime.router.deinit();
+        runtime.instances.reconcile(&.{}) catch unreachable;
+        scheduler.applyQueuedCancellations() catch unreachable;
+        runtime.instances.collectRetired() catch unreachable;
+        runtime.instances.deinit();
+        runtime.tree.deinit();
+        scheduler.destroyScope(window_scope) catch unreachable;
+    }
+    try runtime.instances.reconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .scroll = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .box = .{ .width = 40, .height = 120 } } },
+    });
+    const root = (try runtime.instances.rootRenderObject()).?;
+    _ = try runtime.tree.layout(
+        root,
+        ui.layout.Constraints.tight(.{ .width = 40, .height = 50 }),
+    );
+    try runtime.routePointer(.{ .enter = .{
+        .window = window,
+        .serial = 1,
+        .position = .{ .x = 10, .y = 10 },
+    } });
+    _ = runtime.router.takeEvent();
+    try runtime.routePointer(.{ .axis = .{
+        .window = window,
+        .time_ms = 2,
+        .axis = .vertical,
+        .delta = 18,
+    } });
+    try std.testing.expectEqual(@as(f32, 0), try runtime.instances.scrollOffset(
+        runtime.instances.handleForId(1).?,
+    ));
+    var unused_vm: lua.Vm = undefined;
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqual(@as(f32, 18), try runtime.instances.scrollOffset(
+        runtime.instances.handleForId(1).?,
+    ));
+    try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
+    try std.testing.expect(try runtime.tree.paintDirty(root));
 }
 
 const InputValues = struct {
