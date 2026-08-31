@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig");
+const diagnostic = @import("diagnostic.zig");
 const platform = @import("../platform/window.zig");
 
 pub const Window = struct {
@@ -20,13 +21,52 @@ pub const Application = struct {
         state: *c.State,
         source: []const u8,
     ) !Application {
+        return loadNamed(allocator, state, source, "@application", null);
+    }
+
+    pub fn loadNamed(
+        allocator: std.mem.Allocator,
+        state: *c.State,
+        source: []const u8,
+        chunk_name: [*:0]const u8,
+        diagnostic_output: ?*?diagnostic.Diagnostic,
+    ) !Application {
         try installConstructors(state);
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
-        if (c.luaL_loadbufferx(state, source.ptr, source.len, "@application", null) != c.ok)
+        if (c.luaL_loadbufferx(state, source.ptr, source.len, chunk_name, null) != c.ok) {
+            diagnostic.recordLuaStack(
+                diagnostic_output,
+                allocator,
+                .compile,
+                sourceName(chunk_name),
+                state,
+            );
             return error.LuaLoadFailed;
-        if (c.lua_pcallk(state, 0, 1, 0, 0, null) != c.ok)
+        }
+        if (c.lua_pcallk(state, 0, 1, 0, 0, null) != c.ok) {
+            diagnostic.recordLuaStack(
+                diagnostic_output,
+                allocator,
+                .evaluate,
+                sourceName(chunk_name),
+                state,
+            );
             return error.LuaApplicationFailed;
+        }
+        return parse(allocator, state) catch |err| {
+            diagnostic.recordError(
+                diagnostic_output,
+                allocator,
+                .declaration,
+                sourceName(chunk_name),
+                err,
+            );
+            return err;
+        };
+    }
+
+    fn parse(allocator: std.mem.Allocator, state: *c.State) !Application {
         if (c.lua_type(state, -1) != c.type_table) return error.ApplicationDeclarationRequired;
 
         const id = try requiredString(allocator, state, -1, "id");
@@ -133,6 +173,11 @@ fn luaError(state: *c.State, message: [*:0]const u8) c_int {
     return c.lua_error(state);
 }
 
+fn sourceName(chunk_name: [*:0]const u8) []const u8 {
+    const name = std.mem.span(chunk_name);
+    return if (name.len != 0 and name[0] == '@') name[1..] else name;
+}
+
 test "declarative application owns windows and content callbacks" {
     const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
     defer c.lua_close(state);
@@ -157,4 +202,27 @@ test "declarative application owns windows and content callbacks" {
     try std.testing.expectEqual(@as(usize, 1), application.windows.len);
     try std.testing.expectEqualStrings("main", application.windows[0].declaration.id);
     try std.testing.expectEqual(@as(u32, 320), application.windows[0].declaration.initial_width);
+}
+
+test "named application load reports structured Lua diagnostics" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 2);
+    c.lua_setglobal(state, "ouro");
+    var failure: ?diagnostic.Diagnostic = null;
+    defer if (failure) |*value| value.deinit();
+    try std.testing.expectError(
+        error.LuaLoadFailed,
+        Application.loadNamed(
+            std.testing.allocator,
+            state,
+            "return ouro.app {",
+            "@broken/app.lua",
+            &failure,
+        ),
+    );
+    try std.testing.expect(failure != null);
+    try std.testing.expectEqual(diagnostic.Phase.compile, failure.?.phase);
+    try std.testing.expectEqualStrings("broken/app.lua", failure.?.source_name);
+    try std.testing.expect(failure.?.message.len != 0);
 }

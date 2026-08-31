@@ -9,9 +9,13 @@ pub const UiBuildArgument = @import("ui_build.zig").Argument;
 pub const UiBuildCallback = @import("ui_build.zig").Callback;
 pub const Application = @import("application.zig").Application;
 pub const ApplicationWindow = @import("application.zig").Window;
+pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
+pub const DiagnosticPhase = @import("diagnostic.zig").Phase;
+pub const recordDiagnosticError = @import("diagnostic.zig").recordError;
 
 test {
     _ = @import("application.zig");
+    _ = @import("diagnostic.zig");
     _ = @import("signals.zig");
     _ = @import("vm.zig");
     _ = @import("ui_build.zig");

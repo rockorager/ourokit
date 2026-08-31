@@ -6,6 +6,7 @@ pub const text = @import("text/root.zig");
 pub const varlink = @import("varlink/root.zig");
 pub const loop = @import("loop/root.zig");
 pub const task = @import("task/root.zig");
+pub const bundle = @import("bundle/root.zig");
 pub const lua = @import("lua/root.zig");
 pub const scene = @import("scene/root.zig");
 pub const renderer = @import("renderer/root.zig");
@@ -20,6 +21,7 @@ test {
     _ = varlink;
     _ = loop;
     _ = task;
+    _ = bundle;
     _ = lua;
     _ = scene;
     _ = renderer;

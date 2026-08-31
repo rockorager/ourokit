@@ -41,7 +41,7 @@ src/
     vulkan/                Vulkan backend and software-only capability stub
   platform/wayland/        sole Wayring containment boundary
   lua/                     isolated VM and coroutine adapter
-  bundle/                  future pure-Lua bundle/module loader
+  bundle/                  source providers/snapshots; future Lua module loader
   app/                     small lifecycle/phase and per-window coordinator
 examples/                  added only when environment-testable
 tests/                     cross-module tests as needed

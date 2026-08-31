@@ -1,5 +1,7 @@
 const std = @import("std");
+const bundle = @import("../bundle/root.zig");
 const windows_module = @import("windows.zig");
+const SourceGeneration = @import("source_generation.zig").SourceGeneration;
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const WindowRuntimeConfig = @import("window_runtime.zig").Config;
 const core = @import("../core/root.zig");
@@ -26,6 +28,37 @@ pub const Options = struct {
 /// Applications provide source and policy; this coordinator owns all
 /// native services and preserves the explicit event-loop safe points.
 pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
+    var provider = try bundle.SourceProvider.initEmbedded(
+        init.gpa,
+        "application.lua",
+        source,
+    );
+    defer provider.deinit();
+    return runSource(init, &provider, options);
+}
+
+/// Runs an application from a retained source origin. Disk providers can
+/// produce later snapshots without reconstructing or losing the entry path.
+pub fn runSource(
+    init: std.process.Init,
+    provider: *const bundle.SourceProvider,
+    options: Options,
+) !void {
+    var diagnostic: ?lua.Diagnostic = null;
+    defer if (diagnostic) |*value| value.deinit();
+    var snapshot = provider.snapshot(init.io, init.gpa) catch |err| {
+        lua.recordDiagnosticError(
+            &diagnostic,
+            init.gpa,
+            .source,
+            provider.entryName(),
+            err,
+        );
+        return err;
+    };
+    var snapshot_owned = true;
+    defer if (snapshot_owned) snapshot.deinit();
+
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 128, 32);
     defer loop.deinit();
@@ -33,23 +66,6 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(init.gpa, 32, 8, 8);
     defer scheduler.deinit();
-
-    var vm: lua.Vm = undefined;
-    try vm.init(init.gpa, &scheduler, &loop);
-    var signals: lua.Signals = undefined;
-    var signals_initialized = false;
-    defer {
-        vm.deinit();
-        if (signals_initialized) signals.deinit();
-    }
-    try signals.init(
-        init.gpa,
-        vm.state,
-        options.signal_capacity,
-        options.subscription_capacity,
-        options.dependency_capacity,
-    );
-    signals_initialized = true;
 
     var database = try text.discovery.Database.init();
     defer database.deinit();
@@ -75,19 +91,29 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
     if (options.vulkan) vulkan_glyphs = try renderer.vulkan.GlyphCache.init(init.gpa, &fonts, &vulkan_renderer);
     defer if (options.vulkan) vulkan_glyphs.deinit();
 
-    const descriptor_storage = try init.gpa.alloc(ui.instance.Descriptor, options.window.node_capacity);
-    defer init.gpa.free(descriptor_storage);
-    const semantic_storage = try init.gpa.alloc(ui.semantics.Descriptor, options.window.node_capacity);
-    defer init.gpa.free(semantic_storage);
-    var lua_ui: lua.UiBuild = undefined;
-    try lua_ui.init(vm.state, descriptor_storage);
-    lua_ui.attachSignals(&signals);
-    try lua_ui.attachLabelText(&shapes, &.{primary_font}, 1);
-    try lua_ui.attachSemantics(semantic_storage);
-    lua_ui.enableDeclarativeWidgets(design.tokens.light);
-
-    var application = try lua.Application.load(init.gpa, vm.state, source);
-    defer application.deinit();
+    const theme = design.tokens.light;
+    var generation: SourceGeneration = undefined;
+    // SourceGeneration consumes the snapshot on both success and failure.
+    snapshot_owned = false;
+    try generation.init(
+        init.gpa,
+        &scheduler,
+        &loop,
+        snapshot,
+        .{ .shapes = &shapes, .primary_font = primary_font, .theme = theme },
+        .{
+            .node_capacity = options.window.node_capacity,
+            .signal_capacity = options.signal_capacity,
+            .subscription_capacity = options.subscription_capacity,
+            .dependency_capacity = options.dependency_capacity,
+        },
+        &diagnostic,
+    );
+    defer generation.deinit();
+    const vm = &generation.vm;
+    const signals = &generation.signals;
+    const lua_ui = &generation.ui_build;
+    const application = &generation.application;
     const window_count = application.windows.len;
 
     var window_set: windows_module.WindowSet = undefined;
@@ -131,7 +157,6 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
     @memset(frames_seen, 0);
     const current_storage = try init.gpa.alloc(platform.window.ToplevelDeclaration, window_count);
     defer init.gpa.free(current_storage);
-    const theme = design.tokens.light;
     var disconnect_started = false;
 
     while (true) {
@@ -169,7 +194,7 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
         // Task safe point: platform and CQE dispatch only changed state.
         try scheduler.applyQueuedCancellations();
         for (runtimes) |*runtime| try runtime.collectRetired();
-        for (runtimes) |*runtime| if (runtime.ready) try runtime.dispatchInput(&vm);
+        for (runtimes) |*runtime| if (runtime.ready) try runtime.dispatchInput(vm);
         while (scheduler.takeRunnable()) |handle| _ = try vm.resumeRunnable(handle);
 
         var current_count: usize = 0;
@@ -186,7 +211,7 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
                     try dirty.unregister(runtimes[index].window);
                     runtimes[index].registered = false;
                 }
-                try runtimes[index].clear(&lua_ui);
+                try runtimes[index].clear(lua_ui);
                 continue;
             }
             const handle = window_set.handleForId(window.declaration.id).?;
@@ -199,7 +224,7 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
                     theme.surface_base,
                     theme.accent_default,
                     theme.surface_base,
-                    &signals,
+                    signals,
                     &shapes,
                     options.window,
                 );
@@ -217,7 +242,7 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
                 runtimes[index].frame_state.size orelse return error.DirtyWindowNotConfigured;
             runtimes[index].reconcile(
                 size,
-                &lua_ui,
+                lua_ui,
                 application.windows[index].content_reference,
             ) catch |err| {
                 try dirty.retry(work);

@@ -213,6 +213,7 @@ and shared-memory/dma-buf presentation paths.
 - [Rendering](docs/rendering.md)
 - [Runtime, tasks, Lua, and io_uring](docs/runtime.md)
 - [Application model](docs/application-model.md)
+- [Transactional source reload](docs/hot-reload.md)
 
 Instance-adjacent typed pointer bindings now replace proof-wide global event
 dispatch. Widget-specific callbacks such as `ouro.button { on_press = ... }`

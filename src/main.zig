@@ -19,14 +19,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const application_path = path orelse return error.ExpectedApplicationPath;
-    const file = if (std.fs.path.isAbsolute(application_path))
-        try std.Io.Dir.openFileAbsolute(init.io, application_path, .{})
-    else
-        try std.Io.Dir.cwd().openFile(init.io, application_path, .{});
-    defer file.close(init.io);
-    var buffer: [8192]u8 = undefined;
-    var reader = file.reader(init.io, &buffer);
-    const source = try reader.interface.allocRemaining(init.gpa, .limited(16 * 1024 * 1024));
-    defer init.gpa.free(source);
-    try ourokit.app.runWayland(init, source, options);
+    var provider = try ourokit.bundle.SourceProvider.initDisk(init.gpa, application_path);
+    defer provider.deinit();
+    try ourokit.app.runWaylandSource(init, &provider, options);
 }
