@@ -53,7 +53,7 @@ deterministic without putting shaping or measurement in a renderer.
 - Python 3 for deterministic token validation/generation
 - Fontconfig development files for native Linux font discovery
 - FreeType development files for native software text rasterization
-- Optional: Vulkan loader and headers, plus `glslc`, for `-Dvulkan=true`
+- Vulkan loader and headers, plus `glslc` (not required with `-Dvulkan=false`)
 - A C/C++ toolchain is not required separately; Zig compiles embedded Lua and
   HarfBuzz
 
@@ -66,16 +66,16 @@ zig fmt --check build.zig src examples tools
 zig build tokens
 ```
 
-The default software build installs `zig-out/lib/libourokit.a` without requiring
-Vulkan or `glslc`. `zig build test` includes real kernel `io_uring`
-timeout/cancel tests, deterministic software pixel tests, and the Lua
-coroutine/timer safe-point integration test. `zig build test -Dvulkan=true`
-also runs Vulkan pixel tests. The suite covers logical constraints, Flex/Stack
-layout, invalidation caching, scene lowering, and hit
-testing without a compositor, plus keyed reconciliation, safe retirement, and
-transactional pointer routing. Signal tests cover equal-write suppression,
-dynamic dependency replacement, failed-build rollback, build-time write
-rejection, and owner disposal. Text tests fetch pinned Inter and Noto Sans
+The default build includes both software and Vulkan renderers and installs
+`zig-out/lib/libourokit.a`. Use `-Dvulkan=false` for a software-only build that
+does not require Vulkan or `glslc`. `zig build test` includes Vulkan and
+deterministic software pixel tests, real kernel `io_uring` timeout/cancel tests,
+and the Lua coroutine/timer safe-point integration test. The suite covers
+logical constraints, Flex/Stack layout, invalidation caching, scene lowering,
+and hit testing without a compositor, plus keyed reconciliation, safe
+retirement, and transactional pointer routing. Signal tests cover equal-write
+suppression, dynamic dependency replacement, failed-build rollback, build-time
+write rejection, and owner disposal. Text tests fetch pinned Inter and Noto Sans
 Arabic fixtures and verify HarfBuzz shaping plus Unicode grapheme segmentation.
 Fallback tests verify configured-order face selection, grapheme-safe boundaries,
 visible unresolved glyphs, stable font handles, and Fontconfig variable-instance
@@ -154,8 +154,8 @@ interpreting startup or memory results.
 ## Wayland development
 
 Wayring is pinned as a Zig package and wrapped by `src/platform/wayland`.
-Ourokit owns the ring; Wayring borrows it. Run the software-rendered example
-on a Wayland desktop with:
+Ourokit owns the ring; Wayring borrows it. Run the declarative example on a
+Wayland desktop with:
 
 ```sh
 zig build run-wayland-example
@@ -164,7 +164,8 @@ zig build run-wayland-example
 The executable wrapper is intentionally tiny. Its application is
 `examples/wayland.lua`, which declares the app, window, signal, and button;
 `app.runWayland` owns the ring, scheduler, Lua VM, font/text caches, retained UI,
-software renderer, and Wayland presentation.
+selected renderer, and Wayland presentation. Vulkan-capable builds select Vulkan
+by default; pass `--software` after `--` to select software rendering instead.
 
 Run any declarative application directly through the reusable host:
 
@@ -172,11 +173,14 @@ Run any declarative application directly through the reusable host:
 zig build run-app -- path/to/application.lua
 ```
 
+The reusable host follows the same renderer default. Pass `--software` to force
+the software renderer.
+
 Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
 presenter with:
 
 ```sh
-zig build run-wayland-vulkan-example -Dvulkan=true
+zig build run-wayland-vulkan-example
 ```
 
 The Vulkan example uses linux-dmabuf v4 device/modifier feedback, direct

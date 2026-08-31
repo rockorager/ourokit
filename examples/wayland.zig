@@ -8,6 +8,10 @@ pub fn main(init: std.process.Init) !void {
     for (args[1..]) |argument| {
         if (std.mem.eql(u8, argument, "--exit-after-first-frame")) {
             options.exit_after_first_frame = true;
+        } else if (std.mem.eql(u8, argument, "--vulkan")) {
+            options.vulkan = true;
+        } else if (std.mem.eql(u8, argument, "--software")) {
+            options.vulkan = false;
         } else if (std.mem.eql(u8, argument, "--two-windows")) {
             two_windows = true;
         } else {

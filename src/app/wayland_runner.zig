@@ -14,7 +14,7 @@ const ui = @import("../ui/root.zig");
 
 pub const Options = struct {
     exit_after_first_frame: bool = false,
-    vulkan: bool = false,
+    vulkan: bool = renderer.has_vulkan,
     window: WindowRuntimeConfig = .{},
     platform_event_capacity: usize = 256,
     signal_capacity: usize = 256,

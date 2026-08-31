@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
         bool,
         "vulkan",
         "Enable the Vulkan renderer and dma-buf presentation",
-    ) orelse false;
+    ) orelse true;
     const unicode_ucd = b.dependency("unicode_ucd", .{});
     const uucode_config = addUucodeConfig(b, unicode_ucd);
     const wayring = b.dependency("wayring", .{
@@ -359,7 +359,7 @@ fn addWaylandExample(
     });
     const run = b.addRunArtifact(example);
     if (b.args) |args| run.addArgs(args);
-    const run_step = b.step("run-wayland-example", "Open the software-rendered Wayland example");
+    const run_step = b.step("run-wayland-example", "Open the declarative Wayland example");
     run_step.dependOn(&run.step);
 
     if (enable_vulkan) {

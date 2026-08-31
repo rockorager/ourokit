@@ -3,14 +3,15 @@ const ourokit = @import("ourokit");
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    var use_vulkan = false;
-    var exit_after_first_frame = false;
+    var options: ourokit.app.WaylandRunOptions = .{};
     var path: ?[]const u8 = null;
     for (args[1..]) |argument| {
         if (std.mem.eql(u8, argument, "--vulkan")) {
-            use_vulkan = true;
+            options.vulkan = true;
+        } else if (std.mem.eql(u8, argument, "--software")) {
+            options.vulkan = false;
         } else if (std.mem.eql(u8, argument, "--exit-after-first-frame")) {
-            exit_after_first_frame = true;
+            options.exit_after_first_frame = true;
         } else if (path == null) {
             path = argument;
         } else {
@@ -27,8 +28,5 @@ pub fn main(init: std.process.Init) !void {
     var reader = file.reader(init.io, &buffer);
     const source = try reader.interface.allocRemaining(init.gpa, .limited(16 * 1024 * 1024));
     defer init.gpa.free(source);
-    try ourokit.app.runWayland(init, source, .{
-        .exit_after_first_frame = exit_after_first_frame,
-        .vulkan = use_vulkan,
-    });
+    try ourokit.app.runWayland(init, source, options);
 }

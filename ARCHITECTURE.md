@@ -38,7 +38,7 @@ src/
   scene/                   immutable renderer-neutral display lists
   renderer/
     software/
-    vulkan/                optional Vulkan backend and disabled capability stub
+    vulkan/                Vulkan backend and software-only capability stub
   platform/wayland/        sole Wayring containment boundary
   lua/                     isolated VM and coroutine adapter
   bundle/                  future pure-Lua bundle/module loader
@@ -437,10 +437,10 @@ the backend owns conversion and deterministic source/source-over composition.
 Tests cover clipping, damage, alpha, format, row padding, clear, rectangles, and
 reusable conformance fixtures.
 
-Vulkan is an explicit build capability. Default software/headless builds use
-the type-compatible disabled boundary and neither compile shaders nor discover
-or link the Vulkan loader. `-Dvulkan=true` enables the real backend, its tests,
-and the dma-buf example.
+Vulkan is enabled by default as an explicit build capability. Vulkan-capable
+builds select it as the default runtime renderer while retaining an explicit
+software selection. `-Dvulkan=false` uses the type-compatible disabled boundary
+and neither compiles shaders nor discovers or links the Vulkan loader.
 
 Native software text rendering optionally links system FreeType. Backend-owned
 face entries retain FontCache handles and preserve face/named-instance identity
