@@ -9,11 +9,12 @@ pub const Viewport = struct {
     scale: f32 = 1,
 };
 
-pub const ActionKind = enum { hover, pointer_down, click };
+pub const ActionKind = enum { hover, pointer_down, click, scroll };
 
 pub const Action = struct {
     kind: ActionKind,
     target: []u8,
+    delta: f32 = 0,
 };
 
 pub const Story = struct {
@@ -250,16 +251,34 @@ fn parseActions(allocator: std.mem.Allocator, state: *c.State, table: c_int) ![]
             .pointer_down
         else if (std.mem.eql(u8, kind_value, "click"))
             .click
+        else if (std.mem.eql(u8, kind_value, "scroll"))
+            .scroll
         else
             return error.InvalidStoryActionType;
         const target = try requiredString(allocator, state, -1, "target");
         errdefer allocator.free(target);
         if (!validSelector(target)) return error.InvalidStoryActionTarget;
-        action.* = .{ .kind = kind, .target = target };
+        const delta = if (kind == .scroll)
+            try requiredScrollDelta(state, -1)
+        else
+            0;
+        action.* = .{ .kind = kind, .target = target, .delta = delta };
         initialized += 1;
         c.lua_settop(state, -2);
     }
     return actions;
+}
+
+fn requiredScrollDelta(state: *c.State, table: c_int) !f32 {
+    const value_type = c.lua_getfield(state, table, "delta");
+    defer c.lua_settop(state, -2);
+    if (value_type != c.type_number) return error.InvalidStoryScrollDelta;
+    var is_number: c_int = 0;
+    const value = c.lua_tonumberx(state, -1, &is_number);
+    if (is_number == 0 or !std.math.isFinite(value) or value == 0 or
+        value < -std.math.floatMax(f32) or value > std.math.floatMax(f32))
+        return error.InvalidStoryScrollDelta;
+    return @floatCast(value);
 }
 
 fn validSelector(path: []const u8) bool {
@@ -316,6 +335,7 @@ test "storybook declarations are owned, defaulted, and selectable" {
         \\      actions = {
         \\        { type = "hover", target = "content/button" },
         \\        { type = "pointer_down", target = "content/button" },
+        \\        { type = "scroll", target = "content/list", delta = 120 },
         \\      },
         \\      content = function() end,
         \\    },
@@ -329,9 +349,11 @@ test "storybook declarations are owned, defaulted, and selectable" {
     try std.testing.expectEqual(@as(u32, 320), story.viewport.width);
     try std.testing.expectEqual(@as(f32, 2), story.viewport.scale);
     try std.testing.expectEqual(ColorScheme.dark, story.color_scheme);
-    try std.testing.expectEqual(@as(usize, 2), story.actions.len);
+    try std.testing.expectEqual(@as(usize, 3), story.actions.len);
     try std.testing.expectEqual(ActionKind.pointer_down, story.actions[1].kind);
     try std.testing.expectEqualStrings("content/button", story.actions[1].target);
+    try std.testing.expectEqual(ActionKind.scroll, story.actions[2].kind);
+    try std.testing.expectEqual(@as(f32, 120), story.actions[2].delta);
 }
 
 test "storybook rejects unsafe and duplicate IDs" {
@@ -363,6 +385,14 @@ test "storybook rejects unsafe and duplicate IDs" {
         \\  ouro.story {
         \\    id = "target", name = "Bad target", content = function() end,
         \\    actions = { { type = "click", target = "content//button" } },
+        \\  },
+        \\} }
+    ));
+    try std.testing.expectError(error.InvalidStoryScrollDelta, Storybook.load(std.testing.allocator, state,
+        \\return ouro.storybook { stories = {
+        \\  ouro.story {
+        \\    id = "scroll", name = "Bad scroll", content = function() end,
+        \\    actions = { { type = "scroll", target = "content/list", delta = 0 } },
         \\  },
         \\} }
     ));

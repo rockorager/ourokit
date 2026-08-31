@@ -20,6 +20,7 @@ pub const SemanticTarget = struct {
     center: core.PointF,
     role: ui.semantics.Role,
     enabled: bool,
+    scroll_axis: ?platform.PointerAxis,
 };
 
 /// Retained UI state for one application window. This coordinates sibling UI,
@@ -349,6 +350,13 @@ pub const WindowRuntime = struct {
         const target = self.instances.handleForId(semantic.id) orelse
             return error.SemanticInstanceMissing;
         const render = try self.instances.renderObject(target);
+        const scroll_axis: ?platform.PointerAxis = switch (try self.tree.objectAt(render)) {
+            .scroll => |scroll| switch (scroll.axis) {
+                .vertical => .vertical,
+                .horizontal => .horizontal,
+            },
+            else => null,
+        };
         const size = try self.tree.nodeSize(render);
         var origin: core.PointF = .{};
         var current: ?ui.instance.InstanceHandle = target;
@@ -366,6 +374,7 @@ pub const WindowRuntime = struct {
             },
             .role = semantic.role,
             .enabled = semantic.enabled,
+            .scroll_axis = scroll_axis,
         };
     }
 

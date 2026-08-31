@@ -11,6 +11,27 @@ local function button_story(label, enabled)
   }
 end
 
+local function scroll_story()
+  ouro.scroll {
+    key = "settings-scroll",
+    children = function()
+      ouro.column {
+        key = "settings",
+        gap = 10,
+        children = function()
+          ouro.label { key = "heading", text = "Application settings", size = 18 }
+          for index = 1, 12 do
+            ouro.button {
+              key = "setting-" .. index,
+              label = "Setting " .. index,
+            }
+          end
+        end,
+      }
+    end,
+  }
+end
+
 return ouro.storybook {
   title = "Ourokit built-in widgets",
   stories = {
@@ -184,24 +205,19 @@ return ouro.storybook {
       name = "Scrollable settings list",
       viewport = { width = 380, height = 280 },
       content = function()
-        ouro.scroll {
-          key = "settings-scroll",
-          children = function()
-            ouro.column {
-              key = "settings",
-              gap = 10,
-              children = function()
-                ouro.label { key = "heading", text = "Application settings", size = 18 }
-                for index = 1, 12 do
-                  ouro.button {
-                    key = "setting-" .. index,
-                    label = "Setting " .. index,
-                  }
-                end
-              end,
-            }
-          end,
-        }
+        scroll_story()
+      end,
+    },
+    ouro.story {
+      id = "layout/scroll-offset",
+      group = "Layout",
+      name = "Scrolled settings list",
+      viewport = { width = 380, height = 280 },
+      actions = {
+        { type = "scroll", target = "settings-scroll", delta = 180 },
+      },
+      content = function()
+        scroll_story()
       end,
     },
     ouro.story {

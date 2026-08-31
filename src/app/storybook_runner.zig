@@ -246,7 +246,6 @@ fn playAction(
     action: lua.StorybookAction,
 ) !void {
     const target = try runtime.semanticTarget(action.target);
-    if (target.role != .button) return error.StoryActionTargetNotInteractive;
     const window = runtime.window;
     try runtime.routePointer(.{ .motion = .{
         .window = window,
@@ -254,6 +253,17 @@ fn playAction(
         .position = target.center,
     } });
     try dispatchAndSettle(runtime, vm, scheduler, lua_ui, story);
+    if (action.kind == .scroll) {
+        try runtime.routePointer(.{ .axis = .{
+            .window = window,
+            .time_ms = 0,
+            .axis = target.scroll_axis orelse return error.StoryActionTargetNotScrollable,
+            .delta = action.delta,
+        } });
+        try dispatchAndSettle(runtime, vm, scheduler, lua_ui, story);
+        return;
+    }
+    if (target.role != .button) return error.StoryActionTargetNotInteractive;
     if (action.kind == .hover) return;
 
     try runtime.routePointer(.{ .button = .{

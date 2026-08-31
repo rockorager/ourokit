@@ -220,15 +220,17 @@ actions = {
   { type = "hover", target = "content/button" },
   { type = "pointer_down", target = "content/button" },
   { type = "click", target = "content/other-button" },
+  { type = "scroll", target = "content/list", delta = 180 },
 }
 ```
 
 Playback uses the normal hit tester, pointer router, button policy, callback
-tasks, signals, reconciliation, layout, and paint path. Event timestamps and
-serials are fixed, and each action settles before the next begins. Wall-clock
-`ouro.sleep` calls fail during playback rather than making snapshots timing
-dependent. The interactive Storybook browser is planned after the headless
-catalog and snapshot interface stabilizes.
+tasks, scroll policy, signals, reconciliation, layout, and paint path. Scroll
+deltas are logical surface units and follow the target scroll widget's declared
+axis. Event timestamps and serials are fixed, and each action settles before
+the next begins. Wall-clock `ouro.sleep` calls fail during playback rather than
+making snapshots timing dependent. The interactive Storybook browser is
+planned after the headless catalog and snapshot interface stabilizes.
 
 Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
 presenter with:
