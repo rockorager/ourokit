@@ -228,9 +228,11 @@ Vulkan resources, or pixel formats to text, scenes, or render objects. Cache
 eviction remains deferred until benchmark data establishes a budget.
 
 Borrowed display lists can render glyph handles synchronously. Owned async
-`scene.Frame` construction currently rejects glyph commands because frame-level
-resource leases are not implemented; it does not silently copy handles without
-retaining them.
+`scene.Frame.initWithShapes` construction copies scene storage and retains every
+referenced shape (which in turn retains its candidate fonts) until frame
+destruction. Plain `Frame.init` still rejects glyph commands rather than
+silently copying unleased handles. Shape and font caches are application-owned
+and must outlive all frames that lease their entries.
 
 ## Work not yet frozen
 
@@ -241,5 +243,5 @@ retaining them.
 - empty-line metrics and inherited line-style policy;
 - normalization policy (shaping does not imply mutating application text);
 - variable-font axis selection and cache identity;
-- renderer-neutral frame resource leases for positioned glyph runs;
+- renderer-neutral frame resource leases for direct positioned glyph runs;
 - cache eviction, LCD/subpixel policy, and backend glyph-cache budgets.

@@ -483,7 +483,8 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
             const new_box = new.box;
             break :changed old_box.width != new_box.width or old_box.height != new_box.height or
                 old_box.border_width != new_box.border_width or
-                !std.meta.eql(old_box.padding, new_box.padding);
+                !std.meta.eql(old_box.padding, new_box.padding) or
+                !std.meta.eql(old_box.alignment, new_box.alignment);
         },
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
         .stack => false,
@@ -633,6 +634,37 @@ test "box border participates in layout and lowers decoration" {
     const decoration = builder.displayList().commands[0].decorated_rectangle;
     try std.testing.expectEqual(@as(u32, 2), decoration.border_width);
     try std.testing.expectEqual(@as(u32, 8), decoration.corner_radius);
+}
+
+test "box centers an intrinsic child inside its padded content" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    const root = try tree.create(.{ .box = .{
+        .width = 100,
+        .height = 40,
+        .padding = .all(4),
+        .alignment = .center,
+    } });
+    const child = try tree.create(.{ .box = .{ .width = 20, .height = 10 } });
+    try tree.appendChild(root, child, .none);
+
+    try std.testing.expectEqual(
+        SizeF{ .width = 100, .height = 40 },
+        try tree.layout(root, .{ .max_width = 200, .max_height = 200 }),
+    );
+    try std.testing.expectEqual(SizeF{ .width = 20, .height = 10 }, try tree.nodeSize(child));
+    try std.testing.expectEqual(PointF{ .x = 40, .y = 15 }, try tree.nodeOffset(child));
+
+    try tree.update(root, .{ .box = .{
+        .width = 100,
+        .height = 40,
+        .padding = .all(4),
+        .alignment = .{ .horizontal = .maximum, .vertical = .maximum },
+    } });
+    try std.testing.expect(try tree.layoutDirty(root));
+    _ = try tree.layout(root, .{ .max_width = 200, .max_height = 200 });
+    try std.testing.expectEqual(PointF{ .x = 76, .y = 26 }, try tree.nodeOffset(child));
 }
 
 test "render-object topology rejects cycles and stale generations" {

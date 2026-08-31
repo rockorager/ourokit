@@ -2,10 +2,24 @@ const Color = @import("../../core/color.zig").Color;
 const Insets = @import("../../core/geometry.zig").Insets;
 const ShapeHandle = @import("../../text/shape_cache.zig").ShapeHandle;
 
+/// Physical alignment within a render object's available axis. Widget policy
+/// resolves direction-sensitive start/end before reaching this layer.
+pub const AxisAlignment = enum { minimum, center, maximum };
+
+pub const Alignment = struct {
+    horizontal: AxisAlignment = .minimum,
+    vertical: AxisAlignment = .minimum,
+
+    pub const center: Alignment = .{ .horizontal = .center, .vertical = .center };
+};
+
 pub const Box = struct {
     width: ?f32 = null,
     height: ?f32 = null,
     padding: Insets = .{},
+    /// When present, the child receives loose inner constraints and is placed
+    /// within the resolved padded content box. Null preserves tight propagation.
+    alignment: ?Alignment = null,
     background: ?Color = null,
     border_color: ?Color = null,
     border_width: f32 = 0,

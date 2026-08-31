@@ -104,7 +104,9 @@ and rasterizes through a backend-owned FreeType glyph cache. `ouro.row`,
 `ouro.column`, and `ouro.label` provide nested composition without
 application-managed numeric IDs or parent links. `ouro.button` composes a Box
 and Label using generated design tokens and retains hover, pressed, disabled,
-pointer-capture, and release-inside activation state in the widget layer;
+pointer-capture, and release-inside activation state in the widget layer. Its
+Box centers the intrinsic Label within the padded button bounds; this child
+placement remains separate from future multi-line paragraph alignment.
 Button is not a renderer primitive. Full
 paragraph render-object integration and editing remain deferred; the headless
 itemization, shaping, wrapping, and line-bidi stages are established but not yet

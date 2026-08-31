@@ -39,6 +39,7 @@ pub const WindowRuntime = struct {
     commands: []scene.Command = &.{},
     command_count: usize = 0,
     frame_state: frame.State = .{},
+    output_scale: f32 = 1,
     signals: *lua.Signals = undefined,
     dirty_windows: ?*ui.instance.ReconcileQueue = null,
     reconciling: bool = false,
@@ -217,12 +218,17 @@ pub const WindowRuntime = struct {
                 if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
             try self.build_owners.complete(work);
         }
-        try self.prepareFrame();
+        try self.prepareFrame(self.output_scale);
         self.ready = true;
     }
 
-    pub fn prepareFrame(self: *WindowRuntime) !void {
+    pub fn prepareFrame(self: *WindowRuntime, output_scale: f32) !void {
         if (!self.initialized or self.frame_state.size == null) return;
+        if (!std.math.isFinite(output_scale) or output_scale <= 0) return error.InvalidOutputScale;
+        if (self.output_scale != output_scale) {
+            self.output_scale = output_scale;
+            self.frame_state.invalidatePaint();
+        }
         const root = (try self.instances.rootRenderObject()) orelse return;
         const size = self.frame_state.size.?;
         const width: f32 = @floatFromInt(size.width);
@@ -235,9 +241,9 @@ pub const WindowRuntime = struct {
             );
             try self.frame_state.layoutComplete();
         }
-        if (try self.tree.paintDirty(root)) {
+        if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
             self.frame_state.invalidatePaint();
-            var builder = try ui.render_object.Builder.init(self.commands, 1);
+            var builder = try ui.render_object.Builder.init(self.commands, self.output_scale);
             try self.tree.buildScene(root, &builder);
             self.command_count = builder.displayList().commands.len;
             _ = try self.frame_state.sceneBuilt();

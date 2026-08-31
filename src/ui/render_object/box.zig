@@ -38,13 +38,37 @@ pub fn layout(value: types.Box, context: anytype, node: anytype, incoming: Const
     const child = try context.onlyChild(node);
     var content: SizeF = .{ .width = 0, .height = 0 };
     if (child) |handle| {
-        content = try context.layoutChild(handle, constraints.deflate(content_insets));
-        try context.setChildOffset(handle, .{ .x = content_insets.left, .y = content_insets.top });
+        const inner = constraints.deflate(content_insets);
+        content = try context.layoutChild(
+            handle,
+            if (value.alignment == null) inner else inner.loosen(),
+        );
     }
-    return constraints.constrain(.{
+    const size = constraints.constrain(.{
         .width = content.width + content_insets.horizontal(),
         .height = content.height + content_insets.vertical(),
     });
+    if (child) |handle| {
+        const inner_size: SizeF = .{
+            .width = @max(0, size.width - content_insets.horizontal()),
+            .height = @max(0, size.height - content_insets.vertical()),
+        };
+        const offset = if (value.alignment) |alignment| PointF{
+            .x = content_insets.left + axisOffset(alignment.horizontal, inner_size.width, content.width),
+            .y = content_insets.top + axisOffset(alignment.vertical, inner_size.height, content.height),
+        } else PointF{ .x = content_insets.left, .y = content_insets.top };
+        try context.setChildOffset(handle, offset);
+    }
+    return size;
+}
+
+fn axisOffset(alignment: types.AxisAlignment, available: f32, child: f32) f32 {
+    const remaining = @max(0, available - child);
+    return switch (alignment) {
+        .minimum => 0,
+        .center => remaining / 2,
+        .maximum => remaining,
+    };
 }
 
 fn validExtent(value: f32) bool {
