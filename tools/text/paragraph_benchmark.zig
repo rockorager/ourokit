@@ -27,6 +27,8 @@ pub fn main(init: std.process.Init) !void {
     for (workloads) |workload| try runItemization(init.gpa, workload);
     std.debug.print("UAX #14 opportunities:\n", .{});
     for (workloads) |workload| try runLineBreaks(init.gpa, workload);
+    std.debug.print("UAX #29 word boundaries:\n", .{});
+    for (workloads) |workload| try runWordBreaks(init.gpa, workload);
     std.debug.print("shaped opportunity measurement:\n", .{});
     for (workloads) |workload| try runMeasurements(init.gpa, workload);
     std.debug.print("greedy selection:\n", .{});
@@ -185,6 +187,21 @@ fn runLineBreaks(allocator: std.mem.Allocator, workload: Workload) !void {
     }
     const elapsed = nanoTime() - started;
     std.mem.doNotOptimizeAway(total_breaks);
+    printResult(workload, elapsed);
+}
+
+fn runWordBreaks(allocator: std.mem.Allocator, workload: Workload) !void {
+    var warmup = try ourokit.text.analyzeWordBreaks(allocator, workload.text);
+    warmup.deinit();
+    const started = nanoTime();
+    var total_boundaries: usize = 0;
+    for (0..iterations) |_| {
+        var analysis = try ourokit.text.analyzeWordBreaks(allocator, workload.text);
+        total_boundaries += analysis.boundaries.len;
+        analysis.deinit();
+    }
+    const elapsed = nanoTime() - started;
+    std.mem.doNotOptimizeAway(total_boundaries);
     printResult(workload, elapsed);
 }
 

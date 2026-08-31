@@ -112,6 +112,9 @@ pub fn build(b: *std.Build) void {
     ourokit_ui.addAnonymousImport("unicode_line_break_tests", .{
         .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
     });
+    ourokit_ui.addAnonymousImport("unicode_word_break_tests", .{
+        .root_source_file = unicode_ucd.path("auxiliary/WordBreakTest.txt"),
+    });
     if (enable_freetype) {
         ourokit_ui.linkSystemLibrary("freetype2", .{});
         ourokit_ui.link_libc = true;
@@ -148,6 +151,9 @@ pub fn build(b: *std.Build) void {
     ourokit.addOptions("ourokit_build_options", ourokit_options);
     ourokit.addAnonymousImport("unicode_line_break_tests", .{
         .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
+    });
+    ourokit.addAnonymousImport("unicode_word_break_tests", .{
+        .root_source_file = unicode_ucd.path("auxiliary/WordBreakTest.txt"),
     });
     if (enable_fontconfig) {
         ourokit.linkSystemLibrary("fontconfig", .{});
@@ -257,6 +263,7 @@ fn addUucodeConfig(b: *std.Build, unicode_ucd: *std.Build.Dependency) std.Build.
     const generate = b.addSystemCommand(&.{"python3"});
     generate.addFileArg(b.path("tools/text/generate_uucode_config.py"));
     generate.addFileArg(unicode_ucd.path("LineBreak.txt"));
+    generate.addFileArg(unicode_ucd.path("auxiliary/WordBreakProperty.txt"));
     return generate.addOutputFileArg("ourokit_uucode_config.zig");
 }
 

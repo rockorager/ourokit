@@ -1,4 +1,5 @@
 const std = @import("std");
+const clipboard_module = @import("clipboard.zig");
 const bundle = @import("../bundle/root.zig");
 const windows_module = @import("windows.zig");
 const source_generation = @import("source_generation.zig");
@@ -27,6 +28,10 @@ pub const Options = struct {
     application_window_capacity: usize = 16,
     window: WindowRuntimeConfig = .{},
     scope_capacity: usize = 1024,
+    resource_capacity: usize = 1024,
+    clipboard_request_capacity: usize = 16,
+    clipboard_action_capacity: usize = 128,
+    clipboard_max_text_bytes: usize = 1024 * 1024,
     platform_event_capacity: usize = 256,
     signal_capacity: usize = 256,
     subscription_capacity: usize = 1024,
@@ -102,8 +107,18 @@ fn runSourceWithFontconfig(
     defer loop.deinit();
 
     var scheduler: task.Scheduler = undefined;
-    try scheduler.init(init.gpa, options.scope_capacity, 8, 8);
+    try scheduler.init(init.gpa, options.scope_capacity, 8, options.resource_capacity);
     defer scheduler.deinit();
+
+    var clipboard: clipboard_module.Coordinator = undefined;
+    try clipboard.init(
+        init.gpa,
+        &scheduler,
+        options.clipboard_request_capacity,
+        options.clipboard_action_capacity,
+        options.clipboard_max_text_bytes,
+    );
+    defer clipboard.deinit();
 
     var callbacks: lua.CallbackRegistry = undefined;
     try callbacks.init(init.gpa, options.window.node_capacity);
@@ -251,6 +266,14 @@ fn runSourceWithFontconfig(
         const signals = &active_generation.signals;
         const lua_ui = &active_generation.ui_build;
         var desired_changed = false;
+        clipboard.setPlatformAvailable(host.clipboardAvailable());
+        while (host.takeClipboardCompletion()) |completion| {
+            if (completion.canceled)
+                try clipboard.acknowledgeCancellation(completion.request)
+            else
+                try clipboard.completePaste(completion.request, completion.text);
+            try host.releaseClipboardCompletion(completion.request);
+        }
         if (host.failure != null) {
             for (runtime_slots) |*slot| {
                 if (slot.desired) desired_changed = true;
@@ -310,7 +333,39 @@ fn runSourceWithFontconfig(
         for (runtime_slots) |*slot| try slot.runtime.collectRetired();
         for (runtime_slots) |*slot| if (slot.runtime.ready)
             try slot.runtime.dispatchInput(&callbacks);
+        while (clipboard.takeCompletion()) |completion| {
+            if (completion.text) |bytes| {
+                if (slotForNativeHandle(&window_set, runtime_slots, completion.target.window)) |slot| {
+                    if (slot.runtime.ready) {
+                        _ = try slot.runtime.applyClipboardPaste(completion.target.text_input, bytes);
+                    }
+                }
+            }
+            try clipboard.releaseCompletion(completion.request);
+        }
+        try clipboard.collectCanceled();
         while (scheduler.takeRunnable()) |handle| _ = try source_reload.resumeRunnable(handle);
+
+        while (clipboard.takeAction()) |action| {
+            defer clipboard.releaseAction(action);
+            switch (action) {
+                .set_selection => |selection| try host.setClipboard(
+                    selection.serial,
+                    selection.text,
+                ),
+                .request_paste => |request| {
+                    if (!host.clipboardAvailable() or !(try host.requestClipboard(request.request))) {
+                        try clipboard.completePaste(request.request, null);
+                        const unavailable = clipboard.takeCompletion().?;
+                        try clipboard.releaseCompletion(unavailable.request);
+                    }
+                },
+                .cancel_paste => |request| {
+                    if (!(try host.cancelClipboard(request)))
+                        try clipboard.acknowledgeCancellation(request);
+                },
+            }
+        }
 
         var current_count: usize = 0;
         for (active_application.windows) |window| {
@@ -354,6 +409,7 @@ fn runSourceWithFontconfig(
                 try dirty.register(handle);
                 slot.runtime.registered = true;
                 slot.runtime.setDirtyWindowQueue(&dirty);
+                slot.runtime.setClipboardCoordinator(&clipboard);
             }
             if (slot.configured_size != null and !(try dirty.hasPending(handle)))
                 _ = try dirty.markDirty(handle);
@@ -490,13 +546,15 @@ fn runSourceWithFontconfig(
         const serial_before_flush = window_set.changeSerial();
         try host.flush();
         if (host.quiescent() and window_set.retainedCount() == 0 and
-            !loop.hasPendingTimerKernelWork()) break;
+            !loop.hasPendingTimerKernelWork() and !loop.hasPendingOperations()) break;
         if (desired_changed or window_set.changeSerial() != serial_before_flush) continue;
-        if (host.quiescent() and !loop.hasPendingTimerKernelWork()) continue;
+        if (host.quiescent() and !loop.hasPendingTimerKernelWork() and
+            !loop.hasPendingOperations()) continue;
 
         const completion = try loop.wait();
         switch (loop.dispatch(completion)) {
-            .file => |file| try source_reload.markFileCompleted(file),
+            .file => |file| if (!(try host.dispatchClipboardFile(file)))
+                try source_reload.markFileCompleted(file),
             .operation_cancel => {},
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
                 if (try host.dispatchTimer(timeout.operation)) continue;

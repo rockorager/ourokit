@@ -302,6 +302,42 @@ pub const Tree = struct {
         ) orelse error.CaretNotFound;
     }
 
+    pub fn textLineBoundary(
+        self: *Tree,
+        handle: NodeHandle,
+        byte_offset: usize,
+        affinity: text.CaretAffinity,
+        boundary: text.LineBoundary,
+    ) !text.CaretStop {
+        const target = try self.ensureTextLayout(handle);
+        const paragraph_layout = self.paragraphs.?.get(target.paragraph_layout.?) catch
+            return error.StaleParagraph;
+        return paragraph_layout.positioned.lineBoundary(
+            byte_offset,
+            affinity,
+            boundary,
+        ) orelse error.CaretNotFound;
+    }
+
+    pub fn textVerticalNeighbor(
+        self: *Tree,
+        handle: NodeHandle,
+        byte_offset: usize,
+        affinity: text.CaretAffinity,
+        preferred_x: ?f32,
+        direction: text.VerticalCaretDirection,
+    ) !text.VerticalCaretMove {
+        const target = try self.ensureTextLayout(handle);
+        const paragraph_layout = self.paragraphs.?.get(target.paragraph_layout.?) catch
+            return error.StaleParagraph;
+        return paragraph_layout.positioned.verticalNeighbor(
+            byte_offset,
+            affinity,
+            preferred_x,
+            direction,
+        ) orelse error.CaretNotFound;
+    }
+
     pub fn nodeSize(self: *Tree, handle: NodeHandle) !SizeF {
         const target = try self.slot(handle);
         if (!target.has_layout or !(try self.layoutPathCurrent(handle))) return error.LayoutRequired;

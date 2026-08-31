@@ -1,6 +1,7 @@
 const std = @import("std");
 const uucode = @import("uucode");
 const CaretAffinity = @import("../../text/positioned_lines.zig").CaretAffinity;
+const word_break = @import("../../text/word_break.zig");
 
 /// A logical selection in UTF-8 byte offsets. Anchor and extent preserve the
 /// direction of an extended selection; `range` returns its normalized bounds.
@@ -51,6 +52,7 @@ pub const Model = struct {
     allocator: std.mem.Allocator,
     bytes: std.ArrayList(u8) = .empty,
     boundaries: std.ArrayList(usize) = .empty,
+    word_boundaries: std.ArrayList(usize) = .empty,
     selection: Selection = .collapsed(0),
     revision: u64 = 0,
 
@@ -62,12 +64,14 @@ pub const Model = struct {
         errdefer self.deinit();
         try self.bytes.appendSlice(allocator, initial);
         try self.boundaries.ensureTotalCapacity(allocator, boundary_capacity);
+        try self.word_boundaries.ensureTotalCapacity(allocator, boundary_capacity);
         self.rebuildBoundaries();
         self.selection = .collapsed(initial.len);
         return self;
     }
 
     pub fn deinit(self: *Model) void {
+        self.word_boundaries.deinit(self.allocator);
         self.boundaries.deinit(self.allocator);
         self.bytes.deinit(self.allocator);
         self.* = undefined;
@@ -75,6 +79,14 @@ pub const Model = struct {
 
     pub fn text(self: *const Model) []const u8 {
         return self.bytes.items;
+    }
+
+    /// Returns a borrowed view of the normalized committed-text selection.
+    /// Clipboard owners must copy this view before mutating the model or
+    /// retaining it past the current editing phase.
+    pub fn selectedText(self: *const Model) []const u8 {
+        const range = self.selection.range();
+        return self.bytes.items[range.start..range.end];
     }
 
     pub fn setSelection(self: *Model, value: Selection) !bool {
@@ -124,6 +136,7 @@ pub const Model = struct {
         // Both allocations happen before the first content mutation.
         try self.bytes.ensureTotalCapacity(self.allocator, new_len);
         try self.boundaries.ensureTotalCapacity(self.allocator, boundary_capacity);
+        try self.word_boundaries.ensureTotalCapacity(self.allocator, boundary_capacity);
         self.bytes.replaceRangeAssumeCapacity(range.start, removed_len, replacement);
         self.rebuildBoundaries();
 
@@ -168,12 +181,44 @@ pub const Model = struct {
         return self.replaceSelection("");
     }
 
+    pub fn moveWordPrevious(self: *Model, extend: bool) bool {
+        if (!extend and !self.selection.isCollapsed())
+            return self.setExtent(self.selection.range().start, false);
+        return self.setExtent(self.wordBoundaryBefore(self.selection.extent), extend);
+    }
+
+    pub fn moveWordNext(self: *Model, extend: bool) bool {
+        if (!extend and !self.selection.isCollapsed())
+            return self.setExtent(self.selection.range().end, false);
+        return self.setExtent(self.wordBoundaryAfter(self.selection.extent), extend);
+    }
+
+    pub fn deleteWordBackward(self: *Model) !bool {
+        if (!self.selection.isCollapsed()) return self.replaceSelection("");
+        const end = self.selection.extent;
+        const start = self.wordBoundaryBefore(end);
+        if (start == end) return false;
+        self.selection = .{ .anchor = start, .extent = end };
+        return self.replaceSelection("");
+    }
+
+    pub fn deleteWordForward(self: *Model) !bool {
+        if (!self.selection.isCollapsed()) return self.replaceSelection("");
+        const start = self.selection.extent;
+        const end = self.wordBoundaryAfter(start);
+        if (start == end) return false;
+        self.selection = .{ .anchor = start, .extent = end };
+        return self.replaceSelection("");
+    }
+
     fn rebuildBoundaries(self: *Model) void {
         self.boundaries.clearRetainingCapacity();
         self.boundaries.appendAssumeCapacity(0);
         var iterator = uucode.grapheme.utf8Iterator(self.bytes.items);
         while (iterator.nextGrapheme()) |grapheme|
             self.boundaries.appendAssumeCapacity(grapheme.end);
+        self.word_boundaries.clearRetainingCapacity();
+        word_break.appendAssumeCapacity(self.bytes.items, &self.word_boundaries);
     }
 
     fn isBoundary(self: *const Model, offset: usize) bool {
@@ -198,6 +243,29 @@ pub const Model = struct {
     fn boundaryAtOrAfter(self: *const Model, offset: usize) usize {
         const index = lowerBound(self.boundaries.items, offset);
         return self.boundaries.items[@min(index, self.boundaries.items.len - 1)];
+    }
+
+    fn wordBoundaryBefore(self: *const Model, offset: usize) usize {
+        var index = lowerBound(self.word_boundaries.items, offset);
+        while (index != 0) {
+            const start = self.word_boundaries.items[index - 1];
+            const end = self.word_boundaries.items[index];
+            if (word_break.isWordSegment(self.bytes.items[start..end])) return start;
+            index -= 1;
+        }
+        return 0;
+    }
+
+    fn wordBoundaryAfter(self: *const Model, offset: usize) usize {
+        var index = lowerBound(self.word_boundaries.items, offset);
+        if (index != 0 and (index == self.word_boundaries.items.len or
+            self.word_boundaries.items[index] != offset)) index -= 1;
+        while (index + 1 < self.word_boundaries.items.len) : (index += 1) {
+            const start = self.word_boundaries.items[index];
+            const end = self.word_boundaries.items[index + 1];
+            if (word_break.isWordSegment(self.bytes.items[start..end])) return end;
+        }
+        return self.bytes.items.len;
     }
 
     fn setExtent(self: *Model, extent: usize, extend: bool) bool {
@@ -263,6 +331,7 @@ test "selection direction is retained and replacement is normalized" {
     defer model.deinit();
     try std.testing.expect(try model.setSelection(.{ .anchor = 10, .extent = 4 }));
     try std.testing.expectEqual(Range{ .start = 4, .end = 10 }, model.selection.range());
+    try std.testing.expectEqualStrings("אבג", model.selectedText());
     try std.testing.expect(try model.replaceSelection("two"));
     try std.testing.expectEqualStrings("one two three", model.text());
     try std.testing.expectEqual(Selection.collapsed(7), model.selection);
@@ -279,6 +348,41 @@ test "extended movement preserves anchor and collapses by direction" {
     try std.testing.expect(model.movePrevious(true));
     try std.testing.expect(model.movePrevious(false));
     try std.testing.expectEqual(Selection.collapsed(2), model.selection);
+}
+
+test "word movement and deletion use Unicode word boundaries" {
+    var model = try Model.init(std.testing.allocator, "can't stop 123");
+    defer model.deinit();
+
+    try std.testing.expect(model.moveWordPrevious(false));
+    try std.testing.expectEqual(@as(usize, 11), model.selection.extent);
+    try std.testing.expect(model.moveWordPrevious(false));
+    try std.testing.expectEqual(@as(usize, 6), model.selection.extent);
+    try std.testing.expect(model.moveWordPrevious(false));
+    try std.testing.expectEqual(@as(usize, 0), model.selection.extent);
+    try std.testing.expect(model.moveWordNext(false));
+    try std.testing.expectEqual(@as(usize, 5), model.selection.extent);
+    try std.testing.expect(model.moveWordNext(false));
+    try std.testing.expectEqual(@as(usize, 10), model.selection.extent);
+
+    _ = try model.setSelection(.collapsed(model.text().len));
+    try std.testing.expect(try model.deleteWordBackward());
+    try std.testing.expectEqualStrings("can't stop ", model.text());
+    try std.testing.expect(try model.deleteWordBackward());
+    try std.testing.expectEqualStrings("can't ", model.text());
+}
+
+test "word movement keeps emoji sequences and combining text atomic" {
+    const astronaut = "👩🏽‍🚀";
+    var model = try Model.init(std.testing.allocator, "e\u{301}lan " ++ astronaut);
+    defer model.deinit();
+    try std.testing.expect(model.moveWordPrevious(false));
+    try std.testing.expectEqual("e\u{301}lan ".len, model.selection.extent);
+    try std.testing.expect(model.moveWordPrevious(false));
+    try std.testing.expectEqual(@as(usize, 0), model.selection.extent);
+    try std.testing.expect(model.moveWordNext(true));
+    try std.testing.expectEqual(@as(usize, 0), model.selection.anchor);
+    try std.testing.expectEqual("e\u{301}lan".len, model.selection.extent);
 }
 
 test "replacement seam cannot leave caret inside a grapheme" {

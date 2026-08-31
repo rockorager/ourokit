@@ -141,11 +141,14 @@ produce several glyphs, and substitutions can combine several source positions
 into one shaping cluster.
 
 uucode intentionally tailors isolated emoji modifiers relative to default UAX
-#29. Ourokit currently exposes that behavior explicitly. uucode provides useful
-Unicode properties but does not implement UAX #9 bidi, UAX #14 line breaking,
-UAX #15 normalization, or word breaking. Ourokit combines uucode with the
-official Script_Extensions data for run resolution rather than duplicating its
-singular Script table.
+#29 grapheme breaking. Ourokit currently exposes that behavior explicitly.
+uucode provides useful Unicode properties but does not implement UAX #9 bidi,
+UAX #14 line breaking, UAX #15 normalization, or UAX #29 word breaking.
+Ourokit adds Unicode 17 `Word_Break` through uucode's custom table generator
+and implements default word boundaries in the shared text layer. All 1,944
+official `WordBreakTest.txt` cases run in the deterministic test suite. The
+same generated Unicode source, rather than ASCII character classes, drives
+word-wise editor navigation and deletion.
 
 ## Fonts and fallback
 

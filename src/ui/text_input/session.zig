@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_module = @import("model.zig");
+const CaretAffinity = @import("../../text/positioned_lines.zig").CaretAffinity;
 
 pub const DeleteSurrounding = struct {
     before_bytes: u32,
@@ -35,6 +36,11 @@ pub const Surrounding = struct {
     anchor: usize,
 };
 
+const DragAnchor = struct {
+    byte_offset: usize,
+    affinity: CaretAffinity,
+};
+
 /// Retained editing state independent of Wayland, Lua, and rendering. Preedit
 /// text stays outside the committed model; paragraph presentation can overlay
 /// it at `anchor`, while surrounding text remains directly usable by an input
@@ -45,6 +51,10 @@ pub const Session = struct {
     preedit_bytes: ?[]u8 = null,
     preedit_anchor: usize = 0,
     preedit_cursor: ?model_module.Range = null,
+    /// Paragraph-relative physical X retained across consecutive vertical
+    /// moves. Horizontal movement, pointer placement, and edits clear it.
+    preferred_x: ?f32 = null,
+    drag_anchor: ?DragAnchor = null,
     revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Session {
@@ -74,6 +84,41 @@ pub const Session = struct {
             .cursor = self.model.selection.extent,
             .anchor = self.model.selection.anchor,
         };
+    }
+
+    pub fn beginSelectionDrag(
+        self: *Session,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+    ) !bool {
+        const changed = try self.model.setSelection(.collapsedAt(byte_offset, affinity));
+        self.preferred_x = null;
+        self.drag_anchor = .{ .byte_offset = byte_offset, .affinity = affinity };
+        return changed;
+    }
+
+    pub fn updateSelectionDrag(
+        self: *Session,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+    ) !bool {
+        const anchor = self.drag_anchor orelse return false;
+        const changed = try self.model.setSelection(.{
+            .anchor = anchor.byte_offset,
+            .extent = byte_offset,
+            .anchor_affinity = anchor.affinity,
+            .extent_affinity = affinity,
+        });
+        self.preferred_x = null;
+        return changed;
+    }
+
+    pub fn endSelectionDrag(self: *Session) void {
+        self.drag_anchor = null;
+    }
+
+    pub fn isSelecting(self: *const Session) bool {
+        return self.drag_anchor != null;
     }
 
     pub fn apply(self: *Session, batch: EditBatch) !bool {
@@ -125,7 +170,11 @@ pub const Session = struct {
         transferred = true;
         if (old_preedit) |bytes| self.allocator.free(bytes);
 
-        if (model_changed or preedit_changed) self.revision +%= 1;
+        if (model_changed or preedit_changed) {
+            self.preferred_x = null;
+            self.drag_anchor = null;
+            self.revision +%= 1;
+        }
         return model_changed or preedit_changed;
     }
 };
@@ -148,11 +197,13 @@ fn optionalTextEqual(a: ?[]const u8, b: ?[]const u8) bool {
 test "commit replaces the normalized selection" {
     var session = try Session.init(std.testing.allocator, "hello world");
     defer session.deinit();
+    session.preferred_x = 42;
     _ = try session.model.setSelection(.{ .anchor = 11, .extent = 6 });
     try std.testing.expect(try session.apply(.{ .commit = .{ .text = "planet" } }));
     try std.testing.expectEqualStrings("hello planet", session.model.text());
     try std.testing.expectEqual(model_module.Selection.collapsed(12), session.model.selection);
     try std.testing.expect(session.preedit() == null);
+    try std.testing.expect(session.preferred_x == null);
 }
 
 test "preedit removes selection but remains outside committed text" {
@@ -169,6 +220,28 @@ test "preedit removes selection but remains outside committed text" {
     try std.testing.expectEqual(model_module.Selection.collapsed(6), session.model.selection);
     try std.testing.expectEqualStrings("hello ", session.surrounding().text);
     try std.testing.expectEqual(@as(usize, 6), session.surrounding().cursor);
+}
+
+test "selection drag retains its bidi-aware anchor until release" {
+    var session = try Session.init(std.testing.allocator, "abc");
+    defer session.deinit();
+    try std.testing.expect(try session.beginSelectionDrag(1, .upstream));
+    try std.testing.expect(session.isSelecting());
+    try std.testing.expect(try session.updateSelectionDrag(3, .downstream));
+    try std.testing.expectEqual(model_module.Selection{
+        .anchor = 1,
+        .extent = 3,
+        .anchor_affinity = .upstream,
+        .extent_affinity = .downstream,
+    }, session.model.selection);
+    session.endSelectionDrag();
+    try std.testing.expect(!session.isSelecting());
+    try std.testing.expect(!(try session.updateSelectionDrag(0, .downstream)));
+    try std.testing.expectError(
+        error.InvalidGraphemeBoundary,
+        session.beginSelectionDrag(4, .downstream),
+    );
+    try std.testing.expect(!session.isSelecting());
 }
 
 test "delete is measured outside selection or standalone preedit" {

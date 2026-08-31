@@ -1,4 +1,5 @@
 const std = @import("std");
+const clipboard_module = @import("clipboard.zig");
 const frame = @import("frame.zig");
 const text_input_coordinator = @import("text_input.zig");
 const core = @import("../core/root.zig");
@@ -64,6 +65,7 @@ pub const WindowRuntime = struct {
     paragraph_sources: *text.ParagraphSourceCache = undefined,
     paragraphs: *text.ParagraphCache = undefined,
     dirty_windows: ?*ui.instance.ReconcileQueue = null,
+    clipboard: ?*clipboard_module.Coordinator = null,
     reconciling: bool = false,
     text_input_commit_permitted: bool = true,
 
@@ -135,6 +137,10 @@ pub const WindowRuntime = struct {
     ) void {
         self.dirty_windows = dirty_windows;
         self.build_owners.setDirtySink(.{ .context = self, .notify = notifyDirtyWindow });
+    }
+
+    pub fn setClipboardCoordinator(self: *WindowRuntime, clipboard: *clipboard_module.Coordinator) void {
+        self.clipboard = clipboard;
     }
 
     pub fn deinit(self: *WindowRuntime) void {
@@ -553,28 +559,39 @@ pub const WindowRuntime = struct {
             key.state != .released)
         {
             const session = try self.text_inputs.session(focused);
-            const editing_key = key.translated.logical == .backspace or
-                key.translated.logical == .delete or
-                key.translated.logical == .arrow_left or
-                key.translated.logical == .arrow_right;
-            if (session.preedit() != null and editing_key) return;
-            const changed = switch (key.translated.logical) {
-                .backspace => try session.model.deleteBackward(),
-                .delete => try session.model.deleteForward(),
-                .arrow_left => try self.moveTextInputCaret(
-                    focused,
-                    .left,
-                    key.translated.modifiers.shift,
-                ),
-                .arrow_right => try self.moveTextInputCaret(
-                    focused,
-                    .right,
-                    key.translated.modifiers.shift,
-                ),
-                else => false,
-            };
+            if (key.state == .pressed) {
+                if (textInputClipboardShortcut(key.translated)) |command| {
+                    if (session.preedit() != null) return;
+                    session.endSelectionDrag();
+                    const clipboard = self.clipboard orelse return;
+                    if (!clipboard.platformAvailable()) return;
+                    switch (command) {
+                        .copy, .cut => {
+                            const selected = session.model.selectedText();
+                            if (selected.len == 0) return;
+                            try clipboard.setSelection(key.serial, selected);
+                            if (command == .cut) {
+                                session.preferred_x = null;
+                                if (try session.model.replaceSelection(""))
+                                    try self.syncTextInputVisuals();
+                            }
+                        },
+                        .paste => _ = try clipboard.requestPaste(
+                            try self.instances.scope(focused),
+                            .{ .window = self.window, .text_input = focused },
+                        ),
+                    }
+                    return;
+                }
+            }
+            const intent = textInputIntent(key.translated);
+            if (session.preedit() != null and intent != null) return;
+            const changed = if (intent) |value|
+                try self.applyTextInputIntent(focused, value)
+            else
+                false;
             if (changed) try self.syncTextInputVisuals();
-            if (editing_key) return;
+            if (intent != null) return;
         };
         if (key.translated.logical == .space) switch (key.state) {
             .pressed => {
@@ -755,44 +772,124 @@ pub const WindowRuntime = struct {
             .pointer => |value| value,
             else => return,
         };
-        const button = switch (pointer.event) {
-            .button => |value| value,
-            else => return,
-        };
-        if (button.button != 0x110 or button.state != .pressed) return;
-        const input = (try self.textInputAncestor(target)) orelse return;
-        const previous = self.focus.current();
-        _ = try self.focus.request(&self.instances, input);
-        try self.applyFocusVisual(previous, self.focus.current());
+        switch (pointer.event) {
+            .button => |button| {
+                if (button.button != 0x110) return;
+                const input = (try self.textInputAncestor(target)) orelse return;
+                const session = try self.text_inputs.session(input);
+                switch (button.state) {
+                    .pressed => {
+                        const previous = self.focus.current();
+                        _ = try self.focus.request(&self.instances, input);
+                        try self.applyFocusVisual(previous, self.focus.current());
+                        const caret = try self.textCaretAtPointer(input, pointer.position);
+                        if (try session.beginSelectionDrag(caret.byte_offset, caret.affinity))
+                            try self.syncTextInputVisuals();
+                    },
+                    .released => session.endSelectionDrag(),
+                }
+            },
+            .motion => {
+                const input = (try self.textInputAncestor(target)) orelse return;
+                const session = try self.text_inputs.session(input);
+                if (!session.isSelecting()) return;
+                const caret = try self.textCaretAtPointer(input, pointer.position);
+                if (try session.updateSelectionDrag(caret.byte_offset, caret.affinity))
+                    try self.syncTextInputVisuals();
+            },
+            else => {},
+        }
+    }
 
+    fn textCaretAtPointer(
+        self: *WindowRuntime,
+        input: ui.instance.InstanceHandle,
+        position: core.PointF,
+    ) !text.CaretStop {
         const content = try self.text_inputs.content(input);
         const render = try self.instances.renderObject(content);
         const origin = try self.instanceOrigin(content);
-        const hit = try self.tree.hitTestText(render, .{
-            .x = pointer.position.x - origin.x,
-            .y = pointer.position.y - origin.y,
-        });
-        const session = try self.text_inputs.session(input);
-        _ = try session.model.setSelection(.{
-            .anchor = hit.caret.byte_offset,
-            .extent = hit.caret.byte_offset,
-            .anchor_affinity = hit.caret.affinity,
-            .extent_affinity = hit.caret.affinity,
-        });
-        try self.syncTextInputVisuals();
+        return (try self.tree.hitTestText(render, .{
+            .x = position.x - origin.x,
+            .y = position.y - origin.y,
+        })).caret;
+    }
+
+    fn applyTextInputIntent(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        intent: ui.text_input.EditIntent,
+    ) !bool {
+        const session = try self.text_inputs.session(target);
+        session.endSelectionDrag();
+        return switch (intent) {
+            .select_all => blk: {
+                session.preferred_x = null;
+                break :blk session.model.selectAll();
+            },
+            .delete_backward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteBackward();
+            },
+            .delete_forward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteForward();
+            },
+            .delete_word_backward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteWordBackward();
+            },
+            .delete_word_forward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteWordForward();
+            },
+            .move => |move| switch (move.destination) {
+                .word_previous => blk: {
+                    session.preferred_x = null;
+                    break :blk session.model.moveWordPrevious(move.extend);
+                },
+                .word_next => blk: {
+                    session.preferred_x = null;
+                    break :blk session.model.moveWordNext(move.extend);
+                },
+                else => try self.moveTextInputCaret(target, session, move),
+            },
+        };
+    }
+
+    /// Input safe point only. The app clipboard coordinator has already
+    /// validated request generation and UTF-8 ownership; retained instance
+    /// generation is revalidated here before the edit is applied.
+    pub fn applyClipboardPaste(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        bytes: []const u8,
+    ) !bool {
+        if (!self.instances.isActive(target) or !self.text_inputs.contains(target)) return false;
+        const session = try self.text_inputs.session(target);
+        session.endSelectionDrag();
+        const changed = try session.apply(.{ .commit = .{ .text = bytes } });
+        if (changed) try self.syncTextInputVisuals();
+        return changed;
     }
 
     fn moveTextInputCaret(
         self: *WindowRuntime,
         target: ui.instance.InstanceHandle,
-        direction: text.VisualCaretDirection,
-        extend: bool,
+        session: *ui.text_input.Session,
+        move: ui.text_input.MoveIntent,
     ) !bool {
-        const session = try self.text_inputs.session(target);
         const current = session.model.selection;
         const content = try self.text_inputs.content(target);
         const render = try self.instances.renderObject(content);
-        if (!extend and !current.isCollapsed()) {
+        const horizontal: ?text.VisualCaretDirection = switch (move.destination) {
+            .visual_left => .left,
+            .visual_right => .right,
+            .word_previous, .word_next => unreachable,
+            else => null,
+        };
+        if (horizontal) |direction| if (!move.extend and !current.isCollapsed()) {
+            session.preferred_x = null;
             const order = try self.tree.textVisualOrder(
                 render,
                 current.anchor,
@@ -808,15 +905,41 @@ pub const WindowRuntime = struct {
                 .collapsedAt(current.anchor, current.anchor_affinity)
             else
                 .collapsedAt(current.extent, current.extent_affinity));
-        }
+        };
 
-        const next = try self.tree.textVisualNeighbor(
-            render,
-            current.extent,
-            current.extent_affinity,
-            direction,
-        );
-        return session.model.setSelection(if (extend) .{
+        const next = switch (move.destination) {
+            .word_previous, .word_next => unreachable,
+            .visual_left, .visual_right => blk: {
+                session.preferred_x = null;
+                break :blk try self.tree.textVisualNeighbor(
+                    render,
+                    current.extent,
+                    current.extent_affinity,
+                    horizontal.?,
+                );
+            },
+            .line_start, .line_end => blk: {
+                session.preferred_x = null;
+                break :blk try self.tree.textLineBoundary(
+                    render,
+                    current.extent,
+                    current.extent_affinity,
+                    if (move.destination == .line_start) .start else .end,
+                );
+            },
+            .line_up, .line_down => blk: {
+                const result = try self.tree.textVerticalNeighbor(
+                    render,
+                    current.extent,
+                    current.extent_affinity,
+                    session.preferred_x,
+                    if (move.destination == .line_up) .up else .down,
+                );
+                session.preferred_x = result.preferred_x;
+                break :blk result.caret;
+            },
+        };
+        return session.model.setSelection(if (move.extend) .{
             .anchor = current.anchor,
             .extent = next.byte_offset,
             .anchor_affinity = current.anchor_affinity,
@@ -1200,14 +1323,20 @@ test "text input protocol batches mutate retained sessions only at the input saf
         window,
         2,
     );
+    try runtime.pointer_bindings.init(std.testing.allocator, 2);
+    try runtime.buttons.init(std.testing.allocator, 2);
     try runtime.text_inputs.init(std.testing.allocator, 1);
     runtime.allocator = std.testing.allocator;
     runtime.initialized = true;
     runtime.window = window;
     runtime.paragraph_sources = &sources;
+    runtime.focus_color = core.Color.rgba(20, 80, 220, 255);
     defer {
         runtime.text_inputs.clear();
         runtime.text_inputs.deinit();
+        runtime.buttons.clear();
+        runtime.buttons.deinit();
+        runtime.pointer_bindings.deinit();
         runtime.router.deinit();
         runtime.instances.reconcile(&.{}) catch unreachable;
         scheduler.applyQueuedCancellations() catch unreachable;
@@ -1320,7 +1449,178 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try std.testing.expectEqual(after_left.anchor, extended.anchor);
     try std.testing.expect(!extended.isCollapsed());
 
+    const expected_home = try runtime.tree.textLineBoundary(
+        render,
+        extended.extent,
+        extended.extent_affinity,
+        .start,
+    );
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 5,
+        .time_ms = 6,
+        .state = .pressed,
+        .translated = .{ .keycode = 102, .logical = .home },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    const after_home = try runtime.text_inputs.session(target);
+    try std.testing.expectEqual(expected_home.byte_offset, after_home.model.selection.extent);
+    try std.testing.expectEqual(expected_home.affinity, after_home.model.selection.extent_affinity);
+    try std.testing.expect(after_home.model.selection.isCollapsed());
+    try std.testing.expect(after_home.preferred_x == null);
+
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 6,
+        .time_ms = 7,
+        .state = .pressed,
+        .translated = .{ .keycode = 103, .logical = .arrow_up },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expect((try runtime.text_inputs.session(target)).preferred_x != null);
+
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 7,
+        .time_ms = 8,
+        .state = .pressed,
+        .translated = .{
+            .keycode = 106,
+            .logical = .arrow_right,
+            .modifiers = .{ .control = true },
+        },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    const after_word = try runtime.text_inputs.session(target);
+    try std.testing.expectEqual(@as(usize, 5), after_word.model.selection.extent);
+    try std.testing.expect(after_word.preferred_x == null);
+
+    _ = try runtime.tree.layout(
+        (try runtime.instances.rootRenderObject()).?,
+        ui.layout.Constraints.tight(.{ .width = 160, .height = 32 }),
+    );
+    const drag_start: core.PointF = .{ .x = 1, .y = 10 };
+    const drag_end: core.PointF = .{ .x = 70, .y = 10 };
+    const expected_drag_start = try runtime.textCaretAtPointer(target, drag_start);
+    const expected_drag_end = try runtime.textCaretAtPointer(target, drag_end);
+    try std.testing.expect(expected_drag_start.byte_offset != expected_drag_end.byte_offset);
+    try runtime.routePointer(.{ .enter = .{
+        .window = window,
+        .serial = 8,
+        .position = drag_start,
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    try runtime.routePointer(.{ .button = .{
+        .window = window,
+        .serial = 9,
+        .time_ms = 9,
+        .button = 0x110,
+        .state = .pressed,
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expect((try runtime.text_inputs.session(target)).isSelecting());
+    try runtime.routePointer(.{ .motion = .{
+        .window = window,
+        .time_ms = 10,
+        .position = drag_end,
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    const dragged = (try runtime.text_inputs.session(target)).model.selection;
+    try std.testing.expectEqual(expected_drag_start.byte_offset, dragged.anchor);
+    try std.testing.expectEqual(expected_drag_start.affinity, dragged.anchor_affinity);
+    try std.testing.expectEqual(expected_drag_end.byte_offset, dragged.extent);
+    try std.testing.expectEqual(expected_drag_end.affinity, dragged.extent_affinity);
+    try runtime.routePointer(.{ .button = .{
+        .window = window,
+        .serial = 10,
+        .time_ms = 11,
+        .button = 0x110,
+        .state = .released,
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expect(!(try runtime.text_inputs.session(target)).isSelecting());
+
     try fonts.release(font);
+}
+
+fn textInputIntent(key: platform.TranslatedKey) ?ui.text_input.EditIntent {
+    if (key.modifiers.alt or key.modifiers.logo) return null;
+    const extend = key.modifiers.shift;
+    if (key.modifiers.control) return switch (key.logical) {
+        .key_a => .select_all,
+        .backspace => .delete_word_backward,
+        .delete => .delete_word_forward,
+        .arrow_left => .{ .move = .{ .destination = .word_previous, .extend = extend } },
+        .arrow_right => .{ .move = .{ .destination = .word_next, .extend = extend } },
+        else => null,
+    };
+    return switch (key.logical) {
+        .backspace => .delete_backward,
+        .delete => .delete_forward,
+        .arrow_left => .{ .move = .{ .destination = .visual_left, .extend = extend } },
+        .arrow_right => .{ .move = .{ .destination = .visual_right, .extend = extend } },
+        .arrow_up => .{ .move = .{ .destination = .line_up, .extend = extend } },
+        .arrow_down => .{ .move = .{ .destination = .line_down, .extend = extend } },
+        .home => .{ .move = .{ .destination = .line_start, .extend = extend } },
+        .end => .{ .move = .{ .destination = .line_end, .extend = extend } },
+        else => null,
+    };
+}
+
+const ClipboardShortcut = enum { copy, cut, paste };
+
+fn textInputClipboardShortcut(key: platform.TranslatedKey) ?ClipboardShortcut {
+    if (!key.modifiers.control or key.modifiers.alt or key.modifiers.logo) return null;
+    return switch (key.logical) {
+        .key_c => .copy,
+        .key_x => .cut,
+        .key_v => .paste,
+        else => null,
+    };
+}
+
+test "platform keys translate to neutral text editing intents" {
+    try std.testing.expectEqual(
+        ui.text_input.EditIntent{ .move = .{ .destination = .line_up, .extend = true } },
+        textInputIntent(.{
+            .keycode = 1,
+            .logical = .arrow_up,
+            .modifiers = .{ .shift = true },
+        }).?,
+    );
+    try std.testing.expectEqual(
+        ui.text_input.EditIntent{ .move = .{ .destination = .line_start } },
+        textInputIntent(.{ .keycode = 1, .logical = .home }).?,
+    );
+    try std.testing.expectEqual(
+        ui.text_input.EditIntent{ .move = .{ .destination = .word_previous } },
+        textInputIntent(.{
+            .keycode = 1,
+            .logical = .arrow_left,
+            .modifiers = .{ .control = true },
+        }).?,
+    );
+    try std.testing.expectEqual(
+        ui.text_input.EditIntent.select_all,
+        textInputIntent(.{
+            .keycode = 1,
+            .logical = .key_a,
+            .modifiers = .{ .control = true },
+        }).?,
+    );
+    try std.testing.expectEqual(
+        ClipboardShortcut.copy,
+        textInputClipboardShortcut(.{
+            .keycode = 1,
+            .logical = .key_c,
+            .modifiers = .{ .control = true },
+        }).?,
+    );
+    try std.testing.expect(textInputClipboardShortcut(.{
+        .keycode = 1,
+        .logical = .key_v,
+        .modifiers = .{ .control = true, .alt = true },
+    }) == null);
 }
 
 const InputValues = struct {

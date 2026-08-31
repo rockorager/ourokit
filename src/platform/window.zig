@@ -86,8 +86,14 @@ pub const LogicalKey = enum {
     arrow_right,
     arrow_up,
     arrow_down,
+    home,
+    end,
     backspace,
     delete,
+    key_a,
+    key_c,
+    key_v,
+    key_x,
 };
 
 pub const KeyState = enum { released, pressed, repeated };

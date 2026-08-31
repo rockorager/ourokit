@@ -203,13 +203,35 @@ layout. Enter and Space activation enqueue the existing Button callback task;
 Wayland dispatch never calls Lua directly.
 
 Editable text begins at a separate, platform-neutral model boundary. It owns
-UTF-8 bytes, a directional anchor/extent selection, revisioning, and a cached
-index of uucode UAX #29 extended-grapheme boundaries. Replacement, selection,
-and logical previous/next movement therefore cannot split combining sequences,
-emoji ZWJ sequences, or regional-indicator pairs. The model deliberately does
-not call logical movement “left” or “right”: visual arrow movement requires the
-paragraph layer's future bidi-aware caret map. It also has no Lua, Wayland,
+UTF-8 bytes, a directional anchor/extent selection, revisioning, and cached
+indexes of Unicode extended-grapheme and default word boundaries. Replacement,
+selection, and movement therefore cannot split combining sequences, emoji ZWJ
+sequences, or regional-indicator pairs. Word movement and deletion use the
+Unicode 17 UAX #29 table rather than ASCII classes. Neutral editing intents keep
+platform key translation separate from model operations, while paragraph caret
+maps own visual bidi and vertical geometry. The model has no Lua, Wayland,
 renderer, shaping-cache, or IME ownership.
+
+Select-all is a local editing intent. The app clipboard coordinator represents
+paste as a scheduler-owned asynchronous resource and queues data-only platform
+actions. Its completion owns validated UTF-8 and retains the original
+generation-checked text-input target, which the input safe point validates
+again before editing. Scope cancellation queues platform cancellation without
+delivering racing data to disposed targets. Ctrl+V consumes Wayring selection
+offers through incrementally read `io_uring` pipes; unavailable, oversized, or
+invalid UTF-8 input is a no-op. Ctrl+C and Ctrl+X copy the normalized selection
+into an owned effect before returning from the input phase; only then may cut
+delete it. The Wayland adapter owns each resulting `wl_data_source` and serves
+UTF-8/plain-text send requests with short-write-aware `io_uring` operations.
+Wayland offer/source pipe I/O never runs in a blocking protocol callback or an
+in-process clipboard substitute.
+
+Primary-button text selection stores its bidi-aware anchor in the retained edit
+session. The input router keeps delivering motion to the captured instance even
+when hover moves over another instance or leaves the window; paragraph hit
+testing clamps that motion to a valid line and caret. Release clears the gesture
+without changing the selected anchor/extent. Gesture state never enters the
+render object or scene.
 
 Commands live in an authoritative registry independent of the retained render
 tree. Entries need stable semantic IDs plus revisioned invocation handles,

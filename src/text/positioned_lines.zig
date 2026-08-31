@@ -41,6 +41,15 @@ pub const CaretAffinity = enum {
 };
 
 pub const VisualDirection = enum { left, right };
+pub const VerticalDirection = enum { up, down };
+pub const LineBoundary = enum { start, end };
+
+pub const VerticalMove = struct {
+    caret: CaretStop,
+    /// Paragraph-relative physical X to preserve for subsequent vertical
+    /// movement through shorter lines.
+    preferred_x: f32,
+};
 
 /// One legal extended-grapheme insertion edge. A byte offset may have two
 /// physically distinct stops at a bidi boundary; affinity disambiguates which
@@ -66,6 +75,7 @@ pub const ByteRange = struct {
 pub const Line = struct {
     byte_start: usize,
     byte_len: usize,
+    base_level: u8,
     /// Logical top edge relative to the paragraph origin.
     top: f32,
     /// Physical offset from the paragraph's left edge. Start and end are
@@ -292,6 +302,54 @@ pub const PositionedLines = struct {
         return std.math.order(a, b);
     }
 
+    /// Returns the directional start or end of the current visual line. Start
+    /// is the left edge for an LTR base line and the right edge for RTL.
+    pub fn lineBoundary(
+        self: *const PositionedLines,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+        boundary: LineBoundary,
+    ) ?CaretStop {
+        const index = self.visualIndex(byte_offset, affinity) orelse return null;
+        const line = self.lineForVisualIndex(index) orelse return null;
+        const carets = self.caretsFor(line);
+        if (carets.len == 0) return null;
+        const rtl = line.base_level & 1 != 0;
+        return switch (boundary) {
+            .start => if (rtl) carets[carets.len - 1] else carets[0],
+            .end => if (rtl) carets[0] else carets[carets.len - 1],
+        };
+    }
+
+    /// Moves to the closest physical X on an adjacent visual line. The first
+    /// move captures the current paragraph-relative X; later moves retain it
+    /// so crossing a short line does not permanently shift the caret column.
+    pub fn verticalNeighbor(
+        self: *const PositionedLines,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+        preferred_x: ?f32,
+        direction: VerticalDirection,
+    ) ?VerticalMove {
+        const index = self.visualIndex(byte_offset, affinity) orelse return null;
+        const line_index = self.lineIndexForVisualIndex(index) orelse return null;
+        const line = self.lines[line_index];
+        const x = preferred_x orelse line.left + self.carets[index].x;
+        const target_index = switch (direction) {
+            .up => if (line_index == 0) line_index else line_index - 1,
+            .down => if (line_index + 1 == self.lines.len) line_index else line_index + 1,
+        };
+        if (target_index == line_index) return .{
+            .caret = self.carets[index],
+            .preferred_x = x,
+        };
+        const target = self.lines[target_index];
+        return .{
+            .caret = self.hitTest(target, x - target.left) orelse return null,
+            .preferred_x = x,
+        };
+    }
+
     fn visualIndex(
         self: *const PositionedLines,
         byte_offset: usize,
@@ -339,13 +397,22 @@ pub const PositionedLines = struct {
     }
 
     fn sameVisualPosition(self: *const PositionedLines, a: usize, b: usize) bool {
-        for (self.lines) |line| {
-            const end = line.caret_start + line.caret_count;
-            if (a < line.caret_start or a >= end) continue;
-            if (b < line.caret_start or b >= end) return false;
-            return @abs(self.carets[a].x - self.carets[b].x) <= 0.001;
-        }
-        return false;
+        const line = self.lineForVisualIndex(a) orelse return false;
+        const end = line.caret_start + line.caret_count;
+        if (b < line.caret_start or b >= end) return false;
+        return @abs(self.carets[a].x - self.carets[b].x) <= 0.001;
+    }
+
+    fn lineForVisualIndex(self: *const PositionedLines, index: usize) ?Line {
+        const line_index = self.lineIndexForVisualIndex(index) orelse return null;
+        return self.lines[line_index];
+    }
+
+    fn lineIndexForVisualIndex(self: *const PositionedLines, index: usize) ?usize {
+        for (self.lines, 0..) |line, line_index|
+            if (index >= line.caret_start and index < line.caret_start + line.caret_count)
+                return line_index;
+        return null;
     }
 
     /// Emits one rectangle for each contiguous physical selection fragment.
@@ -613,6 +680,7 @@ pub fn positionLinesWithOptions(
         lines.appendAssumeCapacity(.{
             .byte_start = selected_line.byte_start,
             .byte_len = selected_line.byte_len,
+            .base_level = selected_line.base_level,
             .top = line_top,
             .left = alignmentOffset(
                 style.alignment,
@@ -1255,6 +1323,32 @@ test "caret stops preserve graphemes, ligatures, and bidi affinity" {
         clustered_positioned.hitTest(clustered_line, ligature_first).?.affinity,
     );
 
+    const rtl = "אבג";
+    var rtl_fixture: fixture.Fixture = undefined;
+    try rtl_fixture.init(rtl, 10_000);
+    defer rtl_fixture.deinit();
+    var rtl_positioned = try positionLines(
+        std.testing.allocator,
+        rtl,
+        &rtl_fixture.shaped,
+        &rtl_fixture.selected,
+    );
+    defer rtl_positioned.deinit();
+    const rtl_line = rtl_positioned.lines[0];
+    try std.testing.expect(rtl_line.base_level & 1 != 0);
+    const rtl_middle = rtl_positioned.caretsFor(rtl_line)[1];
+    const rtl_start = rtl_positioned.lineBoundary(
+        rtl_middle.byte_offset,
+        rtl_middle.affinity,
+        .start,
+    ).?;
+    const rtl_end = rtl_positioned.lineBoundary(
+        rtl_middle.byte_offset,
+        rtl_middle.affinity,
+        .end,
+    ).?;
+    try std.testing.expect(rtl_start.x > rtl_end.x);
+
     const wrapped = "one two three four five six";
     var wrapped_fixture: fixture.Fixture = undefined;
     try wrapped_fixture.init(wrapped, 45);
@@ -1289,6 +1383,55 @@ test "caret stops preserve graphemes, ligatures, and bidi affinity" {
         .y = second_line.top + (second_line.ascender - second_line.descender) / 2,
     }).?;
     try std.testing.expectEqual(@as(usize, 1), point_hit.line_index);
+    const second_carets = wrapped_positioned.caretsFor(second_line);
+    const second_middle = second_carets[second_carets.len / 2];
+    try std.testing.expectEqual(
+        second_carets[0],
+        wrapped_positioned.lineBoundary(
+            second_middle.byte_offset,
+            second_middle.affinity,
+            .start,
+        ).?,
+    );
+    try std.testing.expectEqual(
+        second_carets[second_carets.len - 1],
+        wrapped_positioned.lineBoundary(
+            second_middle.byte_offset,
+            second_middle.affinity,
+            .end,
+        ).?,
+    );
+    const preferred_x = second_line.left + second_middle.x;
+    const moved_up = wrapped_positioned.verticalNeighbor(
+        second_middle.byte_offset,
+        second_middle.affinity,
+        null,
+        .up,
+    ).?;
+    try std.testing.expectApproxEqAbs(preferred_x, moved_up.preferred_x, 0.001);
+    const moved_up_index = wrapped_positioned.visualIndex(
+        moved_up.caret.byte_offset,
+        moved_up.caret.affinity,
+    ).?;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        wrapped_positioned.lineIndexForVisualIndex(moved_up_index).?,
+    );
+    const moved_back = wrapped_positioned.verticalNeighbor(
+        moved_up.caret.byte_offset,
+        moved_up.caret.affinity,
+        moved_up.preferred_x,
+        .down,
+    ).?;
+    try std.testing.expectApproxEqAbs(preferred_x, moved_back.preferred_x, 0.001);
+    const moved_back_index = wrapped_positioned.visualIndex(
+        moved_back.caret.byte_offset,
+        moved_back.caret.affinity,
+    ).?;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        wrapped_positioned.lineIndexForVisualIndex(moved_back_index).?,
+    );
     const first_caret = wrapped_positioned.caretsFor(wrapped_positioned.lines[0])[0];
     const caret_rectangle = try wrapped_positioned.caretRectangle(
         0,
