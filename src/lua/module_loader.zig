@@ -40,6 +40,7 @@ pub const ModuleLoader = struct {
     directory: std.os.linux.fd_t,
     reader: fs.Reader,
     slots: []Slot,
+    frozen: bool = false,
 
     pub fn init(
         self: *ModuleLoader,
@@ -76,6 +77,12 @@ pub const ModuleLoader = struct {
         self.reader.deinit();
         self.allocator.free(self.slots);
         self.* = undefined;
+    }
+
+    /// Closes the generation's source closure after entry evaluation. Cached
+    /// modules remain available; later first-time imports are rejected.
+    pub fn freeze(self: *ModuleLoader) void {
+        self.frozen = true;
     }
 
     /// Returns false when the file completion belongs to another reader.
@@ -139,6 +146,8 @@ pub const ModuleLoader = struct {
             }
             return luaError(state, "module is already being loaded");
         }
+        if (self.frozen)
+            return luaError(state, "module was not loaded during application bootstrap");
 
         const slot = self.available() orelse
             return luaError(state, "module capacity exceeded");

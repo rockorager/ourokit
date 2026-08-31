@@ -402,6 +402,7 @@ pub const SourceGeneration = struct {
             );
             return err;
         };
+        self.module_loader.?.freeze();
         errdefer application.deinit();
         const prepared_builds = self.allocator.alloc(
             lua.PreparedBuild,
@@ -535,6 +536,10 @@ test "source generation bootstrap retains async module closure before becoming r
         .sub_path = "title.lua",
         .data = "return 'Loaded asynchronously'",
     });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "late.lua",
+        .data = "return 'too late'",
+    });
     const path = try std.fs.path.join(std.testing.allocator, &.{
         ".zig-cache",
         "tmp",
@@ -584,5 +589,10 @@ test "source generation bootstrap retains async module closure before becoming r
     try std.testing.expectEqualStrings(
         "Loaded asynchronously",
         generation.application.windows[0].declaration.title,
+    );
+    _ = try generation.vm.spawnApplication("require('late')");
+    try std.testing.expectError(
+        error.LuaRuntimeError,
+        generation.vm.resumeRunnable(scheduler.takeRunnable().?),
     );
 }
