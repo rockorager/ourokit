@@ -550,3 +550,178 @@ test "application transaction prepares all retained windows before generation sw
     reload.deinit();
     callbacks.deinit();
 }
+
+test "a later window build failure leaves every retained window on the active generation" {
+    const design = @import("../design/root.zig");
+    const text = @import("../text/root.zig");
+
+    const initial_two_windows =
+        \\local function content(label)
+        \\  return function()
+        \\    ouro.column {
+        \\      key = "content",
+        \\      children = function()
+        \\        ouro.label { key = "label", text = label }
+        \\      end,
+        \\    }
+        \\  end
+        \\end
+        \\return ouro.app {
+        \\  id = "dev.ouro.atomic-window-test",
+        \\  windows = {
+        \\    ouro.window { id = "first", title = "First", content = content("Active first") },
+        \\    ouro.window { id = "second", title = "Second", content = content("Active second") },
+        \\  },
+        \\}
+    ;
+    const failing_second_window =
+        \\return ouro.app {
+        \\  id = "dev.ouro.atomic-window-test",
+        \\  windows = {
+        \\    ouro.window {
+        \\      id = "first",
+        \\      title = "Changed first",
+        \\      content = function()
+        \\        ouro.column {
+        \\          key = "content",
+        \\          children = function()
+        \\            ouro.label { key = "label", text = "Candidate first" }
+        \\          end,
+        \\        }
+        \\      end,
+        \\    },
+        \\    ouro.window {
+        \\      id = "second",
+        \\      title = "Changed second",
+        \\      content = function() error("candidate second failed") end,
+        \\    },
+        \\  },
+        \\}
+    ;
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "app.lua",
+        .data = initial_two_windows,
+    });
+    const path = try std.fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &temporary.sub_path,
+        "app.lua",
+    });
+    defer std.testing.allocator.free(path);
+    var provider = try bundle.SourceProvider.initDisk(std.testing.allocator, path);
+    defer provider.deinit();
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 16, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 24, 4, 4);
+    defer scheduler.deinit();
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(std.testing.allocator, 16);
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font_static"),
+    });
+    defer fonts.release(font) catch unreachable;
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    const services: source_generation.UiServices = .{
+        .shapes = &shapes,
+        .primary_font = font,
+        .theme = design.tokens.light,
+        .callbacks = &callbacks,
+    };
+    const config: source_generation.Config = .{
+        .node_capacity = 8,
+        .semantic_text_capacity = 128,
+    };
+
+    const snapshot = try provider.snapshot(std.testing.io, std.testing.allocator);
+    const initial = try SourceGeneration.create(
+        std.testing.allocator,
+        &scheduler,
+        &loop,
+        snapshot,
+        services,
+        config,
+        null,
+    );
+    var reload: SourceReload = undefined;
+    reload.init(
+        std.testing.allocator,
+        std.testing.io,
+        &provider,
+        &scheduler,
+        &loop,
+        services,
+        config,
+        initial,
+    );
+
+    var scopes: [2]task.ScopeHandle = undefined;
+    var runtimes = [_]WindowRuntime{.{}} ** 2;
+    for (&runtimes, 0..) |*runtime, index| {
+        scopes[index] = try scheduler.createScope(scheduler.application_scope);
+        try runtime.init(
+            std.testing.allocator,
+            &scheduler,
+            scopes[index],
+            .{ .slot = @intCast(index), .generation = 1 },
+            core.Color.rgba(1, 2, 3, 255),
+            core.Color.rgba(4, 5, 6, 255),
+            core.Color.rgba(7, 8, 9, 255),
+            &initial.signals,
+            &shapes,
+            .{ .node_capacity = 8, .command_capacity = 16 },
+        );
+        try runtime.reconcile(
+            .{ .width = 320, .height = 200 },
+            &initial.ui_build,
+            initial.application.windows[index].content_reference,
+        );
+    }
+    try std.testing.expectEqualStrings("Active first", (try runtimes[0].semantics.node(1)).label);
+    try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.node(1)).label);
+    const first_instance_count = runtimes[0].instances.activeCount();
+    const second_instance_count = runtimes[1].instances.activeCount();
+
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "app.lua",
+        .data = failing_second_window,
+    });
+    try reload.prepare();
+    const targets = [_]WindowTarget{
+        .{ .id = "first", .runtime = &runtimes[0], .size = .{ .width = 320, .height = 200 } },
+        .{ .id = "second", .runtime = &runtimes[1], .size = .{ .width = 320, .height = 200 } },
+    };
+    var build_failed = false;
+    reload.prepareApplication(&targets) catch {
+        build_failed = true;
+    };
+    try std.testing.expect(build_failed);
+    try std.testing.expect(reload.active() == initial);
+    try std.testing.expect(reload.candidate == null);
+    try std.testing.expect(runtimes[0].signals == &initial.signals);
+    try std.testing.expect(runtimes[1].signals == &initial.signals);
+    try std.testing.expectEqual(first_instance_count, runtimes[0].instances.activeCount());
+    try std.testing.expectEqual(second_instance_count, runtimes[1].instances.activeCount());
+    try std.testing.expectEqualStrings("Active first", (try runtimes[0].semantics.node(1)).label);
+    try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.node(1)).label);
+    try std.testing.expectEqual(lua.DiagnosticPhase.build, reload.lastDiagnostic().?.phase);
+
+    for (&runtimes) |*runtime| try runtime.clear(&initial.ui_build);
+    try scheduler.applyQueuedCancellations();
+    for (&runtimes) |*runtime| {
+        try runtime.collectRetired();
+        runtime.deinit();
+    }
+    for (scopes) |scope| try scheduler.destroyScope(scope);
+    reload.deinit();
+    callbacks.deinit();
+}
