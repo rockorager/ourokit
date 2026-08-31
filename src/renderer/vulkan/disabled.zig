@@ -2,6 +2,16 @@
 
 const Renderer = @This();
 const std = @import("std");
+const scene = @import("../../scene/root.zig");
+const text = @import("../../text/root.zig");
+
+pub const GlyphCache = struct {
+    pub fn init(_: std.mem.Allocator, _: *text.FontCache, _: *Renderer) !GlyphCache {
+        return error.VulkanDisabled;
+    }
+
+    pub fn deinit(_: *GlyphCache) void {}
+};
 
 pub const DmabufPlane = struct {
     offset: u32 = 0,
@@ -40,6 +50,22 @@ pub const DmabufTarget = struct {
         return error.VulkanDisabled;
     }
 };
+
+pub fn init(_: std.mem.Allocator) !Renderer {
+    return error.VulkanDisabled;
+}
+
+pub fn deinit(_: *Renderer) void {}
+
+pub fn renderDmabufText(
+    _: *Renderer,
+    _: scene.DisplayList,
+    _: *DmabufTarget,
+    _: *GlyphCache,
+    _: *const text.ShapeCache,
+) !void {
+    return error.VulkanDisabled;
+}
 
 pub fn supportsDmabuf(_: *const Renderer) bool {
     return false;
