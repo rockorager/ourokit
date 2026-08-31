@@ -24,6 +24,11 @@ return ouro.app {
               key = "count",
               text = "Pressed " .. count() .. " times",
             }
+            ouro.text_input {
+              key = "query",
+              text = "Editable text",
+              width = 280,
+            }
             ouro.row {
               key = "actions",
               gap = 8,

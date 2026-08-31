@@ -1,5 +1,6 @@
 const std = @import("std");
 const frame = @import("frame.zig");
+const text_input_coordinator = @import("text_input.zig");
 const core = @import("../core/root.zig");
 const design = @import("../design/root.zig");
 const lua = @import("../lua/root.zig");
@@ -22,6 +23,14 @@ pub const SemanticTarget = struct {
     role: ui.semantics.Role,
     enabled: bool,
     scroll_axis: ?platform.PointerAxis,
+};
+
+pub const TextInputStatus = struct {
+    state: platform.TextInputState,
+    model_revision: u64,
+    session_revision: u64,
+    scene_revision: u64,
+    commit_permitted: bool,
 };
 
 /// Retained UI state for one application window. This coordinates sibling UI,
@@ -56,6 +65,7 @@ pub const WindowRuntime = struct {
     paragraphs: *text.ParagraphCache = undefined,
     dirty_windows: ?*ui.instance.ReconcileQueue = null,
     reconciling: bool = false,
+    text_input_commit_permitted: bool = true,
 
     pub fn init(
         self: *WindowRuntime,
@@ -154,7 +164,7 @@ pub const WindowRuntime = struct {
         self.buttons.clear();
         self.text_inputs.clear();
         self.focus.clear();
-        while (self.router.takeEvent() != null) {}
+        while (self.router.takeEvent()) |event| self.router.releaseEvent(event);
         if (self.build_owners.isActive(self.root_owner)) {
             try self.signals.disposeOwner(.{
                 .owners = &self.build_owners,
@@ -357,6 +367,7 @@ pub const WindowRuntime = struct {
             lua_ui.commitBindings(
                 &self.pointer_bindings,
                 &self.buttons,
+                &self.text_inputs,
                 &self.instances,
                 work.owner,
             ) catch |err| {
@@ -412,6 +423,30 @@ pub const WindowRuntime = struct {
         }
     }
 
+    pub fn textInputStatus(self: *WindowRuntime) !?TextInputStatus {
+        const focused = self.focus.current() orelse return null;
+        if (!self.text_inputs.contains(focused)) return null;
+        const session = try self.text_inputs.session(focused);
+        var state = text_input_coordinator.surroundingState(session);
+        const content = try self.text_inputs.content(focused);
+        const render = try self.instances.renderObject(content);
+        const local = try self.tree.textCaretRectangle(render);
+        const origin = try self.instanceOrigin(content);
+        state.cursor_rectangle = .{
+            .x = @intFromFloat(@floor(origin.x + local.x)),
+            .y = @intFromFloat(@floor(origin.y + local.y)),
+            .width = @intFromFloat(@ceil(local.width)),
+            .height = @intFromFloat(@ceil(local.height)),
+        };
+        return .{
+            .state = state,
+            .model_revision = session.model.revision,
+            .session_revision = session.revision,
+            .scene_revision = self.frame_state.scene_revision,
+            .commit_permitted = self.text_input_commit_permitted,
+        };
+    }
+
     pub fn routePointer(self: *WindowRuntime, event: platform.PointerEvent) !void {
         try self.router.route(event);
     }
@@ -420,10 +455,31 @@ pub const WindowRuntime = struct {
         try self.router.routeKeyboard(event);
     }
 
+    pub fn routeTextInput(self: *WindowRuntime, event: platform.TextInputEvent) !void {
+        const batch = switch (event) {
+            .batch => |value| value,
+            .enter, .leave => return,
+        };
+        if (!sameHandle(batch.window, self.window)) return error.WrongWindow;
+        try self.router.routeTextInput(
+            try text_input_coordinator.editBatch(batch),
+            batch.serial_matches_state,
+        );
+    }
+
     /// Dispatches through either the process-wide callback registry used by
     /// reloadable applications or a directly owned VM used by storybooks.
     pub fn dispatchInput(self: *WindowRuntime, callback_service: anytype) !void {
         while (self.router.takeEvent()) |event| {
+            defer self.router.releaseEvent(event);
+            if (event == .text_input) {
+                const focused = self.focus.current() orelse continue;
+                if (!self.text_inputs.contains(focused)) continue;
+                self.text_input_commit_permitted = event.text_input.serial_matches_state;
+                if (try (try self.text_inputs.session(focused)).apply(event.text_input.batch))
+                    try self.syncTextInputVisuals();
+                continue;
+            }
             if (event == .keyboard) {
                 try self.dispatchKeyboard(event.keyboard, callback_service);
                 continue;
@@ -433,8 +489,10 @@ pub const WindowRuntime = struct {
                 .hover_leave => |value| value.target,
                 .pointer => |value| value.target,
                 .keyboard => unreachable,
+                .text_input => unreachable,
             };
             if (!self.instances.isActive(target)) continue;
+            try self.updateTextInputPointer(target, event);
             const activated_button = try self.updateButtonState(event);
             if (try self.applyScrollEvent(target, event)) continue;
             var bound_target = target;
@@ -491,6 +549,33 @@ pub const WindowRuntime = struct {
             try self.applyFocusVisual(previous, self.focus.current());
             return;
         }
+        if (self.focus.current()) |focused| if (self.text_inputs.contains(focused) and
+            key.state != .released)
+        {
+            const session = try self.text_inputs.session(focused);
+            const editing_key = key.translated.logical == .backspace or
+                key.translated.logical == .delete or
+                key.translated.logical == .arrow_left or
+                key.translated.logical == .arrow_right;
+            if (session.preedit() != null and editing_key) return;
+            const changed = switch (key.translated.logical) {
+                .backspace => try session.model.deleteBackward(),
+                .delete => try session.model.deleteForward(),
+                .arrow_left => try self.moveTextInputCaret(
+                    focused,
+                    .left,
+                    key.translated.modifiers.shift,
+                ),
+                .arrow_right => try self.moveTextInputCaret(
+                    focused,
+                    .right,
+                    key.translated.modifiers.shift,
+                ),
+                else => false,
+            };
+            if (changed) try self.syncTextInputVisuals();
+            if (editing_key) return;
+        };
         if (key.translated.logical == .space) switch (key.state) {
             .pressed => {
                 const focused = self.focus.current() orelse return;
@@ -656,8 +741,111 @@ pub const WindowRuntime = struct {
                 else => {},
             },
             .keyboard => {},
+            .text_input => unreachable,
         }
         return null;
+    }
+
+    fn updateTextInputPointer(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        event: ui.input.Event,
+    ) !void {
+        const pointer = switch (event) {
+            .pointer => |value| value,
+            else => return,
+        };
+        const button = switch (pointer.event) {
+            .button => |value| value,
+            else => return,
+        };
+        if (button.button != 0x110 or button.state != .pressed) return;
+        const input = (try self.textInputAncestor(target)) orelse return;
+        const previous = self.focus.current();
+        _ = try self.focus.request(&self.instances, input);
+        try self.applyFocusVisual(previous, self.focus.current());
+
+        const content = try self.text_inputs.content(input);
+        const render = try self.instances.renderObject(content);
+        const origin = try self.instanceOrigin(content);
+        const hit = try self.tree.hitTestText(render, .{
+            .x = pointer.position.x - origin.x,
+            .y = pointer.position.y - origin.y,
+        });
+        const session = try self.text_inputs.session(input);
+        _ = try session.model.setSelection(.{
+            .anchor = hit.caret.byte_offset,
+            .extent = hit.caret.byte_offset,
+            .anchor_affinity = hit.caret.affinity,
+            .extent_affinity = hit.caret.affinity,
+        });
+        try self.syncTextInputVisuals();
+    }
+
+    fn moveTextInputCaret(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        direction: text.VisualCaretDirection,
+        extend: bool,
+    ) !bool {
+        const session = try self.text_inputs.session(target);
+        const current = session.model.selection;
+        const content = try self.text_inputs.content(target);
+        const render = try self.instances.renderObject(content);
+        if (!extend and !current.isCollapsed()) {
+            const order = try self.tree.textVisualOrder(
+                render,
+                current.anchor,
+                current.anchor_affinity,
+                current.extent,
+                current.extent_affinity,
+            );
+            const use_anchor = switch (direction) {
+                .left => order != .gt,
+                .right => order == .gt,
+            };
+            return session.model.setSelection(if (use_anchor)
+                .collapsedAt(current.anchor, current.anchor_affinity)
+            else
+                .collapsedAt(current.extent, current.extent_affinity));
+        }
+
+        const next = try self.tree.textVisualNeighbor(
+            render,
+            current.extent,
+            current.extent_affinity,
+            direction,
+        );
+        return session.model.setSelection(if (extend) .{
+            .anchor = current.anchor,
+            .extent = next.byte_offset,
+            .anchor_affinity = current.anchor_affinity,
+            .extent_affinity = next.affinity,
+        } else .collapsedAt(next.byte_offset, next.affinity));
+    }
+
+    fn textInputAncestor(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+    ) !?ui.instance.InstanceHandle {
+        var current = target;
+        while (true) {
+            if (self.text_inputs.contains(current)) return current;
+            current = (try self.instances.parentOf(current)) orelse return null;
+        }
+    }
+
+    fn instanceOrigin(self: *WindowRuntime, target: ui.instance.InstanceHandle) !core.PointF {
+        var origin: core.PointF = .{};
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |handle| {
+            origin = core.PointF.add(
+                origin,
+                try self.tree.nodeOffset(try self.instances.renderObject(handle)),
+            );
+            current = try self.instances.parentOf(handle);
+        }
+        return origin;
     }
 
     fn buttonAncestor(
@@ -735,6 +923,49 @@ pub const WindowRuntime = struct {
         if (previous) |target| if (self.instances.isActive(target))
             try self.setFocusOutline(target, false);
         if (current) |target| try self.setFocusOutline(target, true);
+        try self.syncTextInputVisuals();
+    }
+
+    fn syncTextInputVisuals(self: *WindowRuntime) !void {
+        if (!self.initialized) return;
+        for (0..self.text_inputs.slotCount()) |index| {
+            const mounted = self.text_inputs.mountedAt(index) orelse continue;
+            if (!self.instances.isActive(mounted.target) or
+                !self.instances.isActive(mounted.content)) continue;
+            const render = try self.instances.renderObject(mounted.content);
+            var object = try self.tree.objectAt(render);
+            if (object != .text_input) return error.TextInputRenderObjectMismatch;
+
+            var presentation = try ui.text_input.buildPresentation(self.allocator, mounted.session);
+            defer presentation.deinit();
+            const previous_source = try self.paragraph_sources.get(object.text_input.source);
+            const source = try self.paragraph_sources.acquire(.{
+                .utf8 = presentation.text,
+                .base_direction = previous_source.base_direction,
+                .language = previous_source.language,
+                .logical_size = previous_source.logical_size,
+                .candidates = previous_source.candidates,
+                .configuration_revision = previous_source.configuration_revision,
+            });
+            defer self.paragraph_sources.release(source) catch unreachable;
+
+            object.text_input.source = source;
+            object.text_input.selection_start = presentation.selection.start;
+            object.text_input.selection_end = presentation.selection.end;
+            object.text_input.caret_offset = presentation.caret_offset;
+            object.text_input.caret_affinity = presentation.caret_affinity;
+            object.text_input.show_caret = presentation.show_caret and
+                optionalSameHandle(self.focus.current(), mounted.target);
+            object.text_input.preedit = if (presentation.preedit) |range| .{
+                .start = range.start,
+                .end = range.end,
+            } else null;
+            object.text_input.preedit_color = if (presentation.preedit != null)
+                object.text_input.caret_color
+            else
+                null;
+            try self.tree.update(render, object);
+        }
     }
 
     fn setFocusOutline(self: *WindowRuntime, target: ui.instance.InstanceHandle, visible: bool) !void {
@@ -928,6 +1159,170 @@ test "queued Tab navigation updates retained focus at the input safe point" {
     try std.testing.expectEqual(runtime.instances.handleForId(3).?, runtime.focus.current().?);
 }
 
+test "text input protocol batches mutate retained sessions only at the input safe point" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    const window: platform.WindowHandle = .{ .slot = 7, .generation = 1 };
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font_static"),
+    });
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const source = try sources.acquire(.{
+        .utf8 = "hello",
+        .language = "und",
+        .logical_size = 14,
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+
+    var runtime: WindowRuntime = .{};
+    try runtime.tree.init(std.testing.allocator, 2);
+    runtime.tree.attachTextCaches(&sources, &paragraphs);
+    try runtime.instances.init(
+        std.testing.allocator,
+        &scheduler,
+        &runtime.tree,
+        window_scope,
+        2,
+    );
+    try runtime.router.init(
+        std.testing.allocator,
+        &runtime.tree,
+        &runtime.instances,
+        window,
+        2,
+    );
+    try runtime.text_inputs.init(std.testing.allocator, 1);
+    runtime.allocator = std.testing.allocator;
+    runtime.initialized = true;
+    runtime.window = window;
+    runtime.paragraph_sources = &sources;
+    defer {
+        runtime.text_inputs.clear();
+        runtime.text_inputs.deinit();
+        runtime.router.deinit();
+        runtime.instances.reconcile(&.{}) catch unreachable;
+        scheduler.applyQueuedCancellations() catch unreachable;
+        runtime.instances.collectRetired() catch unreachable;
+        runtime.instances.deinit();
+        runtime.tree.deinit();
+        scheduler.destroyScope(window_scope) catch unreachable;
+    }
+    try runtime.instances.reconcile(&.{
+        .{
+            .id = 1,
+            .parent = null,
+            .object = .{ .box = .{ .width = 160, .height = 32 } },
+            .focusable = true,
+        },
+        .{ .id = 2, .parent = 1, .object = .{ .text_input = .{
+            .source = source,
+            .color = core.Color.rgba(10, 10, 10, 255),
+            .selection_color = core.Color.rgba(20, 40, 200, 100),
+            .caret_color = core.Color.rgba(10, 10, 10, 255),
+            .selection_start = 5,
+            .selection_end = 5,
+            .caret_offset = 5,
+        } } },
+    });
+    try sources.release(source);
+    const target = runtime.instances.handleForId(1).?;
+    const content = runtime.instances.handleForId(2).?;
+    const owner: ui.instance.BuildOwnerHandle = .{ .slot = 1, .generation = 1 };
+    try runtime.text_inputs.mount(owner, target, content, "hello");
+    _ = try runtime.focus.request(&runtime.instances, target);
+    _ = try runtime.tree.layout(
+        (try runtime.instances.rootRenderObject()).?,
+        ui.layout.Constraints.tight(.{ .width = 160, .height = 32 }),
+    );
+
+    var commit = [_]u8{'!'};
+    try runtime.routeTextInput(.{ .batch = .{
+        .window = window,
+        .serial = 1,
+        .serial_matches_state = true,
+        .delete_surrounding = null,
+        .commit = .{ .text = &commit },
+        .preedit = null,
+    } });
+    @memset(&commit, '?');
+    try std.testing.expectEqualStrings("hello", (try runtime.text_inputs.session(target)).model.text());
+    var unused_vm: lua.Vm = undefined;
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqualStrings("hello!", (try runtime.text_inputs.session(target)).model.text());
+    const render = try runtime.instances.renderObject(content);
+    const object = try runtime.tree.objectAt(render);
+    try std.testing.expectEqualStrings("hello!", (try sources.get(object.text_input.source)).utf8);
+
+    try runtime.routeTextInput(.{ .batch = .{
+        .window = window,
+        .serial = 1,
+        .serial_matches_state = false,
+        .delete_surrounding = null,
+        .commit = .{ .text = "?" },
+        .preedit = null,
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqualStrings("hello!?", (try runtime.text_inputs.session(target)).model.text());
+    try std.testing.expect(!runtime.text_input_commit_permitted);
+    try runtime.routeTextInput(.{ .batch = .{
+        .window = window,
+        .serial = 2,
+        .serial_matches_state = true,
+        .delete_surrounding = null,
+        .commit = null,
+        .preedit = null,
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expect(runtime.text_input_commit_permitted);
+
+    const before_left = (try runtime.text_inputs.session(target)).model.selection;
+    const expected_left = try runtime.tree.textVisualNeighbor(
+        render,
+        before_left.extent,
+        before_left.extent_affinity,
+        .left,
+    );
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 3,
+        .time_ms = 4,
+        .state = .pressed,
+        .translated = .{ .keycode = 105, .logical = .arrow_left },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    const after_left = (try runtime.text_inputs.session(target)).model.selection;
+    try std.testing.expectEqual(expected_left.byte_offset, after_left.extent);
+    try std.testing.expectEqual(expected_left.affinity, after_left.extent_affinity);
+    try std.testing.expect(after_left.isCollapsed());
+
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 4,
+        .time_ms = 5,
+        .state = .pressed,
+        .translated = .{
+            .keycode = 105,
+            .logical = .arrow_left,
+            .modifiers = .{ .shift = true },
+        },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    const extended = (try runtime.text_inputs.session(target)).model.selection;
+    try std.testing.expectEqual(after_left.anchor, extended.anchor);
+    try std.testing.expect(!extended.isCollapsed());
+
+    try fonts.release(font);
+}
+
 const InputValues = struct {
     kind: i64,
     x: f64 = 0,
@@ -951,6 +1346,7 @@ fn inputValues(event: ui.input.Event) InputValues {
             else => .{ .kind = 6 },
         },
         .keyboard => .{ .kind = 7 },
+        .text_input => unreachable,
     };
 }
 
@@ -963,6 +1359,10 @@ fn encodedColor(color: core.Color) i64 {
 
 fn sameHandle(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn optionalSameHandle(a: ?ui.instance.InstanceHandle, b: ui.instance.InstanceHandle) bool {
+    return if (a) |value| sameHandle(value, b) else false;
 }
 
 fn containsDescriptorId(descriptors: []const ui.instance.Descriptor, id: u64) bool {

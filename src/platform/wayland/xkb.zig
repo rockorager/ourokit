@@ -98,6 +98,8 @@ fn logicalKey(keysym: u32) platform.LogicalKey {
         c.XKB_KEY_Right => .arrow_right,
         c.XKB_KEY_Up => .arrow_up,
         c.XKB_KEY_Down => .arrow_down,
+        c.XKB_KEY_BackSpace => .backspace,
+        c.XKB_KEY_Delete, c.XKB_KEY_KP_Delete => .delete,
         else => .unidentified,
     };
 }

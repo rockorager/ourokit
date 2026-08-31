@@ -1037,6 +1037,10 @@ pub const Host = struct {
         self.text_input_active = handle;
     }
 
+    pub fn textInputAvailable(self: *const Host) bool {
+        return self.text_input != null;
+    }
+
     pub fn updateTextInput(self: *Host, handle: WindowHandle, state: platform_window.TextInputState) !void {
         try state.validate();
         if (self.text_input_active == null or !sameWindow(self.text_input_active.?, handle))
