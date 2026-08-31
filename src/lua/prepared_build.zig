@@ -36,6 +36,7 @@ pub const PreparedBuild = struct {
     prepared_buttons: []Button,
     button_count: usize = 0,
     owns_shapes: bool = false,
+    reconcile_plan: ?instance.ReconcilePlan = null,
 
     pub fn init(
         self: *PreparedBuild,
@@ -92,6 +93,7 @@ pub const PreparedBuild = struct {
         self.handler_count = 0;
         self.button_count = 0;
         self.owns_shapes = false;
+        self.reconcile_plan = null;
     }
 
     pub fn descriptors(self: *const PreparedBuild) []const instance.Descriptor {

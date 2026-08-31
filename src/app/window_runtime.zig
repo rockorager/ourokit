@@ -143,6 +143,67 @@ pub const WindowRuntime = struct {
         self.frame_state = .{};
     }
 
+    /// Builds and validates one candidate generation into owned storage
+    /// without changing retained instances, semantics, bindings, or frames.
+    pub fn prepareSourceBuild(
+        self: *WindowRuntime,
+        size: core.SizeU,
+        lua_ui: *lua.UiBuild,
+        prepared: *lua.PreparedBuild,
+        content_reference: c_int,
+        revision: u64,
+    ) !void {
+        if (!self.initialized or size.width == 0 or size.height == 0)
+            return error.WindowRuntimeNotReadyForSourcePreparation;
+        prepared.reset();
+        const work: ui.instance.BuildWork = .{
+            .owner = self.root_owner,
+            .revision = revision,
+        };
+        const width: f32 = @floatFromInt(size.width);
+        const height: f32 = @floatFromInt(size.height);
+        const arguments = [_]lua.UiBuildArgument{
+            .{ .number = width },
+            .{ .number = height },
+            .{ .integer = encodedColor(self.surface_color) },
+            .{ .integer = encodedColor(self.accent_color) },
+            .{ .integer = encodedColor(self.content_color) },
+        };
+        const descriptors = try lua_ui.buildCallback(
+            &self.build_owners,
+            work,
+            .{ .reference = content_reference },
+            &arguments,
+        );
+        var dependencies_pending = true;
+        errdefer if (dependencies_pending) {
+            lua_ui.rollbackHandlers();
+            lua_ui.rollbackDependencies(&self.build_owners, work) catch unreachable;
+        };
+        try self.semantics.validate(lua_ui.semanticDescriptors());
+        try lua_ui.validateDependencies(&self.build_owners, work);
+        try lua_ui.capturePrepared(prepared, descriptors);
+        var captured = true;
+        errdefer if (captured) prepared.reset();
+        if (prepared.handler_count > self.pointer_bindings.availableAfterReconcile(
+            &self.instances,
+            self.root_owner,
+        )) return error.PointerBindingCapacityExceeded;
+        if (prepared.button_count > self.buttons.availableForOwner(self.root_owner))
+            return error.ButtonCapacityExceeded;
+        for (prepared.handlers[0..prepared.handler_count]) |handler|
+            if (!containsDescriptorId(prepared.descriptors(), handler.id))
+                return error.PointerHandlerInstanceMissing;
+        for (prepared.prepared_buttons[0..prepared.button_count]) |button|
+            if (!containsDescriptorId(prepared.descriptors(), button.id))
+                return error.ButtonInstanceMissing;
+        const plan = try self.instances.prepareReconcile(prepared.descriptors());
+        try lua_ui.commitDependencies(&self.build_owners, work);
+        dependencies_pending = false;
+        prepared.reconcile_plan = plan;
+        captured = false;
+    }
+
     pub fn reconcile(
         self: *WindowRuntime,
         size: core.SizeU,
@@ -412,4 +473,86 @@ fn encodedColor(color: core.Color) i64 {
 
 fn sameHandle(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn containsDescriptorId(descriptors: []const ui.instance.Descriptor, id: u64) bool {
+    for (descriptors) |descriptor| if (descriptor.id == id) return true;
+    return false;
+}
+
+test "candidate source build prepares owned output without changing retained UI" {
+    const bundle = @import("../bundle/root.zig");
+    const io_loop = @import("../loop/root.zig");
+    const SourceGeneration = @import("source_generation.zig").SourceGeneration;
+
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 2, 2);
+    defer scheduler.deinit();
+    var active_vm: lua.Vm = undefined;
+    try active_vm.init(std.testing.allocator, &scheduler, &loop);
+    var active_signals: lua.Signals = undefined;
+    try active_signals.init(std.testing.allocator, active_vm.state, 2, 2, 2);
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var runtime: WindowRuntime = .{};
+    try runtime.init(
+        std.testing.allocator,
+        &scheduler,
+        window_scope,
+        .{ .slot = 0, .generation = 1 },
+        core.Color.rgba(1, 2, 3, 255),
+        core.Color.rgba(4, 5, 6, 255),
+        core.Color.rgba(7, 8, 9, 255),
+        &active_signals,
+        &shapes,
+        .{ .node_capacity = 4, .command_capacity = 4 },
+    );
+
+    var provider = try bundle.SourceProvider.initEmbedded(std.testing.allocator, "candidate.lua",
+        \\return ouro.app {
+        \\  id = "dev.ouro.prepared-test",
+        \\  windows = {
+        \\    ouro.window {
+        \\      id = "main",
+        \\      title = "Candidate",
+        \\      content = function() end,
+        \\    },
+        \\  },
+        \\}
+    );
+    defer provider.deinit();
+    const snapshot = try provider.snapshot(std.testing.io, std.testing.allocator);
+    const candidate = try SourceGeneration.create(
+        std.testing.allocator,
+        &scheduler,
+        &loop,
+        snapshot,
+        null,
+        .{ .node_capacity = 4, .semantic_text_capacity = 64 },
+        null,
+    );
+    try runtime.prepareSourceBuild(
+        .{ .width = 320, .height = 200 },
+        &candidate.ui_build,
+        &candidate.prepared_builds[0],
+        candidate.application.windows[0].content_reference,
+        2,
+    );
+    try std.testing.expect(candidate.prepared_builds[0].reconcile_plan != null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.instances.activeCount());
+
+    try runtime.clear(&candidate.ui_build);
+    try scheduler.applyQueuedCancellations();
+    try runtime.collectRetired();
+    runtime.deinit();
+    try scheduler.destroyScope(window_scope);
+    candidate.destroy();
+    active_vm.deinit();
+    active_signals.deinit();
 }
