@@ -201,7 +201,74 @@ pub const WindowRuntime = struct {
         try lua_ui.commitDependencies(&self.build_owners, work);
         dependencies_pending = false;
         prepared.reconcile_plan = plan;
+        prepared.size = size;
         captured = false;
+    }
+
+    pub fn validatePreparedSourceCommit(
+        self: *WindowRuntime,
+        prepared: *const lua.PreparedBuild,
+    ) !void {
+        if (!self.initialized or prepared.reconcile_plan == null or prepared.size == null)
+            return error.SourceBuildNotPrepared;
+        try self.instances.validateReconcilePlan(prepared.reconcile_plan.?);
+    }
+
+    /// Applies only prevalidated, candidate-owned state. Callback capacity
+    /// must be reserved across the complete application before the first
+    /// window enters this method.
+    pub fn commitPreparedSource(
+        self: *WindowRuntime,
+        prepared: *lua.PreparedBuild,
+        callbacks: *lua.CallbackRegistry,
+        vm: *lua.Vm,
+        signals: *lua.Signals,
+    ) void {
+        self.validatePreparedSourceCommit(prepared) catch unreachable;
+        self.semantics.stage(prepared.semanticDescriptors());
+        self.instances.applyReconcile(prepared.reconcile_plan.?) catch unreachable;
+
+        while (self.pointer_bindings.takeInactive(&self.instances)) |old|
+            callbacks.release(old.id) catch unreachable;
+        while (self.pointer_bindings.takeOwner(self.root_owner)) |old|
+            callbacks.release(old.id) catch unreachable;
+        for (prepared.handlers[0..prepared.handler_count]) |*handler| {
+            const callback = callbacks.adoptReference(
+                vm,
+                handler.takeReference(),
+            ) catch unreachable;
+            const target = self.instances.handleForId(handler.id).?;
+            const old = self.pointer_bindings.set(
+                self.root_owner,
+                target,
+                .{ .id = callback, .kind = handler.kind },
+            ) catch unreachable;
+            std.debug.assert(old == null);
+        }
+
+        self.buttons.removeInactive(&self.instances);
+        self.buttons.beginOwner(self.root_owner);
+        for (prepared.prepared_buttons[0..prepared.button_count]) |button| self.buttons.set(
+            self.root_owner,
+            self.instances.handleForId(button.id).?,
+            button.style,
+            button.enabled,
+        );
+        self.buttons.finishOwner(self.root_owner);
+        for (0..self.buttons.slotCount()) |index|
+            if (self.buttons.visualAt(index)) |visual| self.applyButtonUpdate(visual) catch unreachable;
+
+        self.signals.disposeOwner(.{
+            .owners = &self.build_owners,
+            .handle = self.root_owner,
+        }) catch unreachable;
+        self.signals = signals;
+        self.semantics.commitStaged();
+        while (self.router.takeEvent() != null) {}
+        _ = self.frame_state.configure(prepared.size.?) catch unreachable;
+        self.frame_state.invalidatePaint();
+        self.ready = true;
+        prepared.reset();
     }
 
     pub fn reconcile(
@@ -491,6 +558,9 @@ test "candidate source build prepares owned output without changing retained UI"
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 8, 2, 2);
     defer scheduler.deinit();
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(std.testing.allocator, 4);
+    defer callbacks.deinit();
     var active_vm: lua.Vm = undefined;
     try active_vm.init(std.testing.allocator, &scheduler, &loop);
     var active_signals: lua.Signals = undefined;
@@ -546,6 +616,15 @@ test "candidate source build prepares owned output without changing retained UI"
     );
     try std.testing.expect(candidate.prepared_builds[0].reconcile_plan != null);
     try std.testing.expectEqual(@as(usize, 0), runtime.instances.activeCount());
+    try runtime.validatePreparedSourceCommit(&candidate.prepared_builds[0]);
+    runtime.commitPreparedSource(
+        &candidate.prepared_builds[0],
+        &callbacks,
+        &candidate.vm,
+        &candidate.signals,
+    );
+    try std.testing.expect(candidate.prepared_builds[0].reconcile_plan == null);
+    try std.testing.expect(runtime.signals == &candidate.signals);
 
     try runtime.clear(&candidate.ui_build);
     try scheduler.applyQueuedCancellations();

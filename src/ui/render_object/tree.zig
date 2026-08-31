@@ -117,6 +117,16 @@ pub const Tree = struct {
         try validateParentData(parent, data);
     }
 
+    pub fn validateRetain(self: *Tree, object: types.Object) !void {
+        switch (object) {
+            .label => |label| {
+                const cache = self.text_cache orelse return error.TextCacheRequired;
+                try cache.validateRetain(label.shape);
+            },
+            else => {},
+        }
+    }
+
     pub fn appendChild(
         self: *Tree,
         parent: NodeHandle,

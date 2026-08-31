@@ -179,6 +179,11 @@ pub const ShapeCache = struct {
         slot.references += 1;
     }
 
+    pub fn validateRetain(self: *ShapeCache, handle: ShapeHandle) !void {
+        const slot = try self.require(handle);
+        if (slot.references == std.math.maxInt(u32)) return error.ReferenceOverflow;
+    }
+
     pub fn release(self: *ShapeCache, handle: ShapeHandle) !void {
         const slot = try self.require(handle);
         std.debug.assert(slot.references != 0);

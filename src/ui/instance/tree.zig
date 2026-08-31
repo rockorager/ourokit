@@ -162,11 +162,15 @@ pub const Tree = struct {
                 .active => {
                     if (!optionalIdEqual(existing.parent_id, descriptor.parent))
                         return error.InstanceReparented;
+                    const current = try self.render_tree.objectAt(existing.render.?);
+                    if (!std.meta.eql(current, descriptor.object))
+                        try self.render_tree.validateRetain(descriptor.object);
                 },
                 .retiring => return error.InstanceRetiring,
                 .free => unreachable,
             } else {
                 create_count += 1;
+                try self.render_tree.validateRetain(descriptor.object);
                 const parent_scope = if (descriptor.parent) |parent_id|
                     (self.findActiveById(parent_id) orelse continue).scope
                 else
@@ -224,11 +228,15 @@ pub const Tree = struct {
 
     /// Applies a previously validated plan. A retained-tree change between
     /// prepare and apply invalidates the plan rather than misapplying it.
+    pub fn validateReconcilePlan(self: *const Tree, plan: ReconcilePlan) !void {
+        if (plan.revision != self.revision) return error.StaleReconcilePlan;
+    }
+
     pub fn applyReconcile(
         self: *Tree,
         plan: ReconcilePlan,
     ) !void {
-        if (plan.revision != self.revision) return error.StaleReconcilePlan;
+        try self.validateReconcilePlan(plan);
         const descriptors = plan.descriptors;
         const topology_changed = plan.topology_changed;
 
@@ -236,13 +244,13 @@ pub const Tree = struct {
             // Detach first so retained objects can change typed parent roles
             // and desired order without replacing their identities.
             for (self.slots) |slot| if (slot.state == .active and slot.parent_id != null)
-                try self.render_tree.detachChild(slot.render.?);
+                self.render_tree.detachChild(slot.render.?) catch unreachable;
         }
 
         for (self.slots) |*slot| {
             if (slot.state != .active or self.descriptorForId(descriptors, slot.id) != null) continue;
-            try self.scheduler.queueScopeCancellation(slot.scope);
-            try self.render_tree.destroy(slot.render.?);
+            self.scheduler.queueScopeCancellation(slot.scope) catch unreachable;
+            self.render_tree.destroy(slot.render.?) catch unreachable;
             slot.render = null;
             slot.state = .retiring;
         }
@@ -253,14 +261,11 @@ pub const Tree = struct {
                 self.findActiveById(parent_id).?
             else
                 null;
-            const instance_scope = try self.scheduler.createScope(if (parent_slot) |parent|
+            const instance_scope = self.scheduler.createScope(if (parent_slot) |parent|
                 parent.scope
             else
-                self.owner_scope);
-            const render = self.render_tree.create(descriptor.object) catch |err| {
-                self.scheduler.destroyScope(instance_scope) catch unreachable;
-                return err;
-            };
+                self.owner_scope) catch unreachable;
+            const render = self.render_tree.create(descriptor.object) catch unreachable;
             const slot_index = self.freeIndex().?;
             const slot = &self.slots[slot_index];
             var generation = slot.generation +% 1;
@@ -274,16 +279,26 @@ pub const Tree = struct {
                 .scope = instance_scope,
                 .render = render,
             };
-            _ = try (IdIndex{ .entries = self.instance_entries }).put(descriptor.id, slot_index);
-            _ = try (IdIndex{ .entries = self.render_entries }).put(renderKey(render), slot_index);
+            _ = (IdIndex{ .entries = self.instance_entries }).put(
+                descriptor.id,
+                slot_index,
+            ) catch unreachable;
+            _ = (IdIndex{ .entries = self.render_entries }).put(
+                renderKey(render),
+                slot_index,
+            ) catch unreachable;
         }
 
         for (descriptors) |descriptor| {
             const slot = self.findActiveById(descriptor.id).?;
-            try self.render_tree.update(slot.render.?, descriptor.object);
+            self.render_tree.update(slot.render.?, descriptor.object) catch unreachable;
             if (topology_changed) if (descriptor.parent) |parent_id| {
                 const parent = self.findActiveById(parent_id).?;
-                try self.render_tree.appendChild(parent.render.?, slot.render.?, descriptor.parent_data);
+                self.render_tree.appendChild(
+                    parent.render.?,
+                    slot.render.?,
+                    descriptor.parent_data,
+                ) catch unreachable;
             };
         }
         self.revision +%= 1;
@@ -433,6 +448,15 @@ pub const Tree = struct {
                 if (descriptor.parent_data != .none) return error.RootHasParentData;
             }
         }
+        for (descriptors) |parent| if (parent.object == .box) {
+            var child_count: usize = 0;
+            for (descriptors) |candidate| if (candidate.parent != null and
+                candidate.parent.? == parent.id)
+            {
+                child_count += 1;
+                if (child_count > 1) return error.BoxAlreadyHasChild;
+            };
+        };
         if (descriptors.len != 0 and roots != 1) return error.InvalidRootCount;
     }
 

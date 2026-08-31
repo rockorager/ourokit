@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig");
+const core = @import("../core/root.zig");
 const instance = @import("../ui/instance/tree.zig");
 const input = @import("../ui/input/bindings.zig");
 const semantics = @import("../ui/semantics/snapshot.zig");
@@ -10,6 +11,12 @@ pub const Handler = struct {
     id: u64,
     reference: c_int,
     kind: input.HandlerKind,
+
+    pub fn takeReference(self: *Handler) c_int {
+        const reference = self.reference;
+        self.reference = c.no_reference;
+        return reference;
+    }
 };
 
 pub const Button = struct {
@@ -37,6 +44,7 @@ pub const PreparedBuild = struct {
     button_count: usize = 0,
     owns_shapes: bool = false,
     reconcile_plan: ?instance.ReconcilePlan = null,
+    size: ?core.SizeU = null,
 
     pub fn init(
         self: *PreparedBuild,
@@ -94,6 +102,7 @@ pub const PreparedBuild = struct {
         self.button_count = 0;
         self.owns_shapes = false;
         self.reconcile_plan = null;
+        self.size = null;
     }
 
     pub fn descriptors(self: *const PreparedBuild) []const instance.Descriptor {
