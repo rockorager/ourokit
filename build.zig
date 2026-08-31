@@ -433,7 +433,7 @@ fn addWaylandExample(
     enable_vulkan: bool,
 ) void {
     const host = b.addExecutable(.{
-        .name = "ourokit",
+        .name = "ouroctl",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,

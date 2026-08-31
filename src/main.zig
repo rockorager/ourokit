@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
 fn execute(init: std.process.Init, command: cli.Command) !void {
     switch (command) {
         .help => try writeStdout(init, cli.usage),
-        .version => try writeStdout(init, "ourokit " ++ version ++ "\n"),
+        .version => try writeStdout(init, "ouroctl " ++ version ++ "\n"),
         .run => |options| {
             var provider = try ourokit.bundle.SourceProvider.initDisk(init.gpa, options.path);
             defer provider.deinit();
@@ -210,7 +210,7 @@ fn writeStdout(init: std.process.Init, bytes: []const u8) !void {
 }
 
 fn writeError(init: std.process.Init, name: []const u8) !void {
-    const message = try std.fmt.allocPrint(init.gpa, "ourokit: {s}\n", .{name});
+    const message = try std.fmt.allocPrint(init.gpa, "ouroctl: {s}\n", .{name});
     defer init.gpa.free(message);
     try std.Io.File.stderr().writeStreamingAll(init.io, message);
 }

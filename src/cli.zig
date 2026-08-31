@@ -39,12 +39,12 @@ pub const Snapshot = struct {
 
 pub const usage =
     \\Usage:
-    \\  ourokit run <application.lua> [--vulkan|--software] [--exit-after-first-frame]
-    \\  ourokit storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
-    \\  ourokit storybook list <stories.lua> [--json]
-    \\  ourokit storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
-    \\  ourokit help
-    \\  ourokit version
+    \\  ouroctl run <application.lua> [--vulkan|--software] [--exit-after-first-frame]
+    \\  ouroctl storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
+    \\  ouroctl storybook list <stories.lua> [--json]
+    \\  ouroctl storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
+    \\  ouroctl help
+    \\  ouroctl version
     \\
 ;
 
@@ -187,44 +187,44 @@ test "CLI parses application and Storybook commands" {
     try std.testing.expectEqualDeep(Command{ .run = .{
         .path = "app.lua",
         .vulkan = true,
-    } }, try parse(&.{ "ourokit", "run", "app.lua", "--vulkan" }));
+    } }, try parse(&.{ "ouroctl", "run", "app.lua", "--vulkan" }));
     try std.testing.expectEqualDeep(Command{ .run = .{
         .path = "app.lua",
         .vulkan = false,
-    } }, try parse(&.{ "ourokit", "run", "--software", "app.lua" }));
+    } }, try parse(&.{ "ouroctl", "run", "--software", "app.lua" }));
     try std.testing.expectEqualDeep(Command{ .run = .{
         .path = "app.lua",
-    } }, try parse(&.{ "ourokit", "run", "app.lua" }));
+    } }, try parse(&.{ "ouroctl", "run", "app.lua" }));
     try std.testing.expectEqualDeep(Command{ .storybook = .{ .list = .{
         .path = "stories.lua",
         .json = true,
-    } } }, try parse(&.{ "ourokit", "storybook", "list", "stories.lua", "--json" }));
+    } } }, try parse(&.{ "ouroctl", "storybook", "list", "stories.lua", "--json" }));
     try std.testing.expectEqualDeep(Command{ .storybook = .{ .run = .{
         .path = "stories.lua",
         .vulkan = false,
-    } } }, try parse(&.{ "ourokit", "storybook", "run", "stories.lua", "--software" }));
+    } } }, try parse(&.{ "ouroctl", "storybook", "run", "stories.lua", "--software" }));
     try std.testing.expectEqualDeep(Command{ .storybook = .{ .snapshot = .{
         .path = "stories.lua",
         .story_id = "button/default",
         .output_path = "artifacts",
         .json = true,
     } } }, try parse(&.{
-        "ourokit",  "storybook", "snapshot", "stories.lua", "--story=button/default",
+        "ouroctl",  "storybook", "snapshot", "stories.lua", "--story=button/default",
         "--output", "artifacts", "--json",
     }));
 }
 
 test "CLI rejects malformed commands and options" {
-    try std.testing.expectError(error.ExpectedApplicationPath, parse(&.{ "ourokit", "run" }));
-    try std.testing.expectError(error.UnknownCommand, parse(&.{ "ourokit", "wat" }));
-    try std.testing.expectError(error.UnknownOption, parse(&.{ "ourokit", "run", "app.lua", "--wat" }));
+    try std.testing.expectError(error.ExpectedApplicationPath, parse(&.{ "ouroctl", "run" }));
+    try std.testing.expectError(error.UnknownCommand, parse(&.{ "ouroctl", "wat" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "ouroctl", "run", "app.lua", "--wat" }));
     try std.testing.expectError(error.DuplicateOption, parse(&.{
-        "ourokit", "run", "app.lua", "--vulkan", "--software",
+        "ouroctl", "run", "app.lua", "--vulkan", "--software",
     }));
     try std.testing.expectError(error.ExpectedOptionValue, parse(&.{
-        "ourokit", "storybook", "snapshot", "stories.lua", "--story",
+        "ouroctl", "storybook", "snapshot", "stories.lua", "--story",
     }));
     try std.testing.expectError(error.DuplicateOption, parse(&.{
-        "ourokit", "storybook", "snapshot", "stories.lua", "--story", "one", "--story", "two",
+        "ouroctl", "storybook", "snapshot", "stories.lua", "--story", "one", "--story", "two",
     }));
 }

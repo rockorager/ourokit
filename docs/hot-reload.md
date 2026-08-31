@@ -22,7 +22,7 @@ A development application is launched from a source entry path rather than
 from source bytes detached from their origin:
 
 ```sh
-ourokit run ./app.lua --dev
+ouroctl run ./app.lua --dev
 ```
 
 After saving one or more files, the author requests a reload through either:
@@ -30,7 +30,7 @@ After saving one or more files, the author requests a reload through either:
 - the built-in `Reload Source` application command, with a conventional
   `Ctrl+Shift+R` shortcut once keyboard commands are available; or
 - the development control interface, exposed by the CLI as
-  `ourokit reload dev.example.app`.
+  `ouroctl reload dev.example.app`.
 
 Both only enqueue a reload request. They do not read files, enter Lua, or
 reconcile UI from an input callback. The request is consumed at an application
@@ -422,7 +422,7 @@ The CLI discovers an app by application ID and calls this endpoint. The server
 keeps the `Reload` call pending without blocking the event loop until the newest
 coalesced request either commits or fails. Every caller waiting on that request
 receives the committed generation or the same structured `ReloadFailed` error,
-so `ourokit reload` has useful shell exit status without polling. A request that
+so `ouroctl reload` has useful shell exit status without polling. A request that
 arrives during preparation advances the requested source revision; an older
 candidate cannot satisfy it and is discarded before commit. `Status` remains
 available for development surfaces that observe reload without initiating it.

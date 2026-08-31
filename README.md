@@ -202,7 +202,7 @@ Run any declarative application directly through the reusable host:
 ```sh
 zig build run-app -- path/to/application.lua
 # After `zig build`, the installed CLI provides the same host:
-zig-out/bin/ourokit run path/to/application.lua
+zig-out/bin/ouroctl run path/to/application.lua
 ```
 
 The reusable host follows the same renderer default. Pass `--software` to force
@@ -214,7 +214,7 @@ Storybook catalogs are explicit Lua entry points containing named, isolated
 component states. Open the native interactive catalog browser with:
 
 ```sh
-zig-out/bin/ourokit storybook run examples/storybook.lua
+zig-out/bin/ouroctl storybook run examples/storybook.lua
 ```
 
 The browser is an ordinary Ourokit application: its catalog scrolls through
@@ -225,16 +225,16 @@ renderer with `--software` or `--vulkan`.
 List a catalog for people or tools with:
 
 ```sh
-zig-out/bin/ourokit storybook list examples/storybook.lua
-zig-out/bin/ourokit storybook list examples/storybook.lua --json
+zig-out/bin/ouroctl storybook list examples/storybook.lua
+zig-out/bin/ouroctl storybook list examples/storybook.lua --json
 ```
 
 Render every story through the platform-neutral window runtime and software
 renderer, or select one story by ID:
 
 ```sh
-zig-out/bin/ourokit storybook snapshot examples/storybook.lua
-zig-out/bin/ourokit storybook snapshot examples/storybook.lua \
+zig-out/bin/ouroctl storybook snapshot examples/storybook.lua
+zig-out/bin/ouroctl storybook snapshot examples/storybook.lua \
   --story button/disabled-dark --output .amp/in/artifacts --json
 ```
 
