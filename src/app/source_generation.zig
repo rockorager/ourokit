@@ -34,6 +34,40 @@ pub const SourceGeneration = struct {
     ui_build: lua.UiBuild,
     application: lua.Application,
 
+    pub fn create(
+        allocator: std.mem.Allocator,
+        scheduler: *task.Scheduler,
+        loop: *io_loop.Loop,
+        snapshot: bundle.SourceSnapshot,
+        services: ?UiServices,
+        config: Config,
+        diagnostic: ?*?lua.Diagnostic,
+    ) !*SourceGeneration {
+        const generation = allocator.create(SourceGeneration) catch |err| {
+            lua.recordDiagnosticError(
+                diagnostic,
+                allocator,
+                .setup,
+                snapshot.entry_name,
+                err,
+            );
+            var owned_snapshot = snapshot;
+            owned_snapshot.deinit();
+            return err;
+        };
+        errdefer allocator.destroy(generation);
+        try generation.init(
+            allocator,
+            scheduler,
+            loop,
+            snapshot,
+            services,
+            config,
+            diagnostic,
+        );
+        return generation;
+    }
+
     pub fn init(
         self: *SourceGeneration,
         allocator: std.mem.Allocator,
@@ -191,6 +225,12 @@ pub const SourceGeneration = struct {
         self.snapshot.deinit();
         self.* = undefined;
     }
+
+    pub fn destroy(self: *SourceGeneration) void {
+        const allocator = self.allocator;
+        self.deinit();
+        allocator.destroy(self);
+    }
 };
 
 test "source generation owns a named snapshot and application Lua state" {
@@ -216,8 +256,7 @@ test "source generation owns a named snapshot and application Lua state" {
     defer scheduler.deinit();
     var diagnostic: ?lua.Diagnostic = null;
     defer if (diagnostic) |*value| value.deinit();
-    var generation: SourceGeneration = undefined;
-    try generation.init(
+    const generation = try SourceGeneration.create(
         std.testing.allocator,
         &scheduler,
         &loop,
@@ -226,7 +265,7 @@ test "source generation owns a named snapshot and application Lua state" {
         .{ .node_capacity = 8 },
         &diagnostic,
     );
-    defer generation.deinit();
+    defer generation.destroy();
     try std.testing.expect(diagnostic == null);
     try std.testing.expectEqualStrings(
         "dev.ouro.generation-test",

@@ -1,7 +1,9 @@
 const std = @import("std");
 const bundle = @import("../bundle/root.zig");
 const windows_module = @import("windows.zig");
-const SourceGeneration = @import("source_generation.zig").SourceGeneration;
+const source_generation = @import("source_generation.zig");
+const SourceGeneration = source_generation.SourceGeneration;
+const SourceReload = @import("source_reload.zig").SourceReload;
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const WindowRuntimeConfig = @import("window_runtime.zig").Config;
 const core = @import("../core/root.zig");
@@ -92,24 +94,41 @@ pub fn runSource(
     defer if (options.vulkan) vulkan_glyphs.deinit();
 
     const theme = design.tokens.light;
-    var generation: SourceGeneration = undefined;
+    const services: source_generation.UiServices = .{
+        .shapes = &shapes,
+        .primary_font = primary_font,
+        .theme = theme,
+    };
+    const generation_config: source_generation.Config = .{
+        .node_capacity = options.window.node_capacity,
+        .signal_capacity = options.signal_capacity,
+        .subscription_capacity = options.subscription_capacity,
+        .dependency_capacity = options.dependency_capacity,
+    };
     // SourceGeneration consumes the snapshot on both success and failure.
     snapshot_owned = false;
-    try generation.init(
+    const initial_generation = try SourceGeneration.create(
         init.gpa,
         &scheduler,
         &loop,
         snapshot,
-        .{ .shapes = &shapes, .primary_font = primary_font, .theme = theme },
-        .{
-            .node_capacity = options.window.node_capacity,
-            .signal_capacity = options.signal_capacity,
-            .subscription_capacity = options.subscription_capacity,
-            .dependency_capacity = options.dependency_capacity,
-        },
+        services,
+        generation_config,
         &diagnostic,
     );
-    defer generation.deinit();
+    var source_reload: SourceReload = undefined;
+    source_reload.init(
+        init.gpa,
+        init.io,
+        provider,
+        &scheduler,
+        &loop,
+        services,
+        generation_config,
+        initial_generation,
+    );
+    defer source_reload.deinit();
+    const generation = source_reload.active();
     const vm = &generation.vm;
     const signals = &generation.signals;
     const lua_ui = &generation.ui_build;
