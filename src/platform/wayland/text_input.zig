@@ -18,6 +18,7 @@ pub const Pending = struct {
     preedit_bytes: std.ArrayList(u8) = .empty,
     preedit_cursor_begin: i32 = 0,
     preedit_cursor_end: i32 = 0,
+    delete_received: bool = false,
     delete_before_bytes: u32 = 0,
     delete_after_bytes: u32 = 0,
 
@@ -77,6 +78,7 @@ pub const Pending = struct {
     }
 
     pub fn setDelete(self: *Pending, before_bytes: u32, after_bytes: u32) void {
+        self.delete_received = true;
         self.delete_before_bytes = before_bytes;
         self.delete_after_bytes = after_bytes;
     }
@@ -93,12 +95,18 @@ pub const Pending = struct {
             .window = window,
             .serial = serial,
             .serial_matches_state = serial == self.commit_count,
-            .delete_before_bytes = self.delete_before_bytes,
-            .delete_after_bytes = self.delete_after_bytes,
-            .commit = if (!self.commit_received or self.commit_is_null) null else self.commit_bytes.items,
-            .preedit = if (!self.preedit_received or self.preedit_is_null) null else self.preedit_bytes.items,
-            .preedit_cursor_begin = self.preedit_cursor_begin,
-            .preedit_cursor_end = self.preedit_cursor_end,
+            .delete_surrounding = if (self.delete_received) .{
+                .before_bytes = self.delete_before_bytes,
+                .after_bytes = self.delete_after_bytes,
+            } else null,
+            .commit = if (self.commit_received) .{
+                .text = if (self.commit_is_null) null else self.commit_bytes.items,
+            } else null,
+            .preedit = if (self.preedit_received) .{
+                .text = if (self.preedit_is_null) null else self.preedit_bytes.items,
+                .cursor_begin = self.preedit_cursor_begin,
+                .cursor_end = self.preedit_cursor_end,
+            } else null,
         } });
     }
 
@@ -111,6 +119,7 @@ pub const Pending = struct {
         self.preedit_bytes.clearRetainingCapacity();
         self.preedit_cursor_begin = 0;
         self.preedit_cursor_end = 0;
+        self.delete_received = false;
         self.delete_before_bytes = 0;
         self.delete_after_bytes = 0;
     }
@@ -174,12 +183,12 @@ const TestSink = struct {
         try std.testing.expectEqual(self.expected_window, batch.window);
         try std.testing.expectEqual(@as(u32, 7), batch.serial);
         try std.testing.expect(!batch.serial_matches_state);
-        try std.testing.expectEqual(@as(u32, 3), batch.delete_before_bytes);
-        try std.testing.expectEqual(@as(u32, 2), batch.delete_after_bytes);
-        try std.testing.expectEqualStrings("é", batch.commit.?);
-        try std.testing.expectEqualStrings("候補", batch.preedit.?);
-        try std.testing.expectEqual(@as(i32, 0), batch.preedit_cursor_begin);
-        try std.testing.expectEqual(@as(i32, "候補".len), batch.preedit_cursor_end);
+        try std.testing.expectEqual(@as(u32, 3), batch.delete_surrounding.?.before_bytes);
+        try std.testing.expectEqual(@as(u32, 2), batch.delete_surrounding.?.after_bytes);
+        try std.testing.expectEqualStrings("é", batch.commit.?.text.?);
+        try std.testing.expectEqualStrings("候補", batch.preedit.?.text.?);
+        try std.testing.expectEqual(@as(i32, 0), batch.preedit.?.cursor_begin);
+        try std.testing.expectEqual(@as(i32, "候補".len), batch.preedit.?.cursor_end);
         self.calls += 1;
     }
 

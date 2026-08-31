@@ -85,9 +85,21 @@ pub const Model = struct {
     /// Replaces the current selection as one atomic edit. Capacity is secured
     /// before bytes are changed, so allocation failure leaves the value intact.
     pub fn replaceSelection(self: *Model, replacement: []const u8) !bool {
+        return self.replaceRange(self.selection.range(), replacement);
+    }
+
+    /// Replaces a UTF-8 byte range and leaves the caret on a grapheme boundary.
+    /// Input-method deletions are specified at code-point boundaries and may
+    /// legitimately split an existing grapheme (for example, removing a
+    /// combining mark), so the range need not already be a grapheme boundary.
+    pub fn replaceRange(self: *Model, range: Range, replacement: []const u8) !bool {
         if (!std.unicode.utf8ValidateSlice(replacement)) return error.InvalidUtf8;
-        const selected = self.selection.range();
-        const removed_len = selected.end - selected.start;
+        if (range.start > range.end or range.end > self.bytes.items.len)
+            return error.InvalidTextRange;
+        if (!isUtf8Boundary(self.bytes.items, range.start) or
+            !isUtf8Boundary(self.bytes.items, range.end))
+            return error.InvalidTextOffset;
+        const removed_len = range.end - range.start;
         const retained_len = self.bytes.items.len - removed_len;
         const new_len = std.math.add(usize, retained_len, replacement.len) catch
             return error.OutOfMemory;
@@ -100,12 +112,12 @@ pub const Model = struct {
         // Both allocations happen before the first content mutation.
         try self.bytes.ensureTotalCapacity(self.allocator, new_len);
         try self.boundaries.ensureTotalCapacity(self.allocator, boundary_capacity);
-        self.bytes.replaceRangeAssumeCapacity(selected.start, removed_len, replacement);
+        self.bytes.replaceRangeAssumeCapacity(range.start, removed_len, replacement);
         self.rebuildBoundaries();
 
         // Text on either side may join the replacement's edge into a larger
         // grapheme. Snap forward so the resulting caret is always valid.
-        const requested = selected.start + replacement.len;
+        const requested = range.start + replacement.len;
         self.selection = .collapsed(self.boundaryAtOrAfter(requested));
         self.bumpRevision();
         return true;
@@ -192,6 +204,11 @@ pub const Model = struct {
     }
 };
 
+fn isUtf8Boundary(text: []const u8, offset: usize) bool {
+    if (offset > text.len) return false;
+    return offset == text.len or (text[offset] & 0xc0) != 0x80;
+}
+
 fn lowerBound(values: []const usize, needle: usize) usize {
     var first: usize = 0;
     var count = values.len;
@@ -255,6 +272,14 @@ test "replacement seam cannot leave caret inside a grapheme" {
     try std.testing.expect(try model.replaceSelection("a"));
     try std.testing.expectEqualStrings("a\u{301}b", model.text());
     try std.testing.expectEqual(Selection.collapsed("a\u{301}".len), model.selection);
+}
+
+test "input method ranges may remove one code point within a grapheme" {
+    var model = try Model.init(std.testing.allocator, "Ae\u{301}B");
+    defer model.deinit();
+    try std.testing.expect(try model.replaceRange(.{ .start = 2, .end = 4 }, ""));
+    try std.testing.expectEqualStrings("AeB", model.text());
+    try std.testing.expectEqual(Selection.collapsed(2), model.selection);
 }
 
 test "invalid UTF-8 and invalid selection boundaries do not mutate the model" {

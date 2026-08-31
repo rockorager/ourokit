@@ -451,14 +451,19 @@ Pointer capture ensures a release reaches the pressed target, while release-
 inside decides activation. Design-generated semantic accent roles supply idle,
 hovered, and pressed colors.
 
-The first `ui/text_input` boundary is a unit-testable editable value, not yet a
-widget or render object. It owns valid UTF-8, directional selection, revisions,
-and cached uucode extended-grapheme boundaries. Cursor movement at this layer is
-named logical previous/next; visual left/right, caret geometry, and selection
-painting wait for paragraph bidi/caret maps. The Wayring-backed text-input-v3
-adapter and owned safe-point event path now exist, but deliberately remain
-dormant until a retained TextInput owns focus and can apply protocol batches to
-this model in the mandated order. Raw xkb events are never application text.
+The `ui/text_input` boundary now contains a unit-testable editable value and a
+retained input-method session, but not yet a widget or render object. The value
+owns valid UTF-8, directional selection, revisions, and cached uucode
+extended-grapheme boundaries. The session keeps preedit outside committed text,
+applies delete/commit/preedit batches in protocol order, and exposes bounded
+surrounding state through an app-owned platform translator. A separate retained
+registry keys sessions and their content instances by generation-checked
+identity and build-owner lifetime; Lua rebuilds cannot reset edited values, and
+omission disposes composition state deterministically. Cursor movement at this
+layer is named logical previous/next; visual left/right, caret geometry, and
+selection painting wait for paragraph bidi/caret maps. The Wayring-backed
+adapter remains disabled until an actual retained TextInput owns focus. Raw xkb
+events are never application text.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,

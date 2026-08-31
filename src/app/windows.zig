@@ -355,19 +355,26 @@ fn cloneTextInput(allocator: std.mem.Allocator, event: TextInputEvent) !TextInpu
         .enter => |window| .{ .enter = window },
         .leave => |window| .{ .leave = window },
         .batch => |batch| blk: {
-            const commit = if (batch.commit) |text| try allocator.dupe(u8, text) else null;
-            errdefer if (commit) |text| allocator.free(text);
-            const preedit = if (batch.preedit) |text| try allocator.dupe(u8, text) else null;
+            const commit_text = if (batch.commit) |commit|
+                if (commit.text) |text| try allocator.dupe(u8, text) else null
+            else
+                null;
+            errdefer if (commit_text) |text| allocator.free(text);
+            const preedit_text = if (batch.preedit) |preedit|
+                if (preedit.text) |text| try allocator.dupe(u8, text) else null
+            else
+                null;
             break :blk .{ .batch = .{
                 .window = batch.window,
                 .serial = batch.serial,
                 .serial_matches_state = batch.serial_matches_state,
-                .delete_before_bytes = batch.delete_before_bytes,
-                .delete_after_bytes = batch.delete_after_bytes,
-                .commit = commit,
-                .preedit = preedit,
-                .preedit_cursor_begin = batch.preedit_cursor_begin,
-                .preedit_cursor_end = batch.preedit_cursor_end,
+                .delete_surrounding = batch.delete_surrounding,
+                .commit = if (batch.commit != null) .{ .text = commit_text } else null,
+                .preedit = if (batch.preedit) |preedit| .{
+                    .text = preedit_text,
+                    .cursor_begin = preedit.cursor_begin,
+                    .cursor_end = preedit.cursor_end,
+                } else null,
             } };
         },
     };
@@ -376,8 +383,8 @@ fn cloneTextInput(allocator: std.mem.Allocator, event: TextInputEvent) !TextInpu
 fn freeTextInput(allocator: std.mem.Allocator, event: TextInputEvent) void {
     switch (event) {
         .batch => |batch| {
-            if (batch.commit) |text| allocator.free(text);
-            if (batch.preedit) |text| allocator.free(text);
+            if (batch.commit) |commit| if (commit.text) |text| allocator.free(text);
+            if (batch.preedit) |preedit| if (preedit.text) |text| allocator.free(text);
         },
         else => {},
     }
@@ -606,20 +613,17 @@ test "text input batches own protocol strings until safe-point translation" {
         .window = handle,
         .serial = 4,
         .serial_matches_state = true,
-        .delete_before_bytes = 1,
-        .delete_after_bytes = 0,
-        .commit = &commit,
-        .preedit = &preedit,
-        .preedit_cursor_begin = 0,
-        .preedit_cursor_end = 3,
+        .delete_surrounding = .{ .before_bytes = 1, .after_bytes = 0 },
+        .commit = .{ .text = &commit },
+        .preedit = .{ .text = &preedit, .cursor_begin = 0, .cursor_end = 3 },
     } });
     @memset(&commit, 'x');
     @memset(&preedit, 'x');
 
     const event = windows.takeEvent().?;
     defer windows.releaseEvent(event);
-    try std.testing.expectEqualStrings("ok", event.text_input.batch.commit.?);
-    try std.testing.expectEqualStrings("new", event.text_input.batch.preedit.?);
+    try std.testing.expectEqualStrings("ok", event.text_input.batch.commit.?.text.?);
+    try std.testing.expectEqualStrings("new", event.text_input.batch.preedit.?.text.?);
 
     try windows.reconcile(&.{});
     try scheduler.applyQueuedCancellations();

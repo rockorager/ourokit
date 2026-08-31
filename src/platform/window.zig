@@ -189,12 +189,16 @@ pub const TextInputBatch = struct {
     window: WindowHandle,
     serial: u32,
     serial_matches_state: bool,
-    delete_before_bytes: u32,
-    delete_after_bytes: u32,
-    commit: ?[]const u8,
-    preedit: ?[]const u8,
-    preedit_cursor_begin: i32,
-    preedit_cursor_end: i32,
+    delete_surrounding: ?struct {
+        before_bytes: u32,
+        after_bytes: u32,
+    },
+    commit: ?struct { text: ?[]const u8 },
+    preedit: ?struct {
+        text: ?[]const u8,
+        cursor_begin: i32,
+        cursor_end: i32,
+    },
 };
 
 pub const TextInputEvent = union(enum) {

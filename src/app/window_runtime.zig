@@ -40,6 +40,7 @@ pub const WindowRuntime = struct {
     router: ui.input.Router = undefined,
     pointer_bindings: ui.input.PointerBindings = undefined,
     buttons: ui.widget.Buttons = undefined,
+    text_inputs: ui.text_input.Registry = undefined,
     focus: ui.focus.Manager = .{},
     semantics: ui.semantics.Snapshot = undefined,
     surface_color: core.Color = undefined,
@@ -84,6 +85,8 @@ pub const WindowRuntime = struct {
         errdefer self.pointer_bindings.deinit();
         try self.buttons.init(allocator, config.node_capacity);
         errdefer self.buttons.deinit();
+        try self.text_inputs.init(allocator, config.node_capacity);
+        errdefer self.text_inputs.deinit();
         try self.semantics.init(allocator, config.node_capacity, config.semantic_text_capacity);
         errdefer self.semantics.deinit();
         const commands = try allocator.alloc(scene.Command, config.command_capacity);
@@ -100,6 +103,7 @@ pub const WindowRuntime = struct {
             .router = self.router,
             .pointer_bindings = self.pointer_bindings,
             .buttons = self.buttons,
+            .text_inputs = self.text_inputs,
             .focus = .{},
             .semantics = self.semantics,
             .surface_color = surface,
@@ -124,6 +128,7 @@ pub const WindowRuntime = struct {
         std.debug.assert(self.pointer_bindings.takeAny() == null);
         self.allocator.free(self.commands);
         self.semantics.deinit();
+        self.text_inputs.deinit();
         self.buttons.deinit();
         self.pointer_bindings.deinit();
         self.router.deinit();
@@ -143,6 +148,7 @@ pub const WindowRuntime = struct {
         if (!self.initialized) return;
         lua_ui.clearHandlers(&self.pointer_bindings);
         self.buttons.clear();
+        self.text_inputs.clear();
         self.focus.clear();
         while (self.router.takeEvent() != null) {}
         if (self.build_owners.isActive(self.root_owner)) {
@@ -210,6 +216,7 @@ pub const WindowRuntime = struct {
             };
             self.semantics.stage(lua_ui.semanticDescriptors());
             self.buttons.removeInactive(&self.instances);
+            self.text_inputs.removeInactive(&self.instances);
             lua_ui.commitBindings(
                 &self.pointer_bindings,
                 &self.buttons,
