@@ -19,11 +19,22 @@ const ui = @import("../ui/root.zig");
 pub const Options = struct {
     exit_after_first_frame: bool = false,
     vulkan: bool = renderer.has_vulkan,
+    application_window_capacity: usize = 16,
     window: WindowRuntimeConfig = .{},
     platform_event_capacity: usize = 256,
     signal_capacity: usize = 256,
     subscription_capacity: usize = 1024,
     dependency_capacity: usize = 256,
+};
+
+const RuntimeSlot = struct {
+    id: ?[]u8 = null,
+    declared: bool = false,
+    next_declared: bool = false,
+    desired: bool = false,
+    configured_size: ?core.SizeU = null,
+    frames_seen: usize = 0,
+    runtime: WindowRuntime = .{},
 };
 
 /// Runs one declarative Lua application on the production Wayland stack.
@@ -137,7 +148,8 @@ pub fn runSource(
     const signals = &generation.signals;
     const lua_ui = &generation.ui_build;
     const application = &generation.application;
-    const window_count = application.windows.len;
+    if (application.windows.len > options.application_window_capacity)
+        return error.WindowCapacityExceeded;
 
     var window_set: windows_module.WindowSet = undefined;
     var host: platform.wayland.Host = undefined;
@@ -148,7 +160,7 @@ pub fn runSource(
         window_set.eventSink(),
         .{
             .app_id = application.id,
-            .window_capacity = window_count,
+            .window_capacity = options.application_window_capacity,
             .vulkan = if (options.vulkan) &vulkan_renderer else null,
         },
     );
@@ -157,89 +169,92 @@ pub fn runSource(
         init.gpa,
         &scheduler,
         host.nativeHost(),
-        window_count,
+        options.application_window_capacity,
         options.platform_event_capacity,
     );
     defer window_set.deinit();
 
-    const runtimes = try init.gpa.alloc(WindowRuntime, window_count);
-    defer init.gpa.free(runtimes);
-    @memset(runtimes, .{});
-    defer for (runtimes) |*runtime| runtime.deinit();
+    const runtime_slots = try init.gpa.alloc(RuntimeSlot, options.application_window_capacity);
+    @memset(runtime_slots, .{});
+    defer {
+        for (runtime_slots) |*slot| {
+            slot.runtime.deinit();
+            if (slot.id) |id| init.gpa.free(id);
+        }
+        init.gpa.free(runtime_slots);
+    }
+    try syncRuntimeSlots(init.gpa, runtime_slots, application.windows);
     var dirty: ui.instance.ReconcileQueue = undefined;
-    try dirty.init(init.gpa, window_count);
+    try dirty.init(init.gpa, options.application_window_capacity);
     defer dirty.deinit();
-    const configured_sizes = try init.gpa.alloc(?core.SizeU, window_count);
-    defer init.gpa.free(configured_sizes);
-    @memset(configured_sizes, null);
-    const desired = try init.gpa.alloc(bool, window_count);
-    defer init.gpa.free(desired);
-    @memset(desired, true);
-    const frames_seen = try init.gpa.alloc(usize, window_count);
-    defer init.gpa.free(frames_seen);
-    @memset(frames_seen, 0);
-    const current_storage = try init.gpa.alloc(platform.window.ToplevelDeclaration, window_count);
+    const current_storage = try init.gpa.alloc(
+        platform.window.ToplevelDeclaration,
+        options.application_window_capacity,
+    );
     defer init.gpa.free(current_storage);
     var disconnect_started = false;
 
     while (true) {
         var desired_changed = false;
         if (host.failure != null) {
-            for (desired) |*present| {
-                if (present.*) desired_changed = true;
-                present.* = false;
+            for (runtime_slots) |*slot| {
+                if (slot.desired) desired_changed = true;
+                slot.desired = false;
             }
         }
         while (window_set.takeEvent()) |event| switch (event) {
             .close_requested => |handle| {
-                if (indexForHandle(&window_set, application.windows, handle)) |index| {
-                    if (desired[index]) {
-                        desired[index] = false;
+                if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
+                    if (slot.desired) {
+                        slot.desired = false;
                         desired_changed = true;
                     }
                 }
             },
             .configured => |configured| {
-                if (indexForHandle(&window_set, application.windows, configured.window)) |index| {
-                    configured_sizes[index] = .{
+                if (slotForNativeHandle(&window_set, runtime_slots, configured.window)) |slot| {
+                    slot.configured_size = .{
                         .width = configured.width,
                         .height = configured.height,
                     };
-                    if (runtimes[index].registered) _ = try dirty.markDirty(configured.window);
+                    if (slot.runtime.registered) _ = try dirty.markDirty(configured.window);
                 }
             },
             .pointer => |pointer| {
-                if (indexForHandle(&window_set, application.windows, pointerWindow(pointer))) |index|
-                    if (runtimes[index].ready) try runtimes[index].routePointer(pointer);
+                if (slotForNativeHandle(&window_set, runtime_slots, pointerWindow(pointer))) |slot|
+                    if (slot.runtime.ready) try slot.runtime.routePointer(pointer);
             },
         };
 
         // Task safe point: platform and CQE dispatch only changed state.
         try scheduler.applyQueuedCancellations();
-        for (runtimes) |*runtime| try runtime.collectRetired();
-        for (runtimes) |*runtime| if (runtime.ready) try runtime.dispatchInput(&callbacks);
+        for (runtime_slots) |*slot| try slot.runtime.collectRetired();
+        for (runtime_slots) |*slot| if (slot.runtime.ready)
+            try slot.runtime.dispatchInput(&callbacks);
         while (scheduler.takeRunnable()) |handle| _ = try source_reload.resumeRunnable(handle);
 
         var current_count: usize = 0;
-        for (application.windows, desired) |window, present| {
-            if (!present) continue;
+        for (application.windows) |window| {
+            const slot = runtimeSlotForId(runtime_slots, window.declaration.id).?;
+            if (!slot.desired) continue;
             current_storage[current_count] = window.declaration;
             current_count += 1;
         }
         try window_set.reconcile(current_storage[0..current_count]);
 
-        for (application.windows, desired, 0..) |window, present, index| {
-            if (!present) {
-                if (runtimes[index].registered) {
-                    try dirty.unregister(runtimes[index].window);
-                    runtimes[index].registered = false;
+        for (runtime_slots) |*slot| {
+            const window = applicationWindowForId(application.windows, slot.id orelse continue);
+            if (window == null or !slot.desired) {
+                if (slot.runtime.registered) {
+                    try dirty.unregister(slot.runtime.window);
+                    slot.runtime.registered = false;
                 }
-                try runtimes[index].clear(lua_ui);
+                try slot.runtime.clear(lua_ui);
                 continue;
             }
-            const handle = window_set.handleForId(window.declaration.id).?;
-            if (!runtimes[index].initialized) {
-                try runtimes[index].init(
+            const handle = window_set.handleForId(window.?.declaration.id).?;
+            if (!slot.runtime.initialized) {
+                try slot.runtime.init(
                     init.gpa,
                     &scheduler,
                     try window_set.scope(handle),
@@ -252,43 +267,45 @@ pub fn runSource(
                     options.window,
                 );
                 try dirty.register(handle);
-                runtimes[index].registered = true;
-                runtimes[index].setDirtyWindowQueue(&dirty);
+                slot.runtime.registered = true;
+                slot.runtime.setDirtyWindowQueue(&dirty);
             }
-            if (configured_sizes[index] != null and !(try dirty.hasPending(handle)))
+            if (slot.configured_size != null and !(try dirty.hasPending(handle)))
                 _ = try dirty.markDirty(handle);
         }
 
         while (dirty.take()) |work| {
-            const index = indexForRuntime(runtimes, work.owner) orelse return error.UnknownDirtyWindow;
-            const size = configured_sizes[index] orelse
-                runtimes[index].frame_state.size orelse return error.DirtyWindowNotConfigured;
-            runtimes[index].reconcile(
+            const slot = runtimeSlotForHandle(runtime_slots, work.owner) orelse
+                return error.UnknownDirtyWindow;
+            const window = applicationWindowForId(application.windows, slot.id.?) orelse
+                return error.UnknownDirtyWindow;
+            const size = slot.configured_size orelse
+                slot.runtime.frame_state.size orelse return error.DirtyWindowNotConfigured;
+            slot.runtime.reconcile(
                 size,
                 lua_ui,
-                application.windows[index].content_reference,
+                window.content_reference,
             ) catch |err| {
                 try dirty.retry(work);
                 return err;
             };
-            configured_sizes[index] = null;
+            slot.configured_size = null;
             try dirty.complete(work);
         }
 
-        for (runtimes) |*runtime| if (runtime.ready)
-            try runtime.prepareFrame(try host.outputScale(runtime.window));
+        for (runtime_slots) |*slot| if (slot.runtime.ready)
+            try slot.runtime.prepareFrame(try host.outputScale(slot.runtime.window));
 
-        for (application.windows, desired, 0..) |window, present, index| {
-            if (!present) continue;
-            const handle = window_set.handleForId(window.declaration.id).?;
-            if (runtimes[index].wantsSubmission()) try host.requestRedraw(handle);
+        for (runtime_slots) |*slot| {
+            if (!slot.desired or !slot.runtime.initialized) continue;
+            if (slot.runtime.wantsSubmission()) try host.requestRedraw(slot.runtime.window);
         }
 
-        for (application.windows, desired, 0..) |window, present, index| {
-            if (!present) continue;
-            const handle = window_set.handleForId(window.declaration.id).?;
-            if (runtimes[index].wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
-                const list = try runtimes[index].displayList();
+        for (runtime_slots) |*slot| {
+            if (!slot.desired or !slot.runtime.initialized) continue;
+            const handle = slot.runtime.window;
+            if (slot.runtime.wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
+                const list = try slot.runtime.displayList();
                 (switch (frame_buffer.target) {
                     .software => |target| renderer.software.renderText(list, .{
                         .pixels = target.pixels,
@@ -303,20 +320,20 @@ pub fn runSource(
                     return err;
                 };
                 try host.present(frame_buffer);
-                try runtimes[index].frameSubmitted();
+                try slot.runtime.frameSubmitted();
             };
-            frames_seen[index] = @max(frames_seen[index], try host.framesPresented(handle));
+            slot.frames_seen = @max(slot.frames_seen, try host.framesPresented(handle));
         }
 
         if (options.exit_after_first_frame) {
             var all_presented = true;
             var any_present = false;
-            for (desired, frames_seen) |present, count| {
-                any_present = any_present or present;
-                if (present and count == 0) all_presented = false;
+            for (runtime_slots) |slot| {
+                any_present = any_present or slot.desired;
+                if (slot.desired and slot.frames_seen == 0) all_presented = false;
             }
             if (any_present and all_presented) {
-                @memset(desired, false);
+                for (runtime_slots) |*slot| slot.desired = false;
                 desired_changed = true;
             }
         }
@@ -360,21 +377,70 @@ fn loadFont(
     });
 }
 
-fn indexForHandle(
-    windows: *windows_module.WindowSet,
+fn syncRuntimeSlots(
+    allocator: std.mem.Allocator,
+    slots: []RuntimeSlot,
     declarations: []const lua.ApplicationWindow,
+) !void {
+    for (slots) |*slot| slot.next_declared = false;
+    for (declarations) |declaration| {
+        const id = declaration.declaration.id;
+        var slot = runtimeSlotForId(slots, id);
+        if (slot == null) {
+            for (slots) |*candidate| if (candidate.id == null) {
+                const owned_id = try allocator.dupe(u8, id);
+                candidate.* = .{ .id = owned_id };
+                slot = candidate;
+                break;
+            };
+        }
+        const target = slot orelse return error.WindowCapacityExceeded;
+        if (!target.declared) {
+            target.desired = true;
+            target.frames_seen = 0;
+        }
+        target.next_declared = true;
+    }
+    for (slots) |*slot| {
+        if (slot.declared and !slot.next_declared) slot.desired = false;
+        slot.declared = slot.next_declared;
+        slot.next_declared = false;
+    }
+}
+
+fn runtimeSlotForId(slots: []RuntimeSlot, id: []const u8) ?*RuntimeSlot {
+    for (slots) |*slot|
+        if (slot.id != null and std.mem.eql(u8, slot.id.?, id)) return slot;
+    return null;
+}
+
+fn applicationWindowForId(
+    declarations: []const lua.ApplicationWindow,
+    id: []const u8,
+) ?*const lua.ApplicationWindow {
+    for (declarations) |*declaration|
+        if (std.mem.eql(u8, declaration.declaration.id, id)) return declaration;
+    return null;
+}
+
+fn slotForNativeHandle(
+    windows: *windows_module.WindowSet,
+    slots: []RuntimeSlot,
     handle: platform.window.WindowHandle,
-) ?usize {
-    for (declarations, 0..) |declaration, index| {
-        const current = windows.handleForId(declaration.declaration.id) orelse continue;
-        if (sameHandle(current, handle)) return index;
+) ?*RuntimeSlot {
+    for (slots) |*slot| {
+        const current = windows.handleForId(slot.id orelse continue) orelse continue;
+        if (sameHandle(current, handle)) return slot;
     }
     return null;
 }
 
-fn indexForRuntime(runtimes: []WindowRuntime, handle: platform.window.WindowHandle) ?usize {
-    for (runtimes, 0..) |runtime, index|
-        if (runtime.registered and sameHandle(runtime.window, handle)) return index;
+fn runtimeSlotForHandle(
+    slots: []RuntimeSlot,
+    handle: platform.window.WindowHandle,
+) ?*RuntimeSlot {
+    for (slots) |*slot|
+        if (slot.runtime.registered and sameHandle(slot.runtime.window, handle)) return slot;
     return null;
 }
 
@@ -395,4 +461,38 @@ fn pointerWindow(event: platform.window.PointerEvent) platform.window.WindowHand
 
 fn sameHandle(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+test "runtime slots retain window state by ID across declaration changes" {
+    var slots = [_]RuntimeSlot{.{}} ** 2;
+    defer for (&slots) |*slot| if (slot.id) |id| std.testing.allocator.free(id);
+    const initial = [_]lua.ApplicationWindow{
+        .{
+            .declaration = .{ .id = "main", .title = "Main" },
+            .content_reference = 1,
+        },
+        .{
+            .declaration = .{ .id = "tools", .title = "Tools" },
+            .content_reference = 2,
+        },
+    };
+    try syncRuntimeSlots(std.testing.allocator, &slots, &initial);
+    const main = runtimeSlotForId(&slots, "main").?;
+    const tools = runtimeSlotForId(&slots, "tools").?;
+    main.frames_seen = 4;
+    tools.configured_size = .{ .width = 320, .height = 240 };
+
+    const reordered = [_]lua.ApplicationWindow{ initial[1], initial[0] };
+    try syncRuntimeSlots(std.testing.allocator, &slots, &reordered);
+    try std.testing.expect(runtimeSlotForId(&slots, "main").? == main);
+    try std.testing.expect(runtimeSlotForId(&slots, "tools").? == tools);
+    try std.testing.expectEqual(@as(usize, 4), main.frames_seen);
+    try std.testing.expectEqual(@as(u32, 320), tools.configured_size.?.width);
+
+    try syncRuntimeSlots(std.testing.allocator, &slots, initial[1..]);
+    try std.testing.expect(!main.declared and !main.desired);
+    try std.testing.expect(tools.declared and tools.desired);
+    try syncRuntimeSlots(std.testing.allocator, &slots, &initial);
+    try std.testing.expect(main.declared and main.desired);
+    try std.testing.expectEqual(@as(usize, 0), main.frames_seen);
 }
