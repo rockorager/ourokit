@@ -233,7 +233,7 @@ pub const WindowRuntime = struct {
         const size = self.frame_state.size.?;
         const width: f32 = @floatFromInt(size.width);
         const height: f32 = @floatFromInt(size.height);
-        if (try self.tree.layoutDirty(root)) {
+        if (self.frame_state.needsLayout() or try self.tree.layoutDirty(root)) {
             self.frame_state.invalidateLayout();
             _ = try self.tree.layout(
                 root,
@@ -377,6 +377,53 @@ pub const WindowRuntime = struct {
         try self.applyButtonColor(value.target, value.color);
     }
 };
+
+test "resize lays out a clean render tree before rebuilding its scene" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+
+    var runtime: WindowRuntime = .{};
+    try runtime.tree.init(std.testing.allocator, 1);
+    try runtime.instances.init(
+        std.testing.allocator,
+        &scheduler,
+        &runtime.tree,
+        window_scope,
+        1,
+    );
+    defer {
+        runtime.instances.reconcile(&.{}) catch unreachable;
+        scheduler.applyQueuedCancellations() catch unreachable;
+        runtime.instances.collectRetired() catch unreachable;
+        runtime.instances.deinit();
+        runtime.tree.deinit();
+        scheduler.destroyScope(window_scope) catch unreachable;
+    }
+    var commands: [1]scene.Command = undefined;
+    runtime.initialized = true;
+    runtime.commands = &commands;
+    try runtime.instances.reconcile(&.{.{
+        .id = 1,
+        .parent = null,
+        .object = .{ .box = .{ .background = core.Color.rgba(1, 2, 3, 255) } },
+    }});
+
+    _ = try runtime.frame_state.configure(.{ .width = 100, .height = 80 });
+    try runtime.prepareFrame(1);
+    try runtime.frameSubmitted();
+    const root = (try runtime.instances.rootRenderObject()).?;
+    const initial_layout_count = try runtime.tree.layoutCount(root);
+    try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
+
+    _ = try runtime.frame_state.configure(.{ .width = 120, .height = 80 });
+    try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
+    try runtime.prepareFrame(1);
+
+    try std.testing.expectEqual(initial_layout_count + 1, try runtime.tree.layoutCount(root));
+    try std.testing.expect(runtime.wantsSubmission());
+}
 
 const InputValues = struct {
     kind: i64,
