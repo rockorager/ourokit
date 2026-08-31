@@ -358,6 +358,24 @@ pub const Vm = struct {
         return handle;
     }
 
+    /// Rolls back registration when an external operation could not be
+    /// prepared. This is valid only before the C callback yields.
+    pub fn abortExternalWait(
+        self: *Vm,
+        state: *c.State,
+        handle: TaskHandle,
+    ) !void {
+        if (self.running == null or !same(self.running.?, handle))
+            return error.LuaTaskNotRunning;
+        const slot = try self.activeSlot(handle);
+        if (slot.thread != state) return error.WrongLuaTask;
+        if (slot.yield_request != .external or slot.external_pending)
+            return error.LuaTaskNotWaiting;
+        try self.scheduler.destroyResource(slot.external_resource_handle.?);
+        slot.external_resource_handle = null;
+        slot.yield_request = .none;
+    }
+
     /// Completion-phase transition for an external wait. Resource data must
     /// be published before this call. Lua runs only after the task phase takes
     /// the newly-runnable scheduler task.

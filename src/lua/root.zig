@@ -17,6 +17,7 @@ pub const ApplicationWindow = @import("application.zig").Window;
 pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
 pub const DiagnosticPhase = @import("diagnostic.zig").Phase;
 pub const recordDiagnosticError = @import("diagnostic.zig").recordError;
+pub const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 
 test {
     _ = @import("application.zig");
@@ -24,6 +25,7 @@ test {
     _ = @import("diagnostic.zig");
     _ = @import("prepared_build.zig");
     _ = @import("signals.zig");
+    _ = @import("module_loader.zig");
     _ = @import("vm.zig");
     _ = @import("ui_build.zig");
 }
