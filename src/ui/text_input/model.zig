@@ -7,10 +7,20 @@ const CaretAffinity = @import("../../text/positioned_lines.zig").CaretAffinity;
 pub const Selection = struct {
     anchor: usize,
     extent: usize,
-    affinity: CaretAffinity = .downstream,
+    anchor_affinity: CaretAffinity = .downstream,
+    extent_affinity: CaretAffinity = .downstream,
 
     pub fn collapsed(offset: usize) Selection {
         return .{ .anchor = offset, .extent = offset };
+    }
+
+    pub fn collapsedAt(offset: usize, affinity: CaretAffinity) Selection {
+        return .{
+            .anchor = offset,
+            .extent = offset,
+            .anchor_affinity = affinity,
+            .extent_affinity = affinity,
+        };
     }
 
     pub fn range(self: Selection) Range {
@@ -192,7 +202,11 @@ pub const Model = struct {
 
     fn setExtent(self: *Model, extent: usize, extend: bool) bool {
         const value: Selection = if (extend)
-            .{ .anchor = self.selection.anchor, .extent = extent }
+            .{
+                .anchor = self.selection.anchor,
+                .extent = extent,
+                .anchor_affinity = self.selection.anchor_affinity,
+            }
         else
             .collapsed(extent);
         if (std.meta.eql(self.selection, value)) return false;

@@ -553,13 +553,28 @@ pub const WindowRuntime = struct {
             key.state != .released)
         {
             const session = try self.text_inputs.session(focused);
+            const editing_key = key.translated.logical == .backspace or
+                key.translated.logical == .delete or
+                key.translated.logical == .arrow_left or
+                key.translated.logical == .arrow_right;
+            if (session.preedit() != null and editing_key) return;
             const changed = switch (key.translated.logical) {
                 .backspace => try session.model.deleteBackward(),
                 .delete => try session.model.deleteForward(),
+                .arrow_left => try self.moveTextInputCaret(
+                    focused,
+                    .left,
+                    key.translated.modifiers.shift,
+                ),
+                .arrow_right => try self.moveTextInputCaret(
+                    focused,
+                    .right,
+                    key.translated.modifiers.shift,
+                ),
                 else => false,
             };
             if (changed) try self.syncTextInputVisuals();
-            if (key.translated.logical == .backspace or key.translated.logical == .delete) return;
+            if (editing_key) return;
         };
         if (key.translated.logical == .space) switch (key.state) {
             .pressed => {
@@ -761,9 +776,52 @@ pub const WindowRuntime = struct {
         _ = try session.model.setSelection(.{
             .anchor = hit.caret.byte_offset,
             .extent = hit.caret.byte_offset,
-            .affinity = hit.caret.affinity,
+            .anchor_affinity = hit.caret.affinity,
+            .extent_affinity = hit.caret.affinity,
         });
         try self.syncTextInputVisuals();
+    }
+
+    fn moveTextInputCaret(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        direction: text.VisualCaretDirection,
+        extend: bool,
+    ) !bool {
+        const session = try self.text_inputs.session(target);
+        const current = session.model.selection;
+        const content = try self.text_inputs.content(target);
+        const render = try self.instances.renderObject(content);
+        if (!extend and !current.isCollapsed()) {
+            const order = try self.tree.textVisualOrder(
+                render,
+                current.anchor,
+                current.anchor_affinity,
+                current.extent,
+                current.extent_affinity,
+            );
+            const use_anchor = switch (direction) {
+                .left => order != .gt,
+                .right => order == .gt,
+            };
+            return session.model.setSelection(if (use_anchor)
+                .collapsedAt(current.anchor, current.anchor_affinity)
+            else
+                .collapsedAt(current.extent, current.extent_affinity));
+        }
+
+        const next = try self.tree.textVisualNeighbor(
+            render,
+            current.extent,
+            current.extent_affinity,
+            direction,
+        );
+        return session.model.setSelection(if (extend) .{
+            .anchor = current.anchor,
+            .extent = next.byte_offset,
+            .anchor_affinity = current.anchor_affinity,
+            .extent_affinity = next.affinity,
+        } else .collapsedAt(next.byte_offset, next.affinity));
     }
 
     fn textInputAncestor(
@@ -1225,6 +1283,42 @@ test "text input protocol batches mutate retained sessions only at the input saf
     } });
     try runtime.dispatchInput(&unused_vm);
     try std.testing.expect(runtime.text_input_commit_permitted);
+
+    const before_left = (try runtime.text_inputs.session(target)).model.selection;
+    const expected_left = try runtime.tree.textVisualNeighbor(
+        render,
+        before_left.extent,
+        before_left.extent_affinity,
+        .left,
+    );
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 3,
+        .time_ms = 4,
+        .state = .pressed,
+        .translated = .{ .keycode = 105, .logical = .arrow_left },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    const after_left = (try runtime.text_inputs.session(target)).model.selection;
+    try std.testing.expectEqual(expected_left.byte_offset, after_left.extent);
+    try std.testing.expectEqual(expected_left.affinity, after_left.extent_affinity);
+    try std.testing.expect(after_left.isCollapsed());
+
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 4,
+        .time_ms = 5,
+        .state = .pressed,
+        .translated = .{
+            .keycode = 105,
+            .logical = .arrow_left,
+            .modifiers = .{ .shift = true },
+        },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    const extended = (try runtime.text_inputs.session(target)).model.selection;
+    try std.testing.expectEqual(after_left.anchor, extended.anchor);
+    try std.testing.expect(!extended.isCollapsed());
 
     try fonts.release(font);
 }

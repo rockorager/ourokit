@@ -40,6 +40,8 @@ pub const CaretAffinity = enum {
     downstream,
 };
 
+pub const VisualDirection = enum { left, right };
+
 /// One legal extended-grapheme insertion edge. A byte offset may have two
 /// physically distinct stops at a bidi boundary; affinity disambiguates which
 /// neighboring logical grapheme supplies the visual edge.
@@ -231,7 +233,119 @@ pub const PositionedLines = struct {
                     );
             }
         }
+        if (self.visualIndex(byte_offset, affinity)) |index| {
+            for (self.lines, 0..) |line, line_index| {
+                if (index < line.caret_start or index >= line.caret_start + line.caret_count)
+                    continue;
+                const caret = self.carets[index];
+                return self.caretRectangle(
+                    line_index,
+                    caret.byte_offset,
+                    caret.affinity,
+                    caret_width,
+                );
+            }
+        }
         return error.CaretNotFound;
+    }
+
+    /// Traverses the physical caret sequence produced by bidi reordering. Line
+    /// arrays are top-to-bottom and each line's carets are left-to-right.
+    /// Co-located upstream/downstream variants are one visual position and are
+    /// skipped; affinity variants at distinct bidi edges remain traversable.
+    pub fn visualNeighbor(
+        self: *const PositionedLines,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+        direction: VisualDirection,
+    ) ?CaretStop {
+        const index = self.visualIndex(byte_offset, affinity) orelse return null;
+        return switch (direction) {
+            .left => blk: {
+                var candidate = index;
+                while (candidate != 0) {
+                    candidate -= 1;
+                    if (!self.sameVisualPosition(index, candidate)) break;
+                }
+                break :blk self.carets[candidate];
+            },
+            .right => blk: {
+                var candidate = index;
+                while (candidate + 1 < self.carets.len) {
+                    candidate += 1;
+                    if (!self.sameVisualPosition(index, candidate)) break;
+                }
+                break :blk self.carets[candidate];
+            },
+        };
+    }
+
+    pub fn visualOrder(
+        self: *const PositionedLines,
+        a_offset: usize,
+        a_affinity: CaretAffinity,
+        b_offset: usize,
+        b_affinity: CaretAffinity,
+    ) ?std.math.Order {
+        const a = self.visualIndex(a_offset, a_affinity) orelse return null;
+        const b = self.visualIndex(b_offset, b_affinity) orelse return null;
+        return std.math.order(a, b);
+    }
+
+    fn visualIndex(
+        self: *const PositionedLines,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+    ) ?usize {
+        if (self.visualIndexExact(byte_offset, affinity)) |index| return index;
+        if (affinity == .downstream) {
+            for (self.carets, 0..) |caret, index|
+                if (caret.byte_offset == byte_offset) return index;
+        } else {
+            var index = self.carets.len;
+            while (index != 0) {
+                index -= 1;
+                if (self.carets[index].byte_offset == byte_offset) return index;
+            }
+        }
+        return null;
+    }
+
+    fn visualIndexExact(
+        self: *const PositionedLines,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+    ) ?usize {
+        if (affinity == .downstream) {
+            for (self.lines) |line| for (self.caretsFor(line), 0..) |caret, index|
+                if (caret.byte_offset == byte_offset and caret.affinity == affinity)
+                    return line.caret_start + index;
+        } else {
+            var line_index = self.lines.len;
+            while (line_index != 0) {
+                line_index -= 1;
+                const line = self.lines[line_index];
+                const carets = self.caretsFor(line);
+                var index = carets.len;
+                while (index != 0) {
+                    index -= 1;
+                    const caret = carets[index];
+                    if (caret.byte_offset == byte_offset and caret.affinity == affinity)
+                        return line.caret_start + index;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn sameVisualPosition(self: *const PositionedLines, a: usize, b: usize) bool {
+        for (self.lines) |line| {
+            const end = line.caret_start + line.caret_count;
+            if (a < line.caret_start or a >= end) continue;
+            if (b < line.caret_start or b >= end) return false;
+            return @abs(self.carets[a].x - self.carets[b].x) <= 0.001;
+        }
+        return false;
     }
 
     /// Emits one rectangle for each contiguous physical selection fragment.
@@ -1090,6 +1204,16 @@ test "caret stops preserve graphemes, ligatures, and bidi affinity" {
     }
     try std.testing.expect(bidi_boundary_first != null);
     try std.testing.expect(bidi_boundary_second != null);
+    for (mixed_carets) |caret| {
+        const left = mixed_positioned.visualNeighbor(caret.byte_offset, caret.affinity, .left).?;
+        const right = mixed_positioned.visualNeighbor(caret.byte_offset, caret.affinity, .right).?;
+        try std.testing.expect(left.x < caret.x or @abs(left.x - caret.x) <= 0.001);
+        try std.testing.expect(right.x > caret.x or @abs(right.x - caret.x) <= 0.001);
+        if (@abs(left.x - caret.x) <= 0.001)
+            try std.testing.expectEqual(mixed_carets[0].x, caret.x);
+        if (@abs(right.x - caret.x) <= 0.001)
+            try std.testing.expectEqual(mixed_carets[mixed_carets.len - 1].x, caret.x);
+    }
 
     const clustered = "office a\u{301}b";
     var clustered_fixture: fixture.Fixture = undefined;

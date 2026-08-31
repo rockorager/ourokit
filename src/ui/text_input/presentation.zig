@@ -31,7 +31,7 @@ pub fn build(allocator: std.mem.Allocator, session: *const Session) !Presentatio
             .text = try allocator.dupe(u8, committed),
             .selection = selection.range(),
             .caret_offset = selection.extent,
-            .caret_affinity = selection.affinity,
+            .caret_affinity = selection.extent_affinity,
             .show_caret = selection.isCollapsed(),
             .preedit = null,
         };
@@ -95,7 +95,7 @@ test "committed presentation preserves directional selection and affinity" {
     _ = try session.model.setSelection(.{
         .anchor = session.model.text().len,
         .extent = 4,
-        .affinity = .upstream,
+        .extent_affinity = .upstream,
     });
     var result = try build(std.testing.allocator, &session);
     defer result.deinit();

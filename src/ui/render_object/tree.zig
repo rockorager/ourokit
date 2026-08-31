@@ -266,6 +266,42 @@ pub const Tree = struct {
         );
     }
 
+    pub fn textVisualNeighbor(
+        self: *Tree,
+        handle: NodeHandle,
+        byte_offset: usize,
+        affinity: text.CaretAffinity,
+        direction: text.VisualCaretDirection,
+    ) !text.CaretStop {
+        const target = try self.ensureTextLayout(handle);
+        const paragraph_layout = self.paragraphs.?.get(target.paragraph_layout.?) catch
+            return error.StaleParagraph;
+        return paragraph_layout.positioned.visualNeighbor(
+            byte_offset,
+            affinity,
+            direction,
+        ) orelse error.CaretNotFound;
+    }
+
+    pub fn textVisualOrder(
+        self: *Tree,
+        handle: NodeHandle,
+        a_offset: usize,
+        a_affinity: text.CaretAffinity,
+        b_offset: usize,
+        b_affinity: text.CaretAffinity,
+    ) !std.math.Order {
+        const target = try self.ensureTextLayout(handle);
+        const paragraph_layout = self.paragraphs.?.get(target.paragraph_layout.?) catch
+            return error.StaleParagraph;
+        return paragraph_layout.positioned.visualOrder(
+            a_offset,
+            a_affinity,
+            b_offset,
+            b_affinity,
+        ) orelse error.CaretNotFound;
+    }
+
     pub fn nodeSize(self: *Tree, handle: NodeHandle) !SizeF {
         const target = try self.slot(handle);
         if (!target.has_layout or !(try self.layoutPathCurrent(handle))) return error.LayoutRequired;
@@ -660,6 +696,19 @@ pub const Tree = struct {
         self.releaseParagraphLayout(target);
         target.paragraph_layout = layout_handle;
         return result;
+    }
+
+    fn ensureTextLayout(self: *Tree, handle: NodeHandle) !*Slot {
+        var target = try self.slot(handle);
+        if (target.object != .text_input) return error.NotTextInputObject;
+        if (!target.has_layout) return error.LayoutRequired;
+        if (target.needs_layout) {
+            const constraints = target.last_constraints;
+            _ = try self.layoutNode(handle, constraints);
+            target = try self.slot(handle);
+        }
+        if (target.paragraph_layout == null) return error.LayoutRequired;
+        return target;
     }
 
     fn retainObject(self: *Tree, object: types.Object) !void {

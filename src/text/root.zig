@@ -64,6 +64,7 @@ pub const selectGreedyLines = line_layout.selectGreedyLines;
 pub const PositionedGlyph = positioned_lines.Glyph;
 pub const PositionedSpan = positioned_lines.Span;
 pub const CaretAffinity = positioned_lines.CaretAffinity;
+pub const VisualCaretDirection = positioned_lines.VisualDirection;
 pub const CaretStop = positioned_lines.CaretStop;
 pub const TextHitResult = positioned_lines.HitResult;
 pub const ByteRange = positioned_lines.ByteRange;
