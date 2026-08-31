@@ -3,6 +3,7 @@ const Color = @import("../core/color.zig").Color;
 const PointF = @import("../core/geometry.zig").PointF;
 const RectI = @import("../core/geometry.zig").RectI;
 const ShapeHandle = @import("../text/shape_cache.zig").ShapeHandle;
+const ShapeCache = @import("../text/shape_cache.zig").ShapeCache;
 
 pub const BlendMode = enum {
     /// Replace destination pixels with the premultiplied source.
@@ -157,6 +158,8 @@ pub const Frame = struct {
     allocator: std.mem.Allocator,
     command_storage: []const Command,
     damage_storage: []const RectI,
+    shape_cache: ?*ShapeCache,
+    shape_leases: []const ShapeHandle,
     full_damage: bool,
 
     pub fn init(
@@ -164,9 +167,34 @@ pub const Frame = struct {
         commands: []const Command,
         damage: Damage,
     ) !Frame {
+        return initInternal(allocator, commands, damage, null);
+    }
+
+    /// Copies a display list and retains every shape it references. The cache
+    /// must outlive the frame; releasing the UI/render-tree references after
+    /// this call cannot invalidate asynchronous rendering.
+    pub fn initWithShapes(
+        allocator: std.mem.Allocator,
+        commands: []const Command,
+        damage: Damage,
+        shape_cache: *ShapeCache,
+    ) !Frame {
+        return initInternal(allocator, commands, damage, shape_cache);
+    }
+
+    fn initInternal(
+        allocator: std.mem.Allocator,
+        commands: []const Command,
+        damage: Damage,
+        shape_cache: ?*ShapeCache,
+    ) !Frame {
         try (DisplayList{ .commands = commands, .damage = damage }).validate();
-        for (commands) |command| if (command == .glyph_run)
-            return error.ResourceLeaseRequired;
+        var shape_count: usize = 0;
+        for (commands) |command| if (command == .glyph_run) {
+            shape_count += 1;
+        };
+        if (shape_count != 0 and shape_cache == null) return error.ResourceLeaseRequired;
+
         const owned_commands = try allocator.dupe(Command, commands);
         errdefer allocator.free(owned_commands);
         const full_damage = damage == .full;
@@ -174,15 +202,34 @@ pub const Frame = struct {
             .full => try allocator.alloc(RectI, 0),
             .regions => |values| try allocator.dupe(RectI, values),
         };
+        errdefer allocator.free(regions);
+        const leases = try allocator.alloc(ShapeHandle, shape_count);
+        errdefer allocator.free(leases);
+        var retained: usize = 0;
+        errdefer if (shape_cache) |cache| for (leases[0..retained]) |handle|
+            cache.release(handle) catch unreachable;
+        if (shape_cache) |cache| for (commands) |command| switch (command) {
+            .glyph_run => |run| {
+                try cache.retain(run.shape);
+                leases[retained] = run.shape;
+                retained += 1;
+            },
+            else => {},
+        };
         return .{
             .allocator = allocator,
             .command_storage = owned_commands,
             .damage_storage = regions,
+            .shape_cache = shape_cache,
+            .shape_leases = leases,
             .full_damage = full_damage,
         };
     }
 
     pub fn deinit(self: *Frame) void {
+        if (self.shape_cache) |cache| for (self.shape_leases) |handle|
+            cache.release(handle) catch unreachable;
+        self.allocator.free(self.shape_leases);
         self.allocator.free(self.damage_storage);
         self.allocator.free(self.command_storage);
         self.* = undefined;
@@ -206,6 +253,65 @@ test "owned frame isolates asynchronous scene lifetime" {
     const list = frame.displayList();
     try std.testing.expectEqual(@as(u8, 1), list.commands[0].clear.r);
     try std.testing.expectEqual(@as(i32, 1), list.damage.regions[0].x);
+}
+
+test "owned frame leases shapes across asynchronous scene lifetime" {
+    const text = @import("../text/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    const shape = try shapes.acquire(.{
+        .spec = .{
+            .paragraph = "leased",
+            .direction = .left_to_right,
+            .script = .latin,
+            .language = "en",
+            .logical_size = 14,
+        },
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    const commands = [_]Command{.{ .glyph_run = .{
+        .shape = shape,
+        .origin = .{ .x = 2, .y = 16 },
+        .scale = 1,
+        .color = Color.rgba(1, 2, 3, 255),
+    } }};
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseFrameAllocationFailure,
+        .{ &shapes, &commands },
+    );
+    {
+        var frame = try Frame.initWithShapes(
+            std.testing.allocator,
+            &commands,
+            .full,
+            &shapes,
+        );
+        defer frame.deinit();
+        try shapes.release(shape);
+        try fonts.release(font);
+        _ = try shapes.get(shape);
+        _ = try fonts.get(font);
+        try std.testing.expectEqual(shape, frame.displayList().commands[0].glyph_run.shape);
+    }
+    try std.testing.expectError(error.StaleShape, shapes.get(shape));
+    try std.testing.expectError(error.StaleFont, fonts.get(font));
+}
+
+fn exerciseFrameAllocationFailure(
+    allocator: std.mem.Allocator,
+    shapes: *ShapeCache,
+    commands: []const Command,
+) !void {
+    var frame = try Frame.initWithShapes(allocator, commands, .full, shapes);
+    defer frame.deinit();
 }
 
 test "opaque next draw occludes covered work through clips" {

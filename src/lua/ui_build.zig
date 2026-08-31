@@ -358,6 +358,7 @@ pub const UiBuild = struct {
                 .width = width,
                 .height = height,
                 .padding = .all(design.tokens.foundation.spacing_3),
+                .alignment = .center,
                 .background = if (enabled) style.idle else style.disabled,
                 .corner_radius = design.tokens.foundation.corner_radius_medium,
             } },
@@ -808,6 +809,10 @@ test "nested declarative widgets normalize to typed objects and a Button binding
     try std.testing.expect(descriptors[3].object == .label);
     try std.testing.expect(descriptors[4].object == .flex);
     try std.testing.expect(descriptors[5].object == .box);
+    try std.testing.expectEqual(
+        render_types.Alignment.center,
+        descriptors[5].object.box.alignment.?,
+    );
     try std.testing.expect(descriptors[6].object == .label);
     try std.testing.expectEqual(descriptors[5].id, descriptors[6].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
