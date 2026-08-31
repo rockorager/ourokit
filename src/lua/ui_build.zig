@@ -11,6 +11,8 @@ const instance = @import("../ui/instance/tree.zig");
 const PointerBindings = @import("../ui/input/bindings.zig").PointerBindings;
 const Buttons = @import("../ui/widget/buttons.zig").Buttons;
 const ButtonStyle = @import("../ui/widget/buttons.zig").Style;
+const TextInputs = @import("../ui/text_input/registry.zig").Registry;
+const TextInputSession = @import("../ui/text_input/session.zig").Session;
 const render_types = @import("../ui/render_object/types.zig");
 const SemanticDescriptor = @import("../ui/semantics/snapshot.zig").Descriptor;
 const text = @import("../text/root.zig");
@@ -25,6 +27,12 @@ const PendingButton = struct {
     id: u64,
     enabled: bool,
     style: ButtonStyle,
+};
+
+const PendingTextInput = struct {
+    target_id: u64,
+    content_id: u64,
+    session: ?TextInputSession,
 };
 
 const ParentKind = enum { box, flex, stack, scroll };
@@ -73,6 +81,8 @@ pub const UiBuild = struct {
     pending_handler_count: usize = 0,
     pending_buttons: [256]PendingButton = undefined,
     pending_button_count: usize = 0,
+    pending_text_inputs: [256]PendingTextInput = undefined,
+    pending_text_input_count: usize = 0,
 
     pub fn init(
         self: *UiBuild,
@@ -109,6 +119,7 @@ pub const UiBuild = struct {
         if (api_type != c.type_table) return error.OuroApiMissing;
         try self.install("label", emitLabel);
         try self.install("button", emitButton);
+        try self.install("text_input", emitTextInput);
         try self.install("box", emitBox);
         try self.install("row", emitRow);
         try self.install("column", emitColumn);
@@ -137,6 +148,7 @@ pub const UiBuild = struct {
     ) ![]const instance.Descriptor {
         if (self.active_owner != null) return error.LuaBuildReentered;
         self.discardHandlers();
+        self.discardPendingTextInputs();
         self.discardSources();
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
@@ -151,6 +163,7 @@ pub const UiBuild = struct {
         self.parent_count = 0;
         self.theme_count = 0;
         self.pending_button_count = 0;
+        self.pending_text_input_count = 0;
         self.active_owner = .{ .owners = owners, .handle = work.owner };
         defer self.active_owner = null;
         if (self.widget_theme) |theme| {
@@ -181,6 +194,7 @@ pub const UiBuild = struct {
         if (status != c.ok) {
             self.discardHandlers();
             self.pending_button_count = 0;
+            self.discardPendingTextInputs();
             self.discardSources();
             if (self.signals) |signals| try signals.abortEvaluation(signal_owner, work.revision);
             if (status == c.yield) return error.LuaBuildYielded;
@@ -197,6 +211,7 @@ pub const UiBuild = struct {
         self: *UiBuild,
         bindings: *PointerBindings,
         buttons: *Buttons,
+        text_inputs: *TextInputs,
         tree: *instance.Tree,
         owner: build_owner.BuildOwnerHandle,
     ) !void {
@@ -208,6 +223,8 @@ pub const UiBuild = struct {
             return error.PointerBindingCapacityExceeded;
         if (self.pending_button_count > buttons.availableForOwner(owner))
             return error.ButtonCapacityExceeded;
+        if (self.pending_text_input_count > text_inputs.availableForOwner(owner))
+            return error.TextInputCapacityExceeded;
         if (callbacks) |registry| {
             const reclaimable = bindings.reclaimableForOwner(tree, owner);
             if (self.pending_handler_count > reclaimable)
@@ -217,6 +234,10 @@ pub const UiBuild = struct {
             if (tree.handleForId(pending.id) == null) return error.PointerHandlerInstanceMissing;
         for (self.pending_buttons[0..self.pending_button_count]) |pending|
             if (tree.handleForId(pending.id) == null) return error.ButtonInstanceMissing;
+        for (self.pending_text_inputs[0..self.pending_text_input_count]) |pending|
+            if (tree.handleForId(pending.target_id) == null or
+                tree.handleForId(pending.content_id) == null)
+                return error.TextInputInstanceMissing;
         while (bindings.takeInactive(tree)) |old|
             callbacks.?.release(old.id) catch unreachable;
         while (bindings.takeOwner(owner)) |old|
@@ -241,14 +262,26 @@ pub const UiBuild = struct {
             pending.enabled,
         );
         buttons.finishOwner(owner);
+        text_inputs.beginOwner(owner);
+        for (self.pending_text_inputs[0..self.pending_text_input_count]) |*pending| {
+            try text_inputs.mountPrepared(
+                owner,
+                tree.handleForId(pending.target_id).?,
+                tree.handleForId(pending.content_id).?,
+                &pending.session,
+            );
+        }
+        text_inputs.finishOwner(owner);
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
+        self.discardPendingTextInputs();
         self.discardSources();
     }
 
     pub fn rollbackHandlers(self: *UiBuild) void {
         self.discardHandlers();
         self.pending_button_count = 0;
+        self.discardPendingTextInputs();
         self.discardSources();
     }
 
@@ -568,6 +601,87 @@ pub const UiBuild = struct {
         return 0;
     }
 
+    fn emitTextInput(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.text_input expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "text_input requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "text_input key is required");
+        const initial = tableString(state, 1, "text") orelse return luaError(state, "text_input text is required");
+        const width = tableOptionalExtent(state, 1, "width", 240) orelse
+            return luaError(state, "invalid text_input width");
+        const height = tableOptionalExtent(
+            state,
+            1,
+            "height",
+            design.tokens.foundation.component_height_default,
+        ) orelse return luaError(state, "invalid text_input height");
+        const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id);
+        const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
+        self.append(.{
+            .id = target_id,
+            .parent = parent.id,
+            .object = .{ .box = .{
+                .width = width,
+                .height = height,
+                .padding = .all(design.tokens.foundation.spacing_2),
+                .alignment = .{ .vertical = .center },
+                .background = theme.surface_base,
+                .border_color = theme.border_default,
+                .border_width = design.tokens.foundation.border_width_default,
+                .corner_radius = design.tokens.foundation.corner_radius_small,
+            } },
+            .focusable = true,
+            .parent_data = declarativeParentData(self, state, 1) orelse
+                return luaError(state, "invalid text_input position"),
+        }) catch return luaError(state, "cannot append text_input descriptor");
+
+        const sources = self.label_sources orelse return luaError(state, "text service unavailable");
+        const source = sources.acquire(.{
+            .utf8 = initial,
+            .language = "und",
+            .logical_size = design.tokens.foundation.typography_body,
+            .candidates = self.label_candidates,
+            .configuration_revision = self.label_configuration_revision,
+        }) catch return luaError(state, "cannot retain text_input text");
+        self.append(.{
+            .id = content_id,
+            .parent = target_id,
+            .object = .{ .text_input = .{
+                .source = source,
+                .color = theme.content_primary,
+                .selection_color = theme.selection_background,
+                .caret_color = theme.content_primary,
+                .selection_start = initial.len,
+                .selection_end = initial.len,
+                .caret_offset = initial.len,
+                .preedit_color = null,
+            } },
+        }) catch {
+            sources.release(source) catch unreachable;
+            return luaError(state, "cannot append text_input content");
+        };
+        self.sources_staged = true;
+        if (self.pending_text_input_count == self.pending_text_inputs.len)
+            return luaError(state, "text_input capacity exceeded");
+        self.pending_text_inputs[self.pending_text_input_count] = .{
+            .target_id = target_id,
+            .content_id = content_id,
+            .session = TextInputSession.init(self.label_sources.?.allocator, initial) catch
+                return luaError(state, "cannot create text_input session"),
+        };
+        self.pending_text_input_count += 1;
+        self.appendSemantic(.{
+            .id = target_id,
+            .parent = semanticParent(parent),
+            .role = .text_field,
+            .key = key,
+            .label = initial,
+        }) catch return luaError(state, "cannot append text_input semantics");
+        return 0;
+    }
+
     fn emitDeclarativeLabel(self: *UiBuild, state: *c.State) c_int {
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const parent = self.currentParent() orelse return luaError(state, "label requires a widget parent");
@@ -760,11 +874,18 @@ pub const UiBuild = struct {
         self.pending_handler_count = 0;
     }
 
+    fn discardPendingTextInputs(self: *UiBuild) void {
+        for (self.pending_text_inputs[0..self.pending_text_input_count]) |*pending|
+            if (pending.session) |*session| session.deinit();
+        self.pending_text_input_count = 0;
+    }
+
     fn discardSources(self: *UiBuild) void {
         if (!self.sources_staged) return;
         const sources = self.label_sources.?;
         for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
             .label => |label| sources.release(label.source) catch unreachable,
+            .text_input => |input| sources.release(input.source) catch unreachable,
             else => {},
         };
         self.sources_staged = false;
@@ -1015,7 +1136,7 @@ test "Lua UI exposes only declarative constructors without standard libraries" {
     try ui.init(state, &storage);
 
     try std.testing.expectEqual(c.type_table, c.lua_getglobal(state, "ouro"));
-    inline for (.{ "label", "button", "box", "row", "column", "scroll", "theme" }) |name| {
+    inline for (.{ "label", "button", "text_input", "box", "row", "column", "scroll", "theme" }) |name| {
         try std.testing.expectEqual(c.type_function, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
@@ -1023,6 +1144,67 @@ test "Lua UI exposes only declarative constructors without standard libraries" {
         try std.testing.expectEqual(c.type_nil, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
+}
+
+test "declarative text input separates focus identity from editable render content" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 8);
+    c.lua_setglobal(state, "ouro");
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: build_owner.BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, window_scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font_static"),
+    });
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var storage: [5]instance.Descriptor = undefined;
+    var semantic_storage: [2]SemanticDescriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    try ui.attachLabelText(&sources, &.{font}, 1);
+    try ui.attachSemantics(&semantic_storage);
+    ui.enableDeclarativeWidgets(design.tokens.light);
+    try execute(state,
+        \\function build()
+        \\  ouro.column {
+        \\    key = "content",
+        \\    children = function()
+        \\      ouro.text_input { key = "query", text = "Initial", width = 200 }
+        \\    end,
+        \\  }
+        \\end
+    );
+    var cycle = owners.beginCycle();
+    const work = (try cycle.take()).?;
+    const descriptors = try ui.build(&owners, work, "build", &.{});
+    try std.testing.expectEqual(@as(usize, 5), descriptors.len);
+    try std.testing.expect(descriptors[3].object == .box);
+    try std.testing.expect(descriptors[3].focusable);
+    try std.testing.expect(descriptors[4].object == .text_input);
+    try std.testing.expectEqual(descriptors[3].id, descriptors[4].parent.?);
+    try std.testing.expectEqual(@as(usize, 1), ui.pending_text_input_count);
+    try std.testing.expectEqual(.text_field, ui.semanticDescriptors()[1].role);
+    try std.testing.expectEqualStrings("Initial", ui.semanticDescriptors()[1].label);
+    ui.rollbackHandlers();
+    try std.testing.expectEqual(@as(usize, 0), sources.count());
+    try owners.complete(work);
+    try fonts.release(font);
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
+    try owners.collectRetired();
+    try scheduler.destroyScope(window_scope);
 }
 
 test "declarative Lua label flows through layout scene and software glyph cache" {

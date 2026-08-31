@@ -33,6 +33,12 @@ pub const Options = struct {
     dependency_capacity: usize = 256,
 };
 
+const TextInputRevision = struct {
+    model: u64,
+    session: u64,
+    scene: u64,
+};
+
 const RuntimeSlot = struct {
     id: ?[]u8 = null,
     declared: bool = false,
@@ -41,6 +47,9 @@ const RuntimeSlot = struct {
     configured_size: ?core.SizeU = null,
     frames_seen: usize = 0,
     runtime: WindowRuntime = .{},
+    text_input_enabled: bool = false,
+    text_input_surface_focused: bool = false,
+    text_input_revision: ?TextInputRevision = null,
 };
 
 /// Runs one declarative Lua application on the production Wayland stack.
@@ -276,10 +285,23 @@ fn runSourceWithFontconfig(
                     if (slotForNativeHandle(&window_set, runtime_slots, keyboardWindow(keyboard))) |slot|
                         if (slot.runtime.ready) try slot.runtime.routeKeyboard(keyboard);
                 },
-                // The protocol path is complete but remains dormant until a
-                // retained TextInput explicitly owns focus. No raw key event
-                // is promoted to committed text as a fallback.
-                .text_input => {},
+                .text_input => |text_input_event| switch (text_input_event) {
+                    .enter => |handle| if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
+                        slot.text_input_surface_focused = true;
+                        slot.text_input_enabled = false;
+                        slot.text_input_revision = null;
+                    },
+                    .leave => |handle| if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
+                        slot.text_input_surface_focused = false;
+                        slot.text_input_enabled = false;
+                        slot.text_input_revision = null;
+                    },
+                    .batch => |batch| {
+                        if (slotForNativeHandle(&window_set, runtime_slots, batch.window)) |slot|
+                            if (slot.runtime.ready)
+                                try slot.runtime.routeTextInput(text_input_event);
+                    },
+                },
             }
         }
 
@@ -390,6 +412,32 @@ fn runSourceWithFontconfig(
 
         for (runtime_slots) |*slot| if (slot.runtime.ready)
             try slot.runtime.prepareFrame(try host.outputScale(slot.runtime.window));
+
+        if (host.textInputAvailable()) for (runtime_slots) |*slot| {
+            if (!slot.runtime.ready or !slot.text_input_surface_focused) continue;
+            const status = try slot.runtime.textInputStatus();
+            if (status) |value| {
+                const revision: TextInputRevision = .{
+                    .model = value.model_revision,
+                    .session = value.session_revision,
+                    .scene = value.scene_revision,
+                };
+                if (!slot.text_input_enabled) {
+                    try host.enableTextInput(slot.runtime.window, value.state);
+                    slot.text_input_enabled = true;
+                    slot.text_input_revision = revision;
+                } else if (value.commit_permitted and
+                    !std.meta.eql(slot.text_input_revision.?, revision))
+                {
+                    try host.updateTextInput(slot.runtime.window, value.state);
+                    slot.text_input_revision = revision;
+                }
+            } else if (slot.text_input_enabled) {
+                try host.disableTextInput(slot.runtime.window);
+                slot.text_input_enabled = false;
+                slot.text_input_revision = null;
+            }
+        };
 
         for (runtime_slots) |*slot| {
             if (!slot.desired or !slot.runtime.initialized) continue;

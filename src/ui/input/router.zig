@@ -3,6 +3,7 @@ const PointF = @import("../../core/geometry.zig").PointF;
 const platform_window = @import("../../platform/window.zig");
 const instance = @import("../instance/root.zig");
 const render_object = @import("../render_object/root.zig");
+const text_input = @import("../text_input/root.zig");
 
 pub const Event = union(enum) {
     hover_enter: struct {
@@ -17,9 +18,14 @@ pub const Event = union(enum) {
     pointer: struct {
         target: instance.InstanceHandle,
         hovered: ?instance.InstanceHandle,
+        position: PointF,
         event: platform_window.PointerEvent,
     },
     keyboard: platform_window.KeyboardEvent,
+    text_input: struct {
+        batch: text_input.EditBatch,
+        serial_matches_state: bool,
+    },
 };
 
 /// State-only pointer router. Platform events become bounded instance-targeted
@@ -35,6 +41,7 @@ pub const Router = struct {
     count: usize = 0,
     hovered: ?instance.InstanceHandle = null,
     captured: ?instance.InstanceHandle = null,
+    pointer_position: PointF = .{},
 
     pub fn init(
         self: *Router,
@@ -68,6 +75,7 @@ pub const Router = struct {
         };
         switch (event) {
             .enter => |enter| {
+                self.pointer_position = enter.position;
                 const target = try self.targetAt(enter.position);
                 try self.ensureSpace(transitionCount(self.hovered, target));
                 self.transition(target, enter.position, enter.serial);
@@ -82,6 +90,7 @@ pub const Router = struct {
                 self.hovered = null;
             },
             .motion => |motion| {
+                self.pointer_position = motion.position;
                 const target = try self.targetAt(motion.position);
                 try self.ensureSpace(transitionCount(self.hovered, target) +
                     @as(usize, @intFromBool(target != null)));
@@ -89,6 +98,7 @@ pub const Router = struct {
                 if (target) |handle| self.enqueueAssumeCapacity(.{ .pointer = .{
                     .target = handle,
                     .hovered = target,
+                    .position = self.pointer_position,
                     .event = event,
                 } });
             },
@@ -101,6 +111,7 @@ pub const Router = struct {
                 self.enqueueAssumeCapacity(.{ .pointer = .{
                     .target = target,
                     .hovered = self.hovered,
+                    .position = self.pointer_position,
                     .event = event,
                 } });
                 self.captured = switch (button.state) {
@@ -114,6 +125,7 @@ pub const Router = struct {
                 self.enqueueAssumeCapacity(.{ .pointer = .{
                     .target = target,
                     .hovered = self.hovered,
+                    .position = self.pointer_position,
                     .event = event,
                 } });
             },
@@ -126,12 +138,45 @@ pub const Router = struct {
         self.enqueueAssumeCapacity(.{ .keyboard = event });
     }
 
+    pub fn routeTextInput(
+        self: *Router,
+        batch_value: text_input.EditBatch,
+        serial_matches_state: bool,
+    ) !void {
+        try self.ensureSpace(1);
+        var batch = batch_value;
+        var commit_text: ?[]u8 = null;
+        errdefer if (commit_text) |bytes| self.allocator.free(bytes);
+        var preedit_text: ?[]u8 = null;
+        errdefer if (preedit_text) |bytes| self.allocator.free(bytes);
+        if (batch.commit) |*commit| if (commit.text) |value| {
+            commit_text = try self.allocator.dupe(u8, value);
+            commit.text = commit_text.?;
+        };
+        if (batch.preedit) |*preedit| if (preedit.text) |value| {
+            preedit_text = try self.allocator.dupe(u8, value);
+            preedit.text = preedit_text.?;
+        };
+        self.enqueueAssumeCapacity(.{ .text_input = .{
+            .batch = batch,
+            .serial_matches_state = serial_matches_state,
+        } });
+    }
+
     pub fn takeEvent(self: *Router) ?Event {
         if (self.count == 0) return null;
         const event = self.events[self.head];
         self.head = (self.head + 1) % self.events.len;
         self.count -= 1;
         return event;
+    }
+
+    pub fn releaseEvent(self: *Router, event: Event) void {
+        if (event != .text_input) return;
+        if (event.text_input.batch.preedit) |preedit| if (preedit.text) |bytes|
+            self.allocator.free(@constCast(bytes));
+        if (event.text_input.batch.commit) |commit| if (commit.text) |bytes|
+            self.allocator.free(@constCast(bytes));
     }
 
     pub fn hoveredInstance(self: *const Router) ?instance.InstanceHandle {
@@ -288,6 +333,19 @@ test "pointer routing hit tests front to back and queues hover transitions" {
     try std.testing.expectEqual(back, captured_release.target);
     try std.testing.expect(captured_release.hovered == null);
     try std.testing.expect(router.takeEvent() == null);
+
+    var commit = [_]u8{ 'o', 'k' };
+    var preedit = [_]u8{ 'n', 'e', 'w' };
+    try router.routeTextInput(.{
+        .commit = .{ .text = &commit },
+        .preedit = .{ .text = &preedit, .cursor = .{ .start = 0, .end = 3 } },
+    }, true);
+    @memset(&commit, 'x');
+    @memset(&preedit, 'x');
+    const owned = router.takeEvent().?;
+    defer router.releaseEvent(owned);
+    try std.testing.expectEqualStrings("ok", owned.text_input.batch.commit.?.text.?);
+    try std.testing.expectEqualStrings("new", owned.text_input.batch.preedit.?.text.?);
 
     try instances.reconcile(&.{});
     try scheduler.applyQueuedCancellations();

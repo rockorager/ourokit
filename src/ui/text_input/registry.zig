@@ -54,6 +54,21 @@ pub const Registry = struct {
         content_handle: instance.InstanceHandle,
         initial: []const u8,
     ) !void {
+        var prepared: ?Session = try Session.init(self.allocator, initial);
+        defer if (prepared) |*session_value| session_value.deinit();
+        try self.mountPrepared(owner, target, content_handle, &prepared);
+    }
+
+    /// Moves a preallocated session into a new slot without allocating during
+    /// reconciliation commit. Rediscovery preserves the retained session and
+    /// leaves `prepared` for the caller to destroy.
+    pub fn mountPrepared(
+        self: *Registry,
+        owner: build_owner.BuildOwnerHandle,
+        target: instance.InstanceHandle,
+        content_handle: instance.InstanceHandle,
+        prepared: *?Session,
+    ) !void {
         for (self.entries) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.content = content_handle;
@@ -65,10 +80,11 @@ pub const Registry = struct {
                 .owner = owner,
                 .target = target,
                 .content = content_handle,
-                .session = try Session.init(self.allocator, initial),
+                .session = prepared.* orelse return error.TextInputSessionMissing,
                 .active = true,
                 .seen = true,
             };
+            prepared.* = null;
             return;
         };
         return error.TextInputCapacityExceeded;
@@ -98,6 +114,26 @@ pub const Registry = struct {
 
     pub fn content(self: *const Registry, target: instance.InstanceHandle) !instance.InstanceHandle {
         return (self.find(target) orelse return error.TextInputNotFound).content;
+    }
+
+    pub const Mounted = struct {
+        target: instance.InstanceHandle,
+        content: instance.InstanceHandle,
+        session: *Session,
+    };
+
+    pub fn mountedAt(self: *Registry, index: usize) ?Mounted {
+        if (index >= self.entries.len or !self.entries[index].active) return null;
+        const entry = &self.entries[index];
+        return .{
+            .target = entry.target,
+            .content = entry.content,
+            .session = &entry.session.?,
+        };
+    }
+
+    pub fn slotCount(self: *const Registry) usize {
+        return self.entries.len;
     }
 
     fn destroy(entry: *Entry) void {
@@ -136,4 +172,25 @@ test "retained sessions survive rediscovery and dispose with their owner" {
     registry.beginOwner(owner);
     registry.finishOwner(owner);
     try std.testing.expect(!registry.contains(target));
+}
+
+test "prepared mount moves new sessions and leaves rediscovered state untouched" {
+    var registry: Registry = undefined;
+    try registry.init(std.testing.allocator, 1);
+    defer registry.deinit();
+    const owner: build_owner.BuildOwnerHandle = .{ .slot = 1, .generation = 2 };
+    const target: instance.InstanceHandle = .{ .slot = 3, .generation = 4 };
+    const content: instance.InstanceHandle = .{ .slot = 5, .generation = 6 };
+
+    var initial: ?Session = try Session.init(std.testing.allocator, "initial");
+    try registry.mountPrepared(owner, target, content, &initial);
+    try std.testing.expect(initial == null);
+    _ = try (try registry.session(target)).model.replaceSelection(" retained");
+
+    var replacement: ?Session = try Session.init(std.testing.allocator, "replacement");
+    defer if (replacement) |*session| session.deinit();
+    try registry.mountPrepared(owner, target, content, &replacement);
+    try std.testing.expect(replacement != null);
+    try std.testing.expectEqualStrings("initial retained", (try registry.session(target)).model.text());
+    registry.clear();
 }

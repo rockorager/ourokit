@@ -251,6 +251,21 @@ pub const Tree = struct {
             return error.TextPositionNotFound;
     }
 
+    pub fn textCaretRectangle(self: *Tree, handle: NodeHandle) !RectF {
+        const target = try self.slot(handle);
+        if (target.object != .text_input) return error.NotTextInputObject;
+        if (!target.has_layout or target.needs_layout) return error.LayoutRequired;
+        const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
+        const paragraph_layout = self.paragraphs.?.get(paragraph_handle) catch
+            return error.StaleParagraph;
+        const input = target.object.text_input;
+        return paragraph_layout.positioned.caretRectangleForOffset(
+            input.caret_offset,
+            input.caret_affinity,
+            input.caret_width,
+        );
+    }
+
     pub fn nodeSize(self: *Tree, handle: NodeHandle) !SizeF {
         const target = try self.slot(handle);
         if (!target.has_layout or !(try self.layoutPathCurrent(handle))) return error.LayoutRequired;
