@@ -9,6 +9,7 @@ const ui = @import("../ui/root.zig");
 
 pub const Config = struct {
     node_capacity: usize = 256,
+    semantic_text_capacity: usize = 16 * 1024,
     signal_capacity: usize = 256,
     subscription_capacity: usize = 1024,
     dependency_capacity: usize = 256,
@@ -35,6 +36,7 @@ pub const SourceGeneration = struct {
     callbacks: ?*lua.CallbackRegistry,
     ui_build: lua.UiBuild,
     application: lua.Application,
+    prepared_builds: []lua.PreparedBuild,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -87,7 +89,13 @@ pub const SourceGeneration = struct {
         var descriptor_storage: ?[]ui.instance.Descriptor = null;
         var semantic_storage: ?[]ui.semantics.Descriptor = null;
         var application_initialized = false;
+        var prepared_build_storage: ?[]lua.PreparedBuild = null;
+        var prepared_build_count: usize = 0;
         errdefer {
+            if (prepared_build_storage) |storage| {
+                for (storage[0..prepared_build_count]) |*prepared| prepared.deinit();
+                allocator.free(storage);
+            }
             if (application_initialized) self.application.deinit();
             if (vm_initialized) self.vm.deinit();
             if (signals_initialized) self.signals.deinit();
@@ -220,12 +228,47 @@ pub const SourceGeneration = struct {
             return err;
         };
         application_initialized = true;
+        self.prepared_builds = allocator.alloc(
+            lua.PreparedBuild,
+            self.application.windows.len,
+        ) catch |err| {
+            lua.recordDiagnosticError(
+                diagnostic,
+                allocator,
+                .setup,
+                self.snapshot.entry_name,
+                err,
+            );
+            return err;
+        };
+        prepared_build_storage = self.prepared_builds;
+        for (self.prepared_builds) |*prepared| {
+            prepared.init(
+                allocator,
+                self.vm.state,
+                if (services) |value| value.shapes else null,
+                config.node_capacity,
+                config.semantic_text_capacity,
+            ) catch |err| {
+                lua.recordDiagnosticError(
+                    diagnostic,
+                    allocator,
+                    .setup,
+                    self.snapshot.entry_name,
+                    err,
+                );
+                return err;
+            };
+            prepared_build_count += 1;
+        }
     }
 
     pub fn deinit(self: *SourceGeneration) void {
         if (self.callbacks) |callbacks|
             std.debug.assert(callbacks.countForVm(&self.vm) == 0);
         self.application.deinit();
+        for (self.prepared_builds) |*prepared| prepared.deinit();
+        self.allocator.free(self.prepared_builds);
         self.vm.deinit();
         self.signals.deinit();
         self.allocator.free(self.semantic_storage);
@@ -280,4 +323,6 @@ test "source generation owns a named snapshot and application Lua state" {
         generation.application.id,
     );
     try std.testing.expectEqualStrings("generation-test.lua", generation.snapshot.entry_name);
+    try std.testing.expectEqual(@as(usize, 1), generation.prepared_builds.len);
+    try std.testing.expectEqual(@as(usize, 0), generation.prepared_builds[0].descriptors().len);
 }

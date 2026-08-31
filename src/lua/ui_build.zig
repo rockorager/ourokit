@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
 const CallbackRegistry = @import("callbacks.zig").CallbackRegistry;
+const PreparedBuild = @import("prepared_build.zig").PreparedBuild;
 const Vm = @import("vm.zig").Vm;
 const design = @import("../design/root.zig");
 const Signals = @import("signals.zig").Signals;
@@ -218,6 +219,74 @@ pub const UiBuild = struct {
         self.discardHandlers();
         self.pending_button_count = 0;
         self.discardShapes();
+    }
+
+    /// Transfers one completed build into generation-owned storage so another
+    /// candidate window may build without releasing this window's callbacks
+    /// or shapes. No retained native UI is changed here.
+    pub fn capturePrepared(
+        self: *UiBuild,
+        prepared: *PreparedBuild,
+        descriptors: []const instance.Descriptor,
+    ) !void {
+        if (prepared.state != self.state or descriptors.len != self.count or
+            descriptors.ptr != self.storage.ptr) return error.InvalidPreparedBuildSource;
+        if (descriptors.len > prepared.descriptor_storage.len or
+            self.semantic_count > prepared.semantic_storage.len or
+            self.pending_handler_count > prepared.handlers.len or
+            self.pending_button_count > prepared.prepared_buttons.len)
+            return error.PreparedBuildCapacityExceeded;
+        var semantic_text_count: usize = 0;
+        for (self.semantic_storage[0..self.semantic_count]) |descriptor| {
+            semantic_text_count = std.math.add(
+                usize,
+                semantic_text_count,
+                descriptor.label.len,
+            ) catch return error.PreparedSemanticTextCapacityExceeded;
+            if (semantic_text_count > prepared.semantic_text.len)
+                return error.PreparedSemanticTextCapacityExceeded;
+        }
+
+        prepared.reset();
+        @memcpy(prepared.descriptor_storage[0..descriptors.len], descriptors);
+        prepared.descriptor_count = descriptors.len;
+        var text_offset: usize = 0;
+        for (
+            self.semantic_storage[0..self.semantic_count],
+            prepared.semantic_storage[0..self.semantic_count],
+        ) |source, *destination| {
+            @memcpy(
+                prepared.semantic_text[text_offset..][0..source.label.len],
+                source.label,
+            );
+            destination.* = source;
+            destination.label = prepared.semantic_text[text_offset..][0..source.label.len];
+            text_offset += source.label.len;
+        }
+        prepared.semantic_count = self.semantic_count;
+        prepared.semantic_text_count = text_offset;
+        for (
+            self.pending_handlers[0..self.pending_handler_count],
+            prepared.handlers[0..self.pending_handler_count],
+        ) |source, *destination| destination.* = .{
+            .id = source.id,
+            .reference = source.reference,
+            .kind = source.kind,
+        };
+        prepared.handler_count = self.pending_handler_count;
+        for (
+            self.pending_buttons[0..self.pending_button_count],
+            prepared.prepared_buttons[0..self.pending_button_count],
+        ) |source, *destination| destination.* = .{
+            .id = source.id,
+            .enabled = source.enabled,
+            .style = source.style,
+        };
+        prepared.button_count = self.pending_button_count;
+        prepared.owns_shapes = self.shapes_staged;
+        self.pending_handler_count = 0;
+        self.pending_button_count = 0;
+        self.shapes_staged = false;
     }
 
     pub fn clearHandlers(self: *UiBuild, bindings: *PointerBindings) void {
@@ -849,6 +918,18 @@ test "nested declarative widgets normalize to typed objects and a Button binding
     try std.testing.expectEqual(@as(usize, 4), ui.semanticDescriptors().len);
     try std.testing.expectEqualStrings("Controls", ui.semanticDescriptors()[1].label);
     try std.testing.expectEqualStrings("Benchmark", ui.semanticDescriptors()[3].label);
+    var prepared: PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, state, &shapes, 7, 128);
+    defer prepared.deinit();
+    try ui.capturePrepared(&prepared, descriptors);
+    try std.testing.expectEqual(@as(usize, 7), prepared.descriptors().len);
+    try std.testing.expectEqual(@as(usize, 4), prepared.semanticDescriptors().len);
+    try std.testing.expectEqualStrings("Controls", prepared.semanticDescriptors()[1].label);
+    try std.testing.expectEqualStrings("Benchmark", prepared.semanticDescriptors()[3].label);
+    try std.testing.expectEqual(@as(usize, 1), prepared.handler_count);
+    try std.testing.expectEqual(.button, prepared.handlers[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), prepared.button_count);
+    try std.testing.expect(prepared.owns_shapes);
     ui.rollbackHandlers();
     try owners.complete(work);
     try fonts.release(font);

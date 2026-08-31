@@ -117,6 +117,7 @@ pub fn runSource(
     };
     const generation_config: source_generation.Config = .{
         .node_capacity = options.window.node_capacity,
+        .semantic_text_capacity = options.window.semantic_text_capacity,
         .signal_capacity = options.signal_capacity,
         .subscription_capacity = options.subscription_capacity,
         .dependency_capacity = options.dependency_capacity,
