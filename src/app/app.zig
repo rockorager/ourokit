@@ -161,9 +161,15 @@ test "independent Lua coroutine tasks wait and resume through direct operation r
 
     try app.reapOne();
     try app.runReadyTurn();
-    try std.testing.expectEqual(@as(usize, 1), app.lua_vm.activeTaskCount());
-    try app.reapOne();
-    try app.runReadyTurn();
+    try std.testing.expect(app.lua_vm.globalBoolean("first"));
+    // Dispatch deliberately drains every logical timer already expired at the
+    // CQE safe point. A loaded test process may therefore coalesce these two
+    // short deadlines into one wakeup rather than observing one task per CQE.
+    if (!app.lua_vm.globalBoolean("second")) {
+        try std.testing.expectEqual(@as(usize, 1), app.lua_vm.activeTaskCount());
+        try app.reapOne();
+        try app.runReadyTurn();
+    }
     try std.testing.expectEqual(@as(usize, 0), app.lua_vm.activeTaskCount());
     try std.testing.expect(app.lua_vm.globalBoolean("first"));
     try std.testing.expect(app.lua_vm.globalBoolean("second"));
