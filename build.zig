@@ -137,6 +137,10 @@ pub fn build(b: *std.Build) void {
     ourokit.addAnonymousImport("ourokit_storybook_font", .{
         .root_source_file = storybook_font.path("extras/ttf/Inter-Regular.ttf"),
     });
+    const storybook_arabic_font = b.lazyDependency("noto_sans_arabic", .{}) orelse return;
+    ourokit.addAnonymousImport("ourokit_storybook_arabic_font", .{
+        .root_source_file = storybook_arabic_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
+    });
 
     const token_check = b.addSystemCommand(&.{ "python3", "tools/design/generate_tokens.py", "--check" });
     const token_step = b.step("tokens", "Validate tokens and check generated Zig data");
@@ -158,7 +162,7 @@ pub fn build(b: *std.Build) void {
     ourokit.addAnonymousImport("ourokit_test_font_static", .{
         .root_source_file = test_font.path("extras/ttf/Inter-Regular.ttf"),
     });
-    const arabic_test_font = b.lazyDependency("noto_sans_arabic", .{}) orelse return;
+    const arabic_test_font = storybook_arabic_font;
     ourokit.addAnonymousImport("ourokit_arabic_test_font", .{
         .root_source_file = arabic_test_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
     });

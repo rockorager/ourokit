@@ -210,20 +210,22 @@ final release destroys positioned storage and releases every candidate font.
 The cache is width-specific by design: wrapping remains text policy rather than
 a renderer operation.
 
-## Initial label slice
+## Retained labels
 
-The first retained text render object is deliberately a single, already-
-itemized label for benchmark UI. Its public constructor accepts only valid
-UTF-8 whose uucode Script values are Latin, Common, or Inherited, and shapes it
-as one LTR Latin run. Other scripts are rejected instead of being assigned a
-false script or direction. The label has not yet been wired to the
-now-established paragraph analyzers.
+`ParagraphSourceCache` owns and deduplicates width-independent UTF-8, base
+direction, language, logical size, ordered fallback fonts, and font-
+configuration revision behind generation-checked handles. A retained Label
+stores only this source identity and color. Its render-tree slot derives a
+width-specific `ParagraphHandle` when text/style or box constraints change,
+releasing the previous layout only after replacement succeeds. The normal
+unchanged-constraint fast path returns before cache acquisition, shaping, or
+allocation.
 
-The Label render object stores only a generation-checked `ShapeHandle` and
-color. It takes intrinsic width and line height from the immutable shaped result
-and emits a renderer-neutral glyph-run scene command with a baseline and output
-scale. A button remains composition: a padded Box containing a Label, with
-pointer/focus/command behavior owned by the instance layer.
+Label layout uses the positioned paragraph's finite dimensions and emits a
+renderer-neutral paragraph scene command. Lua Labels therefore use the shared
+itemization, fallback, bidi, wrapping, and positioning pipeline rather than a
+guessed single LTR run. A button remains composition: a padded Box containing a
+Label, with pointer/focus/command behavior owned by the instance layer.
 
 Each renderer owns FreeType faces and grayscale glyph masks keyed by font
 generation, glyph ID, and exact 26.6 device size. Cached faces retain their font
@@ -252,6 +254,5 @@ outlive all frames that lease their entries.
 - empty-line metrics and inherited line-style policy;
 - normalization policy (shaping does not imply mutating application text);
 - variable-font axis selection and cache identity;
-- retained-Label lowering into width-specific paragraph layouts without
-  allocating during unchanged steady-state layout;
+- paragraph alignment, overflow, maximum-line, and ellipsis policy;
 - cache eviction, LCD/subpixel policy, and backend glyph-cache budgets.

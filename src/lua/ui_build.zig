@@ -55,13 +55,13 @@ pub const UiBuild = struct {
     semantic_count: usize = 0,
     active_owner: ?ActiveBuildOwner = null,
     signals: ?*Signals = null,
-    label_shapes: ?*text.ShapeCache = null,
+    label_sources: ?*text.ParagraphSourceCache = null,
     label_candidates: []const text.FontHandle = &.{},
     label_configuration_revision: u64 = 0,
     widget_theme: ?design.tokens.Theme = null,
     parent_stack: [32]BuildParent = undefined,
     parent_count: usize = 0,
-    shapes_staged: bool = false,
+    sources_staged: bool = false,
     pending_handlers: [32]PendingHandler = undefined,
     pending_handler_count: usize = 0,
     pending_buttons: [32]PendingButton = undefined,
@@ -105,7 +105,7 @@ pub const UiBuild = struct {
     ) ![]const instance.Descriptor {
         if (self.active_owner != null) return error.LuaBuildReentered;
         self.discardHandlers();
-        self.discardShapes();
+        self.discardSources();
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
         const callback_type = switch (callback) {
@@ -145,7 +145,7 @@ pub const UiBuild = struct {
         if (status != c.ok) {
             self.discardHandlers();
             self.pending_button_count = 0;
-            self.discardShapes();
+            self.discardSources();
             if (self.signals) |signals| try signals.abortEvaluation(signal_owner, work.revision);
             if (status == c.yield) return error.LuaBuildYielded;
             return error.LuaBuildFailed;
@@ -194,13 +194,13 @@ pub const UiBuild = struct {
         buttons.finishOwner(owner);
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
-        self.discardShapes();
+        self.discardSources();
     }
 
     pub fn rollbackHandlers(self: *UiBuild) void {
         self.discardHandlers();
         self.pending_button_count = 0;
-        self.discardShapes();
+        self.discardSources();
     }
 
     pub fn clearHandlers(self: *UiBuild, bindings: *PointerBindings) void {
@@ -256,13 +256,13 @@ pub const UiBuild = struct {
 
     pub fn attachLabelText(
         self: *UiBuild,
-        shapes: *text.ShapeCache,
+        sources: *text.ParagraphSourceCache,
         candidates: []const text.FontHandle,
         configuration_revision: u64,
     ) !void {
-        if (self.active_owner != null or self.label_shapes != null or candidates.len == 0)
+        if (self.active_owner != null or self.label_sources != null or candidates.len == 0)
             return error.InvalidLabelTextService;
-        self.label_shapes = shapes;
+        self.label_sources = sources;
         self.label_candidates = candidates;
         self.label_configuration_revision = configuration_revision;
     }
@@ -366,32 +366,26 @@ pub const UiBuild = struct {
                 return luaError(state, "invalid button position"),
         }) catch return luaError(state, "cannot append button descriptor");
 
-        const shapes = self.label_shapes orelse return luaError(state, "label text service unavailable");
-        if (!text.supportsSimpleLabel(label))
-            return luaError(state, "button label requires one LTR Latin-script line");
-        const shape = shapes.acquire(.{
-            .spec = .{
-                .paragraph = label,
-                .direction = .left_to_right,
-                .script = .latin,
-                .language = "en",
-                .logical_size = design.tokens.foundation.typography_body,
-            },
+        const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
+        const source = sources.acquire(.{
+            .utf8 = label,
+            .language = "und",
+            .logical_size = design.tokens.foundation.typography_body,
             .candidates = self.label_candidates,
             .configuration_revision = self.label_configuration_revision,
-        }) catch return luaError(state, "cannot shape button label");
+        }) catch return luaError(state, "cannot retain button label");
         self.append(.{
             .id = label_id,
             .parent = button_id,
             .object = .{ .label = .{
-                .shape = shape,
+                .source = source,
                 .color = if (enabled) theme.surface_base else theme.content_secondary,
             } },
         }) catch {
-            shapes.release(shape) catch unreachable;
+            sources.release(source) catch unreachable;
             return luaError(state, "cannot append button label descriptor");
         };
-        self.shapes_staged = true;
+        self.sources_staged = true;
         if (self.pending_button_count == self.pending_buttons.len)
             return luaError(state, "button capacity exceeded");
         self.pending_buttons[self.pending_button_count] = .{
@@ -436,34 +430,28 @@ pub const UiBuild = struct {
             "size",
             design.tokens.foundation.typography_body,
         ) orelse return luaError(state, "invalid label size");
-        const shapes = self.label_shapes orelse return luaError(state, "label text service unavailable");
-        if (!text.supportsSimpleLabel(value))
-            return luaError(state, "label requires one LTR Latin-script line");
-        const shape = shapes.acquire(.{
-            .spec = .{
-                .paragraph = value,
-                .direction = .left_to_right,
-                .script = .latin,
-                .language = "en",
-                .logical_size = logical_size,
-            },
+        const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
+        const source = sources.acquire(.{
+            .utf8 = value,
+            .language = "und",
+            .logical_size = logical_size,
             .candidates = self.label_candidates,
             .configuration_revision = self.label_configuration_revision,
-        }) catch return luaError(state, "cannot shape label");
+        }) catch return luaError(state, "cannot retain label text");
         const id = semanticId(key, 0x6c6162656c ^ parent.id);
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .object = .{ .label = .{ .shape = shape, .color = theme.content_primary } },
+            .object = .{ .label = .{ .source = source, .color = theme.content_primary } },
             .parent_data = declarativeParentData(self, state, 1) orelse {
-                shapes.release(shape) catch unreachable;
+                sources.release(source) catch unreachable;
                 return luaError(state, "invalid label position");
             },
         }) catch {
-            shapes.release(shape) catch unreachable;
+            sources.release(source) catch unreachable;
             return luaError(state, "cannot append label descriptor");
         };
-        self.shapes_staged = true;
+        self.sources_staged = true;
         self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
@@ -488,14 +476,14 @@ pub const UiBuild = struct {
         self.pending_handler_count = 0;
     }
 
-    fn discardShapes(self: *UiBuild) void {
-        if (!self.shapes_staged) return;
-        const shapes = self.label_shapes.?;
+    fn discardSources(self: *UiBuild) void {
+        if (!self.sources_staged) return;
+        const sources = self.label_sources.?;
         for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
-            .label => |label| shapes.release(label.shape) catch unreachable,
+            .label => |label| sources.release(label.source) catch unreachable,
             else => {},
         };
-        self.shapes_staged = false;
+        self.sources_staged = false;
     }
 };
 
@@ -678,11 +666,17 @@ test "declarative Lua label flows through layout scene and software glyph cache"
         .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_test_font_static"),
     });
-    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
-    defer shapes.deinit();
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_arabic_test_font"),
+    });
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
     var renders: RenderTree = undefined;
     try renders.init(std.testing.allocator, 4);
-    renders.attachTextCache(&shapes);
+    renders.attachTextCaches(&sources, &paragraphs);
     defer renders.deinit();
     var instances: instance.Tree = undefined;
     try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 4);
@@ -695,7 +689,7 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     var semantic_storage: [2]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try ui.attachLabelText(&shapes, &.{font}, 1);
+    try ui.attachLabelText(&sources, &.{ font, arabic }, 1);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
 
@@ -704,7 +698,7 @@ test "declarative Lua label flows through layout scene and software glyph cache"
         \\  ouro.column {
         \\    key = "content",
         \\    children = function()
-        \\      ouro.label { key = "benchmark", text = "Benchmark", size = 18 }
+        \\      ouro.label { key = "benchmark", text = "Benchmark حفظ", size = 18 }
         \\    end,
         \\  }
         \\end
@@ -715,7 +709,7 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     try instances.reconcile(descriptors);
     ui.rollbackHandlers();
     try owners.complete(work);
-    try std.testing.expectEqual(@as(usize, 1), shapes.count());
+    try std.testing.expectEqual(@as(usize, 1), sources.count());
 
     const root = (try instances.rootRenderObject()).?;
     const size = try renders.layout(root, .{ .max_width = 160, .max_height = 64 });
@@ -723,27 +717,30 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     var command_storage: [8]scene.Command = undefined;
     var builder = try SceneBuilder.init(&command_storage, 1);
     try renders.buildScene(root, &builder);
-    var found_glyph_run = false;
+    var found_paragraph = false;
     for (builder.displayList().commands) |command| {
-        if (command == .glyph_run) found_glyph_run = true;
+        if (command == .paragraph) found_paragraph = true;
     }
-    try std.testing.expect(found_glyph_run);
+    try std.testing.expect(found_paragraph);
+    try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
 
     var glyphs = try software.GlyphCache.init(std.testing.allocator, &fonts);
     defer glyphs.deinit();
     var pixels = [_]u8{0} ** (160 * 64 * 4);
-    try software.renderText(builder.displayList(), .{
+    try software.renderParagraphs(builder.displayList(), .{
         .pixels = &pixels,
         .width = 160,
         .height = 64,
         .stride = 160 * 4,
         .format = .rgba8_unorm,
-    }, &glyphs, &shapes);
+    }, &glyphs, &paragraphs);
     try std.testing.expect(std.mem.indexOfNone(u8, &pixels, &.{0}) != null);
 
     try instances.reconcile(&.{});
-    try std.testing.expectEqual(@as(usize, 0), shapes.count());
+    try std.testing.expectEqual(@as(usize, 0), sources.count());
+    try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
     try fonts.release(font);
+    try fonts.release(arabic);
     try owners.retire(owner);
     try scheduler.applyQueuedCancellations();
     try instances.collectRetired();
@@ -773,13 +770,13 @@ test "nested declarative widgets normalize to typed objects and a Button binding
         .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_test_font_static"),
     });
-    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
-    defer shapes.deinit();
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
     var storage: [7]instance.Descriptor = undefined;
     var semantic_storage: [4]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try ui.attachLabelText(&shapes, &.{font}, 1);
+    try ui.attachLabelText(&sources, &.{font}, 1);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,

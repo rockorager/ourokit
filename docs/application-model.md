@@ -88,13 +88,14 @@ layout, paint, clip, and hit testing. Scenes are immutable backend-neutral
 output.
 
 The implemented headless render-tree kernel starts with Box, Flex, Stack, and a
-narrow single-line Label backed by an immutable shaped-run handle.
+constraint-aware Label backed by immutable paragraph source and layout handles.
 It uses one-way minimum/maximum box constraints and logical `f32` geometry.
 Parents position children after each child chooses a finite constrained size.
 Flex factors and stack offsets are typed edge metadata, not wrapper nodes. The
-fixed-capacity tree allocates nothing during layout, caches unchanged constraint
-results, separates paint-only from layout invalidation, builds ordered display
-lists, and performs reverse-order hit testing without Wayland or Lua.
+fixed-capacity tree caches unchanged constraint results, allocates paragraph
+work only when Label inputs or width change, separates paint-only from layout
+invalidation, builds ordered display lists, and performs reverse-order hit
+testing without Wayland or Lua.
 
 Above it, the implemented instance reconciler consumes parent-before-child
 typed descriptor snapshots with stable numeric semantic IDs. It validates the
@@ -188,9 +189,8 @@ hovered, pressed, and armed state across reconciliation. Pointer presses capture
 their target; release always reaches the captured Button, but activation occurs
 only for a left-button release inside that same enabled Button. CQE and Wayland
 dispatch still only enqueue state; callbacks spawn Lua tasks during the task
-phase. The Label constructor rejects scripts outside
-its explicitly supported LTR Latin/Common/Inherited run until paragraph
-itemization exists.
+phase. Labels pass valid UTF-8 through paragraph itemization, bidi, fallback
+shaping, and width-dependent wrapping.
 
 Commands live in an authoritative registry independent of the retained render
 tree. Entries need stable semantic IDs plus revisioned invocation handles,

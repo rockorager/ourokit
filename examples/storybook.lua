@@ -46,6 +46,44 @@ return ouro.storybook {
       end,
     },
     ouro.story {
+      id = "label/wrapping",
+      group = "Label",
+      name = "Constraint-aware wrapping",
+      viewport = { width = 280, height = 220 },
+      content = function()
+        ouro.column {
+          key = "content",
+          gap = 8,
+          children = function()
+            ouro.label { key = "heading", text = "Wrapped paragraph", size = 18 }
+            ouro.label {
+              key = "paragraph",
+              text = "Ourokit lays this label out from the width supplied by its parent and reuses the positioned paragraph until those constraints change.",
+            }
+          end,
+        }
+      end,
+    },
+    ouro.story {
+      id = "label/mixed-direction",
+      group = "Label",
+      name = "Mixed direction and fallback",
+      viewport = { width = 320, height = 200 },
+      content = function()
+        ouro.column {
+          key = "content",
+          gap = 8,
+          children = function()
+            ouro.label { key = "heading", text = "English and العربية", size = 18 }
+            ouro.label {
+              key = "paragraph",
+              text = "Save حفظ now, then continue متابعة the workflow.",
+            }
+          end,
+        }
+      end,
+    },
+    ouro.story {
       id = "layout/row",
       group = "Layout",
       name = "Row",

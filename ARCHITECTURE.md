@@ -380,9 +380,15 @@ The scene's paragraph command references one such handle; owned frames lease it
 until rendering completes. Software, Vulkan compute, and Vulkan dma-buf
 presentation consume the same already-positioned visual spans. The existing
 single-run glyph command remains a deliberately narrower shape-cache ABI rather
-than being stretched to represent wrapped mixed-direction lines. Retained Label
-lowering is the next integration step and must cache width-specific acquisition
-outside unchanged steady-state layout rather than introducing per-frame work.
+than being stretched to represent wrapped mixed-direction lines.
+
+Retained Labels hold a generation-checked `ParagraphSourceHandle` identifying
+width-independent text/style/font inputs. Their render-tree slots own the
+current width-specific `ParagraphHandle`; a text/style or constraint change
+replaces that lease transactionally. Unchanged constraints return through the
+normal layout cache before paragraph lookup, shaping, or allocation. Lua Labels
+can therefore wrap mixed-direction text without moving text policy into Lua or
+either renderer.
 Empty-line metrics remain an open line-style policy rather than inheriting an
 arbitrary fallback face by accident.
 Fontconfig provides candidate order and a coverage prefilter, not a shaping
@@ -420,16 +426,13 @@ references. Font cache teardown follows shape-cache teardown. Refreshing the
 Fontconfig snapshot and revision is future safe-point orchestration, not a
 renderer concern.
 
-The benchmark-oriented first Label is intentionally narrower than a paragraph:
-one valid LTR run containing only Latin, Common, and Inherited script values.
-uucode enforces that boundary, so unsupported scripts fail rather than inheriting
-incorrect properties. Label owns no font or rasterizer state; it retains a shape
-handle, uses shaping metrics for one-way layout, and emits a baseline glyph-run
-command. Button is Box + Label composition with behavior in a language-neutral
-widget registry, not another core render object. That registry retains hover,
-pressed, disabled, and pointer-armed state across reconciliation. Pointer
-capture ensures a release reaches the pressed target, while release-inside
-decides activation. Design-generated semantic accent roles supply idle,
+Label owns no font or rasterizer state. It retains width-independent paragraph
+source identity, derives positioned lines from one-way constraints, and emits a
+paragraph command. Button is Box + Label composition with behavior in a
+language-neutral widget registry, not another core render object. That registry
+retains hover, pressed, disabled, and pointer-armed state across reconciliation.
+Pointer capture ensures a release reaches the pressed target, while release-
+inside decides activation. Design-generated semantic accent roles supply idle,
 hovered, and pressed colors.
 
 Commands are not discovered by walking render objects. A future authoritative

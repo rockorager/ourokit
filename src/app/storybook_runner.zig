@@ -134,8 +134,15 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         .bytes = @embedFile("ourokit_storybook_font"),
     });
     defer fonts.release(primary_font) catch unreachable;
-    var shapes = text.ShapeCache.init(init.gpa, &fonts);
-    defer shapes.deinit();
+    const arabic_font = try fonts.acquire(.{
+        .key = .{ .file = "/ourokit/storybook/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_storybook_arabic_font"),
+    });
+    defer fonts.release(arabic_font) catch unreachable;
+    var paragraph_sources = text.ParagraphSourceCache.init(init.gpa, &fonts);
+    defer paragraph_sources.deinit();
+    var paragraphs = text.ParagraphCache.init(init.gpa, &fonts);
+    defer paragraphs.deinit();
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
 
@@ -147,7 +154,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     var lua_ui: lua.UiBuild = undefined;
     try lua_ui.init(vm.state, descriptor_storage);
     lua_ui.attachSignals(&signals);
-    try lua_ui.attachLabelText(&shapes, &.{primary_font}, 1);
+    try lua_ui.attachLabelText(&paragraph_sources, &.{ primary_font, arabic_font }, 1);
     try lua_ui.attachSemantics(semantic_storage);
 
     var book = try lua.Storybook.load(init.gpa, vm.state, source);
@@ -170,7 +177,8 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         theme.accent_default,
         theme.content_primary,
         &signals,
-        &shapes,
+        &paragraph_sources,
+        &paragraphs,
         config,
     );
     errdefer teardownRuntime(&runtime, &lua_ui, &scheduler, window_scope) catch {};
@@ -201,13 +209,13 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     const pixels = try init.gpa.alloc(u8, pixel_len);
     defer init.gpa.free(pixels);
     @memset(pixels, 0);
-    try renderer.software.renderText(list, .{
+    try renderer.software.renderTextResources(list, .{
         .pixels = pixels,
         .width = pixel_width,
         .height = pixel_height,
         .stride = stride,
         .format = .rgba8_unorm,
-    }, &glyphs, &shapes);
+    }, &glyphs, null, &paragraphs);
     unpremultiply(pixels);
     const png = try renderer.png.encode(init.gpa, pixels, pixel_width, pixel_height, stride);
     errdefer init.gpa.free(png);

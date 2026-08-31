@@ -60,14 +60,15 @@ pub const WindowRuntime = struct {
         accent: core.Color,
         content: core.Color,
         signals: *lua.Signals,
-        shapes: *text.ShapeCache,
+        paragraph_sources: *text.ParagraphSourceCache,
+        paragraphs: *text.ParagraphCache,
         config: Config,
     ) !void {
         if (config.node_capacity < 2 or config.command_capacity == 0)
             return error.InvalidWindowRuntimeCapacity;
         try self.tree.init(allocator, config.node_capacity);
         errdefer self.tree.deinit();
-        self.tree.attachTextCache(shapes);
+        self.tree.attachTextCaches(paragraph_sources, paragraphs);
         try self.instances.init(allocator, scheduler, &self.tree, window_scope, config.node_capacity);
         errdefer self.instances.deinit();
         try self.build_owners.init(allocator, scheduler, window_scope, 1, config.build_pass_capacity);

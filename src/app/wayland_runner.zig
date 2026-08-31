@@ -26,6 +26,11 @@ pub const Options = struct {
 /// Applications provide source and policy; this coordinator owns all
 /// native services and preserves the explicit event-loop safe points.
 pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
+    if (comptime text.has_fontconfig) return runWithFontconfig(init, source, options);
+    return error.FontconfigDisabled;
+}
+
+fn runWithFontconfig(init: std.process.Init, source: []const u8, options: Options) !void {
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 128, 32);
     defer loop.deinit();
@@ -64,8 +69,10 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
     defer fonts.deinit();
     const primary_font = try loadFont(init, &fonts, configured_fonts.faces[0]);
     defer fonts.release(primary_font) catch unreachable;
-    var shapes = text.ShapeCache.init(init.gpa, &fonts);
-    defer shapes.deinit();
+    var paragraph_sources = text.ParagraphSourceCache.init(init.gpa, &fonts);
+    defer paragraph_sources.deinit();
+    var paragraphs = text.ParagraphCache.init(init.gpa, &fonts);
+    defer paragraphs.deinit();
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
     var vulkan_renderer: renderer.vulkan = undefined;
@@ -82,7 +89,7 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
     var lua_ui: lua.UiBuild = undefined;
     try lua_ui.init(vm.state, descriptor_storage);
     lua_ui.attachSignals(&signals);
-    try lua_ui.attachLabelText(&shapes, &.{primary_font}, 1);
+    try lua_ui.attachLabelText(&paragraph_sources, &.{primary_font}, 1);
     try lua_ui.attachSemantics(semantic_storage);
     lua_ui.enableDeclarativeWidgets(design.tokens.light);
 
@@ -200,7 +207,8 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
                     theme.accent_default,
                     theme.surface_base,
                     &signals,
-                    &shapes,
+                    &paragraph_sources,
+                    &paragraphs,
                     options.window,
                 );
                 try dirty.register(handle);
@@ -242,14 +250,20 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
             if (runtimes[index].wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
                 const list = try runtimes[index].displayList();
                 (switch (frame_buffer.target) {
-                    .software => |target| renderer.software.renderText(list, .{
+                    .software => |target| renderer.software.renderTextResources(list, .{
                         .pixels = target.pixels,
                         .width = frame_buffer.width,
                         .height = frame_buffer.height,
                         .stride = target.stride,
                         .format = .bgra8_unorm,
-                    }, &glyphs, &shapes),
-                    .vulkan => |target| vulkan_renderer.renderDmabufText(list, target, &vulkan_glyphs, &shapes),
+                    }, &glyphs, null, &paragraphs),
+                    .vulkan => |target| vulkan_renderer.renderDmabufTextResources(
+                        list,
+                        target,
+                        &vulkan_glyphs,
+                        null,
+                        &paragraphs,
+                    ),
                 }) catch |err| {
                     try host.discardFrame(frame_buffer);
                     return err;

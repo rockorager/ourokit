@@ -1,35 +1,26 @@
-//! Application-owned cache of immutable, width-specific paragraph layouts.
+//! Width-independent retained paragraph inputs used by render objects.
 
 const std = @import("std");
-const SizeF = @import("../core/geometry.zig").SizeF;
 const api = @import("api.zig");
-const itemization = @import("itemization.zig");
-const line_break = @import("line_break.zig");
-const line_layout = @import("line_layout.zig");
-const measurement = @import("measurement.zig");
 const paragraph = @import("paragraph.zig");
-const positioned_lines = @import("positioned_lines.zig");
-const shaped_paragraph = @import("shaped_paragraph.zig");
 
-pub const ParagraphHandle = struct {
+pub const ParagraphSourceHandle = struct {
     slot: u32,
     generation: u32,
 };
 
-pub const ParagraphLayout = struct {
-    positioned: positioned_lines.PositionedLines,
+pub const ParagraphSource = struct {
+    utf8: []const u8,
+    base_direction: paragraph.BaseDirection,
+    language: []const u8,
     logical_size: f32,
-    size: SizeF,
-
-    fn deinit(self: *ParagraphLayout) void {
-        self.positioned.deinit();
-        self.* = undefined;
-    }
+    candidates: []const api.FontHandle,
+    configuration_revision: u64,
 };
 
-/// Width-specific paragraph layouts. The font cache must outlive this cache;
-/// every live entry retains its complete ordered fallback candidate set.
-pub const ParagraphCache = struct {
+/// Deduplicates immutable text and style independently from width-specific
+/// paragraph layout. The font cache must outlive this cache.
+pub const ParagraphSourceCache = struct {
     allocator: std.mem.Allocator,
     font_cache: *api.FontCache,
     slabs: std.ArrayListUnmanaged(*Slab) = .empty,
@@ -45,9 +36,7 @@ pub const ParagraphCache = struct {
         base_direction: paragraph.BaseDirection = .auto_left_to_right,
         language: []const u8,
         logical_size: f32,
-        max_width: f32,
         candidates: []const api.FontHandle,
-        /// Increment when Fontconfig substitutions/candidate policy changes.
         configuration_revision: u64,
     };
 
@@ -56,14 +45,8 @@ pub const ParagraphCache = struct {
         base_direction: paragraph.BaseDirection,
         language: []const u8,
         logical_size_bits: u32,
-        max_width_bits: u32,
         candidates: []const api.FontHandle,
         configuration_revision: u64,
-    };
-
-    const Entry = struct {
-        key: Key,
-        layout: ParagraphLayout,
     };
 
     const Slot = struct {
@@ -71,7 +54,7 @@ pub const ParagraphCache = struct {
         active: bool = false,
         references: u32 = 0,
         next_free: u32 = invalid_slot,
-        entry: Entry = undefined,
+        source: ParagraphSource = undefined,
     };
 
     const Slab = [slab_size]Slot;
@@ -83,7 +66,6 @@ pub const ParagraphCache = struct {
             hashValue(&hasher, @intFromEnum(key.base_direction));
             hasher.update(key.language);
             hashValue(&hasher, key.logical_size_bits);
-            hashValue(&hasher, key.max_width_bits);
             for (key.candidates) |candidate| {
                 hashValue(&hasher, candidate.slot);
                 hashValue(&hasher, candidate.generation);
@@ -95,7 +77,6 @@ pub const ParagraphCache = struct {
         pub fn eql(_: KeyContext, a: Key, b: Key) bool {
             return a.base_direction == b.base_direction and
                 a.logical_size_bits == b.logical_size_bits and
-                a.max_width_bits == b.max_width_bits and
                 a.configuration_revision == b.configuration_revision and
                 std.mem.eql(u8, a.utf8, b.utf8) and
                 std.mem.eql(u8, a.language, b.language) and
@@ -117,99 +98,82 @@ pub const ParagraphCache = struct {
 
     const Index = std.HashMapUnmanaged(
         Key,
-        ParagraphHandle,
+        ParagraphSourceHandle,
         KeyContext,
         std.hash_map.default_max_load_percentage,
     );
 
-    pub fn init(allocator: std.mem.Allocator, font_cache: *api.FontCache) ParagraphCache {
+    pub fn init(allocator: std.mem.Allocator, font_cache: *api.FontCache) ParagraphSourceCache {
         return .{ .allocator = allocator, .font_cache = font_cache };
     }
 
-    pub fn deinit(self: *ParagraphCache) void {
+    pub fn deinit(self: *ParagraphSourceCache) void {
         self.index.deinit(self.allocator);
         for (self.slabs.items) |slab| {
-            for (slab) |*slot| if (slot.active) self.destroyEntry(&slot.entry);
+            for (slab) |*slot| if (slot.active) self.destroySource(&slot.source);
             self.allocator.destroy(slab);
         }
         self.slabs.deinit(self.allocator);
         self.* = undefined;
     }
 
-    pub fn acquire(self: *ParagraphCache, request: Request) !ParagraphHandle {
-        const transient_key = try requestKey(request);
-        if (self.index.get(transient_key)) |handle| {
-            const slot = try self.require(handle);
-            if (slot.references == std.math.maxInt(u32)) return error.ReferenceOverflow;
-            slot.references += 1;
+    pub fn acquire(self: *ParagraphSourceCache, request: Request) !ParagraphSourceHandle {
+        const key = try requestKey(request);
+        if (self.index.get(key)) |handle| {
+            try self.retain(handle);
             return handle;
         }
 
-        const utf8 = try self.allocator.dupe(u8, transient_key.utf8);
+        const utf8 = try self.allocator.dupe(u8, key.utf8);
         errdefer self.allocator.free(utf8);
-        const language = try self.allocator.dupe(u8, transient_key.language);
+        const language = try self.allocator.dupe(u8, key.language);
         errdefer self.allocator.free(language);
-        const candidate_handles = try self.allocator.dupe(api.FontHandle, request.candidates);
-        errdefer self.allocator.free(candidate_handles);
-
-        const fallback_candidates = try self.allocator.alloc(api.FallbackCandidate, request.candidates.len);
-        defer self.allocator.free(fallback_candidates);
+        const candidates = try self.allocator.dupe(api.FontHandle, key.candidates);
+        errdefer self.allocator.free(candidates);
         var retained: usize = 0;
-        errdefer for (request.candidates[0..retained]) |handle|
+        errdefer for (key.candidates[0..retained]) |handle|
             self.font_cache.release(handle) catch unreachable;
-        for (request.candidates, fallback_candidates) |handle, *candidate| {
-            candidate.* = .{ .handle = handle, .font = try self.font_cache.get(handle) };
+        for (key.candidates) |handle| {
             try self.font_cache.retain(handle);
             retained += 1;
         }
 
-        var layout = try buildLayout(
-            self.allocator,
-            utf8,
-            transient_key.base_direction,
-            fallback_candidates,
-            language,
-            @bitCast(transient_key.logical_size_bits),
-            @bitCast(transient_key.max_width_bits),
-        );
-        errdefer layout.deinit();
         try self.index.ensureUnusedCapacity(self.allocator, 1);
         const slot_index = try self.takeSlot();
         const slot = self.slotAt(slot_index).?;
-        const stored_key: Key = .{
-            .utf8 = utf8,
-            .base_direction = transient_key.base_direction,
-            .language = language,
-            .logical_size_bits = transient_key.logical_size_bits,
-            .max_width_bits = transient_key.max_width_bits,
-            .candidates = candidate_handles,
-            .configuration_revision = transient_key.configuration_revision,
-        };
         slot.* = .{
             .generation = slot.generation,
             .active = true,
             .references = 1,
-            .entry = .{ .key = stored_key, .layout = layout },
+            .source = .{
+                .utf8 = utf8,
+                .base_direction = key.base_direction,
+                .language = language,
+                .logical_size = @bitCast(key.logical_size_bits),
+                .candidates = candidates,
+                .configuration_revision = key.configuration_revision,
+            },
         };
-        const handle: ParagraphHandle = .{ .slot = slot_index, .generation = slot.generation };
+        const stored_key = keyForSource(slot.source);
+        const handle: ParagraphSourceHandle = .{ .slot = slot_index, .generation = slot.generation };
         self.index.putAssumeCapacity(stored_key, handle);
         self.active_count += 1;
         return handle;
     }
 
-    pub fn retain(self: *ParagraphCache, handle: ParagraphHandle) !void {
+    pub fn retain(self: *ParagraphSourceCache, handle: ParagraphSourceHandle) !void {
         const slot = try self.require(handle);
         if (slot.references == std.math.maxInt(u32)) return error.ReferenceOverflow;
         slot.references += 1;
     }
 
-    pub fn release(self: *ParagraphCache, handle: ParagraphHandle) !void {
+    pub fn release(self: *ParagraphSourceCache, handle: ParagraphSourceHandle) !void {
         const slot = try self.require(handle);
         std.debug.assert(slot.references != 0);
         slot.references -= 1;
         if (slot.references != 0) return;
-        _ = self.index.remove(slot.entry.key);
-        self.destroyEntry(&slot.entry);
+        _ = self.index.remove(keyForSource(slot.source));
+        self.destroySource(&slot.source);
         slot.active = false;
         slot.generation +%= 1;
         if (slot.generation == 0) slot.generation = 1;
@@ -218,40 +182,48 @@ pub const ParagraphCache = struct {
         self.active_count -= 1;
     }
 
-    pub fn get(self: *const ParagraphCache, handle: ParagraphHandle) !*const ParagraphLayout {
-        return &(try self.requireConst(handle)).entry.layout;
+    pub fn get(self: *const ParagraphSourceCache, handle: ParagraphSourceHandle) !*const ParagraphSource {
+        return &(try self.requireConst(handle)).source;
     }
 
-    pub fn count(self: *const ParagraphCache) usize {
+    pub fn count(self: *const ParagraphSourceCache) usize {
         return self.active_count;
     }
 
     fn requestKey(request: Request) !Key {
         if (request.candidates.len == 0) return error.NoFallbackCandidates;
+        if (!std.unicode.utf8ValidateSlice(request.utf8)) return error.InvalidUtf8;
         if (!std.math.isFinite(request.logical_size) or request.logical_size <= 0)
             return error.InvalidLogicalSize;
-        if (!std.math.isFinite(request.max_width) or request.max_width < 0)
-            return error.InvalidWidth;
         return .{
             .utf8 = request.utf8,
             .base_direction = request.base_direction,
             .language = request.language,
             .logical_size_bits = @bitCast(request.logical_size),
-            .max_width_bits = @bitCast(if (request.max_width == 0) @as(f32, 0) else request.max_width),
             .candidates = request.candidates,
             .configuration_revision = request.configuration_revision,
         };
     }
 
-    fn destroyEntry(self: *ParagraphCache, entry: *Entry) void {
-        entry.layout.deinit();
-        for (entry.key.candidates) |handle| self.font_cache.release(handle) catch unreachable;
-        self.allocator.free(entry.key.candidates);
-        self.allocator.free(entry.key.language);
-        self.allocator.free(entry.key.utf8);
+    fn keyForSource(source: ParagraphSource) Key {
+        return .{
+            .utf8 = source.utf8,
+            .base_direction = source.base_direction,
+            .language = source.language,
+            .logical_size_bits = @bitCast(source.logical_size),
+            .candidates = source.candidates,
+            .configuration_revision = source.configuration_revision,
+        };
     }
 
-    fn takeSlot(self: *ParagraphCache) !u32 {
+    fn destroySource(self: *ParagraphSourceCache, source: *ParagraphSource) void {
+        for (source.candidates) |handle| self.font_cache.release(handle) catch unreachable;
+        self.allocator.free(source.candidates);
+        self.allocator.free(source.language);
+        self.allocator.free(source.utf8);
+    }
+
+    fn takeSlot(self: *ParagraphSourceCache) !u32 {
         if (self.free_head != invalid_slot) {
             const index = self.free_head;
             const slot = self.slotAt(index).?;
@@ -276,133 +248,77 @@ pub const ParagraphCache = struct {
         return first;
     }
 
-    fn require(self: *ParagraphCache, handle: ParagraphHandle) !*Slot {
-        const slot = self.slotAt(handle.slot) orelse return error.StaleParagraph;
-        if (!slot.active or slot.generation != handle.generation) return error.StaleParagraph;
+    fn require(self: *ParagraphSourceCache, handle: ParagraphSourceHandle) !*Slot {
+        const slot = self.slotAt(handle.slot) orelse return error.StaleParagraphSource;
+        if (!slot.active or slot.generation != handle.generation) return error.StaleParagraphSource;
         return slot;
     }
 
-    fn requireConst(self: *const ParagraphCache, handle: ParagraphHandle) !*const Slot {
-        const slot = self.slotAtConst(handle.slot) orelse return error.StaleParagraph;
-        if (!slot.active or slot.generation != handle.generation) return error.StaleParagraph;
+    fn requireConst(self: *const ParagraphSourceCache, handle: ParagraphSourceHandle) !*const Slot {
+        const slot = self.slotAtConst(handle.slot) orelse return error.StaleParagraphSource;
+        if (!slot.active or slot.generation != handle.generation) return error.StaleParagraphSource;
         return slot;
     }
 
-    fn slotAt(self: *ParagraphCache, index_value: u32) ?*Slot {
+    fn slotAt(self: *ParagraphSourceCache, index_value: u32) ?*Slot {
         const slab_index: usize = index_value / slab_size;
         if (slab_index >= self.slabs.items.len) return null;
         return &self.slabs.items[slab_index][index_value % slab_size];
     }
 
-    fn slotAtConst(self: *const ParagraphCache, index_value: u32) ?*const Slot {
+    fn slotAtConst(self: *const ParagraphSourceCache, index_value: u32) ?*const Slot {
         const slab_index: usize = index_value / slab_size;
         if (slab_index >= self.slabs.items.len) return null;
         return &self.slabs.items[slab_index][index_value % slab_size];
     }
 };
 
-fn buildLayout(
-    allocator: std.mem.Allocator,
-    utf8: []const u8,
-    base_direction: paragraph.BaseDirection,
-    candidates: []const api.FallbackCandidate,
-    language: []const u8,
-    logical_size: f32,
-    max_width: f32,
-) !ParagraphLayout {
-    var itemized = try itemization.itemizeParagraphs(allocator, utf8, base_direction);
-    defer itemized.deinit();
-    var shaped = try shaped_paragraph.shapeItemizedParagraphs(
-        allocator,
-        utf8,
-        &itemized,
-        candidates,
-        language,
-        logical_size,
-    );
-    defer shaped.deinit();
-    var breaks = try line_break.analyzeLineBreaks(allocator, utf8);
-    defer breaks.deinit();
-    var measured = try measurement.measureBreakSegments(allocator, breaks.breaks, &shaped);
-    defer measured.deinit();
-    var selected = try line_layout.selectGreedyLines(
-        allocator,
-        utf8,
-        base_direction,
-        breaks.breaks,
-        &measured,
-        max_width,
-    );
-    defer selected.deinit();
-    var positioned = try positioned_lines.positionLines(allocator, utf8, &shaped, &selected);
-    errdefer positioned.deinit();
-    return .{
-        .size = .{ .width = positioned.width(), .height = positioned.height() },
-        .positioned = positioned,
-        .logical_size = logical_size,
-    };
-}
-
-test "paragraph cache owns mixed-script positioned layouts and font leases" {
+test "paragraph sources deduplicate independently of layout width" {
     var fonts = api.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
-    const latin = try fonts.acquire(.{
+    const font = try fonts.acquire(.{
         .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_test_font"),
     });
-    const arabic = try fonts.acquire(.{
-        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
-        .bytes = @embedFile("ourokit_arabic_test_font"),
-    });
-    var cache = ParagraphCache.init(std.testing.allocator, &fonts);
+    var cache = ParagraphSourceCache.init(std.testing.allocator, &fonts);
     defer cache.deinit();
-    const request: ParagraphCache.Request = .{
-        .utf8 = "Save حفظ now",
+    const request: ParagraphSourceCache.Request = .{
+        .utf8 = "A retained paragraph",
         .language = "und",
         .logical_size = 16,
-        .max_width = 80,
-        .candidates = &.{ latin, arabic },
+        .candidates = &.{font},
         .configuration_revision = 1,
     };
     const first = try cache.acquire(request);
     const second = try cache.acquire(request);
     try std.testing.expectEqual(first, second);
     try std.testing.expectEqual(@as(usize, 1), cache.count());
-    const layout = try cache.get(first);
-    try std.testing.expect(layout.positioned.lines.len >= 1);
-    try std.testing.expect(layout.positioned.glyphs.len != 0);
-    try std.testing.expect(layout.size.width > 0);
-    try std.testing.expect(layout.size.height > 0);
-    try fonts.release(latin);
-    try fonts.release(arabic);
-    _ = try fonts.get(latin);
-    _ = try fonts.get(arabic);
+    try fonts.release(font);
+    _ = try fonts.get(font);
     try cache.release(first);
     try cache.release(second);
-    try std.testing.expectError(error.StaleParagraph, cache.get(first));
-    try std.testing.expectError(error.StaleFont, fonts.get(latin));
-    try std.testing.expectError(error.StaleFont, fonts.get(arabic));
+    try std.testing.expectError(error.StaleParagraphSource, cache.get(first));
+    try std.testing.expectError(error.StaleFont, fonts.get(font));
 }
 
-fn exerciseParagraphAllocationFailure(
+fn exerciseSourceAllocationFailure(
     allocator: std.mem.Allocator,
     fonts: *api.FontCache,
     candidates: [2]api.FontHandle,
 ) !void {
-    var cache = ParagraphCache.init(allocator, fonts);
+    var cache = ParagraphSourceCache.init(allocator, fonts);
     defer cache.deinit();
     const handle = try cache.acquire(.{
-        .utf8 = "Save حفظ now",
+        .utf8 = "Save حفظ",
         .language = "und",
         .logical_size = 16,
-        .max_width = 80,
         .candidates = &candidates,
         .configuration_revision = 1,
     });
     try cache.release(handle);
 }
 
-test "paragraph layout allocation failures unwind font leases" {
+test "paragraph source allocation failures unwind font leases" {
     var fonts = api.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
     const latin = try fonts.acquire(.{
@@ -417,7 +333,7 @@ test "paragraph layout allocation failures unwind font leases" {
     defer fonts.release(arabic) catch unreachable;
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
-        exerciseParagraphAllocationFailure,
+        exerciseSourceAllocationFailure,
         .{ &fonts, [2]api.FontHandle{ latin, arabic } },
     );
     try std.testing.expectEqual(@as(usize, 2), fonts.count());

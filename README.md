@@ -99,21 +99,18 @@ deterministic shaping and rendering tests remain available.
 
 Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
 by default for cross targets. The `ouro.label { key, text, size? }` constructor
-shapes one LTR Latin label through HarfBuzz, lays it out from shaping metrics,
-and rasterizes through a backend-owned FreeType glyph cache. `ouro.row`,
-`ouro.column`, and `ouro.label` provide nested composition without
+retains width-independent text/style identity, resolves a cached paragraph from
+its current box constraints, and rasterizes through a backend-owned FreeType
+glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
+wrapping; unchanged constraints perform no layout acquisition or allocation.
+`ouro.row`, `ouro.column`, and `ouro.label` provide nested composition without
 application-managed numeric IDs or parent links. `ouro.button` composes a Box
 and Label using generated design tokens and retains hover, pressed, disabled,
 pointer-capture, and release-inside activation state in the widget layer. Its
-Box centers the intrinsic Label within the padded button bounds; this child
-placement remains separate from future multi-line paragraph alignment.
-Button is not a renderer primitive. Full
-paragraph Label integration and editing remain deferred. Width-specific,
-generation-checked paragraph layouts now pass through renderer-neutral scene
-commands and owned frame leases, and software and Vulkan consume the identical
-positioned mixed-script glyph sequence. The deliberately narrow Label still
-uses the single-run path until constraint-aware acquisition can be added without
-allocating during unchanged steady-state layout.
+Box centers the constrained Label within the padded button bounds; this child
+placement remains separate from paragraph alignment. Button is not a renderer
+primitive. Editing, selection, overflow, and maximum-line policy remain
+deferred. Software and Vulkan consume the identical positioned glyph sequence.
 
 After editing canonical token JSON:
 
@@ -203,13 +200,14 @@ zig-out/bin/ourokit storybook snapshot examples/storybook.lua \
 ```
 
 Each story declares a fixed logical viewport, output scale, color scheme, and
-ordinary Ourokit content callback. Snapshots use a pinned Inter font, write PNG
-files atomically beneath the output directory, and report SHA-256 hashes. A
-fresh Lua VM and retained UI runtime are created for each PNG so signals,
-globals, tasks, and widget state cannot leak between stories. Slash-separated
-story IDs create corresponding output subdirectories; unsafe path segments are
-rejected. See [`examples/storybook.lua`](examples/storybook.lua) for the
-declaration format and a catalog of every built-in widget.
+ordinary Ourokit content callback. Snapshots use pinned Inter and Noto Sans
+Arabic fixtures, write PNG files atomically beneath the output directory, and
+report SHA-256 hashes. A fresh Lua VM and retained UI runtime are created for
+each PNG so signals, globals, tasks, and widget state cannot leak between
+stories. Slash-separated story IDs create corresponding output subdirectories;
+unsafe path segments are rejected. See
+[`examples/storybook.lua`](examples/storybook.lua) for the declaration format
+and a catalog of every built-in widget.
 
 Stories can deterministically reach real retained widget states by replaying
 declarative actions against slash-separated widget-key paths:

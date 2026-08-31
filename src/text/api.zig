@@ -350,19 +350,6 @@ pub fn graphemes(allocator: std.mem.Allocator, utf8: []const u8) ![]Grapheme {
     return result.toOwnedSlice(allocator);
 }
 
-/// The deliberately narrow first Label contract: one LTR Latin-script line.
-/// Common and Inherited characters remain attached to that run; every other
-/// script is rejected rather than shaped under an incorrect script property.
-pub fn supportsSimpleLabel(utf8: []const u8) bool {
-    const view = std.unicode.Utf8View.init(utf8) catch return false;
-    var iterator = view.iterator();
-    while (iterator.nextCodepoint()) |codepoint| switch (uucode.get(.script, codepoint)) {
-        .latin, .common, .inherited => {},
-        else => return false,
-    };
-    return true;
-}
-
 /// Shape an itemized run using configured candidates in priority order.
 ///
 /// A single face is preferred for the entire run. If none succeeds, selection
@@ -520,13 +507,6 @@ test "uucode segments extended grapheme clusters independently of shaping cluste
     try std.testing.expectEqualStrings("a\u{0301}", text[values[0].byte_start..values[0].byte_end]);
     try std.testing.expectEqualStrings("👩🏽‍🚀", text[values[1].byte_start..values[1].byte_end]);
     try std.testing.expectEqualStrings("🇨🇭", text[values[2].byte_start..values[2].byte_end]);
-}
-
-test "simple label contract rejects scripts requiring paragraph itemization" {
-    try std.testing.expect(supportsSimpleLabel("Save as… (2)"));
-    try std.testing.expect(supportsSimpleLabel("cafe\u{0301}"));
-    try std.testing.expect(!supportsSimpleLabel("Save حفظ"));
-    try std.testing.expect(!supportsSimpleLabel("broken\xff"));
 }
 
 test "HarfBuzz performs OpenType ligature, combining, and RTL shaping" {

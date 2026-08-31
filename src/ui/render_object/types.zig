@@ -1,6 +1,6 @@
 const Color = @import("../../core/color.zig").Color;
 const Insets = @import("../../core/geometry.zig").Insets;
-const ShapeHandle = @import("../../text/shape_cache.zig").ShapeHandle;
+const ParagraphSourceHandle = @import("../../text/paragraph_source_cache.zig").ParagraphSourceHandle;
 
 /// Physical alignment within a render object's available axis. Widget policy
 /// resolves direction-sensitive start/end before reaching this layer.
@@ -42,10 +42,10 @@ pub const Stack = struct {
     clip: bool = false,
 };
 
-/// A single already-itemized shaped run. Paragraph bidi, wrapping, selection,
-/// and editing intentionally remain outside this benchmark-oriented slice.
+/// Width-independent paragraph identity. The retained render-tree slot derives
+/// and caches a width-specific positioned layout from current constraints.
 pub const Label = struct {
-    shape: ShapeHandle,
+    source: ParagraphSourceHandle,
     color: Color,
 };
 
