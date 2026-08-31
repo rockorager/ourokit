@@ -88,6 +88,29 @@ identity, fallback output, retained candidate lifetimes, stable growth, and
 stale shape handles.
 The normal library build does not embed either font.
 
+## Native UI embedding
+
+The `ourokit_ui` Zig module is the platform-neutral embedding boundary for
+native hosts such as compositors. It exports `core`, `text`, `scene`, `layout`,
+`render_object`, the `software` renderer, and a thin `Surface` owner. `Surface`
+reconciles parent-before-child `Descriptor` snapshots, owns fixed-capacity
+render-object and scene storage, lays out in logical coordinates, lowers a
+display list at an explicit output scale, hit tests by descriptor ID, and
+provides platform-free pointer capture through `pointerPress`, `pointerMotion`,
+and `pointerRelease`.
+
+Text remains explicit: a caller that uses Label render objects must create and
+attach its own paragraph source/layout caches, and text-capable software
+rendering requires caller-owned glyph/font caches. Fontconfig discovery is
+always disabled for `ourokit_ui`; `-Dfreetype=true` only enables explicit glyph
+rasterization. The module does not import Ourokit's Lua runtime, task scheduler,
+application/window host, Wayland client, generated Wayland protocols, or Vulkan
+renderer. A consumer-only smoke test can be run independently with:
+
+```sh
+zig build test-ourokit-ui-consumer
+```
+
 The public `ourokit.varlink` module provides bounded sans-I/O client and server
 state machines, `.varlink` interface parsing and schema validation, standard
 address parsing, and the mandatory `org.varlink.service` implementation. See

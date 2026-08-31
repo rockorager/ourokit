@@ -79,12 +79,6 @@ pub fn build(b: *std.Build) void {
     ) orelse true;
     const unicode_ucd = b.dependency("unicode_ucd", .{});
     const uucode_config = addUucodeConfig(b, unicode_ucd);
-    const wayring = b.dependency("wayring", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const wayring_host = b.dependency("wayring", .{});
-    const lua = b.dependency("lua", .{});
     const harfbuzz = b.dependency("harfbuzz", .{});
     const sheenbidi = b.dependency("sheenbidi", .{});
     const uucode = b.dependency("uucode", .{
@@ -93,6 +87,37 @@ pub fn build(b: *std.Build) void {
         .build_config_path = uucode_config,
     });
     const script_extensions = addScriptExtensions(b, target, optimize, uucode, unicode_ucd);
+
+    const ourokit_ui = b.addModule("ourokit_ui", .{
+        .root_source_file = b.path("src/ourokit_ui.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "uucode", .module = uucode.module("uucode") },
+            .{ .name = "script_extensions", .module = script_extensions },
+        },
+    });
+    addHarfBuzz(ourokit_ui, harfbuzz);
+    addSheenBidi(ourokit_ui, sheenbidi);
+    const ourokit_ui_options = b.addOptions();
+    ourokit_ui_options.addOption(bool, "fontconfig", false);
+    ourokit_ui_options.addOption(bool, "freetype", enable_freetype);
+    ourokit_ui_options.addOption(bool, "vulkan", false);
+    ourokit_ui.addOptions("ourokit_build_options", ourokit_ui_options);
+    ourokit_ui.addAnonymousImport("unicode_line_break_tests", .{
+        .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
+    });
+    if (enable_freetype) {
+        ourokit_ui.linkSystemLibrary("freetype2", .{});
+        ourokit_ui.link_libc = true;
+    }
+
+    const wayring = b.dependency("wayring", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const wayring_host = b.dependency("wayring", .{});
+    const lua = b.dependency("lua", .{});
     const wayland_protocol = addWaylandProtocol(b, target, optimize, wayring, wayring_host);
 
     const ourokit = b.addModule("ourokit", .{
@@ -184,9 +209,36 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
+    const ui_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/native_titlebar.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit_ui", .module = ourokit_ui }},
+        }),
+    });
+    const run_ui_tests = b.addRunArtifact(ui_tests);
     const test_step = b.step("test", "Run all deterministic and integration tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_ui_tests.step);
+
+    const ui_test_step = b.step("test-ourokit-ui", "Run platform-neutral UI integration tests");
+    ui_test_step.dependOn(&run_ui_tests.step);
+
+    const consumer_smoke = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build",
+        "--build-file",
+        "tests/embedding/build.zig",
+        "test",
+    });
+    consumer_smoke.setCwd(b.path("."));
+    const consumer_smoke_step = b.step(
+        "test-ourokit-ui-consumer",
+        "Build and run an external package importing only ourokit_ui",
+    );
+    consumer_smoke_step.dependOn(&consumer_smoke.step);
 }
 
 fn addUucodeConfig(b: *std.Build, unicode_ucd: *std.Build.Dependency) std.Build.LazyPath {

@@ -1,5 +1,7 @@
 /.zig-cache/
 /zig-out/
 /zig-pkg/
+/tests/embedding/.zig-cache/
+/tests/embedding/zig-pkg/
 __pycache__/
 *.pyc

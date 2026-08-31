@@ -1,0 +1,10 @@
+.{
+    .name = .ourokit_ui_consumer_smoke,
+    .version = "0.0.0",
+    .fingerprint = 0xde7e4c24f2b283f3,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .ourokit = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}
