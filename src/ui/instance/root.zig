@@ -4,6 +4,7 @@ pub const BuildWork = @import("build_owner.zig").BuildWork;
 pub const BuildOwnerDirtySink = @import("build_owner.zig").DirtySink;
 pub const Descriptor = @import("tree.zig").Descriptor;
 pub const InstanceHandle = @import("tree.zig").InstanceHandle;
+pub const ReconcilePlan = @import("tree.zig").ReconcilePlan;
 pub const ReconcileQueue = @import("reconcile_queue.zig").ReconcileQueue;
 pub const ReconcileWork = @import("reconcile_queue.zig").Work;
 pub const Tree = @import("tree.zig").Tree;

@@ -7,6 +7,12 @@ const render_types = @import("../render_object/types.zig");
 
 pub const InstanceHandle = Handle;
 
+pub const ReconcilePlan = struct {
+    revision: u64,
+    topology_changed: bool,
+    descriptors: []const Descriptor,
+};
+
 /// Compact typed data expected from the eventual generated Lua bridge. IDs are
 /// semantic within one window. Parents must precede children, making snapshots
 /// directly consumable without arbitrary table parsing or a temporary graph.
@@ -86,6 +92,7 @@ pub const Tree = struct {
     descriptor_entries: []IndexEntry,
     instance_entries: []IndexEntry,
     render_entries: []IndexEntry,
+    revision: u64 = 0,
 
     pub fn init(
         self: *Tree,
@@ -131,11 +138,21 @@ pub const Tree = struct {
         self.* = undefined;
     }
 
-    /// Applies one complete normalized snapshot. Validation and capacity
-    /// preflight finish before topology or lifecycle state changes.
+    /// Compatibility wrapper for ordinary single-window builds. Application
+    /// source reload prepares every window before applying any window plan.
     pub fn reconcile(self: *Tree, descriptors: []const Descriptor) !void {
-        try self.validateSnapshot(descriptors);
         try self.collectRetired();
+        const plan = try self.prepareReconcile(descriptors);
+        try self.applyReconcile(plan);
+    }
+
+    /// Completes descriptor, topology, scope, and capacity validation without
+    /// changing retained instance or render-object ownership.
+    pub fn prepareReconcile(
+        self: *Tree,
+        descriptors: []const Descriptor,
+    ) !ReconcilePlan {
+        try self.validateSnapshot(descriptors);
         try self.rebuildIndices();
 
         var create_count: usize = 0;
@@ -198,6 +215,23 @@ pub const Tree = struct {
             };
         }
 
+        return .{
+            .revision = self.revision,
+            .topology_changed = topology_changed,
+            .descriptors = descriptors,
+        };
+    }
+
+    /// Applies a previously validated plan. A retained-tree change between
+    /// prepare and apply invalidates the plan rather than misapplying it.
+    pub fn applyReconcile(
+        self: *Tree,
+        plan: ReconcilePlan,
+    ) !void {
+        if (plan.revision != self.revision) return error.StaleReconcilePlan;
+        const descriptors = plan.descriptors;
+        const topology_changed = plan.topology_changed;
+
         if (topology_changed) {
             // Detach first so retained objects can change typed parent roles
             // and desired order without replacing their identities.
@@ -252,12 +286,14 @@ pub const Tree = struct {
                 try self.render_tree.appendChild(parent.render.?, slot.render.?, descriptor.parent_data);
             };
         }
+        self.revision +%= 1;
     }
 
     /// Retiring instances retain their scopes until the task safe point has
     /// canceled and drained all descendants/resources.
     pub fn collectRetired(self: *Tree) !void {
         var progress = true;
+        var changed = false;
         while (progress) {
             progress = false;
             for (self.slots) |*slot| {
@@ -269,8 +305,10 @@ pub const Tree = struct {
                 const generation = slot.generation;
                 slot.* = .{ .generation = generation };
                 progress = true;
+                changed = true;
             }
         }
+        if (changed) self.revision +%= 1;
     }
 
     pub fn rootRenderObject(self: *Tree) !?render_object.NodeHandle {
@@ -490,7 +528,18 @@ test "typed snapshots preserve keyed state and reorder render children" {
         initial[2],
         .{ .id = 2, .parent = 1, .object = .{ .box = .{ .width = 25, .height = 20 } } },
     };
-    try instances.reconcile(&reordered);
+    const stale_plan = try instances.prepareReconcile(&reordered);
+    try std.testing.expectEqual(
+        try instances.renderObject(second),
+        renders.firstChild(initial_root).?,
+    );
+    try instances.reconcile(&initial);
+    try std.testing.expectError(
+        error.StaleReconcilePlan,
+        instances.applyReconcile(stale_plan),
+    );
+    const plan = try instances.prepareReconcile(&reordered);
+    try instances.applyReconcile(plan);
     try std.testing.expectEqual(second, instances.handleForId(2).?);
     try std.testing.expectEqual(@as(u64, 1), try instances.stateRevision(second));
     const root = (try instances.rootRenderObject()).?;
