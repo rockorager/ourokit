@@ -24,6 +24,10 @@
             .url = "https://github.com/jacobsandlund/uucode/archive/61e54266895f833b307de81a0e3038cf1f1bebd4.tar.gz",
             .hash = "uucode-0.2.0-ZZjBPh-6VADBlunHbwABTPng0DH6uJqd4CvvtjZ19tny",
         },
+        .unicode_ucd = .{
+            .url = "https://www.unicode.org/Public/17.0.0/ucd/UCD.zip",
+            .hash = "N-V-__8AAHZAeQLsPIh95xxx7tkREQSrzi8mFSkX7Bv6MwQQ",
+        },
         .inter = .{
             .url = "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip",
             .hash = "N-V-__8AAAv-sAOXPycbcfSerQ5vsDx3k-PZC5fy2p9ScNi8",

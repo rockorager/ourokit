@@ -25,7 +25,7 @@ src/
   loop/                    raw io_uring ownership and operations
   task/                    language-neutral tasks, scopes, resources
   design/                  generated token API
-  text/                    shaping, metrics, Unicode boundaries; future paragraphs
+  text/                    paragraph analysis, shaping, metrics, Unicode boundaries
   ui/
     widget/                future Lua-facing declarations
     instance/              identity, lifecycle, reconciliation, state
@@ -38,7 +38,7 @@ src/
   scene/                   immutable renderer-neutral display lists
   renderer/
     software/
-    vulkan/                future real Vulkan backend
+    vulkan/                optional Vulkan backend and disabled capability stub
   platform/wayland/        sole Wayring containment boundary
   lua/                     isolated VM and coroutine adapter
   bundle/                  future pure-Lua bundle/module loader
@@ -324,6 +324,13 @@ isolated-emoji-modifier tailoring is retained rather than represented as exact
 default UAX #29 behavior. Grapheme boundaries are for cursoring/selection and
 remain distinct from HarfBuzz clusters.
 
+The pure `text.analyzeScripts` stage combines uucode's singular Script and
+extended-grapheme data with content-hashed official Unicode 17
+Script_Extensions and property-alias data. Deterministic generated lookup data
+resolves Common, Inherited, script-specific shared characters, and enclosing
+paired brackets without splitting grapheme clusters. Its owned logical runs
+remain independently testable and benchmarkable.
+
 Pinned SheenBidi 3.0.0 now supplies Unicode 17 UAX #9 paragraph boundaries,
 embedding levels, isolates, and brackets. Its Apache-2.0
 unity source is compiled with process-global scratch memory disabled. The pure
@@ -331,13 +338,47 @@ headless `text.analyzeBidi` stage returns owned, flattened paragraph data and is
 independently unit-tested and benchmarked; it owns no fonts, UI, renderer,
 platform, or Lua state.
 
-This is a correct bidi analyzer and itemized-run shaper foundation, not yet a
-complete paragraph layout engine. uucode does not implement UAX #14 line
-breaking, UAX #15 normalization, or script-extensions/itemization. Those remain
-explicit work; shaping mixed text as one guessed run would be incorrect.
+`text.itemizeParagraphs` intersects logical bidi and script boundaries per
+paragraph. It excludes paragraph separators from shaping runs and preserves
+embedding levels for line-specific visual ordering. Each resulting run
+can produce the paragraph-relative, explicit direction/script `RunSpec` already
+consumed by HarfBuzz and fallback; language remains caller-owned.
+
+This is not yet a complete paragraph layout engine. uucode does not implement
+UAX #15 normalization. Ourokit adds Unicode 17's `Line_Break` property through
+uucode's custom component interface, retaining its compressed generated table
+machinery. The focused linear-time UAX #14 scanner passes all 19,338 official
+revision-55 conformance cases and remains independent of fonts, UI, and
+renderers. Shaping mixed text as one guessed run remains forbidden.
+
+Unicode opportunity discovery is separate from wrap policy. The first sibling
+selector is an O(n) greedy implementation over measured advances. Future
+Knuth-Plass selection belongs beside it and will require an explicit
+box/glue/penalty projection; it will not be faked through greedy heuristics or
+forced into one universal node API. Both consume shared Unicode opportunities
+and text-layer measurements.
+
+Itemized runs are fallback-shaped with full paragraph context. A linear
+measurement stage projects monotone HarfBuzz clusters onto Unicode
+opportunities and retains unsafe-to-break boundaries as explicit reshaping
+requirements. Only after greedy selection does SheenBidi apply UAX #9 L1-L2 to
+each actual line, producing visual left-to-right level runs and resetting that
+line's trailing whitespace. Final headless assembly intersects those visual
+runs with itemized and fallback-font spans and emits backend-neutral positioned
+glyph spans. Safe boundaries reuse the whole-paragraph shape result. Lines
+touching unsafe boundaries are conservatively reshaped with full paragraph
+context; a changed advance returns `error.ReflowRequired` so stale wrap choices
+cannot reach a renderer. Renderers never perform this text policy.
+
+Positioned paragraph output remains owned by `text` until the scene has explicit
+font-resource leases. The existing one-handle glyph command cannot faithfully
+represent wrapped mixed-direction, multi-font lines and will not be stretched
+into an accidental paragraph ABI. Label/render-object lowering and frame leases
+are the next integration step. Empty-line metrics remain an open line-style
+policy rather than inheriting an arbitrary fallback face by accident.
 Fontconfig provides candidate order and a coverage prefilter, not a shaping
-algorithm. The fallback
-planner first shapes the entire itemized run with each cache-owned candidate.
+algorithm. The fallback planner first shapes the entire itemized run with each
+cache-owned candidate.
 If no face succeeds, it selects by actual HarfBuzz `.notdef` output at extended
 grapheme boundaries, merges adjacent equal-face selections, and reshapes each
 span with full paragraph context. This preserves combining/emoji sequences and
@@ -395,6 +436,11 @@ caller-provided dimensions and stride. Scene colors remain straight-alpha sRGB;
 the backend owns conversion and deterministic source/source-over composition.
 Tests cover clipping, damage, alpha, format, row padding, clear, rectangles, and
 reusable conformance fixtures.
+
+Vulkan is an explicit build capability. Default software/headless builds use
+the type-compatible disabled boundary and neither compile shaders nor discover
+or link the Vulkan loader. `-Dvulkan=true` enables the real backend, its tests,
+and the dma-buf example.
 
 Native software text rendering optionally links system FreeType. Backend-owned
 face entries retain FontCache handles and preserve face/named-instance identity
@@ -502,7 +548,7 @@ Open questions intentionally left unfrozen:
   declaration, including the eventual default for the last window;
 - frame resource leases for future image and glyph references;
 - renderer-neutral image/glyph resource identity and cache eviction;
-- full bidi/script-itemization/line-breaking policy, Fontconfig refresh
+- language inheritance, optimal-wrap item representation, Fontconfig refresh
   orchestration, and exact default versus tailored grapheme behavior;
 - transform, subpixel rasterization, layer, and color-managed surface semantics;
 - Vulkan device-loss recovery and richer damage-region coalescing;

@@ -72,6 +72,13 @@ pub fn build(b: *std.Build) void {
         "freetype",
         "Enable software glyph rasterization through system FreeType",
     ) orelse (target.query.isNative() and target.result.os.tag == .linux);
+    const enable_vulkan = b.option(
+        bool,
+        "vulkan",
+        "Enable the Vulkan renderer and dma-buf presentation",
+    ) orelse false;
+    const unicode_ucd = b.dependency("unicode_ucd", .{});
+    const uucode_config = addUucodeConfig(b, unicode_ucd);
     const wayring = b.dependency("wayring", .{
         .target = target,
         .optimize = optimize,
@@ -83,8 +90,9 @@ pub fn build(b: *std.Build) void {
     const uucode = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
-        .fields = @as([]const []const u8, &.{ "grapheme_break", "script" }),
+        .build_config_path = uucode_config,
     });
+    const script_extensions = addScriptExtensions(b, target, optimize, uucode, unicode_ucd);
     const wayland_protocol = addWaylandProtocol(b, target, optimize, wayring, wayring_host);
 
     const ourokit = b.addModule("ourokit", .{
@@ -95,16 +103,21 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wayring", .module = wayring.module("wayring") },
             .{ .name = "wayland_protocol", .module = wayland_protocol },
             .{ .name = "uucode", .module = uucode.module("uucode") },
+            .{ .name = "script_extensions", .module = script_extensions },
         },
     });
     addLua(ourokit, lua);
     addHarfBuzz(ourokit, harfbuzz);
     addSheenBidi(ourokit, sheenbidi);
-    addVulkan(b, ourokit);
+    if (enable_vulkan) addVulkan(b, ourokit);
     const ourokit_options = b.addOptions();
     ourokit_options.addOption(bool, "fontconfig", enable_fontconfig);
     ourokit_options.addOption(bool, "freetype", enable_freetype);
+    ourokit_options.addOption(bool, "vulkan", enable_vulkan);
     ourokit.addOptions("ourokit_build_options", ourokit_options);
+    ourokit.addAnonymousImport("unicode_line_break_tests", .{
+        .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
+    });
     if (enable_fontconfig) {
         ourokit.linkSystemLibrary("fontconfig", .{});
         ourokit.link_libc = true;
@@ -129,7 +142,7 @@ pub fn build(b: *std.Build) void {
     const generate_step = b.step("generate-tokens", "Validate tokens and regenerate Zig data");
     generate_step.dependOn(&token_generate.step);
 
-    addWaylandExample(b, target, optimize, ourokit);
+    addWaylandExample(b, target, optimize, ourokit, enable_vulkan);
     addRendererBenchmark(b, target, optimize, ourokit);
     addParagraphBenchmark(b, target, optimize, ourokit);
 
@@ -149,6 +162,33 @@ pub fn build(b: *std.Build) void {
     run_tests.step.dependOn(&token_check.step);
     const test_step = b.step("test", "Run all deterministic and integration tests");
     test_step.dependOn(&run_tests.step);
+}
+
+fn addUucodeConfig(b: *std.Build, unicode_ucd: *std.Build.Dependency) std.Build.LazyPath {
+    const generate = b.addSystemCommand(&.{"python3"});
+    generate.addFileArg(b.path("tools/text/generate_uucode_config.py"));
+    generate.addFileArg(unicode_ucd.path("LineBreak.txt"));
+    return generate.addOutputFileArg("ourokit_uucode_config.zig");
+}
+
+fn addScriptExtensions(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    uucode: *std.Build.Dependency,
+    unicode_ucd: *std.Build.Dependency,
+) *std.Build.Module {
+    const generate = b.addSystemCommand(&.{"python3"});
+    generate.addFileArg(b.path("tools/text/generate_script_extensions.py"));
+    generate.addFileArg(unicode_ucd.path("ScriptExtensions.txt"));
+    generate.addFileArg(unicode_ucd.path("PropertyValueAliases.txt"));
+    const generated = generate.addOutputFileArg("script_extensions.zig");
+    return b.createModule(.{
+        .root_source_file = generated,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "uucode", .module = uucode.module("uucode") }},
+    });
 }
 
 fn addSheenBidi(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
@@ -183,7 +223,7 @@ fn addParagraphBenchmark(
         }),
     });
     const run = b.addRunArtifact(benchmark);
-    const step = b.step("bench-paragraph", "Benchmark headless paragraph bidi analysis");
+    const step = b.step("bench-paragraph", "Benchmark headless paragraph itemization stages");
     step.dependOn(&run.step);
 }
 
@@ -292,6 +332,7 @@ fn addWaylandExample(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     ourokit: *std.Build.Module,
+    enable_vulkan: bool,
 ) void {
     const host = b.addExecutable(.{
         .name = "ourokit-run",
@@ -321,20 +362,22 @@ fn addWaylandExample(
     const run_step = b.step("run-wayland-example", "Open the software-rendered Wayland example");
     run_step.dependOn(&run.step);
 
-    const vulkan_example = b.addExecutable(.{
-        .name = "ourokit-wayland-vulkan-example",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/vulkan_wayland.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
-        }),
-    });
-    const run_vulkan = b.addRunArtifact(vulkan_example);
-    run_vulkan.addArg("--vulkan");
-    if (b.args) |args| run_vulkan.addArgs(args);
-    const run_vulkan_step = b.step("run-wayland-vulkan-example", "Open the Vulkan dma-buf Wayland example");
-    run_vulkan_step.dependOn(&run_vulkan.step);
+    if (enable_vulkan) {
+        const vulkan_example = b.addExecutable(.{
+            .name = "ourokit-wayland-vulkan-example",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/vulkan_wayland.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+            }),
+        });
+        const run_vulkan = b.addRunArtifact(vulkan_example);
+        run_vulkan.addArg("--vulkan");
+        if (b.args) |args| run_vulkan.addArgs(args);
+        const run_vulkan_step = b.step("run-wayland-vulkan-example", "Open the Vulkan dma-buf Wayland example");
+        run_vulkan_step.dependOn(&run_vulkan.step);
+    }
 
     const install_benchmark = b.addInstallArtifact(example, .{
         .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },

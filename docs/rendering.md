@@ -86,13 +86,18 @@ lifecycle; closing one window never disconnects the others.
 
 ## Vulkan backend and presentation boundary
 
-The first Vulkan backend is a peer of software and consumes equivalent scenes.
+The optional Vulkan backend is a peer of software and consumes equivalent scenes.
 It owns a Vulkan instance/device/compute queue, pipeline, command resources,
 synchronization, and host-visible storage targets. It lowers clear, solid
 rectangle, rectangular clip, damage, source, and source-over operations with
 the same integer color arithmetic as software. Its synchronous headless target
 and explicit readback make backend conformance testable without a window
 system. Renderer calls are currently serialized and wait for GPU completion.
+
+Vulkan is disabled by default. Software/headless builds neither compile its
+shaders nor discover or link the Vulkan loader. `-Dvulkan=true` enables the real
+backend, its tests, and its Wayland dma-buf example while preserving the same
+renderer-neutral scene boundary.
 
 The presentation profile renders directly into exportable
 `B8G8R8A8_UNORM` modifier images with a graphics pipeline and fixed-function

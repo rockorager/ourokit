@@ -1,8 +1,15 @@
 //! Public text module boundary.
 
 const api = @import("api.zig");
+const itemization = @import("itemization.zig");
+const line_break = @import("line_break.zig");
+const line_layout = @import("line_layout.zig");
+const measurement = @import("measurement.zig");
 const paragraph = @import("paragraph.zig");
+const positioned_lines = @import("positioned_lines.zig");
+const script_itemization = @import("script_itemization.zig");
 const shape_cache = @import("shape_cache.zig");
+const shaped_paragraph = @import("shaped_paragraph.zig");
 
 pub const has_fontconfig = api.has_fontconfig;
 pub const discovery = api.discovery;
@@ -27,11 +34,49 @@ pub const BidiRun = paragraph.BidiRun;
 pub const BidiParagraph = paragraph.BidiParagraph;
 pub const BidiAnalysis = paragraph.BidiAnalysis;
 pub const analyzeBidi = paragraph.analyzeBidi;
+pub const LineRange = paragraph.LineRange;
+pub const VisualRun = paragraph.VisualRun;
+pub const VisualLine = paragraph.VisualLine;
+pub const VisualLines = paragraph.VisualLines;
+pub const reorderLines = paragraph.reorderLines;
+pub const ScriptRun = script_itemization.ScriptRun;
+pub const ScriptAnalysis = script_itemization.ScriptAnalysis;
+pub const analyzeScripts = script_itemization.analyzeScripts;
+pub const ItemizedRun = itemization.ItemizedRun;
+pub const ItemizedParagraph = itemization.ItemizedParagraph;
+pub const ItemizedAnalysis = itemization.ItemizedAnalysis;
+pub const itemizeParagraphs = itemization.itemizeParagraphs;
+pub const BreakKind = line_break.BreakKind;
+pub const LineBreak = line_break.LineBreak;
+pub const LineBreakAnalysis = line_break.LineBreakAnalysis;
+pub const analyzeLineBreaks = line_break.analyzeLineBreaks;
+pub const ShapedItemizedRun = shaped_paragraph.ShapedItemizedRun;
+pub const ShapedParagraphs = shaped_paragraph.ShapedParagraphs;
+pub const shapeItemizedParagraphs = shaped_paragraph.shapeItemizedParagraphs;
+pub const MeasuredBreakSegment = measurement.Segment;
+pub const BreakMeasurement = measurement.Measurement;
+pub const measureBreakSegments = measurement.measureBreakSegments;
+pub const SelectedLine = line_layout.Line;
+pub const GreedyLines = line_layout.GreedyLines;
+pub const selectGreedyLines = line_layout.selectGreedyLines;
+pub const PositionedGlyph = positioned_lines.Glyph;
+pub const PositionedSpan = positioned_lines.Span;
+pub const PositionedLine = positioned_lines.Line;
+pub const PositionedLines = positioned_lines.PositionedLines;
+pub const positionLines = positioned_lines.positionLines;
+pub const wrap = @import("wrap/root.zig");
 pub const ShapeHandle = shape_cache.ShapeHandle;
 pub const ShapeCache = shape_cache.ShapeCache;
 
 test {
     _ = api;
+    _ = itemization;
+    _ = line_break;
+    _ = line_layout;
+    _ = measurement;
     _ = paragraph;
+    _ = positioned_lines;
+    _ = script_itemization;
     _ = shape_cache;
+    _ = shaped_paragraph;
 }

@@ -1,12 +1,16 @@
 const std = @import("std");
 const wayring = @import("wayring");
 const protocol = @import("wayland_protocol");
+const build_options = @import("ourokit_build_options");
 const OuroLoop = @import("../../loop/io_uring.zig").Loop;
 const platform_window = @import("../window.zig");
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
-const Vulkan = @import("../../renderer/vulkan/root.zig");
+const Vulkan = if (build_options.vulkan)
+    @import("../../renderer/vulkan/root.zig")
+else
+    @import("../../renderer/vulkan/disabled.zig");
 
 const linux = std.os.linux;
 const posix = std.posix;

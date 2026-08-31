@@ -58,6 +58,192 @@ pub const BidiAnalysis = struct {
     }
 };
 
+pub const LineRange = struct {
+    byte_start: usize,
+    byte_len: usize,
+};
+
+/// One line-local embedding-level run in visual left-to-right order. The byte
+/// range remains a logical range into the original UTF-8 text.
+pub const VisualRun = struct {
+    byte_start: usize,
+    byte_len: usize,
+    level: u8,
+
+    pub fn rightToLeft(self: VisualRun) bool {
+        return self.level & 1 != 0;
+    }
+};
+
+pub const VisualLine = struct {
+    byte_start: usize,
+    byte_len: usize,
+    base_level: u8,
+    run_start: usize,
+    run_count: usize,
+};
+
+pub const VisualLines = struct {
+    allocator: std.mem.Allocator,
+    lines: []VisualLine,
+    runs: []VisualRun,
+
+    pub fn deinit(self: *VisualLines) void {
+        self.allocator.free(self.runs);
+        self.allocator.free(self.lines);
+        self.* = undefined;
+    }
+
+    pub fn runsFor(self: *const VisualLines, line: VisualLine) []const VisualRun {
+        return self.runs[line.run_start..][0..line.run_count];
+    }
+};
+
+/// Applies UAX #9 L1-L2 to already-selected contiguous line ranges. SheenBidi
+/// resets line-local trailing whitespace and returns level runs in visual
+/// left-to-right order. For UTF-8, every offset and length is a byte count.
+pub fn reorderLines(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    direction: BaseDirection,
+    ranges: []const LineRange,
+) !VisualLines {
+    if (!std.unicode.utf8ValidateSlice(utf8)) return error.InvalidUtf8;
+    try validateLineRanges(utf8, ranges);
+
+    var lines: std.ArrayList(VisualLine) = .empty;
+    errdefer lines.deinit(allocator);
+    var runs: std.ArrayList(VisualRun) = .empty;
+    errdefer runs.deinit(allocator);
+    if (utf8.len == 0) {
+        try lines.append(allocator, .{
+            .byte_start = 0,
+            .byte_len = 0,
+            .base_level = switch (direction) {
+                .auto_left_to_right, .left_to_right => 0,
+                .auto_right_to_left, .right_to_left => 1,
+            },
+            .run_start = 0,
+            .run_count = 0,
+        });
+        return ownedVisualLines(allocator, &lines, &runs);
+    }
+
+    const sequence: c.SBCodepointSequence = .{
+        .stringEncoding = c.SBStringEncodingUTF8,
+        .stringBuffer = utf8.ptr,
+        .stringLength = utf8.len,
+    };
+    const algorithm = c.SBAlgorithmCreate(&sequence) orelse return error.OutOfMemory;
+    defer c.SBAlgorithmRelease(algorithm);
+
+    var paragraph_offset: usize = 0;
+    var range_index: usize = 0;
+    while (paragraph_offset < utf8.len) {
+        var paragraph_len: usize = 0;
+        var separator_len: usize = 0;
+        c.SBAlgorithmGetParagraphBoundary(
+            algorithm,
+            paragraph_offset,
+            utf8.len - paragraph_offset,
+            &paragraph_len,
+            &separator_len,
+        );
+        if (paragraph_len == 0 or paragraph_len > utf8.len - paragraph_offset)
+            return error.InvalidBidiResult;
+        const paragraph_end = paragraph_offset + paragraph_len;
+        const paragraph = c.SBAlgorithmCreateParagraph(
+            algorithm,
+            paragraph_offset,
+            paragraph_len,
+            sheenBaseLevel(direction),
+        ) orelse return error.OutOfMemory;
+        defer c.SBParagraphRelease(paragraph);
+        const base_level = c.SBParagraphGetBaseLevel(paragraph);
+
+        while (range_index < ranges.len and ranges[range_index].byte_start < paragraph_end) {
+            const range = ranges[range_index];
+            const range_end = range.byte_start + range.byte_len;
+            if (range.byte_start < paragraph_offset or range_end > paragraph_end or
+                range.byte_len == 0) return error.LineCrossesParagraph;
+            const bidi_line = c.SBParagraphCreateLine(
+                paragraph,
+                range.byte_start,
+                range.byte_len,
+            ) orelse return error.OutOfMemory;
+            defer c.SBLineRelease(bidi_line);
+            if (c.SBLineGetOffset(bidi_line) != range.byte_start or
+                c.SBLineGetLength(bidi_line) != range.byte_len)
+                return error.InvalidBidiResult;
+
+            const run_start = runs.items.len;
+            const run_count = c.SBLineGetRunCount(bidi_line);
+            const run_pointer = c.SBLineGetRunsPtr(bidi_line);
+            if (run_count == 0 or run_pointer == null) return error.InvalidBidiResult;
+            var covered: usize = 0;
+            for (run_pointer[0..run_count]) |run| {
+                const run_end = std.math.add(usize, run.offset, run.length) catch
+                    return error.InvalidBidiResult;
+                if (run.length == 0 or run.offset < range.byte_start or run_end > range_end)
+                    return error.InvalidBidiResult;
+                covered += run.length;
+                try runs.append(allocator, .{
+                    .byte_start = run.offset,
+                    .byte_len = run.length,
+                    .level = run.level,
+                });
+            }
+            if (covered != range.byte_len) return error.InvalidBidiResult;
+            try lines.append(allocator, .{
+                .byte_start = range.byte_start,
+                .byte_len = range.byte_len,
+                .base_level = base_level,
+                .run_start = run_start,
+                .run_count = runs.items.len - run_start,
+            });
+            range_index += 1;
+        }
+        paragraph_offset = paragraph_end;
+    }
+    if (range_index != ranges.len) return error.InvalidLineRanges;
+    return ownedVisualLines(allocator, &lines, &runs);
+}
+
+fn validateLineRanges(utf8: []const u8, ranges: []const LineRange) !void {
+    if (ranges.len == 0) return error.InvalidLineRanges;
+    if (utf8.len == 0 and (ranges.len != 1 or ranges[0].byte_start != 0 or
+        ranges[0].byte_len != 0)) return error.InvalidLineRanges;
+    var expected_start: usize = 0;
+    for (ranges) |range| {
+        const end = std.math.add(usize, range.byte_start, range.byte_len) catch
+            return error.InvalidLineRanges;
+        if (range.byte_start != expected_start or end > utf8.len or
+            !isCodepointBoundary(utf8, range.byte_start) or
+            !isCodepointBoundary(utf8, end)) return error.InvalidLineRanges;
+        expected_start = end;
+    }
+    if (expected_start != utf8.len)
+        return error.InvalidLineRanges;
+}
+
+fn isCodepointBoundary(utf8: []const u8, index: usize) bool {
+    return index == 0 or index == utf8.len or utf8[index] & 0xc0 != 0x80;
+}
+
+fn ownedVisualLines(
+    allocator: std.mem.Allocator,
+    lines: *std.ArrayList(VisualLine),
+    runs: *std.ArrayList(VisualRun),
+) !VisualLines {
+    const owned_lines = try lines.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_lines);
+    return .{
+        .allocator = allocator,
+        .lines = owned_lines,
+        .runs = try runs.toOwnedSlice(allocator),
+    };
+}
+
 /// Resolves paragraph boundaries, embedding levels, and logical level runs for
 /// valid UTF-8. The returned value is self-contained and does not borrow input.
 /// This stage deliberately performs no shaping, fallback, line breaking, or
@@ -233,6 +419,89 @@ test "bidi runs remain contiguous in logical order through isolates" {
         expected_start += run.byte_len;
     }
     try std.testing.expectEqual(paragraph.byte_start + paragraph.byte_len, expected_start);
+}
+
+test "selected lines receive line-local L1 levels and visual L2 run order" {
+    const utf8 = "abc אבג xyz";
+    var visual = try reorderLines(std.testing.allocator, utf8, .left_to_right, &.{
+        .{ .byte_start = 0, .byte_len = 11 },
+        .{ .byte_start = 11, .byte_len = 3 },
+    });
+    defer visual.deinit();
+    try std.testing.expectEqual(@as(usize, 2), visual.lines.len);
+    try std.testing.expectEqualSlices(VisualRun, &.{
+        .{ .byte_start = 0, .byte_len = 4, .level = 0 },
+        .{ .byte_start = 4, .byte_len = 6, .level = 1 },
+        // UAX #9 L1 resets this line's trailing space to the base level.
+        .{ .byte_start = 10, .byte_len = 1, .level = 0 },
+    }, visual.runsFor(visual.lines[0]));
+    try std.testing.expectEqualSlices(VisualRun, &.{
+        .{ .byte_start = 11, .byte_len = 3, .level = 0 },
+    }, visual.runsFor(visual.lines[1]));
+}
+
+test "visual line ordering preserves paragraphs and validates boundaries" {
+    const utf8 = "one\nאבג";
+    var visual = try reorderLines(std.testing.allocator, utf8, .auto_left_to_right, &.{
+        .{ .byte_start = 0, .byte_len = 4 },
+        .{ .byte_start = 4, .byte_len = 6 },
+    });
+    defer visual.deinit();
+    try std.testing.expectEqual(@as(u8, 0), visual.lines[0].base_level);
+    try std.testing.expectEqual(@as(u8, 1), visual.lines[1].base_level);
+    try std.testing.expect(visual.runsFor(visual.lines[1])[0].rightToLeft());
+
+    try std.testing.expectError(error.LineCrossesParagraph, reorderLines(
+        std.testing.allocator,
+        utf8,
+        .auto_left_to_right,
+        &.{.{ .byte_start = 0, .byte_len = utf8.len }},
+    ));
+    try std.testing.expectError(error.InvalidLineRanges, reorderLines(
+        std.testing.allocator,
+        "é",
+        .left_to_right,
+        &.{
+            .{ .byte_start = 0, .byte_len = 1 },
+            .{ .byte_start = 1, .byte_len = 1 },
+        },
+    ));
+}
+
+test "visual line ordering defines empty input and unwinds allocations" {
+    var empty = try reorderLines(
+        std.testing.allocator,
+        "",
+        .right_to_left,
+        &.{.{ .byte_start = 0, .byte_len = 0 }},
+    );
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 1), empty.lines.len);
+    try std.testing.expectEqual(@as(u8, 1), empty.lines[0].base_level);
+    try std.testing.expectEqual(@as(usize, 0), empty.runs.len);
+    try std.testing.expectError(error.InvalidLineRanges, reorderLines(
+        std.testing.allocator,
+        "",
+        .left_to_right,
+        &.{
+            .{ .byte_start = 0, .byte_len = 0 },
+            .{ .byte_start = 0, .byte_len = 0 },
+        },
+    ));
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseVisualAllocationFailure,
+        .{},
+    );
+}
+
+fn exerciseVisualAllocationFailure(allocator: std.mem.Allocator) !void {
+    var visual = try reorderLines(allocator, "abc אבג", .auto_left_to_right, &.{
+        .{ .byte_start = 0, .byte_len = 4 },
+        .{ .byte_start = 4, .byte_len = 6 },
+    });
+    defer visual.deinit();
 }
 
 test "bidi analysis defines empty input and rejects malformed UTF-8" {

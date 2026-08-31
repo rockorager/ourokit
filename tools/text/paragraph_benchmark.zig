@@ -18,10 +18,23 @@ const workloads = [_]Workload{
 pub fn main(init: std.process.Init) !void {
     if (@import("builtin").mode == .Debug)
         std.debug.print("warning: use -Doptimize=ReleaseFast for meaningful results\n", .{});
-    for (workloads) |workload| try run(init.gpa, workload);
+    std.debug.print("bidi analysis:\n", .{});
+    for (workloads) |workload| try runBidi(init.gpa, workload);
+    std.debug.print("script itemization:\n", .{});
+    for (workloads) |workload| try runScripts(init.gpa, workload);
+    std.debug.print("combined paragraph itemization:\n", .{});
+    for (workloads) |workload| try runItemization(init.gpa, workload);
+    std.debug.print("UAX #14 opportunities:\n", .{});
+    for (workloads) |workload| try runLineBreaks(init.gpa, workload);
+    std.debug.print("shaped opportunity measurement:\n", .{});
+    for (workloads) |workload| try runMeasurements(init.gpa, workload);
+    std.debug.print("greedy selection:\n", .{});
+    for (workloads) |workload| try runGreedy(init.gpa, workload);
+    std.debug.print("greedy selection + line bidi:\n", .{});
+    for (workloads) |workload| try runGreedyLines(init.gpa, workload);
 }
 
-fn run(allocator: std.mem.Allocator, workload: Workload) !void {
+fn runBidi(allocator: std.mem.Allocator, workload: Workload) !void {
     var warmup = try ourokit.text.analyzeBidi(allocator, workload.text, .auto_left_to_right);
     const paragraphs_per_input = warmup.paragraphs.len;
     warmup.deinit();
@@ -40,6 +53,224 @@ fn run(allocator: std.mem.Allocator, workload: Workload) !void {
     std.debug.print(
         "{s}: {d:.1} ns/input, {d:.1} ns/paragraph, {d:.2} ns/byte ({d} iterations)\n",
         .{ workload.name, ns_per_input, ns_per_paragraph, ns_per_byte, iterations },
+    );
+}
+
+fn runScripts(allocator: std.mem.Allocator, workload: Workload) !void {
+    var warmup = try ourokit.text.analyzeScripts(allocator, workload.text);
+    warmup.deinit();
+    const started = nanoTime();
+    var total_runs: usize = 0;
+    for (0..iterations) |_| {
+        var analysis = try ourokit.text.analyzeScripts(allocator, workload.text);
+        total_runs += analysis.runs.len;
+        analysis.deinit();
+    }
+    const elapsed = nanoTime() - started;
+    std.mem.doNotOptimizeAway(total_runs);
+    const ns_per_input = @as(f64, @floatFromInt(elapsed)) / iterations;
+    const ns_per_byte = ns_per_input / @as(f64, @floatFromInt(workload.text.len));
+    std.debug.print(
+        "{s}: {d:.1} ns/input, {d:.2} ns/byte ({d} iterations)\n",
+        .{ workload.name, ns_per_input, ns_per_byte, iterations },
+    );
+}
+
+fn runItemization(allocator: std.mem.Allocator, workload: Workload) !void {
+    var warmup = try ourokit.text.itemizeParagraphs(allocator, workload.text, .auto_left_to_right);
+    warmup.deinit();
+    const started = nanoTime();
+    var total_runs: usize = 0;
+    for (0..iterations) |_| {
+        var analysis = try ourokit.text.itemizeParagraphs(allocator, workload.text, .auto_left_to_right);
+        total_runs += analysis.runs.len;
+        analysis.deinit();
+    }
+    const elapsed = nanoTime() - started;
+    std.mem.doNotOptimizeAway(total_runs);
+    const ns_per_input = @as(f64, @floatFromInt(elapsed)) / iterations;
+    const ns_per_byte = ns_per_input / @as(f64, @floatFromInt(workload.text.len));
+    std.debug.print(
+        "{s}: {d:.1} ns/input, {d:.2} ns/byte ({d} iterations)\n",
+        .{ workload.name, ns_per_input, ns_per_byte, iterations },
+    );
+}
+
+fn runLineBreaks(allocator: std.mem.Allocator, workload: Workload) !void {
+    var warmup = try ourokit.text.analyzeLineBreaks(allocator, workload.text);
+    warmup.deinit();
+    const started = nanoTime();
+    var total_breaks: usize = 0;
+    for (0..iterations) |_| {
+        var analysis = try ourokit.text.analyzeLineBreaks(allocator, workload.text);
+        total_breaks += analysis.breaks.len;
+        analysis.deinit();
+    }
+    const elapsed = nanoTime() - started;
+    std.mem.doNotOptimizeAway(total_breaks);
+    printResult(workload, elapsed);
+}
+
+fn runGreedy(allocator: std.mem.Allocator, workload: Workload) !void {
+    var opportunities = try ourokit.text.analyzeLineBreaks(allocator, workload.text);
+    defer opportunities.deinit();
+    const advances = try allocator.alloc(f32, opportunities.breaks.len);
+    defer allocator.free(advances);
+    @memset(advances, 8);
+    const started = nanoTime();
+    var total_lines: usize = 0;
+    for (0..iterations) |_| {
+        var result = try ourokit.text.wrap.greedy.wrap(
+            allocator,
+            opportunities.breaks,
+            advances,
+            120,
+        );
+        total_lines += result.lines.len;
+        result.deinit();
+    }
+    const elapsed = nanoTime() - started;
+    std.mem.doNotOptimizeAway(total_lines);
+    printResult(workload, elapsed);
+}
+
+fn runMeasurements(allocator: std.mem.Allocator, workload: Workload) !void {
+    var fixture = try MeasurementFixture.init(allocator, workload.text);
+    defer fixture.deinit();
+    const started = nanoTime();
+    var total_segments: usize = 0;
+    for (0..iterations) |_| {
+        var measured = try ourokit.text.measureBreakSegments(
+            allocator,
+            fixture.opportunities.breaks,
+            &fixture.shaped,
+        );
+        total_segments += measured.segments.len;
+        measured.deinit();
+    }
+    const elapsed = nanoTime() - started;
+    std.mem.doNotOptimizeAway(total_segments);
+    printResult(workload, elapsed);
+}
+
+fn runGreedyLines(allocator: std.mem.Allocator, workload: Workload) !void {
+    var fixture = try MeasurementFixture.init(allocator, workload.text);
+    defer fixture.deinit();
+    var measured = try ourokit.text.measureBreakSegments(
+        allocator,
+        fixture.opportunities.breaks,
+        &fixture.shaped,
+    );
+    defer measured.deinit();
+    const started = nanoTime();
+    var total_lines: usize = 0;
+    for (0..iterations) |_| {
+        var selected = try ourokit.text.selectGreedyLines(
+            allocator,
+            workload.text,
+            .auto_left_to_right,
+            fixture.opportunities.breaks,
+            &measured,
+            120,
+        );
+        total_lines += selected.lines.len;
+        selected.deinit();
+    }
+    const elapsed = nanoTime() - started;
+    std.mem.doNotOptimizeAway(total_lines);
+    printResult(workload, elapsed);
+}
+
+const MeasurementFixture = struct {
+    allocator: std.mem.Allocator,
+    glyphs: []ourokit.text.Glyph,
+    spans: []ourokit.text.ShapedSpan,
+    runs: []ourokit.text.ShapedItemizedRun,
+    shaped: ourokit.text.ShapedParagraphs,
+    opportunities: ourokit.text.LineBreakAnalysis,
+
+    fn init(allocator: std.mem.Allocator, utf8: []const u8) !MeasurementFixture {
+        var opportunities = try ourokit.text.analyzeLineBreaks(allocator, utf8);
+        errdefer opportunities.deinit();
+        var glyphs: std.ArrayList(ourokit.text.Glyph) = .empty;
+        errdefer glyphs.deinit(allocator);
+        var view = try std.unicode.Utf8View.init(utf8);
+        var iterator = view.iterator();
+        while (iterator.nextCodepointSlice()) |codepoint| try glyphs.append(allocator, .{
+            .id = 1,
+            .cluster = @intCast(@intFromPtr(codepoint.ptr) - @intFromPtr(utf8.ptr)),
+            .advance = .{ .x = 8 },
+            .offset = .{},
+            .unsafe_to_break = false,
+        });
+        const owned_glyphs = try glyphs.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_glyphs);
+        const spans = try allocator.alloc(ourokit.text.ShapedSpan, 1);
+        errdefer allocator.free(spans);
+        const runs = try allocator.alloc(ourokit.text.ShapedItemizedRun, 1);
+        errdefer allocator.free(runs);
+        var result: MeasurementFixture = .{
+            .allocator = allocator,
+            .glyphs = owned_glyphs,
+            .spans = spans,
+            .runs = runs,
+            .shaped = undefined,
+            .opportunities = opportunities,
+        };
+        result.spans[0] = .{
+            .font = .{ .slot = 1, .generation = 1 },
+            .run = .{
+                .allocator = allocator,
+                .glyphs = result.glyphs,
+                .direction = .left_to_right,
+                .byte_start = 0,
+                .byte_len = utf8.len,
+                .advance = .{ .x = @floatFromInt(result.glyphs.len * 8) },
+                .metrics = .{ .ascender = 1, .descender = 0, .line_gap = 0 },
+            },
+        };
+        result.runs[0] = .{
+            .byte_start = 0,
+            .byte_len = utf8.len,
+            .paragraph_start = 0,
+            .paragraph_content_len = utf8.len,
+            .level = 0,
+            .script = .latin,
+            .result = .{
+                .allocator = allocator,
+                .spans = result.spans,
+                .logical_size = 12,
+                .advance = result.spans[0].run.advance,
+                .metrics = result.spans[0].run.metrics,
+                .has_missing_glyphs = false,
+            },
+        };
+        result.shaped = .{
+            .allocator = allocator,
+            .text_len = utf8.len,
+            .candidates = &.{},
+            .language = "und",
+            .logical_size = 12,
+            .runs = result.runs,
+        };
+        return result;
+    }
+
+    fn deinit(self: *MeasurementFixture) void {
+        self.opportunities.deinit();
+        self.allocator.free(self.runs);
+        self.allocator.free(self.spans);
+        self.allocator.free(self.glyphs);
+        self.* = undefined;
+    }
+};
+
+fn printResult(workload: Workload, elapsed: u64) void {
+    const ns_per_input = @as(f64, @floatFromInt(elapsed)) / iterations;
+    const ns_per_byte = ns_per_input / @as(f64, @floatFromInt(workload.text.len));
+    std.debug.print(
+        "{s}: {d:.1} ns/input, {d:.2} ns/byte ({d} iterations)\n",
+        .{ workload.name, ns_per_input, ns_per_byte, iterations },
     );
 }
 

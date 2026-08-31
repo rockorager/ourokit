@@ -51,18 +51,83 @@ This separation is intentional for testing and profiling. Unit tests exercise
 mixed direction, CRLF paragraph boundaries, explicit direction, malformed
 input, and every caller-owned allocation failure. `zig build bench-paragraph
 -Doptimize=ReleaseFast -Dfontconfig=false -Dfreetype=false` measures bidi
-analysis independently on Latin, mixed-script, isolate, and multi-paragraph
-workloads. Later itemization, shaping, line breaking, and layout stages remain
-separately callable rather than being hidden inside one opaque text API.
+analysis, script analysis, and their combined paragraph itemization on Latin,
+mixed-script, isolate, and multi-paragraph workloads. The same command measures
+UAX #14 discovery, shaped-cluster measurement, greedy selection, and selected-
+line bidi independently. Final positioned assembly is likewise a separate,
+headless API with deterministic mixed-script and allocation-failure tests. The
+stages remain separately callable rather than being hidden inside one opaque
+text API.
 
-These logical runs are not yet a paragraph layout. Script itemization must
-intersect them before HarfBuzz shaping. UAX #14 opportunities and actual line
-boundaries must be resolved before line-specific UAX #9 L1/L2 reordering;
-exposing SheenBidi's visual line runs at this stage would make wrapped text
-incorrect. Ourokit has not selected a line-breaking dependency yet:
-libgrapheme 3.0.0 has Unicode 17 data but known conformance failures, while
-libunibreak 7.0 remains on older Unicode line rules. Neither is accepted merely
-to fill the API.
+`text.analyzeScripts` is the pure headless script stage. It uses uucode's Unicode
+17 Script property and extended-grapheme boundaries together with exact
+Unicode 17 `ScriptExtensions.txt` and `PropertyValueAliases.txt` data fetched as
+a content-hashed Zig dependency. A deterministic build generator emits the
+compact lookup and ISO 15924 mapping. Itemization never splits an extended
+grapheme cluster, resolves Common and Inherited text against compatible
+surrounding scripts, honors Script_Extensions sets such as Hiragana/Katakana
+U+30FC and Arabic U+060C, and keeps paired brackets in the enclosing script.
+The owned runs contain original UTF-8 byte ranges and explicit HarfBuzz scripts.
+The source is Unicode 17.0.0 `UCD.zip`, hash
+`N-V-__8AAHZAeQLsPIh95xxx7tkREQSrzi8mFSkX7Bv6MwQQ`, under the Unicode Terms of
+Use included in that archive.
+
+`text.itemizeParagraphs` intersects the bidi and script boundaries into maximal
+logical runs with explicit level, direction, script, and original byte range.
+Script context resets at each paragraph. Paragraph separators remain explicit
+metadata and are not emitted as shaping runs. `ItemizedRun.runSpec` converts a
+document-relative run into the paragraph-relative contract consumed by the
+existing HarfBuzz fallback shaper; tests shape mixed Latin/Arabic itemized runs
+through real pinned fonts. Language remains caller-supplied rather than guessed
+from script.
+
+Unicode 17 UAX #14 default opportunities are now a separate pure
+`text.analyzeLineBreaks` stage. Ourokit extends uucode through its supported
+custom build configuration with the missing `Line_Break` field, so uucode's
+generated compressed tables also hold General_Category, East_Asian_Width, and
+Extended_Pictographic inputs needed by revision 55. The scanner reports UTF-8
+byte offsets and distinguishes allowed from mandatory breaks. It passes every
+one of the 19,338 official Unicode 17 `LineBreakTest.txt` cases. Its ordered
+rule implementation was informed by `cto-af/linebreak` commit
+`088ff02569c5f213951e819a0578f164455f1075`; that MIT reference license is
+retained under `docs/licenses`.
+
+Opportunity discovery and line selection are intentionally separate. The first
+`text.wrap.greedy` selector consumes measured advances between opportunities in
+linear time and never invents a prohibited break. Wrap strategies live as
+sibling modules rather than behind renderer or widget switches. A future
+Knuth-Plass implementation will consume a real box/glue/penalty projection from
+the same Unicode opportunities and shaped metrics; Ourokit does not expose a
+fake "optimal" mode before that representation exists.
+
+`text.shapeItemizedParagraphs` shapes every logical itemized run with full
+paragraph context. `text.measureBreakSegments` projects monotone HarfBuzz
+clusters onto the shared UAX #14 opportunities in O(glyphs + opportunities)
+time. It preserves `HB_GLYPH_FLAG_UNSAFE_TO_BREAK`: a selected unsafe boundary
+marks both adjacent lines for reshaping instead of silently reusing invalid
+glyph output. `text.selectGreedyLines` then selects logical ranges and asks
+SheenBidi to apply UAX #9 L1-L2 for each actual line, including line-local
+trailing-whitespace reset and visual left-to-right level-run order. UTF-8 byte
+ranges remain logical source ranges throughout.
+
+`text.positionLines` completes the headless pipeline. It intersects visual bidi
+runs with itemized and fallback-font spans, emits renderer-neutral positioned
+glyph spans in visual left-to-right traversal order, and preserves logical byte
+ranges for future caret mapping. Safe boundaries slice the whole-paragraph
+shape result. A line touching either side of an unsafe HarfBuzz boundary is
+conservatively reshaped with the original paragraph context. If that changes
+the provisional line advance, assembly returns `error.ReflowRequired` rather
+than emitting glyphs for stale greedy choices. Any unexpected mismatch at a
+safe boundary is rejected as invalid measurement.
+
+The output remains text-owned rather than being squeezed into the current
+single-`ShapeHandle` scene command: wrapped mixed-direction text can contain
+several visual and fallback-font spans. Scene resource leases and Label/render-
+object lowering are the next integration boundary. Empty/newline-only line
+metrics also require an explicit line-style policy; they currently remain zero
+instead of silently selecting an arbitrary font. Dictionary/locale tailoring
+and hyphenation remain explicit later stages rather than being misrepresented
+as default UAX #14 behavior.
 
 ## Unicode boundaries
 
@@ -75,7 +140,9 @@ into one shaping cluster.
 uucode intentionally tailors isolated emoji modifiers relative to default UAX
 #29. Ourokit currently exposes that behavior explicitly. uucode provides useful
 Unicode properties but does not implement UAX #9 bidi, UAX #14 line breaking,
-UAX #15 normalization, word breaking, or script-extension run resolution.
+UAX #15 normalization, or word breaking. Ourokit combines uucode with the
+official Script_Extensions data for run resolution rather than duplicating its
+singular Script table.
 
 ## Fonts and fallback
 
@@ -140,7 +207,8 @@ The first retained text render object is deliberately a single, already-
 itemized label for benchmark UI. Its public constructor accepts only valid
 UTF-8 whose uucode Script values are Latin, Common, or Inherited, and shapes it
 as one LTR Latin run. Other scripts are rejected instead of being assigned a
-false script or direction. Full paragraph bidi and itemization remain deferred.
+false script or direction. The label has not yet been wired to the
+now-established paragraph analyzers.
 
 The Label render object stores only a generation-checked `ShapeHandle` and
 color. It takes intrinsic width and line height from the immutable shaped result
@@ -166,10 +234,11 @@ retaining them.
 
 ## Work not yet frozen
 
-- full UAX #9 paragraph levels, visual ordering, and logical/visual index maps;
-- script-extension-aware itemization and language inheritance;
+- logical/visual caret and selection maps;
+- language inheritance across itemized runs;
 - async font-file loading and safe-point Fontconfig refresh/invalidation;
-- UAX #14 line opportunities, reshaping at safe breaks, and hyphenation;
+- Knuth-Plass selection, dictionary tailoring, and hyphenation;
+- empty-line metrics and inherited line-style policy;
 - normalization policy (shaping does not imply mutating application text);
 - variable-font axis selection and cache identity;
 - renderer-neutral frame resource leases for positioned glyph runs;

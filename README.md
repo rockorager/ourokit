@@ -32,8 +32,17 @@ declarative Lua application, owns all native services, invokes button handlers
 as scoped task-phase coroutines, and presents signal-driven descriptors through
 the same mounted render path. The shared text layer uses pinned HarfBuzz for
 real OpenType run shaping, pinned SheenBidi for Unicode 17 paragraph bidi, and
-pinned uucode Unicode data for grapheme boundaries. The design
-system requests generic `sans-serif`, and native Linux builds use Fontconfig's
+pinned uucode plus official Unicode 17 Script_Extensions data for grapheme-safe
+script and combined paragraph itemization. A uucode custom field and focused
+UAX #14 scanner provide fully conformant Unicode 17 line opportunities; greedy
+line selection is a separate linear-time strategy so future Knuth-Plass policy
+does not contaminate segmentation. HarfBuzz cluster advances feed that selector,
+unsafe selected boundaries remain explicit, and SheenBidi performs line-local
+UAX #9 L1-L2 ordering only after wrapping. A final headless stage intersects
+visual and fallback-font spans into backend-neutral positioned glyphs, reusing
+safe paragraph shaping and requesting reflow when unsafe reshaping changes a
+line width. The design system requests generic `sans-serif`, and native Linux
+builds use Fontconfig's
 configured primary and fallback faces. Pinned font fixtures keep shaping tests
 deterministic without putting shaping or measurement in a renderer.
 
@@ -44,7 +53,7 @@ deterministic without putting shaping or measurement in a renderer.
 - Python 3 for deterministic token validation/generation
 - Fontconfig development files for native Linux font discovery
 - FreeType development files for native software text rasterization
-- Vulkan loader and headers, plus `glslc` for the Vulkan backend shaders
+- Optional: Vulkan loader and headers, plus `glslc`, for `-Dvulkan=true`
 - A C/C++ toolchain is not required separately; Zig compiles embedded Lua and
   HarfBuzz
 
@@ -53,15 +62,16 @@ deterministic without putting shaping or measurement in a renderer.
 ```sh
 zig build
 zig build test
-zig fmt --check build.zig src examples
+zig fmt --check build.zig src examples tools
 zig build tokens
 ```
 
-The default build installs `zig-out/lib/libourokit.a`. `zig build test` includes
-real kernel `io_uring` timeout/cancel tests, deterministic software and Vulkan
-pixel tests, and the Lua coroutine/timer safe-point integration test. It also
-covers logical
-constraints, Flex/Stack layout, invalidation caching, scene lowering, and hit
+The default software build installs `zig-out/lib/libourokit.a` without requiring
+Vulkan or `glslc`. `zig build test` includes real kernel `io_uring`
+timeout/cancel tests, deterministic software pixel tests, and the Lua
+coroutine/timer safe-point integration test. `zig build test -Dvulkan=true`
+also runs Vulkan pixel tests. The suite covers logical constraints, Flex/Stack
+layout, invalidation caching, scene lowering, and hit
 testing without a compositor, plus keyed reconciliation, safe retirement, and
 transactional pointer routing. Signal tests cover equal-write suppression,
 dynamic dependency replacement, failed-build rollback, build-time write
@@ -69,10 +79,13 @@ rejection, and owner disposal. Text tests fetch pinned Inter and Noto Sans
 Arabic fixtures and verify HarfBuzz shaping plus Unicode grapheme segmentation.
 Fallback tests verify configured-order face selection, grapheme-safe boundaries,
 visible unresolved glyphs, stable font handles, and Fontconfig variable-instance
-translation. The growable font cache tests deduplication, stable addresses across
-growth, reference ownership, source replacement, and stale-handle rejection. A
-separate immutable shaped-run cache verifies complete request identity, fallback
-output, retained candidate lifetimes, stable growth, and stale shape handles.
+translation. Paragraph tests cover real mixed-script itemized shaping, measured
+break segments, unsafe-boundary propagation, greedy selection, and line-local
+visual bidi runs. The growable font cache tests deduplication, stable addresses
+across growth, reference ownership, source replacement, and stale-handle
+rejection. A separate immutable shaped-run cache verifies complete request
+identity, fallback output, retained candidate lifetimes, stable growth, and
+stale shape handles.
 The normal library build does not embed either font.
 
 The public `ourokit.varlink` module provides bounded sans-I/O client and server
@@ -93,7 +106,9 @@ application-managed numeric IDs or parent links. `ouro.button` composes a Box
 and Label using generated design tokens and retains hover, pressed, disabled,
 pointer-capture, and release-inside activation state in the widget layer;
 Button is not a renderer primitive. Full
-bidi, script itemization, wrapping, and editing are explicitly deferred.
+paragraph render-object integration and editing remain deferred; the headless
+itemization, shaping, wrapping, and line-bidi stages are established but not yet
+wired into this deliberately narrow Label.
 
 After editing canonical token JSON:
 
@@ -112,8 +127,9 @@ To run the reproducible software-renderer comparison against pinned Pixman
 zig build bench-renderers -Doptimize=ReleaseFast
 ```
 
-To profile pure headless paragraph bidi analysis independently from fonts, UI,
-rendering, and Wayland:
+To profile pure headless bidi analysis, script analysis, combined paragraph
+itemization, UAX #14 opportunities, shaped measurement, greedy selection, and
+line-local bidi independently from UI, rendering, and Wayland:
 
 ```sh
 zig build bench-paragraph -Doptimize=ReleaseFast \
@@ -160,7 +176,7 @@ Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
 presenter with:
 
 ```sh
-zig build run-wayland-vulkan-example
+zig build run-wayland-vulkan-example -Dvulkan=true
 ```
 
 The Vulkan example uses linux-dmabuf v4 device/modifier feedback, direct
