@@ -6,7 +6,6 @@ pub const ColorScheme = enum { light, dark };
 pub const Viewport = struct {
     width: u32 = 640,
     height: u32 = 480,
-    scale: f32 = 1,
 };
 
 pub const ActionKind = enum { hover, pointer_down, click, scroll };
@@ -22,6 +21,7 @@ pub const Story = struct {
     group: []u8,
     name: []u8,
     viewport: Viewport,
+    snapshot_scale: f32,
     color_scheme: ColorScheme,
     actions: []Action,
     content_reference: c_int,
@@ -75,6 +75,7 @@ pub const Storybook = struct {
             const group = try optionalString(allocator, state, -1, "group", "Stories");
             errdefer allocator.free(group);
             const viewport = try parseViewport(state, -1);
+            const snapshot_scale = try optionalSnapshotScale(state, -1);
             const color_scheme = try parseColorScheme(state, -1);
             const actions = try parseActions(allocator, state, -1);
             errdefer deinitActions(allocator, actions);
@@ -86,6 +87,7 @@ pub const Storybook = struct {
                 .group = group,
                 .name = name,
                 .viewport = viewport,
+                .snapshot_scale = snapshot_scale,
                 .color_scheme = color_scheme,
                 .actions = actions,
                 .content_reference = content_reference,
@@ -188,10 +190,14 @@ fn parseViewport(state: *c.State, table: c_int) !Viewport {
     defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return .{};
     if (value_type != c.type_table) return error.InvalidStoryViewport;
+    if (c.lua_getfield(state, -1, "scale") != c.type_nil) {
+        c.lua_settop(state, -2);
+        return error.StoryViewportScaleMovedToSnapshotScale;
+    }
+    c.lua_settop(state, -2);
     return .{
         .width = try optionalDimension(state, -1, "width", 640),
         .height = try optionalDimension(state, -1, "height", 480),
-        .scale = try optionalScale(state, -1),
     };
 }
 
@@ -206,14 +212,14 @@ fn optionalDimension(state: *c.State, table: c_int, field: [*:0]const u8, defaul
     return @intCast(value);
 }
 
-fn optionalScale(state: *c.State, table: c_int) !f32 {
-    const value_type = c.lua_getfield(state, table, "scale");
+fn optionalSnapshotScale(state: *c.State, table: c_int) !f32 {
+    const value_type = c.lua_getfield(state, table, "snapshot_scale");
     defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return 1;
     var is_number: c_int = 0;
     const value = c.lua_tonumberx(state, -1, &is_number);
     if (is_number == 0 or !std.math.isFinite(value) or value <= 0 or value > 16)
-        return error.InvalidStoryViewport;
+        return error.InvalidStorySnapshotScale;
     return @floatCast(value);
 }
 
@@ -330,7 +336,8 @@ test "storybook declarations are owned, defaulted, and selectable" {
         \\      id = "button/dark",
         \\      group = "Button",
         \\      name = "Dark",
-        \\      viewport = { width = 320, height = 180, scale = 2 },
+        \\      viewport = { width = 320, height = 180 },
+        \\      snapshot_scale = 2,
         \\      color_scheme = "dark",
         \\      actions = {
         \\        { type = "hover", target = "content/button" },
@@ -347,7 +354,7 @@ test "storybook declarations are owned, defaulted, and selectable" {
     const story = book.find("button/dark").?;
     try std.testing.expectEqualStrings("Button", story.group);
     try std.testing.expectEqual(@as(u32, 320), story.viewport.width);
-    try std.testing.expectEqual(@as(f32, 2), story.viewport.scale);
+    try std.testing.expectEqual(@as(f32, 2), story.snapshot_scale);
     try std.testing.expectEqual(ColorScheme.dark, story.color_scheme);
     try std.testing.expectEqual(@as(usize, 3), story.actions.len);
     try std.testing.expectEqual(ActionKind.pointer_down, story.actions[1].kind);
@@ -393,6 +400,14 @@ test "storybook rejects unsafe and duplicate IDs" {
         \\  ouro.story {
         \\    id = "scroll", name = "Bad scroll", content = function() end,
         \\    actions = { { type = "scroll", target = "content/list", delta = 0 } },
+        \\  },
+        \\} }
+    ));
+    try std.testing.expectError(error.StoryViewportScaleMovedToSnapshotScale, Storybook.load(std.testing.allocator, state,
+        \\return ouro.storybook { stories = {
+        \\  ouro.story {
+        \\    id = "scale", name = "Old scale", viewport = { scale = 2 },
+        \\    content = function() end,
         \\  },
         \\} }
     ));

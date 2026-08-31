@@ -238,13 +238,15 @@ zig-out/bin/ourokit storybook snapshot examples/storybook.lua \
   --story button/disabled-dark --output .amp/in/artifacts --json
 ```
 
-Each story declares a fixed logical viewport, output scale, color scheme, and
-ordinary Ourokit content callback. Snapshots use pinned Inter and Noto Sans
-Arabic fixtures, write PNG files atomically beneath the output directory, and
-report SHA-256 hashes. A fresh Lua VM and retained UI runtime are created for
-each PNG so signals, globals, tasks, and widget state cannot leak between
-stories. Slash-separated story IDs create corresponding output subdirectories;
-unsafe path segments are rejected. See
+Each story declares a fixed logical viewport, optional `snapshot_scale`, color
+scheme, and ordinary Ourokit content callback. Snapshot scale affects PNG
+raster dimensions only; the interactive browser uses its window's native
+output scale. Snapshots use pinned Inter and Noto Sans Arabic fixtures, write
+PNG files atomically beneath the output directory, and report SHA-256 hashes. A
+fresh Lua VM and retained UI runtime are created for each PNG so signals,
+globals, tasks, and widget state cannot leak between stories. Slash-separated
+story IDs create corresponding output subdirectories; unsafe path segments are
+rejected. See
 [`examples/storybook.lua`](examples/storybook.lua) for the declaration format
 and a catalog of every built-in widget.
 

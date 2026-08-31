@@ -13,6 +13,7 @@ pub const StoryDescription = struct {
     group: []u8,
     name: []u8,
     viewport: lua.StorybookViewport,
+    snapshot_scale: f32,
     color_scheme: lua.StorybookColorScheme,
     action_count: usize,
 };
@@ -38,6 +39,7 @@ pub const Snapshot = struct {
     allocator: std.mem.Allocator,
     id: []u8,
     viewport: lua.StorybookViewport,
+    snapshot_scale: f32,
     color_scheme: lua.StorybookColorScheme,
     pixel_width: u32,
     pixel_height: u32,
@@ -98,6 +100,7 @@ pub fn describe(init: std.process.Init, source: []const u8) !Description {
             .group = group,
             .name = name,
             .viewport = story.viewport,
+            .snapshot_scale = story.snapshot_scale,
             .color_scheme = story.color_scheme,
             .action_count = story.actions.len,
         };
@@ -188,7 +191,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         &lua_ui,
         story.content_reference,
     );
-    try runtime.prepareFrame(story.viewport.scale);
+    try runtime.prepareFrame(story.snapshot_scale);
     if (story.actions.len != 0) {
         vm.disableSleep();
         for (story.actions) |action| try playAction(
@@ -202,8 +205,8 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     }
     const list = try runtime.displayList();
 
-    const pixel_width = try physicalDimension(story.viewport.width, story.viewport.scale);
-    const pixel_height = try physicalDimension(story.viewport.height, story.viewport.scale);
+    const pixel_width = try physicalDimension(story.viewport.width, story.snapshot_scale);
+    const pixel_height = try physicalDimension(story.viewport.height, story.snapshot_scale);
     const stride = std.math.mul(usize, pixel_width, 4) catch return error.ImageTooLarge;
     const pixel_len = std.math.mul(usize, stride, pixel_height) catch return error.ImageTooLarge;
     if (pixel_len > 256 * 1024 * 1024) return error.ImageTooLarge;
@@ -223,6 +226,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     const id = try init.gpa.dupe(u8, story.id);
     errdefer init.gpa.free(id);
     const viewport = story.viewport;
+    const snapshot_scale = story.snapshot_scale;
     const color_scheme = story.color_scheme;
 
     try teardownRuntime(&runtime, &lua_ui, &scheduler, window_scope);
@@ -231,6 +235,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         .allocator = init.gpa,
         .id = id,
         .viewport = viewport,
+        .snapshot_scale = snapshot_scale,
         .color_scheme = color_scheme,
         .pixel_width = pixel_width,
         .pixel_height = pixel_height,
@@ -304,7 +309,7 @@ fn dispatchAndSettle(
         lua_ui,
         story.content_reference,
     );
-    try runtime.prepareFrame(story.viewport.scale);
+    try runtime.prepareFrame(story.snapshot_scale);
 }
 
 fn teardownRuntime(

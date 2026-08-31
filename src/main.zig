@@ -58,7 +58,7 @@ fn listStories(init: std.process.Init, options: cli.List) !void {
         var json: std.json.Stringify = .{ .writer = &output.writer, .options = .{ .whitespace = .indent_2 } };
         try json.beginObject();
         try json.objectField("schema_version");
-        try json.write(1);
+        try json.write(2);
         try json.objectField("title");
         try json.write(description.title);
         try json.objectField("stories");
@@ -69,14 +69,14 @@ fn listStories(init: std.process.Init, options: cli.List) !void {
         try output.writer.writeByte('\n');
     } else {
         for (description.stories) |story| try output.writer.print(
-            "{s}\t{s}\t{s}\t{d}x{d}@{d}\t{s}\n",
+            "{s}\t{s}\t{s}\t{d}x{d}\tsnapshot@{d}\t{s}\n",
             .{
                 story.id,
                 story.group,
                 story.name,
                 story.viewport.width,
                 story.viewport.height,
-                story.viewport.scale,
+                story.snapshot_scale,
                 @tagName(story.color_scheme),
             },
         );
@@ -104,7 +104,7 @@ fn snapshotStories(init: std.process.Init, options: cli.Snapshot) !void {
     if (options.json) {
         try json.beginObject();
         try json.objectField("schema_version");
-        try json.write(1);
+        try json.write(2);
         try json.objectField("stories");
         try json.beginArray();
     }
@@ -132,6 +132,8 @@ fn snapshotStories(init: std.process.Init, options: cli.Snapshot) !void {
             try json.write(&hash);
             try json.objectField("viewport");
             try writeViewportJson(&json, snapshot.viewport);
+            try json.objectField("snapshot_scale");
+            try json.write(snapshot.snapshot_scale);
             try json.objectField("color_scheme");
             try json.write(@tagName(snapshot.color_scheme));
             try json.objectField("pixel_width");
@@ -161,6 +163,8 @@ fn writeStoryJson(json: *std.json.Stringify, story: ourokit.app.storybook.StoryD
     try json.write(story.name);
     try json.objectField("viewport");
     try writeViewportJson(json, story.viewport);
+    try json.objectField("snapshot_scale");
+    try json.write(story.snapshot_scale);
     try json.objectField("color_scheme");
     try json.write(@tagName(story.color_scheme));
     try json.objectField("action_count");
@@ -174,8 +178,6 @@ fn writeViewportJson(json: *std.json.Stringify, viewport: ourokit.lua.StorybookV
     try json.write(viewport.width);
     try json.objectField("height");
     try json.write(viewport.height);
-    try json.objectField("scale");
-    try json.write(viewport.scale);
     try json.endObject();
 }
 
