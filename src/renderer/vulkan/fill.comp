@@ -12,7 +12,15 @@ layout(push_constant) uniform Push {
     int top;
     int right;
     int bottom;
-    uint source;
+    int shape_left;
+    int shape_top;
+    int shape_right;
+    int shape_bottom;
+    uint background;
+    uint border;
+    uint corner_radius;
+    uint border_width;
+    uint flags;
     uint source_over;
 };
 
@@ -31,6 +39,16 @@ uint sourceOver(uint source, uint destination) {
     return result;
 }
 
+bool insideRoundedRectangle(vec2 point, vec4 bounds, float radius_value) {
+    vec2 size = bounds.zw - bounds.xy;
+    if (size.x <= 0.0 || size.y <= 0.0) return false;
+    float radius = min(radius_value, min(size.x, size.y) * 0.5);
+    if (radius == 0.0) return true;
+    vec2 center = clamp(point, bounds.xy + radius, bounds.zw - radius);
+    vec2 delta = point - center;
+    return dot(delta, delta) <= radius * radius;
+}
+
 void main() {
     uint width = uint(right - left);
     uint index = gl_GlobalInvocationID.x;
@@ -39,8 +57,23 @@ void main() {
 
     uint x = uint(left) + index % width;
     uint y = uint(top) + index / width;
+    vec2 point = vec2(x, y) + vec2(0.5);
+    vec4 shape = vec4(shape_left, shape_top, shape_right, shape_bottom);
+    if (!insideRoundedRectangle(point, shape, float(corner_radius))) return;
+    uint inset = min(border_width, uint(min(shape.z - shape.x, shape.w - shape.y)) / 2u);
+    float inset_value = float(inset);
+    vec4 inner = shape + vec4(inset_value, inset_value, -inset_value, -inset_value);
+    bool in_inner = insideRoundedRectangle(point, inner, float(corner_radius > inset ? corner_radius - inset : 0u));
+    uint source;
+    if ((flags & 2u) != 0u && !in_inner) {
+        source = border;
+    } else if ((flags & 1u) != 0u) {
+        source = background;
+    } else {
+        return;
+    }
     uint offset = y * target_width + x;
-    pixels[offset] = source_over != 0u
+    pixels[offset] = source_over != 0u && channel(source, 24u) != 255u
         ? sourceOver(source, pixels[offset])
         : source;
 }

@@ -690,10 +690,14 @@ pub const DmabufTarget = struct {
 };
 
 const PresentationPush = extern struct {
-    color: [4]f32,
+    background: [4]f32,
+    border: [4]f32,
     target_size: [2]f32,
-    padding: [2]f32 = .{ 0, 0 },
+    corner_radius: f32,
+    border_width: f32,
     bounds: [4]i32,
+    has_background: u32,
+    has_border: u32,
 };
 
 const Push = extern struct {
@@ -702,7 +706,15 @@ const Push = extern struct {
     top: i32,
     right: i32,
     bottom: i32,
-    source: u32,
+    shape_left: i32,
+    shape_top: i32,
+    shape_right: i32,
+    shape_bottom: i32,
+    background: u32,
+    border: u32,
+    corner_radius: u32,
+    border_width: u32,
+    flags: u32,
     source_over: u32,
 };
 
@@ -1654,6 +1666,11 @@ fn renderPresentationRegion(
             if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
                 self.presentationFill(target, bounds, rectangle.color, rectangle.blend);
         },
+        .decorated_rectangle => |rectangle| self.presentationDecoratedRectangle(
+            target,
+            RectI.intersect(rectangle.bounds, clips[depth]),
+            rectangle,
+        ),
         .glyph_run => |run| self.drawPresentationGlyphRun(
             run,
             target,
@@ -1710,14 +1727,66 @@ fn presentationFill(
     const right = @as(i64, bounds.x) + bounds.width;
     const bottom = @as(i64, bounds.y) + bounds.height;
     const push: PresentationPush = .{
-        .color = .{
+        .background = .{
             @as(f32, @floatFromInt(source.r)) / 255,
             @as(f32, @floatFromInt(source.g)) / 255,
             @as(f32, @floatFromInt(source.b)) / 255,
             @as(f32, @floatFromInt(source.a)) / 255,
         },
+        .border = .{ 0, 0, 0, 0 },
         .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
+        .corner_radius = 0,
+        .border_width = 0,
         .bounds = .{ bounds.x, bounds.y, @intCast(right), @intCast(bottom) },
+        .has_background = 1,
+        .has_border = 0,
+    };
+    c.vkCmdPushConstants(
+        target.command_buffer,
+        self.presentation_pipeline_layout,
+        c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
+        0,
+        @sizeOf(PresentationPush),
+        &push,
+    );
+    c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
+}
+
+fn presentationDecoratedRectangle(
+    self: *Renderer,
+    target: *const DmabufTarget,
+    clipped_bounds: RectI,
+    rectangle: scene.DecoratedRectangle,
+) void {
+    if (clipped_bounds.isEmpty()) return;
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_pipeline);
+    var scissor: c.VkRect2D = .{
+        .offset = .{ .x = clipped_bounds.x, .y = clipped_bounds.y },
+        .extent = .{ .width = clipped_bounds.width, .height = clipped_bounds.height },
+    };
+    var viewport: c.VkViewport = .{
+        .x = @floatFromInt(clipped_bounds.x),
+        .y = @floatFromInt(clipped_bounds.y),
+        .width = @floatFromInt(clipped_bounds.width),
+        .height = @floatFromInt(clipped_bounds.height),
+        .minDepth = 0,
+        .maxDepth = 1,
+    };
+    c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
+    c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
+    const background = if (rectangle.background) |color| color.premultiplied() else Color.rgba(0, 0, 0, 0).premultiplied();
+    const border = if (rectangle.border_color) |color| color.premultiplied() else Color.rgba(0, 0, 0, 0).premultiplied();
+    const right = @as(i64, rectangle.bounds.x) + rectangle.bounds.width;
+    const bottom = @as(i64, rectangle.bounds.y) + rectangle.bounds.height;
+    const push: PresentationPush = .{
+        .background = normalizedColor(background),
+        .border = normalizedColor(border),
+        .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
+        .corner_radius = @floatFromInt(rectangle.corner_radius),
+        .border_width = @floatFromInt(rectangle.border_width),
+        .bounds = .{ rectangle.bounds.x, rectangle.bounds.y, @intCast(right), @intCast(bottom) },
+        .has_background = @intFromBool(rectangle.background != null),
+        .has_border = @intFromBool(rectangle.border_color != null),
     };
     c.vkCmdPushConstants(
         target.command_buffer,
@@ -1767,6 +1836,11 @@ fn renderRegion(
             if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
                 self.fill(target, bounds, rectangle.color, rectangle.blend);
         },
+        .decorated_rectangle => |rectangle| self.decoratedRectangle(
+            target,
+            RectI.intersect(rectangle.bounds, clips[depth]),
+            rectangle,
+        ),
         .glyph_run => |run| self.drawGlyphRun(
             run,
             target,
@@ -1787,10 +1861,15 @@ fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, ble
         .top = bounds.y,
         .right = @intCast(@as(i64, bounds.x) + bounds.width),
         .bottom = @intCast(@as(i64, bounds.y) + bounds.height),
-        .source = @as(u32, if (target.format == .rgba) source.r else source.b) |
-            (@as(u32, source.g) << 8) |
-            (@as(u32, if (target.format == .rgba) source.b else source.r) << 16) |
-            (@as(u32, source.a) << 24),
+        .shape_left = bounds.x,
+        .shape_top = bounds.y,
+        .shape_right = @intCast(@as(i64, bounds.x) + bounds.width),
+        .shape_bottom = @intCast(@as(i64, bounds.y) + bounds.height),
+        .background = packedColor(source, target.format),
+        .border = 0,
+        .corner_radius = 0,
+        .border_width = 0,
+        .flags = 1,
         .source_over = @intFromBool(blend == .source_over and source.a != 255),
     };
     c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
@@ -1814,6 +1893,73 @@ fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, ble
         0,
         null,
     );
+}
+
+fn decoratedRectangle(
+    self: *Renderer,
+    target: *const Target,
+    clipped_bounds: RectI,
+    rectangle: scene.DecoratedRectangle,
+) void {
+    if (clipped_bounds.isEmpty()) return;
+    c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+    const background = if (rectangle.background) |color| color.premultiplied() else Color.rgba(0, 0, 0, 0).premultiplied();
+    const border = if (rectangle.border_color) |color| color.premultiplied() else Color.rgba(0, 0, 0, 0).premultiplied();
+    const push: Push = .{
+        .target_width = target.width,
+        .left = clipped_bounds.x,
+        .top = clipped_bounds.y,
+        .right = @intCast(@as(i64, clipped_bounds.x) + clipped_bounds.width),
+        .bottom = @intCast(@as(i64, clipped_bounds.y) + clipped_bounds.height),
+        .shape_left = rectangle.bounds.x,
+        .shape_top = rectangle.bounds.y,
+        .shape_right = @intCast(@as(i64, rectangle.bounds.x) + rectangle.bounds.width),
+        .shape_bottom = @intCast(@as(i64, rectangle.bounds.y) + rectangle.bounds.height),
+        .background = packedColor(background, target.format),
+        .border = packedColor(border, target.format),
+        .corner_radius = rectangle.corner_radius,
+        .border_width = rectangle.border_width,
+        .flags = @as(u32, @intFromBool(rectangle.background != null)) |
+            (@as(u32, @intFromBool(rectangle.border_color != null)) << 1),
+        .source_over = @intFromBool(rectangle.blend == .source_over),
+    };
+    c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
+    const count = @as(u64, clipped_bounds.width) * clipped_bounds.height;
+    c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+    var barrier: c.VkMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = null,
+        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    c.vkCmdPipelineBarrier(
+        self.command_buffer,
+        c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1,
+        &barrier,
+        0,
+        null,
+        0,
+        null,
+    );
+}
+
+fn packedColor(source: @import("../../core/color.zig").PremultipliedSrgba8, format: StorageFormat) u32 {
+    return @as(u32, if (format == .rgba) source.r else source.b) |
+        (@as(u32, source.g) << 8) |
+        (@as(u32, if (format == .rgba) source.b else source.r) << 16) |
+        (@as(u32, source.a) << 24);
+}
+
+fn normalizedColor(source: @import("../../core/color.zig").PremultipliedSrgba8) [4]f32 {
+    return .{
+        @as(f32, @floatFromInt(source.r)) / 255,
+        @as(f32, @floatFromInt(source.g)) / 255,
+        @as(f32, @floatFromInt(source.b)) / 255,
+        @as(f32, @floatFromInt(source.a)) / 255,
+    };
 }
 
 fn prepareText(commands: []const scene.Command, glyphs: *GlyphCache, shapes: *const text.ShapeCache) !void {

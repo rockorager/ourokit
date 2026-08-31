@@ -20,6 +20,15 @@ pub const GlyphRun = struct {
     color: Color,
 };
 
+pub const DecoratedRectangle = struct {
+    bounds: RectI,
+    background: ?Color = null,
+    border_color: ?Color = null,
+    border_width: u32 = 0,
+    corner_radius: u32 = 0,
+    blend: BlendMode = .source_over,
+};
+
 /// Renderer-neutral, value-only painting vocabulary. Clip commands are
 /// balanced and affect subsequent drawing until `pop_clip`.
 pub const Command = union(enum) {
@@ -31,6 +40,7 @@ pub const Command = union(enum) {
         color: Color,
         blend: BlendMode = .source_over,
     },
+    decorated_rectangle: DecoratedRectangle,
     /// One immutable, already-shaped itemized run. `origin` is the device-space
     /// baseline and `scale` converts the run's logical positions to pixels.
     glyph_run: GlyphRun,
@@ -63,6 +73,12 @@ pub const DisplayList = struct {
                 depth -= 1;
             },
             .solid_rectangle => {},
+            .decorated_rectangle => |rectangle| {
+                if (rectangle.background == null and rectangle.border_color == null)
+                    return error.EmptyDecoratedRectangle;
+                if ((rectangle.border_width == 0) != (rectangle.border_color == null))
+                    return error.InvalidDecoratedRectangleBorder;
+            },
             .glyph_run => |run| {
                 if (run.shape.generation == 0 or
                     !std.math.isFinite(run.origin.x) or
@@ -111,6 +127,16 @@ pub fn occludedByNextDraw(
             if (covered.isEmpty()) continue;
             return (rectangle.blend == .source or rectangle.color.a == 255) and
                 contains(covered, bounds);
+        },
+        .decorated_rectangle => |rectangle| {
+            if (rectangle.corner_radius != 0) return false;
+            const covered = RectI.intersect(rectangle.bounds, clips[depth]);
+            if (covered.isEmpty()) continue;
+            const background = rectangle.background orelse return false;
+            const fully_opaque = rectangle.blend == .source or
+                (background.a == 255 and
+                    (rectangle.border_color == null or rectangle.border_color.?.a == 255));
+            return fully_opaque and contains(covered, bounds);
         },
         .glyph_run => if (!clips[depth].isEmpty()) return false,
     };

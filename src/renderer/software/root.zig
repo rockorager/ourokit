@@ -97,6 +97,10 @@ fn renderRegion(
             if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
                 fill(target, bounds, rectangle.color, rectangle.blend);
         },
+        .decorated_rectangle => |rectangle| {
+            const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
+            drawDecoratedRectangle(target, bounds, rectangle);
+        },
         .glyph_run => |run| {
             if (scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;
             if (!has_freetype) return error.FreeTypeDisabled;
@@ -206,6 +210,64 @@ fn fill(target: Target, bounds: RectI, color: Color, blend: scene.BlendMode) voi
             writePixel(target.format, target.pixels[offset..][0..4], sourceOver(source, destination));
         }
     }
+}
+
+fn drawDecoratedRectangle(
+    target: Target,
+    clipped_bounds: RectI,
+    rectangle: scene.DecoratedRectangle,
+) void {
+    if (clipped_bounds.isEmpty()) return;
+    const left: u32 = @intCast(clipped_bounds.x);
+    const top: u32 = @intCast(clipped_bounds.y);
+    const right: u32 = @intCast(@as(i64, clipped_bounds.x) + clipped_bounds.width);
+    const bottom: u32 = @intCast(@as(i64, clipped_bounds.y) + clipped_bounds.height);
+    const inset = @min(rectangle.border_width, @min(rectangle.bounds.width, rectangle.bounds.height) / 2);
+    const inner: RectI = .{
+        .x = rectangle.bounds.x + @as(i32, @intCast(inset)),
+        .y = rectangle.bounds.y + @as(i32, @intCast(inset)),
+        .width = rectangle.bounds.width - 2 * inset,
+        .height = rectangle.bounds.height - 2 * inset,
+    };
+    const inner_radius = rectangle.corner_radius -| inset;
+    for (top..bottom) |y| {
+        for (left..right) |x| {
+            if (!insideRoundedRectangle(rectangle.bounds, rectangle.corner_radius, x, y)) continue;
+            const color = if (rectangle.border_color) |border|
+                if (!insideRoundedRectangle(inner, inner_radius, x, y)) border else rectangle.background orelse continue
+            else
+                rectangle.background orelse continue;
+            blendPixel(target, x, y, color, rectangle.blend);
+        }
+    }
+}
+
+fn insideRoundedRectangle(bounds: RectI, radius_value: u32, x: usize, y: usize) bool {
+    if (bounds.isEmpty()) return false;
+    const radius: f64 = @floatFromInt(@min(radius_value, @min(bounds.width, bounds.height) / 2));
+    if (radius == 0) return true;
+    const px: f64 = @as(f64, @floatFromInt(x)) + 0.5;
+    const py: f64 = @as(f64, @floatFromInt(y)) + 0.5;
+    const left: f64 = @floatFromInt(bounds.x);
+    const top: f64 = @floatFromInt(bounds.y);
+    const right = left + @as(f64, @floatFromInt(bounds.width));
+    const bottom = top + @as(f64, @floatFromInt(bounds.height));
+    const center_x = std.math.clamp(px, left + radius, right - radius);
+    const center_y = std.math.clamp(py, top + radius, bottom - radius);
+    const dx = px - center_x;
+    const dy = py - center_y;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+fn blendPixel(target: Target, x: usize, y: usize, color: Color, blend: scene.BlendMode) void {
+    const source = color.premultiplied();
+    const offset = y * target.stride + x * 4;
+    if (blend == .source or source.a == 255) {
+        writePixel(target.format, target.pixels[offset..][0..4], source);
+        return;
+    }
+    const destination = readPixel(target.format, target.pixels[offset..][0..4]);
+    writePixel(target.format, target.pixels[offset..][0..4], sourceOver(source, destination));
 }
 
 fn fillSource(target: Target, bounds: RectI, source: PremultipliedSrgba8) void {

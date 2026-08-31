@@ -359,6 +359,7 @@ pub const UiBuild = struct {
                 .height = height,
                 .padding = .all(design.tokens.foundation.spacing_3),
                 .background = if (enabled) style.idle else style.disabled,
+                .corner_radius = design.tokens.foundation.corner_radius_medium,
             } },
             .parent_data = declarativeParentData(self, state, 1) orelse
                 return luaError(state, "invalid button position"),

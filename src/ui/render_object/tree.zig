@@ -313,7 +313,15 @@ pub const Tree = struct {
         };
         const clips = switch (target.object) {
             .box => |value| paint: {
-                if (value.background) |color| try builder.solidRectangle(bounds, color);
+                if (value.border_color != null or value.corner_radius != 0) {
+                    try builder.decoratedRectangle(
+                        bounds,
+                        value.background,
+                        value.border_color,
+                        value.border_width,
+                        value.corner_radius,
+                    );
+                } else if (value.background) |color| try builder.solidRectangle(bounds, color);
                 break :paint value.clip;
             },
             .flex => false,
@@ -474,6 +482,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .box => |old_box| changed: {
             const new_box = new.box;
             break :changed old_box.width != new_box.width or old_box.height != new_box.height or
+                old_box.border_width != new_box.border_width or
                 !std.meta.eql(old_box.padding, new_box.padding);
         },
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
@@ -596,6 +605,34 @@ test "box padding participates in constraints and child changes invalidate ances
         try tree.layout(root, .{ .max_width = 100, .max_height = 100 }),
     );
     try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(root));
+}
+
+test "box border participates in layout and lowers decoration" {
+    const scene = @import("../../scene/root.zig");
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    const root = try tree.create(.{ .box = .{
+        .padding = .all(2),
+        .background = Color.rgba(1, 2, 3, 255),
+        .border_color = Color.rgba(4, 5, 6, 255),
+        .border_width = 1,
+        .corner_radius = 4,
+    } });
+    const child = try tree.create(.{ .box = .{ .width = 10, .height = 5 } });
+    try tree.appendChild(root, child, .none);
+    try std.testing.expectEqual(
+        SizeF{ .width = 16, .height = 11 },
+        try tree.layout(root, .{ .max_width = 100, .max_height = 100 }),
+    );
+    try std.testing.expectEqual(PointF{ .x = 3, .y = 3 }, try tree.nodeOffset(child));
+
+    var commands: [1]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 2);
+    try tree.buildScene(root, &builder);
+    const decoration = builder.displayList().commands[0].decorated_rectangle;
+    try std.testing.expectEqual(@as(u32, 2), decoration.border_width);
+    try std.testing.expectEqual(@as(u32, 8), decoration.corner_radius);
 }
 
 test "render-object topology rejects cycles and stale generations" {

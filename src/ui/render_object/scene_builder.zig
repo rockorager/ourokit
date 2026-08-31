@@ -29,6 +29,26 @@ pub const Builder = struct {
         if (!device.isEmpty()) try self.append(.{ .solid_rectangle = .{ .bounds = device, .color = color } });
     }
 
+    pub fn decoratedRectangle(
+        self: *Builder,
+        bounds: RectF,
+        background: ?Color,
+        border_color: ?Color,
+        border_width: f32,
+        corner_radius: f32,
+    ) !void {
+        const device = try self.deviceRect(bounds);
+        if (device.isEmpty()) return;
+        const maximum = @min(device.width, device.height) / 2;
+        try self.append(.{ .decorated_rectangle = .{
+            .bounds = device,
+            .background = background,
+            .border_color = border_color,
+            .border_width = @min(try self.deviceExtent(border_width), maximum),
+            .corner_radius = @min(try self.deviceExtent(corner_radius), maximum),
+        } });
+    }
+
     pub fn pushClip(self: *Builder, bounds: RectF) !void {
         try self.append(.{ .push_clip_rect = try self.deviceRect(bounds) });
     }
@@ -83,6 +103,14 @@ pub const Builder = struct {
             .height = @intFromFloat(@max(0, bottom64 - top64)),
         };
     }
+
+    fn deviceExtent(self: *const Builder, value: f32) !u32 {
+        if (value == 0) return 0;
+        const scaled = @ceil(@as(f64, value) * self.scale);
+        if (!std.math.isFinite(scaled) or scaled > @as(f64, @floatFromInt(std.math.maxInt(u32))))
+            return error.DeviceExtentOverflow;
+        return @intFromFloat(scaled);
+    }
 };
 
 fn validRect(rect: RectF) bool {
@@ -102,4 +130,15 @@ test "scene lowering scales logical rectangles conservatively" {
         RectI{ .x = 2, .y = 5, .width = 8, .height = 9 },
         builder.displayList().commands[0].solid_rectangle.bounds,
     );
+
+    try builder.decoratedRectangle(
+        .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        Color.rgba(4, 5, 6, 255),
+        Color.rgba(7, 8, 9, 255),
+        0.5,
+        2.25,
+    );
+    const decorated = builder.displayList().commands[1].decorated_rectangle;
+    try std.testing.expectEqual(@as(u32, 1), decorated.border_width);
+    try std.testing.expectEqual(@as(u32, 5), decorated.corner_radius);
 }

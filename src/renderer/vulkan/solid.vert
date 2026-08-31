@@ -1,13 +1,15 @@
 #version 450
 
 layout(push_constant) uniform Push {
-    vec4 color;
+    vec4 background;
+    vec4 border;
     vec2 target_size;
-    vec2 padding;
+    float corner_radius;
+    float border_width;
     ivec4 bounds;
+    uint has_background;
+    uint has_border;
 };
-
-layout(location = 0) out vec4 fragment_color;
 
 void main() {
     const vec2 corners[6] = vec2[6](
@@ -16,5 +18,4 @@ void main() {
     );
     vec2 position = corners[gl_VertexIndex] * 2.0 - 1.0;
     gl_Position = vec4(position, 0.0, 1.0);
-    fragment_color = color;
 }

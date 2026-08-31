@@ -41,6 +41,22 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
                 @tagName(rectangle.blend),
             },
         ),
+        .decorated_rectangle => |rectangle| try append(
+            output,
+            &used,
+            "decorated_rectangle x={d} y={d} width={d} height={d} radius={d} border_width={d} background={any} border={any} blend={s}\n",
+            .{
+                rectangle.bounds.x,
+                rectangle.bounds.y,
+                rectangle.bounds.width,
+                rectangle.bounds.height,
+                rectangle.corner_radius,
+                rectangle.border_width,
+                rectangle.background,
+                rectangle.border_color,
+                @tagName(rectangle.blend),
+            },
+        ),
         .glyph_run => |run| try append(
             output,
             &used,

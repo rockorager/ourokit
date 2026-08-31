@@ -7,6 +7,9 @@ pub const Box = struct {
     height: ?f32 = null,
     padding: Insets = .{},
     background: ?Color = null,
+    border_color: ?Color = null,
+    border_width: f32 = 0,
+    corner_radius: f32 = 0,
     clip: bool = false,
 };
 
