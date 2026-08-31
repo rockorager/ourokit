@@ -76,6 +76,8 @@ pub fn runSource(
     };
     var snapshot_owned = true;
     defer if (snapshot_owned) snapshot.deinit();
+    const module_root = try provider.openModuleRoot(init.io);
+    defer if (module_root) |directory| directory.close(init.io);
 
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 128, 32);
@@ -129,15 +131,31 @@ pub fn runSource(
     };
     // SourceGeneration consumes the snapshot on both success and failure.
     snapshot_owned = false;
-    const initial_generation = try SourceGeneration.create(
-        init.gpa,
-        &scheduler,
-        &loop,
-        snapshot,
-        services,
-        generation_config,
-        &diagnostic,
-    );
+    const initial_generation = if (module_root) |directory|
+        try SourceGeneration.createBootstrap(
+            init.gpa,
+            &scheduler,
+            &loop,
+            snapshot,
+            directory.handle,
+            services,
+            generation_config,
+            &diagnostic,
+        )
+    else
+        try SourceGeneration.create(
+            init.gpa,
+            &scheduler,
+            &loop,
+            snapshot,
+            services,
+            generation_config,
+            &diagnostic,
+        );
+    var initial_generation_owned = true;
+    errdefer if (initial_generation_owned) initial_generation.destroy();
+    if (!initial_generation.application_ready)
+        try finishInitialBootstrap(initial_generation, &scheduler, &loop, &diagnostic);
     var source_reload: SourceReload = undefined;
     source_reload.init(
         init.gpa,
@@ -149,6 +167,7 @@ pub fn runSource(
         generation_config,
         initial_generation,
     );
+    initial_generation_owned = false;
     defer source_reload.deinit();
     const application = &source_reload.active().application;
     if (application.windows.len > options.application_window_capacity)
@@ -384,6 +403,35 @@ pub fn runSource(
         }
     }
     if (host.failure) |failure| return failure;
+}
+
+fn finishInitialBootstrap(
+    generation: *SourceGeneration,
+    scheduler: *task.Scheduler,
+    loop: *io_loop.Loop,
+    diagnostic: *?lua.Diagnostic,
+) !void {
+    while (!generation.application_ready) {
+        while (scheduler.takeRunnable()) |runnable|
+            _ = generation.resumeRunnable(runnable, diagnostic) catch |err| {
+                lua.recordDiagnosticError(
+                    diagnostic,
+                    generation.allocator,
+                    .evaluate,
+                    generation.snapshot.entry_name,
+                    err,
+                );
+                return err;
+            };
+        if (generation.application_ready) return;
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .file => |completion| if (!(try generation.dispatchFile(completion)))
+                return error.UnownedIoCompletion,
+            .operation_cancel => {},
+            else => return error.UnexpectedBootstrapCompletion,
+        }
+    }
 }
 
 /// Runs the complete disk-read, candidate-build, and application commit at the
