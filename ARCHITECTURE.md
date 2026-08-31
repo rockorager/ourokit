@@ -373,13 +373,16 @@ touching unsafe boundaries are conservatively reshaped with full paragraph
 context; a changed advance returns `error.ReflowRequired` so stale wrap choices
 cannot reach a renderer. Renderers never perform this text policy.
 
-Positioned paragraph output remains owned by `text` until the scene has direct
-font-resource leases. Owned frames now retain existing `ShapeHandle` commands
-through the application-owned shape cache, making current single-run labels safe
-for asynchronous consumption. The existing one-handle glyph command still
-cannot faithfully represent wrapped mixed-direction, multi-font lines and will
-not be stretched into an accidental paragraph ABI. Direct positioned-span
-leases and Label/render-object lowering are the next integration step.
+Positioned paragraph output is owned by an application-scoped `ParagraphCache`.
+Its width-specific immutable entries live behind generation-checked handles,
+deduplicate complete layout requests, and retain their ordered fallback fonts.
+The scene's paragraph command references one such handle; owned frames lease it
+until rendering completes. Software, Vulkan compute, and Vulkan dma-buf
+presentation consume the same already-positioned visual spans. The existing
+single-run glyph command remains a deliberately narrower shape-cache ABI rather
+than being stretched to represent wrapped mixed-direction lines. Retained Label
+lowering is the next integration step and must cache width-specific acquisition
+outside unchanged steady-state layout rather than introducing per-frame work.
 Empty-line metrics remain an open line-style policy rather than inheriting an
 arbitrary fallback face by accident.
 Fontconfig provides candidate order and a coverage prefilter, not a shaping

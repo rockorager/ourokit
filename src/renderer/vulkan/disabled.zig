@@ -67,6 +67,27 @@ pub fn renderDmabufText(
     return error.VulkanDisabled;
 }
 
+pub fn renderDmabufParagraphs(
+    _: *Renderer,
+    _: scene.DisplayList,
+    _: *DmabufTarget,
+    _: *GlyphCache,
+    _: *const text.ParagraphCache,
+) !void {
+    return error.VulkanDisabled;
+}
+
+pub fn renderDmabufTextResources(
+    _: *Renderer,
+    _: scene.DisplayList,
+    _: *DmabufTarget,
+    _: *GlyphCache,
+    _: ?*const text.ShapeCache,
+    _: ?*const text.ParagraphCache,
+) !void {
+    return error.VulkanDisabled;
+}
+
 pub fn supportsDmabuf(_: *const Renderer) bool {
     return false;
 }

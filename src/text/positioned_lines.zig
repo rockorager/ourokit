@@ -30,6 +30,8 @@ pub const Span = struct {
 pub const Line = struct {
     byte_start: usize,
     byte_len: usize,
+    /// Logical top edge relative to the paragraph origin.
+    top: f32,
     advance: f32,
     ascender: f32,
     descender: f32,
@@ -61,6 +63,18 @@ pub const PositionedLines = struct {
 
     pub fn glyphsFor(self: *const PositionedLines, span: Span) []const Glyph {
         return self.glyphs[span.glyph_start..][0..span.glyph_count];
+    }
+
+    pub fn width(self: *const PositionedLines) f32 {
+        var result: f32 = 0;
+        for (self.lines) |line| result = @max(result, line.advance);
+        return result;
+    }
+
+    pub fn height(self: *const PositionedLines) f32 {
+        if (self.lines.len == 0) return 0;
+        const last = self.lines[self.lines.len - 1];
+        return last.top + @max(0, last.ascender - last.descender + last.line_gap);
     }
 };
 
@@ -99,6 +113,7 @@ pub fn positionLines(
     var glyphs: std.ArrayList(Glyph) = .empty;
     errdefer glyphs.deinit(allocator);
     try lines.ensureTotalCapacity(allocator, selected.lines.len);
+    var line_top: f32 = 0;
 
     for (selected.lines) |selected_line| {
         if (!std.math.isFinite(selected_line.advance) or selected_line.advance < 0)
@@ -137,9 +152,13 @@ pub fn positionLines(
 
         var metrics: api.Metrics = .{ .ascender = 0, .descender = 0, .line_gap = 0 };
         for (fragments.items) |*fragment| mergeMetrics(&metrics, fragment.result().metrics);
+        const line_height = @max(0, metrics.ascender - metrics.descender + metrics.line_gap);
+        if (!std.math.isFinite(line_height) or !std.math.isFinite(line_top))
+            return error.InvalidShaping;
         lines.appendAssumeCapacity(.{
             .byte_start = selected_line.byte_start,
             .byte_len = selected_line.byte_len,
+            .top = line_top,
             .advance = pen_x,
             .ascender = metrics.ascender,
             .descender = metrics.descender,
@@ -150,6 +169,7 @@ pub fn positionLines(
             .glyph_start = line_glyph_start,
             .glyph_count = glyphs.items.len - line_glyph_start,
         });
+        line_top += line_height;
     }
 
     const owned_lines = try lines.toOwnedSlice(allocator);

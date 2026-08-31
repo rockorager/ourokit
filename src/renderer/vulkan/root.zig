@@ -1335,7 +1335,7 @@ fn modifierPlaneCount(self: *const Renderer, modifier: u64) ?u32 {
 }
 
 pub fn render(self: *Renderer, list: scene.DisplayList, target: *Target) !void {
-    return self.renderInternal(list, target, null, null);
+    return self.renderInternal(list, target, null, null, null);
 }
 
 pub fn renderText(
@@ -1346,7 +1346,30 @@ pub fn renderText(
     shapes: *const text.ShapeCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return self.renderInternal(list, target, glyphs, shapes);
+    return self.renderInternal(list, target, glyphs, shapes, null);
+}
+
+pub fn renderParagraphs(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *Target,
+    glyphs: *GlyphCache,
+    paragraphs: *const text.ParagraphCache,
+) !void {
+    return self.renderTextResources(list, target, glyphs, null, paragraphs);
+}
+
+/// Renders a display list containing either or both text command kinds.
+pub fn renderTextResources(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *Target,
+    glyphs: *GlyphCache,
+    shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
+) !void {
+    if (!has_freetype) return error.FreeTypeDisabled;
+    return self.renderInternal(list, target, glyphs, shapes, paragraphs);
 }
 
 fn renderInternal(
@@ -1355,10 +1378,11 @@ fn renderInternal(
     target: *Target,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
 ) !void {
     try list.validate();
-    try validateClipDepth(list.commands, glyphs != null);
-    if (glyphs) |cache| try prepareText(list.commands, cache, shapes orelse return error.TextResourcesRequired);
+    try validateClipDepth(list.commands, shapes != null, paragraphs != null);
+    if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
     try vk(c.vkResetDescriptorPool(self.device, self.descriptor_pool, 0), error.ResetDescriptorPoolFailed);
     var descriptor_allocate_info: c.VkDescriptorSetAllocateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1436,10 +1460,10 @@ fn renderInternal(
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes),
+        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes);
+            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs);
         },
     }
     var host_barrier: c.VkMemoryBarrier = .{
@@ -1483,7 +1507,7 @@ fn renderInternal(
 /// for the GPU. Slot reuse must additionally wait for `ready` and compositor
 /// release.
 pub fn renderDmabuf(self: *Renderer, list: scene.DisplayList, target: *DmabufTarget) !void {
-    return self.renderDmabufInternal(list, target, null, null);
+    return self.renderDmabufInternal(list, target, null, null, null);
 }
 
 pub fn renderDmabufText(
@@ -1494,7 +1518,29 @@ pub fn renderDmabufText(
     shapes: *const text.ShapeCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return self.renderDmabufInternal(list, target, glyphs, shapes);
+    return self.renderDmabufInternal(list, target, glyphs, shapes, null);
+}
+
+pub fn renderDmabufParagraphs(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *DmabufTarget,
+    glyphs: *GlyphCache,
+    paragraphs: *const text.ParagraphCache,
+) !void {
+    return self.renderDmabufTextResources(list, target, glyphs, null, paragraphs);
+}
+
+pub fn renderDmabufTextResources(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *DmabufTarget,
+    glyphs: *GlyphCache,
+    shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
+) !void {
+    if (!has_freetype) return error.FreeTypeDisabled;
+    return self.renderDmabufInternal(list, target, glyphs, shapes, paragraphs);
 }
 
 fn renderDmabufInternal(
@@ -1503,10 +1549,11 @@ fn renderDmabufInternal(
     target: *DmabufTarget,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
 ) !void {
     try list.validate();
-    try validateClipDepth(list.commands, glyphs != null);
-    if (glyphs) |cache| try prepareText(list.commands, cache, shapes orelse return error.TextResourcesRequired);
+    try validateClipDepth(list.commands, shapes != null, paragraphs != null);
+    if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
     if (!try target.ready(self)) return error.TargetBusy;
     try vk(c.vkResetCommandBuffer(target.command_buffer, 0), error.ResetCommandBufferFailed);
     var begin_info: c.VkCommandBufferBeginInfo = .{
@@ -1582,10 +1629,10 @@ fn renderDmabufInternal(
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes),
+        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes);
+            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs);
         },
     }
     c.vkCmdEndRenderPass(target.command_buffer);
@@ -1649,6 +1696,7 @@ fn renderPresentationRegion(
     damage: RectI,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
 ) void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
@@ -1677,6 +1725,13 @@ fn renderPresentationRegion(
             clips[depth],
             glyphs orelse unreachable,
             shapes orelse unreachable,
+        ),
+        .paragraph => |paragraph| self.drawPresentationParagraph(
+            paragraph,
+            target,
+            clips[depth],
+            glyphs orelse unreachable,
+            paragraphs orelse unreachable,
         ),
     };
 }
@@ -1799,7 +1854,11 @@ fn presentationDecoratedRectangle(
     c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
 }
 
-fn validateClipDepth(commands: []const scene.Command, allow_text: bool) !void {
+fn validateClipDepth(
+    commands: []const scene.Command,
+    allow_shapes: bool,
+    allow_paragraphs: bool,
+) !void {
     var depth: usize = 0;
     for (commands) |command| switch (command) {
         .push_clip_rect => {
@@ -1807,7 +1866,8 @@ fn validateClipDepth(commands: []const scene.Command, allow_text: bool) !void {
             depth += 1;
         },
         .pop_clip => depth -= 1,
-        .glyph_run => if (!allow_text) return error.TextResourcesRequired,
+        .glyph_run => if (!allow_shapes) return error.TextResourcesRequired,
+        .paragraph => if (!allow_paragraphs) return error.TextResourcesRequired,
         else => {},
     };
 }
@@ -1819,6 +1879,7 @@ fn renderRegion(
     damage: RectI,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
 ) void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
@@ -1847,6 +1908,13 @@ fn renderRegion(
             clips[depth],
             glyphs orelse unreachable,
             shapes orelse unreachable,
+        ),
+        .paragraph => |paragraph| self.drawParagraph(
+            paragraph,
+            target,
+            clips[depth],
+            glyphs orelse unreachable,
+            paragraphs orelse unreachable,
         ),
     };
 }
@@ -1962,13 +2030,26 @@ fn normalizedColor(source: @import("../../core/color.zig").PremultipliedSrgba8) 
     };
 }
 
-fn prepareText(commands: []const scene.Command, glyphs: *GlyphCache, shapes: *const text.ShapeCache) !void {
+fn prepareText(
+    commands: []const scene.Command,
+    glyphs: *GlyphCache,
+    shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
+) !void {
     for (commands) |command| switch (command) {
         .glyph_run => |run| {
-            const shaped = try shapes.get(run.shape);
+            const shaped = try (shapes orelse return error.TextResourcesRequired).get(run.shape);
             for (shaped.spans) |span| {
                 for (span.run.glyphs) |glyph| {
                     _ = try glyphs.get(span.font, glyph.id, shaped.logical_size * run.scale);
+                }
+            }
+        },
+        .paragraph => |paragraph_command| {
+            const layout = try (paragraphs orelse return error.TextResourcesRequired).get(paragraph_command.layout);
+            for (layout.positioned.spans) |span| {
+                for (layout.positioned.glyphsFor(span)) |glyph| {
+                    _ = try glyphs.get(span.font, glyph.id, layout.logical_size * paragraph_command.scale);
                 }
             }
         },
@@ -2093,6 +2174,65 @@ fn drawPresentationGlyphRun(
         pen.x += glyph.advance.x * command.scale;
         pen.y -= glyph.advance.y * command.scale;
     };
+}
+
+fn drawPresentationParagraph(
+    self: *Renderer,
+    command: scene.Paragraph,
+    target: *const DmabufTarget,
+    clip: RectI,
+    cache: *GlyphCache,
+    paragraphs: *const text.ParagraphCache,
+) void {
+    const layout = paragraphs.get(command.layout) catch unreachable;
+    const color = command.color.premultiplied();
+    for (layout.positioned.lines) |line| {
+        const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
+        for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
+            const atlas = cache.get(span.font, glyph.id, layout.logical_size * command.scale) catch unreachable;
+            const left: i32 = @intFromFloat(@round(command.origin.x + glyph.origin.x * command.scale));
+            const glyph_baseline: i32 = @intFromFloat(@round(baseline + glyph.origin.y * command.scale));
+            const glyph_bounds: RectI = .{
+                .x = left + atlas.left,
+                .y = glyph_baseline - atlas.top,
+                .width = atlas.width,
+                .height = atlas.height,
+            };
+            const bounds = RectI.intersect(clip, glyph_bounds);
+            if (!bounds.isEmpty()) {
+                var scissor: c.VkRect2D = .{
+                    .offset = .{ .x = bounds.x, .y = bounds.y },
+                    .extent = .{ .width = bounds.width, .height = bounds.height },
+                };
+                c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_glyph_pipeline);
+                c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_glyph_pipeline_layout, 0, 1, &cache.descriptor_set, 0, null);
+                var viewport: c.VkViewport = .{
+                    .x = @floatFromInt(bounds.x),
+                    .y = @floatFromInt(bounds.y),
+                    .width = @floatFromInt(bounds.width),
+                    .height = @floatFromInt(bounds.height),
+                    .minDepth = 0,
+                    .maxDepth = 1,
+                };
+                c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
+                c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
+                const push: PresentationGlyphPush = .{
+                    .color = normalizedColor(color),
+                    .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
+                    .bounds = .{
+                        glyph_bounds.x,
+                        glyph_bounds.y,
+                        @intCast(@as(i64, glyph_bounds.x) + glyph_bounds.width),
+                        @intCast(@as(i64, glyph_bounds.y) + glyph_bounds.height),
+                    },
+                    .atlas_origin = .{ atlas.x, atlas.y },
+                    .atlas_width_value = atlas_width,
+                };
+                c.vkCmdPushConstants(target.command_buffer, self.presentation_glyph_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(PresentationGlyphPush), &push);
+                c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
+            }
+        };
+    }
 }
 
 fn findMemoryType(self: *const Renderer, bits: u32, required: c.VkMemoryPropertyFlags) ?u32 {
@@ -2239,7 +2379,7 @@ test "Vulkan lowering bounds its clip stack" {
         commands[commands.len - index - 1] = .pop_clip;
     }
     try (scene.DisplayList{ .commands = &commands }).validate();
-    try std.testing.expectError(error.ClipStackOverflow, validateClipDepth(&commands, false));
+    try std.testing.expectError(error.ClipStackOverflow, validateClipDepth(&commands, false, false));
 }
 
 test "Vulkan backend renders exact conformance fixtures" {
@@ -2259,6 +2399,61 @@ test "Vulkan backend renders exact conformance fixtures" {
         std.testing.expectEqualSlices(u8, fixture.expected_rgba, pixels) catch |err| {
             std.debug.print("Vulkan conformance fixture failed: {s}\n", .{fixture.name});
             return err;
+        };
+    }
+}
+
+fn drawParagraph(
+    self: *Renderer,
+    command: scene.Paragraph,
+    target: *const Target,
+    clip: RectI,
+    cache: *GlyphCache,
+    paragraphs: *const text.ParagraphCache,
+) void {
+    const layout = paragraphs.get(command.layout) catch unreachable;
+    const source_color = command.color.premultiplied();
+    const source = @as(u32, if (target.format == .rgba) source_color.r else source_color.b) |
+        (@as(u32, source_color.g) << 8) |
+        (@as(u32, if (target.format == .rgba) source_color.b else source_color.r) << 16) |
+        (@as(u32, source_color.a) << 24);
+    for (layout.positioned.lines) |line| {
+        const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
+        for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
+            const atlas = cache.get(span.font, glyph.id, layout.logical_size * command.scale) catch unreachable;
+            const left: i32 = @intFromFloat(@round(command.origin.x + glyph.origin.x * command.scale));
+            const glyph_baseline: i32 = @intFromFloat(@round(baseline + glyph.origin.y * command.scale));
+            const glyph_bounds: RectI = .{
+                .x = left + atlas.left,
+                .y = glyph_baseline - atlas.top,
+                .width = atlas.width,
+                .height = atlas.height,
+            };
+            const bounds = RectI.intersect(clip, glyph_bounds);
+            if (!bounds.isEmpty()) {
+                c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
+                const push: GlyphPush = .{
+                    .target_width = target.width,
+                    .atlas_width_value = atlas_width,
+                    .source = source,
+                    .left = bounds.x,
+                    .top = bounds.y,
+                    .right = @intCast(@as(i64, bounds.x) + bounds.width),
+                    .bottom = @intCast(@as(i64, bounds.y) + bounds.height),
+                    .atlas_x = atlas.x + @as(u32, @intCast(bounds.x - glyph_bounds.x)),
+                    .atlas_y = atlas.y + @as(u32, @intCast(bounds.y - glyph_bounds.y)),
+                };
+                c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
+                const count = @as(u64, bounds.width) * bounds.height;
+                c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+                var barrier: c.VkMemoryBarrier = .{
+                    .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = null,
+                    .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+                };
+                c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+            }
         };
     }
 }
@@ -2321,6 +2516,70 @@ test "Vulkan glyph atlas matches exact software text rendering" {
     var target = try Target.init(&renderer, 160, 36);
     defer target.deinit(&renderer);
     try renderer.renderText(list, &target, &glyphs, &shapes);
+    var actual = [_]u8{0} ** expected.len;
+    try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+test "Vulkan positioned paragraphs match exact software text rendering" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    const software = @import("../software/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_arabic_test_font"),
+    });
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const layout = try paragraphs.acquire(.{
+        .utf8 = "Save حفظ now and continue",
+        .language = "und",
+        .logical_size = 18,
+        .max_width = 120,
+        .candidates = &.{ latin, arabic },
+        .configuration_revision = 1,
+    });
+    defer paragraphs.release(layout) catch unreachable;
+    try fonts.release(latin);
+    try fonts.release(arabic);
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(240, 240, 240, 255) },
+        .{ .push_clip_rect = .{ .x = 8, .y = 3, .width = 130, .height = 66 } },
+        .{ .paragraph = .{
+            .layout = layout,
+            .origin = .{ .x = 4, .y = 4 },
+            .scale = 1,
+            .color = Color.rgba(20, 40, 80, 211),
+        } },
+        .pop_clip,
+    };
+    const list: scene.DisplayList = .{ .commands = &commands };
+    var expected = [_]u8{0} ** (160 * 72 * 4);
+    var software_glyphs = try software.GlyphCache.init(std.testing.allocator, &fonts);
+    defer software_glyphs.deinit();
+    try software.renderParagraphs(list, .{
+        .pixels = &expected,
+        .width = 160,
+        .height = 72,
+        .stride = 160 * 4,
+        .format = .rgba8_unorm,
+    }, &software_glyphs, &paragraphs);
+
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var glyphs = try GlyphCache.init(std.testing.allocator, &fonts, &renderer);
+    defer glyphs.deinit();
+    var target = try Target.init(&renderer, 160, 72);
+    defer target.deinit(&renderer);
+    try renderer.renderParagraphs(list, &target, &glyphs, &paragraphs);
     var actual = [_]u8{0} ** expected.len;
     try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);

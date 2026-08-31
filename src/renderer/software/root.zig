@@ -41,7 +41,7 @@ pub const Target = struct {
 const max_clip_depth = scene.max_clip_depth;
 
 pub fn render(list: scene.DisplayList, target: Target) !void {
-    return renderInternal(list, target, null, null);
+    return renderInternal(list, target, null, null, null);
 }
 
 pub fn renderText(
@@ -51,7 +51,28 @@ pub fn renderText(
     shapes: *const text.ShapeCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return renderInternal(list, target, glyphs, shapes);
+    return renderInternal(list, target, glyphs, shapes, null);
+}
+
+pub fn renderParagraphs(
+    list: scene.DisplayList,
+    target: Target,
+    glyphs: *GlyphCache,
+    paragraphs: *const text.ParagraphCache,
+) !void {
+    return renderTextResources(list, target, glyphs, null, paragraphs);
+}
+
+/// Renders a display list containing either or both text command kinds.
+pub fn renderTextResources(
+    list: scene.DisplayList,
+    target: Target,
+    glyphs: *GlyphCache,
+    shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
+) !void {
+    if (!has_freetype) return error.FreeTypeDisabled;
+    return renderInternal(list, target, glyphs, shapes, paragraphs);
 }
 
 fn renderInternal(
@@ -59,15 +80,16 @@ fn renderInternal(
     target: Target,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
 ) !void {
     try target.validate();
     try list.validate();
     switch (list.damage) {
-        .full => try renderRegion(list.commands, target, targetBounds(target), glyphs, shapes),
+        .full => try renderRegion(list.commands, target, targetBounds(target), glyphs, shapes, paragraphs),
         .regions => |regions| {
             for (regions) |region| {
                 const clipped = RectI.intersect(region, targetBounds(target));
-                if (!clipped.isEmpty()) try renderRegion(list.commands, target, clipped, glyphs, shapes);
+                if (!clipped.isEmpty()) try renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs);
             }
         },
     }
@@ -79,6 +101,7 @@ fn renderRegion(
     damage: RectI,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
 ) !void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
@@ -112,6 +135,17 @@ fn renderRegion(
                 shapes orelse return error.TextResourcesRequired,
             );
         },
+        .paragraph => |paragraph| {
+            if (scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;
+            if (!has_freetype) return error.FreeTypeDisabled;
+            try drawParagraph(
+                paragraph,
+                target,
+                clips[depth],
+                glyphs orelse return error.TextResourcesRequired,
+                paragraphs orelse return error.TextResourcesRequired,
+            );
+        },
     };
 }
 
@@ -143,6 +177,42 @@ fn drawGlyphRun(
             );
             pen.x += glyph.advance.x * command.scale;
             pen.y -= glyph.advance.y * command.scale;
+        }
+    }
+}
+
+fn drawParagraph(
+    command: scene.Paragraph,
+    target: Target,
+    clip: RectI,
+    cache: *GlyphCache,
+    paragraphs: *const text.ParagraphCache,
+) !void {
+    const layout = try paragraphs.get(command.layout);
+    for (layout.positioned.lines) |line| {
+        const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
+        for (layout.positioned.spansFor(line)) |span| {
+            for (layout.positioned.glyphsFor(span)) |glyph| {
+                const bitmap = try cache.get(
+                    span.font,
+                    glyph.id,
+                    layout.logical_size * command.scale,
+                );
+                const left: i32 = @intFromFloat(@round(
+                    command.origin.x + glyph.origin.x * command.scale,
+                ));
+                const glyph_baseline: i32 = @intFromFloat(@round(
+                    baseline + glyph.origin.y * command.scale,
+                ));
+                drawMask(
+                    target,
+                    clip,
+                    left + bitmap.left,
+                    glyph_baseline - bitmap.top,
+                    bitmap,
+                    command.color,
+                );
+            }
         }
     }
 }
@@ -550,4 +620,76 @@ test "HarfBuzz glyph runs rasterize deterministically through backend cache" {
         scene.Frame.init(std.testing.allocator, &commands, .full),
     );
     try shapes.release(shape);
+}
+
+test "positioned mixed-script paragraphs rasterize through leased scene resources" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_arabic_test_font"),
+    });
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const layout = try paragraphs.acquire(.{
+        .utf8 = "Save حفظ now and continue",
+        .language = "und",
+        .logical_size = 18,
+        .max_width = 120,
+        .candidates = &.{ latin, arabic },
+        .configuration_revision = 1,
+    });
+    var glyphs = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer glyphs.deinit();
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(240, 240, 240, 255) },
+        .{ .paragraph = .{
+            .layout = layout,
+            .origin = .{ .x = 4, .y = 4 },
+            .scale = 1,
+            .color = Color.rgba(20, 40, 80, 255),
+        } },
+    };
+    {
+        var frame = try scene.Frame.initWithResources(
+            std.testing.allocator,
+            &commands,
+            .full,
+            .{ .paragraphs = &paragraphs },
+        );
+        defer frame.deinit();
+        try paragraphs.release(layout);
+        try fonts.release(latin);
+        try fonts.release(arabic);
+
+        var first = [_]u8{0} ** (160 * 80 * 4);
+        var second = [_]u8{0xaa} ** first.len;
+        const target: Target = .{
+            .pixels = &first,
+            .width = 160,
+            .height = 80,
+            .stride = 160 * 4,
+            .format = .rgba8_unorm,
+        };
+        try renderParagraphs(frame.displayList(), target, &glyphs, &paragraphs);
+        var second_target = target;
+        second_target.pixels = &second;
+        try renderParagraphs(frame.displayList(), second_target, &glyphs, &paragraphs);
+        try std.testing.expectEqualSlices(u8, &first, &second);
+        var changed_pixels: usize = 0;
+        for (0..first.len / 4) |index| {
+            const pixel = first[index * 4 ..][0..4];
+            if (!std.mem.eql(u8, pixel, &.{ 240, 240, 240, 255 })) changed_pixels += 1;
+        }
+        try std.testing.expect(changed_pixels > 300);
+    }
+    try std.testing.expectError(error.StaleParagraph, paragraphs.get(layout));
+    // The backend glyph cache independently leases rasterized faces.
+    _ = try fonts.get(latin);
+    _ = try fonts.get(arabic);
 }

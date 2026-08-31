@@ -73,6 +73,22 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
                 run.color.a,
             },
         ),
+        .paragraph => |paragraph| try append(
+            output,
+            &used,
+            "paragraph layout={d}:{d} origin=({d},{d}) scale={d} rgba({d},{d},{d},{d})\n",
+            .{
+                paragraph.layout.slot,
+                paragraph.layout.generation,
+                paragraph.origin.x,
+                paragraph.origin.y,
+                paragraph.scale,
+                paragraph.color.r,
+                paragraph.color.g,
+                paragraph.color.b,
+                paragraph.color.a,
+            },
+        ),
     };
     return output[0..used];
 }

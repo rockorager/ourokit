@@ -201,6 +201,15 @@ fonts, and increments the shape-slot generation. `FontCache` therefore outlives
 `ShapeCache` in the application scope. Fontconfig refresh happens at a safe
 point and changes the configuration revision rather than mutating live entries.
 
+`ParagraphCache` applies the complete itemize → fallback-shape → Unicode line-
+break → measure → greedy-select → line-bidi → position pipeline and owns the
+result in separate generation-checked slots. Its key includes the paragraph,
+base direction, language, logical size, finite maximum width, ordered candidate
+fonts, and font-configuration revision. Repeated identical requests deduplicate;
+final release destroys positioned storage and releases every candidate font.
+The cache is width-specific by design: wrapping remains text policy rather than
+a renderer operation.
+
 ## Initial label slice
 
 The first retained text render object is deliberately a single, already-
@@ -227,12 +236,12 @@ blended as premultiplied source-over without exposing FreeType, masks, stride,
 Vulkan resources, or pixel formats to text, scenes, or render objects. Cache
 eviction remains deferred until benchmark data establishes a budget.
 
-Borrowed display lists can render glyph handles synchronously. Owned async
-`scene.Frame.initWithShapes` construction copies scene storage and retains every
-referenced shape (which in turn retains its candidate fonts) until frame
-destruction. Plain `Frame.init` still rejects glyph commands rather than
-silently copying unleased handles. Shape and font caches are application-owned
-and must outlive all frames that lease their entries.
+Borrowed display lists can render text handles synchronously. Owned async
+`scene.Frame.initWithResources` construction copies scene storage and retains
+every referenced shape and paragraph layout until frame destruction. Plain
+`Frame.init` rejects text commands rather than silently copying unleased
+handles. Paragraph, shape, and font caches are application-owned and must
+outlive all frames that lease their entries.
 
 ## Work not yet frozen
 
@@ -243,5 +252,6 @@ and must outlive all frames that lease their entries.
 - empty-line metrics and inherited line-style policy;
 - normalization policy (shaping does not imply mutating application text);
 - variable-font axis selection and cache identity;
-- renderer-neutral frame resource leases for direct positioned glyph runs;
+- retained-Label lowering into width-specific paragraph layouts without
+  allocating during unchanged steady-state layout;
 - cache eviction, LCD/subpixel policy, and backend glyph-cache budgets.

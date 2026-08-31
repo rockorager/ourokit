@@ -108,9 +108,12 @@ pointer-capture, and release-inside activation state in the widget layer. Its
 Box centers the intrinsic Label within the padded button bounds; this child
 placement remains separate from future multi-line paragraph alignment.
 Button is not a renderer primitive. Full
-paragraph render-object integration and editing remain deferred; the headless
-itemization, shaping, wrapping, and line-bidi stages are established but not yet
-wired into this deliberately narrow Label.
+paragraph Label integration and editing remain deferred. Width-specific,
+generation-checked paragraph layouts now pass through renderer-neutral scene
+commands and owned frame leases, and software and Vulkan consume the identical
+positioned mixed-script glyph sequence. The deliberately narrow Label still
+uses the single-run path until constraint-aware acquisition can be added without
+allocating during unchanged steady-state layout.
 
 After editing canonical token JSON:
 
