@@ -117,6 +117,97 @@ pub const KeyboardEvent = union(enum) {
     },
 };
 
+pub const TextChangeCause = enum { input_method, other };
+
+pub const TextContentPurpose = enum {
+    normal,
+    alpha,
+    digits,
+    number,
+    phone,
+    url,
+    email,
+    name,
+    password,
+    pin,
+    date,
+    time,
+    datetime,
+    terminal,
+};
+
+pub const TextContentHints = packed struct(u16) {
+    completion: bool = false,
+    spellcheck: bool = false,
+    auto_capitalization: bool = false,
+    lowercase: bool = false,
+    uppercase: bool = false,
+    titlecase: bool = false,
+    hidden_text: bool = false,
+    sensitive_data: bool = false,
+    latin: bool = false,
+    multiline: bool = false,
+    _reserved: u6 = 0,
+};
+
+pub const SurroundingText = struct {
+    text: []const u8,
+    /// UTF-8 byte offsets into `text`, matching the Wayland text-input-v3
+    /// protocol and the platform-independent editable-text model.
+    cursor: usize,
+    anchor: usize,
+};
+
+pub const TextInputState = struct {
+    surrounding: ?SurroundingText = null,
+    change_cause: TextChangeCause = .input_method,
+    content_hints: TextContentHints = .{},
+    content_purpose: TextContentPurpose = .normal,
+    cursor_rectangle: ?struct { x: i32, y: i32, width: i32, height: i32 } = null,
+
+    pub fn validate(self: TextInputState) !void {
+        if (self.surrounding) |surrounding| {
+            if (surrounding.text.len > 4000) return error.SurroundingTextTooLong;
+            if (!@import("std").unicode.utf8ValidateSlice(surrounding.text)) return error.InvalidUtf8;
+            if (@import("std").mem.indexOfScalar(u8, surrounding.text, 0) != null)
+                return error.EmbeddedNul;
+            if (!utf8Boundary(surrounding.text, surrounding.cursor) or
+                !utf8Boundary(surrounding.text, surrounding.anchor))
+                return error.InvalidTextOffset;
+        }
+        if (self.cursor_rectangle) |rectangle|
+            if (rectangle.width < 0 or rectangle.height < 0) return error.InvalidCursorRectangle;
+    }
+};
+
+/// One atomic text-input-v3 edit batch. Protocol callbacks may borrow these
+/// slices only for the duration of `EventSink.textInput`; sinks must copy them
+/// before returning. Consumers apply the fields in protocol order: remove the
+/// old preedit, delete surrounding bytes, insert committed text, then install
+/// the new preedit and its cursor.
+pub const TextInputBatch = struct {
+    window: WindowHandle,
+    serial: u32,
+    serial_matches_state: bool,
+    delete_before_bytes: u32,
+    delete_after_bytes: u32,
+    commit: ?[]const u8,
+    preedit: ?[]const u8,
+    preedit_cursor_begin: i32,
+    preedit_cursor_end: i32,
+};
+
+pub const TextInputEvent = union(enum) {
+    enter: WindowHandle,
+    leave: WindowHandle,
+    batch: TextInputBatch,
+};
+
+fn utf8Boundary(text: []const u8, offset: usize) bool {
+    if (offset > text.len) return false;
+    return offset == text.len or (text[offset] & 0xc0) != 0x80;
+}
+
 /// Language-neutral desired state for one ordinary Wayland toplevel. A future
 /// layer-surface declaration will be a distinct type because its role and
 /// configure contract are not interchangeable with xdg_toplevel.
@@ -171,6 +262,7 @@ pub const EventSink = struct {
         configured: *const fn (*anyopaque, WindowHandle, u32, u32) anyerror!void,
         pointer: *const fn (*anyopaque, PointerEvent) anyerror!void,
         keyboard: *const fn (*anyopaque, KeyboardEvent) anyerror!void,
+        text_input: *const fn (*anyopaque, TextInputEvent) anyerror!void,
         closed: *const fn (*anyopaque, WindowHandle) anyerror!void,
     };
 
@@ -190,7 +282,29 @@ pub const EventSink = struct {
         try self.vtable.keyboard(self.context, event);
     }
 
+    pub fn textInput(self: EventSink, event: TextInputEvent) !void {
+        try self.vtable.text_input(self.context, event);
+    }
+
     pub fn closed(self: EventSink, handle: WindowHandle) !void {
         try self.vtable.closed(self.context, handle);
     }
 };
+
+test "text input state validates UTF-8 protocol offsets" {
+    try (TextInputState{ .surrounding = .{
+        .text = "AéB",
+        .cursor = 3,
+        .anchor = 1,
+    } }).validate();
+    try @import("std").testing.expectError(error.InvalidTextOffset, (TextInputState{ .surrounding = .{
+        .text = "AéB",
+        .cursor = 2,
+        .anchor = 1,
+    } }).validate());
+    try @import("std").testing.expectError(error.InvalidUtf8, (TextInputState{ .surrounding = .{
+        .text = &.{0xff},
+        .cursor = 0,
+        .anchor = 0,
+    } }).validate());
+}

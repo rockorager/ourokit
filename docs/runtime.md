@@ -15,6 +15,28 @@ safe. Logical cancellation invalidates its handle immediately. Tests exercise
 heap ordering/growth/stale handles, one-alarm operation, updates, expiration,
 and cancellation against the real kernel.
 
+Wayland keyboard repeat uses the same heap. The adapter honors compositor
+`repeat_info`, asks xkbcommon whether the held key repeats, cancels on release,
+focus leave, or capability loss, and rearms one logical timer per held key. An
+expired repeat queues a translated `.repeated` key event; it cannot enter Lua or
+mutate retained UI during CQE dispatch. Fractional-millisecond rates retain
+nanosecond cadence rather than accumulating integer-millisecond truncation.
+
+Wayland text composition is a separate channel from keyboard metadata. Ourokit
+binds `zwp_text_input_manager_v3` through generated Wayring code and creates a
+per-seat text-input object, but does not enable it merely because a surface has
+keyboard focus. A retained editable target must explicitly activate it with
+validated UTF-8 surrounding text, byte-indexed cursor/anchor state, content
+hints/purpose, and optional cursor geometry.
+
+Incoming preedit, commit, and surrounding-delete messages borrow Wayring's
+receive storage, so the adapter copies each fragment into bounded host-owned
+storage. Only `done` emits one atomic batch; the window event queue then owns
+another copy until the platform-input safe point. A mismatched `done` serial is
+reported with the edits (which must still be applied) while preventing callers
+from treating compositor state as synchronized. No protocol callback resumes
+Lua or mutates an editable model.
+
 ## Tasks and resources
 
 The language-neutral scheduler separates `waiting`, `runnable`, and `running`.

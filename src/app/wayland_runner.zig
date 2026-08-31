@@ -150,33 +150,40 @@ fn runWithFontconfig(init: std.process.Init, source: []const u8, options: Option
                 present.* = false;
             }
         }
-        while (window_set.takeEvent()) |event| switch (event) {
-            .close_requested => |handle| {
-                if (indexForHandle(&window_set, application.windows, handle)) |index| {
-                    if (desired[index]) {
-                        desired[index] = false;
-                        desired_changed = true;
+        while (window_set.takeEvent()) |event| {
+            defer window_set.releaseEvent(event);
+            switch (event) {
+                .close_requested => |handle| {
+                    if (indexForHandle(&window_set, application.windows, handle)) |index| {
+                        if (desired[index]) {
+                            desired[index] = false;
+                            desired_changed = true;
+                        }
                     }
-                }
-            },
-            .configured => |configured| {
-                if (indexForHandle(&window_set, application.windows, configured.window)) |index| {
-                    configured_sizes[index] = .{
-                        .width = configured.width,
-                        .height = configured.height,
-                    };
-                    if (runtimes[index].registered) _ = try dirty.markDirty(configured.window);
-                }
-            },
-            .pointer => |pointer| {
-                if (indexForHandle(&window_set, application.windows, pointerWindow(pointer))) |index|
-                    if (runtimes[index].ready) try runtimes[index].routePointer(pointer);
-            },
-            .keyboard => |keyboard| {
-                if (indexForHandle(&window_set, application.windows, keyboardWindow(keyboard))) |index|
-                    if (runtimes[index].ready) try runtimes[index].routeKeyboard(keyboard);
-            },
-        };
+                },
+                .configured => |configured| {
+                    if (indexForHandle(&window_set, application.windows, configured.window)) |index| {
+                        configured_sizes[index] = .{
+                            .width = configured.width,
+                            .height = configured.height,
+                        };
+                        if (runtimes[index].registered) _ = try dirty.markDirty(configured.window);
+                    }
+                },
+                .pointer => |pointer| {
+                    if (indexForHandle(&window_set, application.windows, pointerWindow(pointer))) |index|
+                        if (runtimes[index].ready) try runtimes[index].routePointer(pointer);
+                },
+                .keyboard => |keyboard| {
+                    if (indexForHandle(&window_set, application.windows, keyboardWindow(keyboard))) |index|
+                        if (runtimes[index].ready) try runtimes[index].routeKeyboard(keyboard);
+                },
+                // The protocol path is complete but remains dormant until a
+                // retained TextInput explicitly owns focus. No raw key event
+                // is promoted to committed text as a fallback.
+                .text_input => {},
+            }
+        }
 
         // Task safe point: platform and CQE dispatch only changed state.
         try scheduler.applyQueuedCancellations();
@@ -300,14 +307,17 @@ fn runWithFontconfig(init: std.process.Init, source: []const u8, options: Option
             disconnect_started = true;
             try host.flush();
         }
-        if (host.quiescent() and window_set.retainedCount() == 0) break;
+        if (host.quiescent() and window_set.retainedCount() == 0 and
+            !loop.hasPendingTimerKernelWork()) break;
         if (desired_changed or window_set.changeSerial() != serial_before_flush) continue;
-        if (host.quiescent()) continue;
+        if (host.quiescent() and !loop.hasPendingTimerKernelWork()) continue;
 
         const completion = try loop.wait();
         switch (loop.dispatch(completion)) {
-            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
-                try vm.markTimeoutCompleted(timeout.operation),
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
+                if (try host.dispatchTimer(timeout.operation)) continue;
+                try vm.markTimeoutCompleted(timeout.operation);
+            },
             .foreign => try host.dispatchOne(completion),
             .stale => return error.StaleCompletion,
         }

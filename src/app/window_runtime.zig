@@ -333,7 +333,7 @@ pub const WindowRuntime = struct {
             },
             .key => |value| value,
         };
-        if (key.translated.logical == .tab and key.state == .pressed) {
+        if (key.translated.logical == .tab and key.state != .released) {
             try self.applyButtonUpdate(self.buttons.release(null).visual);
             const previous = self.focus.current();
             _ = try self.focus.advance(

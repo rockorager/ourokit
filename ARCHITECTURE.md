@@ -174,8 +174,20 @@ keys, and frame grouping into bounded typed application data. Raw Wayland
 fixed-point values and protocol handles do not cross that boundary. The adapter
 compiles compositor-provided keymaps with xkbcommon and retains raw keycode,
 keysym, logical navigation key, modifiers, and Unicode scalar separately. Text
-composition and IME remain future text-input work; raw key events do not
-masquerade as committed text.
+composition and committed text use Wayring's generated `text-input-v3`
+bindings; raw key events do not masquerade as committed text. The adapter
+creates one text-input object per seat but leaves it disabled until a retained
+editable target explicitly owns focus. Borrowed protocol strings are copied
+and `preedit_string`, `commit_string`, and `delete_surrounding_text` fragments
+remain pending until `done` queues one owned platform batch. Application state
+can consume that batch only at the input safe point. Enable/disable, surrounding
+text, content purpose/hints, cursor rectangle, and commit serials remain behind
+the platform adapter rather than leaking Wayring objects into UI code.
+
+`wl_keyboard.repeat_info` drives client-side repeat through the shared logical
+timer heap. Xkbcommon decides whether a physical key repeats and retranslates it
+against current modifiers on each expiration. The timer CQE only queues a
+`.repeated` platform event; retained input policy consumes it at the safe point.
 
 Driver dispatch can prepare SQEs before returning. The host records that fact
 until the application flush phase submits the shared ring; calling `prepare`
@@ -443,9 +455,10 @@ The first `ui/text_input` boundary is a unit-testable editable value, not yet a
 widget or render object. It owns valid UTF-8, directional selection, revisions,
 and cached uucode extended-grapheme boundaries. Cursor movement at this layer is
 named logical previous/next; visual left/right, caret geometry, and selection
-painting wait for paragraph bidi/caret maps. Platform composition and committed
-text will enter through a future Wayring-backed text-input protocol adapter,
-not by treating raw xkb key events as application text.
+painting wait for paragraph bidi/caret maps. The Wayring-backed text-input-v3
+adapter and owned safe-point event path now exist, but deliberately remain
+dormant until a retained TextInput owns focus and can apply protocol batches to
+this model in the mandated order. Raw xkb events are never application text.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,

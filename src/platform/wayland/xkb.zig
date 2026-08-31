@@ -77,6 +77,11 @@ pub const Keyboard = struct {
             },
         };
     }
+
+    pub fn repeats(self: *const Keyboard, keycode: u32) bool {
+        const keymap = self.keymap orelse return false;
+        return c.xkb_keymap_key_repeats(keymap, keycode + 8) != 0;
+    }
 };
 
 fn modifierActive(state: *c.xkb_state, name: [*:0]const u8) bool {

@@ -12,4 +12,7 @@ pub const Keyboard = struct {
     pub fn translate(_: *Keyboard, keycode: u32) platform.TranslatedKey {
         return .{ .keycode = keycode };
     }
+    pub fn repeats(_: *const Keyboard, _: u32) bool {
+        return false;
+    }
 };
