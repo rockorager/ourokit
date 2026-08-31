@@ -1366,12 +1366,13 @@ pub const Host = struct {
             toplevel,
             .{ .set_app_id = .{ .app_id = self.app_id } },
         );
-        if (viewport) |viewport_handle| try setViewportDestination(
+        if (viewport) |viewport_handle| try setViewport(
             objects,
             transmit,
             viewport_handle,
             declaration.initial_width,
             declaration.initial_height,
+            fractional_scale_denominator,
         );
         try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
         window.* = .{
@@ -1495,12 +1496,13 @@ pub const Host = struct {
                         window.damage_history = .{};
                     window.width = window.pending_width;
                     window.height = window.pending_height;
-                    if (window.viewport) |viewport| try setViewportDestination(
+                    if (window.viewport) |viewport| try setViewport(
                         objects,
                         try self.queue(),
                         viewport,
                         window.width,
                         window.height,
+                        window.scale_120,
                     );
                     window.configured = true;
                     window.pending_redraw = true;
@@ -1522,6 +1524,14 @@ pub const Host = struct {
                         window.scale_120 = preferred.scale;
                         window.damage_history = .{};
                         window.pending_redraw = true;
+                        if (window.viewport) |viewport| try setViewport(
+                            objects,
+                            try self.queue(),
+                            viewport,
+                            window.width,
+                            window.height,
+                            window.scale_120,
+                        );
                     }
                 },
             }
@@ -2169,18 +2179,35 @@ fn scaledExtent(logical: u32, scale_120: u32) !u32 {
     return @intCast(pixels);
 }
 
-fn setViewportDestination(
+fn setViewport(
     objects: *wayring.objects.ClientObjects,
     transmit: *wayring.tx.Queue,
     viewport: Handle,
     width: u32,
     height: u32,
+    scale_120: u32,
 ) !void {
     if (width == 0 or height == 0 or width > std.math.maxInt(i32) or height > std.math.maxInt(i32))
         return error.InvalidViewportDestination;
     try wayring.client.sendRequest(protocol.wp_viewport, objects, transmit, viewport, .{
+        .set_source = .{
+            .x = 0,
+            .y = 0,
+            .width = try scaledSourceExtent(width, scale_120),
+            .height = try scaledSourceExtent(height, scale_120),
+        },
+    });
+    try wayring.client.sendRequest(protocol.wp_viewport, objects, transmit, viewport, .{
         .set_destination = .{ .width = @intCast(width), .height = @intCast(height) },
     });
+}
+
+fn scaledSourceExtent(logical: u32, scale_120: u32) !i32 {
+    if (logical == 0 or scale_120 == 0) return error.InvalidScaledExtent;
+    const numerator = @as(u128, logical) * scale_120 * 256;
+    const fixed = (numerator + fractional_scale_denominator / 2) / fractional_scale_denominator;
+    if (fixed == 0 or fixed > std.math.maxInt(i32)) return error.ScaledExtentOverflow;
+    return @intCast(fixed);
 }
 
 fn fixedValue(raw: i32) f32 {
@@ -2244,4 +2271,11 @@ test "fractional scale rounds buffer extents up" {
     try std.testing.expectEqual(@as(u32, 800), try scaledExtent(640, 150));
     try std.testing.expectEqual(@as(u32, 2), try scaledExtent(1, 150));
     try std.testing.expectEqual(@as(u32, 640), try scaledExtent(640, 120));
+}
+
+test "fractional viewport source excludes rounded buffer padding" {
+    try std.testing.expectEqual(@as(i32, 800 * 256), try scaledSourceExtent(640, 150));
+    try std.testing.expectEqual(@as(i32, 320), try scaledSourceExtent(1, 150));
+    try std.testing.expectEqual(@as(i32, 640 * 256), try scaledSourceExtent(640, 120));
+    try std.testing.expectEqual(@as(i32, 571 * 256 + 64), try scaledSourceExtent(457, 150));
 }
