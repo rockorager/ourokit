@@ -1,31 +1,17 @@
 //! Application-owned cache of immutable, width-specific paragraph layouts.
 
 const std = @import("std");
-const SizeF = @import("../core/geometry.zig").SizeF;
 const api = @import("api.zig");
-const itemization = @import("itemization.zig");
-const line_break = @import("line_break.zig");
-const line_layout = @import("line_layout.zig");
-const measurement = @import("measurement.zig");
 const paragraph = @import("paragraph.zig");
-const positioned_lines = @import("positioned_lines.zig");
-const shaped_paragraph = @import("shaped_paragraph.zig");
+const paragraph_layout = @import("paragraph_layout.zig");
+const paragraph_style = @import("paragraph_style.zig");
 
 pub const ParagraphHandle = struct {
     slot: u32,
     generation: u32,
 };
 
-pub const ParagraphLayout = struct {
-    positioned: positioned_lines.PositionedLines,
-    logical_size: f32,
-    size: SizeF,
-
-    fn deinit(self: *ParagraphLayout) void {
-        self.positioned.deinit();
-        self.* = undefined;
-    }
-};
+pub const ParagraphLayout = paragraph_layout.Layout;
 
 /// Width-specific paragraph layouts. The font cache must outlive this cache;
 /// every live entry retains its complete ordered fallback candidate set.
@@ -46,6 +32,7 @@ pub const ParagraphCache = struct {
         language: []const u8,
         logical_size: f32,
         max_width: f32,
+        style: paragraph_style.Style = .{},
         candidates: []const api.FontHandle,
         /// Increment when Fontconfig substitutions/candidate policy changes.
         configuration_revision: u64,
@@ -57,6 +44,9 @@ pub const ParagraphCache = struct {
         language: []const u8,
         logical_size_bits: u32,
         max_width_bits: u32,
+        alignment: paragraph_style.Alignment,
+        max_lines: u32,
+        overflow: paragraph_style.Overflow,
         candidates: []const api.FontHandle,
         configuration_revision: u64,
     };
@@ -84,6 +74,9 @@ pub const ParagraphCache = struct {
             hasher.update(key.language);
             hashValue(&hasher, key.logical_size_bits);
             hashValue(&hasher, key.max_width_bits);
+            hashValue(&hasher, @intFromEnum(key.alignment));
+            hashValue(&hasher, key.max_lines);
+            hashValue(&hasher, @intFromEnum(key.overflow));
             for (key.candidates) |candidate| {
                 hashValue(&hasher, candidate.slot);
                 hashValue(&hasher, candidate.generation);
@@ -96,6 +89,9 @@ pub const ParagraphCache = struct {
             return a.base_direction == b.base_direction and
                 a.logical_size_bits == b.logical_size_bits and
                 a.max_width_bits == b.max_width_bits and
+                a.alignment == b.alignment and
+                a.max_lines == b.max_lines and
+                a.overflow == b.overflow and
                 a.configuration_revision == b.configuration_revision and
                 std.mem.eql(u8, a.utf8, b.utf8) and
                 std.mem.eql(u8, a.language, b.language) and
@@ -163,7 +159,7 @@ pub const ParagraphCache = struct {
             retained += 1;
         }
 
-        var layout = try buildLayout(
+        var layout = try paragraph_layout.build(
             self.allocator,
             utf8,
             transient_key.base_direction,
@@ -171,6 +167,11 @@ pub const ParagraphCache = struct {
             language,
             @bitCast(transient_key.logical_size_bits),
             @bitCast(transient_key.max_width_bits),
+            .{
+                .alignment = transient_key.alignment,
+                .max_lines = if (transient_key.max_lines == 0) null else transient_key.max_lines,
+                .overflow = transient_key.overflow,
+            },
         );
         errdefer layout.deinit();
         try self.index.ensureUnusedCapacity(self.allocator, 1);
@@ -182,6 +183,9 @@ pub const ParagraphCache = struct {
             .language = language,
             .logical_size_bits = transient_key.logical_size_bits,
             .max_width_bits = transient_key.max_width_bits,
+            .alignment = transient_key.alignment,
+            .max_lines = transient_key.max_lines,
+            .overflow = transient_key.overflow,
             .candidates = candidate_handles,
             .configuration_revision = transient_key.configuration_revision,
         };
@@ -232,12 +236,18 @@ pub const ParagraphCache = struct {
             return error.InvalidLogicalSize;
         if (!std.math.isFinite(request.max_width) or request.max_width < 0)
             return error.InvalidWidth;
+        if (request.style.max_lines == 0) return error.InvalidMaxLines;
+        if (request.style.overflow == .ellipsis and request.style.max_lines == null)
+            return error.EllipsisRequiresMaxLines;
         return .{
             .utf8 = request.utf8,
             .base_direction = request.base_direction,
             .language = request.language,
             .logical_size_bits = @bitCast(request.logical_size),
             .max_width_bits = @bitCast(if (request.max_width == 0) @as(f32, 0) else request.max_width),
+            .alignment = request.style.alignment,
+            .max_lines = request.style.max_lines orelse 0,
+            .overflow = request.style.overflow,
             .candidates = request.candidates,
             .configuration_revision = request.configuration_revision,
         };
@@ -301,48 +311,6 @@ pub const ParagraphCache = struct {
     }
 };
 
-fn buildLayout(
-    allocator: std.mem.Allocator,
-    utf8: []const u8,
-    base_direction: paragraph.BaseDirection,
-    candidates: []const api.FallbackCandidate,
-    language: []const u8,
-    logical_size: f32,
-    max_width: f32,
-) !ParagraphLayout {
-    var itemized = try itemization.itemizeParagraphs(allocator, utf8, base_direction);
-    defer itemized.deinit();
-    var shaped = try shaped_paragraph.shapeItemizedParagraphs(
-        allocator,
-        utf8,
-        &itemized,
-        candidates,
-        language,
-        logical_size,
-    );
-    defer shaped.deinit();
-    var breaks = try line_break.analyzeLineBreaks(allocator, utf8);
-    defer breaks.deinit();
-    var measured = try measurement.measureBreakSegments(allocator, breaks.breaks, &shaped);
-    defer measured.deinit();
-    var selected = try line_layout.selectGreedyLines(
-        allocator,
-        utf8,
-        base_direction,
-        breaks.breaks,
-        &measured,
-        max_width,
-    );
-    defer selected.deinit();
-    var positioned = try positioned_lines.positionLines(allocator, utf8, &shaped, &selected);
-    errdefer positioned.deinit();
-    return .{
-        .size = .{ .width = positioned.width(), .height = positioned.height() },
-        .positioned = positioned,
-        .logical_size = logical_size,
-    };
-}
-
 test "paragraph cache owns mixed-script positioned layouts and font leases" {
     var fonts = api.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
@@ -373,15 +341,113 @@ test "paragraph cache owns mixed-script positioned layouts and font leases" {
     try std.testing.expect(layout.positioned.glyphs.len != 0);
     try std.testing.expect(layout.size.width > 0);
     try std.testing.expect(layout.size.height > 0);
+    const centered = try cache.acquire(.{
+        .utf8 = request.utf8,
+        .language = request.language,
+        .logical_size = request.logical_size,
+        .max_width = request.max_width,
+        .style = .{ .alignment = .center, .max_lines = 1 },
+        .candidates = request.candidates,
+        .configuration_revision = request.configuration_revision,
+    });
+    const centered_layout = try cache.get(centered);
+    try std.testing.expectEqual(@as(usize, 1), centered_layout.positioned.lines.len);
+    try std.testing.expect(centered_layout.positioned.truncated);
+    try std.testing.expect(centered_layout.positioned.lines[0].left > 0);
+    try std.testing.expectEqual(@as(usize, 2), cache.count());
     try fonts.release(latin);
     try fonts.release(arabic);
     _ = try fonts.get(latin);
     _ = try fonts.get(arabic);
     try cache.release(first);
     try cache.release(second);
+    try cache.release(centered);
     try std.testing.expectError(error.StaleParagraph, cache.get(first));
     try std.testing.expectError(error.StaleFont, fonts.get(latin));
     try std.testing.expectError(error.StaleFont, fonts.get(arabic));
+}
+
+test "ellipsis is shaped in paragraph context and maps to a source boundary" {
+    var fonts = api.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(latin) catch unreachable;
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_arabic_test_font"),
+    });
+    defer fonts.release(arabic) catch unreachable;
+    var cache = ParagraphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    const source = "Save this document then continue to the next workflow step";
+    const handle = try cache.acquire(.{
+        .utf8 = source,
+        .language = "und",
+        .logical_size = 16,
+        .max_width = 130,
+        .style = .{ .max_lines = 1, .overflow = .ellipsis },
+        .candidates = &.{ latin, arabic },
+        .configuration_revision = 1,
+    });
+    defer cache.release(handle) catch unreachable;
+    const layout = try cache.get(handle);
+    try std.testing.expectEqual(@as(usize, 1), layout.positioned.lines.len);
+    try std.testing.expect(layout.positioned.truncated);
+    try std.testing.expectEqual(source.len, layout.positioned.source_byte_len);
+    const insertion = layout.positioned.ellipsis_byte_offset.?;
+    try std.testing.expect(insertion > 0 and insertion < source.len);
+    try std.testing.expect(std.unicode.utf8ByteSequenceLength(source[insertion]) catch 0 != 0);
+    var synthetic_count: usize = 0;
+    for (layout.positioned.glyphs) |glyph| {
+        if (glyph.synthetic) {
+            synthetic_count += 1;
+            try std.testing.expectEqual(insertion, glyph.cluster);
+        } else {
+            try std.testing.expect(glyph.cluster < insertion);
+        }
+    }
+    try std.testing.expect(synthetic_count != 0);
+    for (layout.positioned.spans) |span|
+        try std.testing.expect(span.byte_start + span.byte_len <= insertion);
+
+    const rtl_source = "احفظ هذا المستند ثم تابع إلى خطوة سير العمل التالية";
+    const rtl_handle = try cache.acquire(.{
+        .utf8 = rtl_source,
+        .language = "ar",
+        .logical_size = 16,
+        .max_width = 130,
+        .style = .{ .max_lines = 1, .overflow = .ellipsis },
+        .candidates = &.{ latin, arabic },
+        .configuration_revision = 1,
+    });
+    defer cache.release(rtl_handle) catch unreachable;
+    const rtl_layout = try cache.get(rtl_handle);
+    try std.testing.expectEqual(@as(usize, 1), rtl_layout.positioned.lines.len);
+    try std.testing.expect(rtl_layout.positioned.truncated);
+    var synthetic_x = std.math.inf(f32);
+    var source_x = std.math.inf(f32);
+    for (rtl_layout.positioned.glyphs) |glyph| {
+        if (glyph.synthetic)
+            synthetic_x = @min(synthetic_x, glyph.origin.x)
+        else
+            source_x = @min(source_x, glyph.origin.x);
+    }
+    try std.testing.expect(std.math.isFinite(synthetic_x));
+    try std.testing.expect(std.math.isFinite(source_x));
+    try std.testing.expect(synthetic_x < source_x);
+
+    try std.testing.expectError(error.EllipsisRequiresMaxLines, cache.acquire(.{
+        .utf8 = source,
+        .language = "und",
+        .logical_size = 16,
+        .max_width = 130,
+        .style = .{ .overflow = .ellipsis },
+        .candidates = &.{latin},
+        .configuration_revision = 1,
+    }));
 }
 
 fn exerciseParagraphAllocationFailure(
@@ -392,10 +458,11 @@ fn exerciseParagraphAllocationFailure(
     var cache = ParagraphCache.init(allocator, fonts);
     defer cache.deinit();
     const handle = try cache.acquire(.{
-        .utf8 = "Save حفظ now",
+        .utf8 = "Save حفظ now and continue to the next workflow step",
         .language = "und",
         .logical_size = 16,
         .max_width = 80,
+        .style = .{ .max_lines = 1, .overflow = .ellipsis },
         .candidates = &candidates,
         .configuration_revision = 1,
     });

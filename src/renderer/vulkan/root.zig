@@ -2190,7 +2190,7 @@ fn drawPresentationParagraph(
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
             const atlas = cache.get(span.font, glyph.id, layout.logical_size * command.scale) catch unreachable;
-            const left: i32 = @intFromFloat(@round(command.origin.x + glyph.origin.x * command.scale));
+            const left: i32 = @intFromFloat(@round(command.origin.x + (line.left + glyph.origin.x) * command.scale));
             const glyph_baseline: i32 = @intFromFloat(@round(baseline + glyph.origin.y * command.scale));
             const glyph_bounds: RectI = .{
                 .x = left + atlas.left,
@@ -2421,7 +2421,7 @@ fn drawParagraph(
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
             const atlas = cache.get(span.font, glyph.id, layout.logical_size * command.scale) catch unreachable;
-            const left: i32 = @intFromFloat(@round(command.origin.x + glyph.origin.x * command.scale));
+            const left: i32 = @intFromFloat(@round(command.origin.x + (line.left + glyph.origin.x) * command.scale));
             const glyph_baseline: i32 = @intFromFloat(@round(baseline + glyph.origin.y * command.scale));
             const glyph_bounds: RectI = .{
                 .x = left + atlas.left,

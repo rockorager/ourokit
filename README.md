@@ -98,7 +98,8 @@ cross-compilation can omit that system capability with `-Dfontconfig=false`;
 deterministic shaping and rendering tests remain available.
 
 Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
-by default for cross targets. The `ouro.label { key, text, size? }` constructor
+by default for cross targets. The
+`ouro.label { key, text, size?, alignment?, max_lines?, overflow? }` constructor
 retains width-independent text/style identity, resolves a cached paragraph from
 its current box constraints, and rasterizes through a backend-owned FreeType
 glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
@@ -109,8 +110,10 @@ and Label using generated design tokens and retains hover, pressed, disabled,
 pointer-capture, and release-inside activation state in the widget layer. Its
 Box centers the constrained Label within the padded button bounds; this child
 placement remains separate from paragraph alignment. Button is not a renderer
-primitive. Editing, selection, overflow, and maximum-line policy remain
-deferred. Software and Vulkan consume the identical positioned glyph sequence.
+primitive. Direction-aware alignment, whole-line clipping, and shaped ellipsis
+remain text-layer policy; renderers never inject the ellipsis. Editing and
+selection remain deferred. Software and Vulkan consume the identical positioned
+glyph sequence.
 
 After editing canonical token JSON:
 

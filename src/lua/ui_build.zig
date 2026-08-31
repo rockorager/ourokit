@@ -124,7 +124,10 @@ pub const UiBuild = struct {
             try self.append(.{
                 .id = 1,
                 .parent = null,
-                .object = .{ .box = .{ .background = theme.surface_base } },
+                .object = .{ .box = .{
+                    .padding = .all(design.tokens.foundation.spacing_3),
+                    .background = theme.surface_base,
+                } },
             });
             self.parent_stack[0] = .{ .id = 2, .kind = .stack };
             self.parent_count = 1;
@@ -380,6 +383,7 @@ pub const UiBuild = struct {
             .object = .{ .label = .{
                 .source = source,
                 .color = if (enabled) theme.surface_base else theme.content_secondary,
+                .alignment = .center,
             } },
         }) catch {
             sources.release(source) catch unreachable;
@@ -430,6 +434,14 @@ pub const UiBuild = struct {
             "size",
             design.tokens.foundation.typography_body,
         ) orelse return luaError(state, "invalid label size");
+        const alignment = tableOptionalParagraphAlignment(state, 1, "alignment", .start) orelse
+            return luaError(state, "invalid label alignment");
+        const max_lines_value = tableOptionalPositiveInteger(state, 1, "max_lines", 0) orelse
+            return luaError(state, "invalid label max_lines");
+        const overflow = tableOptionalParagraphOverflow(state, 1, "overflow", .clip) orelse
+            return luaError(state, "invalid label overflow");
+        if (overflow == .ellipsis and max_lines_value == 0)
+            return luaError(state, "label ellipsis requires max_lines");
         const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
         const source = sources.acquire(.{
             .utf8 = value,
@@ -442,7 +454,13 @@ pub const UiBuild = struct {
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .object = .{ .label = .{ .source = source, .color = theme.content_primary } },
+            .object = .{ .label = .{
+                .source = source,
+                .color = theme.content_primary,
+                .alignment = alignment,
+                .max_lines = if (max_lines_value == 0) null else max_lines_value,
+                .overflow = overflow,
+            } },
             .parent_data = declarativeParentData(self, state, 1) orelse {
                 sources.release(source) catch unreachable;
                 return luaError(state, "invalid label position");
@@ -580,14 +598,61 @@ fn tableOptionalBoolean(
     return c.lua_toboolean(state, -1) != 0;
 }
 
+fn tableOptionalParagraphAlignment(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: text.ParagraphAlignment,
+) ?text.ParagraphAlignment {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "start")) return .start;
+    if (std.mem.eql(u8, value, "end")) return .end;
+    if (std.mem.eql(u8, value, "center")) return .center;
+    return null;
+}
+
+fn tableOptionalParagraphOverflow(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: text.ParagraphOverflow,
+) ?text.ParagraphOverflow {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "clip")) return .clip;
+    if (std.mem.eql(u8, value, "ellipsis")) return .ellipsis;
+    return null;
+}
+
+/// A zero default represents an omitted optional positive integer. Explicit
+/// zero and negative values remain invalid.
+fn tableOptionalPositiveInteger(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: u32,
+) ?u32 {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    var is_number: c_int = 0;
+    const value = c.lua_tointegerx(state, -1, &is_number);
+    if (is_number == 0 or value <= 0 or value > std.math.maxInt(u32)) return null;
+    return @intCast(value);
+}
+
 fn declarativeParentData(self: *const UiBuild, state: *c.State, table: c_int) ?render_types.ParentData {
     const parent = self.currentParent() orelse return null;
     return switch (parent.kind) {
         .box, .flex => .none,
         .stack => stack: {
-            const default = if (parent.id == 2) design.tokens.foundation.spacing_3 else 0;
-            const x = tableOptionalExtent(state, table, "x", default) orelse return null;
-            const y = tableOptionalExtent(state, table, "y", default) orelse return null;
+            const x = tableOptionalExtent(state, table, "x", 0) orelse return null;
+            const y = tableOptionalExtent(state, table, "y", 0) orelse return null;
             break :stack .{ .stack = .{ .x = x, .y = y } };
         },
     };
@@ -698,7 +763,14 @@ test "declarative Lua label flows through layout scene and software glyph cache"
         \\  ouro.column {
         \\    key = "content",
         \\    children = function()
-        \\      ouro.label { key = "benchmark", text = "Benchmark حفظ", size = 18 }
+        \\      ouro.label {
+        \\        key = "benchmark",
+        \\        text = "Benchmark حفظ",
+        \\        size = 18,
+        \\        alignment = "center",
+        \\        max_lines = 1,
+        \\        overflow = "ellipsis",
+        \\      }
         \\    end,
         \\  }
         \\end
@@ -710,6 +782,15 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     ui.rollbackHandlers();
     try owners.complete(work);
     try std.testing.expectEqual(@as(usize, 1), sources.count());
+    var retained_label: ?render_types.Label = null;
+    for (descriptors) |descriptor| switch (descriptor.object) {
+        .label => |label| retained_label = label,
+        else => {},
+    };
+    const label_descriptor = retained_label.?;
+    try std.testing.expectEqual(text.ParagraphAlignment.center, label_descriptor.alignment);
+    try std.testing.expectEqual(@as(?u32, 1), label_descriptor.max_lines);
+    try std.testing.expectEqual(text.ParagraphOverflow.ellipsis, label_descriptor.overflow);
 
     const root = (try instances.rootRenderObject()).?;
     const size = try renders.layout(root, .{ .max_width = 160, .max_height = 64 });

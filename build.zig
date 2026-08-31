@@ -153,7 +153,14 @@ pub fn build(b: *std.Build) void {
 
     addWaylandExample(b, target, optimize, ourokit, enable_vulkan);
     addRendererBenchmark(b, target, optimize, ourokit);
-    addParagraphBenchmark(b, target, optimize, ourokit);
+    addParagraphBenchmark(
+        b,
+        target,
+        optimize,
+        ourokit,
+        storybook_font,
+        storybook_arabic_font,
+    );
 
     const test_font = storybook_font;
     ourokit.addAnonymousImport("ourokit_test_font", .{
@@ -230,18 +237,27 @@ fn addParagraphBenchmark(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     ourokit: *std.Build.Module,
+    latin_font: *std.Build.Dependency,
+    arabic_font: *std.Build.Dependency,
 ) void {
+    const module = b.createModule(.{
+        .root_source_file = b.path("tools/text/paragraph_benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+    });
+    module.addAnonymousImport("ourokit_benchmark_font", .{
+        .root_source_file = latin_font.path("extras/ttf/Inter-Regular.ttf"),
+    });
+    module.addAnonymousImport("ourokit_benchmark_arabic_font", .{
+        .root_source_file = arabic_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
+    });
     const benchmark = b.addExecutable(.{
         .name = "ourokit-paragraph-benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/text/paragraph_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
-        }),
+        .root_module = module,
     });
     const run = b.addRunArtifact(benchmark);
-    const step = b.step("bench-paragraph", "Benchmark headless paragraph itemization stages");
+    const step = b.step("bench-paragraph", "Benchmark headless paragraph analysis and layout");
     step.dependOn(&run.step);
 }
 

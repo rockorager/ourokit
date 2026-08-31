@@ -453,6 +453,11 @@ pub const Tree = struct {
                 std.math.floatMax(f32),
             .candidates = source.candidates,
             .configuration_revision = source.configuration_revision,
+            .style = .{
+                .alignment = label.alignment,
+                .max_lines = label.max_lines,
+                .overflow = label.overflow,
+            },
         }) catch return error.ParagraphLayoutFailed;
         errdefer paragraphs.release(layout_handle) catch unreachable;
         const paragraph_layout = paragraphs.get(layout_handle) catch return error.StaleParagraph;
@@ -492,7 +497,11 @@ fn validateObject(object: types.Object) !void {
         .box => |value| try box_impl.validate(value),
         .flex => |value| try flex_impl.validate(value),
         .stack => {},
-        .label => {},
+        .label => |label| {
+            if (label.max_lines == 0) return error.InvalidMaxLines;
+            if (label.overflow == .ellipsis and label.max_lines == null)
+                return error.EllipsisRequiresMaxLines;
+        },
     }
 }
 
@@ -522,7 +531,10 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         },
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
         .stack => false,
-        .label => |old_label| !sameSource(old_label.source, new.label.source),
+        .label => |old_label| !sameSource(old_label.source, new.label.source) or
+            old_label.alignment != new.label.alignment or
+            old_label.max_lines != new.label.max_lines or
+            old_label.overflow != new.label.overflow,
     };
 }
 

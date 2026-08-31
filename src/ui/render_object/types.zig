@@ -1,6 +1,7 @@
 const Color = @import("../../core/color.zig").Color;
 const Insets = @import("../../core/geometry.zig").Insets;
 const ParagraphSourceHandle = @import("../../text/paragraph_source_cache.zig").ParagraphSourceHandle;
+const paragraph_style = @import("../../text/paragraph_style.zig");
 
 /// Physical alignment within a render object's available axis. Widget policy
 /// resolves direction-sensitive start/end before reaching this layer.
@@ -47,6 +48,9 @@ pub const Stack = struct {
 pub const Label = struct {
     source: ParagraphSourceHandle,
     color: Color,
+    alignment: paragraph_style.Alignment = .start,
+    max_lines: ?u32 = null,
+    overflow: paragraph_style.Overflow = .clip,
 };
 
 /// This is a small closed render-object vocabulary, not a generic widget node.

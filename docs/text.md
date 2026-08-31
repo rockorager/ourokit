@@ -53,6 +53,9 @@ input, and every caller-owned allocation failure. `zig build bench-paragraph
 -Doptimize=ReleaseFast -Dfontconfig=false -Dfreetype=false` measures bidi
 analysis, script analysis, and their combined paragraph itemization on Latin,
 mixed-script, isolate, and multi-paragraph workloads. The same command measures
+complete wrapped and ellipsized paragraph cache misses using pinned Latin and
+Arabic fonts, keeping finalization independently profileable without Wayland or
+a renderer. It also measures
 UAX #14 discovery, shaped-cluster measurement, greedy selection, and selected-
 line bidi independently. Final positioned assembly is likewise a separate,
 headless API with deterministic mixed-script and allocation-failure tests. The
@@ -227,6 +230,21 @@ itemization, fallback, bidi, wrapping, and positioning pipeline rather than a
 guessed single LTR run. A button remains composition: a padded Box containing a
 Label, with pointer/focus/command behavior owned by the instance layer.
 
+Paragraph presentation is also text-owned. Each positioned line stores a
+physical offset resolved from its UAX #9 base level, so `start` and `end` follow
+the line direction while `center` remains physical center. A finite layout width
+is part of paragraph cache identity. Optional `max_lines` truncates only at
+selected line boundaries and records whether content was omitted; Labels clip
+the resulting paragraph to their layout bounds. Lua exposes these as typed
+`alignment = "start" | "end" | "center"`, positive `max_lines`, and
+`overflow = "clip" | "ellipsis"` fields. Ellipsis requires `max_lines`. It
+finalizes at the latest fitting UAX #14 opportunity, synthesizes U+2026 at that
+source boundary, and reruns itemization, fallback shaping, wrapping, line bidi,
+and positioning. Synthetic glyphs explicitly map to a zero-length source
+boundary, preserving the source-cluster contract for future selection APIs.
+Contextual reshaping that changes fit retreats to the preceding legal break;
+renderers never inject or position the ellipsis themselves.
+
 Each renderer owns FreeType faces and grayscale glyph masks keyed by font
 generation, glyph ID, and exact 26.6 device size. Cached faces retain their font
 handles, use the exact collection/named-instance index selected for HarfBuzz,
@@ -254,5 +272,6 @@ outlive all frames that lease their entries.
 - empty-line metrics and inherited line-style policy;
 - normalization policy (shaping does not imply mutating application text);
 - variable-font axis selection and cache identity;
-- paragraph alignment, overflow, maximum-line, and ellipsis policy;
+- justification policy and optional grapheme-level rather than line-break-level
+  ellipsis refinement;
 - cache eviction, LCD/subpixel policy, and backend glyph-cache budgets.

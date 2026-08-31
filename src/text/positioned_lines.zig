@@ -5,6 +5,7 @@ const PointF = @import("../core/geometry.zig").PointF;
 const api = @import("api.zig");
 const line_layout = @import("line_layout.zig");
 const paragraph = @import("paragraph.zig");
+const paragraph_style = @import("paragraph_style.zig");
 const shaped_paragraph = @import("shaped_paragraph.zig");
 
 pub const Glyph = struct {
@@ -15,6 +16,9 @@ pub const Glyph = struct {
     /// downward, unlike HarfBuzz's Y coordinates.
     origin: PointF,
     advance: PointF,
+    /// True for presentation glyphs such as an ellipsis that do not consume a
+    /// source range. Their cluster is the source insertion boundary.
+    synthetic: bool = false,
 };
 
 pub const Span = struct {
@@ -32,6 +36,9 @@ pub const Line = struct {
     byte_len: usize,
     /// Logical top edge relative to the paragraph origin.
     top: f32,
+    /// Physical offset from the paragraph's left edge. Start and end are
+    /// resolved from this line's UAX #9 base direction during positioning.
+    left: f32,
     advance: f32,
     ascender: f32,
     descender: f32,
@@ -49,6 +56,10 @@ pub const PositionedLines = struct {
     lines: []Line,
     spans: []Span,
     glyphs: []Glyph,
+    layout_width: f32,
+    truncated: bool,
+    source_byte_len: usize,
+    ellipsis_byte_offset: ?usize,
 
     pub fn deinit(self: *PositionedLines) void {
         self.allocator.free(self.glyphs);
@@ -66,9 +77,7 @@ pub const PositionedLines = struct {
     }
 
     pub fn width(self: *const PositionedLines) f32 {
-        var result: f32 = 0;
-        for (self.lines) |line| result = @max(result, line.advance);
-        return result;
+        return self.layout_width;
     }
 
     pub fn height(self: *const PositionedLines) f32 {
@@ -105,17 +114,38 @@ pub fn positionLines(
     shaped: *const shaped_paragraph.ShapedParagraphs,
     selected: *const line_layout.GreedyLines,
 ) !PositionedLines {
+    return positionLinesWithStyle(allocator, utf8, shaped, selected, .{}, null);
+}
+
+/// Positions only visible lines and resolves physical line offsets. A finite
+/// available width makes paragraph alignment observable; null preserves the
+/// natural width used by unconstrained measurement.
+pub fn positionLinesWithStyle(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    shaped: *const shaped_paragraph.ShapedParagraphs,
+    selected: *const line_layout.GreedyLines,
+    style: paragraph_style.Style,
+    available_width: ?f32,
+) !PositionedLines {
     if (utf8.len != shaped.text_len) return error.InvalidShaping;
+    if (style.max_lines == 0) return error.InvalidMaxLines;
+    if (available_width) |width|
+        if (!std.math.isFinite(width) or width < 0) return error.InvalidWidth;
+    const visible_count = @min(
+        selected.lines.len,
+        if (style.max_lines) |count| @as(usize, count) else selected.lines.len,
+    );
     var lines: std.ArrayList(Line) = .empty;
     errdefer lines.deinit(allocator);
     var spans: std.ArrayList(Span) = .empty;
     errdefer spans.deinit(allocator);
     var glyphs: std.ArrayList(Glyph) = .empty;
     errdefer glyphs.deinit(allocator);
-    try lines.ensureTotalCapacity(allocator, selected.lines.len);
+    try lines.ensureTotalCapacity(allocator, visible_count);
     var line_top: f32 = 0;
 
-    for (selected.lines) |selected_line| {
+    for (selected.lines[0..visible_count]) |selected_line| {
         if (!std.math.isFinite(selected_line.advance) or selected_line.advance < 0)
             return error.InvalidMeasurements;
         var fragments: std.ArrayList(Fragment) = .empty;
@@ -159,6 +189,12 @@ pub fn positionLines(
             .byte_start = selected_line.byte_start,
             .byte_len = selected_line.byte_len,
             .top = line_top,
+            .left = alignmentOffset(
+                style.alignment,
+                available_width orelse pen_x,
+                pen_x,
+                selected_line.base_level,
+            ),
             .advance = pen_x,
             .ascender = metrics.ascender,
             .descender = metrics.descender,
@@ -176,11 +212,31 @@ pub fn positionLines(
     errdefer allocator.free(owned_lines);
     const owned_spans = try spans.toOwnedSlice(allocator);
     errdefer allocator.free(owned_spans);
+    var natural_width: f32 = 0;
+    for (owned_lines) |line| natural_width = @max(natural_width, line.advance);
     return .{
         .allocator = allocator,
         .lines = owned_lines,
         .spans = owned_spans,
         .glyphs = try glyphs.toOwnedSlice(allocator),
+        .layout_width = available_width orelse natural_width,
+        .truncated = visible_count < selected.lines.len,
+        .source_byte_len = utf8.len,
+        .ellipsis_byte_offset = null,
+    };
+}
+
+fn alignmentOffset(
+    alignment: paragraph_style.Alignment,
+    available_width: f32,
+    line_width: f32,
+    base_level: u8,
+) f32 {
+    const remaining = @max(0, available_width - line_width);
+    return switch (alignment) {
+        .start => if (base_level & 1 == 0) 0 else remaining,
+        .end => if (base_level & 1 == 0) remaining else 0,
+        .center => remaining / 2,
     };
 }
 
@@ -413,6 +469,48 @@ test "positioned assembly unwinds every caller-owned allocation failure" {
         std.testing.allocator,
         exerciseAllocationFailure,
         .{&value},
+    );
+}
+
+test "paragraph alignment resolves from each line base direction and clips whole lines" {
+    const fixture = @import("positioned_lines_test.zig");
+    var value: fixture.Fixture = undefined;
+    try value.init("one two three four five six", 45);
+    defer value.deinit();
+    try std.testing.expect(value.selected.lines.len > 1);
+
+    var centered = try positionLinesWithStyle(
+        std.testing.allocator,
+        value.utf8,
+        &value.shaped,
+        &value.selected,
+        .{ .alignment = .center, .max_lines = 1 },
+        100,
+    );
+    defer centered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), centered.lines.len);
+    try std.testing.expect(centered.truncated);
+    try std.testing.expectEqual(@as(f32, 100), centered.width());
+    try std.testing.expectApproxEqAbs(
+        (100 - centered.lines[0].advance) / 2,
+        centered.lines[0].left,
+        0.001,
+    );
+
+    value.selected.lines[0].base_level = 1;
+    var rtl_start = try positionLinesWithStyle(
+        std.testing.allocator,
+        value.utf8,
+        &value.shaped,
+        &value.selected,
+        .{ .max_lines = 1 },
+        100,
+    );
+    defer rtl_start.deinit();
+    try std.testing.expectApproxEqAbs(
+        100 - rtl_start.lines[0].advance,
+        rtl_start.lines[0].left,
+        0.001,
     );
 }
 

@@ -84,6 +84,54 @@ return ouro.storybook {
       end,
     },
     ouro.story {
+      id = "label/alignment",
+      group = "Label",
+      name = "Paragraph alignment",
+      viewport = { width = 420, height = 240 },
+      content = function()
+        ouro.column {
+          key = "content",
+          gap = 10,
+          children = function()
+            ouro.label { key = "start", text = "Start aligned", alignment = "start" }
+            ouro.label { key = "center", text = "Center aligned", alignment = "center" }
+            ouro.label { key = "end", text = "End aligned", alignment = "end" }
+            ouro.label {
+              key = "rtl-start",
+              text = "بداية الفقرة العربية",
+              alignment = "start",
+            }
+          end,
+        }
+      end,
+    },
+    ouro.story {
+      id = "label/max-lines",
+      group = "Label",
+      name = "Maximum lines",
+      viewport = { width = 300, height = 180 },
+      content = function()
+        ouro.column {
+          key = "content",
+          gap = 10,
+          children = function()
+            ouro.label {
+              key = "limited",
+              text = "This paragraph is deliberately long enough to wrap beyond two visible lines while the retained layout clips the remaining lines.",
+              max_lines = 2,
+              overflow = "ellipsis",
+            }
+            ouro.label {
+              key = "rtl-limited",
+              text = "احفظ هذا المستند ثم تابع إلى خطوة سير العمل التالية",
+              max_lines = 1,
+              overflow = "ellipsis",
+            }
+          end,
+        }
+      end,
+    },
+    ouro.story {
       id = "layout/row",
       group = "Layout",
       name = "Row",

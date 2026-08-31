@@ -199,7 +199,7 @@ fn drawParagraph(
                     layout.logical_size * command.scale,
                 );
                 const left: i32 = @intFromFloat(@round(
-                    command.origin.x + glyph.origin.x * command.scale,
+                    command.origin.x + (line.left + glyph.origin.x) * command.scale,
                 ));
                 const glyph_baseline: i32 = @intFromFloat(@round(
                     baseline + glyph.origin.y * command.scale,
