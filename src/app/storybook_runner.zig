@@ -69,14 +69,26 @@ pub fn describe(init: std.process.Init, source: []const u8) !Description {
         vm.deinit();
         if (signals_initialized) signals.deinit();
     }
-    try signals.init(init.gpa, vm.state, 256, 1024, 256);
+    try signals.initWithApi(
+        init.gpa,
+        vm.state,
+        256,
+        1024,
+        256,
+        vm.apiReference(),
+    );
     signals_initialized = true;
     var descriptor_storage: [2]ui.instance.Descriptor = undefined;
     var lua_ui: lua.UiBuild = undefined;
-    try lua_ui.init(vm.state, &descriptor_storage);
+    try lua_ui.initWithApi(vm.state, &descriptor_storage, vm.apiReference());
     lua_ui.attachSignals(&signals);
 
-    var book = try lua.Storybook.load(init.gpa, vm.state, source);
+    var book = try lua.Storybook.loadWithApi(
+        init.gpa,
+        vm.state,
+        vm.apiReference(),
+        source,
+    );
     defer book.deinit();
     const title = try init.gpa.dupe(u8, book.title);
     errdefer init.gpa.free(title);
@@ -127,7 +139,14 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         vm.deinit();
         if (signals_initialized) signals.deinit();
     }
-    try signals.init(init.gpa, vm.state, 256, 1024, 256);
+    try signals.initWithApi(
+        init.gpa,
+        vm.state,
+        256,
+        1024,
+        256,
+        vm.apiReference(),
+    );
     signals_initialized = true;
 
     var fonts = text.FontCache.init(init.gpa);
@@ -158,13 +177,18 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     const semantic_storage = try init.gpa.alloc(ui.semantics.Descriptor, config.node_capacity);
     defer init.gpa.free(semantic_storage);
     var lua_ui: lua.UiBuild = undefined;
-    try lua_ui.init(vm.state, descriptor_storage);
+    try lua_ui.initWithApi(vm.state, descriptor_storage, vm.apiReference());
     lua_ui.attachSignals(&signals);
     lua_ui.attachCallbacks(&callbacks, &vm);
     try lua_ui.attachLabelText(&paragraph_sources, &.{ primary_font, arabic_font }, 1);
     try lua_ui.attachSemantics(semantic_storage);
 
-    var book = try lua.Storybook.load(init.gpa, vm.state, source);
+    var book = try lua.Storybook.loadWithApi(
+        init.gpa,
+        vm.state,
+        vm.apiReference(),
+        source,
+    );
     defer book.deinit();
     const story = book.find(story_id) orelse return error.UnknownStory;
     const theme = switch (story.color_scheme) {

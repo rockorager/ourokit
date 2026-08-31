@@ -1,3 +1,4 @@
+local ouro = require("ouro")
 local count = ouro.signal(0)
 
 local function button_story(label, enabled)

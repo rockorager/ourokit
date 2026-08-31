@@ -40,7 +40,25 @@ pub const Storybook = struct {
         state: *c.State,
         source: []const u8,
     ) !Storybook {
-        try installConstructors(state);
+        return loadWithApiReference(allocator, state, null, source);
+    }
+
+    pub fn loadWithApi(
+        allocator: std.mem.Allocator,
+        state: *c.State,
+        api_reference: c_int,
+        source: []const u8,
+    ) !Storybook {
+        return loadWithApiReference(allocator, state, api_reference, source);
+    }
+
+    fn loadWithApiReference(
+        allocator: std.mem.Allocator,
+        state: *c.State,
+        api_reference: ?c_int,
+        source: []const u8,
+    ) !Storybook {
+        try installConstructors(state, api_reference);
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
         if (c.luaL_loadbufferx(state, source.ptr, source.len, "@storybook", null) != c.ok)
@@ -116,10 +134,14 @@ pub const Storybook = struct {
     }
 };
 
-fn installConstructors(state: *c.State) !void {
+fn installConstructors(state: *c.State, api_reference: ?c_int) !void {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    if (c.lua_getglobal(state, "ouro") != c.type_table) return error.OuroApiMissing;
+    const api_type = if (api_reference) |reference|
+        c.lua_rawgeti(state, c.registry_index, reference)
+    else
+        c.lua_getglobal(state, "ouro");
+    if (api_type != c.type_table) return error.OuroApiMissing;
     c.lua_pushcclosure(state, storybookConstructor, 0);
     c.lua_setfield(state, -2, "storybook");
     c.lua_pushcclosure(state, storyConstructor, 0);
