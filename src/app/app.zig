@@ -73,6 +73,7 @@ pub const App = struct {
         switch (self.loop.dispatch(completion)) {
             .timeout => |timeout| try self.lua_vm.markTimeoutCompleted(timeout.operation),
             .timeout_cancel => {},
+            .file, .operation_cancel => return error.UnownedIoCompletion,
             .foreign => return error.ForeignCompletion,
             .stale => return error.StaleCompletion,
         }

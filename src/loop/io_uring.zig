@@ -7,17 +7,54 @@ pub const OperationHandle = Handle;
 const Operation = enum(u8) {
     timeout = 0xa0,
     timeout_cancel = 0xa1,
+    openat2 = 0xa2,
+    statx = 0xa3,
+    read = 0xa4,
+    close = 0xa5,
+    operation_cancel = 0xa6,
+};
+
+pub const OperationKind = enum {
+    openat2,
+    statx,
+    read,
+    close,
+};
+
+pub const OpenHow = extern struct {
+    flags: u64,
+    mode: u64 = 0,
+    resolve: u64 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(OpenHow) == 24);
+    std.debug.assert(@alignOf(OpenHow) == 8);
+}
+
+pub const Resolve = struct {
+    pub const no_magic_links: u64 = 0x02;
+    pub const no_symlinks: u64 = 0x04;
+    pub const beneath: u64 = 0x08;
 };
 
 const Slot = struct {
     generation: u32 = 0,
     active: bool = false,
     cancel_pending: bool = false,
+    operation: Operation = .timeout,
     timeout: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+    open_how: OpenHow = .{ .flags = 0 },
 };
 
 pub const Completion = struct {
     operation: OperationHandle,
+    result: i32,
+};
+
+pub const FileCompletion = struct {
+    operation: OperationHandle,
+    kind: OperationKind,
     result: i32,
 };
 
@@ -28,6 +65,8 @@ pub const Dispatch = union(enum) {
     stale,
     timeout: Completion,
     timeout_cancel: Completion,
+    file: FileCompletion,
+    operation_cancel: Completion,
 };
 
 /// Ourokit-owned raw io_uring plus a stable operation directory. `Loop` and
@@ -74,6 +113,7 @@ pub const Loop = struct {
         if (slot.generation == 0) slot.generation = 1;
         slot.active = true;
         slot.cancel_pending = false;
+        slot.operation = .timeout;
         slot.timeout = .{
             .sec = @intCast(nanoseconds / std.time.ns_per_s),
             .nsec = @intCast(nanoseconds % std.time.ns_per_s),
@@ -86,20 +126,115 @@ pub const Loop = struct {
         return handle;
     }
 
-    /// Prepares cancellation. The operation slot remains alive until the
-    /// timeout's own terminal CQE arrives, regardless of cancel CQE ordering.
+    /// Prepares cancellation. The operation slot remains unavailable until
+    /// both the operation and cancellation terminal CQEs arrive, regardless
+    /// of their ordering.
     pub fn prepareCancel(self: *Loop, handle: OperationHandle) !void {
         const slot = try self.activeSlot(handle);
         if (slot.cancel_pending) return error.CancellationAlreadyPending;
         slot.cancel_pending = true;
-        _ = self.ring.timeout_remove(
-            encode(.timeout_cancel, handle),
-            encode(.timeout, handle),
-            0,
-        ) catch |err| {
-            slot.cancel_pending = false;
+        if (slot.operation == .timeout) {
+            _ = self.ring.timeout_remove(
+                encode(.timeout_cancel, handle),
+                encode(.timeout, handle),
+                0,
+            ) catch |err| {
+                slot.cancel_pending = false;
+                return err;
+            };
+        } else {
+            _ = self.ring.cancel(
+                encode(.operation_cancel, handle),
+                encode(slot.operation, handle),
+                0,
+            ) catch |err| {
+                slot.cancel_pending = false;
+                return err;
+            };
+        }
+    }
+
+    pub fn prepareOpenAt2(
+        self: *Loop,
+        directory: linux.fd_t,
+        path: [*:0]const u8,
+        how: OpenHow,
+    ) !OperationHandle {
+        const reserved = try self.reserve(.openat2);
+        const slot = reserved.slot;
+        slot.open_how = how;
+        const sqe = self.ring.get_sqe() catch |err| {
+            slot.active = false;
             return err;
         };
+        sqe.prep_rw(
+            .OPENAT2,
+            directory,
+            @intFromPtr(path),
+            @sizeOf(OpenHow),
+            @intFromPtr(&slot.open_how),
+        );
+        sqe.user_data = encode(.openat2, reserved.handle);
+        sqe.flags |= linux.IOSQE_ASYNC;
+        return reserved.handle;
+    }
+
+    pub fn prepareStatx(
+        self: *Loop,
+        fd: linux.fd_t,
+        output: *linux.Statx,
+    ) !OperationHandle {
+        const reserved = try self.reserve(.statx);
+        const sqe = self.ring.statx(
+            encode(.statx, reserved.handle),
+            fd,
+            "",
+            linux.AT.EMPTY_PATH,
+            .{
+                .TYPE = true,
+                .SIZE = true,
+                .INO = true,
+                .MTIME = true,
+                .CTIME = true,
+                .MNT_ID = true,
+            },
+            output,
+        ) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        sqe.flags |= linux.IOSQE_ASYNC;
+        return reserved.handle;
+    }
+
+    pub fn prepareRead(
+        self: *Loop,
+        fd: linux.fd_t,
+        buffer: []u8,
+        offset: u64,
+    ) !OperationHandle {
+        if (buffer.len == 0) return error.EmptyReadBuffer;
+        const reserved = try self.reserve(.read);
+        const sqe = self.ring.read(
+            encode(.read, reserved.handle),
+            fd,
+            .{ .buffer = buffer },
+            offset,
+        ) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        sqe.flags |= linux.IOSQE_ASYNC;
+        return reserved.handle;
+    }
+
+    pub fn prepareClose(self: *Loop, fd: linux.fd_t) !OperationHandle {
+        const reserved = try self.reserve(.close);
+        _ = self.ring.close(encode(.close, reserved.handle), fd) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        return reserved.handle;
     }
 
     pub fn submit(self: *Loop) !u32 {
@@ -132,6 +267,26 @@ pub const Loop = struct {
                 slot.cancel_pending = false;
                 return .{ .timeout_cancel = .{ .operation = decoded.handle, .result = cqe.res } };
             },
+            .operation_cancel => {
+                if (!slot.cancel_pending) return .stale;
+                slot.cancel_pending = false;
+                return .{ .operation_cancel = .{ .operation = decoded.handle, .result = cqe.res } };
+            },
+            .openat2, .statx, .read, .close => |operation| {
+                if (!slot.active or slot.operation != operation) return .stale;
+                slot.active = false;
+                return .{ .file = .{
+                    .operation = decoded.handle,
+                    .kind = switch (operation) {
+                        .openat2 => .openat2,
+                        .statx => .statx,
+                        .read => .read,
+                        .close => .close,
+                        else => unreachable,
+                    },
+                    .result = cqe.res,
+                } };
+            },
         }
     }
 
@@ -147,6 +302,25 @@ pub const Loop = struct {
         const slot = &self.slots[handle.slot];
         if (!slot.active or slot.generation != handle.generation) return error.StaleOperation;
         return slot;
+    }
+
+    const Reservation = struct {
+        handle: OperationHandle,
+        slot: *Slot,
+    };
+
+    fn reserve(self: *Loop, operation: Operation) !Reservation {
+        const index = self.availableSlot() orelse return error.OperationCapacityExceeded;
+        const slot = &self.slots[index];
+        slot.generation +%= 1;
+        if (slot.generation == 0) slot.generation = 1;
+        slot.active = true;
+        slot.cancel_pending = false;
+        slot.operation = operation;
+        return .{
+            .handle = .{ .slot = @intCast(index), .generation = slot.generation },
+            .slot = slot,
+        };
     }
 };
 
@@ -165,6 +339,11 @@ fn decode(value: u64) ?Decoded {
     const operation: Operation = switch (@as(u8, @truncate(value))) {
         @intFromEnum(Operation.timeout) => .timeout,
         @intFromEnum(Operation.timeout_cancel) => .timeout_cancel,
+        @intFromEnum(Operation.openat2) => .openat2,
+        @intFromEnum(Operation.statx) => .statx,
+        @intFromEnum(Operation.read) => .read,
+        @intFromEnum(Operation.close) => .close,
+        @intFromEnum(Operation.operation_cancel) => .operation_cancel,
         else => return null,
     };
     return .{

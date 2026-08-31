@@ -23,6 +23,7 @@ src/
   core/                    dependency-light values and handles
   varlink/                 sans-I/O client/server protocol state machines
   loop/                    raw io_uring ownership and operations
+  fs/                      language-neutral asynchronous file operations
   task/                    language-neutral tasks, scopes, resources
   design/                  generated token API
   text/                    paragraph analysis, shaping, metrics, Unicode boundaries

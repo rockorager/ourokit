@@ -378,6 +378,7 @@ pub fn runSource(
         switch (loop.dispatch(completion)) {
             .timeout => |timeout| try source_reload.markTimeoutCompleted(timeout.operation),
             .timeout_cancel => {},
+            .file, .operation_cancel => return error.UnownedIoCompletion,
             .foreign => try host.dispatchOne(completion),
             .stale => return error.StaleCompletion,
         }

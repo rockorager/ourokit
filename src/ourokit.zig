@@ -5,6 +5,7 @@ pub const design = @import("design/root.zig");
 pub const text = @import("text/root.zig");
 pub const varlink = @import("varlink/root.zig");
 pub const loop = @import("loop/root.zig");
+pub const fs = @import("fs/root.zig");
 pub const task = @import("task/root.zig");
 pub const bundle = @import("bundle/root.zig");
 pub const lua = @import("lua/root.zig");
@@ -20,6 +21,7 @@ test {
     _ = text;
     _ = varlink;
     _ = loop;
+    _ = fs;
     _ = task;
     _ = bundle;
     _ = lua;
