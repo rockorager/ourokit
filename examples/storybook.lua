@@ -307,7 +307,8 @@ return ouro.storybook {
       id = "button/disabled-dark",
       group = "Button",
       name = "Disabled (dark, 2x)",
-      viewport = { width = 360, height = 180, scale = 2 },
+      viewport = { width = 360, height = 180 },
+      snapshot_scale = 2,
       color_scheme = "dark",
       content = function()
         button_story("Disabled dark button", false)

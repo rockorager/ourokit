@@ -501,7 +501,10 @@ pub const UiBuild = struct {
             .object = .{ .box = .{
                 .width = width,
                 .height = height,
-                .padding = .all(design.tokens.foundation.spacing_3),
+                .padding = .{
+                    .left = design.tokens.foundation.spacing_3,
+                    .right = design.tokens.foundation.spacing_3,
+                },
                 .alignment = .center,
                 .background = if (enabled) style.idle else style.disabled,
                 .corner_radius = design.tokens.foundation.corner_radius_medium,
@@ -1228,6 +1231,10 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expect(descriptors[6].object == .flex);
     try std.testing.expectEqual(design.tokens.dark.accent_default, descriptors[7].object.box.background.?);
     try std.testing.expect(descriptors[7].focusable);
+    try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.padding.top);
+    try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.padding.bottom);
+    try std.testing.expectEqual(design.tokens.foundation.spacing_3, descriptors[7].object.box.padding.left);
+    try std.testing.expectEqual(design.tokens.foundation.spacing_3, descriptors[7].object.box.padding.right);
     try std.testing.expectEqual(design.tokens.dark.surface_base, descriptors[8].object.label.color);
     try std.testing.expectEqual(descriptors[7].id, descriptors[8].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
