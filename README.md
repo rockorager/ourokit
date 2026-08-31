@@ -85,11 +85,10 @@ cross-compilation can omit that system capability with `-Dfontconfig=false`;
 deterministic shaping and rendering tests remain available.
 
 Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
-by default for cross targets. The low-level benchmark-oriented Lua text surface
-is `ouro.label(id, parent, text, size, color)`: it correctly shapes one LTR Latin
-label through HarfBuzz, lays it out from shaping metrics, and rasterizes through
-a backend-owned FreeType glyph cache. The application-facing `ouro.row`,
-`ouro.column`, and `ouro.label` constructors provide nested composition without
+by default for cross targets. The `ouro.label { key, text, size? }` constructor
+shapes one LTR Latin label through HarfBuzz, lays it out from shaping metrics,
+and rasterizes through a backend-owned FreeType glyph cache. `ouro.row`,
+`ouro.column`, and `ouro.label` provide nested composition without
 application-managed numeric IDs or parent links. `ouro.button` composes a Box
 and Label using generated design tokens and retains hover, pressed, disabled,
 pointer-capture, and release-inside activation state in the widget layer;
@@ -194,7 +193,6 @@ and shared-memory/dma-buf presentation paths.
 - [Application model](docs/application-model.md)
 
 Instance-adjacent typed pointer bindings now replace proof-wide global event
-dispatch. The provisional `ouro.on_pointer(instance_id, function)` build API
-uses explicit Lua registry lifetime and task-phase scoped coroutine dispatch;
-render objects and platform callbacks remain callback-free. This spelling is
-not stable and is intended to be replaced by generated component bindings.
+dispatch. Widget-specific callbacks such as `ouro.button { on_press = ... }`
+use explicit Lua registry lifetime and task-phase scoped coroutine dispatch;
+render objects and platform callbacks remain callback-free.

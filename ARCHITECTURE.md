@@ -129,9 +129,9 @@ pointers may live inside that private registry but are never kernel identities.
 Semantic pointer handlers live in a language-neutral registry adjacent to the
 instance tree, keyed by generation-checked instance handles and typed handler
 kind plus opaque invocation ID. Render objects never own callbacks. The Lua
-build bridge stages low-level `ouro.on_pointer` and widget-specific
-`ouro.button { on_press = ... }` references and commits them only after typed
-descriptor reconciliation; replacement, rollback, removal, and window teardown
+build bridge stages widget-specific `ouro.button { on_press = ... }` references
+and commits them only after typed descriptor reconciliation; replacement,
+rollback, removal, and window teardown
 release references. Routing bubbles visual descendants to the nearest bound
 instance. It spawns handlers only at the task safe point, so yielding handlers
 retain structured scope.
@@ -463,9 +463,10 @@ Mounted UI builds may install constructor-specific Ouro functions into that
 same table. They append compact typed descriptors only while a build owner is
 actively reconciling; calls outside that phase fail. Build callbacks execute
 under protected, non-yielding calls, and their descriptor storage is bounded
-and borrowed only until the next build. The current positional spelling is a
-pipeline proof, not the public ABI: schema-generated constructors and bindings
-will replace it without introducing generic string `type` dispatch.
+and borrowed only until the next build. Applications use stable string keys and
+constructor tables; numeric descriptor IDs, parent links, and renderer objects
+are not exposed. A future schema generator may produce these constructors and
+bindings without introducing generic string `type` dispatch.
 
 `ouro.signal(initial)` is the first reactive primitive. Calling its userdata
 reads the value and `signal:set(value)` changes it. Dependency tracking belongs

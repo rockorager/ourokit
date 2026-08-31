@@ -152,10 +152,11 @@ active target's instance-owned typed pointer binding, bubbling from a visual
 descendant such as a Label to its owning widget instance and scope, then spawns
 its registry-referenced Lua function as an independently yieldable coroutine task.
 Bindings use generation-checked instance handles; stale targets are dropped.
-The constructor-specific `ouro.on_pointer(instance_id, function)` spelling and
-compact event argument ABI are explicitly provisional pending generated
-component bindings. Build references commit only after descriptor reconciliation
-succeeds; rollback, replacement, removal, and window teardown release them.
+The application-facing binding is constructor-specific, currently
+`ouro.button { on_press = function() ... end }`; numeric instance IDs and the
+compact pointer event ABI are not exposed. Build references commit only after
+descriptor reconciliation succeeds; rollback, replacement, removal, and window
+teardown release them.
 
 Padding is Box layout policy rather than a wrapper render object. Theme, keyed
 identity, focus, shortcuts, and stateful components are instance/widget policy,
@@ -164,13 +165,11 @@ permanent arbitrary table parser based on repeated string `type` dispatch.
 
 The eventual component schema should generate Lua constructors, compact Zig
 bindings/decoding into this normalized snapshot, Lua language-server types,
-documentation, and cross-language validation. Numeric IDs and the current
-descriptor spelling prove the native contract but do not freeze the public Lua
-ABI. A provisional constructor-specific bridge now proves this route end to
-end: a protected non-yielding mounted Lua build emits Box/Stack/Label descriptors
-directly into bounded native storage, which the existing transactional
-reconciler validates. It has no generic string `type` parser and is not the
-final generated constructor surface. The first ergonomic constructors maintain
+documentation, and cross-language validation. The constructor-specific bridge
+proves this route end to end: a protected non-yielding mounted Lua build emits
+Box/Stack/Label descriptors directly into bounded native storage, which the
+existing transactional reconciler validates. It has no generic string `type`
+parser or application-facing descriptor escape hatch. The constructors maintain
 a bounded native parent stack: `ouro.row` and `ouro.column` normalize to Flex,
 `ouro.label` normalizes to Label, and `ouro.button` normalizes to Box plus Label.
 Applications provide stable local keys but no numeric IDs or parent links.

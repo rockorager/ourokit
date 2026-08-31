@@ -1,6 +1,5 @@
 const std = @import("std");
 const c = @import("c.zig");
-const Color = @import("../core/color.zig").Color;
 const design = @import("../design/root.zig");
 const Signals = @import("signals.zig").Signals;
 const SignalOwnerRef = @import("signals.zig").OwnerRef;
@@ -16,7 +15,7 @@ const text = @import("../text/root.zig");
 const PendingHandler = struct {
     id: u64,
     reference: c_int,
-    kind: @import("../ui/input/bindings.zig").HandlerKind = .pointer,
+    kind: @import("../ui/input/bindings.zig").HandlerKind,
 };
 
 const PendingButton = struct {
@@ -44,10 +43,10 @@ pub const ActiveBuildOwner = struct {
     handle: build_owner.BuildOwnerHandle,
 };
 
-/// Provisional constructor-specific Lua boundary. Build callbacks append
-/// already-typed normalized descriptors; there is no `{ type = "..." }`
-/// parser or renderer access. The eventual schema generator will replace the
-/// spelling while preserving this native contract.
+/// Constructor-specific Lua boundary. Build callbacks append already-typed
+/// normalized descriptors; there is no `{ type = "..." }` parser, numeric-ID
+/// escape hatch, or renderer access. A future schema generator may produce
+/// this binding while preserving the native contract.
 pub const UiBuild = struct {
     state: *c.State,
     storage: []instance.Descriptor,
@@ -79,12 +78,7 @@ pub const UiBuild = struct {
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
         if (c.lua_getglobal(state, "ouro") != c.type_table) return error.OuroApiMissing;
-        try self.install("box", emitBox);
-        try self.install("padded_box", emitPaddedBox);
-        try self.install("stack", emitStack);
-        try self.install("positioned_box", emitPositionedBox);
         try self.install("label", emitLabel);
-        try self.install("on_pointer", bindPointer);
         try self.install("button", emitButton);
         try self.install("row", emitRow);
         try self.install("column", emitColumn);
@@ -324,142 +318,11 @@ pub const UiBuild = struct {
         self.parent_count -= 1;
     }
 
-    fn emitBox(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (c.lua_gettop(state) != 5) return luaError(state, "ouro.box expects 5 arguments");
-        const descriptor: instance.Descriptor = .{
-            .id = integerId(state, 1) orelse return luaError(state, "invalid box id"),
-            .parent = parentId(state, 2) orelse return luaError(state, "invalid box parent"),
-            .object = .{ .box = .{
-                .width = optionalExtent(state, 3) orelse return luaError(state, "invalid box width"),
-                .height = optionalExtent(state, 4) orelse return luaError(state, "invalid box height"),
-                .background = packedColor(state, 5) orelse return luaError(state, "invalid box color"),
-            } },
-        };
-        self.append(descriptor) catch return luaError(state, "cannot append box descriptor");
-        return 0;
-    }
-
-    fn emitPaddedBox(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (c.lua_gettop(state) != 6) return luaError(state, "ouro.padded_box expects 6 arguments");
-        const padding = requiredExtent(state, 5) orelse
-            return luaError(state, "invalid box padding");
-        const descriptor: instance.Descriptor = .{
-            .id = integerId(state, 1) orelse return luaError(state, "invalid box id"),
-            .parent = parentId(state, 2) orelse return luaError(state, "invalid box parent"),
-            .object = .{ .box = .{
-                .width = optionalExtent(state, 3) orelse return luaError(state, "invalid box width"),
-                .height = optionalExtent(state, 4) orelse return luaError(state, "invalid box height"),
-                .padding = .all(padding),
-                .background = packedColor(state, 6) orelse return luaError(state, "invalid box color"),
-            } },
-        };
-        self.append(descriptor) catch return luaError(state, "cannot append box descriptor");
-        return 0;
-    }
-
-    fn emitStack(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (c.lua_gettop(state) != 3) return luaError(state, "ouro.stack expects 3 arguments");
-        if (c.lua_type(state, 3) != c.type_boolean) return luaError(state, "invalid stack clip");
-        const descriptor: instance.Descriptor = .{
-            .id = integerId(state, 1) orelse return luaError(state, "invalid stack id"),
-            .parent = parentId(state, 2) orelse return luaError(state, "invalid stack parent"),
-            .object = .{ .stack = .{ .clip = c.lua_toboolean(state, 3) != 0 } },
-        };
-        self.append(descriptor) catch return luaError(state, "cannot append stack descriptor");
-        return 0;
-    }
-
-    fn emitPositionedBox(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (c.lua_gettop(state) != 7) return luaError(state, "ouro.positioned_box expects 7 arguments");
-        const descriptor: instance.Descriptor = .{
-            .id = integerId(state, 1) orelse return luaError(state, "invalid positioned box id"),
-            .parent = parentId(state, 2) orelse return luaError(state, "invalid positioned box parent"),
-            .object = .{ .box = .{
-                .width = requiredExtent(state, 5) orelse return luaError(state, "invalid positioned box width"),
-                .height = requiredExtent(state, 6) orelse return luaError(state, "invalid positioned box height"),
-                .background = packedColor(state, 7) orelse return luaError(state, "invalid positioned box color"),
-            } },
-            .parent_data = .{ .stack = .{
-                .x = finiteFloat(state, 3) orelse return luaError(state, "invalid positioned box x"),
-                .y = finiteFloat(state, 4) orelse return luaError(state, "invalid positioned box y"),
-            } },
-        };
-        self.append(descriptor) catch return luaError(state, "cannot append positioned box descriptor");
-        return 0;
-    }
-
     fn emitLabel(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (c.lua_gettop(state) == 1 and c.lua_type(state, 1) == c.type_table)
-            return self.emitDeclarativeLabel(state);
-        if (c.lua_gettop(state) != 5) return luaError(state, "ouro.label expects 5 arguments");
-        const shapes = self.label_shapes orelse return luaError(state, "label text service unavailable");
-        const value = string(state, 3) orelse return luaError(state, "invalid label text");
-        if (!text.supportsSimpleLabel(value))
-            return luaError(state, "label requires one LTR Latin-script line");
-        const logical_size = requiredExtent(state, 4) orelse
-            return luaError(state, "invalid label size");
-        if (logical_size == 0) return luaError(state, "invalid label size");
-        const shape = shapes.acquire(.{
-            .spec = .{
-                .paragraph = value,
-                .direction = .left_to_right,
-                .script = .latin,
-                .language = "en",
-                .logical_size = logical_size,
-            },
-            .candidates = self.label_candidates,
-            .configuration_revision = self.label_configuration_revision,
-        }) catch return luaError(state, "cannot shape label");
-        const descriptor: instance.Descriptor = .{
-            .id = integerId(state, 1) orelse {
-                shapes.release(shape) catch unreachable;
-                return luaError(state, "invalid label id");
-            },
-            .parent = parentId(state, 2) orelse {
-                shapes.release(shape) catch unreachable;
-                return luaError(state, "invalid label parent");
-            },
-            .object = .{ .label = .{
-                .shape = shape,
-                .color = packedColor(state, 5) orelse {
-                    shapes.release(shape) catch unreachable;
-                    return luaError(state, "invalid label color");
-                },
-            } },
-        };
-        self.append(descriptor) catch {
-            shapes.release(shape) catch unreachable;
-            return luaError(state, "cannot append label descriptor");
-        };
-        self.shapes_staged = true;
-        return 0;
-    }
-
-    fn bindPointer(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (c.lua_gettop(state) != 2 or c.lua_type(state, 2) != c.type_function)
-            return luaError(state, "ouro.on_pointer expects instance id and function");
-        const id = integerId(state, 1) orelse return luaError(state, "invalid pointer instance id");
-        for (self.pending_handlers[0..self.pending_handler_count]) |*pending| if (pending.id == id) {
-            c.luaL_unref(state, c.registry_index, pending.reference);
-            c.lua_pushvalue(state, 2);
-            pending.reference = c.luaL_ref(state, c.registry_index);
-            return 0;
-        };
-        if (self.pending_handler_count == self.pending_handlers.len)
-            return luaError(state, "pointer handler capacity exceeded");
-        c.lua_pushvalue(state, 2);
-        self.pending_handlers[self.pending_handler_count] = .{
-            .id = id,
-            .reference = c.luaL_ref(state, c.registry_index),
-        };
-        self.pending_handler_count += 1;
-        return 0;
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.label expects one declaration table");
+        return self.emitDeclarativeLabel(state);
     }
 
     fn emitButton(state: *c.State) callconv(.c) c_int {
@@ -682,13 +545,6 @@ fn bridge(state: *c.State) ?*UiBuild {
     return if (self.active_owner != null) self else null;
 }
 
-fn integerId(state: *c.State, index: c_int) ?u64 {
-    var is_number: c_int = 0;
-    const value = c.lua_tointegerx(state, index, &is_number);
-    if (is_number == 0 or value <= 0) return null;
-    return @intCast(value);
-}
-
 fn string(state: *c.State, index: c_int) ?[]const u8 {
     if (c.lua_type(state, index) != c.type_string) return null;
     var length: usize = 0;
@@ -752,21 +608,6 @@ fn semanticParent(parent: BuildParent) ?u64 {
     return if (parent.id == 2) null else parent.id;
 }
 
-/// Parent zero is the compact root sentinel. Returning a nested optional lets
-/// callers distinguish a valid root from malformed input.
-fn parentId(state: *c.State, index: c_int) ??u64 {
-    var is_number: c_int = 0;
-    const value = c.lua_tointegerx(state, index, &is_number);
-    if (is_number == 0 or value < 0) return null;
-    return if (value == 0) @as(?u64, null) else @as(?u64, @intCast(value));
-}
-
-fn optionalExtent(state: *c.State, index: c_int) ??f32 {
-    if (c.lua_type(state, index) == c.type_nil) return @as(?f32, null);
-    const value = requiredExtent(state, index) orelse return null;
-    return @as(?f32, value);
-}
-
 fn requiredExtent(state: *c.State, index: c_int) ?f32 {
     const value = finiteFloat(state, index) orelse return null;
     return if (value >= 0) value else null;
@@ -780,81 +621,35 @@ fn finiteFloat(state: *c.State, index: c_int) ?f32 {
     return @floatCast(value);
 }
 
-fn packedColor(state: *c.State, index: c_int) ?Color {
-    var is_number: c_int = 0;
-    const value = c.lua_tointegerx(state, index, &is_number);
-    if (is_number == 0 or value < 0 or value > std.math.maxInt(u32)) return null;
-    const encoded: u32 = @intCast(value);
-    return Color.rgba(
-        @truncate(encoded >> 24),
-        @truncate(encoded >> 16),
-        @truncate(encoded >> 8),
-        @truncate(encoded),
-    );
-}
-
 fn luaError(state: *c.State, message: [*:0]const u8) c_int {
     _ = c.lua_pushstring(state, message);
     return c.lua_error(state);
 }
 
-test "Lua build emits typed normalized descriptors without standard libraries" {
-    const Scheduler = @import("../task/scheduler.zig").Scheduler;
-    const BuildOwners = build_owner.BuildOwners;
-    const RenderTree = @import("../ui/render_object/root.zig").Tree;
-
+test "Lua UI exposes only declarative constructors without standard libraries" {
     const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
     defer c.lua_close(state);
-    c.lua_createtable(state, 0, 3);
+    c.lua_createtable(state, 0, 4);
     c.lua_setglobal(state, "ouro");
     try std.testing.expectEqual(c.type_nil, c.lua_getglobal(state, "print"));
     c.lua_settop(state, -2);
 
-    var scheduler: Scheduler = undefined;
-    try scheduler.init(std.testing.allocator, 8, 1, 0);
-    defer scheduler.deinit();
-    const window_scope = try scheduler.createScope(scheduler.application_scope);
-    var renders: RenderTree = undefined;
-    try renders.init(std.testing.allocator, 3);
-    defer renders.deinit();
-    var instances: instance.Tree = undefined;
-    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 3);
-    defer instances.deinit();
-    var owners: BuildOwners = undefined;
-    try owners.init(std.testing.allocator, &scheduler, window_scope, 1, 4);
-    defer owners.deinit();
-    const owner = try owners.mount(null, 1);
-    var storage: [3]instance.Descriptor = undefined;
+    var storage: [1]instance.Descriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
 
-    const source =
-        \\function build()
-        \\  ouro.stack(1, 0, true)
-        \\  ouro.box(2, 1, nil, nil, 0x112233ff)
-        \\  ouro.positioned_box(3, 1, 4, 5, 20, 10, 0xaabbccff)
-        \\end
-    ;
-    try execute(state, source);
-    var cycle = owners.beginCycle();
-    const work = (try cycle.take()).?;
-    const descriptors = try ui.build(&owners, work, "build", &.{});
-    try std.testing.expectEqual(@as(usize, 3), descriptors.len);
-    try std.testing.expect(descriptors[0].object.stack.clip);
-    try std.testing.expectEqual(@as(u8, 0x11), descriptors[1].object.box.background.?.r);
-    try std.testing.expectEqual(@as(f32, 4), descriptors[2].parent_data.stack.x);
-    try instances.reconcile(descriptors);
-    try owners.complete(work);
-
-    try instances.reconcile(&.{});
-    try owners.retire(owner);
-    try scheduler.applyQueuedCancellations();
-    try instances.collectRetired();
-    try owners.collectRetired();
-    try scheduler.destroyScope(window_scope);
+    try std.testing.expectEqual(c.type_table, c.lua_getglobal(state, "ouro"));
+    inline for (.{ "label", "button", "row", "column" }) |name| {
+        try std.testing.expectEqual(c.type_function, c.lua_getfield(state, -1, name));
+        c.lua_settop(state, -2);
+    }
+    inline for (.{ "box", "padded_box", "stack", "positioned_box", "on_pointer" }) |name| {
+        try std.testing.expectEqual(c.type_nil, c.lua_getfield(state, -1, name));
+        c.lua_settop(state, -2);
+    }
 }
 
-test "Lua composed button label flows through layout scene and software glyph cache" {
+test "declarative Lua label flows through layout scene and software glyph cache" {
     const software = @import("../renderer/software/root.zig");
     if (comptime !software.has_freetype) return error.SkipZigTest;
     const Scheduler = @import("../task/scheduler.zig").Scheduler;
@@ -881,25 +676,32 @@ test "Lua composed button label flows through layout scene and software glyph ca
     var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
     defer shapes.deinit();
     var renders: RenderTree = undefined;
-    try renders.init(std.testing.allocator, 2);
+    try renders.init(std.testing.allocator, 4);
     renders.attachTextCache(&shapes);
     defer renders.deinit();
     var instances: instance.Tree = undefined;
-    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 2);
+    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 4);
     defer instances.deinit();
     var owners: BuildOwners = undefined;
     try owners.init(std.testing.allocator, &scheduler, window_scope, 1, 4);
     defer owners.deinit();
     const owner = try owners.mount(null, 1);
-    var storage: [2]instance.Descriptor = undefined;
+    var storage: [4]instance.Descriptor = undefined;
+    var semantic_storage: [2]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachLabelText(&shapes, &.{font}, 1);
+    try ui.attachSemantics(&semantic_storage);
+    ui.enableDeclarativeWidgets(design.tokens.light);
 
     try execute(state,
         \\function build()
-        \\  ouro.padded_box(1, 0, 120, 36, 8, 0xf0f0f0ff)
-        \\  ouro.label(2, 1, "Benchmark", 18, 0x142850ff)
+        \\  ouro.column {
+        \\    key = "content",
+        \\    children = function()
+        \\      ouro.label { key = "benchmark", text = "Benchmark", size = 18 }
+        \\    end,
+        \\  }
         \\end
     );
     var cycle = owners.beginCycle();
@@ -911,31 +713,28 @@ test "Lua composed button label flows through layout scene and software glyph ca
     try std.testing.expectEqual(@as(usize, 1), shapes.count());
 
     const root = (try instances.rootRenderObject()).?;
-    const size = try renders.layout(root, .{ .max_width = 160, .max_height = 36 });
-    try std.testing.expectEqual(@as(f32, 120), size.width);
-    try std.testing.expectEqual(@as(f32, 36), size.height);
-    var command_storage: [4]scene.Command = undefined;
+    const size = try renders.layout(root, .{ .max_width = 160, .max_height = 64 });
+    try std.testing.expect(size.width > 0 and size.height > 0);
+    var command_storage: [8]scene.Command = undefined;
     var builder = try SceneBuilder.init(&command_storage, 1);
     try renders.buildScene(root, &builder);
-    try std.testing.expectEqual(@as(usize, 4), builder.displayList().commands.len);
-    try std.testing.expect(builder.displayList().commands[2] == .glyph_run);
+    var found_glyph_run = false;
+    for (builder.displayList().commands) |command| {
+        if (command == .glyph_run) found_glyph_run = true;
+    }
+    try std.testing.expect(found_glyph_run);
 
     var glyphs = try software.GlyphCache.init(std.testing.allocator, &fonts);
     defer glyphs.deinit();
-    var pixels = [_]u8{0} ** (160 * 36 * 4);
+    var pixels = [_]u8{0} ** (160 * 64 * 4);
     try software.renderText(builder.displayList(), .{
         .pixels = &pixels,
         .width = 160,
-        .height = 36,
+        .height = 64,
         .stride = 160 * 4,
         .format = .rgba8_unorm,
     }, &glyphs, &shapes);
-    var ink: usize = 0;
-    for (0..pixels.len / 4) |index| {
-        if (!std.mem.eql(u8, pixels[index * 4 ..][0..4], &.{ 240, 240, 240, 255 }))
-            ink += 1;
-    }
-    try std.testing.expect(ink > 200);
+    try std.testing.expect(std.mem.indexOfNone(u8, &pixels, &.{0}) != null);
 
     try instances.reconcile(&.{});
     try std.testing.expectEqual(@as(usize, 0), shapes.count());
@@ -1033,7 +832,10 @@ test "Lua constructors reject calls outside the mounted build phase" {
     var storage: [1]instance.Descriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try std.testing.expectError(error.LuaChunkFailed, execute(state, "ouro.box(1, 0, nil, nil, 0xffffffff)"));
+    try std.testing.expectError(
+        error.LuaChunkFailed,
+        execute(state, "ouro.column { key = 'content', children = function() end }"),
+    );
 }
 
 fn execute(state: *c.State, source: []const u8) !void {
@@ -1072,19 +874,22 @@ test "signals dirty only dependent mounted builds and replace dependencies trans
     defer scheduler.deinit();
     const window_scope = try scheduler.createScope(scheduler.application_scope);
     var renders: RenderTree = undefined;
-    try renders.init(std.testing.allocator, 2);
+    try renders.init(std.testing.allocator, 5);
     defer renders.deinit();
     var instances: instance.Tree = undefined;
-    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 2);
+    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 5);
     defer instances.deinit();
     var owners: BuildOwners = undefined;
     try owners.init(std.testing.allocator, &scheduler, window_scope, 1, 8);
     defer owners.deinit();
     const owner = try owners.mount(null, 1);
-    var storage: [2]instance.Descriptor = undefined;
+    var storage: [5]instance.Descriptor = undefined;
+    var semantic_storage: [3]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     ui.attachSignals(&signals);
+    try ui.attachSemantics(&semantic_storage);
+    ui.enableDeclarativeWidgets(design.tokens.light);
 
     const source =
         \\count = ouro.signal(10)
@@ -1094,14 +899,20 @@ test "signals dirty only dependent mounted builds and replace dependencies trans
         \\late = ouro.signal(50)
         \\mutate = ouro.signal(false)
         \\function build()
-        \\  local width = other()
-        \\  if choose_count() then width = count() end
+        \\  local gap = other()
+        \\  if choose_count() then gap = count() end
         \\  if mutate() then count:set(99) end
-        \\  ouro.box(1, 0, width, 10, 0xffffffff)
-        \\  if duplicate() then
-        \\    late()
-        \\    ouro.box(1, 0, 1, 1, 0xffffffff)
-        \\  end
+        \\  ouro.column {
+        \\    key = "content",
+        \\    gap = gap,
+        \\    children = function()
+        \\      ouro.row { key = "child", children = function() end }
+        \\      if duplicate() then
+        \\        late()
+        \\        ouro.row { key = "child", children = function() end }
+        \\      end
+        \\    end,
+        \\  }
         \\end
     ;
     try execute(state, source);
@@ -1109,7 +920,7 @@ test "signals dirty only dependent mounted builds and replace dependencies trans
     var initial = owners.beginCycle();
     const first = (try initial.take()).?;
     const first_descriptors = try ui.build(&owners, first, "build", &.{});
-    try std.testing.expectEqual(@as(f32, 10), first_descriptors[0].object.box.width.?);
+    try std.testing.expectEqual(@as(f32, 10), first_descriptors[2].object.flex.gap);
     try instances.reconcile(first_descriptors);
     try ui.commitDependencies(&owners, first);
     try owners.complete(first);
@@ -1127,7 +938,7 @@ test "signals dirty only dependent mounted builds and replace dependencies trans
     var changed = owners.beginCycle();
     const second = (try changed.take()).?;
     const second_descriptors = try ui.build(&owners, second, "build", &.{});
-    try std.testing.expectEqual(@as(f32, 20), second_descriptors[0].object.box.width.?);
+    try std.testing.expectEqual(@as(f32, 20), second_descriptors[2].object.flex.gap);
     try instances.reconcile(second_descriptors);
     try ui.commitDependencies(&owners, second);
     try owners.complete(second);
@@ -1138,7 +949,7 @@ test "signals dirty only dependent mounted builds and replace dependencies trans
     var switched = owners.beginCycle();
     const third = (try switched.take()).?;
     const third_descriptors = try ui.build(&owners, third, "build", &.{});
-    try std.testing.expectEqual(@as(f32, 30), third_descriptors[0].object.box.width.?);
+    try std.testing.expectEqual(@as(f32, 30), third_descriptors[2].object.flex.gap);
     try instances.reconcile(third_descriptors);
     try ui.commitDependencies(&owners, third);
     try owners.complete(third);

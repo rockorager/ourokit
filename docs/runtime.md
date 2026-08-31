@@ -69,16 +69,14 @@ across the yield. Normal completion, errors, and cancellation call Lua 5.5's
 `lua_closethread` before releasing the registry reference, ensuring pending
 to-be-closed values unwind and the slot can be safely generation-reused.
 
-The mounted-UI proof can extend the same Ouro-owned table with
-constructor-specific `box`, `stack`, positioned-box, and provisional
-`on_pointer(instance_id, function)` emitters. They are
-available only during a protected build-owner callback in the reconciliation
-phase, cannot yield, and write directly into a bounded typed descriptor buffer.
-There is no generic widget table parser or renderer access. This positional
-surface is explicitly provisional pending schema-generated Lua constructors,
-Zig bindings, language-server types, and validation tests.
-Pointer functions are explicitly registry-anchored and staged with the build;
-they become visible only after descriptor reconciliation succeeds.
+Mounted UI builds extend the same Ouro-owned table with the constructor-specific
+`row`, `column`, `label`, and `button` functions. They are available only during
+a protected build-owner callback in the reconciliation phase, cannot yield, and
+write directly into a bounded typed descriptor buffer. Applications provide
+stable string keys; numeric descriptor IDs, parent links, generic widget table
+parsing, and renderer access are not exposed. Button callbacks are explicitly
+registry-anchored and staged with the build; they become visible only after
+descriptor reconciliation succeeds.
 
 `ouro.signal(initial)` creates full userdata whose Lua user value stores the
 application value. Calling a signal reads it; `signal:set(value)` writes it.
