@@ -24,6 +24,7 @@ const Roundtrip = wayring.client.Roundtrip(protocol, *Host);
 
 const buffer_count = 3;
 const presentation_feedback_capacity = 8;
+const fractional_scale_denominator = 120;
 
 pub const Config = struct {
     app_id: []const u8,
@@ -471,6 +472,8 @@ const Window = struct {
     surface: ?Handle = null,
     xdg_surface: ?Handle = null,
     toplevel: ?Handle = null,
+    viewport: ?Handle = null,
+    fractional_scale: ?Handle = null,
     frame_callback: ?Handle = null,
     presentation_feedbacks: [presentation_feedback_capacity]?Handle = [_]?Handle{null} ** presentation_feedback_capacity,
     sync_surface: ?Handle = null,
@@ -483,6 +486,7 @@ const Window = struct {
     height: u32 = 0,
     pending_width: u32 = 0,
     pending_height: u32 = 0,
+    scale_120: u32 = fractional_scale_denominator,
     configured: bool = false,
     pending_redraw: bool = false,
     frames_presented: usize = 0,
@@ -493,6 +497,8 @@ const Window = struct {
         return (self.surface != null and self.surface.?.id == object_id) or
             (self.xdg_surface != null and self.xdg_surface.?.id == object_id) or
             (self.toplevel != null and self.toplevel.?.id == object_id) or
+            (self.viewport != null and self.viewport.?.id == object_id) or
+            (self.fractional_scale != null and self.fractional_scale.?.id == object_id) or
             (self.frame_callback != null and self.frame_callback.?.id == object_id) or
             self.ownsPresentationFeedback(object_id) or
             (self.sync_surface != null and self.sync_surface.?.id == object_id) or
@@ -552,6 +558,8 @@ pub const Host = struct {
     dmabuf_linear_argb8888: bool = false,
     presentation: ?Handle = null,
     presentation_clock_id: ?u32 = null,
+    viewporter: ?Handle = null,
+    fractional_scale_manager: ?Handle = null,
     sync_manager: ?Handle = null,
     wm_base: ?Handle = null,
     seat: ?Handle = null,
@@ -602,6 +610,8 @@ pub const Host = struct {
         self.dmabuf_linear_argb8888 = false;
         self.presentation = null;
         self.presentation_clock_id = null;
+        self.viewporter = null;
+        self.fractional_scale_manager = null;
         self.sync_manager = null;
         self.wm_base = null;
         self.seat = null;
@@ -622,7 +632,7 @@ pub const Host = struct {
                 .transmit_byte_budget = 128 * 1024,
                 .transmit_fd_budget = 32,
             },
-            .{ .max_objects = 64 + config.window_capacity * 16, .max_client_ids = 48 + config.window_capacity * 16 },
+            .{ .max_objects = 64 + config.window_capacity * 18, .max_client_ids = 48 + config.window_capacity * 18 },
         );
         self.driver = Driver.init(&self.connection);
         self.finishStartup() catch |err| {
@@ -739,6 +749,11 @@ pub const Host = struct {
         window.pending_redraw = true;
     }
 
+    pub fn outputScale(self: *Host, handle: WindowHandle) !f32 {
+        const scale = (try self.windowFor(handle)).scale_120;
+        return @as(f32, @floatFromInt(scale)) / fractional_scale_denominator;
+    }
+
     /// Borrows one persistent presentation slot during frame submission. CPU
     /// access or Vulkan queue submission must finish with `present` or
     /// `discardFrame` before completion dispatch resumes; Vulkan execution may
@@ -747,17 +762,19 @@ pub const Host = struct {
         const window = try self.windowFor(handle);
         if (window.state != .open or !window.configured or !window.pending_redraw or
             window.frame_callback != null) return null;
+        const pixel_width = try scaledExtent(window.width, window.scale_120);
+        const pixel_height = try scaledExtent(window.height, window.scale_120);
         try self.prepareBuffers(window);
         if (self.usingDmabuf()) {
-            if (!window.dmabuf_buffers.matches(window.width, window.height)) return null;
+            if (!window.dmabuf_buffers.matches(pixel_width, pixel_height)) return null;
             for (&window.dmabuf_buffers.slots, 0..) |*slot, index| {
                 if (slot.busy or slot.acquired) continue;
                 if (!try slot.target.?.ready(self.vulkan.?)) continue;
                 slot.acquired = true;
                 return .{
                     .target = .{ .vulkan = &slot.target.? },
-                    .width = window.width,
-                    .height = window.height,
+                    .width = pixel_width,
+                    .height = pixel_height,
                     .window = handle,
                     .pool_generation = window.dmabuf_buffers.generation,
                     .slot = @intCast(index),
@@ -765,7 +782,7 @@ pub const Host = struct {
             }
             return null;
         }
-        if (!window.buffers.matches(window.width, window.height)) return null;
+        if (!window.buffers.matches(pixel_width, pixel_height)) return null;
         for (&window.buffers.slots, 0..) |*slot, index| {
             if (slot.busy or slot.acquired) continue;
             slot.acquired = true;
@@ -775,8 +792,8 @@ pub const Host = struct {
                     .pixels = window.buffers.mapping.?[start..][0..window.buffers.slot_size],
                     .stride = window.buffers.stride,
                 } },
-                .width = window.width,
-                .height = window.height,
+                .width = pixel_width,
+                .height = pixel_height,
                 .window = handle,
                 .pool_generation = window.buffers.generation,
                 .slot = @intCast(index),
@@ -1042,9 +1059,11 @@ pub const Host = struct {
         if (self.usingDmabuf()) return self.prepareDmabufBuffers(window);
         const objects = &self.connection.objects;
         const transmit = try self.queue();
+        const pixel_width = try scaledExtent(window.width, window.scale_120);
+        const pixel_height = try scaledExtent(window.height, window.scale_120);
         if (window.retired_buffers.mapping != null and !window.retired_buffers.anyBusy())
             try window.retired_buffers.destroy(objects, transmit);
-        if (window.buffers.matches(window.width, window.height)) return;
+        if (window.buffers.matches(pixel_width, pixel_height)) return;
         if (window.retired_buffers.mapping != null) return;
         if (window.buffers.mapping != null) {
             if (window.buffers.anyBusy()) {
@@ -1060,8 +1079,8 @@ pub const Host = struct {
             objects,
             transmit,
             self.shm.?,
-            window.width,
-            window.height,
+            pixel_width,
+            pixel_height,
             window.next_pool_generation,
         );
         _ = try self.driver.schedule();
@@ -1071,10 +1090,12 @@ pub const Host = struct {
         const renderer = self.vulkan.?;
         const objects = &self.connection.objects;
         const transmit = try self.queue();
+        const pixel_width = try scaledExtent(window.width, window.scale_120);
+        const pixel_height = try scaledExtent(window.height, window.scale_120);
         if (window.retired_dmabuf_buffers.slots[0].target != null and
             !window.retired_dmabuf_buffers.anyBusy())
             try window.retired_dmabuf_buffers.destroy(renderer, objects, transmit);
-        if (window.dmabuf_buffers.matches(window.width, window.height)) return;
+        if (window.dmabuf_buffers.matches(pixel_width, pixel_height)) return;
         if (window.retired_dmabuf_buffers.slots[0].target != null) return;
         if (window.dmabuf_buffers.slots[0].target != null) {
             if (window.dmabuf_buffers.anyBusy()) {
@@ -1093,8 +1114,8 @@ pub const Host = struct {
             self.dmabuf.?,
             self.sync_manager,
             self.selectedDmabufModifier().?,
-            window.width,
-            window.height,
+            pixel_width,
+            pixel_height,
             window.next_pool_generation,
         );
         _ = try self.driver.schedule();
@@ -1170,6 +1191,10 @@ pub const Host = struct {
         }
         const objects = &self.connection.objects;
         const transmit = try self.queue();
+        if (window.fractional_scale) |handle|
+            try wayring.client.sendRequest(protocol.wp_fractional_scale_v1, objects, transmit, handle, .{ .destroy = .{} });
+        if (window.viewport) |handle|
+            try wayring.client.sendRequest(protocol.wp_viewport, objects, transmit, handle, .{ .destroy = .{} });
         if (window.toplevel) |handle|
             try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, handle, .{ .destroy = .{} });
         if (window.xdg_surface) |handle|
@@ -1186,6 +1211,8 @@ pub const Host = struct {
             try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, handle, .{ .destroy = .{} });
         window.toplevel = null;
         window.xdg_surface = null;
+        window.fractional_scale = null;
+        window.viewport = null;
         window.sync_surface = null;
         window.surface = null;
         for (&window.buffers.slots) |*slot| slot.acquired = false;
@@ -1229,6 +1256,24 @@ pub const Host = struct {
             xdg_surface,
             .{},
         )).id;
+        const viewport = if (self.viewporter) |viewporter|
+            (try protocol.wp_viewporter.construct_get_viewport(
+                objects,
+                transmit,
+                viewporter,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
+        const fractional_scale = if (self.fractional_scale_manager != null and viewport != null)
+            (try protocol.wp_fractional_scale_manager_v1.construct_get_fractional_scale(
+                objects,
+                transmit,
+                self.fractional_scale_manager.?,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
         const sync_surface = if (self.sync_manager) |manager|
             (try protocol.wp_linux_drm_syncobj_manager_v1.construct_get_surface(
                 objects,
@@ -1252,6 +1297,13 @@ pub const Host = struct {
             toplevel,
             .{ .set_app_id = .{ .app_id = self.app_id } },
         );
+        if (viewport) |viewport_handle| try setViewportDestination(
+            objects,
+            transmit,
+            viewport_handle,
+            declaration.initial_width,
+            declaration.initial_height,
+        );
         try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
         window.* = .{
             .state = .open,
@@ -1260,6 +1312,8 @@ pub const Host = struct {
             .surface = surface,
             .xdg_surface = xdg_surface,
             .toplevel = toplevel,
+            .viewport = viewport,
+            .fractional_scale = fractional_scale,
             .sync_surface = sync_surface,
             .width = declaration.initial_width,
             .height = declaration.initial_height,
@@ -1359,9 +1413,34 @@ pub const Host = struct {
                         window.damage_history = .{};
                     window.width = window.pending_width;
                     window.height = window.pending_height;
+                    if (window.viewport) |viewport| try setViewportDestination(
+                        objects,
+                        try self.queue(),
+                        viewport,
+                        window.width,
+                        window.height,
+                    );
                     window.configured = true;
                     window.pending_redraw = true;
                     try self.sink.configured(window.handle, window.width, window.height);
+                },
+            }
+        } else if (interface == &protocol.wp_fractional_scale_v1.info) {
+            const window = try self.windowForObject(message.header.object_id);
+            switch (try wayring.client.decodeEvent(
+                protocol.wp_fractional_scale_v1,
+                objects,
+                window.fractional_scale.?,
+                message,
+                fds,
+            )) {
+                .preferred_scale => |preferred| {
+                    if (preferred.scale == 0) return error.InvalidFractionalScale;
+                    if (window.scale_120 != preferred.scale) {
+                        window.scale_120 = preferred.scale;
+                        window.damage_history = .{};
+                        window.pending_redraw = true;
+                    }
                 },
             }
         } else if (interface == &protocol.wl_buffer.info) {
@@ -1529,6 +1608,26 @@ pub const Host = struct {
                 @min(global.version, 2),
                 null,
             );
+        } else if (std.mem.eql(u8, global.interface, protocol.wp_viewporter.info.name)) {
+            self.viewporter = try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.wp_viewporter.info,
+                1,
+                null,
+            );
+        } else if (std.mem.eql(u8, global.interface, protocol.wp_fractional_scale_manager_v1.info.name)) {
+            self.fractional_scale_manager = try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.wp_fractional_scale_manager_v1.info,
+                1,
+                null,
+            );
         } else if (self.vulkan != null and
             std.mem.eql(u8, global.interface, protocol.wp_linux_drm_syncobj_manager_v1.info.name))
         {
@@ -1692,7 +1791,9 @@ pub const Host = struct {
                 .axis = try pointerAxis(value.axis),
                 .steps120 = value.value120,
             } }),
-            .frame => try self.sink.pointer(.{ .frame = try self.focusedWindow() }),
+            // A frame terminates the preceding logical group. In particular,
+            // it can follow leave, after that event has cleared focus.
+            .frame => if (self.pointer_focus) |window| try self.sink.pointer(.{ .frame = window }),
             .axis_relative_direction, .warp => return error.UnsupportedPointerEventVersion,
         }
     }
@@ -1717,6 +1818,28 @@ pub const Host = struct {
 
 fn sameWindow(a: WindowHandle, b: WindowHandle) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn scaledExtent(logical: u32, scale_120: u32) !u32 {
+    if (logical == 0 or scale_120 == 0) return error.InvalidScaledExtent;
+    const numerator = @as(u64, logical) * scale_120;
+    const pixels = (numerator + fractional_scale_denominator - 1) / fractional_scale_denominator;
+    if (pixels > std.math.maxInt(u32)) return error.ScaledExtentOverflow;
+    return @intCast(pixels);
+}
+
+fn setViewportDestination(
+    objects: *wayring.objects.ClientObjects,
+    transmit: *wayring.tx.Queue,
+    viewport: Handle,
+    width: u32,
+    height: u32,
+) !void {
+    if (width == 0 or height == 0 or width > std.math.maxInt(i32) or height > std.math.maxInt(i32))
+        return error.InvalidViewportDestination;
+    try wayring.client.sendRequest(protocol.wp_viewport, objects, transmit, viewport, .{
+        .set_destination = .{ .width = @intCast(width), .height = @intCast(height) },
+    });
 }
 
 fn fixedValue(raw: i32) f32 {
@@ -1767,4 +1890,10 @@ test "damage history expands a stale slot and falls back when age is unknown" {
     _ = history.commit(.none);
     _ = history.commit(.none);
     try std.testing.expect(history.expand(first, .none, bounds) == .full);
+}
+
+test "fractional scale rounds buffer extents up" {
+    try std.testing.expectEqual(@as(u32, 800), try scaledExtent(640, 150));
+    try std.testing.expectEqual(@as(u32, 2), try scaledExtent(1, 150));
+    try std.testing.expectEqual(@as(u32, 640), try scaledExtent(640, 120));
 }

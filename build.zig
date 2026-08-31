@@ -417,8 +417,10 @@ fn addWaylandProtocol(
     const generate = b.addRunArtifact(scanner);
     generate.addFileArg(wayland.path("protocol/wayland.xml"));
     generate.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
+    generate.addFileArg(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     generate.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));
+    generate.addFileArg(wayland_protocols.path("staging/fractional-scale/fractional-scale-v1.xml"));
     generate.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
     const generated = generate.addOutputFileArg("ourokit-wayland-protocol.zig");
     return b.createModule(.{

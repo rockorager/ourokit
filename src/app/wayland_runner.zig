@@ -227,7 +227,8 @@ pub fn run(init: std.process.Init, source: []const u8, options: Options) !void {
             try dirty.complete(work);
         }
 
-        for (runtimes) |*runtime| if (runtime.ready) try runtime.prepareFrame();
+        for (runtimes) |*runtime| if (runtime.ready)
+            try runtime.prepareFrame(try host.outputScale(runtime.window));
 
         for (application.windows, desired, 0..) |window, present, index| {
             if (!present) continue;
