@@ -3,6 +3,7 @@ const wayland_runner = @import("wayland_runner.zig");
 const storybook_runner = @import("storybook_runner.zig");
 
 const browser_prefix =
+    \\local ouro = require("ouro")
     \\local function declaration(value)
     \\  return value
     \\end
@@ -139,6 +140,7 @@ pub fn run(
 
 test "browser wrapper retains catalog source inside an application" {
     const source =
+        \\local ouro = require("ouro")
         \\return ouro.storybook {
         \\  title = "Controls",
         \\  stories = {
@@ -152,6 +154,7 @@ test "browser wrapper retains catalog source inside an application" {
     try output.writer.writeAll(source);
     try output.writer.writeByte('\n');
     try output.writer.writeAll(browser_suffix);
+    try std.testing.expect(std.mem.startsWith(u8, output.written(), "local ouro = require(\"ouro\")"));
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "local catalog = (function()") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "title = \"Controls\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "return ouro.app") != null);
