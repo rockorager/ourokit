@@ -90,8 +90,8 @@ change requires a restart.
 
 ## Source and modules
 
-`app.runWayland` currently receives detached source bytes. A reloadable host
-instead receives a source provider:
+`app.runWayland` accepts immutable embedded bytes, while the executable passes
+the reloadable host a retained source provider:
 
 ```zig
 pub const SourceProvider = union(enum) {
@@ -385,14 +385,19 @@ fixed `Application` and `Vm`. The implemented ownership boundary includes:
 - old generations cancel and drain asynchronously while task and completion
   routing continues by owning VM; and
 - source, declaration, and build failures become structured diagnostics and do
-  not escape the run loop after successful startup.
+  not escape the run loop after successful startup;
+- disk startup and reload evaluate the entry in scheduler-owned retained
+  coroutines, with cache misses yielding opaquely through asynchronous
+  capability-relative whole-file reads; and
+- `require("ouro")` resolves the runtime-owned built-in module synchronously,
+  while the disk module closure freezes when entry evaluation completes.
 
 The first runner integration deliberately accepts only an unchanged window-ID
 set. Added and removed windows still require transactional native-host
 preparation, and a public control transport still needs to wake the event loop
-and submit the in-process request. Snapshot-backed modules, persistent state,
-component-family identity, and post-commit lifecycle hooks also remain future
-slices below.
+and submit the in-process request. Module dependency revalidation before commit,
+persistent state, component-family identity, and post-commit lifecycle hooks
+also remain future slices below.
 
 These changes belong in existing ownership modules. There is still no broad
 `runtime` module: `bundle` owns source, `lua` owns language generations and
