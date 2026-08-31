@@ -208,6 +208,26 @@ zig-out/bin/ouroctl run path/to/application.lua
 The reusable host follows the same renderer default. Pass `--software` to force
 the software renderer.
 
+Text inputs support an explicit controlled or retained-value contract. Use
+`text` with `on_change` when application state is authoritative:
+
+```lua
+local query = ouro.signal("")
+
+ouro.text_input {
+  key = "query",
+  text = query(),
+  on_change = function(value)
+    query:set(value)
+  end,
+}
+```
+
+Use `default_text` instead when native retained editing state should own the
+value after first mount. Exactly one of `text` and `default_text` is required.
+`on_change` runs as a scoped Lua task during the task safe point, never from an
+input protocol callback; selection-only changes do not invoke it.
+
 ## Storybook
 
 Storybook catalogs are explicit Lua entry points containing named, isolated

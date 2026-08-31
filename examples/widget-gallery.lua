@@ -1,6 +1,7 @@
 local ouro = require("ouro")
 
 local count = ouro.signal(0)
+local query = ouro.signal("Editable text")
 
 return ouro.app {
   id = "dev.ourokit.benchmark.settings.ourokit",
@@ -26,8 +27,11 @@ return ouro.app {
             }
             ouro.text_input {
               key = "query",
-              text = "Editable text",
+              text = query(),
               width = 280,
+              on_change = function(value)
+                query:set(value)
+              end,
             }
             ouro.row {
               key = "actions",

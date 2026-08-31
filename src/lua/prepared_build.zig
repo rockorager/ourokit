@@ -5,6 +5,7 @@ const instance = @import("../ui/instance/tree.zig");
 const input = @import("../ui/input/bindings.zig");
 const semantics = @import("../ui/semantics/snapshot.zig");
 const buttons = @import("../ui/widget/buttons.zig");
+const text_input = @import("../ui/text_input/root.zig");
 const text = @import("../text/root.zig");
 
 pub const Handler = struct {
@@ -25,6 +26,13 @@ pub const Button = struct {
     style: buttons.Style,
 };
 
+pub const TextInput = struct {
+    target_id: u64,
+    content_id: u64,
+    mode: text_input.ValueMode,
+    session: ?text_input.Session,
+};
+
 /// One candidate-owned, normalized window build. Registry references and
 /// acquired shape references remain owned here until an application commit
 /// transfers them into retained native UI or a failed candidate discards them.
@@ -42,6 +50,8 @@ pub const PreparedBuild = struct {
     handler_count: usize = 0,
     prepared_buttons: []Button,
     button_count: usize = 0,
+    text_inputs: []TextInput,
+    text_input_count: usize = 0,
     owns_shapes: bool = false,
     reconcile_plan: ?instance.ReconcilePlan = null,
     size: ?core.SizeU = null,
@@ -65,6 +75,8 @@ pub const PreparedBuild = struct {
         const handlers = try allocator.alloc(Handler, node_capacity);
         errdefer allocator.free(handlers);
         const prepared_buttons = try allocator.alloc(Button, node_capacity);
+        errdefer allocator.free(prepared_buttons);
+        const text_inputs = try allocator.alloc(TextInput, node_capacity);
         self.* = .{
             .allocator = allocator,
             .state = state,
@@ -74,11 +86,13 @@ pub const PreparedBuild = struct {
             .semantic_text = semantic_text,
             .handlers = handlers,
             .prepared_buttons = prepared_buttons,
+            .text_inputs = text_inputs,
         };
     }
 
     pub fn deinit(self: *PreparedBuild) void {
         self.reset();
+        self.allocator.free(self.text_inputs);
         self.allocator.free(self.prepared_buttons);
         self.allocator.free(self.handlers);
         self.allocator.free(self.semantic_text);
@@ -90,9 +104,12 @@ pub const PreparedBuild = struct {
     pub fn reset(self: *PreparedBuild) void {
         for (self.handlers[0..self.handler_count]) |handler|
             c.luaL_unref(self.state, c.registry_index, handler.reference);
+        for (self.text_inputs[0..self.text_input_count]) |*text_input_value|
+            if (text_input_value.session) |*session| session.deinit();
         if (self.owns_shapes) for (self.descriptor_storage[0..self.descriptor_count]) |descriptor|
             switch (descriptor.object) {
                 .label => |label| self.shapes.?.release(label.source) catch unreachable,
+                .text_input => |text_input_value| self.shapes.?.release(text_input_value.source) catch unreachable,
                 else => {},
             };
         self.descriptor_count = 0;
@@ -100,6 +117,7 @@ pub const PreparedBuild = struct {
         self.semantic_text_count = 0;
         self.handler_count = 0;
         self.button_count = 0;
+        self.text_input_count = 0;
         self.owns_shapes = false;
         self.reconcile_plan = null;
         self.size = null;

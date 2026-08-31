@@ -42,6 +42,7 @@ pub extern fn lua_pushvalue(state: *State, index: c_int) void;
 pub extern fn lua_pushlightuserdata(state: *State, pointer: *anyopaque) void;
 pub extern fn lua_pushcclosure(state: *State, function: CFunction, upvalue_count: c_int) void;
 pub extern fn lua_pushstring(state: *State, string: [*:0]const u8) ?[*:0]const u8;
+pub extern fn lua_pushlstring(state: *State, string: [*]const u8, length: usize) ?[*]const u8;
 pub extern fn lua_setfield(state: *State, index: c_int, key: [*:0]const u8) void;
 pub extern fn lua_setglobal(state: *State, name: [*:0]const u8) void;
 pub extern fn lua_getglobal(state: *State, name: [*:0]const u8) c_int;

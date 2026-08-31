@@ -337,7 +337,11 @@ fn runSourceWithFontconfig(
             if (completion.text) |bytes| {
                 if (slotForNativeHandle(&window_set, runtime_slots, completion.target.window)) |slot| {
                     if (slot.runtime.ready) {
-                        _ = try slot.runtime.applyClipboardPaste(completion.target.text_input, bytes);
+                        _ = try slot.runtime.applyClipboardPaste(
+                            &callbacks,
+                            completion.target.text_input,
+                            bytes,
+                        );
                     }
                 }
             }

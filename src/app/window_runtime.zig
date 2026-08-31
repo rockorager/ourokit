@@ -5,6 +5,7 @@ const text_input_coordinator = @import("text_input.zig");
 const core = @import("../core/root.zig");
 const design = @import("../design/root.zig");
 const lua = @import("../lua/root.zig");
+const lua_c = @import("../lua/c.zig");
 const platform = @import("../platform/window.zig");
 const scene = @import("../scene/root.zig");
 const task = @import("../task/root.zig");
@@ -232,6 +233,8 @@ pub const WindowRuntime = struct {
         )) return error.PointerBindingCapacityExceeded;
         if (prepared.button_count > self.buttons.availableForOwner(self.root_owner))
             return error.ButtonCapacityExceeded;
+        if (prepared.text_input_count > self.text_inputs.availableForOwner(self.root_owner))
+            return error.TextInputCapacityExceeded;
         for (prepared.handlers[0..prepared.handler_count]) |handler|
             if (!containsDescriptorId(prepared.descriptors(), handler.id))
                 return error.PointerHandlerInstanceMissing;
@@ -240,6 +243,55 @@ pub const WindowRuntime = struct {
                 if (descriptor.object != .box) return error.ButtonRenderObjectMismatch;
             } else {
                 return error.ButtonInstanceMissing;
+            }
+        }
+        for (prepared.text_inputs[0..prepared.text_input_count]) |*input| {
+            if (!containsDescriptorId(prepared.descriptors(), input.target_id) or
+                !containsDescriptorId(prepared.descriptors(), input.content_id))
+                return error.TextInputInstanceMissing;
+            if (self.instances.handleForId(input.target_id)) |target| {
+                try self.text_inputs.prepareMount(target, input.mode, &input.session);
+                if (!self.text_inputs.contains(target)) continue;
+                const retained = try self.text_inputs.session(target);
+                const candidate = &input.session.?.model;
+                const descriptor_index = descriptorIndexForId(
+                    prepared.descriptors(),
+                    input.content_id,
+                ).?;
+                var object = &prepared.descriptor_storage[descriptor_index].object;
+                if (object.* != .text_input) return error.TextInputRenderObjectMismatch;
+                if (input.mode == .uncontrolled or
+                    std.mem.eql(u8, retained.model.text(), candidate.text()))
+                {
+                    const retained_content = try self.text_inputs.content(target);
+                    const retained_object = try self.tree.objectAt(
+                        try self.instances.renderObject(retained_content),
+                    );
+                    if (retained_object != .text_input)
+                        return error.TextInputRenderObjectMismatch;
+                    try self.paragraph_sources.validateRetain(retained_object.text_input.source);
+                    try self.paragraph_sources.retain(retained_object.text_input.source);
+                    self.paragraph_sources.release(object.text_input.source) catch unreachable;
+                    object.text_input.source = retained_object.text_input.source;
+                    object.text_input.selection_start = retained_object.text_input.selection_start;
+                    object.text_input.selection_end = retained_object.text_input.selection_end;
+                    object.text_input.caret_offset = retained_object.text_input.caret_offset;
+                    object.text_input.caret_affinity = retained_object.text_input.caret_affinity;
+                    object.text_input.show_caret = retained_object.text_input.show_caret;
+                    object.text_input.preedit = retained_object.text_input.preedit;
+                    object.text_input.preedit_color = if (object.text_input.preedit != null)
+                        object.text_input.caret_color
+                    else
+                        null;
+                } else {
+                    const selection = candidate.selection;
+                    const range = selection.range();
+                    object.text_input.selection_start = range.start;
+                    object.text_input.selection_end = range.end;
+                    object.text_input.caret_offset = selection.extent;
+                    object.text_input.caret_affinity = selection.extent_affinity;
+                    object.text_input.show_caret = optionalSameHandle(self.focus.current(), target);
+                }
             }
         }
         const plan = try self.instances.prepareReconcile(prepared.descriptors());
@@ -303,6 +355,17 @@ pub const WindowRuntime = struct {
         self.buttons.finishOwner(self.root_owner);
         for (0..self.buttons.slotCount()) |index|
             if (self.buttons.visualAt(index)) |visual| self.applyButtonUpdate(visual) catch unreachable;
+
+        self.text_inputs.removeInactive(&self.instances);
+        self.text_inputs.beginOwner(self.root_owner);
+        for (prepared.text_inputs[0..prepared.text_input_count]) |*input| self.text_inputs.mountPrepared(
+            self.root_owner,
+            self.instances.handleForId(input.target_id).?,
+            self.instances.handleForId(input.content_id).?,
+            input.mode,
+            &input.session,
+        ) catch unreachable;
+        self.text_inputs.finishOwner(self.root_owner);
 
         self.signals.disposeOwner(.{
             .owners = &self.build_owners,
@@ -482,8 +545,11 @@ pub const WindowRuntime = struct {
                 const focused = self.focus.current() orelse continue;
                 if (!self.text_inputs.contains(focused)) continue;
                 self.text_input_commit_permitted = event.text_input.serial_matches_state;
-                if (try (try self.text_inputs.session(focused)).apply(event.text_input.batch))
-                    try self.syncTextInputVisuals();
+                const session = try self.text_inputs.session(focused);
+                const model_revision = session.model.revision;
+                if (try session.apply(event.text_input.batch)) try self.syncTextInputVisuals();
+                if (session.model.revision != model_revision)
+                    try self.notifyTextInputChanged(callback_service, focused);
                 continue;
             }
             if (event == .keyboard) {
@@ -518,6 +584,7 @@ pub const WindowRuntime = struct {
                     );
                 continue;
             }
+            if (binding.kind == .text_input_change) continue;
             const values = inputValues(event);
             const arguments = [_]lua.TaskArgument{
                 .{ .integer = values.kind },
@@ -572,8 +639,10 @@ pub const WindowRuntime = struct {
                             try clipboard.setSelection(key.serial, selected);
                             if (command == .cut) {
                                 session.preferred_x = null;
-                                if (try session.model.replaceSelection(""))
+                                if (try session.model.replaceSelection("")) {
                                     try self.syncTextInputVisuals();
+                                    try self.notifyTextInputChanged(callback_service, focused);
+                                }
                             }
                         },
                         .paste => _ = try clipboard.requestPaste(
@@ -590,7 +659,11 @@ pub const WindowRuntime = struct {
                 try self.applyTextInputIntent(focused, value)
             else
                 false;
-            if (changed) try self.syncTextInputVisuals();
+            if (changed) {
+                try self.syncTextInputVisuals();
+                if (intentEditsText(intent.?))
+                    try self.notifyTextInputChanged(callback_service, focused);
+            }
             if (intent != null) return;
         };
         if (key.translated.logical == .space) switch (key.state) {
@@ -643,6 +716,22 @@ pub const WindowRuntime = struct {
         } else {
             return error.CallbackServiceUnavailable;
         }
+    }
+
+    fn notifyTextInputChanged(
+        self: *WindowRuntime,
+        callback_service: anytype,
+        target: ui.instance.InstanceHandle,
+    ) !void {
+        const binding = self.pointer_bindings.get(target) orelse return;
+        if (binding.kind != .text_input_change) return;
+        const value = (try self.text_inputs.session(target)).model.text();
+        try self.spawnCallback(
+            callback_service,
+            binding.id,
+            try self.instances.scope(target),
+            &.{.{ .string = value }},
+        );
     }
 
     pub fn wantsSubmission(self: *const WindowRuntime) bool {
@@ -862,6 +951,7 @@ pub const WindowRuntime = struct {
     /// generation is revalidated here before the edit is applied.
     pub fn applyClipboardPaste(
         self: *WindowRuntime,
+        callback_service: anytype,
         target: ui.instance.InstanceHandle,
         bytes: []const u8,
     ) !bool {
@@ -869,7 +959,10 @@ pub const WindowRuntime = struct {
         const session = try self.text_inputs.session(target);
         session.endSelectionDrag();
         const changed = try session.apply(.{ .commit = .{ .text = bytes } });
-        if (changed) try self.syncTextInputVisuals();
+        if (changed) {
+            try self.syncTextInputVisuals();
+            try self.notifyTextInputChanged(callback_service, target);
+        }
         return changed;
     }
 
@@ -1367,6 +1460,35 @@ test "text input protocol batches mutate retained sessions only at the input saf
     const content = runtime.instances.handleForId(2).?;
     const owner: ui.instance.BuildOwnerHandle = .{ .slot = 1, .generation = 1 };
     try runtime.text_inputs.mount(owner, target, content, "hello");
+    var loop: @import("../loop/io_uring.zig").Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 2);
+    defer loop.deinit();
+    var callback_vm: lua.Vm = undefined;
+    try callback_vm.init(std.testing.allocator, &scheduler, &loop);
+    defer callback_vm.deinit();
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(std.testing.allocator, 1);
+    defer callbacks.deinit();
+    const callback_source = "return function(value) changed_text = value end";
+    try std.testing.expectEqual(
+        lua_c.ok,
+        lua_c.luaL_loadbufferx(
+            callback_vm.state,
+            callback_source.ptr,
+            callback_source.len,
+            "@text-change-test",
+            null,
+        ),
+    );
+    try std.testing.expectEqual(lua_c.ok, lua_c.lua_pcallk(callback_vm.state, 0, 1, 0, 0, null));
+    const callback = try callbacks.adoptReference(
+        &callback_vm,
+        lua_c.luaL_ref(callback_vm.state, lua_c.registry_index),
+    );
+    _ = try runtime.pointer_bindings.set(owner, target, .{
+        .id = callback,
+        .kind = .text_input_change,
+    });
     _ = try runtime.focus.request(&runtime.instances, target);
     _ = try runtime.tree.layout(
         (try runtime.instances.rootRenderObject()).?,
@@ -1384,9 +1506,18 @@ test "text input protocol batches mutate retained sessions only at the input saf
     } });
     @memset(&commit, '?');
     try std.testing.expectEqualStrings("hello", (try runtime.text_inputs.session(target)).model.text());
-    var unused_vm: lua.Vm = undefined;
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expectEqualStrings("hello!", (try runtime.text_inputs.session(target)).model.text());
+    try std.testing.expect(!callback_vm.hasGlobal("changed_text"));
+    try std.testing.expectEqual(
+        lua.ResumeResult.completed,
+        try callback_vm.resumeRunnable(scheduler.takeRunnable().?),
+    );
+    try std.testing.expectEqual(lua_c.type_string, lua_c.lua_getglobal(callback_vm.state, "changed_text"));
+    var changed_length: usize = 0;
+    const changed_text = lua_c.lua_tolstring(callback_vm.state, -1, &changed_length).?;
+    try std.testing.expectEqualStrings("hello!", changed_text[0..changed_length]);
+    lua_c.lua_settop(callback_vm.state, -2);
     const render = try runtime.instances.renderObject(content);
     const object = try runtime.tree.objectAt(render);
     try std.testing.expectEqualStrings("hello!", (try sources.get(object.text_input.source)).utf8);
@@ -1399,7 +1530,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .commit = .{ .text = "?" },
         .preedit = null,
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expectEqualStrings("hello!?", (try runtime.text_inputs.session(target)).model.text());
     try std.testing.expect(!runtime.text_input_commit_permitted);
     try runtime.routeTextInput(.{ .batch = .{
@@ -1410,7 +1541,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .commit = null,
         .preedit = null,
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expect(runtime.text_input_commit_permitted);
 
     const before_left = (try runtime.text_inputs.session(target)).model.selection;
@@ -1427,7 +1558,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .state = .pressed,
         .translated = .{ .keycode = 105, .logical = .arrow_left },
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     const after_left = (try runtime.text_inputs.session(target)).model.selection;
     try std.testing.expectEqual(expected_left.byte_offset, after_left.extent);
     try std.testing.expectEqual(expected_left.affinity, after_left.extent_affinity);
@@ -1444,7 +1575,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
             .modifiers = .{ .shift = true },
         },
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     const extended = (try runtime.text_inputs.session(target)).model.selection;
     try std.testing.expectEqual(after_left.anchor, extended.anchor);
     try std.testing.expect(!extended.isCollapsed());
@@ -1462,7 +1593,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .state = .pressed,
         .translated = .{ .keycode = 102, .logical = .home },
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     const after_home = try runtime.text_inputs.session(target);
     try std.testing.expectEqual(expected_home.byte_offset, after_home.model.selection.extent);
     try std.testing.expectEqual(expected_home.affinity, after_home.model.selection.extent_affinity);
@@ -1476,7 +1607,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .state = .pressed,
         .translated = .{ .keycode = 103, .logical = .arrow_up },
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expect((try runtime.text_inputs.session(target)).preferred_x != null);
 
     try runtime.routeKeyboard(.{ .key = .{
@@ -1490,7 +1621,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
             .modifiers = .{ .control = true },
         },
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     const after_word = try runtime.text_inputs.session(target);
     try std.testing.expectEqual(@as(usize, 5), after_word.model.selection.extent);
     try std.testing.expect(after_word.preferred_x == null);
@@ -1509,7 +1640,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .serial = 8,
         .position = drag_start,
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try runtime.routePointer(.{ .button = .{
         .window = window,
         .serial = 9,
@@ -1517,14 +1648,14 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .button = 0x110,
         .state = .pressed,
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expect((try runtime.text_inputs.session(target)).isSelecting());
     try runtime.routePointer(.{ .motion = .{
         .window = window,
         .time_ms = 10,
         .position = drag_end,
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     const dragged = (try runtime.text_inputs.session(target)).model.selection;
     try std.testing.expectEqual(expected_drag_start.byte_offset, dragged.anchor);
     try std.testing.expectEqual(expected_drag_start.affinity, dragged.anchor_affinity);
@@ -1537,8 +1668,13 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .button = 0x110,
         .state = .released,
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expect(!(try runtime.text_inputs.session(target)).isSelecting());
+
+    while (scheduler.takeRunnable()) |runnable|
+        _ = try callback_vm.resumeRunnable(runnable);
+    _ = runtime.pointer_bindings.remove(target);
+    try callbacks.release(callback);
 
     try fonts.release(font);
 }
@@ -1564,6 +1700,13 @@ fn textInputIntent(key: platform.TranslatedKey) ?ui.text_input.EditIntent {
         .home => .{ .move = .{ .destination = .line_start, .extend = extend } },
         .end => .{ .move = .{ .destination = .line_end, .extend = extend } },
         else => null,
+    };
+}
+
+fn intentEditsText(intent: ui.text_input.EditIntent) bool {
+    return switch (intent) {
+        .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
+        .select_all, .move => false,
     };
 }
 

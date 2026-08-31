@@ -10,6 +10,7 @@ pub const Preedit = @import("session.zig").Preedit;
 pub const Presentation = @import("presentation.zig").Presentation;
 pub const buildPresentation = @import("presentation.zig").build;
 pub const Registry = @import("registry.zig").Registry;
+pub const ValueMode = @import("registry.zig").ValueMode;
 
 test {
     _ = @import("intent.zig");

@@ -461,8 +461,12 @@ session keeps preedit outside committed text,
 applies delete/commit/preedit batches in protocol order, and exposes bounded
 surrounding state through an app-owned platform translator. A separate retained
 registry keys sessions and their content instances by generation-checked
-identity and build-owner lifetime; Lua rebuilds cannot reset edited values, and
-omission disposes composition state deterministically. Neutral editing intents
+identity and build-owner lifetime. Declarative `default_text` initializes an
+uncontrolled session once, while controlled `text` synchronizes only when its
+value differs; equal values preserve caret, selection, and preedit. Changed
+controlled values replace transactionally with selection offsets clamped to
+valid grapheme boundaries. Omission disposes composition state deterministically.
+Neutral editing intents
 cover grapheme, Unicode-word, visual bidi, line-boundary, and preferred-X
 vertical movement plus select-all. The model exposes selected committed text as
 a borrowed normalized slice; the clipboard coordinator must take ownership
@@ -486,6 +490,14 @@ the normalized selection into an owned app effect, then the adapter creates a
 `wl_data_source`, offers UTF-8/plain text, and services every compositor send
 with short-write-aware Ourokit write/close operations. Cut mutates the model
 only after the outgoing effect owns its bytes.
+
+Committed user edits enqueue at most one scoped `on_change(text)` Lua task per
+input transaction. Dispatch copies the length-delimited UTF-8 value onto the
+new Lua coroutine stack immediately, including embedded NUL bytes, but does not
+resume that coroutine. Task-phase scheduling therefore preserves the invariant
+that input dispatch, reconciliation, and Lua execution cannot re-enter one
+another. Selection movement, preedit-only changes, and controlled external
+synchronization do not emit `on_change`.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,

@@ -3,6 +3,8 @@ const build_owner = @import("../instance/build_owner.zig");
 const instance = @import("../instance/tree.zig");
 const Session = @import("session.zig").Session;
 
+pub const ValueMode = enum { uncontrolled, controlled };
+
 const Entry = struct {
     owner: build_owner.BuildOwnerHandle = .invalid,
     target: instance.InstanceHandle = .invalid,
@@ -56,7 +58,27 @@ pub const Registry = struct {
     ) !void {
         var prepared: ?Session = try Session.init(self.allocator, initial);
         defer if (prepared) |*session_value| session_value.deinit();
-        try self.mountPrepared(owner, target, content_handle, &prepared);
+        try self.prepareMount(target, .uncontrolled, &prepared);
+        try self.mountPrepared(owner, target, content_handle, .uncontrolled, &prepared);
+    }
+
+    /// Prepares all allocation and selection normalization before a retained
+    /// reconciliation commit starts mutating registries.
+    pub fn prepareMount(
+        self: *Registry,
+        target: instance.InstanceHandle,
+        mode: ValueMode,
+        prepared: *?Session,
+    ) !void {
+        const candidate = if (prepared.*) |*session_value| session_value else return error.TextInputSessionMissing;
+        const entry = self.find(target) orelse return;
+        if (mode == .uncontrolled or std.mem.eql(
+            u8,
+            entry.session.?.model.text(),
+            candidate.model.text(),
+        )) return;
+        _ = candidate.model.setSelectionClamped(entry.session.?.model.selection);
+        candidate.revision = entry.session.?.revision +% 1;
     }
 
     /// Moves a preallocated session into a new slot without allocating during
@@ -67,12 +89,22 @@ pub const Registry = struct {
         owner: build_owner.BuildOwnerHandle,
         target: instance.InstanceHandle,
         content_handle: instance.InstanceHandle,
+        mode: ValueMode,
         prepared: *?Session,
     ) !void {
         for (self.entries) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.content = content_handle;
             entry.seen = true;
+            if (mode == .controlled and !std.mem.eql(
+                u8,
+                entry.session.?.model.text(),
+                prepared.*.?.model.text(),
+            )) {
+                entry.session.?.deinit();
+                entry.session = prepared.*.?;
+                prepared.* = null;
+            }
             return;
         };
         for (self.entries) |*entry| if (!entry.active) {
@@ -183,14 +215,43 @@ test "prepared mount moves new sessions and leaves rediscovered state untouched"
     const content: instance.InstanceHandle = .{ .slot = 5, .generation = 6 };
 
     var initial: ?Session = try Session.init(std.testing.allocator, "initial");
-    try registry.mountPrepared(owner, target, content, &initial);
+    try registry.prepareMount(target, .uncontrolled, &initial);
+    try registry.mountPrepared(owner, target, content, .uncontrolled, &initial);
     try std.testing.expect(initial == null);
     _ = try (try registry.session(target)).model.replaceSelection(" retained");
 
     var replacement: ?Session = try Session.init(std.testing.allocator, "replacement");
     defer if (replacement) |*session| session.deinit();
-    try registry.mountPrepared(owner, target, content, &replacement);
+    try registry.prepareMount(target, .uncontrolled, &replacement);
+    try registry.mountPrepared(owner, target, content, .uncontrolled, &replacement);
     try std.testing.expect(replacement != null);
     try std.testing.expectEqualStrings("initial retained", (try registry.session(target)).model.text());
+    registry.clear();
+}
+
+test "controlled mounts replace changed values and preserve valid selection" {
+    var registry: Registry = undefined;
+    try registry.init(std.testing.allocator, 1);
+    defer registry.deinit();
+    const owner: build_owner.BuildOwnerHandle = .{ .slot = 1, .generation = 2 };
+    const target: instance.InstanceHandle = .{ .slot = 3, .generation = 4 };
+    const content: instance.InstanceHandle = .{ .slot = 5, .generation = 6 };
+    try registry.mount(owner, target, content, "abcdef");
+    _ = try (try registry.session(target)).model.setSelection(.{ .anchor = 2, .extent = 4 });
+
+    var equal: ?Session = try Session.init(std.testing.allocator, "abcdef");
+    defer if (equal) |*session_value| session_value.deinit();
+    try registry.prepareMount(target, .controlled, &equal);
+    try registry.mountPrepared(owner, target, content, .controlled, &equal);
+    try std.testing.expectEqual(@as(usize, 2), (try registry.session(target)).model.selection.anchor);
+
+    var changed: ?Session = try Session.init(std.testing.allocator, "abc");
+    defer if (changed) |*session_value| session_value.deinit();
+    try registry.prepareMount(target, .controlled, &changed);
+    try registry.mountPrepared(owner, target, content, .controlled, &changed);
+    const retained = try registry.session(target);
+    try std.testing.expectEqualStrings("abc", retained.model.text());
+    try std.testing.expectEqual(@as(usize, 2), retained.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 3), retained.model.selection.extent);
     registry.clear();
 }

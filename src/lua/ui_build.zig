@@ -12,6 +12,7 @@ const PointerBindings = @import("../ui/input/bindings.zig").PointerBindings;
 const Buttons = @import("../ui/widget/buttons.zig").Buttons;
 const ButtonStyle = @import("../ui/widget/buttons.zig").Style;
 const TextInputs = @import("../ui/text_input/registry.zig").Registry;
+const TextInputValueMode = @import("../ui/text_input/registry.zig").ValueMode;
 const TextInputSession = @import("../ui/text_input/session.zig").Session;
 const render_types = @import("../ui/render_object/types.zig");
 const SemanticDescriptor = @import("../ui/semantics/snapshot.zig").Descriptor;
@@ -32,6 +33,7 @@ const PendingButton = struct {
 const PendingTextInput = struct {
     target_id: u64,
     content_id: u64,
+    mode: TextInputValueMode,
     session: ?TextInputSession,
 };
 
@@ -238,6 +240,12 @@ pub const UiBuild = struct {
             if (tree.handleForId(pending.target_id) == null or
                 tree.handleForId(pending.content_id) == null)
                 return error.TextInputInstanceMissing;
+        for (self.pending_text_inputs[0..self.pending_text_input_count]) |*pending|
+            try text_inputs.prepareMount(
+                tree.handleForId(pending.target_id).?,
+                pending.mode,
+                &pending.session,
+            );
         while (bindings.takeInactive(tree)) |old|
             callbacks.?.release(old.id) catch unreachable;
         while (bindings.takeOwner(owner)) |old|
@@ -268,6 +276,7 @@ pub const UiBuild = struct {
                 owner,
                 tree.handleForId(pending.target_id).?,
                 tree.handleForId(pending.content_id).?,
+                pending.mode,
                 &pending.session,
             );
         }
@@ -298,7 +307,8 @@ pub const UiBuild = struct {
         if (descriptors.len > prepared.descriptor_storage.len or
             self.semantic_count > prepared.semantic_storage.len or
             self.pending_handler_count > prepared.handlers.len or
-            self.pending_button_count > prepared.prepared_buttons.len)
+            self.pending_button_count > prepared.prepared_buttons.len or
+            self.pending_text_input_count > prepared.text_inputs.len)
             return error.PreparedBuildCapacityExceeded;
         var semantic_text_count: usize = 0;
         for (self.semantic_storage[0..self.semantic_count]) |descriptor| {
@@ -347,9 +357,23 @@ pub const UiBuild = struct {
             .style = source.style,
         };
         prepared.button_count = self.pending_button_count;
+        for (
+            self.pending_text_inputs[0..self.pending_text_input_count],
+            prepared.text_inputs[0..self.pending_text_input_count],
+        ) |*source, *destination| {
+            destination.* = .{
+                .target_id = source.target_id,
+                .content_id = source.content_id,
+                .mode = source.mode,
+                .session = source.session,
+            };
+            source.session = null;
+        }
+        prepared.text_input_count = self.pending_text_input_count;
         prepared.owns_shapes = self.sources_staged;
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
+        self.pending_text_input_count = 0;
         self.sources_staged = false;
     }
 
@@ -608,7 +632,14 @@ pub const UiBuild = struct {
             return luaError(state, "ouro.text_input expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "text_input requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "text_input key is required");
-        const initial = tableString(state, 1, "text") orelse return luaError(state, "text_input text is required");
+        const controlled = tableOptionalString(state, 1, "text") orelse
+            return luaError(state, "text_input text must be a string");
+        const uncontrolled = tableOptionalString(state, 1, "default_text") orelse
+            return luaError(state, "text_input default_text must be a string");
+        if (controlled.present == uncontrolled.present)
+            return luaError(state, "text_input requires exactly one of text or default_text");
+        const mode: TextInputValueMode = if (controlled.present) .controlled else .uncontrolled;
+        const initial = if (controlled.present) controlled.value else uncontrolled.value;
         const width = tableOptionalExtent(state, 1, "width", 240) orelse
             return luaError(state, "invalid text_input width");
         const height = tableOptionalExtent(
@@ -668,6 +699,7 @@ pub const UiBuild = struct {
         self.pending_text_inputs[self.pending_text_input_count] = .{
             .target_id = target_id,
             .content_id = content_id,
+            .mode = mode,
             .session = TextInputSession.init(self.label_sources.?.allocator, initial) catch
                 return luaError(state, "cannot create text_input session"),
         };
@@ -679,6 +711,21 @@ pub const UiBuild = struct {
             .key = key,
             .label = initial,
         }) catch return luaError(state, "cannot append text_input semantics");
+
+        const callback_type = c.lua_getfield(state, 1, "on_change");
+        defer c.lua_settop(state, -2);
+        if (callback_type == c.type_nil) return 0;
+        if (callback_type != c.type_function)
+            return luaError(state, "text_input on_change must be a function");
+        if (self.pending_handler_count == self.pending_handlers.len)
+            return luaError(state, "input handler capacity exceeded");
+        c.lua_pushvalue(state, -1);
+        self.pending_handlers[self.pending_handler_count] = .{
+            .id = target_id,
+            .reference = c.luaL_ref(state, c.registry_index),
+            .kind = .text_input_change,
+        };
+        self.pending_handler_count += 1;
         return 0;
     }
 
@@ -960,6 +1007,22 @@ fn tableString(state: *c.State, table: c_int, field: [*:0]const u8) ?[]const u8 
     return value;
 }
 
+const OptionalString = struct {
+    present: bool,
+    value: []const u8 = "",
+};
+
+fn tableOptionalString(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+) ?OptionalString {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .{ .present = false };
+    return .{ .present = true, .value = string(state, -1) orelse return null };
+}
+
 fn tableOptionalExtent(
     state: *c.State,
     table: c_int,
@@ -1181,7 +1244,12 @@ test "declarative text input separates focus identity from editable render conte
         \\  ouro.column {
         \\    key = "content",
         \\    children = function()
-        \\      ouro.text_input { key = "query", text = "Initial", width = 200 }
+        \\      ouro.text_input {
+        \\        key = "query",
+        \\        text = "Initial",
+        \\        width = 200,
+        \\        on_change = function(value) changed = value end,
+        \\      }
         \\    end,
         \\  }
         \\end
@@ -1195,9 +1263,24 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expect(descriptors[4].object == .text_input);
     try std.testing.expectEqual(descriptors[3].id, descriptors[4].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_text_input_count);
+    try std.testing.expectEqual(.controlled, ui.pending_text_inputs[0].mode);
+    try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
+    try std.testing.expectEqual(.text_input_change, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(.text_field, ui.semanticDescriptors()[1].role);
     try std.testing.expectEqualStrings("Initial", ui.semanticDescriptors()[1].label);
-    ui.rollbackHandlers();
+    var prepared: PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, state, &sources, 5, 64);
+    defer prepared.deinit();
+    try ui.capturePrepared(&prepared, descriptors);
+    try std.testing.expectEqual(@as(usize, 1), prepared.text_input_count);
+    try std.testing.expectEqual(.controlled, prepared.text_inputs[0].mode);
+    try std.testing.expectEqualStrings(
+        "Initial",
+        prepared.text_inputs[0].session.?.model.text(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), prepared.handler_count);
+    try std.testing.expectEqual(.text_input_change, prepared.handlers[0].kind);
+    prepared.reset();
     try std.testing.expectEqual(@as(usize, 0), sources.count());
     try owners.complete(work);
     try fonts.release(font);

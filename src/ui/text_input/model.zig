@@ -98,6 +98,22 @@ pub const Model = struct {
         return true;
     }
 
+    /// Restores a selection across a controlled value replacement. Offsets
+    /// beyond the new value or inside a changed grapheme snap backward to the
+    /// nearest valid caret boundary.
+    pub fn setSelectionClamped(self: *Model, value: Selection) bool {
+        const next: Selection = .{
+            .anchor = self.boundaryAtOrBefore(@min(value.anchor, self.bytes.items.len)),
+            .extent = self.boundaryAtOrBefore(@min(value.extent, self.bytes.items.len)),
+            .anchor_affinity = value.anchor_affinity,
+            .extent_affinity = value.extent_affinity,
+        };
+        if (std.meta.eql(self.selection, next)) return false;
+        self.selection = next;
+        self.bumpRevision();
+        return true;
+    }
+
     pub fn selectAll(self: *Model) bool {
         const value: Selection = .{ .anchor = 0, .extent = self.bytes.items.len };
         if (std.meta.eql(self.selection, value)) return false;
@@ -245,6 +261,13 @@ pub const Model = struct {
         return self.boundaries.items[@min(index, self.boundaries.items.len - 1)];
     }
 
+    fn boundaryAtOrBefore(self: *const Model, offset: usize) usize {
+        const index = lowerBound(self.boundaries.items, offset);
+        if (index == self.boundaries.items.len or self.boundaries.items[index] != offset)
+            return self.boundaries.items[index - 1];
+        return self.boundaries.items[index];
+    }
+
     fn wordBoundaryBefore(self: *const Model, offset: usize) usize {
         var index = lowerBound(self.word_boundaries.items, offset);
         while (index != 0) {
@@ -335,6 +358,14 @@ test "selection direction is retained and replacement is normalized" {
     try std.testing.expect(try model.replaceSelection("two"));
     try std.testing.expectEqualStrings("one two three", model.text());
     try std.testing.expectEqual(Selection.collapsed(7), model.selection);
+}
+
+test "controlled selection restoration clamps to grapheme boundaries" {
+    var model = try Model.init(std.testing.allocator, "aé");
+    defer model.deinit();
+    try std.testing.expect(model.setSelectionClamped(.{ .anchor = 2, .extent = 99 }));
+    try std.testing.expectEqual(@as(usize, 1), model.selection.anchor);
+    try std.testing.expectEqual("aé".len, model.selection.extent);
 }
 
 test "extended movement preserves anchor and collapses by direction" {
