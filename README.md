@@ -176,10 +176,41 @@ Run any declarative application directly through the reusable host:
 
 ```sh
 zig build run-app -- path/to/application.lua
+# After `zig build`, the installed CLI provides the same host:
+zig-out/bin/ourokit run path/to/application.lua
 ```
 
 The reusable host follows the same renderer default. Pass `--software` to force
 the software renderer.
+
+## Storybook
+
+Storybook catalogs are explicit Lua entry points containing named, isolated
+component states. List a catalog for people or tools with:
+
+```sh
+zig-out/bin/ourokit storybook list examples/storybook.lua
+zig-out/bin/ourokit storybook list examples/storybook.lua --json
+```
+
+Render every story through the platform-neutral window runtime and software
+renderer, or select one story by ID:
+
+```sh
+zig-out/bin/ourokit storybook snapshot examples/storybook.lua
+zig-out/bin/ourokit storybook snapshot examples/storybook.lua \
+  --story button/disabled-dark --output .amp/in/artifacts --json
+```
+
+Each story declares a fixed logical viewport, output scale, color scheme, and
+ordinary Ourokit content callback. Snapshots use a pinned Inter font, write PNG
+files atomically beneath the output directory, and report SHA-256 hashes. A
+fresh Lua VM and retained UI runtime are created for each PNG so signals,
+globals, tasks, and widget state cannot leak between stories. Slash-separated
+story IDs create corresponding output subdirectories; unsafe path segments are
+rejected. See [`examples/storybook.lua`](examples/storybook.lua) for the
+declaration format. The interactive Storybook browser is planned after the
+headless catalog and snapshot interface stabilizes.
 
 Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
 presenter with:

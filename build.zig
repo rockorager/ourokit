@@ -133,6 +133,11 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(library);
 
+    const storybook_font = b.lazyDependency("inter", .{}) orelse return;
+    ourokit.addAnonymousImport("ourokit_storybook_font", .{
+        .root_source_file = storybook_font.path("extras/ttf/Inter-Regular.ttf"),
+    });
+
     const token_check = b.addSystemCommand(&.{ "python3", "tools/design/generate_tokens.py", "--check" });
     const token_step = b.step("tokens", "Validate tokens and check generated Zig data");
     token_step.dependOn(&token_check.step);
@@ -146,7 +151,7 @@ pub fn build(b: *std.Build) void {
     addRendererBenchmark(b, target, optimize, ourokit);
     addParagraphBenchmark(b, target, optimize, ourokit);
 
-    const test_font = b.lazyDependency("inter", .{}) orelse return;
+    const test_font = storybook_font;
     ourokit.addAnonymousImport("ourokit_test_font", .{
         .root_source_file = test_font.path("InterVariable.ttf"),
     });
@@ -160,8 +165,17 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = ourokit });
     const run_tests = b.addRunArtifact(tests);
     run_tests.step.dependOn(&token_check.step);
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
     const test_step = b.step("test", "Run all deterministic and integration tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
 }
 
 fn addUucodeConfig(b: *std.Build, unicode_ucd: *std.Build.Dependency) std.Build.LazyPath {
@@ -335,7 +349,7 @@ fn addWaylandExample(
     enable_vulkan: bool,
 ) void {
     const host = b.addExecutable(.{
-        .name = "ourokit-run",
+        .name = "ourokit",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -343,7 +357,9 @@ fn addWaylandExample(
             .imports = &.{.{ .name = "ourokit", .module = ourokit }},
         }),
     });
+    b.installArtifact(host);
     const run_host = b.addRunArtifact(host);
+    run_host.addArg("run");
     if (b.args) |args| run_host.addArgs(args);
     const run_host_step = b.step("run-app", "Run a declarative Lua application");
     run_host_step.dependOn(&run_host.step);
