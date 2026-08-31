@@ -7,6 +7,7 @@ pub const WindowHandle = platform_window.WindowHandle;
 pub const ToplevelDeclaration = platform_window.ToplevelDeclaration;
 pub const NativeHost = platform_window.NativeHost;
 pub const PointerEvent = platform_window.PointerEvent;
+pub const KeyboardEvent = platform_window.KeyboardEvent;
 
 /// Events are data queued by the platform phase. They contain no callback
 /// capable of entering Lua or mutating a retained UI tree.
@@ -18,6 +19,7 @@ pub const Event = union(enum) {
         height: u32,
     },
     pointer: PointerEvent,
+    keyboard: KeyboardEvent,
 };
 
 const State = enum { free, active, closing, closed };
@@ -137,6 +139,11 @@ pub const WindowSet = struct {
     pub fn enqueuePointer(self: *WindowSet, event: PointerEvent) !void {
         _ = try self.slotFor(pointerWindow(event));
         try self.enqueue(.{ .pointer = event });
+    }
+
+    pub fn enqueueKeyboard(self: *WindowSet, event: KeyboardEvent) !void {
+        _ = try self.slotFor(keyboardWindow(event));
+        try self.enqueue(.{ .keyboard = event });
     }
 
     /// Consumed only by the application's platform-event translation phase.
@@ -274,6 +281,11 @@ pub const WindowSet = struct {
         try self.enqueuePointer(event);
     }
 
+    fn sinkKeyboard(context: *anyopaque, event: KeyboardEvent) !void {
+        const self: *WindowSet = @ptrCast(@alignCast(context));
+        try self.enqueueKeyboard(event);
+    }
+
     fn sinkClosed(context: *anyopaque, handle: WindowHandle) !void {
         const self: *WindowSet = @ptrCast(@alignCast(context));
         try self.markClosed(handle);
@@ -283,6 +295,7 @@ pub const WindowSet = struct {
         .close_requested = sinkCloseRequested,
         .configured = sinkConfigured,
         .pointer = sinkPointer,
+        .keyboard = sinkKeyboard,
         .closed = sinkClosed,
     };
 };
@@ -299,6 +312,14 @@ fn pointerWindow(event: PointerEvent) WindowHandle {
         .axis_steps => |value| value.window,
         .axis_steps120 => |value| value.window,
         .frame => |window| window,
+    };
+}
+
+fn keyboardWindow(event: KeyboardEvent) WindowHandle {
+    return switch (event) {
+        .enter => |value| value.window,
+        .leave => |value| value.window,
+        .key => |value| value.window,
     };
 }
 

@@ -176,6 +176,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         theme.surface_base,
         theme.accent_default,
         theme.content_primary,
+        theme.focus_ring,
         &signals,
         &paragraph_sources,
         &paragraphs,

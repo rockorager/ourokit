@@ -25,6 +25,9 @@ pub const Box = struct {
     border_color: ?Color = null,
     border_width: f32 = 0,
     corner_radius: f32 = 0,
+    outline_color: ?Color = null,
+    outline_width: f32 = 0,
+    outline_gap: f32 = 0,
     clip: bool = false,
 };
 

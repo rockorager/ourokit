@@ -387,6 +387,7 @@ pub const UiBuild = struct {
                 .background = if (enabled) style.idle else style.disabled,
                 .corner_radius = design.tokens.foundation.corner_radius_medium,
             } },
+            .focusable = enabled,
             .parent_data = declarativeParentData(self, state, 1) orelse
                 return luaError(state, "invalid button position"),
         }) catch return luaError(state, "cannot append button descriptor");
@@ -1107,6 +1108,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expect(descriptors[5].object == .label);
     try std.testing.expect(descriptors[6].object == .flex);
     try std.testing.expectEqual(design.tokens.dark.accent_default, descriptors[7].object.box.background.?);
+    try std.testing.expect(descriptors[7].focusable);
     try std.testing.expectEqual(design.tokens.dark.surface_base, descriptors[8].object.label.color);
     try std.testing.expectEqual(descriptors[7].id, descriptors[8].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);

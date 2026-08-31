@@ -71,8 +71,8 @@ pub const App = struct {
 
     fn dispatchCompletion(self: *App, completion: std.os.linux.io_uring_cqe) !void {
         switch (self.loop.dispatch(completion)) {
-            .timeout => |timeout| try self.lua_vm.markTimeoutCompleted(timeout.operation),
-            .timeout_cancel => {},
+            .timer_wakeup, .timer_control => while (try self.loop.takeExpired()) |timeout|
+                try self.lua_vm.markTimeoutCompleted(timeout.operation),
             .foreign => return error.ForeignCompletion,
             .stale => return error.StaleCompletion,
         }
@@ -225,16 +225,15 @@ test "scope cancellation stops only its owned Lua coroutine tasks" {
 
     try app.scheduler.queueScopeCancellation(first_scope);
     try app.runReadyTurn();
-    try app.reapOne();
-    try app.reapOne();
-    try app.runReadyTurn();
     try std.testing.expectEqual(@as(usize, 1), app.lua_vm.activeTaskCount());
     try std.testing.expect(!app.lua_vm.globalBoolean("first_after"));
 
     try app.scheduler.queueScopeCancellation(second_scope);
     try app.runReadyTurn();
-    try app.reapOne();
-    try app.reapOne();
+    while (app.loop.hasPendingTimerKernelWork()) {
+        try app.reapOne();
+        try app.runReadyTurn();
+    }
     try app.runReadyTurn();
     try std.testing.expectEqual(@as(usize, 0), app.lua_vm.activeTaskCount());
     try std.testing.expect(!app.lua_vm.globalBoolean("second_after"));
@@ -293,8 +292,10 @@ test "canceling a suspended Lua task closes to-be-closed values" {
 
     try app.scheduler.queueScopeCancellation(app.scheduler.application_scope);
     try app.runReadyTurn();
-    try app.reapOne();
-    try app.reapOne();
+    while (app.loop.hasPendingTimerKernelWork()) {
+        try app.reapOne();
+        try app.runReadyTurn();
+    }
     try app.runReadyTurn();
     try std.testing.expect(probe.closed);
 }

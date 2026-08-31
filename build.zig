@@ -77,6 +77,11 @@ pub fn build(b: *std.Build) void {
         "vulkan",
         "Enable the Vulkan renderer and dma-buf presentation",
     ) orelse true;
+    const enable_xkbcommon = b.option(
+        bool,
+        "xkbcommon",
+        "Enable Wayland keyboard translation through system xkbcommon",
+    ) orelse (target.query.isNative() and target.result.os.tag == .linux);
     const unicode_ucd = b.dependency("unicode_ucd", .{});
     const uucode_config = addUucodeConfig(b, unicode_ucd);
     const harfbuzz = b.dependency("harfbuzz", .{});
@@ -139,6 +144,7 @@ pub fn build(b: *std.Build) void {
     ourokit_options.addOption(bool, "fontconfig", enable_fontconfig);
     ourokit_options.addOption(bool, "freetype", enable_freetype);
     ourokit_options.addOption(bool, "vulkan", enable_vulkan);
+    ourokit_options.addOption(bool, "xkbcommon", enable_xkbcommon);
     ourokit.addOptions("ourokit_build_options", ourokit_options);
     ourokit.addAnonymousImport("unicode_line_break_tests", .{
         .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
@@ -151,6 +157,7 @@ pub fn build(b: *std.Build) void {
         ourokit.linkSystemLibrary("freetype2", .{});
         ourokit.link_libc = true;
     }
+    if (enable_xkbcommon) ourokit.linkSystemLibrary("xkbcommon", .{});
 
     const library = b.addLibrary(.{
         .name = "ourokit",
@@ -198,7 +205,12 @@ pub fn build(b: *std.Build) void {
     ourokit.addAnonymousImport("ourokit_arabic_test_font", .{
         .root_source_file = arabic_test_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
     });
-    const tests = b.addTest(.{ .root_module = ourokit });
+    const test_filters: []const []const u8 = if (b.option(
+        []const u8,
+        "test-filter",
+        "Run only tests whose names contain this text",
+    )) |filter| &.{filter} else &.{};
+    const tests = b.addTest(.{ .root_module = ourokit, .filters = test_filters });
     const run_tests = b.addRunArtifact(tests);
     run_tests.step.dependOn(&token_check.step);
     const cli_tests = b.addTest(.{

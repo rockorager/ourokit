@@ -374,6 +374,21 @@ pub const Tree = struct {
         };
         const clips = switch (target.object) {
             .box => |value| paint: {
+                if (value.outline_color) |outline_color| {
+                    const expansion = value.outline_gap + value.outline_width;
+                    try builder.decoratedRectangle(
+                        .{
+                            .x = bounds.x - expansion,
+                            .y = bounds.y - expansion,
+                            .width = bounds.width + expansion * 2,
+                            .height = bounds.height + expansion * 2,
+                        },
+                        null,
+                        outline_color,
+                        value.outline_width,
+                        value.corner_radius + expansion,
+                    );
+                }
                 if (value.border_color != null or value.corner_radius != 0) {
                     try builder.decoratedRectangle(
                         bounds,
@@ -847,6 +862,26 @@ test "render-object topology rejects cycles and stale generations" {
     const replacement = try tree.create(.{ .box = .{} });
     try std.testing.expectEqual(child.slot, replacement.slot);
     try std.testing.expect(child.generation != replacement.generation);
+}
+
+test "box outline is paint-only state" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    defer tree.deinit();
+    const box = try tree.create(.{ .box = .{ .width = 40, .height = 20 } });
+    _ = try tree.layout(box, Constraints.tight(.{ .width = 40, .height = 20 }));
+    var commands: [1]@import("../../scene/root.zig").Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(box, &builder);
+    try tree.update(box, .{ .box = .{
+        .width = 40,
+        .height = 20,
+        .outline_color = Color.rgba(20, 80, 220, 255),
+        .outline_width = 2,
+        .outline_gap = 2,
+    } });
+    try std.testing.expect(!(try tree.layoutDirty(box)));
+    try std.testing.expect(try tree.paintDirty(box));
 }
 
 test "scroll lays out unbounded content and clips paint and hit testing" {

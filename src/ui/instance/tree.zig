@@ -15,6 +15,7 @@ pub const Descriptor = struct {
     parent: ?u64,
     object: render_types.Object,
     parent_data: render_types.ParentData = .none,
+    focusable: bool = false,
 };
 
 const State = enum { free, active, retiring };
@@ -29,6 +30,8 @@ const Slot = struct {
     render: ?render_object.NodeHandle = null,
     state_revision: u64 = 0,
     scroll_offset: f32 = 0,
+    focusable: bool = false,
+    traversal_order: usize = 0,
     reconcile_child: ?render_object.NodeHandle = null,
 };
 
@@ -245,8 +248,10 @@ pub const Tree = struct {
             _ = try (IdIndex{ .entries = self.render_entries }).put(renderKey(render), slot_index);
         }
 
-        for (descriptors) |descriptor| {
+        for (descriptors, 0..) |descriptor, traversal_order| {
             const slot = self.findActiveById(descriptor.id).?;
+            slot.focusable = descriptor.focusable;
+            slot.traversal_order = traversal_order;
             const previous = try self.render_tree.objectAt(slot.render.?);
             try self.render_tree.update(slot.render.?, descriptor.object);
             if (descriptor.object == .scroll) {
@@ -335,6 +340,42 @@ pub const Tree = struct {
     pub fn isActive(self: *Tree, handle: InstanceHandle) bool {
         _ = self.activeSlot(handle) catch return false;
         return true;
+    }
+
+    pub fn isFocusable(self: *Tree, handle: InstanceHandle) bool {
+        const slot = self.activeSlot(handle) catch return false;
+        return slot.focusable;
+    }
+
+    pub fn nextFocusable(
+        self: *Tree,
+        current: ?InstanceHandle,
+        reverse: bool,
+    ) !?InstanceHandle {
+        const current_order: usize = if (current) |handle|
+            (try self.activeSlot(handle)).traversal_order
+        else if (reverse)
+            std.math.maxInt(usize)
+        else
+            0;
+        var selected: ?usize = null;
+        var wrapped: ?usize = null;
+        for (self.slots, 0..) |slot, index| {
+            if (slot.state != .active or !slot.focusable) continue;
+            if (wrapped == null or orderBefore(slot.traversal_order, self.slots[wrapped.?].traversal_order, reverse))
+                wrapped = index;
+            const eligible = if (current == null)
+                true
+            else if (reverse)
+                slot.traversal_order < current_order
+            else
+                slot.traversal_order > current_order;
+            if (eligible and (selected == null or
+                orderBefore(slot.traversal_order, self.slots[selected.?].traversal_order, reverse)))
+                selected = index;
+        }
+        const index = selected orelse wrapped orelse return null;
+        return handleFor(self.slots[index], index);
     }
 
     pub fn bumpStateRevision(self: *Tree, handle: InstanceHandle) !void {
@@ -504,6 +545,10 @@ fn handleFor(slot: Slot, index: usize) InstanceHandle {
 
 fn same(a: Handle, b: Handle) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+fn orderBefore(a: usize, b: usize, reverse: bool) bool {
+    return if (reverse) a > b else a < b;
 }
 
 test "typed snapshots preserve keyed state and reorder render children" {

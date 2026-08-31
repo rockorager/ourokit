@@ -53,6 +53,7 @@ deterministic without putting shaping or measurement in a renderer.
 - Python 3 for deterministic token validation/generation
 - Fontconfig development files for native Linux font discovery
 - FreeType development files for native software text rasterization
+- xkbcommon development files for native Wayland keyboard translation
 - Vulkan loader and headers, plus `glslc` (not required with `-Dvulkan=false`)
 - A C/C++ toolchain is not required separately; Zig compiles embedded Lua and
   HarfBuzz
@@ -69,8 +70,9 @@ zig build tokens
 The default build includes both software and Vulkan renderers and installs
 `zig-out/lib/libourokit.a`. Use `-Dvulkan=false` for a software-only build that
 does not require Vulkan or `glslc`. `zig build test` includes Vulkan and
-deterministic software pixel tests, real kernel `io_uring` timeout/cancel tests,
-and the Lua coroutine/timer safe-point integration test. The suite covers
+deterministic software pixel tests, userspace timer-heap tests, real kernel
+`io_uring` alarm/update/cancel tests, and the Lua coroutine/timer safe-point
+integration test. The suite covers
 logical constraints, Flex/Stack layout, invalidation caching, scene lowering,
 and hit testing without a compositor, plus keyed reconciliation, safe
 retirement, and transactional pointer routing. Signal tests cover equal-write

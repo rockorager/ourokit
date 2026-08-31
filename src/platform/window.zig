@@ -76,6 +76,47 @@ pub const PointerEvent = union(enum) {
     frame: WindowHandle,
 };
 
+pub const LogicalKey = enum {
+    unidentified,
+    tab,
+    enter,
+    space,
+    escape,
+    arrow_left,
+    arrow_right,
+    arrow_up,
+    arrow_down,
+};
+
+pub const KeyState = enum { released, pressed, repeated };
+
+pub const Modifiers = packed struct {
+    shift: bool = false,
+    control: bool = false,
+    alt: bool = false,
+    logo: bool = false,
+};
+
+pub const TranslatedKey = struct {
+    keycode: u32,
+    keysym: u32 = 0,
+    unicode: u32 = 0,
+    logical: LogicalKey = .unidentified,
+    modifiers: Modifiers = .{},
+};
+
+pub const KeyboardEvent = union(enum) {
+    enter: struct { window: WindowHandle, serial: u32 },
+    leave: struct { window: WindowHandle, serial: u32 },
+    key: struct {
+        window: WindowHandle,
+        serial: u32,
+        time_ms: u32,
+        state: KeyState,
+        translated: TranslatedKey,
+    },
+};
+
 /// Language-neutral desired state for one ordinary Wayland toplevel. A future
 /// layer-surface declaration will be a distinct type because its role and
 /// configure contract are not interchangeable with xdg_toplevel.
@@ -129,6 +170,7 @@ pub const EventSink = struct {
         close_requested: *const fn (*anyopaque, WindowHandle) anyerror!void,
         configured: *const fn (*anyopaque, WindowHandle, u32, u32) anyerror!void,
         pointer: *const fn (*anyopaque, PointerEvent) anyerror!void,
+        keyboard: *const fn (*anyopaque, KeyboardEvent) anyerror!void,
         closed: *const fn (*anyopaque, WindowHandle) anyerror!void,
     };
 
@@ -142,6 +184,10 @@ pub const EventSink = struct {
 
     pub fn pointer(self: EventSink, event: PointerEvent) !void {
         try self.vtable.pointer(self.context, event);
+    }
+
+    pub fn keyboard(self: EventSink, event: KeyboardEvent) !void {
+        try self.vtable.keyboard(self.context, event);
     }
 
     pub fn closed(self: EventSink, handle: WindowHandle) !void {

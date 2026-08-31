@@ -89,10 +89,11 @@ as backend policy. `core` contains only small values that break real cycles.
 ## Event loop and safe points
 
 Ourokit owns and directly drives one `std.os.linux.IoUring`. Operation identity
-is a slot plus generation encoded into `user_data`; allocated pointers are
-never encoded. Slots retain kernel-referenced timeout storage until terminal
-CQEs. Cancel CQEs and operation CQEs are tracked separately, so either ordering
-is safe. Wayring and all future I/O share this ring.
+is generation checked and allocated pointers are never encoded into
+`user_data`. Logical timers use a userspace min-heap and consume no SQEs of
+their own. One absolute kernel timeout follows the earliest deadline and moves
+through `IORING_TIMEOUT_UPDATE`; cancellation, update, alarm, and retired CQEs
+are tracked independently. Wayring and all future I/O share this ring.
 
 Each application turn has explicit phases:
 
@@ -151,8 +152,8 @@ before passing CQEs to Wayring.
 
 Shared-ring constraints:
 
-- Wayring reserves low `user_data` bytes 1 through 5; Ourokit uses `0xa0` and
-  `0xa1` for first-milestone timeout operations.
+- Wayring reserves low `user_data` bytes 1 through 5; Ourokit uses `0xa0`
+  through `0xa2` for its timer alarm/update/remove namespace.
 - Wayring's provided-buffer group ID must not collide with other users.
 - The ring and Wayring reactor retain stable addresses.
 - SQ capacity and submission ownership are shared.
@@ -168,11 +169,13 @@ flush. Ourokit's host retains the display connection, registry, required
 globals, per-window surfaces, configure state, frame callbacks, persistent
 shared-memory buffers, and independent close state rather than flattening them
 into a fictional generic window protocol. The host binds `wl_seat` when present
-and translates pointer enter/leave, motion, buttons, scrolling, and frame
-grouping into bounded typed application data. Raw Wayland fixed-point values
-and protocol handles do not cross that boundary. Keyboard support remains a
-separate addition because keymap and compose handling require an explicit XKB
-design rather than raw key events masquerading as text input.
+and translates pointer enter/leave, motion, buttons, scrolling, keyboard focus,
+keys, and frame grouping into bounded typed application data. Raw Wayland
+fixed-point values and protocol handles do not cross that boundary. The adapter
+compiles compositor-provided keymaps with xkbcommon and retains raw keycode,
+keysym, logical navigation key, modifiers, and Unicode scalar separately. Text
+composition and IME remain future text-input work; raw key events do not
+masquerade as committed text.
 
 Driver dispatch can prepare SQEs before returning. The host records that fact
 until the application flush phase submits the shared ring; calling `prepare`
@@ -435,6 +438,14 @@ retains hover, pressed, disabled, and pointer-armed state across reconciliation.
 Pointer capture ensures a release reaches the pressed target, while release-
 inside decides activation. Design-generated semantic accent roles supply idle,
 hovered, and pressed colors.
+
+The first `ui/text_input` boundary is a unit-testable editable value, not yet a
+widget or render object. It owns valid UTF-8, directional selection, revisions,
+and cached uucode extended-grapheme boundaries. Cursor movement at this layer is
+named logical previous/next; visual left/right, caret geometry, and selection
+painting wait for paragraph bidi/caret maps. Platform composition and committed
+text will enter through a future Wayring-backed text-input protocol adapter,
+not by treating raw xkb key events as application text.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,

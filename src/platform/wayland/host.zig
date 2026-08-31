@@ -7,6 +7,7 @@ const platform_window = @import("../window.zig");
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
+const Xkb = if (build_options.xkbcommon) @import("xkb.zig") else @import("xkb_disabled.zig");
 const Vulkan = if (build_options.vulkan)
     @import("../../renderer/vulkan/root.zig")
 else
@@ -566,6 +567,9 @@ pub const Host = struct {
     seat_global_name: ?u32 = null,
     pointer: ?Handle = null,
     pointer_focus: ?WindowHandle = null,
+    keyboard: ?Handle = null,
+    keyboard_focus: ?WindowHandle = null,
+    xkb: Xkb.Keyboard,
     windows: []Window,
     disconnect_started: bool = false,
     transport_lost: bool = false,
@@ -618,6 +622,10 @@ pub const Host = struct {
         self.seat_global_name = null;
         self.pointer = null;
         self.pointer_focus = null;
+        self.keyboard = null;
+        self.keyboard_focus = null;
+        self.xkb = try Xkb.Keyboard.init();
+        errdefer self.xkb.deinit();
         try self.adapter.init(allocator, loop, config.reactor);
         errdefer self.adapter.deinit(allocator);
 
@@ -702,6 +710,7 @@ pub const Host = struct {
         self.connection.deinit(self.allocator) catch unreachable;
         self.releaseDmabufFormatTable();
         self.adapter.deinit(self.allocator);
+        self.xkb.deinit();
         self.allocator.free(self.windows);
         self.allocator.free(self.app_id);
         self.* = undefined;
@@ -1189,6 +1198,9 @@ pub const Host = struct {
         if (self.pointer_focus) |focus| {
             if (sameWindow(focus, window.handle)) self.pointer_focus = null;
         }
+        if (self.keyboard_focus) |focus| {
+            if (sameWindow(focus, window.handle)) self.keyboard_focus = null;
+        }
         const objects = &self.connection.objects;
         const transmit = try self.queue();
         if (window.fractional_scale) |handle|
@@ -1371,13 +1383,21 @@ pub const Host = struct {
             }
         } else if (interface == &protocol.wl_seat.info) {
             switch (try wayring.client.decodeEvent(protocol.wl_seat, objects, self.seat.?, message, fds)) {
-                .capabilities => |capabilities| try self.updatePointerCapability(
-                    capabilities.capabilities.contains(protocol.wl_seat.capability.pointer),
-                ),
+                .capabilities => |capabilities| {
+                    try self.updatePointerCapability(
+                        capabilities.capabilities.contains(protocol.wl_seat.capability.pointer),
+                    );
+                    try self.updateKeyboardCapability(
+                        build_options.xkbcommon and
+                            capabilities.capabilities.contains(protocol.wl_seat.capability.keyboard),
+                    );
+                },
                 .name => {},
             }
         } else if (interface == &protocol.wl_pointer.info) {
             try self.pointerEvent(message, fds);
+        } else if (interface == &protocol.wl_keyboard.info) {
+            try self.keyboardEvent(message, fds);
         } else if (interface == &protocol.xdg_wm_base.info) {
             switch (try wayring.client.decodeEvent(protocol.xdg_wm_base, objects, self.wm_base.?, message, fds)) {
                 .ping => |ping| try wayring.client.sendRequest(
@@ -1708,6 +1728,7 @@ pub const Host = struct {
 
     fn releaseInput(self: *Host) !void {
         try self.releasePointer();
+        try self.releaseKeyboard();
         if (self.seat) |seat| {
             try wayring.client.sendRequest(
                 protocol.wl_seat,
@@ -1719,6 +1740,89 @@ pub const Host = struct {
             self.seat = null;
             self.seat_global_name = null;
             _ = try self.driver.schedule();
+        }
+    }
+
+    fn updateKeyboardCapability(self: *Host, available: bool) !void {
+        if (available and self.keyboard == null) {
+            self.keyboard = (try protocol.wl_seat.construct_get_keyboard(
+                &self.connection.objects,
+                try self.queue(),
+                self.seat.?,
+                .{},
+            )).id;
+            _ = try self.driver.schedule();
+        } else if (!available and self.keyboard != null) {
+            try self.releaseKeyboard();
+        }
+    }
+
+    fn releaseKeyboard(self: *Host) !void {
+        const keyboard = self.keyboard orelse return;
+        try wayring.client.sendRequest(
+            protocol.wl_keyboard,
+            &self.connection.objects,
+            try self.queue(),
+            keyboard,
+            .{ .release = .{} },
+        );
+        self.keyboard = null;
+        self.keyboard_focus = null;
+        _ = try self.driver.schedule();
+    }
+
+    fn keyboardEvent(
+        self: *Host,
+        message: wayring.wire.Message,
+        fds: *wayring.ancillary.FdQueue,
+    ) !void {
+        const keyboard_event = try wayring.client.decodeEvent(
+            protocol.wl_keyboard,
+            &self.connection.objects,
+            self.keyboard.?,
+            message,
+            fds,
+        );
+        switch (keyboard_event) {
+            .keymap => |keymap| {
+                if (keymap.format.value != protocol.wl_keyboard.keymap_format.xkb_v1.value) {
+                    _ = linux.close(keymap.fd);
+                    return error.UnsupportedKeymapFormat;
+                }
+                try self.xkb.installKeymap(keymap.fd, keymap.size);
+            },
+            .enter => |enter| {
+                const window = try self.windowForSurface(enter.surface);
+                self.keyboard_focus = window.handle;
+                try self.sink.keyboard(.{ .enter = .{
+                    .window = window.handle,
+                    .serial = enter.serial,
+                } });
+            },
+            .leave => |leave| {
+                const window = try self.windowForSurface(leave.surface);
+                try self.sink.keyboard(.{ .leave = .{
+                    .window = window.handle,
+                    .serial = leave.serial,
+                } });
+                if (self.keyboard_focus) |focused| {
+                    if (sameWindow(focused, window.handle)) self.keyboard_focus = null;
+                }
+            },
+            .key => |key| try self.sink.keyboard(.{ .key = .{
+                .window = self.keyboard_focus orelse return error.KeyboardWithoutFocus,
+                .serial = key.serial,
+                .time_ms = key.time,
+                .state = try keyboardKeyState(key.state),
+                .translated = self.xkb.translate(key.key),
+            } }),
+            .modifiers => |modifiers| self.xkb.updateModifiers(
+                modifiers.mods_depressed,
+                modifiers.mods_latched,
+                modifiers.mods_locked,
+                modifiers.group,
+            ),
+            .repeat_info => {},
         }
     }
 
@@ -1854,6 +1958,13 @@ fn pointerButtonState(value: protocol.wl_pointer.button_state) !platform_window.
     if (value.value == protocol.wl_pointer.button_state.pressed.value) return .pressed;
     if (value.value == protocol.wl_pointer.button_state.released.value) return .released;
     return error.InvalidPointerButtonState;
+}
+
+fn keyboardKeyState(value: protocol.wl_keyboard.key_state) !platform_window.KeyState {
+    if (value.value == protocol.wl_keyboard.key_state.released.value) return .released;
+    if (value.value == protocol.wl_keyboard.key_state.pressed.value) return .pressed;
+    if (value.value == protocol.wl_keyboard.key_state.repeated.value) return .repeated;
+    return error.UnknownKeyboardKeyState;
 }
 
 fn pointerAxis(value: protocol.wl_pointer.axis) !platform_window.PointerAxis {

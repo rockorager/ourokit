@@ -172,6 +172,10 @@ fn runWithFontconfig(init: std.process.Init, source: []const u8, options: Option
                 if (indexForHandle(&window_set, application.windows, pointerWindow(pointer))) |index|
                     if (runtimes[index].ready) try runtimes[index].routePointer(pointer);
             },
+            .keyboard => |keyboard| {
+                if (indexForHandle(&window_set, application.windows, keyboardWindow(keyboard))) |index|
+                    if (runtimes[index].ready) try runtimes[index].routeKeyboard(keyboard);
+            },
         };
 
         // Task safe point: platform and CQE dispatch only changed state.
@@ -207,6 +211,7 @@ fn runWithFontconfig(init: std.process.Init, source: []const u8, options: Option
                     theme.surface_base,
                     theme.accent_default,
                     theme.surface_base,
+                    theme.focus_ring,
                     &signals,
                     &paragraph_sources,
                     &paragraphs,
@@ -301,8 +306,8 @@ fn runWithFontconfig(init: std.process.Init, source: []const u8, options: Option
 
         const completion = try loop.wait();
         switch (loop.dispatch(completion)) {
-            .timeout => |timeout| try vm.markTimeoutCompleted(timeout.operation),
-            .timeout_cancel => {},
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
+                try vm.markTimeoutCompleted(timeout.operation),
             .foreign => try host.dispatchOne(completion),
             .stale => return error.StaleCompletion,
         }
@@ -357,6 +362,14 @@ fn pointerWindow(event: platform.window.PointerEvent) platform.window.WindowHand
         .axis_steps => |value| value.window,
         .axis_steps120 => |value| value.window,
         .frame => |window| window,
+    };
+}
+
+fn keyboardWindow(event: platform.window.KeyboardEvent) platform.window.WindowHandle {
+    return switch (event) {
+        .enter => |value| value.window,
+        .leave => |value| value.window,
+        .key => |value| value.window,
     };
 }
 

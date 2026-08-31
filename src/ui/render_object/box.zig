@@ -7,10 +7,13 @@ const types = @import("types.zig");
 pub fn validate(value: types.Box) !void {
     if (value.width) |width| if (!validExtent(width)) return error.InvalidExtent;
     if (value.height) |height| if (!validExtent(height)) return error.InvalidExtent;
-    if (!validExtent(value.border_width) or !validExtent(value.corner_radius))
+    if (!validExtent(value.border_width) or !validExtent(value.corner_radius) or
+        !validExtent(value.outline_width) or !validExtent(value.outline_gap))
         return error.InvalidExtent;
     if ((value.border_width == 0) != (value.border_color == null))
         return error.InvalidBorder;
+    if ((value.outline_width == 0) != (value.outline_color == null))
+        return error.InvalidOutline;
     if (!validExtent(value.padding.left) or !validExtent(value.padding.top) or
         !validExtent(value.padding.right) or !validExtent(value.padding.bottom))
         return error.InvalidInsets;

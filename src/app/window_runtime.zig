@@ -1,6 +1,7 @@
 const std = @import("std");
 const frame = @import("frame.zig");
 const core = @import("../core/root.zig");
+const design = @import("../design/root.zig");
 const lua = @import("../lua/root.zig");
 const platform = @import("../platform/window.zig");
 const scene = @import("../scene/root.zig");
@@ -39,10 +40,12 @@ pub const WindowRuntime = struct {
     router: ui.input.Router = undefined,
     pointer_bindings: ui.input.PointerBindings = undefined,
     buttons: ui.widget.Buttons = undefined,
+    focus: ui.focus.Manager = .{},
     semantics: ui.semantics.Snapshot = undefined,
     surface_color: core.Color = undefined,
     accent_color: core.Color = undefined,
     content_color: core.Color = undefined,
+    focus_color: core.Color = undefined,
     commands: []scene.Command = &.{},
     command_count: usize = 0,
     frame_state: frame.State = .{},
@@ -60,6 +63,7 @@ pub const WindowRuntime = struct {
         surface: core.Color,
         accent: core.Color,
         content: core.Color,
+        focus_color: core.Color,
         signals: *lua.Signals,
         paragraph_sources: *text.ParagraphSourceCache,
         paragraphs: *text.ParagraphCache,
@@ -96,10 +100,12 @@ pub const WindowRuntime = struct {
             .router = self.router,
             .pointer_bindings = self.pointer_bindings,
             .buttons = self.buttons,
+            .focus = .{},
             .semantics = self.semantics,
             .surface_color = surface,
             .accent_color = accent,
             .content_color = content,
+            .focus_color = focus_color,
             .commands = commands,
             .signals = signals,
         };
@@ -137,6 +143,7 @@ pub const WindowRuntime = struct {
         if (!self.initialized) return;
         lua_ui.clearHandlers(&self.pointer_bindings);
         self.buttons.clear();
+        self.focus.clear();
         while (self.router.takeEvent() != null) {}
         if (self.build_owners.isActive(self.root_owner)) {
             try self.signals.disposeOwner(.{
@@ -222,6 +229,8 @@ pub const WindowRuntime = struct {
                 return err;
             };
             self.semantics.commitStaged();
+            self.focus.reconcile(&self.instances);
+            try self.applyFocusVisual(null, self.focus.current());
             for (0..self.buttons.slotCount()) |index|
                 if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
             try self.build_owners.complete(work);
@@ -263,12 +272,21 @@ pub const WindowRuntime = struct {
         try self.router.route(event);
     }
 
+    pub fn routeKeyboard(self: *WindowRuntime, event: platform.KeyboardEvent) !void {
+        try self.router.routeKeyboard(event);
+    }
+
     pub fn dispatchInput(self: *WindowRuntime, vm: *lua.Vm) !void {
         while (self.router.takeEvent()) |event| {
+            if (event == .keyboard) {
+                try self.dispatchKeyboard(event.keyboard, vm);
+                continue;
+            }
             const target = switch (event) {
                 .hover_enter => |value| value.target,
                 .hover_leave => |value| value.target,
                 .pointer => |value| value.target,
+                .keyboard => unreachable,
             };
             if (!self.instances.isActive(target)) continue;
             const activated_button = try self.updateButtonState(event);
@@ -304,6 +322,60 @@ pub const WindowRuntime = struct {
                 &arguments,
             );
         }
+    }
+
+    fn dispatchKeyboard(self: *WindowRuntime, event: platform.KeyboardEvent, vm: *lua.Vm) !void {
+        const key = switch (event) {
+            .enter => return,
+            .leave => {
+                try self.applyButtonUpdate(self.buttons.release(null).visual);
+                return;
+            },
+            .key => |value| value,
+        };
+        if (key.translated.logical == .tab and key.state == .pressed) {
+            try self.applyButtonUpdate(self.buttons.release(null).visual);
+            const previous = self.focus.current();
+            _ = try self.focus.advance(
+                &self.instances,
+                if (key.translated.modifiers.shift) .backward else .forward,
+            );
+            try self.applyFocusVisual(previous, self.focus.current());
+            return;
+        }
+        if (key.translated.logical == .space) switch (key.state) {
+            .pressed => {
+                const focused = self.focus.current() orelse return;
+                if (!self.buttons.contains(focused)) return;
+                try self.applyButtonUpdate(self.buttons.press(focused));
+            },
+            .released => try self.activateButton(vm, self.buttons.releaseKeyboard()),
+            .repeated => {},
+        } else if (key.translated.logical == .enter and key.state == .pressed) {
+            const focused = self.focus.current() orelse return;
+            if (!self.buttons.contains(focused) or !self.buttons.isEnabled(focused)) return;
+            try self.spawnButtonCallback(vm, focused);
+        }
+    }
+
+    fn activateButton(self: *WindowRuntime, vm: *lua.Vm, release: ui.widget.ButtonRelease) !void {
+        try self.applyButtonUpdate(release.visual);
+        const activated = release.activated orelse return;
+        try self.spawnButtonCallback(vm, activated);
+    }
+
+    fn spawnButtonCallback(
+        self: *WindowRuntime,
+        vm: *lua.Vm,
+        focused: ui.instance.InstanceHandle,
+    ) !void {
+        const binding = self.pointer_bindings.get(focused) orelse return;
+        if (binding.kind != .button) return;
+        _ = try vm.spawnReference(
+            try self.instances.scope(focused),
+            @intCast(binding.id),
+            &.{},
+        );
     }
 
     pub fn wantsSubmission(self: *const WindowRuntime) bool {
@@ -400,6 +472,9 @@ pub const WindowRuntime = struct {
                     switch (button_event.state) {
                         .pressed => {
                             const button = (try self.buttonAncestor(pointer.target)) orelse return null;
+                            const previous = self.focus.current();
+                            _ = try self.focus.request(&self.instances, button);
+                            try self.applyFocusVisual(previous, self.focus.current());
                             try self.applyButtonUpdate(self.buttons.press(button));
                         },
                         .released => {
@@ -415,6 +490,7 @@ pub const WindowRuntime = struct {
                 },
                 else => {},
             },
+            .keyboard => {},
         }
         return null;
     }
@@ -448,6 +524,26 @@ pub const WindowRuntime = struct {
     fn applyButtonUpdate(self: *WindowRuntime, update: ?ui.widget.ButtonVisualUpdate) !void {
         const value = update orelse return;
         try self.applyButtonColor(value.target, value.color);
+    }
+
+    fn applyFocusVisual(
+        self: *WindowRuntime,
+        previous: ?ui.instance.InstanceHandle,
+        current: ?ui.instance.InstanceHandle,
+    ) !void {
+        if (previous) |target| if (self.instances.isActive(target))
+            try self.setFocusOutline(target, false);
+        if (current) |target| try self.setFocusOutline(target, true);
+    }
+
+    fn setFocusOutline(self: *WindowRuntime, target: ui.instance.InstanceHandle, visible: bool) !void {
+        const render = try self.instances.renderObject(target);
+        var object = try self.tree.objectAt(render);
+        if (object != .box) return;
+        object.box.outline_color = if (visible) self.focus_color else null;
+        object.box.outline_width = if (visible) design.tokens.foundation.focus_ring_width else 0;
+        object.box.outline_gap = if (visible) design.tokens.foundation.focus_ring_gap else 0;
+        try self.tree.update(render, object);
     }
 };
 
@@ -562,6 +658,75 @@ test "queued pointer axis scrolls retained instance only during input dispatch" 
     try std.testing.expect(try runtime.tree.paintDirty(root));
 }
 
+test "queued Tab navigation updates retained focus at the input safe point" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    const window: platform.WindowHandle = .{ .slot = 3, .generation = 1 };
+    var runtime: WindowRuntime = .{};
+    try runtime.tree.init(std.testing.allocator, 3);
+    try runtime.instances.init(
+        std.testing.allocator,
+        &scheduler,
+        &runtime.tree,
+        window_scope,
+        3,
+    );
+    try runtime.router.init(
+        std.testing.allocator,
+        &runtime.tree,
+        &runtime.instances,
+        window,
+        2,
+    );
+    try runtime.buttons.init(std.testing.allocator, 3);
+    runtime.focus_color = core.Color.rgba(20, 80, 220, 255);
+    defer {
+        runtime.buttons.clear();
+        runtime.buttons.deinit();
+        runtime.router.deinit();
+        runtime.instances.reconcile(&.{}) catch unreachable;
+        scheduler.applyQueuedCancellations() catch unreachable;
+        runtime.instances.collectRetired() catch unreachable;
+        runtime.instances.deinit();
+        runtime.tree.deinit();
+        scheduler.destroyScope(window_scope) catch unreachable;
+    }
+    try runtime.instances.reconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .box = .{} }, .focusable = true },
+        .{ .id = 3, .parent = 1, .object = .{ .box = .{} }, .focusable = true },
+    });
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 1,
+        .time_ms = 2,
+        .state = .pressed,
+        .translated = .{ .keycode = 15, .logical = .tab },
+    } });
+    try std.testing.expect(runtime.focus.current() == null);
+    var unused_vm: lua.Vm = undefined;
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqual(runtime.instances.handleForId(2).?, runtime.focus.current().?);
+    const focused_render = try runtime.instances.renderObject(runtime.focus.current().?);
+    try std.testing.expectEqual(runtime.focus_color, (try runtime.tree.objectAt(focused_render)).box.outline_color.?);
+
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 2,
+        .time_ms = 3,
+        .state = .pressed,
+        .translated = .{
+            .keycode = 15,
+            .logical = .tab,
+            .modifiers = .{ .shift = true },
+        },
+    } });
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqual(runtime.instances.handleForId(3).?, runtime.focus.current().?);
+}
+
 const InputValues = struct {
     kind: i64,
     x: f64 = 0,
@@ -584,6 +749,7 @@ fn inputValues(event: ui.input.Event) InputValues {
             .axis => |axis| .{ .kind = 5, .value1 = @intFromEnum(axis.axis), .x = axis.delta },
             else => .{ .kind = 6 },
         },
+        .keyboard => .{ .kind = 7 },
     };
 }
 

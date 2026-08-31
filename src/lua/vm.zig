@@ -258,6 +258,10 @@ pub const Vm = struct {
                 try self.scheduler.wait(scheduler_handle);
                 return .waiting;
             }
+            if (slot.timer_resource_handle) |resource| {
+                try self.scheduler.destroyResource(resource);
+                slot.timer_resource_handle = null;
+            }
             try self.scheduler.complete(scheduler_handle);
             if (self.closeTask(handle) != c.ok) return error.LuaThreadCloseFailed;
             return .canceled;
@@ -298,7 +302,7 @@ pub const Vm = struct {
                     return err;
                 };
                 slot.pending_timeout = operation;
-                std.debug.assert(operation.slot < self.operation_tasks.len);
+                try self.ensureOperationMap(operation.slot);
                 std.debug.assert(self.operation_tasks[operation.slot] == null);
                 self.operation_tasks[operation.slot] = handle;
                 try self.scheduler.wait(scheduler_handle);
@@ -417,6 +421,16 @@ pub const Vm = struct {
         @memset(self.scheduler_tasks[old_len..], null);
     }
 
+    fn ensureOperationMap(self: *Vm, slot: u32) !void {
+        if (slot < self.operation_tasks.len) return;
+        var new_len = self.operation_tasks.len;
+        while (slot >= new_len) new_len = std.math.mul(usize, new_len, 2) catch
+            return error.TimerCapacityExceeded;
+        const old_len = self.operation_tasks.len;
+        self.operation_tasks = try self.allocator.realloc(self.operation_tasks, new_len);
+        @memset(self.operation_tasks[old_len..], null);
+    }
+
     fn handleForSchedulerTask(
         self: *Vm,
         scheduler_handle: task.TaskHandle,
@@ -463,7 +477,10 @@ const TimerResource = struct {
     fn requestCancel(pointer: *anyopaque) !void {
         const resource: *TimerResource = @ptrCast(@alignCast(pointer));
         const slot = try resource.vm.activeSlot(resource.task_handle);
-        try resource.vm.loop.prepareCancel(slot.pending_timeout.?);
+        const operation = slot.pending_timeout orelse return;
+        try resource.vm.loop.prepareCancel(operation);
+        resource.vm.operation_tasks[operation.slot] = null;
+        slot.pending_timeout = null;
     }
 
     fn destroy(_: *anyopaque) void {}

@@ -193,6 +193,23 @@ dispatch still only enqueue state; callbacks spawn Lua tasks during the task
 phase. Labels pass valid UTF-8 through paragraph itemization, bidi, fallback
 shaping, and width-dependent wrapping.
 
+Instances also retain focusability and deterministic descriptor traversal
+order. A window-local focus manager holds only a generation-checked instance
+handle. Tab and Shift-Tab move through enabled controls with wrapping during the
+input safe point, pointer presses request focus through the same policy, and
+focused Buttons paint the generated semantic focus-ring token without changing
+layout. Enter and Space activation enqueue the existing Button callback task;
+Wayland dispatch never calls Lua directly.
+
+Editable text begins at a separate, platform-neutral model boundary. It owns
+UTF-8 bytes, a directional anchor/extent selection, revisioning, and a cached
+index of uucode UAX #29 extended-grapheme boundaries. Replacement, selection,
+and logical previous/next movement therefore cannot split combining sequences,
+emoji ZWJ sequences, or regional-indicator pairs. The model deliberately does
+not call logical movement “left” or “right”: visual arrow movement requires the
+paragraph layer's future bidi-aware caret map. It also has no Lua, Wayland,
+renderer, shaping-cache, or IME ownership.
+
 Commands live in an authoritative registry independent of the retained render
 tree. Entries need stable semantic IDs plus revisioned invocation handles,
 scope, title/category/aliases, enabled state and reason, state, argument schema,
