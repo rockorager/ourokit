@@ -41,6 +41,7 @@ pub const WindowRuntime = struct {
     frame_state: frame.State = .{},
     output_scale: f32 = 1,
     signals: *lua.Signals = undefined,
+    shapes: *text.ShapeCache = undefined,
     dirty_windows: ?*ui.instance.ReconcileQueue = null,
     reconciling: bool = false,
 
@@ -94,6 +95,7 @@ pub const WindowRuntime = struct {
             .content_color = content,
             .commands = commands,
             .signals = signals,
+            .shapes = shapes,
         };
     }
 
@@ -194,10 +196,15 @@ pub const WindowRuntime = struct {
         for (prepared.handlers[0..prepared.handler_count]) |handler|
             if (!containsDescriptorId(prepared.descriptors(), handler.id))
                 return error.PointerHandlerInstanceMissing;
-        for (prepared.prepared_buttons[0..prepared.button_count]) |button|
-            if (!containsDescriptorId(prepared.descriptors(), button.id))
+        for (prepared.prepared_buttons[0..prepared.button_count]) |button| {
+            if (descriptorForId(prepared.descriptors(), button.id)) |descriptor| {
+                if (descriptor.object != .box) return error.ButtonRenderObjectMismatch;
+            } else {
                 return error.ButtonInstanceMissing;
+            }
+        }
         const plan = try self.instances.prepareReconcile(prepared.descriptors());
+        try self.validatePreparedFrame(prepared.descriptors(), size);
         try lua_ui.commitDependencies(&self.build_owners, work);
         dependencies_pending = false;
         prepared.reconcile_plan = plan;
@@ -361,7 +368,7 @@ pub const WindowRuntime = struct {
         const size = self.frame_state.size.?;
         const width: f32 = @floatFromInt(size.width);
         const height: f32 = @floatFromInt(size.height);
-        if (try self.tree.layoutDirty(root)) {
+        if (self.frame_state.needsLayout() or try self.tree.layoutDirty(root)) {
             self.frame_state.invalidateLayout();
             _ = try self.tree.layout(
                 root,
@@ -504,6 +511,42 @@ pub const WindowRuntime = struct {
         const value = update orelse return;
         try self.applyButtonColor(value.target, value.color);
     }
+
+    /// Exercises candidate layout and scene lowering against isolated native
+    /// storage. This closes the transaction boundary before retained instances
+    /// change, including command-capacity and descriptor-dependent layout
+    /// failures that ordinary reconciliation only encounters during framing.
+    fn validatePreparedFrame(
+        self: *WindowRuntime,
+        descriptors: []const ui.instance.Descriptor,
+        size: core.SizeU,
+    ) !void {
+        if (descriptors.len == 0) return;
+        var tree: ui.render_object.Tree = undefined;
+        try tree.init(self.allocator, descriptors.len);
+        defer tree.deinit();
+        tree.attachTextCache(self.shapes);
+        const handles = try self.allocator.alloc(ui.render_object.NodeHandle, descriptors.len);
+        defer self.allocator.free(handles);
+        for (descriptors, 0..) |descriptor, index| {
+            handles[index] = try tree.create(descriptor.object);
+            if (descriptor.parent) |parent_id| {
+                const parent_index = descriptorIndexForId(descriptors[0..index], parent_id).?;
+                try tree.appendChild(handles[parent_index], handles[index], descriptor.parent_data);
+            }
+        }
+        const root_index = descriptorRootIndex(descriptors).?;
+        const width: f32 = @floatFromInt(size.width);
+        const height: f32 = @floatFromInt(size.height);
+        _ = try tree.layout(
+            handles[root_index],
+            ui.layout.Constraints.tight(.{ .width = width, .height = height }),
+        );
+        const commands = try self.allocator.alloc(scene.Command, self.commands.len);
+        defer self.allocator.free(commands);
+        var builder = try ui.render_object.Builder.init(commands, self.output_scale);
+        try tree.buildScene(handles[root_index], &builder);
+    }
 };
 
 const InputValues = struct {
@@ -545,6 +588,24 @@ fn sameHandle(a: anytype, b: @TypeOf(a)) bool {
 fn containsDescriptorId(descriptors: []const ui.instance.Descriptor, id: u64) bool {
     for (descriptors) |descriptor| if (descriptor.id == id) return true;
     return false;
+}
+
+fn descriptorForId(
+    descriptors: []const ui.instance.Descriptor,
+    id: u64,
+) ?ui.instance.Descriptor {
+    for (descriptors) |descriptor| if (descriptor.id == id) return descriptor;
+    return null;
+}
+
+fn descriptorIndexForId(descriptors: []const ui.instance.Descriptor, id: u64) ?usize {
+    for (descriptors, 0..) |descriptor, index| if (descriptor.id == id) return index;
+    return null;
+}
+
+fn descriptorRootIndex(descriptors: []const ui.instance.Descriptor) ?usize {
+    for (descriptors, 0..) |descriptor, index| if (descriptor.parent == null) return index;
+    return null;
 }
 
 test "candidate source build prepares owned output without changing retained UI" {
