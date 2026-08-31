@@ -3,7 +3,9 @@ const bundle = @import("../bundle/root.zig");
 const windows_module = @import("windows.zig");
 const source_generation = @import("source_generation.zig");
 const SourceGeneration = source_generation.SourceGeneration;
-const SourceReload = @import("source_reload.zig").SourceReload;
+const source_reload_module = @import("source_reload.zig");
+const SourceReload = source_reload_module.SourceReload;
+const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const WindowRuntimeConfig = @import("window_runtime.zig").Config;
 const core = @import("../core/root.zig");
@@ -19,6 +21,9 @@ const ui = @import("../ui/root.zig");
 pub const Options = struct {
     exit_after_first_frame: bool = false,
     vulkan: bool = renderer.has_vulkan,
+    /// Optional process-lifetime control edge. Any thread may call `request`;
+    /// this runner consumes and commits requests only at its safe point.
+    reload_requests: ?*ReloadRequests = null,
     application_window_capacity: usize = 16,
     window: WindowRuntimeConfig = .{},
     platform_event_capacity: usize = 256,
@@ -145,10 +150,7 @@ pub fn runSource(
         initial_generation,
     );
     defer source_reload.deinit();
-    const generation = source_reload.active();
-    const signals = &generation.signals;
-    const lua_ui = &generation.ui_build;
-    const application = &generation.application;
+    const application = &source_reload.active().application;
     if (application.windows.len > options.application_window_capacity)
         return error.WindowCapacityExceeded;
 
@@ -193,9 +195,18 @@ pub fn runSource(
         options.application_window_capacity,
     );
     defer init.gpa.free(current_storage);
+    const reload_targets = try init.gpa.alloc(
+        source_reload_module.WindowTarget,
+        options.application_window_capacity,
+    );
+    defer init.gpa.free(reload_targets);
     var disconnect_started = false;
 
     while (true) {
+        const active_generation = source_reload.active();
+        const active_application = &active_generation.application;
+        const signals = &active_generation.signals;
+        const lua_ui = &active_generation.ui_build;
         var desired_changed = false;
         if (host.failure != null) {
             for (runtime_slots) |*slot| {
@@ -235,7 +246,7 @@ pub fn runSource(
         while (scheduler.takeRunnable()) |handle| _ = try source_reload.resumeRunnable(handle);
 
         var current_count: usize = 0;
-        for (application.windows) |window| {
+        for (active_application.windows) |window| {
             const slot = runtimeSlotForId(runtime_slots, window.declaration.id).?;
             if (!slot.desired) continue;
             current_storage[current_count] = window.declaration;
@@ -244,7 +255,7 @@ pub fn runSource(
         try window_set.reconcile(current_storage[0..current_count]);
 
         for (runtime_slots) |*slot| {
-            const window = applicationWindowForId(application.windows, slot.id orelse continue);
+            const window = applicationWindowForId(active_application.windows, slot.id orelse continue);
             if (window == null or !slot.desired) {
                 if (slot.runtime.registered) {
                     try dirty.unregister(slot.runtime.window);
@@ -278,7 +289,7 @@ pub fn runSource(
         while (dirty.take()) |work| {
             const slot = runtimeSlotForHandle(runtime_slots, work.owner) orelse
                 return error.UnknownDirtyWindow;
-            const window = applicationWindowForId(application.windows, slot.id.?) orelse
+            const window = applicationWindowForId(active_application.windows, slot.id.?) orelse
                 return error.UnknownDirtyWindow;
             const size = slot.configured_size orelse
                 slot.runtime.frame_state.size orelse return error.DirtyWindowNotConfigured;
@@ -293,6 +304,19 @@ pub fn runSource(
             slot.configured_size = null;
             try dirty.complete(work);
         }
+
+        if (options.reload_requests) |requests| if (requests.take()) |sequence| {
+            serviceReload(
+                &source_reload,
+                runtime_slots,
+                reload_targets,
+                &callbacks,
+                sequence,
+            );
+        };
+        source_reload.beginRetirement() catch |err|
+            std.log.err("could not begin source-generation retirement: {s}", .{@errorName(err)});
+        _ = source_reload.collectRetired();
 
         for (runtime_slots) |*slot| if (slot.runtime.ready)
             try slot.runtime.prepareFrame(try host.outputScale(slot.runtime.window));
@@ -359,6 +383,79 @@ pub fn runSource(
         }
     }
     if (host.failure) |failure| return failure;
+}
+
+/// Runs the complete disk-read, candidate-build, and application commit at the
+/// reconciliation safe point. Failure is deliberately non-fatal: the active
+/// generation and its last good frames remain authoritative.
+fn serviceReload(
+    reload: *SourceReload,
+    slots: []RuntimeSlot,
+    target_storage: []source_reload_module.WindowTarget,
+    callbacks: *lua.CallbackRegistry,
+    request_sequence: u64,
+) void {
+    reload.prepare() catch |err| {
+        reportReloadFailure(reload, request_sequence, err);
+        return;
+    };
+    var candidate_pending = true;
+    defer if (candidate_pending) reload.discard();
+
+    const candidate = reload.candidate.?;
+    var target_count: usize = 0;
+    for (candidate.application.windows) |window| {
+        const slot = runtimeSlotForId(slots, window.declaration.id) orelse {
+            reportReloadFailure(reload, request_sequence, error.SourceWindowSetChanged);
+            return;
+        };
+        target_storage[target_count] = .{
+            .id = window.declaration.id,
+            .runtime = &slot.runtime,
+            .size = slot.configured_size orelse slot.runtime.frame_state.size orelse .{
+                .width = 0,
+                .height = 0,
+            },
+        };
+        target_count += 1;
+    }
+    const targets = target_storage[0..target_count];
+    reload.prepareApplication(targets) catch |err| {
+        reportReloadFailure(reload, request_sequence, err);
+        return;
+    };
+    const committed = reload.commitApplication(targets, callbacks) catch |err| {
+        reportReloadFailure(reload, request_sequence, err);
+        return;
+    };
+    candidate_pending = false;
+    std.log.info(
+        "source reload request {d} committed generation {d}",
+        .{ request_sequence, committed.generation },
+    );
+}
+
+fn reportReloadFailure(
+    reload: *const SourceReload,
+    request_sequence: u64,
+    err: anyerror,
+) void {
+    if (reload.lastDiagnostic()) |diagnostic| {
+        std.log.err(
+            "source reload request {d} failed in {s} ({s}): {s}",
+            .{
+                request_sequence,
+                @tagName(diagnostic.phase),
+                diagnostic.source_name,
+                diagnostic.message,
+            },
+        );
+    } else {
+        std.log.err(
+            "source reload request {d} failed: {s}",
+            .{ request_sequence, @errorName(err) },
+        );
+    }
 }
 
 fn loadFont(

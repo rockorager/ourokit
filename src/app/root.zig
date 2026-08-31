@@ -7,6 +7,7 @@ pub const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 pub const WindowRuntimeConfig = @import("window_runtime.zig").Config;
 pub const SourceGeneration = @import("source_generation.zig").SourceGeneration;
 pub const SourceReload = @import("source_reload.zig").SourceReload;
+pub const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
 pub const runWayland = @import("wayland_runner.zig").run;
 pub const runWaylandSource = @import("wayland_runner.zig").runSource;
 pub const WaylandRunOptions = @import("wayland_runner.zig").Options;
@@ -19,5 +20,6 @@ test {
     _ = @import("window_runtime.zig");
     _ = @import("source_generation.zig");
     _ = @import("source_reload.zig");
+    _ = @import("reload_requests.zig");
     _ = @import("wayland_runner.zig");
 }
