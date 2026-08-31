@@ -13,6 +13,7 @@ pub const Config = struct {
     signal_capacity: usize = 256,
     subscription_capacity: usize = 1024,
     dependency_capacity: usize = 256,
+    module_capacity: usize = 64,
 };
 
 pub const UiServices = struct {
@@ -37,6 +38,11 @@ pub const SourceGeneration = struct {
     ui_build: lua.UiBuild,
     application: lua.Application,
     prepared_builds: []lua.PreparedBuild,
+    module_loader: ?lua.ModuleLoader = null,
+    bootstrap: ?lua.ApplicationBootstrap = null,
+    application_ready: bool = false,
+    services: ?UiServices = null,
+    config: Config = .{},
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -82,8 +88,65 @@ pub const SourceGeneration = struct {
         config: Config,
         diagnostic: ?*?lua.Diagnostic,
     ) !void {
+        return self.initMode(
+            allocator,
+            scheduler,
+            loop,
+            snapshot,
+            services,
+            config,
+            diagnostic,
+            null,
+        );
+    }
+
+    pub fn createBootstrap(
+        allocator: std.mem.Allocator,
+        scheduler: *task.Scheduler,
+        loop: *io_loop.Loop,
+        snapshot: bundle.SourceSnapshot,
+        module_root: std.os.linux.fd_t,
+        services: ?UiServices,
+        config: Config,
+        diagnostic: ?*?lua.Diagnostic,
+    ) !*SourceGeneration {
+        const generation = allocator.create(SourceGeneration) catch |err| {
+            var owned_snapshot = snapshot;
+            owned_snapshot.deinit();
+            return err;
+        };
+        errdefer allocator.destroy(generation);
+        try generation.initMode(
+            allocator,
+            scheduler,
+            loop,
+            snapshot,
+            services,
+            config,
+            diagnostic,
+            module_root,
+        );
+        return generation;
+    }
+
+    fn initMode(
+        self: *SourceGeneration,
+        allocator: std.mem.Allocator,
+        scheduler: *task.Scheduler,
+        loop: *io_loop.Loop,
+        snapshot: bundle.SourceSnapshot,
+        services: ?UiServices,
+        config: Config,
+        diagnostic: ?*?lua.Diagnostic,
+        module_root: ?std.os.linux.fd_t,
+    ) !void {
         self.allocator = allocator;
         self.snapshot = snapshot;
+        self.module_loader = null;
+        self.bootstrap = null;
+        self.application_ready = false;
+        self.services = services;
+        self.config = config;
         var vm_initialized = false;
         var signals_initialized = false;
         var descriptor_storage: ?[]ui.instance.Descriptor = null;
@@ -91,12 +154,14 @@ pub const SourceGeneration = struct {
         var application_initialized = false;
         var prepared_build_storage: ?[]lua.PreparedBuild = null;
         var prepared_build_count: usize = 0;
+        var module_loader_initialized = false;
         errdefer {
             if (prepared_build_storage) |storage| {
                 for (storage[0..prepared_build_count]) |*prepared| prepared.deinit();
                 allocator.free(storage);
             }
             if (application_initialized) self.application.deinit();
+            if (module_loader_initialized) self.module_loader.?.deinit();
             if (vm_initialized) self.vm.deinit();
             if (signals_initialized) self.signals.deinit();
             if (semantic_storage) |storage| allocator.free(storage);
@@ -216,6 +281,44 @@ pub const SourceGeneration = struct {
             self.callbacks = null;
         }
 
+        if (module_root) |root_fd| {
+            self.module_loader = @as(lua.ModuleLoader, undefined);
+            self.module_loader.?.init(
+                allocator,
+                &self.vm,
+                loop,
+                root_fd,
+                config.module_capacity,
+            ) catch |err| {
+                lua.recordDiagnosticError(
+                    diagnostic,
+                    allocator,
+                    .setup,
+                    self.snapshot.entry_name,
+                    err,
+                );
+                return err;
+            };
+            module_loader_initialized = true;
+            self.bootstrap = lua.ApplicationBootstrap.start(
+                allocator,
+                &self.vm,
+                scheduler.application_scope,
+                self.snapshot.bytes,
+                self.snapshot.chunk_name,
+            ) catch |err| {
+                lua.recordDiagnosticError(
+                    diagnostic,
+                    allocator,
+                    .evaluate,
+                    self.snapshot.entry_name,
+                    err,
+                );
+                return err;
+            };
+            return;
+        }
+
         self.application = lua.Application.loadNamedWithApi(
             allocator,
             self.vm.state,
@@ -234,6 +337,7 @@ pub const SourceGeneration = struct {
             return err;
         };
         application_initialized = true;
+        self.application_ready = true;
         self.prepared_builds = allocator.alloc(
             lua.PreparedBuild,
             self.application.windows.len,
@@ -269,12 +373,89 @@ pub const SourceGeneration = struct {
         }
     }
 
+    pub fn resumeRunnable(
+        self: *SourceGeneration,
+        scheduler_handle: task.TaskHandle,
+        diagnostic: ?*?lua.Diagnostic,
+    ) !lua.ResumeResult {
+        const result = try self.vm.resumeRunnable(scheduler_handle);
+        if (result == .completed and self.bootstrap != null)
+            try self.finishBootstrap(diagnostic);
+        return result;
+    }
+
+    pub fn dispatchFile(self: *SourceGeneration, completion: io_loop.FileCompletion) !bool {
+        if (self.module_loader) |*loader| return loader.dispatch(completion);
+        return false;
+    }
+
+    fn finishBootstrap(self: *SourceGeneration, diagnostic: ?*?lua.Diagnostic) !void {
+        var bootstrap = self.bootstrap orelse return error.ApplicationBootstrapMissing;
+        self.bootstrap = null;
+        var application = bootstrap.take() catch |err| {
+            lua.recordDiagnosticError(
+                diagnostic,
+                self.allocator,
+                .declaration,
+                self.snapshot.entry_name,
+                err,
+            );
+            return err;
+        };
+        errdefer application.deinit();
+        const prepared_builds = self.allocator.alloc(
+            lua.PreparedBuild,
+            application.windows.len,
+        ) catch |err| {
+            lua.recordDiagnosticError(
+                diagnostic,
+                self.allocator,
+                .setup,
+                self.snapshot.entry_name,
+                err,
+            );
+            return err;
+        };
+        var initialized: usize = 0;
+        errdefer {
+            for (prepared_builds[0..initialized]) |*prepared| prepared.deinit();
+            self.allocator.free(prepared_builds);
+        }
+        for (prepared_builds) |*prepared| {
+            prepared.init(
+                self.allocator,
+                self.vm.state,
+                if (self.services) |value| value.shapes else null,
+                self.config.node_capacity,
+                self.config.semantic_text_capacity,
+            ) catch |err| {
+                lua.recordDiagnosticError(
+                    diagnostic,
+                    self.allocator,
+                    .setup,
+                    self.snapshot.entry_name,
+                    err,
+                );
+                return err;
+            };
+            initialized += 1;
+        }
+        self.application = application;
+        self.prepared_builds = prepared_builds;
+        self.application_ready = true;
+    }
+
     pub fn deinit(self: *SourceGeneration) void {
         if (self.callbacks) |callbacks|
             std.debug.assert(callbacks.countForVm(&self.vm) == 0);
-        self.application.deinit();
-        for (self.prepared_builds) |*prepared| prepared.deinit();
-        self.allocator.free(self.prepared_builds);
+        if (self.application_ready) {
+            self.application.deinit();
+            for (self.prepared_builds) |*prepared| prepared.deinit();
+            self.allocator.free(self.prepared_builds);
+        } else {
+            std.debug.assert(self.vm.activeTaskCount() == 0);
+        }
+        if (self.module_loader) |*loader| loader.deinit();
         self.vm.deinit();
         self.signals.deinit();
         self.allocator.free(self.semantic_storage);
@@ -332,4 +513,76 @@ test "source generation owns a named snapshot and application Lua state" {
     try std.testing.expectEqualStrings("generation-test.lua", generation.snapshot.entry_name);
     try std.testing.expectEqual(@as(usize, 1), generation.prepared_builds.len);
     try std.testing.expectEqual(@as(usize, 0), generation.prepared_builds[0].descriptors().len);
+}
+
+test "source generation bootstrap retains async module closure before becoming ready" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "app.lua",
+        .data =
+        \\local ouro = require("ouro")
+        \\local title = require("title")
+        \\return ouro.app {
+        \\  id = "dev.ouro.async-generation",
+        \\  windows = {
+        \\    ouro.window { id = "main", title = title, content = function() end },
+        \\  },
+        \\}
+        ,
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "title.lua",
+        .data = "return 'Loaded asynchronously'",
+    });
+    const path = try std.fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &temporary.sub_path,
+        "app.lua",
+    });
+    defer std.testing.allocator.free(path);
+    var provider = try bundle.SourceProvider.initDisk(std.testing.allocator, path);
+    defer provider.deinit();
+    const module_root = (try provider.openModuleRoot(std.testing.io)).?;
+    defer module_root.close(std.testing.io);
+    const snapshot = try provider.snapshot(std.testing.io, std.testing.allocator);
+
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 32, 16);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 2, 4);
+    defer scheduler.deinit();
+    const generation = try SourceGeneration.createBootstrap(
+        std.testing.allocator,
+        &scheduler,
+        &loop,
+        snapshot,
+        module_root.handle,
+        null,
+        .{ .node_capacity = 8, .module_capacity = 4 },
+        null,
+    );
+    defer generation.destroy();
+
+    while (!generation.application_ready) {
+        while (scheduler.takeRunnable()) |runnable|
+            _ = try generation.resumeRunnable(runnable, null);
+        if (generation.application_ready) break;
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .file => |completion| try std.testing.expect(try generation.dispatchFile(completion)),
+            .operation_cancel => {},
+            else => return error.UnexpectedCompletion,
+        }
+    }
+    try std.testing.expectEqualStrings(
+        "dev.ouro.async-generation",
+        generation.application.id,
+    );
+    try std.testing.expectEqualStrings(
+        "Loaded asynchronously",
+        generation.application.windows[0].declaration.title,
+    );
 }

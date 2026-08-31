@@ -1,5 +1,6 @@
 pub const Vm = @import("vm.zig").Vm;
 pub const TaskHandle = @import("vm.zig").TaskHandle;
+pub const ResumeResult = @import("vm.zig").ResumeResult;
 pub const TaskArgument = @import("vm.zig").Argument;
 pub const CallbackRegistry = @import("callbacks.zig").CallbackRegistry;
 pub const CallbackHandle = @import("callbacks.zig").CallbackHandle;
