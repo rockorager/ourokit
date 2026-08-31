@@ -7,6 +7,7 @@ pub const Phase = enum {
     compile,
     evaluate,
     declaration,
+    build,
 };
 
 /// Owned structured failure from preparing one source generation.

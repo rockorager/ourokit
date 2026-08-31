@@ -1,9 +1,11 @@
 const std = @import("std");
 const bundle = @import("../bundle/root.zig");
+const core = @import("../core/root.zig");
 const io_loop = @import("../loop/root.zig");
 const lua = @import("../lua/root.zig");
 const task = @import("../task/root.zig");
 const source_generation = @import("source_generation.zig");
+const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 
 const SourceGeneration = source_generation.SourceGeneration;
 const retiring_capacity = 4;
@@ -18,6 +20,12 @@ pub const Commit = struct {
     generation: u64,
     /// Borrowed until `collectRetired` succeeds or SourceReload is destroyed.
     retired: *SourceGeneration,
+};
+
+pub const WindowTarget = struct {
+    id: []const u8,
+    runtime: *WindowRuntime,
+    size: core.SizeU,
 };
 
 /// Owns the active source generation and at most one fully prepared candidate.
@@ -133,6 +141,73 @@ pub const SourceReload = struct {
         self.candidate = null;
     }
 
+    /// Prepares every retained window against the candidate generation. The
+    /// first implementation requires the same window ID set; structural
+    /// window changes will use reserved runtime slots in a subsequent step.
+    pub fn prepareApplication(self: *SourceReload, targets: []const WindowTarget) !void {
+        const candidate = self.candidate orelse return error.SourceCandidateNotPrepared;
+        if (targets.len != candidate.application.windows.len) {
+            self.recordBuildError(error.SourceWindowSetChanged);
+            self.discard();
+            return error.SourceWindowSetChanged;
+        }
+        for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
+            const target = findWindowTarget(targets, window.declaration.id) orelse {
+                self.recordBuildError(error.SourceWindowSetChanged);
+                self.discard();
+                return error.SourceWindowSetChanged;
+            };
+            target.runtime.prepareSourceBuild(
+                target.size,
+                &candidate.ui_build,
+                prepared,
+                window.content_reference,
+                self.generation + 1,
+            ) catch |err| {
+                self.recordBuildError(err);
+                self.discard();
+                return err;
+            };
+        }
+    }
+
+    /// Commits an already prepared same-window-set candidate. Every fallible
+    /// check and allocation completes before the first retained window changes.
+    pub fn commitApplication(
+        self: *SourceReload,
+        targets: []const WindowTarget,
+        callbacks: *lua.CallbackRegistry,
+    ) !Commit {
+        const candidate = self.candidate orelse return error.SourceCandidateNotPrepared;
+        if (targets.len != candidate.application.windows.len)
+            return error.SourceWindowSetChanged;
+        var callback_count: usize = 0;
+        for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
+            const target = findWindowTarget(targets, window.declaration.id) orelse
+                return error.SourceWindowSetChanged;
+            try target.runtime.validatePreparedSourceCommit(prepared);
+            callback_count = std.math.add(
+                usize,
+                callback_count,
+                prepared.handler_count,
+            ) catch return error.CallbackCapacityExceeded;
+        }
+        try callbacks.ensureAvailable(callback_count);
+
+        for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
+            const target = findWindowTarget(targets, window.declaration.id).?;
+            target.runtime.commitPreparedSource(
+                prepared,
+                callbacks,
+                &candidate.vm,
+                &candidate.signals,
+            );
+        }
+        const committed = self.commit();
+        self.markRetiringNativeStateDetached(committed.retired);
+        return committed;
+    }
+
     /// Atomically changes which prepared Lua declaration is authoritative.
     /// No fallible work belongs here. The returned generation remains live
     /// until its callbacks, tasks, and resources have been retired by `app`.
@@ -230,7 +305,23 @@ pub const SourceReload = struct {
         if (self.diagnostic) |*value| value.deinit();
         self.diagnostic = null;
     }
+
+    fn recordBuildError(self: *SourceReload, err: anyerror) void {
+        const candidate = self.candidate orelse return;
+        lua.recordDiagnosticError(
+            &self.diagnostic,
+            self.allocator,
+            .build,
+            candidate.snapshot.entry_name,
+            err,
+        );
+    }
 };
+
+fn findWindowTarget(targets: []const WindowTarget, id: []const u8) ?WindowTarget {
+    for (targets) |target| if (std.mem.eql(u8, target.id, id)) return target;
+    return null;
+}
 
 const initial_source =
     \\return ouro.app {
@@ -375,4 +466,87 @@ test "failed candidates preserve active generation and valid source commits" {
     reload.markRetiringNativeStateDetached(committed.retired);
     try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
     try std.testing.expectEqual(@as(usize, 0), reload.retiringCount());
+}
+
+test "application transaction prepares all retained windows before generation swap" {
+    const text = @import("../text/root.zig");
+
+    var provider = try bundle.SourceProvider.initEmbedded(
+        std.testing.allocator,
+        "transaction.lua",
+        initial_source,
+    );
+    defer provider.deinit();
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 12, 2, 2);
+    defer scheduler.deinit();
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(std.testing.allocator, 4);
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+
+    const snapshot = try provider.snapshot(std.testing.io, std.testing.allocator);
+    const initial = try SourceGeneration.create(
+        std.testing.allocator,
+        &scheduler,
+        &loop,
+        snapshot,
+        null,
+        .{ .node_capacity = 4, .semantic_text_capacity = 64 },
+        null,
+    );
+    var reload: SourceReload = undefined;
+    reload.init(
+        std.testing.allocator,
+        std.testing.io,
+        &provider,
+        &scheduler,
+        &loop,
+        null,
+        .{ .node_capacity = 4, .semantic_text_capacity = 64 },
+        initial,
+    );
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var runtime: WindowRuntime = .{};
+    try runtime.init(
+        std.testing.allocator,
+        &scheduler,
+        window_scope,
+        .{ .slot = 0, .generation = 1 },
+        core.Color.rgba(1, 2, 3, 255),
+        core.Color.rgba(4, 5, 6, 255),
+        core.Color.rgba(7, 8, 9, 255),
+        &initial.signals,
+        &shapes,
+        .{ .node_capacity = 4, .command_capacity = 4 },
+    );
+    const targets = [_]WindowTarget{.{
+        .id = "main",
+        .runtime = &runtime,
+        .size = .{ .width = 320, .height = 200 },
+    }};
+
+    try reload.prepare();
+    const candidate = reload.candidate.?;
+    try reload.prepareApplication(&targets);
+    try std.testing.expect(reload.active() == initial);
+    const committed = try reload.commitApplication(&targets, &callbacks);
+    try std.testing.expect(reload.active() == candidate);
+    try std.testing.expect(runtime.signals == &candidate.signals);
+    try std.testing.expectEqual(@as(u64, 2), committed.generation);
+    try reload.beginRetirement();
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+
+    try runtime.clear(&candidate.ui_build);
+    try scheduler.applyQueuedCancellations();
+    try runtime.collectRetired();
+    runtime.deinit();
+    try scheduler.destroyScope(window_scope);
+    reload.deinit();
+    callbacks.deinit();
 }
