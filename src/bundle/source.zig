@@ -66,6 +66,28 @@ pub const SourceProvider = struct {
         return self.kind == .disk;
     }
 
+    /// Opens the capability root used for application module resolution. The
+    /// caller owns the returned directory for the process/runtime lifetime.
+    pub fn openModuleRoot(self: *const SourceProvider, io: std.Io) !?std.Io.Dir {
+        return switch (self.kind) {
+            .embedded => null,
+            .disk => |path| blk: {
+                const parent = std.fs.path.dirname(path) orelse ".";
+                break :blk if (std.fs.path.isAbsolute(parent))
+                    try std.Io.Dir.openDirAbsolute(io, parent, .{})
+                else
+                    try std.Io.Dir.cwd().openDir(io, parent, .{});
+            },
+        };
+    }
+
+    pub fn entryRelativeName(self: *const SourceProvider) []const u8 {
+        return switch (self.kind) {
+            .embedded => |embedded| embedded.name,
+            .disk => |path| std.fs.path.basename(path),
+        };
+    }
+
     /// Captures one immutable entry-source generation. Module closure and
     /// filesystem identity will extend this snapshot rather than bypass it.
     pub fn snapshot(
@@ -184,6 +206,11 @@ test "disk provider rereads its retained entry path" {
     var provider = try SourceProvider.initDisk(std.testing.allocator, path);
     defer provider.deinit();
     try std.testing.expect(provider.reloadable());
+    try std.testing.expectEqualStrings("app.lua", provider.entryRelativeName());
+    const module_root = (try provider.openModuleRoot(std.testing.io)).?;
+    defer module_root.close(std.testing.io);
+    const entry = try module_root.openFile(std.testing.io, provider.entryRelativeName(), .{});
+    defer entry.close(std.testing.io);
 
     var first = try provider.snapshot(std.testing.io, std.testing.allocator);
     defer first.deinit();
