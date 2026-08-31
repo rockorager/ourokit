@@ -126,11 +126,12 @@ test "io_uring completion marks Lua runnable without re-entering it" {
     try app.init(std.testing.allocator);
     defer app.deinit();
 
-    try std.testing.expect(app.lua_vm.hasGlobal("ouro"));
+    try std.testing.expect(!app.lua_vm.hasGlobal("ouro"));
+    try std.testing.expect(app.lua_vm.hasGlobal("require"));
     try std.testing.expect(!app.lua_vm.hasGlobal("print"));
     try std.testing.expect(!app.lua_vm.hasGlobal("package"));
     try std.testing.expect(!app.lua_vm.hasGlobal("coroutine"));
-    try app.prepareScript("done = false; ouro.sleep(1); done = true");
+    try app.prepareScript("local ouro = require('ouro'); done = false; ouro.sleep(1); done = true");
     try app.runReadyTurn();
     try std.testing.expect(!app.lua_vm.globalBoolean("done"));
 
@@ -153,8 +154,8 @@ test "independent Lua coroutine tasks wait and resume through direct operation r
     try app.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.prepareScript("first = false; ouro.sleep(1); first = true");
-    try app.prepareScript("second = false; ouro.sleep(2); second = true");
+    try app.prepareScript("local ouro = require('ouro'); first = false; ouro.sleep(1); first = true");
+    try app.prepareScript("local ouro = require('ouro'); second = false; ouro.sleep(2); second = true");
     try app.runReadyTurn();
     try std.testing.expectEqual(@as(usize, 2), app.lua_vm.activeTaskCount());
     try std.testing.expect(!app.lua_vm.globalBoolean("first"));
@@ -175,6 +176,7 @@ test "existing Lua handlers spawn as scoped yieldable tasks with typed arguments
     try app.init(std.testing.allocator);
     defer app.deinit();
     try app.prepareScript(
+        \\local ouro = require("ouro")
         \\function handler(value)
         \\  handler_started = value == 7
         \\  ouro.sleep(1)
@@ -200,7 +202,7 @@ test "Lua coroutine slabs and scheduler routing grow without moving active tasks
 
     // One task enters I/O before later spawns force both a second Lua slab and
     // scheduler-directory growth. Its resource context must remain stable.
-    try app.prepareScript("sleeper_done = false; ouro.sleep(1); sleeper_done = true");
+    try app.prepareScript("local ouro = require('ouro'); sleeper_done = false; ouro.sleep(1); sleeper_done = true");
     try app.runReadyTurn();
     for (0..40) |_| try app.prepareScript("spawned = true");
     try std.testing.expectEqual(@as(usize, 41), app.lua_vm.activeTaskCount());
@@ -220,8 +222,8 @@ test "scope cancellation stops only its owned Lua coroutine tasks" {
     defer app.deinit();
     const first_scope = try app.scheduler.createScope(app.scheduler.application_scope);
     const second_scope = try app.scheduler.createScope(app.scheduler.application_scope);
-    _ = try app.lua_vm.spawn(first_scope, "first_after = false; ouro.sleep(60000); first_after = true");
-    _ = try app.lua_vm.spawn(second_scope, "second_after = false; ouro.sleep(60000); second_after = true");
+    _ = try app.lua_vm.spawn(first_scope, "local ouro = require('ouro'); first_after = false; ouro.sleep(60000); first_after = true");
+    _ = try app.lua_vm.spawn(second_scope, "local ouro = require('ouro'); second_after = false; ouro.sleep(60000); second_after = true");
     try app.runReadyTurn();
 
     try app.scheduler.queueScopeCancellation(first_scope);
@@ -286,6 +288,7 @@ test "canceling a suspended Lua task closes to-be-closed values" {
     var probe: CloseProbe = .{};
     probe.install(app.lua_vm.state);
     try app.prepareScript(
+        \\local ouro = require("ouro")
         \\local resource <close> = make_close_probe()
         \\ouro.sleep(60000)
     );

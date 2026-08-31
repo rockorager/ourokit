@@ -31,7 +31,43 @@ pub const Application = struct {
         chunk_name: [*:0]const u8,
         diagnostic_output: ?*?diagnostic.Diagnostic,
     ) !Application {
-        try installConstructors(state);
+        return loadNamedWithApiReference(
+            allocator,
+            state,
+            source,
+            chunk_name,
+            diagnostic_output,
+            null,
+        );
+    }
+
+    pub fn loadNamedWithApi(
+        allocator: std.mem.Allocator,
+        state: *c.State,
+        source: []const u8,
+        chunk_name: [*:0]const u8,
+        diagnostic_output: ?*?diagnostic.Diagnostic,
+        api_reference: c_int,
+    ) !Application {
+        return loadNamedWithApiReference(
+            allocator,
+            state,
+            source,
+            chunk_name,
+            diagnostic_output,
+            api_reference,
+        );
+    }
+
+    fn loadNamedWithApiReference(
+        allocator: std.mem.Allocator,
+        state: *c.State,
+        source: []const u8,
+        chunk_name: [*:0]const u8,
+        diagnostic_output: ?*?diagnostic.Diagnostic,
+        api_reference: ?c_int,
+    ) !Application {
+        try installConstructors(state, api_reference);
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
         if (c.luaL_loadbufferx(state, source.ptr, source.len, chunk_name, null) != c.ok) {
@@ -64,6 +100,16 @@ pub const Application = struct {
             );
             return err;
         };
+    }
+
+    pub fn installApi(state: *c.State, api_reference: c_int) !void {
+        try installConstructors(state, api_reference);
+    }
+
+    /// Parses the application declaration at the top of the Lua stack. The
+    /// caller retains stack ownership and may pop the declaration afterward.
+    pub fn parseStack(allocator: std.mem.Allocator, state: *c.State) !Application {
+        return parse(allocator, state);
     }
 
     fn parse(allocator: std.mem.Allocator, state: *c.State) !Application {
@@ -115,10 +161,14 @@ pub const Application = struct {
     }
 };
 
-fn installConstructors(state: *c.State) !void {
+fn installConstructors(state: *c.State, api_reference: ?c_int) !void {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    if (c.lua_getglobal(state, "ouro") != c.type_table) return error.OuroApiMissing;
+    const api_type = if (api_reference) |reference|
+        c.lua_rawgeti(state, c.registry_index, reference)
+    else
+        c.lua_getglobal(state, "ouro");
+    if (api_type != c.type_table) return error.OuroApiMissing;
     c.lua_pushcclosure(state, identityTable, 0);
     c.lua_setfield(state, -2, "app");
     c.lua_pushcclosure(state, identityTable, 0);

@@ -1,3 +1,5 @@
+local ouro = require("ouro")
+
 local clicked = ouro.signal(false)
 
 local function content()

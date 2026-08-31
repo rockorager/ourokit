@@ -13,6 +13,7 @@ Applications declare their desired window set rather than imperatively owning
 Wayring objects. The first working application-facing surface is:
 
 ```lua
+local ouro = require("ouro")
 local clicked = ouro.signal(false)
 
 return ouro.app {

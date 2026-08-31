@@ -625,7 +625,14 @@ test "candidate source build prepares owned output without changing retained UI"
     var active_vm: lua.Vm = undefined;
     try active_vm.init(std.testing.allocator, &scheduler, &loop);
     var active_signals: lua.Signals = undefined;
-    try active_signals.init(std.testing.allocator, active_vm.state, 2, 2, 2);
+    try active_signals.initWithApi(
+        std.testing.allocator,
+        active_vm.state,
+        2,
+        2,
+        2,
+        active_vm.apiReference(),
+    );
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
     var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
@@ -646,6 +653,7 @@ test "candidate source build prepares owned output without changing retained UI"
     );
 
     var provider = try bundle.SourceProvider.initEmbedded(std.testing.allocator, "candidate.lua",
+        \\local ouro = require("ouro")
         \\return ouro.app {
         \\  id = "dev.ouro.prepared-test",
         \\  windows = {

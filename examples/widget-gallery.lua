@@ -1,3 +1,5 @@
+local ouro = require("ouro")
+
 local count = ouro.signal(0)
 
 return ouro.app {

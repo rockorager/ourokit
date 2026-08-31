@@ -58,7 +58,10 @@ this seam only during task phase; the scheduler subsequently grants execution.
 An event handler may therefore await Ouro I/O without blocking later handlers
 or bypassing scope cancellation.
 
-The proof async API registers only `ouro.sleep(milliseconds)`. Its C callback
+The runtime API is a built-in module loaded with `local ouro = require("ouro")`;
+it is not installed as an ambient global and cannot be shadowed by application
+source. The proof async API currently exposes `ouro.sleep(milliseconds)`. Its C
+callback
 uses the VM's current generation-checked task, records the request, and calls
 `lua_yieldk`. After `lua_resume` reports a yield, Zig registers the timer under
 that task's actual owner scope and prepares a real ring timeout. The CQE phase

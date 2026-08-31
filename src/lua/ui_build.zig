@@ -77,12 +77,34 @@ pub const UiBuild = struct {
         state: *c.State,
         storage: []instance.Descriptor,
     ) !void {
+        return self.initWithApiReference(state, storage, null);
+    }
+
+    pub fn initWithApi(
+        self: *UiBuild,
+        state: *c.State,
+        storage: []instance.Descriptor,
+        api_reference: c_int,
+    ) !void {
+        return self.initWithApiReference(state, storage, api_reference);
+    }
+
+    fn initWithApiReference(
+        self: *UiBuild,
+        state: *c.State,
+        storage: []instance.Descriptor,
+        api_reference: ?c_int,
+    ) !void {
         if (storage.len == 0) return error.InvalidDescriptorCapacity;
         self.* = .{ .state = state, .storage = storage };
 
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
-        if (c.lua_getglobal(state, "ouro") != c.type_table) return error.OuroApiMissing;
+        const api_type = if (api_reference) |reference|
+            c.lua_rawgeti(state, c.registry_index, reference)
+        else
+            c.lua_getglobal(state, "ouro");
+        if (api_type != c.type_table) return error.OuroApiMissing;
         try self.install("label", emitLabel);
         try self.install("button", emitButton);
         try self.install("row", emitRow);

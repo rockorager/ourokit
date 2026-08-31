@@ -40,6 +40,8 @@ const Slot = struct {
     requested_nanoseconds: u64 = 0,
     yield_request: YieldRequest = .none,
     resume_arguments: c_int = 0,
+    retain_result: bool = false,
+    completed_result_count: ?c_int = null,
 };
 
 const slots_per_chunk = 32;
@@ -54,6 +56,7 @@ pub const Vm = struct {
     scheduler: *task.Scheduler,
     loop: *io.Loop,
     state: *c.State,
+    api_reference: c_int,
     chunks: [][]Slot,
     free_head: u32 = invalid_slot,
     scheduler_tasks: []?TaskHandle,
@@ -76,21 +79,26 @@ pub const Vm = struct {
         errdefer allocator.free(operation_tasks);
         @memset(scheduler_tasks, null);
         @memset(operation_tasks, null);
+        c.lua_createtable(state, 0, 1);
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, sleep, 1);
+        c.lua_setfield(state, -2, "sleep");
+        const api_reference = c.luaL_ref(state, c.registry_index);
+
         self.* = .{
             .allocator = allocator,
             .scheduler = scheduler,
             .loop = loop,
             .state = state,
+            .api_reference = api_reference,
             .chunks = chunks,
             .scheduler_tasks = scheduler_tasks,
             .operation_tasks = operation_tasks,
         };
 
-        c.lua_createtable(state, 0, 1);
         c.lua_pushlightuserdata(state, self);
-        c.lua_pushcclosure(state, sleep, 1);
-        c.lua_setfield(state, -2, "sleep");
-        c.lua_setglobal(state, "ouro");
+        c.lua_pushcclosure(state, builtinRequire, 1);
+        c.lua_setglobal(state, "require");
     }
 
     pub fn deinit(self: *Vm) void {
@@ -100,6 +108,7 @@ pub const Vm = struct {
         }
         for (self.scheduler_tasks) |entry| std.debug.assert(entry == null);
         for (self.operation_tasks) |entry| std.debug.assert(entry == null);
+        c.luaL_unref(self.state, c.registry_index, self.api_reference);
         c.lua_close(self.state);
         self.allocator.free(self.operation_tasks);
         self.allocator.free(self.scheduler_tasks);
@@ -112,6 +121,15 @@ pub const Vm = struct {
         return self.spawn(self.scheduler.application_scope, source);
     }
 
+    pub fn pushApi(self: *Vm, state: *c.State) void {
+        const value_type = c.lua_rawgeti(state, c.registry_index, self.api_reference);
+        std.debug.assert(value_type == c.type_table);
+    }
+
+    pub fn apiReference(self: *const Vm) c_int {
+        return self.api_reference;
+    }
+
     /// Loads a chunk into a new explicitly anchored coroutine and creates its
     /// language-neutral scheduler task under the supplied ownership scope.
     pub fn spawn(
@@ -119,13 +137,35 @@ pub const Vm = struct {
         scope: task.ScopeHandle,
         source: []const u8,
     ) !TaskHandle {
+        return self.spawnNamed(scope, source, "@application", false);
+    }
+
+    /// Candidate bootstrap variant. Completion retains the coroutine and its
+    /// one result until `takeRetainedResult` transfers that value to the main
+    /// state for declaration parsing.
+    pub fn spawnRetainedNamed(
+        self: *Vm,
+        scope: task.ScopeHandle,
+        source: []const u8,
+        chunk_name: [*:0]const u8,
+    ) !TaskHandle {
+        return self.spawnNamed(scope, source, chunk_name, true);
+    }
+
+    fn spawnNamed(
+        self: *Vm,
+        scope: task.ScopeHandle,
+        source: []const u8,
+        chunk_name: [*:0]const u8,
+        retain_result: bool,
+    ) !TaskHandle {
         const handle = try self.reserveSlot();
         var reserved = true;
         errdefer if (reserved) self.releaseSlot(handle);
         const main_top = c.lua_gettop(self.state);
         errdefer c.lua_settop(self.state, main_top);
         const thread = c.lua_newthread(self.state) orelse return error.LuaThreadCreationFailed;
-        if (c.luaL_loadbufferx(thread, source.ptr, source.len, "@application", null) != c.ok) {
+        if (c.luaL_loadbufferx(thread, source.ptr, source.len, chunk_name, null) != c.ok) {
             _ = c.lua_closethread(thread, null);
             c.lua_settop(thread, 0);
             return error.LuaLoadFailed;
@@ -146,6 +186,7 @@ pub const Vm = struct {
             .scheduler_handle = scheduler_handle,
             .scope = scope,
             .timer_resource = .{ .vm = self, .task_handle = handle },
+            .retain_result = retain_result,
         };
         std.debug.assert(self.scheduler_tasks[scheduler_handle.slot] == null);
         self.scheduler_tasks[scheduler_handle.slot] = handle;
@@ -271,6 +312,11 @@ pub const Vm = struct {
         switch (status) {
             c.ok => {
                 try self.scheduler.complete(scheduler_handle);
+                if (slot.retain_result) {
+                    slot.completed_result_count = result_count;
+                    self.scheduler_tasks[scheduler_handle.slot] = null;
+                    return .completed;
+                }
                 if (self.closeTask(handle) != c.ok) return error.LuaThreadCloseFailed;
                 return .completed;
             },
@@ -388,6 +434,18 @@ pub const Vm = struct {
         try self.scheduler.markRunnable(slot.scheduler_handle);
     }
 
+    /// Moves the sole retained result to the main state and releases the
+    /// bootstrap coroutine. The caller owns the main-state stack value.
+    pub fn takeRetainedResult(self: *Vm, handle: TaskHandle) !void {
+        const slot = try self.activeSlot(handle);
+        const result_count = slot.completed_result_count orelse
+            return error.LuaTaskNotCompleted;
+        if (!slot.retain_result or result_count != 1)
+            return error.LuaBootstrapResultRequired;
+        c.lua_xmove(slot.thread.?, self.state, 1);
+        if (self.closeTask(handle) != c.ok) return error.LuaThreadCloseFailed;
+    }
+
     pub fn hasGlobal(self: *Vm, name: [*:0]const u8) bool {
         const value_type = c.lua_getglobal(self.state, name);
         c.lua_settop(self.state, -2);
@@ -441,7 +499,9 @@ pub const Vm = struct {
         const status = c.lua_closethread(slot.thread.?, null);
         c.lua_settop(slot.thread.?, 0);
         c.luaL_unref(self.state, c.registry_index, slot.thread_reference);
-        self.scheduler_tasks[slot.scheduler_handle.slot] = null;
+        if (self.scheduler_tasks[slot.scheduler_handle.slot]) |mapped| {
+            if (same(mapped, handle)) self.scheduler_tasks[slot.scheduler_handle.slot] = null;
+        }
         self.releaseSlot(handle);
         return status;
     }
@@ -540,6 +600,21 @@ pub const Vm = struct {
 
     fn sleepContinuation(_: *c.State, _: c_int, _: c.KContext) callconv(.c) c_int {
         return 0;
+    }
+
+    fn builtinRequire(state: *c.State) callconv(.c) c_int {
+        const pointer = c.lua_touserdata(state, c.upvalueIndex(1)) orelse
+            return luaError(state, "missing Ouro VM");
+        const self: *Vm = @ptrCast(@alignCast(pointer));
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_string)
+            return luaError(state, "require expects one module name");
+        var length: usize = 0;
+        const name = c.lua_tolstring(state, 1, &length) orelse
+            return luaError(state, "require expects one module name");
+        if (!std.mem.eql(u8, name[0..length], "ouro"))
+            return luaError(state, "application module loading is unavailable");
+        self.pushApi(state);
+        return 1;
     }
 };
 
@@ -661,4 +736,32 @@ test "external waits resume only in task phase and drain before cancellation" {
         try vm.resumeRunnable(scheduler.takeRunnable().?),
     );
     try std.testing.expect(!vm.hasGlobal("canceled_resumed"));
+}
+
+test "retained bootstrap task transfers exactly one result to the main state" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 1, 0);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+
+    const retained = try vm.spawnRetainedNamed(
+        scheduler.application_scope,
+        "return 42",
+        "@bootstrap.lua",
+    );
+    const runnable = scheduler.takeRunnable().?;
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(runnable));
+    try std.testing.expect(!vm.ownsSchedulerTask(runnable));
+    try std.testing.expectEqual(@as(usize, 1), vm.activeTaskCount());
+    try vm.takeRetainedResult(retained);
+    try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
+    var is_integer: c_int = 0;
+    try std.testing.expectEqual(@as(c.Integer, 42), c.lua_tointegerx(vm.state, -1, &is_integer));
+    try std.testing.expectEqual(@as(c_int, 1), is_integer);
+    c.lua_settop(vm.state, -2);
 }

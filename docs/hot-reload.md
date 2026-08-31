@@ -155,6 +155,7 @@ schema identity and native state version. Future source-defined components use
 a stable module-local `hot_id` and positive integer `hot_version`:
 
 ```lua
+local ouro = require("ouro")
 local Counter = ouro.component {
   hot_id = "counter",
   hot_version = 2,
@@ -176,6 +177,7 @@ Ordinary Lua globals and module locals reset. State intended to survive source
 replacement uses a stable key:
 
 ```lua
+local ouro = require("ouro")
 local count = ouro.state("counter", 0)
 
 local settings = ouro.state("settings", {
@@ -300,6 +302,7 @@ State initialization and side effects have deliberately different lifetimes:
 An application may declare post-commit work explicitly:
 
 ```lua
+local ouro = require("ouro")
 return ouro.app {
   id = "dev.example.app",
   start = function()

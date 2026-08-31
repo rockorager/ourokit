@@ -125,6 +125,10 @@ pub const ModuleLoader = struct {
         const name_pointer = c.lua_tolstring(state, 1, &name_len) orelse
             return luaError(state, "require expects one module name");
         const name = name_pointer[0..name_len];
+        if (std.mem.eql(u8, name, "ouro")) {
+            self.vm.pushApi(state);
+            return 1;
+        }
 
         for (self.slots) |*slot| {
             if (slot.state == .free or !std.mem.eql(u8, slot.paths.?.canonical, name)) continue;

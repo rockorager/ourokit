@@ -324,6 +324,7 @@ fn findWindowTarget(targets: []const WindowTarget, id: []const u8) ?WindowTarget
 }
 
 const initial_source =
+    \\local ouro = require("ouro")
     \\return ouro.app {
     \\  id = "dev.ouro.reload-test",
     \\  windows = {
@@ -337,6 +338,7 @@ const initial_source =
 ;
 
 const replacement_source =
+    \\local ouro = require("ouro")
     \\return ouro.app {
     \\  id = "dev.ouro.reload-test",
     \\  windows = {
@@ -350,6 +352,7 @@ const replacement_source =
 ;
 
 const changed_identity_source =
+    \\local ouro = require("ouro")
     \\return ouro.app {
     \\  id = "dev.ouro.other-app",
     \\  windows = {
@@ -433,7 +436,7 @@ test "failed candidates preserve active generation and valid source commits" {
     try reload.prepare();
     try std.testing.expect(reload.active() == active);
     try std.testing.expectEqualStrings("Initial", active.application.windows[0].declaration.title);
-    _ = try active.vm.spawnApplication("ouro.sleep(1000); retired_ran = true");
+    _ = try active.vm.spawnApplication("local ouro = require('ouro'); ouro.sleep(1000); retired_ran = true");
     _ = try active.vm.resumeRunnable(scheduler.takeRunnable().?);
     const committed = reload.commit();
     try std.testing.expectEqual(@as(u64, 2), committed.generation);
@@ -556,6 +559,7 @@ test "a later window build failure leaves every retained window on the active ge
     const text = @import("../text/root.zig");
 
     const initial_two_windows =
+        \\local ouro = require("ouro")
         \\local function content(label)
         \\  return function()
         \\    ouro.column {
@@ -575,6 +579,7 @@ test "a later window build failure leaves every retained window on the active ge
         \\}
     ;
     const failing_second_window =
+        \\local ouro = require("ouro")
         \\return ouro.app {
         \\  id = "dev.ouro.atomic-window-test",
         \\  windows = {

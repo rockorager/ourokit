@@ -52,6 +52,44 @@ pub const Signals = struct {
         subscription_capacity: usize,
         dependency_capacity: usize,
     ) !void {
+        return self.initWithApiReference(
+            allocator,
+            state,
+            signal_capacity,
+            subscription_capacity,
+            dependency_capacity,
+            null,
+        );
+    }
+
+    pub fn initWithApi(
+        self: *Signals,
+        allocator: std.mem.Allocator,
+        state: *c.State,
+        signal_capacity: usize,
+        subscription_capacity: usize,
+        dependency_capacity: usize,
+        api_reference: c_int,
+    ) !void {
+        return self.initWithApiReference(
+            allocator,
+            state,
+            signal_capacity,
+            subscription_capacity,
+            dependency_capacity,
+            api_reference,
+        );
+    }
+
+    fn initWithApiReference(
+        self: *Signals,
+        allocator: std.mem.Allocator,
+        state: *c.State,
+        signal_capacity: usize,
+        subscription_capacity: usize,
+        dependency_capacity: usize,
+        api_reference: ?c_int,
+    ) !void {
         if (signal_capacity == 0 or subscription_capacity == 0 or dependency_capacity == 0)
             return error.InvalidSignalCapacity;
         const slots = try allocator.alloc(SignalSlot, signal_capacity);
@@ -69,7 +107,7 @@ pub const Signals = struct {
             .edges = edges,
             .pending = pending,
         };
-        try self.install();
+        try self.install(api_reference);
     }
 
     /// Close the associated Lua state first so signal `__gc` callbacks can
@@ -144,10 +182,14 @@ pub const Signals = struct {
         }
     }
 
-    fn install(self: *Signals) !void {
+    fn install(self: *Signals, api_reference: ?c_int) !void {
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
-        if (c.lua_getglobal(self.state, "ouro") != c.type_table) return error.OuroApiMissing;
+        const api_type = if (api_reference) |reference|
+            c.lua_rawgeti(self.state, c.registry_index, reference)
+        else
+            c.lua_getglobal(self.state, "ouro");
+        if (api_type != c.type_table) return error.OuroApiMissing;
 
         c.lua_pushlightuserdata(self.state, self);
         c.lua_pushcclosure(self.state, createSignal, 1);

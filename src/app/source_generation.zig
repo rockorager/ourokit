@@ -125,12 +125,13 @@ pub const SourceGeneration = struct {
             return err;
         };
         vm_initialized = true;
-        self.signals.init(
+        self.signals.initWithApi(
             allocator,
             self.vm.state,
             config.signal_capacity,
             config.subscription_capacity,
             config.dependency_capacity,
+            self.vm.apiReference(),
         ) catch |err| {
             lua.recordDiagnosticError(
                 diagnostic,
@@ -171,7 +172,11 @@ pub const SourceGeneration = struct {
             return err;
         };
         semantic_storage = self.semantic_storage;
-        self.ui_build.init(self.vm.state, self.descriptor_storage) catch |err| {
+        self.ui_build.initWithApi(
+            self.vm.state,
+            self.descriptor_storage,
+            self.vm.apiReference(),
+        ) catch |err| {
             lua.recordDiagnosticError(
                 diagnostic,
                 allocator,
@@ -211,12 +216,13 @@ pub const SourceGeneration = struct {
             self.callbacks = null;
         }
 
-        self.application = lua.Application.loadNamed(
+        self.application = lua.Application.loadNamedWithApi(
             allocator,
             self.vm.state,
             self.snapshot.bytes,
             self.snapshot.chunk_name,
             diagnostic,
+            self.vm.apiReference(),
         ) catch |err| {
             lua.recordDiagnosticError(
                 diagnostic,
@@ -286,6 +292,7 @@ pub const SourceGeneration = struct {
 
 test "source generation owns a named snapshot and application Lua state" {
     var provider = try bundle.SourceProvider.initEmbedded(std.testing.allocator, "generation-test.lua",
+        \\local ouro = require("ouro")
         \\return ouro.app {
         \\  id = "dev.ouro.generation-test",
         \\  windows = {
