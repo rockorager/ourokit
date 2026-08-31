@@ -13,6 +13,8 @@ pub const Storybook = @import("storybook.zig").Storybook;
 pub const StorybookStory = @import("storybook.zig").Story;
 pub const StorybookViewport = @import("storybook.zig").Viewport;
 pub const StorybookColorScheme = @import("storybook.zig").ColorScheme;
+pub const StorybookAction = @import("storybook.zig").Action;
+pub const StorybookActionKind = @import("storybook.zig").ActionKind;
 
 test {
     _ = @import("application.zig");

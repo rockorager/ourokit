@@ -154,6 +154,8 @@ fn writeStoryJson(json: *std.json.Stringify, story: ourokit.app.storybook.StoryD
     try writeViewportJson(json, story.viewport);
     try json.objectField("color_scheme");
     try json.write(@tagName(story.color_scheme));
+    try json.objectField("action_count");
+    try json.write(story.action_count);
     try json.endObject();
 }
 

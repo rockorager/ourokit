@@ -51,6 +51,7 @@ pub const Vm = struct {
     scheduler_tasks: []?TaskHandle,
     operation_tasks: []?TaskHandle,
     running: ?TaskHandle = null,
+    sleep_enabled: bool = true,
 
     pub fn init(
         self: *Vm,
@@ -98,6 +99,13 @@ pub const Vm = struct {
         for (self.chunks) |chunk| self.allocator.free(chunk);
         self.allocator.free(self.chunks);
         self.* = undefined;
+    }
+
+    /// Headless deterministic hosts disable wall-clock waits before invoking
+    /// user callbacks. The Lua call then fails synchronously without creating
+    /// an io_uring operation that would make snapshot completion time-based.
+    pub fn disableSleep(self: *Vm) void {
+        self.sleep_enabled = false;
     }
 
     pub fn spawnApplication(self: *Vm, source: []const u8) !TaskHandle {
@@ -424,6 +432,7 @@ pub const Vm = struct {
         const pointer = c.lua_touserdata(state, c.upvalueIndex(1)) orelse
             return luaError(state, "missing Ouro VM");
         const self: *Vm = @ptrCast(@alignCast(pointer));
+        if (!self.sleep_enabled) return luaError(state, "sleep is unavailable in deterministic playback");
         const handle = self.running orelse return luaError(state, "sleep called outside a task");
         const slot = self.activeSlot(handle) catch return luaError(state, "stale Ouro task");
         if (slot.thread != state) return luaError(state, "wrong Ouro task");

@@ -209,8 +209,25 @@ fresh Lua VM and retained UI runtime are created for each PNG so signals,
 globals, tasks, and widget state cannot leak between stories. Slash-separated
 story IDs create corresponding output subdirectories; unsafe path segments are
 rejected. See [`examples/storybook.lua`](examples/storybook.lua) for the
-declaration format. The interactive Storybook browser is planned after the
-headless catalog and snapshot interface stabilizes.
+declaration format and a catalog of every built-in widget.
+
+Stories can deterministically reach real retained widget states by replaying
+declarative actions against slash-separated widget-key paths:
+
+```lua
+actions = {
+  { type = "hover", target = "content/button" },
+  { type = "pointer_down", target = "content/button" },
+  { type = "click", target = "content/other-button" },
+}
+```
+
+Playback uses the normal hit tester, pointer router, button policy, callback
+tasks, signals, reconciliation, layout, and paint path. Event timestamps and
+serials are fixed, and each action settles before the next begins. Wall-clock
+`ouro.sleep` calls fail during playback rather than making snapshots timing
+dependent. The interactive Storybook browser is planned after the headless
+catalog and snapshot interface stabilizes.
 
 Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
 presenter with:

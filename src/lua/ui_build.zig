@@ -404,6 +404,7 @@ pub const UiBuild = struct {
             .id = button_id,
             .parent = semanticParent(parent),
             .role = .button,
+            .key = key,
             .label = label,
             .enabled = enabled,
         }) catch return luaError(state, "cannot append button semantics");
@@ -467,6 +468,7 @@ pub const UiBuild = struct {
             .id = id,
             .parent = semanticParent(parent),
             .role = .label,
+            .key = key,
             .label = value,
         }) catch return luaError(state, "cannot append label semantics");
         return 0;
@@ -526,6 +528,7 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         .id = id,
         .parent = semanticParent(parent),
         .role = .group,
+        .key = key,
     }) catch return luaError(state, "cannot append container semantics");
     if (c.lua_getfield(state, 1, "children") != c.type_function) {
         c.lua_settop(state, -2);

@@ -16,6 +16,12 @@ pub const Config = struct {
     semantic_text_capacity: usize = 16 * 1024,
 };
 
+pub const SemanticTarget = struct {
+    center: core.PointF,
+    role: ui.semantics.Role,
+    enabled: bool,
+};
+
 /// Retained UI state for one application window. This coordinates sibling UI,
 /// task, Lua, text, and scene implementations without owning platform objects
 /// or a renderer backend.
@@ -303,6 +309,36 @@ pub const WindowRuntime = struct {
     pub fn displayList(self: *WindowRuntime) !scene.DisplayList {
         if (!self.frame_state.readyForSubmission()) return error.FrameNotReady;
         return .{ .commands = self.commands[0..self.command_count] };
+    }
+
+    /// Resolves a retained semantic key path into the logical center used by
+    /// deterministic headless input. Geometry is accumulated through the
+    /// actual laid-out instance ancestry, so synthetic events use normal hit
+    /// testing rather than addressing widget state directly.
+    pub fn semanticTarget(self: *WindowRuntime, path: []const u8) !SemanticTarget {
+        if (!self.ready) return error.WindowRuntimeNotReady;
+        const semantic = try self.semantics.findPath(path);
+        const target = self.instances.handleForId(semantic.id) orelse
+            return error.SemanticInstanceMissing;
+        const render = try self.instances.renderObject(target);
+        const size = try self.tree.nodeSize(render);
+        var origin: core.PointF = .{};
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |instance_handle| {
+            origin = core.PointF.add(
+                origin,
+                try self.tree.nodeOffset(try self.instances.renderObject(instance_handle)),
+            );
+            current = try self.instances.parentOf(instance_handle);
+        }
+        return .{
+            .center = .{
+                .x = origin.x + size.width / 2,
+                .y = origin.y + size.height / 2,
+            },
+            .role = semantic.role,
+            .enabled = semantic.enabled,
+        };
     }
 
     pub fn frameSubmitted(self: *WindowRuntime) !void {

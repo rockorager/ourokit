@@ -9,12 +9,20 @@ pub const Viewport = struct {
     scale: f32 = 1,
 };
 
+pub const ActionKind = enum { hover, pointer_down, click };
+
+pub const Action = struct {
+    kind: ActionKind,
+    target: []u8,
+};
+
 pub const Story = struct {
     id: []u8,
     group: []u8,
     name: []u8,
     viewport: Viewport,
     color_scheme: ColorScheme,
+    actions: []Action,
     content_reference: c_int,
 };
 
@@ -67,6 +75,8 @@ pub const Storybook = struct {
             errdefer allocator.free(group);
             const viewport = try parseViewport(state, -1);
             const color_scheme = try parseColorScheme(state, -1);
+            const actions = try parseActions(allocator, state, -1);
+            errdefer deinitActions(allocator, actions);
             if (c.lua_getfield(state, -1, "content") != c.type_function)
                 return error.StoryContentRequired;
             const content_reference = c.luaL_ref(state, c.registry_index);
@@ -76,6 +86,7 @@ pub const Storybook = struct {
                 .name = name,
                 .viewport = viewport,
                 .color_scheme = color_scheme,
+                .actions = actions,
                 .content_reference = content_reference,
             };
             initialized += 1;
@@ -217,6 +228,47 @@ fn parseColorScheme(state: *c.State, table: c_int) !ColorScheme {
     return error.InvalidStoryColorScheme;
 }
 
+fn parseActions(allocator: std.mem.Allocator, state: *c.State, table: c_int) ![]Action {
+    const value_type = c.lua_getfield(state, table, "actions");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return allocator.alloc(Action, 0);
+    if (value_type != c.type_table) return error.InvalidStoryActions;
+    const count = c.lua_rawlen(state, -1);
+    if (count > 64) return error.TooManyStoryActions;
+    const actions = try allocator.alloc(Action, count);
+    errdefer allocator.free(actions);
+    var initialized: usize = 0;
+    errdefer for (actions[0..initialized]) |action| allocator.free(action.target);
+    for (actions, 1..) |*action, index| {
+        if (c.lua_rawgeti(state, -1, @intCast(index)) != c.type_table)
+            return error.InvalidStoryAction;
+        const kind_value = try requiredString(allocator, state, -1, "type");
+        defer allocator.free(kind_value);
+        const kind: ActionKind = if (std.mem.eql(u8, kind_value, "hover"))
+            .hover
+        else if (std.mem.eql(u8, kind_value, "pointer_down"))
+            .pointer_down
+        else if (std.mem.eql(u8, kind_value, "click"))
+            .click
+        else
+            return error.InvalidStoryActionType;
+        const target = try requiredString(allocator, state, -1, "target");
+        errdefer allocator.free(target);
+        if (!validSelector(target)) return error.InvalidStoryActionTarget;
+        action.* = .{ .kind = kind, .target = target };
+        initialized += 1;
+        c.lua_settop(state, -2);
+    }
+    return actions;
+}
+
+fn validSelector(path: []const u8) bool {
+    if (path.len == 0) return false;
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| if (segment.len == 0) return false;
+    return true;
+}
+
 fn validId(id: []const u8) bool {
     var segments = std.mem.splitScalar(u8, id, '/');
     while (segments.next()) |segment| {
@@ -230,9 +282,15 @@ fn validId(id: []const u8) bool {
 
 fn deinitStory(allocator: std.mem.Allocator, state: *c.State, story: Story) void {
     c.luaL_unref(state, c.registry_index, story.content_reference);
+    deinitActions(allocator, story.actions);
     allocator.free(story.name);
     allocator.free(story.group);
     allocator.free(story.id);
+}
+
+fn deinitActions(allocator: std.mem.Allocator, actions: []Action) void {
+    for (actions) |action| allocator.free(action.target);
+    allocator.free(actions);
 }
 
 fn luaError(state: *c.State, message: [*:0]const u8) c_int {
@@ -255,6 +313,10 @@ test "storybook declarations are owned, defaulted, and selectable" {
         \\      name = "Dark",
         \\      viewport = { width = 320, height = 180, scale = 2 },
         \\      color_scheme = "dark",
+        \\      actions = {
+        \\        { type = "hover", target = "content/button" },
+        \\        { type = "pointer_down", target = "content/button" },
+        \\      },
         \\      content = function() end,
         \\    },
         \\  },
@@ -267,6 +329,9 @@ test "storybook declarations are owned, defaulted, and selectable" {
     try std.testing.expectEqual(@as(u32, 320), story.viewport.width);
     try std.testing.expectEqual(@as(f32, 2), story.viewport.scale);
     try std.testing.expectEqual(ColorScheme.dark, story.color_scheme);
+    try std.testing.expectEqual(@as(usize, 2), story.actions.len);
+    try std.testing.expectEqual(ActionKind.pointer_down, story.actions[1].kind);
+    try std.testing.expectEqualStrings("content/button", story.actions[1].target);
 }
 
 test "storybook rejects unsafe and duplicate IDs" {
@@ -283,6 +348,22 @@ test "storybook rejects unsafe and duplicate IDs" {
         \\return ouro.storybook { stories = {
         \\  ouro.story { id = "same", name = "One", content = function() end },
         \\  ouro.story { id = "same", name = "Two", content = function() end },
+        \\} }
+    ));
+    try std.testing.expectError(error.InvalidStoryActionType, Storybook.load(std.testing.allocator, state,
+        \\return ouro.storybook { stories = {
+        \\  ouro.story {
+        \\    id = "action", name = "Bad action", content = function() end,
+        \\    actions = { { type = "wait", target = "content/button" } },
+        \\  },
+        \\} }
+    ));
+    try std.testing.expectError(error.InvalidStoryActionTarget, Storybook.load(std.testing.allocator, state,
+        \\return ouro.storybook { stories = {
+        \\  ouro.story {
+        \\    id = "target", name = "Bad target", content = function() end,
+        \\    actions = { { type = "click", target = "content//button" } },
+        \\  },
         \\} }
     ));
 }

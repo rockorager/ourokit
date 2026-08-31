@@ -1,35 +1,169 @@
+local count = ouro.signal(0)
+
+local function button_story(label, enabled)
+  ouro.column {
+    key = "content",
+    gap = 12,
+    children = function()
+      ouro.label { key = "heading", text = label, size = 18 }
+      ouro.button { key = "button", label = "Continue", enabled = enabled }
+    end,
+  }
+end
+
 return ouro.storybook {
-  title = "Ourokit controls",
+  title = "Ourokit built-in widgets",
   stories = {
     ouro.story {
-      id = "button/default",
-      group = "Button",
+      id = "label/default",
+      group = "Label",
       name = "Default",
-      viewport = { width = 320, height = 180, scale = 1 },
+      viewport = { width = 360, height = 160 },
       content = function()
         ouro.column {
           key = "content",
-          gap = 12,
           children = function()
-            ouro.label { key = "heading", text = "Default button", size = 18 }
-            ouro.button { key = "button", label = "Continue" }
+            ouro.label { key = "label", text = "A default Ourokit label" }
           end,
         }
       end,
     },
     ouro.story {
-      id = "button/disabled-dark",
-      group = "Button",
-      name = "Disabled (dark)",
-      viewport = { width = 320, height = 180, scale = 2 },
-      color_scheme = "dark",
+      id = "label/sizes",
+      group = "Label",
+      name = "Sizes",
+      viewport = { width = 360, height = 180 },
+      content = function()
+        ouro.column {
+          key = "content",
+          gap = 8,
+          children = function()
+            ouro.label { key = "small", text = "Small label", size = 12 }
+            ouro.label { key = "body", text = "Body label", size = 14 }
+            ouro.label { key = "heading", text = "Heading label", size = 18 }
+          end,
+        }
+      end,
+    },
+    ouro.story {
+      id = "layout/row",
+      group = "Layout",
+      name = "Row",
+      viewport = { width = 560, height = 180 },
       content = function()
         ouro.column {
           key = "content",
           gap = 12,
           children = function()
-            ouro.label { key = "heading", text = "Disabled button", size = 18 }
-            ouro.button { key = "button", label = "Continue", enabled = false }
+            ouro.label { key = "heading", text = "Horizontal row", size = 18 }
+            ouro.row {
+              key = "items",
+              gap = 8,
+              children = function()
+                ouro.button { key = "first", label = "First" }
+                ouro.button { key = "second", label = "Second" }
+                ouro.button { key = "third", label = "Third" }
+              end,
+            }
+          end,
+        }
+      end,
+    },
+    ouro.story {
+      id = "layout/column",
+      group = "Layout",
+      name = "Column",
+      viewport = { width = 360, height = 260 },
+      content = function()
+        ouro.column {
+          key = "content",
+          gap = 8,
+          children = function()
+            ouro.label { key = "heading", text = "Vertical column", size = 18 }
+            ouro.button { key = "first", label = "First" }
+            ouro.button { key = "second", label = "Second" }
+            ouro.button { key = "third", label = "Third" }
+          end,
+        }
+      end,
+    },
+    ouro.story {
+      id = "button/default",
+      group = "Button",
+      name = "Default",
+      viewport = { width = 360, height = 180 },
+      content = function()
+        button_story("Default button", true)
+      end,
+    },
+    ouro.story {
+      id = "button/hovered",
+      group = "Button",
+      name = "Hovered",
+      viewport = { width = 360, height = 180 },
+      actions = {
+        { type = "hover", target = "content/button" },
+      },
+      content = function()
+        button_story("Hovered button", true)
+      end,
+    },
+    ouro.story {
+      id = "button/pressed",
+      group = "Button",
+      name = "Pressed",
+      viewport = { width = 360, height = 180 },
+      actions = {
+        { type = "pointer_down", target = "content/button" },
+      },
+      content = function()
+        button_story("Pressed button", true)
+      end,
+    },
+    ouro.story {
+      id = "button/disabled",
+      group = "Button",
+      name = "Disabled",
+      viewport = { width = 360, height = 180 },
+      content = function()
+        button_story("Disabled button", false)
+      end,
+    },
+    ouro.story {
+      id = "button/disabled-dark",
+      group = "Button",
+      name = "Disabled (dark, 2x)",
+      viewport = { width = 360, height = 180, scale = 2 },
+      color_scheme = "dark",
+      content = function()
+        button_story("Disabled dark button", false)
+      end,
+    },
+    ouro.story {
+      id = "button/after-click",
+      group = "Button",
+      name = "After click",
+      viewport = { width = 360, height = 180 },
+      actions = {
+        { type = "click", target = "content/button" },
+      },
+      content = function()
+        ouro.column {
+          key = "content",
+          gap = 12,
+          children = function()
+            ouro.label {
+              key = "count",
+              text = "Pressed " .. count() .. " times",
+              size = 18,
+            }
+            ouro.button {
+              key = "button",
+              label = "Increment",
+              on_press = function()
+                count:set(count() + 1)
+              end,
+            }
           end,
         }
       end,

@@ -14,6 +14,7 @@ pub const StoryDescription = struct {
     name: []u8,
     viewport: lua.StorybookViewport,
     color_scheme: lua.StorybookColorScheme,
+    action_count: usize,
 };
 
 pub const Description = struct {
@@ -98,6 +99,7 @@ pub fn describe(init: std.process.Init, source: []const u8) !Description {
             .name = name,
             .viewport = story.viewport,
             .color_scheme = story.color_scheme,
+            .action_count = story.actions.len,
         };
         initialized += 1;
     }
@@ -178,6 +180,17 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         story.content_reference,
     );
     try runtime.prepareFrame(story.viewport.scale);
+    if (story.actions.len != 0) {
+        vm.disableSleep();
+        for (story.actions) |action| try playAction(
+            &runtime,
+            &vm,
+            &scheduler,
+            &lua_ui,
+            story,
+            action,
+        );
+    }
     const list = try runtime.displayList();
 
     const pixel_width = try physicalDimension(story.viewport.width, story.viewport.scale);
@@ -214,6 +227,65 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         .pixel_height = pixel_height,
         .png = png,
     };
+}
+
+fn playAction(
+    runtime: *WindowRuntime,
+    vm: *lua.Vm,
+    scheduler: *task.Scheduler,
+    lua_ui: *lua.UiBuild,
+    story: *const lua.StorybookStory,
+    action: lua.StorybookAction,
+) !void {
+    const target = try runtime.semanticTarget(action.target);
+    if (target.role != .button) return error.StoryActionTargetNotInteractive;
+    const window = runtime.window;
+    try runtime.routePointer(.{ .motion = .{
+        .window = window,
+        .time_ms = 0,
+        .position = target.center,
+    } });
+    try dispatchAndSettle(runtime, vm, scheduler, lua_ui, story);
+    if (action.kind == .hover) return;
+
+    try runtime.routePointer(.{ .button = .{
+        .window = window,
+        .serial = 1,
+        .time_ms = 0,
+        .button = 0x110,
+        .state = .pressed,
+    } });
+    try dispatchAndSettle(runtime, vm, scheduler, lua_ui, story);
+    if (action.kind == .pointer_down) return;
+
+    try runtime.routePointer(.{ .button = .{
+        .window = window,
+        .serial = 2,
+        .time_ms = 0,
+        .button = 0x110,
+        .state = .released,
+    } });
+    try dispatchAndSettle(runtime, vm, scheduler, lua_ui, story);
+}
+
+fn dispatchAndSettle(
+    runtime: *WindowRuntime,
+    vm: *lua.Vm,
+    scheduler: *task.Scheduler,
+    lua_ui: *lua.UiBuild,
+    story: *const lua.StorybookStory,
+) !void {
+    try runtime.dispatchInput(vm);
+    while (scheduler.takeRunnable()) |handle| switch (try vm.resumeRunnable(handle)) {
+        .completed, .canceled => {},
+        .waiting => return error.StoryActionDidNotSettle,
+    };
+    try runtime.reconcile(
+        .{ .width = story.viewport.width, .height = story.viewport.height },
+        lua_ui,
+        story.content_reference,
+    );
+    try runtime.prepareFrame(story.viewport.scale);
 }
 
 fn teardownRuntime(
