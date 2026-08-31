@@ -167,6 +167,7 @@ pub fn runSource(
         generation_config,
         initial_generation,
     );
+    if (module_root) |directory| source_reload.attachModuleRoot(directory.handle);
     initial_generation_owned = false;
     defer source_reload.deinit();
     const application = &source_reload.active().application;
@@ -220,6 +221,8 @@ pub fn runSource(
     );
     defer init.gpa.free(reload_targets);
     var disconnect_started = false;
+    var active_reload_sequence: ?u64 = null;
+    var queued_reload_sequence: ?u64 = null;
 
     while (true) {
         const active_generation = source_reload.active();
@@ -325,13 +328,32 @@ pub fn runSource(
         }
 
         if (options.reload_requests) |requests| if (requests.take()) |sequence| {
-            serviceReload(
-                &source_reload,
-                runtime_slots,
-                reload_targets,
-                &callbacks,
-                sequence,
-            );
+            if (active_reload_sequence == null) {
+                if (beginReload(&source_reload, sequence))
+                    active_reload_sequence = sequence;
+            } else {
+                queued_reload_sequence = sequence;
+            }
+        };
+        if (active_reload_sequence) |sequence| {
+            if (source_reload.takeCandidateFailure()) |err| {
+                reportReloadFailure(&source_reload, sequence, err);
+                active_reload_sequence = null;
+            } else if (source_reload.candidateReady()) {
+                servicePreparedReload(
+                    &source_reload,
+                    runtime_slots,
+                    reload_targets,
+                    &callbacks,
+                    sequence,
+                );
+                active_reload_sequence = null;
+            }
+        }
+        if (active_reload_sequence == null) if (queued_reload_sequence) |sequence| {
+            queued_reload_sequence = null;
+            if (beginReload(&source_reload, sequence))
+                active_reload_sequence = sequence;
         };
         source_reload.beginRetirement() catch |err|
             std.log.err("could not begin source-generation retirement: {s}", .{@errorName(err)});
@@ -397,7 +419,8 @@ pub fn runSource(
         switch (loop.dispatch(completion)) {
             .timeout => |timeout| try source_reload.markTimeoutCompleted(timeout.operation),
             .timeout_cancel => {},
-            .file, .operation_cancel => return error.UnownedIoCompletion,
+            .file => |file| try source_reload.markFileCompleted(file),
+            .operation_cancel => {},
             .foreign => try host.dispatchOne(completion),
             .stale => return error.StaleCompletion,
         }
@@ -437,17 +460,21 @@ fn finishInitialBootstrap(
 /// Runs the complete disk-read, candidate-build, and application commit at the
 /// reconciliation safe point. Failure is deliberately non-fatal: the active
 /// generation and its last good frames remain authoritative.
-fn serviceReload(
+fn beginReload(reload: *SourceReload, request_sequence: u64) bool {
+    reload.prepare() catch |err| {
+        reportReloadFailure(reload, request_sequence, err);
+        return false;
+    };
+    return true;
+}
+
+fn servicePreparedReload(
     reload: *SourceReload,
     slots: []RuntimeSlot,
     target_storage: []source_reload_module.WindowTarget,
     callbacks: *lua.CallbackRegistry,
     request_sequence: u64,
 ) void {
-    reload.prepare() catch |err| {
-        reportReloadFailure(reload, request_sequence, err);
-        return;
-    };
     var candidate_pending = true;
     defer if (candidate_pending) reload.discard();
 

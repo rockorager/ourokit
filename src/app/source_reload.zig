@@ -42,6 +42,8 @@ pub const SourceReload = struct {
     config: source_generation.Config,
     active_generation: *SourceGeneration,
     candidate: ?*SourceGeneration = null,
+    module_root: ?std.os.linux.fd_t = null,
+    candidate_failure: ?anyerror = null,
     retiring_generations: [retiring_capacity]?RetiringGeneration =
         [_]?RetiringGeneration{null} ** retiring_capacity,
     generation: u64 = 1,
@@ -83,6 +85,20 @@ pub const SourceReload = struct {
         return self.active_generation;
     }
 
+    pub fn attachModuleRoot(self: *SourceReload, directory: std.os.linux.fd_t) void {
+        self.module_root = directory;
+    }
+
+    pub fn candidateReady(self: *const SourceReload) bool {
+        return if (self.candidate) |candidate| candidate.application_ready else false;
+    }
+
+    pub fn takeCandidateFailure(self: *SourceReload) ?anyerror {
+        const failure = self.candidate_failure;
+        self.candidate_failure = null;
+        return failure;
+    }
+
     pub fn retiringCount(self: *const SourceReload) usize {
         var count: usize = 0;
         for (self.retiring_generations) |entry| if (entry != null) {
@@ -102,6 +118,7 @@ pub const SourceReload = struct {
         if (self.retiringCount() == retiring_capacity)
             return error.SourceRetirementCapacityExceeded;
         self.clearDiagnostic();
+        self.candidate_failure = null;
         const snapshot = self.provider.snapshot(self.io, self.allocator) catch |err| {
             lua.recordDiagnosticError(
                 &self.diagnostic,
@@ -112,27 +129,43 @@ pub const SourceReload = struct {
             );
             return err;
         };
-        const candidate = SourceGeneration.create(
-            self.allocator,
-            self.scheduler,
-            self.loop,
-            snapshot,
-            self.services,
-            self.config,
-            &self.diagnostic,
-        ) catch |err| return err;
-        errdefer candidate.destroy();
-        if (!std.mem.eql(u8, candidate.application.id, self.active_generation.application.id)) {
+        const candidate = if (self.module_root) |root|
+            SourceGeneration.createBootstrap(
+                self.allocator,
+                self.scheduler,
+                self.loop,
+                snapshot,
+                root,
+                self.services,
+                self.config,
+                &self.diagnostic,
+            )
+        else
+            SourceGeneration.create(
+                self.allocator,
+                self.scheduler,
+                self.loop,
+                snapshot,
+                self.services,
+                self.config,
+                &self.diagnostic,
+            );
+        const prepared = candidate catch |err| return err;
+        const candidate_generation = prepared;
+        errdefer candidate_generation.destroy();
+        if (candidate_generation.application_ready and
+            !std.mem.eql(u8, candidate_generation.application.id, self.active_generation.application.id))
+        {
             lua.recordDiagnosticError(
                 &self.diagnostic,
                 self.allocator,
                 .declaration,
-                candidate.snapshot.entry_name,
+                candidate_generation.snapshot.entry_name,
                 error.ApplicationIdChanged,
             );
             return error.ApplicationIdChanged;
         }
-        self.candidate = candidate;
+        self.candidate = candidate_generation;
     }
 
     pub fn discard(self: *SourceReload) void {
@@ -259,6 +292,37 @@ pub const SourceReload = struct {
         self: *SourceReload,
         handle: task.TaskHandle,
     ) !void {
+        if (self.candidate) |candidate| if (candidate.vm.ownsSchedulerTask(handle)) {
+            _ = candidate.resumeRunnable(handle, &self.diagnostic) catch |err| {
+                lua.recordDiagnosticError(
+                    &self.diagnostic,
+                    self.allocator,
+                    .evaluate,
+                    candidate.snapshot.entry_name,
+                    err,
+                );
+                candidate.destroy();
+                self.candidate = null;
+                self.candidate_failure = err;
+                return;
+            };
+            if (candidate.application_ready and
+                !std.mem.eql(u8, candidate.application.id, self.active_generation.application.id))
+            {
+                const err = error.ApplicationIdChanged;
+                lua.recordDiagnosticError(
+                    &self.diagnostic,
+                    self.allocator,
+                    .declaration,
+                    candidate.snapshot.entry_name,
+                    err,
+                );
+                candidate.destroy();
+                self.candidate = null;
+                self.candidate_failure = err;
+            }
+            return;
+        };
         if (self.active_generation.vm.ownsSchedulerTask(handle)) {
             _ = try self.active_generation.vm.resumeRunnable(handle);
             return;
@@ -269,6 +333,15 @@ pub const SourceReload = struct {
                 return;
             };
         return error.UnownedSourceTask;
+    }
+
+    pub fn markFileCompleted(self: *SourceReload, completion: io_loop.FileCompletion) !void {
+        if (self.candidate) |candidate|
+            if (try candidate.dispatchFile(completion)) return;
+        if (try self.active_generation.dispatchFile(completion)) return;
+        for (self.retiring_generations) |entry| if (entry) |retiring|
+            if (try retiring.generation.dispatchFile(completion)) return;
+        return error.UnownedSourceOperation;
     }
 
     /// Routes completion-phase state to the VM that prepared the operation.
@@ -469,6 +542,92 @@ test "failed candidates preserve active generation and valid source commits" {
     reload.markRetiringNativeStateDetached(committed.retired);
     try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
     try std.testing.expectEqual(@as(usize, 0), reload.retiringCount());
+}
+
+test "disk reload keeps active generation while candidate requires modules" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "app.lua",
+        .data = initial_source,
+    });
+    const path = try std.fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &temporary.sub_path,
+        "app.lua",
+    });
+    defer std.testing.allocator.free(path);
+    var provider = try bundle.SourceProvider.initDisk(std.testing.allocator, path);
+    defer provider.deinit();
+    const module_root = (try provider.openModuleRoot(std.testing.io)).?;
+    defer module_root.close(std.testing.io);
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 32, 16);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 2, 4);
+    defer scheduler.deinit();
+    const initial_snapshot = try provider.snapshot(std.testing.io, std.testing.allocator);
+    const initial = try SourceGeneration.create(
+        std.testing.allocator,
+        &scheduler,
+        &loop,
+        initial_snapshot,
+        null,
+        .{ .node_capacity = 8, .module_capacity = 4 },
+        null,
+    );
+    var reload: SourceReload = undefined;
+    reload.init(
+        std.testing.allocator,
+        std.testing.io,
+        &provider,
+        &scheduler,
+        &loop,
+        null,
+        .{ .node_capacity = 8, .module_capacity = 4 },
+        initial,
+    );
+    defer reload.deinit();
+    reload.attachModuleRoot(module_root.handle);
+
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "title.lua",
+        .data = "return 'Required title'",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "app.lua",
+        .data =
+        \\local ouro = require("ouro")
+        \\local title = require("title")
+        \\return ouro.app {
+        \\  id = "dev.ouro.reload-test",
+        \\  windows = {
+        \\    ouro.window { id = "main", title = title, content = function() end },
+        \\  },
+        \\}
+        ,
+    });
+    try reload.prepare();
+    try std.testing.expect(!reload.candidateReady());
+    try std.testing.expect(reload.active() == initial);
+
+    while (!reload.candidateReady()) {
+        while (scheduler.takeRunnable()) |runnable| try reload.resumeRunnable(runnable);
+        if (reload.candidateReady()) break;
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .file => |completion| try reload.markFileCompleted(completion),
+            .operation_cancel => {},
+            else => return error.UnexpectedCompletion,
+        }
+    }
+    try std.testing.expect(reload.active() == initial);
+    try std.testing.expectEqualStrings(
+        "Required title",
+        reload.candidate.?.application.windows[0].declaration.title,
+    );
 }
 
 test "application transaction prepares all retained windows before generation swap" {
