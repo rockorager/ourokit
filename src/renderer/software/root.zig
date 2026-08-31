@@ -232,42 +232,94 @@ fn drawDecoratedRectangle(
     const inner_radius = rectangle.corner_radius -| inset;
     for (top..bottom) |y| {
         for (left..right) |x| {
-            if (!insideRoundedRectangle(rectangle.bounds, rectangle.corner_radius, x, y)) continue;
-            const color = if (rectangle.border_color) |border|
-                if (!insideRoundedRectangle(inner, inner_radius, x, y)) border else rectangle.background orelse continue
+            const outer_coverage = roundedRectangleCoverage(rectangle.bounds, rectangle.corner_radius, x, y);
+            if (outer_coverage == 0) continue;
+            const inner_coverage = if (rectangle.border_color != null)
+                roundedRectangleCoverage(inner, inner_radius, x, y)
             else
-                rectangle.background orelse continue;
-            blendPixel(target, x, y, color, rectangle.blend);
+                255;
+            const border_coverage = if (rectangle.border_color != null)
+                multiply(outer_coverage, 255 - inner_coverage)
+            else
+                0;
+            const background_coverage = if (rectangle.background != null)
+                multiply(outer_coverage, inner_coverage)
+            else
+                0;
+            const coverage = addSaturating(border_coverage, background_coverage);
+            if (coverage == 0) continue;
+            const source = addPixels(
+                coveredColor(rectangle.border_color, border_coverage),
+                coveredColor(rectangle.background, background_coverage),
+            );
+            blendCoveredPixel(target, x, y, source, coverage, rectangle.blend);
         }
     }
 }
 
-fn insideRoundedRectangle(bounds: RectI, radius_value: u32, x: usize, y: usize) bool {
-    if (bounds.isEmpty()) return false;
+fn roundedRectangleCoverage(bounds: RectI, radius_value: u32, x: usize, y: usize) u8 {
+    if (bounds.isEmpty()) return 0;
     const radius: f64 = @floatFromInt(@min(radius_value, @min(bounds.width, bounds.height) / 2));
-    if (radius == 0) return true;
     const px: f64 = @as(f64, @floatFromInt(x)) + 0.5;
     const py: f64 = @as(f64, @floatFromInt(y)) + 0.5;
     const left: f64 = @floatFromInt(bounds.x);
     const top: f64 = @floatFromInt(bounds.y);
     const right = left + @as(f64, @floatFromInt(bounds.width));
     const bottom = top + @as(f64, @floatFromInt(bounds.height));
-    const center_x = std.math.clamp(px, left + radius, right - radius);
-    const center_y = std.math.clamp(py, top + radius, bottom - radius);
-    const dx = px - center_x;
-    const dy = py - center_y;
-    return dx * dx + dy * dy <= radius * radius;
+    if (radius == 0) return if (px >= left and px < right and py >= top and py < bottom) 255 else 0;
+    const half_width = (right - left) * 0.5;
+    const half_height = (bottom - top) * 0.5;
+    const dx = @abs(px - (left + right) * 0.5) - (half_width - radius);
+    const dy = @abs(py - (top + bottom) * 0.5) - (half_height - radius);
+    const outside = @sqrt(@max(dx, 0) * @max(dx, 0) + @max(dy, 0) * @max(dy, 0));
+    const distance = outside + @min(@max(dx, dy), 0) - radius;
+    const coverage = std.math.clamp(0.5 - distance, 0, 1);
+    return @intFromFloat(@floor(coverage * 255 + 0.5));
 }
 
-fn blendPixel(target: Target, x: usize, y: usize, color: Color, blend: scene.BlendMode) void {
-    const source = color.premultiplied();
+fn coveredColor(color: ?Color, coverage: u8) PremultipliedSrgba8 {
+    const source = if (color) |value| value.premultiplied() else return .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+    return .{
+        .r = multiply(source.r, coverage),
+        .g = multiply(source.g, coverage),
+        .b = multiply(source.b, coverage),
+        .a = multiply(source.a, coverage),
+    };
+}
+
+fn addPixels(a: PremultipliedSrgba8, b: PremultipliedSrgba8) PremultipliedSrgba8 {
+    return .{
+        .r = addSaturating(a.r, b.r),
+        .g = addSaturating(a.g, b.g),
+        .b = addSaturating(a.b, b.b),
+        .a = addSaturating(a.a, b.a),
+    };
+}
+
+fn blendCoveredPixel(
+    target: Target,
+    x: usize,
+    y: usize,
+    source: PremultipliedSrgba8,
+    coverage: u8,
+    blend: scene.BlendMode,
+) void {
     const offset = y * target.stride + x * 4;
-    if (blend == .source or source.a == 255) {
+    if (coverage == 255 and (blend == .source or source.a == 255)) {
         writePixel(target.format, target.pixels[offset..][0..4], source);
         return;
     }
     const destination = readPixel(target.format, target.pixels[offset..][0..4]);
-    writePixel(target.format, target.pixels[offset..][0..4], sourceOver(source, destination));
+    const result = if (blend == .source)
+        addPixels(source, .{
+            .r = multiply(destination.r, 255 - coverage),
+            .g = multiply(destination.g, 255 - coverage),
+            .b = multiply(destination.b, 255 - coverage),
+            .a = multiply(destination.a, 255 - coverage),
+        })
+    else
+        sourceOver(source, destination);
+    writePixel(target.format, target.pixels[offset..][0..4], result);
 }
 
 fn fillSource(target: Target, bounds: RectI, source: PremultipliedSrgba8) void {

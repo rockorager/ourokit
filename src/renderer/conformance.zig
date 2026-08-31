@@ -33,9 +33,11 @@ const decorated_commands = [_]scene.Command{
     } },
 };
 
-const black = [_]u8{ 0, 0, 0, 255 };
 const red = [_]u8{ 200, 0, 0, 255 };
 const green = [_]u8{ 0, 200, 0, 255 };
+const corner_red = [_]u8{ 76, 0, 0, 255 };
+const edge_red = [_]u8{ 184, 0, 0, 255 };
+const edge_mix = [_]u8{ 42, 158, 0, 255 };
 
 pub const fixtures = [_]Fixture{
     .{
@@ -50,11 +52,11 @@ pub const fixtures = [_]Fixture{
         .width = 5,
         .height = 5,
         .commands = &decorated_commands,
-        .expected_rgba = &(black ++ red ++ red ++ red ++ black ++
+        .expected_rgba = &(corner_red ++ edge_red ++ red ++ edge_red ++ corner_red ++
+            edge_red ++ edge_mix ++ green ++ edge_mix ++ edge_red ++
             red ++ green ++ green ++ green ++ red ++
-            red ++ green ++ green ++ green ++ red ++
-            red ++ green ++ green ++ green ++ red ++
-            black ++ red ++ red ++ red ++ black),
+            edge_red ++ edge_mix ++ green ++ edge_mix ++ edge_red ++
+            corner_red ++ edge_red ++ red ++ edge_red ++ corner_red),
     },
 };
 

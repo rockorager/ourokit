@@ -39,14 +39,31 @@ uint sourceOver(uint source, uint destination) {
     return result;
 }
 
-bool insideRoundedRectangle(vec2 point, vec4 bounds, float radius_value) {
+float roundedRectangleCoverage(vec2 point, vec4 bounds, float radius_value) {
     vec2 size = bounds.zw - bounds.xy;
-    if (size.x <= 0.0 || size.y <= 0.0) return false;
+    if (size.x <= 0.0 || size.y <= 0.0) return 0.0;
     float radius = min(radius_value, min(size.x, size.y) * 0.5);
-    if (radius == 0.0) return true;
-    vec2 center = clamp(point, bounds.xy + radius, bounds.zw - radius);
-    vec2 delta = point - center;
-    return dot(delta, delta) <= radius * radius;
+    if (radius == 0.0) return all(greaterThanEqual(point, bounds.xy)) && all(lessThan(point, bounds.zw)) ? 1.0 : 0.0;
+    vec2 half_size = size * 0.5;
+    vec2 delta = abs(point - (bounds.xy + bounds.zw) * 0.5) - (half_size - radius);
+    float distance = length(max(delta, 0.0)) + min(max(delta.x, delta.y), 0.0) - radius;
+    return clamp(0.5 - distance, 0.0, 1.0);
+}
+
+uint scalePixel(uint pixel, uint coverage) {
+    uint result = 0u;
+    for (uint shift = 0u; shift <= 24u; shift += 8u) {
+        result |= ((channel(pixel, shift) * coverage + 127u) / 255u) << shift;
+    }
+    return result;
+}
+
+uint addPixels(uint a, uint b) {
+    uint result = 0u;
+    for (uint shift = 0u; shift <= 24u; shift += 8u) {
+        result |= min(channel(a, shift) + channel(b, shift), 255u) << shift;
+    }
+    return result;
 }
 
 void main() {
@@ -59,21 +76,29 @@ void main() {
     uint y = uint(top) + index / width;
     vec2 point = vec2(x, y) + vec2(0.5);
     vec4 shape = vec4(shape_left, shape_top, shape_right, shape_bottom);
-    if (!insideRoundedRectangle(point, shape, float(corner_radius))) return;
+    uint outer_coverage = uint(roundedRectangleCoverage(point, shape, float(corner_radius)) * 255.0 + 0.5);
+    if (outer_coverage == 0u) return;
     uint inset = min(border_width, uint(min(shape.z - shape.x, shape.w - shape.y)) / 2u);
     float inset_value = float(inset);
     vec4 inner = shape + vec4(inset_value, inset_value, -inset_value, -inset_value);
-    bool in_inner = insideRoundedRectangle(point, inner, float(corner_radius > inset ? corner_radius - inset : 0u));
-    uint source;
-    if ((flags & 2u) != 0u && !in_inner) {
-        source = border;
-    } else if ((flags & 1u) != 0u) {
-        source = background;
-    } else {
-        return;
-    }
+    uint inner_coverage = (flags & 2u) != 0u
+        ? uint(roundedRectangleCoverage(point, inner, float(corner_radius > inset ? corner_radius - inset : 0u)) * 255.0 + 0.5)
+        : 255u;
+    uint border_coverage = (flags & 2u) != 0u
+        ? (outer_coverage * (255u - inner_coverage) + 127u) / 255u
+        : 0u;
+    uint background_coverage = (flags & 1u) != 0u
+        ? (outer_coverage * inner_coverage + 127u) / 255u
+        : 0u;
+    uint coverage = min(border_coverage + background_coverage, 255u);
+    if (coverage == 0u) return;
+    uint source = addPixels(scalePixel(border, border_coverage), scalePixel(background, background_coverage));
     uint offset = y * target_width + x;
-    pixels[offset] = source_over != 0u && channel(source, 24u) != 255u
-        ? sourceOver(source, pixels[offset])
-        : source;
+    if (source_over != 0u) {
+        pixels[offset] = channel(source, 24u) != 255u ? sourceOver(source, pixels[offset]) : source;
+    } else if (coverage == 255u) {
+        pixels[offset] = source;
+    } else {
+        pixels[offset] = addPixels(source, scalePixel(pixels[offset], 255u - coverage));
+    }
 }
