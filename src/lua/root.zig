@@ -13,6 +13,7 @@ pub const PreparedBuild = @import("prepared_build.zig").PreparedBuild;
 pub const PreparedHandler = @import("prepared_build.zig").Handler;
 pub const PreparedButton = @import("prepared_build.zig").Button;
 pub const Application = @import("application.zig").Application;
+pub const ApplicationBootstrap = @import("application.zig").Bootstrap;
 pub const ApplicationWindow = @import("application.zig").Window;
 pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
 pub const DiagnosticPhase = @import("diagnostic.zig").Phase;

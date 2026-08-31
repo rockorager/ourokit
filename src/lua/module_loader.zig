@@ -3,6 +3,7 @@ const bundle = @import("../bundle/root.zig");
 const fs = @import("../fs/root.zig");
 const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
+const application = @import("application.zig");
 const c = @import("c.zig");
 const vm_module = @import("vm.zig");
 
@@ -270,7 +271,7 @@ fn luaError(state: *c.State, message: [*:0]const u8) c_int {
     return c.lua_error(state);
 }
 
-test "require asynchronously loads fallback and nested modules then caches them" {
+test "application bootstrap asynchronously loads fallback and nested modules" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     try temporary.dir.createDirPath(std.testing.io, "model");
@@ -302,14 +303,23 @@ test "require asynchronously loads fallback and nested modules then caches them"
     );
     defer loader.deinit();
 
-    _ = try vm.spawnApplication(
-        "local first = require('model'); " ++
-            "local second = require('model'); loaded = first == 42 and first == second",
+    var bootstrap = try application.Bootstrap.start(
+        std.testing.allocator,
+        &vm,
+        scheduler.application_scope,
+        "local ouro = require('ouro'); " ++
+            "local first = require('model'); local second = require('model'); " ++
+            "return ouro.app { id = 'dev.ouro.bootstrap-test', windows = { " ++
+            "ouro.window { id = 'main', title = first == 42 and first == second " ++
+            "and 'Loaded' or 'Wrong', content = function() end } } }",
+        "@app.lua",
     );
-    while (vm.activeTaskCount() != 0) {
-        while (scheduler.takeRunnable()) |runnable|
-            _ = try vm.resumeRunnable(runnable);
-        if (vm.activeTaskCount() == 0) break;
+    var completed = false;
+    while (!completed) {
+        while (scheduler.takeRunnable()) |runnable| {
+            completed = try vm.resumeRunnable(runnable) == .completed;
+        }
+        if (completed) break;
         _ = try loop.submit();
         switch (loop.dispatch(try loop.wait())) {
             .file => |completion| try std.testing.expect(try loader.dispatch(completion)),
@@ -317,5 +327,8 @@ test "require asynchronously loads fallback and nested modules then caches them"
             else => return error.UnexpectedCompletion,
         }
     }
-    try std.testing.expect(vm.globalBoolean("loaded"));
+    var result = try bootstrap.take();
+    defer result.deinit();
+    try std.testing.expectEqualStrings("dev.ouro.bootstrap-test", result.id);
+    try std.testing.expectEqualStrings("Loaded", result.windows[0].declaration.title);
 }

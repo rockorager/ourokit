@@ -2,10 +2,42 @@ const std = @import("std");
 const c = @import("c.zig");
 const diagnostic = @import("diagnostic.zig");
 const platform = @import("../platform/window.zig");
+const task = @import("../task/root.zig");
+const vm_module = @import("vm.zig");
 
 pub const Window = struct {
     declaration: platform.ToplevelDeclaration,
     content_reference: c_int,
+};
+
+/// One yieldable application-entry evaluation. The bootstrap task retains its
+/// sole Lua result until `take` parses it into native-owned declaration data.
+pub const Bootstrap = struct {
+    allocator: std.mem.Allocator,
+    vm: *vm_module.Vm,
+    task_handle: vm_module.TaskHandle,
+
+    pub fn start(
+        allocator: std.mem.Allocator,
+        vm: *vm_module.Vm,
+        scope: task.ScopeHandle,
+        source: []const u8,
+        chunk_name: [*:0]const u8,
+    ) !Bootstrap {
+        try Application.installApi(vm.state, vm.apiReference());
+        return .{
+            .allocator = allocator,
+            .vm = vm,
+            .task_handle = try vm.spawnRetainedNamed(scope, source, chunk_name),
+        };
+    }
+
+    pub fn take(self: *Bootstrap) !Application {
+        const top = c.lua_gettop(self.vm.state);
+        defer c.lua_settop(self.vm.state, top);
+        try self.vm.takeRetainedResult(self.task_handle);
+        return Application.parseStack(self.allocator, self.vm.state);
+    }
 };
 
 /// One validated application declaration. Strings are native-owned and every
