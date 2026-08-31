@@ -119,11 +119,15 @@ pub const Scheduler = struct {
     }
 
     /// Completion/platform phases may mark state only; they receive no code
-    /// pointer capable of entering a language VM.
+    /// pointer capable of entering a language VM. Already-runnable is a valid
+    /// convergence state when cancellation and I/O completion race.
     pub fn markRunnable(self: *Scheduler, handle: TaskHandle) !void {
         const slot = try self.taskSlot(handle);
-        if (slot.state != .waiting) return error.InvalidTaskTransition;
-        slot.state = .runnable;
+        switch (slot.state) {
+            .waiting => slot.state = .runnable,
+            .runnable => {},
+            .running, .free => return error.InvalidTaskTransition,
+        }
     }
 
     pub fn complete(self: *Scheduler, handle: TaskHandle) !void {
