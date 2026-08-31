@@ -16,6 +16,7 @@ pub const Options = struct {
     exit_after_first_frame: bool = false,
     vulkan: bool = renderer.has_vulkan,
     window: WindowRuntimeConfig = .{},
+    scope_capacity: usize = 1024,
     platform_event_capacity: usize = 256,
     signal_capacity: usize = 256,
     subscription_capacity: usize = 1024,
@@ -36,7 +37,7 @@ fn runWithFontconfig(init: std.process.Init, source: []const u8, options: Option
     defer loop.deinit();
 
     var scheduler: task.Scheduler = undefined;
-    try scheduler.init(init.gpa, 32, 8, 8);
+    try scheduler.init(init.gpa, options.scope_capacity, 8, 8);
     defer scheduler.deinit();
 
     var vm: lua.Vm = undefined;

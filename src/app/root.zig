@@ -8,6 +8,7 @@ pub const WindowRuntimeConfig = @import("window_runtime.zig").Config;
 pub const runWayland = @import("wayland_runner.zig").run;
 pub const WaylandRunOptions = @import("wayland_runner.zig").Options;
 pub const storybook = @import("storybook_runner.zig");
+pub const runStorybook = @import("storybook_browser.zig").run;
 
 test {
     _ = @import("app.zig");
@@ -17,4 +18,5 @@ test {
     _ = @import("window_runtime.zig");
     _ = @import("wayland_runner.zig");
     _ = @import("storybook_runner.zig");
+    _ = @import("storybook_browser.zig");
 }

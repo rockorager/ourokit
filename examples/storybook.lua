@@ -200,6 +200,24 @@ return ouro.storybook {
       end,
     },
     ouro.story {
+      id = "layout/box",
+      group = "Layout",
+      name = "Constrained box",
+      viewport = { width = 360, height = 200 },
+      content = function()
+        ouro.box {
+          key = "frame",
+          width = 320,
+          height = 160,
+          padding = 20,
+          alignment = "center",
+          children = function()
+            ouro.button { key = "centered", label = "Centered" }
+          end,
+        }
+      end,
+    },
+    ouro.story {
       id = "layout/scroll",
       group = "Layout",
       name = "Scrollable settings list",
@@ -218,6 +236,29 @@ return ouro.storybook {
       },
       content = function()
         scroll_story()
+      end,
+    },
+    ouro.story {
+      id = "theme/dark",
+      group = "Theme",
+      name = "Dark scope",
+      viewport = { width = 360, height = 200 },
+      content = function()
+        ouro.theme {
+          key = "dark-theme",
+          color_scheme = "dark",
+          children = function()
+            ouro.box {
+              key = "surface",
+              width = 336,
+              height = 176,
+              alignment = "center",
+              children = function()
+                ouro.button { key = "button", label = "Dark theme" }
+              end,
+            }
+          end,
+        }
       end,
     },
     ouro.story {

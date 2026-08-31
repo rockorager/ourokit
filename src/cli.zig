@@ -14,8 +14,15 @@ pub const Run = struct {
 };
 
 pub const Storybook = union(enum) {
+    run: StorybookRun,
     list: List,
     snapshot: Snapshot,
+};
+
+pub const StorybookRun = struct {
+    path: []const u8,
+    vulkan: ?bool = null,
+    exit_after_first_frame: bool = false,
 };
 
 pub const List = struct {
@@ -33,6 +40,7 @@ pub const Snapshot = struct {
 pub const usage =
     \\Usage:
     \\  ourokit run <application.lua> [--vulkan|--software] [--exit-after-first-frame]
+    \\  ourokit storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
     \\  ourokit storybook list <stories.lua> [--json]
     \\  ourokit storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
     \\  ourokit help
@@ -86,9 +94,19 @@ fn parseRun(args: []const []const u8) !Run {
 
 fn parseStorybook(args: []const []const u8) !Storybook {
     if (args.len == 0) return error.ExpectedStorybookCommand;
+    if (std.mem.eql(u8, args[0], "run")) return .{ .run = try parseStorybookRun(args[1..]) };
     if (std.mem.eql(u8, args[0], "list")) return .{ .list = try parseList(args[1..]) };
     if (std.mem.eql(u8, args[0], "snapshot")) return .{ .snapshot = try parseSnapshot(args[1..]) };
     return error.UnknownStorybookCommand;
+}
+
+fn parseStorybookRun(args: []const []const u8) !StorybookRun {
+    const run = try parseRun(args);
+    return .{
+        .path = run.path,
+        .vulkan = run.vulkan,
+        .exit_after_first_frame = run.exit_after_first_frame,
+    };
 }
 
 fn parseList(args: []const []const u8) !List {
@@ -181,6 +199,10 @@ test "CLI parses application and Storybook commands" {
         .path = "stories.lua",
         .json = true,
     } } }, try parse(&.{ "ourokit", "storybook", "list", "stories.lua", "--json" }));
+    try std.testing.expectEqualDeep(Command{ .storybook = .{ .run = .{
+        .path = "stories.lua",
+        .vulkan = false,
+    } } }, try parse(&.{ "ourokit", "storybook", "run", "stories.lua", "--software" }));
     try std.testing.expectEqualDeep(Command{ .storybook = .{ .snapshot = .{
         .path = "stories.lua",
         .story_id = "button/default",

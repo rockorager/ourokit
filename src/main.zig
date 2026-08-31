@@ -31,6 +31,15 @@ fn execute(init: std.process.Init, command: cli.Command) !void {
             try ourokit.app.runWayland(init, source, run_options);
         },
         .storybook => |storybook| switch (storybook) {
+            .run => |options| {
+                const source = try readSource(init, options.path);
+                defer init.gpa.free(source);
+                var run_options: ourokit.app.WaylandRunOptions = .{
+                    .exit_after_first_frame = options.exit_after_first_frame,
+                };
+                if (options.vulkan) |vulkan| run_options.vulkan = vulkan;
+                try ourokit.app.runStorybook(init, source, run_options);
+            },
             .list => |options| try listStories(init, options),
             .snapshot => |options| try snapshotStories(init, options),
         },

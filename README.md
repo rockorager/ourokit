@@ -186,7 +186,18 @@ the software renderer.
 ## Storybook
 
 Storybook catalogs are explicit Lua entry points containing named, isolated
-component states. List a catalog for people or tools with:
+component states. Open the native interactive catalog browser with:
+
+```sh
+zig-out/bin/ourokit storybook run examples/storybook.lua
+```
+
+The browser is an ordinary Ourokit application: its catalog scrolls through
+the normal pointer input path, selection uses a signal, and the selected story
+is mounted as live content at its declared viewport and color scheme. Force a
+renderer with `--software` or `--vulkan`.
+
+List a catalog for people or tools with:
 
 ```sh
 zig-out/bin/ourokit storybook list examples/storybook.lua
@@ -230,7 +241,30 @@ deltas are logical surface units and follow the target scroll widget's declared
 axis. Event timestamps and serials are fixed, and each action settles before
 the next begins. Wall-clock `ouro.sleep` calls fail during playback rather than
 making snapshots timing dependent. The interactive Storybook browser is
-planned after the headless catalog and snapshot interface stabilizes.
+available through `storybook run`; deterministic actions remain a snapshot
+playback contract while the live browser accepts ordinary user input.
+
+Constrained and themed composition use the same nested callback convention as
+rows, columns, and scroll views:
+
+```lua
+ouro.theme {
+  key = "dark-preview",
+  color_scheme = "dark",
+  children = function()
+    ouro.box {
+      key = "viewport",
+      width = 640,
+      height = 480,
+      padding = 12,
+      alignment = "center",
+      children = function()
+        ouro.button { key = "action", label = "Continue" }
+      end,
+    }
+  end,
+}
+```
 
 Run the Vulkan renderer through Ourokit's libwayland-free linux-dmabuf
 presenter with:
