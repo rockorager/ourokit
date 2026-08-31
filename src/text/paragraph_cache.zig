@@ -33,6 +33,8 @@ pub const ParagraphCache = struct {
         logical_size: f32,
         max_width: f32,
         style: paragraph_style.Style = .{},
+        /// Noninteractive labels avoid extra per-grapheme storage and work.
+        include_caret_stops: bool = false,
         candidates: []const api.FontHandle,
         /// Increment when Fontconfig substitutions/candidate policy changes.
         configuration_revision: u64,
@@ -47,6 +49,7 @@ pub const ParagraphCache = struct {
         alignment: paragraph_style.Alignment,
         max_lines: u32,
         overflow: paragraph_style.Overflow,
+        include_caret_stops: bool,
         candidates: []const api.FontHandle,
         configuration_revision: u64,
     };
@@ -77,6 +80,7 @@ pub const ParagraphCache = struct {
             hashValue(&hasher, @intFromEnum(key.alignment));
             hashValue(&hasher, key.max_lines);
             hashValue(&hasher, @intFromEnum(key.overflow));
+            hashValue(&hasher, key.include_caret_stops);
             for (key.candidates) |candidate| {
                 hashValue(&hasher, candidate.slot);
                 hashValue(&hasher, candidate.generation);
@@ -92,6 +96,7 @@ pub const ParagraphCache = struct {
                 a.alignment == b.alignment and
                 a.max_lines == b.max_lines and
                 a.overflow == b.overflow and
+                a.include_caret_stops == b.include_caret_stops and
                 a.configuration_revision == b.configuration_revision and
                 std.mem.eql(u8, a.utf8, b.utf8) and
                 std.mem.eql(u8, a.language, b.language) and
@@ -172,6 +177,7 @@ pub const ParagraphCache = struct {
                 .max_lines = if (transient_key.max_lines == 0) null else transient_key.max_lines,
                 .overflow = transient_key.overflow,
             },
+            transient_key.include_caret_stops,
         );
         errdefer layout.deinit();
         try self.index.ensureUnusedCapacity(self.allocator, 1);
@@ -186,6 +192,7 @@ pub const ParagraphCache = struct {
             .alignment = transient_key.alignment,
             .max_lines = transient_key.max_lines,
             .overflow = transient_key.overflow,
+            .include_caret_stops = transient_key.include_caret_stops,
             .candidates = candidate_handles,
             .configuration_revision = transient_key.configuration_revision,
         };
@@ -248,6 +255,7 @@ pub const ParagraphCache = struct {
             .alignment = request.style.alignment,
             .max_lines = request.style.max_lines orelse 0,
             .overflow = request.style.overflow,
+            .include_caret_stops = request.include_caret_stops,
             .candidates = request.candidates,
             .configuration_revision = request.configuration_revision,
         };
@@ -339,8 +347,20 @@ test "paragraph cache owns mixed-script positioned layouts and font leases" {
     const layout = try cache.get(first);
     try std.testing.expect(layout.positioned.lines.len >= 1);
     try std.testing.expect(layout.positioned.glyphs.len != 0);
+    try std.testing.expectEqual(@as(usize, 0), layout.positioned.carets.len);
     try std.testing.expect(layout.size.width > 0);
     try std.testing.expect(layout.size.height > 0);
+    const interactive = try cache.acquire(.{
+        .utf8 = request.utf8,
+        .language = request.language,
+        .logical_size = request.logical_size,
+        .max_width = request.max_width,
+        .include_caret_stops = true,
+        .candidates = request.candidates,
+        .configuration_revision = request.configuration_revision,
+    });
+    try std.testing.expect(interactive.slot != first.slot);
+    try std.testing.expect((try cache.get(interactive)).positioned.carets.len != 0);
     const centered = try cache.acquire(.{
         .utf8 = request.utf8,
         .language = request.language,
@@ -354,13 +374,14 @@ test "paragraph cache owns mixed-script positioned layouts and font leases" {
     try std.testing.expectEqual(@as(usize, 1), centered_layout.positioned.lines.len);
     try std.testing.expect(centered_layout.positioned.truncated);
     try std.testing.expect(centered_layout.positioned.lines[0].left > 0);
-    try std.testing.expectEqual(@as(usize, 2), cache.count());
+    try std.testing.expectEqual(@as(usize, 3), cache.count());
     try fonts.release(latin);
     try fonts.release(arabic);
     _ = try fonts.get(latin);
     _ = try fonts.get(arabic);
     try cache.release(first);
     try cache.release(second);
+    try cache.release(interactive);
     try cache.release(centered);
     try std.testing.expectError(error.StaleParagraph, cache.get(first));
     try std.testing.expectError(error.StaleFont, fonts.get(latin));

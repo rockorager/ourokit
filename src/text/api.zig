@@ -222,15 +222,8 @@ pub const Font = struct {
             byte_len > std.math.maxInt(c_int)) return error.TextTooLarge;
         if (spec.language.len == 0 or spec.language.len > std.math.maxInt(c_int)) return error.InvalidLanguage;
 
-        const scale_f = spec.logical_size * 64.0;
-        if (scale_f > @as(f32, @floatFromInt(std.math.maxInt(c_int)))) return error.InvalidSize;
-        const scale: c_int = @intFromFloat(@round(scale_f));
-        if (scale == 0) return error.InvalidSize;
-
-        const font = c.hb_font_create_sub_font(self.base_font) orelse return error.OutOfMemory;
+        const font = try self.createScaledFont(spec.logical_size);
         defer c.hb_font_destroy(font);
-        c.hb_font_set_scale(font, scale, scale);
-        c.hb_font_set_ptem(font, spec.logical_size);
 
         const buffer = c.hb_buffer_create() orelse return error.OutOfMemory;
         defer c.hb_buffer_destroy(buffer);
@@ -295,6 +288,60 @@ pub const Font = struct {
                 .line_gap = fromFixed(extents.line_gap),
             },
         };
+    }
+
+    /// Returns font-provided GDEF caret coordinates for one ligature glyph in
+    /// increasing physical coordinate order. Callers still decide which
+    /// Unicode grapheme boundaries are legal and provide proportional fallback
+    /// when the font does not define a matching caret for every component.
+    pub fn ligatureCarets(
+        self: *const Font,
+        direction: Direction,
+        logical_size: f32,
+        glyph: u32,
+        positions: []f32,
+    ) !usize {
+        const font = try self.createScaledFont(logical_size);
+        defer c.hb_font_destroy(font);
+
+        var copied: c_uint = 0;
+        const total = c.hb_ot_layout_get_ligature_carets(
+            font,
+            direction.harfbuzz(),
+            glyph,
+            0,
+            &copied,
+            null,
+        );
+        const count = @min(@as(usize, total), positions.len);
+        for (positions[0..count], 0..) |*position, index| {
+            var one: c_uint = 1;
+            var fixed: c.hb_position_t = 0;
+            _ = c.hb_ot_layout_get_ligature_carets(
+                font,
+                direction.harfbuzz(),
+                glyph,
+                @intCast(index),
+                &one,
+                &fixed,
+            );
+            if (one != 1) return error.InvalidFont;
+            position.* = fromFixed(fixed);
+        }
+        return total;
+    }
+
+    fn createScaledFont(self: *const Font, logical_size: f32) !*c.hb_font_t {
+        if (!std.math.isFinite(logical_size) or logical_size <= 0) return error.InvalidSize;
+        const scale_f = logical_size * 64.0;
+        if (scale_f > @as(f32, @floatFromInt(std.math.maxInt(c_int)))) return error.InvalidSize;
+        const scale: c_int = @intFromFloat(@round(scale_f));
+        if (scale == 0) return error.InvalidSize;
+
+        const font = c.hb_font_create_sub_font(self.base_font) orelse return error.OutOfMemory;
+        c.hb_font_set_scale(font, scale, scale);
+        c.hb_font_set_ptem(font, logical_size);
+        return font;
     }
 };
 

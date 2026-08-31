@@ -26,10 +26,12 @@ pub const LayoutError = error{
     ScrollInUnboundedAxis,
     InvalidParentData,
     LabelHasChildren,
+    TextInputHasChildren,
     ParagraphResourcesRequired,
     StaleParagraphSource,
     StaleParagraph,
     ParagraphLayoutFailed,
+    InvalidTextInputRange,
 };
 
 const Slot = struct {
@@ -163,6 +165,7 @@ pub const Tree = struct {
         if ((parent_slot.object == .box or parent_slot.object == .scroll) and
             parent_slot.first_child != null) return error.BoxAlreadyHasChild;
         if (parent_slot.object == .label) return error.LabelHasChildren;
+        if (parent_slot.object == .text_input) return error.TextInputHasChildren;
 
         child_slot.parent = parent;
         child_slot.parent_data = data;
@@ -233,6 +236,19 @@ pub const Tree = struct {
         const root_slot = try self.slot(root);
         if (!root_slot.has_layout or root_slot.needs_layout) return error.LayoutRequired;
         return self.hitTestNode(root, point);
+    }
+
+    /// Converts a coordinate local to an editable render object into its
+    /// retained paragraph position. Input routing remains instance-owned.
+    pub fn hitTestText(self: *Tree, handle: NodeHandle, point: PointF) !text.TextHitResult {
+        const target = try self.slot(handle);
+        if (target.object != .text_input) return error.NotTextInputObject;
+        if (!target.has_layout or target.needs_layout) return error.LayoutRequired;
+        const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
+        const paragraph_layout = self.paragraphs.?.get(paragraph_handle) catch
+            return error.StaleParagraph;
+        return paragraph_layout.positioned.hitTestPoint(point) orelse
+            return error.TextPositionNotFound;
     }
 
     pub fn nodeSize(self: *Tree, handle: NodeHandle) !SizeF {
@@ -355,6 +371,7 @@ pub const Tree = struct {
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
             .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
             .label => try self.layoutLabel(handle, object.label, constraints),
+            .text_input => try self.layoutTextInput(handle, object.text_input, constraints),
         };
         if (!validSize(result)) return error.InvalidLayoutSize;
         const constrained = constraints.constrain(result);
@@ -419,8 +436,54 @@ pub const Tree = struct {
                 try builder.paragraph(paragraph_handle, origin, value.color);
                 break :paint true;
             },
+            .text_input => |value| paint: {
+                const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
+                const paragraph_layout = self.paragraphs.?.get(paragraph_handle) catch
+                    return error.StaleParagraph;
+                try builder.pushClip(bounds);
+                if (value.selection_start != value.selection_end) {
+                    var rectangles = try paragraph_layout.positioned.selectionRectangleIterator(.{
+                        .start = value.selection_start,
+                        .end = value.selection_end,
+                    });
+                    while (try rectangles.next()) |rectangle| try builder.solidRectangle(.{
+                        .x = origin.x + rectangle.x,
+                        .y = origin.y + rectangle.y,
+                        .width = rectangle.width,
+                        .height = rectangle.height,
+                    }, value.selection_color);
+                }
+                try builder.paragraph(paragraph_handle, origin, value.color);
+                if (value.preedit) |range| {
+                    var rectangles = try paragraph_layout.positioned.selectionRectangleIterator(.{
+                        .start = range.start,
+                        .end = range.end,
+                    });
+                    while (try rectangles.next()) |rectangle| try builder.solidRectangle(.{
+                        .x = origin.x + rectangle.x,
+                        .y = origin.y + rectangle.y + rectangle.height - value.preedit_width,
+                        .width = rectangle.width,
+                        .height = value.preedit_width,
+                    }, value.preedit_color.?);
+                }
+                if (value.show_caret and value.selection_start == value.selection_end) {
+                    const rectangle = try paragraph_layout.positioned.caretRectangleForOffset(
+                        value.caret_offset,
+                        value.caret_affinity,
+                        value.caret_width,
+                    );
+                    try builder.solidRectangle(.{
+                        .x = origin.x + rectangle.x,
+                        .y = origin.y + rectangle.y,
+                        .width = rectangle.width,
+                        .height = rectangle.height,
+                    }, value.caret_color);
+                }
+                break :paint true;
+            },
         };
-        if (clips and target.object != .label) try builder.pushClip(bounds);
+        if (clips and target.object != .label and target.object != .text_input)
+            try builder.pushClip(bounds);
         var child = target.first_child;
         while (child) |child_handle| {
             const child_slot = try self.slot(child_handle);
@@ -540,11 +603,59 @@ pub const Tree = struct {
         return result;
     }
 
+    fn layoutTextInput(
+        self: *Tree,
+        handle: NodeHandle,
+        input: types.TextInput,
+        constraints: Constraints,
+    ) LayoutError!SizeF {
+        const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
+        const paragraphs = self.paragraphs orelse return error.ParagraphResourcesRequired;
+        const source = sources.get(input.source) catch return error.StaleParagraphSource;
+        if (input.selection_start > input.selection_end or
+            input.selection_end > source.utf8.len or input.caret_offset > source.utf8.len)
+            return error.InvalidTextInputRange;
+        if (input.preedit) |range| if (range.start > range.end or range.end > source.utf8.len)
+            return error.InvalidTextInputRange;
+        const layout_handle = paragraphs.acquire(.{
+            .utf8 = source.utf8,
+            .base_direction = source.base_direction,
+            .language = source.language,
+            .logical_size = source.logical_size,
+            .max_width = if (constraints.hasBoundedWidth())
+                constraints.max_width
+            else
+                std.math.floatMax(f32),
+            .candidates = source.candidates,
+            .configuration_revision = source.configuration_revision,
+            .style = .{ .alignment = input.alignment },
+            .include_caret_stops = true,
+        }) catch return error.ParagraphLayoutFailed;
+        errdefer paragraphs.release(layout_handle) catch unreachable;
+        const paragraph_layout = paragraphs.get(layout_handle) catch return error.StaleParagraph;
+        if (!hasCaretBoundary(&paragraph_layout.positioned, input.selection_start) or
+            !hasCaretBoundary(&paragraph_layout.positioned, input.selection_end) or
+            !hasCaretBoundary(&paragraph_layout.positioned, input.caret_offset))
+            return error.InvalidTextInputRange;
+        if (input.preedit) |range| if (!hasCaretBoundary(&paragraph_layout.positioned, range.start) or
+            !hasCaretBoundary(&paragraph_layout.positioned, range.end))
+            return error.InvalidTextInputRange;
+        const result = constraints.constrain(paragraph_layout.size);
+        const target = try self.slot(handle);
+        self.releaseParagraphLayout(target);
+        target.paragraph_layout = layout_handle;
+        return result;
+    }
+
     fn retainObject(self: *Tree, object: types.Object) !void {
         switch (object) {
             .label => |label| {
                 const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
                 try sources.retain(label.source);
+            },
+            .text_input => |input| {
+                const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
+                try sources.retain(input.source);
             },
             else => {},
         }
@@ -553,6 +664,7 @@ pub const Tree = struct {
     fn releaseObject(self: *Tree, object: types.Object) void {
         switch (object) {
             .label => |label| self.paragraph_sources.?.release(label.source) catch unreachable,
+            .text_input => |input| self.paragraph_sources.?.release(input.source) catch unreachable,
             else => {},
         }
     }
@@ -575,6 +687,18 @@ fn validateObject(object: types.Object) !void {
             if (label.overflow == .ellipsis and label.max_lines == null)
                 return error.EllipsisRequiresMaxLines;
         },
+        .text_input => |input| {
+            if (!std.math.isFinite(input.caret_width) or input.caret_width <= 0)
+                return error.InvalidCaretWidth;
+            if (!std.math.isFinite(input.preedit_width) or input.preedit_width <= 0)
+                return error.InvalidPreeditWidth;
+            if (input.selection_start > input.selection_end)
+                return error.InvalidTextInputRange;
+            if (input.preedit) |range| {
+                if (range.start > range.end or input.preedit_color == null)
+                    return error.InvalidTextInputRange;
+            } else if (input.preedit_color != null) return error.InvalidTextInputRange;
+        },
     }
 }
 
@@ -590,6 +714,7 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
         },
         .scroll => if (data != .none) return error.InvalidParentData,
         .label => return error.LabelHasChildren,
+        .text_input => return error.TextInputHasChildren,
     }
 }
 
@@ -610,6 +735,8 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
             old_label.alignment != new.label.alignment or
             old_label.max_lines != new.label.max_lines or
             old_label.overflow != new.label.overflow,
+        .text_input => |old_input| !sameSource(old_input.source, new.text_input.source) or
+            old_input.alignment != new.text_input.alignment,
     };
 }
 
@@ -635,8 +762,23 @@ fn sameParagraph(a: text.ParagraphHandle, b: text.ParagraphHandle) bool {
 }
 
 fn sourceChanged(old: types.Object, new: types.Object) bool {
-    if (old != .label or new != .label) return old == .label;
-    return !sameSource(old.label.source, new.label.source);
+    const old_source = objectSource(old);
+    const new_source = objectSource(new);
+    if (old_source == null or new_source == null) return old_source != null or new_source != null;
+    return !sameSource(old_source.?, new_source.?);
+}
+
+fn objectSource(object: types.Object) ?text.ParagraphSourceHandle {
+    return switch (object) {
+        .label => |label| label.source,
+        .text_input => |input| input.source,
+        else => null,
+    };
+}
+
+fn hasCaretBoundary(positioned: *const text.PositionedLines, byte_offset: usize) bool {
+    for (positioned.carets) |caret| if (caret.byte_offset == byte_offset) return true;
+    return false;
 }
 
 test "flex layout is bounded, cached, and separates paint invalidation" {
@@ -855,6 +997,113 @@ test "labels cache width-specific mixed-script paragraphs across unchanged layou
     try std.testing.expect(!sameParagraph(wide_layout, narrow_layout));
 
     try tree.destroy(label);
+    try std.testing.expectEqual(@as(usize, 0), sources.count());
+    try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
+}
+
+test "text input paints selection, text, and caret from interactive paragraph geometry" {
+    const scene = @import("../../scene/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_arabic_test_font"),
+    });
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const source = try sources.acquire(.{
+        .utf8 = "office حفظ",
+        .language = "und",
+        .logical_size = 18,
+        .candidates = &.{ latin, arabic },
+        .configuration_revision = 1,
+    });
+    try fonts.release(latin);
+    try fonts.release(arabic);
+
+    const foreground = Color.rgba(10, 20, 30, 255);
+    const selection = Color.rgba(80, 120, 240, 120);
+    const caret = Color.rgba(20, 40, 80, 255);
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    tree.attachTextCaches(&sources, &paragraphs);
+    defer tree.deinit();
+    const input = try tree.create(.{ .text_input = .{
+        .source = source,
+        .color = foreground,
+        .selection_color = selection,
+        .caret_color = caret,
+        .selection_start = 1,
+        .selection_end = 4,
+        .caret_offset = 4,
+    } });
+    try sources.release(source);
+    _ = try tree.layout(input, .{ .max_width = 200, .max_height = 100 });
+    try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
+
+    var commands: [16]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(input, &builder);
+    const selected = builder.displayList();
+    try std.testing.expect(selected.commands.len >= 4);
+    try std.testing.expect(selected.commands[0] == .push_clip_rect);
+    try std.testing.expect(selected.commands[1] == .solid_rectangle);
+    try std.testing.expect(selected.commands[2] == .paragraph);
+    try std.testing.expect(selected.commands[selected.commands.len - 1] == .pop_clip);
+
+    try tree.update(input, .{ .text_input = .{
+        .source = source,
+        .color = foreground,
+        .selection_color = selection,
+        .caret_color = caret,
+        .selection_start = 4,
+        .selection_end = 4,
+        .caret_offset = 4,
+        .show_caret = true,
+    } });
+    try std.testing.expect(!(try tree.layoutDirty(input)));
+    try std.testing.expect(try tree.paintDirty(input));
+    builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(input, &builder);
+    const collapsed = builder.displayList();
+    try std.testing.expectEqual(@as(usize, 4), collapsed.commands.len);
+    try std.testing.expect(collapsed.commands[1] == .paragraph);
+    try std.testing.expect(collapsed.commands[2] == .solid_rectangle);
+    const hit = try tree.hitTestText(input, .{
+        .x = @floatFromInt(collapsed.commands[2].solid_rectangle.bounds.x),
+        .y = 1,
+    });
+    try std.testing.expect(hit.caret.byte_offset <= "office حفظ".len);
+
+    try tree.update(input, .{ .text_input = .{
+        .source = source,
+        .color = foreground,
+        .selection_color = selection,
+        .caret_color = caret,
+        .selection_start = 6,
+        .selection_end = 6,
+        .caret_offset = 6,
+        .show_caret = true,
+        .preedit = .{ .start = 0, .end = 6 },
+        .preedit_color = caret,
+        .preedit_width = 2,
+    } });
+    builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(input, &builder);
+    const composing = builder.displayList();
+    try std.testing.expectEqual(@as(usize, 5), composing.commands.len);
+    try std.testing.expect(composing.commands[1] == .paragraph);
+    try std.testing.expect(composing.commands[2] == .solid_rectangle);
+    try std.testing.expectEqual(@as(u32, 2), composing.commands[2].solid_rectangle.bounds.height);
+    try std.testing.expect(composing.commands[3] == .solid_rectangle);
+
+    try tree.destroy(input);
     try std.testing.expectEqual(@as(usize, 0), sources.count());
     try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
 }

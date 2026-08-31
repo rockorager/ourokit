@@ -1,11 +1,13 @@
 const std = @import("std");
 const uucode = @import("uucode");
+const CaretAffinity = @import("../../text/positioned_lines.zig").CaretAffinity;
 
 /// A logical selection in UTF-8 byte offsets. Anchor and extent preserve the
 /// direction of an extended selection; `range` returns its normalized bounds.
 pub const Selection = struct {
     anchor: usize,
     extent: usize,
+    affinity: CaretAffinity = .downstream,
 
     pub fn collapsed(offset: usize) Selection {
         return .{ .anchor = offset, .extent = offset };

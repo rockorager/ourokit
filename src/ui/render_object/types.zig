@@ -2,6 +2,7 @@ const Color = @import("../../core/color.zig").Color;
 const Insets = @import("../../core/geometry.zig").Insets;
 const ParagraphSourceHandle = @import("../../text/paragraph_source_cache.zig").ParagraphSourceHandle;
 const paragraph_style = @import("../../text/paragraph_style.zig");
+const CaretAffinity = @import("../../text/positioned_lines.zig").CaretAffinity;
 
 /// Physical alignment within a render object's available axis. Widget policy
 /// resolves direction-sensitive start/end before reaching this layer.
@@ -62,6 +63,31 @@ pub const Label = struct {
     overflow: paragraph_style.Overflow = .clip,
 };
 
+pub const TextRange = struct {
+    start: usize,
+    end: usize,
+};
+
+/// Immutable presentation snapshot for retained editable text. The owning
+/// TextInput session remains in `ui/text_input`; application coordination
+/// replaces this value when committed text, selection, or focus changes.
+pub const TextInput = struct {
+    source: ParagraphSourceHandle,
+    color: Color,
+    selection_color: Color,
+    caret_color: Color,
+    selection_start: usize,
+    selection_end: usize,
+    caret_offset: usize,
+    caret_affinity: CaretAffinity = .downstream,
+    caret_width: f32 = 1,
+    show_caret: bool = false,
+    preedit: ?TextRange = null,
+    preedit_color: ?Color = null,
+    preedit_width: f32 = 1,
+    alignment: paragraph_style.Alignment = .start,
+};
+
 /// This is a small closed render-object vocabulary, not a generic widget node.
 /// Identity, component state, focus, commands, and keyed reconciliation belong
 /// to the separate instance layer.
@@ -71,6 +97,7 @@ pub const Object = union(enum) {
     stack: Stack,
     scroll: Scroll,
     label: Label,
+    text_input: TextInput,
 };
 
 pub const FlexFit = enum { loose, tight };

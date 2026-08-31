@@ -32,6 +32,7 @@ pub fn build(
     logical_size: f32,
     max_width: f32,
     style: paragraph_style.Style,
+    include_caret_stops: bool,
 ) !Layout {
     var positioned = try buildPositioned(
         allocator,
@@ -42,6 +43,7 @@ pub fn build(
         logical_size,
         max_width,
         style,
+        include_caret_stops,
     );
     errdefer positioned.deinit();
     return .{
@@ -60,6 +62,7 @@ fn buildPositioned(
     logical_size: f32,
     max_width: f32,
     style: paragraph_style.Style,
+    include_caret_stops: bool,
 ) !positioned_lines.PositionedLines {
     var itemized = try itemization.itemizeParagraphs(allocator, utf8, base_direction);
     defer itemized.deinit();
@@ -85,13 +88,14 @@ fn buildPositioned(
         max_width,
     );
     defer selected.deinit();
-    var positioned = try positioned_lines.positionLinesWithStyle(
+    var positioned = try positioned_lines.positionLinesWithOptions(
         allocator,
         utf8,
         &shaped,
         &selected,
         style,
         if (max_width == std.math.floatMax(f32)) null else max_width,
+        include_caret_stops,
     );
     if (style.overflow != .ellipsis or !positioned.truncated) return positioned;
     positioned.deinit();
@@ -104,6 +108,7 @@ fn buildPositioned(
         logical_size,
         max_width,
         style,
+        include_caret_stops,
         selected.lines[@as(usize, style.max_lines.?) - 1],
         breaks.breaks,
     );
@@ -118,6 +123,7 @@ fn buildPlainPositioned(
     logical_size: f32,
     max_width: f32,
     style: paragraph_style.Style,
+    include_caret_stops: bool,
 ) !positioned_lines.PositionedLines {
     var itemized = try itemization.itemizeParagraphs(allocator, utf8, base_direction);
     defer itemized.deinit();
@@ -143,13 +149,14 @@ fn buildPlainPositioned(
         max_width,
     );
     defer selected.deinit();
-    return positioned_lines.positionLinesWithStyle(
+    return positioned_lines.positionLinesWithOptions(
         allocator,
         utf8,
         &shaped,
         &selected,
         style,
         if (max_width == std.math.floatMax(f32)) null else max_width,
+        include_caret_stops,
     );
 }
 
@@ -169,6 +176,7 @@ fn buildEllipsized(
     logical_size: f32,
     max_width: f32,
     style: paragraph_style.Style,
+    include_caret_stops: bool,
     final_line: line_layout.Line,
     breaks: []const line_break.LineBreak,
 ) !positioned_lines.PositionedLines {
@@ -188,6 +196,7 @@ fn buildEllipsized(
             logical_size,
             max_width,
             .{ .alignment = style.alignment },
+            include_caret_stops,
         );
         if (candidate.lines.len <= style.max_lines.?) {
             remapEllipsis(&candidate, utf8.len, prefix_len);
@@ -222,10 +231,17 @@ fn remapEllipsis(
     source_byte_len: usize,
     insertion: usize,
 ) void {
+    for (positioned.lines) |*line| {
+        const line_end = line.byte_start + line.byte_len;
+        if (line_end > insertion) line.byte_len = insertion -| line.byte_start;
+    }
     for (positioned.glyphs) |*glyph| if (glyph.cluster >= insertion) {
         glyph.cluster = insertion;
         glyph.synthetic = true;
     };
+    for (positioned.carets) |*caret| {
+        if (caret.byte_offset >= insertion) caret.byte_offset = insertion;
+    }
     for (positioned.spans) |*span| {
         if (span.byte_start >= insertion) {
             span.byte_start = insertion;
