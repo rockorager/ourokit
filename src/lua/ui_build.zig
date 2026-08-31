@@ -1,5 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
+const CallbackRegistry = @import("callbacks.zig").CallbackRegistry;
+const Vm = @import("vm.zig").Vm;
 const design = @import("../design/root.zig");
 const Signals = @import("signals.zig").Signals;
 const SignalOwnerRef = @import("signals.zig").OwnerRef;
@@ -55,6 +57,8 @@ pub const UiBuild = struct {
     semantic_count: usize = 0,
     active_owner: ?ActiveBuildOwner = null,
     signals: ?*Signals = null,
+    callbacks: ?*CallbackRegistry = null,
+    callback_vm: ?*Vm = null,
     label_shapes: ?*text.ShapeCache = null,
     label_candidates: []const text.FontHandle = &.{},
     label_configuration_revision: u64 = 0,
@@ -164,25 +168,38 @@ pub const UiBuild = struct {
         tree: *instance.Tree,
         owner: build_owner.BuildOwnerHandle,
     ) !void {
-        if (self.pending_handler_count > bindings.availableForOwner(owner))
+        const callbacks = self.callbacks orelse if (self.pending_handler_count == 0)
+            null
+        else
+            return error.CallbackServiceUnavailable;
+        if (self.pending_handler_count > bindings.availableAfterReconcile(tree, owner))
             return error.PointerBindingCapacityExceeded;
         if (self.pending_button_count > buttons.availableForOwner(owner))
             return error.ButtonCapacityExceeded;
+        if (callbacks) |registry| {
+            const reclaimable = bindings.reclaimableForOwner(tree, owner);
+            if (self.pending_handler_count > reclaimable)
+                try registry.ensureAvailable(self.pending_handler_count - reclaimable);
+        }
         for (self.pending_handlers[0..self.pending_handler_count]) |pending|
             if (tree.handleForId(pending.id) == null) return error.PointerHandlerInstanceMissing;
         for (self.pending_buttons[0..self.pending_button_count]) |pending|
             if (tree.handleForId(pending.id) == null) return error.ButtonInstanceMissing;
         while (bindings.takeInactive(tree)) |old|
-            c.luaL_unref(self.state, c.registry_index, @intCast(old.id));
+            callbacks.?.release(old.id) catch unreachable;
         while (bindings.takeOwner(owner)) |old|
-            c.luaL_unref(self.state, c.registry_index, @intCast(old.id));
+            callbacks.?.release(old.id) catch unreachable;
         for (self.pending_handlers[0..self.pending_handler_count]) |pending| {
-            const old = try bindings.set(
+            const handle = callbacks.?.adoptReference(
+                self.callback_vm.?,
+                pending.reference,
+            ) catch unreachable;
+            const old = bindings.set(
                 owner,
                 tree.handleForId(pending.id).?,
-                .{ .id = @intCast(pending.reference), .kind = pending.kind },
-            );
-            if (old) |handler| c.luaL_unref(self.state, c.registry_index, @intCast(handler.id));
+                .{ .id = handle, .kind = pending.kind },
+            ) catch unreachable;
+            if (old) |handler| callbacks.?.release(handler.id) catch unreachable;
         }
         buttons.beginOwner(owner);
         for (self.pending_buttons[0..self.pending_button_count]) |pending| buttons.set(
@@ -205,7 +222,7 @@ pub const UiBuild = struct {
 
     pub fn clearHandlers(self: *UiBuild, bindings: *PointerBindings) void {
         while (bindings.takeAny()) |handler|
-            c.luaL_unref(self.state, c.registry_index, @intCast(handler.id));
+            self.callbacks.?.release(handler.id) catch unreachable;
     }
 
     /// Commits signal dependencies after the typed descriptor snapshot has
@@ -252,6 +269,17 @@ pub const UiBuild = struct {
     pub fn attachSignals(self: *UiBuild, signals: *Signals) void {
         std.debug.assert(self.active_owner == null and self.signals == null);
         self.signals = signals;
+    }
+
+    pub fn attachCallbacks(
+        self: *UiBuild,
+        callbacks: *CallbackRegistry,
+        vm: *Vm,
+    ) void {
+        std.debug.assert(self.active_owner == null and self.callbacks == null);
+        std.debug.assert(self.state == vm.state);
+        self.callbacks = callbacks;
+        self.callback_vm = vm;
     }
 
     pub fn attachLabelText(

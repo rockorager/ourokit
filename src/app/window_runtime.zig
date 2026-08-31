@@ -254,7 +254,7 @@ pub const WindowRuntime = struct {
         try self.router.route(event);
     }
 
-    pub fn dispatchInput(self: *WindowRuntime, vm: *lua.Vm) !void {
+    pub fn dispatchInput(self: *WindowRuntime, callbacks: *lua.CallbackRegistry) !void {
         while (self.router.takeEvent()) |event| {
             const target = switch (event) {
                 .hover_enter => |value| value.target,
@@ -272,9 +272,9 @@ pub const WindowRuntime = struct {
             const binding = handler orelse continue;
             if (binding.kind == .button) {
                 if (activated_button != null and sameHandle(activated_button.?, bound_target))
-                    _ = try vm.spawnReference(
+                    _ = try callbacks.spawn(
+                        binding.id,
                         try self.instances.scope(bound_target),
-                        @intCast(binding.id),
                         &.{},
                     );
                 continue;
@@ -288,9 +288,9 @@ pub const WindowRuntime = struct {
                 .{ .integer = values.value1 },
                 .{ .integer = values.value2 },
             };
-            _ = try vm.spawnReference(
+            _ = try callbacks.spawn(
+                binding.id,
                 try self.instances.scope(bound_target),
-                @intCast(binding.id),
                 &arguments,
             );
         }

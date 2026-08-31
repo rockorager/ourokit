@@ -1,11 +1,12 @@
 const std = @import("std");
+const Handle = @import("../../core/handle.zig").Handle;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
 pub const HandlerKind = enum { pointer, button };
 
 pub const Handler = struct {
-    id: u32,
+    id: Handle,
     kind: HandlerKind = .pointer,
 };
 
@@ -56,10 +57,31 @@ pub const PointerBindings = struct {
         return error.PointerBindingCapacityExceeded;
     }
 
-    pub fn availableForOwner(self: *const PointerBindings, owner: BuildOwnerHandle) usize {
+    pub fn availableAfterReconcile(
+        self: *const PointerBindings,
+        tree: *instance.Tree,
+        owner: BuildOwnerHandle,
+    ) usize {
         var count: usize = 0;
         for (self.entries) |entry|
-            if (entry.handler == null or same(entry.owner, owner)) {
+            if (entry.handler == null or same(entry.owner, owner) or
+                !tree.isActive(entry.target))
+            {
+                count += 1;
+            };
+        return count;
+    }
+
+    pub fn reclaimableForOwner(
+        self: *const PointerBindings,
+        tree: *instance.Tree,
+        owner: BuildOwnerHandle,
+    ) usize {
+        var count: usize = 0;
+        for (self.entries) |entry|
+            if (entry.handler != null and
+                (same(entry.owner, owner) or !tree.isActive(entry.target)))
+            {
                 count += 1;
             };
         return count;
@@ -127,16 +149,18 @@ test "pointer bindings replace, clean removal, and reject stale generations" {
     try tree.reconcile(&.{.{ .id = 1, .parent = null, .object = .{ .box = .{} } }});
     const original = tree.handleForId(1).?;
     const owner: BuildOwnerHandle = .{ .slot = 0, .generation = 1 };
-    try std.testing.expect((try bindings.set(owner, original, .{ .id = 10 })) == null);
-    try std.testing.expectEqual(@as(?Handler, .{ .id = 10 }), bindings.get(original));
+    const first: Handle = .{ .slot = 10, .generation = 1 };
+    const second: Handle = .{ .slot = 11, .generation = 2 };
+    try std.testing.expect((try bindings.set(owner, original, .{ .id = first })) == null);
+    try std.testing.expectEqual(@as(?Handler, .{ .id = first }), bindings.get(original));
     try std.testing.expectEqual(
-        @as(?Handler, .{ .id = 10 }),
-        try bindings.set(owner, original, .{ .id = 11, .kind = .button }),
+        @as(?Handler, .{ .id = first }),
+        try bindings.set(owner, original, .{ .id = second, .kind = .button }),
     );
 
     try tree.reconcile(&.{});
     try std.testing.expectEqual(
-        @as(?Handler, .{ .id = 11, .kind = .button }),
+        @as(?Handler, .{ .id = second, .kind = .button }),
         bindings.takeInactive(&tree),
     );
     try scheduler.applyQueuedCancellations();

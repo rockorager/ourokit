@@ -276,7 +276,7 @@ free and cannot fail after preparation. In one commit it:
 4. replaces callback capabilities and signal dependency sets;
 5. switches the active generation pointer;
 6. invalidates affected scenes and schedules frames;
-7. queues cancellation of the old generation scope.
+7. queues cancellation of the old generation's language work.
 
 The previous display list remains valid until the replacement list is built
 and accepted by a renderer. Reload never produces a blank error frame as an

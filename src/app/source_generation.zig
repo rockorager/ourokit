@@ -18,6 +18,7 @@ pub const UiServices = struct {
     shapes: *text.ShapeCache,
     primary_font: text.FontHandle,
     theme: design.tokens.Theme,
+    callbacks: *lua.CallbackRegistry,
 };
 
 /// All Lua-owned meaning for one application source snapshot. This value and
@@ -31,6 +32,7 @@ pub const SourceGeneration = struct {
     descriptor_storage: []ui.instance.Descriptor,
     semantic_storage: []ui.semantics.Descriptor,
     font_candidates: [1]text.FontHandle,
+    callbacks: ?*lua.CallbackRegistry,
     ui_build: lua.UiBuild,
     application: lua.Application,
 
@@ -183,6 +185,8 @@ pub const SourceGeneration = struct {
             return err;
         };
         if (services) |value| {
+            self.callbacks = value.callbacks;
+            self.ui_build.attachCallbacks(value.callbacks, &self.vm);
             self.font_candidates = .{value.primary_font};
             self.ui_build.attachLabelText(value.shapes, &self.font_candidates, 1) catch |err| {
                 lua.recordDiagnosticError(
@@ -195,6 +199,8 @@ pub const SourceGeneration = struct {
                 return err;
             };
             self.ui_build.enableDeclarativeWidgets(value.theme);
+        } else {
+            self.callbacks = null;
         }
 
         self.application = lua.Application.loadNamed(
@@ -217,6 +223,8 @@ pub const SourceGeneration = struct {
     }
 
     pub fn deinit(self: *SourceGeneration) void {
+        if (self.callbacks) |callbacks|
+            std.debug.assert(callbacks.countForVm(&self.vm) == 0);
         self.application.deinit();
         self.vm.deinit();
         self.signals.deinit();

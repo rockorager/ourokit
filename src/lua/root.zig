@@ -1,6 +1,8 @@
 pub const Vm = @import("vm.zig").Vm;
 pub const TaskHandle = @import("vm.zig").TaskHandle;
 pub const TaskArgument = @import("vm.zig").Argument;
+pub const CallbackRegistry = @import("callbacks.zig").CallbackRegistry;
+pub const CallbackHandle = @import("callbacks.zig").CallbackHandle;
 pub const ActiveBuildOwner = @import("ui_build.zig").ActiveBuildOwner;
 pub const Signals = @import("signals.zig").Signals;
 pub const SignalOwnerRef = @import("signals.zig").OwnerRef;
@@ -15,6 +17,7 @@ pub const recordDiagnosticError = @import("diagnostic.zig").recordError;
 
 test {
     _ = @import("application.zig");
+    _ = @import("callbacks.zig");
     _ = @import("diagnostic.zig");
     _ = @import("signals.zig");
     _ = @import("vm.zig");

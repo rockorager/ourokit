@@ -6,9 +6,17 @@ const task = @import("../task/root.zig");
 const source_generation = @import("source_generation.zig");
 
 const SourceGeneration = source_generation.SourceGeneration;
+const retiring_capacity = 4;
+
+const RetiringGeneration = struct {
+    generation: *SourceGeneration,
+    cancellation_started: bool = false,
+    native_state_detached: bool = false,
+};
 
 pub const Commit = struct {
     generation: u64,
+    /// Borrowed until `collectRetired` succeeds or SourceReload is destroyed.
     retired: *SourceGeneration,
 };
 
@@ -26,6 +34,8 @@ pub const SourceReload = struct {
     config: source_generation.Config,
     active_generation: *SourceGeneration,
     candidate: ?*SourceGeneration = null,
+    retiring_generations: [retiring_capacity]?RetiringGeneration =
+        [_]?RetiringGeneration{null} ** retiring_capacity,
     generation: u64 = 1,
     diagnostic: ?lua.Diagnostic = null,
 
@@ -54,6 +64,8 @@ pub const SourceReload = struct {
 
     pub fn deinit(self: *SourceReload) void {
         if (self.candidate) |candidate| candidate.destroy();
+        for (&self.retiring_generations) |*entry| if (entry.*) |retiring|
+            retiring.generation.destroy();
         self.active_generation.destroy();
         if (self.diagnostic) |*value| value.deinit();
         self.* = undefined;
@@ -61,6 +73,14 @@ pub const SourceReload = struct {
 
     pub fn active(self: *const SourceReload) *SourceGeneration {
         return self.active_generation;
+    }
+
+    pub fn retiringCount(self: *const SourceReload) usize {
+        var count: usize = 0;
+        for (self.retiring_generations) |entry| if (entry != null) {
+            count += 1;
+        };
+        return count;
     }
 
     pub fn lastDiagnostic(self: *const SourceReload) ?*const lua.Diagnostic {
@@ -71,6 +91,8 @@ pub const SourceReload = struct {
     /// The active generation remains authoritative until `commit` is called.
     pub fn prepare(self: *SourceReload) !void {
         if (self.candidate != null) return error.SourceCandidateAlreadyPrepared;
+        if (self.retiringCount() == retiring_capacity)
+            return error.SourceRetirementCapacityExceeded;
         self.clearDiagnostic();
         const snapshot = self.provider.snapshot(self.io, self.allocator) catch |err| {
             lua.recordDiagnosticError(
@@ -115,13 +137,93 @@ pub const SourceReload = struct {
     /// No fallible work belongs here. The returned generation remains live
     /// until its callbacks, tasks, and resources have been retired by `app`.
     pub fn commit(self: *SourceReload) Commit {
+        var available_retirement_slot: ?*?RetiringGeneration = null;
+        for (&self.retiring_generations) |*entry| if (entry.* == null) {
+            available_retirement_slot = entry;
+            break;
+        };
+        const retirement_slot = available_retirement_slot orelse
+            @panic("source generation commit without retirement capacity");
         const candidate = self.candidate orelse @panic("source generation commit without candidate");
         const retired = self.active_generation;
         self.active_generation = candidate;
         self.candidate = null;
+        retirement_slot.* = .{ .generation = retired };
         self.generation += 1;
         self.clearDiagnostic();
         return .{ .generation = self.generation, .retired = retired };
+    }
+
+    /// Starts safe-point cancellation of only the language work belonging to
+    /// the retiring VM. Retained application/window scopes are not canceled.
+    pub fn beginRetirement(self: *SourceReload) !void {
+        for (&self.retiring_generations) |*entry| {
+            const retiring = &(entry.* orelse continue);
+            if (retiring.cancellation_started) continue;
+            try retiring.generation.vm.requestCancellation();
+            retiring.cancellation_started = true;
+        }
+    }
+
+    /// The app coordinator calls this after retained windows, build owners,
+    /// signals, and callback bindings no longer borrow the old generation.
+    pub fn markRetiringNativeStateDetached(
+        self: *SourceReload,
+        generation: *SourceGeneration,
+    ) void {
+        for (&self.retiring_generations) |*entry| if (entry.*) |*retiring| {
+            if (retiring.generation != generation) continue;
+            retiring.native_state_detached = true;
+            return;
+        };
+        @panic("detaching unknown source generation");
+    }
+
+    /// Routes a scheduler grant by ownership rather than by currentness.
+    pub fn resumeRunnable(
+        self: *SourceReload,
+        handle: task.TaskHandle,
+    ) !void {
+        if (self.active_generation.vm.ownsSchedulerTask(handle)) {
+            _ = try self.active_generation.vm.resumeRunnable(handle);
+            return;
+        }
+        for (self.retiring_generations) |entry| if (entry) |retiring|
+            if (retiring.generation.vm.ownsSchedulerTask(handle)) {
+                _ = try retiring.generation.vm.resumeRunnable(handle);
+                return;
+            };
+        return error.UnownedSourceTask;
+    }
+
+    /// Routes completion-phase state to the VM that prepared the operation.
+    pub fn markTimeoutCompleted(
+        self: *SourceReload,
+        operation: io_loop.OperationHandle,
+    ) !void {
+        if (self.active_generation.vm.ownsOperation(operation))
+            return self.active_generation.vm.markTimeoutCompleted(operation);
+        for (self.retiring_generations) |entry| if (entry) |retiring|
+            if (retiring.generation.vm.ownsOperation(operation))
+                return retiring.generation.vm.markTimeoutCompleted(operation);
+        return error.UnownedSourceOperation;
+    }
+
+    /// Destroys a retiring VM only after both native handoff and asynchronous
+    /// task/resource retirement have completed.
+    pub fn collectRetired(self: *SourceReload) usize {
+        var collected: usize = 0;
+        for (&self.retiring_generations) |*entry| {
+            const retiring = entry.* orelse continue;
+            if (!retiring.native_state_detached or
+                retiring.generation.vm.activeTaskCount() != 0) continue;
+            if (self.services) |services|
+                if (services.callbacks.countForVm(&retiring.generation.vm) != 0) continue;
+            retiring.generation.destroy();
+            entry.* = null;
+            collected += 1;
+        }
+        return collected;
     }
 
     fn clearDiagnostic(self: *SourceReload) void {
@@ -240,13 +342,37 @@ test "failed candidates preserve active generation and valid source commits" {
     try reload.prepare();
     try std.testing.expect(reload.active() == active);
     try std.testing.expectEqualStrings("Initial", active.application.windows[0].declaration.title);
+    _ = try active.vm.spawnApplication("ouro.sleep(1000); retired_ran = true");
+    _ = try active.vm.resumeRunnable(scheduler.takeRunnable().?);
     const committed = reload.commit();
-    defer committed.retired.destroy();
     try std.testing.expectEqual(@as(u64, 2), committed.generation);
+    try std.testing.expect(committed.retired == active);
     try std.testing.expect(reload.active() != active);
     try std.testing.expectEqualStrings(
         "Replacement",
         reload.active().application.windows[0].declaration.title,
     );
     try std.testing.expect(reload.lastDiagnostic() == null);
+
+    _ = try reload.active().vm.spawnApplication("active_ran = true");
+    try reload.beginRetirement();
+    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
+    _ = try loop.submit();
+    var timeout_seen = false;
+    var cancel_seen = false;
+    while (!timeout_seen or !cancel_seen) switch (loop.dispatch(try loop.wait())) {
+        .timeout => |timeout| {
+            try reload.markTimeoutCompleted(timeout.operation);
+            timeout_seen = true;
+        },
+        .timeout_cancel => cancel_seen = true,
+        else => return error.UnexpectedCompletion,
+    };
+    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
+    try std.testing.expect(!active.vm.globalBoolean("retired_ran"));
+    try std.testing.expect(reload.active().vm.globalBoolean("active_ran"));
+    try std.testing.expectEqual(@as(usize, 0), active.vm.activeTaskCount());
+    reload.markRetiringNativeStateDetached(committed.retired);
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+    try std.testing.expectEqual(@as(usize, 0), reload.retiringCount());
 }

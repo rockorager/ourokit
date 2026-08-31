@@ -147,6 +147,16 @@ pub const Scheduler = struct {
         (try self.scopeSlot(scope)).cancellation_queued = true;
     }
 
+    /// Requests cancellation of one language task without canceling the
+    /// native ownership scope that contains it. Retiring source generations
+    /// use this to leave retained windows and instances alive.
+    pub fn requestTaskCancellation(self: *Scheduler, handle: TaskHandle) !void {
+        const slot = try self.taskSlot(handle);
+        if (slot.cancellation_requested) return;
+        slot.cancellation_requested = true;
+        if (slot.state == .waiting) slot.state = .runnable;
+    }
+
     pub fn createScope(self: *Scheduler, parent: ScopeHandle) !ScopeHandle {
         if (!(try self.scopeAcceptsNew(parent))) return error.ScopeCanceled;
         for (self.scopes, 0..) |*slot, index| if (!slot.active) {
@@ -246,6 +256,23 @@ pub const Scheduler = struct {
         slot.context = null;
         slot.lifecycle = null;
         lifecycle.destroy(context);
+    }
+
+    /// Requests cancellation of one resource without affecting sibling
+    /// resources in the same retained native scope.
+    pub fn requestResourceCancellation(
+        self: *Scheduler,
+        handle: ResourceHandle,
+    ) !void {
+        if (handle.slot >= self.resources.len) return error.StaleResource;
+        const slot = &self.resources[handle.slot];
+        if (!slot.active or slot.generation != handle.generation) return error.StaleResource;
+        if (slot.cancellation_requested) return;
+        slot.cancellation_requested = true;
+        slot.lifecycle.?.request_cancel(slot.context.?) catch |err| {
+            slot.cancellation_requested = false;
+            return err;
+        };
     }
 
     pub fn availableScopeCapacity(self: *const Scheduler) usize {
@@ -418,5 +445,25 @@ test "queued ancestor cancellation rejects new descendants before the safe point
     try std.testing.expectError(error.ScopeCanceled, scheduler.createTask(widget));
     try scheduler.applyQueuedCancellations();
     try scheduler.destroyScope(widget);
+    try scheduler.destroyScope(window);
+}
+
+test "targeted cancellation leaves a task's native scope and siblings active" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 2, 2, 0);
+    defer scheduler.deinit();
+    const window = try scheduler.createScope(scheduler.application_scope);
+    const retiring = try scheduler.createTask(window);
+    const retained = try scheduler.createTask(window);
+
+    try scheduler.requestTaskCancellation(retiring);
+    try std.testing.expect(try scheduler.cancellationRequested(retiring));
+    try std.testing.expect(!(try scheduler.cancellationRequested(retained)));
+    try std.testing.expect(try scheduler.scopeAcceptsResources(window));
+
+    try std.testing.expectEqual(retiring, scheduler.takeRunnable().?);
+    try scheduler.complete(retiring);
+    try std.testing.expectEqual(retained, scheduler.takeRunnable().?);
+    try scheduler.complete(retained);
     try scheduler.destroyScope(window);
 }

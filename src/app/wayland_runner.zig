@@ -69,6 +69,10 @@ pub fn runSource(
     try scheduler.init(init.gpa, 32, 8, 8);
     defer scheduler.deinit();
 
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(init.gpa, options.window.node_capacity);
+    defer callbacks.deinit();
+
     var database = try text.discovery.Database.init();
     defer database.deinit();
     var configured_fonts = try database.candidates(init.gpa, .{
@@ -98,6 +102,7 @@ pub fn runSource(
         .shapes = &shapes,
         .primary_font = primary_font,
         .theme = theme,
+        .callbacks = &callbacks,
     };
     const generation_config: source_generation.Config = .{
         .node_capacity = options.window.node_capacity,
@@ -129,7 +134,6 @@ pub fn runSource(
     );
     defer source_reload.deinit();
     const generation = source_reload.active();
-    const vm = &generation.vm;
     const signals = &generation.signals;
     const lua_ui = &generation.ui_build;
     const application = &generation.application;
@@ -213,8 +217,8 @@ pub fn runSource(
         // Task safe point: platform and CQE dispatch only changed state.
         try scheduler.applyQueuedCancellations();
         for (runtimes) |*runtime| try runtime.collectRetired();
-        for (runtimes) |*runtime| if (runtime.ready) try runtime.dispatchInput(vm);
-        while (scheduler.takeRunnable()) |handle| _ = try vm.resumeRunnable(handle);
+        for (runtimes) |*runtime| if (runtime.ready) try runtime.dispatchInput(&callbacks);
+        while (scheduler.takeRunnable()) |handle| _ = try source_reload.resumeRunnable(handle);
 
         var current_count: usize = 0;
         for (application.windows, desired) |window, present| {
@@ -330,7 +334,7 @@ pub fn runSource(
 
         const completion = try loop.wait();
         switch (loop.dispatch(completion)) {
-            .timeout => |timeout| try vm.markTimeoutCompleted(timeout.operation),
+            .timeout => |timeout| try source_reload.markTimeoutCompleted(timeout.operation),
             .timeout_cancel => {},
             .foreign => try host.dispatchOne(completion),
             .stale => return error.StaleCompletion,

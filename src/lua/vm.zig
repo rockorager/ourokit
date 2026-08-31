@@ -339,6 +339,29 @@ pub const Vm = struct {
         return count;
     }
 
+    pub fn ownsSchedulerTask(self: *Vm, handle: task.TaskHandle) bool {
+        _ = self.handleForSchedulerTask(handle) catch return false;
+        return true;
+    }
+
+    pub fn ownsOperation(self: *Vm, operation: io.OperationHandle) bool {
+        if (operation.slot >= self.operation_tasks.len) return false;
+        const handle = self.operation_tasks[operation.slot] orelse return false;
+        const slot = self.activeSlot(handle) catch return false;
+        const pending = slot.pending_timeout orelse return false;
+        return same(pending, operation);
+    }
+
+    /// Cancels only tasks and resources created by this VM. Their retained
+    /// native scopes remain usable by a replacement source generation.
+    pub fn requestCancellation(self: *Vm) !void {
+        for (self.chunks) |chunk| for (chunk) |*slot| if (slot.active) {
+            if (slot.timer_resource_handle) |resource|
+                try self.scheduler.requestResourceCancellation(resource);
+            try self.scheduler.requestTaskCancellation(slot.scheduler_handle);
+        };
+    }
+
     fn closeTask(self: *Vm, handle: TaskHandle) c_int {
         const slot = self.activeSlot(handle) catch return c.ok;
         std.debug.assert(slot.pending_timeout == null and slot.timer_resource_handle == null);
