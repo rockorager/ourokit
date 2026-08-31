@@ -13,12 +13,11 @@ layout(push_constant) uniform Push {
     uint atlas_width;
 };
 
-layout(location = 0) in vec4 fragment_color;
 layout(location = 0) out vec4 target_color;
 
 void main() {
     uvec2 local = uvec2(ivec2(gl_FragCoord.xy) - bounds.xy);
     uint index = (atlas_origin.y + local.y) * atlas_width + atlas_origin.x + local.x;
     uint coverage = (masks[index / 4u] >> ((index % 4u) * 8u)) & 255u;
-    target_color = fragment_color * (float(coverage) / 255.0);
+    target_color = color * (float(coverage) / 255.0);
 }
