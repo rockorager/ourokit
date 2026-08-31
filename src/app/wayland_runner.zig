@@ -297,6 +297,10 @@ fn runSourceWithFontconfig(
             current_storage[current_count] = window.declaration;
             current_count += 1;
         }
+        if (!disconnect_started and current_count == 0) {
+            try host.beginShutdown();
+            disconnect_started = true;
+        }
         try window_set.reconcile(current_storage[0..current_count]);
 
         for (runtime_slots) |*slot| {
@@ -437,11 +441,6 @@ fn runSourceWithFontconfig(
 
         const serial_before_flush = window_set.changeSerial();
         try host.flush();
-        if (!disconnect_started and current_count == 0 and window_set.retainedCount() == 0) {
-            try host.beginDisconnect();
-            disconnect_started = true;
-            try host.flush();
-        }
         if (host.quiescent() and window_set.retainedCount() == 0 and
             !loop.hasPendingTimerKernelWork()) break;
         if (desired_changed or window_set.changeSerial() != serial_before_flush) continue;

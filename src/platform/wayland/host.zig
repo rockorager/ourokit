@@ -466,7 +466,7 @@ const DmabufBuffers = struct {
     }
 };
 
-const WindowState = enum { free, open, closing, surfaces_destroyed };
+const WindowState = enum { free, open, closing, surfaces_destroyed, shutdown };
 
 const Window = struct {
     state: WindowState = .free,
@@ -721,8 +721,11 @@ pub const Host = struct {
 
     pub fn deinit(self: *Host) void {
         std.debug.assert(self.quiescent());
-        for (self.windows) |window| std.debug.assert(window.state == .free);
         self.connection.deinit(self.allocator) catch unreachable;
+        for (self.windows) |*window| {
+            std.debug.assert(window.state == .free or window.state == .shutdown);
+            if (window.state == .shutdown) self.releaseWindowLocal(window);
+        }
         self.releaseDmabufFormatTable();
         self.adapter.deinit(self.allocator);
         self.text_input_pending.deinit();
@@ -759,6 +762,25 @@ pub const Host = struct {
         if ((try self.connection.actor()).lifecycle == .open and
             try self.connection.prepareClose()) self.submission_pending = true;
         self.disconnect_started = true;
+        _ = try self.driver.schedule();
+    }
+
+    /// Stops the connection without publishing per-object destructors. This
+    /// is the final-application shutdown path: retiring objects locally while
+    /// receive dispatch remains active can reject already-in-flight Wayland
+    /// events that still name those objects.
+    pub fn beginShutdown(self: *Host) !void {
+        if (self.disconnect_started) return;
+        if ((try self.connection.actor()).lifecycle == .open and
+            try self.connection.prepareClose()) self.submission_pending = true;
+        self.disconnect_started = true;
+        for (self.windows) |*window| {
+            if (window.state == .free) continue;
+            const handle = window.handle;
+            window.state = .shutdown;
+            window.pending_redraw = false;
+            try self.sink.closed(handle);
+        }
         _ = try self.driver.schedule();
     }
 
@@ -1229,17 +1251,22 @@ pub const Host = struct {
         self.text_input_pending.resetObject();
         for (self.windows) |*window| {
             if (window.state == .free) continue;
-            window.buffers.releaseLocal();
-            window.retired_buffers.releaseLocal();
-            if (self.vulkan) |renderer| {
-                window.dmabuf_buffers.releaseLocal(renderer);
-                window.retired_dmabuf_buffers.releaseLocal(renderer);
-            }
+            const closed_reported = window.state == .shutdown;
             const handle = window.handle;
-            const next_pool_generation = window.next_pool_generation;
-            window.* = .{ .next_pool_generation = next_pool_generation };
-            try self.sink.closed(handle);
+            self.releaseWindowLocal(window);
+            if (!closed_reported) try self.sink.closed(handle);
         }
+    }
+
+    fn releaseWindowLocal(self: *Host, window: *Window) void {
+        window.buffers.releaseLocal();
+        window.retired_buffers.releaseLocal();
+        if (self.vulkan) |renderer| {
+            window.dmabuf_buffers.releaseLocal(renderer);
+            window.retired_dmabuf_buffers.releaseLocal(renderer);
+        }
+        const next_pool_generation = window.next_pool_generation;
+        window.* = .{ .next_pool_generation = next_pool_generation };
     }
 
     fn releaseDmabufFormatTable(self: *Host) void {
