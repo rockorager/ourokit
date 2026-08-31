@@ -360,26 +360,36 @@ revision, candidates older than the newest completed snapshot are discarded,
 and more than one old generation may drain concurrently within a fixed host
 capacity.
 
-## Native host changes
+## Native host implementation
 
-The current production runner uses one fixed `Application`, one `Vm`, and
-parallel arrays indexed by the initial declaration order. Reload requires the
-following ownership changes:
+The production runner now owns a `SourceReload` coordinator rather than one
+fixed `Application` and `Vm`. The implemented ownership boundary includes:
 
-- `main.zig` passes a disk source provider/path instead of reading the entry
-  file once and discarding its origin;
-- `wayland_runner.zig` becomes a stateful coordinator with one active source
-  generation and a bounded retiring-generation list;
-- window runtime records are keyed by window identity rather than declaration
-  array index, and host capacity is independent of the initial window count;
-- callback bindings carry generation capabilities rather than raw registry
-  references;
-- signal dependency preparation can retain staged dependency sets for all
-  windows until application-level commit;
-- language execution scopes are distinct from persistent native instance
-  scopes;
-- source/runtime errors become diagnostics instead of escaping the run loop
-  after a successful initial generation.
+- `main.zig` passes a retained disk source provider instead of source bytes
+  detached from their origin;
+- the runner fetches active application, UI-build, and signal ownership once
+  per turn and services coalesced requests at its reconciliation safe point;
+- window runtime records are keyed by window identity, with host capacity
+  independent of the initial declaration count;
+- callback bindings carry generation capabilities rather than raw Lua
+  registry references;
+- every candidate window owns its staged descriptors, semantics, handlers,
+  shapes, signal dependencies, and revision-checked instance plan;
+- candidate layout and scene lowering run in isolated scratch storage before
+  any retained window changes;
+- one application commit validates every window and reserves callback capacity
+  before applying the first retained plan;
+- old generations cancel and drain asynchronously while task and completion
+  routing continues by owning VM; and
+- source, declaration, and build failures become structured diagnostics and do
+  not escape the run loop after successful startup.
+
+The first runner integration deliberately accepts only an unchanged window-ID
+set. Added and removed windows still require transactional native-host
+preparation, and a public control transport still needs to wake the event loop
+and submit the in-process request. Snapshot-backed modules, persistent state,
+component-family identity, and post-commit lifecycle hooks also remain future
+slices below.
 
 These changes belong in existing ownership modules. There is still no broad
 `runtime` module: `bundle` owns source, `lua` owns language generations and
