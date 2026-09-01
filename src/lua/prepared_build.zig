@@ -6,6 +6,7 @@ const input = @import("../ui/input/bindings.zig");
 const semantics = @import("../ui/semantics/snapshot.zig");
 const buttons = @import("../ui/widget/buttons.zig");
 const text_input = @import("../ui/text_input/root.zig");
+const listboxes = @import("../ui/widget/listboxes.zig");
 const text = @import("../text/root.zig");
 
 pub const Handler = struct {
@@ -33,6 +34,8 @@ pub const TextInput = struct {
     behavior: text_input.Behavior,
     session: ?text_input.Session,
 };
+pub const ListBox = struct { id: u64, selected: i64 };
+pub const Option = struct { id: u64, listbox_id: u64, value: i64, style: listboxes.Style };
 
 /// One candidate-owned, normalized window build. Registry references and
 /// acquired shape references remain owned here until an application commit
@@ -53,6 +56,10 @@ pub const PreparedBuild = struct {
     button_count: usize = 0,
     text_inputs: []TextInput,
     text_input_count: usize = 0,
+    prepared_listboxes: []ListBox,
+    listbox_count: usize = 0,
+    prepared_options: []Option,
+    option_count: usize = 0,
     owns_shapes: bool = false,
     reconcile_plan: ?instance.ReconcilePlan = null,
     size: ?core.SizeU = null,
@@ -78,6 +85,10 @@ pub const PreparedBuild = struct {
         const prepared_buttons = try allocator.alloc(Button, node_capacity);
         errdefer allocator.free(prepared_buttons);
         const text_inputs = try allocator.alloc(TextInput, node_capacity);
+        errdefer allocator.free(text_inputs);
+        const prepared_listboxes = try allocator.alloc(ListBox, node_capacity);
+        errdefer allocator.free(prepared_listboxes);
+        const prepared_options = try allocator.alloc(Option, node_capacity);
         self.* = .{
             .allocator = allocator,
             .state = state,
@@ -88,12 +99,16 @@ pub const PreparedBuild = struct {
             .handlers = handlers,
             .prepared_buttons = prepared_buttons,
             .text_inputs = text_inputs,
+            .prepared_listboxes = prepared_listboxes,
+            .prepared_options = prepared_options,
         };
     }
 
     pub fn deinit(self: *PreparedBuild) void {
         self.reset();
         self.allocator.free(self.text_inputs);
+        self.allocator.free(self.prepared_options);
+        self.allocator.free(self.prepared_listboxes);
         self.allocator.free(self.prepared_buttons);
         self.allocator.free(self.handlers);
         self.allocator.free(self.semantic_text);
@@ -119,6 +134,8 @@ pub const PreparedBuild = struct {
         self.handler_count = 0;
         self.button_count = 0;
         self.text_input_count = 0;
+        self.listbox_count = 0;
+        self.option_count = 0;
         self.owns_shapes = false;
         self.reconcile_plan = null;
         self.size = null;

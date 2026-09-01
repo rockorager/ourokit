@@ -24,16 +24,26 @@ return ouro.app {
       title = "Example",
       width = 480,
       height = 320,
+      min_width = 360,
+      min_height = 240,
       content = function()
-        ouro.column {
-          key = "content",
+        ouro.row {
+          key = "layout",
+          cross_alignment = "stretch",
           children = function()
-            ouro.label { key = "title", text = "Example" }
-            ouro.button {
-              key = "run",
-              label = clicked() and "Clicked" or "Run",
-              on_press = function()
-                clicked:set(not clicked())
+            ouro.box { key = "sidebar", width = 120, children = function() end }
+            ouro.column {
+              key = "content",
+              flex = 1,
+              children = function()
+                ouro.label { key = "title", text = "Example" }
+                ouro.button {
+                  key = "run",
+                  label = clicked() and "Clicked" or "Run",
+                  on_press = function()
+                    clicked:set(not clicked())
+                  end,
+                }
               end,
             }
           end,
@@ -61,9 +71,10 @@ remains unfrozen. Constructors are specific native decoders, not one generic
 - the platform owns Wayring objects and shared-memory buffers behind a native
   host boundary; declarations never contain protocol objects.
 
-Only mutable native policy is updated in place. Title is the first such field;
-initial dimensions apply at creation. A future layer-shell declaration will be
-a distinct type rather than a mode bit on an interchangeable generic window.
+Mutable title and minimum dimensions are updated in place; initial dimensions
+apply at creation. A zero minimum leaves that axis unconstrained. A future
+layer-shell declaration will be a distinct type rather than a mode bit on an
+interchangeable generic window.
 The reusable `app.runWayland` host implements this contract and owns the loop,
 scheduler, isolated VM, font/text caches, retained per-window UI, software
 renderer, and Wayland adapter. The executable example only embeds a Lua source
@@ -97,6 +108,12 @@ fixed-capacity tree caches unchanged constraint results, allocates paragraph
 work only when Label inputs or width change, separates paint-only from layout
 invalidation, builds ordered display lists, and performs reverse-order hit
 testing without Wayland or Lua.
+
+Declarative rows and columns expose that edge metadata as a contextual
+`flex = <positive integer>` child property. It is rejected anywhere except on
+a direct row or column child. `cross_alignment = "start" | "center" | "end" |
+"stretch"` controls the container's cross axis; flex children use tight fitting
+and divide the remaining bounded main-axis space according to their factors.
 
 Above it, the implemented instance reconciler consumes parent-before-child
 typed descriptor snapshots with stable numeric semantic IDs. It validates the
@@ -174,7 +191,11 @@ existing transactional reconciler validates. It has no generic string `type`
 parser or application-facing descriptor escape hatch. The constructors maintain
 a bounded native parent stack: `ouro.row` and `ouro.column` normalize to Flex,
 `ouro.scroll` normalizes to a single-child Scroll viewport, `ouro.label`
-normalizes to Label, and `ouro.button` normalizes to Box plus Label.
+normalizes to Label, and `ouro.button` normalizes to Box plus Label. The
+single-selection `ouro.listbox` composes a vertical Flex with direct
+`ouro.option` Box/Label children. It is one focus stop, uses integer values,
+and calls `on_select(value)` for pointer selection and Up/Down/Home/End navigation;
+the application remains the source of truth through the `selected` property.
 Applications provide stable local keys but no numeric IDs or parent links.
 Their visual defaults come only from generated design tokens, with no Lua theme
 mirror. The Wayland example exercises this actual Lua-build path for both

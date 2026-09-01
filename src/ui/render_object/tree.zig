@@ -905,11 +905,17 @@ test "flex layout is bounded, cached, and separates paint invalidation" {
     _ = try tree.layout(root, Constraints.tight(.{ .width = 100, .height = 20 }));
     try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(root));
     try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(expanded));
+    try std.testing.expectEqual(
+        SizeF{ .width = 120, .height = 30 },
+        try tree.layout(root, Constraints.tight(.{ .width = 120, .height = 30 })),
+    );
+    try std.testing.expectEqual(SizeF{ .width = 20, .height = 30 }, try tree.nodeSize(fixed));
+    try std.testing.expectEqual(SizeF{ .width = 95, .height = 30 }, try tree.nodeSize(expanded));
     try tree.update(expanded, .{ .box = .{ .background = Color.rgba(70, 80, 90, 255) } });
     try std.testing.expect(!(try tree.layoutDirty(root)));
     try std.testing.expect(try tree.paintDirty(root));
-    _ = try tree.layout(root, Constraints.tight(.{ .width = 100, .height = 20 }));
-    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(root));
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 120, .height = 30 }));
+    try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(root));
 }
 
 test "stack paints in order and hit tests front to back" {

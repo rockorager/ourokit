@@ -1453,6 +1453,13 @@ pub const Host = struct {
             toplevel,
             .{ .set_app_id = .{ .app_id = self.app_id } },
         );
+        try setMinimumSize(
+            objects,
+            transmit,
+            toplevel,
+            declaration.min_width,
+            declaration.min_height,
+        );
         if (viewport) |viewport_handle| try setViewport(
             objects,
             transmit,
@@ -1494,6 +1501,28 @@ pub const Host = struct {
         _ = try self.driver.schedule();
     }
 
+    fn nativeUpdateMinimumSize(
+        context: *anyopaque,
+        handle: WindowHandle,
+        width: u32,
+        height: u32,
+    ) !void {
+        const self: *Host = @ptrCast(@alignCast(context));
+        const window = try self.windowFor(handle);
+        if (window.state != .open) return error.WindowClosing;
+        const objects = &self.connection.objects;
+        const transmit = try self.queue();
+        try setMinimumSize(objects, transmit, window.toplevel.?, width, height);
+        try wayring.client.sendRequest(
+            protocol.wl_surface,
+            objects,
+            transmit,
+            window.surface.?,
+            .{ .commit = .{} },
+        );
+        _ = try self.driver.schedule();
+    }
+
     fn nativeBeginClose(context: *anyopaque, handle: WindowHandle) !void {
         const self: *Host = @ptrCast(@alignCast(context));
         const window = try self.windowFor(handle);
@@ -1505,6 +1534,7 @@ pub const Host = struct {
     const native_vtable: platform_window.NativeHost.VTable = .{
         .create = nativeCreate,
         .update_title = nativeUpdateTitle,
+        .update_minimum_size = nativeUpdateMinimumSize,
         .begin_close = nativeBeginClose,
     };
 
@@ -2306,6 +2336,20 @@ fn scaledExtent(logical: u32, scale_120: u32) !u32 {
     const pixels = (numerator + fractional_scale_denominator - 1) / fractional_scale_denominator;
     if (pixels > std.math.maxInt(u32)) return error.ScaledExtentOverflow;
     return @intCast(pixels);
+}
+
+fn setMinimumSize(
+    objects: *wayring.objects.ClientObjects,
+    transmit: *wayring.tx.Queue,
+    toplevel: Handle,
+    width: u32,
+    height: u32,
+) !void {
+    if (width > std.math.maxInt(i32) or height > std.math.maxInt(i32))
+        return error.InvalidMinimumWindowSize;
+    try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, toplevel, .{
+        .set_min_size = .{ .width = @intCast(width), .height = @intCast(height) },
+    });
 }
 
 fn setViewport(

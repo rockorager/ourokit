@@ -135,7 +135,9 @@ and Label using generated design tokens and retains hover, pressed, disabled,
 pointer-capture, and release-inside activation state in the widget layer. Its
 Box centers the constrained Label within the padded button bounds; this child
 placement remains separate from paragraph alignment. Button is not a renderer
-primitive. Direction-aware alignment, whole-line clipping, and shaped ellipsis
+primitive. `ouro.listbox` and its direct `ouro.option` children provide a
+controlled single-selection list with one Tab stop and Up/Down/Home/End navigation.
+Direction-aware alignment, whole-line clipping, and shaped ellipsis
 remain text-layer policy; renderers never inject the ellipsis. Editing and
 selection remain deferred. Software and Vulkan consume the identical positioned
 glyph sequence.

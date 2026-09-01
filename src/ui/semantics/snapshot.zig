@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Role = enum { group, label, button, text_field };
+pub const Role = enum { group, label, button, text_field, listbox, option };
 
 /// Borrowed normalized semantic data emitted beside render descriptors during
 /// one build. Text is copied into the retained Snapshot before another Lua call.
@@ -11,6 +11,7 @@ pub const Descriptor = struct {
     key: []const u8 = "",
     label: []const u8 = "",
     enabled: bool = true,
+    selected: bool = false,
 };
 
 const StoredNode = struct {
@@ -22,6 +23,7 @@ const StoredNode = struct {
     label_start: usize,
     label_len: usize,
     enabled: bool,
+    selected: bool,
 };
 
 pub const Node = struct {
@@ -31,6 +33,7 @@ pub const Node = struct {
     key: []const u8,
     label: []const u8,
     enabled: bool,
+    selected: bool,
 };
 
 /// Double-buffered, allocation-free-after-init semantic snapshot suitable for
@@ -94,7 +97,7 @@ pub const Snapshot = struct {
             if (descriptor.parent) |parent| if (!indexContains(self.validation_index, parent))
                 return error.SemanticParentMustPrecedeChild;
             if (!indexPut(self.validation_index, descriptor.id)) return error.DuplicateSemanticId;
-            if ((descriptor.role == .label or descriptor.role == .button) and descriptor.label.len == 0)
+            if ((descriptor.role == .label or descriptor.role == .button or descriptor.role == .option) and descriptor.label.len == 0)
                 return error.SemanticLabelRequired;
         }
     }
@@ -120,6 +123,7 @@ pub const Snapshot = struct {
                 .label_start = label_start,
                 .label_len = descriptor.label.len,
                 .enabled = descriptor.enabled,
+                .selected = descriptor.selected,
             };
             text_count += descriptor.label.len;
         }
@@ -182,6 +186,7 @@ pub const Snapshot = struct {
             .key = self.text[self.active][stored.key_start..][0..stored.key_len],
             .label = self.text[self.active][stored.label_start..][0..stored.label_len],
             .enabled = stored.enabled,
+            .selected = stored.selected,
         };
     }
 };

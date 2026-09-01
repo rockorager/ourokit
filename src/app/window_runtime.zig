@@ -51,6 +51,7 @@ pub const WindowRuntime = struct {
     router: ui.input.Router = undefined,
     pointer_bindings: ui.input.PointerBindings = undefined,
     buttons: ui.widget.Buttons = undefined,
+    listboxes: ui.widget.ListBoxes = .{},
     text_inputs: ui.text_input.Registry = undefined,
     focus: ui.focus.Manager = .{},
     semantics: ui.semantics.Snapshot = undefined,
@@ -100,6 +101,8 @@ pub const WindowRuntime = struct {
         errdefer self.pointer_bindings.deinit();
         try self.buttons.init(allocator, config.node_capacity);
         errdefer self.buttons.deinit();
+        try self.listboxes.init(allocator, config.node_capacity);
+        errdefer self.listboxes.deinit();
         try self.text_inputs.init(allocator, config.node_capacity);
         errdefer self.text_inputs.deinit();
         try self.semantics.init(allocator, config.node_capacity, config.semantic_text_capacity);
@@ -118,6 +121,7 @@ pub const WindowRuntime = struct {
             .router = self.router,
             .pointer_bindings = self.pointer_bindings,
             .buttons = self.buttons,
+            .listboxes = self.listboxes,
             .text_inputs = self.text_inputs,
             .focus = .{},
             .semantics = self.semantics,
@@ -150,6 +154,7 @@ pub const WindowRuntime = struct {
         self.allocator.free(self.commands);
         self.semantics.deinit();
         self.text_inputs.deinit();
+        self.listboxes.deinit();
         self.buttons.deinit();
         self.pointer_bindings.deinit();
         self.router.deinit();
@@ -169,6 +174,7 @@ pub const WindowRuntime = struct {
         if (!self.initialized) return;
         lua_ui.clearHandlers(&self.pointer_bindings);
         self.buttons.clear();
+        self.listboxes.clear();
         self.text_inputs.clear();
         self.focus.clear();
         while (self.router.takeEvent()) |event| self.router.releaseEvent(event);
@@ -353,8 +359,24 @@ pub const WindowRuntime = struct {
             button.enabled,
         );
         self.buttons.finishOwner(self.root_owner);
+        self.listboxes.removeInactive(&self.instances);
+        self.listboxes.beginOwner(self.root_owner);
+        for (prepared.prepared_listboxes[0..prepared.listbox_count]) |listbox| self.listboxes.setList(
+            self.root_owner,
+            self.instances.handleForId(listbox.id).?,
+            listbox.selected,
+        ) catch unreachable;
+        for (prepared.prepared_options[0..prepared.option_count]) |option| self.listboxes.setOption(
+            self.root_owner,
+            self.instances.handleForId(option.listbox_id).?,
+            self.instances.handleForId(option.id).?,
+            option.value,
+            option.style,
+        ) catch unreachable;
+        self.listboxes.finishOwner(self.root_owner);
         for (0..self.buttons.slotCount()) |index|
             if (self.buttons.visualAt(index)) |visual| self.applyButtonUpdate(visual) catch unreachable;
+        self.refreshListBoxVisuals() catch unreachable;
 
         self.text_inputs.removeInactive(&self.instances);
         self.text_inputs.beginOwner(self.root_owner);
@@ -433,11 +455,13 @@ pub const WindowRuntime = struct {
             };
             self.semantics.stage(lua_ui.semanticDescriptors());
             self.buttons.removeInactive(&self.instances);
+            self.listboxes.removeInactive(&self.instances);
             self.text_inputs.removeInactive(&self.instances);
             lua_ui.commitBindings(
                 &self.pointer_bindings,
                 &self.buttons,
                 &self.text_inputs,
+                &self.listboxes,
                 &self.instances,
                 work.owner,
             ) catch |err| {
@@ -455,9 +479,10 @@ pub const WindowRuntime = struct {
             };
             self.semantics.commitStaged();
             self.focus.reconcile(&self.instances);
-            try self.applyFocusVisual(null, self.focus.current());
             for (0..self.buttons.slotCount()) |index|
                 if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
+            try self.refreshListBoxVisuals();
+            try self.applyFocusVisual(null, self.focus.current());
             try self.build_owners.complete(work);
         }
         try self.prepareFrame(self.output_scale);
@@ -589,6 +614,17 @@ pub const WindowRuntime = struct {
                     );
                 continue;
             }
+            if (binding.kind == .listbox) {
+                const selection = try self.listBoxPointerSelection(target, event) orelse continue;
+                const previous = self.focus.current();
+                self.listboxes.select(selection);
+                try self.refreshListBoxVisuals();
+                _ = try self.focus.request(&self.instances, selection.listbox);
+                try self.applyFocusVisual(previous, self.focus.current());
+                try self.ensureOptionVisible(selection.option);
+                try self.spawnListBoxCallback(callback_service, binding.id, selection);
+                continue;
+            }
             if (binding.kind == .text_input_change) continue;
             const values = inputValues(event);
             const arguments = [_]lua.TaskArgument{
@@ -675,6 +711,27 @@ pub const WindowRuntime = struct {
             }
             if (intent != null) return;
         };
+        if ((key.translated.logical == .arrow_up or key.translated.logical == .arrow_down or
+            key.translated.logical == .home or key.translated.logical == .end) and
+            key.state != .released)
+        {
+            const focused = self.focus.current() orelse return;
+            if (!self.listboxes.contains(focused)) return;
+            const selection = switch (key.translated.logical) {
+                .home => self.listboxes.edge(focused, false),
+                .end => self.listboxes.edge(focused, true),
+                .arrow_up => self.listboxes.move(focused, -1),
+                .arrow_down => self.listboxes.move(focused, 1),
+                else => unreachable,
+            } orelse return;
+            const binding = self.pointer_bindings.get(focused) orelse return;
+            if (binding.kind != .listbox) return;
+            try self.refreshListBoxVisuals();
+            try self.applyFocusVisual(null, self.focus.current());
+            try self.ensureOptionVisible(selection.option);
+            try self.spawnListBoxCallback(callback_service, binding.id, selection);
+            return;
+        }
         if (key.translated.logical == .space) switch (key.state) {
             .pressed => {
                 const focused = self.focus.current() orelse return;
@@ -709,6 +766,63 @@ pub const WindowRuntime = struct {
             try self.instances.scope(focused),
             &.{},
         );
+    }
+
+    fn spawnListBoxCallback(
+        self: *WindowRuntime,
+        callback_service: anytype,
+        callback: lua.CallbackHandle,
+        selection: ui.widget.ListBoxSelection,
+    ) !void {
+        const arguments = [_]lua.TaskArgument{.{ .integer = selection.value }};
+        try self.spawnCallback(
+            callback_service,
+            callback,
+            try self.instances.scope(selection.listbox),
+            &arguments,
+        );
+    }
+
+    fn listBoxPointerSelection(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        event: ui.input.Event,
+    ) !?ui.widget.ListBoxSelection {
+        const pointer = switch (event) {
+            .pointer => |value| value,
+            else => return null,
+        };
+        const button = switch (pointer.event) {
+            .button => |value| value,
+            else => return null,
+        };
+        if (button.button != 0x110 or button.state != .released) return null;
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |candidate| {
+            if (self.listboxes.option(candidate)) |selection| return selection;
+            current = try self.instances.parentOf(candidate);
+        }
+        return null;
+    }
+
+    fn ensureOptionVisible(self: *WindowRuntime, option: ui.instance.InstanceHandle) !void {
+        const scroll = (try self.instances.nearestScroll(option, .vertical)) orelse return;
+        const scroll_render = try self.instances.renderObject(scroll);
+        const viewport = try self.tree.nodeSize(scroll_render);
+        const option_size = try self.tree.nodeSize(try self.instances.renderObject(option));
+        var y: f32 = 0;
+        var current: ?ui.instance.InstanceHandle = option;
+        while (current) |candidate| {
+            if (sameHandle(candidate, scroll)) break;
+            y += (try self.tree.nodeOffset(try self.instances.renderObject(candidate))).y;
+            current = try self.instances.parentOf(candidate);
+        }
+        const delta = if (y < 0) y else if (y + option_size.height > viewport.height)
+            y + option_size.height - viewport.height
+        else
+            0;
+        if (delta != 0 and try self.instances.scrollBy(scroll, delta))
+            self.frame_state.invalidatePaint();
     }
 
     fn spawnCallback(
@@ -1107,6 +1221,21 @@ pub const WindowRuntime = struct {
         try self.applyButtonColor(value.target, value.color);
     }
 
+    fn refreshListBoxVisuals(self: *WindowRuntime) !void {
+        for (0..self.listboxes.optionSlots()) |index| {
+            const option = self.listboxes.optionAt(index) orelse continue;
+            const render = try self.instances.renderObject(option);
+            var object = try self.tree.objectAt(render);
+            if (object != .box) return error.ListBoxOptionRenderObjectMismatch;
+            object.box.background = self.listboxes.color(option);
+            object.box.outline_color = null;
+            object.box.outline_width = 0;
+            object.box.outline_gap = 0;
+            try self.tree.update(render, object);
+        }
+        self.frame_state.invalidatePaint();
+    }
+
     /// Exercises candidate layout and scene lowering against isolated native
     /// storage. This closes the transaction boundary before retained instances
     /// change, including command-capacity and descriptor-dependent layout
@@ -1149,8 +1278,11 @@ pub const WindowRuntime = struct {
         current: ?ui.instance.InstanceHandle,
     ) !void {
         if (previous) |target| if (self.instances.isActive(target))
-            try self.setFocusOutline(target, false);
-        if (current) |target| try self.setFocusOutline(target, true);
+            try self.setFocusOutline(self.listboxes.selectedOption(target) orelse target, false);
+        if (current) |target| try self.setFocusOutline(
+            self.listboxes.selectedOption(target) orelse target,
+            true,
+        );
         try self.syncTextInputVisuals();
     }
 

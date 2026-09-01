@@ -33,6 +33,8 @@ const Slot = struct {
     title: ?[]u8 = null,
     initial_width: u32 = 0,
     initial_height: u32 = 0,
+    min_width: u32 = 0,
+    min_height: u32 = 0,
     scope: ScopeHandle = .invalid,
 };
 
@@ -102,6 +104,15 @@ pub const WindowSet = struct {
                 try self.host.updateTitle(handleFor(slot, index), declaration.title);
                 self.allocator.free(slot.title.?);
                 slot.title = replacement;
+            }
+            if (slot.min_width != declaration.min_width or slot.min_height != declaration.min_height) {
+                try self.host.updateMinimumSize(
+                    handleFor(slot, index),
+                    declaration.min_width,
+                    declaration.min_height,
+                );
+                slot.min_width = declaration.min_width;
+                slot.min_height = declaration.min_height;
             }
         }
 
@@ -229,6 +240,8 @@ pub const WindowSet = struct {
             .title = title,
             .initial_width = declaration.initial_width,
             .initial_height = declaration.initial_height,
+            .min_width = declaration.min_width,
+            .min_height = declaration.min_height,
             .scope = scope_handle,
         };
     }
@@ -395,6 +408,10 @@ fn validateDeclarations(declarations: []const ToplevelDeclaration) !void {
         if (declaration.id.len == 0) return error.EmptyWindowId;
         if (declaration.initial_width == 0 or declaration.initial_height == 0)
             return error.InvalidWindowSize;
+        if (declaration.min_width > declaration.initial_width or
+            declaration.min_height > declaration.initial_height or
+            declaration.min_width > std.math.maxInt(i32) or
+            declaration.min_height > std.math.maxInt(i32)) return error.InvalidMinimumWindowSize;
         for (declarations[0..index]) |earlier|
             if (std.mem.eql(u8, earlier.id, declaration.id)) return error.DuplicateWindowId;
     }
@@ -417,6 +434,7 @@ const FakeHost = struct {
     const Action = union(enum) {
         create: struct { handle: WindowHandle, scope: ScopeHandle },
         update_title: WindowHandle,
+        update_minimum_size: struct { handle: WindowHandle, width: u32, height: u32 },
         begin_close: WindowHandle,
     };
 
@@ -447,6 +465,20 @@ const FakeHost = struct {
         self.append(.{ .update_title = handle });
     }
 
+    fn updateMinimumSize(
+        context: *anyopaque,
+        handle: WindowHandle,
+        width: u32,
+        height: u32,
+    ) !void {
+        const self: *FakeHost = @ptrCast(@alignCast(context));
+        self.append(.{ .update_minimum_size = .{
+            .handle = handle,
+            .width = width,
+            .height = height,
+        } });
+    }
+
     fn beginClose(context: *anyopaque, handle: WindowHandle) !void {
         const self: *FakeHost = @ptrCast(@alignCast(context));
         self.append(.{ .begin_close = handle });
@@ -455,6 +487,7 @@ const FakeHost = struct {
     const vtable: NativeHost.VTable = .{
         .create = create,
         .update_title = updateTitle,
+        .update_minimum_size = updateMinimumSize,
         .begin_close = beginClose,
     };
 };
@@ -480,14 +513,17 @@ test "window declarations reconcile into stable scoped native identities" {
     try std.testing.expectEqual(main_scope, try windows.scope(main_handle));
 
     const updated = [_]ToplevelDeclaration{
-        .{ .id = "main", .title = "Renamed" },
+        .{ .id = "main", .title = "Renamed", .min_width = 300, .min_height = 200 },
     };
     try windows.reconcile(&updated);
     try std.testing.expectEqual(@as(usize, 1), windows.activeCount());
-    try std.testing.expectEqual(@as(usize, 4), host.count);
+    try std.testing.expectEqual(@as(usize, 5), host.count);
     try std.testing.expectEqual(main_handle, host.actions[2].update_title);
+    try std.testing.expectEqual(main_handle, host.actions[3].update_minimum_size.handle);
+    try std.testing.expectEqual(@as(u32, 300), host.actions[3].update_minimum_size.width);
+    try std.testing.expectEqual(@as(u32, 200), host.actions[3].update_minimum_size.height);
     const tools_handle = host.actions[1].create.handle;
-    try std.testing.expectEqual(tools_handle, host.actions[3].begin_close);
+    try std.testing.expectEqual(tools_handle, host.actions[4].begin_close);
 
     try scheduler.applyQueuedCancellations();
     try windows.markClosed(tools_handle);

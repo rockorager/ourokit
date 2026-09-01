@@ -228,6 +228,8 @@ pub const ToplevelDeclaration = struct {
     title: []const u8,
     initial_width: u32 = 640,
     initial_height: u32 = 480,
+    min_width: u32 = 0,
+    min_height: u32 = 0,
 };
 
 /// Native platform ownership boundary used by the desired-state reconciler.
@@ -241,6 +243,7 @@ pub const NativeHost = struct {
     pub const VTable = struct {
         create: *const fn (*anyopaque, WindowHandle, ScopeHandle, ToplevelDeclaration) anyerror!void,
         update_title: *const fn (*anyopaque, WindowHandle, []const u8) anyerror!void,
+        update_minimum_size: *const fn (*anyopaque, WindowHandle, u32, u32) anyerror!void,
         begin_close: *const fn (*anyopaque, WindowHandle) anyerror!void,
     };
 
@@ -255,6 +258,15 @@ pub const NativeHost = struct {
 
     pub fn updateTitle(self: NativeHost, handle: WindowHandle, title: []const u8) !void {
         try self.vtable.update_title(self.context, handle, title);
+    }
+
+    pub fn updateMinimumSize(
+        self: NativeHost,
+        handle: WindowHandle,
+        width: u32,
+        height: u32,
+    ) !void {
+        try self.vtable.update_minimum_size(self.context, handle, width, height);
     }
 
     pub fn beginClose(self: NativeHost, handle: WindowHandle) !void {
