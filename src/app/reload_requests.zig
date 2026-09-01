@@ -9,8 +9,8 @@ pub const ReloadRequests = struct {
 
     /// Requests coalesce: the coordinator performs one reload for every batch
     /// visible at a safe point, not one reload for every producer call.
-    pub fn request(self: *ReloadRequests) void {
-        _ = self.requested.fetchAdd(1, .release);
+    pub fn request(self: *ReloadRequests) u64 {
+        return self.requested.fetchAdd(1, .release) + 1;
     }
 
     /// Single-consumer operation. The returned sequence identifies the newest
@@ -28,11 +28,11 @@ test "reload requests coalesce without losing a later request" {
     var requests: ReloadRequests = .{};
     try std.testing.expect(requests.take() == null);
 
-    requests.request();
-    requests.request();
+    try std.testing.expectEqual(@as(u64, 1), requests.request());
+    try std.testing.expectEqual(@as(u64, 2), requests.request());
     try std.testing.expectEqual(@as(?u64, 2), requests.take());
     try std.testing.expect(requests.take() == null);
 
-    requests.request();
+    try std.testing.expectEqual(@as(u64, 3), requests.request());
     try std.testing.expectEqual(@as(?u64, 3), requests.take());
 }

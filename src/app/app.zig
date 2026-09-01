@@ -71,7 +71,7 @@ pub const App = struct {
 
     fn dispatchCompletion(self: *App, completion: std.os.linux.io_uring_cqe) !void {
         switch (self.loop.dispatch(completion)) {
-            .file, .operation_cancel => return error.UnownedIoCompletion,
+            .file, .socket, .operation_cancel => return error.UnownedIoCompletion,
             .timer_wakeup, .timer_control => while (try self.loop.takeExpired()) |timeout|
                 try self.lua_vm.markTimeoutCompleted(timeout.operation),
             .foreign => return error.ForeignCompletion,

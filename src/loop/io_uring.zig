@@ -13,6 +13,9 @@ const Operation = enum(u8) {
     read = 0xa5,
     close = 0xa6,
     operation_cancel = 0xa7,
+    accept = 0xa8,
+    recv = 0xa9,
+    send = 0xaa,
 };
 
 pub const OperationKind = enum {
@@ -20,6 +23,12 @@ pub const OperationKind = enum {
     statx,
     read,
     close,
+};
+
+pub const SocketOperationKind = enum {
+    accept,
+    recv,
+    send,
 };
 
 pub const OpenHow = extern struct {
@@ -62,12 +71,19 @@ pub const FileCompletion = struct {
     result: i32,
 };
 
+pub const SocketCompletion = struct {
+    operation: OperationHandle,
+    kind: SocketOperationKind,
+    result: i32,
+};
+
 /// `foreign` is intentionally returned unchanged to let one CQ loop route
 /// Wayring and future subsystems before or after Ourokit's own operations.
 pub const Dispatch = union(enum) {
     foreign,
     stale,
     file: FileCompletion,
+    socket: SocketCompletion,
     operation_cancel: Completion,
     timer_wakeup,
     timer_control,
@@ -153,6 +169,13 @@ pub const Loop = struct {
         };
     }
 
+    pub fn operationPending(self: *const Loop, handle: OperationHandle) bool {
+        if (handle.generation & timer_generation_bit != 0) return false;
+        if (handle.slot >= self.slots.len) return false;
+        const slot = &self.slots[handle.slot];
+        return slot.generation == handle.generation and (slot.active or slot.cancel_pending);
+    }
+
     pub fn prepareOpenAt2(
         self: *Loop,
         directory: linux.fd_t,
@@ -230,6 +253,51 @@ pub const Loop = struct {
     pub fn prepareClose(self: *Loop, fd: linux.fd_t) !OperationHandle {
         const reserved = try self.reserve(.close);
         _ = self.ring.close(encodeFile(.close, reserved.handle), fd) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        return reserved.handle;
+    }
+
+    pub fn prepareAccept(self: *Loop, fd: linux.fd_t) !OperationHandle {
+        const reserved = try self.reserve(.accept);
+        _ = self.ring.accept(
+            encodeFile(.accept, reserved.handle),
+            fd,
+            null,
+            null,
+            linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        ) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        return reserved.handle;
+    }
+
+    pub fn prepareRecv(self: *Loop, fd: linux.fd_t, buffer: []u8) !OperationHandle {
+        if (buffer.len == 0) return error.EmptyReceiveBuffer;
+        const reserved = try self.reserve(.recv);
+        _ = self.ring.recv(
+            encodeFile(.recv, reserved.handle),
+            fd,
+            .{ .buffer = buffer },
+            0,
+        ) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        return reserved.handle;
+    }
+
+    pub fn prepareSend(self: *Loop, fd: linux.fd_t, buffer: []const u8) !OperationHandle {
+        if (buffer.len == 0) return error.EmptySendBuffer;
+        const reserved = try self.reserve(.send);
+        _ = self.ring.send(
+            encodeFile(.send, reserved.handle),
+            fd,
+            buffer,
+            linux.MSG.NOSIGNAL,
+        ) catch |err| {
             reserved.slot.active = false;
             return err;
         };
@@ -317,6 +385,24 @@ pub const Loop = struct {
                         .statx => .statx,
                         .read => .read,
                         .close => .close,
+                        else => unreachable,
+                    },
+                    .result = cqe.res,
+                } };
+            },
+            .accept, .recv, .send => |operation| {
+                const handle = decoded.handle orelse return .stale;
+                if (handle.slot >= self.slots.len) return .stale;
+                const slot = &self.slots[handle.slot];
+                if (slot.generation != handle.generation) return .stale;
+                if (!slot.active or slot.operation != operation) return .stale;
+                slot.active = false;
+                return .{ .socket = .{
+                    .operation = handle,
+                    .kind = switch (operation) {
+                        .accept => .accept,
+                        .recv => .recv,
+                        .send => .send,
                         else => unreachable,
                     },
                     .result = cqe.res,
@@ -425,6 +511,9 @@ fn decode(value: u64) ?Decoded {
         @intFromEnum(Operation.read) => .read,
         @intFromEnum(Operation.close) => .close,
         @intFromEnum(Operation.operation_cancel) => .operation_cancel,
+        @intFromEnum(Operation.accept) => .accept,
+        @intFromEnum(Operation.recv) => .recv,
+        @intFromEnum(Operation.send) => .send,
         @intFromEnum(Operation.timer_alarm) => .timer_alarm,
         @intFromEnum(Operation.timer_update) => .timer_update,
         @intFromEnum(Operation.timer_remove) => .timer_remove,
@@ -432,7 +521,7 @@ fn decode(value: u64) ?Decoded {
     };
     const generation: u32 = @truncate(value >> 32);
     const handle = switch (operation) {
-        .openat2, .statx, .read, .close, .operation_cancel => OperationHandle{
+        .openat2, .statx, .read, .close, .operation_cancel, .accept, .recv, .send => OperationHandle{
             .slot = @truncate((value >> 8) & 0x00ff_ffff),
             .generation = generation,
         },
@@ -521,4 +610,85 @@ test "logical cancellation invalidates immediately and removes the kernel alarm"
     try std.testing.expectError(error.StaleOperation, loop.prepareCancel(operation));
     try drainKernelTimer(&loop);
     try std.testing.expect((try loop.takeExpired()) == null);
+}
+
+test "socket operations accept receive and send on a Unix socket" {
+    var address: linux.sockaddr.un = .{ .path = undefined };
+    @memset(&address.path, 0);
+    const name = try std.fmt.bufPrint(address.path[1..], "ouro-loop-{d}", .{linux.getpid()});
+    const address_len: linux.socklen_t = @intCast(
+        @offsetOf(linux.sockaddr.un, "path") + 1 + name.len,
+    );
+
+    const listener_result = linux.socket(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+    );
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(listener_result));
+    const listener: linux.fd_t = @intCast(listener_result);
+    defer _ = linux.close(listener);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(
+        listener,
+        @ptrCast(&address),
+        address_len,
+    )));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(listener, 1)));
+
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    const accept_handle = try loop.prepareAccept(listener);
+    _ = try loop.submit();
+
+    const client_result = linux.socket(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+    );
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(client_result));
+    const client: linux.fd_t = @intCast(client_result);
+    defer _ = linux.close(client);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.connect(
+        client,
+        @ptrCast(&address),
+        address_len,
+    )));
+
+    const accepted_dispatch = loop.dispatch(try loop.wait());
+    const accepted_completion = switch (accepted_dispatch) {
+        .socket => |completion| completion,
+        else => return error.UnexpectedCompletion,
+    };
+    try std.testing.expectEqual(accept_handle, accepted_completion.operation);
+    try std.testing.expectEqual(SocketOperationKind.accept, accepted_completion.kind);
+    try std.testing.expect(accepted_completion.result >= 0);
+    const accepted: linux.fd_t = @intCast(accepted_completion.result);
+    defer _ = linux.close(accepted);
+
+    var receive_buffer: [16]u8 = undefined;
+    const receive_handle = try loop.prepareRecv(accepted, &receive_buffer);
+    try std.testing.expectEqual(@as(usize, 4), linux.write(client, "ping", 4));
+    _ = try loop.submit();
+    const receive_completion = switch (loop.dispatch(try loop.wait())) {
+        .socket => |completion| completion,
+        else => return error.UnexpectedCompletion,
+    };
+    try std.testing.expectEqual(receive_handle, receive_completion.operation);
+    try std.testing.expectEqual(SocketOperationKind.recv, receive_completion.kind);
+    try std.testing.expectEqual(@as(i32, 4), receive_completion.result);
+    try std.testing.expectEqualStrings("ping", receive_buffer[0..4]);
+
+    const send_handle = try loop.prepareSend(accepted, "pong");
+    _ = try loop.submit();
+    const send_completion = switch (loop.dispatch(try loop.wait())) {
+        .socket => |completion| completion,
+        else => return error.UnexpectedCompletion,
+    };
+    try std.testing.expectEqual(send_handle, send_completion.operation);
+    try std.testing.expectEqual(SocketOperationKind.send, send_completion.kind);
+    try std.testing.expectEqual(@as(i32, 4), send_completion.result);
+    var response: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), linux.read(client, &response, response.len));
+    try std.testing.expectEqualStrings("pong", &response);
 }

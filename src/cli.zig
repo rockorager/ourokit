@@ -3,12 +3,18 @@ const std = @import("std");
 pub const Command = union(enum) {
     help,
     version,
+    reload: RuntimeTarget,
+    status: RuntimeTarget,
     run: Run,
     storybook: Storybook,
 };
 
+pub const RuntimeTarget = struct {
+    application_id: []const u8,
+};
+
 pub const Run = struct {
-    path: []const u8,
+    path: ?[]const u8 = null,
     vulkan: ?bool = null,
     exit_after_first_frame: bool = false,
 };
@@ -39,7 +45,9 @@ pub const Snapshot = struct {
 
 pub const usage =
     \\Usage:
-    \\  ouroctl run <application.lua> [--vulkan|--software] [--exit-after-first-frame]
+    \\  ouroctl run [application.lua|ouro.json] [--vulkan|--software] [--exit-after-first-frame]
+    \\  ouroctl reload <application-id>
+    \\  ouroctl status <application-id>
     \\  ouroctl storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
     \\  ouroctl storybook list <stories.lua> [--json]
     \\  ouroctl storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
@@ -56,10 +64,22 @@ pub fn parse(args: []const []const u8) !Command {
         return if (args.len == 2) .help else error.UnexpectedArgument;
     if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version"))
         return if (args.len == 2) .version else error.UnexpectedArgument;
+    if (std.mem.eql(u8, command, "reload"))
+        return .{ .reload = try parseRuntimeTarget(args[2..]) };
+    if (std.mem.eql(u8, command, "status"))
+        return .{ .status = try parseRuntimeTarget(args[2..]) };
     if (std.mem.eql(u8, command, "run")) return .{ .run = try parseRun(args[2..]) };
     if (std.mem.eql(u8, command, "storybook"))
         return .{ .storybook = try parseStorybook(args[2..]) };
     return error.UnknownCommand;
+}
+
+fn parseRuntimeTarget(args: []const []const u8) !RuntimeTarget {
+    if (args.len == 0) return error.ExpectedApplicationId;
+    if (args.len != 1) return error.UnexpectedArgument;
+    if (args[0].len == 0 or std.mem.startsWith(u8, args[0], "--"))
+        return error.ExpectedApplicationId;
+    return .{ .application_id = args[0] };
 }
 
 fn parseRun(args: []const []const u8) !Run {
@@ -85,7 +105,7 @@ fn parseRun(args: []const []const u8) !Run {
         }
     }
     result = .{
-        .path = path orelse return error.ExpectedApplicationPath,
+        .path = path,
         .vulkan = vulkan,
         .exit_after_first_frame = exit_after_first_frame,
     };
@@ -103,7 +123,7 @@ fn parseStorybook(args: []const []const u8) !Storybook {
 fn parseStorybookRun(args: []const []const u8) !StorybookRun {
     const run = try parseRun(args);
     return .{
-        .path = run.path,
+        .path = run.path orelse return error.ExpectedStorybookPath,
         .vulkan = run.vulkan,
         .exit_after_first_frame = run.exit_after_first_frame,
     };
@@ -195,6 +215,15 @@ test "CLI parses application and Storybook commands" {
     try std.testing.expectEqualDeep(Command{ .run = .{
         .path = "app.lua",
     } }, try parse(&.{ "ouroctl", "run", "app.lua" }));
+    try std.testing.expectEqualDeep(Command{ .run = .{} }, try parse(&.{ "ouroctl", "run" }));
+    try std.testing.expectEqualDeep(
+        Command{ .reload = .{ .application_id = "dev.example.app" } },
+        try parse(&.{ "ouroctl", "reload", "dev.example.app" }),
+    );
+    try std.testing.expectEqualDeep(
+        Command{ .status = .{ .application_id = "dev.example.app" } },
+        try parse(&.{ "ouroctl", "status", "dev.example.app" }),
+    );
     try std.testing.expectEqualDeep(Command{ .storybook = .{ .list = .{
         .path = "stories.lua",
         .json = true,
@@ -215,7 +244,8 @@ test "CLI parses application and Storybook commands" {
 }
 
 test "CLI rejects malformed commands and options" {
-    try std.testing.expectError(error.ExpectedApplicationPath, parse(&.{ "ouroctl", "run" }));
+    try std.testing.expectError(error.ExpectedStorybookPath, parse(&.{ "ouroctl", "storybook", "run" }));
+    try std.testing.expectError(error.ExpectedApplicationId, parse(&.{ "ouroctl", "reload" }));
     try std.testing.expectError(error.UnknownCommand, parse(&.{ "ouroctl", "wat" }));
     try std.testing.expectError(error.UnknownOption, parse(&.{ "ouroctl", "run", "app.lua", "--wat" }));
     try std.testing.expectError(error.DuplicateOption, parse(&.{

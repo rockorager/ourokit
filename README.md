@@ -118,6 +118,34 @@ state machines, `.varlink` interface parsing and schema validation, standard
 address parsing, and the mandatory `org.varlink.service` implementation. See
 [the Varlink transport and ownership contract](docs/varlink.md).
 
+Every running Ouro application also exposes a same-user Varlink runtime socket
+under `$XDG_RUNTIME_DIR`. `ouroctl` discovers it by application ID, and an
+explicit reload waits for the transaction to commit or fail:
+
+```sh
+ouroctl status dev.example.app
+ouroctl reload dev.example.app
+```
+
+See [transactional source reload](docs/hot-reload.md) for the generation and
+failure-preservation guarantees.
+
+Installed or socket-activated applications use `ouro.json` so identity is
+known before mutable Lua source is evaluated:
+
+```json
+{
+  "schema_version": 1,
+  "id": "dev.example.Contacts",
+  "entry": "app.lua"
+}
+```
+
+From the application directory, `ouroctl run` loads `./ouro.json` and validates
+that the returned `ouro.app` declaration has the same ID. It does not search
+parent directories. `ouroctl run app.lua` remains available as an explicit
+override.
+
 Native Linux builds enable Fontconfig by default. Minimal/headless builds and
 cross-compilation can omit that system capability with `-Dfontconfig=false`;
 deterministic shaping and rendering tests remain available.

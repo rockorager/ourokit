@@ -291,6 +291,51 @@ pub const Vm = struct {
         return handle;
     }
 
+    /// Candidate `ouro.app.run(context)` invocation. The sole return value is
+    /// retained so native declaration parsing can happen after any opaque
+    /// asynchronous yields complete.
+    pub fn spawnRetainedRun(
+        self: *Vm,
+        scope: task.ScopeHandle,
+        reference: c_int,
+        instance_id: []const u8,
+    ) !TaskHandle {
+        const handle = try self.reserveSlot();
+        var reserved = true;
+        errdefer if (reserved) self.releaseSlot(handle);
+        const main_top = c.lua_gettop(self.state);
+        errdefer c.lua_settop(self.state, main_top);
+        const thread = c.lua_newthread(self.state) orelse return error.LuaThreadCreationFailed;
+        if (c.lua_rawgeti(self.state, c.registry_index, reference) != c.type_function)
+            return error.LuaFunctionMissing;
+        c.lua_xmove(self.state, thread, 1);
+        c.lua_createtable(thread, 0, 1);
+        _ = c.lua_pushlstring(thread, instance_id.ptr, instance_id.len);
+        c.lua_setfield(thread, -2, "instance_id");
+        const scheduler_handle = try self.scheduler.createTask(scope);
+        var scheduler_created = true;
+        errdefer if (scheduler_created)
+            self.scheduler.discardRunnableTask(scheduler_handle) catch unreachable;
+        try self.ensureSchedulerMap(scheduler_handle.slot);
+        const thread_reference = c.luaL_ref(self.state, c.registry_index);
+        const slot = try self.activeSlot(handle);
+        slot.* = .{
+            .generation = handle.generation,
+            .active = true,
+            .thread = thread,
+            .thread_reference = thread_reference,
+            .scheduler_handle = scheduler_handle,
+            .scope = scope,
+            .timer_resource = .{ .vm = self, .task_handle = handle },
+            .resume_arguments = 1,
+            .retain_result = true,
+        };
+        self.scheduler_tasks[scheduler_handle.slot] = handle;
+        reserved = false;
+        scheduler_created = false;
+        return handle;
+    }
+
     /// Must only run after Scheduler.takeRunnable grants task-phase execution.
     pub fn resumeRunnable(
         self: *Vm,

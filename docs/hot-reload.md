@@ -22,7 +22,7 @@ A development application is launched from a source entry path rather than
 from source bytes detached from their origin:
 
 ```sh
-ouroctl run ./app.lua --dev
+ouroctl run
 ```
 
 After saving one or more files, the author requests a reload through either:
@@ -43,8 +43,9 @@ the same diagnostic is available to the in-app development surface and control
 client. Reload failure is not a process-fatal error.
 
 Production bundles use the same generation machinery with an immutable source
-provider. A production host need not expose a reload command or development
-control endpoint.
+provider. Every application still owns the runtime Varlink server; an immutable
+provider can expose status and future application-defined commands without
+granting source mutation.
 
 ## Lifetime model
 
@@ -305,14 +306,16 @@ An application may declare post-commit work explicitly:
 local ouro = require("ouro")
 return ouro.app {
   id = "dev.example.app",
-  start = function()
-    -- Spawn subscriptions, services, and other generation-owned effects here.
+  run = function(context)
+    return { windows = { ... } }
   end,
-  windows = { ... },
+  start = function()
+    -- Future post-commit, generation-owned effects live here.
+  end,
 }
 ```
 
-`start` is spawned only after the generation pointer and prepared UI commit. It
+`start` will be spawned only after the generation pointer and prepared UI commit. It
 inherits the generation root execution scope and may yield. At the first task
 safe point after commit, queued cancellation of the old generation is applied
 before the scheduler grants new `start` work, preventing overlapping old and
@@ -394,10 +397,11 @@ fixed `Application` and `Vm`. The implemented ownership boundary includes:
 
 The first runner integration deliberately accepts only an unchanged window-ID
 set. Added and removed windows still require transactional native-host
-preparation, and a public control transport still needs to wake the event loop
-and submit the in-process request. Module dependency revalidation before commit,
+preparation. The process-lifetime Varlink control transport now wakes the shared
+event loop and submits the same in-process request used by other producers.
+Module dependency revalidation before commit, stale-candidate supersession,
 persistent state, component-family identity, and post-commit lifecycle hooks
-also remain future slices below.
+remain future slices below.
 
 These changes belong in existing ownership modules. There is still no broad
 `runtime` module: `bundle` owns source, `lua` owns language generations and
@@ -405,29 +409,33 @@ bindings, UI owns prepared typed snapshots, and `app` orders their transaction.
 
 ## Development control interface
 
-Development mode exposes a per-user control endpoint under
-`$XDG_RUNTIME_DIR`, with permissions preventing access by other users. The
-existing sans-I/O Varlink implementation is suitable for the protocol. Its
-transport remains integrated with Ourokit's shared `io_uring` loop.
+Each running application exposes a PID-scoped per-user control endpoint under
+`$XDG_RUNTIME_DIR`. The server authenticates the Unix peer UID, uses Ourokit's
+bounded sans-I/O Varlink state machines, and submits accept, receive, and send
+operations through disjoint tags in the shared `io_uring` loop. `ouroctl`
+discovers sockets by calling `Status` and matching the application ID.
 
-The initial interface needs only:
+The built-in `dev.ourokit.runtime` interface is:
 
 ```text
+type Diagnostic (phase: string, source: string, message: string)
 Reload() -> (generation: int)
-error ReloadFailed (diagnostic: Diagnostic)
-Status() -> (activeGeneration: int, reloading: bool, diagnostic: ?Diagnostic)
+Status() -> (applicationId: string, activeGeneration: int,
+             reloading: bool, diagnostic: ?Diagnostic)
+error ReloadFailed(phase: string, source: string, message: string)
 ```
 
 The CLI discovers an app by application ID and calls this endpoint. The server
 keeps the `Reload` call pending without blocking the event loop until the newest
 coalesced request either commits or fails. Every caller waiting on that request
 receives the committed generation or the same structured `ReloadFailed` error,
-so `ouroctl reload` has useful shell exit status without polling. A request that
-arrives during preparation advances the requested source revision; an older
-candidate cannot satisfy it and is discarded before commit. `Status` remains
-available for development surfaces that observe reload without initiating it.
-The built-in command calls the same in-process request API and does not depend
-on the control socket.
+so `ouroctl reload` has useful shell exit status without polling. Requests that
+arrive during preparation remain queued for the next transaction and cannot be
+satisfied by the in-flight candidate. Discarding that now-stale in-flight
+candidate before commit remains a separate optimization and correctness polish.
+`Status` remains available for development surfaces that observe reload without
+initiating it. The future built-in command will call the same in-process request
+API and will not depend on the control socket.
 
 Automatic watching is optional policy on top. An inotify watcher may debounce
 changes and enqueue `Reload`, but it receives no privileged fast path and

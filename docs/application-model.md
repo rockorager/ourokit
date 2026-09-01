@@ -14,35 +14,45 @@ Wayring objects. The first working application-facing surface is:
 
 ```lua
 local ouro = require("ouro")
-local clicked = ouro.signal(false)
 
 return ouro.app {
   id = "dev.ouro.example",
-  windows = {
-    ouro.window {
-      id = "main",
-      title = "Example",
-      width = 480,
-      height = 320,
-      content = function()
-        ouro.column {
-          key = "content",
-          children = function()
-            ouro.label { key = "title", text = "Example" }
-            ouro.button {
-              key = "run",
-              label = clicked() and "Clicked" or "Run",
-              on_press = function()
-                clicked:set(not clicked())
-              end,
-            }
-          end,
-        }
-      end,
-    },
+  actions = {
+    ping = function() return "pong" end,
   },
+  run = function(context)
+    local clicked = ouro.signal(false)
+    return { windows = {
+      ouro.window {
+        id = "main",
+        title = "Example (" .. context.instance_id .. ")",
+        width = 480,
+        height = 320,
+        content = function()
+          ouro.column {
+            key = "content",
+            children = function()
+              ouro.label { key = "title", text = "Example" }
+              ouro.button {
+                key = "run",
+                label = clicked() and "Clicked" or "Run",
+                on_press = function()
+                  clicked:set(not clicked())
+                end,
+              }
+            end,
+          }
+        end,
+      },
+    } }
+  end,
 }
 ```
+
+Application actions belong to the headless application service and do not call
+`run` or initialize a native UI. A UI runtime invokes `run(context)` once for
+each candidate source generation. Reload therefore prepares a fresh run and
+atomically replaces the active run only after all returned windows validate.
 
 The public surface is deliberately small and its cross-language descriptor ABI
 remains unfrozen. Constructors are specific native decoders, not one generic

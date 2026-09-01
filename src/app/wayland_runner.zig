@@ -6,6 +6,7 @@ const SourceGeneration = source_generation.SourceGeneration;
 const source_reload_module = @import("source_reload.zig");
 const SourceReload = source_reload_module.SourceReload;
 const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
+const ControlServer = @import("control_server.zig").ControlServer;
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const WindowRuntimeConfig = @import("window_runtime.zig").Config;
 const core = @import("../core/root.zig");
@@ -241,6 +242,19 @@ fn runSourceWithFontconfig(
         options.application_window_capacity,
     );
     defer init.gpa.free(reload_targets);
+    var runtime_reload_requests: ReloadRequests = .{};
+    const reload_requests = options.reload_requests orelse &runtime_reload_requests;
+    var control: ControlServer = undefined;
+    try control.init(
+        init.gpa,
+        &loop,
+        init.minimal.environ,
+        provider.applicationId() orelse application.id,
+        source_reload.generation,
+        reload_requests,
+    );
+    defer shutdownControl(&control, &loop, &host, &source_reload);
+    std.log.info("runtime control socket: {s}", .{control.socketPath()});
     var disconnect_started = false;
     var active_reload_sequence: ?u64 = null;
     var queued_reload_sequence: ?u64 = null;
@@ -306,6 +320,8 @@ fn runSourceWithFontconfig(
         }
 
         // Task safe point: platform and CQE dispatch only changed state.
+        control.collectClosed();
+        try control.serviceRequests();
         try scheduler.applyQueuedCancellations();
         for (runtime_slots) |*slot| try slot.runtime.collectRetired();
         for (runtime_slots) |*slot| if (slot.runtime.ready)
@@ -321,6 +337,7 @@ fn runSourceWithFontconfig(
         }
         if (!disconnect_started and current_count == 0) {
             try host.beginShutdown();
+            try control.beginShutdown();
             disconnect_started = true;
         }
         try window_set.reconcile(current_storage[0..current_count]);
@@ -378,24 +395,25 @@ fn runSourceWithFontconfig(
             try dirty.complete(work);
         }
 
-        if (options.reload_requests) |requests| if (requests.take()) |sequence| {
+        if (reload_requests.take()) |sequence| {
             if (active_reload_sequence == null) {
-                if (beginReload(&source_reload, sequence))
+                if (try beginReload(&source_reload, &control, sequence))
                     active_reload_sequence = sequence;
             } else {
                 queued_reload_sequence = sequence;
             }
-        };
+        }
         if (active_reload_sequence) |sequence| {
             if (source_reload.takeCandidateFailure()) |err| {
-                reportReloadFailure(&source_reload, sequence, err);
+                try reportReloadFailure(&source_reload, &control, sequence, err);
                 active_reload_sequence = null;
             } else if (source_reload.candidateReady()) {
-                servicePreparedReload(
+                try servicePreparedReload(
                     &source_reload,
                     runtime_slots,
                     reload_targets,
                     &callbacks,
+                    &control,
                     sequence,
                 );
                 active_reload_sequence = null;
@@ -403,9 +421,10 @@ fn runSourceWithFontconfig(
         }
         if (active_reload_sequence == null) if (queued_reload_sequence) |sequence| {
             queued_reload_sequence = null;
-            if (beginReload(&source_reload, sequence))
+            if (try beginReload(&source_reload, &control, sequence))
                 active_reload_sequence = sequence;
         };
+        control.setReloading(active_reload_sequence != null or queued_reload_sequence != null);
         source_reload.beginRetirement() catch |err|
             std.log.err("could not begin source-generation retirement: {s}", .{@errorName(err)});
         _ = source_reload.collectRetired();
@@ -489,15 +508,18 @@ fn runSourceWithFontconfig(
 
         const serial_before_flush = window_set.changeSerial();
         try host.flush();
-        if (host.quiescent() and window_set.retainedCount() == 0 and
+        if (host.quiescent() and window_set.retainedCount() == 0 and control.quiescent() and
             !loop.hasPendingTimerKernelWork()) break;
         if (desired_changed or window_set.changeSerial() != serial_before_flush) continue;
-        if (host.quiescent() and !loop.hasPendingTimerKernelWork()) continue;
+        if (host.quiescent() and control.quiescent() and
+            !loop.hasPendingTimerKernelWork()) continue;
 
         const completion = try loop.wait();
         switch (loop.dispatch(completion)) {
             .file => |file| try source_reload.markFileCompleted(file),
-            .operation_cancel => {},
+            .socket => |socket| if (!(try control.dispatch(socket)))
+                return error.UnownedIoCompletion,
+            .operation_cancel => control.collectClosed(),
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
                 if (try host.dispatchTimer(timeout.operation)) continue;
                 try source_reload.markTimeoutCompleted(timeout.operation);
@@ -541,11 +563,16 @@ fn finishInitialBootstrap(
 /// Runs the complete disk-read, candidate-build, and application commit at the
 /// reconciliation safe point. Failure is deliberately non-fatal: the active
 /// generation and its last good frames remain authoritative.
-fn beginReload(reload: *SourceReload, request_sequence: u64) bool {
+fn beginReload(
+    reload: *SourceReload,
+    control: *ControlServer,
+    request_sequence: u64,
+) !bool {
     reload.prepare() catch |err| {
-        reportReloadFailure(reload, request_sequence, err);
+        try reportReloadFailure(reload, control, request_sequence, err);
         return false;
     };
+    control.setReloading(true);
     return true;
 }
 
@@ -554,8 +581,9 @@ fn servicePreparedReload(
     slots: []RuntimeSlot,
     target_storage: []source_reload_module.WindowTarget,
     callbacks: *lua.CallbackRegistry,
+    control: *ControlServer,
     request_sequence: u64,
-) void {
+) !void {
     var candidate_pending = true;
     defer if (candidate_pending) reload.discard();
 
@@ -563,7 +591,12 @@ fn servicePreparedReload(
     var target_count: usize = 0;
     for (candidate.application.windows) |window| {
         const slot = runtimeSlotForId(slots, window.declaration.id) orelse {
-            reportReloadFailure(reload, request_sequence, error.SourceWindowSetChanged);
+            try reportReloadFailure(
+                reload,
+                control,
+                request_sequence,
+                error.SourceWindowSetChanged,
+            );
             return;
         };
         target_storage[target_count] = .{
@@ -578,14 +611,15 @@ fn servicePreparedReload(
     }
     const targets = target_storage[0..target_count];
     reload.prepareApplication(targets) catch |err| {
-        reportReloadFailure(reload, request_sequence, err);
+        try reportReloadFailure(reload, control, request_sequence, err);
         return;
     };
     const committed = reload.commitApplication(targets, callbacks) catch |err| {
-        reportReloadFailure(reload, request_sequence, err);
+        try reportReloadFailure(reload, control, request_sequence, err);
         return;
     };
     candidate_pending = false;
+    try control.reloadSucceeded(request_sequence, committed.generation);
     std.log.info(
         "source reload request {d} committed generation {d}",
         .{ request_sequence, committed.generation },
@@ -594,9 +628,10 @@ fn servicePreparedReload(
 
 fn reportReloadFailure(
     reload: *const SourceReload,
+    control: *ControlServer,
     request_sequence: u64,
     err: anyerror,
-) void {
+) !void {
     if (reload.lastDiagnostic()) |diagnostic| {
         std.log.err(
             "source reload request {d} failed in {s} ({s}): {s}",
@@ -607,12 +642,53 @@ fn reportReloadFailure(
                 diagnostic.message,
             },
         );
+        try control.reloadFailed(request_sequence, diagnostic, err);
     } else {
         std.log.err(
             "source reload request {d} failed: {s}",
             .{ request_sequence, @errorName(err) },
         );
+        try control.reloadFailed(request_sequence, null, err);
     }
+}
+
+fn shutdownControl(
+    control: *ControlServer,
+    loop: *io_loop.Loop,
+    host: *platform.wayland.Host,
+    source_reload: *SourceReload,
+) void {
+    control.beginShutdown() catch |err|
+        std.debug.panic("could not stop runtime control server: {s}", .{@errorName(err)});
+    while (!control.quiescent()) {
+        _ = loop.submit() catch |err|
+            std.debug.panic("could not submit control shutdown: {s}", .{@errorName(err)});
+        const completion = loop.wait() catch |err|
+            std.debug.panic("could not wait for control shutdown: {s}", .{@errorName(err)});
+        switch (loop.dispatch(completion)) {
+            .file => |file| source_reload.markFileCompleted(file) catch |err|
+                std.debug.panic("could not drain source I/O: {s}", .{@errorName(err)}),
+            .socket => |socket| {
+                if (!(control.dispatch(socket) catch |err|
+                    std.debug.panic("could not drain control I/O: {s}", .{@errorName(err)})))
+                    std.debug.panic("unowned socket completion during shutdown", .{});
+            },
+            .operation_cancel => control.collectClosed(),
+            .timer_wakeup, .timer_control => while (loop.takeExpired() catch |err|
+                std.debug.panic("could not drain timer: {s}", .{@errorName(err)})) |timeout|
+            {
+                if (host.dispatchTimer(timeout.operation) catch |err|
+                    std.debug.panic("could not drain host timer: {s}", .{@errorName(err)})) continue;
+                source_reload.markTimeoutCompleted(timeout.operation) catch |err|
+                    std.debug.panic("could not drain source timer: {s}", .{@errorName(err)});
+            },
+            .foreign => host.dispatchOne(completion) catch |err|
+                std.debug.panic("could not drain host I/O: {s}", .{@errorName(err)}),
+            .stale => std.debug.panic("stale completion during control shutdown", .{}),
+        }
+        control.collectClosed();
+    }
+    control.deinit();
 }
 
 fn loadFont(

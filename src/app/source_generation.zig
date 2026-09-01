@@ -338,6 +338,7 @@ pub const SourceGeneration = struct {
             return err;
         };
         application_initialized = true;
+        try self.validateApplicationIdentity(diagnostic);
         self.application_ready = true;
         self.prepared_builds = allocator.alloc(
             lua.PreparedBuild,
@@ -391,9 +392,7 @@ pub const SourceGeneration = struct {
     }
 
     fn finishBootstrap(self: *SourceGeneration, diagnostic: ?*?lua.Diagnostic) !void {
-        var bootstrap = self.bootstrap orelse return error.ApplicationBootstrapMissing;
-        self.bootstrap = null;
-        var application = bootstrap.take() catch |err| {
+        const application_optional = self.bootstrap.?.advance("default") catch |err| {
             lua.recordDiagnosticError(
                 diagnostic,
                 self.allocator,
@@ -403,8 +402,14 @@ pub const SourceGeneration = struct {
             );
             return err;
         };
+        if (application_optional == null) return;
+        var application = application_optional.?;
+        self.bootstrap.?.deinit();
+        self.bootstrap = null;
         self.module_loader.?.freeze();
         errdefer application.deinit();
+        self.application = application;
+        try self.validateApplicationIdentity(diagnostic);
         const prepared_builds = self.allocator.alloc(
             lua.PreparedBuild,
             application.windows.len,
@@ -442,9 +447,24 @@ pub const SourceGeneration = struct {
             };
             initialized += 1;
         }
-        self.application = application;
         self.prepared_builds = prepared_builds;
         self.application_ready = true;
+    }
+
+    fn validateApplicationIdentity(
+        self: *SourceGeneration,
+        diagnostic: ?*?lua.Diagnostic,
+    ) !void {
+        const expected = self.snapshot.application_id orelse return;
+        if (std.mem.eql(u8, expected, self.application.id)) return;
+        lua.recordDiagnosticError(
+            diagnostic,
+            self.allocator,
+            .declaration,
+            self.snapshot.entry_name,
+            error.ApplicationIdMismatch,
+        );
+        return error.ApplicationIdMismatch;
     }
 
     pub fn deinit(self: *SourceGeneration) void {
@@ -456,6 +476,7 @@ pub const SourceGeneration = struct {
             self.allocator.free(self.prepared_builds);
         } else {
             std.debug.assert(self.vm.activeTaskCount() == 0);
+            if (self.bootstrap) |*bootstrap| bootstrap.deinit();
         }
         if (self.module_loader) |*loader| loader.deinit();
         self.vm.deinit();
@@ -517,6 +538,40 @@ test "source generation owns a named snapshot and application Lua state" {
     try std.testing.expectEqual(@as(usize, 0), generation.prepared_builds[0].descriptors().len);
 }
 
+test "source generation rejects Lua identity that differs from package metadata" {
+    const snapshot = try bundle.SourceSnapshot.initApplication(
+        std.testing.allocator,
+        "app.lua",
+        \\local ouro = require("ouro")
+        \\return ouro.app {
+        \\  id = "dev.ouro.wrong",
+        \\  windows = {
+        \\    ouro.window { id = "main", title = "Wrong", content = function() end },
+        \\  },
+        \\}
+    ,
+        "dev.ouro.expected",
+    );
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 2, 4);
+    defer scheduler.deinit();
+    try std.testing.expectError(
+        error.ApplicationIdMismatch,
+        SourceGeneration.create(
+            std.testing.allocator,
+            &scheduler,
+            &loop,
+            snapshot,
+            null,
+            .{ .node_capacity = 8 },
+            null,
+        ),
+    );
+}
+
 test "source generation bootstrap retains async module closure before becoming ready" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -524,12 +579,19 @@ test "source generation bootstrap retains async module closure before becoming r
         .sub_path = "app.lua",
         .data =
         \\local ouro = require("ouro")
-        \\local title = require("title")
         \\return ouro.app {
         \\  id = "dev.ouro.async-generation",
-        \\  windows = {
-        \\    ouro.window { id = "main", title = title, content = function() end },
-        \\  },
+        \\  actions = { ping = function() return "pong" end },
+        \\  run = function(context)
+        \\    local title = require("title")
+        \\    return { windows = {
+        \\      ouro.window {
+        \\        id = "main",
+        \\        title = title .. ":" .. context.instance_id,
+        \\        content = function() end,
+        \\      },
+        \\    } }
+        \\  end,
         \\}
         ,
     });
@@ -548,7 +610,11 @@ test "source generation bootstrap retains async module closure before becoming r
         "app.lua",
     });
     defer std.testing.allocator.free(path);
-    var provider = try bundle.SourceProvider.initDisk(std.testing.allocator, path);
+    var provider = try bundle.SourceProvider.initDiskApplication(
+        std.testing.allocator,
+        path,
+        "dev.ouro.async-generation",
+    );
     defer provider.deinit();
     const module_root = (try provider.openModuleRoot(std.testing.io)).?;
     defer module_root.close(std.testing.io);
@@ -588,9 +654,10 @@ test "source generation bootstrap retains async module closure before becoming r
         generation.application.id,
     );
     try std.testing.expectEqualStrings(
-        "Loaded asynchronously",
+        "Loaded asynchronously:default",
         generation.application.windows[0].declaration.title,
     );
+    try std.testing.expect(generation.application.hasActions());
     _ = try generation.vm.spawnApplication("require('late')");
     try std.testing.expectError(
         error.LuaRuntimeError,

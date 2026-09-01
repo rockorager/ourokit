@@ -21,8 +21,27 @@ fn execute(init: std.process.Init, command: cli.Command) !void {
     switch (command) {
         .help => try writeStdout(init, cli.usage),
         .version => try writeStdout(init, "ouroctl " ++ version ++ "\n"),
+        .status => |target| try statusApplication(init, target.application_id),
+        .reload => |target| try reloadApplication(init, target.application_id),
         .run => |options| {
-            var provider = try ourokit.bundle.SourceProvider.initDisk(init.gpa, options.path);
+            const path = options.path orelse ourokit.bundle.manifest_file_name;
+            var provider = if (std.mem.eql(
+                u8,
+                std.fs.path.basename(path),
+                ourokit.bundle.manifest_file_name,
+            )) blk: {
+                var manifest = ourokit.bundle.Manifest.load(init.io, init.gpa, path) catch |err| {
+                    if (options.path == null and err == error.FileNotFound)
+                        return error.ApplicationManifestNotFound;
+                    return err;
+                };
+                defer manifest.deinit();
+                break :blk try ourokit.bundle.SourceProvider.initDiskApplication(
+                    init.gpa,
+                    manifest.entry_path,
+                    manifest.id,
+                );
+            } else try ourokit.bundle.SourceProvider.initDisk(init.gpa, path);
             defer provider.deinit();
             var run_options: ourokit.app.WaylandRunOptions = .{
                 .exit_after_first_frame = options.exit_after_first_frame,
@@ -42,6 +61,61 @@ fn execute(init: std.process.Init, command: cli.Command) !void {
             },
             .list => |options| try listStories(init, options),
             .snapshot => |options| try snapshotStories(init, options),
+        },
+    }
+}
+
+fn statusApplication(init: std.process.Init, application_id: []const u8) !void {
+    var application = try ourokit.app.control_client.findApplication(
+        init.io,
+        init.gpa,
+        init.minimal.environ,
+        application_id,
+    );
+    defer application.deinit(init.gpa);
+    var output: std.Io.Writer.Allocating = .init(init.gpa);
+    defer output.deinit();
+    try output.writer.print("{s}\tgeneration {d}\t{s}\n", .{
+        application.status.application_id,
+        application.status.generation,
+        if (application.status.reloading) "reloading" else "idle",
+    });
+    if (application.status.diagnostic) |diagnostic| try output.writer.print(
+        "last reload failed in {s} ({s}): {s}\n",
+        .{ diagnostic.phase, diagnostic.source, diagnostic.message },
+    );
+    try writeStdout(init, output.written());
+}
+
+fn reloadApplication(init: std.process.Init, application_id: []const u8) !void {
+    var application = try ourokit.app.control_client.findApplication(
+        init.io,
+        init.gpa,
+        init.minimal.environ,
+        application_id,
+    );
+    defer application.deinit(init.gpa);
+    var result = try ourokit.app.control_client.reloadAt(init.gpa, application.path);
+    defer result.deinit(init.gpa);
+    switch (result) {
+        .committed => |generation| {
+            const message = try std.fmt.allocPrint(
+                init.gpa,
+                "reloaded {s} as generation {d}\n",
+                .{ application_id, generation },
+            );
+            defer init.gpa.free(message);
+            try writeStdout(init, message);
+        },
+        .failed => |diagnostic| {
+            const message = try std.fmt.allocPrint(
+                init.gpa,
+                "reload failed in {s} ({s}): {s}\n",
+                .{ diagnostic.phase, diagnostic.source, diagnostic.message },
+            );
+            defer init.gpa.free(message);
+            try std.Io.File.stderr().writeStreamingAll(init.io, message);
+            std.process.exit(1);
         },
     }
 }

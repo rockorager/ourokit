@@ -17,6 +17,7 @@ const Kind = union(enum) {
 pub const SourceProvider = struct {
     allocator: std.mem.Allocator,
     kind: Kind,
+    application_id: ?[]u8 = null,
 
     pub fn initDisk(
         allocator: std.mem.Allocator,
@@ -44,7 +45,31 @@ pub const SourceProvider = struct {
         };
     }
 
+    pub fn initDiskApplication(
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        application_id: []const u8,
+    ) !SourceProvider {
+        var provider = try initDisk(allocator, path);
+        errdefer provider.deinit();
+        provider.application_id = try allocator.dupe(u8, application_id);
+        return provider;
+    }
+
+    pub fn initEmbeddedApplication(
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        bytes: []const u8,
+        application_id: []const u8,
+    ) !SourceProvider {
+        var provider = try initEmbedded(allocator, name, bytes);
+        errdefer provider.deinit();
+        provider.application_id = try allocator.dupe(u8, application_id);
+        return provider;
+    }
+
     pub fn deinit(self: *SourceProvider) void {
+        if (self.application_id) |id| self.allocator.free(id);
         switch (self.kind) {
             .disk => |path| self.allocator.free(path),
             .embedded => |embedded| {
@@ -53,6 +78,10 @@ pub const SourceProvider = struct {
             },
         }
         self.* = undefined;
+    }
+
+    pub fn applicationId(self: *const SourceProvider) ?[]const u8 {
+        return self.application_id;
     }
 
     pub fn entryName(self: *const SourceProvider) []const u8 {
@@ -109,12 +138,18 @@ pub const SourceProvider = struct {
                     .limited(max_entry_bytes),
                 );
                 errdefer allocator.free(bytes);
-                break :blk try SourceSnapshot.initOwned(allocator, path, bytes);
+                break :blk try SourceSnapshot.initOwned(
+                    allocator,
+                    path,
+                    bytes,
+                    self.application_id,
+                );
             },
-            .embedded => |embedded| SourceSnapshot.init(
+            .embedded => |embedded| SourceSnapshot.initApplication(
                 allocator,
                 embedded.name,
                 embedded.bytes,
+                self.application_id,
             ),
         };
     }
@@ -127,6 +162,7 @@ pub const SourceSnapshot = struct {
     chunk_name: [:0]u8,
     bytes: []u8,
     content_hash: ContentHash,
+    application_id: ?[]u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -135,18 +171,35 @@ pub const SourceSnapshot = struct {
     ) !SourceSnapshot {
         const owned_bytes = try allocator.dupe(u8, bytes);
         errdefer allocator.free(owned_bytes);
-        return initOwned(allocator, entry_name, owned_bytes);
+        return initOwned(allocator, entry_name, owned_bytes, null);
+    }
+
+    pub fn initApplication(
+        allocator: std.mem.Allocator,
+        entry_name: []const u8,
+        bytes: []const u8,
+        application_id: ?[]const u8,
+    ) !SourceSnapshot {
+        const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
+        return initOwned(allocator, entry_name, owned_bytes, application_id);
     }
 
     fn initOwned(
         allocator: std.mem.Allocator,
         entry_name: []const u8,
         owned_bytes: []u8,
+        application_id: ?[]const u8,
     ) !SourceSnapshot {
         const owned_name = try allocator.dupe(u8, entry_name);
         errdefer allocator.free(owned_name);
         const chunk_name = try allocator.allocSentinel(u8, entry_name.len + 1, 0);
         errdefer allocator.free(chunk_name);
+        const owned_application_id = if (application_id) |id|
+            try allocator.dupe(u8, id)
+        else
+            null;
+        errdefer if (owned_application_id) |id| allocator.free(id);
         chunk_name[0] = '@';
         @memcpy(chunk_name[1..], entry_name);
         var content_hash: ContentHash = undefined;
@@ -157,10 +210,12 @@ pub const SourceSnapshot = struct {
             .chunk_name = chunk_name,
             .bytes = owned_bytes,
             .content_hash = content_hash,
+            .application_id = owned_application_id,
         };
     }
 
     pub fn deinit(self: *SourceSnapshot) void {
+        if (self.application_id) |id| self.allocator.free(id);
         self.allocator.free(self.bytes);
         self.allocator.free(self.chunk_name);
         self.allocator.free(self.entry_name);
