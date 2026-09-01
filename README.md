@@ -131,8 +131,9 @@ glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
 wrapping; unchanged constraints perform no layout acquisition or allocation.
 `ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.label` provide nested composition without
 application-managed numeric IDs or parent links. `ouro.button` composes a Box
-and Label using generated design tokens and retains hover, pressed, disabled,
-pointer-capture, and release-inside activation state in the widget layer. Its
+and Label using generated design tokens and retains hover, pressed, and disabled
+state in the widget layer. Buttons activate on press; release clears their
+pressed visual state. Its
 Box centers the constrained Label within the padded button bounds; this child
 placement remains separate from paragraph alignment. Button is not a renderer
 primitive. `ouro.listbox` and its direct `ouro.option` children provide a

@@ -866,7 +866,13 @@ pub const UiBuild = struct {
                 if (listbox.id == parent.id) break :blk listbox.selected == value;
             return luaError(state, "option listbox state is missing");
         };
-        const style: ListBoxStyle = .{ .idle = theme.surface_base, .selected = theme.selection_background };
+        var hovered = theme.content_primary;
+        hovered.a = 31;
+        const style: ListBoxStyle = .{
+            .idle = null,
+            .hovered = hovered,
+            .selected = theme.selection_background,
+        };
         self.append(.{
             .id = option_id,
             .parent = parent.id,
@@ -874,7 +880,7 @@ pub const UiBuild = struct {
                 .height = design.tokens.foundation.component_height_default,
                 .padding = .{ .left = design.tokens.foundation.spacing_2, .right = design.tokens.foundation.spacing_2 },
                 .alignment = .{ .horizontal = .minimum, .vertical = .center },
-                .background = if (selected) style.selected else style.idle,
+                .background = if (selected) style.selected else null,
                 .corner_radius = design.tokens.foundation.corner_radius_small,
             } },
         }) catch return luaError(state, "cannot append option descriptor");
@@ -889,7 +895,12 @@ pub const UiBuild = struct {
         self.append(.{
             .id = label_id,
             .parent = option_id,
-            .object = .{ .label = .{ .source = source, .color = theme.content_primary } },
+            .object = .{ .label = .{
+                .source = source,
+                .color = theme.content_primary,
+                .max_lines = 1,
+                .overflow = .ellipsis,
+            } },
         }) catch {
             sources.release(source) catch unreachable;
             return luaError(state, "cannot append option label descriptor");
@@ -981,7 +992,7 @@ pub const UiBuild = struct {
 
     fn emitBox(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.box expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "box requires a widget parent");
@@ -994,6 +1005,8 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box padding");
         const alignment = tableOptionalBoxAlignment(state, 1) orelse
             return luaError(state, "invalid box alignment");
+        const surface = tableOptionalSurface(state, 1, theme) orelse
+            return luaError(state, "box surface must be 'base' or 'raised'");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x626f78 ^ parent.id);
@@ -1005,6 +1018,7 @@ pub const UiBuild = struct {
                 .height = height.value,
                 .padding = .all(padding),
                 .alignment = alignment.value,
+                .background = surface.value,
             } },
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append box descriptor");
@@ -1293,6 +1307,22 @@ fn tableOptionalParagraphAlignment(
     if (std.mem.eql(u8, value, "end")) return .end;
     if (std.mem.eql(u8, value, "center")) return .center;
     if (std.mem.eql(u8, value, "justify")) return .justify;
+    return null;
+}
+
+const OptionalSurface = struct { value: ?@TypeOf(design.tokens.light.surface_base) };
+
+fn tableOptionalSurface(
+    state: *c.State,
+    table: c_int,
+    theme: design.tokens.Theme,
+) ?OptionalSurface {
+    const value_type = c.lua_getfield(state, table, "surface");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .{ .value = null };
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "base")) return .{ .value = theme.surface_base };
+    if (std.mem.eql(u8, value, "raised")) return .{ .value = theme.surface_raised };
     return null;
 }
 

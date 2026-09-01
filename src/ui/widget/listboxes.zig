@@ -3,7 +3,8 @@ const Color = @import("../../core/color.zig").Color;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const Style = struct { idle: Color, selected: Color };
+pub const Style = struct { idle: ?Color, hovered: Color, selected: Color };
+pub const VisualUpdate = struct { color: ?Color };
 pub const Selection = struct {
     listbox: instance.InstanceHandle,
     option: instance.InstanceHandle,
@@ -24,6 +25,7 @@ const Option = struct {
     target: instance.InstanceHandle = .invalid,
     value: i64 = 0,
     style: Style = undefined,
+    hovered: bool = false,
     active: bool = false,
     seen: bool = false,
 };
@@ -81,7 +83,11 @@ pub const ListBoxes = struct {
 
     pub fn setOption(self: *ListBoxes, owner: BuildOwnerHandle, listbox: instance.InstanceHandle, target: instance.InstanceHandle, value: i64, style: Style) !void {
         for (self.options) |*entry| if (entry.active and same(entry.target, target)) {
-            entry.* = .{ .owner = owner, .listbox = listbox, .target = target, .value = value, .style = style, .active = true, .seen = true };
+            entry.owner = owner;
+            entry.listbox = listbox;
+            entry.value = value;
+            entry.style = style;
+            entry.seen = true;
             return;
         };
         for (self.options) |*entry| if (!entry.active) {
@@ -159,20 +165,20 @@ pub const ListBoxes = struct {
         list.selected = selection.value;
     }
 
-    pub fn color(self: *const ListBoxes, target: instance.InstanceHandle) ?Color {
-        for (self.options) |entry| if (entry.active and same(entry.target, target)) {
-            const list = self.findList(entry.listbox) orelse return null;
-            return if (entry.value == list.selected) entry.style.selected else entry.style.idle;
+    pub fn setHovered(self: *ListBoxes, target: instance.InstanceHandle, hovered: bool) ?VisualUpdate {
+        for (self.options) |*entry| if (entry.active and same(entry.target, target)) {
+            if (entry.hovered == hovered) return null;
+            entry.hovered = hovered;
+            return .{ .color = self.optionColor(entry.*) };
         };
         return null;
     }
 
-    pub fn selectedOption(self: *const ListBoxes, listbox: instance.InstanceHandle) ?instance.InstanceHandle {
-        const list = self.findList(listbox) orelse return null;
-        for (self.options) |entry|
-            if (entry.active and same(entry.listbox, listbox) and entry.value == list.selected)
-                return entry.target;
-        return null;
+    pub fn currentColor(self: *const ListBoxes, target: instance.InstanceHandle) ?Color {
+        for (self.options) |entry| if (entry.active and same(entry.target, target)) {
+            return self.optionColor(entry);
+        };
+        unreachable;
     }
 
     pub fn optionSlots(self: *const ListBoxes) usize {
@@ -190,6 +196,13 @@ pub const ListBoxes = struct {
     fn findListMutable(self: *ListBoxes, target: instance.InstanceHandle) ?*ListBox {
         for (self.lists) |*entry| if (entry.active and same(entry.target, target)) return entry;
         return null;
+    }
+
+    fn optionColor(self: *const ListBoxes, option_value: Option) ?Color {
+        const list = self.findList(option_value.listbox).?;
+        if (option_value.value == list.selected) return option_value.style.selected;
+        if (option_value.hovered) return option_value.style.hovered;
+        return option_value.style.idle;
     }
 };
 
@@ -218,10 +231,20 @@ test "listbox moves through options without wrapping" {
     const list: instance.InstanceHandle = .{ .slot = 2, .generation = 1 };
     boxes.beginOwner(owner);
     try boxes.setList(owner, list, 1);
-    try boxes.setOption(owner, list, .{ .slot = 3, .generation = 1 }, 1, undefined);
-    try boxes.setOption(owner, list, .{ .slot = 4, .generation = 1 }, 2, undefined);
+    const style: Style = .{
+        .idle = null,
+        .hovered = Color.rgba(2, 0, 0, 255),
+        .selected = Color.rgba(3, 0, 0, 255),
+    };
+    const first: instance.InstanceHandle = .{ .slot = 3, .generation = 1 };
+    const second: instance.InstanceHandle = .{ .slot = 4, .generation = 1 };
+    try boxes.setOption(owner, list, first, 1, style);
+    try boxes.setOption(owner, list, second, 2, style);
     boxes.finishOwner(owner);
+    try std.testing.expectEqual(@as(u8, 3), boxes.currentColor(first).?.r);
+    try std.testing.expectEqual(@as(u8, 2), boxes.setHovered(second, true).?.color.?.r);
     try std.testing.expectEqual(@as(i64, 2), boxes.move(list, 1).?.value);
+    try std.testing.expectEqual(@as(u8, 3), boxes.currentColor(second).?.r);
     try std.testing.expectEqual(@as(i64, 1), boxes.move(list, -1).?.value);
     boxes.clear();
 }

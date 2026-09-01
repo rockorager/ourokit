@@ -596,6 +596,7 @@ pub const WindowRuntime = struct {
             if (!self.instances.isActive(target)) continue;
             try self.updateTextInputPointer(target, event);
             const activated_button = try self.updateButtonState(event);
+            try self.updateListBoxHover(event);
             if (try self.applyScrollEvent(target, event)) continue;
             var bound_target = target;
             var handler = self.pointer_bindings.get(bound_target);
@@ -648,13 +649,13 @@ pub const WindowRuntime = struct {
         const key = switch (event) {
             .enter => return,
             .leave => {
-                try self.applyButtonUpdate(self.buttons.release(null).visual);
+                try self.applyButtonUpdate(self.buttons.release());
                 return;
             },
             .key => |value| value,
         };
         if (key.translated.logical == .tab and key.state != .released) {
-            try self.applyButtonUpdate(self.buttons.release(null).visual);
+            try self.applyButtonUpdate(self.buttons.release());
             const previous = self.focus.current();
             _ = try self.focus.advance(
                 &self.instances,
@@ -735,22 +736,17 @@ pub const WindowRuntime = struct {
         if (key.translated.logical == .space) switch (key.state) {
             .pressed => {
                 const focused = self.focus.current() orelse return;
-                if (!self.buttons.contains(focused)) return;
+                if (!self.buttons.contains(focused) or !self.buttons.isEnabled(focused)) return;
                 try self.applyButtonUpdate(self.buttons.press(focused));
+                try self.spawnButtonCallback(callback_service, focused);
             },
-            .released => try self.activateButton(callback_service, self.buttons.releaseKeyboard()),
+            .released => try self.applyButtonUpdate(self.buttons.releaseKeyboard()),
             .repeated => {},
         } else if (key.translated.logical == .enter and key.state == .pressed) {
             const focused = self.focus.current() orelse return;
             if (!self.buttons.contains(focused) or !self.buttons.isEnabled(focused)) return;
             try self.spawnButtonCallback(callback_service, focused);
         }
-    }
-
-    fn activateButton(self: *WindowRuntime, callback_service: anytype, release: ui.widget.ButtonRelease) !void {
-        try self.applyButtonUpdate(release.visual);
-        const activated = release.activated orelse return;
-        try self.spawnButtonCallback(callback_service, activated);
     }
 
     fn spawnButtonCallback(
@@ -951,19 +947,15 @@ pub const WindowRuntime = struct {
                     switch (button_event.state) {
                         .pressed => {
                             const button = (try self.buttonAncestor(pointer.target)) orelse return null;
+                            if (!self.buttons.isEnabled(button)) return null;
                             const previous = self.focus.current();
                             _ = try self.focus.request(&self.instances, button);
                             try self.applyFocusVisual(previous, self.focus.current());
                             try self.applyButtonUpdate(self.buttons.press(button));
+                            return button;
                         },
                         .released => {
-                            const hovered = if (pointer.hovered) |target|
-                                try self.buttonAncestor(target)
-                            else
-                                null;
-                            const release = self.buttons.release(hovered);
-                            try self.applyButtonUpdate(release.visual);
-                            return release.activated;
+                            try self.applyButtonUpdate(self.buttons.release());
                         },
                     }
                 },
@@ -971,6 +963,28 @@ pub const WindowRuntime = struct {
             },
             .keyboard => {},
             .text_input => unreachable,
+        }
+        return null;
+    }
+
+    fn updateListBoxHover(self: *WindowRuntime, event: ui.input.Event) !void {
+        switch (event) {
+            .hover_enter => |hover| if (try self.listBoxOptionAncestor(hover.target)) |option|
+                try self.applyListBoxColor(option, self.listboxes.setHovered(option, true)),
+            .hover_leave => |hover| if (try self.listBoxOptionAncestor(hover.target)) |option|
+                try self.applyListBoxColor(option, self.listboxes.setHovered(option, false)),
+            else => {},
+        }
+    }
+
+    fn listBoxOptionAncestor(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+    ) !?ui.instance.InstanceHandle {
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |candidate| {
+            if (self.listboxes.option(candidate) != null) return candidate;
+            current = try self.instances.parentOf(candidate);
         }
         return null;
     }
@@ -1227,12 +1241,27 @@ pub const WindowRuntime = struct {
             const render = try self.instances.renderObject(option);
             var object = try self.tree.objectAt(render);
             if (object != .box) return error.ListBoxOptionRenderObjectMismatch;
-            object.box.background = self.listboxes.color(option);
+            object.box.background = self.listboxes.currentColor(option);
             object.box.outline_color = null;
             object.box.outline_width = 0;
             object.box.outline_gap = 0;
             try self.tree.update(render, object);
         }
+        self.frame_state.invalidatePaint();
+    }
+
+    fn applyListBoxColor(
+        self: *WindowRuntime,
+        option: ui.instance.InstanceHandle,
+        update: ?ui.widget.ListBoxVisualUpdate,
+    ) !void {
+        const next = update orelse return;
+        const render = try self.instances.renderObject(option);
+        var object = try self.tree.objectAt(render);
+        if (object != .box) return error.ListBoxOptionRenderObjectMismatch;
+        if (std.meta.eql(object.box.background, next.color)) return;
+        object.box.background = next.color;
+        try self.tree.update(render, object);
         self.frame_state.invalidatePaint();
     }
 
@@ -1278,12 +1307,18 @@ pub const WindowRuntime = struct {
         current: ?ui.instance.InstanceHandle,
     ) !void {
         if (previous) |target| if (self.instances.isActive(target))
-            try self.setFocusOutline(self.listboxes.selectedOption(target) orelse target, false);
-        if (current) |target| try self.setFocusOutline(
-            self.listboxes.selectedOption(target) orelse target,
-            true,
-        );
+            if (self.focusOutlineTarget(target)) |outline| try self.setFocusOutline(outline, false);
+        if (current) |target|
+            if (self.focusOutlineTarget(target)) |outline| try self.setFocusOutline(outline, true);
         try self.syncTextInputVisuals();
+    }
+
+    fn focusOutlineTarget(
+        self: *const WindowRuntime,
+        target: ui.instance.InstanceHandle,
+    ) ?ui.instance.InstanceHandle {
+        if (self.buttons.contains(target) or self.listboxes.contains(target)) return null;
+        return target;
     }
 
     fn syncTextInputVisuals(self: *WindowRuntime) !void {

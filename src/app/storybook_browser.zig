@@ -40,14 +40,16 @@ const browser_suffix =
     \\          children = function()
     \\            ouro.box {
     \\              key = "catalog-panel",
-    \\              width = 260,
+    \\              width = 280,
+    \\              padding = 12,
+    \\              surface = "raised",
     \\              children = function()
     \\                ouro.scroll {
     \\                  key = "catalog-scroll",
     \\                  children = function()
     \\                    ouro.column {
     \\                      key = "catalog",
-    \\                      gap = 8,
+    \\                      gap = 12,
     \\                      children = function()
     \\                        ouro.label {
     \\                          key = "catalog-title",
@@ -56,6 +58,7 @@ const browser_suffix =
     \\                        }
     \\                        ouro.listbox {
     \\                          key = "stories",
+    \\                          gap = 4,
     \\                          selected = current,
     \\                          on_select = function(index)
     \\                            selected:set(index)

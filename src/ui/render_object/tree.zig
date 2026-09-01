@@ -503,7 +503,9 @@ pub const Tree = struct {
                         value.corner_radius + expansion,
                     );
                 }
-                if (value.border_color != null or value.corner_radius != 0) {
+                if (value.border_color != null or
+                    (value.background != null and value.corner_radius != 0))
+                {
                     try builder.decoratedRectangle(
                         bounds,
                         value.background,

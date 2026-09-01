@@ -114,6 +114,8 @@ Declarative rows and columns expose that edge metadata as a contextual
 a direct row or column child. `cross_alignment = "start" | "center" | "end" |
 "stretch"` controls the container's cross axis; flex children use tight fitting
 and divide the remaining bounded main-axis space according to their factors.
+Boxes may opt into generated theme surfaces with `surface = "base" | "raised"`;
+omitting it leaves the Box transparent.
 
 Above it, the implemented instance reconciler consumes parent-before-child
 typed descriptor snapshots with stable numeric semantic IDs. It validates the
@@ -196,6 +198,10 @@ single-selection `ouro.listbox` composes a vertical Flex with direct
 `ouro.option` Box/Label children. It is one focus stop, uses integer values,
 and calls `on_select(value)` for pointer selection and Up/Down/Home/End navigation;
 the application remains the source of truth through the `selected` property.
+Options are transparent over their containing surface at rest and retain hover
+state across reconciliation. Hover follows Spectrum's menu treatment by
+overlaying primary content at 12% opacity; selected styling takes precedence
+while the pointer is over the selected option.
 Applications provide stable local keys but no numeric IDs or parent links.
 Their visual defaults come only from generated design tokens, with no Lua theme
 mirror. The Wayland example exercises this actual Lua-build path for both
@@ -208,9 +214,9 @@ emitting only Box and Label render objects. Button is not a render object. Its
 stable string key is normalized into domain-separated semantic IDs; duplicate
 or colliding IDs are rejected by snapshot validation rather than silently
 aliasing instances. A language-neutral widget registry retains enabled,
-hovered, pressed, and armed state across reconciliation. Pointer presses capture
-their target; release always reaches the captured Button, but activation occurs
-only for a left-button release inside that same enabled Button. CQE and Wayland
+hovered, pressed, and armed state across reconciliation. Enabled Buttons
+activate on left-button press; release clears the pressed visual regardless of
+the pointer's current position. CQE and Wayland
 dispatch still only enqueue state; callbacks spawn Lua tasks during the task
 phase. Labels pass valid UTF-8 through paragraph itemization, bidi, fallback
 shaping, and width-dependent wrapping.
@@ -219,8 +225,8 @@ Instances also retain focusability and deterministic descriptor traversal
 order. A window-local focus manager holds only a generation-checked instance
 handle. Tab and Shift-Tab move through enabled controls with wrapping during the
 input safe point, pointer presses request focus through the same policy, and
-focused Buttons paint the generated semantic focus-ring token without changing
-layout. Enter and Space activation enqueue the existing Button callback task;
+Button and ListBox focus currently has no visual outline. Enter and Space
+activate on key press and enqueue the existing Button callback task;
 Wayland dispatch never calls Lua directly.
 
 Editable text begins at a separate, platform-neutral model boundary. It owns

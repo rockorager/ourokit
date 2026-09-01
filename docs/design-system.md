@@ -7,7 +7,9 @@ typography sizes, palette values, and light/dark semantic mappings for surface,
 content, border, accent, focus, selection, and status roles.
 Accent defaults include distinct idle, hovered, and pressed semantic mappings;
 widget policy selects among those pre-resolved values rather than embedding
-interaction colors in Lua or renderer code.
+interaction colors in Lua or renderer code. Components may derive a state from
+those roles where the source design system defines component-level composition;
+ListBox hover, for example, overlays primary content at 12% opacity.
 
 `tools/design/generate_tokens.py` validates document shape, namespace, token
 name grammar, allowed types, non-negative dimensions, color encoding,
@@ -19,6 +21,17 @@ in output; `zig build generate-tokens` updates it.
 Runtime theme selection chooses one pre-resolved generated `Theme` value. It
 does not repeatedly traverse references. Any future Lua representation must be
 generated from the same source rather than manually mirrored.
+
+## Widget design guidance
+
+Before adding a widget state, visual role, or design token, consult the current
+Spectrum 2 component CSS, theme mappings, and design data for the equivalent
+control. Prefer its established component-level recipe over inventing a generic
+semantic token: interaction treatments may be composed from existing roles or
+palette values rather than exposed as global tokens. Keep Ourokit's public
+widget and token vocabulary deliberately smaller than Spectrum's, and record
+intentional behavioral or visual departures here or in the relevant widget
+documentation.
 
 Spectrum 2 informed category selection but was not imported wholesale. Exact
 source/version/license and exclusions are recorded in
