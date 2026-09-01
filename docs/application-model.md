@@ -235,8 +235,10 @@ Instances also retain focusability and deterministic descriptor traversal
 order. A window-local focus manager holds only a generation-checked instance
 handle. Tab and Shift-Tab move through enabled controls with wrapping during the
 input safe point, pointer presses request focus through the same policy, and
-Button and ListBox focus currently has no visual outline. Enter and Space
-activate on key press and enqueue the existing Button callback task;
+Controls currently add no visual focus outline. Text input focus changes its
+existing one-pixel border to the generated focus color without affecting layout,
+and remains visible through its caret. Enter and Space activate on key press and
+enqueue the existing Button callback task;
 Wayland dispatch never calls Lua directly.
 
 Editable text begins at a separate, platform-neutral model boundary. It owns

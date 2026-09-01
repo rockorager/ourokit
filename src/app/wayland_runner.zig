@@ -421,6 +421,7 @@ fn runSourceWithFontconfig(
                     theme.surface_base,
                     theme.accent_default,
                     theme.surface_base,
+                    theme.border_default,
                     theme.focus_ring,
                     signals,
                     &paragraph_sources,

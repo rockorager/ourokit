@@ -3,7 +3,6 @@ const clipboard_module = @import("clipboard.zig");
 const frame = @import("frame.zig");
 const text_input_coordinator = @import("text_input.zig");
 const core = @import("../core/root.zig");
-const design = @import("../design/root.zig");
 const lua = @import("../lua/root.zig");
 const lua_c = @import("../lua/c.zig");
 const platform = @import("../platform/window.zig");
@@ -58,6 +57,7 @@ pub const WindowRuntime = struct {
     surface_color: core.Color = undefined,
     accent_color: core.Color = undefined,
     content_color: core.Color = undefined,
+    border_color: core.Color = undefined,
     focus_color: core.Color = undefined,
     commands: []scene.Command = &.{},
     command_count: usize = 0,
@@ -80,6 +80,7 @@ pub const WindowRuntime = struct {
         surface: core.Color,
         accent: core.Color,
         content: core.Color,
+        border_color: core.Color,
         focus_color: core.Color,
         signals: *lua.Signals,
         paragraph_sources: *text.ParagraphSourceCache,
@@ -128,6 +129,7 @@ pub const WindowRuntime = struct {
             .surface_color = surface,
             .accent_color = accent,
             .content_color = content,
+            .border_color = border_color,
             .focus_color = focus_color,
             .commands = commands,
             .signals = signals,
@@ -1306,19 +1308,26 @@ pub const WindowRuntime = struct {
         previous: ?ui.instance.InstanceHandle,
         current: ?ui.instance.InstanceHandle,
     ) !void {
-        if (previous) |target| if (self.instances.isActive(target))
-            if (self.focusOutlineTarget(target)) |outline| try self.setFocusOutline(outline, false);
-        if (current) |target|
-            if (self.focusOutlineTarget(target)) |outline| try self.setFocusOutline(outline, true);
+        if (!self.initialized) return;
+        if (previous) |target| if (self.instances.isActive(target) and self.text_inputs.contains(target))
+            try self.setTextInputBorder(target, self.border_color);
+        if (current) |target| if (self.text_inputs.contains(target))
+            try self.setTextInputBorder(target, self.focus_color);
         try self.syncTextInputVisuals();
     }
 
-    fn focusOutlineTarget(
-        self: *const WindowRuntime,
+    fn setTextInputBorder(
+        self: *WindowRuntime,
         target: ui.instance.InstanceHandle,
-    ) ?ui.instance.InstanceHandle {
-        if (self.buttons.contains(target) or self.listboxes.contains(target)) return null;
-        return target;
+        color: core.Color,
+    ) !void {
+        const render = try self.instances.renderObject(target);
+        var object = try self.tree.objectAt(render);
+        if (object != .box) return error.TextInputRenderObjectMismatch;
+        if (std.meta.eql(object.box.border_color, color)) return;
+        object.box.border_color = color;
+        try self.tree.update(render, object);
+        self.frame_state.invalidatePaint();
     }
 
     fn syncTextInputVisuals(self: *WindowRuntime) !void {
@@ -1361,16 +1370,6 @@ pub const WindowRuntime = struct {
                 null;
             try self.tree.update(render, object);
         }
-    }
-
-    fn setFocusOutline(self: *WindowRuntime, target: ui.instance.InstanceHandle, visible: bool) !void {
-        const render = try self.instances.renderObject(target);
-        var object = try self.tree.objectAt(render);
-        if (object != .box) return;
-        object.box.outline_color = if (visible) self.focus_color else null;
-        object.box.outline_width = if (visible) design.tokens.foundation.focus_ring_width else 0;
-        object.box.outline_gap = if (visible) design.tokens.foundation.focus_ring_gap else 0;
-        try self.tree.update(render, object);
     }
 };
 
@@ -1508,7 +1507,6 @@ test "queued Tab navigation updates retained focus at the input safe point" {
         2,
     );
     try runtime.buttons.init(std.testing.allocator, 3);
-    runtime.focus_color = core.Color.rgba(20, 80, 220, 255);
     defer {
         runtime.buttons.clear();
         runtime.buttons.deinit();
@@ -1537,7 +1535,7 @@ test "queued Tab navigation updates retained focus at the input safe point" {
     try runtime.dispatchInput(&unused_vm);
     try std.testing.expectEqual(runtime.instances.handleForId(2).?, runtime.focus.current().?);
     const focused_render = try runtime.instances.renderObject(runtime.focus.current().?);
-    try std.testing.expectEqual(runtime.focus_color, (try runtime.tree.objectAt(focused_render)).box.outline_color.?);
+    try std.testing.expect((try runtime.tree.objectAt(focused_render)).box.outline_color == null);
 
     try runtime.routeKeyboard(.{ .key = .{
         .window = window,
@@ -1602,6 +1600,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
     runtime.initialized = true;
     runtime.window = window;
     runtime.paragraph_sources = &sources;
+    runtime.border_color = core.Color.rgba(90, 90, 90, 255);
     runtime.focus_color = core.Color.rgba(20, 80, 220, 255);
     defer {
         runtime.text_inputs.clear();
@@ -1621,7 +1620,12 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .{
             .id = 1,
             .parent = null,
-            .object = .{ .box = .{ .width = 160, .height = 32 } },
+            .object = .{ .box = .{
+                .width = 160,
+                .height = 32,
+                .border_color = runtime.border_color,
+                .border_width = 1,
+            } },
             .focusable = true,
         },
         .{ .id = 2, .parent = 1, .object = .{ .text_input = .{
@@ -1673,6 +1677,11 @@ test "text input protocol batches mutate retained sessions only at the input saf
         (try runtime.instances.rootRenderObject()).?,
         ui.layout.Constraints.tight(.{ .width = 160, .height = 32 }),
     );
+    try runtime.applyFocusVisual(null, target);
+    const focused_box = (try runtime.tree.objectAt(try runtime.instances.renderObject(target))).box;
+    try std.testing.expectEqual(runtime.focus_color, focused_box.border_color.?);
+    try std.testing.expectEqual(@as(f32, 1), focused_box.border_width);
+    try std.testing.expect(focused_box.outline_color == null);
 
     var commit = [_]u8{'!'};
     try runtime.routeTextInput(.{ .batch = .{
@@ -2086,6 +2095,7 @@ test "candidate source build prepares owned output without changing retained UI"
         core.Color.rgba(4, 5, 6, 255),
         core.Color.rgba(7, 8, 9, 255),
         core.Color.rgba(10, 11, 12, 255),
+        core.Color.rgba(13, 14, 15, 255),
         &active_signals,
         &paragraph_sources,
         &paragraphs,
