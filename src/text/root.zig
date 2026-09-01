@@ -13,6 +13,7 @@ const positioned_lines = @import("positioned_lines.zig");
 const script_itemization = @import("script_itemization.zig");
 const shape_cache = @import("shape_cache.zig");
 const shaped_paragraph = @import("shaped_paragraph.zig");
+const word_break = @import("word_break.zig");
 
 pub const has_fontconfig = api.has_fontconfig;
 pub const discovery = api.discovery;
@@ -52,6 +53,8 @@ pub const BreakKind = line_break.BreakKind;
 pub const LineBreak = line_break.LineBreak;
 pub const LineBreakAnalysis = line_break.LineBreakAnalysis;
 pub const analyzeLineBreaks = line_break.analyzeLineBreaks;
+pub const WordBreakAnalysis = word_break.Analysis;
+pub const analyzeWordBreaks = word_break.analyze;
 pub const ShapedItemizedRun = shaped_paragraph.ShapedItemizedRun;
 pub const ShapedParagraphs = shaped_paragraph.ShapedParagraphs;
 pub const shapeItemizedParagraphs = shaped_paragraph.shapeItemizedParagraphs;
@@ -65,6 +68,9 @@ pub const PositionedGlyph = positioned_lines.Glyph;
 pub const PositionedSpan = positioned_lines.Span;
 pub const CaretAffinity = positioned_lines.CaretAffinity;
 pub const VisualCaretDirection = positioned_lines.VisualDirection;
+pub const VerticalCaretDirection = positioned_lines.VerticalDirection;
+pub const VerticalCaretMove = positioned_lines.VerticalMove;
+pub const LineBoundary = positioned_lines.LineBoundary;
 pub const CaretStop = positioned_lines.CaretStop;
 pub const TextHitResult = positioned_lines.HitResult;
 pub const ByteRange = positioned_lines.ByteRange;
@@ -75,6 +81,10 @@ pub const positionLines = positioned_lines.positionLines;
 pub const ParagraphHandle = paragraph_cache.ParagraphHandle;
 pub const ParagraphLayout = paragraph_cache.ParagraphLayout;
 pub const ParagraphCache = paragraph_cache.ParagraphCache;
+
+test {
+    _ = word_break;
+}
 pub const ParagraphSourceHandle = paragraph_source_cache.ParagraphSourceHandle;
 pub const ParagraphSource = paragraph_source_cache.ParagraphSource;
 pub const ParagraphSourceCache = paragraph_source_cache.ParagraphSourceCache;

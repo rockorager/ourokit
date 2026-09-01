@@ -28,16 +28,26 @@ return ouro.app {
         title = "Example (" .. context.instance_id .. ")",
         width = 480,
         height = 320,
+        min_width = 360,
+        min_height = 240,
         content = function()
-          ouro.column {
-            key = "content",
+          ouro.row {
+            key = "layout",
+            cross_alignment = "stretch",
             children = function()
-              ouro.label { key = "title", text = "Example" }
-              ouro.button {
-                key = "run",
-                label = clicked() and "Clicked" or "Run",
-                on_press = function()
-                  clicked:set(not clicked())
+              ouro.box { key = "sidebar", width = 120, children = function() end }
+              ouro.column {
+                key = "content",
+                flex = 1,
+                children = function()
+                  ouro.label { key = "title", text = "Example" }
+                  ouro.button {
+                    key = "run",
+                    label = clicked() and "Clicked" or "Run",
+                    on_press = function()
+                      clicked:set(not clicked())
+                    end,
+                  }
                 end,
               }
             end,
@@ -71,9 +81,10 @@ remains unfrozen. Constructors are specific native decoders, not one generic
 - the platform owns Wayring objects and shared-memory buffers behind a native
   host boundary; declarations never contain protocol objects.
 
-Only mutable native policy is updated in place. Title is the first such field;
-initial dimensions apply at creation. A future layer-shell declaration will be
-a distinct type rather than a mode bit on an interchangeable generic window.
+Mutable title and minimum dimensions are updated in place; initial dimensions
+apply at creation. A zero minimum leaves that axis unconstrained. A future
+layer-shell declaration will be a distinct type rather than a mode bit on an
+interchangeable generic window.
 The reusable `app.runWayland` host implements this contract and owns the loop,
 scheduler, isolated VM, font/text caches, retained per-window UI, software
 renderer, and Wayland adapter. The executable example only embeds a Lua source
@@ -107,6 +118,14 @@ fixed-capacity tree caches unchanged constraint results, allocates paragraph
 work only when Label inputs or width change, separates paint-only from layout
 invalidation, builds ordered display lists, and performs reverse-order hit
 testing without Wayland or Lua.
+
+Declarative rows and columns expose that edge metadata as a contextual
+`flex = <positive integer>` child property. It is rejected anywhere except on
+a direct row or column child. `cross_alignment = "start" | "center" | "end" |
+"stretch"` controls the container's cross axis; flex children use tight fitting
+and divide the remaining bounded main-axis space according to their factors.
+Boxes may opt into generated theme surfaces with `surface = "base" | "raised"`;
+omitting it leaves the Box transparent.
 
 Above it, the implemented instance reconciler consumes parent-before-child
 typed descriptor snapshots with stable numeric semantic IDs. It validates the
@@ -184,7 +203,15 @@ existing transactional reconciler validates. It has no generic string `type`
 parser or application-facing descriptor escape hatch. The constructors maintain
 a bounded native parent stack: `ouro.row` and `ouro.column` normalize to Flex,
 `ouro.scroll` normalizes to a single-child Scroll viewport, `ouro.label`
-normalizes to Label, and `ouro.button` normalizes to Box plus Label.
+normalizes to Label, and `ouro.button` normalizes to Box plus Label. The
+single-selection `ouro.listbox` composes a vertical Flex with direct
+`ouro.option` Box/Label children. It is one focus stop, uses integer values,
+and calls `on_select(value)` for pointer selection and Up/Down/Home/End navigation;
+the application remains the source of truth through the `selected` property.
+Options are transparent over their containing surface at rest and retain hover
+state across reconciliation. Hover follows Spectrum's menu treatment by
+overlaying primary content at 12% opacity; selected styling takes precedence
+while the pointer is over the selected option.
 Applications provide stable local keys but no numeric IDs or parent links.
 Their visual defaults come only from generated design tokens, with no Lua theme
 mirror. The Wayland example exercises this actual Lua-build path for both
@@ -197,9 +224,9 @@ emitting only Box and Label render objects. Button is not a render object. Its
 stable string key is normalized into domain-separated semantic IDs; duplicate
 or colliding IDs are rejected by snapshot validation rather than silently
 aliasing instances. A language-neutral widget registry retains enabled,
-hovered, pressed, and armed state across reconciliation. Pointer presses capture
-their target; release always reaches the captured Button, but activation occurs
-only for a left-button release inside that same enabled Button. CQE and Wayland
+hovered, pressed, and armed state across reconciliation. Enabled Buttons
+activate on left-button press; release clears the pressed visual regardless of
+the pointer's current position. CQE and Wayland
 dispatch still only enqueue state; callbacks spawn Lua tasks during the task
 phase. Labels pass valid UTF-8 through paragraph itemization, bidi, fallback
 shaping, and width-dependent wrapping.
@@ -208,18 +235,40 @@ Instances also retain focusability and deterministic descriptor traversal
 order. A window-local focus manager holds only a generation-checked instance
 handle. Tab and Shift-Tab move through enabled controls with wrapping during the
 input safe point, pointer presses request focus through the same policy, and
-focused Buttons paint the generated semantic focus-ring token without changing
-layout. Enter and Space activation enqueue the existing Button callback task;
+Button and ListBox focus currently has no visual outline. Enter and Space
+activate on key press and enqueue the existing Button callback task;
 Wayland dispatch never calls Lua directly.
 
 Editable text begins at a separate, platform-neutral model boundary. It owns
-UTF-8 bytes, a directional anchor/extent selection, revisioning, and a cached
-index of uucode UAX #29 extended-grapheme boundaries. Replacement, selection,
-and logical previous/next movement therefore cannot split combining sequences,
-emoji ZWJ sequences, or regional-indicator pairs. The model deliberately does
-not call logical movement “left” or “right”: visual arrow movement requires the
-paragraph layer's future bidi-aware caret map. It also has no Lua, Wayland,
+UTF-8 bytes, a directional anchor/extent selection, revisioning, and cached
+indexes of Unicode extended-grapheme and default word boundaries. Replacement,
+selection, and movement therefore cannot split combining sequences, emoji ZWJ
+sequences, or regional-indicator pairs. Word movement and deletion use the
+Unicode 17 UAX #29 table rather than ASCII classes. Neutral editing intents keep
+platform key translation separate from model operations, while paragraph caret
+maps own visual bidi and vertical geometry. The model has no Lua, Wayland,
 renderer, shaping-cache, or IME ownership.
+
+Select-all is a local editing intent. The app clipboard coordinator represents
+paste as a scheduler-owned asynchronous resource and queues data-only platform
+actions. Its completion owns validated UTF-8 and retains the original
+generation-checked text-input target, which the input safe point validates
+again before editing. Scope cancellation queues platform cancellation without
+delivering racing data to disposed targets. Ctrl+V consumes Wayring selection
+offers through incrementally read `io_uring` pipes; unavailable, oversized, or
+invalid UTF-8 input is a no-op. Ctrl+C and Ctrl+X copy the normalized selection
+into an owned effect before returning from the input phase; only then may cut
+delete it. The Wayland adapter owns each resulting `wl_data_source` and serves
+UTF-8/plain-text send requests with short-write-aware `io_uring` operations.
+Wayland offer/source pipe I/O never runs in a blocking protocol callback or an
+in-process clipboard substitute.
+
+Primary-button text selection stores its bidi-aware anchor in the retained edit
+session. The input router keeps delivering motion to the captured instance even
+when hover moves over another instance or leaves the window; paragraph hit
+testing clamps that motion to a valid line and caret. Release clears the gesture
+without changing the selected anchor/extent. Gesture state never enters the
+render object or scene.
 
 Commands live in an authoritative registry independent of the retained render
 tree. Entries need stable semantic IDs plus revisioned invocation handles,

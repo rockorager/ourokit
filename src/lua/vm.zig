@@ -16,6 +16,7 @@ pub const Argument = union(enum) {
     number: f64,
     integer: i64,
     boolean: bool,
+    string: []const u8,
 };
 
 const YieldRequest = enum {
@@ -224,6 +225,7 @@ pub const Vm = struct {
             .number => |value| c.lua_pushnumber(thread, value),
             .integer => |value| c.lua_pushinteger(thread, value),
             .boolean => |value| c.lua_pushboolean(thread, @intFromBool(value)),
+            .string => |value| _ = c.lua_pushlstring(thread, value.ptr, value.len),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -267,6 +269,7 @@ pub const Vm = struct {
             .number => |value| c.lua_pushnumber(thread, value),
             .integer => |value| c.lua_pushinteger(thread, value),
             .boolean => |value| c.lua_pushboolean(thread, @intFromBool(value)),
+            .string => |value| _ = c.lua_pushlstring(thread, value.ptr, value.len),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -835,4 +838,37 @@ test "retained bootstrap task transfers exactly one result to the main state" {
     try std.testing.expectEqual(@as(c.Integer, 42), c.lua_tointegerx(vm.state, -1, &is_integer));
     try std.testing.expectEqual(@as(c_int, 1), is_integer);
     c.lua_settop(vm.state, -2);
+}
+
+test "callback string arguments preserve UTF-8 bytes and embedded NUL" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 1, 0);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+
+    _ = try vm.spawnApplication("function receive(value) received = value end");
+    try std.testing.expectEqual(
+        ResumeResult.completed,
+        try vm.resumeRunnable(scheduler.takeRunnable().?),
+    );
+    const value = "héllo\x00世界";
+    _ = try vm.spawnGlobal(
+        scheduler.application_scope,
+        "receive",
+        &.{.{ .string = value }},
+    );
+    try std.testing.expectEqual(
+        ResumeResult.completed,
+        try vm.resumeRunnable(scheduler.takeRunnable().?),
+    );
+    try std.testing.expectEqual(c.type_string, c.lua_getglobal(vm.state, "received"));
+    defer c.lua_settop(vm.state, -2);
+    var length: usize = 0;
+    const received = c.lua_tolstring(vm.state, -1, &length).?;
+    try std.testing.expectEqualStrings(value, received[0..length]);
 }

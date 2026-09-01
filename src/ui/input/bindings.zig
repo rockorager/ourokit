@@ -3,7 +3,7 @@ const Handle = @import("../../core/handle.zig").Handle;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const HandlerKind = enum { pointer, button };
+pub const HandlerKind = enum { pointer, button, text_input_change, listbox };
 
 pub const Handler = struct {
     id: Handle,

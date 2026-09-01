@@ -12,7 +12,10 @@ const PointerBindings = @import("../ui/input/bindings.zig").PointerBindings;
 const Buttons = @import("../ui/widget/buttons.zig").Buttons;
 const ButtonStyle = @import("../ui/widget/buttons.zig").Style;
 const TextInputs = @import("../ui/text_input/registry.zig").Registry;
+const TextInputValueMode = @import("../ui/text_input/registry.zig").ValueMode;
 const TextInputSession = @import("../ui/text_input/session.zig").Session;
+const ListBoxes = @import("../ui/widget/listboxes.zig").ListBoxes;
+const ListBoxStyle = @import("../ui/widget/listboxes.zig").Style;
 const render_types = @import("../ui/render_object/types.zig");
 const SemanticDescriptor = @import("../ui/semantics/snapshot.zig").Descriptor;
 const text = @import("../text/root.zig");
@@ -28,14 +31,18 @@ const PendingButton = struct {
     enabled: bool,
     style: ButtonStyle,
 };
+const PendingListBox = struct { id: u64, selected: i64 };
+const PendingOption = struct { id: u64, listbox_id: u64, value: i64, style: ListBoxStyle };
 
 const PendingTextInput = struct {
     target_id: u64,
     content_id: u64,
+    mode: TextInputValueMode,
+    behavior: @import("../ui/text_input/registry.zig").Behavior,
     session: ?TextInputSession,
 };
 
-const ParentKind = enum { box, flex, stack, scroll };
+const ParentKind = enum { box, flex, stack, scroll, listbox };
 const BuildParent = struct { id: u64, kind: ParentKind };
 
 pub const Argument = union(enum) {
@@ -83,6 +90,10 @@ pub const UiBuild = struct {
     pending_button_count: usize = 0,
     pending_text_inputs: [256]PendingTextInput = undefined,
     pending_text_input_count: usize = 0,
+    pending_listboxes: [256]PendingListBox = undefined,
+    pending_listbox_count: usize = 0,
+    pending_options: [256]PendingOption = undefined,
+    pending_option_count: usize = 0,
 
     pub fn init(
         self: *UiBuild,
@@ -120,6 +131,8 @@ pub const UiBuild = struct {
         try self.install("label", emitLabel);
         try self.install("button", emitButton);
         try self.install("text_input", emitTextInput);
+        try self.install("listbox", emitListBox);
+        try self.install("option", emitOption);
         try self.install("box", emitBox);
         try self.install("row", emitRow);
         try self.install("column", emitColumn);
@@ -164,6 +177,8 @@ pub const UiBuild = struct {
         self.theme_count = 0;
         self.pending_button_count = 0;
         self.pending_text_input_count = 0;
+        self.pending_listbox_count = 0;
+        self.pending_option_count = 0;
         self.active_owner = .{ .owners = owners, .handle = work.owner };
         defer self.active_owner = null;
         if (self.widget_theme) |theme| {
@@ -195,6 +210,8 @@ pub const UiBuild = struct {
             self.discardHandlers();
             self.pending_button_count = 0;
             self.discardPendingTextInputs();
+            self.pending_listbox_count = 0;
+            self.pending_option_count = 0;
             self.discardSources();
             if (self.signals) |signals| try signals.abortEvaluation(signal_owner, work.revision);
             if (status == c.yield) return error.LuaBuildYielded;
@@ -212,6 +229,7 @@ pub const UiBuild = struct {
         bindings: *PointerBindings,
         buttons: *Buttons,
         text_inputs: *TextInputs,
+        listboxes: *ListBoxes,
         tree: *instance.Tree,
         owner: build_owner.BuildOwnerHandle,
     ) !void {
@@ -238,6 +256,17 @@ pub const UiBuild = struct {
             if (tree.handleForId(pending.target_id) == null or
                 tree.handleForId(pending.content_id) == null)
                 return error.TextInputInstanceMissing;
+        for (self.pending_text_inputs[0..self.pending_text_input_count]) |*pending|
+            try text_inputs.prepareMount(
+                tree.handleForId(pending.target_id).?,
+                pending.mode,
+                &pending.session,
+            );
+        for (self.pending_listboxes[0..self.pending_listbox_count]) |pending|
+            if (tree.handleForId(pending.id) == null) return error.ListBoxInstanceMissing;
+        for (self.pending_options[0..self.pending_option_count]) |pending|
+            if (tree.handleForId(pending.id) == null or tree.handleForId(pending.listbox_id) == null)
+                return error.ListBoxOptionInstanceMissing;
         while (bindings.takeInactive(tree)) |old|
             callbacks.?.release(old.id) catch unreachable;
         while (bindings.takeOwner(owner)) |old|
@@ -268,6 +297,8 @@ pub const UiBuild = struct {
                 owner,
                 tree.handleForId(pending.target_id).?,
                 tree.handleForId(pending.content_id).?,
+                pending.mode,
+                pending.behavior,
                 &pending.session,
             );
         }
@@ -275,6 +306,24 @@ pub const UiBuild = struct {
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
         self.discardPendingTextInputs();
+        listboxes.beginOwner(owner);
+        for (self.pending_listboxes[0..self.pending_listbox_count]) |pending| try listboxes.setList(
+            owner,
+            tree.handleForId(pending.id).?,
+            pending.selected,
+        );
+        for (self.pending_options[0..self.pending_option_count]) |pending| try listboxes.setOption(
+            owner,
+            tree.handleForId(pending.listbox_id).?,
+            tree.handleForId(pending.id).?,
+            pending.value,
+            pending.style,
+        );
+        listboxes.finishOwner(owner);
+        self.pending_handler_count = 0;
+        self.pending_button_count = 0;
+        self.pending_listbox_count = 0;
+        self.pending_option_count = 0;
         self.discardSources();
     }
 
@@ -282,6 +331,8 @@ pub const UiBuild = struct {
         self.discardHandlers();
         self.pending_button_count = 0;
         self.discardPendingTextInputs();
+        self.pending_listbox_count = 0;
+        self.pending_option_count = 0;
         self.discardSources();
     }
 
@@ -298,7 +349,11 @@ pub const UiBuild = struct {
         if (descriptors.len > prepared.descriptor_storage.len or
             self.semantic_count > prepared.semantic_storage.len or
             self.pending_handler_count > prepared.handlers.len or
-            self.pending_button_count > prepared.prepared_buttons.len)
+            self.pending_button_count > prepared.prepared_buttons.len or
+            self.pending_text_input_count > prepared.text_inputs.len)
+            return error.PreparedBuildCapacityExceeded;
+        if (self.pending_listbox_count > prepared.prepared_listboxes.len or
+            self.pending_option_count > prepared.prepared_options.len)
             return error.PreparedBuildCapacityExceeded;
         var semantic_text_count: usize = 0;
         for (self.semantic_storage[0..self.semantic_count]) |descriptor| {
@@ -347,9 +402,35 @@ pub const UiBuild = struct {
             .style = source.style,
         };
         prepared.button_count = self.pending_button_count;
+        for (
+            self.pending_text_inputs[0..self.pending_text_input_count],
+            prepared.text_inputs[0..self.pending_text_input_count],
+        ) |*source, *destination| {
+            destination.* = .{
+                .target_id = source.target_id,
+                .content_id = source.content_id,
+                .mode = source.mode,
+                .behavior = source.behavior,
+                .session = source.session,
+            };
+            source.session = null;
+        }
+        prepared.text_input_count = self.pending_text_input_count;
         prepared.owns_shapes = self.sources_staged;
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
+        self.pending_text_input_count = 0;
+        for (self.pending_listboxes[0..self.pending_listbox_count], prepared.prepared_listboxes[0..self.pending_listbox_count]) |source, *destination|
+            destination.* = .{ .id = source.id, .selected = source.selected };
+        prepared.listbox_count = self.pending_listbox_count;
+        for (self.pending_options[0..self.pending_option_count], prepared.prepared_options[0..self.pending_option_count]) |source, *destination|
+            destination.* = .{ .id = source.id, .listbox_id = source.listbox_id, .value = source.value, .style = source.style };
+        prepared.option_count = self.pending_option_count;
+        prepared.owns_shapes = self.sources_staged;
+        self.pending_handler_count = 0;
+        self.pending_button_count = 0;
+        self.pending_listbox_count = 0;
+        self.pending_option_count = 0;
         self.sources_staged = false;
     }
 
@@ -520,6 +601,8 @@ pub const UiBuild = struct {
             "height",
             design.tokens.foundation.component_height_large,
         ) orelse return luaError(state, "invalid button height");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
         const button_id = semanticId(key, 0x627574746f6e ^ parent.id);
         const label_id = semanticId(key, 0x6c6162656c ^ button_id);
         const style: ButtonStyle = .{
@@ -543,8 +626,7 @@ pub const UiBuild = struct {
                 .corner_radius = design.tokens.foundation.corner_radius_medium,
             } },
             .focusable = enabled,
-            .parent_data = declarativeParentData(self, state, 1) orelse
-                return luaError(state, "invalid button position"),
+            .parent_data = parent_data,
         }) catch return luaError(state, "cannot append button descriptor");
 
         const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
@@ -608,7 +690,14 @@ pub const UiBuild = struct {
             return luaError(state, "ouro.text_input expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "text_input requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "text_input key is required");
-        const initial = tableString(state, 1, "text") orelse return luaError(state, "text_input text is required");
+        const controlled = tableOptionalString(state, 1, "text") orelse
+            return luaError(state, "text_input text must be a string");
+        const uncontrolled = tableOptionalString(state, 1, "default_text") orelse
+            return luaError(state, "text_input default_text must be a string");
+        if (controlled.present == uncontrolled.present)
+            return luaError(state, "text_input requires exactly one of text or default_text");
+        const mode: TextInputValueMode = if (controlled.present) .controlled else .uncontrolled;
+        const initial = if (controlled.present) controlled.value else uncontrolled.value;
         const width = tableOptionalExtent(state, 1, "width", 240) orelse
             return luaError(state, "invalid text_input width");
         const height = tableOptionalExtent(
@@ -617,6 +706,10 @@ pub const UiBuild = struct {
             "height",
             design.tokens.foundation.component_height_default,
         ) orelse return luaError(state, "invalid text_input height");
+        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
+            return luaError(state, "text_input enabled must be a boolean");
+        const read_only = tableOptionalBoolean(state, 1, "read_only", false) orelse
+            return luaError(state, "text_input read_only must be a boolean");
         const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id);
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
         self.append(.{
@@ -625,16 +718,19 @@ pub const UiBuild = struct {
             .object = .{ .box = .{
                 .width = width,
                 .height = height,
-                .padding = .all(design.tokens.foundation.spacing_2),
+                .padding = .{
+                    .left = design.tokens.foundation.spacing_2,
+                    .right = design.tokens.foundation.spacing_2,
+                },
                 .alignment = .{ .vertical = .center },
                 .background = theme.surface_base,
                 .border_color = theme.border_default,
                 .border_width = design.tokens.foundation.border_width_default,
                 .corner_radius = design.tokens.foundation.corner_radius_small,
             } },
-            .focusable = true,
-            .parent_data = declarativeParentData(self, state, 1) orelse
-                return luaError(state, "invalid text_input position"),
+            .focusable = enabled,
+            .parent_data = declarativeParentData(self, state, 1) catch |err|
+                return luaError(state, parentDataErrorMessage(err)),
         }) catch return luaError(state, "cannot append text_input descriptor");
 
         const sources = self.label_sources orelse return luaError(state, "text service unavailable");
@@ -650,7 +746,7 @@ pub const UiBuild = struct {
             .parent = target_id,
             .object = .{ .text_input = .{
                 .source = source,
-                .color = theme.content_primary,
+                .color = if (enabled) theme.content_primary else theme.content_secondary,
                 .selection_color = theme.selection_background,
                 .caret_color = theme.content_primary,
                 .selection_start = initial.len,
@@ -668,6 +764,8 @@ pub const UiBuild = struct {
         self.pending_text_inputs[self.pending_text_input_count] = .{
             .target_id = target_id,
             .content_id = content_id,
+            .mode = mode,
+            .behavior = .{ .enabled = enabled, .read_only = read_only },
             .session = TextInputSession.init(self.label_sources.?.allocator, initial) catch
                 return luaError(state, "cannot create text_input session"),
         };
@@ -678,7 +776,153 @@ pub const UiBuild = struct {
             .role = .text_field,
             .key = key,
             .label = initial,
+            .enabled = enabled,
         }) catch return luaError(state, "cannot append text_input semantics");
+
+        const callback_type = c.lua_getfield(state, 1, "on_change");
+        defer c.lua_settop(state, -2);
+        if (callback_type == c.type_nil) return 0;
+        if (callback_type != c.type_function)
+            return luaError(state, "text_input on_change must be a function");
+        if (self.pending_handler_count == self.pending_handlers.len)
+            return luaError(state, "input handler capacity exceeded");
+        c.lua_pushvalue(state, -1);
+        self.pending_handlers[self.pending_handler_count] = .{
+            .id = target_id,
+            .reference = c.luaL_ref(state, c.registry_index),
+            .kind = .text_input_change,
+        };
+        self.pending_handler_count += 1;
+        return 0;
+    }
+
+    fn emitListBox(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.listbox expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "listbox requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "listbox key is required");
+        const selected = tableRequiredInteger(state, 1, "selected") orelse
+            return luaError(state, "listbox selected must be an integer");
+        const gap = tableOptionalExtent(state, 1, "gap", design.tokens.foundation.spacing_1) orelse
+            return luaError(state, "invalid listbox gap");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
+        const id = semanticId(key, 0x6c697374626f78 ^ parent.id);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .flex = .{ .axis = .vertical, .gap = gap, .cross_axis_alignment = .stretch } },
+            .focusable = true,
+            .parent_data = parent_data,
+        }) catch return luaError(state, "cannot append listbox descriptor");
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .listbox,
+            .key = key,
+        }) catch return luaError(state, "cannot append listbox semantics");
+        if (self.pending_listbox_count == self.pending_listboxes.len)
+            return luaError(state, "listbox capacity exceeded");
+        self.pending_listboxes[self.pending_listbox_count] = .{ .id = id, .selected = selected };
+        self.pending_listbox_count += 1;
+
+        const callback_type = c.lua_getfield(state, 1, "on_select");
+        if (callback_type != c.type_function) {
+            c.lua_settop(state, -2);
+            return luaError(state, "listbox on_select must be a function");
+        }
+        if (self.pending_handler_count == self.pending_handlers.len) {
+            c.lua_settop(state, -2);
+            return luaError(state, "pointer handler capacity exceeded");
+        }
+        c.lua_pushvalue(state, -1);
+        self.pending_handlers[self.pending_handler_count] = .{
+            .id = id,
+            .reference = c.luaL_ref(state, c.registry_index),
+            .kind = .listbox,
+        };
+        self.pending_handler_count += 1;
+        c.lua_settop(state, -2);
+        return self.emitChildren(state, .{ .id = id, .kind = .listbox }, "listbox children function is required");
+    }
+
+    fn emitOption(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.option expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "option requires a listbox parent");
+        if (parent.kind != .listbox) return luaError(state, "option requires a direct listbox parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "option key is required");
+        const label = tableString(state, 1, "label") orelse return luaError(state, "option label is required");
+        const value = tableRequiredInteger(state, 1, "value") orelse
+            return luaError(state, "option value must be an integer");
+        const option_id = semanticId(key, 0x6f7074696f6e ^ parent.id);
+        const label_id = semanticId(key, 0x6c6162656c ^ option_id);
+        const selected = blk: {
+            for (self.pending_listboxes[0..self.pending_listbox_count]) |listbox|
+                if (listbox.id == parent.id) break :blk listbox.selected == value;
+            return luaError(state, "option listbox state is missing");
+        };
+        var hovered = theme.content_primary;
+        hovered.a = 31;
+        const style: ListBoxStyle = .{
+            .idle = null,
+            .hovered = hovered,
+            .selected = theme.selection_background,
+        };
+        self.append(.{
+            .id = option_id,
+            .parent = parent.id,
+            .object = .{ .box = .{
+                .height = design.tokens.foundation.component_height_default,
+                .padding = .{ .left = design.tokens.foundation.spacing_2, .right = design.tokens.foundation.spacing_2 },
+                .alignment = .{ .horizontal = .minimum, .vertical = .center },
+                .background = if (selected) style.selected else null,
+                .corner_radius = design.tokens.foundation.corner_radius_small,
+            } },
+        }) catch return luaError(state, "cannot append option descriptor");
+        const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
+        const source = sources.acquire(.{
+            .utf8 = label,
+            .language = "und",
+            .logical_size = design.tokens.foundation.typography_body,
+            .candidates = self.label_candidates,
+            .configuration_revision = self.label_configuration_revision,
+        }) catch return luaError(state, "cannot retain option label");
+        self.append(.{
+            .id = label_id,
+            .parent = option_id,
+            .object = .{ .label = .{
+                .source = source,
+                .color = theme.content_primary,
+                .max_lines = 1,
+                .overflow = .ellipsis,
+            } },
+        }) catch {
+            sources.release(source) catch unreachable;
+            return luaError(state, "cannot append option label descriptor");
+        };
+        self.sources_staged = true;
+        if (self.pending_option_count == self.pending_options.len)
+            return luaError(state, "listbox option capacity exceeded");
+        self.pending_options[self.pending_option_count] = .{
+            .id = option_id,
+            .listbox_id = parent.id,
+            .value = value,
+            .style = style,
+        };
+        self.pending_option_count += 1;
+        self.appendSemantic(.{
+            .id = option_id,
+            .parent = parent.id,
+            .role = .option,
+            .key = key,
+            .label = label,
+            .selected = selected,
+        }) catch return luaError(state, "cannot append option semantics");
         return 0;
     }
 
@@ -701,6 +945,8 @@ pub const UiBuild = struct {
             return luaError(state, "invalid label overflow");
         if (overflow == .ellipsis and max_lines_value == 0)
             return luaError(state, "label ellipsis requires max_lines");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
         const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
         const source = sources.acquire(.{
             .utf8 = value,
@@ -720,10 +966,7 @@ pub const UiBuild = struct {
                 .max_lines = if (max_lines_value == 0) null else max_lines_value,
                 .overflow = overflow,
             } },
-            .parent_data = declarativeParentData(self, state, 1) orelse {
-                sources.release(source) catch unreachable;
-                return luaError(state, "invalid label position");
-            },
+            .parent_data = parent_data,
         }) catch {
             sources.release(source) catch unreachable;
             return luaError(state, "cannot append label descriptor");
@@ -749,7 +992,7 @@ pub const UiBuild = struct {
 
     fn emitBox(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.box expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "box requires a widget parent");
@@ -762,6 +1005,10 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box padding");
         const alignment = tableOptionalBoxAlignment(state, 1) orelse
             return luaError(state, "invalid box alignment");
+        const surface = tableOptionalSurface(state, 1, theme) orelse
+            return luaError(state, "box surface must be 'base' or 'raised'");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x626f78 ^ parent.id);
         self.append(.{
             .id = id,
@@ -771,9 +1018,9 @@ pub const UiBuild = struct {
                 .height = height.value,
                 .padding = .all(padding),
                 .alignment = alignment.value,
+                .background = surface.value,
             } },
-            .parent_data = declarativeParentData(self, state, 1) orelse
-                return luaError(state, "invalid box position"),
+            .parent_data = parent_data,
         }) catch return luaError(state, "cannot append box descriptor");
         self.appendSemantic(.{
             .id = id,
@@ -792,13 +1039,14 @@ pub const UiBuild = struct {
         const parent = self.currentParent() orelse return luaError(state, "theme requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "theme key is required");
         const theme = tableTheme(state, 1) orelse return luaError(state, "invalid theme color_scheme");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x7468656d65 ^ parent.id);
         self.append(.{
             .id = id,
             .parent = parent.id,
             .object = .{ .box = .{ .background = theme.surface_base } },
-            .parent_data = declarativeParentData(self, state, 1) orelse
-                return luaError(state, "invalid theme position"),
+            .parent_data = parent_data,
         }) catch return luaError(state, "cannot append theme descriptor");
         self.appendSemantic(.{
             .id = id,
@@ -840,13 +1088,14 @@ pub const UiBuild = struct {
         const key = tableString(state, 1, "key") orelse return luaError(state, "scroll key is required");
         const axis = tableOptionalAxis(state, 1, "axis", .vertical) orelse
             return luaError(state, "invalid scroll axis");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x7363726f6c6c ^ parent.id);
         self.append(.{
             .id = id,
             .parent = parent.id,
             .object = .{ .scroll = .{ .axis = axis } },
-            .parent_data = declarativeParentData(self, state, 1) orelse
-                return luaError(state, "invalid scroll position"),
+            .parent_data = parent_data,
         }) catch return luaError(state, "cannot append scroll descriptor");
         self.appendSemantic(.{
             .id = id,
@@ -901,6 +1150,14 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
     const key = tableString(state, 1, "key") orelse return luaError(state, "container key is required");
     const gap = tableOptionalExtent(state, 1, "gap", design.tokens.foundation.spacing_2) orelse
         return luaError(state, "invalid container gap");
+    const cross_alignment = tableOptionalCrossAxisAlignment(
+        state,
+        1,
+        "cross_alignment",
+        .start,
+    ) orelse return luaError(state, "invalid container cross_alignment");
+    const parent_data = declarativeParentData(self, state, 1) catch |err|
+        return luaError(state, parentDataErrorMessage(err));
     const id = semanticId(
         key,
         (if (axis == .horizontal) @as(u64, 0x726f77) else @as(u64, 0x636f6c756d6e)) ^ parent.id,
@@ -911,11 +1168,10 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         .object = .{ .flex = .{
             .axis = axis,
             .main_axis_size = .min,
-            .cross_axis_alignment = .start,
+            .cross_axis_alignment = cross_alignment,
             .gap = gap,
         } },
-        .parent_data = declarativeParentData(self, state, 1) orelse
-            return luaError(state, "invalid container position"),
+        .parent_data = parent_data,
     }) catch return luaError(state, "cannot append container descriptor");
     self.appendSemantic(.{
         .id = id,
@@ -958,6 +1214,22 @@ fn tableString(state: *c.State, table: c_int, field: [*:0]const u8) ?[]const u8 
     const value = string(state, -1);
     c.lua_settop(state, -2);
     return value;
+}
+
+const OptionalString = struct {
+    present: bool,
+    value: []const u8 = "",
+};
+
+fn tableOptionalString(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+) ?OptionalString {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .{ .present = false };
+    return .{ .present = true, .value = string(state, -1) orelse return null };
 }
 
 fn tableOptionalExtent(
@@ -1038,6 +1310,22 @@ fn tableOptionalParagraphAlignment(
     return null;
 }
 
+const OptionalSurface = struct { value: ?@TypeOf(design.tokens.light.surface_base) };
+
+fn tableOptionalSurface(
+    state: *c.State,
+    table: c_int,
+    theme: design.tokens.Theme,
+) ?OptionalSurface {
+    const value_type = c.lua_getfield(state, table, "surface");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .{ .value = null };
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "base")) return .{ .value = theme.surface_base };
+    if (std.mem.eql(u8, value, "raised")) return .{ .value = theme.surface_raised };
+    return null;
+}
+
 fn tableOptionalParagraphOverflow(
     state: *c.State,
     table: c_int,
@@ -1068,6 +1356,23 @@ fn tableOptionalAxis(
     return null;
 }
 
+fn tableOptionalCrossAxisAlignment(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: render_types.CrossAxisAlignment,
+) ?render_types.CrossAxisAlignment {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "start")) return .start;
+    if (std.mem.eql(u8, value, "center")) return .center;
+    if (std.mem.eql(u8, value, "end")) return .end;
+    if (std.mem.eql(u8, value, "stretch")) return .stretch;
+    return null;
+}
+
 /// A zero default represents an omitted optional positive integer. Explicit
 /// zero and negative values remain invalid.
 fn tableOptionalPositiveInteger(
@@ -1085,15 +1390,52 @@ fn tableOptionalPositiveInteger(
     return @intCast(value);
 }
 
-fn declarativeParentData(self: *const UiBuild, state: *c.State, table: c_int) ?render_types.ParentData {
-    const parent = self.currentParent() orelse return null;
+fn declarativeParentData(
+    self: *const UiBuild,
+    state: *c.State,
+    table: c_int,
+) !render_types.ParentData {
+    const parent = self.currentParent() orelse return error.WidgetParentMissing;
+    const flex = try tableOptionalFlexFactor(state, table);
     return switch (parent.kind) {
-        .box, .flex, .scroll => .none,
+        .flex => if (flex) |factor| .{ .flex = .{ .factor = factor } } else .none,
+        .box, .scroll, .listbox => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
         .stack => stack: {
-            const x = tableOptionalExtent(state, table, "x", 0) orelse return null;
-            const y = tableOptionalExtent(state, table, "y", 0) orelse return null;
+            if (flex != null) return error.FlexRequiresRowOrColumnParent;
+            const x = tableOptionalExtent(state, table, "x", 0) orelse return error.InvalidPosition;
+            const y = tableOptionalExtent(state, table, "y", 0) orelse return error.InvalidPosition;
             break :stack .{ .stack = .{ .x = x, .y = y } };
         },
+    };
+}
+
+fn tableOptionalFlexFactor(state: *c.State, table: c_int) !?u16 {
+    const value_type = c.lua_getfield(state, table, "flex");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return null;
+    var is_number: c_int = 0;
+    const value = c.lua_tointegerx(state, -1, &is_number);
+    if (is_number == 0 or value <= 0 or value > std.math.maxInt(u16))
+        return error.InvalidFlexFactor;
+    return @intCast(value);
+}
+
+fn tableRequiredInteger(state: *c.State, table: c_int, field: [*:0]const u8) ?i64 {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type != c.type_number) return null;
+    var is_number: c_int = 0;
+    const value = c.lua_tointegerx(state, -1, &is_number);
+    return if (is_number != 0) value else null;
+}
+
+fn parentDataErrorMessage(err: anyerror) [*:0]const u8 {
+    return switch (err) {
+        error.InvalidFlexFactor => "flex must be a positive integer",
+        error.FlexRequiresRowOrColumnParent => "flex requires a direct row or column parent",
+        error.InvalidPosition => "invalid widget position",
+        error.WidgetParentMissing => "widget parent is missing",
+        else => "invalid widget parent data",
     };
 }
 
@@ -1181,7 +1523,13 @@ test "declarative text input separates focus identity from editable render conte
         \\  ouro.column {
         \\    key = "content",
         \\    children = function()
-        \\      ouro.text_input { key = "query", text = "Initial", width = 200 }
+        \\      ouro.text_input {
+        \\        key = "query",
+        \\        text = "Initial",
+        \\        width = 200,
+        \\        read_only = true,
+        \\        on_change = function(value) changed = value end,
+        \\      }
         \\    end,
         \\  }
         \\end
@@ -1192,12 +1540,35 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(@as(usize, 5), descriptors.len);
     try std.testing.expect(descriptors[3].object == .box);
     try std.testing.expect(descriptors[3].focusable);
+    try std.testing.expectEqual(@as(f32, 0), descriptors[3].object.box.padding.top);
+    try std.testing.expectEqual(@as(f32, 0), descriptors[3].object.box.padding.bottom);
+    try std.testing.expectEqual(
+        design.tokens.foundation.spacing_2,
+        descriptors[3].object.box.padding.left,
+    );
     try std.testing.expect(descriptors[4].object == .text_input);
     try std.testing.expectEqual(descriptors[3].id, descriptors[4].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_text_input_count);
+    try std.testing.expectEqual(.controlled, ui.pending_text_inputs[0].mode);
+    try std.testing.expect(ui.pending_text_inputs[0].behavior.read_only);
+    try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
+    try std.testing.expectEqual(.text_input_change, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(.text_field, ui.semanticDescriptors()[1].role);
     try std.testing.expectEqualStrings("Initial", ui.semanticDescriptors()[1].label);
-    ui.rollbackHandlers();
+    var prepared: PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, state, &sources, 5, 64);
+    defer prepared.deinit();
+    try ui.capturePrepared(&prepared, descriptors);
+    try std.testing.expectEqual(@as(usize, 1), prepared.text_input_count);
+    try std.testing.expectEqual(.controlled, prepared.text_inputs[0].mode);
+    try std.testing.expect(prepared.text_inputs[0].behavior.read_only);
+    try std.testing.expectEqualStrings(
+        "Initial",
+        prepared.text_inputs[0].session.?.model.text(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), prepared.handler_count);
+    try std.testing.expectEqual(.text_input_change, prepared.handlers[0].kind);
+    prepared.reset();
     try std.testing.expectEqual(@as(usize, 0), sources.count());
     try owners.complete(work);
     try fonts.release(font);
@@ -1205,6 +1576,79 @@ test "declarative text input separates focus identity from editable render conte
     try scheduler.applyQueuedCancellations();
     try owners.collectRetired();
     try scheduler.destroyScope(window_scope);
+}
+
+test "declarative flex is contextual child data and containers expose cross alignment" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+    const BuildOwners = build_owner.BuildOwners;
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 4);
+    c.lua_setglobal(state, "ouro");
+
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, window_scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var storage: [5]instance.Descriptor = undefined;
+    var semantic_storage: [3]SemanticDescriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    try ui.attachSemantics(&semantic_storage);
+    ui.enableDeclarativeWidgets(design.tokens.light);
+    try execute(state,
+        \\function build()
+        \\  ouro.row {
+        \\    key = "layout",
+        \\    cross_alignment = "stretch",
+        \\    children = function()
+        \\      ouro.box { key = "fixed", width = 40, children = function() end }
+        \\      ouro.box { key = "expanded", flex = 2, children = function() end }
+        \\    end,
+        \\  }
+        \\end
+    );
+    var cycle = owners.beginCycle();
+    const work = (try cycle.take()).?;
+    const descriptors = try ui.build(&owners, work, "build", &.{});
+    try std.testing.expectEqual(@as(usize, 5), descriptors.len);
+    try std.testing.expectEqual(
+        render_types.CrossAxisAlignment.stretch,
+        descriptors[2].object.flex.cross_axis_alignment,
+    );
+    try std.testing.expectEqual(@as(u16, 2), descriptors[4].parent_data.flex.factor);
+    try std.testing.expectEqual(render_types.FlexFit.tight, descriptors[4].parent_data.flex.fit);
+    ui.rollbackHandlers();
+    try owners.complete(work);
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
+    try owners.collectRetired();
+    try scheduler.destroyScope(window_scope);
+}
+
+test "declarative flex rejects invalid factors and non-flex parents" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 1);
+    c.lua_pushinteger(state, 1);
+    c.lua_setfield(state, -2, "flex");
+    var storage: [1]instance.Descriptor = undefined;
+    var ui: UiBuild = .{ .state = state, .storage = &storage };
+    ui.parent_stack[0] = .{ .id = 1, .kind = .box };
+    ui.parent_count = 1;
+    try std.testing.expectError(
+        error.FlexRequiresRowOrColumnParent,
+        declarativeParentData(&ui, state, -1),
+    );
+
+    ui.parent_stack[0].kind = .flex;
+    c.lua_pushinteger(state, 0);
+    c.lua_setfield(state, -2, "flex");
+    try std.testing.expectError(error.InvalidFlexFactor, declarativeParentData(&ui, state, -1));
 }
 
 test "declarative Lua label flows through layout scene and software glyph cache" {

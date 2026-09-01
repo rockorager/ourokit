@@ -1,9 +1,11 @@
 const std = @import("std");
+const clipboard_module = @import("clipboard.zig");
 const frame = @import("frame.zig");
 const text_input_coordinator = @import("text_input.zig");
 const core = @import("../core/root.zig");
 const design = @import("../design/root.zig");
 const lua = @import("../lua/root.zig");
+const lua_c = @import("../lua/c.zig");
 const platform = @import("../platform/window.zig");
 const scene = @import("../scene/root.zig");
 const task = @import("../task/root.zig");
@@ -49,6 +51,7 @@ pub const WindowRuntime = struct {
     router: ui.input.Router = undefined,
     pointer_bindings: ui.input.PointerBindings = undefined,
     buttons: ui.widget.Buttons = undefined,
+    listboxes: ui.widget.ListBoxes = .{},
     text_inputs: ui.text_input.Registry = undefined,
     focus: ui.focus.Manager = .{},
     semantics: ui.semantics.Snapshot = undefined,
@@ -64,6 +67,7 @@ pub const WindowRuntime = struct {
     paragraph_sources: *text.ParagraphSourceCache = undefined,
     paragraphs: *text.ParagraphCache = undefined,
     dirty_windows: ?*ui.instance.ReconcileQueue = null,
+    clipboard: ?*clipboard_module.Coordinator = null,
     reconciling: bool = false,
     text_input_commit_permitted: bool = true,
 
@@ -97,6 +101,8 @@ pub const WindowRuntime = struct {
         errdefer self.pointer_bindings.deinit();
         try self.buttons.init(allocator, config.node_capacity);
         errdefer self.buttons.deinit();
+        try self.listboxes.init(allocator, config.node_capacity);
+        errdefer self.listboxes.deinit();
         try self.text_inputs.init(allocator, config.node_capacity);
         errdefer self.text_inputs.deinit();
         try self.semantics.init(allocator, config.node_capacity, config.semantic_text_capacity);
@@ -115,6 +121,7 @@ pub const WindowRuntime = struct {
             .router = self.router,
             .pointer_bindings = self.pointer_bindings,
             .buttons = self.buttons,
+            .listboxes = self.listboxes,
             .text_inputs = self.text_inputs,
             .focus = .{},
             .semantics = self.semantics,
@@ -137,12 +144,17 @@ pub const WindowRuntime = struct {
         self.build_owners.setDirtySink(.{ .context = self, .notify = notifyDirtyWindow });
     }
 
+    pub fn setClipboardCoordinator(self: *WindowRuntime, clipboard: *clipboard_module.Coordinator) void {
+        self.clipboard = clipboard;
+    }
+
     pub fn deinit(self: *WindowRuntime) void {
         if (!self.initialized) return;
         std.debug.assert(self.pointer_bindings.takeAny() == null);
         self.allocator.free(self.commands);
         self.semantics.deinit();
         self.text_inputs.deinit();
+        self.listboxes.deinit();
         self.buttons.deinit();
         self.pointer_bindings.deinit();
         self.router.deinit();
@@ -162,6 +174,7 @@ pub const WindowRuntime = struct {
         if (!self.initialized) return;
         lua_ui.clearHandlers(&self.pointer_bindings);
         self.buttons.clear();
+        self.listboxes.clear();
         self.text_inputs.clear();
         self.focus.clear();
         while (self.router.takeEvent()) |event| self.router.releaseEvent(event);
@@ -226,6 +239,8 @@ pub const WindowRuntime = struct {
         )) return error.PointerBindingCapacityExceeded;
         if (prepared.button_count > self.buttons.availableForOwner(self.root_owner))
             return error.ButtonCapacityExceeded;
+        if (prepared.text_input_count > self.text_inputs.availableForOwner(self.root_owner))
+            return error.TextInputCapacityExceeded;
         for (prepared.handlers[0..prepared.handler_count]) |handler|
             if (!containsDescriptorId(prepared.descriptors(), handler.id))
                 return error.PointerHandlerInstanceMissing;
@@ -234,6 +249,55 @@ pub const WindowRuntime = struct {
                 if (descriptor.object != .box) return error.ButtonRenderObjectMismatch;
             } else {
                 return error.ButtonInstanceMissing;
+            }
+        }
+        for (prepared.text_inputs[0..prepared.text_input_count]) |*input| {
+            if (!containsDescriptorId(prepared.descriptors(), input.target_id) or
+                !containsDescriptorId(prepared.descriptors(), input.content_id))
+                return error.TextInputInstanceMissing;
+            if (self.instances.handleForId(input.target_id)) |target| {
+                try self.text_inputs.prepareMount(target, input.mode, &input.session);
+                if (!self.text_inputs.contains(target)) continue;
+                const retained = try self.text_inputs.session(target);
+                const candidate = &input.session.?.model;
+                const descriptor_index = descriptorIndexForId(
+                    prepared.descriptors(),
+                    input.content_id,
+                ).?;
+                var object = &prepared.descriptor_storage[descriptor_index].object;
+                if (object.* != .text_input) return error.TextInputRenderObjectMismatch;
+                if (input.mode == .uncontrolled or
+                    std.mem.eql(u8, retained.model.text(), candidate.text()))
+                {
+                    const retained_content = try self.text_inputs.content(target);
+                    const retained_object = try self.tree.objectAt(
+                        try self.instances.renderObject(retained_content),
+                    );
+                    if (retained_object != .text_input)
+                        return error.TextInputRenderObjectMismatch;
+                    try self.paragraph_sources.validateRetain(retained_object.text_input.source);
+                    try self.paragraph_sources.retain(retained_object.text_input.source);
+                    self.paragraph_sources.release(object.text_input.source) catch unreachable;
+                    object.text_input.source = retained_object.text_input.source;
+                    object.text_input.selection_start = retained_object.text_input.selection_start;
+                    object.text_input.selection_end = retained_object.text_input.selection_end;
+                    object.text_input.caret_offset = retained_object.text_input.caret_offset;
+                    object.text_input.caret_affinity = retained_object.text_input.caret_affinity;
+                    object.text_input.show_caret = retained_object.text_input.show_caret;
+                    object.text_input.preedit = retained_object.text_input.preedit;
+                    object.text_input.preedit_color = if (object.text_input.preedit != null)
+                        object.text_input.caret_color
+                    else
+                        null;
+                } else {
+                    const selection = candidate.selection;
+                    const range = selection.range();
+                    object.text_input.selection_start = range.start;
+                    object.text_input.selection_end = range.end;
+                    object.text_input.caret_offset = selection.extent;
+                    object.text_input.caret_affinity = selection.extent_affinity;
+                    object.text_input.show_caret = optionalSameHandle(self.focus.current(), target);
+                }
             }
         }
         const plan = try self.instances.prepareReconcile(prepared.descriptors());
@@ -295,8 +359,36 @@ pub const WindowRuntime = struct {
             button.enabled,
         );
         self.buttons.finishOwner(self.root_owner);
+        self.listboxes.removeInactive(&self.instances);
+        self.listboxes.beginOwner(self.root_owner);
+        for (prepared.prepared_listboxes[0..prepared.listbox_count]) |listbox| self.listboxes.setList(
+            self.root_owner,
+            self.instances.handleForId(listbox.id).?,
+            listbox.selected,
+        ) catch unreachable;
+        for (prepared.prepared_options[0..prepared.option_count]) |option| self.listboxes.setOption(
+            self.root_owner,
+            self.instances.handleForId(option.listbox_id).?,
+            self.instances.handleForId(option.id).?,
+            option.value,
+            option.style,
+        ) catch unreachable;
+        self.listboxes.finishOwner(self.root_owner);
         for (0..self.buttons.slotCount()) |index|
             if (self.buttons.visualAt(index)) |visual| self.applyButtonUpdate(visual) catch unreachable;
+        self.refreshListBoxVisuals() catch unreachable;
+
+        self.text_inputs.removeInactive(&self.instances);
+        self.text_inputs.beginOwner(self.root_owner);
+        for (prepared.text_inputs[0..prepared.text_input_count]) |*input| self.text_inputs.mountPrepared(
+            self.root_owner,
+            self.instances.handleForId(input.target_id).?,
+            self.instances.handleForId(input.content_id).?,
+            input.mode,
+            input.behavior,
+            &input.session,
+        ) catch unreachable;
+        self.text_inputs.finishOwner(self.root_owner);
 
         self.signals.disposeOwner(.{
             .owners = &self.build_owners,
@@ -363,11 +455,13 @@ pub const WindowRuntime = struct {
             };
             self.semantics.stage(lua_ui.semanticDescriptors());
             self.buttons.removeInactive(&self.instances);
+            self.listboxes.removeInactive(&self.instances);
             self.text_inputs.removeInactive(&self.instances);
             lua_ui.commitBindings(
                 &self.pointer_bindings,
                 &self.buttons,
                 &self.text_inputs,
+                &self.listboxes,
                 &self.instances,
                 work.owner,
             ) catch |err| {
@@ -385,9 +479,10 @@ pub const WindowRuntime = struct {
             };
             self.semantics.commitStaged();
             self.focus.reconcile(&self.instances);
-            try self.applyFocusVisual(null, self.focus.current());
             for (0..self.buttons.slotCount()) |index|
                 if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
+            try self.refreshListBoxVisuals();
+            try self.applyFocusVisual(null, self.focus.current());
             try self.build_owners.complete(work);
         }
         try self.prepareFrame(self.output_scale);
@@ -426,6 +521,8 @@ pub const WindowRuntime = struct {
     pub fn textInputStatus(self: *WindowRuntime) !?TextInputStatus {
         const focused = self.focus.current() orelse return null;
         if (!self.text_inputs.contains(focused)) return null;
+        const behavior = try self.text_inputs.getBehavior(focused);
+        if (!behavior.enabled or behavior.read_only) return null;
         const session = try self.text_inputs.session(focused);
         var state = text_input_coordinator.surroundingState(session);
         const content = try self.text_inputs.content(focused);
@@ -475,9 +572,14 @@ pub const WindowRuntime = struct {
             if (event == .text_input) {
                 const focused = self.focus.current() orelse continue;
                 if (!self.text_inputs.contains(focused)) continue;
+                const behavior = try self.text_inputs.getBehavior(focused);
+                if (!behavior.enabled or behavior.read_only) continue;
                 self.text_input_commit_permitted = event.text_input.serial_matches_state;
-                if (try (try self.text_inputs.session(focused)).apply(event.text_input.batch))
-                    try self.syncTextInputVisuals();
+                const session = try self.text_inputs.session(focused);
+                const model_revision = session.model.revision;
+                if (try session.apply(event.text_input.batch)) try self.syncTextInputVisuals();
+                if (session.model.revision != model_revision)
+                    try self.notifyTextInputChanged(callback_service, focused);
                 continue;
             }
             if (event == .keyboard) {
@@ -494,6 +596,7 @@ pub const WindowRuntime = struct {
             if (!self.instances.isActive(target)) continue;
             try self.updateTextInputPointer(target, event);
             const activated_button = try self.updateButtonState(event);
+            try self.updateListBoxHover(event);
             if (try self.applyScrollEvent(target, event)) continue;
             var bound_target = target;
             var handler = self.pointer_bindings.get(bound_target);
@@ -512,6 +615,18 @@ pub const WindowRuntime = struct {
                     );
                 continue;
             }
+            if (binding.kind == .listbox) {
+                const selection = try self.listBoxPointerSelection(target, event) orelse continue;
+                const previous = self.focus.current();
+                self.listboxes.select(selection);
+                try self.refreshListBoxVisuals();
+                _ = try self.focus.request(&self.instances, selection.listbox);
+                try self.applyFocusVisual(previous, self.focus.current());
+                try self.ensureOptionVisible(selection.option);
+                try self.spawnListBoxCallback(callback_service, binding.id, selection);
+                continue;
+            }
+            if (binding.kind == .text_input_change) continue;
             const values = inputValues(event);
             const arguments = [_]lua.TaskArgument{
                 .{ .integer = values.kind },
@@ -534,13 +649,13 @@ pub const WindowRuntime = struct {
         const key = switch (event) {
             .enter => return,
             .leave => {
-                try self.applyButtonUpdate(self.buttons.release(null).visual);
+                try self.applyButtonUpdate(self.buttons.release());
                 return;
             },
             .key => |value| value,
         };
         if (key.translated.logical == .tab and key.state != .released) {
-            try self.applyButtonUpdate(self.buttons.release(null).visual);
+            try self.applyButtonUpdate(self.buttons.release());
             const previous = self.focus.current();
             _ = try self.focus.advance(
                 &self.instances,
@@ -553,48 +668,85 @@ pub const WindowRuntime = struct {
             key.state != .released)
         {
             const session = try self.text_inputs.session(focused);
-            const editing_key = key.translated.logical == .backspace or
-                key.translated.logical == .delete or
-                key.translated.logical == .arrow_left or
-                key.translated.logical == .arrow_right;
-            if (session.preedit() != null and editing_key) return;
-            const changed = switch (key.translated.logical) {
-                .backspace => try session.model.deleteBackward(),
-                .delete => try session.model.deleteForward(),
-                .arrow_left => try self.moveTextInputCaret(
-                    focused,
-                    .left,
-                    key.translated.modifiers.shift,
-                ),
-                .arrow_right => try self.moveTextInputCaret(
-                    focused,
-                    .right,
-                    key.translated.modifiers.shift,
-                ),
-                else => false,
-            };
-            if (changed) try self.syncTextInputVisuals();
-            if (editing_key) return;
+            const behavior = try self.text_inputs.getBehavior(focused);
+            if (key.state == .pressed) {
+                if (textInputClipboardShortcut(key.translated)) |command| {
+                    if (!behavior.enabled or (behavior.read_only and command != .copy)) return;
+                    if (session.preedit() != null) return;
+                    session.endSelectionDrag();
+                    const clipboard = self.clipboard orelse return;
+                    if (!clipboard.platformAvailable()) return;
+                    switch (command) {
+                        .copy, .cut => {
+                            const selected = session.model.selectedText();
+                            if (selected.len == 0) return;
+                            try clipboard.setSelection(key.serial, selected);
+                            if (command == .cut) {
+                                session.preferred_x = null;
+                                if (try session.model.replaceSelection("")) {
+                                    try self.syncTextInputVisuals();
+                                    try self.notifyTextInputChanged(callback_service, focused);
+                                }
+                            }
+                        },
+                        .paste => _ = try clipboard.requestPaste(
+                            try self.instances.scope(focused),
+                            .{ .window = self.window, .text_input = focused },
+                        ),
+                    }
+                    return;
+                }
+            }
+            const intent = textInputIntent(key.translated);
+            if (session.preedit() != null and intent != null) return;
+            if (intent) |value| if (!behavior.enabled or
+                (behavior.read_only and intentEditsText(value))) return;
+            const changed = if (intent) |value|
+                try self.applyTextInputIntent(focused, value)
+            else
+                false;
+            if (changed) {
+                try self.syncTextInputVisuals();
+                if (intentEditsText(intent.?))
+                    try self.notifyTextInputChanged(callback_service, focused);
+            }
+            if (intent != null) return;
         };
+        if ((key.translated.logical == .arrow_up or key.translated.logical == .arrow_down or
+            key.translated.logical == .home or key.translated.logical == .end) and
+            key.state != .released)
+        {
+            const focused = self.focus.current() orelse return;
+            if (!self.listboxes.contains(focused)) return;
+            const selection = switch (key.translated.logical) {
+                .home => self.listboxes.edge(focused, false),
+                .end => self.listboxes.edge(focused, true),
+                .arrow_up => self.listboxes.move(focused, -1),
+                .arrow_down => self.listboxes.move(focused, 1),
+                else => unreachable,
+            } orelse return;
+            const binding = self.pointer_bindings.get(focused) orelse return;
+            if (binding.kind != .listbox) return;
+            try self.refreshListBoxVisuals();
+            try self.applyFocusVisual(null, self.focus.current());
+            try self.ensureOptionVisible(selection.option);
+            try self.spawnListBoxCallback(callback_service, binding.id, selection);
+            return;
+        }
         if (key.translated.logical == .space) switch (key.state) {
             .pressed => {
                 const focused = self.focus.current() orelse return;
-                if (!self.buttons.contains(focused)) return;
+                if (!self.buttons.contains(focused) or !self.buttons.isEnabled(focused)) return;
                 try self.applyButtonUpdate(self.buttons.press(focused));
+                try self.spawnButtonCallback(callback_service, focused);
             },
-            .released => try self.activateButton(callback_service, self.buttons.releaseKeyboard()),
+            .released => try self.applyButtonUpdate(self.buttons.releaseKeyboard()),
             .repeated => {},
         } else if (key.translated.logical == .enter and key.state == .pressed) {
             const focused = self.focus.current() orelse return;
             if (!self.buttons.contains(focused) or !self.buttons.isEnabled(focused)) return;
             try self.spawnButtonCallback(callback_service, focused);
         }
-    }
-
-    fn activateButton(self: *WindowRuntime, callback_service: anytype, release: ui.widget.ButtonRelease) !void {
-        try self.applyButtonUpdate(release.visual);
-        const activated = release.activated orelse return;
-        try self.spawnButtonCallback(callback_service, activated);
     }
 
     fn spawnButtonCallback(
@@ -612,6 +764,63 @@ pub const WindowRuntime = struct {
         );
     }
 
+    fn spawnListBoxCallback(
+        self: *WindowRuntime,
+        callback_service: anytype,
+        callback: lua.CallbackHandle,
+        selection: ui.widget.ListBoxSelection,
+    ) !void {
+        const arguments = [_]lua.TaskArgument{.{ .integer = selection.value }};
+        try self.spawnCallback(
+            callback_service,
+            callback,
+            try self.instances.scope(selection.listbox),
+            &arguments,
+        );
+    }
+
+    fn listBoxPointerSelection(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        event: ui.input.Event,
+    ) !?ui.widget.ListBoxSelection {
+        const pointer = switch (event) {
+            .pointer => |value| value,
+            else => return null,
+        };
+        const button = switch (pointer.event) {
+            .button => |value| value,
+            else => return null,
+        };
+        if (button.button != 0x110 or button.state != .released) return null;
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |candidate| {
+            if (self.listboxes.option(candidate)) |selection| return selection;
+            current = try self.instances.parentOf(candidate);
+        }
+        return null;
+    }
+
+    fn ensureOptionVisible(self: *WindowRuntime, option: ui.instance.InstanceHandle) !void {
+        const scroll = (try self.instances.nearestScroll(option, .vertical)) orelse return;
+        const scroll_render = try self.instances.renderObject(scroll);
+        const viewport = try self.tree.nodeSize(scroll_render);
+        const option_size = try self.tree.nodeSize(try self.instances.renderObject(option));
+        var y: f32 = 0;
+        var current: ?ui.instance.InstanceHandle = option;
+        while (current) |candidate| {
+            if (sameHandle(candidate, scroll)) break;
+            y += (try self.tree.nodeOffset(try self.instances.renderObject(candidate))).y;
+            current = try self.instances.parentOf(candidate);
+        }
+        const delta = if (y < 0) y else if (y + option_size.height > viewport.height)
+            y + option_size.height - viewport.height
+        else
+            0;
+        if (delta != 0 and try self.instances.scrollBy(scroll, delta))
+            self.frame_state.invalidatePaint();
+    }
+
     fn spawnCallback(
         self: *WindowRuntime,
         callback_service: anytype,
@@ -626,6 +835,22 @@ pub const WindowRuntime = struct {
         } else {
             return error.CallbackServiceUnavailable;
         }
+    }
+
+    fn notifyTextInputChanged(
+        self: *WindowRuntime,
+        callback_service: anytype,
+        target: ui.instance.InstanceHandle,
+    ) !void {
+        const binding = self.pointer_bindings.get(target) orelse return;
+        if (binding.kind != .text_input_change) return;
+        const value = (try self.text_inputs.session(target)).model.text();
+        try self.spawnCallback(
+            callback_service,
+            binding.id,
+            try self.instances.scope(target),
+            &.{.{ .string = value }},
+        );
     }
 
     pub fn wantsSubmission(self: *const WindowRuntime) bool {
@@ -722,19 +947,15 @@ pub const WindowRuntime = struct {
                     switch (button_event.state) {
                         .pressed => {
                             const button = (try self.buttonAncestor(pointer.target)) orelse return null;
+                            if (!self.buttons.isEnabled(button)) return null;
                             const previous = self.focus.current();
                             _ = try self.focus.request(&self.instances, button);
                             try self.applyFocusVisual(previous, self.focus.current());
                             try self.applyButtonUpdate(self.buttons.press(button));
+                            return button;
                         },
                         .released => {
-                            const hovered = if (pointer.hovered) |target|
-                                try self.buttonAncestor(target)
-                            else
-                                null;
-                            const release = self.buttons.release(hovered);
-                            try self.applyButtonUpdate(release.visual);
-                            return release.activated;
+                            try self.applyButtonUpdate(self.buttons.release());
                         },
                     }
                 },
@@ -742,6 +963,28 @@ pub const WindowRuntime = struct {
             },
             .keyboard => {},
             .text_input => unreachable,
+        }
+        return null;
+    }
+
+    fn updateListBoxHover(self: *WindowRuntime, event: ui.input.Event) !void {
+        switch (event) {
+            .hover_enter => |hover| if (try self.listBoxOptionAncestor(hover.target)) |option|
+                try self.applyListBoxColor(option, self.listboxes.setHovered(option, true)),
+            .hover_leave => |hover| if (try self.listBoxOptionAncestor(hover.target)) |option|
+                try self.applyListBoxColor(option, self.listboxes.setHovered(option, false)),
+            else => {},
+        }
+    }
+
+    fn listBoxOptionAncestor(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+    ) !?ui.instance.InstanceHandle {
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |candidate| {
+            if (self.listboxes.option(candidate) != null) return candidate;
+            current = try self.instances.parentOf(candidate);
         }
         return null;
     }
@@ -755,44 +998,131 @@ pub const WindowRuntime = struct {
             .pointer => |value| value,
             else => return,
         };
-        const button = switch (pointer.event) {
-            .button => |value| value,
-            else => return,
-        };
-        if (button.button != 0x110 or button.state != .pressed) return;
-        const input = (try self.textInputAncestor(target)) orelse return;
-        const previous = self.focus.current();
-        _ = try self.focus.request(&self.instances, input);
-        try self.applyFocusVisual(previous, self.focus.current());
+        switch (pointer.event) {
+            .button => |button| {
+                if (button.button != 0x110) return;
+                const input = (try self.textInputAncestor(target)) orelse return;
+                if (!(try self.text_inputs.getBehavior(input)).enabled) return;
+                const session = try self.text_inputs.session(input);
+                switch (button.state) {
+                    .pressed => {
+                        const previous = self.focus.current();
+                        _ = try self.focus.request(&self.instances, input);
+                        try self.applyFocusVisual(previous, self.focus.current());
+                        const caret = try self.textCaretAtPointer(input, pointer.position);
+                        if (try session.beginSelectionDrag(caret.byte_offset, caret.affinity))
+                            try self.syncTextInputVisuals();
+                    },
+                    .released => session.endSelectionDrag(),
+                }
+            },
+            .motion => {
+                const input = (try self.textInputAncestor(target)) orelse return;
+                const session = try self.text_inputs.session(input);
+                if (!session.isSelecting()) return;
+                const caret = try self.textCaretAtPointer(input, pointer.position);
+                if (try session.updateSelectionDrag(caret.byte_offset, caret.affinity))
+                    try self.syncTextInputVisuals();
+            },
+            else => {},
+        }
+    }
 
+    fn textCaretAtPointer(
+        self: *WindowRuntime,
+        input: ui.instance.InstanceHandle,
+        position: core.PointF,
+    ) !text.CaretStop {
         const content = try self.text_inputs.content(input);
         const render = try self.instances.renderObject(content);
         const origin = try self.instanceOrigin(content);
-        const hit = try self.tree.hitTestText(render, .{
-            .x = pointer.position.x - origin.x,
-            .y = pointer.position.y - origin.y,
-        });
-        const session = try self.text_inputs.session(input);
-        _ = try session.model.setSelection(.{
-            .anchor = hit.caret.byte_offset,
-            .extent = hit.caret.byte_offset,
-            .anchor_affinity = hit.caret.affinity,
-            .extent_affinity = hit.caret.affinity,
-        });
-        try self.syncTextInputVisuals();
+        return (try self.tree.hitTestText(render, .{
+            .x = position.x - origin.x,
+            .y = position.y - origin.y,
+        })).caret;
+    }
+
+    fn applyTextInputIntent(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        intent: ui.text_input.EditIntent,
+    ) !bool {
+        const session = try self.text_inputs.session(target);
+        session.endSelectionDrag();
+        return switch (intent) {
+            .select_all => blk: {
+                session.preferred_x = null;
+                break :blk session.model.selectAll();
+            },
+            .delete_backward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteBackward();
+            },
+            .delete_forward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteForward();
+            },
+            .delete_word_backward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteWordBackward();
+            },
+            .delete_word_forward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteWordForward();
+            },
+            .move => |move| switch (move.destination) {
+                .word_previous => blk: {
+                    session.preferred_x = null;
+                    break :blk session.model.moveWordPrevious(move.extend);
+                },
+                .word_next => blk: {
+                    session.preferred_x = null;
+                    break :blk session.model.moveWordNext(move.extend);
+                },
+                else => try self.moveTextInputCaret(target, session, move),
+            },
+        };
+    }
+
+    /// Input safe point only. The app clipboard coordinator has already
+    /// validated request generation and UTF-8 ownership; retained instance
+    /// generation is revalidated here before the edit is applied.
+    pub fn applyClipboardPaste(
+        self: *WindowRuntime,
+        callback_service: anytype,
+        target: ui.instance.InstanceHandle,
+        bytes: []const u8,
+    ) !bool {
+        if (!self.instances.isActive(target) or !self.text_inputs.contains(target)) return false;
+        const behavior = try self.text_inputs.getBehavior(target);
+        if (!behavior.enabled or behavior.read_only) return false;
+        const session = try self.text_inputs.session(target);
+        session.endSelectionDrag();
+        const changed = try session.apply(.{ .commit = .{ .text = bytes } });
+        if (changed) {
+            try self.syncTextInputVisuals();
+            try self.notifyTextInputChanged(callback_service, target);
+        }
+        return changed;
     }
 
     fn moveTextInputCaret(
         self: *WindowRuntime,
         target: ui.instance.InstanceHandle,
-        direction: text.VisualCaretDirection,
-        extend: bool,
+        session: *ui.text_input.Session,
+        move: ui.text_input.MoveIntent,
     ) !bool {
-        const session = try self.text_inputs.session(target);
         const current = session.model.selection;
         const content = try self.text_inputs.content(target);
         const render = try self.instances.renderObject(content);
-        if (!extend and !current.isCollapsed()) {
+        const horizontal: ?text.VisualCaretDirection = switch (move.destination) {
+            .visual_left => .left,
+            .visual_right => .right,
+            .word_previous, .word_next => unreachable,
+            else => null,
+        };
+        if (horizontal) |direction| if (!move.extend and !current.isCollapsed()) {
+            session.preferred_x = null;
             const order = try self.tree.textVisualOrder(
                 render,
                 current.anchor,
@@ -808,15 +1138,41 @@ pub const WindowRuntime = struct {
                 .collapsedAt(current.anchor, current.anchor_affinity)
             else
                 .collapsedAt(current.extent, current.extent_affinity));
-        }
+        };
 
-        const next = try self.tree.textVisualNeighbor(
-            render,
-            current.extent,
-            current.extent_affinity,
-            direction,
-        );
-        return session.model.setSelection(if (extend) .{
+        const next = switch (move.destination) {
+            .word_previous, .word_next => unreachable,
+            .visual_left, .visual_right => blk: {
+                session.preferred_x = null;
+                break :blk try self.tree.textVisualNeighbor(
+                    render,
+                    current.extent,
+                    current.extent_affinity,
+                    horizontal.?,
+                );
+            },
+            .line_start, .line_end => blk: {
+                session.preferred_x = null;
+                break :blk try self.tree.textLineBoundary(
+                    render,
+                    current.extent,
+                    current.extent_affinity,
+                    if (move.destination == .line_start) .start else .end,
+                );
+            },
+            .line_up, .line_down => blk: {
+                const result = try self.tree.textVerticalNeighbor(
+                    render,
+                    current.extent,
+                    current.extent_affinity,
+                    session.preferred_x,
+                    if (move.destination == .line_up) .up else .down,
+                );
+                session.preferred_x = result.preferred_x;
+                break :blk result.caret;
+            },
+        };
+        return session.model.setSelection(if (move.extend) .{
             .anchor = current.anchor,
             .extent = next.byte_offset,
             .anchor_affinity = current.anchor_affinity,
@@ -879,6 +1235,36 @@ pub const WindowRuntime = struct {
         try self.applyButtonColor(value.target, value.color);
     }
 
+    fn refreshListBoxVisuals(self: *WindowRuntime) !void {
+        for (0..self.listboxes.optionSlots()) |index| {
+            const option = self.listboxes.optionAt(index) orelse continue;
+            const render = try self.instances.renderObject(option);
+            var object = try self.tree.objectAt(render);
+            if (object != .box) return error.ListBoxOptionRenderObjectMismatch;
+            object.box.background = self.listboxes.currentColor(option);
+            object.box.outline_color = null;
+            object.box.outline_width = 0;
+            object.box.outline_gap = 0;
+            try self.tree.update(render, object);
+        }
+        self.frame_state.invalidatePaint();
+    }
+
+    fn applyListBoxColor(
+        self: *WindowRuntime,
+        option: ui.instance.InstanceHandle,
+        update: ?ui.widget.ListBoxVisualUpdate,
+    ) !void {
+        const next = update orelse return;
+        const render = try self.instances.renderObject(option);
+        var object = try self.tree.objectAt(render);
+        if (object != .box) return error.ListBoxOptionRenderObjectMismatch;
+        if (std.meta.eql(object.box.background, next.color)) return;
+        object.box.background = next.color;
+        try self.tree.update(render, object);
+        self.frame_state.invalidatePaint();
+    }
+
     /// Exercises candidate layout and scene lowering against isolated native
     /// storage. This closes the transaction boundary before retained instances
     /// change, including command-capacity and descriptor-dependent layout
@@ -921,9 +1307,18 @@ pub const WindowRuntime = struct {
         current: ?ui.instance.InstanceHandle,
     ) !void {
         if (previous) |target| if (self.instances.isActive(target))
-            try self.setFocusOutline(target, false);
-        if (current) |target| try self.setFocusOutline(target, true);
+            if (self.focusOutlineTarget(target)) |outline| try self.setFocusOutline(outline, false);
+        if (current) |target|
+            if (self.focusOutlineTarget(target)) |outline| try self.setFocusOutline(outline, true);
         try self.syncTextInputVisuals();
+    }
+
+    fn focusOutlineTarget(
+        self: *const WindowRuntime,
+        target: ui.instance.InstanceHandle,
+    ) ?ui.instance.InstanceHandle {
+        if (self.buttons.contains(target) or self.listboxes.contains(target)) return null;
+        return target;
     }
 
     fn syncTextInputVisuals(self: *WindowRuntime) !void {
@@ -1200,14 +1595,20 @@ test "text input protocol batches mutate retained sessions only at the input saf
         window,
         2,
     );
+    try runtime.pointer_bindings.init(std.testing.allocator, 2);
+    try runtime.buttons.init(std.testing.allocator, 2);
     try runtime.text_inputs.init(std.testing.allocator, 1);
     runtime.allocator = std.testing.allocator;
     runtime.initialized = true;
     runtime.window = window;
     runtime.paragraph_sources = &sources;
+    runtime.focus_color = core.Color.rgba(20, 80, 220, 255);
     defer {
         runtime.text_inputs.clear();
         runtime.text_inputs.deinit();
+        runtime.buttons.clear();
+        runtime.buttons.deinit();
+        runtime.pointer_bindings.deinit();
         runtime.router.deinit();
         runtime.instances.reconcile(&.{}) catch unreachable;
         scheduler.applyQueuedCancellations() catch unreachable;
@@ -1238,6 +1639,35 @@ test "text input protocol batches mutate retained sessions only at the input saf
     const content = runtime.instances.handleForId(2).?;
     const owner: ui.instance.BuildOwnerHandle = .{ .slot = 1, .generation = 1 };
     try runtime.text_inputs.mount(owner, target, content, "hello");
+    var loop: @import("../loop/io_uring.zig").Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 2);
+    defer loop.deinit();
+    var callback_vm: lua.Vm = undefined;
+    try callback_vm.init(std.testing.allocator, &scheduler, &loop);
+    defer callback_vm.deinit();
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(std.testing.allocator, 1);
+    defer callbacks.deinit();
+    const callback_source = "return function(value) changed_text = value end";
+    try std.testing.expectEqual(
+        lua_c.ok,
+        lua_c.luaL_loadbufferx(
+            callback_vm.state,
+            callback_source.ptr,
+            callback_source.len,
+            "@text-change-test",
+            null,
+        ),
+    );
+    try std.testing.expectEqual(lua_c.ok, lua_c.lua_pcallk(callback_vm.state, 0, 1, 0, 0, null));
+    const callback = try callbacks.adoptReference(
+        &callback_vm,
+        lua_c.luaL_ref(callback_vm.state, lua_c.registry_index),
+    );
+    _ = try runtime.pointer_bindings.set(owner, target, .{
+        .id = callback,
+        .kind = .text_input_change,
+    });
     _ = try runtime.focus.request(&runtime.instances, target);
     _ = try runtime.tree.layout(
         (try runtime.instances.rootRenderObject()).?,
@@ -1255,9 +1685,18 @@ test "text input protocol batches mutate retained sessions only at the input saf
     } });
     @memset(&commit, '?');
     try std.testing.expectEqualStrings("hello", (try runtime.text_inputs.session(target)).model.text());
-    var unused_vm: lua.Vm = undefined;
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expectEqualStrings("hello!", (try runtime.text_inputs.session(target)).model.text());
+    try std.testing.expect(!callback_vm.hasGlobal("changed_text"));
+    try std.testing.expectEqual(
+        lua.ResumeResult.completed,
+        try callback_vm.resumeRunnable(scheduler.takeRunnable().?),
+    );
+    try std.testing.expectEqual(lua_c.type_string, lua_c.lua_getglobal(callback_vm.state, "changed_text"));
+    var changed_length: usize = 0;
+    const changed_text = lua_c.lua_tolstring(callback_vm.state, -1, &changed_length).?;
+    try std.testing.expectEqualStrings("hello!", changed_text[0..changed_length]);
+    lua_c.lua_settop(callback_vm.state, -2);
     const render = try runtime.instances.renderObject(content);
     const object = try runtime.tree.objectAt(render);
     try std.testing.expectEqualStrings("hello!", (try sources.get(object.text_input.source)).utf8);
@@ -1270,7 +1709,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .commit = .{ .text = "?" },
         .preedit = null,
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expectEqualStrings("hello!?", (try runtime.text_inputs.session(target)).model.text());
     try std.testing.expect(!runtime.text_input_commit_permitted);
     try runtime.routeTextInput(.{ .batch = .{
@@ -1281,7 +1720,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .commit = null,
         .preedit = null,
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expect(runtime.text_input_commit_permitted);
 
     const before_left = (try runtime.text_inputs.session(target)).model.selection;
@@ -1298,7 +1737,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .state = .pressed,
         .translated = .{ .keycode = 105, .logical = .arrow_left },
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     const after_left = (try runtime.text_inputs.session(target)).model.selection;
     try std.testing.expectEqual(expected_left.byte_offset, after_left.extent);
     try std.testing.expectEqual(expected_left.affinity, after_left.extent_affinity);
@@ -1315,12 +1754,229 @@ test "text input protocol batches mutate retained sessions only at the input saf
             .modifiers = .{ .shift = true },
         },
     } });
-    try runtime.dispatchInput(&unused_vm);
+    try runtime.dispatchInput(&callbacks);
     const extended = (try runtime.text_inputs.session(target)).model.selection;
     try std.testing.expectEqual(after_left.anchor, extended.anchor);
     try std.testing.expect(!extended.isCollapsed());
 
+    const expected_home = try runtime.tree.textLineBoundary(
+        render,
+        extended.extent,
+        extended.extent_affinity,
+        .start,
+    );
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 5,
+        .time_ms = 6,
+        .state = .pressed,
+        .translated = .{ .keycode = 102, .logical = .home },
+    } });
+    try runtime.dispatchInput(&callbacks);
+    const after_home = try runtime.text_inputs.session(target);
+    try std.testing.expectEqual(expected_home.byte_offset, after_home.model.selection.extent);
+    try std.testing.expectEqual(expected_home.affinity, after_home.model.selection.extent_affinity);
+    try std.testing.expect(after_home.model.selection.isCollapsed());
+    try std.testing.expect(after_home.preferred_x == null);
+
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 6,
+        .time_ms = 7,
+        .state = .pressed,
+        .translated = .{ .keycode = 103, .logical = .arrow_up },
+    } });
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expect((try runtime.text_inputs.session(target)).preferred_x != null);
+
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 7,
+        .time_ms = 8,
+        .state = .pressed,
+        .translated = .{
+            .keycode = 106,
+            .logical = .arrow_right,
+            .modifiers = .{ .control = true },
+        },
+    } });
+    try runtime.dispatchInput(&callbacks);
+    const after_word = try runtime.text_inputs.session(target);
+    try std.testing.expectEqual(@as(usize, 5), after_word.model.selection.extent);
+    try std.testing.expect(after_word.preferred_x == null);
+
+    _ = try runtime.tree.layout(
+        (try runtime.instances.rootRenderObject()).?,
+        ui.layout.Constraints.tight(.{ .width = 160, .height = 32 }),
+    );
+    const drag_start: core.PointF = .{ .x = 1, .y = 10 };
+    const drag_end: core.PointF = .{ .x = 70, .y = 10 };
+    const expected_drag_start = try runtime.textCaretAtPointer(target, drag_start);
+    const expected_drag_end = try runtime.textCaretAtPointer(target, drag_end);
+    try std.testing.expect(expected_drag_start.byte_offset != expected_drag_end.byte_offset);
+    try runtime.routePointer(.{ .enter = .{
+        .window = window,
+        .serial = 8,
+        .position = drag_start,
+    } });
+    try runtime.dispatchInput(&callbacks);
+    try runtime.routePointer(.{ .button = .{
+        .window = window,
+        .serial = 9,
+        .time_ms = 9,
+        .button = 0x110,
+        .state = .pressed,
+    } });
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expect((try runtime.text_inputs.session(target)).isSelecting());
+    try runtime.routePointer(.{ .motion = .{
+        .window = window,
+        .time_ms = 10,
+        .position = drag_end,
+    } });
+    try runtime.dispatchInput(&callbacks);
+    const dragged = (try runtime.text_inputs.session(target)).model.selection;
+    try std.testing.expectEqual(expected_drag_start.byte_offset, dragged.anchor);
+    try std.testing.expectEqual(expected_drag_start.affinity, dragged.anchor_affinity);
+    try std.testing.expectEqual(expected_drag_end.byte_offset, dragged.extent);
+    try std.testing.expectEqual(expected_drag_end.affinity, dragged.extent_affinity);
+    try runtime.routePointer(.{ .button = .{
+        .window = window,
+        .serial = 10,
+        .time_ms = 11,
+        .button = 0x110,
+        .state = .released,
+    } });
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expect(!(try runtime.text_inputs.session(target)).isSelecting());
+
+    while (scheduler.takeRunnable()) |runnable|
+        _ = try callback_vm.resumeRunnable(runnable);
+    var read_only_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(
+        std.testing.allocator,
+        "ignored",
+    );
+    defer if (read_only_candidate) |*session_value| session_value.deinit();
+    try runtime.text_inputs.prepareMount(target, .uncontrolled, &read_only_candidate);
+    try runtime.text_inputs.mountPrepared(
+        owner,
+        target,
+        content,
+        .uncontrolled,
+        .{ .read_only = true },
+        &read_only_candidate,
+    );
+    const before_read_only = try std.testing.allocator.dupe(
+        u8,
+        (try runtime.text_inputs.session(target)).model.text(),
+    );
+    defer std.testing.allocator.free(before_read_only);
+    try runtime.routeTextInput(.{ .batch = .{
+        .window = window,
+        .serial = 11,
+        .serial_matches_state = true,
+        .delete_surrounding = null,
+        .commit = .{ .text = "blocked" },
+        .preedit = null,
+    } });
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings(
+        before_read_only,
+        (try runtime.text_inputs.session(target)).model.text(),
+    );
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    try std.testing.expect((try runtime.textInputStatus()) == null);
+    _ = runtime.pointer_bindings.remove(target);
+    try callbacks.release(callback);
+
     try fonts.release(font);
+}
+
+fn textInputIntent(key: platform.TranslatedKey) ?ui.text_input.EditIntent {
+    if (key.modifiers.alt or key.modifiers.logo) return null;
+    const extend = key.modifiers.shift;
+    if (key.modifiers.control) return switch (key.logical) {
+        .key_a => .select_all,
+        .backspace => .delete_word_backward,
+        .delete => .delete_word_forward,
+        .arrow_left => .{ .move = .{ .destination = .word_previous, .extend = extend } },
+        .arrow_right => .{ .move = .{ .destination = .word_next, .extend = extend } },
+        else => null,
+    };
+    return switch (key.logical) {
+        .backspace => .delete_backward,
+        .delete => .delete_forward,
+        .arrow_left => .{ .move = .{ .destination = .visual_left, .extend = extend } },
+        .arrow_right => .{ .move = .{ .destination = .visual_right, .extend = extend } },
+        .arrow_up => .{ .move = .{ .destination = .line_up, .extend = extend } },
+        .arrow_down => .{ .move = .{ .destination = .line_down, .extend = extend } },
+        .home => .{ .move = .{ .destination = .line_start, .extend = extend } },
+        .end => .{ .move = .{ .destination = .line_end, .extend = extend } },
+        else => null,
+    };
+}
+
+fn intentEditsText(intent: ui.text_input.EditIntent) bool {
+    return switch (intent) {
+        .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
+        .select_all, .move => false,
+    };
+}
+
+const ClipboardShortcut = enum { copy, cut, paste };
+
+fn textInputClipboardShortcut(key: platform.TranslatedKey) ?ClipboardShortcut {
+    if (!key.modifiers.control or key.modifiers.alt or key.modifiers.logo) return null;
+    return switch (key.logical) {
+        .key_c => .copy,
+        .key_x => .cut,
+        .key_v => .paste,
+        else => null,
+    };
+}
+
+test "platform keys translate to neutral text editing intents" {
+    try std.testing.expectEqual(
+        ui.text_input.EditIntent{ .move = .{ .destination = .line_up, .extend = true } },
+        textInputIntent(.{
+            .keycode = 1,
+            .logical = .arrow_up,
+            .modifiers = .{ .shift = true },
+        }).?,
+    );
+    try std.testing.expectEqual(
+        ui.text_input.EditIntent{ .move = .{ .destination = .line_start } },
+        textInputIntent(.{ .keycode = 1, .logical = .home }).?,
+    );
+    try std.testing.expectEqual(
+        ui.text_input.EditIntent{ .move = .{ .destination = .word_previous } },
+        textInputIntent(.{
+            .keycode = 1,
+            .logical = .arrow_left,
+            .modifiers = .{ .control = true },
+        }).?,
+    );
+    try std.testing.expectEqual(
+        ui.text_input.EditIntent.select_all,
+        textInputIntent(.{
+            .keycode = 1,
+            .logical = .key_a,
+            .modifiers = .{ .control = true },
+        }).?,
+    );
+    try std.testing.expectEqual(
+        ClipboardShortcut.copy,
+        textInputClipboardShortcut(.{
+            .keycode = 1,
+            .logical = .key_c,
+            .modifiers = .{ .control = true },
+        }).?,
+    );
+    try std.testing.expect(textInputClipboardShortcut(.{
+        .keycode = 1,
+        .logical = .key_v,
+        .modifiers = .{ .control = true, .alt = true },
+    }) == null);
 }
 
 const InputValues = struct {

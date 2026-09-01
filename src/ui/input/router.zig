@@ -91,13 +91,14 @@ pub const Router = struct {
             },
             .motion => |motion| {
                 self.pointer_position = motion.position;
-                const target = try self.targetAt(motion.position);
-                try self.ensureSpace(transitionCount(self.hovered, target) +
+                const hovered = try self.targetAt(motion.position);
+                const target = self.captured orelse hovered;
+                try self.ensureSpace(transitionCount(self.hovered, hovered) +
                     @as(usize, @intFromBool(target != null)));
-                self.transition(target, motion.position, null);
+                self.transition(hovered, motion.position, null);
                 if (target) |handle| self.enqueueAssumeCapacity(.{ .pointer = .{
                     .target = handle,
-                    .hovered = target,
+                    .hovered = hovered,
                     .position = self.pointer_position,
                     .event = event,
                 } });
@@ -320,8 +321,27 @@ test "pointer routing hit tests front to back and queues hover transitions" {
         .state = .pressed,
     } });
     try std.testing.expectEqual(back, router.takeEvent().?.pointer.target);
-    try router.route(.{ .leave = .{ .window = window, .serial = 12 } });
+    try router.route(.{ .motion = .{
+        .window = window,
+        .time_ms = 21,
+        .position = .{ .x = 15, .y = 15 },
+    } });
     try std.testing.expectEqual(back, router.takeEvent().?.hover_leave.target);
+    try std.testing.expectEqual(front, router.takeEvent().?.hover_enter.target);
+    const captured_motion = router.takeEvent().?.pointer;
+    try std.testing.expectEqual(back, captured_motion.target);
+    try std.testing.expectEqual(front, captured_motion.hovered.?);
+    try router.route(.{ .motion = .{
+        .window = window,
+        .time_ms = 22,
+        .position = .{ .x = 150, .y = 100 },
+    } });
+    try std.testing.expectEqual(front, router.takeEvent().?.hover_leave.target);
+    const captured_outside = router.takeEvent().?.pointer;
+    try std.testing.expectEqual(back, captured_outside.target);
+    try std.testing.expect(captured_outside.hovered == null);
+    try router.route(.{ .leave = .{ .window = window, .serial = 12 } });
+    try std.testing.expect(router.takeEvent() == null);
     try router.route(.{ .button = .{
         .window = window,
         .serial = 13,

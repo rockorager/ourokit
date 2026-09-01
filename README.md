@@ -159,11 +159,14 @@ glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
 wrapping; unchanged constraints perform no layout acquisition or allocation.
 `ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.label` provide nested composition without
 application-managed numeric IDs or parent links. `ouro.button` composes a Box
-and Label using generated design tokens and retains hover, pressed, disabled,
-pointer-capture, and release-inside activation state in the widget layer. Its
+and Label using generated design tokens and retains hover, pressed, and disabled
+state in the widget layer. Buttons activate on press; release clears their
+pressed visual state. Its
 Box centers the constrained Label within the padded button bounds; this child
 placement remains separate from paragraph alignment. Button is not a renderer
-primitive. Direction-aware alignment, whole-line clipping, and shaped ellipsis
+primitive. `ouro.listbox` and its direct `ouro.option` children provide a
+controlled single-selection list with one Tab stop and Up/Down/Home/End navigation.
+Direction-aware alignment, whole-line clipping, and shaped ellipsis
 remain text-layer policy; renderers never inject the ellipsis. Editing and
 selection remain deferred. Software and Vulkan consume the identical positioned
 glyph sequence.
@@ -235,6 +238,29 @@ zig-out/bin/ouroctl run path/to/application.lua
 
 The reusable host follows the same renderer default. Pass `--software` to force
 the software renderer.
+
+Text inputs support an explicit controlled or retained-value contract. Use
+`text` with `on_change` when application state is authoritative:
+
+```lua
+local query = ouro.signal("")
+
+ouro.text_input {
+  key = "query",
+  text = query(),
+  on_change = function(value)
+    query:set(value)
+  end,
+}
+```
+
+Use `default_text` instead when native retained editing state should own the
+value after first mount. Exactly one of `text` and `default_text` is required.
+`on_change` runs as a scoped Lua task during the task safe point, never from an
+input protocol callback; selection-only changes do not invoke it. `enabled =
+false` removes the field from focus traversal and rejects all interaction.
+`read_only = true` keeps focus, selection, navigation, and copy available while
+rejecting text-input commits, deletion, cut, and paste.
 
 ## Storybook
 

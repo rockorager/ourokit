@@ -302,6 +302,42 @@ pub const Tree = struct {
         ) orelse error.CaretNotFound;
     }
 
+    pub fn textLineBoundary(
+        self: *Tree,
+        handle: NodeHandle,
+        byte_offset: usize,
+        affinity: text.CaretAffinity,
+        boundary: text.LineBoundary,
+    ) !text.CaretStop {
+        const target = try self.ensureTextLayout(handle);
+        const paragraph_layout = self.paragraphs.?.get(target.paragraph_layout.?) catch
+            return error.StaleParagraph;
+        return paragraph_layout.positioned.lineBoundary(
+            byte_offset,
+            affinity,
+            boundary,
+        ) orelse error.CaretNotFound;
+    }
+
+    pub fn textVerticalNeighbor(
+        self: *Tree,
+        handle: NodeHandle,
+        byte_offset: usize,
+        affinity: text.CaretAffinity,
+        preferred_x: ?f32,
+        direction: text.VerticalCaretDirection,
+    ) !text.VerticalCaretMove {
+        const target = try self.ensureTextLayout(handle);
+        const paragraph_layout = self.paragraphs.?.get(target.paragraph_layout.?) catch
+            return error.StaleParagraph;
+        return paragraph_layout.positioned.verticalNeighbor(
+            byte_offset,
+            affinity,
+            preferred_x,
+            direction,
+        ) orelse error.CaretNotFound;
+    }
+
     pub fn nodeSize(self: *Tree, handle: NodeHandle) !SizeF {
         const target = try self.slot(handle);
         if (!target.has_layout or !(try self.layoutPathCurrent(handle))) return error.LayoutRequired;
@@ -467,7 +503,9 @@ pub const Tree = struct {
                         value.corner_radius + expansion,
                     );
                 }
-                if (value.border_color != null or value.corner_radius != 0) {
+                if (value.border_color != null or
+                    (value.background != null and value.corner_radius != 0))
+                {
                     try builder.decoratedRectangle(
                         bounds,
                         value.background,
@@ -869,11 +907,17 @@ test "flex layout is bounded, cached, and separates paint invalidation" {
     _ = try tree.layout(root, Constraints.tight(.{ .width = 100, .height = 20 }));
     try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(root));
     try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(expanded));
+    try std.testing.expectEqual(
+        SizeF{ .width = 120, .height = 30 },
+        try tree.layout(root, Constraints.tight(.{ .width = 120, .height = 30 })),
+    );
+    try std.testing.expectEqual(SizeF{ .width = 20, .height = 30 }, try tree.nodeSize(fixed));
+    try std.testing.expectEqual(SizeF{ .width = 95, .height = 30 }, try tree.nodeSize(expanded));
     try tree.update(expanded, .{ .box = .{ .background = Color.rgba(70, 80, 90, 255) } });
     try std.testing.expect(!(try tree.layoutDirty(root)));
     try std.testing.expect(try tree.paintDirty(root));
-    _ = try tree.layout(root, Constraints.tight(.{ .width = 100, .height = 20 }));
-    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(root));
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 120, .height = 30 }));
+    try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(root));
 }
 
 test "stack paints in order and hit tests front to back" {

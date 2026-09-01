@@ -365,11 +365,13 @@ can produce the paragraph-relative, explicit direction/script `RunSpec` already
 consumed by HarfBuzz and fallback; language remains caller-owned.
 
 This is not yet a complete paragraph layout engine. uucode does not implement
-UAX #15 normalization. Ourokit adds Unicode 17's `Line_Break` property through
-uucode's custom component interface, retaining its compressed generated table
-machinery. The focused linear-time UAX #14 scanner passes all 19,338 official
-revision-55 conformance cases and remains independent of fonts, UI, and
-renderers. Shaping mixed text as one guessed run remains forbidden.
+UAX #15 normalization. Ourokit adds Unicode 17's `Line_Break` and `Word_Break`
+properties through uucode's custom component interface, retaining its
+compressed generated table machinery. The focused linear-time UAX #14 scanner
+passes all 19,338 official revision-55 conformance cases. The sibling UAX #29
+word scanner passes all 1,944 official Unicode 17 cases and supplies editor
+word boundaries without ASCII heuristics. Both remain independent of fonts,
+UI, and renderers. Shaping mixed text as one guessed run remains forbidden.
 
 Unicode opportunity discovery is separate from wrap policy. The first sibling
 selector is an O(n) greedy implementation over measured advances. Future
@@ -452,19 +454,54 @@ Pointer capture ensures a release reaches the pressed target, while release-
 inside decides activation. Design-generated semantic accent roles supply idle,
 hovered, and pressed colors.
 
-The `ui/text_input` boundary now contains a unit-testable editable value and a
-retained input-method session, but not yet a widget or render object. The value
-owns valid UTF-8, directional selection, revisions, and cached uucode
-extended-grapheme boundaries. The session keeps preedit outside committed text,
+The `ui/text_input` boundary contains a unit-testable editable value and a
+retained input-method session. The value owns valid UTF-8, directional
+selection, revisions, and cached Unicode grapheme and word boundaries. The
+session keeps preedit outside committed text,
 applies delete/commit/preedit batches in protocol order, and exposes bounded
 surrounding state through an app-owned platform translator. A separate retained
 registry keys sessions and their content instances by generation-checked
-identity and build-owner lifetime; Lua rebuilds cannot reset edited values, and
-omission disposes composition state deterministically. Cursor movement at this
-layer is named logical previous/next; visual left/right, caret geometry, and
-selection painting wait for paragraph bidi/caret maps. The Wayring-backed
-adapter remains disabled until an actual retained TextInput owns focus. Raw xkb
+identity and build-owner lifetime. Declarative `default_text` initializes an
+uncontrolled session once, while controlled `text` synchronizes only when its
+value differs; equal values preserve caret, selection, and preedit. Changed
+controlled values replace transactionally with selection offsets clamped to
+valid grapheme boundaries. Omission disposes composition state deterministically.
+Neutral editing intents
+cover grapheme, Unicode-word, visual bidi, line-boundary, and preferred-X
+vertical movement plus select-all. The model exposes selected committed text as
+a borrowed normalized slice; the clipboard coordinator must take ownership
+before cutting or crossing a safe-point boundary. Paragraph caret
+maps provide geometry without moving text policy into a renderer. Raw xkb
 events are never application text.
+
+Wayland clipboard transfer is not an in-process string. The platform adapter
+owns `wl_data_device`/offer/source lifetimes, while the focused app-level
+clipboard coordinator owns asynchronous requests and generation-checked
+destinations. Requests are scheduler resources in their application, window,
+or widget scope, so disposal follows the same deferred cancellation path as
+other native operations. Platform actions and owned UTF-8 completions cross
+the coordinator only as data; completion cannot execute Lua.
+The Wayland adapter binds the core data-device protocol through Wayring, tracks
+UTF-8 and plain-text selection offers separately from rejected drag offers, and
+reads paste pipes incrementally with generation-checked Ourokit read/cancel/
+close operations. Pipe CQEs only queue state; validated pasted text reaches its
+still-live retained input during the input safe point. Copy and cut first copy
+the normalized selection into an owned app effect, then the adapter creates a
+`wl_data_source`, offers UTF-8/plain text, and services every compositor send
+with short-write-aware Ourokit write/close operations. Cut mutates the model
+only after the outgoing effect owns its bytes.
+
+Committed user edits enqueue at most one scoped `on_change(text)` Lua task per
+input transaction. Dispatch copies the length-delimited UTF-8 value onto the
+new Lua coroutine stack immediately, including embedded NUL bytes, but does not
+resume that coroutine. Task-phase scheduling therefore preserves the invariant
+that input dispatch, reconciliation, and Lua execution cannot re-enter one
+another. Selection movement, preedit-only changes, and controlled external
+synchronization do not emit `on_change`.
+Enabled and read-only behavior is retained beside the session rather than in
+Lua or the render object. Disabled fields leave focus traversal and reject all
+input. Read-only fields retain selection/navigation/copy behavior but do not
+activate the platform text-input protocol or accept any mutating operation.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,

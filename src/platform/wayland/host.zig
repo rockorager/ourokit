@@ -3,12 +3,14 @@ const wayring = @import("wayring");
 const protocol = @import("wayland_protocol");
 const build_options = @import("ourokit_build_options");
 const OuroLoop = @import("../../loop/io_uring.zig").Loop;
+const LoopFileCompletion = @import("../../loop/io_uring.zig").FileCompletion;
 const platform_window = @import("../window.zig");
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
 const Repeat = @import("repeat.zig");
 const TextInput = @import("text_input.zig");
+const WaylandClipboard = @import("clipboard.zig");
 const Xkb = if (build_options.xkbcommon) @import("xkb.zig") else @import("xkb_disabled.zig");
 const Vulkan = if (build_options.vulkan)
     @import("../../renderer/vulkan/root.zig")
@@ -19,6 +21,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const Handle = wayring.objects.Handle;
 const WindowHandle = platform_window.WindowHandle;
+const ClipboardRequestHandle = @import("../../core/handle.zig").Handle;
 const ScopeHandle = @import("../../task/scheduler.zig").ScopeHandle;
 const Core = wayring.client.Core(protocol);
 const Connection = wayring.client.Connection(protocol);
@@ -570,6 +573,7 @@ pub const Host = struct {
     text_input: ?Handle = null,
     text_input_active: ?WindowHandle = null,
     text_input_pending: TextInput.Pending,
+    clipboard: WaylandClipboard.Clipboard,
     seat: ?Handle = null,
     seat_global_name: ?u32 = null,
     pointer: ?Handle = null,
@@ -632,6 +636,8 @@ pub const Host = struct {
         self.text_input_active = null;
         self.text_input_pending = TextInput.Pending.init(allocator);
         errdefer self.text_input_pending.deinit();
+        self.clipboard = try WaylandClipboard.Clipboard.init(allocator, loop, 8, 4, 16, 16, 1024 * 1024);
+        errdefer self.clipboard.deinit();
         self.seat = null;
         self.seat_global_name = null;
         self.pointer = null;
@@ -655,11 +661,12 @@ pub const Host = struct {
                 .transmit_byte_budget = 128 * 1024,
                 .transmit_fd_budget = 32,
             },
-            .{ .max_objects = 66 + config.window_capacity * 18, .max_client_ids = 50 + config.window_capacity * 18 },
+            .{ .max_objects = 100 + config.window_capacity * 18, .max_client_ids = 80 + config.window_capacity * 18 },
         );
         self.driver = Driver.init(&self.connection);
         self.finishStartup() catch |err| {
             try self.abortStartup();
+            self.clipboard.abandonProtocol();
             return err;
         };
     }
@@ -722,12 +729,14 @@ pub const Host = struct {
     pub fn deinit(self: *Host) void {
         std.debug.assert(self.quiescent());
         self.connection.deinit(self.allocator) catch unreachable;
+        self.clipboard.abandonProtocol();
         for (self.windows) |*window| {
             std.debug.assert(window.state == .free or window.state == .shutdown);
             if (window.state == .shutdown) self.releaseWindowLocal(window);
         }
         self.releaseDmabufFormatTable();
         self.adapter.deinit(self.allocator);
+        self.clipboard.deinit();
         self.text_input_pending.deinit();
         self.xkb.deinit();
         self.allocator.free(self.windows);
@@ -759,6 +768,7 @@ pub const Host = struct {
         if (self.disconnect_started) return;
         for (self.windows) |window| if (window.state != .free) return error.WindowsRemainOpen;
         try self.releaseInput();
+        try self.releaseClipboardManager();
         if ((try self.connection.actor()).lifecycle == .open and
             try self.connection.prepareClose()) self.submission_pending = true;
         self.disconnect_started = true;
@@ -1039,6 +1049,52 @@ pub const Host = struct {
 
     pub fn textInputAvailable(self: *const Host) bool {
         return self.text_input != null;
+    }
+
+    pub fn clipboardAvailable(self: *const Host) bool {
+        return self.clipboard.available();
+    }
+
+    pub fn setClipboard(self: *Host, serial: u32, text: []const u8) !void {
+        try self.clipboard.setSelection(
+            &self.connection.objects,
+            try self.queue(),
+            serial,
+            text,
+        );
+        _ = try self.driver.schedule();
+    }
+
+    pub fn requestClipboard(self: *Host, request: ClipboardRequestHandle) !bool {
+        const started = try self.clipboard.requestPaste(
+            &self.connection.objects,
+            try self.queue(),
+            request,
+        );
+        if (!started) return false;
+        self.submission_pending = true;
+        _ = try self.driver.schedule();
+        return true;
+    }
+
+    pub fn cancelClipboard(self: *Host, request: ClipboardRequestHandle) !bool {
+        const canceled = try self.clipboard.cancel(request);
+        if (canceled) self.submission_pending = true;
+        return canceled;
+    }
+
+    pub fn dispatchClipboardFile(self: *Host, completion: LoopFileCompletion) !bool {
+        const handled = try self.clipboard.dispatchFile(completion);
+        if (handled) self.submission_pending = true;
+        return handled;
+    }
+
+    pub fn takeClipboardCompletion(self: *Host) ?WaylandClipboard.Completion {
+        return self.clipboard.takeCompletion();
+    }
+
+    pub fn releaseClipboardCompletion(self: *Host, request: ClipboardRequestHandle) !void {
+        try self.clipboard.releaseCompletion(request);
     }
 
     pub fn updateTextInput(self: *Host, handle: WindowHandle, state: platform_window.TextInputState) !void {
@@ -1397,6 +1453,13 @@ pub const Host = struct {
             toplevel,
             .{ .set_app_id = .{ .app_id = self.app_id } },
         );
+        try setMinimumSize(
+            objects,
+            transmit,
+            toplevel,
+            declaration.min_width,
+            declaration.min_height,
+        );
         if (viewport) |viewport_handle| try setViewport(
             objects,
             transmit,
@@ -1438,6 +1501,28 @@ pub const Host = struct {
         _ = try self.driver.schedule();
     }
 
+    fn nativeUpdateMinimumSize(
+        context: *anyopaque,
+        handle: WindowHandle,
+        width: u32,
+        height: u32,
+    ) !void {
+        const self: *Host = @ptrCast(@alignCast(context));
+        const window = try self.windowFor(handle);
+        if (window.state != .open) return error.WindowClosing;
+        const objects = &self.connection.objects;
+        const transmit = try self.queue();
+        try setMinimumSize(objects, transmit, window.toplevel.?, width, height);
+        try wayring.client.sendRequest(
+            protocol.wl_surface,
+            objects,
+            transmit,
+            window.surface.?,
+            .{ .commit = .{} },
+        );
+        _ = try self.driver.schedule();
+    }
+
     fn nativeBeginClose(context: *anyopaque, handle: WindowHandle) !void {
         const self: *Host = @ptrCast(@alignCast(context));
         const window = try self.windowFor(handle);
@@ -1449,6 +1534,7 @@ pub const Host = struct {
     const native_vtable: platform_window.NativeHost.VTable = .{
         .create = nativeCreate,
         .update_title = nativeUpdateTitle,
+        .update_minimum_size = nativeUpdateMinimumSize,
         .begin_close = nativeBeginClose,
     };
 
@@ -1468,6 +1554,8 @@ pub const Host = struct {
                 .global_remove => |removed| {
                     if (self.seat_global_name != null and self.seat_global_name.? == removed.name)
                         try self.releaseInput();
+                    if (self.clipboard.managerRemoved(removed.name))
+                        try self.releaseClipboardManager();
                     if (self.text_input_manager_global_name != null and
                         self.text_input_manager_global_name.? == removed.name)
                         try self.releaseTextInputManager();
@@ -1490,6 +1578,13 @@ pub const Host = struct {
             try self.pointerEvent(message, fds);
         } else if (interface == &protocol.wl_keyboard.info) {
             try self.keyboardEvent(message, fds);
+        } else if (interface == &protocol.wl_data_device.info) {
+            try self.clipboard.dataDeviceEvent(objects, try self.queue(), message, fds);
+        } else if (interface == &protocol.wl_data_offer.info) {
+            try self.clipboard.dataOfferEvent(objects, message, fds);
+        } else if (interface == &protocol.wl_data_source.info) {
+            try self.clipboard.dataSourceEvent(objects, try self.queue(), message, fds);
+            self.submission_pending = true;
         } else if (interface == &protocol.zwp_text_input_v3.info) {
             try self.textInputEvent(message, fds);
         } else if (interface == &protocol.xdg_wm_base.info) {
@@ -1801,6 +1896,19 @@ pub const Host = struct {
             );
             self.text_input_manager_global_name = global.name;
             try self.ensureTextInput();
+        } else if (std.mem.eql(u8, global.interface, protocol.wl_data_device_manager.info.name) and
+            self.clipboard.manager == null)
+        {
+            self.clipboard.bindManager(try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.wl_data_device_manager.info,
+                @min(global.version, 3),
+                null,
+            ), global.name);
+            try self.ensureClipboardDevice();
         } else if (std.mem.eql(u8, global.interface, protocol.wl_seat.info.name) and self.seat == null) {
             self.seat = try Core.bind(
                 objects,
@@ -1813,7 +1921,23 @@ pub const Host = struct {
             );
             self.seat_global_name = global.name;
             try self.ensureTextInput();
+            try self.ensureClipboardDevice();
         }
+    }
+
+    fn ensureClipboardDevice(self: *Host) !void {
+        if (try self.clipboard.ensureDevice(
+            &self.connection.objects,
+            try self.queue(),
+            self.seat,
+        )) _ = try self.driver.schedule();
+    }
+
+    fn releaseClipboardManager(self: *Host) !void {
+        if (try self.clipboard.releaseManager(
+            &self.connection.objects,
+            try self.queue(),
+        )) _ = try self.driver.schedule();
     }
 
     fn ensureTextInput(self: *Host) !void {
@@ -1891,6 +2015,10 @@ pub const Host = struct {
         try self.releaseTextInput();
         try self.releasePointer();
         try self.releaseKeyboard();
+        if (try self.clipboard.releaseDevice(
+            &self.connection.objects,
+            try self.queue(),
+        )) _ = try self.driver.schedule();
         if (self.seat) |seat| {
             try wayring.client.sendRequest(
                 protocol.wl_seat,
@@ -2208,6 +2336,20 @@ fn scaledExtent(logical: u32, scale_120: u32) !u32 {
     const pixels = (numerator + fractional_scale_denominator - 1) / fractional_scale_denominator;
     if (pixels > std.math.maxInt(u32)) return error.ScaledExtentOverflow;
     return @intCast(pixels);
+}
+
+fn setMinimumSize(
+    objects: *wayring.objects.ClientObjects,
+    transmit: *wayring.tx.Queue,
+    toplevel: Handle,
+    width: u32,
+    height: u32,
+) !void {
+    if (width > std.math.maxInt(i32) or height > std.math.maxInt(i32))
+        return error.InvalidMinimumWindowSize;
+    try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, toplevel, .{
+        .set_min_size = .{ .width = @intCast(width), .height = @intCast(height) },
+    });
 }
 
 fn setViewport(

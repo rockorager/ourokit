@@ -1,6 +1,7 @@
 pub const App = @import("app.zig").App;
 pub const Phase = @import("app.zig").Phase;
 pub const frame = @import("frame.zig");
+pub const clipboard = @import("clipboard.zig");
 pub const text_input = @import("text_input.zig");
 pub const turn = @import("turn.zig");
 pub const windows = @import("windows.zig");
@@ -20,6 +21,7 @@ pub const runStorybook = @import("storybook_browser.zig").run;
 
 test {
     _ = @import("app.zig");
+    _ = @import("clipboard.zig");
     _ = @import("frame.zig");
     _ = @import("text_input.zig");
     _ = @import("turn.zig");

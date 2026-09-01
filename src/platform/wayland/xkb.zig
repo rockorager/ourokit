@@ -98,8 +98,14 @@ fn logicalKey(keysym: u32) platform.LogicalKey {
         c.XKB_KEY_Right => .arrow_right,
         c.XKB_KEY_Up => .arrow_up,
         c.XKB_KEY_Down => .arrow_down,
+        c.XKB_KEY_Home, c.XKB_KEY_KP_Home => .home,
+        c.XKB_KEY_End, c.XKB_KEY_KP_End => .end,
         c.XKB_KEY_BackSpace => .backspace,
         c.XKB_KEY_Delete, c.XKB_KEY_KP_Delete => .delete,
+        c.XKB_KEY_a, c.XKB_KEY_A => .key_a,
+        c.XKB_KEY_c, c.XKB_KEY_C => .key_c,
+        c.XKB_KEY_v, c.XKB_KEY_V => .key_v,
+        c.XKB_KEY_x, c.XKB_KEY_X => .key_x,
         else => .unidentified,
     };
 }

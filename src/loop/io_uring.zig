@@ -13,15 +13,17 @@ const Operation = enum(u8) {
     read = 0xa5,
     close = 0xa6,
     operation_cancel = 0xa7,
-    accept = 0xa8,
-    recv = 0xa9,
-    send = 0xaa,
+    write = 0xa8,
+    accept = 0xa9,
+    recv = 0xaa,
+    send = 0xab,
 };
 
 pub const OperationKind = enum {
     openat2,
     statx,
     read,
+    write,
     close,
 };
 
@@ -250,6 +252,30 @@ pub const Loop = struct {
         return reserved.handle;
     }
 
+    /// The caller retains `buffer` until the terminal completion is
+    /// dispatched. Pipe and socket callers must handle short writes by
+    /// preparing another operation for the remaining suffix.
+    pub fn prepareWrite(
+        self: *Loop,
+        fd: linux.fd_t,
+        buffer: []const u8,
+        offset: u64,
+    ) !OperationHandle {
+        if (buffer.len == 0) return error.EmptyWriteBuffer;
+        const reserved = try self.reserve(.write);
+        const sqe = self.ring.write(
+            encodeFile(.write, reserved.handle),
+            fd,
+            buffer,
+            offset,
+        ) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        sqe.flags |= linux.IOSQE_ASYNC;
+        return reserved.handle;
+    }
+
     pub fn prepareClose(self: *Loop, fd: linux.fd_t) !OperationHandle {
         const reserved = try self.reserve(.close);
         _ = self.ring.close(encodeFile(.close, reserved.handle), fd) catch |err| {
@@ -313,6 +339,11 @@ pub const Loop = struct {
         return self.operation_capacity_hint;
     }
 
+    pub fn hasPendingOperations(self: *const Loop) bool {
+        for (self.slots) |slot| if (slot.active or slot.cancel_pending) return true;
+        return false;
+    }
+
     pub fn hasPendingTimerKernelWork(self: *const Loop) bool {
         return self.alarm_active or self.retired_alarm_generation != null or self.control != .none;
     }
@@ -371,7 +402,7 @@ pub const Loop = struct {
                 slot.cancel_pending = false;
                 return .{ .operation_cancel = .{ .operation = handle, .deadline_ns = 0 } };
             },
-            .openat2, .statx, .read, .close => |operation| {
+            .openat2, .statx, .read, .write, .close => |operation| {
                 const handle = decoded.handle orelse return .stale;
                 if (handle.slot >= self.slots.len) return .stale;
                 const slot = &self.slots[handle.slot];
@@ -384,6 +415,7 @@ pub const Loop = struct {
                         .openat2 => .openat2,
                         .statx => .statx,
                         .read => .read,
+                        .write => .write,
                         .close => .close,
                         else => unreachable,
                     },
@@ -509,6 +541,7 @@ fn decode(value: u64) ?Decoded {
         @intFromEnum(Operation.openat2) => .openat2,
         @intFromEnum(Operation.statx) => .statx,
         @intFromEnum(Operation.read) => .read,
+        @intFromEnum(Operation.write) => .write,
         @intFromEnum(Operation.close) => .close,
         @intFromEnum(Operation.operation_cancel) => .operation_cancel,
         @intFromEnum(Operation.accept) => .accept,
@@ -521,7 +554,7 @@ fn decode(value: u64) ?Decoded {
     };
     const generation: u32 = @truncate(value >> 32);
     const handle = switch (operation) {
-        .openat2, .statx, .read, .close, .operation_cancel, .accept, .recv, .send => OperationHandle{
+        .openat2, .statx, .read, .write, .close, .operation_cancel, .accept, .recv, .send => OperationHandle{
             .slot = @truncate((value >> 8) & 0x00ff_ffff),
             .generation = generation,
         },
@@ -691,4 +724,30 @@ test "socket operations accept receive and send on a Unix socket" {
     var response: [4]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 4), linux.read(client, &response, response.len));
     try std.testing.expectEqualStrings("pong", &response);
+}
+
+test "write operation reports stable identity and writes a pipe" {
+    var pipe: [2]linux.fd_t = undefined;
+    switch (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true }))) {
+        .SUCCESS => {},
+        else => return error.PipeCreationFailed,
+    }
+    defer _ = linux.close(pipe[0]);
+    defer _ = linux.close(pipe[1]);
+
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, 4, 1);
+    defer loop.deinit();
+
+    const bytes = "clipboard payload";
+    const operation = try loop.prepareWrite(pipe[1], bytes, std.math.maxInt(u64));
+    _ = try loop.submit();
+    const completion = loop.dispatch(try loop.wait()).file;
+    try std.testing.expectEqual(operation, completion.operation);
+    try std.testing.expectEqual(OperationKind.write, completion.kind);
+    try std.testing.expectEqual(@as(i32, bytes.len), completion.result);
+
+    var output: [bytes.len]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try std.posix.read(pipe[0], &output));
+    try std.testing.expectEqualStrings(bytes, &output);
 }

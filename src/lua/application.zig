@@ -435,6 +435,10 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
         errdefer allocator.free(title);
         const width = try optionalDimension(state, -1, "width", 640);
         const height = try optionalDimension(state, -1, "height", 480);
+        const min_width = try optionalNonNegativeDimension(state, -1, "min_width", 0);
+        const min_height = try optionalNonNegativeDimension(state, -1, "min_height", 0);
+        if (min_width > width or min_height > height)
+            return error.MinimumWindowSizeExceedsInitialSize;
         if (c.lua_getfield(state, -1, "content") != c.type_function)
             return error.WindowContentRequired;
         const content_reference = c.luaL_ref(state, c.registry_index);
@@ -444,6 +448,8 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
                 .title = title,
                 .initial_width = width,
                 .initial_height = height,
+                .min_width = min_width,
+                .min_height = min_height,
             },
             .content_reference = content_reference,
         };
@@ -504,6 +510,22 @@ fn optionalDimension(
     return @intCast(value);
 }
 
+fn optionalNonNegativeDimension(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: u32,
+) !u32 {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    var is_number: c_int = 0;
+    const value = c.lua_tointegerx(state, -1, &is_number);
+    if (is_number == 0 or value < 0 or value > std.math.maxInt(i32))
+        return error.InvalidWindowDimension;
+    return @intCast(value);
+}
+
 fn deinitWindow(allocator: std.mem.Allocator, state: *c.State, window: Window) void {
     c.luaL_unref(state, c.registry_index, window.content_reference);
     allocator.free(window.declaration.title);
@@ -534,6 +556,8 @@ test "declarative application owns windows and content callbacks" {
         \\      title = "Test",
         \\      width = 320,
         \\      height = 200,
+        \\      min_width = 280,
+        \\      min_height = 160,
         \\      content = function() end,
         \\    },
         \\  },
@@ -544,6 +568,27 @@ test "declarative application owns windows and content callbacks" {
     try std.testing.expectEqual(@as(usize, 1), application.windows.len);
     try std.testing.expectEqualStrings("main", application.windows[0].declaration.id);
     try std.testing.expectEqual(@as(u32, 320), application.windows[0].declaration.initial_width);
+    try std.testing.expectEqual(@as(u32, 280), application.windows[0].declaration.min_width);
+    try std.testing.expectEqual(@as(u32, 160), application.windows[0].declaration.min_height);
+}
+
+test "window minimum dimensions cannot exceed the initial size" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 2);
+    c.lua_setglobal(state, "ouro");
+    try std.testing.expectError(
+        error.MinimumWindowSizeExceedsInitialSize,
+        Application.load(std.testing.allocator, state,
+            \\return ouro.app {
+            \\  id = "dev.ouro.test",
+            \\  windows = { ouro.window {
+            \\    id = "main", title = "Test", width = 320, min_width = 321,
+            \\    content = function() end,
+            \\  } },
+            \\}
+        ),
+    );
 }
 
 test "application actions remain headless while run builds one UI generation" {

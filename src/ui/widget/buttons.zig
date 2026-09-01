@@ -15,11 +15,6 @@ pub const VisualUpdate = struct {
     color: Color,
 };
 
-pub const Release = struct {
-    visual: ?VisualUpdate = null,
-    activated: ?instance.InstanceHandle = null,
-};
-
 const Entry = struct {
     owner: BuildOwnerHandle = .invalid,
     target: instance.InstanceHandle = .invalid,
@@ -151,28 +146,18 @@ pub const Buttons = struct {
         return .{ .target = target, .color = next };
     }
 
-    pub fn release(self: *Buttons, hovered: ?instance.InstanceHandle) Release {
-        const armed = self.armed orelse return .{};
+    pub fn release(self: *Buttons) ?VisualUpdate {
+        const armed = self.armed orelse return null;
         self.armed = null;
         const next = self.setPressed(armed, false);
-        const activated = if (hovered != null and same(armed, hovered.?) and self.isEnabled(armed))
-            armed
-        else
-            null;
-        return .{
-            .visual = if (next) |value| .{ .target = armed, .color = value } else null,
-            .activated = activated,
-        };
+        return if (next) |value| .{ .target = armed, .color = value } else null;
     }
 
-    pub fn releaseKeyboard(self: *Buttons) Release {
-        const armed = self.armed orelse return .{};
+    pub fn releaseKeyboard(self: *Buttons) ?VisualUpdate {
+        const armed = self.armed orelse return null;
         self.armed = null;
         const next = self.setPressed(armed, false);
-        return .{
-            .visual = if (next) |value| .{ .target = armed, .color = value } else null,
-            .activated = if (self.isEnabled(armed)) armed else null,
-        };
+        return if (next) |value| .{ .target = armed, .color = value } else null;
     }
 
     pub fn currentColor(self: *const Buttons, target: instance.InstanceHandle) Color {
@@ -228,13 +213,12 @@ test "Button state preserves identity and resolves interaction colors" {
     buttons.set(owner, target, style, true);
     buttons.finishOwner(owner);
     try std.testing.expectEqual(@as(u8, 3), buttons.currentColor(target).r);
-    const release = buttons.release(target);
-    try std.testing.expectEqual(target, release.activated.?);
-    try std.testing.expectEqual(@as(u8, 2), release.visual.?.color.r);
+    const release = buttons.release();
+    try std.testing.expectEqual(@as(u8, 2), release.?.color.r);
     _ = buttons.press(target);
-    try std.testing.expect(buttons.release(null).activated == null);
+    _ = buttons.release();
     _ = buttons.press(target);
     const keyboard_release = buttons.releaseKeyboard();
-    try std.testing.expectEqual(target, keyboard_release.activated.?);
+    try std.testing.expectEqual(@as(u8, 2), keyboard_release.?.color.r);
     buttons.clear();
 }
