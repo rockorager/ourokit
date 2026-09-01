@@ -226,7 +226,10 @@ ouro.text_input {
 Use `default_text` instead when native retained editing state should own the
 value after first mount. Exactly one of `text` and `default_text` is required.
 `on_change` runs as a scoped Lua task during the task safe point, never from an
-input protocol callback; selection-only changes do not invoke it.
+input protocol callback; selection-only changes do not invoke it. `enabled =
+false` removes the field from focus traversal and rejects all interaction.
+`read_only = true` keeps focus, selection, navigation, and copy available while
+rejecting text-input commits, deletion, cut, and paste.
 
 ## Storybook
 

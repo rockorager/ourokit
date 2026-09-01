@@ -34,6 +34,7 @@ const PendingTextInput = struct {
     target_id: u64,
     content_id: u64,
     mode: TextInputValueMode,
+    behavior: @import("../ui/text_input/registry.zig").Behavior,
     session: ?TextInputSession,
 };
 
@@ -277,6 +278,7 @@ pub const UiBuild = struct {
                 tree.handleForId(pending.target_id).?,
                 tree.handleForId(pending.content_id).?,
                 pending.mode,
+                pending.behavior,
                 &pending.session,
             );
         }
@@ -365,6 +367,7 @@ pub const UiBuild = struct {
                 .target_id = source.target_id,
                 .content_id = source.content_id,
                 .mode = source.mode,
+                .behavior = source.behavior,
                 .session = source.session,
             };
             source.session = null;
@@ -648,6 +651,10 @@ pub const UiBuild = struct {
             "height",
             design.tokens.foundation.component_height_default,
         ) orelse return luaError(state, "invalid text_input height");
+        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
+            return luaError(state, "text_input enabled must be a boolean");
+        const read_only = tableOptionalBoolean(state, 1, "read_only", false) orelse
+            return luaError(state, "text_input read_only must be a boolean");
         const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id);
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
         self.append(.{
@@ -656,14 +663,17 @@ pub const UiBuild = struct {
             .object = .{ .box = .{
                 .width = width,
                 .height = height,
-                .padding = .all(design.tokens.foundation.spacing_2),
+                .padding = .{
+                    .left = design.tokens.foundation.spacing_2,
+                    .right = design.tokens.foundation.spacing_2,
+                },
                 .alignment = .{ .vertical = .center },
                 .background = theme.surface_base,
                 .border_color = theme.border_default,
                 .border_width = design.tokens.foundation.border_width_default,
                 .corner_radius = design.tokens.foundation.corner_radius_small,
             } },
-            .focusable = true,
+            .focusable = enabled,
             .parent_data = declarativeParentData(self, state, 1) orelse
                 return luaError(state, "invalid text_input position"),
         }) catch return luaError(state, "cannot append text_input descriptor");
@@ -681,7 +691,7 @@ pub const UiBuild = struct {
             .parent = target_id,
             .object = .{ .text_input = .{
                 .source = source,
-                .color = theme.content_primary,
+                .color = if (enabled) theme.content_primary else theme.content_secondary,
                 .selection_color = theme.selection_background,
                 .caret_color = theme.content_primary,
                 .selection_start = initial.len,
@@ -700,6 +710,7 @@ pub const UiBuild = struct {
             .target_id = target_id,
             .content_id = content_id,
             .mode = mode,
+            .behavior = .{ .enabled = enabled, .read_only = read_only },
             .session = TextInputSession.init(self.label_sources.?.allocator, initial) catch
                 return luaError(state, "cannot create text_input session"),
         };
@@ -710,6 +721,7 @@ pub const UiBuild = struct {
             .role = .text_field,
             .key = key,
             .label = initial,
+            .enabled = enabled,
         }) catch return luaError(state, "cannot append text_input semantics");
 
         const callback_type = c.lua_getfield(state, 1, "on_change");
@@ -1248,6 +1260,7 @@ test "declarative text input separates focus identity from editable render conte
         \\        key = "query",
         \\        text = "Initial",
         \\        width = 200,
+        \\        read_only = true,
         \\        on_change = function(value) changed = value end,
         \\      }
         \\    end,
@@ -1260,10 +1273,17 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(@as(usize, 5), descriptors.len);
     try std.testing.expect(descriptors[3].object == .box);
     try std.testing.expect(descriptors[3].focusable);
+    try std.testing.expectEqual(@as(f32, 0), descriptors[3].object.box.padding.top);
+    try std.testing.expectEqual(@as(f32, 0), descriptors[3].object.box.padding.bottom);
+    try std.testing.expectEqual(
+        design.tokens.foundation.spacing_2,
+        descriptors[3].object.box.padding.left,
+    );
     try std.testing.expect(descriptors[4].object == .text_input);
     try std.testing.expectEqual(descriptors[3].id, descriptors[4].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_text_input_count);
     try std.testing.expectEqual(.controlled, ui.pending_text_inputs[0].mode);
+    try std.testing.expect(ui.pending_text_inputs[0].behavior.read_only);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
     try std.testing.expectEqual(.text_input_change, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(.text_field, ui.semanticDescriptors()[1].role);
@@ -1274,6 +1294,7 @@ test "declarative text input separates focus identity from editable render conte
     try ui.capturePrepared(&prepared, descriptors);
     try std.testing.expectEqual(@as(usize, 1), prepared.text_input_count);
     try std.testing.expectEqual(.controlled, prepared.text_inputs[0].mode);
+    try std.testing.expect(prepared.text_inputs[0].behavior.read_only);
     try std.testing.expectEqualStrings(
         "Initial",
         prepared.text_inputs[0].session.?.model.text(),

@@ -30,6 +30,7 @@ pub const TextInput = struct {
     target_id: u64,
     content_id: u64,
     mode: text_input.ValueMode,
+    behavior: text_input.Behavior,
     session: ?text_input.Session,
 };
 

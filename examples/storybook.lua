@@ -263,6 +263,37 @@ return ouro.storybook {
       end,
     },
     ouro.story {
+      id = "text-input/states",
+      group = "Text input",
+      name = "Editable, read-only, and disabled",
+      viewport = { width = 420, height = 240 },
+      content = function()
+        ouro.column {
+          key = "content",
+          gap = 10,
+          children = function()
+            ouro.text_input {
+              key = "editable",
+              default_text = "Editable value",
+              width = 280,
+            }
+            ouro.text_input {
+              key = "read-only",
+              default_text = "Read-only value",
+              width = 280,
+              read_only = true,
+            }
+            ouro.text_input {
+              key = "disabled",
+              default_text = "Disabled value",
+              width = 280,
+              enabled = false,
+            }
+          end,
+        }
+      end,
+    },
+    ouro.story {
       id = "button/default",
       group = "Button",
       name = "Default",

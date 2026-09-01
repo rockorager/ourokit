@@ -498,6 +498,10 @@ resume that coroutine. Task-phase scheduling therefore preserves the invariant
 that input dispatch, reconciliation, and Lua execution cannot re-enter one
 another. Selection movement, preedit-only changes, and controlled external
 synchronization do not emit `on_change`.
+Enabled and read-only behavior is retained beside the session rather than in
+Lua or the render object. Disabled fields leave focus traversal and reject all
+input. Read-only fields retain selection/navigation/copy behavior but do not
+activate the platform text-input protocol or accept any mutating operation.
 
 Commands are not discovered by walking render objects. A future authoritative
 registry owns stable semantic IDs and revisioned invocation handles plus title,

@@ -5,11 +5,17 @@ const Session = @import("session.zig").Session;
 
 pub const ValueMode = enum { uncontrolled, controlled };
 
+pub const Behavior = struct {
+    enabled: bool = true,
+    read_only: bool = false,
+};
+
 const Entry = struct {
     owner: build_owner.BuildOwnerHandle = .invalid,
     target: instance.InstanceHandle = .invalid,
     content: instance.InstanceHandle = .invalid,
     session: ?Session = null,
+    behavior: Behavior = .{},
     active: bool = false,
     seen: bool = false,
 };
@@ -59,7 +65,7 @@ pub const Registry = struct {
         var prepared: ?Session = try Session.init(self.allocator, initial);
         defer if (prepared) |*session_value| session_value.deinit();
         try self.prepareMount(target, .uncontrolled, &prepared);
-        try self.mountPrepared(owner, target, content_handle, .uncontrolled, &prepared);
+        try self.mountPrepared(owner, target, content_handle, .uncontrolled, .{}, &prepared);
     }
 
     /// Prepares all allocation and selection normalization before a retained
@@ -90,11 +96,14 @@ pub const Registry = struct {
         target: instance.InstanceHandle,
         content_handle: instance.InstanceHandle,
         mode: ValueMode,
+        behavior: Behavior,
         prepared: *?Session,
     ) !void {
         for (self.entries) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.content = content_handle;
+            entry.behavior = behavior;
+            if (!behavior.enabled) entry.session.?.endSelectionDrag();
             entry.seen = true;
             if (mode == .controlled and !std.mem.eql(
                 u8,
@@ -113,6 +122,7 @@ pub const Registry = struct {
                 .target = target,
                 .content = content_handle,
                 .session = prepared.* orelse return error.TextInputSessionMissing,
+                .behavior = behavior,
                 .active = true,
                 .seen = true,
             };
@@ -146,6 +156,10 @@ pub const Registry = struct {
 
     pub fn content(self: *const Registry, target: instance.InstanceHandle) !instance.InstanceHandle {
         return (self.find(target) orelse return error.TextInputNotFound).content;
+    }
+
+    pub fn getBehavior(self: *const Registry, target: instance.InstanceHandle) !Behavior {
+        return (self.find(target) orelse return error.TextInputNotFound).behavior;
     }
 
     pub const Mounted = struct {
@@ -216,14 +230,14 @@ test "prepared mount moves new sessions and leaves rediscovered state untouched"
 
     var initial: ?Session = try Session.init(std.testing.allocator, "initial");
     try registry.prepareMount(target, .uncontrolled, &initial);
-    try registry.mountPrepared(owner, target, content, .uncontrolled, &initial);
+    try registry.mountPrepared(owner, target, content, .uncontrolled, .{}, &initial);
     try std.testing.expect(initial == null);
     _ = try (try registry.session(target)).model.replaceSelection(" retained");
 
     var replacement: ?Session = try Session.init(std.testing.allocator, "replacement");
     defer if (replacement) |*session| session.deinit();
     try registry.prepareMount(target, .uncontrolled, &replacement);
-    try registry.mountPrepared(owner, target, content, .uncontrolled, &replacement);
+    try registry.mountPrepared(owner, target, content, .uncontrolled, .{}, &replacement);
     try std.testing.expect(replacement != null);
     try std.testing.expectEqualStrings("initial retained", (try registry.session(target)).model.text());
     registry.clear();
@@ -242,16 +256,42 @@ test "controlled mounts replace changed values and preserve valid selection" {
     var equal: ?Session = try Session.init(std.testing.allocator, "abcdef");
     defer if (equal) |*session_value| session_value.deinit();
     try registry.prepareMount(target, .controlled, &equal);
-    try registry.mountPrepared(owner, target, content, .controlled, &equal);
+    try registry.mountPrepared(owner, target, content, .controlled, .{}, &equal);
     try std.testing.expectEqual(@as(usize, 2), (try registry.session(target)).model.selection.anchor);
 
     var changed: ?Session = try Session.init(std.testing.allocator, "abc");
     defer if (changed) |*session_value| session_value.deinit();
     try registry.prepareMount(target, .controlled, &changed);
-    try registry.mountPrepared(owner, target, content, .controlled, &changed);
+    try registry.mountPrepared(owner, target, content, .controlled, .{}, &changed);
     const retained = try registry.session(target);
     try std.testing.expectEqualStrings("abc", retained.model.text());
     try std.testing.expectEqual(@as(usize, 2), retained.model.selection.anchor);
     try std.testing.expectEqual(@as(usize, 3), retained.model.selection.extent);
+    registry.clear();
+}
+
+test "rediscovery updates text input behavior without resetting its session" {
+    var registry: Registry = undefined;
+    try registry.init(std.testing.allocator, 1);
+    defer registry.deinit();
+    const owner: build_owner.BuildOwnerHandle = .{ .slot = 1, .generation = 2 };
+    const target: instance.InstanceHandle = .{ .slot = 3, .generation = 4 };
+    const content: instance.InstanceHandle = .{ .slot = 5, .generation = 6 };
+    try registry.mount(owner, target, content, "initial");
+    _ = try (try registry.session(target)).model.replaceSelection(" edit");
+
+    var candidate: ?Session = try Session.init(std.testing.allocator, "ignored");
+    defer if (candidate) |*session_value| session_value.deinit();
+    try registry.prepareMount(target, .uncontrolled, &candidate);
+    try registry.mountPrepared(
+        owner,
+        target,
+        content,
+        .uncontrolled,
+        .{ .read_only = true },
+        &candidate,
+    );
+    try std.testing.expect((try registry.getBehavior(target)).read_only);
+    try std.testing.expectEqualStrings("initial edit", (try registry.session(target)).model.text());
     registry.clear();
 }

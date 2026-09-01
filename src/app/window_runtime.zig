@@ -363,6 +363,7 @@ pub const WindowRuntime = struct {
             self.instances.handleForId(input.target_id).?,
             self.instances.handleForId(input.content_id).?,
             input.mode,
+            input.behavior,
             &input.session,
         ) catch unreachable;
         self.text_inputs.finishOwner(self.root_owner);
@@ -495,6 +496,8 @@ pub const WindowRuntime = struct {
     pub fn textInputStatus(self: *WindowRuntime) !?TextInputStatus {
         const focused = self.focus.current() orelse return null;
         if (!self.text_inputs.contains(focused)) return null;
+        const behavior = try self.text_inputs.getBehavior(focused);
+        if (!behavior.enabled or behavior.read_only) return null;
         const session = try self.text_inputs.session(focused);
         var state = text_input_coordinator.surroundingState(session);
         const content = try self.text_inputs.content(focused);
@@ -544,6 +547,8 @@ pub const WindowRuntime = struct {
             if (event == .text_input) {
                 const focused = self.focus.current() orelse continue;
                 if (!self.text_inputs.contains(focused)) continue;
+                const behavior = try self.text_inputs.getBehavior(focused);
+                if (!behavior.enabled or behavior.read_only) continue;
                 self.text_input_commit_permitted = event.text_input.serial_matches_state;
                 const session = try self.text_inputs.session(focused);
                 const model_revision = session.model.revision;
@@ -626,8 +631,10 @@ pub const WindowRuntime = struct {
             key.state != .released)
         {
             const session = try self.text_inputs.session(focused);
+            const behavior = try self.text_inputs.getBehavior(focused);
             if (key.state == .pressed) {
                 if (textInputClipboardShortcut(key.translated)) |command| {
+                    if (!behavior.enabled or (behavior.read_only and command != .copy)) return;
                     if (session.preedit() != null) return;
                     session.endSelectionDrag();
                     const clipboard = self.clipboard orelse return;
@@ -655,6 +662,8 @@ pub const WindowRuntime = struct {
             }
             const intent = textInputIntent(key.translated);
             if (session.preedit() != null and intent != null) return;
+            if (intent) |value| if (!behavior.enabled or
+                (behavior.read_only and intentEditsText(value))) return;
             const changed = if (intent) |value|
                 try self.applyTextInputIntent(focused, value)
             else
@@ -865,6 +874,7 @@ pub const WindowRuntime = struct {
             .button => |button| {
                 if (button.button != 0x110) return;
                 const input = (try self.textInputAncestor(target)) orelse return;
+                if (!(try self.text_inputs.getBehavior(input)).enabled) return;
                 const session = try self.text_inputs.session(input);
                 switch (button.state) {
                     .pressed => {
@@ -956,6 +966,8 @@ pub const WindowRuntime = struct {
         bytes: []const u8,
     ) !bool {
         if (!self.instances.isActive(target) or !self.text_inputs.contains(target)) return false;
+        const behavior = try self.text_inputs.getBehavior(target);
+        if (!behavior.enabled or behavior.read_only) return false;
         const session = try self.text_inputs.session(target);
         session.endSelectionDrag();
         const changed = try session.apply(.{ .commit = .{ .text = bytes } });
@@ -1673,6 +1685,40 @@ test "text input protocol batches mutate retained sessions only at the input saf
 
     while (scheduler.takeRunnable()) |runnable|
         _ = try callback_vm.resumeRunnable(runnable);
+    var read_only_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(
+        std.testing.allocator,
+        "ignored",
+    );
+    defer if (read_only_candidate) |*session_value| session_value.deinit();
+    try runtime.text_inputs.prepareMount(target, .uncontrolled, &read_only_candidate);
+    try runtime.text_inputs.mountPrepared(
+        owner,
+        target,
+        content,
+        .uncontrolled,
+        .{ .read_only = true },
+        &read_only_candidate,
+    );
+    const before_read_only = try std.testing.allocator.dupe(
+        u8,
+        (try runtime.text_inputs.session(target)).model.text(),
+    );
+    defer std.testing.allocator.free(before_read_only);
+    try runtime.routeTextInput(.{ .batch = .{
+        .window = window,
+        .serial = 11,
+        .serial_matches_state = true,
+        .delete_surrounding = null,
+        .commit = .{ .text = "blocked" },
+        .preedit = null,
+    } });
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings(
+        before_read_only,
+        (try runtime.text_inputs.session(target)).model.text(),
+    );
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    try std.testing.expect((try runtime.textInputStatus()) == null);
     _ = runtime.pointer_bindings.remove(target);
     try callbacks.release(callback);
 
