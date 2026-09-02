@@ -20,5 +20,5 @@ upstream release must update this record and be reviewed rather than silently
 absorbing the upstream corpus.
 
 Spectrum 2 is no longer Ourokit's component or token source of truth. The
-current direction and source are recorded in `shadcn-ui.md`; this file is
+current direction and source are recorded in `radix.md`; this file is
 retained to preserve attribution for the project's earlier design work.

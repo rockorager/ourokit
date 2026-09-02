@@ -5,6 +5,14 @@ test "canonical typography delegates generic sans-serif to platform discovery" {
     try std.testing.expectEqualStrings("sans-serif", tokens.foundation.typography_family);
 }
 
+test "semantic themes map onto public Radix color scales" {
+    const std = @import("std");
+    try std.testing.expectEqual(tokens.palette.light.indigo.step_9, tokens.light.primary);
+    try std.testing.expectEqual(tokens.palette.dark.indigo.step_9, tokens.dark.primary);
+    try std.testing.expectEqual(tokens.palette.light.slate.step_5, tokens.light.sidebar_accent_selected);
+    try std.testing.expect(tokens.palette.dark.indigo_alpha.step_5.a < 255);
+}
+
 test "semantic tokens are consumable by renderer-neutral scenes" {
     const std = @import("std");
     const scene = @import("../scene/root.zig");
@@ -25,5 +33,5 @@ test "semantic tokens are consumable by renderer-neutral scenes" {
         .stride = 4,
         .format = .rgba8_unorm,
     });
-    try std.testing.expectEqualSlices(u8, &.{ 0x17, 0x17, 0x17, 0xff }, &pixel);
+    try std.testing.expectEqualSlices(u8, &.{ 0x3e, 0x63, 0xdd, 0xff }, &pixel);
 }

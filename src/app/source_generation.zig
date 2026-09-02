@@ -280,7 +280,7 @@ pub const SourceGeneration = struct {
                 );
                 return err;
             };
-            self.ui_build.attachButtonText(&self.medium_font_candidates) catch |err| {
+            self.ui_build.attachMediumText(&self.medium_font_candidates) catch |err| {
                 lua.recordDiagnosticError(
                     diagnostic,
                     allocator,

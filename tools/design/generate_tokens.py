@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TOKENS = ROOT / "design" / "tokens"
 OUTPUT = ROOT / "src" / "design" / "generated" / "tokens.zig"
-NAME = re.compile(r"^ouro\.(?:foundation|semantic)\.[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*$")
+NAME = re.compile(r"^ouro\.(?:foundation|palette|semantic)\.[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*$")
 REF = re.compile(r"^\{(ouro\..+)\}$")
 HEX = re.compile(r"^#[0-9a-fA-F]{8}$")
 TYPES = {"dimension", "font_size", "font_family", "color"}
@@ -68,14 +68,15 @@ def color_literal(value: str, values: dict[str, dict]) -> str:
 
 def generate() -> str:
     foundation = load("foundation.json")
+    palette = load("palette.json")
     light = load("semantic-light.json")
     dark = load("semantic-dark.json")
     if {t["name"] for t in light} != {t["name"] for t in dark}:
         raise ValueError("light and dark themes must define exactly the same semantic roles")
     if any(t["type"] != "color" for t in light + dark):
         raise ValueError("semantic roles must be colors in this schema version")
-    all_values = {t["name"]: t for t in foundation + light}
-    for token in foundation + light + dark:
+    all_values = {t["name"]: t for t in foundation + palette + light}
+    for token in foundation + palette + light + dark:
         if isinstance(token["value"], str) and (match := REF.fullmatch(token["value"])):
             if match.group(1) not in all_values:
                 raise ValueError(f"unresolved reference {match.group(1)}")
@@ -96,6 +97,33 @@ def generate() -> str:
             lines.append(f"    pub const {name}: []const u8 = {json.dumps(token['value'])};")
         else:
             lines.append(f"    pub const {name}: f32 = {float(token['value']):.1f};")
+    lines.extend(["};", "", "pub const ColorScale = struct {"])
+    for step in range(1, 13):
+        lines.append(f"    step_{step}: Color,")
+    lines.extend(["};", "", "pub const palette = struct {"])
+    basics = {token["name"]: token for token in palette if token["name"].count(".") == 2}
+    for name in ("black", "white", "transparent"):
+        token = basics[f"ouro.palette.{name}"]
+        lines.append(f"    pub const {name}: Color = {color_literal(token['value'], all_values)};")
+    grouped: dict[str, dict[str, dict[int, dict]]] = {}
+    for token in palette:
+        parts = token["name"].removeprefix("ouro.palette.").split(".")
+        if len(parts) == 1:
+            continue
+        if len(parts) != 3 or not parts[2].isdigit() or not 1 <= int(parts[2]) <= 12:
+            raise ValueError(f"invalid palette scale token {token['name']}")
+        mode, family, step = parts
+        grouped.setdefault(mode, {}).setdefault(family, {})[int(step)] = token
+    for mode in ("light", "dark", "overlay"):
+        lines.append(f"    pub const {mode} = struct {{")
+        for family, steps in sorted(grouped[mode].items()):
+            if set(steps) != set(range(1, 13)):
+                raise ValueError(f"palette scale {mode}.{family} must define steps 1 through 12")
+            lines.append(f"        pub const {family}: ColorScale = .{{")
+            for step in range(1, 13):
+                lines.append(f"            .step_{step} = {color_literal(steps[step]['value'], all_values)},")
+            lines.append("        };")
+        lines.append("    };")
     lines.extend(["};", "", "pub const Theme = struct {"])
     for token in sorted(light, key=lambda item: item["name"]):
         lines.append(f"    {identifier(token['name'], 'ouro.semantic.')}: Color,")

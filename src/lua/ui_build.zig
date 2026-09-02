@@ -20,11 +20,8 @@ const render_types = @import("../ui/render_object/types.zig");
 const SemanticDescriptor = @import("../ui/semantics/snapshot.zig").Descriptor;
 const text = @import("../text/root.zig");
 
-// shadcn/ui keeps component geometry and state opacity in component recipes;
-// only reusable semantic roles belong in the generated theme.
-const button_hover_opacity: u8 = 204; // 80% of 255.
-const disabled_opacity: u8 = 128; // 50% of 255, rounded.
-const radius_medium_multiplier: f32 = 0.8;
+// Radix Themes keeps widget geometry in component recipes while reusable color
+// roles and scales remain generated design data.
 
 const PendingHandler = struct {
     id: u64,
@@ -90,7 +87,7 @@ pub const UiBuild = struct {
     callback_vm: ?*Vm = null,
     label_sources: ?*text.ParagraphSourceCache = null,
     label_candidates: []const text.FontHandle = &.{},
-    button_candidates: []const text.FontHandle = &.{},
+    medium_candidates: []const text.FontHandle = &.{},
     label_configuration_revision: u64 = 0,
     widget_theme: ?design.tokens.Theme = null,
     theme_stack: [32]design.tokens.Theme = undefined,
@@ -530,11 +527,11 @@ pub const UiBuild = struct {
         self.label_configuration_revision = configuration_revision;
     }
 
-    pub fn attachButtonText(self: *UiBuild, candidates: []const text.FontHandle) !void {
+    pub fn attachMediumText(self: *UiBuild, candidates: []const text.FontHandle) !void {
         if (self.active_owner != null or self.label_sources == null or
-            self.button_candidates.len != 0 or candidates.len == 0)
-            return error.InvalidButtonTextService;
-        self.button_candidates = candidates;
+            self.medium_candidates.len != 0 or candidates.len == 0)
+            return error.InvalidMediumTextService;
+        self.medium_candidates = candidates;
     }
 
     pub fn enableDeclarativeWidgets(self: *UiBuild, theme: design.tokens.Theme) void {
@@ -627,7 +624,7 @@ pub const UiBuild = struct {
             state,
             1,
             "height",
-            design.tokens.foundation.component_height_default,
+            design.tokens.foundation.spacing_6,
         ) orelse return luaError(state, "invalid button height");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
@@ -635,9 +632,9 @@ pub const UiBuild = struct {
         const label_id = semanticId(key, 0x6c6162656c ^ button_id);
         const style: ButtonStyle = .{
             .idle = theme.primary,
-            .hovered = withOpacity(theme.primary, button_hover_opacity),
-            .pressed = withOpacity(theme.primary, button_hover_opacity),
-            .disabled = withOpacity(theme.primary, disabled_opacity),
+            .hovered = theme.primary_hover,
+            .pressed = theme.primary_hover,
+            .disabled = theme.disabled,
         };
         self.append(.{
             .id = button_id,
@@ -646,12 +643,12 @@ pub const UiBuild = struct {
                 .width = width.value,
                 .height = height,
                 .padding = .{
-                    .left = design.tokens.foundation.spacing_2_5,
-                    .right = design.tokens.foundation.spacing_2_5,
+                    .left = design.tokens.foundation.spacing_3,
+                    .right = design.tokens.foundation.spacing_3,
                 },
                 .alignment = .center,
                 .background = if (enabled) style.idle else style.disabled,
-                .corner_radius = design.tokens.foundation.radius,
+                .corner_radius = design.tokens.foundation.radius_2,
             } },
             .focusable = enabled,
             .parent_data = parent_data,
@@ -661,11 +658,11 @@ pub const UiBuild = struct {
         const source = sources.acquire(.{
             .utf8 = label,
             .language = "und",
-            .logical_size = design.tokens.foundation.typography_body,
-            .candidates = if (self.button_candidates.len == 0)
+            .logical_size = design.tokens.foundation.typography_2,
+            .candidates = if (self.medium_candidates.len == 0)
                 self.label_candidates
             else
-                self.button_candidates,
+                self.medium_candidates,
             .configuration_revision = self.label_configuration_revision,
         }) catch return luaError(state, "cannot retain button label");
         self.append(.{
@@ -676,7 +673,7 @@ pub const UiBuild = struct {
                 .color = if (enabled)
                     theme.primary_foreground
                 else
-                    withOpacity(theme.primary_foreground, disabled_opacity),
+                    theme.disabled_foreground,
                 .alignment = .center,
                 .max_lines = 1,
                 .overflow = .ellipsis,
@@ -740,7 +737,7 @@ pub const UiBuild = struct {
             state,
             1,
             "height",
-            design.tokens.foundation.component_height_default,
+            design.tokens.foundation.spacing_6,
         ) orelse return luaError(state, "invalid text_input height");
         const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
             return luaError(state, "text_input enabled must be a boolean");
@@ -756,13 +753,14 @@ pub const UiBuild = struct {
                 .fill_width = width.isFill(),
                 .height = height,
                 .padding = .{
-                    .left = design.tokens.foundation.spacing_2_5,
-                    .right = design.tokens.foundation.spacing_2_5,
+                    .left = design.tokens.foundation.spacing_2,
+                    .right = design.tokens.foundation.spacing_2,
                 },
                 .alignment = .{ .vertical = .center },
-                .border_color = if (enabled) theme.input else withOpacity(theme.input, disabled_opacity),
+                .background = theme.surface,
+                .border_color = if (enabled) theme.input else theme.border,
                 .border_width = design.tokens.foundation.border_width_default,
-                .corner_radius = design.tokens.foundation.radius,
+                .corner_radius = design.tokens.foundation.radius_2,
             } },
             .focusable = enabled,
             .parent_data = declarativeParentData(self, state, 1) catch |err|
@@ -773,7 +771,7 @@ pub const UiBuild = struct {
         const source = sources.acquire(.{
             .utf8 = initial,
             .language = "und",
-            .logical_size = design.tokens.foundation.typography_body,
+            .logical_size = design.tokens.foundation.typography_2,
             .candidates = self.label_candidates,
             .configuration_revision = self.label_configuration_revision,
         }) catch return luaError(state, "cannot retain text_input text");
@@ -782,8 +780,8 @@ pub const UiBuild = struct {
             .parent = target_id,
             .object = .{ .text_input = .{
                 .source = source,
-                .color = if (enabled) theme.foreground else withOpacity(theme.foreground, disabled_opacity),
-                .selection_color = theme.accent,
+                .color = if (enabled) theme.foreground else theme.disabled_foreground,
+                .selection_color = theme.selection,
                 .caret_color = theme.foreground,
                 .selection_start = initial.len,
                 .selection_end = initial.len,
@@ -913,33 +911,40 @@ pub const UiBuild = struct {
             theme.sidebar_foreground
         else
             theme.foreground;
-        const accent = if (listbox.appearance == .sidebar) theme.sidebar_accent else theme.accent;
+        const hovered = if (listbox.appearance == .sidebar) theme.sidebar_accent else theme.accent;
+        const selected_background = if (listbox.appearance == .sidebar)
+            theme.sidebar_accent_selected
+        else
+            theme.accent_selected;
         const accent_foreground = if (listbox.appearance == .sidebar)
             theme.sidebar_accent_foreground
         else
             theme.accent_foreground;
         const style: ListBoxStyle = .{
             .idle = .{ .background = null, .foreground = idle_foreground },
-            .hovered = .{ .background = accent, .foreground = accent_foreground },
-            .selected = .{ .background = accent, .foreground = accent_foreground },
+            .hovered = .{ .background = hovered, .foreground = accent_foreground },
+            .selected = .{ .background = selected_background, .foreground = accent_foreground },
         };
         self.append(.{
             .id = option_id,
             .parent = parent.id,
             .object = .{ .box = .{
-                .height = design.tokens.foundation.component_height_default,
+                .height = design.tokens.foundation.spacing_6,
                 .padding = .{ .left = design.tokens.foundation.spacing_2, .right = design.tokens.foundation.spacing_2 },
                 .alignment = .{ .horizontal = .minimum, .vertical = .center },
                 .background = if (selected) style.selected.background else style.idle.background,
-                .corner_radius = design.tokens.foundation.radius * radius_medium_multiplier,
+                .corner_radius = design.tokens.foundation.radius_1,
             } },
         }) catch return luaError(state, "cannot append option descriptor");
         const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
         const source = sources.acquire(.{
             .utf8 = label,
             .language = "und",
-            .logical_size = design.tokens.foundation.typography_body,
-            .candidates = self.label_candidates,
+            .logical_size = design.tokens.foundation.typography_2,
+            .candidates = if (selected and listbox.appearance == .sidebar and self.medium_candidates.len != 0)
+                self.medium_candidates
+            else
+                self.label_candidates,
             .configuration_revision = self.label_configuration_revision,
         }) catch return luaError(state, "cannot retain option label");
         self.append(.{
@@ -986,7 +991,7 @@ pub const UiBuild = struct {
             state,
             1,
             "size",
-            design.tokens.foundation.typography_body,
+            design.tokens.foundation.typography_3,
         ) orelse return luaError(state, "invalid label size");
         const alignment = tableOptionalParagraphAlignment(state, 1, "alignment", .start) orelse
             return luaError(state, "invalid label alignment");
@@ -1436,12 +1441,6 @@ fn tableOptionalListBoxAppearance(state: *c.State, table: c_int) ?ListBoxAppeara
     return null;
 }
 
-fn withOpacity(color: @TypeOf(design.tokens.light.background), opacity: u8) @TypeOf(color) {
-    var result = color;
-    result.a = @intCast((@as(u16, color.a) * opacity + 127) / 255);
-    return result;
-}
-
 fn tableOptionalParagraphOverflow(
     state: *c.State,
     table: c_int,
@@ -1662,11 +1661,12 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(@as(f32, 0), descriptors[3].object.box.padding.top);
     try std.testing.expectEqual(@as(f32, 0), descriptors[3].object.box.padding.bottom);
     try std.testing.expectEqual(
-        design.tokens.foundation.spacing_2_5,
+        design.tokens.foundation.spacing_2,
         descriptors[3].object.box.padding.left,
     );
     try std.testing.expectEqual(design.tokens.light.input, descriptors[3].object.box.border_color.?);
-    try std.testing.expectEqual(design.tokens.foundation.radius, descriptors[3].object.box.corner_radius);
+    try std.testing.expectEqual(design.tokens.light.surface, descriptors[3].object.box.background.?);
+    try std.testing.expectEqual(design.tokens.foundation.radius_2, descriptors[3].object.box.corner_radius);
     try std.testing.expect(descriptors[4].object == .text_input);
     try std.testing.expectEqual(descriptors[3].id, descriptors[4].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_text_input_count);
@@ -1721,6 +1721,10 @@ test "declarative sidebar listbox uses paired active visuals" {
         .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_test_font_static"),
     });
+    const medium_font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Medium.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_storybook_medium_font"),
+    });
     var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
     defer sources.deinit();
     var storage: [7]instance.Descriptor = undefined;
@@ -1728,6 +1732,7 @@ test "declarative sidebar listbox uses paired active visuals" {
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachLabelText(&sources, &.{font}, 1);
+    try ui.attachMediumText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
@@ -1749,7 +1754,10 @@ test "declarative sidebar listbox uses paired active visuals" {
     const descriptors = try ui.build(&owners, work, "build", &.{});
     try std.testing.expectEqual(@as(usize, 7), descriptors.len);
     try std.testing.expectEqual(design.tokens.light.sidebar_foreground, descriptors[4].object.label.color);
-    try std.testing.expectEqual(design.tokens.light.sidebar_accent, descriptors[5].object.box.background.?);
+    try std.testing.expectEqual(
+        design.tokens.light.sidebar_accent_selected,
+        descriptors[5].object.box.background.?,
+    );
     try std.testing.expectEqual(
         design.tokens.light.sidebar_accent_foreground,
         descriptors[6].object.label.color,
@@ -1760,6 +1768,10 @@ test "declarative sidebar listbox uses paired active visuals" {
         design.tokens.light.sidebar_accent_foreground,
         ui.pending_options[0].style.hovered.foreground,
     );
+    const idle_source = try sources.get(descriptors[4].object.label.source);
+    const selected_source = try sources.get(descriptors[6].object.label.source);
+    try std.testing.expectEqual(font, idle_source.candidates[0]);
+    try std.testing.expectEqual(medium_font, selected_source.candidates[0]);
 
     var prepared: PreparedBuild = undefined;
     try prepared.init(std.testing.allocator, state, &sources, 7, 64);
@@ -1769,6 +1781,7 @@ test "declarative sidebar listbox uses paired active visuals" {
     prepared.reset();
     try owners.complete(work);
     try fonts.release(font);
+    try fonts.release(medium_font);
     try owners.retire(owner);
     try scheduler.applyQueuedCancellations();
     try owners.collectRetired();
@@ -2003,7 +2016,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachLabelText(&sources, &.{font}, 1);
-    try ui.attachButtonText(&.{medium_font});
+    try ui.attachMediumText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
@@ -2066,17 +2079,17 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expect(descriptors[7].object.box.width == null);
     try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.min_width);
     try std.testing.expectEqual(
-        @as(?f32, design.tokens.foundation.component_height_default),
+        @as(?f32, design.tokens.foundation.spacing_6),
         descriptors[7].object.box.height,
     );
     try std.testing.expectEqual(
-        design.tokens.foundation.radius,
+        design.tokens.foundation.radius_2,
         descriptors[7].object.box.corner_radius,
     );
     try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.padding.top);
     try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.padding.bottom);
-    try std.testing.expectEqual(design.tokens.foundation.spacing_2_5, descriptors[7].object.box.padding.left);
-    try std.testing.expectEqual(design.tokens.foundation.spacing_2_5, descriptors[7].object.box.padding.right);
+    try std.testing.expectEqual(design.tokens.foundation.spacing_3, descriptors[7].object.box.padding.left);
+    try std.testing.expectEqual(design.tokens.foundation.spacing_3, descriptors[7].object.box.padding.right);
     try std.testing.expectEqual(design.tokens.dark.primary_foreground, descriptors[8].object.label.color);
     const button_source = try sources.get(descriptors[8].object.label.source);
     try std.testing.expectEqual(@as(usize, 1), button_source.candidates.len);
@@ -2087,10 +2100,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
     try std.testing.expectEqual(.button, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_button_count);
-    try std.testing.expectEqual(
-        withOpacity(design.tokens.dark.primary, disabled_opacity),
-        ui.pending_buttons[0].style.disabled,
-    );
+    try std.testing.expectEqual(design.tokens.dark.disabled, ui.pending_buttons[0].style.disabled);
     try std.testing.expectEqual(@as(usize, 6), ui.semanticDescriptors().len);
     try std.testing.expectEqualStrings("Controls", ui.semanticDescriptors()[3].label);
     try std.testing.expectEqualStrings("Benchmark", ui.semanticDescriptors()[5].label);

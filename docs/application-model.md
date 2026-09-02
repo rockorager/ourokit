@@ -212,18 +212,20 @@ single-selection `ouro.listbox` composes a vertical Flex with direct
 and calls `on_select(value)` for pointer selection and Up/Down/Home/End navigation;
 the application remains the source of truth through the `selected` property.
 Options are transparent over their containing surface at rest and retain hover
-state across reconciliation. Hover and selection use the generated `accent`
-and `accent_foreground` pair. `appearance = "sidebar"` selects the corresponding
-sidebar pair for navigation catalogs without introducing a separate widget.
+state across reconciliation. Default options use accent steps 3 and 5 for hover
+and selection. `appearance = "sidebar"` instead uses gray steps 3 and 5 plus a
+medium selected label for navigation catalogs without introducing a separate
+widget.
 Applications provide stable local keys but no numeric IDs or parent links.
-Their visual defaults come from generated shadcn-style semantic tokens and
+Their visual defaults come from generated Radix-derived semantic tokens and
 documented component recipes, with no Lua theme mirror. Buttons are
-intrinsically sized with a 32-pixel token height, 10-pixel horizontal padding,
-the shared radius, medium label face, primary color pair, and one-line
-ellipsis. Text inputs fill their bounded parent width by default and use the
-input border role; focus replaces that border color with `ring` rather than
-adding an outline. The Wayland example exercises this actual Lua-build path for
-both windows. Both mounted
+intrinsically sized with Radix Themes size-2 geometry: 32-pixel height,
+12-pixel horizontal padding, 4-pixel radius, medium label face, primary color
+pair, and one-line ellipsis. Text inputs fill their bounded parent width by
+default and use the corresponding 32-pixel height, 8-pixel inset, 4-pixel
+radius, surface, and input-border roles; focus replaces that border color with
+`ring` rather than adding an outline. The Wayland example exercises this actual
+Lua-build path for both windows. Both mounted
 window owners also read one shared signal, proving dependency identity across
 separate per-window registries sharing one VM.
 

@@ -186,7 +186,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     lua_ui.attachSignals(&signals);
     lua_ui.attachCallbacks(&callbacks, &vm);
     try lua_ui.attachLabelText(&paragraph_sources, &.{ primary_font, arabic_font }, 1);
-    try lua_ui.attachButtonText(&.{ medium_font, arabic_font });
+    try lua_ui.attachMediumText(&.{ medium_font, arabic_font });
     try lua_ui.attachSemantics(semantic_storage);
 
     var book = try lua.Storybook.loadWithApi(
