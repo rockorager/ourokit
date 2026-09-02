@@ -35,6 +35,7 @@ const fractional_scale_denominator = 120;
 pub const Config = struct {
     app_id: []const u8,
     window_capacity: usize = 8,
+    output_capacity: usize = 16,
     /// Prefer Vulkan linux-dmabuf presentation when compositor feedback and
     /// the selected Vulkan device share a renderable ARGB8888 modifier.
     vulkan: ?*Vulkan = null,
@@ -469,7 +470,77 @@ const DmabufBuffers = struct {
     }
 };
 
-const WindowState = enum { free, open, closing, surfaces_destroyed, shutdown };
+const WindowState = enum { free, waiting_output, open, closing, surfaces_destroyed, shutdown };
+
+const Output = struct {
+    global_name: u32 = 0,
+    handle: ?Handle = null,
+    name: ?[]u8 = null,
+};
+
+const LayerState = struct {
+    namespace: []u8,
+    output: ?[]u8,
+    width: u32,
+    height: u32,
+    layer: platform_window.Layer,
+    anchors: platform_window.Anchors,
+    exclusive_zone: i32,
+    exclusive_edge: ?platform_window.Edge,
+    margins: platform_window.Margins,
+    keyboard_interactivity: platform_window.KeyboardInteractivity,
+
+    fn init(allocator: std.mem.Allocator, declaration: platform_window.LayerSurfaceDeclaration) !LayerState {
+        const namespace = try allocator.dupe(u8, declaration.namespace);
+        errdefer allocator.free(namespace);
+        const output = if (declaration.output) |name| try allocator.dupe(u8, name) else null;
+        return .{
+            .namespace = namespace,
+            .output = output,
+            .width = declaration.width,
+            .height = declaration.height,
+            .layer = declaration.layer,
+            .anchors = declaration.anchors,
+            .exclusive_zone = declaration.exclusive_zone,
+            .exclusive_edge = declaration.exclusive_edge,
+            .margins = declaration.margins,
+            .keyboard_interactivity = declaration.keyboard_interactivity,
+        };
+    }
+
+    fn asDeclaration(self: *const LayerState) platform_window.LayerSurfaceDeclaration {
+        return .{
+            .id = "host-owned-layer-surface",
+            .namespace = self.namespace,
+            .output = self.output,
+            .width = self.width,
+            .height = self.height,
+            .layer = self.layer,
+            .anchors = self.anchors,
+            .exclusive_zone = self.exclusive_zone,
+            .exclusive_edge = self.exclusive_edge,
+            .margins = self.margins,
+            .keyboard_interactivity = self.keyboard_interactivity,
+        };
+    }
+
+    fn update(self: *LayerState, declaration: platform_window.LayerSurfaceDeclaration) void {
+        self.width = declaration.width;
+        self.height = declaration.height;
+        self.layer = declaration.layer;
+        self.anchors = declaration.anchors;
+        self.exclusive_zone = declaration.exclusive_zone;
+        self.exclusive_edge = declaration.exclusive_edge;
+        self.margins = declaration.margins;
+        self.keyboard_interactivity = declaration.keyboard_interactivity;
+    }
+
+    fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
+        if (self.output) |output| allocator.free(output);
+        allocator.free(self.namespace);
+        self.* = undefined;
+    }
+};
 
 const Window = struct {
     state: WindowState = .free,
@@ -479,6 +550,9 @@ const Window = struct {
     xdg_surface: ?Handle = null,
     toplevel: ?Handle = null,
     layer_surface: ?Handle = null,
+    layer_state: ?LayerState = null,
+    output_global_name: ?u32 = null,
+    recreate: bool = false,
     layer: platform_window.Layer = .top,
     viewport: ?Handle = null,
     fractional_scale: ?Handle = null,
@@ -588,6 +662,7 @@ pub const Host = struct {
     keyboard_repeat: Repeat.State = .{},
     xkb: Xkb.Keyboard,
     windows: []Window,
+    outputs: []Output,
     disconnect_started: bool = false,
     transport_lost: bool = false,
     submission_pending: bool = false,
@@ -603,10 +678,15 @@ pub const Host = struct {
         sink: platform_window.EventSink,
         config: Config,
     ) !void {
-        if (config.window_capacity == 0 or config.app_id.len == 0) return error.InvalidConfig;
+        if (config.window_capacity == 0 or config.output_capacity == 0 or config.app_id.len == 0)
+            return error.InvalidConfig;
         const windows = try allocator.alloc(Window, config.window_capacity);
         errdefer allocator.free(windows);
         @memset(windows, .{});
+        const outputs = try allocator.alloc(Output, config.output_capacity);
+        errdefer allocator.free(outputs);
+        @memset(outputs, .{});
+        errdefer for (outputs) |output| if (output.name) |name| allocator.free(name);
         const app_id = try allocator.dupe(u8, config.app_id);
         errdefer allocator.free(app_id);
 
@@ -616,6 +696,7 @@ pub const Host = struct {
         self.app_id = app_id;
         self.vulkan = config.vulkan;
         self.windows = windows;
+        self.outputs = outputs;
         self.disconnect_started = false;
         self.transport_lost = false;
         self.submission_pending = false;
@@ -668,7 +749,10 @@ pub const Host = struct {
                 .transmit_byte_budget = 128 * 1024,
                 .transmit_fd_budget = 32,
             },
-            .{ .max_objects = 100 + config.window_capacity * 18, .max_client_ids = 80 + config.window_capacity * 18 },
+            .{
+                .max_objects = 100 + config.output_capacity + config.window_capacity * 18,
+                .max_client_ids = 80 + config.output_capacity + config.window_capacity * 18,
+            },
         );
         self.driver = Driver.init(&self.connection);
         self.finishStartup() catch |err| {
@@ -746,6 +830,8 @@ pub const Host = struct {
         self.clipboard.deinit();
         self.text_input_pending.deinit();
         self.xkb.deinit();
+        for (self.outputs) |*output| if (output.name) |name| self.allocator.free(name);
+        self.allocator.free(self.outputs);
         self.allocator.free(self.windows);
         self.allocator.free(self.app_id);
         self.* = undefined;
@@ -809,6 +895,7 @@ pub const Host = struct {
 
     pub fn requestRedraw(self: *Host, handle: WindowHandle) !void {
         const window = try self.windowFor(handle);
+        if (window.state == .waiting_output or window.recreate) return;
         if (window.state != .open) return error.WindowClosing;
         window.pending_redraw = true;
     }
@@ -824,7 +911,7 @@ pub const Host = struct {
     /// continue under the slot's GPU/compositor completion gates.
     pub fn acquireFrame(self: *Host, handle: WindowHandle) !?Frame {
         const window = try self.windowFor(handle);
-        if (window.state != .open or !window.configured or !window.pending_redraw or
+        if (window.state != .open or window.recreate or !window.configured or !window.pending_redraw or
             window.frame_callback != null) return null;
         const pixel_width = try scaledExtent(window.width, window.scale_120);
         const pixel_height = try scaledExtent(window.height, window.scale_120);
@@ -1305,8 +1392,17 @@ pub const Host = struct {
             if (window.buffers.mapping != null or window.retired_buffers.mapping != null or
                 window.dmabuf_buffers.slots[0].target != null or
                 window.retired_dmabuf_buffers.slots[0].target != null) continue;
+            if (window.recreate) {
+                window.state = .waiting_output;
+                window.recreate = false;
+                if (window.layer_state.?.output == null or
+                    self.outputNamed(window.layer_state.?.output.?) != null)
+                    try self.activateLayerSurface(window);
+                continue;
+            }
             const handle = window.handle;
             const next_pool_generation = window.next_pool_generation;
+            if (window.layer_state) |*layer_state| layer_state.deinit(self.allocator);
             window.* = .{ .next_pool_generation = next_pool_generation };
             try self.sink.closed(handle);
         }
@@ -1332,6 +1428,7 @@ pub const Host = struct {
             window.dmabuf_buffers.releaseLocal(renderer);
             window.retired_dmabuf_buffers.releaseLocal(renderer);
         }
+        if (window.layer_state) |*layer_state| layer_state.deinit(self.allocator);
         const next_pool_generation = window.next_pool_generation;
         window.* = .{ .next_pool_generation = next_pool_generation };
     }
@@ -1377,6 +1474,7 @@ pub const Host = struct {
         window.toplevel = null;
         window.xdg_surface = null;
         window.layer_surface = null;
+        window.output_global_name = null;
         window.fractional_scale = null;
         window.viewport = null;
         window.sync_surface = null;
@@ -1412,6 +1510,28 @@ pub const Host = struct {
                     return error.LayerShellVersionTooOld;
             },
         }
+        if (declaration == .layer_surface) {
+            const layer_state = try LayerState.init(self.allocator, declaration.layer_surface);
+            window.* = .{
+                .state = .waiting_output,
+                .handle = handle,
+                .scope = scope,
+                .layer_state = layer_state,
+                .layer = layer_state.layer,
+                .width = layer_state.width,
+                .height = layer_state.height,
+                .pending_width = layer_state.width,
+                .pending_height = layer_state.height,
+            };
+            errdefer {
+                window.layer_state.?.deinit(self.allocator);
+                window.* = .{};
+            }
+            try self.activateLayerSurface(window);
+            _ = try self.driver.schedule();
+            return;
+        }
+        const toplevel_declaration = declaration.toplevel;
         const objects = &self.connection.objects;
         const transmit = try self.queue();
         const surface = (try protocol.wl_compositor.construct_create_surface(
@@ -1420,54 +1540,39 @@ pub const Host = struct {
             self.compositor.?,
             .{},
         )).id;
-        var xdg_surface: ?Handle = null;
-        var toplevel: ?Handle = null;
-        var layer_surface: ?Handle = null;
-        switch (declaration) {
-            .toplevel => |value| {
-                xdg_surface = (try protocol.xdg_wm_base.construct_get_xdg_surface(
-                    objects,
-                    transmit,
-                    self.wm_base.?,
-                    .{ .surface = surface.id },
-                )).id;
-                toplevel = (try protocol.xdg_surface.construct_get_toplevel(
-                    objects,
-                    transmit,
-                    xdg_surface.?,
-                    .{},
-                )).id;
-                try wayring.client.sendRequest(
-                    protocol.xdg_toplevel,
-                    objects,
-                    transmit,
-                    toplevel.?,
-                    .{ .set_title = .{ .title = value.title } },
-                );
-                try wayring.client.sendRequest(
-                    protocol.xdg_toplevel,
-                    objects,
-                    transmit,
-                    toplevel.?,
-                    .{ .set_app_id = .{ .app_id = self.app_id } },
-                );
-                try setMinimumSize(objects, transmit, toplevel.?, value.min_width, value.min_height);
-            },
-            .layer_surface => |value| {
-                layer_surface = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
-                    objects,
-                    transmit,
-                    self.layer_shell.?,
-                    .{
-                        .surface = surface.id,
-                        .output = null,
-                        .layer = layerValue(value.layer),
-                        .namespace = value.namespace,
-                    },
-                )).id;
-                try setLayerSurfaceState(objects, transmit, layer_surface.?, value, false, self.layer_shell_version);
-            },
-        }
+        const xdg_surface = (try protocol.xdg_wm_base.construct_get_xdg_surface(
+            objects,
+            transmit,
+            self.wm_base.?,
+            .{ .surface = surface.id },
+        )).id;
+        const toplevel = (try protocol.xdg_surface.construct_get_toplevel(
+            objects,
+            transmit,
+            xdg_surface,
+            .{},
+        )).id;
+        try wayring.client.sendRequest(
+            protocol.xdg_toplevel,
+            objects,
+            transmit,
+            toplevel,
+            .{ .set_title = .{ .title = toplevel_declaration.title } },
+        );
+        try wayring.client.sendRequest(
+            protocol.xdg_toplevel,
+            objects,
+            transmit,
+            toplevel,
+            .{ .set_app_id = .{ .app_id = self.app_id } },
+        );
+        try setMinimumSize(
+            objects,
+            transmit,
+            toplevel,
+            toplevel_declaration.min_width,
+            toplevel_declaration.min_height,
+        );
         const viewport = if (self.viewporter) |viewporter|
             (try protocol.wp_viewporter.construct_get_viewport(
                 objects,
@@ -1495,8 +1600,8 @@ pub const Host = struct {
             )).id
         else
             null;
-        const initial_width = declaration.initialWidth();
-        const initial_height = declaration.initialHeight();
+        const initial_width = toplevel_declaration.initial_width;
+        const initial_height = toplevel_declaration.initial_height;
         if (viewport != null and initial_width != 0 and initial_height != 0) try setViewport(
             objects,
             transmit,
@@ -1513,11 +1618,6 @@ pub const Host = struct {
             .surface = surface,
             .xdg_surface = xdg_surface,
             .toplevel = toplevel,
-            .layer_surface = layer_surface,
-            .layer = switch (declaration) {
-                .toplevel => .top,
-                .layer_surface => |value| value.layer,
-            },
             .viewport = viewport,
             .fractional_scale = fractional_scale,
             .sync_surface = sync_surface,
@@ -1526,6 +1626,97 @@ pub const Host = struct {
             .pending_width = initial_width,
             .pending_height = initial_height,
         };
+        _ = try self.driver.schedule();
+    }
+
+    fn activateLayerSurface(self: *Host, window: *Window) !void {
+        std.debug.assert(window.state == .waiting_output);
+        const layer_state = &(window.layer_state orelse return error.LayerStateMissing);
+        const output = if (layer_state.output) |name|
+            self.outputNamed(name) orelse return
+        else
+            null;
+        const declaration = layer_state.asDeclaration();
+        const objects = &self.connection.objects;
+        const transmit = try self.queue();
+        const surface = (try protocol.wl_compositor.construct_create_surface(
+            objects,
+            transmit,
+            self.compositor.?,
+            .{},
+        )).id;
+        const layer_surface = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
+            objects,
+            transmit,
+            self.layer_shell.?,
+            .{
+                .surface = surface.id,
+                .output = if (output) |value| value.handle.?.id else null,
+                .layer = layerValue(declaration.layer),
+                .namespace = declaration.namespace,
+            },
+        )).id;
+        try setLayerSurfaceState(
+            objects,
+            transmit,
+            layer_surface,
+            declaration,
+            false,
+            self.layer_shell_version,
+        );
+        const viewport = if (self.viewporter) |viewporter|
+            (try protocol.wp_viewporter.construct_get_viewport(
+                objects,
+                transmit,
+                viewporter,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
+        const fractional_scale = if (self.fractional_scale_manager != null and viewport != null)
+            (try protocol.wp_fractional_scale_manager_v1.construct_get_fractional_scale(
+                objects,
+                transmit,
+                self.fractional_scale_manager.?,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
+        const sync_surface = if (self.sync_manager) |manager|
+            (try protocol.wp_linux_drm_syncobj_manager_v1.construct_get_surface(
+                objects,
+                transmit,
+                manager,
+                .{ .surface = surface.id },
+            )).id
+        else
+            null;
+        if (viewport != null and declaration.width != 0 and declaration.height != 0) try setViewport(
+            objects,
+            transmit,
+            viewport.?,
+            declaration.width,
+            declaration.height,
+            fractional_scale_denominator,
+        );
+        try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
+        window.state = .open;
+        window.surface = surface;
+        window.layer_surface = layer_surface;
+        window.output_global_name = if (output) |value| value.global_name else null;
+        window.recreate = false;
+        window.layer = declaration.layer;
+        window.viewport = viewport;
+        window.fractional_scale = fractional_scale;
+        window.sync_surface = sync_surface;
+        window.width = declaration.width;
+        window.height = declaration.height;
+        window.pending_width = declaration.width;
+        window.pending_height = declaration.height;
+        window.scale_120 = fractional_scale_denominator;
+        window.configured = false;
+        window.pending_redraw = false;
+        window.damage_history = .{};
         _ = try self.driver.schedule();
     }
 
@@ -1573,29 +1764,33 @@ pub const Host = struct {
     ) !void {
         const self: *Host = @ptrCast(@alignCast(context));
         const window = try self.windowFor(handle);
-        if (window.state != .open) return error.WindowClosing;
-        const layer_surface = window.layer_surface orelse return error.NotLayerSurface;
+        if (window.layer_state == null) return error.NotLayerSurface;
+        if (window.state != .open and window.state != .waiting_output and
+            !(window.state == .closing and window.recreate)) return error.WindowClosing;
         if (declaration.keyboard_interactivity == .on_demand and self.layer_shell_version < 4)
             return error.LayerShellVersionTooOld;
         if (declaration.exclusive_edge != null and self.layer_shell_version < 5)
             return error.LayerShellVersionTooOld;
-        const objects = &self.connection.objects;
-        const transmit = try self.queue();
-        try setLayerSurfaceState(
-            objects,
-            transmit,
-            layer_surface,
-            declaration,
-            window.layer != declaration.layer,
-            self.layer_shell_version,
-        );
-        try wayring.client.sendRequest(
-            protocol.wl_surface,
-            objects,
-            transmit,
-            window.surface.?,
-            .{ .commit = .{} },
-        );
+        if (window.state == .open and !window.recreate) {
+            const objects = &self.connection.objects;
+            const transmit = try self.queue();
+            try setLayerSurfaceState(
+                objects,
+                transmit,
+                window.layer_surface.?,
+                declaration,
+                window.layer != declaration.layer,
+                self.layer_shell_version,
+            );
+            try wayring.client.sendRequest(
+                protocol.wl_surface,
+                objects,
+                transmit,
+                window.surface.?,
+                .{ .commit = .{} },
+            );
+        }
+        window.layer_state.?.update(declaration);
         window.layer = declaration.layer;
         if (declaration.width != 0) window.pending_width = declaration.width;
         if (declaration.height != 0) window.pending_height = declaration.height;
@@ -1605,7 +1800,13 @@ pub const Host = struct {
     fn nativeBeginClose(context: *anyopaque, handle: WindowHandle) !void {
         const self: *Host = @ptrCast(@alignCast(context));
         const window = try self.windowFor(handle);
-        if (window.state != .open) return;
+        window.recreate = false;
+        if (window.state == .waiting_output) {
+            window.state = .surfaces_destroyed;
+            _ = try self.driver.schedule();
+            return;
+        }
+        if (window.state != .open and window.state != .closing) return;
         window.state = .closing;
         window.pending_redraw = false;
     }
@@ -1632,6 +1833,7 @@ pub const Host = struct {
             switch (try Core.decodeRegistryEvent(objects, self.registry, message, fds)) {
                 .global => |global| try self.bindGlobal(global),
                 .global_remove => |removed| {
+                    try self.removeOutput(removed.name);
                     if (self.seat_global_name != null and self.seat_global_name.? == removed.name)
                         try self.releaseInput();
                     if (self.clipboard.managerRemoved(removed.name))
@@ -1640,6 +1842,19 @@ pub const Host = struct {
                         self.text_input_manager_global_name.? == removed.name)
                         try self.releaseTextInputManager();
                 },
+            }
+        } else if (interface == &protocol.wl_output.info) {
+            const output = self.outputForObject(message.header.object_id) orelse
+                return error.UnknownWaylandOutput;
+            switch (try wayring.client.decodeEvent(
+                protocol.wl_output,
+                objects,
+                output.handle.?,
+                message,
+                fds,
+            )) {
+                .geometry, .mode, .done, .scale, .description => {},
+                .name => |name| try self.nameOutput(output, name.name),
             }
         } else if (interface == &protocol.wl_seat.info) {
             switch (try wayring.client.decodeEvent(protocol.wl_seat, objects, self.seat.?, message, fds)) {
@@ -1752,7 +1967,10 @@ pub const Host = struct {
                     window.pending_redraw = true;
                     try self.sink.configured(window.handle, window.width, window.height);
                 },
-                .closed => try self.sink.closeRequested(window.handle),
+                .closed => if (window.recreate) {
+                    window.state = .closing;
+                    window.pending_redraw = false;
+                } else try self.sink.closeRequested(window.handle),
             }
         } else if (interface == &protocol.wp_fractional_scale_v1.info) {
             const window = try self.windowForObject(message.header.object_id);
@@ -1936,6 +2154,8 @@ pub const Host = struct {
                 1,
                 null,
             );
+        } else if (std.mem.eql(u8, global.interface, protocol.wl_output.info.name) and global.version >= 4) {
+            try self.bindOutput(global);
         } else if (std.mem.eql(u8, global.interface, protocol.wp_presentation.info.name)) {
             self.presentation = try Core.bind(
                 objects,
@@ -2054,6 +2274,85 @@ pub const Host = struct {
             self.seat_global_name = global.name;
             try self.ensureTextInput();
             try self.ensureClipboardDevice();
+        }
+    }
+
+    fn bindOutput(self: *Host, global: protocol.wl_registry.Event_global) !void {
+        var slot: ?*Output = null;
+        for (self.outputs) |*candidate| if (candidate.handle == null) {
+            slot = candidate;
+            break;
+        };
+        const output = slot orelse return error.OutputCapacityExceeded;
+        output.* = .{
+            .global_name = global.name,
+            .handle = try Core.bind(
+                &self.connection.objects,
+                try self.queue(),
+                self.registry,
+                global.name,
+                &protocol.wl_output.info,
+                4,
+                null,
+            ),
+        };
+    }
+
+    fn nameOutput(self: *Host, output: *Output, name: []const u8) !void {
+        if (name.len == 0) return error.EmptyOutputName;
+        for (self.outputs) |*candidate| {
+            if (candidate == output or candidate.name == null) continue;
+            if (std.mem.eql(u8, candidate.name.?, name)) return error.DuplicateOutputName;
+        }
+        const owned = try self.allocator.dupe(u8, name);
+        if (output.name) |old| self.allocator.free(old);
+        output.name = owned;
+        std.log.info("Wayland output available: {s}", .{name});
+        try self.resumeWaitingOutputs();
+    }
+
+    fn removeOutput(self: *Host, global_name: u32) !void {
+        for (self.outputs) |*output| {
+            if (output.handle == null or output.global_name != global_name) continue;
+            for (self.windows) |*window| {
+                if (window.state != .open or window.output_global_name != global_name) continue;
+                window.recreate = true;
+                window.pending_redraw = false;
+            }
+            try wayring.client.sendRequest(
+                protocol.wl_output,
+                &self.connection.objects,
+                try self.queue(),
+                output.handle.?,
+                .{ .release = .{} },
+            );
+            if (output.name) |name| {
+                std.log.info("Wayland output removed: {s}", .{name});
+                self.allocator.free(name);
+            }
+            output.* = .{};
+            _ = try self.driver.schedule();
+            return;
+        }
+    }
+
+    fn outputForObject(self: *Host, object_id: u32) ?*Output {
+        for (self.outputs) |*output|
+            if (output.handle != null and output.handle.?.id == object_id) return output;
+        return null;
+    }
+
+    fn outputNamed(self: *Host, name: []const u8) ?*Output {
+        for (self.outputs) |*output|
+            if (output.name != null and std.mem.eql(u8, output.name.?, name)) return output;
+        return null;
+    }
+
+    fn resumeWaitingOutputs(self: *Host) !void {
+        for (self.windows) |*window| {
+            if (window.state != .waiting_output) continue;
+            const name = window.layer_state.?.output orelse continue;
+            if (self.outputNamed(name) != null) try self.activateLayerSurface(window);
         }
     }
 
@@ -2634,6 +2933,28 @@ test "Wayland host frame tokens retain generation-checked window identity" {
     try std.testing.expect(@hasDecl(Host, "nativeHost"));
     try std.testing.expect(@hasDecl(Host, "acquireFrame"));
     try std.testing.expect(@hasDecl(Host, "present"));
+}
+
+test "layer state owns output identity across hotplug recreation" {
+    var state = try LayerState.init(std.testing.allocator, .{
+        .id = "panel",
+        .namespace = "ouro-shell",
+        .output = "DP-1",
+        .width = 0,
+        .height = 32,
+        .layer = .top,
+        .anchors = .{ .top = true, .left = true, .right = true },
+    });
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ouro-shell", state.namespace);
+    try std.testing.expectEqualStrings("DP-1", state.output.?);
+
+    var updated = state.asDeclaration();
+    updated.height = 40;
+    updated.exclusive_zone = 40;
+    state.update(updated);
+    try std.testing.expectEqual(@as(u32, 40), state.height);
+    try std.testing.expectEqual(@as(i32, 40), state.exclusive_zone);
 }
 
 test "damage history expands a stale slot and falls back when age is unknown" {

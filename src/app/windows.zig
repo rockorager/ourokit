@@ -35,6 +35,7 @@ const Slot = struct {
     id: ?[]u8 = null,
     title: ?[]u8 = null,
     namespace: ?[]u8 = null,
+    output: ?[]u8 = null,
     role: Role = .toplevel,
     initial_width: u32 = 0,
     initial_height: u32 = 0,
@@ -253,6 +254,14 @@ pub const WindowSet = struct {
             .layer_surface => |value| try self.allocator.dupe(u8, value.namespace),
         };
         errdefer if (namespace) |value| self.allocator.free(value);
+        const output = switch (declaration) {
+            .toplevel => null,
+            .layer_surface => |value| if (value.output) |name|
+                try self.allocator.dupe(u8, name)
+            else
+                null,
+        };
+        errdefer if (output) |value| self.allocator.free(value);
         const scope_handle = try self.scheduler.createScope(self.scheduler.application_scope);
         errdefer self.scheduler.destroyScope(scope_handle) catch unreachable;
 
@@ -267,6 +276,7 @@ pub const WindowSet = struct {
             .id = id,
             .title = title,
             .namespace = namespace,
+            .output = output,
             .role = declarationRole(declaration),
             .initial_width = declaration.initialWidth(),
             .initial_height = declaration.initialHeight(),
@@ -291,6 +301,7 @@ pub const WindowSet = struct {
             self.allocator.free(slot.id.?);
             if (slot.title) |title| self.allocator.free(title);
             if (slot.namespace) |namespace| self.allocator.free(namespace);
+            if (slot.output) |output| self.allocator.free(output);
             const generation = slot.generation;
             slot.* = .{ .generation = generation };
         }
@@ -322,6 +333,8 @@ pub const WindowSet = struct {
             if (declaration == .layer_surface) {
                 if (!std.mem.eql(u8, slot.namespace.?, declaration.layer_surface.namespace))
                     return error.LayerSurfaceNamespaceChanged;
+                if (!optionalStringEqual(slot.output, declaration.layer_surface.output))
+                    return error.LayerSurfaceOutputChanged;
                 if (slot.exclusive_edge != null and declaration.layer_surface.exclusive_edge == null)
                     return error.LayerSurfaceExclusiveEdgeCannotBeCleared;
             }
@@ -490,6 +503,11 @@ fn declarationRole(declaration: SurfaceDeclaration) Role {
     };
 }
 
+fn optionalStringEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
 fn layerStateEqual(slot: *const Slot, declaration: LayerSurfaceDeclaration) bool {
     return slot.initial_width == declaration.width and
         slot.initial_height == declaration.height and
@@ -645,6 +663,7 @@ test "layer surface declarations retain identity and update role-specific state"
     const initial: SurfaceDeclaration = .{ .layer_surface = .{
         .id = "panel",
         .namespace = "ouro-shell",
+        .output = "DP-1",
         .width = 0,
         .height = 32,
         .layer = .top,
@@ -674,6 +693,14 @@ test "layer surface declarations retain identity and update role-specific state"
     try std.testing.expectError(
         error.LayerSurfaceNamespaceChanged,
         windows.reconcile(&.{changed_namespace}),
+    );
+    try std.testing.expectEqual(@as(usize, 2), host.count);
+
+    var changed_output = updated;
+    changed_output.layer_surface.output = "HDMI-A-1";
+    try std.testing.expectError(
+        error.LayerSurfaceOutputChanged,
+        windows.reconcile(&.{changed_output}),
     );
     try std.testing.expectEqual(@as(usize, 2), host.count);
 

@@ -454,9 +454,12 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
             .layer_surface => blk: {
                 const namespace = try requiredString(allocator, state, -1, "namespace");
                 errdefer allocator.free(namespace);
+                const output = try optionalString(allocator, state, -1, "output");
+                errdefer if (output) |value| allocator.free(value);
                 const layer_surface: platform.LayerSurfaceDeclaration = .{
                     .id = window_id,
                     .namespace = namespace,
+                    .output = output,
                     .width = try optionalNonNegativeDimension(state, -1, "width", 0),
                     .height = try optionalNonNegativeDimension(state, -1, "height", 0),
                     .layer = try requiredEnum(platform.Layer, state, -1, "layer"),
@@ -634,6 +637,22 @@ fn requiredString(
     return allocator.dupe(u8, value[0..length]);
 }
 
+fn optionalString(
+    allocator: std.mem.Allocator,
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+) !?[]u8 {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return null;
+    if (value_type != c.type_string) return error.InvalidOptionalString;
+    var length: usize = 0;
+    const value = c.lua_tolstring(state, -1, &length) orelse return error.InvalidOptionalString;
+    if (length == 0) return error.EmptyOutputName;
+    return try allocator.dupe(u8, value[0..length]);
+}
+
 fn optionalDimension(
     state: *c.State,
     table: c_int,
@@ -691,6 +710,7 @@ fn deinitWindow(allocator: std.mem.Allocator, state: *c.State, window: Window) v
             allocator.free(declaration.id);
         },
         .layer_surface => |declaration| {
+            if (declaration.output) |output| allocator.free(output);
             allocator.free(declaration.namespace);
             allocator.free(declaration.id);
         },
@@ -748,6 +768,7 @@ test "layer surface constructor parses shell policy into a distinct declaration"
         \\  windows = { ouro.layer_surface {
         \\    id = "panel",
         \\    namespace = "ouro-shell",
+        \\    output = "DP-1",
         \\    layer = "top",
         \\    width = 0,
         \\    height = 32,
@@ -764,6 +785,7 @@ test "layer surface constructor parses shell policy into a distinct declaration"
     const declaration = application.windows[0].declaration.layer_surface;
     try std.testing.expectEqualStrings("panel", declaration.id);
     try std.testing.expectEqualStrings("ouro-shell", declaration.namespace);
+    try std.testing.expectEqualStrings("DP-1", declaration.output.?);
     try std.testing.expectEqual(platform.Layer.top, declaration.layer);
     try std.testing.expectEqual(@as(u32, 0), declaration.width);
     try std.testing.expectEqual(@as(u32, 32), declaration.height);

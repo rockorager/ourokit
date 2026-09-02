@@ -66,6 +66,7 @@ bit on `ouro.window`:
 ouro.layer_surface {
   id = "panel",
   namespace = "ouro-shell",
+  output = "DP-1", -- optional wl_output name; omit for compositor selection
   layer = "top", -- background, bottom, top, or overlay
   width = 0,
   height = 32,
@@ -86,8 +87,20 @@ An exclusive edge must also be one of the anchors. It is optional when the
 compositor can infer the edge, but disambiguates corner-anchored exclusive zones
 with version 5 of `wlr-layer-shell`. Because the protocol has no request to
 unset an explicit edge, remove and recreate the declaration to return to
-automatic inference. The first implementation also lets the compositor choose
-the output. Namespace and surface role are immutable for a retained ID, while
+automatic inference.
+
+Set `output` to the name advertised by `wl_output.name` to place a surface on a
+specific active output. Ourokit logs discovered output names. Declare one layer
+surface with a unique ID for each output that should host a panel, wallpaper, or
+other component. If a named output is absent, its declaration waits without
+affecting surfaces on other outputs. Removing an output tears down its native
+surface; if an output with the same name returns, Ourokit recreates the surface
+while preserving its declarative identity and UI runtime. Wayland guarantees
+these names are unique for one compositor instance, but not persistent across
+sessions, so application configuration may need to follow compositor naming.
+Omit `output` to retain compositor-selected placement.
+
+Namespace, output, and surface role are immutable for a retained ID, while
 size, layer, anchors, exclusive zone and edge, margins, and keyboard
 interactivity update transactionally.
 

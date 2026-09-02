@@ -27,6 +27,7 @@ pub const Options = struct {
     /// this runner consumes and commits requests only at its safe point.
     reload_requests: ?*ReloadRequests = null,
     application_window_capacity: usize = 16,
+    output_capacity: usize = 16,
     window: WindowRuntimeConfig = .{},
     scope_capacity: usize = 1024,
     resource_capacity: usize = 1024,
@@ -232,6 +233,7 @@ fn runSourceWithFontconfig(
         .{
             .app_id = application.id,
             .window_capacity = options.application_window_capacity,
+            .output_capacity = options.output_capacity,
             .vulkan = if (options.vulkan) &vulkan_renderer else null,
         },
     );

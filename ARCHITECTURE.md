@@ -207,11 +207,14 @@ xdg-toplevels and `wlr-layer-shell` surfaces. Their role-specific declarations,
 configuration, and updates remain distinct while both reuse surface-generic
 input, rendering, scaling, frame pacing, and buffer ownership. One surface can
 configure, resize, frame, and close without tearing down its siblings or the
-display connection. Busy current and retired buffer generations remain mapped
-until `wl_buffer.release`; only then are their
-protocol objects and mappings destroyed. On display loss, protocol requests
-are no longer attempted: local mappings are released, native windows are
-reported closed through the same state-only sink, scopes are canceled at the
+display connection. Named `wl_output` globals provide per-output layer
+placement. The host keeps targeted declarations pending while an output is
+absent and recreates their native surface resources on hotplug without
+replacing the declarative identity or retained UI runtime. Busy current and
+retired buffer generations remain mapped until `wl_buffer.release`; only then
+are their protocol objects and mappings destroyed. On display loss, protocol
+requests are no longer attempted: local mappings are released, native windows
+are reported closed through the same state-only sink, scopes are canceled at the
 next task safe point, and Wayring cancellation CQEs are drained before teardown.
 
 ## UI, text, scene, and commands

@@ -234,7 +234,10 @@ by default; pass `--software` after `--` to select software rendering instead.
 The layer-shell example requires a compositor advertising
 `zwlr_layer_shell_v1`. Ourokit targets the current version 5 protocol while
 remaining compatible with older versions when declarations do not request
-newer-version features.
+newer-version features. A layer declaration can select an output by its
+`wl_output.name`; declare one uniquely identified surface per output for
+multi-monitor panels or backgrounds. Named surfaces wait through output removal
+and are recreated if that output returns.
 
 Run any declarative application directly through the reusable host:
 

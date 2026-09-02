@@ -248,12 +248,13 @@ pub const Margins = struct {
     left: i32 = 0,
 };
 
-/// Language-neutral desired state for one wlr-layer-shell surface. Output is
-/// deliberately compositor-selected until Ourokit exposes stable output
-/// identities at the application boundary.
+/// Language-neutral desired state for one wlr-layer-shell surface. A null
+/// output delegates placement to the compositor; otherwise the name selects
+/// one active wl_output for the lifetime of this declaration identity.
 pub const LayerSurfaceDeclaration = struct {
     id: []const u8,
     namespace: []const u8,
+    output: ?[]const u8 = null,
     width: u32,
     height: u32,
     layer: Layer,
@@ -266,6 +267,7 @@ pub const LayerSurfaceDeclaration = struct {
     pub fn validate(self: LayerSurfaceDeclaration) !void {
         if (self.id.len == 0) return error.EmptyWindowId;
         if (self.namespace.len == 0) return error.EmptyLayerSurfaceNamespace;
+        if (self.output) |output| if (output.len == 0) return error.EmptyOutputName;
         if (self.width == 0 and !(self.anchors.left and self.anchors.right))
             return error.InvalidLayerSurfaceSize;
         if (self.height == 0 and !(self.anchors.top and self.anchors.bottom))
@@ -440,4 +442,7 @@ test "layer surface dimensions validate against opposing anchors" {
     invalid = panel;
     invalid.exclusive_edge = .bottom;
     try @import("std").testing.expectError(error.InvalidExclusiveEdge, invalid.validate());
+    invalid = panel;
+    invalid.output = "";
+    try @import("std").testing.expectError(error.EmptyOutputName, invalid.validate());
 }
