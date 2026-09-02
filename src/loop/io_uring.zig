@@ -17,6 +17,7 @@ const Operation = enum(u8) {
     accept = 0xa9,
     recv = 0xaa,
     send = 0xab,
+    connect = 0xac,
 };
 
 pub const OperationKind = enum {
@@ -31,6 +32,7 @@ pub const SocketOperationKind = enum {
     accept,
     recv,
     send,
+    connect,
 };
 
 pub const OpenHow = extern struct {
@@ -56,6 +58,8 @@ const Slot = struct {
     cancel_pending: bool = false,
     operation: Operation = .openat2,
     open_how: OpenHow = .{ .flags = 0 },
+    connect_address: linux.sockaddr.un = undefined,
+    connect_address_len: linux.socklen_t = 0,
 };
 
 const Control = enum { none, update, remove };
@@ -330,6 +334,30 @@ pub const Loop = struct {
         return reserved.handle;
     }
 
+    /// Copies a Unix address into stable operation storage before preparing
+    /// the asynchronous connect. The caller may release its address value as
+    /// soon as this function returns.
+    pub fn prepareUnixConnect(
+        self: *Loop,
+        fd: linux.fd_t,
+        address: *const linux.sockaddr.un,
+        address_len: linux.socklen_t,
+    ) !OperationHandle {
+        const reserved = try self.reserve(.connect);
+        reserved.slot.connect_address = address.*;
+        reserved.slot.connect_address_len = address_len;
+        _ = self.ring.connect(
+            encodeFile(.connect, reserved.handle),
+            fd,
+            @ptrCast(&reserved.slot.connect_address),
+            reserved.slot.connect_address_len,
+        ) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        return reserved.handle;
+    }
+
     pub fn submit(self: *Loop) !u32 {
         try self.synchronizeAlarm();
         return self.ring.submit();
@@ -422,7 +450,7 @@ pub const Loop = struct {
                     .result = cqe.res,
                 } };
             },
-            .accept, .recv, .send => |operation| {
+            .accept, .recv, .send, .connect => |operation| {
                 const handle = decoded.handle orelse return .stale;
                 if (handle.slot >= self.slots.len) return .stale;
                 const slot = &self.slots[handle.slot];
@@ -435,6 +463,7 @@ pub const Loop = struct {
                         .accept => .accept,
                         .recv => .recv,
                         .send => .send,
+                        .connect => .connect,
                         else => unreachable,
                     },
                     .result = cqe.res,
@@ -547,6 +576,7 @@ fn decode(value: u64) ?Decoded {
         @intFromEnum(Operation.accept) => .accept,
         @intFromEnum(Operation.recv) => .recv,
         @intFromEnum(Operation.send) => .send,
+        @intFromEnum(Operation.connect) => .connect,
         @intFromEnum(Operation.timer_alarm) => .timer_alarm,
         @intFromEnum(Operation.timer_update) => .timer_update,
         @intFromEnum(Operation.timer_remove) => .timer_remove,
@@ -554,7 +584,7 @@ fn decode(value: u64) ?Decoded {
     };
     const generation: u32 = @truncate(value >> 32);
     const handle = switch (operation) {
-        .openat2, .statx, .read, .write, .close, .operation_cancel, .accept, .recv, .send => OperationHandle{
+        .openat2, .statx, .read, .write, .close, .operation_cancel, .accept, .recv, .send, .connect => OperationHandle{
             .slot = @truncate((value >> 8) & 0x00ff_ffff),
             .generation = generation,
         },

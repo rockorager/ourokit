@@ -357,6 +357,7 @@ fn runSourceWithFontconfig(
 
         // Task safe point: platform and CQE dispatch only changed state.
         control.collectClosed();
+        try source_reload.collectCanceledVarlink();
         try control.serviceRequests();
         try scheduler.applyQueuedCancellations();
         for (runtime_slots) |*slot| try slot.runtime.collectRetired();
@@ -593,8 +594,11 @@ fn runSourceWithFontconfig(
             .file => |file| if (!(try host.dispatchClipboardFile(file)))
                 try source_reload.markFileCompleted(file),
             .socket => |socket| if (!(try control.dispatch(socket)))
-                return error.UnownedIoCompletion,
-            .operation_cancel => control.collectClosed(),
+                try source_reload.markSocketCompleted(socket),
+            .operation_cancel => {
+                control.collectClosed();
+                try source_reload.collectCanceledVarlink();
+            },
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
                 if (try host.dispatchTimer(timeout.operation)) continue;
                 try source_reload.markTimeoutCompleted(timeout.operation);
@@ -629,7 +633,9 @@ fn finishInitialBootstrap(
         switch (loop.dispatch(try loop.wait())) {
             .file => |completion| if (!(try generation.dispatchFile(completion)))
                 return error.UnownedIoCompletion,
-            .operation_cancel => {},
+            .socket => |completion| if (!(try generation.dispatchSocket(completion)))
+                return error.UnownedIoCompletion,
+            .operation_cancel => try generation.collectCanceledVarlink(),
             else => return error.UnexpectedBootstrapCompletion,
         }
     }

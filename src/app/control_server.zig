@@ -270,7 +270,7 @@ pub const ControlServer = struct {
                         client.transmit = null;
                     }
                 },
-                .accept => return error.UnexpectedSocketCompletion,
+                .accept, .connect => return error.UnexpectedSocketCompletion,
             }
             try self.pumpClient(client);
             return true;

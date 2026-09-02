@@ -6,8 +6,54 @@ validation, and the mandatory `org.varlink.service` interface. It does not open
 file descriptors, submit `io_uring` operations, invoke Lua, or choose a task
 scheduler.
 
-This boundary lets the native async adapter and a later Lua binding share one
-protocol implementation.
+This boundary lets the native async adapter and Lua binding share one protocol
+implementation.
+
+## Lua client API
+
+Declarative applications load the runtime API and make an ordinary call from
+any yieldable Ouro task:
+
+```lua
+local ouro = require("ouro")
+
+local reply = ouro.varlink.call(
+  "unix:/run/org.example.service",
+  "org.example.Service.GetStatus",
+  { verbose = true }
+)
+
+if reply.error then
+  -- A Varlink service error. Its parameters remain available for details.
+  handle_error(reply.error, reply.parameters)
+else
+  use_status(reply.parameters)
+end
+```
+
+`ouro.varlink.call(address, method, parameters?)` suspends only its current Lua
+task and returns one table. `reply.parameters` is the reply's optional JSON
+object and `reply.error` is the optional qualified Varlink error name. Transport,
+framing, malformed-reply, and capacity failures raise a Lua error. The optional
+parameters table must represent a JSON object: string-keyed tables become
+objects, non-empty consecutive integer-keyed tables become arrays, and values
+may be booleans, finite numbers, strings, nested tables, or
+`ouro.varlink.null`. The same sentinel represents JSON null in replies. Empty
+tables are objects.
+
+The runtime currently accepts standard filesystem and abstract Unix addresses,
+`unix:/path` and `unix:@name`, including ignored Varlink address properties.
+TCP and device transports, streaming calls (`more`), one-way calls, and protocol
+upgrades are not exposed by this initial Lua API.
+
+Each source generation owns a fixed-capacity call adapter (16 concurrent calls
+by default), and each call uses bounded 64 KiB inbound and outbound records,
+32 levels of JSON nesting, and 4096 converted values. Socket connect, send, and
+receive operations use the application's shared `io_uring`; Lua never owns a
+descriptor or blocks a runtime thread. Calls register as scheduler resources
+under the current task's scope. Scope or source-generation cancellation cancels
+the active ring operation, waits for both operation and cancellation CQEs, then
+closes the coroutine without running its continuation.
 
 ## Transport contract
 
@@ -54,8 +100,9 @@ oneway calls are consumed without a reply.
 The registry also provides `validateRequest`, `validateMethodInput`,
 `validateMethodOutput`, and `validateError`. Validation resolves local and
 fully-qualified registered types and reports the interface, member, or
-top-level parameter that failed. This is the intended schema boundary for a
-future dynamic Lua API; raw Zig users may dispatch the owned JSON directly.
+top-level parameter that failed. This is also the schema boundary available to
+typed native adapters; the Lua client currently sends dynamic JSON without
+loading an interface description.
 
 `Address.parse` recognizes standard `unix:`, abstract `unix:@`, `tcp:`
 (including bracketed IPv6), and `device:` addresses. It intentionally ignores

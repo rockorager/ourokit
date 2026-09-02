@@ -344,6 +344,22 @@ pub const SourceReload = struct {
         return error.UnownedSourceOperation;
     }
 
+    pub fn markSocketCompleted(self: *SourceReload, completion: io_loop.SocketCompletion) !void {
+        if (self.candidate) |candidate|
+            if (try candidate.dispatchSocket(completion)) return;
+        if (try self.active_generation.dispatchSocket(completion)) return;
+        for (self.retiring_generations) |entry| if (entry) |retiring|
+            if (try retiring.generation.dispatchSocket(completion)) return;
+        return error.UnownedSourceOperation;
+    }
+
+    pub fn collectCanceledVarlink(self: *SourceReload) !void {
+        if (self.candidate) |candidate| try candidate.collectCanceledVarlink();
+        try self.active_generation.collectCanceledVarlink();
+        for (self.retiring_generations) |entry| if (entry) |retiring|
+            try retiring.generation.collectCanceledVarlink();
+    }
+
     /// Routes completion-phase state to the VM that prepared the operation.
     pub fn markTimeoutCompleted(
         self: *SourceReload,

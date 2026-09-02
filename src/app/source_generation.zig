@@ -14,6 +14,7 @@ pub const Config = struct {
     subscription_capacity: usize = 1024,
     dependency_capacity: usize = 256,
     module_capacity: usize = 64,
+    varlink_call_capacity: usize = 16,
 };
 
 pub const UiServices = struct {
@@ -32,6 +33,7 @@ pub const SourceGeneration = struct {
     allocator: std.mem.Allocator,
     snapshot: bundle.SourceSnapshot,
     vm: lua.Vm,
+    varlink_client: lua.VarlinkClient,
     signals: lua.Signals,
     descriptor_storage: []ui.instance.Descriptor,
     semantic_storage: []ui.semantics.Descriptor,
@@ -151,6 +153,7 @@ pub const SourceGeneration = struct {
         self.services = services;
         self.config = config;
         var vm_initialized = false;
+        var varlink_client_initialized = false;
         var signals_initialized = false;
         var descriptor_storage: ?[]ui.instance.Descriptor = null;
         var semantic_storage: ?[]ui.semantics.Descriptor = null;
@@ -165,6 +168,7 @@ pub const SourceGeneration = struct {
             }
             if (application_initialized) self.application.deinit();
             if (module_loader_initialized) self.module_loader.?.deinit();
+            if (varlink_client_initialized) self.varlink_client.deinit();
             if (vm_initialized) self.vm.deinit();
             if (signals_initialized) self.signals.deinit();
             if (semantic_storage) |storage| allocator.free(storage);
@@ -193,6 +197,22 @@ pub const SourceGeneration = struct {
             return err;
         };
         vm_initialized = true;
+        self.varlink_client.init(
+            allocator,
+            &self.vm,
+            loop,
+            config.varlink_call_capacity,
+        ) catch |err| {
+            lua.recordDiagnosticError(
+                diagnostic,
+                allocator,
+                .setup,
+                self.snapshot.entry_name,
+                err,
+            );
+            return err;
+        };
+        varlink_client_initialized = true;
         self.signals.initWithApi(
             allocator,
             self.vm.state,
@@ -404,6 +424,14 @@ pub const SourceGeneration = struct {
         return false;
     }
 
+    pub fn dispatchSocket(self: *SourceGeneration, completion: io_loop.SocketCompletion) !bool {
+        return self.varlink_client.dispatch(completion);
+    }
+
+    pub fn collectCanceledVarlink(self: *SourceGeneration) !void {
+        try self.varlink_client.collectCanceled();
+    }
+
     fn finishBootstrap(self: *SourceGeneration, diagnostic: ?*?lua.Diagnostic) !void {
         const application_optional = self.bootstrap.?.advance("default") catch |err| {
             lua.recordDiagnosticError(
@@ -492,6 +520,7 @@ pub const SourceGeneration = struct {
             if (self.bootstrap) |*bootstrap| bootstrap.deinit();
         }
         if (self.module_loader) |*loader| loader.deinit();
+        self.varlink_client.deinit();
         self.vm.deinit();
         self.signals.deinit();
         self.allocator.free(self.semantic_storage);
