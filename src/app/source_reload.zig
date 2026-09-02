@@ -185,7 +185,7 @@ pub const SourceReload = struct {
             return error.SourceWindowSetChanged;
         }
         for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
-            const target = findWindowTarget(targets, window.declaration.id) orelse {
+            const target = findWindowTarget(targets, window.declaration.id()) orelse {
                 self.recordBuildError(error.SourceWindowSetChanged);
                 self.discard();
                 return error.SourceWindowSetChanged;
@@ -216,7 +216,7 @@ pub const SourceReload = struct {
             return error.SourceWindowSetChanged;
         var callback_count: usize = 0;
         for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
-            const target = findWindowTarget(targets, window.declaration.id) orelse
+            const target = findWindowTarget(targets, window.declaration.id()) orelse
                 return error.SourceWindowSetChanged;
             try target.runtime.validatePreparedSourceCommit(prepared);
             callback_count = std.math.add(
@@ -228,7 +228,7 @@ pub const SourceReload = struct {
         try callbacks.ensureAvailable(callback_count);
 
         for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
-            const target = findWindowTarget(targets, window.declaration.id).?;
+            const target = findWindowTarget(targets, window.declaration.id()).?;
             target.runtime.commitPreparedSource(
                 prepared,
                 callbacks,
@@ -491,7 +491,7 @@ test "failed candidates preserve active generation and valid source commits" {
     });
     try std.testing.expectError(error.LuaLoadFailed, reload.prepare());
     try std.testing.expect(reload.active() == active);
-    try std.testing.expectEqualStrings("Initial", active.application.windows[0].declaration.title);
+    try std.testing.expectEqualStrings("Initial", active.application.windows[0].declaration.toplevel.title);
     try std.testing.expectEqual(lua.DiagnosticPhase.compile, reload.lastDiagnostic().?.phase);
 
     try temporary.dir.writeFile(std.testing.io, .{
@@ -508,7 +508,7 @@ test "failed candidates preserve active generation and valid source commits" {
     });
     try reload.prepare();
     try std.testing.expect(reload.active() == active);
-    try std.testing.expectEqualStrings("Initial", active.application.windows[0].declaration.title);
+    try std.testing.expectEqualStrings("Initial", active.application.windows[0].declaration.toplevel.title);
     _ = try active.vm.spawnApplication("local ouro = require('ouro'); ouro.sleep(1000); retired_ran = true");
     _ = try active.vm.resumeRunnable(scheduler.takeRunnable().?);
     const committed = reload.commit();
@@ -517,7 +517,7 @@ test "failed candidates preserve active generation and valid source commits" {
     try std.testing.expect(reload.active() != active);
     try std.testing.expectEqualStrings(
         "Replacement",
-        reload.active().application.windows[0].declaration.title,
+        reload.active().application.windows[0].declaration.toplevel.title,
     );
     try std.testing.expect(reload.lastDiagnostic() == null);
 
@@ -614,7 +614,7 @@ test "disk reload keeps active generation while candidate requires modules" {
     try std.testing.expect(reload.active() == initial);
     try std.testing.expectEqualStrings(
         "Required title",
-        reload.candidate.?.application.windows[0].declaration.title,
+        reload.candidate.?.application.windows[0].declaration.toplevel.title,
     );
 }
 

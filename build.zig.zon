@@ -46,6 +46,10 @@
             .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz",
             .hash = "N-V-__8AAOTNEADZkChhsSciYizE4kIbZsozjDZXVeG5R_uY",
         },
+        .wlr_protocols = .{
+            .url = "https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/archive/bf4fc79abc359eea5a0edec0ac6d4a2b2955f82a/wlr-protocols-bf4fc79abc359eea5a0edec0ac6d4a2b2955f82a.tar.gz",
+            .hash = "N-V-__8AAMq4AQASESNUzI38keQUB1Pz9OXa_YoUwXAgWQQl",
+        },
         .pixman = .{
             .url = "https://cairographics.org/releases/pixman-0.46.4.tar.xz",
             .hash = "N-V-__8AAFGFLwDqH3MBb66PDaioYrGihvXKTS3FzQVque04",

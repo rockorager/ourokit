@@ -7,7 +7,7 @@ UI and Wayland example now exercise reconciliation, layout/scene construction,
 and frame submission as distinct phases; the general `App` host hooks remain
 the integration seam rather than absorbing those implementations.
 
-## Declarative windows
+## Declarative surfaces
 
 Applications declare their desired window set rather than imperatively owning
 Wayring objects. The first working application-facing surface is:
@@ -59,6 +59,38 @@ return ouro.app {
 }
 ```
 
+Desktop components use a distinct layer-shell declaration rather than a mode
+bit on `ouro.window`:
+
+```lua
+ouro.layer_surface {
+  id = "panel",
+  namespace = "ouro-shell",
+  layer = "top", -- background, bottom, top, or overlay
+  width = 0,
+  height = 32,
+  anchors = { "top", "left", "right" },
+  exclusive_zone = 32,
+  exclusive_edge = "top", -- optional v5 disambiguation: top, bottom, left, or right
+  margins = { top = 0, right = 0, bottom = 0, left = 0 },
+  keyboard_interactivity = "none", -- none, exclusive, or on_demand
+  content = function()
+    ouro.label { key = "clock", text = "12:00" }
+  end,
+}
+```
+
+A zero width requires both left and right anchors; a zero height requires both
+top and bottom anchors. In those cases the compositor chooses that dimension.
+An exclusive edge must also be one of the anchors. It is optional when the
+compositor can infer the edge, but disambiguates corner-anchored exclusive zones
+with version 5 of `wlr-layer-shell`. Because the protocol has no request to
+unset an explicit edge, remove and recreate the declaration to return to
+automatic inference. The first implementation also lets the compositor choose
+the output. Namespace and surface role are immutable for a retained ID, while
+size, layer, anchors, exclusive zone and edge, margins, and keyboard
+interactivity update transactionally.
+
 Application actions belong to the headless application service and do not call
 `run` or initialize a native UI. A UI runtime invokes `run(context)` once for
 each candidate source generation. Reload therefore prepares a fresh run and
@@ -81,10 +113,11 @@ remains unfrozen. Constructors are specific native decoders, not one generic
 - the platform owns Wayring objects and shared-memory buffers behind a native
   host boundary; declarations never contain protocol objects.
 
-Mutable title and minimum dimensions are updated in place; initial dimensions
-apply at creation. A zero minimum leaves that axis unconstrained. A future
-layer-shell declaration will be a distinct type rather than a mode bit on an
-interchangeable generic window.
+Mutable toplevel title and minimum dimensions are updated in place; initial
+dimensions apply at creation. A zero minimum leaves that axis unconstrained.
+Layer surfaces follow their separate configure/acknowledge contract and reuse
+the same retained UI, input, scaling, rendering, frame pacing, and teardown
+paths after configuration.
 The reusable `app.runWayland` host implements this contract and owns the loop,
 scheduler, isolated VM, font/text caches, retained per-window UI, software
 renderer, and Wayland adapter. The executable example only embeds a Lua source

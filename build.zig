@@ -523,10 +523,12 @@ fn addWaylandProtocol(
 ) *std.Build.Module {
     const wayland = b.dependency("wayland", .{});
     const wayland_protocols = b.dependency("wayland_protocols", .{});
+    const wlr_protocols = b.dependency("wlr_protocols", .{});
     const scanner = wayring_host.artifact("wayring-scanner");
     const generate = b.addRunArtifact(scanner);
     generate.addFileArg(wayland.path("protocol/wayland.xml"));
     generate.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
+    generate.addFileArg(wlr_protocols.path("unstable/wlr-layer-shell-unstable-v1.xml"));
     generate.addFileArg(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     generate.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     generate.addFileArg(wayland_protocols.path("stable/presentation-time/presentation-time.xml"));

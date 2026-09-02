@@ -1,7 +1,7 @@
 const std = @import("std");
 const ourokit = @import("ourokit");
 
-const ToplevelDeclaration = ourokit.app.windows.ToplevelDeclaration;
+const SurfaceDeclaration = ourokit.app.windows.SurfaceDeclaration;
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -58,14 +58,14 @@ pub fn main(init: std.process.Init) !void {
     try windows.init(init.gpa, &scheduler, host.nativeHost(), 2, 16);
     defer windows.deinit();
 
-    const declarations = [_]ToplevelDeclaration{
-        .{ .id = "main", .title = if (use_vulkan) "Ourokit Vulkan renderer" else "Ourokit software renderer" },
-        .{
+    const declarations = [_]SurfaceDeclaration{
+        .{ .toplevel = .{ .id = "main", .title = if (use_vulkan) "Ourokit Vulkan renderer" else "Ourokit software renderer" } },
+        .{ .toplevel = .{
             .id = "secondary",
             .title = "Ourokit second window",
             .initial_width = 420,
             .initial_height = 320,
-        },
+        } },
     };
     var desired = [_]bool{ true, two_windows };
     var frames_seen = [_]usize{ 0, 0 };
@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         while (windows.takeEvent()) |event| switch (event) {
             .close_requested => |handle| {
                 for (declarations, 0..) |declaration, index| {
-                    const current = windows.handleForId(declaration.id) orelse continue;
+                    const current = windows.handleForId(declaration.id()) orelse continue;
                     if (sameWindow(current, handle) and desired[index]) {
                         desired[index] = false;
                         desired_changed = true;
@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
         // from Wayring dispatch or from native window reconciliation.
         try scheduler.applyQueuedCancellations();
 
-        var current_storage: [declarations.len]ToplevelDeclaration = undefined;
+        var current_storage: [declarations.len]SurfaceDeclaration = undefined;
         var current_count: usize = 0;
         for (declarations, desired) |declaration, present| {
             if (!present) continue;
@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
 
         for (declarations, desired, 0..) |declaration, present, index| {
             if (!present) continue;
-            const handle = windows.handleForId(declaration.id).?;
+            const handle = windows.handleForId(declaration.id()).?;
             frames_seen[index] = @max(frames_seen[index], try host.framesPresented(handle));
             if (try host.takePresentationTiming(handle)) |timing| {
                 timings_seen[index] += 1;

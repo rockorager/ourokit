@@ -203,9 +203,12 @@ close/configure data and mark native teardown complete, but cannot invoke Lua
 or reconcile declarations. Closed IDs remain tombstoned until a declaration
 snapshot omits them, preventing stale state from recreating a compositor-closed
 window. The reusable Wayring host implements this boundary for multiple
-toplevels. One window can configure, resize, frame, and close without tearing
-down its siblings or the display connection. Busy current and retired buffer
-generations remain mapped until `wl_buffer.release`; only then are their
+xdg-toplevels and `wlr-layer-shell` surfaces. Their role-specific declarations,
+configuration, and updates remain distinct while both reuse surface-generic
+input, rendering, scaling, frame pacing, and buffer ownership. One surface can
+configure, resize, frame, and close without tearing down its siblings or the
+display connection. Busy current and retired buffer generations remain mapped
+until `wl_buffer.release`; only then are their
 protocol objects and mappings destroyed. On display loss, protocol requests
 are no longer attempted: local mappings are released, native windows are
 reported closed through the same state-only sink, scopes are canceled at the

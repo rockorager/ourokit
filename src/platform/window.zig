@@ -220,9 +220,7 @@ fn utf8Boundary(text: []const u8, offset: usize) bool {
     return offset == text.len or (text[offset] & 0xc0) != 0x80;
 }
 
-/// Language-neutral desired state for one ordinary Wayland toplevel. A future
-/// layer-surface declaration will be a distinct type because its role and
-/// configure contract are not interchangeable with xdg_toplevel.
+/// Language-neutral desired state for one ordinary Wayland toplevel.
 pub const ToplevelDeclaration = struct {
     id: []const u8,
     title: []const u8,
@@ -230,6 +228,86 @@ pub const ToplevelDeclaration = struct {
     initial_height: u32 = 480,
     min_width: u32 = 0,
     min_height: u32 = 0,
+};
+
+pub const Layer = enum { background, bottom, top, overlay };
+pub const KeyboardInteractivity = enum { none, exclusive, on_demand };
+pub const Edge = enum { top, bottom, left, right };
+
+pub const Anchors = struct {
+    top: bool = false,
+    bottom: bool = false,
+    left: bool = false,
+    right: bool = false,
+};
+
+pub const Margins = struct {
+    top: i32 = 0,
+    right: i32 = 0,
+    bottom: i32 = 0,
+    left: i32 = 0,
+};
+
+/// Language-neutral desired state for one wlr-layer-shell surface. Output is
+/// deliberately compositor-selected until Ourokit exposes stable output
+/// identities at the application boundary.
+pub const LayerSurfaceDeclaration = struct {
+    id: []const u8,
+    namespace: []const u8,
+    width: u32,
+    height: u32,
+    layer: Layer,
+    anchors: Anchors = .{},
+    exclusive_zone: i32 = 0,
+    exclusive_edge: ?Edge = null,
+    margins: Margins = .{},
+    keyboard_interactivity: KeyboardInteractivity = .none,
+
+    pub fn validate(self: LayerSurfaceDeclaration) !void {
+        if (self.id.len == 0) return error.EmptyWindowId;
+        if (self.namespace.len == 0) return error.EmptyLayerSurfaceNamespace;
+        if (self.width == 0 and !(self.anchors.left and self.anchors.right))
+            return error.InvalidLayerSurfaceSize;
+        if (self.height == 0 and !(self.anchors.top and self.anchors.bottom))
+            return error.InvalidLayerSurfaceSize;
+        if (self.exclusive_zone < -1) return error.InvalidExclusiveZone;
+        if (self.exclusive_edge) |edge| {
+            const anchored = switch (edge) {
+                .top => self.anchors.top,
+                .bottom => self.anchors.bottom,
+                .left => self.anchors.left,
+                .right => self.anchors.right,
+            };
+            if (!anchored) return error.InvalidExclusiveEdge;
+        }
+    }
+};
+
+/// Surface roles remain distinct because their configure and update contracts
+/// are not interchangeable.
+pub const SurfaceDeclaration = union(enum) {
+    toplevel: ToplevelDeclaration,
+    layer_surface: LayerSurfaceDeclaration,
+
+    pub fn id(self: SurfaceDeclaration) []const u8 {
+        return switch (self) {
+            inline else => |declaration| declaration.id,
+        };
+    }
+
+    pub fn initialWidth(self: SurfaceDeclaration) u32 {
+        return switch (self) {
+            .toplevel => |declaration| declaration.initial_width,
+            .layer_surface => |declaration| declaration.width,
+        };
+    }
+
+    pub fn initialHeight(self: SurfaceDeclaration) u32 {
+        return switch (self) {
+            .toplevel => |declaration| declaration.initial_height,
+            .layer_surface => |declaration| declaration.height,
+        };
+    }
 };
 
 /// Native platform ownership boundary used by the desired-state reconciler.
@@ -241,9 +319,10 @@ pub const NativeHost = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        create: *const fn (*anyopaque, WindowHandle, ScopeHandle, ToplevelDeclaration) anyerror!void,
+        create: *const fn (*anyopaque, WindowHandle, ScopeHandle, SurfaceDeclaration) anyerror!void,
         update_title: *const fn (*anyopaque, WindowHandle, []const u8) anyerror!void,
         update_minimum_size: *const fn (*anyopaque, WindowHandle, u32, u32) anyerror!void,
+        update_layer_surface: *const fn (*anyopaque, WindowHandle, LayerSurfaceDeclaration) anyerror!void,
         begin_close: *const fn (*anyopaque, WindowHandle) anyerror!void,
     };
 
@@ -251,7 +330,7 @@ pub const NativeHost = struct {
         self: NativeHost,
         handle: WindowHandle,
         scope: ScopeHandle,
-        declaration: ToplevelDeclaration,
+        declaration: SurfaceDeclaration,
     ) !void {
         try self.vtable.create(self.context, handle, scope, declaration);
     }
@@ -267,6 +346,14 @@ pub const NativeHost = struct {
         height: u32,
     ) !void {
         try self.vtable.update_minimum_size(self.context, handle, width, height);
+    }
+
+    pub fn updateLayerSurface(
+        self: NativeHost,
+        handle: WindowHandle,
+        declaration: LayerSurfaceDeclaration,
+    ) !void {
+        try self.vtable.update_layer_surface(self.context, handle, declaration);
     }
 
     pub fn beginClose(self: NativeHost, handle: WindowHandle) !void {
@@ -331,4 +418,26 @@ test "text input state validates UTF-8 protocol offsets" {
         .cursor = 0,
         .anchor = 0,
     } }).validate());
+}
+
+test "layer surface dimensions validate against opposing anchors" {
+    const panel: LayerSurfaceDeclaration = .{
+        .id = "panel",
+        .namespace = "ouro-shell",
+        .width = 0,
+        .height = 32,
+        .layer = .top,
+        .anchors = .{ .top = true, .left = true, .right = true },
+    };
+    try panel.validate();
+
+    var invalid = panel;
+    invalid.anchors.right = false;
+    try @import("std").testing.expectError(error.InvalidLayerSurfaceSize, invalid.validate());
+    invalid = panel;
+    invalid.exclusive_zone = -2;
+    try @import("std").testing.expectError(error.InvalidExclusiveZone, invalid.validate());
+    invalid = panel;
+    invalid.exclusive_edge = .bottom;
+    try @import("std").testing.expectError(error.InvalidExclusiveEdge, invalid.validate());
 }

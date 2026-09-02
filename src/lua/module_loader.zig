@@ -339,5 +339,5 @@ test "application bootstrap asynchronously loads fallback and nested modules" {
     var result = try bootstrap.take();
     defer result.deinit();
     try std.testing.expectEqualStrings("dev.ouro.bootstrap-test", result.id);
-    try std.testing.expectEqualStrings("Loaded", result.windows[0].declaration.title);
+    try std.testing.expectEqualStrings("Loaded", result.windows[0].declaration.toplevel.title);
 }

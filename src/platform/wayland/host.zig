@@ -478,6 +478,8 @@ const Window = struct {
     surface: ?Handle = null,
     xdg_surface: ?Handle = null,
     toplevel: ?Handle = null,
+    layer_surface: ?Handle = null,
+    layer: platform_window.Layer = .top,
     viewport: ?Handle = null,
     fractional_scale: ?Handle = null,
     frame_callback: ?Handle = null,
@@ -503,6 +505,7 @@ const Window = struct {
         return (self.surface != null and self.surface.?.id == object_id) or
             (self.xdg_surface != null and self.xdg_surface.?.id == object_id) or
             (self.toplevel != null and self.toplevel.?.id == object_id) or
+            (self.layer_surface != null and self.layer_surface.?.id == object_id) or
             (self.viewport != null and self.viewport.?.id == object_id) or
             (self.fractional_scale != null and self.fractional_scale.?.id == object_id) or
             (self.frame_callback != null and self.frame_callback.?.id == object_id) or
@@ -568,6 +571,8 @@ pub const Host = struct {
     fractional_scale_manager: ?Handle = null,
     sync_manager: ?Handle = null,
     wm_base: ?Handle = null,
+    layer_shell: ?Handle = null,
+    layer_shell_version: u32 = 0,
     text_input_manager: ?Handle = null,
     text_input_manager_global_name: ?u32 = null,
     text_input: ?Handle = null,
@@ -630,6 +635,8 @@ pub const Host = struct {
         self.fractional_scale_manager = null;
         self.sync_manager = null;
         self.wm_base = null;
+        self.layer_shell = null;
+        self.layer_shell_version = 0;
         self.text_input_manager = null;
         self.text_input_manager_global_name = null;
         self.text_input = null;
@@ -707,7 +714,7 @@ pub const Host = struct {
             }
         }
         if (self.failure) |failure| return failure;
-        if (self.compositor == null or self.shm == null or self.wm_base == null)
+        if (self.compositor == null or self.shm == null)
             return error.RequiredWaylandGlobalMissing;
     }
 
@@ -1355,6 +1362,8 @@ pub const Host = struct {
             try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, handle, .{ .destroy = .{} });
         if (window.xdg_surface) |handle|
             try wayring.client.sendRequest(protocol.xdg_surface, objects, transmit, handle, .{ .destroy = .{} });
+        if (window.layer_surface) |handle|
+            try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, handle, .{ .destroy = .{} });
         if (window.sync_surface) |handle|
             try wayring.client.sendRequest(
                 protocol.wp_linux_drm_syncobj_surface_v1,
@@ -1367,6 +1376,7 @@ pub const Host = struct {
             try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, handle, .{ .destroy = .{} });
         window.toplevel = null;
         window.xdg_surface = null;
+        window.layer_surface = null;
         window.fractional_scale = null;
         window.viewport = null;
         window.sync_surface = null;
@@ -1383,7 +1393,7 @@ pub const Host = struct {
         context: *anyopaque,
         handle: WindowHandle,
         scope: ScopeHandle,
-        declaration: platform_window.ToplevelDeclaration,
+        declaration: platform_window.SurfaceDeclaration,
     ) !void {
         const self: *Host = @ptrCast(@alignCast(context));
         var slot: ?*Window = null;
@@ -1392,6 +1402,16 @@ pub const Host = struct {
             break;
         };
         const window = slot orelse return error.WindowCapacityExceeded;
+        switch (declaration) {
+            .toplevel => if (self.wm_base == null) return error.XdgShellUnavailable,
+            .layer_surface => |value| {
+                if (self.layer_shell == null) return error.LayerShellUnavailable;
+                if (value.keyboard_interactivity == .on_demand and self.layer_shell_version < 4)
+                    return error.LayerShellVersionTooOld;
+                if (value.exclusive_edge != null and self.layer_shell_version < 5)
+                    return error.LayerShellVersionTooOld;
+            },
+        }
         const objects = &self.connection.objects;
         const transmit = try self.queue();
         const surface = (try protocol.wl_compositor.construct_create_surface(
@@ -1400,18 +1420,54 @@ pub const Host = struct {
             self.compositor.?,
             .{},
         )).id;
-        const xdg_surface = (try protocol.xdg_wm_base.construct_get_xdg_surface(
-            objects,
-            transmit,
-            self.wm_base.?,
-            .{ .surface = surface.id },
-        )).id;
-        const toplevel = (try protocol.xdg_surface.construct_get_toplevel(
-            objects,
-            transmit,
-            xdg_surface,
-            .{},
-        )).id;
+        var xdg_surface: ?Handle = null;
+        var toplevel: ?Handle = null;
+        var layer_surface: ?Handle = null;
+        switch (declaration) {
+            .toplevel => |value| {
+                xdg_surface = (try protocol.xdg_wm_base.construct_get_xdg_surface(
+                    objects,
+                    transmit,
+                    self.wm_base.?,
+                    .{ .surface = surface.id },
+                )).id;
+                toplevel = (try protocol.xdg_surface.construct_get_toplevel(
+                    objects,
+                    transmit,
+                    xdg_surface.?,
+                    .{},
+                )).id;
+                try wayring.client.sendRequest(
+                    protocol.xdg_toplevel,
+                    objects,
+                    transmit,
+                    toplevel.?,
+                    .{ .set_title = .{ .title = value.title } },
+                );
+                try wayring.client.sendRequest(
+                    protocol.xdg_toplevel,
+                    objects,
+                    transmit,
+                    toplevel.?,
+                    .{ .set_app_id = .{ .app_id = self.app_id } },
+                );
+                try setMinimumSize(objects, transmit, toplevel.?, value.min_width, value.min_height);
+            },
+            .layer_surface => |value| {
+                layer_surface = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
+                    objects,
+                    transmit,
+                    self.layer_shell.?,
+                    .{
+                        .surface = surface.id,
+                        .output = null,
+                        .layer = layerValue(value.layer),
+                        .namespace = value.namespace,
+                    },
+                )).id;
+                try setLayerSurfaceState(objects, transmit, layer_surface.?, value, false, self.layer_shell_version);
+            },
+        }
         const viewport = if (self.viewporter) |viewporter|
             (try protocol.wp_viewporter.construct_get_viewport(
                 objects,
@@ -1439,33 +1495,14 @@ pub const Host = struct {
             )).id
         else
             null;
-        try wayring.client.sendRequest(
-            protocol.xdg_toplevel,
+        const initial_width = declaration.initialWidth();
+        const initial_height = declaration.initialHeight();
+        if (viewport != null and initial_width != 0 and initial_height != 0) try setViewport(
             objects,
             transmit,
-            toplevel,
-            .{ .set_title = .{ .title = declaration.title } },
-        );
-        try wayring.client.sendRequest(
-            protocol.xdg_toplevel,
-            objects,
-            transmit,
-            toplevel,
-            .{ .set_app_id = .{ .app_id = self.app_id } },
-        );
-        try setMinimumSize(
-            objects,
-            transmit,
-            toplevel,
-            declaration.min_width,
-            declaration.min_height,
-        );
-        if (viewport) |viewport_handle| try setViewport(
-            objects,
-            transmit,
-            viewport_handle,
-            declaration.initial_width,
-            declaration.initial_height,
+            viewport.?,
+            initial_width,
+            initial_height,
             fractional_scale_denominator,
         );
         try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
@@ -1476,13 +1513,18 @@ pub const Host = struct {
             .surface = surface,
             .xdg_surface = xdg_surface,
             .toplevel = toplevel,
+            .layer_surface = layer_surface,
+            .layer = switch (declaration) {
+                .toplevel => .top,
+                .layer_surface => |value| value.layer,
+            },
             .viewport = viewport,
             .fractional_scale = fractional_scale,
             .sync_surface = sync_surface,
-            .width = declaration.initial_width,
-            .height = declaration.initial_height,
-            .pending_width = declaration.initial_width,
-            .pending_height = declaration.initial_height,
+            .width = initial_width,
+            .height = initial_height,
+            .pending_width = initial_width,
+            .pending_height = initial_height,
         };
         _ = try self.driver.schedule();
     }
@@ -1491,11 +1533,12 @@ pub const Host = struct {
         const self: *Host = @ptrCast(@alignCast(context));
         const window = try self.windowFor(handle);
         if (window.state != .open) return error.WindowClosing;
+        const toplevel = window.toplevel orelse return error.NotToplevel;
         try wayring.client.sendRequest(
             protocol.xdg_toplevel,
             &self.connection.objects,
             try self.queue(),
-            window.toplevel.?,
+            toplevel,
             .{ .set_title = .{ .title = title } },
         );
         _ = try self.driver.schedule();
@@ -1512,7 +1555,7 @@ pub const Host = struct {
         if (window.state != .open) return error.WindowClosing;
         const objects = &self.connection.objects;
         const transmit = try self.queue();
-        try setMinimumSize(objects, transmit, window.toplevel.?, width, height);
+        try setMinimumSize(objects, transmit, window.toplevel orelse return error.NotToplevel, width, height);
         try wayring.client.sendRequest(
             protocol.wl_surface,
             objects,
@@ -1520,6 +1563,42 @@ pub const Host = struct {
             window.surface.?,
             .{ .commit = .{} },
         );
+        _ = try self.driver.schedule();
+    }
+
+    fn nativeUpdateLayerSurface(
+        context: *anyopaque,
+        handle: WindowHandle,
+        declaration: platform_window.LayerSurfaceDeclaration,
+    ) !void {
+        const self: *Host = @ptrCast(@alignCast(context));
+        const window = try self.windowFor(handle);
+        if (window.state != .open) return error.WindowClosing;
+        const layer_surface = window.layer_surface orelse return error.NotLayerSurface;
+        if (declaration.keyboard_interactivity == .on_demand and self.layer_shell_version < 4)
+            return error.LayerShellVersionTooOld;
+        if (declaration.exclusive_edge != null and self.layer_shell_version < 5)
+            return error.LayerShellVersionTooOld;
+        const objects = &self.connection.objects;
+        const transmit = try self.queue();
+        try setLayerSurfaceState(
+            objects,
+            transmit,
+            layer_surface,
+            declaration,
+            window.layer != declaration.layer,
+            self.layer_shell_version,
+        );
+        try wayring.client.sendRequest(
+            protocol.wl_surface,
+            objects,
+            transmit,
+            window.surface.?,
+            .{ .commit = .{} },
+        );
+        window.layer = declaration.layer;
+        if (declaration.width != 0) window.pending_width = declaration.width;
+        if (declaration.height != 0) window.pending_height = declaration.height;
         _ = try self.driver.schedule();
     }
 
@@ -1535,6 +1614,7 @@ pub const Host = struct {
         .create = nativeCreate,
         .update_title = nativeUpdateTitle,
         .update_minimum_size = nativeUpdateMinimumSize,
+        .update_layer_surface = nativeUpdateLayerSurface,
         .begin_close = nativeBeginClose,
     };
 
@@ -1635,6 +1715,45 @@ pub const Host = struct {
                     try self.sink.configured(window.handle, window.width, window.height);
                 },
             }
+        } else if (interface == &protocol.zwlr_layer_surface_v1.info) {
+            const window = try self.windowForObject(message.header.object_id);
+            switch (try wayring.client.decodeEvent(
+                protocol.zwlr_layer_surface_v1,
+                objects,
+                window.layer_surface.?,
+                message,
+                fds,
+            )) {
+                .configure => |configure| {
+                    try wayring.client.sendRequest(
+                        protocol.zwlr_layer_surface_v1,
+                        objects,
+                        try self.queue(),
+                        window.layer_surface.?,
+                        .{ .ack_configure = .{ .serial = configure.serial } },
+                    );
+                    if (configure.width != 0) window.pending_width = configure.width;
+                    if (configure.height != 0) window.pending_height = configure.height;
+                    if (window.pending_width == 0 or window.pending_height == 0)
+                        return error.InvalidLayerSurfaceConfigure;
+                    if (window.width != window.pending_width or window.height != window.pending_height)
+                        window.damage_history = .{};
+                    window.width = window.pending_width;
+                    window.height = window.pending_height;
+                    if (window.viewport) |viewport| try setViewport(
+                        objects,
+                        try self.queue(),
+                        viewport,
+                        window.width,
+                        window.height,
+                        window.scale_120,
+                    );
+                    window.configured = true;
+                    window.pending_redraw = true;
+                    try self.sink.configured(window.handle, window.width, window.height);
+                },
+                .closed => try self.sink.closeRequested(window.handle),
+            }
         } else if (interface == &protocol.wp_fractional_scale_v1.info) {
             const window = try self.windowForObject(message.header.object_id);
             switch (try wayring.client.decodeEvent(
@@ -1650,14 +1769,15 @@ pub const Host = struct {
                         window.scale_120 = preferred.scale;
                         window.damage_history = .{};
                         window.pending_redraw = true;
-                        if (window.viewport) |viewport| try setViewport(
-                            objects,
-                            try self.queue(),
-                            viewport,
-                            window.width,
-                            window.height,
-                            window.scale_120,
-                        );
+                        if (window.viewport != null and window.width != 0 and window.height != 0)
+                            try setViewport(
+                                objects,
+                                try self.queue(),
+                                window.viewport.?,
+                                window.width,
+                                window.height,
+                                window.scale_120,
+                            );
                     }
                 },
             }
@@ -1882,6 +2002,18 @@ pub const Host = struct {
                 @min(global.version, 5),
                 null,
             );
+        } else if (std.mem.eql(u8, global.interface, protocol.zwlr_layer_shell_v1.info.name)) {
+            const version = @min(global.version, 5);
+            self.layer_shell = try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.zwlr_layer_shell_v1.info,
+                version,
+                null,
+            );
+            self.layer_shell_version = version;
         } else if (std.mem.eql(u8, global.interface, protocol.zwp_text_input_manager_v3.info.name) and
             self.text_input_manager == null)
         {
@@ -2349,6 +2481,86 @@ fn setMinimumSize(
         return error.InvalidMinimumWindowSize;
     try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, toplevel, .{
         .set_min_size = .{ .width = @intCast(width), .height = @intCast(height) },
+    });
+}
+
+fn layerValue(layer: platform_window.Layer) protocol.zwlr_layer_shell_v1.layer {
+    return switch (layer) {
+        .background => .background,
+        .bottom => .bottom,
+        .top => .top,
+        .overlay => .overlay,
+    };
+}
+
+fn keyboardInteractivityValue(
+    interactivity: platform_window.KeyboardInteractivity,
+) protocol.zwlr_layer_surface_v1.keyboard_interactivity {
+    return switch (interactivity) {
+        .none => .none,
+        .exclusive => .exclusive,
+        .on_demand => .on_demand,
+    };
+}
+
+fn anchorValue(anchors: platform_window.Anchors) protocol.zwlr_layer_surface_v1.anchor {
+    var value: u32 = 0;
+    if (anchors.top) value |= protocol.zwlr_layer_surface_v1.anchor.top.toInt();
+    if (anchors.bottom) value |= protocol.zwlr_layer_surface_v1.anchor.bottom.toInt();
+    if (anchors.left) value |= protocol.zwlr_layer_surface_v1.anchor.left.toInt();
+    if (anchors.right) value |= protocol.zwlr_layer_surface_v1.anchor.right.toInt();
+    return protocol.zwlr_layer_surface_v1.anchor.fromInt(value);
+}
+
+fn edgeValue(edge: platform_window.Edge) protocol.zwlr_layer_surface_v1.anchor {
+    return switch (edge) {
+        .top => .top,
+        .bottom => .bottom,
+        .left => .left,
+        .right => .right,
+    };
+}
+
+fn setLayerSurfaceState(
+    objects: *wayring.objects.ClientObjects,
+    transmit: *wayring.tx.Queue,
+    layer_surface: Handle,
+    declaration: platform_window.LayerSurfaceDeclaration,
+    update_layer: bool,
+    protocol_version: u32,
+) !void {
+    if (update_layer) {
+        if (protocol_version < 2) return error.LayerShellVersionTooOld;
+        try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer_surface, .{
+            .set_layer = .{ .layer = layerValue(declaration.layer) },
+        });
+    }
+    try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer_surface, .{
+        .set_size = .{ .width = declaration.width, .height = declaration.height },
+    });
+    try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer_surface, .{
+        .set_anchor = .{ .anchor = anchorValue(declaration.anchors) },
+    });
+    if (declaration.exclusive_edge) |edge| {
+        try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer_surface, .{
+            .set_exclusive_edge = .{ .edge = edgeValue(edge) },
+        });
+    }
+    try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer_surface, .{
+        .set_exclusive_zone = .{ .zone = declaration.exclusive_zone },
+    });
+    try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer_surface, .{
+        .set_margin = .{
+            .top = declaration.margins.top,
+            .right = declaration.margins.right,
+            .bottom = declaration.margins.bottom,
+            .left = declaration.margins.left,
+        },
+    });
+    try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer_surface, .{
+        .set_keyboard_interactivity = .{
+            .keyboard_interactivity = keyboardInteractivityValue(declaration.keyboard_interactivity),
+        },
     });
 }
 

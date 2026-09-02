@@ -259,7 +259,7 @@ fn runSourceWithFontconfig(
     try dirty.init(init.gpa, options.application_window_capacity);
     defer dirty.deinit();
     const current_storage = try init.gpa.alloc(
-        platform.window.ToplevelDeclaration,
+        platform.window.SurfaceDeclaration,
         options.application_window_capacity,
     );
     defer init.gpa.free(current_storage);
@@ -400,7 +400,7 @@ fn runSourceWithFontconfig(
 
         var current_count: usize = 0;
         for (active_application.windows) |window| {
-            const slot = runtimeSlotForId(runtime_slots, window.declaration.id).?;
+            const slot = runtimeSlotForId(runtime_slots, window.declaration.id()).?;
             if (!slot.desired) continue;
             current_storage[current_count] = window.declaration;
             current_count += 1;
@@ -422,7 +422,7 @@ fn runSourceWithFontconfig(
                 try slot.runtime.clear(lua_ui);
                 continue;
             }
-            const handle = window_set.handleForId(window.?.declaration.id).?;
+            const handle = window_set.handleForId(window.?.declaration.id()).?;
             if (!slot.runtime.initialized) {
                 try slot.runtime.init(
                     init.gpa,
@@ -663,7 +663,7 @@ fn servicePreparedReload(
     const candidate = reload.candidate.?;
     var target_count: usize = 0;
     for (candidate.application.windows) |window| {
-        const slot = runtimeSlotForId(slots, window.declaration.id) orelse {
+        const slot = runtimeSlotForId(slots, window.declaration.id()) orelse {
             try reportReloadFailure(
                 reload,
                 control,
@@ -673,7 +673,7 @@ fn servicePreparedReload(
             return;
         };
         target_storage[target_count] = .{
-            .id = window.declaration.id,
+            .id = window.declaration.id(),
             .runtime = &slot.runtime,
             .size = slot.configured_size orelse slot.runtime.frame_state.size orelse .{
                 .width = 0,
@@ -788,7 +788,7 @@ fn syncRuntimeSlots(
 ) !void {
     for (slots) |*slot| slot.next_declared = false;
     for (declarations) |declaration| {
-        const id = declaration.declaration.id;
+        const id = declaration.declaration.id();
         var slot = runtimeSlotForId(slots, id);
         if (slot == null) {
             for (slots) |*candidate| if (candidate.id == null) {
@@ -823,7 +823,7 @@ fn applicationWindowForId(
     id: []const u8,
 ) ?*const lua.ApplicationWindow {
     for (declarations) |*declaration|
-        if (std.mem.eql(u8, declaration.declaration.id, id)) return declaration;
+        if (std.mem.eql(u8, declaration.declaration.id(), id)) return declaration;
     return null;
 }
 
@@ -880,11 +880,11 @@ test "runtime slots retain window state by ID across declaration changes" {
     defer for (&slots) |*slot| if (slot.id) |id| std.testing.allocator.free(id);
     const initial = [_]lua.ApplicationWindow{
         .{
-            .declaration = .{ .id = "main", .title = "Main" },
+            .declaration = .{ .toplevel = .{ .id = "main", .title = "Main" } },
             .content_reference = 1,
         },
         .{
-            .declaration = .{ .id = "tools", .title = "Tools" },
+            .declaration = .{ .toplevel = .{ .id = "tools", .title = "Tools" } },
             .content_reference = 2,
         },
     };

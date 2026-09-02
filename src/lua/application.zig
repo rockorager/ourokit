@@ -6,7 +6,7 @@ const task = @import("../task/root.zig");
 const vm_module = @import("vm.zig");
 
 pub const Window = struct {
-    declaration: platform.ToplevelDeclaration,
+    declaration: platform.SurfaceDeclaration,
     content_reference: c_int,
 };
 
@@ -431,26 +431,56 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
             return error.InvalidWindowDeclaration;
         const window_id = try requiredString(allocator, state, -1, "id");
         errdefer allocator.free(window_id);
-        const title = try requiredString(allocator, state, -1, "title");
-        errdefer allocator.free(title);
-        const width = try optionalDimension(state, -1, "width", 640);
-        const height = try optionalDimension(state, -1, "height", 480);
-        const min_width = try optionalNonNegativeDimension(state, -1, "min_width", 0);
-        const min_height = try optionalNonNegativeDimension(state, -1, "min_height", 0);
-        if (min_width > width or min_height > height)
-            return error.MinimumWindowSizeExceedsInitialSize;
+        const role = try surfaceRole(state, -1);
+        const declaration: platform.SurfaceDeclaration = switch (role) {
+            .toplevel => blk: {
+                const title = try requiredString(allocator, state, -1, "title");
+                errdefer allocator.free(title);
+                const width = try optionalDimension(state, -1, "width", 640);
+                const height = try optionalDimension(state, -1, "height", 480);
+                const min_width = try optionalNonNegativeDimension(state, -1, "min_width", 0);
+                const min_height = try optionalNonNegativeDimension(state, -1, "min_height", 0);
+                if (min_width > width or min_height > height)
+                    return error.MinimumWindowSizeExceedsInitialSize;
+                break :blk .{ .toplevel = .{
+                    .id = window_id,
+                    .title = title,
+                    .initial_width = width,
+                    .initial_height = height,
+                    .min_width = min_width,
+                    .min_height = min_height,
+                } };
+            },
+            .layer_surface => blk: {
+                const namespace = try requiredString(allocator, state, -1, "namespace");
+                errdefer allocator.free(namespace);
+                const layer_surface: platform.LayerSurfaceDeclaration = .{
+                    .id = window_id,
+                    .namespace = namespace,
+                    .width = try optionalNonNegativeDimension(state, -1, "width", 0),
+                    .height = try optionalNonNegativeDimension(state, -1, "height", 0),
+                    .layer = try requiredEnum(platform.Layer, state, -1, "layer"),
+                    .anchors = try optionalAnchors(state, -1),
+                    .exclusive_zone = try optionalSignedInteger(state, -1, "exclusive_zone", 0, -1),
+                    .exclusive_edge = try optionalNullableEnum(platform.Edge, state, -1, "exclusive_edge"),
+                    .margins = try optionalMargins(state, -1),
+                    .keyboard_interactivity = try optionalEnum(
+                        platform.KeyboardInteractivity,
+                        state,
+                        -1,
+                        "keyboard_interactivity",
+                        .none,
+                    ),
+                };
+                try layer_surface.validate();
+                break :blk .{ .layer_surface = layer_surface };
+            },
+        };
         if (c.lua_getfield(state, -1, "content") != c.type_function)
             return error.WindowContentRequired;
         const content_reference = c.luaL_ref(state, c.registry_index);
         window.* = .{
-            .declaration = .{
-                .id = window_id,
-                .title = title,
-                .initial_width = width,
-                .initial_height = height,
-                .min_width = min_width,
-                .min_height = min_height,
-            },
+            .declaration = declaration,
             .content_reference = content_reference,
         };
         initialized += 1;
@@ -471,6 +501,8 @@ fn installConstructors(state: *c.State, api_reference: ?c_int) !void {
     c.lua_setfield(state, -2, "app");
     c.lua_pushcclosure(state, identityTable, 0);
     c.lua_setfield(state, -2, "window");
+    c.lua_pushcclosure(state, layerSurfaceTable, 0);
+    c.lua_setfield(state, -2, "layer_surface");
 }
 
 fn identityTable(state: *c.State) callconv(.c) c_int {
@@ -478,6 +510,114 @@ fn identityTable(state: *c.State) callconv(.c) c_int {
         return luaError(state, "constructor expects one declaration table");
     c.lua_pushvalue(state, 1);
     return 1;
+}
+
+fn layerSurfaceTable(state: *c.State) callconv(.c) c_int {
+    if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+        return luaError(state, "constructor expects one declaration table");
+    _ = c.lua_pushstring(state, "layer_surface");
+    c.lua_setfield(state, 1, "__ouro_surface_role");
+    c.lua_pushvalue(state, 1);
+    return 1;
+}
+
+const SurfaceRole = enum { toplevel, layer_surface };
+
+fn surfaceRole(state: *c.State, table: c_int) !SurfaceRole {
+    const value_type = c.lua_getfield(state, table, "__ouro_surface_role");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .toplevel;
+    if (value_type != c.type_string) return error.InvalidSurfaceRole;
+    var length: usize = 0;
+    const value = c.lua_tolstring(state, -1, &length) orelse return error.InvalidSurfaceRole;
+    return std.meta.stringToEnum(SurfaceRole, value[0..length]) orelse error.InvalidSurfaceRole;
+}
+
+fn requiredEnum(
+    comptime Enum: type,
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+) !Enum {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type != c.type_string) return error.RequiredEnumMissing;
+    var length: usize = 0;
+    const value = c.lua_tolstring(state, -1, &length) orelse return error.RequiredEnumMissing;
+    return std.meta.stringToEnum(Enum, value[0..length]) orelse error.InvalidEnumValue;
+}
+
+fn optionalEnum(
+    comptime Enum: type,
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: Enum,
+) !Enum {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    if (value_type != c.type_string) return error.InvalidEnumValue;
+    var length: usize = 0;
+    const value = c.lua_tolstring(state, -1, &length) orelse return error.InvalidEnumValue;
+    return std.meta.stringToEnum(Enum, value[0..length]) orelse error.InvalidEnumValue;
+}
+
+fn optionalNullableEnum(
+    comptime Enum: type,
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+) !?Enum {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return null;
+    if (value_type != c.type_string) return error.InvalidEnumValue;
+    var length: usize = 0;
+    const value = c.lua_tolstring(state, -1, &length) orelse return error.InvalidEnumValue;
+    return std.meta.stringToEnum(Enum, value[0..length]) orelse error.InvalidEnumValue;
+}
+
+fn optionalAnchors(state: *c.State, table: c_int) !platform.Anchors {
+    const value_type = c.lua_getfield(state, table, "anchors");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .{};
+    if (value_type != c.type_table) return error.InvalidLayerSurfaceAnchors;
+    var anchors: platform.Anchors = .{};
+    const count = c.lua_rawlen(state, -1);
+    for (1..count + 1) |index| {
+        if (c.lua_rawgeti(state, -1, @intCast(index)) != c.type_string)
+            return error.InvalidLayerSurfaceAnchor;
+        var length: usize = 0;
+        const value = c.lua_tolstring(state, -1, &length) orelse
+            return error.InvalidLayerSurfaceAnchor;
+        const name = value[0..length];
+        if (std.mem.eql(u8, name, "top"))
+            anchors.top = true
+        else if (std.mem.eql(u8, name, "bottom"))
+            anchors.bottom = true
+        else if (std.mem.eql(u8, name, "left"))
+            anchors.left = true
+        else if (std.mem.eql(u8, name, "right"))
+            anchors.right = true
+        else
+            return error.InvalidLayerSurfaceAnchor;
+        c.lua_settop(state, -2);
+    }
+    return anchors;
+}
+
+fn optionalMargins(state: *c.State, table: c_int) !platform.Margins {
+    const value_type = c.lua_getfield(state, table, "margins");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .{};
+    if (value_type != c.type_table) return error.InvalidLayerSurfaceMargins;
+    return .{
+        .top = try optionalSignedInteger(state, -1, "top", 0, std.math.minInt(i32)),
+        .right = try optionalSignedInteger(state, -1, "right", 0, std.math.minInt(i32)),
+        .bottom = try optionalSignedInteger(state, -1, "bottom", 0, std.math.minInt(i32)),
+        .left = try optionalSignedInteger(state, -1, "left", 0, std.math.minInt(i32)),
+    };
 }
 
 fn requiredString(
@@ -526,10 +666,35 @@ fn optionalNonNegativeDimension(
     return @intCast(value);
 }
 
+fn optionalSignedInteger(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: i32,
+    minimum: i32,
+) !i32 {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    var is_number: c_int = 0;
+    const value = c.lua_tointegerx(state, -1, &is_number);
+    if (is_number == 0 or value < minimum or value > std.math.maxInt(i32))
+        return error.InvalidLayerSurfaceInteger;
+    return @intCast(value);
+}
+
 fn deinitWindow(allocator: std.mem.Allocator, state: *c.State, window: Window) void {
     c.luaL_unref(state, c.registry_index, window.content_reference);
-    allocator.free(window.declaration.title);
-    allocator.free(window.declaration.id);
+    switch (window.declaration) {
+        .toplevel => |declaration| {
+            allocator.free(declaration.title);
+            allocator.free(declaration.id);
+        },
+        .layer_surface => |declaration| {
+            allocator.free(declaration.namespace);
+            allocator.free(declaration.id);
+        },
+    }
 }
 
 fn luaError(state: *c.State, message: [*:0]const u8) c_int {
@@ -566,10 +731,49 @@ test "declarative application owns windows and content callbacks" {
     defer application.deinit();
     try std.testing.expectEqualStrings("dev.ouro.test", application.id);
     try std.testing.expectEqual(@as(usize, 1), application.windows.len);
-    try std.testing.expectEqualStrings("main", application.windows[0].declaration.id);
-    try std.testing.expectEqual(@as(u32, 320), application.windows[0].declaration.initial_width);
-    try std.testing.expectEqual(@as(u32, 280), application.windows[0].declaration.min_width);
-    try std.testing.expectEqual(@as(u32, 160), application.windows[0].declaration.min_height);
+    try std.testing.expectEqualStrings("main", application.windows[0].declaration.id());
+    try std.testing.expectEqual(@as(u32, 320), application.windows[0].declaration.toplevel.initial_width);
+    try std.testing.expectEqual(@as(u32, 280), application.windows[0].declaration.toplevel.min_width);
+    try std.testing.expectEqual(@as(u32, 160), application.windows[0].declaration.toplevel.min_height);
+}
+
+test "layer surface constructor parses shell policy into a distinct declaration" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 3);
+    c.lua_setglobal(state, "ouro");
+    var application = try Application.load(std.testing.allocator, state,
+        \\return ouro.app {
+        \\  id = "dev.ouro.shell",
+        \\  windows = { ouro.layer_surface {
+        \\    id = "panel",
+        \\    namespace = "ouro-shell",
+        \\    layer = "top",
+        \\    width = 0,
+        \\    height = 32,
+        \\    anchors = { "top", "left", "right" },
+        \\    exclusive_zone = 32,
+        \\    exclusive_edge = "top",
+        \\    margins = { top = 1, right = 2, bottom = 3, left = 4 },
+        \\    keyboard_interactivity = "on_demand",
+        \\    content = function() end,
+        \\  } },
+        \\}
+    );
+    defer application.deinit();
+    const declaration = application.windows[0].declaration.layer_surface;
+    try std.testing.expectEqualStrings("panel", declaration.id);
+    try std.testing.expectEqualStrings("ouro-shell", declaration.namespace);
+    try std.testing.expectEqual(platform.Layer.top, declaration.layer);
+    try std.testing.expectEqual(@as(u32, 0), declaration.width);
+    try std.testing.expectEqual(@as(u32, 32), declaration.height);
+    try std.testing.expect(declaration.anchors.top);
+    try std.testing.expect(declaration.anchors.left);
+    try std.testing.expect(declaration.anchors.right);
+    try std.testing.expectEqual(@as(i32, 32), declaration.exclusive_zone);
+    try std.testing.expectEqual(platform.Edge.top, declaration.exclusive_edge.?);
+    try std.testing.expectEqual(@as(i32, 4), declaration.margins.left);
+    try std.testing.expectEqual(platform.KeyboardInteractivity.on_demand, declaration.keyboard_interactivity);
 }
 
 test "window minimum dimensions cannot exceed the initial size" {
@@ -615,7 +819,7 @@ test "application actions remain headless while run builds one UI generation" {
     );
     defer application.deinit();
     try std.testing.expect(application.hasActions());
-    try std.testing.expectEqualStrings("Contacts", application.windows[0].declaration.title);
+    try std.testing.expectEqualStrings("Contacts", application.windows[0].declaration.toplevel.title);
 }
 
 test "application rejects malformed action declarations" {

@@ -13,7 +13,7 @@ catalog. A headless declarative-window reconciler
 now proves stable native identity, per-window resource scopes, transactional
 snapshot validation, and callback-free platform event queuing. A reusable
 multi-window Wayring host connects that model to independently configured,
-rendered, resized, and closed xdg-toplevels.
+rendered, resized, and closed xdg-toplevels and `wlr-layer-shell` surfaces.
 The first headless UI kernel adds logical box constraints, typed Box/Flex/Stack
 render objects, cached allocation-free layout, ordered scene construction, and
 hit testing. A separate keyed instance layer now reconciles normalized typed
@@ -222,6 +222,8 @@ Wayland desktop with:
 
 ```sh
 zig build run-wayland-example
+# Run the layer-shell panel example:
+zig build run-wayland-example -- --layer-shell
 ```
 
 The executable wrapper is intentionally tiny. Its application is
@@ -229,6 +231,10 @@ The executable wrapper is intentionally tiny. Its application is
 `app.runWayland` owns the ring, scheduler, Lua VM, font/text caches, retained UI,
 selected renderer, and Wayland presentation. Vulkan-capable builds select Vulkan
 by default; pass `--software` after `--` to select software rendering instead.
+The layer-shell example requires a compositor advertising
+`zwlr_layer_shell_v1`. Ourokit targets the current version 5 protocol while
+remaining compatible with older versions when declarations do not request
+newer-version features.
 
 Run any declarative application directly through the reusable host:
 

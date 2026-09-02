@@ -668,7 +668,7 @@ test "source generation bootstrap retains async module closure before becoming r
     );
     try std.testing.expectEqualStrings(
         "Loaded asynchronously:default",
-        generation.application.windows[0].declaration.title,
+        generation.application.windows[0].declaration.toplevel.title,
     );
     try std.testing.expect(generation.application.hasActions());
     _ = try generation.vm.spawnApplication("require('late')");
