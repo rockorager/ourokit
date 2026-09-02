@@ -33,6 +33,19 @@ local function scroll_story()
   }
 end
 
+local function listbox_story()
+  ouro.listbox {
+    key = "options",
+    selected = 2,
+    on_select = function() end,
+    children = function()
+      ouro.option { key = "first", value = 1, label = "First option" }
+      ouro.option { key = "second", value = 2, label = "Selected option" }
+      ouro.option { key = "third", value = 3, label = "Hovered option" }
+    end,
+  }
+end
+
 return ouro.storybook {
   title = "Ourokit built-in widgets",
   stories = {
@@ -275,22 +288,31 @@ return ouro.storybook {
             ouro.text_input {
               key = "editable",
               default_text = "Editable value",
-              width = 280,
             }
             ouro.text_input {
               key = "read-only",
               default_text = "Read-only value",
-              width = 280,
               read_only = true,
             }
             ouro.text_input {
               key = "disabled",
               default_text = "Disabled value",
-              width = 280,
               enabled = false,
             }
           end,
         }
+      end,
+    },
+    ouro.story {
+      id = "listbox/states",
+      group = "ListBox",
+      name = "Default, selected, and hovered",
+      viewport = { width = 360, height = 220 },
+      actions = {
+        { type = "hover", target = "options/third" },
+      },
+      content = function()
+        listbox_story()
       end,
     },
     ouro.story {

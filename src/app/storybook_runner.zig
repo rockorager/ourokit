@@ -156,6 +156,11 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         .bytes = @embedFile("ourokit_storybook_font"),
     });
     defer fonts.release(primary_font) catch unreachable;
+    const medium_font = try fonts.acquire(.{
+        .key = .{ .file = "/ourokit/storybook/Inter-Medium.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_storybook_medium_font"),
+    });
+    defer fonts.release(medium_font) catch unreachable;
     const arabic_font = try fonts.acquire(.{
         .key = .{ .file = "/ourokit/storybook/NotoSansArabic.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_storybook_arabic_font"),
@@ -181,6 +186,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     lua_ui.attachSignals(&signals);
     lua_ui.attachCallbacks(&callbacks, &vm);
     try lua_ui.attachLabelText(&paragraph_sources, &.{ primary_font, arabic_font }, 1);
+    try lua_ui.attachButtonText(&.{ medium_font, arabic_font });
     try lua_ui.attachSemantics(semantic_storage);
 
     var book = try lua.Storybook.loadWithApi(
@@ -204,11 +210,11 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         &scheduler,
         window_scope,
         .{ .slot = 0, .generation = 1 },
-        theme.surface_base,
-        theme.accent_default,
-        theme.content_primary,
-        theme.border_default,
-        theme.focus_ring,
+        theme.background,
+        theme.primary,
+        theme.foreground,
+        theme.input,
+        theme.ring,
         &signals,
         &paragraph_sources,
         &paragraphs,
@@ -300,8 +306,8 @@ fn playAction(
         try dispatchAndSettle(runtime, vm, callbacks, scheduler, lua_ui, story);
         return;
     }
-    if (target.role != .button) return error.StoryActionTargetNotInteractive;
     if (action.kind == .hover) return;
+    if (target.role != .button) return error.StoryActionTargetNotInteractive;
 
     try runtime.routePointer(.{ .button = .{
         .window = window,

@@ -137,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
                     .height = rectangle_height,
                 }} };
                 const commands = [_]ourokit.scene.Command{
-                    .{ .clear = theme.surface_base },
+                    .{ .clear = theme.background },
                     .{ .solid_rectangle = .{
                         .bounds = .{
                             .x = @intCast(current_x),
@@ -145,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
                             .width = rectangle_width,
                             .height = rectangle_height,
                         },
-                        .color = theme.accent_default,
+                        .color = theme.primary,
                     } },
                 };
                 try host.prepareFrameDamage(&frame, requested_damage);

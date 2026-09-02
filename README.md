@@ -161,11 +161,13 @@ wrapping; unchanged constraints perform no layout acquisition or allocation.
 application-managed numeric IDs or parent links. `ouro.button` composes a Box
 and Label using generated design tokens and retains hover, pressed, and disabled
 state in the widget layer. Buttons activate on press; release clears their
-pressed visual state. Its
-Box centers the constrained Label within the padded button bounds; this child
-placement remains separate from paragraph alignment. Button is not a renderer
-primitive. `ouro.listbox` and its direct `ouro.option` children provide a
-controlled single-selection list with one Tab stop and Up/Down/Home/End navigation.
+pressed visual state. Buttons are content-sized by default, use token-derived
+height and horizontal padding, and constrain labels to one ellipsized line;
+applications may still declare an explicit width. The Box centers the Label
+within those padded bounds, separately from paragraph alignment. Button is not
+a renderer primitive. `ouro.listbox` and its direct `ouro.option` children
+provide a controlled single-selection list with one Tab stop and
+Up/Down/Home/End navigation.
 Direction-aware alignment, whole-line clipping, and shaped ellipsis
 remain text-layer policy; renderers never inject the ellipsis. Editing and
 selection remain deferred. Software and Vulkan consume the identical positioned

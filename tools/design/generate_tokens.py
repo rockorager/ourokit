@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TOKENS = ROOT / "design" / "tokens"
 OUTPUT = ROOT / "src" / "design" / "generated" / "tokens.zig"
-NAME = re.compile(r"^ouro\.(?:foundation|semantic)\.[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+$")
+NAME = re.compile(r"^ouro\.(?:foundation|semantic)\.[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*$")
 REF = re.compile(r"^\{(ouro\..+)\}$")
 HEX = re.compile(r"^#[0-9a-fA-F]{8}$")
 TYPES = {"dimension", "font_size", "font_family", "color"}

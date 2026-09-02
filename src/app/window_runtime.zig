@@ -372,6 +372,7 @@ pub const WindowRuntime = struct {
             self.root_owner,
             self.instances.handleForId(option.listbox_id).?,
             self.instances.handleForId(option.id).?,
+            self.instances.handleForId(option.content_id).?,
             option.value,
             option.style,
         ) catch unreachable;
@@ -972,9 +973,9 @@ pub const WindowRuntime = struct {
     fn updateListBoxHover(self: *WindowRuntime, event: ui.input.Event) !void {
         switch (event) {
             .hover_enter => |hover| if (try self.listBoxOptionAncestor(hover.target)) |option|
-                try self.applyListBoxColor(option, self.listboxes.setHovered(option, true)),
+                try self.applyListBoxVisualUpdate(self.listboxes.setHovered(option, true)),
             .hover_leave => |hover| if (try self.listBoxOptionAncestor(hover.target)) |option|
-                try self.applyListBoxColor(option, self.listboxes.setHovered(option, false)),
+                try self.applyListBoxVisualUpdate(self.listboxes.setHovered(option, false)),
             else => {},
         }
     }
@@ -1240,31 +1241,35 @@ pub const WindowRuntime = struct {
     fn refreshListBoxVisuals(self: *WindowRuntime) !void {
         for (0..self.listboxes.optionSlots()) |index| {
             const option = self.listboxes.optionAt(index) orelse continue;
-            const render = try self.instances.renderObject(option);
-            var object = try self.tree.objectAt(render);
-            if (object != .box) return error.ListBoxOptionRenderObjectMismatch;
-            object.box.background = self.listboxes.currentColor(option);
-            object.box.outline_color = null;
-            object.box.outline_width = 0;
-            object.box.outline_gap = 0;
-            try self.tree.update(render, object);
+            try self.applyListBoxVisual(self.listboxes.currentVisual(option));
         }
         self.frame_state.invalidatePaint();
     }
 
-    fn applyListBoxColor(
+    fn applyListBoxVisualUpdate(
         self: *WindowRuntime,
-        option: ui.instance.InstanceHandle,
         update: ?ui.widget.ListBoxVisualUpdate,
     ) !void {
         const next = update orelse return;
-        const render = try self.instances.renderObject(option);
-        var object = try self.tree.objectAt(render);
-        if (object != .box) return error.ListBoxOptionRenderObjectMismatch;
-        if (std.meta.eql(object.box.background, next.color)) return;
-        object.box.background = next.color;
-        try self.tree.update(render, object);
+        try self.applyListBoxVisual(next);
         self.frame_state.invalidatePaint();
+    }
+
+    fn applyListBoxVisual(self: *WindowRuntime, update: ui.widget.ListBoxVisualUpdate) !void {
+        const option_render = try self.instances.renderObject(update.option);
+        var option = try self.tree.objectAt(option_render);
+        if (option != .box) return error.ListBoxOptionRenderObjectMismatch;
+        option.box.background = update.visual.background;
+        option.box.outline_color = null;
+        option.box.outline_width = 0;
+        option.box.outline_gap = 0;
+        try self.tree.update(option_render, option);
+
+        const content_render = try self.instances.renderObject(update.content);
+        var content = try self.tree.objectAt(content_render);
+        if (content != .label) return error.ListBoxOptionContentRenderObjectMismatch;
+        content.label.color = update.visual.foreground;
+        try self.tree.update(content_render, content);
     }
 
     /// Exercises candidate layout and scene lowering against isolated native

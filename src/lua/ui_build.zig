@@ -20,6 +20,12 @@ const render_types = @import("../ui/render_object/types.zig");
 const SemanticDescriptor = @import("../ui/semantics/snapshot.zig").Descriptor;
 const text = @import("../text/root.zig");
 
+// shadcn/ui keeps component geometry and state opacity in component recipes;
+// only reusable semantic roles belong in the generated theme.
+const button_hover_opacity: u8 = 204; // 80% of 255.
+const disabled_opacity: u8 = 128; // 50% of 255, rounded.
+const radius_medium_multiplier: f32 = 0.8;
+
 const PendingHandler = struct {
     id: u64,
     reference: c_int,
@@ -31,8 +37,15 @@ const PendingButton = struct {
     enabled: bool,
     style: ButtonStyle,
 };
-const PendingListBox = struct { id: u64, selected: i64 };
-const PendingOption = struct { id: u64, listbox_id: u64, value: i64, style: ListBoxStyle };
+const ListBoxAppearance = enum { default, sidebar };
+const PendingListBox = struct { id: u64, selected: i64, appearance: ListBoxAppearance };
+const PendingOption = struct {
+    id: u64,
+    content_id: u64,
+    listbox_id: u64,
+    value: i64,
+    style: ListBoxStyle,
+};
 
 const PendingTextInput = struct {
     target_id: u64,
@@ -77,6 +90,7 @@ pub const UiBuild = struct {
     callback_vm: ?*Vm = null,
     label_sources: ?*text.ParagraphSourceCache = null,
     label_candidates: []const text.FontHandle = &.{},
+    button_candidates: []const text.FontHandle = &.{},
     label_configuration_revision: u64 = 0,
     widget_theme: ?design.tokens.Theme = null,
     theme_stack: [32]design.tokens.Theme = undefined,
@@ -187,7 +201,7 @@ pub const UiBuild = struct {
                 .parent = null,
                 .object = .{ .box = .{
                     .padding = .all(design.tokens.foundation.spacing_3),
-                    .background = theme.surface_base,
+                    .background = theme.background,
                 } },
             });
             self.parent_stack[0] = .{ .id = 2, .kind = .stack };
@@ -316,6 +330,7 @@ pub const UiBuild = struct {
             owner,
             tree.handleForId(pending.listbox_id).?,
             tree.handleForId(pending.id).?,
+            tree.handleForId(pending.content_id).?,
             pending.value,
             pending.style,
         );
@@ -424,7 +439,13 @@ pub const UiBuild = struct {
             destination.* = .{ .id = source.id, .selected = source.selected };
         prepared.listbox_count = self.pending_listbox_count;
         for (self.pending_options[0..self.pending_option_count], prepared.prepared_options[0..self.pending_option_count]) |source, *destination|
-            destination.* = .{ .id = source.id, .listbox_id = source.listbox_id, .value = source.value, .style = source.style };
+            destination.* = .{
+                .id = source.id,
+                .content_id = source.content_id,
+                .listbox_id = source.listbox_id,
+                .value = source.value,
+                .style = source.style,
+            };
         prepared.option_count = self.pending_option_count;
         prepared.owns_shapes = self.sources_staged;
         self.pending_handler_count = 0;
@@ -507,6 +528,13 @@ pub const UiBuild = struct {
         self.label_sources = sources;
         self.label_candidates = candidates;
         self.label_configuration_revision = configuration_revision;
+    }
+
+    pub fn attachButtonText(self: *UiBuild, candidates: []const text.FontHandle) !void {
+        if (self.active_owner != null or self.label_sources == null or
+            self.button_candidates.len != 0 or candidates.len == 0)
+            return error.InvalidButtonTextService;
+        self.button_candidates = candidates;
     }
 
     pub fn enableDeclarativeWidgets(self: *UiBuild, theme: design.tokens.Theme) void {
@@ -593,37 +621,37 @@ pub const UiBuild = struct {
         const parent = self.currentParent() orelse return luaError(state, "button requires a widget parent");
         const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
             return luaError(state, "invalid button enabled state");
-        const width = tableOptionalExtent(state, 1, "width", 160) orelse
+        const width = tableOptionalNullableExtent(state, 1, "width") orelse
             return luaError(state, "invalid button width");
         const height = tableOptionalExtent(
             state,
             1,
             "height",
-            design.tokens.foundation.component_height_large,
+            design.tokens.foundation.component_height_default,
         ) orelse return luaError(state, "invalid button height");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const button_id = semanticId(key, 0x627574746f6e ^ parent.id);
         const label_id = semanticId(key, 0x6c6162656c ^ button_id);
         const style: ButtonStyle = .{
-            .idle = theme.accent_default,
-            .hovered = theme.accent_hovered,
-            .pressed = theme.accent_pressed,
-            .disabled = theme.border_default,
+            .idle = theme.primary,
+            .hovered = withOpacity(theme.primary, button_hover_opacity),
+            .pressed = withOpacity(theme.primary, button_hover_opacity),
+            .disabled = withOpacity(theme.primary, disabled_opacity),
         };
         self.append(.{
             .id = button_id,
             .parent = parent.id,
             .object = .{ .box = .{
-                .width = width,
+                .width = width.value,
                 .height = height,
                 .padding = .{
-                    .left = design.tokens.foundation.spacing_3,
-                    .right = design.tokens.foundation.spacing_3,
+                    .left = design.tokens.foundation.spacing_2_5,
+                    .right = design.tokens.foundation.spacing_2_5,
                 },
                 .alignment = .center,
                 .background = if (enabled) style.idle else style.disabled,
-                .corner_radius = design.tokens.foundation.corner_radius_medium,
+                .corner_radius = design.tokens.foundation.radius,
             } },
             .focusable = enabled,
             .parent_data = parent_data,
@@ -634,7 +662,10 @@ pub const UiBuild = struct {
             .utf8 = label,
             .language = "und",
             .logical_size = design.tokens.foundation.typography_body,
-            .candidates = self.label_candidates,
+            .candidates = if (self.button_candidates.len == 0)
+                self.label_candidates
+            else
+                self.button_candidates,
             .configuration_revision = self.label_configuration_revision,
         }) catch return luaError(state, "cannot retain button label");
         self.append(.{
@@ -642,8 +673,13 @@ pub const UiBuild = struct {
             .parent = button_id,
             .object = .{ .label = .{
                 .source = source,
-                .color = if (enabled) theme.surface_base else theme.content_secondary,
+                .color = if (enabled)
+                    theme.primary_foreground
+                else
+                    withOpacity(theme.primary_foreground, disabled_opacity),
                 .alignment = .center,
+                .max_lines = 1,
+                .overflow = .ellipsis,
             } },
         }) catch {
             sources.release(source) catch unreachable;
@@ -698,7 +734,7 @@ pub const UiBuild = struct {
             return luaError(state, "text_input requires exactly one of text or default_text");
         const mode: TextInputValueMode = if (controlled.present) .controlled else .uncontrolled;
         const initial = if (controlled.present) controlled.value else uncontrolled.value;
-        const width = tableOptionalExtent(state, 1, "width", 240) orelse
+        const width = tableOptionalSize(state, 1, "width", .fill) orelse
             return luaError(state, "invalid text_input width");
         const height = tableOptionalExtent(
             state,
@@ -716,17 +752,17 @@ pub const UiBuild = struct {
             .id = target_id,
             .parent = parent.id,
             .object = .{ .box = .{
-                .width = width,
+                .width = width.extent(),
+                .fill_width = width.isFill(),
                 .height = height,
                 .padding = .{
-                    .left = design.tokens.foundation.spacing_2,
-                    .right = design.tokens.foundation.spacing_2,
+                    .left = design.tokens.foundation.spacing_2_5,
+                    .right = design.tokens.foundation.spacing_2_5,
                 },
                 .alignment = .{ .vertical = .center },
-                .background = theme.surface_base,
-                .border_color = theme.border_default,
+                .border_color = if (enabled) theme.input else withOpacity(theme.input, disabled_opacity),
                 .border_width = design.tokens.foundation.border_width_default,
-                .corner_radius = design.tokens.foundation.corner_radius_small,
+                .corner_radius = design.tokens.foundation.radius,
             } },
             .focusable = enabled,
             .parent_data = declarativeParentData(self, state, 1) catch |err|
@@ -746,9 +782,9 @@ pub const UiBuild = struct {
             .parent = target_id,
             .object = .{ .text_input = .{
                 .source = source,
-                .color = if (enabled) theme.content_primary else theme.content_secondary,
-                .selection_color = theme.selection_background,
-                .caret_color = theme.content_primary,
+                .color = if (enabled) theme.foreground else withOpacity(theme.foreground, disabled_opacity),
+                .selection_color = theme.accent,
+                .caret_color = theme.foreground,
                 .selection_start = initial.len,
                 .selection_end = initial.len,
                 .caret_offset = initial.len,
@@ -805,6 +841,8 @@ pub const UiBuild = struct {
         const key = tableString(state, 1, "key") orelse return luaError(state, "listbox key is required");
         const selected = tableRequiredInteger(state, 1, "selected") orelse
             return luaError(state, "listbox selected must be an integer");
+        const appearance = tableOptionalListBoxAppearance(state, 1) orelse
+            return luaError(state, "listbox appearance must be 'default' or 'sidebar'");
         const gap = tableOptionalExtent(state, 1, "gap", design.tokens.foundation.spacing_1) orelse
             return luaError(state, "invalid listbox gap");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
@@ -825,7 +863,11 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append listbox semantics");
         if (self.pending_listbox_count == self.pending_listboxes.len)
             return luaError(state, "listbox capacity exceeded");
-        self.pending_listboxes[self.pending_listbox_count] = .{ .id = id, .selected = selected };
+        self.pending_listboxes[self.pending_listbox_count] = .{
+            .id = id,
+            .selected = selected,
+            .appearance = appearance,
+        };
         self.pending_listbox_count += 1;
 
         const callback_type = c.lua_getfield(state, 1, "on_select");
@@ -861,17 +903,25 @@ pub const UiBuild = struct {
             return luaError(state, "option value must be an integer");
         const option_id = semanticId(key, 0x6f7074696f6e ^ parent.id);
         const label_id = semanticId(key, 0x6c6162656c ^ option_id);
-        const selected = blk: {
-            for (self.pending_listboxes[0..self.pending_listbox_count]) |listbox|
-                if (listbox.id == parent.id) break :blk listbox.selected == value;
+        const listbox = blk: {
+            for (self.pending_listboxes[0..self.pending_listbox_count]) |candidate|
+                if (candidate.id == parent.id) break :blk candidate;
             return luaError(state, "option listbox state is missing");
         };
-        var hovered = theme.content_primary;
-        hovered.a = 31;
+        const selected = listbox.selected == value;
+        const idle_foreground = if (listbox.appearance == .sidebar)
+            theme.sidebar_foreground
+        else
+            theme.foreground;
+        const accent = if (listbox.appearance == .sidebar) theme.sidebar_accent else theme.accent;
+        const accent_foreground = if (listbox.appearance == .sidebar)
+            theme.sidebar_accent_foreground
+        else
+            theme.accent_foreground;
         const style: ListBoxStyle = .{
-            .idle = null,
-            .hovered = hovered,
-            .selected = theme.selection_background,
+            .idle = .{ .background = null, .foreground = idle_foreground },
+            .hovered = .{ .background = accent, .foreground = accent_foreground },
+            .selected = .{ .background = accent, .foreground = accent_foreground },
         };
         self.append(.{
             .id = option_id,
@@ -880,8 +930,8 @@ pub const UiBuild = struct {
                 .height = design.tokens.foundation.component_height_default,
                 .padding = .{ .left = design.tokens.foundation.spacing_2, .right = design.tokens.foundation.spacing_2 },
                 .alignment = .{ .horizontal = .minimum, .vertical = .center },
-                .background = if (selected) style.selected else null,
-                .corner_radius = design.tokens.foundation.corner_radius_small,
+                .background = if (selected) style.selected.background else style.idle.background,
+                .corner_radius = design.tokens.foundation.radius * radius_medium_multiplier,
             } },
         }) catch return luaError(state, "cannot append option descriptor");
         const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
@@ -897,7 +947,7 @@ pub const UiBuild = struct {
             .parent = option_id,
             .object = .{ .label = .{
                 .source = source,
-                .color = theme.content_primary,
+                .color = if (selected) style.selected.foreground else style.idle.foreground,
                 .max_lines = 1,
                 .overflow = .ellipsis,
             } },
@@ -910,6 +960,7 @@ pub const UiBuild = struct {
             return luaError(state, "listbox option capacity exceeded");
         self.pending_options[self.pending_option_count] = .{
             .id = option_id,
+            .content_id = label_id,
             .listbox_id = parent.id,
             .value = value,
             .style = style,
@@ -961,7 +1012,7 @@ pub const UiBuild = struct {
             .parent = parent.id,
             .object = .{ .label = .{
                 .source = source,
-                .color = theme.content_primary,
+                .color = theme.foreground,
                 .alignment = alignment,
                 .max_lines = if (max_lines_value == 0) null else max_lines_value,
                 .overflow = overflow,
@@ -997,16 +1048,24 @@ pub const UiBuild = struct {
             return luaError(state, "ouro.box expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "box requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "box key is required");
-        const width = tableOptionalNullableExtent(state, 1, "width") orelse
+        const width = tableOptionalSize(state, 1, "width", .auto) orelse
             return luaError(state, "invalid box width");
-        const height = tableOptionalNullableExtent(state, 1, "height") orelse
+        const height = tableOptionalSize(state, 1, "height", .auto) orelse
             return luaError(state, "invalid box height");
+        const min_width = tableOptionalExtent(state, 1, "min_width", 0) orelse
+            return luaError(state, "invalid box min_width");
+        const min_height = tableOptionalExtent(state, 1, "min_height", 0) orelse
+            return luaError(state, "invalid box min_height");
+        if (width.extent()) |value| if (value < min_width)
+            return luaError(state, "box width must be at least min_width");
+        if (height.extent()) |value| if (value < min_height)
+            return luaError(state, "box height must be at least min_height");
         const padding = tableOptionalExtent(state, 1, "padding", 0) orelse
             return luaError(state, "invalid box padding");
         const alignment = tableOptionalBoxAlignment(state, 1) orelse
             return luaError(state, "invalid box alignment");
         const surface = tableOptionalSurface(state, 1, theme) orelse
-            return luaError(state, "box surface must be 'base' or 'raised'");
+            return luaError(state, "box surface must be 'background', 'card', 'popover', or 'sidebar'");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x626f78 ^ parent.id);
@@ -1014,8 +1073,12 @@ pub const UiBuild = struct {
             .id = id,
             .parent = parent.id,
             .object = .{ .box = .{
-                .width = width.value,
-                .height = height.value,
+                .width = width.extent(),
+                .height = height.extent(),
+                .fill_width = width.isFill(),
+                .fill_height = height.isFill(),
+                .min_width = min_width,
+                .min_height = min_height,
                 .padding = .all(padding),
                 .alignment = alignment.value,
                 .background = surface.value,
@@ -1045,7 +1108,7 @@ pub const UiBuild = struct {
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .object = .{ .box = .{ .background = theme.surface_base } },
+            .object = .{ .box = .{ .background = theme.background } },
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append theme descriptor");
         self.appendSemantic(.{
@@ -1257,6 +1320,41 @@ fn tableOptionalNullableExtent(
     return .{ .value = requiredExtent(state, -1) orelse return null };
 }
 
+const DeclaredSize = union(enum) {
+    auto,
+    fill,
+    exact: f32,
+
+    fn extent(self: DeclaredSize) ?f32 {
+        return switch (self) {
+            .auto, .fill => null,
+            .exact => |value| value,
+        };
+    }
+
+    fn isFill(self: DeclaredSize) bool {
+        return switch (self) {
+            .fill => true,
+            .auto, .exact => false,
+        };
+    }
+};
+
+fn tableOptionalSize(
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: DeclaredSize,
+) ?DeclaredSize {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    if (value_type == c.type_number)
+        return .{ .exact = requiredExtent(state, -1) orelse return null };
+    const value = string(state, -1) orelse return null;
+    return if (std.mem.eql(u8, value, "fill")) .fill else null;
+}
+
 const OptionalAlignment = struct { value: ?render_types.Alignment };
 
 fn tableOptionalBoxAlignment(state: *c.State, table: c_int) ?OptionalAlignment {
@@ -1310,7 +1408,7 @@ fn tableOptionalParagraphAlignment(
     return null;
 }
 
-const OptionalSurface = struct { value: ?@TypeOf(design.tokens.light.surface_base) };
+const OptionalSurface = struct { value: ?@TypeOf(design.tokens.light.background) };
 
 fn tableOptionalSurface(
     state: *c.State,
@@ -1321,9 +1419,27 @@ fn tableOptionalSurface(
     defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return .{ .value = null };
     const value = string(state, -1) orelse return null;
-    if (std.mem.eql(u8, value, "base")) return .{ .value = theme.surface_base };
-    if (std.mem.eql(u8, value, "raised")) return .{ .value = theme.surface_raised };
+    if (std.mem.eql(u8, value, "background")) return .{ .value = theme.background };
+    if (std.mem.eql(u8, value, "card")) return .{ .value = theme.card };
+    if (std.mem.eql(u8, value, "popover")) return .{ .value = theme.popover };
+    if (std.mem.eql(u8, value, "sidebar")) return .{ .value = theme.sidebar };
     return null;
+}
+
+fn tableOptionalListBoxAppearance(state: *c.State, table: c_int) ?ListBoxAppearance {
+    const value_type = c.lua_getfield(state, table, "appearance");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return .default;
+    const value = string(state, -1) orelse return null;
+    if (std.mem.eql(u8, value, "default")) return .default;
+    if (std.mem.eql(u8, value, "sidebar")) return .sidebar;
+    return null;
+}
+
+fn withOpacity(color: @TypeOf(design.tokens.light.background), opacity: u8) @TypeOf(color) {
+    var result = color;
+    result.a = @intCast((@as(u16, color.a) * opacity + 127) / 255);
+    return result;
 }
 
 fn tableOptionalParagraphOverflow(
@@ -1478,7 +1594,9 @@ test "Lua UI exposes only declarative constructors without standard libraries" {
     try ui.init(state, &storage);
 
     try std.testing.expectEqual(c.type_table, c.lua_getglobal(state, "ouro"));
-    inline for (.{ "label", "button", "text_input", "box", "row", "column", "scroll", "theme" }) |name| {
+    inline for (.{
+        "label", "button", "text_input", "listbox", "option", "box", "row", "column", "scroll", "theme",
+    }) |name| {
         try std.testing.expectEqual(c.type_function, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
@@ -1526,7 +1644,6 @@ test "declarative text input separates focus identity from editable render conte
         \\      ouro.text_input {
         \\        key = "query",
         \\        text = "Initial",
-        \\        width = 200,
         \\        read_only = true,
         \\        on_change = function(value) changed = value end,
         \\      }
@@ -1540,12 +1657,16 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(@as(usize, 5), descriptors.len);
     try std.testing.expect(descriptors[3].object == .box);
     try std.testing.expect(descriptors[3].focusable);
+    try std.testing.expect(descriptors[3].object.box.width == null);
+    try std.testing.expect(descriptors[3].object.box.fill_width);
     try std.testing.expectEqual(@as(f32, 0), descriptors[3].object.box.padding.top);
     try std.testing.expectEqual(@as(f32, 0), descriptors[3].object.box.padding.bottom);
     try std.testing.expectEqual(
-        design.tokens.foundation.spacing_2,
+        design.tokens.foundation.spacing_2_5,
         descriptors[3].object.box.padding.left,
     );
+    try std.testing.expectEqual(design.tokens.light.input, descriptors[3].object.box.border_color.?);
+    try std.testing.expectEqual(design.tokens.foundation.radius, descriptors[3].object.box.corner_radius);
     try std.testing.expect(descriptors[4].object == .text_input);
     try std.testing.expectEqual(descriptors[3].id, descriptors[4].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_text_input_count);
@@ -1570,6 +1691,82 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(.text_input_change, prepared.handlers[0].kind);
     prepared.reset();
     try std.testing.expectEqual(@as(usize, 0), sources.count());
+    try owners.complete(work);
+    try fonts.release(font);
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
+    try owners.collectRetired();
+    try scheduler.destroyScope(window_scope);
+}
+
+test "declarative sidebar listbox uses paired active visuals" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+    const BuildOwners = build_owner.BuildOwners;
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 3);
+    c.lua_setglobal(state, "ouro");
+
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, window_scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font_static"),
+    });
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var storage: [7]instance.Descriptor = undefined;
+    var semantic_storage: [3]SemanticDescriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    try ui.attachLabelText(&sources, &.{font}, 1);
+    try ui.attachSemantics(&semantic_storage);
+    ui.enableDeclarativeWidgets(design.tokens.light);
+    try execute(state,
+        \\function build()
+        \\  ouro.listbox {
+        \\    key = "navigation",
+        \\    appearance = "sidebar",
+        \\    selected = 2,
+        \\    on_select = function() end,
+        \\    children = function()
+        \\      ouro.option { key = "first", value = 1, label = "First" }
+        \\      ouro.option { key = "second", value = 2, label = "Second" }
+        \\    end,
+        \\  }
+        \\end
+    );
+    var cycle = owners.beginCycle();
+    const work = (try cycle.take()).?;
+    const descriptors = try ui.build(&owners, work, "build", &.{});
+    try std.testing.expectEqual(@as(usize, 7), descriptors.len);
+    try std.testing.expectEqual(design.tokens.light.sidebar_foreground, descriptors[4].object.label.color);
+    try std.testing.expectEqual(design.tokens.light.sidebar_accent, descriptors[5].object.box.background.?);
+    try std.testing.expectEqual(
+        design.tokens.light.sidebar_accent_foreground,
+        descriptors[6].object.label.color,
+    );
+    try std.testing.expectEqual(@as(usize, 2), ui.pending_option_count);
+    try std.testing.expectEqual(descriptors[4].id, ui.pending_options[0].content_id);
+    try std.testing.expectEqual(
+        design.tokens.light.sidebar_accent_foreground,
+        ui.pending_options[0].style.hovered.foreground,
+    );
+
+    var prepared: PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, state, &sources, 7, 64);
+    defer prepared.deinit();
+    try ui.capturePrepared(&prepared, descriptors);
+    try std.testing.expectEqual(descriptors[6].id, prepared.prepared_options[1].content_id);
+    prepared.reset();
     try owners.complete(work);
     try fonts.release(font);
     try owners.retire(owner);
@@ -1795,6 +1992,10 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
         .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_test_font_static"),
     });
+    const medium_font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter-Medium.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_storybook_medium_font"),
+    });
     var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
     defer sources.deinit();
     var storage: [9]instance.Descriptor = undefined;
@@ -1802,6 +2003,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachLabelText(&sources, &.{font}, 1);
+    try ui.attachButtonText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
@@ -1810,6 +2012,8 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
         \\    key = "frame",
         \\    width = 320,
         \\    height = 200,
+        \\    min_width = 280,
+        \\    min_height = 160,
         \\    padding = 8,
         \\    alignment = "center",
         \\    children = function()
@@ -1847,25 +2051,46 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expect(descriptors[1].object == .stack);
     try std.testing.expectEqual(@as(?f32, 320), descriptors[2].object.box.width);
     try std.testing.expectEqual(@as(?f32, 200), descriptors[2].object.box.height);
+    try std.testing.expectEqual(@as(f32, 280), descriptors[2].object.box.min_width);
+    try std.testing.expectEqual(@as(f32, 160), descriptors[2].object.box.min_height);
     try std.testing.expectEqual(
         render_types.Alignment.center,
         descriptors[2].object.box.alignment.?,
     );
-    try std.testing.expectEqual(design.tokens.dark.surface_base, descriptors[3].object.box.background.?);
+    try std.testing.expectEqual(design.tokens.dark.background, descriptors[3].object.box.background.?);
     try std.testing.expect(descriptors[4].object == .flex);
     try std.testing.expect(descriptors[5].object == .label);
     try std.testing.expect(descriptors[6].object == .flex);
-    try std.testing.expectEqual(design.tokens.dark.accent_default, descriptors[7].object.box.background.?);
+    try std.testing.expectEqual(design.tokens.dark.primary, descriptors[7].object.box.background.?);
     try std.testing.expect(descriptors[7].focusable);
+    try std.testing.expect(descriptors[7].object.box.width == null);
+    try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.min_width);
+    try std.testing.expectEqual(
+        @as(?f32, design.tokens.foundation.component_height_default),
+        descriptors[7].object.box.height,
+    );
+    try std.testing.expectEqual(
+        design.tokens.foundation.radius,
+        descriptors[7].object.box.corner_radius,
+    );
     try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.padding.top);
     try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.padding.bottom);
-    try std.testing.expectEqual(design.tokens.foundation.spacing_3, descriptors[7].object.box.padding.left);
-    try std.testing.expectEqual(design.tokens.foundation.spacing_3, descriptors[7].object.box.padding.right);
-    try std.testing.expectEqual(design.tokens.dark.surface_base, descriptors[8].object.label.color);
+    try std.testing.expectEqual(design.tokens.foundation.spacing_2_5, descriptors[7].object.box.padding.left);
+    try std.testing.expectEqual(design.tokens.foundation.spacing_2_5, descriptors[7].object.box.padding.right);
+    try std.testing.expectEqual(design.tokens.dark.primary_foreground, descriptors[8].object.label.color);
+    const button_source = try sources.get(descriptors[8].object.label.source);
+    try std.testing.expectEqual(@as(usize, 1), button_source.candidates.len);
+    try std.testing.expectEqual(medium_font, button_source.candidates[0]);
+    try std.testing.expectEqual(@as(?u32, 1), descriptors[8].object.label.max_lines);
+    try std.testing.expectEqual(text.ParagraphOverflow.ellipsis, descriptors[8].object.label.overflow);
     try std.testing.expectEqual(descriptors[7].id, descriptors[8].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
     try std.testing.expectEqual(.button, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_button_count);
+    try std.testing.expectEqual(
+        withOpacity(design.tokens.dark.primary, disabled_opacity),
+        ui.pending_buttons[0].style.disabled,
+    );
     try std.testing.expectEqual(@as(usize, 6), ui.semanticDescriptors().len);
     try std.testing.expectEqualStrings("Controls", ui.semanticDescriptors()[3].label);
     try std.testing.expectEqualStrings("Benchmark", ui.semanticDescriptors()[5].label);
@@ -1883,6 +2108,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     ui.rollbackHandlers();
     try owners.complete(work);
     try fonts.release(font);
+    try fonts.release(medium_font);
     try owners.retire(owner);
     try scheduler.applyQueuedCancellations();
     try owners.collectRetired();

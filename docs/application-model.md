@@ -124,8 +124,11 @@ Declarative rows and columns expose that edge metadata as a contextual
 a direct row or column child. `cross_alignment = "start" | "center" | "end" |
 "stretch"` controls the container's cross axis; flex children use tight fitting
 and divide the remaining bounded main-axis space according to their factors.
-Boxes may opt into generated theme surfaces with `surface = "base" | "raised"`;
-omitting it leaves the Box transparent.
+Boxes may opt into generated theme surfaces with `surface = "background" |
+"card" | "popover" | "sidebar"`; omitting it leaves the Box transparent.
+`width` and `height` accept a non-negative number or `"fill"`; omitted values
+remain intrinsic. Optional `min_width` and `min_height` participate in the same
+one-way constraints and yield when a parent supplies a tighter maximum.
 
 Above it, the implemented instance reconciler consumes parent-before-child
 typed descriptor snapshots with stable numeric semantic IDs. It validates the
@@ -209,13 +212,18 @@ single-selection `ouro.listbox` composes a vertical Flex with direct
 and calls `on_select(value)` for pointer selection and Up/Down/Home/End navigation;
 the application remains the source of truth through the `selected` property.
 Options are transparent over their containing surface at rest and retain hover
-state across reconciliation. Hover follows Spectrum's menu treatment by
-overlaying primary content at 12% opacity; selected styling takes precedence
-while the pointer is over the selected option.
+state across reconciliation. Hover and selection use the generated `accent`
+and `accent_foreground` pair. `appearance = "sidebar"` selects the corresponding
+sidebar pair for navigation catalogs without introducing a separate widget.
 Applications provide stable local keys but no numeric IDs or parent links.
-Their visual defaults come only from generated design tokens, with no Lua theme
-mirror. The Wayland example exercises this actual Lua-build path for both
-windows. Both mounted
+Their visual defaults come from generated shadcn-style semantic tokens and
+documented component recipes, with no Lua theme mirror. Buttons are
+intrinsically sized with a 32-pixel token height, 10-pixel horizontal padding,
+the shared radius, medium label face, primary color pair, and one-line
+ellipsis. Text inputs fill their bounded parent width by default and use the
+input border role; focus replaces that border color with `ring` rather than
+adding an outline. The Wayland example exercises this actual Lua-build path for
+both windows. Both mounted
 window owners also read one shared signal, proving dependency identity across
 separate per-window registries sharing one VM.
 

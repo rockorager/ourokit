@@ -175,6 +175,9 @@ pub fn build(b: *std.Build) void {
     ourokit.addAnonymousImport("ourokit_storybook_font", .{
         .root_source_file = storybook_font.path("extras/ttf/Inter-Regular.ttf"),
     });
+    ourokit.addAnonymousImport("ourokit_storybook_medium_font", .{
+        .root_source_file = storybook_font.path("extras/ttf/Inter-Medium.ttf"),
+    });
     const storybook_arabic_font = b.lazyDependency("noto_sans_arabic", .{}) orelse return;
     ourokit.addAnonymousImport("ourokit_storybook_arabic_font", .{
         .root_source_file = storybook_arabic_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),

@@ -42,7 +42,7 @@ const browser_suffix =
     \\              key = "catalog-panel",
     \\              width = 280,
     \\              padding = 12,
-    \\              surface = "raised",
+    \\              surface = "sidebar",
     \\              children = function()
     \\                ouro.scroll {
     \\                  key = "catalog-scroll",
@@ -58,6 +58,7 @@ const browser_suffix =
     \\                        }
     \\                        ouro.listbox {
     \\                          key = "stories",
+    \\                          appearance = "sidebar",
     \\                          gap = 4,
     \\                          selected = current,
     \\                          on_select = function(index)
@@ -206,6 +207,7 @@ test "browser wrapper retains catalog source inside an application" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "cross_alignment = \"stretch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "flex = 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "ouro.listbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "appearance = \"sidebar\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "ouro.option") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "local preview_key = story.id") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "key = \"story-metadata\"") != null);

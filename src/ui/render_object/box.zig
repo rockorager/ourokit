@@ -7,9 +7,14 @@ const types = @import("types.zig");
 pub fn validate(value: types.Box) !void {
     if (value.width) |width| if (!validExtent(width)) return error.InvalidExtent;
     if (value.height) |height| if (!validExtent(height)) return error.InvalidExtent;
-    if (!validExtent(value.border_width) or !validExtent(value.corner_radius) or
+    if (!validExtent(value.min_width) or !validExtent(value.min_height) or
+        !validExtent(value.border_width) or !validExtent(value.corner_radius) or
         !validExtent(value.outline_width) or !validExtent(value.outline_gap))
         return error.InvalidExtent;
+    if (value.width) |width| if (width < value.min_width) return error.InvalidExtent;
+    if (value.height) |height| if (height < value.min_height) return error.InvalidExtent;
+    if ((value.width != null and value.fill_width) or (value.height != null and value.fill_height))
+        return error.ConflictingExtent;
     if ((value.border_width == 0) != (value.border_color == null))
         return error.InvalidBorder;
     if ((value.outline_width == 0) != (value.outline_color == null))
@@ -21,6 +26,18 @@ pub fn validate(value: types.Box) !void {
 
 pub fn layout(value: types.Box, context: anytype, node: anytype, incoming: Constraints) !SizeF {
     var constraints = incoming;
+    constraints.min_width = @min(
+        @max(constraints.min_width, value.min_width),
+        constraints.max_width,
+    );
+    constraints.min_height = @min(
+        @max(constraints.min_height, value.min_height),
+        constraints.max_height,
+    );
+    if (value.fill_width and constraints.hasBoundedWidth())
+        constraints.min_width = constraints.max_width;
+    if (value.fill_height and constraints.hasBoundedHeight())
+        constraints.min_height = constraints.max_height;
     if (value.width) |width| {
         const resolved = std.math.clamp(width, constraints.min_width, constraints.max_width);
         constraints.min_width = resolved;
@@ -88,5 +105,7 @@ test "box module remains a typed layout implementation" {
         .corner_radius = 4,
     });
     try std.testing.expectError(error.InvalidExtent, validate(.{ .height = -1 }));
+    try std.testing.expectError(error.InvalidExtent, validate(.{ .width = 10, .min_width = 20 }));
+    try std.testing.expectError(error.ConflictingExtent, validate(.{ .width = 10, .fill_width = true }));
     try std.testing.expectError(error.InvalidBorder, validate(.{ .border_width = 1 }));
 }

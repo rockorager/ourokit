@@ -18,6 +18,10 @@ pub const Alignment = struct {
 pub const Box = struct {
     width: ?f32 = null,
     height: ?f32 = null,
+    fill_width: bool = false,
+    fill_height: bool = false,
+    min_width: f32 = 0,
+    min_height: f32 = 0,
     padding: Insets = .{},
     /// When present, the child receives loose inner constraints and is placed
     /// within the resolved padded content box. Null preserves tight propagation.

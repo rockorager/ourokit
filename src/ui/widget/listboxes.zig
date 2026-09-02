@@ -3,8 +3,16 @@ const Color = @import("../../core/color.zig").Color;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const Style = struct { idle: ?Color, hovered: Color, selected: Color };
-pub const VisualUpdate = struct { color: ?Color };
+pub const Visual = struct {
+    background: ?Color,
+    foreground: Color,
+};
+pub const Style = struct { idle: Visual, hovered: Visual, selected: Visual };
+pub const VisualUpdate = struct {
+    option: instance.InstanceHandle,
+    content: instance.InstanceHandle,
+    visual: Visual,
+};
 pub const Selection = struct {
     listbox: instance.InstanceHandle,
     option: instance.InstanceHandle,
@@ -23,6 +31,7 @@ const Option = struct {
     owner: BuildOwnerHandle = .invalid,
     listbox: instance.InstanceHandle = .invalid,
     target: instance.InstanceHandle = .invalid,
+    content: instance.InstanceHandle = .invalid,
     value: i64 = 0,
     style: Style = undefined,
     hovered: bool = false,
@@ -81,17 +90,35 @@ pub const ListBoxes = struct {
         return error.ListBoxCapacityExceeded;
     }
 
-    pub fn setOption(self: *ListBoxes, owner: BuildOwnerHandle, listbox: instance.InstanceHandle, target: instance.InstanceHandle, value: i64, style: Style) !void {
+    pub fn setOption(
+        self: *ListBoxes,
+        owner: BuildOwnerHandle,
+        listbox: instance.InstanceHandle,
+        target: instance.InstanceHandle,
+        content: instance.InstanceHandle,
+        value: i64,
+        style: Style,
+    ) !void {
         for (self.options) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.listbox = listbox;
+            entry.content = content;
             entry.value = value;
             entry.style = style;
             entry.seen = true;
             return;
         };
         for (self.options) |*entry| if (!entry.active) {
-            entry.* = .{ .owner = owner, .listbox = listbox, .target = target, .value = value, .style = style, .active = true, .seen = true };
+            entry.* = .{
+                .owner = owner,
+                .listbox = listbox,
+                .target = target,
+                .content = content,
+                .value = value,
+                .style = style,
+                .active = true,
+                .seen = true,
+            };
             return;
         };
         return error.ListBoxOptionCapacityExceeded;
@@ -169,14 +196,14 @@ pub const ListBoxes = struct {
         for (self.options) |*entry| if (entry.active and same(entry.target, target)) {
             if (entry.hovered == hovered) return null;
             entry.hovered = hovered;
-            return .{ .color = self.optionColor(entry.*) };
+            return update(entry.*, self.optionVisual(entry.*));
         };
         return null;
     }
 
-    pub fn currentColor(self: *const ListBoxes, target: instance.InstanceHandle) ?Color {
+    pub fn currentVisual(self: *const ListBoxes, target: instance.InstanceHandle) VisualUpdate {
         for (self.options) |entry| if (entry.active and same(entry.target, target)) {
-            return self.optionColor(entry);
+            return update(entry, self.optionVisual(entry));
         };
         unreachable;
     }
@@ -198,13 +225,17 @@ pub const ListBoxes = struct {
         return null;
     }
 
-    fn optionColor(self: *const ListBoxes, option_value: Option) ?Color {
+    fn optionVisual(self: *const ListBoxes, option_value: Option) Visual {
         const list = self.findList(option_value.listbox).?;
         if (option_value.value == list.selected) return option_value.style.selected;
         if (option_value.hovered) return option_value.style.hovered;
         return option_value.style.idle;
     }
 };
+
+fn update(option: Option, visual: Visual) VisualUpdate {
+    return .{ .option = option.target, .content = option.content, .visual = visual };
+}
 
 fn previousOption(options: []const Option, listbox: instance.InstanceHandle, start: usize) ?usize {
     var index = start;
@@ -232,19 +263,23 @@ test "listbox moves through options without wrapping" {
     boxes.beginOwner(owner);
     try boxes.setList(owner, list, 1);
     const style: Style = .{
-        .idle = null,
-        .hovered = Color.rgba(2, 0, 0, 255),
-        .selected = Color.rgba(3, 0, 0, 255),
+        .idle = .{ .background = null, .foreground = Color.rgba(1, 0, 0, 255) },
+        .hovered = .{ .background = Color.rgba(2, 0, 0, 255), .foreground = Color.rgba(4, 0, 0, 255) },
+        .selected = .{ .background = Color.rgba(3, 0, 0, 255), .foreground = Color.rgba(5, 0, 0, 255) },
     };
     const first: instance.InstanceHandle = .{ .slot = 3, .generation = 1 };
     const second: instance.InstanceHandle = .{ .slot = 4, .generation = 1 };
-    try boxes.setOption(owner, list, first, 1, style);
-    try boxes.setOption(owner, list, second, 2, style);
+    const first_content: instance.InstanceHandle = .{ .slot = 5, .generation = 1 };
+    const second_content: instance.InstanceHandle = .{ .slot = 6, .generation = 1 };
+    try boxes.setOption(owner, list, first, first_content, 1, style);
+    try boxes.setOption(owner, list, second, second_content, 2, style);
     boxes.finishOwner(owner);
-    try std.testing.expectEqual(@as(u8, 3), boxes.currentColor(first).?.r);
-    try std.testing.expectEqual(@as(u8, 2), boxes.setHovered(second, true).?.color.?.r);
+    try std.testing.expectEqual(@as(u8, 3), boxes.currentVisual(first).visual.background.?.r);
+    try std.testing.expectEqual(@as(u8, 2), boxes.setHovered(second, true).?.visual.background.?.r);
+    try std.testing.expectEqual(@as(u8, 4), boxes.currentVisual(second).visual.foreground.r);
     try std.testing.expectEqual(@as(i64, 2), boxes.move(list, 1).?.value);
-    try std.testing.expectEqual(@as(u8, 3), boxes.currentColor(second).?.r);
+    try std.testing.expectEqual(@as(u8, 3), boxes.currentVisual(second).visual.background.?.r);
+    try std.testing.expectEqual(@as(u8, 5), boxes.currentVisual(second).visual.foreground.r);
     try std.testing.expectEqual(@as(i64, 1), boxes.move(list, -1).?.value);
     boxes.clear();
 }

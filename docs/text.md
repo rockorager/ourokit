@@ -232,6 +232,10 @@ renderer-neutral paragraph scene command. Lua Labels therefore use the shared
 itemization, fallback, bidi, wrapping, and positioning pipeline rather than a
 guessed single LTR run. A button remains composition: a padded Box containing a
 Label, with pointer/focus/command behavior owned by the instance layer.
+Under loose width constraints, Label reports the longest visible shaped line
+rather than reserving the parent's entire maximum width; a second cached layout
+at that fitted width resolves center/end alignment correctly. Tight constraints
+still force the Label to fill the width selected by its parent.
 
 Paragraph presentation is also text-owned. Each positioned line stores a
 physical offset resolved from its UAX #9 base level, so `start` and `end` follow

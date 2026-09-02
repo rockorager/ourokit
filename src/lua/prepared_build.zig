@@ -35,7 +35,13 @@ pub const TextInput = struct {
     session: ?text_input.Session,
 };
 pub const ListBox = struct { id: u64, selected: i64 };
-pub const Option = struct { id: u64, listbox_id: u64, value: i64, style: listboxes.Style };
+pub const Option = struct {
+    id: u64,
+    content_id: u64,
+    listbox_id: u64,
+    value: i64,
+    style: listboxes.Style,
+};
 
 /// One candidate-owned, normalized window build. Registry references and
 /// acquired shape references remain owned here until an application commit

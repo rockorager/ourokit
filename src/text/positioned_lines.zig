@@ -447,6 +447,14 @@ pub const PositionedLines = struct {
         return self.layout_width;
     }
 
+    /// Maximum shaped advance of the visible lines, independent of the width
+    /// reserved for paragraph alignment.
+    pub fn contentWidth(self: *const PositionedLines) f32 {
+        var result: f32 = 0;
+        for (self.lines) |line| result = @max(result, line.advance);
+        return result;
+    }
+
     pub fn height(self: *const PositionedLines) f32 {
         if (self.lines.len == 0) return 0;
         const last = self.lines[self.lines.len - 1];
@@ -1477,6 +1485,8 @@ test "paragraph alignment resolves from each line base direction and clips whole
     try std.testing.expectEqual(@as(usize, 1), centered.lines.len);
     try std.testing.expect(centered.truncated);
     try std.testing.expectEqual(@as(f32, 100), centered.width());
+    try std.testing.expectEqual(centered.lines[0].advance, centered.contentWidth());
+    try std.testing.expect(centered.contentWidth() < centered.width());
     try std.testing.expectApproxEqAbs(
         (100 - centered.lines[0].advance) / 2,
         centered.lines[0].left,

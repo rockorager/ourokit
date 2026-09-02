@@ -1,4 +1,4 @@
-# Spectrum 2 provenance
+# Spectrum 2 historical provenance
 
 Ourokit's initial token categories were informed by the durable organization
 of Adobe Spectrum 2 design data, specifically `@adobe/spectrum-tokens` 14.6.0
@@ -18,3 +18,7 @@ The transformation is represented by the canonical JSON under
 `tools/design/generate_tokens.py`. Future changes derived from a different
 upstream release must update this record and be reviewed rather than silently
 absorbing the upstream corpus.
+
+Spectrum 2 is no longer Ourokit's component or token source of truth. The
+current direction and source are recorded in `shadcn-ui.md`; this file is
+retained to preserve attribution for the project's earlier design work.

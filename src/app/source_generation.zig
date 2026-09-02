@@ -20,6 +20,7 @@ pub const UiServices = struct {
     paragraph_sources: *text.ParagraphSourceCache,
     paragraphs: *text.ParagraphCache,
     primary_font: text.FontHandle,
+    medium_font: text.FontHandle,
     theme: design.tokens.Theme,
     callbacks: *lua.CallbackRegistry,
 };
@@ -35,6 +36,7 @@ pub const SourceGeneration = struct {
     descriptor_storage: []ui.instance.Descriptor,
     semantic_storage: []ui.semantics.Descriptor,
     font_candidates: [1]text.FontHandle,
+    medium_font_candidates: [1]text.FontHandle,
     callbacks: ?*lua.CallbackRegistry,
     ui_build: lua.UiBuild,
     application: lua.Application,
@@ -267,7 +269,18 @@ pub const SourceGeneration = struct {
             self.callbacks = value.callbacks;
             self.ui_build.attachCallbacks(value.callbacks, &self.vm);
             self.font_candidates = .{value.primary_font};
+            self.medium_font_candidates = .{value.medium_font};
             self.ui_build.attachLabelText(value.paragraph_sources, &self.font_candidates, 1) catch |err| {
+                lua.recordDiagnosticError(
+                    diagnostic,
+                    allocator,
+                    .setup,
+                    self.snapshot.entry_name,
+                    err,
+                );
+                return err;
+            };
+            self.ui_build.attachButtonText(&self.medium_font_candidates) catch |err| {
                 lua.recordDiagnosticError(
                     diagnostic,
                     allocator,

@@ -794,6 +794,7 @@ test "a later window build failure leaves every retained window on the active ge
         .paragraph_sources = &paragraph_sources,
         .paragraphs = &paragraphs,
         .primary_font = font,
+        .medium_font = font,
         .theme = design.tokens.light,
         .callbacks = &callbacks,
     };

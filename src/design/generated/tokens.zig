@@ -8,26 +8,13 @@ pub const foundation = struct {
     pub const component_height_compact: f32 = 24.0;
     pub const component_height_default: f32 = 32.0;
     pub const component_height_large: f32 = 40.0;
-    pub const corner_radius_medium: f32 = 8.0;
-    pub const corner_radius_small: f32 = 4.0;
     pub const focus_ring_gap: f32 = 2.0;
     pub const focus_ring_width: f32 = 2.0;
-    pub const palette_black: Color = Color.rgba(16, 16, 18, 255);
-    pub const palette_blue_100: Color = Color.rgba(220, 234, 255, 255);
-    pub const palette_blue_300: Color = Color.rgba(114, 165, 245, 255);
-    pub const palette_blue_500: Color = Color.rgba(36, 107, 219, 255);
-    pub const palette_blue_600: Color = Color.rgba(29, 93, 191, 255);
-    pub const palette_blue_700: Color = Color.rgba(23, 74, 153, 255);
-    pub const palette_gray_200: Color = Color.rgba(216, 216, 220, 255);
-    pub const palette_gray_50: Color = Color.rgba(247, 247, 248, 255);
-    pub const palette_gray_600: Color = Color.rgba(96, 96, 105, 255);
-    pub const palette_gray_900: Color = Color.rgba(32, 32, 36, 255);
-    pub const palette_green_500: Color = Color.rgba(35, 133, 87, 255);
-    pub const palette_orange_500: Color = Color.rgba(185, 101, 22, 255);
-    pub const palette_red_500: Color = Color.rgba(201, 59, 59, 255);
-    pub const palette_white: Color = Color.rgba(255, 255, 255, 255);
+    pub const radius: f32 = 10.0;
     pub const spacing_1: f32 = 4.0;
+    pub const spacing_1_5: f32 = 6.0;
     pub const spacing_2: f32 = 8.0;
+    pub const spacing_2_5: f32 = 10.0;
     pub const spacing_3: f32 = 12.0;
     pub const spacing_4: f32 = 16.0;
     pub const spacing_6: f32 = 24.0;
@@ -41,49 +28,88 @@ pub const foundation = struct {
 };
 
 pub const Theme = struct {
-    accent_default: Color,
-    accent_hovered: Color,
-    accent_pressed: Color,
-    border_default: Color,
-    content_primary: Color,
-    content_secondary: Color,
-    focus_ring: Color,
-    selection_background: Color,
-    status_negative: Color,
-    status_notice: Color,
-    status_positive: Color,
-    surface_base: Color,
-    surface_raised: Color,
+    accent: Color,
+    accent_foreground: Color,
+    background: Color,
+    border: Color,
+    card: Color,
+    card_foreground: Color,
+    destructive: Color,
+    foreground: Color,
+    input: Color,
+    muted: Color,
+    muted_foreground: Color,
+    popover: Color,
+    popover_foreground: Color,
+    primary: Color,
+    primary_foreground: Color,
+    ring: Color,
+    secondary: Color,
+    secondary_foreground: Color,
+    sidebar: Color,
+    sidebar_accent: Color,
+    sidebar_accent_foreground: Color,
+    sidebar_border: Color,
+    sidebar_foreground: Color,
+    sidebar_primary: Color,
+    sidebar_primary_foreground: Color,
+    sidebar_ring: Color,
 };
 
 pub const light: Theme = .{
-    .accent_default = Color.rgba(36, 107, 219, 255),
-    .accent_hovered = Color.rgba(29, 93, 191, 255),
-    .accent_pressed = Color.rgba(23, 74, 153, 255),
-    .border_default = Color.rgba(216, 216, 220, 255),
-    .content_primary = Color.rgba(32, 32, 36, 255),
-    .content_secondary = Color.rgba(96, 96, 105, 255),
-    .focus_ring = Color.rgba(36, 107, 219, 255),
-    .selection_background = Color.rgba(220, 234, 255, 255),
-    .status_negative = Color.rgba(201, 59, 59, 255),
-    .status_notice = Color.rgba(185, 101, 22, 255),
-    .status_positive = Color.rgba(35, 133, 87, 255),
-    .surface_base = Color.rgba(255, 255, 255, 255),
-    .surface_raised = Color.rgba(247, 247, 248, 255),
+    .accent = Color.rgba(245, 245, 245, 255),
+    .accent_foreground = Color.rgba(23, 23, 23, 255),
+    .background = Color.rgba(255, 255, 255, 255),
+    .border = Color.rgba(229, 229, 229, 255),
+    .card = Color.rgba(255, 255, 255, 255),
+    .card_foreground = Color.rgba(10, 10, 10, 255),
+    .destructive = Color.rgba(231, 0, 11, 255),
+    .foreground = Color.rgba(10, 10, 10, 255),
+    .input = Color.rgba(229, 229, 229, 255),
+    .muted = Color.rgba(245, 245, 245, 255),
+    .muted_foreground = Color.rgba(115, 115, 115, 255),
+    .popover = Color.rgba(255, 255, 255, 255),
+    .popover_foreground = Color.rgba(10, 10, 10, 255),
+    .primary = Color.rgba(23, 23, 23, 255),
+    .primary_foreground = Color.rgba(250, 250, 250, 255),
+    .ring = Color.rgba(161, 161, 161, 255),
+    .secondary = Color.rgba(245, 245, 245, 255),
+    .secondary_foreground = Color.rgba(23, 23, 23, 255),
+    .sidebar = Color.rgba(250, 250, 250, 255),
+    .sidebar_accent = Color.rgba(245, 245, 245, 255),
+    .sidebar_accent_foreground = Color.rgba(23, 23, 23, 255),
+    .sidebar_border = Color.rgba(229, 229, 229, 255),
+    .sidebar_foreground = Color.rgba(10, 10, 10, 255),
+    .sidebar_primary = Color.rgba(23, 23, 23, 255),
+    .sidebar_primary_foreground = Color.rgba(250, 250, 250, 255),
+    .sidebar_ring = Color.rgba(161, 161, 161, 255),
 };
 
 pub const dark: Theme = .{
-    .accent_default = Color.rgba(114, 165, 245, 255),
-    .accent_hovered = Color.rgba(36, 107, 219, 255),
-    .accent_pressed = Color.rgba(29, 93, 191, 255),
-    .border_default = Color.rgba(96, 96, 105, 255),
-    .content_primary = Color.rgba(255, 255, 255, 255),
-    .content_secondary = Color.rgba(216, 216, 220, 255),
-    .focus_ring = Color.rgba(114, 165, 245, 255),
-    .selection_background = Color.rgba(36, 107, 219, 255),
-    .status_negative = Color.rgba(201, 59, 59, 255),
-    .status_notice = Color.rgba(185, 101, 22, 255),
-    .status_positive = Color.rgba(35, 133, 87, 255),
-    .surface_base = Color.rgba(16, 16, 18, 255),
-    .surface_raised = Color.rgba(32, 32, 36, 255),
+    .accent = Color.rgba(38, 38, 38, 255),
+    .accent_foreground = Color.rgba(250, 250, 250, 255),
+    .background = Color.rgba(10, 10, 10, 255),
+    .border = Color.rgba(255, 255, 255, 26),
+    .card = Color.rgba(23, 23, 23, 255),
+    .card_foreground = Color.rgba(250, 250, 250, 255),
+    .destructive = Color.rgba(255, 100, 103, 255),
+    .foreground = Color.rgba(250, 250, 250, 255),
+    .input = Color.rgba(255, 255, 255, 38),
+    .muted = Color.rgba(38, 38, 38, 255),
+    .muted_foreground = Color.rgba(161, 161, 161, 255),
+    .popover = Color.rgba(23, 23, 23, 255),
+    .popover_foreground = Color.rgba(250, 250, 250, 255),
+    .primary = Color.rgba(229, 229, 229, 255),
+    .primary_foreground = Color.rgba(23, 23, 23, 255),
+    .ring = Color.rgba(115, 115, 115, 255),
+    .secondary = Color.rgba(38, 38, 38, 255),
+    .secondary_foreground = Color.rgba(250, 250, 250, 255),
+    .sidebar = Color.rgba(23, 23, 23, 255),
+    .sidebar_accent = Color.rgba(38, 38, 38, 255),
+    .sidebar_accent_foreground = Color.rgba(250, 250, 250, 255),
+    .sidebar_border = Color.rgba(255, 255, 255, 26),
+    .sidebar_foreground = Color.rgba(250, 250, 250, 255),
+    .sidebar_primary = Color.rgba(20, 71, 230, 255),
+    .sidebar_primary_foreground = Color.rgba(250, 250, 250, 255),
+    .sidebar_ring = Color.rgba(115, 115, 115, 255),
 };

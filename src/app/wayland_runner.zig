@@ -134,10 +134,20 @@ fn runSourceWithFontconfig(
     });
     defer configured_fonts.deinit();
     if (configured_fonts.faces.len == 0) return error.ConfiguredSansSerifNotFound;
+    var configured_medium_fonts = try database.candidates(init.gpa, .{
+        .family = "sans-serif",
+        .language = "en",
+        .pixel_size = 14,
+        .weight = .medium,
+    });
+    defer configured_medium_fonts.deinit();
+    if (configured_medium_fonts.faces.len == 0) return error.ConfiguredSansSerifMediumNotFound;
     var fonts = text.FontCache.init(init.gpa);
     defer fonts.deinit();
     const primary_font = try loadFont(init, &fonts, configured_fonts.faces[0]);
     defer fonts.release(primary_font) catch unreachable;
+    const medium_font = try loadFont(init, &fonts, configured_medium_fonts.faces[0]);
+    defer fonts.release(medium_font) catch unreachable;
     var paragraph_sources = text.ParagraphSourceCache.init(init.gpa, &fonts);
     defer paragraph_sources.deinit();
     var paragraphs = text.ParagraphCache.init(init.gpa, &fonts);
@@ -156,6 +166,7 @@ fn runSourceWithFontconfig(
         .paragraph_sources = &paragraph_sources,
         .paragraphs = &paragraphs,
         .primary_font = primary_font,
+        .medium_font = medium_font,
         .theme = theme,
         .callbacks = &callbacks,
     };
@@ -418,11 +429,11 @@ fn runSourceWithFontconfig(
                     &scheduler,
                     try window_set.scope(handle),
                     handle,
-                    theme.surface_base,
-                    theme.accent_default,
-                    theme.surface_base,
-                    theme.border_default,
-                    theme.focus_ring,
+                    theme.background,
+                    theme.primary,
+                    theme.foreground,
+                    theme.input,
+                    theme.ring,
                     signals,
                     &paragraph_sources,
                     &paragraphs,

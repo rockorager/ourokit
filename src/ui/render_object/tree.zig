@@ -666,7 +666,7 @@ pub const Tree = struct {
         const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
         const paragraphs = self.paragraphs orelse return error.ParagraphResourcesRequired;
         const source = sources.get(label.source) catch return error.StaleParagraphSource;
-        const layout_handle = paragraphs.acquire(.{
+        var request: text.ParagraphCache.Request = .{
             .utf8 = source.utf8,
             .base_direction = source.base_direction,
             .language = source.language,
@@ -682,9 +682,21 @@ pub const Tree = struct {
                 .max_lines = label.max_lines,
                 .overflow = label.overflow,
             },
-        }) catch return error.ParagraphLayoutFailed;
+        };
+        var layout_handle = paragraphs.acquire(request) catch return error.ParagraphLayoutFailed;
         errdefer paragraphs.release(layout_handle) catch unreachable;
-        const paragraph_layout = paragraphs.get(layout_handle) catch return error.StaleParagraph;
+        var paragraph_layout = paragraphs.get(layout_handle) catch return error.StaleParagraph;
+        const fitted_width = constraints.constrain(.{
+            .width = paragraph_layout.positioned.contentWidth(),
+            .height = paragraph_layout.size.height,
+        }).width;
+        if (fitted_width != paragraph_layout.size.width) {
+            request.max_width = fitted_width;
+            const fitted_handle = paragraphs.acquire(request) catch return error.ParagraphLayoutFailed;
+            paragraphs.release(layout_handle) catch unreachable;
+            layout_handle = fitted_handle;
+            paragraph_layout = paragraphs.get(layout_handle) catch return error.StaleParagraph;
+        }
         const result = constraints.constrain(paragraph_layout.size);
         const target = try self.slot(handle);
         self.releaseParagraphLayout(target);
@@ -1047,6 +1059,34 @@ test "box centers an intrinsic child inside its padded content" {
     try std.testing.expectEqual(PointF{ .x = 76, .y = 26 }, try tree.nodeOffset(child));
 }
 
+test "box minimum dimensions yield to tighter parent constraints" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    defer tree.deinit();
+    const box = try tree.create(.{ .box = .{ .min_width = 80, .min_height = 30 } });
+
+    try std.testing.expectEqual(
+        SizeF{ .width = 80, .height = 30 },
+        try tree.layout(box, .{ .max_width = 100, .max_height = 100 }),
+    );
+    try std.testing.expectEqual(
+        SizeF{ .width = 40, .height = 20 },
+        try tree.layout(box, .{ .max_width = 40, .max_height = 20 }),
+    );
+}
+
+test "box fill dimensions use bounded parent maxima" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    defer tree.deinit();
+    const box = try tree.create(.{ .box = .{ .fill_width = true, .fill_height = true } });
+
+    try std.testing.expectEqual(
+        SizeF{ .width = 100, .height = 60 },
+        try tree.layout(box, .{ .max_width = 100, .max_height = 60 }),
+    );
+}
+
 test "labels cache width-specific mixed-script paragraphs across unchanged layout" {
     const scene = @import("../../scene/root.zig");
     var fonts = text.FontCache.init(std.testing.allocator);
@@ -1084,6 +1124,7 @@ test "labels cache width-specific mixed-script paragraphs across unchanged layou
     try sources.release(source);
 
     const wide_size = try tree.layout(label, .{ .max_width = 180, .max_height = 200 });
+    try std.testing.expect(wide_size.width < 180);
     var commands: [3]scene.Command = undefined;
     var builder = try scene_builder.Builder.init(&commands, 1);
     try tree.buildScene(label, &builder);
@@ -1103,6 +1144,15 @@ test "labels cache width-specific mixed-script paragraphs across unchanged layou
     try tree.buildScene(label, &builder);
     const narrow_layout = builder.displayList().commands[1].paragraph.layout;
     try std.testing.expect(!sameParagraph(wide_layout, narrow_layout));
+
+    const tight_size = try tree.layout(label, .{
+        .min_width = 180,
+        .max_width = 180,
+        .max_height = 200,
+    });
+    try std.testing.expectEqual(@as(f32, 180), tight_size.width);
+    try std.testing.expectEqual(@as(usize, 3), try tree.layoutCount(label));
+    try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
 
     try tree.destroy(label);
     try std.testing.expectEqual(@as(usize, 0), sources.count());
