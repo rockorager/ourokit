@@ -209,7 +209,7 @@ a bounded native parent stack: `ouro.row` and `ouro.column` normalize to Flex,
 normalizes to Label, and `ouro.button` normalizes to Box plus Label. The
 single-selection `ouro.listbox` composes a vertical Flex with direct
 `ouro.option` Box/Label children. It is one focus stop, uses integer values,
-and calls `on_select(value)` for pointer selection and Up/Down/Home/End navigation;
+and calls `on_select(value)` on primary-button press or Up/Down/Home/End navigation;
 the application remains the source of truth through the `selected` property.
 Options are transparent over their containing surface at rest and retain hover
 state across reconciliation. Default options use accent steps 3 and 5 for hover
@@ -250,6 +250,11 @@ existing one-pixel border to the generated focus color without affecting layout,
 and remains visible through its caret. Enter and Space activate on key press and
 enqueue the existing Button callback task;
 Wayland dispatch never calls Lua directly.
+
+Actionable widgets invoke their semantic callback on primary-button or
+activation-key press, never on release. Release only ends transient pressed,
+pointer-capture, or drag state. Low-level pointer bindings remain raw event
+streams and therefore receive both press and release events.
 
 Editable text begins at a separate, platform-neutral model boundary. It owns
 UTF-8 bytes, a directional anchor/extent selection, revisioning, and cached

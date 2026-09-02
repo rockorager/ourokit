@@ -795,7 +795,7 @@ pub const WindowRuntime = struct {
             .button => |value| value,
             else => return null,
         };
-        if (button.button != 0x110 or button.state != .released) return null;
+        if (!isListBoxActivation(button.button, button.state)) return null;
         var current: ?ui.instance.InstanceHandle = target;
         while (current) |candidate| {
             if (self.listboxes.option(candidate)) |selection| return selection;
@@ -1937,6 +1937,10 @@ fn intentEditsText(intent: ui.text_input.EditIntent) bool {
     };
 }
 
+fn isListBoxActivation(button: u32, state: platform.PointerButtonState) bool {
+    return button == 0x110 and state == .pressed;
+}
+
 const ClipboardShortcut = enum { copy, cut, paste };
 
 fn textInputClipboardShortcut(key: platform.TranslatedKey) ?ClipboardShortcut {
@@ -1991,6 +1995,12 @@ test "platform keys translate to neutral text editing intents" {
         .logical = .key_v,
         .modifiers = .{ .control = true, .alt = true },
     }) == null);
+}
+
+test "listbox pointer activation occurs on primary press" {
+    try std.testing.expect(isListBoxActivation(0x110, .pressed));
+    try std.testing.expect(!isListBoxActivation(0x110, .released));
+    try std.testing.expect(!isListBoxActivation(0x111, .pressed));
 }
 
 const InputValues = struct {
