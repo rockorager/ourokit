@@ -11,4 +11,5 @@ test {
     _ = @import("host.zig");
     _ = @import("repeat.zig");
     _ = @import("text_input.zig");
+    _ = @import("workspaces.zig");
 }

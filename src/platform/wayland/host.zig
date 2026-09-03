@@ -11,6 +11,8 @@ const Adapter = @import("adapter.zig").Adapter;
 const Repeat = @import("repeat.zig");
 const TextInput = @import("text_input.zig");
 const WaylandClipboard = @import("clipboard.zig");
+const WaylandWorkspaces = @import("workspaces.zig");
+const ShellWorkspaces = @import("../../shell/workspaces.zig");
 const Xkb = if (build_options.xkbcommon) @import("xkb.zig") else @import("xkb_disabled.zig");
 const Vulkan = if (build_options.vulkan)
     @import("../../renderer/vulkan/root.zig")
@@ -36,6 +38,8 @@ pub const Config = struct {
     app_id: []const u8,
     window_capacity: usize = 8,
     output_capacity: usize = 16,
+    workspaces: ?*ShellWorkspaces.Store = null,
+    workspace_capacity: usize = 32,
     /// Prefer Vulkan linux-dmabuf presentation when compositor feedback and
     /// the selected Vulkan device share a renderable ARGB8888 modifier.
     vulkan: ?*Vulkan = null,
@@ -653,6 +657,7 @@ pub const Host = struct {
     text_input_active: ?WindowHandle = null,
     text_input_pending: TextInput.Pending,
     clipboard: WaylandClipboard.Clipboard,
+    workspaces: ?WaylandWorkspaces.Client = null,
     seat: ?Handle = null,
     seat_global_name: ?u32 = null,
     pointer: ?Handle = null,
@@ -726,6 +731,12 @@ pub const Host = struct {
         errdefer self.text_input_pending.deinit();
         self.clipboard = try WaylandClipboard.Clipboard.init(allocator, loop, 8, 4, 16, 16, 1024 * 1024);
         errdefer self.clipboard.deinit();
+        self.workspaces = null;
+        if (config.workspaces) |store| {
+            self.workspaces = @as(WaylandWorkspaces.Client, undefined);
+            try self.workspaces.?.init(allocator, store, config.workspace_capacity);
+        }
+        errdefer if (self.workspaces) |*client| client.deinit();
         self.seat = null;
         self.seat_global_name = null;
         self.pointer = null;
@@ -750,8 +761,10 @@ pub const Host = struct {
                 .transmit_fd_budget = 32,
             },
             .{
-                .max_objects = 100 + config.output_capacity + config.window_capacity * 18,
-                .max_client_ids = 80 + config.output_capacity + config.window_capacity * 18,
+                .max_objects = 100 + config.output_capacity + config.window_capacity * 18 +
+                    (if (config.workspaces != null) config.workspace_capacity * 2 + 1 else 0),
+                .max_client_ids = 80 + config.output_capacity + config.window_capacity * 18 +
+                    @as(usize, @intFromBool(config.workspaces != null)),
             },
         );
         self.driver = Driver.init(&self.connection);
@@ -828,6 +841,7 @@ pub const Host = struct {
         self.releaseDmabufFormatTable();
         self.adapter.deinit(self.allocator);
         self.clipboard.deinit();
+        if (self.workspaces) |*client| client.deinit();
         self.text_input_pending.deinit();
         self.xkb.deinit();
         for (self.outputs) |*output| if (output.name) |name| self.allocator.free(name);
@@ -903,6 +917,20 @@ pub const Host = struct {
     pub fn outputScale(self: *Host, handle: WindowHandle) !f32 {
         const scale = (try self.windowFor(handle)).scale_120;
         return @as(f32, @floatFromInt(scale)) / fractional_scale_denominator;
+    }
+
+    pub fn enableWorkspacesIf(self: *Host, requested: bool) !void {
+        if (requested) if (self.workspaces) |*client| {
+            if (try client.enable(&self.connection.objects, try self.queue(), self.registry))
+                _ = try self.driver.schedule();
+        };
+    }
+
+    pub fn serviceWorkspaceActions(self: *Host) !void {
+        if (self.workspaces) |*client| {
+            if (try client.serviceActions(&self.connection.objects, try self.queue()))
+                _ = try self.driver.schedule();
+        }
     }
 
     /// Borrows one persistent presentation slot during frame submission. CPU
@@ -1834,6 +1862,7 @@ pub const Host = struct {
                 .global => |global| try self.bindGlobal(global),
                 .global_remove => |removed| {
                     try self.removeOutput(removed.name);
+                    if (self.workspaces) |*client| client.removeGlobal(removed.name);
                     if (self.seat_global_name != null and self.seat_global_name.? == removed.name)
                         try self.releaseInput();
                     if (self.clipboard.managerRemoved(removed.name))
@@ -1882,6 +1911,12 @@ pub const Host = struct {
             self.submission_pending = true;
         } else if (interface == &protocol.zwp_text_input_v3.info) {
             try self.textInputEvent(message, fds);
+        } else if (interface == &protocol.ext_workspace_manager_v1.info) {
+            try self.workspaces.?.managerEvent(objects, try self.queue(), message, fds);
+        } else if (interface == &protocol.ext_workspace_group_handle_v1.info) {
+            try self.workspaces.?.groupEvent(objects, try self.queue(), message.header.object_id, message, fds);
+        } else if (interface == &protocol.ext_workspace_handle_v1.info) {
+            try self.workspaces.?.workspaceEvent(objects, try self.queue(), message.header.object_id, message, fds);
         } else if (interface == &protocol.xdg_wm_base.info) {
             switch (try wayring.client.decodeEvent(protocol.xdg_wm_base, objects, self.wm_base.?, message, fds)) {
                 .ping => |ping| try wayring.client.sendRequest(
@@ -2274,6 +2309,14 @@ pub const Host = struct {
             self.seat_global_name = global.name;
             try self.ensureTextInput();
             try self.ensureClipboardDevice();
+        } else if (std.mem.eql(u8, global.interface, protocol.ext_workspace_manager_v1.info.name)) {
+            if (self.workspaces) |*client| try client.observeGlobal(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                global.version,
+            );
         }
     }
 

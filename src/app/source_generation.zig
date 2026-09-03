@@ -3,6 +3,7 @@ const bundle = @import("../bundle/root.zig");
 const design = @import("../design/root.zig");
 const io_loop = @import("../loop/root.zig");
 const lua = @import("../lua/root.zig");
+const shell = @import("../shell/root.zig");
 const task = @import("../task/root.zig");
 const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
@@ -24,6 +25,7 @@ pub const UiServices = struct {
     medium_font: text.FontHandle,
     theme: design.tokens.Theme,
     callbacks: *lua.CallbackRegistry,
+    workspaces: ?*shell.workspaces.Store = null,
 };
 
 /// All Lua-owned meaning for one application source snapshot. This value and
@@ -35,6 +37,7 @@ pub const SourceGeneration = struct {
     vm: lua.Vm,
     varlink_client: lua.VarlinkClient,
     signals: lua.Signals,
+    shell_workspaces: ?lua.ShellWorkspaces = null,
     descriptor_storage: []ui.instance.Descriptor,
     semantic_storage: []ui.semantics.Descriptor,
     font_candidates: [1]text.FontHandle,
@@ -148,6 +151,7 @@ pub const SourceGeneration = struct {
         self.allocator = allocator;
         self.snapshot = snapshot;
         self.module_loader = null;
+        self.shell_workspaces = null;
         self.bootstrap = null;
         self.application_ready = false;
         self.services = services;
@@ -155,6 +159,7 @@ pub const SourceGeneration = struct {
         var vm_initialized = false;
         var varlink_client_initialized = false;
         var signals_initialized = false;
+        var shell_workspaces_initialized = false;
         var descriptor_storage: ?[]ui.instance.Descriptor = null;
         var semantic_storage: ?[]ui.semantics.Descriptor = null;
         var application_initialized = false;
@@ -170,6 +175,7 @@ pub const SourceGeneration = struct {
             if (module_loader_initialized) self.module_loader.?.deinit();
             if (varlink_client_initialized) self.varlink_client.deinit();
             if (vm_initialized) self.vm.deinit();
+            if (shell_workspaces_initialized) self.shell_workspaces.?.deinit();
             if (signals_initialized) self.signals.deinit();
             if (semantic_storage) |storage| allocator.free(storage);
             if (descriptor_storage) |storage| allocator.free(storage);
@@ -231,6 +237,25 @@ pub const SourceGeneration = struct {
             return err;
         };
         signals_initialized = true;
+        if (services) |value| if (value.workspaces) |store| {
+            self.shell_workspaces = @as(lua.ShellWorkspaces, undefined);
+            self.shell_workspaces.?.init(
+                self.vm.state,
+                &self.signals,
+                store,
+                self.vm.apiReference(),
+            ) catch |err| {
+                lua.recordDiagnosticError(
+                    diagnostic,
+                    allocator,
+                    .setup,
+                    self.snapshot.entry_name,
+                    err,
+                );
+                return err;
+            };
+            shell_workspaces_initialized = true;
+        };
 
         self.descriptor_storage = allocator.alloc(
             ui.instance.Descriptor,
@@ -432,6 +457,14 @@ pub const SourceGeneration = struct {
         try self.varlink_client.collectCanceled();
     }
 
+    pub fn workspacesRequested(self: *const SourceGeneration) bool {
+        return if (self.shell_workspaces) |*binding| binding.requested() else false;
+    }
+
+    pub fn syncWorkspaces(self: *SourceGeneration) !void {
+        if (self.shell_workspaces) |*binding| try binding.sync();
+    }
+
     fn finishBootstrap(self: *SourceGeneration, diagnostic: ?*?lua.Diagnostic) !void {
         const application_optional = self.bootstrap.?.advance("default") catch |err| {
             lua.recordDiagnosticError(
@@ -522,6 +555,7 @@ pub const SourceGeneration = struct {
         if (self.module_loader) |*loader| loader.deinit();
         self.varlink_client.deinit();
         self.vm.deinit();
+        if (self.shell_workspaces) |*binding| binding.deinit();
         self.signals.deinit();
         self.allocator.free(self.semantic_storage);
         self.allocator.free(self.descriptor_storage);

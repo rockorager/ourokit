@@ -239,6 +239,9 @@ newer-version features. A layer declaration can select an output by its
 multi-monitor panels or backgrounds. Named surfaces wait through output removal
 and are recreated if that output returns.
 
+Shell applications can opt into reactive `ext-workspace-v1` snapshots and
+workspace actions through [`ouro.shell.workspaces`](docs/workspaces.md).
+
 Run any declarative application directly through the reusable host:
 
 ```sh

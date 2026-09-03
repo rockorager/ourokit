@@ -16,6 +16,7 @@ const io_loop = @import("../loop/root.zig");
 const lua = @import("../lua/root.zig");
 const platform = @import("../platform/root.zig");
 const renderer = @import("../renderer/root.zig");
+const shell = @import("../shell/root.zig");
 const task = @import("../task/root.zig");
 const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
@@ -38,6 +39,8 @@ pub const Options = struct {
     signal_capacity: usize = 256,
     subscription_capacity: usize = 1024,
     dependency_capacity: usize = 256,
+    workspace_capacity: usize = 32,
+    workspace_action_capacity: usize = 32,
 };
 
 const TextInputRevision = struct {
@@ -126,6 +129,14 @@ fn runSourceWithFontconfig(
     try callbacks.init(init.gpa, options.window.node_capacity);
     defer callbacks.deinit();
 
+    var workspaces: shell.workspaces.Store = undefined;
+    try workspaces.init(
+        init.gpa,
+        options.workspace_capacity,
+        options.workspace_action_capacity,
+    );
+    defer workspaces.deinit();
+
     var database = try text.discovery.Database.init();
     defer database.deinit();
     var configured_fonts = try database.candidates(init.gpa, .{
@@ -170,6 +181,7 @@ fn runSourceWithFontconfig(
         .medium_font = medium_font,
         .theme = theme,
         .callbacks = &callbacks,
+        .workspaces = &workspaces,
     };
     const generation_config: source_generation.Config = .{
         .node_capacity = options.window.node_capacity,
@@ -234,6 +246,8 @@ fn runSourceWithFontconfig(
             .app_id = application.id,
             .window_capacity = options.application_window_capacity,
             .output_capacity = options.output_capacity,
+            .workspaces = &workspaces,
+            .workspace_capacity = options.workspace_capacity,
             .vulkan = if (options.vulkan) &vulkan_renderer else null,
         },
     );
@@ -356,6 +370,8 @@ fn runSourceWithFontconfig(
         }
 
         // Task safe point: platform and CQE dispatch only changed state.
+        try host.enableWorkspacesIf(active_generation.workspacesRequested());
+        try active_generation.syncWorkspaces();
         control.collectClosed();
         try source_reload.collectCanceledVarlink();
         try control.serviceRequests();
@@ -379,6 +395,8 @@ fn runSourceWithFontconfig(
         }
         try clipboard.collectCanceled();
         while (scheduler.takeRunnable()) |handle| _ = try source_reload.resumeRunnable(handle);
+
+        try host.serviceWorkspaceActions();
 
         while (clipboard.takeAction()) |action| {
             defer clipboard.releaseAction(action);

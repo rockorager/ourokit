@@ -12,6 +12,7 @@ pub const lua = @import("lua/root.zig");
 pub const scene = @import("scene/root.zig");
 pub const renderer = @import("renderer/root.zig");
 pub const ui = @import("ui/root.zig");
+pub const shell = @import("shell/root.zig");
 pub const platform = @import("platform/root.zig");
 pub const app = @import("app/root.zig");
 
@@ -28,6 +29,7 @@ test {
     _ = scene;
     _ = renderer;
     _ = ui;
+    _ = shell;
     _ = platform;
     _ = app;
 }

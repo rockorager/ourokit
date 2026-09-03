@@ -182,6 +182,25 @@ pub const Signals = struct {
         }
     }
 
+    /// Reserves a dependency node whose value is owned by another Lua binding.
+    /// The binding must release it from its userdata finalizer before the VM
+    /// closes, and may read/publish it only at the same safe points as signals.
+    pub fn createExternal(self: *Signals) !SignalHandle {
+        return self.allocateSignal();
+    }
+
+    pub fn releaseExternal(self: *Signals, signal: SignalHandle) void {
+        self.releaseSignal(signal);
+    }
+
+    pub fn readExternal(self: *Signals, signal: SignalHandle) !void {
+        try self.recordRead(signal);
+    }
+
+    pub fn publishExternal(self: *Signals, signal: SignalHandle) !void {
+        try self.publish(signal);
+    }
+
     fn install(self: *Signals, api_reference: ?c_int) !void {
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
