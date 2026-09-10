@@ -5,8 +5,9 @@ const images = @import("cache.zig");
 const codec = @import("codec.zig");
 const Bitmap = @import("pixels.zig").Bitmap;
 const build = @import("../ui/instance/build_owner.zig");
+const icons = @import("../xdg/icons.zig");
 
-pub const Source = union(enum) { path: []const u8, bytes: []const u8 };
+pub const Source = union(enum) { path: []const u8, bytes: []const u8, icon: icons.Request };
 pub const OwnerRef = struct { owners: *build.BuildOwners, handle: build.BuildOwnerHandle };
 pub const Status = enum { missing, pending, ready, failed };
 
@@ -39,6 +40,7 @@ const Job = struct {
     source: Source,
     options: codec.Options,
     root: ?linux.fd_t,
+    icon_roots: []const []const u8,
     encoded_budget: usize,
     decode: Decode,
     pipe: [2]linux.fd_t,
@@ -64,6 +66,19 @@ const Job = struct {
         const allocator = std.heap.page_allocator;
         switch (self.source) {
             .bytes => |bytes| return self.decode(allocator, bytes, self.options),
+            .icon => |request| {
+                var threaded = std.Io.Threaded.init(allocator, .{});
+                defer threaded.deinit();
+                const path = (try icons.lookup(allocator, threaded.io(), self.icon_roots, request)) orelse return error.IconNotFound;
+                defer allocator.free(path);
+                const name = try allocator.dupeZ(u8, path);
+                defer allocator.free(name);
+                // Theme symlinks are normal. Only the resolver can select this
+                // system path; application src paths remain beneath asset_root.
+                const opened = linux.open(name, .{ .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true }, 0);
+                if (linux.errno(opened) != .SUCCESS) return fileError(linux.errno(opened));
+                return self.loadFile(@intCast(opened));
+            },
             .path => |path| {
                 const root = self.root orelse return error.NoImageRoot;
                 if (path.len == 0 or path.len >= 4096 or path[0] == '/' or std.mem.indexOfScalar(u8, path, 0) != null)
@@ -76,40 +91,44 @@ const Job = struct {
                 };
                 const opened = linux.syscall4(.openat2, @bitCast(@as(isize, root)), @intFromPtr(name.ptr), @intFromPtr(&how), @sizeOf(io.OpenHow));
                 if (linux.errno(opened) != .SUCCESS) return fileError(linux.errno(opened));
-                const fd: linux.fd_t = @intCast(opened);
-                defer _ = linux.close(fd);
-                var stat: linux.Statx = undefined;
-                const stated = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .SIZE = true }, &stat);
-                if (linux.errno(stated) != .SUCCESS) return fileError(linux.errno(stated));
-                if (!stat.mask.TYPE or !stat.mask.SIZE or !linux.S.ISREG(stat.mode)) return error.NotRegularFile;
-                if (stat.size > self.encoded_budget) return error.ImageEncodedBudgetExceeded;
-                const size: usize = @intCast(stat.size);
-                const bytes = try allocator.alloc(u8, size);
-                defer allocator.free(bytes);
-                var read: usize = 0;
-                while (read < size) {
-                    const n = linux.read(fd, bytes[read..].ptr, size - read);
-                    switch (linux.errno(n)) {
-                        .SUCCESS => {},
-                        .INTR => continue,
-                        else => |err| return fileError(err),
-                    }
-                    if (n == 0) return error.ImageFileChanged;
-                    read += n;
-                }
-                var extra: [1]u8 = undefined;
-                while (true) {
-                    const n = linux.read(fd, &extra, 1);
-                    switch (linux.errno(n)) {
-                        .SUCCESS => if (n != 0) return error.ImageFileChanged,
-                        .INTR => continue,
-                        else => |err| return fileError(err),
-                    }
-                    break;
-                }
-                return self.decode(allocator, bytes, self.options);
+                return self.loadFile(@intCast(opened));
             },
         }
+    }
+
+    fn loadFile(self: *Job, fd: linux.fd_t) !Bitmap {
+        const allocator = std.heap.page_allocator;
+        defer _ = linux.close(fd);
+        var stat: linux.Statx = undefined;
+        const stated = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .SIZE = true }, &stat);
+        if (linux.errno(stated) != .SUCCESS) return fileError(linux.errno(stated));
+        if (!stat.mask.TYPE or !stat.mask.SIZE or !linux.S.ISREG(stat.mode)) return error.NotRegularFile;
+        if (stat.size > self.encoded_budget) return error.ImageEncodedBudgetExceeded;
+        const size: usize = @intCast(stat.size);
+        const bytes = try allocator.alloc(u8, size);
+        defer allocator.free(bytes);
+        var read: usize = 0;
+        while (read < size) {
+            const n = linux.read(fd, bytes[read..].ptr, size - read);
+            switch (linux.errno(n)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => |err| return fileError(err),
+            }
+            if (n == 0) return error.ImageFileChanged;
+            read += n;
+        }
+        var extra: [1]u8 = undefined;
+        while (true) {
+            const n = linux.read(fd, &extra, 1);
+            switch (linux.errno(n)) {
+                .SUCCESS => if (n != 0) return error.ImageFileChanged,
+                .INTR => continue,
+                else => |err| return fileError(err),
+            }
+            break;
+        }
+        return self.decode(allocator, bytes, self.options);
     }
 };
 
@@ -123,6 +142,8 @@ pub const Service = struct {
     loop: *io.Loop,
     cache: *images.Cache,
     root: ?linux.fd_t,
+    /// Borrowed, immutable search roots; keep alive through canDeinit().
+    icon_roots: []const []const u8 = &.{},
     entries: [max_sources]?Entry = @splat(null),
     owners: [max_owners]?Owner = @splat(null),
     active: ?struct { index: usize, job: *Job } = null,
@@ -188,9 +209,9 @@ pub const Service = struct {
         const owner = if (owner_ref) |ref| try self.ensureOwner(ref) else null;
         const normalized = normalize(options);
         const index = self.find(source, normalized) orelse blk: {
-            const key = sourceBytes(source);
-            if (key.len > max_encoded) return error.ImageEncodedBudgetExceeded;
-            while (self.encoded_bytes + self.encoded_reserved > max_encoded_total - key.len) {
+            const key_len = sourceLength(source);
+            if (key_len > max_encoded) return error.ImageEncodedBudgetExceeded;
+            while (self.encoded_bytes + self.encoded_reserved > max_encoded_total - key_len) {
                 if (!self.evict(null)) return error.ImageEncodedBudgetExceeded;
             }
             var free = self.freeSlot();
@@ -198,13 +219,10 @@ pub const Service = struct {
                 if (!self.evict(null)) return error.ImageSourceCapacityExceeded;
                 free = self.freeSlot();
             }
-            const copied = try self.allocator.dupe(u8, key);
-            self.encoded_bytes += copied.len;
+            const copied = try copySource(self.allocator, source);
+            self.encoded_bytes += key_len;
             self.entries[free.?] = .{
-                .source = switch (source) {
-                    .bytes => .{ .bytes = copied },
-                    .path => .{ .path = copied },
-                },
+                .source = copied,
                 .options = normalized,
                 .age = self.clock,
             };
@@ -256,6 +274,7 @@ pub const Service = struct {
                 .source = entry.source,
                 .options = entry.options,
                 .root = self.root,
+                .icon_roots = self.icon_roots,
                 .encoded_budget = @min(max_encoded, max_encoded_total - self.encoded_bytes),
                 .decode = self.decode,
                 .pipe = pipe,
@@ -263,7 +282,7 @@ pub const Service = struct {
             job.options.max_decoded_bytes = @min(job.options.max_decoded_bytes, max_decoded_total - self.cache.byteSize());
             job.operation = try self.loop.prepareRead(pipe[0], &job.byte, std.math.maxInt(u64));
             self.active = .{ .index = index, .job = job };
-            self.encoded_reserved = if (entry.source == .path) job.encoded_budget else 0;
+            self.encoded_reserved = if (entry.source != .bytes) job.encoded_budget else 0;
             // After prepareRead, cleanup must follow its CQE even if spawning
             // fails. Publish that failure through the same completion path.
             job.thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
@@ -380,8 +399,7 @@ pub const Service = struct {
 
     fn find(self: *const Service, source: Source, options: codec.Options) ?usize {
         for (self.entries, 0..) |slot, index| if (slot) |entry| {
-            if (std.meta.activeTag(source) == std.meta.activeTag(entry.source) and
-                std.mem.eql(u8, sourceBytes(source), sourceBytes(entry.source)) and
+            if (sourcesEqual(source, entry.source) and
                 optionsEqual(options, entry.options)) return index;
         };
         return null;
@@ -429,9 +447,14 @@ pub const Service = struct {
             self.decoded_bytes -= (self.cache.get(image) catch unreachable).pixels.len;
             self.cache.release(image) catch unreachable;
         }
-        const key = sourceBytes(entry.source);
-        self.encoded_bytes -= key.len;
-        self.allocator.free(key);
+        self.encoded_bytes -= sourceLength(entry.source);
+        switch (entry.source) {
+            .icon => |icon| {
+                self.allocator.free(icon.name);
+                self.allocator.free(icon.theme);
+            },
+            inline else => |bytes| self.allocator.free(bytes),
+        }
         self.entries[index] = null;
         for (&self.owners) |*slot| if (slot.*) |*owner| {
             owner.committed &= ~bit(index);
@@ -457,9 +480,34 @@ fn optionsEqual(a: codec.Options, b: codec.Options) bool {
     return std.meta.eql(first, second);
 }
 
-fn sourceBytes(source: Source) []const u8 {
+fn sourceLength(source: Source) usize {
     return switch (source) {
-        inline else => |bytes| bytes,
+        .icon => |icon| icon.name.len +| icon.theme.len,
+        inline else => |bytes| bytes.len,
+    };
+}
+
+fn copySource(allocator: std.mem.Allocator, source: Source) !Source {
+    return switch (source) {
+        .icon => |icon| blk: {
+            var copy = icon;
+            copy.name = try allocator.dupe(u8, icon.name);
+            errdefer allocator.free(copy.name);
+            copy.theme = try allocator.dupe(u8, icon.theme);
+            break :blk .{ .icon = copy };
+        },
+        .path => |path| .{ .path = try allocator.dupe(u8, path) },
+        .bytes => |bytes| .{ .bytes = try allocator.dupe(u8, bytes) },
+    };
+}
+
+fn sourcesEqual(a: Source, b: Source) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .icon => |icon| icon.size == b.icon.size and icon.scale == b.icon.scale and
+            std.mem.eql(u8, icon.name, b.icon.name) and std.mem.eql(u8, icon.theme, b.icon.theme),
+        .path => |path| std.mem.eql(u8, path, b.path),
+        .bytes => |bytes| std.mem.eql(u8, bytes, b.bytes),
     };
 }
 
@@ -871,4 +919,47 @@ test "image native service decodes SVG through worker and publishes stable error
     try std.testing.expectEqual(error.InvalidDimensions, service.failure(svg, nan).?);
     try std.testing.expect(try service.request(svg, nan, context.refs[0]) == null);
     try std.testing.expect(!service.hasPending());
+}
+
+test "image service resolves icon requests asynchronously and keys theme size and scale" {
+    const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    for ([_][]const u8{ "a/24", "a/24@2", "a/48", "b/24" }) |path|
+        try temporary.dir.createDirPath(std.testing.io, path);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "a/index.theme",
+        .data = "[Icon Theme]\nDirectories=24,48\nScaledDirectories=24@2\n[24]\nSize=24\nType=Fixed\n[48]\nSize=48\nType=Fixed\n[24@2]\nSize=24\nScale=2\nType=Fixed\n",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "b/index.theme", .data = "[Icon Theme]\nDirectories=24\n[24]\nSize=24\n" });
+    for ([_][]const u8{ "a/24/folder.png", "a/24@2/folder.png", "a/48/folder.png", "b/24/folder.png" }, "ABCD") |path, byte|
+        try temporary.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = &.{byte} });
+    var context: TestContext = undefined;
+    try context.init(null);
+    defer context.deinit();
+    const service = &context.service;
+    service.icon_roots = &.{root};
+    const requests = [_]Source{
+        .{ .icon = .{ .name = "folder", .theme = "a" } },
+        .{ .icon = .{ .name = "folder", .theme = "a", .scale = 2 } },
+        .{ .icon = .{ .name = "folder", .theme = "a", .size = 48 } },
+        .{ .icon = .{ .name = "folder", .theme = "b" } },
+    };
+    for (requests) |source| try std.testing.expect(try service.request(source, .{}, context.refs[0]) == null);
+    try std.testing.expect(!context.loop.hasPendingOperations());
+    try context.drain();
+    for (requests, "ABCD") |source, byte| {
+        const handle = (try service.request(source, .{}, context.refs[0])).?;
+        try std.testing.expectEqualSlices(u8, &.{ byte, 13, 29, 255 }, (try context.cache.get(handle)).pixels);
+    }
+    try std.testing.expect(!service.hasPending());
+    const invalid: Source = .{ .icon = .{ .name = "../outside", .theme = "a" } };
+    const missing: Source = .{ .icon = .{ .name = "absent", .theme = "a" } };
+    _ = try service.request(invalid, .{}, context.refs[0]);
+    _ = try service.request(missing, .{}, context.refs[0]);
+    try context.drain();
+    try std.testing.expectEqual(error.InvalidIconName, service.failure(invalid, .{}).?);
+    try std.testing.expectEqual(error.IconNotFound, service.failure(missing, .{}).?);
 }

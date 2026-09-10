@@ -9,6 +9,15 @@ const Scheduler = @import("../task/root.zig").Scheduler;
 
 test "Lua images queue after build, apply icon defaults and retain prepared pixels beyond source lifetime" {
     const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const icon_root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(icon_root);
+    try temporary.dir.createDirPath(std.testing.io, "test/24");
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "test/index.theme", .data = "[Icon Theme]\nDirectories=24\n[24]\nSize=24\nType=Fixed\n" });
+    const svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><path fill=\"#123456\" d=\"M0 0h24v24H0Z\"/></svg>";
+    for ([_][]const u8{ "test/24/folder.svg", "test/24/folder-symbolic.svg" }) |path|
+        try temporary.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = svg });
     const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
     defer c.lua_close(state);
     c.lua_createtable(state, 0, 4);
@@ -28,14 +37,15 @@ test "Lua images queue after build, apply icon defaults and retain prepared pixe
     defer cache.deinit();
     var assets: images.Service = undefined;
     try assets.init(allocator, &loop, &cache, null);
+    assets.icon_roots = &.{icon_root};
     var assets_alive = true;
     defer if (assets_alive) {
         assets.shutdown();
         while (!assets.canDeinit()) completeImage(&assets, &loop) catch unreachable;
         assets.deinit();
     };
-    var descriptors: [5]ui.instance.Descriptor = undefined;
-    var semantics: [3]ui.semantics.Descriptor = undefined;
+    var descriptors: [8]ui.instance.Descriptor = undefined;
+    var semantics: [6]ui.semantics.Descriptor = undefined;
     var build: UiBuild = undefined;
     try build.init(state, &descriptors);
     build.enableDeclarativeWidgets(@import("../design/root.zig").tokens.light);
@@ -55,22 +65,29 @@ test "Lua images queue after build, apply icon defaults and retain prepared pixe
         \\  return ouro.row { key = "row",
         \\    ouro.image { key = "photo", bytes = encoded, width = 30, height = 20, fit = "cover", alt = "Mountains" },
         \\    ouro.icon { key = "arrow", bytes = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path d="M0 0h24v24H0Z"/></svg>' },
+        \\    ouro.xdg.icon { key = "folder", name = "folder", theme = "test", alt = "Folder" },
+        \\    ouro.icon { key = "symbolic", name = "folder-symbolic", theme = "test" },
+        \\    ouro.xdg.icon { key = "missing", name = "absent", theme = "test", width = 32 },
         \\  }
         \\end
         \\function both() return ouro.image { key = "bad", src = "photo.png", bytes = encoded } end
         \\function neither() return ouro.image { key = "bad" } end
         \\function badpath() return ouro.image { key = "bad", src = false, bytes = encoded } end
         \\function badbytes() return ouro.image { key = "bad", src = "photo.png", bytes = 1 } end
+        \\function mixed() return ouro.icon { key = "bad", name = "folder", src = "photo.png" } end
+        \\function badname() return ouro.xdg.icon { key = "bad", name = false } end
+        \\function badtheme() return ouro.icon { key = "bad", name = "folder", theme = 1 } end
+        \\function imagename() return ouro.image { key = "bad", name = "folder" } end
     ;
     try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source.ptr, source.len, "@images-test", "t"));
     try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 0, 0, 0, null));
     var cycle = owners.beginCycle();
     var work = (try cycle.take()).?;
-    for ([_][*:0]const u8{ "both", "neither", "badpath", "badbytes" }) |name|
+    for ([_][*:0]const u8{ "both", "neither", "badpath", "badbytes", "mixed", "badname", "badtheme", "imagename" }) |name|
         try std.testing.expectError(error.LuaBuildFailed, build.build(&owners, work, name, &.{}));
     try std.testing.expect(!assets.hasPending());
     var result = try build.build(&owners, work, "build", &.{});
-    try std.testing.expectEqual(@as(usize, 5), result.len);
+    try std.testing.expectEqual(@as(usize, 8), result.len);
     try std.testing.expect(result[3].object.image.image == null);
     try std.testing.expectEqual(@as(?f32, 30), result[3].object.image.width);
     try std.testing.expectEqual(@as(?f32, 20), result[3].object.image.height);
@@ -97,8 +114,18 @@ test "Lua images queue after build, apply icon defaults and retain prepared pixe
     try std.testing.expectEqual(@as(u32, 48), (try cache.get(icon)).width);
     const foreground = @import("../design/root.zig").tokens.light.foreground.premultiplied();
     try std.testing.expectEqualSlices(u8, &.{ foreground.r, foreground.g, foreground.b, foreground.a }, (try cache.get(icon)).pixels[0..4]);
+    const folder = result[5].object.image.image.?;
+    const symbolic = result[6].object.image.image.?;
+    try std.testing.expectEqual(@as(u32, 48), (try cache.get(folder)).width);
+    try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56, 255 }, (try cache.get(folder)).pixels[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ foreground.r, foreground.g, foreground.b, foreground.a }, (try cache.get(symbolic)).pixels[0..4]);
+    try std.testing.expectEqualStrings("Folder", semantics[3].label);
+    try std.testing.expectEqual(ui.semantics.Role.image, semantics[3].role);
+    try std.testing.expect(result[7].object.image.image == null);
+    try std.testing.expectEqual(@as(?f32, 32), result[7].object.image.width);
+    try std.testing.expect(!assets.hasPending());
     var prepared: PreparedBuild = undefined;
-    try prepared.init(allocator, state, null, 5, 128);
+    try prepared.init(allocator, state, null, 8, 128);
     defer prepared.deinit();
     try build.capturePrepared(&prepared, result);
     try build.commitDependencies(&owners, work);
@@ -111,6 +138,8 @@ test "Lua images queue after build, apply icon defaults and retain prepared pixe
     prepared.reset();
     try std.testing.expectError(error.StaleImageHandle, cache.get(photo));
     try std.testing.expectError(error.StaleImageHandle, cache.get(icon));
+    try std.testing.expectError(error.StaleImageHandle, cache.get(folder));
+    try std.testing.expectError(error.StaleImageHandle, cache.get(symbolic));
     try owners.retire(owner);
     try scheduler.applyQueuedCancellations();
     try owners.collectRetired();

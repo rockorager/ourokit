@@ -548,6 +548,61 @@ See `examples/images.lua` for file-backed formats, byte-backed icons, fit modes,
 theme inheritance, interaction, and failed assets. Storybook snapshots wait for
 asset completion before capturing pixels.
 
+### XDG named icons use the system icon themes
+
+```lua
+ouro.xdg.icon {
+  key = "save", name = "document-save-symbolic", theme = "Adwaita",
+  width = 24, height = 24, alt = "Save",
+}
+ouro.icon { key = "folder", name = "folder", theme = "Adwaita" }
+```
+
+`ouro.xdg.icon` is the same widget constructor as `ouro.icon`. A named source
+uses `name` instead of `src` or `bytes`; exactly one source is required. `theme`
+is an icon-theme directory name, not an Ouro color theme. It defaults to
+`hicolor`; this first version does not discover the desktop's selected theme.
+Names are exact, extensionless icon names, not file paths. No implicit name
+shortening or symbolic-to-regular fallback is performed.
+
+Lookup follows the [XDG Icon Theme lookup algorithm](https://specifications.freedesktop.org/icon-theme-spec/latest/):
+read the first `index.theme` across search roots, search `Directories` and
+`ScaledDirectories` for matching logical size and scale, then choose the closest
+physical size within that theme. Any matching name in the selected theme wins
+over inherited themes, even when a parent has a closer size. Parents are searched
+recursively in order with cycle protection, followed by `hicolor`, then unthemed
+icons. PNG precedes SVG within a directory; legacy XPM is not supported.
+
+Search roots are `$HOME/.icons`, `$XDG_DATA_HOME/icons` (default
+`$HOME/.local/share/icons`), each `$XDG_DATA_DIRS/icons` (default
+`/usr/local/share/icons` and `/usr/share/icons`), then `/usr/share/pixmaps`.
+Relative environment paths are ignored. Installed theme symlinks are supported;
+the restrictions on application-relative `src` paths are unchanged.
+
+Named icons keep their original colors unless the name ends in `-symbolic`,
+which uses the inherited foreground as an alpha-mask tint. Explicit `tint`
+overrides either behavior. Symbolic semantic color classes are not interpreted.
+The default logical size is 24×24. Lookup uses the larger declared dimension,
+rounded up, and output scale rounded up to an integer; SVG rasterization still
+uses the actual output scale. Missing icons paint nothing and retain their size.
+
+Resolution, reading, and decoding run on the image worker after build commit.
+The cache includes name, theme, lookup size/scale, and raster options. Changing
+these properties reconciles normally. Filesystem theme changes are not watched:
+cached results, including misses, persist until eviction or application source
+reload. No desktop settings subscription or icon-cache binary parsing is included.
+
+Native Zig consumers can use `ourokit.xdg.icons.SearchPaths.init(allocator, environ)`
+and `ourokit.xdg.icons.lookup(allocator, io, roots, request)` directly. Lookup is
+synchronous and returns an owned path or `null`; callers free the path. The async
+image service accepts `.icon = .{ .name = "folder", .theme = "Adwaita" }` as a
+source. Set its borrowed `icon_roots` before requesting icons and keep those paths
+alive until the service is drained and destroyed. The application and Storybook
+runners configure these paths automatically.
+
+See `examples/xdg-icons.lua` for light/dark, color, symbolic, and missing states.
+It requires an installed Adwaita theme; icons are not bundled with the example.
+
 ### Virtual lists
 
 Large, generic vertical viewports use `ouro.virtual_list`:

@@ -4,6 +4,7 @@ pub const core = @import("core/root.zig");
 pub const design = @import("design/root.zig");
 pub const text = @import("text/root.zig");
 pub const image = @import("image/root.zig");
+pub const xdg = @import("xdg/root.zig");
 pub const varlink = @import("varlink/root.zig");
 pub const loop = @import("loop/root.zig");
 pub const fs = @import("fs/root.zig");
@@ -22,6 +23,7 @@ test {
     _ = design;
     _ = text;
     _ = image;
+    _ = xdg;
     _ = varlink;
     _ = loop;
     _ = fs;

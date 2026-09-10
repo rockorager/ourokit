@@ -31,6 +31,7 @@ pub const UiServices = struct {
     theme_fonts: ?*@import("../lua/theme_fonts.zig").ThemeFonts = null,
     workspaces: ?*shell.workspaces.Store = null,
     images: ?*ImageCache = null,
+    icon_roots: []const []const u8 = &.{},
 };
 
 /// All Lua-owned meaning for one application source snapshot. This value and
@@ -354,7 +355,7 @@ pub const SourceGeneration = struct {
             };
             self.ui_build.enableDeclarativeWidgets(value.theme);
             self.ui_build.theme_fonts = value.theme_fonts;
-            try self.attachImages(value.images);
+            try self.attachImages(value.images, value.icon_roots);
         } else {
             self.callbacks = null;
         }
@@ -524,14 +525,14 @@ pub const SourceGeneration = struct {
         self.ui_build.enableDeclarativeWidgets(services.theme);
         if (self.application.theme) |theme| self.ui_build.widget_theme = theme;
         self.ui_build.theme_fonts = services.theme_fonts;
-        try self.attachImages(services.images);
+        try self.attachImages(services.images, services.icon_roots);
         if (services.workspaces) |store| {
             self.shell_workspaces = @as(lua.ShellWorkspaces, undefined);
             try self.shell_workspaces.?.init(self.vm.state, &self.signals, store, self.vm.apiReference());
         }
     }
 
-    fn attachImages(self: *SourceGeneration, cache_optional: ?*ImageCache) !void {
+    fn attachImages(self: *SourceGeneration, cache_optional: ?*ImageCache, icon_roots: []const []const u8) !void {
         const cache = cache_optional orelse return;
         std.debug.assert(self.images == null);
         self.images = @as(image_service.Service, undefined);
@@ -539,6 +540,7 @@ pub const SourceGeneration = struct {
             self.images = null;
             return err;
         };
+        self.images.?.icon_roots = icon_roots;
         self.ui_build.images = &self.images.?;
     }
 

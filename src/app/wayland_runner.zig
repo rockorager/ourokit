@@ -270,6 +270,8 @@ fn runSourceWithFontconfig(
     defer paragraphs.deinit();
     var images = try @import("../image/cache.zig").Cache.init(init.gpa, 256);
     defer images.deinit();
+    var icon_paths = try @import("../xdg/icons.zig").SearchPaths.init(init.gpa, init.minimal.environ);
+    defer icon_paths.deinit();
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
     var vulkan_renderer: renderer.vulkan = undefined;
@@ -289,6 +291,7 @@ fn runSourceWithFontconfig(
         .theme_fonts = &theme_fonts,
         .workspaces = &workspaces,
         .images = &images,
+        .icon_roots = icon_paths.paths,
     };
     // Generations must release their text resources before the caches above.
     defer {

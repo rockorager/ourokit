@@ -841,8 +841,11 @@ pub const UiBuild = struct {
         const key = tableString(state, 1, "key") orelse return luaError(state, "image key is required");
         const path = tableOptionalString(state, 1, "src") orelse return luaError(state, "image src must be a string");
         const bytes = tableOptionalString(state, 1, "bytes") orelse return luaError(state, "image bytes must be a string");
-        if (path.present == bytes.present)
-            return luaError(state, "image expects exactly one src path or encoded bytes string");
+        const name = tableOptionalString(state, 1, "name") orelse return luaError(state, "icon name must be a string");
+        const icon_theme = tableOptionalString(state, 1, "theme") orelse return luaError(state, "icon theme must be a string");
+        if ((!icon and name.present) or (icon_theme.present and !name.present) or
+            @as(u8, @intFromBool(path.present)) + @as(u8, @intFromBool(bytes.present)) + @as(u8, @intFromBool(name.present)) != 1)
+            return luaError(state, "image expects exactly one src or bytes; icons also accept name and optional theme");
         const width = tableOptionalNullableExtent(state, 1, "width") orelse
             return luaError(state, "invalid image width");
         const height = tableOptionalNullableExtent(state, 1, "height") orelse
@@ -852,19 +855,26 @@ pub const UiBuild = struct {
         var fit: image_pixels.Fit = .contain;
         const fit_type = c.lua_getfield(state, 1, "fit");
         if (fit_type != c.type_nil) {
-            const name = string(state, -1) orelse return luaError(state, "invalid image fit");
-            fit = std.meta.stringToEnum(image_pixels.Fit, name) orelse return luaError(state, "invalid image fit");
+            const fit_name = string(state, -1) orelse return luaError(state, "invalid image fit");
+            fit = std.meta.stringToEnum(image_pixels.Fit, fit_name) orelse return luaError(state, "invalid image fit");
         }
         c.lua_settop(state, -2);
-        var tint: ?@import("../core/color.zig").Color = if (icon) theme.foreground else null;
+        var tint: ?@import("../core/color.zig").Color = if (icon and
+            (!name.present or std.mem.endsWith(u8, name.value, "-symbolic"))) theme.foreground else null;
         if (c.lua_getfield(state, 1, "tint") != c.type_nil)
             tint = theming.color(state, -1) catch |err| return luaError(state, @errorName(err));
         c.lua_settop(state, -2);
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const active = self.active_owner.?;
+        const source: image_service.Source = if (name.present) .{ .icon = .{
+            .name = name.value,
+            .theme = if (icon_theme.present) icon_theme.value else "hicolor",
+            .size = (rasterDimension(@max(logical_width.?, logical_height.?), 1) catch return luaError(state, "icon too large")).?,
+            .scale = (rasterDimension(1, self.image_scale) catch return luaError(state, "icon scale too large")).?,
+        } } else if (path.present) .{ .path = path.value } else .{ .bytes = bytes.value };
         const handle = images.request(
-            if (path.present) .{ .path = path.value } else .{ .bytes = bytes.value },
+            source,
             .{
                 .width = rasterDimension(logical_width, self.image_scale) catch return luaError(state, "image raster too large"),
                 .height = rasterDimension(logical_height, self.image_scale) catch return luaError(state, "image raster too large"),

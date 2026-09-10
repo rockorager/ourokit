@@ -175,7 +175,12 @@ wrapping; unchanged constraints perform no layout acquisition or allocation.
 `ouro.image { key, src, width?, height?, fit?, tint?, alt? }` loads PNG, JPEG,
 WebP, and self-contained static SVG asynchronously. Use `bytes` instead of `src`
 for encoded data. `ouro.icon` uses the same native Image primitive with a 24×24
-default and inherited foreground tint. See [image authoring](docs/application-model.md#images-and-icons-load-asynchronously)
+default and inherited foreground tint for file/byte sources. Named XDG icons use
+`ouro.xdg.icon { key, name, theme? }` (also accepted by `ouro.icon`), with system
+theme inheritance, size/scale lookup, and `hicolor` fallback. Regular named icons
+keep their colors; `-symbolic` icons inherit the foreground. See
+[XDG icon authoring](docs/application-model.md#xdg-named-icons-use-the-system-icon-themes)
+and `examples/xdg-icons.lua`. See [image authoring](docs/application-model.md#images-and-icons-load-asynchronously)
 and `examples/images.lua` for formats, fit modes, and theme-aware icons.
 
 `ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.text` provide nested composition without

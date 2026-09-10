@@ -49,6 +49,11 @@ pub const Description = struct {
         }
         c.lua_pushcclosure(state, component, 0);
         c.lua_setfield(state, -2, "component");
+        c.lua_createtable(state, 0, 1);
+        c.lua_pushinteger(state, @intFromEnum(Kind.icon));
+        c.lua_pushcclosure(state, construct, 1);
+        c.lua_setfield(state, -2, "icon");
+        c.lua_setfield(state, -2, "xdg");
     }
 
     fn component(state: *c.State) callconv(.c) c_int {

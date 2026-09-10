@@ -178,8 +178,11 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     defer paragraphs.deinit();
     var images = try ImageCache.init(init.gpa, 256);
     defer images.deinit();
+    var icon_paths = try @import("../xdg/icons.zig").SearchPaths.init(init.gpa, init.minimal.environ);
+    defer icon_paths.deinit();
     var assets: image_service.Service = undefined;
     try assets.init(init.gpa, &loop, &images, asset_root);
+    assets.icon_roots = icon_paths.paths;
     defer {
         drainImages(&assets, &loop) catch |err| std.debug.panic("image shutdown failed: {s}", .{@errorName(err)});
         assets.deinit();
