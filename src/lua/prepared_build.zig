@@ -135,7 +135,7 @@ pub const PreparedBuild = struct {
             if (text_input_value.session) |*session| session.deinit();
         if (self.owns_shapes) for (self.descriptor_storage[0..self.descriptor_count]) |descriptor|
             switch (descriptor.object) {
-                .label => |label| self.shapes.?.release(label.source) catch unreachable,
+                .text => |value| self.shapes.?.release(value.source) catch unreachable,
                 .text_input => |text_input_value| self.shapes.?.release(text_input_value.source) catch unreachable,
                 else => {},
             };

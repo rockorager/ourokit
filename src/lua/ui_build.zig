@@ -93,10 +93,10 @@ pub const UiBuild = struct {
     signals: ?*Signals = null,
     callbacks: ?*CallbackRegistry = null,
     callback_vm: ?*Vm = null,
-    label_sources: ?*text.ParagraphSourceCache = null,
-    label_candidates: []const text.FontHandle = &.{},
+    text_sources: ?*text.ParagraphSourceCache = null,
+    text_candidates: []const text.FontHandle = &.{},
     medium_candidates: []const text.FontHandle = &.{},
-    label_configuration_revision: u64 = 0,
+    text_configuration_revision: u64 = 0,
     widget_theme: ?theming.Theme = null,
     theme_fonts: ?*ThemeFonts = null,
     theme_stack: [32]theming.Theme = undefined,
@@ -567,21 +567,21 @@ pub const UiBuild = struct {
         self.callback_vm = vm;
     }
 
-    pub fn attachLabelText(
+    pub fn attachText(
         self: *UiBuild,
         sources: *text.ParagraphSourceCache,
         candidates: []const text.FontHandle,
         configuration_revision: u64,
     ) !void {
-        if (self.active_owner != null or self.label_sources != null or candidates.len == 0)
-            return error.InvalidLabelTextService;
-        self.label_sources = sources;
-        self.label_candidates = candidates;
-        self.label_configuration_revision = configuration_revision;
+        if (self.active_owner != null or self.text_sources != null or candidates.len == 0)
+            return error.InvalidTextService;
+        self.text_sources = sources;
+        self.text_candidates = candidates;
+        self.text_configuration_revision = configuration_revision;
     }
 
     pub fn attachMediumText(self: *UiBuild, candidates: []const text.FontHandle) !void {
-        if (self.active_owner != null or self.label_sources == null or
+        if (self.active_owner != null or self.text_sources == null or
             self.medium_candidates.len != 0 or candidates.len == 0)
             return error.InvalidMediumTextService;
         self.medium_candidates = candidates;
@@ -608,7 +608,7 @@ pub const UiBuild = struct {
         const description = Description.get(state, 1) orelse
             return luaError(state, "build must return a widget description or nil");
         const emit: c.CFunction = switch (description.kind) {
-            .label => emitLabel,
+            .text => emitText,
             .button => emitButton,
             .text_input => emitTextInput,
             .listbox => emitListBox,
@@ -789,7 +789,7 @@ pub const UiBuild = struct {
             const fonts = self.theme_fonts orelse return error.ThemeFontServiceUnavailable;
             return fonts.get(family, medium);
         }
-        return if (medium and self.medium_candidates.len != 0) self.medium_candidates else self.label_candidates;
+        return if (medium and self.medium_candidates.len != 0) self.medium_candidates else self.text_candidates;
     }
 
     fn pushTheme(self: *UiBuild, theme: theming.Theme) !void {
@@ -803,11 +803,11 @@ pub const UiBuild = struct {
         self.theme_count -= 1;
     }
 
-    fn emitLabel(state: *c.State) callconv(.c) c_int {
+    fn emitText(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
-            return luaError(state, "ouro.label expects one declaration table");
-        return self.emitDeclarativeLabel(state);
+            return luaError(state, "ouro.text expects one declaration table");
+        return self.emitDeclarativeText(state);
     }
 
     fn emitButton(state: *c.State) callconv(.c) c_int {
@@ -863,18 +863,18 @@ pub const UiBuild = struct {
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append button descriptor");
 
-        const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
+        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         const source = sources.acquire(.{
             .utf8 = label,
             .language = "und",
             .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
             .candidates = self.themedFonts(true) catch |err| return luaError(state, @errorName(err)),
-            .configuration_revision = self.label_configuration_revision,
+            .configuration_revision = self.text_configuration_revision,
         }) catch return luaError(state, "cannot retain button label");
         self.append(.{
             .id = label_id,
             .parent = button_id,
-            .object = .{ .label = .{
+            .object = .{ .text = .{
                 .source = source,
                 .color = if (enabled)
                     visual.foreground orelse theme.primary_foreground
@@ -976,13 +976,13 @@ pub const UiBuild = struct {
                 return luaError(state, parentDataErrorMessage(err)),
         }) catch return luaError(state, "cannot append text_input descriptor");
 
-        const sources = self.label_sources orelse return luaError(state, "text service unavailable");
+        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         const source = sources.acquire(.{
             .utf8 = initial,
             .language = "und",
             .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
             .candidates = self.themedFonts(false) catch |err| return luaError(state, @errorName(err)),
-            .configuration_revision = self.label_configuration_revision,
+            .configuration_revision = self.text_configuration_revision,
         }) catch return luaError(state, "cannot retain text_input text");
         self.append(.{
             .id = content_id,
@@ -1009,7 +1009,7 @@ pub const UiBuild = struct {
             .content_id = content_id,
             .mode = mode,
             .behavior = .{ .enabled = enabled, .read_only = read_only, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
-            .session = TextInputSession.init(self.label_sources.?.allocator, initial) catch
+            .session = TextInputSession.init(self.text_sources.?.allocator, initial) catch
                 return luaError(state, "cannot create text_input session"),
         };
         self.pending_text_input_count += 1;
@@ -1150,18 +1150,18 @@ pub const UiBuild = struct {
                 .corner_radius = visual.radius orelse defaults.controls.radius orelse design.tokens.foundation.radius_1,
             } },
         }) catch return luaError(state, "cannot append option descriptor");
-        const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
+        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         const source = sources.acquire(.{
             .utf8 = label,
             .language = "und",
             .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
             .candidates = self.themedFonts(selected and listbox.appearance == .sidebar) catch |err| return luaError(state, @errorName(err)),
-            .configuration_revision = self.label_configuration_revision,
+            .configuration_revision = self.text_configuration_revision,
         }) catch return luaError(state, "cannot retain option label");
         self.append(.{
             .id = label_id,
             .parent = option_id,
-            .object = .{ .label = .{
+            .object = .{ .text = .{
                 .source = source,
                 .color = if (selected) style.selected.foreground else style.idle.foreground,
                 .max_lines = 1,
@@ -1193,42 +1193,42 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn emitDeclarativeLabel(self: *UiBuild, state: *c.State) c_int {
+    fn emitDeclarativeText(self: *UiBuild, state: *c.State) c_int {
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.label) catch |err| return luaError(state, @errorName(err));
-        const parent = self.currentParent() orelse return luaError(state, "label requires a widget parent");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "label key is required");
-        const value = tableString(state, 1, "text") orelse return luaError(state, "label text is required");
+        const visual = widgetOverrides(state, defaults.widgets.text) catch |err| return luaError(state, @errorName(err));
+        const parent = self.currentParent() orelse return luaError(state, "text requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "text key is required");
+        const value = tableString(state, 1, "text") orelse return luaError(state, "text content is required");
         const logical_size = tableOptionalExtent(
             state,
             1,
             "size",
             visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_3,
-        ) orelse return luaError(state, "invalid label size");
+        ) orelse return luaError(state, "invalid text size");
         const alignment = tableOptionalParagraphAlignment(state, 1, "alignment", .start) orelse
-            return luaError(state, "invalid label alignment");
+            return luaError(state, "invalid text alignment");
         const max_lines_value = tableOptionalPositiveInteger(state, 1, "max_lines", 0) orelse
-            return luaError(state, "invalid label max_lines");
+            return luaError(state, "invalid text max_lines");
         const overflow = tableOptionalParagraphOverflow(state, 1, "overflow", .clip) orelse
-            return luaError(state, "invalid label overflow");
+            return luaError(state, "invalid text overflow");
         if (overflow == .ellipsis and max_lines_value == 0)
-            return luaError(state, "label ellipsis requires max_lines");
+            return luaError(state, "text ellipsis requires max_lines");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
-        const sources = self.label_sources orelse return luaError(state, "label text service unavailable");
+        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         const source = sources.acquire(.{
             .utf8 = value,
             .language = "und",
             .logical_size = logical_size,
             .candidates = self.themedFonts(false) catch |err| return luaError(state, @errorName(err)),
-            .configuration_revision = self.label_configuration_revision,
-        }) catch return luaError(state, "cannot retain label text");
+            .configuration_revision = self.text_configuration_revision,
+        }) catch return luaError(state, "cannot retain text");
         const id = semanticId(key, 0x6c6162656c ^ parent.id ^ self.component_namespace);
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .object = .{ .label = .{
+            .object = .{ .text = .{
                 .source = source,
                 .color = visual.foreground orelse theme.foreground,
                 .alignment = alignment,
@@ -1238,16 +1238,16 @@ pub const UiBuild = struct {
             .parent_data = parent_data,
         }) catch {
             sources.release(source) catch unreachable;
-            return luaError(state, "cannot append label descriptor");
+            return luaError(state, "cannot append text descriptor");
         };
         self.sources_staged = true;
         self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
-            .role = .label,
+            .role = .text,
             .key = key,
             .label = value,
-        }) catch return luaError(state, "cannot append label semantics");
+        }) catch return luaError(state, "cannot append text semantics");
         return 0;
     }
 
@@ -1401,9 +1401,9 @@ pub const UiBuild = struct {
 
     fn discardSources(self: *UiBuild) void {
         if (!self.sources_staged) return;
-        const sources = self.label_sources.?;
+        const sources = self.text_sources.?;
         for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
-            .label => |label| sources.release(label.source) catch unreachable,
+            .text => |value| sources.release(value.source) catch unreachable,
             .text_input => |input| sources.release(input.source) catch unreachable,
             else => {},
         };
@@ -1796,12 +1796,12 @@ test "Lua UI exposes only declarative constructors without standard libraries" {
 
     try std.testing.expectEqual(c.type_table, c.lua_getglobal(state, "ouro"));
     inline for (.{
-        "label", "button", "text_input", "listbox", "option", "box", "row", "column", "scroll", "theme",
+        "text", "button", "text_input", "listbox", "option", "box", "row", "column", "scroll", "theme",
     }) |name| {
         try std.testing.expectEqual(c.type_function, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
-    inline for (.{ "padded_box", "stack", "positioned_box", "on_pointer" }) |name| {
+    inline for (.{ "label", "padded_box", "stack", "positioned_box", "on_pointer" }) |name| {
         try std.testing.expectEqual(c.type_nil, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
@@ -1834,7 +1834,7 @@ test "declarative text input separates focus identity from editable render conte
     var semantic_storage: [2]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try ui.attachLabelText(&sources, &.{font}, 1);
+    try ui.attachText(&sources, &.{font}, 1);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
@@ -1931,7 +1931,7 @@ test "declarative sidebar listbox uses paired active visuals" {
     var semantic_storage: [3]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try ui.attachLabelText(&sources, &.{font}, 1);
+    try ui.attachText(&sources, &.{font}, 1);
     try ui.attachMediumText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
@@ -1951,14 +1951,14 @@ test "declarative sidebar listbox uses paired active visuals" {
     const work = (try cycle.take()).?;
     const descriptors = try ui.build(&owners, work, "build", &.{});
     try std.testing.expectEqual(@as(usize, 7), descriptors.len);
-    try std.testing.expectEqual(design.tokens.light.sidebar_foreground, descriptors[4].object.label.color);
+    try std.testing.expectEqual(design.tokens.light.sidebar_foreground, descriptors[4].object.text.color);
     try std.testing.expectEqual(
         design.tokens.light.sidebar_accent_selected,
         descriptors[5].object.box.background.?,
     );
     try std.testing.expectEqual(
         design.tokens.light.sidebar_accent_foreground,
-        descriptors[6].object.label.color,
+        descriptors[6].object.text.color,
     );
     try std.testing.expectEqual(@as(usize, 2), ui.pending_option_count);
     try std.testing.expectEqual(descriptors[4].id, ui.pending_options[0].content_id);
@@ -1966,8 +1966,8 @@ test "declarative sidebar listbox uses paired active visuals" {
         design.tokens.light.sidebar_accent_foreground,
         ui.pending_options[0].style.hovered.foreground,
     );
-    const idle_source = try sources.get(descriptors[4].object.label.source);
-    const selected_source = try sources.get(descriptors[6].object.label.source);
+    const idle_source = try sources.get(descriptors[4].object.text.source);
+    const selected_source = try sources.get(descriptors[6].object.text.source);
     try std.testing.expectEqual(font, idle_source.candidates[0]);
     try std.testing.expectEqual(medium_font, selected_source.candidates[0]);
 
@@ -2057,7 +2057,7 @@ test "declarative flex rejects invalid factors and non-flex parents" {
     try std.testing.expectError(error.InvalidFlexFactor, declarativeParentData(&ui, state, -1));
 }
 
-test "declarative Lua label flows through layout scene and software glyph cache" {
+test "declarative Lua text flows through layout scene and software glyph cache" {
     const software = @import("../renderer/software/root.zig");
     if (comptime !software.has_freetype) return error.SkipZigTest;
     const Scheduler = @import("../task/scheduler.zig").Scheduler;
@@ -2104,7 +2104,7 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     var semantic_storage: [2]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try ui.attachLabelText(&sources, &.{ font, arabic }, 1);
+    try ui.attachText(&sources, &.{ font, arabic }, 1);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
 
@@ -2112,7 +2112,7 @@ test "declarative Lua label flows through layout scene and software glyph cache"
         \\function build()
         \\  return ouro.column {
         \\    key = "content",
-        \\    ouro.label {
+        \\    ouro.text {
         \\      key = "benchmark",
         \\      text = "Benchmark حفظ",
         \\      size = 18,
@@ -2130,15 +2130,15 @@ test "declarative Lua label flows through layout scene and software glyph cache"
     ui.rollbackHandlers();
     try owners.complete(work);
     try std.testing.expectEqual(@as(usize, 1), sources.count());
-    var retained_label: ?render_types.Label = null;
+    var retained_text: ?render_types.Text = null;
     for (descriptors) |descriptor| switch (descriptor.object) {
-        .label => |label| retained_label = label,
+        .text => |value| retained_text = value,
         else => {},
     };
-    const label_descriptor = retained_label.?;
-    try std.testing.expectEqual(text.ParagraphAlignment.center, label_descriptor.alignment);
-    try std.testing.expectEqual(@as(?u32, 1), label_descriptor.max_lines);
-    try std.testing.expectEqual(text.ParagraphOverflow.ellipsis, label_descriptor.overflow);
+    const text_descriptor = retained_text.?;
+    try std.testing.expectEqual(text.ParagraphAlignment.center, text_descriptor.alignment);
+    try std.testing.expectEqual(@as(?u32, 1), text_descriptor.max_lines);
+    try std.testing.expectEqual(text.ParagraphOverflow.ellipsis, text_descriptor.overflow);
 
     const root = (try instances.rootRenderObject()).?;
     const size = try renders.layout(root, .{ .max_width = 160, .max_height = 64 });
@@ -2209,7 +2209,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     var semantic_storage: [6]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try ui.attachLabelText(&sources, &.{font}, 1);
+    try ui.attachText(&sources, &.{font}, 1);
     try ui.attachMediumText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(design.tokens.light);
@@ -2228,7 +2228,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
         \\      color_scheme = "dark",
         \\      ouro.column {
         \\        key = "content",
-        \\        ouro.label { key = "title", text = "Controls" },
+        \\        ouro.text { key = "title", text = "Controls" },
         \\        ouro.row {
         \\          key = "actions",
         \\          ouro.button {
@@ -2258,7 +2258,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     );
     try std.testing.expectEqual(design.tokens.dark.background, descriptors[3].object.box.background.?);
     try std.testing.expect(descriptors[4].object == .flex);
-    try std.testing.expect(descriptors[5].object == .label);
+    try std.testing.expect(descriptors[5].object == .text);
     try std.testing.expect(descriptors[6].object == .flex);
     try std.testing.expectEqual(design.tokens.dark.primary, descriptors[7].object.box.background.?);
     try std.testing.expect(descriptors[7].focusable);
@@ -2276,12 +2276,12 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expectEqual(@as(f32, 0), descriptors[7].object.box.padding.bottom);
     try std.testing.expectEqual(design.tokens.foundation.spacing_3, descriptors[7].object.box.padding.left);
     try std.testing.expectEqual(design.tokens.foundation.spacing_3, descriptors[7].object.box.padding.right);
-    try std.testing.expectEqual(design.tokens.dark.primary_foreground, descriptors[8].object.label.color);
-    const button_source = try sources.get(descriptors[8].object.label.source);
+    try std.testing.expectEqual(design.tokens.dark.primary_foreground, descriptors[8].object.text.color);
+    const button_source = try sources.get(descriptors[8].object.text.source);
     try std.testing.expectEqual(@as(usize, 1), button_source.candidates.len);
     try std.testing.expectEqual(medium_font, button_source.candidates[0]);
-    try std.testing.expectEqual(@as(?u32, 1), descriptors[8].object.label.max_lines);
-    try std.testing.expectEqual(text.ParagraphOverflow.ellipsis, descriptors[8].object.label.overflow);
+    try std.testing.expectEqual(@as(?u32, 1), descriptors[8].object.text.max_lines);
+    try std.testing.expectEqual(text.ParagraphOverflow.ellipsis, descriptors[8].object.text.overflow);
     try std.testing.expectEqual(descriptors[7].id, descriptors[8].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
     try std.testing.expectEqual(.button, ui.pending_handlers[0].kind);
@@ -2331,7 +2331,7 @@ test "Lua constructors are pure and reject callback children" {
         "ouro.column { children = { named = ouro.box { key = 'child' } } }",
         "ouro.column { {} }",
         "ouro.column { false }",
-        "ouro.label { key = 'leaf', text = 'Hello', ouro.box { key = 'child' } }",
+        "ouro.text { key = 'leaf', text = 'Hello', ouro.box { key = 'child' } }",
         "ouro.button { key = 'leaf', label = 'Hello', children = {} }",
     }) |source| try std.testing.expectError(error.LuaChunkFailed, execute(state, source));
 }

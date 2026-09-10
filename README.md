@@ -24,7 +24,7 @@ bridge lowers returned opaque UI descriptions into typed normalized descriptors
 during reconciliation. `ouro.component` separates one-time initialization from
 signal-driven rebuilds and retains keyed component state. Clean components reuse
 their descriptions; native reconciliation still consumes a window snapshot.
-The first ergonomic constructor composes `ouro.button` from Box and Label while
+The first ergonomic constructor composes `ouro.button` from Box and Text while
 the eventual generated constructor ABI remains intentionally unfrozen. A
 minimal Lua signal primitive tracks per-build-owner dependencies
 transactionally, rejects writes during builds, and wakes only subscribed dirty
@@ -104,7 +104,7 @@ display list at an explicit output scale, hit tests by descriptor ID, and
 provides platform-free pointer capture through `pointerPress`, `pointerMotion`,
 and `pointerRelease`.
 
-Text remains explicit: a caller that uses Label render objects must create and
+Text remains explicit: a caller that uses Text render objects must create and
 attach its own paragraph source/layout caches, and text-capable software
 rendering requires caller-owned glyph/font caches. Fontconfig discovery is
 always disabled for `ourokit_ui`; `-Dfreetype=true` only enables explicit glyph
@@ -162,12 +162,12 @@ deterministic shaping and rendering tests remain available.
 
 Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
 by default for cross targets. The
-`ouro.label { key, text, size?, alignment?, max_lines?, overflow? }` constructor
+`ouro.text { key, text, size?, alignment?, max_lines?, overflow? }` constructor
 retains width-independent text/style identity, resolves a cached paragraph from
 its current box constraints, and rasterizes through a backend-owned FreeType
 glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
 wrapping; unchanged constraints perform no layout acquisition or allocation.
-`ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.label` provide nested composition without
+`ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.text` provide nested composition without
 application-managed numeric IDs or parent links. Each widget constructor takes
 one props table and returns an opaque description; it does not emit UI when
 called. A window or story's `content` function returns one root description, or
@@ -175,11 +175,11 @@ nil for empty content. Containers take ordered array entries in the props table
 or an explicit dense `children = { ... }` table, never both or a child callback.
 Use a structural parent such as a row or column for multiple widgets and keep
 stable local `key` values. `ouro.button` composes a Box
-and Label using generated design tokens and retains hover, pressed, and disabled
+and Text using generated design tokens and retains hover, pressed, and disabled
 state in the widget layer. Buttons activate on press; release clears their
 pressed visual state. Buttons are content-sized by default, use token-derived
 height and horizontal padding, and constrain labels to one ellipsized line;
-applications may still declare an explicit width. The Box centers the Label
+applications may still declare an explicit width. The Box centers the Text
 within those padded bounds, separately from paragraph alignment. Button is not
 a renderer primitive. `ouro.listbox` and its direct `ouro.option` children
 provide a controlled single-selection list with one Tab stop and
@@ -220,7 +220,7 @@ zig build bench-paragraph -Doptimize=ReleaseFast \
 ```
 
 The optional end-to-end application benchmark compares one matched clickable
-Label/Button window against GTK 4 and Qt 6 under Wayland. GTK/Qt development
+Text/Button window against GTK 4 and Qt 6 under Wayland. GTK/Qt development
 packages are required only for this benchmark; normal Ourokit builds do not
 link either toolkit:
 

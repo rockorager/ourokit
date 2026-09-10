@@ -16,12 +16,12 @@ return ouro.app {
             key = "gallery",
             gap = 12,
             children = {
-              ouro.label {
+              ouro.text {
                 key = "heading",
                 text = "Ourokit controls",
                 size = 18,
               },
-              ouro.label {
+              ouro.text {
                 key = "count",
                 text = "Pressed " .. count() .. " times",
               },

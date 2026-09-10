@@ -11,7 +11,7 @@ local workspaces = ouro.shell.workspaces.connect()
 local function content()
   local state = workspaces()
   if not state.available then
-    return ouro.label { key = "unavailable", text = "Workspaces unavailable" }
+    return ouro.text { key = "unavailable", text = "Workspaces unavailable" }
   end
 
   local children = {}

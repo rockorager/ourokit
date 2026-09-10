@@ -324,7 +324,7 @@ pub const SourceGeneration = struct {
             self.ui_build.attachCallbacks(value.callbacks, &self.vm);
             self.font_candidates = .{value.primary_font};
             self.medium_font_candidates = .{value.medium_font};
-            self.ui_build.attachLabelText(value.paragraph_sources, &self.font_candidates, 1) catch |err| {
+            self.ui_build.attachText(value.paragraph_sources, &self.font_candidates, 1) catch |err| {
                 lua.recordDiagnosticError(
                     diagnostic,
                     allocator,
@@ -510,7 +510,7 @@ pub const SourceGeneration = struct {
         self.ui_build.attachCallbacks(services.callbacks, &self.vm);
         self.font_candidates = .{services.primary_font};
         self.medium_font_candidates = .{services.medium_font};
-        try self.ui_build.attachLabelText(services.paragraph_sources, &self.font_candidates, 1);
+        try self.ui_build.attachText(services.paragraph_sources, &self.font_candidates, 1);
         try self.ui_build.attachMediumText(&self.medium_font_candidates);
         self.ui_build.enableDeclarativeWidgets(services.theme);
         if (self.application.theme) |theme| self.ui_build.widget_theme = theme;

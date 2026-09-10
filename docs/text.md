@@ -125,7 +125,7 @@ safe boundary is rejected as invalid measurement.
 
 The output remains text-owned rather than being squeezed into the current
 single-`ShapeHandle` scene command: wrapped mixed-direction text can contain
-several visual and fallback-font spans. Scene resource leases and Label/render-
+several visual and fallback-font spans. Scene resource leases and Text/render-
 object lowering are the next integration boundary. Empty/newline-only line
 metrics also require an explicit line-style policy; they currently remain zero
 instead of silently selecting an arbitrary font. Dictionary/locale tailoring
@@ -216,32 +216,32 @@ final release destroys positioned storage and releases every candidate font.
 The cache is width-specific by design: wrapping remains text policy rather than
 a renderer operation.
 
-## Retained labels
+## Retained text
 
 `ParagraphSourceCache` owns and deduplicates width-independent UTF-8, base
 direction, language, logical size, ordered fallback fonts, and font-
-configuration revision behind generation-checked handles. A retained Label
+configuration revision behind generation-checked handles. A retained Text
 stores only this source identity and color. Its render-tree slot derives a
 width-specific `ParagraphHandle` when text/style or box constraints change,
 releasing the previous layout only after replacement succeeds. The normal
 unchanged-constraint fast path returns before cache acquisition, shaping, or
 allocation.
 
-Label layout uses the positioned paragraph's finite dimensions and emits a
-renderer-neutral paragraph scene command. Lua Labels therefore use the shared
+Text layout uses the positioned paragraph's finite dimensions and emits a
+renderer-neutral paragraph scene command. Lua Text nodes therefore use the shared
 itemization, fallback, bidi, wrapping, and positioning pipeline rather than a
 guessed single LTR run. A button remains composition: a padded Box containing a
-Label, with pointer/focus/command behavior owned by the instance layer.
-Under loose width constraints, Label reports the longest visible shaped line
+Text, with pointer/focus/command behavior owned by the instance layer.
+Under loose width constraints, Text reports the longest visible shaped line
 rather than reserving the parent's entire maximum width; a second cached layout
 at that fitted width resolves center/end alignment correctly. Tight constraints
-still force the Label to fill the width selected by its parent.
+still force the Text to fill the width selected by its parent.
 
 Paragraph presentation is also text-owned. Each positioned line stores a
 physical offset resolved from its UAX #9 base level, so `start` and `end` follow
 the line direction while `center` remains physical center. A finite layout width
 is part of paragraph cache identity. Optional `max_lines` truncates only at
-selected line boundaries and records whether content was omitted; Labels clip
+selected line boundaries and records whether content was omitted; Text nodes clip
 the resulting paragraph to their layout bounds. Lua exposes these as typed
 `alignment = "start" | "end" | "center" | "justify"`, positive `max_lines`, and
 `overflow = "clip" | "ellipsis"` fields. Ellipsis requires `max_lines`. It

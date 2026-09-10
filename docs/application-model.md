@@ -44,7 +44,7 @@ return ouro.app {
                 key = "content",
                 flex = 1,
                 children = {
-                  ouro.label { key = "title", text = "Example" },
+                  ouro.text { key = "title", text = "Example" },
                   ouro.button {
                     key = "run",
                     label = clicked() and "Clicked" or "Run",
@@ -76,7 +76,7 @@ never a function that emits widgets. For example, the array-entry form is:
 ```lua
 return ouro.column {
   key = "content",
-  ouro.label { key = "title", text = "Example" },
+  ouro.text { key = "title", text = "Example" },
   ouro.button { key = "run", label = "Run", on_press = function() end },
 }
 ```
@@ -101,7 +101,7 @@ local Counter = ouro.component(function(props)
     return ouro.column {
       key = "counter",
       gap = 12,
-      ouro.label { key = "value", text = props.title .. ": " .. count() },
+      ouro.text { key = "value", text = props.title .. ": " .. count() },
       ouro.button { key = "increment", label = "Increment", on_press = increment },
     }
   end
@@ -179,7 +179,7 @@ ouro.layer_surface {
   margins = { top = 0, right = 0, bottom = 0, left = 0 },
   keyboard_interactivity = "none", -- none, exclusive, or on_demand
   content = function()
-    return ouro.label { key = "clock", text = "12:00" }
+    return ouro.text { key = "clock", text = "12:00" }
   end,
 }
 ```
@@ -309,12 +309,12 @@ layout, paint, clip, and hit testing. Scenes are immutable backend-neutral
 output.
 
 The implemented headless render-tree kernel starts with Box, Flex, Stack, and a
-constraint-aware Label backed by immutable paragraph source and layout handles.
+constraint-aware Text backed by immutable paragraph source and layout handles.
 It uses one-way minimum/maximum box constraints and logical `f32` geometry.
 Parents position children after each child chooses a finite constrained size.
 Flex factors and stack offsets are typed edge metadata, not wrapper nodes. The
 fixed-capacity tree caches unchanged constraint results, allocates paragraph
-work only when Label inputs or width change, separates paint-only from layout
+work only when Text inputs or width change, separates paint-only from layout
 invalidation, builds ordered display lists, and performs reverse-order hit
 testing without Wayland or Lua.
 
@@ -368,10 +368,10 @@ The supported defaults are:
 | `widgets.button` | `height`, `padding_x`, `radius`, `border_width`, `font_size`, `background`, `foreground`, `border`, `hover`, `pressed`, `disabled`, `disabled_foreground`, `focus` |
 | `widgets.text_input` | Same as button except `hover` and `pressed` |
 | `widgets.option` | Same as button except `disabled`, `disabled_foreground`, and `focus`; `pressed` is the selected background |
-| `widgets.label` | `foreground`, `font_size` |
+| `widgets.text` | `foreground`, `font_size` |
 
 Widget defaults override shared controls/typography values. Explicit widget
-fields override those defaults; a label's existing `size` prop takes precedence
+fields override those defaults; a text node's existing `size` prop takes precedence
 over `font_size`. Font sizes and theme heights must be positive; other metrics
 are non-negative logical pixels. A zero border width disables the border,
 including its focus-color treatment. A theme does not change widget behavior,
@@ -452,7 +452,7 @@ Hover enter/leave transitions and motion/button/axis events use a bounded ring
 queue. Queue overflow cannot partially change hover state. Application code
 observes this data only from the task phase. The current proof resolves an
 active target's instance-owned typed pointer binding, bubbling from a visual
-descendant such as a Label to its owning widget instance and scope, then spawns
+descendant such as a Text to its owning widget instance and scope, then spawns
 its registry-referenced Lua function as an independently yieldable coroutine task.
 Bindings use generation-checked instance handles; stale targets are dropped.
 The application-facing binding is constructor-specific, currently
@@ -476,10 +476,10 @@ storage for transactional validation. Constructors do not emit descriptors
 during Lua evaluation, and unattached descriptions do not become UI. There is
 no generic string `type` parser or application-facing descriptor escape hatch.
 During lowering, `ouro.row` and `ouro.column` normalize to Flex,
-`ouro.scroll` normalizes to a single-child Scroll viewport, `ouro.label`
-normalizes to Label, and `ouro.button` normalizes to Box plus Label. The
+`ouro.scroll` normalizes to a single-child Scroll viewport, `ouro.text`
+normalizes to Text, and `ouro.button` normalizes to Box plus Text. The
 single-selection `ouro.listbox` composes a vertical Flex with direct
-`ouro.option` Box/Label children. It is one focus stop, uses integer values,
+`ouro.option` Box/Text children. It is one focus stop, uses integer values,
 and calls `on_select(value)` on primary-button press or Up/Down/Home/End navigation;
 the application remains the source of truth through the `selected` property.
 Options are transparent over their containing surface at rest and retain hover
@@ -497,7 +497,7 @@ ouro.virtual_list {
   item_key = function(index) return "person-" .. index end,
   item_height = 40,
   render_item = function(index)
-    return ouro.label { key = "name", text = "Person " .. index }
+    return ouro.text { key = "name", text = "Person " .. index }
   end,
 }
 ```
@@ -534,7 +534,7 @@ window owners also read one shared signal, proving dependency identity across
 separate per-window registries sharing one VM.
 
 For the benchmark slice, `ouro.button` owns composition and input policy while
-lowering to only Box and Label render objects. Button is not a render object. Its
+lowering to only Box and Text render objects. Button is not a render object. Its
 stable string key is normalized into domain-separated semantic IDs; duplicate
 or colliding IDs are rejected by snapshot validation rather than silently
 aliasing instances. A language-neutral widget registry retains enabled,
@@ -542,7 +542,7 @@ hovered, pressed, and armed state across reconciliation. Enabled Buttons
 activate on left-button press; release clears the pressed visual regardless of
 the pointer's current position. CQE and Wayland
 dispatch still only enqueue state; callbacks spawn Lua tasks during the task
-phase. Labels pass valid UTF-8 through paragraph itemization, bidi, fallback
+phase. Text nodes pass valid UTF-8 through paragraph itemization, bidi, fallback
 shaping, and width-dependent wrapping.
 
 Instances also retain focusability and deterministic descriptor traversal
@@ -600,7 +600,7 @@ register there, but external enumeration never walks render objects.
 Headless retained layout, software glyph rendering, deterministic scene
 logging, Button interaction state tests, and semantic snapshots are available
 now. The semantic snapshot is a validated, allocation-free-after-init retained
-tree of groups, labels, and Buttons. Lua text is copied into an inactive buffer
+tree of groups, text, and Buttons. Lua text is copied into an inactive buffer
 before another Lua API call can collect it, and the buffer becomes visible only
 when the surrounding build transaction commits. A future design-system gallery
 will expand this path without requiring Wayland or Vulkan.

@@ -62,7 +62,7 @@ pub const Scroll = struct {
 
 /// Width-independent paragraph identity. The retained render-tree slot derives
 /// and caches a width-specific positioned layout from current constraints.
-pub const Label = struct {
+pub const Text = struct {
     source: ParagraphSourceHandle,
     color: Color,
     alignment: paragraph_style.Alignment = .start,
@@ -103,7 +103,7 @@ pub const Object = union(enum) {
     flex: Flex,
     stack: Stack,
     scroll: Scroll,
-    label: Label,
+    text: Text,
     text_input: TextInput,
 };
 

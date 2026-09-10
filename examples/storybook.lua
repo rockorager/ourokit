@@ -6,7 +6,7 @@ local function button_story(label, enabled)
     key = "content",
     gap = 12,
     children = {
-      ouro.label { key = "heading", text = label, size = 18 },
+      ouro.text { key = "heading", text = label, size = 18 },
       ouro.button { key = "button", label = "Continue", enabled = enabled },
     },
   }
@@ -14,7 +14,7 @@ end
 
 local function scroll_story()
   local children = {
-    ouro.label { key = "heading", text = "Application settings", size = 18 },
+    ouro.text { key = "heading", text = "Application settings", size = 18 },
   }
   for index = 1, 12 do
     children[#children + 1] = ouro.button {
@@ -51,22 +51,22 @@ return ouro.storybook {
   title = "Ourokit built-in widgets",
   stories = {
     ouro.story {
-      id = "label/default",
-      group = "Label",
+      id = "text/default",
+      group = "Text",
       name = "Default",
       viewport = { width = 360, height = 160 },
       content = function()
         return ouro.column {
           key = "content",
           children = {
-            ouro.label { key = "label", text = "A default Ourokit label" },
+            ouro.text { key = "label", text = "Default Ourokit text" },
           },
         }
       end,
     },
     ouro.story {
-      id = "label/sizes",
-      group = "Label",
+      id = "text/sizes",
+      group = "Text",
       name = "Sizes",
       viewport = { width = 360, height = 180 },
       content = function()
@@ -74,16 +74,16 @@ return ouro.storybook {
           key = "content",
           gap = 8,
           children = {
-            ouro.label { key = "small", text = "Small label", size = 12 },
-            ouro.label { key = "body", text = "Body label", size = 14 },
-            ouro.label { key = "heading", text = "Heading label", size = 18 },
+            ouro.text { key = "small", text = "Small text", size = 12 },
+            ouro.text { key = "body", text = "Body text", size = 14 },
+            ouro.text { key = "heading", text = "Heading text", size = 18 },
           },
         }
       end,
     },
     ouro.story {
-      id = "label/wrapping",
-      group = "Label",
+      id = "text/wrapping",
+      group = "Text",
       name = "Constraint-aware wrapping",
       viewport = { width = 280, height = 220 },
       content = function()
@@ -91,18 +91,18 @@ return ouro.storybook {
           key = "content",
           gap = 8,
           children = {
-            ouro.label { key = "heading", text = "Wrapped paragraph", size = 18 },
-            ouro.label {
+            ouro.text { key = "heading", text = "Wrapped paragraph", size = 18 },
+            ouro.text {
               key = "paragraph",
-              text = "Ourokit lays this label out from the width supplied by its parent and reuses the positioned paragraph until those constraints change.",
+              text = "Ourokit lays this text out from the width supplied by its parent and reuses the positioned paragraph until those constraints change.",
             },
           },
         }
       end,
     },
     ouro.story {
-      id = "label/mixed-direction",
-      group = "Label",
+      id = "text/mixed-direction",
+      group = "Text",
       name = "Mixed direction and fallback",
       viewport = { width = 320, height = 200 },
       content = function()
@@ -110,8 +110,8 @@ return ouro.storybook {
           key = "content",
           gap = 8,
           children = {
-            ouro.label { key = "heading", text = "English and العربية", size = 18 },
-            ouro.label {
+            ouro.text { key = "heading", text = "English and العربية", size = 18 },
+            ouro.text {
               key = "paragraph",
               text = "Save حفظ now, then continue متابعة the workflow.",
             },
@@ -120,8 +120,8 @@ return ouro.storybook {
       end,
     },
     ouro.story {
-      id = "label/alignment",
-      group = "Label",
+      id = "text/alignment",
+      group = "Text",
       name = "Paragraph alignment",
       viewport = { width = 420, height = 240 },
       content = function()
@@ -129,17 +129,17 @@ return ouro.storybook {
           key = "content",
           gap = 10,
           children = {
-            ouro.label { key = "start", text = "Start aligned", alignment = "start" },
-            ouro.label { key = "center", text = "Center aligned", alignment = "center" },
-            ouro.label { key = "end", text = "End aligned", alignment = "end" },
-            ouro.label {
+            ouro.text { key = "start", text = "Start aligned", alignment = "start" },
+            ouro.text { key = "center", text = "Center aligned", alignment = "center" },
+            ouro.text { key = "end", text = "End aligned", alignment = "end" },
+            ouro.text {
               key = "rtl-start",
               text = "بداية الفقرة العربية",
               alignment = "start",
             },
-            ouro.label {
+            ouro.text {
               key = "justified",
-              text = "Justified labels expand eligible spaces on every soft-wrapped line except the final line.",
+              text = "Justified text expands eligible spaces on every soft-wrapped line except the final line.",
               alignment = "justify",
             },
           },
@@ -147,8 +147,8 @@ return ouro.storybook {
       end,
     },
     ouro.story {
-      id = "label/max-lines",
-      group = "Label",
+      id = "text/max-lines",
+      group = "Text",
       name = "Maximum lines",
       viewport = { width = 300, height = 180 },
       content = function()
@@ -156,13 +156,13 @@ return ouro.storybook {
           key = "content",
           gap = 10,
           children = {
-            ouro.label {
+            ouro.text {
               key = "limited",
               text = "This paragraph is deliberately long enough to wrap beyond two visible lines while the retained layout clips the remaining lines.",
               max_lines = 2,
               overflow = "ellipsis",
             },
-            ouro.label {
+            ouro.text {
               key = "rtl-limited",
               text = "احفظ هذا المستند ثم تابع إلى خطوة سير العمل التالية",
               max_lines = 1,
@@ -182,7 +182,7 @@ return ouro.storybook {
           key = "content",
           gap = 12,
           children = {
-            ouro.label { key = "heading", text = "Horizontal row", size = 18 },
+            ouro.text { key = "heading", text = "Horizontal row", size = 18 },
             ouro.row {
               key = "items",
               gap = 8,
@@ -206,7 +206,7 @@ return ouro.storybook {
           key = "content",
           gap = 8,
           children = {
-            ouro.label { key = "heading", text = "Vertical column", size = 18 },
+            ouro.text { key = "heading", text = "Vertical column", size = 18 },
             ouro.button { key = "first", label = "First" },
             ouro.button { key = "second", label = "Second" },
             ouro.button { key = "third", label = "Third" },
@@ -382,7 +382,7 @@ return ouro.storybook {
           key = "content",
           gap = 12,
           children = {
-            ouro.label {
+            ouro.text {
               key = "count",
               text = "Pressed " .. count() .. " times",
               size = 18,

@@ -16,7 +16,7 @@ local function fixed_content()
       return ouro.box {
         key = "row",
         padding = 10,
-        ouro.label { key = "name", text = "Person " .. index },
+        ouro.text { key = "name", text = "Person " .. index },
       }
     end,
   }
@@ -43,7 +43,7 @@ local function variable_content()
         local open = expanded[key] == true
         local detail = variable_text[index % #variable_text + 1]
         local children = {
-          ouro.label {
+          ouro.text {
             key = "description",
             text = "Person " .. index .. ": " .. detail,
           },
@@ -57,7 +57,7 @@ local function variable_content()
           },
         }
         if open then
-          children[#children + 1] = ouro.label {
+          children[#children + 1] = ouro.text {
             key = "details",
             text = "Expanded details remain durable in keyed application state after this row scrolls out of the viewport.",
           }

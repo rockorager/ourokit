@@ -34,16 +34,16 @@ return ouro.app {
               key = "body",
               gap = 20,
               cross_alignment = "stretch",
-              ouro.label { key = "title", text = "Allow a screenshot?", size = 24 },
-              ouro.label {
+              ouro.text { key = "title", text = "Allow a screenshot?", size = 24 },
+              ouro.text {
                 key = "requester",
                 text = (request.app_name or "An application") .. " wants to capture your screen.",
               },
-              ouro.label {
+              ouro.text {
                 key = "privacy",
                 text = "Your screen may contain private information.",
               },
-              ouro.label { key = "scope", text = "This permission applies to one screenshot." },
+              ouro.text { key = "scope", text = "This permission applies to one screenshot." },
               ouro.row {
                 key = "buttons",
                 gap = 12,

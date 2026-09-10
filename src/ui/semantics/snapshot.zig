@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Role = enum { group, label, button, text_field, listbox, option };
+pub const Role = enum { group, text, button, text_field, listbox, option };
 
 /// Borrowed normalized semantic data emitted beside render descriptors during
 /// one build. Text is copied into the retained Snapshot before another Lua call.
@@ -97,7 +97,7 @@ pub const Snapshot = struct {
             if (descriptor.parent) |parent| if (!indexContains(self.validation_index, parent))
                 return error.SemanticParentMustPrecedeChild;
             if (!indexPut(self.validation_index, descriptor.id)) return error.DuplicateSemanticId;
-            if ((descriptor.role == .label or descriptor.role == .button or descriptor.role == .option) and descriptor.label.len == 0)
+            if ((descriptor.role == .text or descriptor.role == .button or descriptor.role == .option) and descriptor.label.len == 0)
                 return error.SemanticLabelRequired;
         }
     }
@@ -240,7 +240,7 @@ test "semantic snapshots are deterministic, validated, and replace atomically" {
     defer snapshot.deinit();
     const initial = [_]Descriptor{
         .{ .id = 1, .parent = null, .role = .group, .key = "content" },
-        .{ .id = 2, .parent = 1, .role = .label, .key = "heading", .label = "Settings" },
+        .{ .id = 2, .parent = 1, .role = .text, .key = "heading", .label = "Settings" },
         .{ .id = 3, .parent = 1, .role = .button, .key = "save", .label = "Save", .enabled = false },
     };
     try snapshot.validate(&initial);
@@ -254,7 +254,7 @@ test "semantic snapshots are deterministic, validated, and replace atomically" {
     try std.testing.expectError(error.InvalidSemanticPath, snapshot.findPath("content//save"));
     try std.testing.expect(!(try snapshot.node(2)).enabled);
     try std.testing.expectError(error.SemanticParentMustPrecedeChild, snapshot.validate(&.{
-        .{ .id = 4, .parent = 9, .role = .label, .label = "Invalid" },
+        .{ .id = 4, .parent = 9, .role = .text, .label = "Invalid" },
     }));
     try std.testing.expectEqualStrings("Settings", (try snapshot.node(1)).label);
 }

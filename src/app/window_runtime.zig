@@ -1394,8 +1394,8 @@ pub const WindowRuntime = struct {
 
         const content_render = try self.instances.renderObject(update.content);
         var content = try self.tree.objectAt(content_render);
-        if (content != .label) return error.ListBoxOptionContentRenderObjectMismatch;
-        content.label.color = update.visual.foreground;
+        if (content != .text) return error.ListBoxOptionContentRenderObjectMismatch;
+        content.text.color = update.visual.foreground;
         try self.tree.update(content_render, content);
     }
 

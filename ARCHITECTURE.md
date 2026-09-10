@@ -239,8 +239,8 @@ ordered children; unattached descriptions have no UI effects. Builds return one
 root description or nil. Containers accept array entries or an explicit dense
 `children` table, never callback children. Native lowering walks the returned
 tree parent-first: rows and columns become Flex, scroll becomes a single-child
-viewport with instance-retained offset, labels become Label, and buttons become
-Box plus Label and a typed widget binding. A bounded lowering context derives
+viewport with instance-retained offset, text becomes Text, and buttons become
+Box plus Text and a typed widget binding. A bounded lowering context derives
 identity and parent links from stable local keys and resolves inherited themes
 and parent data. No Button render object or Lua theme mirror is introduced.
 
@@ -410,11 +410,11 @@ presentation consume the same already-positioned visual spans. The existing
 single-run glyph command remains a deliberately narrower shape-cache ABI rather
 than being stretched to represent wrapped mixed-direction lines.
 
-Retained Labels hold a generation-checked `ParagraphSourceHandle` identifying
+Retained Text nodes hold a generation-checked `ParagraphSourceHandle` identifying
 width-independent text/style/font inputs. Their render-tree slots own the
 current width-specific `ParagraphHandle`; a text/style or constraint change
 replaces that lease transactionally. Unchanged constraints return through the
-normal layout cache before paragraph lookup, shaping, or allocation. Lua Labels
+normal layout cache before paragraph lookup, shaping, or allocation. Lua Text nodes
 can therefore wrap mixed-direction text without moving text policy into Lua or
 either renderer.
 Empty-line metrics remain an open line-style policy rather than inheriting an
@@ -454,9 +454,9 @@ references. Font cache teardown follows shape-cache teardown. Refreshing the
 Fontconfig snapshot and revision is future safe-point orchestration, not a
 renderer concern.
 
-Label owns no font or rasterizer state. It retains width-independent paragraph
+Text owns no font or rasterizer state. It retains width-independent paragraph
 source identity, derives positioned lines from one-way constraints, and emits a
-paragraph command. Button is Box + Label composition with behavior in a
+paragraph command. Button is Box + Text composition with behavior in a
 language-neutral widget registry, not another core render object. That registry
 retains hover, pressed, disabled, and pointer-armed state across reconciliation.
 Pointer capture ensures a release reaches the pressed target, while release-
@@ -581,7 +581,7 @@ has already been validated.
 
 Headless development remains first-class: deterministic software buffers,
 scene logging, Button interaction tests, and retained semantic snapshots exist
-now. Semantic groups, labels, and Buttons validate parent ordering, identity,
+now. Semantic groups, text, and Buttons validate parent ordering, identity,
 required labels, capacity, and disabled state; double buffering keeps the prior
 snapshot visible until a complete build commits. A larger design-system gallery
 remains planned without requiring Wayland or Vulkan.

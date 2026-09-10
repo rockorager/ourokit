@@ -38,7 +38,7 @@ pub const Widgets = struct {
     button: Overrides = .{},
     text_input: Overrides = .{},
     option: Overrides = .{},
-    label: Overrides = .{},
+    text: Overrides = .{},
 };
 
 pub const Overrides = struct {
@@ -108,7 +108,7 @@ fn merge(comptime T: type, state: *c.State, index: c_int, base: T, comptime owne
 }
 
 fn supportsWidgetField(comptime widget: []const u8, comptime field: []const u8) bool {
-    if (std.mem.eql(u8, widget, "label"))
+    if (std.mem.eql(u8, widget, "text"))
         return std.mem.eql(u8, field, "foreground") or std.mem.eql(u8, field, "font_size");
     if (std.mem.eql(u8, widget, "text_input"))
         return !std.mem.eql(u8, field, "hover") and !std.mem.eql(u8, field, "pressed");
@@ -200,7 +200,7 @@ test "lua theme inherits nested overrides and preserves zero metrics" {
         \\  typography = {size = 19, family = 'Noto 日本語'},
         \\  controls = {height = 41, radius = 7, border_width = 2},
         \\  widgets = {button = {padding_x = 13, foreground = '#654321'},
-        \\             label = {font_size = 17}, option = {height = 23},
+        \\             text = {font_size = 17}, option = {height = 23},
         \\             text_input = {border_width = 3}}
         \\}
     , defaults);
@@ -255,7 +255,7 @@ test "lua theme accepts every generated color and validates each widget field se
         .{ "button", ",height,padding_x,radius,border_width,font_size,background,foreground,border,hover,pressed,disabled,disabled_foreground,focus," },
         .{ "text_input", ",height,padding_x,radius,border_width,font_size,background,foreground,border,disabled,disabled_foreground,focus," },
         .{ "option", ",height,padding_x,radius,border_width,font_size,background,foreground,border,hover,pressed," },
-        .{ "label", ",foreground,font_size," },
+        .{ "text", ",foreground,font_size," },
     };
     inline for (supported) |widget| {
         inline for (std.meta.fields(Overrides)) |field| {
@@ -288,7 +288,8 @@ test "lua theme rejects unknown fields and invalid values without changing the s
         .{ "return {controls={padding=1}}", error.UnknownThemeField },
         .{ "return {widgets={slider={}}}", error.UnknownThemeField },
         .{ "return {widgets={button={children={}}}}", error.UnknownThemeField },
-        .{ "return {widgets={label={[1]=2}}}", error.UnknownThemeField },
+        .{ "return {widgets={text={[1]=2}}}", error.UnknownThemeField },
+        .{ "return {widgets={label={font_size=17}}}", error.UnknownThemeField },
         .{ "return {colors=false}", error.InvalidThemeType },
         .{ "return {typography=7}", error.InvalidThemeType },
         .{ "return {controls='x'}", error.InvalidThemeType },
@@ -325,7 +326,7 @@ test "lua theme rejects unknown fields and invalid values without changing the s
             c.lua_settop(state, 0);
         }
     }
-    inline for (.{ "controls={height=0}", "typography={size=0}", "widgets={label={font_size=0}}", "widgets={option={height=0}}" }) |fields| {
+    inline for (.{ "controls={height=0}", "typography={size=0}", "widgets={text={font_size=0}}", "widgets={option={height=0}}" }) |fields| {
         try loadTestValue(state, "return {" ++ fields ++ "}");
         try std.testing.expectError(error.InvalidThemeNumber, apply(state, 1, .{ .colors = tokens.light }));
         try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));

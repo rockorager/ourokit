@@ -7,12 +7,12 @@ local Counter = ouro.component(function(props)
     renders = renders + 1
     return ouro.column {
       key = "counter", gap = 10, flex = props.flex,
-      ouro.label { key = "title", text = props.title, size = 18 },
+      ouro.text { key = "title", text = props.title, size = 18 },
       ouro.button {
         key = "increment", label = "Count: " .. count(),
         on_press = function() count:set(count() + 1) end,
       },
-      ouro.label { key = "renders", text = "Counter renders: " .. renders },
+      ouro.text { key = "renders", text = "Counter renders: " .. renders },
     }
   end
 end)
@@ -32,8 +32,8 @@ local Demo = ouro.component(function()
     else counters = { first, second } end
     return ouro.column {
       key = "content", gap = 20,
-      ouro.label { key = "heading", text = "Retained Lua components", size = 24 },
-      ouro.label { key = "renders", text = "Parent renders: " .. renders },
+      ouro.text { key = "heading", text = "Retained Lua components", size = 24 },
+      ouro.text { key = "renders", text = "Parent renders: " .. renders },
       ouro.row { key = "counters", gap = 40, children = counters },
       ouro.row {
         key = "controls", gap = 10,
@@ -41,7 +41,7 @@ local Demo = ouro.component(function()
         ouro.button { key = "reverse", label = "Reorder", on_press = function() reversed:set(not reversed()) end },
         ouro.button { key = "visible", label = "Unmount / remount A", on_press = function() visible:set(not visible()) end },
       },
-      ouro.label { key = "help", text = "Increment one counter: its sibling and parent do not render. Reorder and rename preserve state." },
+      ouro.text { key = "help", text = "Increment one counter: its sibling and parent do not render. Reorder and rename preserve state." },
     }
   end
 end)

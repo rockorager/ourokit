@@ -61,8 +61,8 @@ return ouro.app {
             key = "app", padding = 24,
             ouro.column {
               key = "body", gap = 24, cross_alignment = "stretch",
-              ouro.label { key = "title", text = "Contacts", size = 28 },
-              ouro.label { key = "subtitle", text = "One address book. With or without a window." },
+              ouro.text { key = "title", text = "Contacts", size = 28 },
+              ouro.text { key = "subtitle", text = "One address book. With or without a window." },
               ouro.row {
                 key = "panels", gap = 24, cross_alignment = "stretch",
                 ouro.box {
@@ -75,9 +75,9 @@ return ouro.app {
                 },
                 ouro.column {
                   key = "details", gap = 16, flex = 1,
-                  ouro.label { key = "name", text = person.name, size = 22 },
-                  ouro.label { key = "email", text = person.email },
-                  ouro.label { key = "note", text = "Changes through Varlink appear here." },
+                  ouro.text { key = "name", text = person.name, size = 22 },
+                  ouro.text { key = "email", text = person.email },
+                  ouro.text { key = "note", text = "Changes through Varlink appear here." },
                   ouro.button {
                     key = "quit", label = "Quit", width = 100, height = 40,
                     on_press = function() ouro.exit(0) end,

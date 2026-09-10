@@ -44,7 +44,7 @@ const Fixture = struct {
         try self.ui.init(self.state, &self.descriptors);
         self.ui.attachSignals(&self.signals);
         try self.ui.attachSemantics(&self.semantic_storage);
-        try self.ui.attachLabelText(&self.sources, &self.font, 1);
+        try self.ui.attachText(&self.sources, &self.font, 1);
         const theme = @import("../design/root.zig").tokens.light;
         self.ui.enableDeclarativeWidgets(theme);
         try self.runtime.init(std.testing.allocator, &self.scheduler, self.scope, .{ .slot = 0, .generation = 1 }, theme.background, theme.primary, theme.foreground, theme.input, theme.ring, &self.signals, &self.sources, &self.paragraphs, .{});
@@ -248,7 +248,7 @@ test "virtual wrapped rows retain deep within-row offset across width changes" {
         \\function build() return ouro.virtual_list {
         \\  key = 'people', item_count = 10000, estimated_item_height = 20,
         \\  item_key = function(i) return 'person-' .. i end,
-        \\  render_item = function() return ouro.label { key = 'text', size = 24,
+        \\  render_item = function() return ouro.text { key = 'text', size = 24,
         \\    text = 'A long profile with several lines of text. A long profile with several lines of text. A long profile with several lines of text. A long profile with several lines of text.' } end,
         \\} end
     );

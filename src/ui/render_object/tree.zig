@@ -25,7 +25,7 @@ pub const LayoutError = error{
     FlexInUnboundedAxis,
     ScrollInUnboundedAxis,
     InvalidParentData,
-    LabelHasChildren,
+    TextHasChildren,
     TextInputHasChildren,
     ParagraphResourcesRequired,
     StaleParagraphSource,
@@ -57,7 +57,7 @@ const Slot = struct {
 };
 
 /// Fixed-capacity storage for the closed typed render-object set. Unchanged
-/// layout is allocation-free; dirty Labels may populate the paragraph cache.
+/// layout is allocation-free; dirty Text objects may populate the paragraph cache.
 /// This is deliberately not the widget/instance tree.
 pub const Tree = struct {
     allocator: std.mem.Allocator,
@@ -81,7 +81,7 @@ pub const Tree = struct {
         self.* = undefined;
     }
 
-    /// Both caches must outlive this tree. Labels retain width-independent
+    /// Both caches must outlive this tree. Text objects retain width-independent
     /// sources and tree slots retain their current width-specific layouts.
     pub fn attachTextCaches(
         self: *Tree,
@@ -139,9 +139,9 @@ pub const Tree = struct {
 
     pub fn validateRetain(self: *Tree, object: types.Object) !void {
         switch (object) {
-            .label => |label| {
+            .text => |value| {
                 const cache = self.paragraph_sources orelse return error.TextCacheRequired;
-                try cache.validateRetain(label.source);
+                try cache.validateRetain(value.source);
             },
             else => {},
         }
@@ -164,7 +164,7 @@ pub const Tree = struct {
         try validateParentData(parent_slot.object, data);
         if ((parent_slot.object == .box or parent_slot.object == .scroll) and
             parent_slot.first_child != null) return error.BoxAlreadyHasChild;
-        if (parent_slot.object == .label) return error.LabelHasChildren;
+        if (parent_slot.object == .text) return error.TextHasChildren;
         if (parent_slot.object == .text_input) return error.TextInputHasChildren;
 
         child_slot.parent = parent;
@@ -457,7 +457,7 @@ pub const Tree = struct {
             .flex => |value| try flex_impl.layout(value, self, handle, constraints),
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
             .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
-            .label => try self.layoutLabel(handle, object.label, constraints),
+            .text => try self.layoutText(handle, object.text, constraints),
             .text_input => try self.layoutTextInput(handle, object.text_input, constraints),
         };
         if (!validSize(result)) return error.InvalidLayoutSize;
@@ -519,7 +519,7 @@ pub const Tree = struct {
             .flex => false,
             .stack => |value| value.clip,
             .scroll => true,
-            .label => |value| paint: {
+            .text => |value| paint: {
                 const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
                 try builder.pushClip(bounds);
                 try builder.paragraph(paragraph_handle, origin, value.color);
@@ -571,7 +571,7 @@ pub const Tree = struct {
                 break :paint true;
             },
         };
-        if (clips and target.object != .label and target.object != .text_input)
+        if (clips and target.object != .text and target.object != .text_input)
             try builder.pushClip(bounds);
         var child = target.first_child;
         while (child) |child_handle| {
@@ -657,15 +657,15 @@ pub const Tree = struct {
         return target;
     }
 
-    fn layoutLabel(
+    fn layoutText(
         self: *Tree,
         handle: NodeHandle,
-        label: types.Label,
+        value: types.Text,
         constraints: Constraints,
     ) LayoutError!SizeF {
         const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
         const paragraphs = self.paragraphs orelse return error.ParagraphResourcesRequired;
-        const source = sources.get(label.source) catch return error.StaleParagraphSource;
+        const source = sources.get(value.source) catch return error.StaleParagraphSource;
         var request: text.ParagraphCache.Request = .{
             .utf8 = source.utf8,
             .base_direction = source.base_direction,
@@ -678,9 +678,9 @@ pub const Tree = struct {
             .candidates = source.candidates,
             .configuration_revision = source.configuration_revision,
             .style = .{
-                .alignment = label.alignment,
-                .max_lines = label.max_lines,
-                .overflow = label.overflow,
+                .alignment = value.alignment,
+                .max_lines = value.max_lines,
+                .overflow = value.overflow,
             },
         };
         var layout_handle = paragraphs.acquire(request) catch return error.ParagraphLayoutFailed;
@@ -763,9 +763,9 @@ pub const Tree = struct {
 
     fn retainObject(self: *Tree, object: types.Object) !void {
         switch (object) {
-            .label => |label| {
+            .text => |value| {
                 const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
-                try sources.retain(label.source);
+                try sources.retain(value.source);
             },
             .text_input => |input| {
                 const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
@@ -777,7 +777,7 @@ pub const Tree = struct {
 
     fn releaseObject(self: *Tree, object: types.Object) void {
         switch (object) {
-            .label => |label| self.paragraph_sources.?.release(label.source) catch unreachable,
+            .text => |value| self.paragraph_sources.?.release(value.source) catch unreachable,
             .text_input => |input| self.paragraph_sources.?.release(input.source) catch unreachable,
             else => {},
         }
@@ -796,9 +796,9 @@ fn validateObject(object: types.Object) !void {
         .flex => |value| try flex_impl.validate(value),
         .stack => {},
         .scroll => {},
-        .label => |label| {
-            if (label.max_lines == 0) return error.InvalidMaxLines;
-            if (label.overflow == .ellipsis and label.max_lines == null)
+        .text => |value| {
+            if (value.max_lines == 0) return error.InvalidMaxLines;
+            if (value.overflow == .ellipsis and value.max_lines == null)
                 return error.EllipsisRequiresMaxLines;
         },
         .text_input => |input| {
@@ -827,7 +827,7 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
             .flex => return error.InvalidParentData,
         },
         .scroll => if (data != .none) return error.InvalidParentData,
-        .label => return error.LabelHasChildren,
+        .text => return error.TextHasChildren,
         .text_input => return error.TextInputHasChildren,
     }
 }
@@ -845,10 +845,10 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
         .stack => false,
         .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
-        .label => |old_label| !sameSource(old_label.source, new.label.source) or
-            old_label.alignment != new.label.alignment or
-            old_label.max_lines != new.label.max_lines or
-            old_label.overflow != new.label.overflow,
+        .text => |old_text| !sameSource(old_text.source, new.text.source) or
+            old_text.alignment != new.text.alignment or
+            old_text.max_lines != new.text.max_lines or
+            old_text.overflow != new.text.overflow,
         .text_input => |old_input| !sameSource(old_input.source, new.text_input.source) or
             old_input.alignment != new.text_input.alignment,
     };
@@ -884,7 +884,7 @@ fn sourceChanged(old: types.Object, new: types.Object) bool {
 
 fn objectSource(object: types.Object) ?text.ParagraphSourceHandle {
     return switch (object) {
-        .label => |label| label.source,
+        .text => |value| value.source,
         .text_input => |input| input.source,
         else => null,
     };
@@ -1087,7 +1087,7 @@ test "box fill dimensions use bounded parent maxima" {
     );
 }
 
-test "labels cache width-specific mixed-script paragraphs across unchanged layout" {
+test "text objects cache width-specific mixed-script paragraphs across unchanged layout" {
     const scene = @import("../../scene/root.zig");
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
@@ -1117,44 +1117,44 @@ test "labels cache width-specific mixed-script paragraphs across unchanged layou
     try tree.init(std.testing.allocator, 1);
     tree.attachTextCaches(&sources, &paragraphs);
     defer tree.deinit();
-    const label = try tree.create(.{ .label = .{
+    const paragraph = try tree.create(.{ .text = .{
         .source = source,
         .color = Color.rgba(20, 40, 80, 255),
     } });
     try sources.release(source);
 
-    const wide_size = try tree.layout(label, .{ .max_width = 180, .max_height = 200 });
+    const wide_size = try tree.layout(paragraph, .{ .max_width = 180, .max_height = 200 });
     try std.testing.expect(wide_size.width < 180);
     var commands: [3]scene.Command = undefined;
     var builder = try scene_builder.Builder.init(&commands, 1);
-    try tree.buildScene(label, &builder);
+    try tree.buildScene(paragraph, &builder);
     const wide_layout = builder.displayList().commands[1].paragraph.layout;
-    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(label));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(paragraph));
     try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
 
-    _ = try tree.layout(label, .{ .max_width = 180, .max_height = 200 });
-    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(label));
+    _ = try tree.layout(paragraph, .{ .max_width = 180, .max_height = 200 });
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(paragraph));
     try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
 
-    const narrow_size = try tree.layout(label, .{ .max_width = 70, .max_height = 200 });
+    const narrow_size = try tree.layout(paragraph, .{ .max_width = 70, .max_height = 200 });
     try std.testing.expect(narrow_size.height > wide_size.height);
-    try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(label));
+    try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(paragraph));
     try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
     builder = try scene_builder.Builder.init(&commands, 1);
-    try tree.buildScene(label, &builder);
+    try tree.buildScene(paragraph, &builder);
     const narrow_layout = builder.displayList().commands[1].paragraph.layout;
     try std.testing.expect(!sameParagraph(wide_layout, narrow_layout));
 
-    const tight_size = try tree.layout(label, .{
+    const tight_size = try tree.layout(paragraph, .{
         .min_width = 180,
         .max_width = 180,
         .max_height = 200,
     });
     try std.testing.expectEqual(@as(f32, 180), tight_size.width);
-    try std.testing.expectEqual(@as(usize, 3), try tree.layoutCount(label));
+    try std.testing.expectEqual(@as(usize, 3), try tree.layoutCount(paragraph));
     try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
 
-    try tree.destroy(label);
+    try tree.destroy(paragraph);
     try std.testing.expectEqual(@as(usize, 0), sources.count());
     try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
 }

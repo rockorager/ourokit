@@ -856,7 +856,7 @@ test "a later window build failure leaves every retained window on the active ge
         \\    return ouro.virtual_list {
         \\      key = "content", item_count = 1, estimated_item_height = 48,
         \\      item_key = function() return "item" end,
-        \\      render_item = function() return ouro.label { key = "label", text = label() } end,
+        \\      render_item = function() return ouro.text { key = "label", text = label() } end,
         \\    }
         \\  end
         \\end)
@@ -881,7 +881,7 @@ test "a later window build failure leaves every retained window on the active ge
         \\    return ouro.virtual_list {
         \\      key = "content", item_count = 1, estimated_item_height = 48,
         \\      item_key = function() return "item" end,
-        \\      render_item = function() return ouro.label { key = "label", text = label() } end,
+        \\      render_item = function() return ouro.text { key = "label", text = label() } end,
         \\    }
         \\  end
         \\end)

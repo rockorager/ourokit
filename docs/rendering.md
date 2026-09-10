@@ -148,7 +148,7 @@ The scene receives common positioned glyph runs; each backend may own
 atlas/image caching, hinting, and rasterization details. Neither backend exposes
 a `measureText` operation, chooses fonts, performs bidi, or reshapes strings.
 
-Retained Labels emit a `paragraph` command referencing an immutable width-
+Retained Text nodes emit a `paragraph` command referencing an immutable width-
 specific `ParagraphLayout`. That layout already contains line tops, baselines,
 visual-order spans, font handles, glyph IDs, and positions. Software, Vulkan
 compute, and Vulkan dma-buf presentation consume that same sequence; their only

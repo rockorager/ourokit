@@ -2,7 +2,7 @@ const std = @import("std");
 const c = @import("c.zig");
 
 pub const Kind = enum {
-    label,
+    text,
     button,
     text_input,
     listbox,

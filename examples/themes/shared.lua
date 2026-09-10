@@ -11,7 +11,7 @@ local themes = {
     },
     typography = { family = "serif", size = 19 },
     controls = { height = 44, radius = 0, border_width = 1 },
-    widgets = { button = { padding_x = 22 }, label = { font_size = 19 } },
+    widgets = { button = { padding_x = 22 }, text = { font_size = 19 } },
   },
   terminal = {
     color_scheme = "dark",
@@ -66,8 +66,8 @@ local function content()
       key = "app", padding = 24,
       ouro.column {
         key = "body", gap = 24, cross_alignment = "stretch",
-        ouro.label { key = "heading", text = "Contacts", size = 32 },
-        ouro.label { key = "subtitle", text = "One app. Different defaults. No per-control styling." },
+        ouro.text { key = "heading", text = "Contacts", size = 32 },
+        ouro.text { key = "subtitle", text = "One app. Different defaults. No per-control styling." },
         ouro.row {
           key = "panels", gap = 32, cross_alignment = "stretch",
           ouro.box {
@@ -76,9 +76,9 @@ local function content()
           },
           ouro.column {
             key = "details", flex = 1, gap = 12, cross_alignment = "stretch",
-            ouro.label { key = "name-label", text = "Name" },
+            ouro.text { key = "name-label", text = "Name" },
             ouro.text_input { key = "name", text = name(), on_change = function(value) name:set(value); status:set("Unsaved changes") end },
-            ouro.label { key = "email-label", text = "Email" },
+            ouro.text { key = "email-label", text = "Email" },
             ouro.text_input { key = "email", text = email(), on_change = function(value) email:set(value); status:set("Unsaved changes") end },
             ouro.row {
               key = "actions", gap = 12,
@@ -89,7 +89,7 @@ local function content()
               ouro.button { key = "reset", label = "Reset", on_press = function() select(selected()) end },
               ouro.button { key = "sync", label = "Sync", enabled = false },
             },
-            ouro.label { key = "status", text = status() },
+            ouro.text { key = "status", text = status() },
           },
         },
       },

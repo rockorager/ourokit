@@ -43,7 +43,7 @@ const Fixture = struct {
         try self.ui.init(self.state, &self.descriptors);
         self.ui.attachSignals(&self.signals);
         try self.ui.attachSemantics(&self.semantic_storage);
-        try self.ui.attachLabelText(&self.sources, &self.font, 1);
+        try self.ui.attachText(&self.sources, &self.font, 1);
         const theme = @import("../design/root.zig").tokens.light;
         self.ui.enableDeclarativeWidgets(theme);
         try self.runtime.init(std.testing.allocator, &self.scheduler, self.scope, .{ .slot = 0, .generation = 1 }, theme.background, theme.primary, theme.foreground, theme.input, theme.ring, &self.signals, &self.sources, &self.paragraphs, .{});

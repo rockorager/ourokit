@@ -60,7 +60,7 @@ const browser_suffix =
     \\                      key = "catalog",
     \\                      gap = 12,
     \\                      children = {
-    \\                        ouro.label {
+    \\                        ouro.text {
     \\                          key = "catalog-title",
     \\                          text = catalog.title or "Ourokit Storybook",
     \\                          size = 18,
@@ -100,14 +100,14 @@ const browser_suffix =
     \\                          flex = 1,
     \\                          gap = 4,
     \\                          children = {
-    \\                            ouro.label {
+    \\                            ouro.text {
     \\                              key = "story-name",
     \\                              text = story.name,
     \\                              size = 18,
     \\                              max_lines = 1,
     \\                              overflow = "ellipsis",
     \\                            },
-    \\                            ouro.label {
+    \\                            ouro.text {
     \\                              key = "story-metadata",
     \\                              text = (story.group or "Stories") .. " · " ..
     \\                                (story_viewport.width or 640) .. "×" ..
