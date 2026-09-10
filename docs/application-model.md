@@ -236,6 +236,15 @@ Closing the last window drains accepted calls/output and exits. Explicit
 `ouro.exit(code)` drains stdio output, cancels remaining tasks and exits.
 Lua state is process-local, not persistent storage.
 
+Ctrl+C (`SIGINT`) and `SIGTERM` request shutdown through the event loop, cancel
+remaining tasks, and remove only the runtime socket owned by the application.
+`ouroctl run` exits with status 130 or 143 respectively. Inherited systemd sockets
+remain in place. `SIGKILL` and crashes cannot run cleanup; any orphaned socket
+still requires explicit removal after confirming no listener owns it.
+Native hosts must enter the application runner before starting other threads
+so worker threads inherit its signal mask. The runner restores the calling
+thread's previous mask after teardown and preserves ignored signal dispositions.
+
 Headless reload validates a fresh declaration without invoking `run`. UI reload
 prepares a fresh UI in a candidate source generation and atomically replaces the
 active generation only after its windows, interface and handlers validate.

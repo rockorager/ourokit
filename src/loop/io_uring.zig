@@ -18,6 +18,7 @@ const Operation = enum(u8) {
     recv = 0xaa,
     send = 0xab,
     connect = 0xac,
+    signal_poll = 0xad,
 };
 
 pub const OperationKind = enum {
@@ -93,6 +94,7 @@ pub const Dispatch = union(enum) {
     operation_cancel: Completion,
     timer_wakeup,
     timer_control,
+    signal_wakeup,
 };
 
 /// Ourokit-owned raw io_uring plus a userspace logical-timer heap. Logical
@@ -113,6 +115,12 @@ pub const Loop = struct {
     control: Control = .none,
     control_deadline_ns: u64 = 0,
     control_time: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+
+    signal_fd: ?linux.fd_t = null,
+    previous_signal_mask: linux.sigset_t = undefined,
+    signal_poll_active: bool = false,
+    signal_poll_failed: bool = false,
+    received_signal: ?linux.SIG = null,
 
     pub fn init(
         self: *Loop,
@@ -142,10 +150,53 @@ pub const Loop = struct {
         std.debug.assert(!self.alarm_active and self.retired_alarm_generation == null and
             self.control == .none);
         self.timers.deinit();
+        // POLL_ADD borrows no userspace buffer. Closing the ring cancels its
+        // signal watch after application operations have been drained.
         self.ring.deinit();
+        if (self.signal_fd) |fd| {
+            var info: linux.signalfd_siginfo = undefined;
+            while (linux.read(fd, @ptrCast(&info), @sizeOf(@TypeOf(info))) == @sizeOf(@TypeOf(info))) {}
+            _ = linux.close(fd);
+            _ = linux.sigprocmask(linux.SIG.SETMASK, &self.previous_signal_mask, null);
+        }
         for (self.slots) |slot| std.debug.assert(!slot.active and !slot.cancel_pending);
         self.allocator.free(self.slots);
         self.* = undefined;
+    }
+
+    /// Call before creating worker/renderer threads so they inherit the mask.
+    /// The watch is loop-owned, not application work, and does not keep drains
+    /// alive. Signal dispositions are unchanged; ignored signals stay ignored.
+    pub fn watchSignals(self: *Loop, signals: []const linux.SIG) !void {
+        std.debug.assert(self.signal_fd == null);
+        var mask = linux.sigemptyset();
+        for (signals) |signal| {
+            var action: linux.Sigaction = undefined;
+            if (linux.errno(linux.sigaction(signal, null, &action)) != .SUCCESS)
+                return error.SignalWatchFailed;
+            if (action.handler.handler != linux.SIG.IGN) linux.sigaddset(&mask, signal);
+        }
+        if (linux.errno(linux.sigprocmask(linux.SIG.BLOCK, &mask, &self.previous_signal_mask)) != .SUCCESS)
+            return error.SignalWatchFailed;
+        errdefer _ = linux.sigprocmask(linux.SIG.SETMASK, &self.previous_signal_mask, null);
+        const result = linux.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
+        if (linux.errno(result) != .SUCCESS) return error.SignalWatchFailed;
+        self.signal_fd = @intCast(result);
+    }
+
+    /// Retains the first signal across startup, activation and shutdown phases.
+    /// Read on the owning thread rather than through an io_uring worker, since
+    /// signalfd consumes signals pending for the reading thread/process.
+    pub fn receivedSignal(self: *Loop) !?linux.SIG {
+        if (self.signal_poll_failed) return error.SignalWatchFailed;
+        if (self.received_signal) |signal| return signal;
+        const fd = self.signal_fd orelse return null;
+        var info: linux.signalfd_siginfo = undefined;
+        const result = linux.read(fd, @ptrCast(&info), @sizeOf(@TypeOf(info)));
+        if (linux.errno(result) == .AGAIN) return null;
+        if (result != @sizeOf(@TypeOf(info))) return error.SignalWatchFailed;
+        self.received_signal = @enumFromInt(info.signo);
+        return self.received_signal;
     }
 
     /// Adds a logical CLOCK_MONOTONIC timer. The next `submit` synchronizes one
@@ -360,6 +411,12 @@ pub const Loop = struct {
 
     pub fn submit(self: *Loop) !u32 {
         try self.synchronizeAlarm();
+        if (self.signal_fd) |fd| {
+            if (!self.signal_poll_active and !self.signal_poll_failed and self.received_signal == null) {
+                _ = try self.ring.poll_add(encode(.signal_poll, 0), fd, linux.POLL.IN);
+                self.signal_poll_active = true;
+            }
+        }
         return self.ring.submit();
     }
 
@@ -398,6 +455,12 @@ pub const Loop = struct {
             return .timer_control;
         }
         switch (decoded.operation) {
+            .signal_poll => {
+                if (!self.signal_poll_active) return .stale;
+                self.signal_poll_active = false;
+                self.signal_poll_failed = cqe.res < 0;
+                return .signal_wakeup;
+            },
             .timer_alarm => {
                 if (decoded.generation != self.alarm_generation) return .stale;
                 if (!self.alarm_active) return .stale;
@@ -580,6 +643,7 @@ fn decode(value: u64) ?Decoded {
         @intFromEnum(Operation.timer_alarm) => .timer_alarm,
         @intFromEnum(Operation.timer_update) => .timer_update,
         @intFromEnum(Operation.timer_remove) => .timer_remove,
+        @intFromEnum(Operation.signal_poll) => .signal_poll,
         else => return null,
     };
     const generation: u32 = @truncate(value >> 32);
@@ -780,4 +844,40 @@ test "write operation reports stable identity and writes a pipe" {
     var output: [bytes.len]u8 = undefined;
     try std.testing.expectEqual(bytes.len, try std.posix.read(pipe[0], &output));
     try std.testing.expectEqualStrings(bytes, &output);
+}
+
+test "signal watch wakes the ring and retains the first signal through shutdown" {
+    var previous_mask = linux.sigemptyset();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sigprocmask(linux.SIG.BLOCK, null, &previous_mask)));
+    {
+        var loop: Loop = undefined;
+        try loop.init(std.testing.allocator, 4, 1);
+        defer loop.deinit();
+        try loop.watchSignals(&.{ .USR1, .USR2 });
+        try std.testing.expectEqual(null, try loop.receivedSignal());
+        _ = try loop.submit();
+        try std.testing.expect(!loop.hasPendingOperations());
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.tgkill(linux.getpid(), linux.gettid(), .USR1)));
+        try std.testing.expectEqual(Dispatch.signal_wakeup, loop.dispatch(try loop.wait()));
+        try std.testing.expectEqual(linux.SIG.USR1, (try loop.receivedSignal()).?);
+        // A second signal must not change the exit reason or terminate the
+        // process when deinit restores the original mask.
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.tgkill(linux.getpid(), linux.gettid(), .USR2)));
+        _ = try loop.submit();
+        try std.testing.expectEqual(linux.SIG.USR1, (try loop.receivedSignal()).?);
+        try std.testing.expect(!loop.hasPendingOperations());
+    }
+    var restored_mask = linux.sigemptyset();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sigprocmask(linux.SIG.BLOCK, null, &restored_mask)));
+    try std.testing.expectEqualDeep(previous_mask, restored_mask);
+}
+
+test "signal watch does not prevent normal teardown with an outstanding poll" {
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, 4, 1);
+    defer loop.deinit();
+    try loop.watchSignals(&.{.USR1});
+    _ = try loop.submit();
+    try std.testing.expect(loop.signal_poll_active);
+    try std.testing.expect(!loop.hasPendingOperations());
 }

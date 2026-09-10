@@ -9,6 +9,8 @@ exercise native activation, repeated activation, live actions and exit draining.
 import json
 import os
 from pathlib import Path
+import select
+import signal
 import socket
 import subprocess
 import tempfile
@@ -30,6 +32,88 @@ def call(path, method, parameters=None):
                 raise AssertionError(f"connection closed before {method} replied")
             response.extend(chunk)
         return json.loads(response.split(b"\0", 1)[0])
+
+
+def check_signal_shutdown(directory, env):
+    manifest = directory / "interrupt" / "ouro.json"
+    manifest.parent.mkdir()
+    app = manifest.parent / "interrupt.lua"
+    manifest.write_text(json.dumps({"schema_version": 1, "id": "dev.ourokit.interrupt",
+                                    "entry": "interrupt.lua"}))
+    path = directory / "ourokit/apps/dev.ourokit.interrupt"
+    sources = {
+        "module-bootstrap": "o.stdout.write('ready\\n'); o.stdin.read(1); o.exit(0)",
+        "ui-bootstrap": """
+return o.app {
+  id = 'dev.ourokit.interrupt', actions = {},
+  run = function() o.stdout.write('ready\\n'); o.sleep(30000) end,
+}
+""",
+        "inherited-headless": "return o.app {id='dev.ourokit.interrupt', actions={}}",
+    }
+    if os.environ.get("OUROKIT_TEST_WAYLAND_DISPLAY"):
+        sources["native"] = """
+return o.app {
+  id = 'dev.ourokit.interrupt', actions = {},
+  run = function() return {windows={o.layer_surface {
+    id='panel', namespace='interrupt-test', layer='top',
+    width=0, height=36, anchors={'top', 'left', 'right'},
+    exclusive_zone=36, keyboard_interactivity='none',
+    content=function() return o.text{key='title', text='Interrupt test'} end,
+  }}} end,
+}
+"""
+    for name, source in sources.items():
+        app.write_text("local o = require('ouro')\n" + source)
+        inherited = name == "inherited-headless"
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            # Reuse the exact pathname on the next launch: leftover owned
+            # sockets must fail this test rather than being manually removed.
+            args = [str(BINARY), "run", str(app if name == "module-bootstrap" else manifest), "--software"]
+            child_env = env.copy()
+            if name == "native":
+                child_env["WAYLAND_DISPLAY"] = os.environ["OUROKIT_TEST_WAYLAND_DISPLAY"]
+            if inherited:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                args = ["systemd-socket-activate", f"--listen={path}", "--fdname=varlink",
+                        "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY"] + args
+            process = subprocess.Popen(args, env=child_env, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                if name in ("module-bootstrap", "ui-bootstrap"):
+                    assert select.select([process.stdout], [], [], 8)[0], "bootstrap never became ready"
+                    assert process.stdout.readline() == b"ready\n"
+                else:
+                    deadline = time.monotonic() + 8
+                    while True:
+                        assert process.poll() is None, process.stderr.read().decode()
+                        assert time.monotonic() < deadline, "server never became ready"
+                        if path.exists():
+                            status = call(path, "dev.ourokit.runtime.Status")["parameters"]
+                            if inherited or status["uiActive"]:
+                                break
+                        time.sleep(.01)
+                if name != "module-bootstrap":
+                    assert path.is_socket()
+                    identity = path.stat().st_ino
+                process.send_signal(sig)
+                assert process.wait(timeout=8) == 128 + sig
+                errors = process.stderr.read().decode()
+                assert "panic" not in errors and "leaked" not in errors, errors
+                if inherited:
+                    assert path.is_socket() and path.stat().st_ino == identity
+                    # This path belongs to the test's socket activator.
+                    path.unlink()
+                else:
+                    assert not path.exists(), f"{name} left an owned socket behind"
+                print(f"PASS: {name} {sig.name} exits cleanly and preserves socket ownership")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=8)
+                process.stdin.close()
+                process.stdout.close()
+                process.stderr.close()
 
 
 def main():
@@ -62,6 +146,8 @@ o.exit(7)
         assert not (directory / "ourokit").exists(), "stdio-only app created a server namespace"
         print("PASS: async stdin/stdout/stderr, JSON array/null roundtrip, explicit exit, no UI/socket")
 
+        check_signal_shutdown(directory, env)
+
         app = directory / "app.lua"
         source = """
 local o = require('ouro')
@@ -89,7 +175,7 @@ return o.app {
         manifest = directory / "ouro.json"
         manifest.write_text(json.dumps({"schema_version": 1, "id": "dev.ourokit.servicetest", "entry": "app.lua"}))
         path = directory / "ourokit/apps/dev.ourokit.servicetest"
-        path.parent.mkdir(parents=True, mode=0o700)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         log = directory / "service.log"
         with log.open("wb") as errors:
             process = subprocess.Popen(["systemd-socket-activate", f"--listen={path}", "--fdname=varlink",

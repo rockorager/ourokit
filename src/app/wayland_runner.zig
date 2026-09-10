@@ -88,7 +88,11 @@ pub fn runSource(
     provider: *const bundle.SourceProvider,
     options: Options,
 ) !void {
-    if (comptime text.has_fontconfig) return runSourceWithFontconfig(init, provider, options);
+    if (comptime text.has_fontconfig) {
+        return runSourceWithFontconfig(init, provider, options) catch |err| {
+            if (err != error.ApplicationInterrupted) return err;
+        };
+    }
     return error.FontconfigDisabled;
 }
 
@@ -116,6 +120,11 @@ fn runSourceWithFontconfig(
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 128, 32);
     defer loop.deinit();
+    // Renderer and image threads created below inherit the blocked signals.
+    try loop.watchSignals(&.{ .INT, .TERM });
+    defer if (loop.receivedSignal() catch null) |signal| {
+        if (options.exit_code) |code| code.* = @intCast(128 + @intFromEnum(signal));
+    };
 
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(init.gpa, options.scope_capacity, 8, options.resource_capacity);
@@ -366,6 +375,7 @@ fn runSourceWithFontconfig(
     var initial_activation_token = std.process.Environ.getPosix(init.minimal.environ, "XDG_ACTIVATION_TOKEN");
 
     while (true) {
+        const shutdown_signal = try loop.receivedSignal();
         const active_generation = source_reload.active();
         const active_application = &active_generation.application;
         const signals = &active_generation.signals;
@@ -379,7 +389,7 @@ fn runSourceWithFontconfig(
                 try clipboard.completePaste(completion.request, completion.text);
             try host.releaseClipboardCompletion(completion.request);
         }
-        if (host.failure != null) {
+        if (host.failure != null or shutdown_signal != null) {
             for (runtime_slots) |*slot| {
                 if (slot.desired) desired_changed = true;
                 slot.desired = false;
@@ -515,8 +525,8 @@ fn runSourceWithFontconfig(
         }
         const calls_pending = if (control) |server| server.hasPendingCalls() else false;
         if (!disconnect_started and current_count == 0 and
-            (!calls_pending or active_generation.vm.exit_code != null) and
-            !active_generation.stdio.hasPendingOutput())
+            (!calls_pending or active_generation.vm.exit_code != null or shutdown_signal != null) and
+            (!active_generation.stdio.hasPendingOutput() or shutdown_signal != null))
         {
             try host.beginShutdown();
             if (control) |server| try server.beginShutdown();
@@ -746,6 +756,7 @@ fn runSourceWithFontconfig(
             },
             .foreign => try host.dispatchOne(completion),
             .stale => return error.StaleCompletion,
+            .signal_wakeup => {},
         }
     }
     if (host.failure) |failure| return @as(anyerror!void, failure);
@@ -777,6 +788,7 @@ fn runHeadless(
     var idle_timer: ?io_loop.OperationHandle = null;
     defer if (idle_timer) |timer| loop.prepareCancel(timer) catch {};
     while (true) {
+        if (try loop.receivedSignal() != null) return false;
         control.collectClosed();
         try control.setApplication(&reload.active().application, &reload.active().vm);
         try control.serviceRequests();
@@ -821,6 +833,7 @@ fn runHeadless(
 
 fn finishUiBootstrap(reload: *SourceReload, control: ?*ControlServer, loop: *io_loop.Loop, scheduler: *task.Scheduler) !void {
     while (reload.active().ui_task != null) {
+        if (try loop.receivedSignal() != null) return error.ApplicationInterrupted;
         if (control) |server| try server.serviceRequests();
         while (scheduler.takeRunnable()) |handle| {
             if (control) |server| if (try server.resumeRunnable(handle)) continue;
@@ -841,6 +854,7 @@ const StartupIo = struct {
     fn dispatch(context: *anyopaque, completion: std.os.linux.io_uring_cqe) anyerror!void {
         const self: *StartupIo = @ptrCast(@alignCast(context));
         _ = try dispatchApplicationCompletion(self.reload, self.loop, self.control, null, null, completion);
+        if (try self.loop.receivedSignal() != null) return error.ApplicationInterrupted;
     }
 };
 
@@ -876,6 +890,7 @@ fn dispatchApplicationCompletion(reload: *SourceReload, loop: *io_loop.Loop, con
         },
         .foreign => if (host) |value| try value.dispatchOne(completion) else return error.UnownedIoCompletion,
         .stale => return error.StaleCompletion,
+        .signal_wakeup => {},
     }
     return idle_expired;
 }
@@ -906,6 +921,7 @@ fn finishInitialBootstrap(
     diagnostic: *?lua.Diagnostic,
 ) !void {
     while (!generation.application_ready) {
+        if (try loop.receivedSignal() != null) return error.ApplicationInterrupted;
         while (scheduler.takeRunnable()) |runnable|
             _ = generation.resumeRunnable(runnable, diagnostic) catch |err| {
                 lua.recordDiagnosticError(
@@ -928,6 +944,7 @@ fn finishInitialBootstrap(
             .operation_cancel => try generation.collectCanceledVarlink(),
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
                 try generation.vm.markTimeoutCompleted(timeout.operation),
+            .signal_wakeup => {},
             else => return error.UnexpectedBootstrapCompletion,
         }
     }
@@ -948,6 +965,7 @@ fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Schedu
             .operation_cancel => try generation.collectCanceledVarlink(),
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
                 try generation.vm.markTimeoutCompleted(timeout.operation),
+            .signal_wakeup => {},
             else => return error.UnexpectedBootstrapCompletion,
         }
     }
@@ -1104,6 +1122,7 @@ fn shutdownControl(
             .foreign => if (host) |value| value.dispatchOne(completion) catch |err|
                 std.debug.panic("could not drain host I/O: {s}", .{@errorName(err)}) else std.debug.panic("unowned host I/O", .{}),
             .stale => std.debug.panic("stale completion during control shutdown", .{}),
+            .signal_wakeup => {},
         }
         control.collectClosed();
     }

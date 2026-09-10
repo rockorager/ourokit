@@ -75,7 +75,7 @@ pub const App = struct {
 
     fn dispatchCompletion(self: *App, completion: std.os.linux.io_uring_cqe) !void {
         switch (self.loop.dispatch(completion)) {
-            .file => return error.UnownedIoCompletion,
+            .file, .signal_wakeup => return error.UnownedIoCompletion,
             .socket => |socket| if (!(try self.varlink_client.dispatch(socket)))
                 return error.UnownedIoCompletion,
             .operation_cancel => try self.varlink_client.collectCanceled(),
