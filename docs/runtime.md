@@ -59,11 +59,39 @@ Exact release: **Lua 5.5.1** (official source archive dated 2026-07-24).
 - Zig package content hash:
   `N-V-__8AAPqeFQDipy0CdI6MKBmwYYarybBTO3IIJPrSzH_w`
 
-The build compiles Lua's core C files and `lauxlib.c` only. It excludes
-`lbaselib`, `lcorolib`, `ldblib`, `liolib`, `lmathlib`, `loadlib`, `loslib`,
-`lstrlib`, `ltablib`, `lutf8lib`, and `linit`. No call to `luaL_openlibs`
-exists. Consequently base, package, coroutine, table, string, math, utf8, io,
-os, and debug libraries are all absent.
+The build compiles Lua's core C files, `lauxlib.c`, and an explicit library
+allowlist in `src/lua/safe_libraries.c`. The allowlist includes the pinned base,
+string, table, math, and UTF-8 implementation sources to register selected
+functions directly; it never calls `luaL_openlibs` or the broad library openers.
+Library tables belong to each VM and are available as ordinary Lua globals:
+
+| Surface | Available |
+| --- | --- |
+| Base | `assert`, `error`, `ipairs`, `next`, `pairs`, `pcall`, `select`, `tonumber`, `tostring`, `type`, `xpcall` |
+| `string` | Standard Lua 5.5.1 functions except `dump`; includes pattern matching, formatting and binary packing. String method syntax works. |
+| `table` | `concat`, `create`, `insert`, `pack`, `unpack`, `remove`, `move`, `sort` |
+| `math` | Standard non-compatibility numeric functions and constants, excluding `random` and `randomseed` |
+| `utf8` | Unchanged Lua `char`, `charpattern`, `codes`, `codepoint`, `len`, `offset`, including strict/lax behavior and byte indexing |
+
+No `io`, `os`, `package`, `debug`, or `coroutine` library is exposed. Base I/O
+(`print`, `warn`, `dofile`, `loadfile`), dynamic `load`, raw/metatable accessors,
+and `collectgarbage` are also absent. Output, file access, module loading,
+process exit and asynchronous task lifetimes remain Ouro-owned. The existing
+`require` implementation is preserved: it exposes `ouro`, and bundled hosts
+add their scoped application-module loader, not Lua's package/native loader.
+
+`pcall` and `xpcall` can wrap yielding Ouro callbacks. They catch Lua errors,
+including errors after an awaited operation, but cannot catch host task
+cancellation or keep a canceled task running. Lua library callbacks retain
+upstream yield restrictions (for example, a `table.sort` comparator cannot
+await I/O).
+
+The math RNG is never initialized. Table sorting uses Lua's documented fixed
+pivot-randomization alternative instead of requesting OS entropy. This avoids
+adding hidden I/O to permitted library calls; Lua's existing VM hash seeding is
+unchanged. These libraries execute synchronously and may consume substantial
+CPU or memory on large inputs. The allowlist controls capabilities, not CPU or
+memory quotas, and is not by itself an untrusted-code security boundary.
 
 One isolated `lua.Vm` owns growable stable-address slabs of coroutine tasks. Each
 task has generation-checked Lua identity, a language-neutral scheduler handle,

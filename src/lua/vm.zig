@@ -53,8 +53,8 @@ const invalid_slot = std.math.maxInt(u32);
 
 /// One isolated Lua state with growable stable-address slabs of scoped
 /// coroutine tasks. The VM itself must retain a stable address because
-/// Ouro-owned C closures and resource lifecycle records reference it. Lua's
-/// standard libraries remain unopened.
+/// Ouro-owned C closures and resource lifecycle records reference it. Only
+/// allowlisted computation libraries are exposed; Ouro owns I/O and scheduling.
 pub const Vm = struct {
     allocator: std.mem.Allocator,
     scheduler: *task.Scheduler,
@@ -79,6 +79,9 @@ pub const Vm = struct {
     ) !void {
         const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
         errdefer c.lua_close(state);
+        c.lua_pushcclosure(state, c.ouro_open_safe_libraries, 0);
+        if (c.lua_pcallk(state, 0, 0, 0, 0, null) != c.ok)
+            return error.LuaLibraryInitializationFailed;
         const chunks = try allocator.alloc([]Slot, 0);
         errdefer allocator.free(chunks);
         const scheduler_tasks = try allocator.alloc(?TaskHandle, scheduler.taskCapacity());
@@ -892,6 +895,147 @@ const test_external_lifecycle: task.ResourceLifecycle = .{
     .request_cancel = TestExternalWait.requestCancel,
     .destroy = TestExternalWait.destroy,
 };
+
+test "safe Lua libraries expose only computation helpers with standard UTF-8 semantics" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 2, 2);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 8);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_gettop(vm.state));
+
+    // Check the entire initial global surface, not only known forbidden names.
+    // Global enumeration is host-side: apps have no _G or metatable access.
+    _ = c.lua_rawgeti(vm.state, c.registry_index, 2); // LUA_RIDX_GLOBALS
+    var globals: usize = 0;
+    c.lua_pushnil(vm.state);
+    while (c.lua_next(vm.state, -2) != 0) {
+        var length: usize = 0;
+        const key = c.lua_tolstring(vm.state, -2, &length).?;
+        const allowed = [_][]const u8{ "assert", "error", "ipairs", "next", "pairs", "pcall", "select", "tonumber", "tostring", "type", "xpcall", "string", "table", "math", "utf8", "require" };
+        var found = false;
+        for (allowed) |name| if (std.mem.eql(u8, name, key[0..length])) {
+            found = true;
+            break;
+        };
+        try std.testing.expect(found);
+        globals += 1;
+        c.lua_settop(vm.state, -2);
+    }
+    c.lua_settop(vm.state, -2);
+    try std.testing.expectEqual(@as(usize, 16), globals);
+
+    _ = try vm.spawnApplication(
+        \\local function check_fields(lib, names)
+        \\  local expected = {}; for name in names:gmatch('%S+') do expected[name] = true end
+        \\  for name in pairs(lib) do assert(expected[name], name); expected[name] = nil end
+        \\  assert(next(expected) == nil)
+        \\end
+        \\check_fields(string, 'byte char find format gmatch gsub len lower match rep reverse sub upper pack packsize unpack')
+        \\check_fields(table, 'concat create insert pack unpack remove move sort')
+        \\check_fields(math, 'abs acos asin atan ceil cos deg exp tointeger floor fmod frexp ult ldexp log max min modf rad sin sqrt tan type pi huge maxinteger mininteger')
+        \\check_fields(utf8, 'offset codepoint char len codes charpattern')
+        \\assert(string.dump == nil and ('').dump == nil)
+        \\assert(math.random == nil and math.randomseed == nil)
+        \\assert(not pcall(require, 'io') and not pcall(require, 'package'))
+        \\assert(type(require('ouro').sleep) == 'function')
+        \\assert(tonumber('ff', 16) == 255 and tostring(-23) == '-23')
+        \\assert(select('#', 1, nil, 3) == 3)
+        \\local sum = 0
+        \\for i, v in ipairs({4, 7, 9}) do sum = sum + i * v end
+        \\assert(sum == 45)
+        \\local names = { z=3, a=7 }; sum = 0
+        \\for _, v in pairs(names) do sum = sum + v end
+        \\assert(sum == 10 and next({}) == nil)
+        \\assert(('a\0B'):sub(2) == '\0B' and string.format('%s:%02d', 'row', 7) == 'row:07')
+        \\local changed, n = string.gsub('a12 b3', '%d+', '#')
+        \\assert(changed == 'a# b#' and n == 2)
+        \\local packed = string.pack('<I2', 513)
+        \\assert(packed == '\1\2' and string.unpack('<I2', packed) == 513)
+        \\local values = table.pack(9, nil, 4); assert(values.n == 3)
+        \\local a, b, d = table.unpack(values, 1, 3); assert(a == 9 and b == nil and d == 4)
+        \\values = {9, -2, 4}; table.sort(values); table.insert(values, 2, 3)
+        \\assert(table.remove(values, 4) == 9 and table.concat(values, ',') == '-2,3,4')
+        \\table.move(values, 1, 2, 2); assert(table.concat(values, ',') == '-2,-2,3')
+        \\values = table.create(300)
+        \\for i = 1, 300 do values[i] = (i * 97) % 301 end
+        \\table.sort(values); for i = 1, 300 do assert(values[i] == i) end
+        \\assert(math.floor(-2.3) == -3 and math.sqrt(81) == 9 and math.tointeger(2.5) == nil)
+        \\assert(math.type(4) == 'integer' and math.maxinteger > 0 and math.mininteger < 0)
+        \\assert(math.pi > 3.14 and math.pi < 3.15 and math.huge > math.maxinteger)
+        \\local text = 'Aé🙂\0'
+        \\assert(utf8.len(text) == 4 and utf8.codepoint(text, 2) == 233)
+        \\assert(utf8.char(65, 233, 0x1f642, 0) == text)
+        \\local first, last = utf8.offset(text, 3); assert(first == 4 and last == 7)
+        \\local positions = {}; for pos, cp in utf8.codes(text) do positions[#positions+1] = pos end
+        \\assert(table.concat(positions, ',') == '1,2,4,8')
+        \\local count, bad = utf8.len('a\255b'); assert(count == nil and bad == 2)
+        \\assert(not pcall(function() for _ in utf8.codes('\255') do end end))
+        \\local surrogate = '\237\160\128'
+        \\assert(utf8.len(surrogate) == nil and utf8.len(surrogate, 1, -1, true) == 1)
+        \\assert(utf8.codepoint(surrogate, 1, 1, true) == 0xd800)
+        \\local ok, err = pcall(error, 'expected', 0); assert(not ok and err == 'expected')
+        \\ok, err = xpcall(function() error('bad', 0) end, function(e) return 'caught:' .. e end)
+        \\assert(not ok and err == 'caught:bad')
+        \\libraries_ok = true
+    );
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("libraries_ok"));
+}
+
+test "safe Lua protected calls yield through Ouro and cannot catch cancellation" {
+    inline for (.{ "pcall", "xpcall" }) |protected| {
+        var scheduler: task.Scheduler = undefined;
+        try scheduler.init(std.testing.allocator, 1, 2, 2);
+        defer scheduler.deinit();
+        var loop: io.Loop = undefined;
+        try loop.init(std.testing.allocator, 8, 8);
+        defer loop.deinit();
+        var vm: Vm = undefined;
+        try vm.init(std.testing.allocator, &scheduler, &loop);
+        defer vm.deinit();
+        const source = "local ok, result = " ++ protected ++
+            "(function() wait_external(); return 37 end, function(e) caught = true; return e end); " ++
+            "assert(ok and result == 37); resumed = true";
+
+        var completed: TestExternalWait = .{ .vm = &vm };
+        completed.install();
+        _ = try vm.spawnApplication(source);
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try vm.markExternalCompleted(completed.handle);
+        try std.testing.expect(completed.destroyed);
+        try std.testing.expect(!vm.hasGlobal("resumed"));
+        try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try std.testing.expect(vm.globalBoolean("resumed"));
+
+        var failed: TestExternalWait = .{ .vm = &vm };
+        failed.install();
+        _ = try vm.spawnApplication("local ok, err = " ++ protected ++
+            "(function() wait_external(); error('after wait', 0) end, function(e) return e .. ':handled' end); " ++
+            "assert(not ok and err == 'after wait" ++ (if (comptime std.mem.eql(u8, protected, "xpcall")) ":handled" else "") ++ "'); failure_handled = true");
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try vm.markExternalCompleted(failed.handle);
+        try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try std.testing.expect(vm.globalBoolean("failure_handled"));
+
+        var canceled: TestExternalWait = .{ .vm = &vm };
+        canceled.install();
+        _ = try vm.spawnApplication("resumed = false; " ++ source);
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try vm.requestCancellation();
+        try std.testing.expect(canceled.canceled);
+        try vm.markExternalCompleted(canceled.handle);
+        try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try std.testing.expect(canceled.destroyed);
+        try std.testing.expect(!vm.globalBoolean("resumed"));
+        try std.testing.expect(!vm.hasGlobal("caught"));
+        try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
+    }
+}
 
 test "external waits resume only in task phase and drain before cancellation" {
     var scheduler: task.Scheduler = undefined;

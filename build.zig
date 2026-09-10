@@ -578,6 +578,10 @@ fn addLua(module: *std.Build.Module, lua: *std.Build.Dependency) void {
         .files = lua_sources,
         .flags = &.{ "-std=c99", "-DLUA_USE_LINUX" },
     });
+    module.addCSourceFile(.{
+        .file = module.owner.path("src/lua/safe_libraries.c"),
+        .flags = &.{ "-std=c99", "-DLUA_USE_LINUX" },
+    });
     module.addIncludePath(lua.path("src"));
     module.link_libc = true;
 }
