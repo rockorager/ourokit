@@ -411,7 +411,10 @@ fn runSourceWithFontconfig(
                 },
                 .keyboard => |keyboard| {
                     if (slotForNativeHandle(&window_set, runtime_slots, keyboardWindow(keyboard))) |slot|
-                        if (slot.runtime.ready) try slot.runtime.routeKeyboard(keyboard);
+                        if (slot.runtime.ready) {
+                            slot.runtime.keyboard_text_fallback = !host.textInputAvailable();
+                            try slot.runtime.routeKeyboard(keyboard);
+                        };
                 },
                 .text_input => |text_input_event| switch (text_input_event) {
                     .enter => |handle| if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {

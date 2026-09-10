@@ -71,6 +71,8 @@ pub const WindowRuntime = struct {
     clipboard: ?*clipboard_module.Coordinator = null,
     reconciling: bool = false,
     text_input_commit_permitted: bool = true,
+    /// The host enables direct XKB text only when text-input-v3 is unavailable.
+    keyboard_text_fallback: bool = false,
     virtual_lists: virtual_list.Snapshot = .{},
     virtual_work: bool = false,
     virtual_offsets_pending: bool = false,
@@ -816,6 +818,22 @@ pub const WindowRuntime = struct {
                     try self.notifyTextInputChanged(callback_service, focused);
             }
             if (intent != null) return;
+            const translated = key.translated;
+            if (self.keyboard_text_fallback and behavior.enabled and !behavior.read_only and
+                session.preedit() == null and !translated.modifiers.control and
+                !translated.modifiers.alt and !translated.modifiers.logo and
+                translated.unicode >= 0x20 and translated.unicode <= 0x10ffff and
+                !(translated.unicode >= 0x7f and translated.unicode <= 0x9f))
+            {
+                var bytes: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(@intCast(translated.unicode), &bytes) catch return;
+                session.endSelectionDrag();
+                if (try session.apply(.{ .commit = .{ .text = bytes[0..len] } })) {
+                    try self.syncTextInputVisuals();
+                    try self.notifyTextInputChanged(callback_service, focused);
+                }
+                return;
+            }
         };
         if (key.state != .released) if (self.focus.current()) |focused| {
             if (!self.listboxes.contains(focused)) if (try self.instances.nearestScroll(focused, .vertical)) |scroll| {
@@ -2007,6 +2025,53 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try runtime.dispatchInput(&callbacks);
     try std.testing.expect(!(try runtime.text_inputs.session(target)).isSelecting());
 
+    const editing = try runtime.text_inputs.session(target);
+    _ = editing.model.selectAll();
+    var character: platform.KeyboardEvent = .{ .key = .{
+        .window = window,
+        .serial = 11,
+        .time_ms = 12,
+        .state = .pressed,
+        .translated = .{ .keycode = 30, .unicode = 'Ω' },
+    } };
+    const before_keyboard = try std.testing.allocator.dupe(u8, editing.model.text());
+    defer std.testing.allocator.free(before_keyboard);
+    try runtime.routeKeyboard(character);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings(before_keyboard, editing.model.text()); // IME owns commits.
+    runtime.keyboard_text_fallback = true;
+    try runtime.routeKeyboard(character);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings("Ω", editing.model.text());
+    character.key.state = .repeated;
+    character.key.translated.unicode = 'β';
+    try runtime.routeKeyboard(character);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings("Ωβ", editing.model.text());
+    inline for (.{ platform.Modifiers{ .control = true }, platform.Modifiers{ .alt = true }, platform.Modifiers{ .logo = true } }) |modifiers| {
+        character.key.translated.modifiers = modifiers;
+        try runtime.routeKeyboard(character);
+        try runtime.dispatchInput(&callbacks);
+        try std.testing.expectEqualStrings("Ωβ", editing.model.text());
+    }
+    character.key.translated.modifiers = .{};
+    character.key.state = .released;
+    try runtime.routeKeyboard(character);
+    try runtime.dispatchInput(&callbacks);
+    character.key.state = .pressed;
+    for ([_]u32{ 0x1f, 0x7f, 0x9f, 0xd800, 0x110000 }) |codepoint| {
+        character.key.translated.unicode = codepoint;
+        try runtime.routeKeyboard(character);
+        try runtime.dispatchInput(&callbacks);
+    }
+    try std.testing.expectEqualStrings("Ωβ", editing.model.text());
+    _ = try editing.apply(.{ .preedit = .{ .text = "composing", .cursor = null } });
+    character.key.translated.unicode = 'x';
+    try runtime.routeKeyboard(character);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings("Ωβ", editing.model.text());
+    _ = try editing.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+
     while (scheduler.takeRunnable()) |runnable|
         _ = try callback_vm.resumeRunnable(runnable);
     var read_only_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(
@@ -2036,6 +2101,8 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .commit = .{ .text = "blocked" },
         .preedit = null,
     } });
+    try runtime.dispatchInput(&callbacks);
+    try runtime.routeKeyboard(character);
     try runtime.dispatchInput(&callbacks);
     try std.testing.expectEqualStrings(
         before_read_only,
