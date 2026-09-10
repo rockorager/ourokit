@@ -8,6 +8,8 @@ pub const ValueMode = enum { uncontrolled, controlled };
 pub const Behavior = struct {
     enabled: bool = true,
     read_only: bool = false,
+    border_color: ?@import("../../core/color.zig").Color = null,
+    focus_color: ?@import("../../core/color.zig").Color = null,
 };
 
 const Entry = struct {

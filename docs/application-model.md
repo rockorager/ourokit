@@ -329,6 +329,72 @@ Boxes may opt into generated theme surfaces with `surface = "background" |
 remain intrinsic. Optional `min_width` and `min_height` participate in the same
 one-way constraints and yield when a parent supplies a tighter maximum.
 
+### Inherited visual defaults
+
+Set `theme` on `ouro.app` to style every window without repeating widget props:
+
+```lua
+return ouro.app {
+  id = "dev.ouro.example",
+  theme = {
+    color_scheme = "dark",
+    colors = { primary = "#83d75c", primary_foreground = "#101810" },
+    typography = { family = "monospace", size = 15 },
+    controls = { height = 36, radius = 0, border_width = 1 },
+    widgets = { button = { padding_x = 20 } },
+  },
+  windows = { ouro.window {
+    id = "main", title = "Example",
+    content = function()
+      return ouro.button { key = "save", label = "Save" }
+    end,
+  } },
+}
+```
+
+Resolution order is built-in defaults → app theme → enclosing `ouro.theme`
+overrides → explicit widget props. Nested tables merge field by field; missing
+fields inherit. `color_scheme = "light" | "dark"` replaces the inherited color
+palette, then explicit `colors` apply; it does not reset typography or metrics.
+Colors use the generated semantic token names and `#RRGGBB` or `#RRGGBBAA`.
+Unknown theme fields and invalid colors/metrics are errors, not ignored typos.
+
+The supported defaults are:
+
+| Section | Fields |
+| --- | --- |
+| `typography` | `family`, `size` |
+| `controls` | `height`, `radius`, `border_width` |
+| `widgets.button` | `height`, `padding_x`, `radius`, `border_width`, `font_size`, `background`, `foreground`, `border`, `hover`, `pressed`, `disabled`, `disabled_foreground`, `focus` |
+| `widgets.text_input` | Same as button except `hover` and `pressed` |
+| `widgets.option` | Same as button except `disabled`, `disabled_foreground`, and `focus`; `pressed` is the selected background |
+| `widgets.label` | `foreground`, `font_size` |
+
+Widget defaults override shared controls/typography values. Explicit widget
+fields override those defaults; a label's existing `size` prop takes precedence
+over `font_size`. Font sizes and theme heights must be positive; other metrics
+are non-negative logical pixels. A zero border width disables the border,
+including its focus-color treatment. A theme does not change widget behavior,
+container gaps, application layout, or explicit dimensions.
+
+`typography.family` selects an installed family (including `serif`, `sans-serif`,
+and `monospace`) through Fontconfig. Names are copied, not retained Lua strings;
+the host caches loaded font candidates. Family overrides require a
+Fontconfig-enabled build and a host font service. Omit the family to retain the
+host's fonts, including the pinned fonts in deterministic Storybook snapshots.
+Snapshots with an explicit family depend on the installed system fonts.
+
+The app declaration is a fixed default, copied at load/reload. For a reactive
+override, return `ouro.theme { key = "local", controls = { radius = radius() },
+children = { ... } }` from a content/component function. It affects only its
+descendants, including cached component descriptions; changing the theme does
+not remount those components. `ouro.theme` paints its resolved background;
+themed Box surfaces can select other color roles. App `colors.background`
+supplies the window background.
+
+See [the three Contacts themes](../examples/themes/shared.lua): the same content
+function, data, and event handlers run with Paper, Terminal, or Candy defaults.
+
 Above it, the implemented instance reconciler consumes parent-before-child
 typed descriptor snapshots with stable numeric semantic IDs. It validates the
 whole snapshot and capacity before mutation, preserves instance identity and
@@ -456,7 +522,7 @@ Rows unmount outside the viewport, so durable per-row state belongs in external
 application state keyed by `item_key`, rather than in the row description.
 Applications provide stable local keys but no numeric IDs or parent links.
 Their visual defaults come from generated Radix-derived semantic tokens and
-documented component recipes, with no Lua theme mirror. Buttons are
+documented component recipes, with optional inherited Lua theme overrides. Buttons are
 intrinsically sized with Radix Themes size-2 geometry: 32-pixel height,
 12-pixel horizontal padding, 4-pixel radius, medium label face, primary color
 pair, and one-line ellipsis. Text inputs fill their bounded parent width by

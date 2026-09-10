@@ -6,6 +6,7 @@ const task = @import("../task/root.zig");
 const vm_module = @import("vm.zig");
 const varlink_json = @import("varlink_client.zig");
 const varlink = @import("../varlink/root.zig");
+const theming = @import("theme.zig");
 
 pub const Window = struct {
     declaration: platform.SurfaceDeclaration,
@@ -16,6 +17,7 @@ pub const Definition = struct {
     allocator: std.mem.Allocator,
     state: *c.State,
     id: []u8,
+    theme: ?theming.Theme = null,
     action_schema: ?varlink.Service = null,
     actions_reference: c_int = c.no_reference,
     run_reference: c_int = c.no_reference,
@@ -52,6 +54,7 @@ pub const Definition = struct {
             .allocator = self.allocator,
             .state = self.state,
             .id = self.id,
+            .theme = self.theme,
             .action_schema = self.action_schema,
             .actions_reference = self.actions_reference,
             .run_reference = self.run_reference,
@@ -159,6 +162,7 @@ pub const Application = struct {
     allocator: std.mem.Allocator,
     state: *c.State,
     id: []u8,
+    theme: ?theming.Theme = null,
     action_schema: ?varlink.Service = null,
     actions_reference: c_int,
     run_reference: c_int,
@@ -412,6 +416,13 @@ pub const Application = struct {
 
 fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     if (c.lua_type(state, -1) != c.type_table) return error.ApplicationDeclarationRequired;
+    const theme = blk: {
+        const kind = c.lua_getfield(state, -1, "theme");
+        defer c.lua_settop(state, -2);
+        break :blk if (kind == c.type_nil) null else try theming.apply(state, -1, .{
+            .colors = @import("../design/root.zig").tokens.light,
+        });
+    };
     const id = try requiredString(allocator, state, -1, "id");
     errdefer allocator.free(id);
     const actions_reference = try optionalActions(state, -1);
@@ -433,6 +444,7 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
         .allocator = allocator,
         .state = state,
         .id = id,
+        .theme = theme,
         .action_schema = action_schema,
         .actions_reference = actions_reference,
         .run_reference = run_reference,

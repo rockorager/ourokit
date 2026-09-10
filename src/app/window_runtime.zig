@@ -289,10 +289,18 @@ pub const WindowRuntime = struct {
                     );
                     if (retained_object != .text_input)
                         return error.TextInputRenderObjectMismatch;
-                    try self.paragraph_sources.validateRetain(retained_object.text_input.source);
-                    try self.paragraph_sources.retain(retained_object.text_input.source);
+                    const old_source = try self.paragraph_sources.get(retained_object.text_input.source);
+                    const new_source = try self.paragraph_sources.get(object.text_input.source);
+                    const source = try self.paragraph_sources.acquire(.{
+                        .utf8 = old_source.utf8,
+                        .base_direction = new_source.base_direction,
+                        .language = new_source.language,
+                        .logical_size = new_source.logical_size,
+                        .candidates = new_source.candidates,
+                        .configuration_revision = new_source.configuration_revision,
+                    });
                     self.paragraph_sources.release(object.text_input.source) catch unreachable;
-                    object.text_input.source = retained_object.text_input.source;
+                    object.text_input.source = source;
                     object.text_input.selection_start = retained_object.text_input.selection_start;
                     object.text_input.selection_end = retained_object.text_input.selection_end;
                     object.text_input.caret_offset = retained_object.text_input.caret_offset;
@@ -405,6 +413,8 @@ pub const WindowRuntime = struct {
         ) catch unreachable;
         self.text_inputs.finishOwner(self.root_owner);
 
+        self.focus.reconcile(&self.instances);
+        if (self.focus.current()) |target| self.setFocusBorder(target, true) catch unreachable;
         self.signals.disposeOwner(.{
             .owners = &self.build_owners,
             .handle = self.root_owner,
@@ -1431,21 +1441,31 @@ pub const WindowRuntime = struct {
         current: ?ui.instance.InstanceHandle,
     ) !void {
         if (!self.initialized) return;
-        if (previous) |target| if (self.instances.isActive(target) and self.text_inputs.contains(target))
-            try self.setTextInputBorder(target, self.border_color);
-        if (current) |target| if (self.text_inputs.contains(target))
-            try self.setTextInputBorder(target, self.focus_color);
+        if (previous) |target| if (self.instances.isActive(target)) try self.setFocusBorder(target, false);
+        if (current) |target| if (self.instances.isActive(target)) try self.setFocusBorder(target, true);
         try self.syncTextInputVisuals();
     }
 
-    fn setTextInputBorder(
+    fn setFocusBorder(self: *WindowRuntime, target: ui.instance.InstanceHandle, focused: bool) !void {
+        const color = if (self.text_inputs.contains(target)) blk: {
+            const behavior = try self.text_inputs.getBehavior(target);
+            break :blk if (focused) behavior.focus_color orelse self.focus_color else behavior.border_color orelse self.border_color;
+        } else if (self.buttons.styleFor(target)) |style|
+            (if (focused) style.focus else style.border) orelse return
+        else
+            return;
+        try self.setControlBorder(target, color);
+    }
+
+    fn setControlBorder(
         self: *WindowRuntime,
         target: ui.instance.InstanceHandle,
         color: core.Color,
     ) !void {
         const render = try self.instances.renderObject(target);
         var object = try self.tree.objectAt(render);
-        if (object != .box) return error.TextInputRenderObjectMismatch;
+        if (object != .box) return error.ControlRenderObjectMismatch;
+        if (object.box.border_width == 0) return;
         if (std.meta.eql(object.box.border_color, color)) return;
         object.box.border_color = color;
         try self.tree.update(render, object);

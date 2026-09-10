@@ -245,6 +245,8 @@ fn runSourceWithFontconfig(
     if (configured_medium_fonts.faces.len == 0) return error.ConfiguredSansSerifMediumNotFound;
     var fonts = text.FontCache.init(init.gpa);
     defer fonts.deinit();
+    var theme_fonts: @import("../lua/theme_fonts.zig").ThemeFonts = .{ .allocator = init.gpa, .io = init.io, .fonts = &fonts };
+    defer theme_fonts.deinit();
     const primary_font = try loadFont(init, &fonts, configured_fonts.faces[0]);
     defer fonts.release(primary_font) catch unreachable;
     const medium_font = try loadFont(init, &fonts, configured_medium_fonts.faces[0]);
@@ -269,6 +271,7 @@ fn runSourceWithFontconfig(
         .medium_font = medium_font,
         .theme = theme,
         .callbacks = &callbacks,
+        .theme_fonts = &theme_fonts,
         .workspaces = &workspaces,
     };
     // Generations must release their text resources before the caches above.

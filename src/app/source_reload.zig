@@ -865,6 +865,7 @@ test "a later window build failure leaves every retained window on the active ge
         \\end
         \\return ouro.app {
         \\  id = "dev.ouro.atomic-window-test",
+        \\  theme = { typography = { size = 19 }, controls = { height = 43 } },
         \\  windows = {
         \\    ouro.window { id = "first", title = "First", content = content("Active first") },
         \\    ouro.window { id = "second", title = "Second", content = content("Active second") },
@@ -886,6 +887,7 @@ test "a later window build failure leaves every retained window on the active ge
         \\end)
         \\return ouro.app {
         \\  id = "dev.ouro.atomic-window-test",
+        \\  theme = { typography = { size = 25 }, controls = { height = 57 } },
         \\  windows = {
         \\    ouro.window {
         \\      id = "first",
@@ -999,6 +1001,8 @@ test "a later window build failure leaves every retained window on the active ge
     }
     try std.testing.expectEqualStrings("Active first", (try runtimes[0].semantics.findPath("panel/content/item/label")).label);
     try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.findPath("panel/content/item/label")).label);
+    try std.testing.expectEqual(@as(f32, 43), initial.ui_build.widget_theme.?.controls.height);
+    try std.testing.expectEqual(@as(?f32, 19), initial.ui_build.widget_theme.?.typography.size);
     const first_instance_count = runtimes[0].instances.activeCount();
     const second_instance_count = runtimes[1].instances.activeCount();
     const first_id = (try runtimes[0].semantics.findPath("panel/content/item/label")).id;
@@ -1010,6 +1014,7 @@ test "a later window build failure leaves every retained window on the active ge
         .data = failing_second_window,
     });
     try reload.prepare();
+    try std.testing.expectEqual(@as(f32, 57), reload.candidate.?.ui_build.widget_theme.?.controls.height);
     const targets = [_]WindowTarget{
         .{ .id = "first", .runtime = &runtimes[0], .size = .{ .width = 320, .height = 200 } },
         .{ .id = "second", .runtime = &runtimes[1], .size = .{ .width = 320, .height = 200 } },
@@ -1021,6 +1026,7 @@ test "a later window build failure leaves every retained window on the active ge
     try std.testing.expect(build_failed);
     try std.testing.expect(reload.active() == initial);
     try std.testing.expect(reload.candidate == null);
+    try std.testing.expectEqual(@as(f32, 43), reload.active().ui_build.widget_theme.?.controls.height);
     try std.testing.expect(runtimes[0].signals == &initial.signals);
     try std.testing.expect(runtimes[1].signals == &initial.signals);
     try std.testing.expectEqual(first_instance_count, runtimes[0].instances.activeCount());

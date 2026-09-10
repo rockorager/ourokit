@@ -8,6 +8,8 @@ pub const Style = struct {
     hovered: Color,
     pressed: Color,
     disabled: Color,
+    border: ?Color = null,
+    focus: ?Color = null,
 };
 
 pub const VisualUpdate = struct {
@@ -91,6 +93,11 @@ pub const Buttons = struct {
             return;
         };
         unreachable;
+    }
+
+    pub fn styleFor(self: *const Buttons, target: instance.InstanceHandle) ?Style {
+        for (self.entries) |entry| if (entry.active and same(entry.target, target)) return entry.style;
+        return null;
     }
 
     pub fn finishOwner(self: *Buttons, owner: BuildOwnerHandle) void {

@@ -26,6 +26,7 @@ pub const UiServices = struct {
     medium_font: text.FontHandle,
     theme: design.tokens.Theme,
     callbacks: *lua.CallbackRegistry,
+    theme_fonts: ?*@import("../lua/theme_fonts.zig").ThemeFonts = null,
     workspaces: ?*shell.workspaces.Store = null,
 };
 
@@ -344,6 +345,7 @@ pub const SourceGeneration = struct {
                 return err;
             };
             self.ui_build.enableDeclarativeWidgets(value.theme);
+            self.ui_build.theme_fonts = value.theme_fonts;
         } else {
             self.callbacks = null;
         }
@@ -417,6 +419,9 @@ pub const SourceGeneration = struct {
             return err;
         };
         application_initialized = true;
+        if (services != null) {
+            if (self.application.theme) |theme| self.ui_build.widget_theme = theme;
+        }
         try self.validateApplicationIdentity(diagnostic);
         self.application_ready = true;
         self.prepared_builds = allocator.alloc(
@@ -508,6 +513,8 @@ pub const SourceGeneration = struct {
         try self.ui_build.attachLabelText(services.paragraph_sources, &self.font_candidates, 1);
         try self.ui_build.attachMediumText(&self.medium_font_candidates);
         self.ui_build.enableDeclarativeWidgets(services.theme);
+        if (self.application.theme) |theme| self.ui_build.widget_theme = theme;
+        self.ui_build.theme_fonts = services.theme_fonts;
         if (services.workspaces) |store| {
             self.shell_workspaces = @as(lua.ShellWorkspaces, undefined);
             try self.shell_workspaces.?.init(self.vm.state, &self.signals, store, self.vm.apiReference());
@@ -555,6 +562,9 @@ pub const SourceGeneration = struct {
         if (!self.config.defer_run) if (self.module_loader) |*loader| loader.freeze();
         errdefer application.deinit();
         self.application = application;
+        if (self.services != null) {
+            if (application.theme) |theme| self.ui_build.widget_theme = theme;
+        }
         try self.validateApplicationIdentity(diagnostic);
         const prepared_builds = self.allocator.alloc(
             lua.PreparedBuild,

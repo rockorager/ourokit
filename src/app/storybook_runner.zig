@@ -153,6 +153,8 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
 
     var fonts = text.FontCache.init(init.gpa);
     defer fonts.deinit();
+    var theme_fonts: @import("../lua/theme_fonts.zig").ThemeFonts = .{ .allocator = init.gpa, .io = init.io, .fonts = &fonts };
+    defer theme_fonts.deinit();
     const primary_font = try fonts.acquire(.{
         .key = .{ .file = "/ourokit/storybook/Inter-Regular.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_storybook_font"),
@@ -184,6 +186,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     defer init.gpa.free(semantic_storage);
     var lua_ui: lua.UiBuild = undefined;
     try lua_ui.initWithApi(vm.state, descriptor_storage, vm.apiReference());
+    lua_ui.theme_fonts = &theme_fonts;
     lua_ui.attachSignals(&signals);
     lua_ui.attachCallbacks(&callbacks, &vm);
     try lua_ui.attachLabelText(&paragraph_sources, &.{ primary_font, arabic_font }, 1);

@@ -364,6 +364,18 @@ making snapshots timing dependent. The interactive Storybook browser is
 available through `storybook run`; deterministic actions remain a snapshot
 playback contract while the live browser accepts ordinary user input.
 
+Application-wide themes override colors, typography, control geometry, and
+per-widget defaults on `ouro.app { theme = { ... }, windows = { ... } }`.
+Nested `ouro.theme` descriptions inherit and override those defaults; explicit
+widget props win. See [the theme API](docs/application-model.md#inherited-visual-defaults).
+These three applications share exactly the same Contacts content and behavior:
+
+```sh
+zig-out/bin/ouroctl run examples/themes/paper.lua --software
+zig-out/bin/ouroctl run examples/themes/terminal.lua --software
+zig-out/bin/ouroctl run examples/themes/candy.lua --software
+```
+
 Constrained and themed composition use the same returned descriptions as rows,
 columns, and scroll views. A content function can return this tree:
 

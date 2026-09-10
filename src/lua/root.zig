@@ -43,6 +43,7 @@ test {
     _ = @import("varlink_client.zig");
     _ = @import("stdio.zig");
     _ = @import("storybook.zig");
+    _ = @import("theme_integration_test.zig");
     _ = @import("virtual_list_test.zig");
     _ = @import("vm.zig");
     _ = @import("ui_build.zig");
