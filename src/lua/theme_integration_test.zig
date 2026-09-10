@@ -205,3 +205,52 @@ test "prepared theme changes preserve input text but use candidate typography" {
     }
     try std.testing.expect(found);
 }
+
+test "host appearance rethemes retained components while app and nested overrides win" {
+    const tokens = @import("../design/root.zig").tokens;
+    const Application = @import("application.zig").Application;
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\local Child = ouro.component(function()
+        \\  return function() return ouro.button { key = 'button', label = 'Retained' } end
+        \\end)
+        \\function build()
+        \\  return ouro.column { key = 'root',
+        \\    Child {key = 'child'},
+        \\    ouro.theme {key = 'fixed', color_scheme = 'light',
+        \\      ouro.button {key = 'button', label = 'Pinned'},
+        \\    },
+        \\  }
+        \\end
+    );
+    var application = try Application.load(std.testing.allocator, f.state,
+        \\return ouro.app {
+        \\  id = 'dev.test.appearance',
+        \\  theme = {controls = {height = 45}, colors = {background = '#ffffff'}},
+        \\  windows = {ouro.window {id = 'main', title = 'Appearance', content = build}},
+        \\}
+    );
+    defer application.deinit();
+    f.ui.widget_theme = application.resolvedTheme(tokens.light);
+    try f.build();
+    const child = try f.handle("root/child/button");
+    f.ui.widget_theme = application.resolvedTheme(tokens.dark);
+    try f.runtime.setTheme(f.ui.widget_theme.?.colors);
+    try f.build();
+    try std.testing.expectEqual(child, try f.handle("root/child/button"));
+    try std.testing.expectEqual(tokens.dark.primary, (try f.object("root/child/button")).box.background.?);
+    try std.testing.expectEqual(tokens.light.primary, (try f.object("root/fixed/button")).box.background.?);
+    try std.testing.expectEqual(@as(f32, 45), (try f.object("root/child/button")).box.height.?);
+    try std.testing.expectEqual(core.Color.rgba(255, 255, 255, 255), f.ui.widget_theme.?.colors.background);
+    try std.testing.expectEqual(tokens.dark.foreground, f.ui.widget_theme.?.colors.foreground);
+
+    var pinned = try Application.load(std.testing.allocator, f.state,
+        \\return ouro.app {
+        \\  id = 'dev.test.pinned', theme = {color_scheme = 'light'},
+        \\  windows = {ouro.window {id = 'main', title = 'Pinned', content = build}},
+        \\}
+    );
+    defer pinned.deinit();
+    try std.testing.expectEqualDeep(tokens.light, pinned.resolvedTheme(tokens.dark).colors);
+}

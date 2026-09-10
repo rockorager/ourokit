@@ -40,6 +40,8 @@ pub const SourceReload = struct {
     loop: *io_loop.Loop,
     services: ?source_generation.UiServices,
     config: source_generation.Config,
+    /// Borrowed host service; never canceled by source-generation retirement.
+    appearance: ?*@import("appearance.zig").Client = null,
     active_generation: *SourceGeneration,
     candidate: ?*SourceGeneration = null,
     module_root: ?std.os.linux.fd_t = null,
@@ -83,6 +85,12 @@ pub const SourceReload = struct {
 
     pub fn active(self: *const SourceReload) *SourceGeneration {
         return self.active_generation;
+    }
+
+    pub fn setTheme(self: *SourceReload, theme: @import("../design/root.zig").tokens.Theme) bool {
+        if (self.services) |*services| services.theme = theme;
+        if (self.candidate) |candidate| _ = candidate.setTheme(theme);
+        return self.active_generation.setTheme(theme);
     }
 
     pub fn attachModuleRoot(self: *SourceReload, directory: std.os.linux.fd_t) void {
@@ -373,6 +381,7 @@ pub const SourceReload = struct {
     }
 
     pub fn markSocketCompleted(self: *SourceReload, completion: io_loop.SocketCompletion) !void {
+        if (self.appearance) |client| if (try client.dispatch(completion)) return;
         if (self.candidate) |candidate|
             if (try candidate.dispatchSocket(completion)) return;
         if (try self.active_generation.dispatchSocket(completion)) return;
@@ -382,6 +391,7 @@ pub const SourceReload = struct {
     }
 
     pub fn collectCanceledVarlink(self: *SourceReload) !void {
+        if (self.appearance) |client| try client.collectCanceled();
         if (self.candidate) |candidate| try candidate.collectCanceledVarlink();
         try self.active_generation.collectCanceledVarlink();
         for (self.retiring_generations) |entry| if (entry) |retiring|
@@ -393,6 +403,7 @@ pub const SourceReload = struct {
         self: *SourceReload,
         operation: io_loop.OperationHandle,
     ) !void {
+        if (self.appearance) |client| if (try client.dispatchTimer(operation)) return;
         if (self.candidate) |candidate| if (candidate.vm.ownsOperation(operation))
             return candidate.vm.markTimeoutCompleted(operation);
         if (self.active_generation.vm.ownsOperation(operation))
@@ -1026,6 +1037,12 @@ test "a later window build failure leaves every retained window on the active ge
     });
     try reload.prepare();
     try std.testing.expectEqual(@as(f32, 57), reload.candidate.?.ui_build.widget_theme.?.controls.height);
+    // Host appearance reaches both generations, without replacing their
+    // different declaration overrides. A failed candidate cannot undo it.
+    try std.testing.expect(reload.setTheme(design.tokens.dark));
+    try std.testing.expect(!reload.setTheme(design.tokens.dark));
+    try std.testing.expectEqualDeep(design.tokens.dark, initial.ui_build.widget_theme.?.colors);
+    try std.testing.expectEqualDeep(design.tokens.dark, reload.candidate.?.ui_build.widget_theme.?.colors);
     const targets = [_]WindowTarget{
         .{ .id = "first", .runtime = &runtimes[0], .size = .{ .width = 320, .height = 200 } },
         .{ .id = "second", .runtime = &runtimes[1], .size = .{ .width = 320, .height = 200 } },
@@ -1058,6 +1075,8 @@ test "a later window build failure leaves every retained window on the active ge
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = initial_two_windows });
     try reload.prepare();
     const candidate = reload.candidate.?;
+    try std.testing.expectEqualDeep(design.tokens.dark, candidate.ui_build.widget_theme.?.colors);
+    try std.testing.expectEqual(@as(f32, 43), candidate.ui_build.widget_theme.?.controls.height);
     try reload.prepareApplication(&targets);
     try std.testing.expectEqual(available_scopes, scheduler.availableScopeCapacity());
     _ = try reload.commitApplication(&targets, &callbacks);

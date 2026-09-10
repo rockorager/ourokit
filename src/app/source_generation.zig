@@ -18,6 +18,8 @@ pub const Config = struct {
     dependency_capacity: usize = 256,
     module_capacity: usize = 64,
     varlink_call_capacity: usize = 16,
+    /// Borrowed for the generation/config lifetime; copied into each Lua VM.
+    runtime_dir: ?[]const u8 = null,
     defer_run: bool = false,
 };
 
@@ -317,6 +319,7 @@ pub const SourceGeneration = struct {
             );
             return err;
         };
+        self.vm.setRuntimeDirectory(config.runtime_dir);
         self.ui_build.attachSignals(&self.signals);
         self.ui_build.attachSemantics(self.semantic_storage) catch |err| {
             lua.recordDiagnosticError(
@@ -429,8 +432,8 @@ pub const SourceGeneration = struct {
             return err;
         };
         application_initialized = true;
-        if (services != null) {
-            if (self.application.theme) |theme| self.ui_build.widget_theme = theme;
+        if (services) |value| {
+            self.ui_build.widget_theme = self.application.resolvedTheme(value.theme);
         }
         try self.validateApplicationIdentity(diagnostic);
         self.application_ready = true;
@@ -523,7 +526,7 @@ pub const SourceGeneration = struct {
         try self.ui_build.attachText(services.paragraph_sources, &self.font_candidates, 1);
         try self.ui_build.attachMediumText(&self.medium_font_candidates);
         self.ui_build.enableDeclarativeWidgets(services.theme);
-        if (self.application.theme) |theme| self.ui_build.widget_theme = theme;
+        self.ui_build.widget_theme = self.application.resolvedTheme(services.theme);
         self.ui_build.theme_fonts = services.theme_fonts;
         try self.attachImages(services.images, services.icon_roots);
         if (services.workspaces) |store| {
@@ -578,6 +581,18 @@ pub const SourceGeneration = struct {
         return if (self.shell_workspaces) |*binding| binding.requested() else false;
     }
 
+    /// Apply host defaults at a safe point, retaining declaration overrides.
+    /// The caller invalidates mounted build owners when this returns true.
+    pub fn setTheme(self: *SourceGeneration, theme: design.tokens.Theme) bool {
+        const services = if (self.services) |*value| value else return false;
+        services.theme = theme;
+        if (!self.application_ready) return false;
+        const resolved = self.application.resolvedTheme(theme);
+        if (std.meta.eql(self.ui_build.widget_theme, @as(@TypeOf(self.ui_build.widget_theme), resolved))) return false;
+        self.ui_build.widget_theme = resolved;
+        return true;
+    }
+
     pub fn syncWorkspaces(self: *SourceGeneration) !void {
         if (self.shell_workspaces) |*binding| try binding.sync();
     }
@@ -600,8 +615,8 @@ pub const SourceGeneration = struct {
         if (!self.config.defer_run) if (self.module_loader) |*loader| loader.freeze();
         errdefer application.deinit();
         self.application = application;
-        if (self.services != null) {
-            if (application.theme) |theme| self.ui_build.widget_theme = theme;
+        if (self.services) |value| {
+            self.ui_build.widget_theme = application.resolvedTheme(value.theme);
         }
         try self.validateApplicationIdentity(diagnostic);
         const prepared_builds = self.allocator.alloc(
@@ -695,6 +710,8 @@ pub const SourceGeneration = struct {
 test "source generation owns a named snapshot and application Lua state" {
     var provider = try bundle.SourceProvider.initEmbedded(std.testing.allocator, "generation-test.lua",
         \\local ouro = require("ouro")
+        \\assert(ouro.xdg.runtime_dir == "/run/user/1234")
+        \\assert(type(ouro.xdg.icon) == "function")
         \\return ouro.app {
         \\  id = "dev.ouro.generation-test",
         \\  windows = {
@@ -722,7 +739,7 @@ test "source generation owns a named snapshot and application Lua state" {
         &loop,
         snapshot,
         null,
-        .{ .node_capacity = 8 },
+        .{ .node_capacity = 8, .runtime_dir = "/run/user/1234" },
         &diagnostic,
     );
     defer generation.destroy();

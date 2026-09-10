@@ -18,6 +18,7 @@ pub const Definition = struct {
     state: *c.State,
     id: []u8,
     theme: ?theming.Theme = null,
+    inherited_colors: theming.ColorFields = .initEmpty(),
     action_schema: ?varlink.Service = null,
     actions_reference: c_int = c.no_reference,
     run_reference: c_int = c.no_reference,
@@ -55,6 +56,7 @@ pub const Definition = struct {
             .state = self.state,
             .id = self.id,
             .theme = self.theme,
+            .inherited_colors = self.inherited_colors,
             .action_schema = self.action_schema,
             .actions_reference = self.actions_reference,
             .run_reference = self.run_reference,
@@ -163,10 +165,20 @@ pub const Application = struct {
     state: *c.State,
     id: []u8,
     theme: ?theming.Theme = null,
+    inherited_colors: theming.ColorFields = .initEmpty(),
     action_schema: ?varlink.Service = null,
     actions_reference: c_int,
     run_reference: c_int,
     windows: []Window,
+
+    pub fn resolvedTheme(self: *const Application, base: @import("../design/root.zig").tokens.Theme) theming.Theme {
+        var result = self.theme orelse return .{ .colors = base };
+        inline for (std.meta.fields(@TypeOf(base)), 0..) |field, i| {
+            if (self.inherited_colors.contains(@enumFromInt(i)))
+                @field(result.colors, field.name) = @field(base, field.name);
+        }
+        return result;
+    }
 
     pub fn load(
         allocator: std.mem.Allocator,
@@ -416,12 +428,16 @@ pub const Application = struct {
 
 fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     if (c.lua_type(state, -1) != c.type_table) return error.ApplicationDeclarationRequired;
+    var inherited_colors = theming.ColorFields.initEmpty();
     const theme = blk: {
         const kind = c.lua_getfield(state, -1, "theme");
         defer c.lua_settop(state, -2);
-        break :blk if (kind == c.type_nil) null else try theming.apply(state, -1, .{
+        if (kind == c.type_nil) break :blk null;
+        const value = try theming.apply(state, -1, .{
             .colors = @import("../design/root.zig").tokens.light,
         });
+        inherited_colors = theming.inheritedColors(state, -1);
+        break :blk value;
     };
     const id = try requiredString(allocator, state, -1, "id");
     errdefer allocator.free(id);
@@ -445,6 +461,7 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
         .state = state,
         .id = id,
         .theme = theme,
+        .inherited_colors = inherited_colors,
         .action_schema = action_schema,
         .actions_reference = actions_reference,
         .run_reference = run_reference,

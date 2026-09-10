@@ -127,6 +127,24 @@ pub const Vm = struct {
         c.lua_setglobal(state, "require");
     }
 
+    /// Publish the host's XDG runtime directory without exposing the environment.
+    /// Lua owns a copy; absent/empty values leave runtime_dir nil.
+    pub fn setRuntimeDirectory(self: *Vm, directory: ?[]const u8) void {
+        self.pushApi(self.state);
+        if (c.lua_getfield(self.state, -1, "xdg") != c.type_table) {
+            c.lua_settop(self.state, -2);
+            c.lua_createtable(self.state, 0, 1);
+        }
+        if (directory) |value| {
+            if (value.len != 0) {
+                _ = c.lua_pushlstring(self.state, value.ptr, value.len);
+            } else c.lua_pushnil(self.state);
+        } else c.lua_pushnil(self.state);
+        c.lua_setfield(self.state, -2, "runtime_dir");
+        c.lua_setfield(self.state, -2, "xdg");
+        c.lua_settop(self.state, -2);
+    }
+
     pub fn deinit(self: *Vm) void {
         std.debug.assert(self.running == null);
         for (self.chunks) |chunk| {
@@ -895,6 +913,40 @@ const test_external_lifecycle: task.ResourceLifecycle = .{
     .request_cancel = TestExternalWait.requestCancel,
     .destroy = TestExternalWait.destroy,
 };
+
+test "Lua XDG runtime directory is copied and absent values clear it" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 1, 1);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+
+    var directory = "/run/user/1234".*;
+    vm.setRuntimeDirectory(&directory);
+    @memset(&directory, 'x');
+    _ = try vm.spawnApplication(
+        \\local xdg = require('ouro').xdg
+        \\runtime_ok = xdg.runtime_dir == '/run/user/1234'
+        \\xdg.retained = true
+    );
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("runtime_ok"));
+    for ([_]?[]const u8{ null, "" }) |absent| {
+        vm.setRuntimeDirectory("/another/runtime");
+        vm.setRuntimeDirectory(absent);
+        _ = try vm.spawnApplication(
+            \\local xdg = require('ouro').xdg
+            \\runtime_cleared = xdg.runtime_dir == nil and xdg.retained == true
+        );
+        try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try std.testing.expect(vm.globalBoolean("runtime_cleared"));
+        try std.testing.expectEqual(@as(c_int, 0), c.lua_gettop(vm.state));
+    }
+}
 
 test "safe Lua libraries expose only computation helpers with standard UTF-8 semantics" {
     var scheduler: task.Scheduler = undefined;

@@ -10,6 +10,27 @@ pub const Theme = struct {
     widgets: Widgets = .{},
 };
 
+pub const ColorFields = std.EnumSet(std.meta.FieldEnum(tokens.Theme));
+
+/// Record inheritance separately from resolved values: an explicit color equal
+/// to the light default must still win when the host later switches to dark.
+pub fn inheritedColors(state: *c.State, index: c_int) ColorFields {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    const table = if (index < 0) top + index + 1 else index;
+    if (c.lua_getfield(state, table, "color_scheme") != c.type_nil) return .initEmpty();
+    c.lua_settop(state, top);
+    var inherited = ColorFields.initFull();
+    if (c.lua_getfield(state, table, "colors") == c.type_table) {
+        inline for (std.meta.fields(tokens.Theme), 0..) |field, i| {
+            if (c.lua_getfield(state, -1, field.name) != c.type_nil)
+                inherited.remove(@enumFromInt(i));
+            c.lua_settop(state, -2);
+        }
+    }
+    return inherited;
+}
+
 pub const Typography = struct {
     /// Null preserves the widget-specific built-in font size.
     size: ?f32 = null,

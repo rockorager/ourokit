@@ -152,6 +152,15 @@ pub const WindowRuntime = struct {
         self.build_owners.setDirtySink(.{ .context = self, .notify = notifyDirtyWindow });
     }
 
+    pub fn setTheme(self: *WindowRuntime, theme: @import("../design/root.zig").tokens.Theme) !void {
+        self.surface_color = theme.background;
+        self.accent_color = theme.primary;
+        self.content_color = theme.foreground;
+        self.border_color = theme.input;
+        self.focus_color = theme.ring;
+        if (self.ready) _ = try self.build_owners.markDirty(self.root_owner);
+    }
+
     pub fn setClipboardCoordinator(self: *WindowRuntime, clipboard: *clipboard_module.Coordinator) void {
         self.clipboard = clipboard;
     }

@@ -361,12 +361,37 @@ return ouro.app {
 }
 ```
 
-Resolution order is built-in defaults → app theme → enclosing `ouro.theme`
+Resolution order is host appearance → app theme → enclosing `ouro.theme`
 overrides → explicit widget props. Nested tables merge field by field; missing
 fields inherit. `color_scheme = "light" | "dark"` replaces the inherited color
 palette, then explicit `colors` apply; it does not reset typography or metrics.
 Colors use the generated semantic token names and `#RRGGBB` or `#RRGGBBAA`.
 Unknown theme fields and invalid colors/metrics are errors, not ignored typos.
+
+The standard runner follows [ourosettings](https://github.com/rockorager/ourosettings)'
+`appearance.color_scheme` automatically. Omit `theme.color_scheme` to follow the
+system; typography, metrics, and individual color overrides still apply. Set
+`color_scheme = "light"` or `"dark"` on the app or a nested `ouro.theme` to pin
+that palette. Explicit colors remain explicit even when they match the previous
+system default.
+
+Startup never waits for the settings daemon. The initial fallback and the
+`"default"` preference use the light palette. Changes invalidate existing windows
+without remounting their components. New windows and reloaded Lua inherit the
+latest snapshot. A daemon disconnect keeps the last known preference and retries
+with bounded backoff; no Lua subscription is needed for ordinary theme following.
+See [system-appearance.lua](../examples/system-appearance.lua) for a following
+window with an explicitly light section.
+
+Native hosts can use `app.appearance.Store`: `current` is a typed `Snapshot`,
+`update(snapshot)` publishes changes, and `takeEvent()` returns
+`.appearance_changed` with the newest snapshot. Equal updates are suppressed and
+multiple pending changes coalesce. `Snapshot.color_scheme` is `.default`,
+`.light`, or `.dark`. Pass a process-lifetime store as `app.WaylandRunOptions.appearance`
+to supply appearance instead of connecting to ourosettings. The store is not
+thread-safe: update it on the owning event-loop thread and wake that loop. The
+runner consumes its events at the UI safe point. Its built-in ourosettings
+client shares the native I/O loop and survives Lua source-generation retirement.
 
 The supported defaults are:
 

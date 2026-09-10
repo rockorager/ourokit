@@ -1,5 +1,6 @@
 const std = @import("std");
 const clipboard_module = @import("clipboard.zig");
+const appearance_module = @import("appearance.zig");
 const bundle = @import("../bundle/root.zig");
 const windows_module = @import("windows.zig");
 const source_generation = @import("source_generation.zig");
@@ -33,6 +34,9 @@ pub const Options = struct {
     /// Optional process-lifetime control edge. Any thread may call `request`;
     /// this runner consumes and commits requests only at its safe point.
     reload_requests: ?*ReloadRequests = null,
+    /// Optional host-owned appearance state. When supplied, ourosettings is
+    /// not connected. Mutate on the owning event-loop thread, then wake it.
+    appearance: ?*appearance_module.Store = null,
     application_window_capacity: usize = 16,
     output_capacity: usize = 16,
     window: WindowRuntimeConfig = .{},
@@ -158,6 +162,7 @@ fn runSourceWithFontconfig(
         .signal_capacity = options.signal_capacity,
         .subscription_capacity = options.subscription_capacity,
         .dependency_capacity = options.dependency_capacity,
+        .runtime_dir = std.process.Environ.getPosix(init.minimal.environ, "XDG_RUNTIME_DIR"),
         .defer_run = true,
     };
     // SourceGeneration consumes the snapshot on both success and failure.
@@ -196,6 +201,17 @@ fn runSourceWithFontconfig(
         if (options.exit_code) |result| result.* = code;
         return;
     }
+    var appearance_store: appearance_module.Store = .{};
+    const appearance = options.appearance orelse &appearance_store;
+    const settings_path = if (options.appearance == null and generation_config.runtime_dir != null and
+        generation_config.runtime_dir.?.len != 0)
+        try std.fmt.allocPrint(init.gpa, "{s}/ouro/settings.sock", .{generation_config.runtime_dir.?})
+    else
+        null;
+    defer if (settings_path) |path| init.gpa.free(path);
+    var appearance_client: appearance_module.Client = undefined;
+    try appearance_client.init(init.gpa, &loop, appearance, settings_path);
+    defer appearance_client.deinit();
     var source_reload: SourceReload = undefined;
     source_reload.init(
         init.gpa,
@@ -207,6 +223,7 @@ fn runSourceWithFontconfig(
         generation_config,
         initial_generation,
     );
+    source_reload.appearance = &appearance_client;
     if (module_root) |directory| source_reload.attachModuleRoot(directory.handle);
     initial_generation_owned = false;
     var sources_destroyed = false;
@@ -280,7 +297,7 @@ fn runSourceWithFontconfig(
     var vulkan_glyphs: renderer.vulkan.GlyphCache = undefined;
     if (options.vulkan) vulkan_glyphs = try renderer.vulkan.GlyphCache.init(init.gpa, &fonts, &vulkan_renderer);
     defer if (options.vulkan) vulkan_glyphs.deinit();
-    const theme = design.tokens.light;
+    const theme = appearanceTheme(appearance.current);
     const services: source_generation.UiServices = .{
         .paragraph_sources = &paragraph_sources,
         .paragraphs = &paragraphs,
@@ -383,6 +400,14 @@ fn runSourceWithFontconfig(
         const active_application = &active_generation.application;
         const signals = &active_generation.signals;
         const lua_ui = &active_generation.ui_build;
+        if (appearance.takeEvent()) |event| switch (event) {
+            .appearance_changed => |snapshot_value| {
+                if (source_reload.setTheme(appearanceTheme(snapshot_value))) {
+                    for (runtime_slots) |*slot| if (slot.runtime.initialized)
+                        try slot.runtime.setTheme(lua_ui.widget_theme.?.colors);
+                }
+            },
+        };
         var desired_changed = false;
         clipboard.setPlatformAvailable(host.clipboardAvailable());
         while (host.takeClipboardCompletion()) |completion| {
@@ -532,6 +557,7 @@ fn runSourceWithFontconfig(
             (!active_generation.stdio.hasPendingOutput() or shutdown_signal != null))
         {
             try host.beginShutdown();
+            try appearance_client.stop();
             if (control) |server| try server.beginShutdown();
             try source_reload.active().vm.requestCancellation();
             disconnect_started = true;
@@ -550,16 +576,17 @@ fn runSourceWithFontconfig(
             }
             const handle = window_set.handleForId(window.?.declaration.id()).?;
             if (!slot.runtime.initialized) {
+                const window_theme = lua_ui.widget_theme.?.colors;
                 try slot.runtime.init(
                     init.gpa,
                     &scheduler,
                     try window_set.scope(handle),
                     handle,
-                    theme.background,
-                    theme.primary,
-                    theme.foreground,
-                    theme.input,
-                    theme.ring,
+                    window_theme.background,
+                    window_theme.primary,
+                    window_theme.foreground,
+                    window_theme.input,
+                    window_theme.ring,
                     signals,
                     &paragraph_sources,
                     &paragraphs,
@@ -899,6 +926,7 @@ fn dispatchApplicationCompletion(reload: *SourceReload, loop: *io_loop.Loop, con
 }
 
 fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlServer, host: ?*platform.wayland.Host) !void {
+    if (reload.appearance) |client| try client.stop();
     reload.active().shutdownImages();
     if (reload.candidate) |candidate| candidate.shutdownImages();
     try reload.active().vm.requestCancellation();
@@ -915,6 +943,13 @@ fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlSe
         if (!loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork()) break;
         _ = try dispatchApplication(reload, loop, control, host, null);
     }
+}
+
+fn appearanceTheme(snapshot: appearance_module.Snapshot) design.tokens.Theme {
+    return switch (snapshot.color_scheme) {
+        .default, .light => design.tokens.light,
+        .dark => design.tokens.dark,
+    };
 }
 
 fn finishInitialBootstrap(

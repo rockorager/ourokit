@@ -26,6 +26,10 @@ const Slot = struct {
     task_handle: vm_module.TaskHandle = .invalid,
     failure: ?[]const u8 = null,
     cancellation_requested: bool = false,
+    streaming: bool = false,
+    guard: ?*?*Slot = null,
+    received: usize = 0,
+    consumed: usize = 0,
     receive_buffer: [receive_capacity]u8 = undefined,
 };
 
@@ -56,6 +60,9 @@ pub const VarlinkClient = struct {
         c.lua_pushlightuserdata(vm.state, self);
         c.lua_pushcclosure(vm.state, call, 1);
         c.lua_setfield(vm.state, -2, "call");
+        c.lua_pushlightuserdata(vm.state, self);
+        c.lua_pushcclosure(vm.state, subscribe, 1);
+        c.lua_setfield(vm.state, -2, "subscribe");
         c.lua_pushlightuserdata(vm.state, &json_null);
         c.lua_setfield(vm.state, -2, "null");
         c.lua_setfield(vm.state, -2, "varlink");
@@ -110,30 +117,15 @@ pub const VarlinkClient = struct {
                         try self.finish(slot, "Varlink connection closed before a reply");
                         return true;
                     }
-                    const received: usize = @intCast(completion.result);
-                    var consumed: usize = 0;
-                    while (consumed < received) {
-                        const count = slot.protocol.feed(slot.receive_buffer[consumed..received]) catch {
-                            try self.finish(slot, "invalid Varlink reply");
-                            return true;
-                        };
-                        consumed += count;
-                        if (slot.protocol.takeEvent()) |event_value| {
-                            var event = event_value;
-                            switch (event) {
-                                .reply => |*reply| {
-                                    slot.reply = reply.message;
-                                    reply.message = undefined;
-                                    event = undefined;
-                                },
-                            }
-                            try self.finish(slot, null);
-                            return true;
-                        }
-                        if (count == 0) {
-                            try self.finish(slot, "Varlink reply exceeded event capacity");
-                            return true;
-                        }
+                    slot.received = @intCast(completion.result);
+                    slot.consumed = 0;
+                    const ready = readReply(slot) catch {
+                        try self.finish(slot, "invalid Varlink reply");
+                        return true;
+                    };
+                    if (ready) {
+                        try self.finish(slot, null);
+                        return true;
                     }
                     try self.prepareNext(slot);
                 },
@@ -175,11 +167,27 @@ pub const VarlinkClient = struct {
     fn finish(self: *VarlinkClient, slot: *Slot, failure: ?[]const u8) !void {
         slot.failure = failure;
         slot.state = .ready;
-        if (slot.fd >= 0) {
+        if (slot.fd >= 0 and (failure != null or !slot.streaming or !slot.reply.?.continues)) {
             _ = linux.close(slot.fd);
             slot.fd = -1;
         }
         try self.vm.markExternalCompleted(slot.task_handle);
+    }
+
+    /// Stop at the first record. Coalesced later records stay in receive_buffer
+    /// until the callback has finished, including across callback yields.
+    fn readReply(slot: *Slot) !bool {
+        const remaining = slot.receive_buffer[slot.consumed..slot.received];
+        if (remaining.len == 0) return false;
+        const end = if (std.mem.indexOfScalar(u8, remaining, 0)) |index| index + 1 else remaining.len;
+        const count = try slot.protocol.feed(remaining[0..end]);
+        if (count != end) return error.UnexpectedBackpressure;
+        slot.consumed += count;
+        if (slot.protocol.takeEvent()) |event| {
+            slot.reply = event.reply.message;
+            return true;
+        }
+        return false;
     }
 
     fn available(self: *VarlinkClient) ?*Slot {
@@ -188,6 +196,8 @@ pub const VarlinkClient = struct {
     }
 
     fn release(self: *VarlinkClient, slot: *Slot) void {
+        std.debug.assert(slot.operation == null);
+        if (slot.guard) |guard| guard.* = null;
         if (slot.fd >= 0) _ = linux.close(slot.fd);
         if (slot.reply) |*reply| reply.deinit();
         if (slot.transmit) |*transmit| transmit.deinit();
@@ -196,13 +206,33 @@ pub const VarlinkClient = struct {
     }
 
     fn call(state: *c.State) callconv(.c) c_int {
+        return start(state, false);
+    }
+
+    fn subscribe(state: *c.State) callconv(.c) c_int {
+        return start(state, true);
+    }
+
+    fn start(state: *c.State, streaming: bool) c_int {
         const self = clientFromUpvalue(state) orelse
             return luaError(state, "missing Ouro Varlink client");
         const argument_count = c.lua_gettop(state);
-        if ((argument_count != 2 and argument_count != 3) or
+        if (streaming and (argument_count != 4 or c.lua_type(state, 4) != c.type_function))
+            return luaError(state, "ouro.varlink.subscribe expects address, method, parameters table, and callback");
+        if ((!streaming and argument_count != 2 and argument_count != 3) or
             c.lua_type(state, 1) != c.type_string or c.lua_type(state, 2) != c.type_string or
-            (argument_count == 3 and c.lua_type(state, 3) != c.type_table))
-            return luaError(state, "ouro.varlink.call expects address, method, and optional parameters table");
+            (argument_count >= 3 and c.lua_type(state, 3) != c.type_table))
+            return luaError(state, "Varlink expects address, method, and a parameters table");
+
+        // A C-stack to-be-closed guard covers errors, exit, and cancellation
+        // even while a subscription callback is yielding on another resource.
+        const guard: *?*Slot = @ptrCast(@alignCast(c.lua_newuserdatauv(state, @sizeOf(?*Slot), 0).?));
+        guard.* = null;
+        _ = c.luaL_newmetatable(state, "ouro.varlink.guard");
+        c.lua_pushcclosure(state, closeGuard, 0);
+        c.lua_setfield(state, -2, "__close");
+        _ = c.lua_setmetatable(state, -2);
+        c.lua_toclose(state, -1);
 
         var address_length: usize = 0;
         const address_pointer = c.lua_tolstring(state, 1, &address_length).?;
@@ -226,6 +256,9 @@ pub const VarlinkClient = struct {
         var method_length: usize = 0;
         const method_pointer = c.lua_tolstring(state, 2, &method_length).?;
         const slot = self.available() orelse return luaError(state, "Varlink call capacity exceeded");
+        slot.streaming = streaming;
+        slot.guard = guard;
+        guard.* = slot;
         slot.protocol = varlink.Client.init(self.allocator, .{
             .max_message_bytes = receive_capacity,
             .max_outbound_message_bytes = receive_capacity,
@@ -237,7 +270,7 @@ pub const VarlinkClient = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         var value_count: usize = 0;
-        const parameters: ?std.json.Value = if (argument_count == 3)
+        const parameters: ?std.json.Value = if (argument_count >= 3)
             luaToJson(state, 3, arena.allocator(), 0, &value_count) catch {
                 arena.deinit();
                 self.release(slot);
@@ -248,6 +281,7 @@ pub const VarlinkClient = struct {
         _ = slot.protocol.call(.{
             .method = method_pointer[0..method_length],
             .parameters = parameters,
+            .more = streaming,
         }) catch {
             arena.deinit();
             self.release(slot);
@@ -294,6 +328,7 @@ pub const VarlinkClient = struct {
             slot.owner.release(slot);
             return luaErrorSlice(state, failure);
         }
+        if (slot.streaming) return runSubscription(state, context, null);
         const reply = &(slot.reply orelse {
             slot.owner.release(slot);
             return luaError(state, "Varlink call completed without a reply");
@@ -312,6 +347,63 @@ pub const VarlinkClient = struct {
         }
         slot.owner.release(slot);
         return 1;
+    }
+
+    fn subscriptionContinuation(state: *c.State, status: c_int, context: c.KContext) callconv(.c) c_int {
+        return runSubscription(state, context, status);
+    }
+
+    fn runSubscription(state: *c.State, context: c.KContext, callback_status: ?c_int) c_int {
+        const slot = slotFromContext(context);
+        const self = slot.owner;
+        var status = callback_status;
+        while (true) {
+            if (status) |result| {
+                if (result != c.ok and result != c.yield) return c.lua_error(state);
+                const stop = c.lua_type(state, -1) == c.type_boolean and c.lua_toboolean(state, -1) == 0;
+                c.lua_settop(state, -2);
+                const final = !slot.reply.?.continues;
+                slot.reply.?.deinit();
+                slot.reply = null;
+                if (stop or final) {
+                    self.release(slot);
+                    return 0;
+                }
+            }
+            if (slot.reply == null) {
+                const ready = readReply(slot) catch return luaError(state, "invalid Varlink reply");
+                if (!ready) {
+                    slot.state = .receiving;
+                    slot.task_handle = self.vm.beginExternalWait(state, .operation, slot, &resource_lifecycle) catch
+                        return luaError(state, "could not park Varlink subscription");
+                    slot.operation = self.loop.prepareRecv(slot.fd, &slot.receive_buffer) catch {
+                        self.vm.abortExternalWait(state, slot.task_handle) catch unreachable;
+                        return luaError(state, "could not prepare Varlink subscription receive");
+                    };
+                    return c.lua_yieldk(state, 0, context, callContinuation);
+                }
+            }
+            c.lua_pushvalue(state, 4);
+            c.lua_createtable(state, 0, 3);
+            const reply = &slot.reply.?;
+            if (reply.parameters) |parameters| {
+                pushJson(state, parameters) catch return luaError(state, "Varlink reply could not be represented in Lua");
+                c.lua_setfield(state, -2, "parameters");
+            }
+            if (reply.error_name) |name| {
+                _ = c.lua_pushlstring(state, name.ptr, name.len);
+                c.lua_setfield(state, -2, "error");
+            }
+            c.lua_pushboolean(state, @intFromBool(reply.continues));
+            c.lua_setfield(state, -2, "continues");
+            status = c.lua_pcallk(state, 1, 1, 0, context, subscriptionContinuation);
+        }
+    }
+
+    fn closeGuard(state: *c.State) callconv(.c) c_int {
+        const guard: *?*Slot = @ptrCast(@alignCast(c.lua_touserdata(state, 1).?));
+        if (guard.*) |slot| slot.owner.release(slot);
+        return 0;
     }
 };
 
@@ -511,6 +603,7 @@ fn luaErrorSlice(state: *c.State, message: []const u8) c_int {
 
 const TestServer = struct {
     listener: linux.fd_t,
+    reply: []const u8 = "{\"parameters\":{\"answer\":42,\"nested\":[true,\"ok\",null],\"empty\":[]}}\x00",
     request: [512]u8 = undefined,
     request_length: usize = 0,
     succeeded: bool = false,
@@ -530,10 +623,9 @@ const TestServer = struct {
             self.request_length += result;
             if (std.mem.indexOfScalar(u8, self.request[0..self.request_length], 0) != null) break;
         }
-        const reply = "{\"parameters\":{\"answer\":42,\"nested\":[true,\"ok\",null],\"empty\":[]}}\x00";
         var written: usize = 0;
-        while (written < reply.len) {
-            const result = linux.write(accepted, reply[written..].ptr, reply.len - written);
+        while (written < self.reply.len) {
+            const result = linux.write(accepted, self.reply[written..].ptr, self.reply.len - written);
             if (linux.errno(result) != .SUCCESS or result == 0) return;
             written += result;
         }
@@ -626,6 +718,14 @@ test "Lua Varlink call uses runtime transport and converts JSON values" {
 }
 
 test "canceling a Lua Varlink call drains ring operations before releasing its slot" {
+    try testCancelReceive(false);
+}
+
+test "canceling a Lua Varlink subscription drains its pending receive" {
+    try testCancelReceive(true);
+}
+
+fn testCancelReceive(streaming: bool) !void {
     var name_buffer: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buffer, "ouro-lua-varlink-cancel-{d}", .{linux.getpid()});
     const listener = try testListener(name);
@@ -648,9 +748,9 @@ test "canceling a Lua Varlink call drains ring operations before releasing its s
     const source = try std.fmt.allocPrint(
         std.testing.allocator,
         "local ouro = require('ouro'); canceled_call_continued = false; " ++
-            "ouro.varlink.call('unix:@{s}', 'org.example.Wait'); " ++
+            "ouro.varlink.{s}('unix:@{s}', 'org.example.Wait'{s}); " ++
             "canceled_call_continued = true",
-        .{name},
+        .{ if (streaming) "subscribe" else "call", name, if (streaming) ", {}, function() canceled_call_continued = true end" else "" },
     );
     defer std.testing.allocator.free(source);
     _ = try vm.spawn(scope, source);
@@ -678,4 +778,174 @@ test "canceling a Lua Varlink call drains ring operations before releasing its s
     try std.testing.expectEqual(vm_module.ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
     try std.testing.expect(!vm.globalBoolean("canceled_call_continued"));
     try scheduler.destroyScope(scope);
+}
+
+const continued_reply = "{\"parameters\":{\"value\":7},\"continues\":true}\x00";
+const final_reply = "{\"parameters\":{\"value\":19}}\x00";
+
+test "Lua Varlink subscription delivers ordered replies across yielding callbacks" {
+    try testSubscription(continued_reply ++ final_reply,
+        \\local values = {}
+        \\watch(function(reply)
+        \\  ouro.sleep(1)
+        \\  values[#values + 1] = reply.parameters.value
+        \\  assert(reply.continues == (#values == 1))
+        \\end)
+        \\subscription_ok = #values == 2 and values[1] == 7 and values[2] == 19
+    , .none);
+}
+
+test "Lua Varlink subscription stops before buffered replies and propagates callback errors" {
+    try testSubscription(continued_reply ++ final_reply,
+        \\local count = 0
+        \\watch(function(reply)
+        \\  count = count + 1
+        \\  assert(reply.parameters.value == 7)
+        \\  return false
+        \\end)
+        \\subscription_ok = count == 1
+    , .none);
+    try testSubscription(continued_reply ++ final_reply,
+        \\local ok, err = pcall(watch, function()
+        \\  ouro.sleep(1)
+        \\  error('callback failed')
+        \\end)
+        \\subscription_ok = not ok and string.find(err, 'callback failed') ~= nil
+    , .none);
+}
+
+test "Lua Varlink subscription exposes final service errors and rejects broken streams" {
+    try testSubscription(continued_reply ++ "{\"error\":\"org.example.Denied\",\"parameters\":{\"reason\":\"no\"}}\x00",
+        \\local count = 0
+        \\watch(function(reply)
+        \\  count = count + 1
+        \\  if count == 2 then
+        \\    assert(reply.error == 'org.example.Denied' and reply.parameters.reason == 'no')
+        \\    assert(reply.continues == false)
+        \\  end
+        \\end)
+        \\subscription_ok = count == 2
+    , .none);
+    for ([_][]const u8{ continued_reply, continued_reply ++ "{", continued_reply ++ "invalid\x00" }) |replies| {
+        try testSubscription(replies,
+            \\local count = 0
+            \\local ok = pcall(watch, function() count = count + 1 end)
+            \\subscription_ok = not ok and count == 1
+        , .none);
+    }
+}
+
+test "Lua Varlink subscription cancellation closes ready replies and yielding callbacks" {
+    try testSubscription(continued_reply,
+        \\watch(function() subscription_ran = true end)
+    , .ready);
+    try testSubscription(continued_reply ++ final_reply,
+        \\watch(function()
+        \\  ouro.sleep(60)
+        \\  subscription_ran = true
+        \\end)
+    , .callback);
+}
+
+fn testSubscription(replies: []const u8, body: []const u8, cancel: enum { none, ready, callback }) !void {
+    var name_buffer: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buffer, "ouro-lua-subscription-{d}", .{linux.getpid()});
+    const listener = try testListener(name);
+    defer _ = linux.close(listener);
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 8);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 1, 2);
+    defer scheduler.deinit();
+    var vm: vm_module.Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    var client: VarlinkClient = undefined;
+    try client.init(std.testing.allocator, &vm, &loop, 1);
+    defer client.deinit();
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "local ouro = require('ouro'); " ++
+            "local function watch(callback) ouro.varlink.subscribe('unix:@{s}', " ++
+            "'org.example.Watch', {{path='/appearance/color_scheme'}}, callback) end; {s}",
+        .{ name, body },
+    );
+    defer std.testing.allocator.free(source);
+    _ = try vm.spawnApplication(source);
+    try std.testing.expectEqual(vm_module.ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+
+    // Complete connect and send, then queue all replies before submitting recv.
+    // This exercises coalesced records rather than relying on thread timing.
+    for (0..2) |_| {
+        _ = try loop.submit();
+        try std.testing.expect(try client.dispatch(loop.dispatch(try loop.wait()).socket));
+    }
+    var server: TestServer = .{ .listener = listener, .reply = replies };
+    TestServer.run(&server);
+    try std.testing.expect(server.succeeded);
+    const request = server.request[0 .. server.request_length - 1];
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("more").?.bool);
+    try std.testing.expectEqualStrings("org.example.Watch", parsed.value.object.get("method").?.string);
+    try std.testing.expectEqualStrings("/appearance/color_scheme", parsed.value.object.get("parameters").?.object.get("path").?.string);
+
+    var canceled = false;
+    while (vm.activeTaskCount() != 0) {
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .socket => |completion| try std.testing.expect(try client.dispatch(completion)),
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
+                try vm.markTimeoutCompleted(timeout.operation),
+            .operation_cancel => try client.collectCanceled(),
+            else => return error.UnexpectedCompletion,
+        }
+        if (cancel == .ready and !canceled) {
+            try vm.requestCancellation();
+            canceled = true;
+        }
+        while (scheduler.takeRunnable()) |runnable| {
+            _ = try vm.resumeRunnable(runnable);
+            if (cancel == .callback and !canceled) {
+                try vm.requestCancellation();
+                canceled = true;
+            }
+        }
+    }
+    try std.testing.expect(client.available() != null);
+    try std.testing.expect(!loop.hasPendingOperations());
+    while (loop.hasPendingTimerKernelWork()) {
+        _ = try loop.submit();
+        _ = loop.dispatch(try loop.wait());
+    }
+    if (cancel == .none) {
+        try std.testing.expect(vm.globalBoolean("subscription_ok"));
+    } else {
+        try std.testing.expect(canceled);
+        try std.testing.expect(!vm.globalBoolean("subscription_ran"));
+    }
+}
+
+test "Lua Varlink subscription decoder retains fragmented and coalesced records" {
+    var slot: Slot = .{};
+    slot.protocol = try varlink.Client.init(std.testing.allocator, .{ .max_events = 1 });
+    defer slot.protocol.deinit();
+    _ = try slot.protocol.call(.{ .method = "org.example.Watch", .more = true });
+    const split = continued_reply.len - 4;
+    @memcpy(slot.receive_buffer[0..split], continued_reply[0..split]);
+    slot.received = split;
+    try std.testing.expect(!try VarlinkClient.readReply(&slot));
+    const rest = continued_reply[split..] ++ final_reply;
+    @memcpy(slot.receive_buffer[0..rest.len], rest);
+    slot.received = rest.len;
+    slot.consumed = 0;
+    for ([_][]const u8{ "7", "19" }) |expected| {
+        try std.testing.expect(try VarlinkClient.readReply(&slot));
+        try std.testing.expectEqualStrings(expected, slot.reply.?.parameters.?.object.get("value").?.number_string);
+        slot.reply.?.deinit();
+        slot.reply = null;
+    }
+    try std.testing.expectEqual(slot.received, slot.consumed);
+    try std.testing.expect(!try VarlinkClient.readReply(&slot));
 }

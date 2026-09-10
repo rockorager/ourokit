@@ -60,6 +60,7 @@ pub extern fn lua_rawlen(state: *State, index: c_int) usize;
 pub extern fn lua_next(state: *State, index: c_int) c_int;
 pub extern fn lua_settop(state: *State, index: c_int) void;
 pub extern fn lua_rotate(state: *State, index: c_int, count: c_int) void;
+pub extern fn lua_toclose(state: *State, index: c_int) void;
 pub extern fn lua_newuserdatauv(state: *State, size: usize, user_value_count: c_int) ?*anyopaque;
 pub extern fn lua_getiuservalue(state: *State, index: c_int, user_value: c_int) c_int;
 pub extern fn lua_setiuservalue(state: *State, index: c_int, user_value: c_int) c_int;
