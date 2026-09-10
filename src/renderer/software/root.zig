@@ -5,6 +5,8 @@ const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const text = @import("../../text/root.zig");
 const build_options = @import("ourokit_build_options");
+const ImageCache = @import("../../image/cache.zig").Cache;
+const ImagePlacement = @import("../image_sampling.zig").Placement;
 
 pub const has_freetype = build_options.freetype;
 pub const GlyphCache = if (has_freetype)
@@ -41,7 +43,7 @@ pub const Target = struct {
 const max_clip_depth = scene.max_clip_depth;
 
 pub fn render(list: scene.DisplayList, target: Target) !void {
-    return renderInternal(list, target, null, null, null);
+    return renderResources(list, target, null, null, null, null);
 }
 
 pub fn renderText(
@@ -51,7 +53,7 @@ pub fn renderText(
     shapes: *const text.ShapeCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return renderInternal(list, target, glyphs, shapes, null);
+    return renderResources(list, target, glyphs, shapes, null, null);
 }
 
 pub fn renderParagraphs(
@@ -72,24 +74,30 @@ pub fn renderTextResources(
     paragraphs: ?*const text.ParagraphCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return renderInternal(list, target, glyphs, shapes, paragraphs);
+    return renderResources(list, target, glyphs, shapes, paragraphs, null);
 }
 
-fn renderInternal(
+pub fn renderResources(
     list: scene.DisplayList,
     target: Target,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
+    images: ?*const ImageCache,
 ) !void {
     try target.validate();
     try list.validate();
+    // Resolve before touching the target, even for clipped or undamaged images.
+    for (list.commands) |command| switch (command) {
+        .image => |value| _ = try (images orelse return error.ImageResourcesRequired).get(value.image),
+        else => {},
+    };
     switch (list.damage) {
-        .full => try renderRegion(list.commands, target, targetBounds(target), glyphs, shapes, paragraphs),
+        .full => try renderRegion(list.commands, target, targetBounds(target), glyphs, shapes, paragraphs, images),
         .regions => |regions| {
             for (regions) |region| {
                 const clipped = RectI.intersect(region, targetBounds(target));
-                if (!clipped.isEmpty()) try renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs);
+                if (!clipped.isEmpty()) try renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, images);
             }
         },
     }
@@ -102,6 +110,7 @@ fn renderRegion(
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
+    images: ?*const ImageCache,
 ) !void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
@@ -123,6 +132,20 @@ fn renderRegion(
         .decorated_rectangle => |rectangle| {
             const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
             drawDecoratedRectangle(target, bounds, rectangle);
+        },
+        .image => |value| {
+            const bitmap = try images.?.get(value.image);
+            const bounds = RectI.intersect(value.bounds, clips[depth]);
+            if (bounds.isEmpty()) continue;
+            const placement = ImagePlacement.init(value, bitmap);
+            const left: usize = @intCast(bounds.x);
+            const top: usize = @intCast(bounds.y);
+            for (top..top + bounds.height) |y| for (left..left + bounds.width) |x| {
+                const source = placement.sample(bitmap, x, y) orelse continue;
+                const offset = y * target.stride + x * 4;
+                const destination = readPixel(target.format, target.pixels[offset..][0..4]);
+                writePixel(target.format, target.pixels[offset..][0..4], sourceOver(source, destination));
+            };
         },
         .glyph_run => |run| {
             if (scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;

@@ -81,8 +81,15 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
             .run => |options| {
                 const source = try readSource(init, options.path);
                 defer init.gpa.free(source);
+                const parent = std.fs.path.dirname(options.path) orelse ".";
+                var asset_root = if (std.fs.path.isAbsolute(parent))
+                    try std.Io.Dir.openDirAbsolute(init.io, parent, .{})
+                else
+                    try std.Io.Dir.cwd().openDir(init.io, parent, .{});
+                defer asset_root.close(init.io);
                 var run_options: ourokit.app.WaylandRunOptions = .{
                     .exit_after_first_frame = options.exit_after_first_frame,
+                    .asset_root = asset_root.handle,
                 };
                 if (options.vulkan) |vulkan| run_options.vulkan = vulkan;
                 try ourokit.app.runStorybook(init, source, run_options);
@@ -190,6 +197,12 @@ fn listStories(init: std.process.Init, options: cli.List) !void {
 fn snapshotStories(init: std.process.Init, options: cli.Snapshot) !void {
     const source = try readSource(init, options.path);
     defer init.gpa.free(source);
+    const parent = std.fs.path.dirname(options.path) orelse ".";
+    var asset_root = if (std.fs.path.isAbsolute(parent))
+        try std.Io.Dir.openDirAbsolute(init.io, parent, .{})
+    else
+        try std.Io.Dir.cwd().openDir(init.io, parent, .{});
+    defer asset_root.close(init.io);
     var description = try ourokit.app.storybook.describe(init, source);
     defer description.deinit();
     if (options.story_id) |id| {
@@ -214,7 +227,7 @@ fn snapshotStories(init: std.process.Init, options: cli.Snapshot) !void {
 
     for (description.stories) |story| {
         if (options.story_id) |selected| if (!std.mem.eql(u8, story.id, selected)) continue;
-        var snapshot = try ourokit.app.storybook.snapshot(init, source, story.id);
+        var snapshot = try ourokit.app.storybook.snapshot(init, source, story.id, asset_root.handle);
         defer snapshot.deinit();
         const file_name = try std.fmt.allocPrint(init.gpa, "{s}.png", .{snapshot.id});
         defer init.gpa.free(file_name);

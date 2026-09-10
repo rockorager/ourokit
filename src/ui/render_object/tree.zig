@@ -7,6 +7,8 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const Constraints = @import("../layout/constraints.zig").Constraints;
 const box_impl = @import("box.zig");
 const flex_impl = @import("flex.zig");
+const image_impl = @import("image.zig");
+const ImageCache = @import("../../image/cache.zig").Cache;
 const scroll_impl = @import("scroll.zig");
 const stack_impl = @import("stack.zig");
 const scene_builder = @import("scene_builder.zig");
@@ -27,6 +29,8 @@ pub const LayoutError = error{
     InvalidParentData,
     TextHasChildren,
     TextInputHasChildren,
+    ImageResourcesRequired,
+    StaleImageHandle,
     ParagraphResourcesRequired,
     StaleParagraphSource,
     StaleParagraph,
@@ -64,6 +68,7 @@ pub const Tree = struct {
     slots: []Slot,
     paragraph_sources: ?*text.ParagraphSourceCache = null,
     paragraphs: ?*text.ParagraphCache = null,
+    images: ?*ImageCache = null,
 
     pub fn init(self: *Tree, allocator: std.mem.Allocator, capacity: usize) !void {
         if (capacity == 0) return error.InvalidCapacity;
@@ -91,6 +96,13 @@ pub const Tree = struct {
         std.debug.assert(self.paragraph_sources == null and self.paragraphs == null);
         self.paragraph_sources = sources;
         self.paragraphs = paragraphs;
+    }
+
+    /// Attach immediately after init. The cache must outlive this tree; every
+    /// loaded image object owns a lease independent of the loader and frames.
+    pub fn attachImageCache(self: *Tree, images: *ImageCache) void {
+        std.debug.assert(self.images == null);
+        self.images = images;
     }
 
     pub fn create(self: *Tree, object: types.Object) !NodeHandle {
@@ -142,6 +154,10 @@ pub const Tree = struct {
             .text => |value| {
                 const cache = self.paragraph_sources orelse return error.TextCacheRequired;
                 try cache.validateRetain(value.source);
+            },
+            .image => |value| if (value.image) |image| {
+                const cache = self.images orelse return error.ImageResourcesRequired;
+                try cache.validateRetain(image);
             },
             else => {},
         }
@@ -457,6 +473,7 @@ pub const Tree = struct {
             .flex => |value| try flex_impl.layout(value, self, handle, constraints),
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
             .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
+            .image => |value| try self.layoutImage(value, constraints),
             .text => try self.layoutText(handle, object.text, constraints),
             .text_input => try self.layoutTextInput(handle, object.text_input, constraints),
         };
@@ -519,6 +536,10 @@ pub const Tree = struct {
             .flex => false,
             .stack => |value| value.clip,
             .scroll => true,
+            .image => |value| paint: {
+                if (value.image) |image| try builder.image(image, bounds, value.fit);
+                break :paint false;
+            },
             .text => |value| paint: {
                 const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
                 try builder.pushClip(bounds);
@@ -657,6 +678,18 @@ pub const Tree = struct {
         return target;
     }
 
+    fn layoutImage(self: *Tree, value: types.Image, constraints: Constraints) LayoutError!SizeF {
+        const intrinsic: ?SizeF = if (value.image) |image| size: {
+            const cache = self.images orelse return error.ImageResourcesRequired;
+            const bitmap = cache.get(image) catch return error.StaleImageHandle;
+            break :size .{
+                .width = @floatFromInt(bitmap.intrinsic_width),
+                .height = @floatFromInt(bitmap.intrinsic_height),
+            };
+        } else null;
+        return image_impl.layout(value, intrinsic, constraints);
+    }
+
     fn layoutText(
         self: *Tree,
         handle: NodeHandle,
@@ -763,6 +796,10 @@ pub const Tree = struct {
 
     fn retainObject(self: *Tree, object: types.Object) !void {
         switch (object) {
+            .image => |value| if (value.image) |image| {
+                const cache = self.images orelse return error.ImageResourcesRequired;
+                try cache.retain(image);
+            },
             .text => |value| {
                 const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
                 try sources.retain(value.source);
@@ -777,6 +814,7 @@ pub const Tree = struct {
 
     fn releaseObject(self: *Tree, object: types.Object) void {
         switch (object) {
+            .image => |value| if (value.image) |image| self.images.?.release(image) catch unreachable,
             .text => |value| self.paragraph_sources.?.release(value.source) catch unreachable,
             .text_input => |input| self.paragraph_sources.?.release(input.source) catch unreachable,
             else => {},
@@ -796,6 +834,7 @@ fn validateObject(object: types.Object) !void {
         .flex => |value| try flex_impl.validate(value),
         .stack => {},
         .scroll => {},
+        .image => |value| try image_impl.validate(value),
         .text => |value| {
             if (value.max_lines == 0) return error.InvalidMaxLines;
             if (value.overflow == .ellipsis and value.max_lines == null)
@@ -827,6 +866,7 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
             .flex => return error.InvalidParentData,
         },
         .scroll => if (data != .none) return error.InvalidParentData,
+        .image => return error.ImageHasChildren,
         .text => return error.TextHasChildren,
         .text_input => return error.TextInputHasChildren,
     }
@@ -845,6 +885,8 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
         .stack => false,
         .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
+        .image => |old_image| !std.meta.eql(old_image.image, new.image.image) or
+            old_image.width != new.image.width or old_image.height != new.image.height,
         .text => |old_text| !sameSource(old_text.source, new.text.source) or
             old_text.alignment != new.text.alignment or
             old_text.max_lines != new.text.max_lines or
@@ -1334,4 +1376,115 @@ test "scroll lays out unbounded content and clips paint and hit testing" {
     try std.testing.expectEqual(content, (try tree.hitTest(scroll, .{ .x = 10, .y = 10 })).?);
     try std.testing.expect((try tree.hitTest(scroll, .{ .x = 10, .y = 60 })) == null);
     try std.testing.expectEqual(@as(f32, 70), try tree.setScrollOffset(scroll, 500));
+}
+
+test "image tree retains intrinsic resources and emits scaled clipped native commands" {
+    const scene = @import("../../scene/root.zig");
+    const RectI = @import("../../core/geometry.zig").RectI;
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try images.insert(.{
+        .allocator = std.testing.allocator,
+        .pixels = try std.testing.allocator.dupe(u8, &.{ 17, 31, 63, 255 }),
+        .width = 1,
+        .height = 1,
+        .intrinsic_width = 120,
+        .intrinsic_height = 40,
+    });
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    tree.attachImageCache(&images);
+    const root = try tree.create(.{ .stack = .{ .clip = true } });
+    const leaf = try tree.create(.{ .image = .{ .width = 35.5, .height = 17.25 } });
+    try tree.appendChild(root, leaf, .{ .stack = .{ .x = 1.25, .y = 2.5 } });
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 100, .height = 80 }));
+    try std.testing.expectEqual(SizeF{ .width = 35.5, .height = 17.25 }, try tree.nodeSize(leaf));
+    var commands: [3]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 2);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(@as(usize, 2), builder.count);
+    try std.testing.expect(commands[0] == .push_clip_rect and commands[1] == .pop_clip);
+
+    try tree.update(leaf, .{ .image = .{ .image = image } });
+    try images.release(image);
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 150, .height = 80 }));
+    try std.testing.expectEqual(SizeF{ .width = 120, .height = 40 }, try tree.nodeSize(leaf));
+    try tree.update(leaf, .{ .image = .{ .image = image, .fit = .cover } });
+    try std.testing.expect(!(try tree.layoutDirty(leaf)));
+    try std.testing.expect(try tree.paintDirty(leaf));
+    builder = try scene_builder.Builder.init(&commands, 2);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(@as(usize, 3), builder.count);
+    try std.testing.expectEqual(RectI{ .x = 0, .y = 0, .width = 300, .height = 160 }, commands[0].push_clip_rect);
+    try std.testing.expectEqual(image, commands[1].image.image);
+    try std.testing.expectEqual(RectI{ .x = 2, .y = 5, .width = 241, .height = 80 }, commands[1].image.bounds);
+    try std.testing.expectEqual(@import("../../image/pixels.zig").Fit.cover, commands[1].image.fit);
+    try std.testing.expect(commands[2] == .pop_clip);
+    try builder.displayList().validate();
+
+    try tree.destroy(leaf);
+    try std.testing.expectError(error.StaleImageHandle, images.get(image));
+}
+
+test "image tree rejects stale replacements and children without changing ownership" {
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try images.insert(.{
+        .allocator = std.testing.allocator,
+        .pixels = try std.testing.allocator.dupe(u8, &.{ 17, 31, 63, 255 }),
+        .width = 1,
+        .height = 1,
+        .intrinsic_width = 90,
+        .intrinsic_height = 30,
+    });
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 3);
+    defer tree.deinit();
+    try std.testing.expectError(error.ImageResourcesRequired, tree.create(.{ .image = .{ .image = image } }));
+    tree.attachImageCache(&images);
+    const leaf = try tree.create(.{ .image = .{ .image = image } });
+    try images.release(image);
+    const stale: Handle = .{ .slot = image.slot, .generation = image.generation + 1 };
+    try std.testing.expectError(error.StaleImageHandle, tree.validateRetain(.{ .image = .{ .image = stale } }));
+    try std.testing.expectError(error.StaleImageHandle, tree.update(leaf, .{ .image = .{ .image = stale } }));
+    try std.testing.expectError(error.StaleImageHandle, tree.create(.{ .image = .{ .image = stale } }));
+    try std.testing.expectEqual(image, (try tree.objectAt(leaf)).image.image.?);
+    try tree.validateRetain(.{ .image = .{ .image = image } });
+    const parent = try tree.create(.{ .box = .{} });
+    const child = try tree.create(.{ .box = .{} });
+    try std.testing.expectError(error.ImageHasChildren, tree.appendChild(leaf, child, .none));
+    try tree.appendChild(parent, child, .none);
+    try std.testing.expectError(error.ImageHasChildren, tree.update(parent, .{ .image = .{ .image = image } }));
+    try std.testing.expect((try tree.objectAt(parent)) == .box);
+    try std.testing.expectEqual(child, tree.firstChild(parent).?);
+    try std.testing.expectError(error.RenderObjectCapacityExceeded, tree.create(.{ .image = .{ .image = image } }));
+    try tree.update(leaf, .{ .image = .{ .width = 51, .height = 19 } });
+    try std.testing.expectError(error.StaleImageHandle, images.get(image));
+    try std.testing.expectEqual(SizeF{ .width = 51, .height = 19 }, try tree.layout(leaf, .{}));
+}
+
+test "image tree deinit releases every shared image lease" {
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try images.insert(.{
+        .allocator = std.testing.allocator,
+        .pixels = try std.testing.allocator.dupe(u8, &.{ 17, 31, 63, 255 }),
+        .width = 1,
+        .height = 1,
+        .intrinsic_width = 90,
+        .intrinsic_height = 30,
+    });
+    {
+        var tree: Tree = undefined;
+        try tree.init(std.testing.allocator, 2);
+        defer tree.deinit();
+        tree.attachImageCache(&images);
+        const first = try tree.create(.{ .image = .{ .image = image } });
+        _ = try tree.create(.{ .image = .{ .image = image } });
+        try images.release(image);
+        try tree.update(first, .{ .box = .{} });
+        try std.testing.expectEqual(@as(u32, 90), (try images.get(image)).intrinsic_width);
+    }
+    try std.testing.expectError(error.StaleImageHandle, images.get(image));
 }

@@ -4,6 +4,14 @@
     .fingerprint = 0xfcff6af0be23d251, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .wuffs = .{
+            .url = "https://github.com/google/wuffs/archive/0f214ba59c20c0c9c7ba841ecc3683f863965312.tar.gz",
+            .hash = "N-V-__8AAFIG5AE6jBrubRPU8xkbb3aesB086MeUSnN1qZ-q",
+        },
+        .libwebp = .{
+            .url = "https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz",
+            .hash = "N-V-__8AAGkrewARcKiSyLfJKsaW0ZoqHh4hzi4mTGwekxjk",
+        },
         .wayring = .{
             .url = "https://github.com/rockorager/wayring/archive/700b194fff32adc619c6ebdae5199223f87f9fc0.tar.gz",
             .hash = "wayring-0.1.0-N0pph2HsEwAW-8708IpDnSEpqNL-ajkaEZeXzOEjcLrB",

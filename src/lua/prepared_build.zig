@@ -52,6 +52,8 @@ pub const PreparedBuild = struct {
     description_reference: c_int = c.no_reference,
     virtual_lists: @import("../ui/widget/virtual_list.zig").Snapshot = .{},
     shapes: ?*text.ParagraphSourceCache,
+    images: ?*@import("../image/cache.zig").Cache = null,
+    owns_images: bool = false,
     descriptor_storage: []instance.Descriptor,
     descriptor_count: usize = 0,
     semantic_storage: []semantics.Descriptor,
@@ -139,6 +141,12 @@ pub const PreparedBuild = struct {
                 .text_input => |text_input_value| self.shapes.?.release(text_input_value.source) catch unreachable,
                 else => {},
             };
+        if (self.owns_images) for (self.descriptor_storage[0..self.descriptor_count]) |descriptor|
+            switch (descriptor.object) {
+                .image => |value| if (value.image) |handle| self.images.?.release(handle) catch unreachable,
+                else => {},
+            };
+        self.owns_images = false;
         self.descriptor_count = 0;
         self.semantic_count = 0;
         self.semantic_text_count = 0;

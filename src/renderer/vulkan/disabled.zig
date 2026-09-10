@@ -4,6 +4,21 @@ const Renderer = @This();
 const std = @import("std");
 const scene = @import("../../scene/root.zig");
 const text = @import("../../text/root.zig");
+const ImageCache = @import("../../image/cache.zig").Cache;
+
+pub const PixelFormat = enum { rgba8_unorm, bgra8_unorm };
+
+pub const Target = struct {
+    pub fn init(_: *Renderer, _: u32, _: u32) !Target {
+        return error.VulkanDisabled;
+    }
+
+    pub fn deinit(_: *Target, _: *Renderer) void {}
+
+    pub fn readPixels(_: *const Target, _: []u8, _: usize, _: PixelFormat) !void {
+        return error.VulkanDisabled;
+    }
+};
 
 pub const GlyphCache = struct {
     pub fn init(_: std.mem.Allocator, _: *text.FontCache, _: *Renderer) !GlyphCache {
@@ -56,6 +71,30 @@ pub fn init(_: std.mem.Allocator) !Renderer {
 }
 
 pub fn deinit(_: *Renderer) void {}
+
+pub fn renderResources(
+    _: *Renderer,
+    _: scene.DisplayList,
+    _: *Target,
+    _: ?*GlyphCache,
+    _: ?*const text.ShapeCache,
+    _: ?*const text.ParagraphCache,
+    _: ?*const ImageCache,
+) !void {
+    return error.VulkanDisabled;
+}
+
+pub fn renderDmabufResources(
+    _: *Renderer,
+    _: scene.DisplayList,
+    _: *DmabufTarget,
+    _: ?*GlyphCache,
+    _: ?*const text.ShapeCache,
+    _: ?*const text.ParagraphCache,
+    _: ?*const ImageCache,
+) !void {
+    return error.VulkanDisabled;
+}
 
 pub fn renderDmabufText(
     _: *Renderer,

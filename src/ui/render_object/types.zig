@@ -60,6 +60,15 @@ pub const Scroll = struct {
     axis: Axis = .vertical,
 };
 
+/// A retained bitmap leaf. Null represents pending or failed loading and paints
+/// nothing while preserving any declared layout dimensions.
+pub const Image = struct {
+    image: ?@import("../../image/cache.zig").ImageHandle = null,
+    width: ?f32 = null,
+    height: ?f32 = null,
+    fit: @import("../../image/pixels.zig").Fit = .contain,
+};
+
 /// Width-independent paragraph identity. The retained render-tree slot derives
 /// and caches a width-specific positioned layout from current constraints.
 pub const Text = struct {
@@ -103,6 +112,7 @@ pub const Object = union(enum) {
     flex: Flex,
     stack: Stack,
     scroll: Scroll,
+    image: Image,
     text: Text,
     text_input: TextInput,
 };

@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 64) in;
 
@@ -20,7 +21,15 @@ layout(push_constant) uniform Push {
     int bottom;
     uint atlas_x;
     uint atlas_y;
+    uint image_mode;
+    uint image_rows;
+    float image_left;
+    float image_top;
+    float image_width;
+    float image_height;
 };
+
+#include "image.glsl"
 
 uint channel(uint pixel, uint shift) {
     return (pixel >> shift) & 255u;
@@ -45,6 +54,13 @@ void main() {
 
     uint x = index % width;
     uint y = index / width;
+    uint target_index = uint(top + int(y)) * target_width + uint(left + int(x));
+    if (image_mode != 0u) {
+        uint sampled = imageSample(vec2(left + int(x), top + int(y)) + vec2(0.5));
+        if (source != 0u) sampled = (sampled & 0xff00ff00u) | ((sampled & 255u) << 16u) | ((sampled >> 16u) & 255u);
+        pixels[target_index] = sourceOver(sampled, pixels[target_index]);
+        return;
+    }
     uint atlas_index = (atlas_y + y) * atlas_width + atlas_x + x;
     uint coverage = (masks[atlas_index / 4u] >> ((atlas_index % 4u) * 8u)) & 255u;
     if (coverage == 0u) return;
@@ -52,6 +68,5 @@ void main() {
     for (uint shift = 0u; shift <= 24u; shift += 8u) {
         covered |= ((channel(source, shift) * coverage + 127u) / 255u) << shift;
     }
-    uint target_index = uint(top + int(y)) * target_width + uint(left + int(x));
     pixels[target_index] = sourceOver(covered, pixels[target_index]);
 }

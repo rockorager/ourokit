@@ -19,4 +19,5 @@ test {
     _ = vulkan;
     _ = @import("log.zig");
     _ = @import("conformance.zig");
+    _ = @import("image_test.zig");
 }

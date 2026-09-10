@@ -13,6 +13,8 @@ const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const text = @import("../../text/root.zig");
 const build_options = @import("ourokit_build_options");
+const ImageCache = @import("../../image/cache.zig").Cache;
+const ImagePlacement = @import("../image_sampling.zig").Placement;
 
 pub const has_freetype = build_options.freetype;
 const RasterCache = if (has_freetype)
@@ -69,6 +71,7 @@ command_pool: c.VkCommandPool,
 command_buffer: c.VkCommandBuffer,
 fence: c.VkFence,
 max_pixels: u64,
+max_image_pixels: u64,
 
 const atlas_width = 2048;
 const atlas_height = 2048;
@@ -315,8 +318,12 @@ pub const Target = struct {
     }
 
     fn initFormat(renderer: *Renderer, width: u32, height: u32, format: StorageFormat) !Target {
+        return initBuffer(renderer, width, height, format, renderer.max_pixels);
+    }
+
+    fn initBuffer(renderer: *Renderer, width: u32, height: u32, format: StorageFormat, limit: u64) !Target {
         const pixel_count = std.math.mul(u64, width, height) catch return error.InvalidExtent;
-        if (pixel_count == 0 or pixel_count > renderer.max_pixels) return error.InvalidExtent;
+        if (pixel_count == 0 or pixel_count > limit) return error.InvalidExtent;
         const byte_size_u64 = std.math.mul(u64, pixel_count, 4) catch return error.InvalidExtent;
         const byte_size = std.math.cast(usize, byte_size_u64) orelse return error.InvalidExtent;
 
@@ -407,6 +414,113 @@ pub const Target = struct {
 
 const StorageFormat = enum { rgba, bgra };
 
+/// Immutable upload copies, independent of the thread-confined decode cache.
+/// A dma-buf target owns these until its submission fence signals.
+const ImageUploads = struct {
+    entries: std.ArrayList(Entry) = .empty,
+    resources: std.ArrayList(Resource) = .empty,
+    byte_size: u64 = 0,
+
+    const Entry = struct {
+        resource_index: usize,
+        placement: ImagePlacement,
+    };
+
+    const Resource = struct {
+        pixels: Target,
+        pool: c.VkDescriptorPool,
+        descriptor: c.VkDescriptorSet,
+    };
+
+    fn init(renderer: *Renderer, commands: []const scene.Command, cache: ?*const ImageCache, target: ?*const Target) !ImageUploads {
+        var self: ImageUploads = .{};
+        errdefer self.deinit(renderer);
+        var indices: std.AutoHashMapUnmanaged(@import("../../image/cache.zig").ImageHandle, usize) = .empty;
+        defer indices.deinit(std.heap.page_allocator);
+        const byte_limit = @min(256 * 1024 * 1024, renderer.max_image_pixels * 4);
+        for (commands) |command| switch (command) {
+            .image => |value| {
+                const bitmap = try (cache orelse return error.ImageResourcesRequired).get(value.image);
+                const index = try indices.getOrPut(std.heap.page_allocator, value.image);
+                if (!index.found_existing) {
+                    if (bitmap.pixels.len > byte_limit - self.byte_size) return error.ImageUploadBudgetExceeded;
+                    var resource = try upload(renderer, bitmap, target);
+                    errdefer {
+                        c.vkDestroyDescriptorPool(renderer.device, resource.pool, null);
+                        resource.pixels.deinit(renderer);
+                    }
+                    try self.resources.append(std.heap.page_allocator, resource);
+                    index.value_ptr.* = self.resources.items.len - 1;
+                    self.byte_size += bitmap.pixels.len;
+                }
+                try self.entries.append(std.heap.page_allocator, .{
+                    .resource_index = index.value_ptr.*,
+                    .placement = ImagePlacement.init(value, bitmap),
+                });
+            },
+            else => {},
+        };
+        return self;
+    }
+
+    fn upload(renderer: *Renderer, bitmap: *const @import("../../image/pixels.zig").Bitmap, target: ?*const Target) !Resource {
+        // Source images are storage-limited, not dispatch-limited: a
+        // large image can be drawn into a much smaller destination.
+        var pixels = try Target.initBuffer(renderer, bitmap.width, bitmap.height, .rgba, renderer.max_image_pixels);
+        errdefer pixels.deinit(renderer);
+        @memcpy(@as([*]u8, @ptrCast(pixels.mapping))[0..pixels.byte_size], bitmap.pixels);
+        var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
+        var pool_info: c.VkDescriptorPoolCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        var pool: c.VkDescriptorPool = undefined;
+        try vk(c.vkCreateDescriptorPool(renderer.device, &pool_info, null, &pool), error.CreateDescriptorPoolFailed);
+        errdefer c.vkDestroyDescriptorPool(renderer.device, pool, null);
+        var layout = if (target != null) renderer.descriptor_layout else renderer.atlas_descriptor_layout;
+        var allocate: c.VkDescriptorSetAllocateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        var descriptor: c.VkDescriptorSet = undefined;
+        try vk(c.vkAllocateDescriptorSets(renderer.device, &allocate, &descriptor), error.AllocateDescriptorSetFailed);
+        const first = target orelse &pixels;
+        var buffers = [_]c.VkDescriptorBufferInfo{
+            .{ .buffer = first.buffer, .offset = 0, .range = first.byte_size },
+            .{ .buffer = pixels.buffer, .offset = 0, .range = pixels.byte_size },
+        };
+        var writes: [2]c.VkWriteDescriptorSet = undefined;
+        for (&writes, 0..) |*write, binding| write.* = .{
+            .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor,
+            .dstBinding = @intCast(binding),
+            .descriptorCount = 1,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buffers[binding],
+        };
+        c.vkUpdateDescriptorSets(renderer.device, if (target != null) 2 else 1, &writes, 0, null);
+        return .{
+            .pixels = pixels,
+            .pool = pool,
+            .descriptor = descriptor,
+        };
+    }
+
+    fn deinit(self: *ImageUploads, renderer: *Renderer) void {
+        for (self.resources.items) |*resource| {
+            c.vkDestroyDescriptorPool(renderer.device, resource.pool, null);
+            resource.pixels.deinit(renderer);
+        }
+        self.resources.deinit(std.heap.page_allocator);
+        self.entries.deinit(std.heap.page_allocator);
+        self.* = .{};
+    }
+};
+
 pub const DmabufPlane = struct {
     offset: u32,
     stride: u32,
@@ -433,6 +547,7 @@ pub const DmabufTarget = struct {
     explicit_sync: bool = false,
     acquire_point: u64 = 0,
     release_point: u64 = 0,
+    image_uploads: ImageUploads = .{},
 
     pub fn init(renderer: *Renderer, width: u32, height: u32, modifier: u64) !DmabufTarget {
         if (!renderer.dmabuf_enabled) return error.DmabufUnavailable;
@@ -627,6 +742,7 @@ pub const DmabufTarget = struct {
     pub fn deinit(self: *DmabufTarget, renderer: *Renderer) void {
         if (self.gpu_pending)
             _ = c.vkWaitForFences(renderer.device, 1, &self.fence, c.VK_TRUE, std.math.maxInt(u64));
+        self.image_uploads.deinit(renderer);
         c.vkDestroySemaphore(renderer.device, self.timeline, null);
         c.vkDestroyFence(renderer.device, self.fence, null);
         c.vkDestroyCommandPool(renderer.device, self.command_pool, null);
@@ -642,6 +758,7 @@ pub const DmabufTarget = struct {
         return switch (c.vkGetFenceStatus(renderer.device, self.fence)) {
             c.VK_SUCCESS => blk: {
                 self.gpu_pending = false;
+                self.image_uploads.deinit(renderer);
                 break :blk true;
             },
             c.VK_NOT_READY => false,
@@ -653,6 +770,7 @@ pub const DmabufTarget = struct {
         if (!self.gpu_pending) return;
         try vk(c.vkWaitForFences(renderer.device, 1, &self.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
         self.gpu_pending = false;
+        self.image_uploads.deinit(renderer);
     }
 
     pub fn exportSyncobjFd(self: *DmabufTarget, renderer: *Renderer) !std.posix.fd_t {
@@ -728,6 +846,12 @@ const GlyphPush = extern struct {
     bottom: i32,
     atlas_x: u32,
     atlas_y: u32,
+    image_mode: u32 = 0,
+    image_rows: u32 = 0,
+    image_left: f32 = 0,
+    image_top: f32 = 0,
+    image_width: f32 = 0,
+    image_height: f32 = 0,
 };
 
 const PresentationGlyphPush = extern struct {
@@ -737,6 +861,12 @@ const PresentationGlyphPush = extern struct {
     bounds: [4]i32,
     atlas_origin: [2]u32,
     atlas_width_value: u32,
+    image_mode: u32 = 0,
+    image_rows: u32 = 0,
+    image_left: f32 = 0,
+    image_top: f32 = 0,
+    image_width: f32 = 0,
+    image_height: f32 = 0,
 };
 
 const PresentationObjects = struct {
@@ -1270,6 +1400,7 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
             @as(u64, properties.limits.maxStorageBufferRange) / 4,
             @as(u64, properties.limits.maxComputeWorkGroupCount[0]) * local_size,
         ),
+        .max_image_pixels = @as(u64, properties.limits.maxStorageBufferRange) / 4,
     };
 }
 
@@ -1335,7 +1466,7 @@ fn modifierPlaneCount(self: *const Renderer, modifier: u64) ?u32 {
 }
 
 pub fn render(self: *Renderer, list: scene.DisplayList, target: *Target) !void {
-    return self.renderInternal(list, target, null, null, null);
+    return self.renderResources(list, target, null, null, null, null);
 }
 
 pub fn renderText(
@@ -1346,7 +1477,7 @@ pub fn renderText(
     shapes: *const text.ShapeCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return self.renderInternal(list, target, glyphs, shapes, null);
+    return self.renderResources(list, target, glyphs, shapes, null, null);
 }
 
 pub fn renderParagraphs(
@@ -1369,20 +1500,23 @@ pub fn renderTextResources(
     paragraphs: ?*const text.ParagraphCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return self.renderInternal(list, target, glyphs, shapes, paragraphs);
+    return self.renderResources(list, target, glyphs, shapes, paragraphs, null);
 }
 
-fn renderInternal(
+pub fn renderResources(
     self: *Renderer,
     list: scene.DisplayList,
     target: *Target,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
+    images: ?*const ImageCache,
 ) !void {
     try list.validate();
-    try validateClipDepth(list.commands, shapes != null, paragraphs != null);
+    try validateClipDepth(list.commands, glyphs != null and shapes != null, glyphs != null and paragraphs != null);
     if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
+    var image_uploads = try ImageUploads.init(self, list.commands, images, target);
+    defer image_uploads.deinit(self);
     try vk(c.vkResetDescriptorPool(self.device, self.descriptor_pool, 0), error.ResetDescriptorPoolFailed);
     var descriptor_allocate_info: c.VkDescriptorSetAllocateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1395,7 +1529,7 @@ fn renderInternal(
     try vk(c.vkAllocateDescriptorSets(self.device, &descriptor_allocate_info, &descriptor_set), error.AllocateDescriptorSetFailed);
     var buffer_infos = [_]c.VkDescriptorBufferInfo{
         .{ .buffer = target.buffer, .offset = 0, .range = target.byte_size },
-        .{ .buffer = if (glyphs) |cache| cache.buffer else target.buffer, .offset = 0, .range = if (glyphs != null) atlas_bytes else target.byte_size },
+        .{ .buffer = if (has_freetype and glyphs != null) glyphs.?.buffer else target.buffer, .offset = 0, .range = if (glyphs != null) atlas_bytes else target.byte_size },
     };
     var descriptor_writes = [_]c.VkWriteDescriptorSet{
         .{
@@ -1433,8 +1567,8 @@ fn renderInternal(
         .pInheritanceInfo = null,
     };
     try vk(c.vkBeginCommandBuffer(self.command_buffer, &begin_info), error.BeginCommandBufferFailed);
-    const atlas_uploaded = if (glyphs) |cache|
-        cache.recordUpload(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+    const atlas_uploaded = if (has_freetype and glyphs != null)
+        glyphs.?.recordUpload(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     else
         false;
     c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
@@ -1460,10 +1594,10 @@ fn renderInternal(
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs),
+        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, descriptor_set),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs);
+            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, descriptor_set);
         },
     }
     var host_barrier: c.VkMemoryBarrier = .{
@@ -1498,7 +1632,7 @@ fn renderInternal(
         .pSignalSemaphores = null,
     };
     try vk(c.vkQueueSubmit(self.queue, 1, &submit_info, self.fence), error.QueueSubmitFailed);
-    if (atlas_uploaded) glyphs.?.uploaded();
+    if (has_freetype and atlas_uploaded) glyphs.?.uploaded();
     try vk(c.vkWaitForFences(self.device, 1, &self.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
 }
 
@@ -1507,7 +1641,7 @@ fn renderInternal(
 /// for the GPU. Slot reuse must additionally wait for `ready` and compositor
 /// release.
 pub fn renderDmabuf(self: *Renderer, list: scene.DisplayList, target: *DmabufTarget) !void {
-    return self.renderDmabufInternal(list, target, null, null, null);
+    return self.renderDmabufResources(list, target, null, null, null, null);
 }
 
 pub fn renderDmabufText(
@@ -1518,7 +1652,7 @@ pub fn renderDmabufText(
     shapes: *const text.ShapeCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return self.renderDmabufInternal(list, target, glyphs, shapes, null);
+    return self.renderDmabufResources(list, target, glyphs, shapes, null, null);
 }
 
 pub fn renderDmabufParagraphs(
@@ -1540,21 +1674,24 @@ pub fn renderDmabufTextResources(
     paragraphs: ?*const text.ParagraphCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    return self.renderDmabufInternal(list, target, glyphs, shapes, paragraphs);
+    return self.renderDmabufResources(list, target, glyphs, shapes, paragraphs, null);
 }
 
-fn renderDmabufInternal(
+pub fn renderDmabufResources(
     self: *Renderer,
     list: scene.DisplayList,
     target: *DmabufTarget,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
+    images: ?*const ImageCache,
 ) !void {
     try list.validate();
-    try validateClipDepth(list.commands, shapes != null, paragraphs != null);
+    try validateClipDepth(list.commands, glyphs != null and shapes != null, glyphs != null and paragraphs != null);
     if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
     if (!try target.ready(self)) return error.TargetBusy;
+    var image_uploads = try ImageUploads.init(self, list.commands, images, null);
+    errdefer image_uploads.deinit(self);
     try vk(c.vkResetCommandBuffer(target.command_buffer, 0), error.ResetCommandBufferFailed);
     var begin_info: c.VkCommandBufferBeginInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -1563,8 +1700,8 @@ fn renderDmabufInternal(
         .pInheritanceInfo = null,
     };
     try vk(c.vkBeginCommandBuffer(target.command_buffer, &begin_info), error.BeginCommandBufferFailed);
-    const atlas_uploaded = if (glyphs) |cache|
-        cache.recordUpload(target.command_buffer, c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+    const atlas_uploaded = if (has_freetype and glyphs != null)
+        glyphs.?.recordUpload(target.command_buffer, c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
     else
         false;
     var image_barrier: c.VkImageMemoryBarrier = .{
@@ -1629,10 +1766,10 @@ fn renderDmabufInternal(
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs),
+        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs);
+            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads);
         },
     }
     c.vkCmdEndRenderPass(target.command_buffer);
@@ -1680,7 +1817,8 @@ fn renderDmabufInternal(
         .pSignalSemaphores = if (target.explicit_sync) &target.timeline else null,
     };
     try vk(c.vkQueueSubmit(self.queue, 1, &submit_info, target.fence), error.QueueSubmitFailed);
-    if (atlas_uploaded) glyphs.?.uploaded();
+    if (has_freetype and atlas_uploaded) glyphs.?.uploaded();
+    target.image_uploads = image_uploads;
     target.layout = c.VK_IMAGE_LAYOUT_GENERAL;
     target.gpu_pending = true;
     if (target.explicit_sync) {
@@ -1697,10 +1835,12 @@ fn renderPresentationRegion(
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
+    images: *const ImageUploads,
 ) void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
+    var image_index: usize = 0;
     for (commands, 0..) |command, index| switch (command) {
         .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
             self.presentationFill(target, damage, color, .source),
@@ -1719,6 +1859,11 @@ fn renderPresentationRegion(
             RectI.intersect(rectangle.bounds, clips[depth]),
             rectangle,
         ),
+        .image => |value| {
+            const entry = &images.entries.items[image_index];
+            self.drawPresentationImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
+            image_index += 1;
+        },
         .glyph_run => |run| self.drawPresentationGlyphRun(
             run,
             target,
@@ -1880,10 +2025,13 @@ fn renderRegion(
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
+    images: *const ImageUploads,
+    descriptor: c.VkDescriptorSet,
 ) void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
+    var image_index: usize = 0;
     for (commands, 0..) |command, index| switch (command) {
         .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
             self.fill(target, damage, color, .source),
@@ -1902,6 +2050,12 @@ fn renderRegion(
             RectI.intersect(rectangle.bounds, clips[depth]),
             rectangle,
         ),
+        .image => |value| {
+            const entry = &images.entries.items[image_index];
+            self.drawImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
+            image_index += 1;
+            c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
+        },
         .glyph_run => |run| self.drawGlyphRun(
             run,
             target,
@@ -1917,6 +2071,73 @@ fn renderRegion(
             paragraphs orelse unreachable,
         ),
     };
+}
+
+fn drawImage(self: *Renderer, target: *const Target, bounds: RectI, placement: ImagePlacement, image: *const ImageUploads.Resource) void {
+    if (bounds.isEmpty()) return;
+    c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
+    c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &image.descriptor, 0, null);
+    const push: GlyphPush = .{
+        .target_width = target.width,
+        .atlas_width_value = image.pixels.width,
+        .source = @intFromBool(target.format == .bgra),
+        .left = bounds.x,
+        .top = bounds.y,
+        .right = @intCast(@as(i64, bounds.x) + bounds.width),
+        .bottom = @intCast(@as(i64, bounds.y) + bounds.height),
+        .atlas_x = 0,
+        .atlas_y = 0,
+        .image_mode = 1,
+        .image_rows = image.pixels.height,
+        .image_left = placement.left,
+        .image_top = placement.top,
+        .image_width = placement.width,
+        .image_height = placement.height,
+    };
+    c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
+    const count = @as(u64, bounds.width) * bounds.height;
+    c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+    var barrier: c.VkMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+}
+
+fn drawPresentationImage(self: *Renderer, target: *const DmabufTarget, bounds: RectI, placement: ImagePlacement, image: *const ImageUploads.Resource) void {
+    if (bounds.isEmpty()) return;
+    var scissor: c.VkRect2D = .{
+        .offset = .{ .x = bounds.x, .y = bounds.y },
+        .extent = .{ .width = bounds.width, .height = bounds.height },
+    };
+    var viewport: c.VkViewport = .{
+        .x = @floatFromInt(bounds.x),
+        .y = @floatFromInt(bounds.y),
+        .width = @floatFromInt(bounds.width),
+        .height = @floatFromInt(bounds.height),
+        .minDepth = 0,
+        .maxDepth = 1,
+    };
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_glyph_pipeline);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_glyph_pipeline_layout, 0, 1, &image.descriptor, 0, null);
+    c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
+    c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
+    const push: PresentationGlyphPush = .{
+        .color = .{ 1, 1, 1, 1 },
+        .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
+        .bounds = .{ bounds.x, bounds.y, @intCast(@as(i64, bounds.x) + bounds.width), @intCast(@as(i64, bounds.y) + bounds.height) },
+        .atlas_origin = .{ 0, 0 },
+        .atlas_width_value = image.pixels.width,
+        .image_mode = 1,
+        .image_rows = image.pixels.height,
+        .image_left = placement.left,
+        .image_top = placement.top,
+        .image_width = placement.width,
+        .image_height = placement.height,
+    };
+    c.vkCmdPushConstants(target.command_buffer, self.presentation_glyph_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(PresentationGlyphPush), &push);
+    c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
 }
 
 fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, blend: scene.BlendMode) void {
@@ -2036,6 +2257,7 @@ fn prepareText(
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
 ) !void {
+    if (!has_freetype) return error.FreeTypeDisabled;
     for (commands) |command| switch (command) {
         .glyph_run => |run| {
             const shaped = try (shapes orelse return error.TextResourcesRequired).get(run.shape);
@@ -2065,6 +2287,7 @@ fn drawGlyphRun(
     cache: *GlyphCache,
     shapes: *const text.ShapeCache,
 ) void {
+    if (!has_freetype) unreachable;
     const shaped = shapes.get(command.shape) catch unreachable;
     const source_color = command.color.premultiplied();
     const source = @as(u32, if (target.format == .rgba) source_color.r else source_color.b) |
@@ -2120,6 +2343,7 @@ fn drawPresentationGlyphRun(
     cache: *GlyphCache,
     shapes: *const text.ShapeCache,
 ) void {
+    if (!has_freetype) unreachable;
     const shaped = shapes.get(command.shape) catch unreachable;
     const color = command.color.premultiplied();
     var pen = command.origin;
@@ -2184,6 +2408,7 @@ fn drawPresentationParagraph(
     cache: *GlyphCache,
     paragraphs: *const text.ParagraphCache,
 ) void {
+    if (!has_freetype) unreachable;
     const layout = paragraphs.get(command.layout) catch unreachable;
     const color = command.color.premultiplied();
     for (layout.positioned.lines) |line| {
@@ -2411,6 +2636,7 @@ fn drawParagraph(
     cache: *GlyphCache,
     paragraphs: *const text.ParagraphCache,
 ) void {
+    if (!has_freetype) unreachable;
     const layout = paragraphs.get(command.layout) catch unreachable;
     const source_color = command.color.premultiplied();
     const source = @as(u32, if (target.format == .rgba) source_color.r else source_color.b) |
@@ -2639,4 +2865,199 @@ test "Vulkan renders and exports a linear dma-buf image and syncobj timeline" {
     const fd = try target.exportFd(&renderer);
     defer _ = std.os.linux.close(fd);
     try std.testing.expect(target.planes[0].stride >= 8);
+}
+
+test "graphics image sampling matches software and upload copies outlive source cache" {
+    const software = @import("../software/root.zig");
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    // A host-visible linear color attachment exercises the dma-buf graphics
+    // pipeline even on drivers without external-memory export support.
+    var format_properties: c.VkFormatProperties = undefined;
+    c.vkGetPhysicalDeviceFormatProperties(renderer.physical_device, c.VK_FORMAT_B8G8R8A8_UNORM, &format_properties);
+    if (format_properties.linearTilingFeatures & c.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT == 0) return error.SkipZigTest;
+    var image_info: c.VkImageCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = c.VK_IMAGE_TYPE_2D,
+        .format = c.VK_FORMAT_B8G8R8A8_UNORM,
+        .extent = .{ .width = 32, .height = 12, .depth = 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = c.VK_SAMPLE_COUNT_1_BIT,
+        .tiling = c.VK_IMAGE_TILING_LINEAR,
+        .usage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    var image: c.VkImage = undefined;
+    try vk(c.vkCreateImage(renderer.device, &image_info, null, &image), error.CreateImageFailed);
+    defer c.vkDestroyImage(renderer.device, image, null);
+    var requirements: c.VkMemoryRequirements = undefined;
+    c.vkGetImageMemoryRequirements(renderer.device, image, &requirements);
+    const memory_type = renderer.findMemoryType(requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) orelse return error.SkipZigTest;
+    var allocate: c.VkMemoryAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = requirements.size, .memoryTypeIndex = memory_type };
+    var memory: c.VkDeviceMemory = undefined;
+    try vk(c.vkAllocateMemory(renderer.device, &allocate, null, &memory), error.AllocateMemoryFailed);
+    defer c.vkFreeMemory(renderer.device, memory, null);
+    try vk(c.vkBindImageMemory(renderer.device, image, memory, 0), error.BindMemoryFailed);
+    var mapping: ?*anyopaque = null;
+    try vk(c.vkMapMemory(renderer.device, memory, 0, requirements.size, 0, &mapping), error.MapMemoryFailed);
+    defer c.vkUnmapMemory(renderer.device, memory);
+    const range: c.VkImageSubresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 };
+    var view_info: c.VkImageViewCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = image,
+        .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+        .format = c.VK_FORMAT_B8G8R8A8_UNORM,
+        .subresourceRange = range,
+    };
+    var view: c.VkImageView = undefined;
+    try vk(c.vkCreateImageView(renderer.device, &view_info, null, &view), error.CreateImageViewFailed);
+    defer c.vkDestroyImageView(renderer.device, view, null);
+    var framebuffer_info: c.VkFramebufferCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass = renderer.presentation_render_pass,
+        .attachmentCount = 1,
+        .pAttachments = &view,
+        .width = 32,
+        .height = 12,
+        .layers = 1,
+    };
+    var framebuffer: c.VkFramebuffer = undefined;
+    try vk(c.vkCreateFramebuffer(renderer.device, &framebuffer_info, null, &framebuffer), error.CreateFramebufferFailed);
+    defer c.vkDestroyFramebuffer(renderer.device, framebuffer, null);
+    var cache = try ImageCache.init(std.testing.allocator, 1);
+    defer cache.deinit();
+    const handle = try @import("../image_test.zig").insertFixture(&cache);
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(20, 40, 60, 255) },
+        .{ .image = .{ .image = handle, .bounds = .{ .x = 1, .y = 1, .width = 8, .height = 9 }, .fit = .contain } },
+        .{ .push_clip_rect = .{ .x = 12, .y = 2, .width = 7, .height = 8 } },
+        .{ .image = .{ .image = handle, .bounds = .{ .x = 11, .y = 1, .width = 8, .height = 9 }, .fit = .cover } },
+        .pop_clip,
+        .{ .image = .{ .image = handle, .bounds = .{ .x = 21, .y = 1, .width = 8, .height = 9 }, .fit = .fill } },
+        .{ .image = .{ .image = handle, .bounds = .{ .x = 27, .y = 9, .width = 2, .height = 1 }, .fit = .fill } },
+    };
+    var expected: [32 * 12 * 4]u8 = undefined;
+    try software.renderResources(.{ .commands = &commands }, .{ .pixels = &expected, .width = 32, .height = 12, .stride = 128, .format = .bgra8_unorm }, null, null, null, &cache);
+    var uploads = try ImageUploads.init(&renderer, &commands, &cache, null);
+    defer uploads.deinit(&renderer);
+    try std.testing.expectEqual(@as(usize, 4), uploads.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), uploads.resources.items.len);
+    try std.testing.expectEqual(@as(u64, 24), uploads.byte_size);
+    try std.testing.expectEqual(@as(f32, 1), uploads.entries.items[0].placement.left);
+    try std.testing.expectEqual(@as(f32, 21), uploads.entries.items[2].placement.left);
+    for (uploads.entries.items) |entry| try std.testing.expectEqual(@as(usize, 0), entry.resource_index);
+    try cache.release(handle);
+    try std.testing.expectError(error.StaleImageHandle, cache.get(handle));
+    // Only the graphics target and command buffer fields are consumed here.
+    const target: DmabufTarget = .{
+        .image = image,
+        .memory = memory,
+        .view = view,
+        .framebuffer = framebuffer,
+        .command_pool = renderer.command_pool,
+        .command_buffer = renderer.command_buffer,
+        .fence = renderer.fence,
+        .timeline = null,
+        .width = 32,
+        .height = 12,
+        .modifier = 0,
+        .planes = undefined,
+        .plane_count = 0,
+    };
+    try vk(c.vkResetCommandPool(renderer.device, renderer.command_pool, 0), error.ResetCommandPoolFailed);
+    var begin: c.VkCommandBufferBeginInfo = .{ .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    try vk(c.vkBeginCommandBuffer(renderer.command_buffer, &begin), error.BeginCommandBufferFailed);
+    var barrier: c.VkImageMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = range,
+    };
+    c.vkCmdPipelineBarrier(renderer.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, null, 0, null, 1, &barrier);
+    var pass: c.VkRenderPassBeginInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = renderer.presentation_render_pass,
+        .framebuffer = framebuffer,
+        .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = 32, .height = 12 } },
+    };
+    c.vkCmdBeginRenderPass(renderer.command_buffer, &pass, c.VK_SUBPASS_CONTENTS_INLINE);
+    renderer.renderPresentationRegion(&commands, &target, .{ .x = 0, .y = 0, .width = 32, .height = 12 }, null, null, null, &uploads);
+    c.vkCmdEndRenderPass(renderer.command_buffer);
+    barrier.srcAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = c.VK_ACCESS_HOST_READ_BIT;
+    barrier.oldLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrier.newLayout = c.VK_IMAGE_LAYOUT_GENERAL;
+    c.vkCmdPipelineBarrier(renderer.command_buffer, c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, c.VK_PIPELINE_STAGE_HOST_BIT, 0, 0, null, 0, null, 1, &barrier);
+    try vk(c.vkEndCommandBuffer(renderer.command_buffer), error.EndCommandBufferFailed);
+    var submit: c.VkSubmitInfo = .{ .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &renderer.command_buffer };
+    try vk(c.vkResetFences(renderer.device, 1, &renderer.fence), error.ResetFenceFailed);
+    try vk(c.vkQueueSubmit(renderer.queue, 1, &submit, renderer.fence), error.QueueSubmitFailed);
+    try vk(c.vkWaitForFences(renderer.device, 1, &renderer.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
+    var subresource: c.VkImageSubresource = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .arrayLayer = 0 };
+    var layout: c.VkSubresourceLayout = undefined;
+    c.vkGetImageSubresourceLayout(renderer.device, image, &subresource, &layout);
+    const bytes: [*]const u8 = @ptrCast(mapping.?);
+    for (0..12) |y| for (0..128) |x| {
+        const actual = bytes[layout.offset + y * layout.rowPitch + x];
+        // Fixed-function UNORM blending may round one channel differently.
+        try std.testing.expect(@abs(@as(i16, actual) - @as(i16, expected[y * 128 + x])) <= 1);
+    };
+}
+
+test "image uploads deduplicate repeated handles and bound unique bytes per submission" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var target = try Target.init(&renderer, 1, 1);
+    defer target.deinit(&renderer);
+    var cache = try ImageCache.init(std.testing.allocator, 2);
+    defer cache.deinit();
+    const first = try @import("../image_test.zig").insertFixture(&cache);
+    const second = try @import("../image_test.zig").insertFixture(&cache);
+    var commands: [256]scene.Command = undefined;
+    for (&commands, 0..) |*command, index| command.* = .{ .image = .{
+        .image = if (index % 2 == 0) first else second,
+        .bounds = .{ .x = @intCast(index), .y = 3, .width = 6, .height = 4 },
+        .fit = .fill,
+    } };
+    // A smaller synthetic native storage limit lets the test exercise both
+    // sides of the byte budget without allocating hundreds of megabytes.
+    renderer.max_image_pixels = 11; // 44 bytes: each 24-byte image fits alone.
+    for ([_]?*const Target{ &target, null }) |destination| {
+        try std.testing.expectError(error.ImageUploadBudgetExceeded, ImageUploads.init(&renderer, &commands, &cache, destination));
+        renderer.max_image_pixels = 12; // Exactly 48 unique bytes, not 256 * 24.
+        var uploads = try ImageUploads.init(&renderer, &commands, &cache, destination);
+        defer uploads.deinit(&renderer);
+        try std.testing.expectEqual(@as(usize, 256), uploads.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 2), uploads.resources.items.len);
+        try std.testing.expectEqual(@as(u64, 48), uploads.byte_size);
+        for (uploads.entries.items, 0..) |entry, index| {
+            try std.testing.expectEqual(index % 2, entry.resource_index);
+            try std.testing.expectEqual(@as(f32, @floatFromInt(index)), entry.placement.left);
+            const resource = uploads.resources.items[entry.resource_index];
+            const bytes: [*]const u8 = @ptrCast(resource.pixels.mapping);
+            try std.testing.expectEqualSlices(u8, (try cache.get(commands[index].image.image)).pixels, bytes[0..24]);
+        }
+        uploads.deinit(&renderer);
+        try std.testing.expectEqual(@as(usize, 0), uploads.resources.items.len);
+        try std.testing.expectEqual(@as(usize, 0), uploads.entries.items.len);
+        try std.testing.expectEqual(@as(u64, 0), uploads.byte_size);
+        renderer.max_image_pixels = 11;
+    }
+    // Failed and successful uploads must not acquire or leak cache leases.
+    try cache.release(first);
+    try cache.release(second);
+    try std.testing.expectError(error.StaleImageHandle, cache.get(first));
+    try std.testing.expectError(error.StaleImageHandle, cache.get(second));
 }

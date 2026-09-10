@@ -3,6 +3,8 @@ const c = @import("c.zig");
 
 pub const Kind = enum {
     text,
+    image,
+    icon,
     button,
     text_input,
     listbox,

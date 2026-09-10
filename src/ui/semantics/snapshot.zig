@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Role = enum { group, text, button, text_field, listbox, option };
+pub const Role = enum { group, text, button, text_field, listbox, option, image };
 
 /// Borrowed normalized semantic data emitted beside render descriptors during
 /// one build. Text is copied into the retained Snapshot before another Lua call.

@@ -488,6 +488,59 @@ and selection. `appearance = "sidebar"` instead uses gray steps 3 and 5 plus a
 medium selected label for navigation catalogs without introducing a separate
 widget.
 
+### Images and icons load asynchronously
+
+```lua
+ouro.image {
+  key = "photo",
+  src = "assets/photo.webp",
+  width = 240,
+  height = 160,
+  fit = "cover",
+  alt = "A mountain lake",
+}
+
+ouro.icon { key = "next", src = "assets/arrow.svg" }
+```
+
+`src` is a path relative to the application's source/module root. Alternatively,
+pass an encoded Lua string as `bytes`; exactly one source is required. Absolute
+paths, directory escapes, symlinks, and implicit network access are not supported.
+Storybook uses the catalog file's directory as its asset root.
+
+PNG, JPEG, WebP, and static SVG use the same native Image leaf. JPEG orientation
+is applied before layout; animated WebP displays only its first frame. SVG is
+restricted to self-contained paths and shapes: external references and embedded
+images are disabled, and text must be converted to paths. Embedded ICC profiles
+are not converted; output is premultiplied encoded sRGB, without HDR/wide gamut.
+
+File reading, decoding, and SVG rasterization run on a worker, never in layout or
+paint. A successful build queues work; completions invalidate only subscribed
+windows. Pending and failed assets paint nothing but keep declared dimensions.
+Use an enclosing box for a placeholder surface. Missing dimensions use the loaded
+intrinsic size; one declared dimension preserves aspect ratio, subject to parent
+constraints. Failed sources remain failed until eviction or source reload.
+
+`fit` defaults to `contain` (centered, aspect-preserving). `cover` fills the box
+and crops; `fill` stretches. `tint` applies a color through the decoded alpha mask;
+without it, images preserve their colors. `ouro.icon` supplies a 24×24 logical size
+and the inherited theme foreground tint. Set `width`, `height`, or `tint` to
+override those defaults. `alt` supplies the semantic image name.
+
+Decoded assets are cached by source and raster options, including physical size,
+scale, and tint. Trees, prepared builds, and frames hold separate pixel leases.
+Omitted subscriptions allow eviction; a retiring generation drains its active
+worker without blocking input or publishing its result. Source and decoded-memory
+budgets are bounded. Both software and Vulkan renderers support the same fitting,
+bilinear filtering, clipping, and alpha compositing. Vulkan currently uploads
+pixels per submission; persistent GPU texture caching is not implemented.
+
+See `examples/images.lua` for file-backed formats, byte-backed icons, fit modes,
+theme inheritance, interaction, and failed assets. Storybook snapshots wait for
+asset completion before capturing pixels.
+
+### Virtual lists
+
 Large, generic vertical viewports use `ouro.virtual_list`:
 
 ```lua

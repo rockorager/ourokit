@@ -7,6 +7,8 @@ const shell = @import("../shell/root.zig");
 const task = @import("../task/root.zig");
 const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
+const image_service = @import("../image/service.zig");
+const ImageCache = @import("../image/cache.zig").Cache;
 
 pub const Config = struct {
     node_capacity: usize = 256,
@@ -28,6 +30,7 @@ pub const UiServices = struct {
     callbacks: *lua.CallbackRegistry,
     theme_fonts: ?*@import("../lua/theme_fonts.zig").ThemeFonts = null,
     workspaces: ?*shell.workspaces.Store = null,
+    images: ?*ImageCache = null,
 };
 
 /// All Lua-owned meaning for one application source snapshot. This value and
@@ -50,6 +53,8 @@ pub const SourceGeneration = struct {
     application: lua.Application,
     prepared_builds: []lua.PreparedBuild,
     module_loader: ?lua.ModuleLoader = null,
+    images: ?image_service.Service = null,
+    asset_root: ?std.os.linux.fd_t = null,
     bootstrap: ?lua.ApplicationBootstrap = null,
     ui_task: ?lua.TaskHandle = null,
     application_ready: bool = false,
@@ -155,6 +160,8 @@ pub const SourceGeneration = struct {
         self.allocator = allocator;
         self.snapshot = snapshot;
         self.module_loader = null;
+        self.images = null;
+        self.asset_root = module_root;
         self.shell_workspaces = null;
         self.bootstrap = null;
         self.ui_task = null;
@@ -179,6 +186,7 @@ pub const SourceGeneration = struct {
             }
             if (application_initialized) self.application.deinit();
             if (module_loader_initialized) self.module_loader.?.deinit();
+            if (self.images) |*images| images.deinit();
             if (stdio_initialized) self.stdio.deinit();
             if (varlink_client_initialized) self.varlink_client.deinit();
             if (vm_initialized) self.vm.deinit();
@@ -346,6 +354,7 @@ pub const SourceGeneration = struct {
             };
             self.ui_build.enableDeclarativeWidgets(value.theme);
             self.ui_build.theme_fonts = value.theme_fonts;
+            try self.attachImages(value.images);
         } else {
             self.callbacks = null;
         }
@@ -515,13 +524,40 @@ pub const SourceGeneration = struct {
         self.ui_build.enableDeclarativeWidgets(services.theme);
         if (self.application.theme) |theme| self.ui_build.widget_theme = theme;
         self.ui_build.theme_fonts = services.theme_fonts;
+        try self.attachImages(services.images);
         if (services.workspaces) |store| {
             self.shell_workspaces = @as(lua.ShellWorkspaces, undefined);
             try self.shell_workspaces.?.init(self.vm.state, &self.signals, store, self.vm.apiReference());
         }
     }
 
+    fn attachImages(self: *SourceGeneration, cache_optional: ?*ImageCache) !void {
+        const cache = cache_optional orelse return;
+        std.debug.assert(self.images == null);
+        self.images = @as(image_service.Service, undefined);
+        self.images.?.init(self.allocator, self.vm.loop, cache, self.asset_root) catch |err| {
+            self.images = null;
+            return err;
+        };
+        self.ui_build.images = &self.images.?;
+    }
+
+    /// Starts queued asset work only after the active generation reconciles.
+    /// Candidate preparation queues descriptions but never starts workers.
+    pub fn pumpImages(self: *SourceGeneration) !void {
+        if (self.images) |*images| try images.pump();
+    }
+
+    pub fn shutdownImages(self: *SourceGeneration) void {
+        if (self.images) |*images| images.shutdown();
+    }
+
+    pub fn imagesQuiescent(self: *const SourceGeneration) bool {
+        return if (self.images) |*images| images.canDeinit() else true;
+    }
+
     pub fn dispatchFile(self: *SourceGeneration, completion: io_loop.FileCompletion) !bool {
+        if (self.images) |*images| if (try images.dispatch(completion)) return true;
         if (try self.stdio.dispatch(completion)) return true;
         if (self.module_loader) |*loader| return loader.dispatch(completion);
         return false;
@@ -635,6 +671,7 @@ pub const SourceGeneration = struct {
             if (self.bootstrap) |*bootstrap| bootstrap.deinit();
         }
         if (self.module_loader) |*loader| loader.deinit();
+        if (self.images) |*images| images.deinit();
         self.stdio.deinit();
         self.varlink_client.deinit();
         self.vm.deinit();

@@ -53,6 +53,7 @@ deterministic without putting shaping or measurement in a renderer.
 
 - Linux 5.10 or newer with `io_uring`
 - Zig 0.16.0 exactly (Wayring's current minimum and target)
+- Rust/Cargo 1.85 or newer for the pinned resvg image bridge (tested with 1.94)
 - Python 3 for deterministic token validation/generation
 - Fontconfig development files for native Linux font discovery
 - FreeType development files for native software text rasterization
@@ -103,6 +104,10 @@ render-object and scene storage, lays out in logical coordinates, lowers a
 display list at an explicit output scale, hit tests by descriptor ID, and
 provides platform-free pointer capture through `pointerPress`, `pointerMotion`,
 and `pointerRelease`.
+
+Images remain caller-decoded at this boundary: insert an `ImageBitmap` into an
+`ImageCache`, call `Surface.attachImageCache`, and render with
+`software.renderResources`. Neither Cargo nor the image decoders are required.
 
 Text remains explicit: a caller that uses Text render objects must create and
 attach its own paragraph source/layout caches, and text-capable software
@@ -167,6 +172,12 @@ retains width-independent text/style identity, resolves a cached paragraph from
 its current box constraints, and rasterizes through a backend-owned FreeType
 glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
 wrapping; unchanged constraints perform no layout acquisition or allocation.
+`ouro.image { key, src, width?, height?, fit?, tint?, alt? }` loads PNG, JPEG,
+WebP, and self-contained static SVG asynchronously. Use `bytes` instead of `src`
+for encoded data. `ouro.icon` uses the same native Image primitive with a 24×24
+default and inherited foreground tint. See [image authoring](docs/application-model.md#images-and-icons-load-asynchronously)
+and `examples/images.lua` for formats, fit modes, and theme-aware icons.
+
 `ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.text` provide nested composition without
 application-managed numeric IDs or parent links. Each widget constructor takes
 one props table and returns an opaque description; it does not emit UI when

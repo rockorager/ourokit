@@ -164,12 +164,32 @@ pub fn build(b: *std.Build) void {
         ourokit.link_libc = true;
     }
     if (enable_xkbcommon) ourokit.linkSystemLibrary("xkbcommon", .{});
+    // Keep codec/native Rust linkage off ourokit_ui and its renderer/cache path.
+    const image_codecs = addImageCodecs(b, target, optimize);
+    ourokit.addImport("ourokit_image_codecs", image_codecs);
+
+    // An isolated root keeps codec tests independent of the platform renderer.
+    const codec_sources = b.addWriteFiles();
+    const codec_test_root = codec_sources.add("root.zig", "test { _ = @import(\"image/codec.zig\"); }");
+    _ = codec_sources.addCopyDirectory(b.path("src/core"), "core", .{});
+    _ = codec_sources.addCopyFile(b.path("src/image/pixels.zig"), "image/pixels.zig");
+    _ = codec_sources.addCopyFile(b.path("src/image/codec.zig"), "image/codec.zig");
+    _ = codec_sources.addCopyFile(b.path("src/image/codec_tests.zig"), "image/codec_tests.zig");
+    _ = codec_sources.addCopyDirectory(b.path("src/image/codec_fixtures"), "image/codec_fixtures", .{});
+    const codec_tests_module = b.createModule(.{ .root_source_file = codec_test_root, .target = target, .optimize = optimize });
+    codec_tests_module.addImport("ourokit_image_codecs", image_codecs);
+    const codec_tests = b.addTest(.{ .root_module = codec_tests_module });
+    const run_codec_tests = b.addRunArtifact(codec_tests);
+    const codec_test_step = b.step("test-image-codecs", "Decode PNG, JPEG, WebP and isolated static SVG fixtures");
+    codec_test_step.dependOn(&run_codec_tests.step);
 
     const library = b.addLibrary(.{
         .name = "ourokit",
         .root_module = ourokit,
     });
     b.installArtifact(library);
+    b.installFile("tools/image/THIRD_PARTY_NOTICES.txt", "share/licenses/ourokit/image-codecs.txt");
+    b.installFile("tools/image/RUST_LIBRARY_LICENSES.html", "share/licenses/ourokit/rust-library.html");
 
     const storybook_font = b.lazyDependency("inter", .{}) orelse return;
     ourokit.addAnonymousImport("ourokit_storybook_font", .{
@@ -243,6 +263,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_ui_tests.step);
+    test_step.dependOn(&run_codec_tests.step);
 
     const ui_test_step = b.step("test-ourokit-ui", "Run platform-neutral UI integration tests");
     ui_test_step.dependOn(&run_ui_tests.step);
@@ -352,6 +373,11 @@ fn addVulkan(b: *std.Build, module: *std.Build.Module) void {
 fn compileShader(b: *std.Build, source: []const u8, output: []const u8) std.Build.LazyPath {
     const compile = b.addSystemCommand(&.{ "glslc", "-O" });
     compile.addFileArg(b.path(source));
+    if (std.mem.eql(u8, source, "src/renderer/vulkan/glyph.comp") or
+        std.mem.eql(u8, source, "src/renderer/vulkan/glyph.frag"))
+    {
+        compile.addFileInput(b.path("src/renderer/vulkan/image.glsl"));
+    }
     compile.addArg("-o");
     return compile.addOutputFileArg(output);
 }
@@ -564,4 +590,59 @@ fn addHarfBuzz(module: *std.Build.Module, harfbuzz: *std.Build.Dependency) void 
     });
     module.addIncludePath(harfbuzz.path("src"));
     module.link_libcpp = true;
+}
+
+fn addImageCodecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    // Rust's prebuilt std needs unwind symbols even with panic=abort. Reuse
+    // Zig's bundled C++/unwind runtime (already used by Ourokit's HarfBuzz).
+    const module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
+    const wuffs = b.dependency("wuffs", .{});
+    const webp = b.dependency("libwebp", .{});
+    module.addIncludePath(wuffs.path("release/c"));
+    module.addIncludePath(webp.path(""));
+    module.addCSourceFile(.{ .file = b.path("tools/image/raster.c"), .flags = &.{"-std=c99"} });
+    // Decoder-only portable C, without target-specific SIMD or encoder objects.
+    // The empty config intentionally disables auto-detected SIMD implementations.
+    module.addIncludePath(b.path("tools/image"));
+    module.addCSourceFiles(.{
+        .root = webp.path(""),
+        .files = &.{
+            "src/dec/alpha_dec.c",           "src/dec/buffer_dec.c",               "src/dec/frame_dec.c",
+            "src/dec/idec_dec.c",            "src/dec/io_dec.c",                   "src/dec/quant_dec.c",
+            "src/dec/tree_dec.c",            "src/dec/vp8_dec.c",                  "src/dec/vp8l_dec.c",
+            "src/dec/webp_dec.c",            "src/demux/demux.c",                  "src/dsp/alpha_processing.c",
+            "src/dsp/cpu.c",                 "src/dsp/dec.c",                      "src/dsp/dec_clip_tables.c",
+            "src/dsp/filters.c",             "src/dsp/lossless.c",                 "src/dsp/rescaler.c",
+            "src/dsp/upsampling.c",          "src/dsp/yuv.c",                      "src/utils/bit_reader_utils.c",
+            "src/utils/color_cache_utils.c", "src/utils/filters_utils.c",          "src/utils/huffman_utils.c",
+            "src/utils/palette.c",           "src/utils/quant_levels_dec_utils.c", "src/utils/random_utils.c",
+            "src/utils/rescaler_utils.c",    "src/utils/thread_utils.c",           "src/utils/utils.c",
+        },
+        .flags = &.{ "-std=c99", "-DHAVE_CONFIG_H", "-DWEBP_USE_THREAD", "-DWEBP_DISABLE_STAT", "-DWEBP_REDUCE_SIZE" },
+    });
+    const system_resvg = b.option(bool, "resvg-system", "Link a packager-provided ourokit_resvg bridge (ABI 1) instead of building with Cargo") orelse false;
+    if (system_resvg) {
+        module.linkSystemLibrary("ourokit_resvg", .{});
+    } else {
+        // Copy only pinned inputs into the build cache: no generated files or
+        // Cargo writes in the source tree; lockfile and bridge edits invalidate it.
+        const source = b.addWriteFiles();
+        const manifest = source.addCopyFile(b.path("src/image/resvg/Cargo.toml"), "Cargo.toml");
+        _ = source.addCopyFile(b.path("src/image/resvg/Cargo.lock"), "Cargo.lock");
+        _ = source.addCopyFile(b.path("src/image/resvg/lib.rs"), "lib.rs");
+        const cargo = b.addSystemCommand(&.{"sh"});
+        cargo.addFileArg(b.path("tools/image/build_resvg.sh"));
+        cargo.addFileArg(manifest);
+        const output = cargo.addOutputDirectoryArg("resvg");
+        cargo.addArg(b.fmt("{s}-{s}-{s}", .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag), @tagName(target.result.abi) }));
+        cargo.addArg(if (target.query.isNative()) "true" else "false");
+        module.addLibraryPath(output);
+        module.linkSystemLibrary("ourokit_resvg", .{ .use_pkg_config = .no, .preferred_link_mode = .static });
+    }
+    if (target.result.os.tag == .linux) {
+        module.linkSystemLibrary("dl", .{});
+        module.linkSystemLibrary("pthread", .{});
+        module.linkSystemLibrary("m", .{});
+    }
+    return module;
 }

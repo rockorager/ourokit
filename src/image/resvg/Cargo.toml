@@ -1,0 +1,19 @@
+[package]
+name = "ourokit-resvg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "MIT"
+
+[lib]
+name = "ourokit_resvg"
+crate-type = ["staticlib"]
+path = "lib.rs"
+
+[dependencies]
+resvg = { version = "=0.48.1", default-features = false }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1

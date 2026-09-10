@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The base development image supplies Zig and the native graphics dependencies.
+# Image decoding also builds the pinned resvg bridge with Cargo.
+if ! command -v cargo >/dev/null && [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
+  installer="$(mktemp)"
+  trap 'rm -f "$installer"' EXIT
+  curl --fail --silent --show-error --location https://sh.rustup.rs -o "$installer"
+  sh "$installer" -y --profile minimal --default-toolchain 1.94.0 --no-modify-path
+fi
+
+# ~/.local/bin is available to subsequent non-interactive orb login shells.
+mkdir -p "$HOME/.local/bin"
+for command in cargo rustc rustup; do
+  if ! command -v "$command" >/dev/null && [[ -x "$HOME/.cargo/bin/$command" ]]; then
+    if [[ ! -e "$HOME/.local/bin/$command" && ! -L "$HOME/.local/bin/$command" ]]; then
+      ln -s "$HOME/.cargo/bin/$command" "$HOME/.local/bin/$command"
+    fi
+  fi
+done
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+cargo --version

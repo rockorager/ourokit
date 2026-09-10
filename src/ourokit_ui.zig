@@ -2,10 +2,12 @@
 //!
 //! This module intentionally excludes the application host, scheduler, Lua,
 //! Wayland client integration, and Vulkan presentation backend. Applications
-//! own text caches and software-rendering targets explicitly.
+//! own text/image caches and software-rendering targets explicitly.
 
 pub const core = @import("core/root.zig");
 pub const text = @import("text/root.zig");
+pub const ImageCache = @import("image/cache.zig").Cache;
+pub const ImageBitmap = @import("image/pixels.zig").Bitmap;
 pub const scene = @import("scene/root.zig");
 pub const layout = @import("ui/layout/root.zig");
 pub const render_object = @import("ui/render_object/root.zig");

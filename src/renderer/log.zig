@@ -25,6 +25,12 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
             .{ clip.x, clip.y, clip.width, clip.height },
         ),
         .pop_clip => try append(output, &used, "pop_clip\n", .{}),
+        .image => |image| try append(
+            output,
+            &used,
+            "image handle={d}:{d} x={d} y={d} width={d} height={d} fit={s}\n",
+            .{ image.image.slot, image.image.generation, image.bounds.x, image.bounds.y, image.bounds.width, image.bounds.height, @tagName(image.fit) },
+        ),
         .solid_rectangle => |rectangle| try append(
             output,
             &used,

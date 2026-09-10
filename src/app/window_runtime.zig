@@ -230,6 +230,8 @@ pub const WindowRuntime = struct {
         lua_ui.components.instances = &self.instances;
         lua_ui.components.focused = self.focus.current();
         lua_ui.components.native_update = false;
+        lua_ui.image_scale = self.output_scale;
+        if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
         defer lua_ui.components.instances = null;
         const descriptors = try lua_ui.buildCallback(
             &self.build_owners,
@@ -445,6 +447,8 @@ pub const WindowRuntime = struct {
         const width: f32 = @floatFromInt(size.width);
         const height: f32 = @floatFromInt(size.height);
         lua_ui.components.instances = &self.instances;
+        lua_ui.image_scale = self.output_scale;
+        if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
         defer lua_ui.components.instances = null;
         var builds = self.build_owners.beginCycle();
         while (try builds.take()) |work| {
@@ -551,6 +555,7 @@ pub const WindowRuntime = struct {
         if (self.output_scale != output_scale) {
             self.output_scale = output_scale;
             self.frame_state.invalidatePaint();
+            _ = try self.build_owners.markDirty(self.root_owner);
         }
         const root = (try self.instances.rootRenderObject()) orelse return;
         const size = self.frame_state.size.?;
@@ -1413,6 +1418,7 @@ pub const WindowRuntime = struct {
         try tree.init(self.allocator, descriptors.len);
         defer tree.deinit();
         tree.attachTextCaches(self.paragraph_sources, self.paragraphs);
+        if (self.tree.images) |images| tree.attachImageCache(images);
         const handles = try self.allocator.alloc(ui.render_object.NodeHandle, descriptors.len);
         defer self.allocator.free(handles);
         for (descriptors, 0..) |descriptor, index| {

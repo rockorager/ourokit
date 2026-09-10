@@ -24,6 +24,8 @@ const ListBoxStyle = @import("../ui/widget/listboxes.zig").Style;
 const render_types = @import("../ui/render_object/types.zig");
 const SemanticDescriptor = @import("../ui/semantics/snapshot.zig").Descriptor;
 const text = @import("../text/root.zig");
+const image_service = @import("../image/service.zig");
+const image_pixels = @import("../image/pixels.zig");
 
 // Radix Themes keeps widget geometry in component recipes while reusable color
 // roles and scales remain generated design data.
@@ -99,6 +101,9 @@ pub const UiBuild = struct {
     text_configuration_revision: u64 = 0,
     widget_theme: ?theming.Theme = null,
     theme_fonts: ?*ThemeFonts = null,
+    images: ?*image_service.Service = null,
+    image_scale: f32 = 1,
+    images_staged: bool = false,
     theme_stack: [32]theming.Theme = undefined,
     theme_count: usize = 0,
     parent_stack: [32]BuildParent = undefined,
@@ -203,6 +208,8 @@ pub const UiBuild = struct {
         self.pending_option_count = 0;
         self.active_owner = .{ .owners = owners, .handle = work.owner };
         defer self.active_owner = null;
+        if (self.images) |images| try images.beginOwner(owners, work.owner);
+        errdefer if (self.images) |images| images.rollbackOwner(owners, work.owner);
         if (self.widget_theme) |theme| {
             try self.append(.{
                 .id = 1,
@@ -494,6 +501,9 @@ pub const UiBuild = struct {
         self.pending_listbox_count = 0;
         self.pending_option_count = 0;
         self.sources_staged = false;
+        prepared.images = if (self.images) |images| images.cache else null;
+        prepared.owns_images = self.images_staged;
+        self.images_staged = false;
     }
 
     pub fn clearHandlers(self: *UiBuild, bindings: *PointerBindings) void {
@@ -524,6 +534,7 @@ pub const UiBuild = struct {
             work.revision,
         );
         self.components.call("commit") catch unreachable;
+        if (self.images) |images| images.commitOwner(owners, work.owner);
     }
 
     /// Preserves the previous dependency set when descriptor reconciliation
@@ -538,9 +549,11 @@ pub const UiBuild = struct {
             work.revision,
         );
         self.components.call("rollback") catch unreachable;
+        if (self.images) |images| images.rollbackOwner(owners, work.owner);
     }
 
     pub fn disposeOwner(self: *UiBuild, owners: *build_owner.BuildOwners, owner: build_owner.BuildOwnerHandle) void {
+        if (self.images) |images| images.disposeOwner(owners, owner);
         self.components.dispose(owners, owner);
         c.luaL_unref(self.state, c.registry_index, self.root_reference);
         self.root_reference = c.no_reference;
@@ -609,6 +622,8 @@ pub const UiBuild = struct {
             return luaError(state, "build must return a widget description or nil");
         const emit: c.CFunction = switch (description.kind) {
             .text => emitText,
+            .image => emitImage,
+            .icon => emitIcon,
             .button => emitButton,
             .text_input => emitTextInput,
             .listbox => emitListBox,
@@ -808,6 +823,76 @@ pub const UiBuild = struct {
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.text expects one declaration table");
         return self.emitDeclarativeText(state);
+    }
+
+    fn emitImage(state: *c.State) callconv(.c) c_int {
+        return emitImageKind(state, false);
+    }
+
+    fn emitIcon(state: *c.State) callconv(.c) c_int {
+        return emitImageKind(state, true);
+    }
+
+    fn emitImageKind(state: *c.State, icon: bool) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const images = self.images orelse return luaError(state, "image service unavailable");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        const parent = self.currentParent() orelse return luaError(state, "image requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "image key is required");
+        const path = tableOptionalString(state, 1, "src") orelse return luaError(state, "image src must be a string");
+        const bytes = tableOptionalString(state, 1, "bytes") orelse return luaError(state, "image bytes must be a string");
+        if (path.present == bytes.present)
+            return luaError(state, "image expects exactly one src path or encoded bytes string");
+        const width = tableOptionalNullableExtent(state, 1, "width") orelse
+            return luaError(state, "invalid image width");
+        const height = tableOptionalNullableExtent(state, 1, "height") orelse
+            return luaError(state, "invalid image height");
+        const logical_width = width.value orelse if (icon) @as(?f32, 24) else null;
+        const logical_height = height.value orelse if (icon) @as(?f32, 24) else null;
+        var fit: image_pixels.Fit = .contain;
+        const fit_type = c.lua_getfield(state, 1, "fit");
+        if (fit_type != c.type_nil) {
+            const name = string(state, -1) orelse return luaError(state, "invalid image fit");
+            fit = std.meta.stringToEnum(image_pixels.Fit, name) orelse return luaError(state, "invalid image fit");
+        }
+        c.lua_settop(state, -2);
+        var tint: ?@import("../core/color.zig").Color = if (icon) theme.foreground else null;
+        if (c.lua_getfield(state, 1, "tint") != c.type_nil)
+            tint = theming.color(state, -1) catch |err| return luaError(state, @errorName(err));
+        c.lua_settop(state, -2);
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
+        const active = self.active_owner.?;
+        const handle = images.request(
+            if (path.present) .{ .path = path.value } else .{ .bytes = bytes.value },
+            .{
+                .width = rasterDimension(logical_width, self.image_scale) catch return luaError(state, "image raster too large"),
+                .height = rasterDimension(logical_height, self.image_scale) catch return luaError(state, "image raster too large"),
+                .tint = tint,
+                .scale = self.image_scale,
+            },
+            .{ .owners = active.owners, .handle = active.handle },
+        ) catch |err| return luaError(state, @errorName(err));
+        if (handle) |value| images.cache.retain(value) catch |err| return luaError(state, @errorName(err));
+        const id = semanticId(key, 0x696d616765 ^ parent.id ^ self.component_namespace);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .image = .{ .image = handle, .width = logical_width, .height = logical_height, .fit = fit } },
+            .parent_data = parent_data,
+        }) catch {
+            if (handle) |value| images.cache.release(value) catch unreachable;
+            return luaError(state, "cannot append image descriptor");
+        };
+        self.images_staged = true;
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .image,
+            .key = key,
+            .label = tableString(state, 1, "alt") orelse "",
+        }) catch return luaError(state, "cannot append image semantics");
+        return 0;
     }
 
     fn emitButton(state: *c.State) callconv(.c) c_int {
@@ -1400,16 +1485,26 @@ pub const UiBuild = struct {
     }
 
     fn discardSources(self: *UiBuild) void {
-        if (!self.sources_staged) return;
-        const sources = self.text_sources.?;
-        for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
-            .text => |value| sources.release(value.source) catch unreachable,
-            .text_input => |input| sources.release(input.source) catch unreachable,
+        if (self.images_staged) for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
+            .image => |value| if (value.image) |handle| self.images.?.cache.release(handle) catch unreachable,
+            else => {},
+        };
+        self.images_staged = false;
+        if (self.sources_staged) for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
+            .text => |value| self.text_sources.?.release(value.source) catch unreachable,
+            .text_input => |input| self.text_sources.?.release(input.source) catch unreachable,
             else => {},
         };
         self.sources_staged = false;
     }
 };
+
+fn rasterDimension(logical: ?f32, scale: f32) !?u32 {
+    const value = logical orelse return null;
+    const physical = @ceil(value * scale);
+    if (!std.math.isFinite(physical) or physical > 8192) return error.ImageTooLarge;
+    return @intFromFloat(@max(1, physical));
+}
 
 fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
     const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");

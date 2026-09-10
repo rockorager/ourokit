@@ -6,6 +6,14 @@ const ParagraphHandle = @import("../text/paragraph_cache.zig").ParagraphHandle;
 const ParagraphCache = @import("../text/paragraph_cache.zig").ParagraphCache;
 const ShapeHandle = @import("../text/shape_cache.zig").ShapeHandle;
 const ShapeCache = @import("../text/shape_cache.zig").ShapeCache;
+const ImageHandle = @import("../image/cache.zig").ImageHandle;
+const ImageCache = @import("../image/cache.zig").Cache;
+
+pub const Image = struct {
+    image: ImageHandle,
+    bounds: RectI,
+    fit: @import("../image/pixels.zig").Fit = .contain,
+};
 
 pub const BlendMode = enum {
     /// Replace destination pixels with the premultiplied source.
@@ -58,6 +66,7 @@ pub const Command = union(enum) {
     /// Immutable positioned lines. Text policy and visual ordering are already
     /// complete; renderers only rasterize the referenced glyph sequence.
     paragraph: Paragraph,
+    image: Image,
 };
 
 pub const Damage = union(enum) {
@@ -87,6 +96,7 @@ pub const DisplayList = struct {
                 depth -= 1;
             },
             .solid_rectangle => {},
+            .image => |value| if (value.image.generation == 0) return error.InvalidImage,
             .decorated_rectangle => |rectangle| {
                 if (rectangle.background == null and rectangle.border_color == null)
                     return error.EmptyDecoratedRectangle;
@@ -161,6 +171,7 @@ pub fn occludedByNextDraw(
         },
         .glyph_run => if (!clips[depth].isEmpty()) return false,
         .paragraph => if (!clips[depth].isEmpty()) return false,
+        .image => |value| if (!RectI.intersect(value.bounds, clips[depth]).isEmpty()) return false,
     };
     return false;
 }
@@ -183,11 +194,14 @@ pub const Frame = struct {
     shape_leases: []const ShapeHandle,
     paragraph_cache: ?*ParagraphCache,
     paragraph_leases: []const ParagraphHandle,
+    image_cache: ?*ImageCache,
+    image_leases: []const ImageHandle,
     full_damage: bool,
 
     pub const ResourceCaches = struct {
         shapes: ?*ShapeCache = null,
         paragraphs: ?*ParagraphCache = null,
+        images: ?*ImageCache = null,
     };
 
     pub fn init(
@@ -230,13 +244,16 @@ pub const Frame = struct {
         try (DisplayList{ .commands = commands, .damage = damage }).validate();
         var shape_count: usize = 0;
         var paragraph_count: usize = 0;
+        var image_count: usize = 0;
         for (commands) |command| switch (command) {
             .glyph_run => shape_count += 1,
             .paragraph => paragraph_count += 1,
+            .image => image_count += 1,
             else => {},
         };
         if ((shape_count != 0 and caches.shapes == null) or
-            (paragraph_count != 0 and caches.paragraphs == null))
+            (paragraph_count != 0 and caches.paragraphs == null) or
+            (image_count != 0 and caches.images == null))
             return error.ResourceLeaseRequired;
 
         const owned_commands = try allocator.dupe(Command, commands);
@@ -251,6 +268,8 @@ pub const Frame = struct {
         errdefer allocator.free(leases);
         const paragraph_leases = try allocator.alloc(ParagraphHandle, paragraph_count);
         errdefer allocator.free(paragraph_leases);
+        const image_leases = try allocator.alloc(ImageHandle, image_count);
+        errdefer allocator.free(image_leases);
         var shapes_retained: usize = 0;
         errdefer if (caches.shapes) |cache| for (leases[0..shapes_retained]) |handle|
             cache.release(handle) catch unreachable;
@@ -273,6 +292,17 @@ pub const Frame = struct {
             },
             else => {},
         };
+        var images_retained: usize = 0;
+        errdefer if (caches.images) |cache| for (image_leases[0..images_retained]) |handle|
+            cache.release(handle) catch unreachable;
+        if (caches.images) |cache| for (commands) |command| switch (command) {
+            .image => |value| {
+                try cache.retain(value.image);
+                image_leases[images_retained] = value.image;
+                images_retained += 1;
+            },
+            else => {},
+        };
         return .{
             .allocator = allocator,
             .command_storage = owned_commands,
@@ -281,6 +311,8 @@ pub const Frame = struct {
             .shape_leases = leases,
             .paragraph_cache = caches.paragraphs,
             .paragraph_leases = paragraph_leases,
+            .image_cache = caches.images,
+            .image_leases = image_leases,
             .full_damage = full_damage,
         };
     }
@@ -290,6 +322,9 @@ pub const Frame = struct {
             cache.release(handle) catch unreachable;
         if (self.paragraph_cache) |cache| for (self.paragraph_leases) |handle|
             cache.release(handle) catch unreachable;
+        if (self.image_cache) |cache| for (self.image_leases) |handle|
+            cache.release(handle) catch unreachable;
+        self.allocator.free(self.image_leases);
         self.allocator.free(self.paragraph_leases);
         self.allocator.free(self.shape_leases);
         self.allocator.free(self.damage_storage);
@@ -412,4 +447,38 @@ test "translucent source-over does not occlude previous work" {
         .blend = .source,
     } }};
     try std.testing.expect(occludedByNextDraw(&source, &.{root}, root));
+}
+
+test "frame owns image leases and rolls back partial resource acquisition" {
+    var cache = try ImageCache.init(std.testing.allocator, 1);
+    defer cache.deinit();
+    const handle = try cache.insert(.{
+        .allocator = std.testing.allocator,
+        .pixels = try std.testing.allocator.dupe(u8, &.{ 17, 31, 63, 127 }),
+        .width = 1,
+        .height = 1,
+        .intrinsic_width = 1,
+        .intrinsic_height = 1,
+    });
+    const command: Command = .{ .image = .{ .image = handle, .bounds = .{ .x = 0, .y = 0, .width = 4, .height = 4 } } };
+    const commands = [_]Command{ command, command };
+    try std.testing.expectError(error.ResourceLeaseRequired, Frame.init(std.testing.allocator, &commands, .full));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseImageFrameAllocationFailure, .{ &cache, &commands });
+    var invalid = commands;
+    invalid[1].image.image.generation += 1;
+    try std.testing.expectError(error.StaleImageHandle, Frame.initWithResources(std.testing.allocator, &invalid, .full, .{ .images = &cache }));
+    {
+        var frame = try Frame.initWithResources(std.testing.allocator, &commands, .full, .{ .images = &cache });
+        defer frame.deinit();
+        try cache.release(handle);
+        try std.testing.expectEqualSlices(u8, &.{ 17, 31, 63, 127 }, (try cache.get(handle)).pixels);
+        try std.testing.expectEqual(@as(usize, 2), frame.image_leases.len);
+    }
+    // Any leaked lease from the failed frame would keep this handle alive.
+    try std.testing.expectError(error.StaleImageHandle, cache.get(handle));
+}
+
+fn exerciseImageFrameAllocationFailure(allocator: std.mem.Allocator, cache: *ImageCache, commands: []const Command) !void {
+    var frame = try Frame.initWithResources(allocator, commands, .full, .{ .images = cache });
+    defer frame.deinit();
 }

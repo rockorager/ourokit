@@ -7,6 +7,8 @@ const renderer = @import("../renderer/root.zig");
 const task = @import("../task/root.zig");
 const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
+const image_service = @import("../image/service.zig");
+const ImageCache = @import("../image/cache.zig").Cache;
 
 pub const StoryDescription = struct {
     id: []u8,
@@ -123,7 +125,7 @@ pub fn describe(init: std.process.Init, source: []const u8) !Description {
 
 /// Renders one selected story in a fresh VM and platform-neutral window
 /// runtime, then encodes the software-rendered pixels as PNG.
-pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8) !Snapshot {
+pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8, asset_root: ?std.os.linux.fd_t) !Snapshot {
     if (!renderer.software.has_freetype) return error.FreeTypeDisabled;
     const config: @import("window_runtime.zig").Config = .{};
     var loop: io_loop.Loop = undefined;
@@ -174,6 +176,14 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     defer paragraph_sources.deinit();
     var paragraphs = text.ParagraphCache.init(init.gpa, &fonts);
     defer paragraphs.deinit();
+    var images = try ImageCache.init(init.gpa, 256);
+    defer images.deinit();
+    var assets: image_service.Service = undefined;
+    try assets.init(init.gpa, &loop, &images, asset_root);
+    defer {
+        drainImages(&assets, &loop) catch |err| std.debug.panic("image shutdown failed: {s}", .{@errorName(err)});
+        assets.deinit();
+    }
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
 
@@ -187,6 +197,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     var lua_ui: lua.UiBuild = undefined;
     try lua_ui.initWithApi(vm.state, descriptor_storage, vm.apiReference());
     lua_ui.theme_fonts = &theme_fonts;
+    lua_ui.images = &assets;
     lua_ui.attachSignals(&signals);
     lua_ui.attachCallbacks(&callbacks, &vm);
     try lua_ui.attachText(&paragraph_sources, &.{ primary_font, arabic_font }, 1);
@@ -224,6 +235,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         &paragraphs,
         config,
     );
+    runtime.output_scale = story.snapshot_scale;
     errdefer teardownRuntime(&runtime, &lua_ui, &scheduler, window_scope) catch {};
     try runtime.reconcile(
         .{ .width = story.viewport.width, .height = story.viewport.height },
@@ -231,6 +243,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         story.content_reference,
     );
     try runtime.prepareFrame(story.snapshot_scale);
+    try settleImages(&runtime, &lua_ui, story, &loop);
     if (story.actions.len != 0) {
         vm.disableSleep();
         for (story.actions) |action| try playAction(
@@ -253,13 +266,13 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     const pixels = try init.gpa.alloc(u8, pixel_len);
     defer init.gpa.free(pixels);
     @memset(pixels, 0);
-    try renderer.software.renderTextResources(list, .{
+    try renderer.software.renderResources(list, .{
         .pixels = pixels,
         .width = pixel_width,
         .height = pixel_height,
         .stride = stride,
         .format = .rgba8_unorm,
-    }, &glyphs, null, &paragraphs);
+    }, &glyphs, null, &paragraphs, &images);
     unpremultiply(pixels);
     const png = try renderer.png.encode(init.gpa, pixels, pixel_width, pixel_height, stride);
     errdefer init.gpa.free(png);
@@ -354,6 +367,33 @@ fn dispatchAndSettle(
         story.content_reference,
     );
     try runtime.prepareFrame(story.snapshot_scale);
+    try settleImages(runtime, lua_ui, story, vm.loop);
+}
+
+fn settleImages(runtime: *WindowRuntime, lua_ui: *lua.UiBuild, story: *const lua.StorybookStory, loop: *io_loop.Loop) !void {
+    const assets = lua_ui.images orelse return;
+    while (assets.hasPending()) {
+        try assets.pump();
+        if (assets.canDeinit()) break;
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .file => |completion| if (!(try assets.dispatch(completion))) return error.UnownedImageCompletion,
+            else => return error.UnexpectedImageCompletion,
+        }
+        try runtime.reconcile(.{ .width = story.viewport.width, .height = story.viewport.height }, lua_ui, story.content_reference);
+        try runtime.prepareFrame(story.snapshot_scale);
+    }
+}
+
+fn drainImages(assets: *image_service.Service, loop: *io_loop.Loop) !void {
+    assets.shutdown();
+    while (!assets.canDeinit()) {
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .file => |completion| if (!(try assets.dispatch(completion))) return error.UnownedImageCompletion,
+            else => return error.UnexpectedImageCompletion,
+        }
+    }
 }
 
 fn teardownRuntime(

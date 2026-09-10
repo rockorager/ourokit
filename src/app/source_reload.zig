@@ -281,6 +281,7 @@ pub const SourceReload = struct {
             const retiring = &(entry.* orelse continue);
             if (retiring.cancellation_started) continue;
             try retiring.generation.vm.requestCancellation();
+            retiring.generation.shutdownImages();
             retiring.cancellation_started = true;
         }
     }
@@ -410,6 +411,7 @@ pub const SourceReload = struct {
             const retiring = entry.* orelse continue;
             if (!retiring.native_state_detached or
                 retiring.generation.vm.activeTaskCount() != 0) continue;
+            if (!retiring.generation.imagesQuiescent()) continue;
             if (self.services) |services|
                 if (services.callbacks.countForVm(&retiring.generation.vm) != 0) continue;
             retiring.generation.destroy();
@@ -881,7 +883,13 @@ test "a later window build failure leaves every retained window on the active ge
         \\    return ouro.virtual_list {
         \\      key = "content", item_count = 1, estimated_item_height = 48,
         \\      item_key = function() return "item" end,
-        \\      render_item = function() return ouro.text { key = "label", text = label() } end,
+        \\      render_item = function()
+        \\        return ouro.row { key = "row",
+        \\          ouro.text { key = "label", text = label() },
+        \\          ouro.image { key = "image", width = 16, height = 16,
+        \\            bytes = '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1"><path d="M0 0h2v1H0Z"/></svg>' },
+        \\        }
+        \\      end,
         \\    }
         \\  end
         \\end)
@@ -939,6 +947,8 @@ test "a later window build failure leaves every retained window on the active ge
     defer paragraph_sources.deinit();
     var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
     defer paragraphs.deinit();
+    var images = try @import("../image/cache.zig").Cache.init(std.testing.allocator, 4);
+    defer images.deinit();
     const services: source_generation.UiServices = .{
         .paragraph_sources = &paragraph_sources,
         .paragraphs = &paragraphs,
@@ -946,6 +956,7 @@ test "a later window build failure leaves every retained window on the active ge
         .medium_font = font,
         .theme = design.tokens.light,
         .callbacks = &callbacks,
+        .images = &images,
     };
     const config: source_generation.Config = .{
         .node_capacity = 16,
@@ -1037,6 +1048,10 @@ test "a later window build failure leaves every retained window on the active ge
     try std.testing.expectEqualDeep(first_list, runtimes[0].virtual_lists.lists[0]);
     try std.testing.expectEqual(available_scopes, scheduler.availableScopeCapacity());
     try std.testing.expectEqual(lua.DiagnosticPhase.build, reload.lastDiagnostic().?.phase);
+    // The first window queued an asset, but the failed candidate must never
+    // start a decoder or leave native resources behind.
+    try std.testing.expect(!loop.hasPendingOperations());
+    try std.testing.expectEqual(@as(usize, 0), images.byteSize());
 
     // Retry with two valid component windows. Preparation must still allocate
     // no native scopes, while commit must replace the old component mounts.

@@ -80,6 +80,11 @@ pub const Surface = struct {
         self.tree.attachTextCaches(sources, paragraphs);
     }
 
+    /// Decoding is caller-owned; the pixel cache must outlive the surface.
+    pub fn attachImageCache(self: *Surface, images: *@import("../image/cache.zig").Cache) void {
+        self.tree.attachImageCache(images);
+    }
+
     /// Reconciles one complete native snapshot. Validation and capacity checks
     /// complete before the retained tree is changed. Existing IDs keep their
     /// render-object handles, including across reordering and reparenting.

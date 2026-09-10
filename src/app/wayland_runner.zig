@@ -27,6 +27,9 @@ pub const Options = struct {
     /// Receives the Lua-requested exit status after all resources are drained.
     exit_code: ?*u8 = null,
     vulkan: bool = renderer.has_vulkan,
+    /// Borrowed directory capability for embedded-source hosts such as Storybook.
+    /// Disk applications otherwise use their source module root.
+    asset_root: ?std.os.linux.fd_t = null,
     /// Optional process-lifetime control edge. Any thread may call `request`;
     /// this runner consumes and commits requests only at its safe point.
     reload_requests: ?*ReloadRequests = null,
@@ -171,6 +174,7 @@ fn runSourceWithFontconfig(
             generation_config,
             &diagnostic,
         );
+    if (options.asset_root) |root| initial_generation.asset_root = root;
     var initial_generation_owned = true;
     defer if (initial_generation_owned) {
         drainInitialGeneration(initial_generation, &scheduler, &loop) catch |err|
@@ -255,6 +259,8 @@ fn runSourceWithFontconfig(
     defer paragraph_sources.deinit();
     var paragraphs = text.ParagraphCache.init(init.gpa, &fonts);
     defer paragraphs.deinit();
+    var images = try @import("../image/cache.zig").Cache.init(init.gpa, 256);
+    defer images.deinit();
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
     var vulkan_renderer: renderer.vulkan = undefined;
@@ -273,6 +279,7 @@ fn runSourceWithFontconfig(
         .callbacks = &callbacks,
         .theme_fonts = &theme_fonts,
         .workspaces = &workspaces,
+        .images = &images,
     };
     // Generations must release their text resources before the caches above.
     defer {
@@ -606,6 +613,7 @@ fn runSourceWithFontconfig(
 
         for (runtime_slots) |*slot| if (slot.runtime.ready)
             try slot.runtime.prepareFrame(try host.outputScale(slot.runtime.window));
+        try source_reload.active().pumpImages();
 
         if (host.textInputAvailable()) for (runtime_slots) |*slot| {
             if (!slot.runtime.ready or !slot.text_input_surface_focused) continue;
@@ -644,19 +652,20 @@ fn runSourceWithFontconfig(
             if (slot.runtime.wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
                 const list = try slot.runtime.displayList();
                 (switch (frame_buffer.target) {
-                    .software => |target| renderer.software.renderTextResources(list, .{
+                    .software => |target| renderer.software.renderResources(list, .{
                         .pixels = target.pixels,
                         .width = frame_buffer.width,
                         .height = frame_buffer.height,
                         .stride = target.stride,
                         .format = .bgra8_unorm,
-                    }, &glyphs, null, &paragraphs),
-                    .vulkan => |target| vulkan_renderer.renderDmabufTextResources(
+                    }, &glyphs, null, &paragraphs, &images),
+                    .vulkan => |target| vulkan_renderer.renderDmabufResources(
                         list,
                         target,
                         &vulkan_glyphs,
                         null,
                         &paragraphs,
+                        &images,
                     ),
                 }) catch |err| {
                     try host.discardFrame(frame_buffer);
@@ -869,6 +878,8 @@ fn dispatchApplicationCompletion(reload: *SourceReload, loop: *io_loop.Loop, con
 }
 
 fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlServer, host: ?*platform.wayland.Host) !void {
+    reload.active().shutdownImages();
+    if (reload.candidate) |candidate| candidate.shutdownImages();
     try reload.active().vm.requestCancellation();
     if (reload.candidate) |candidate| try candidate.vm.requestCancellation();
     try reload.beginRetirement();
@@ -920,6 +931,7 @@ fn finishInitialBootstrap(
 }
 
 fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Scheduler, loop: *io_loop.Loop) !void {
+    generation.shutdownImages();
     try generation.vm.requestCancellation();
     while (true) {
         try scheduler.applyQueuedCancellations();

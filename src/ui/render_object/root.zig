@@ -6,6 +6,7 @@ pub const types = @import("types.zig");
 test {
     _ = @import("box.zig");
     _ = @import("flex.zig");
+    _ = @import("image.zig");
     _ = @import("scene_builder.zig");
     _ = @import("scroll.zig");
     _ = @import("stack.zig");

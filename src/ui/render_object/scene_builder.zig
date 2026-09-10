@@ -6,6 +6,8 @@ const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const ParagraphHandle = @import("../../text/paragraph_cache.zig").ParagraphHandle;
 const ShapeHandle = @import("../../text/shape_cache.zig").ShapeHandle;
+const ImageHandle = @import("../../image/cache.zig").ImageHandle;
+const ImageFit = @import("../../image/pixels.zig").Fit;
 
 /// Allocation-free lowering from logical layout coordinates to the existing
 /// renderer-neutral device-space display list. Conservative edge rounding is
@@ -28,6 +30,11 @@ pub const Builder = struct {
     pub fn solidRectangle(self: *Builder, bounds: RectF, color: Color) !void {
         const device = try self.deviceRect(bounds);
         if (!device.isEmpty()) try self.append(.{ .solid_rectangle = .{ .bounds = device, .color = color } });
+    }
+
+    pub fn image(self: *Builder, handle: ImageHandle, bounds: RectF, fit: ImageFit) !void {
+        const device = try self.deviceRect(bounds);
+        if (!device.isEmpty()) try self.append(.{ .image = .{ .image = handle, .bounds = device, .fit = fit } });
     }
 
     pub fn decoratedRectangle(

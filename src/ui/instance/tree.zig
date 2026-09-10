@@ -747,3 +747,75 @@ test "scroll offset is retained by keyed instance and clamped by layout" {
     try instances.collectRetired();
     try scheduler.destroyScope(window_scope);
 }
+
+test "image reconciliation preserves identity and prevalidates stale replacements before removal" {
+    const ImageCache = @import("../../image/cache.zig").Cache;
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 6, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 2);
+    defer renders.deinit();
+    renders.attachImageCache(&images);
+    var instances: Tree = undefined;
+    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 2);
+    defer instances.deinit();
+    try instances.reconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .image = .{ .width = 63, .height = 21 } } },
+    });
+    const identity = instances.handleForId(2).?;
+    const root = (try instances.rootRenderObject()).?;
+    const leaf = renders.firstChild(root).?;
+    const bitmap = @import("../../image/pixels.zig").Bitmap{
+        .allocator = std.testing.allocator,
+        .pixels = try std.testing.allocator.dupe(u8, &.{ 17, 31, 63, 255 }),
+        .width = 1,
+        .height = 1,
+        .intrinsic_width = 120,
+        .intrinsic_height = 40,
+    };
+    const image = try images.insert(bitmap);
+    const loaded = [_]Descriptor{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .image = .{ .image = image } } },
+    };
+    try instances.reconcile(&loaded);
+    try images.release(image);
+    try instances.reconcile(&loaded);
+    try std.testing.expectEqual(identity, instances.handleForId(2).?);
+    try std.testing.expectEqual(leaf, renders.firstChild(root).?);
+
+    const stale: Handle = .{ .slot = image.slot, .generation = image.generation + 1 };
+    try std.testing.expectError(error.StaleImageHandle, instances.prepareReconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .image = .{ .image = stale } } },
+    }));
+    try std.testing.expectEqual(identity, instances.handleForId(2).?);
+    try std.testing.expectEqual(leaf, renders.firstChild(root).?);
+    try std.testing.expectEqual(image, (try renders.objectAt(leaf)).image.image.?);
+    try std.testing.expectError(error.ImageHasChildren, instances.prepareReconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .image = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .image = .{} } },
+    }));
+
+    try instances.reconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+    });
+    try std.testing.expectError(error.StaleImageHandle, images.get(image));
+    var replacement_bitmap = bitmap;
+    replacement_bitmap.pixels = try std.testing.allocator.dupe(u8, &.{ 3, 7, 11, 255 });
+    const replacement = try images.insert(replacement_bitmap);
+    try std.testing.expect(replacement.generation != image.generation);
+    try std.testing.expectError(error.StaleImageHandle, instances.prepareReconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .image = .{ .image = image } } },
+    }));
+    try images.release(replacement);
+
+    try instances.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try instances.collectRetired();
+    try scheduler.destroyScope(window_scope);
+}
