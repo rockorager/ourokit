@@ -33,29 +33,38 @@ const browser_suffix =
     \\        local story = catalog.stories[current]
     \\        local story_viewport = viewport(story)
     \\        local preview_key = story.id
-    \\        ouro.row {
+    \\        local options = {}
+    \\        for index = 1, #catalog.stories do
+    \\          local item = catalog.stories[index]
+    \\          options[#options + 1] = ouro.option {
+    \\            key = "story-" .. index,
+    \\            value = index,
+    \\            label = (item.group or "Stories") .. " / " .. item.name,
+    \\          }
+    \\        end
+    \\        return ouro.row {
     \\          key = "storybook-browser",
     \\          gap = 12,
     \\          cross_alignment = "stretch",
-    \\          children = function()
+    \\          children = {
     \\            ouro.box {
     \\              key = "catalog-panel",
     \\              width = 280,
     \\              padding = 12,
     \\              surface = "sidebar",
-    \\              children = function()
+    \\              children = {
     \\                ouro.scroll {
     \\                  key = "catalog-scroll",
-    \\                  children = function()
+    \\                  children = {
     \\                    ouro.column {
     \\                      key = "catalog",
     \\                      gap = 12,
-    \\                      children = function()
+    \\                      children = {
     \\                        ouro.label {
     \\                          key = "catalog-title",
     \\                          text = catalog.title or "Ourokit Storybook",
     \\                          size = 18,
-    \\                        }
+    \\                        },
     \\                        ouro.listbox {
     \\                          key = "stories",
     \\                          appearance = "sidebar",
@@ -64,49 +73,40 @@ const browser_suffix =
     \\                          on_select = function(index)
     \\                            selected:set(index)
     \\                          end,
-    \\                          children = function()
-    \\                            for index = 1, #catalog.stories do
-    \\                              local item = catalog.stories[index]
-    \\                              ouro.option {
-    \\                                key = "story-" .. index,
-    \\                                value = index,
-    \\                                label = (item.group or "Stories") .. " / " .. item.name,
-    \\                              }
-    \\                            end
-    \\                          end,
-    \\                        }
-    \\                      end,
-    \\                    }
-    \\                  end,
-    \\                }
-    \\              end,
-    \\            }
+    \\                          children = options,
+    \\                        },
+    \\                      },
+    \\                    },
+    \\                  },
+    \\                },
+    \\              },
+    \\            },
     \\            ouro.box {
     \\              key = "preview-area",
     \\              flex = 1,
-    \\              children = function()
+    \\              children = {
     \\                ouro.column {
     \\                  key = "preview-layout",
     \\                  gap = 8,
     \\                  cross_alignment = "stretch",
-    \\                  children = function()
+    \\                  children = {
     \\                    ouro.row {
     \\                      key = "preview-header",
     \\                      gap = 8,
     \\                      cross_alignment = "center",
-    \\                      children = function()
+    \\                      children = {
     \\                        ouro.column {
     \\                          key = "preview-details",
     \\                          flex = 1,
     \\                          gap = 4,
-    \\                          children = function()
+    \\                          children = {
     \\                            ouro.label {
     \\                              key = "story-name",
     \\                              text = story.name,
     \\                              size = 18,
     \\                              max_lines = 1,
     \\                              overflow = "ellipsis",
-    \\                            }
+    \\                            },
     \\                            ouro.label {
     \\                              key = "story-metadata",
     \\                              text = (story.group or "Stories") .. " · " ..
@@ -116,46 +116,46 @@ const browser_suffix =
     \\                              size = 12,
     \\                              max_lines = 1,
     \\                              overflow = "ellipsis",
-    \\                            }
-    \\                          end,
-    \\                        }
-    \\                      end,
-    \\                    }
+    \\                            },
+    \\                          },
+    \\                        },
+    \\                      },
+    \\                    },
     \\                    ouro.box {
     \\                      key = "preview-frame",
     \\                      flex = 1,
     \\                      alignment = "center",
-    \\                      children = function()
+    \\                      children = {
     \\                        ouro.scroll {
     \\                          key = "preview-vertical-" .. preview_key,
-    \\                          children = function()
+    \\                          children = {
     \\                            ouro.scroll {
     \\                              key = "preview-horizontal-" .. preview_key,
     \\                              axis = "horizontal",
-    \\                              children = function()
+    \\                              children = {
     \\                                ouro.theme {
     \\                                  key = "preview-theme-" .. preview_key,
     \\                                  color_scheme = story.color_scheme or "light",
-    \\                                  children = function()
+    \\                                  children = {
     \\                                    ouro.box {
     \\                                      key = "preview-" .. preview_key,
     \\                                      width = story_viewport.width or 640,
     \\                                      height = story_viewport.height or 480,
-    \\                                      children = story.content,
-    \\                                    }
-    \\                                  end,
-    \\                                }
-    \\                              end,
-    \\                            }
-    \\                          end,
-    \\                        }
-    \\                      end,
-    \\                    }
-    \\                  end,
-    \\                }
-    \\              end,
-    \\            }
-    \\          end,
+    \\                                      children = { story.content() },
+    \\                                    },
+    \\                                  },
+    \\                                },
+    \\                              },
+    \\                            },
+    \\                          },
+    \\                        },
+    \\                      },
+    \\                    },
+    \\                  },
+    \\                },
+    \\              },
+    \\            },
+    \\          },
     \\        }
     \\      end,
     \\    },

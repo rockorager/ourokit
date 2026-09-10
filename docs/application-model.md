@@ -35,32 +35,131 @@ return ouro.app {
         min_width = 360,
         min_height = 240,
         content = function()
-          ouro.row {
+          return ouro.row {
             key = "layout",
             cross_alignment = "stretch",
-            children = function()
-              ouro.box { key = "sidebar", width = 120, children = function() end }
+            children = {
+              ouro.box { key = "sidebar", width = 120, children = {} },
               ouro.column {
                 key = "content",
                 flex = 1,
-                children = function()
-                  ouro.label { key = "title", text = "Example" }
+                children = {
+                  ouro.label { key = "title", text = "Example" },
                   ouro.button {
                     key = "run",
                     label = clicked() and "Clicked" or "Run",
                     on_press = function()
                       clicked:set(not clicked())
                     end,
-                  }
-                end,
-              }
-            end,
+                  },
+                },
+              },
+            },
           }
         end,
       },
     } }
   end,
 }
+```
+
+Widget constructors take one props table and return an opaque description;
+calling a constructor does not emit UI. A window, layer surface, or story's
+`content` function must return one root description, or nil for empty content.
+Helper functions used to render UI follow the same return contract. Multiple
+widgets need a structural parent such as a row or column, not a list of roots.
+
+Containers accept either ordered array entries in their props table or an
+explicit dense `children = { ... }` table, but not both. Children are descriptions,
+never a function that emits widgets. For example, the array-entry form is:
+
+```lua
+return ouro.column {
+  key = "content",
+  ouro.label { key = "title", text = "Example" },
+  ouro.button { key = "run", label = "Run", on_press = function() end },
+}
+```
+
+Build dynamic child lists in a local table, append descriptions in order, and
+pass that table as `children`. Keep explicit stable keys on each widget.
+Event handlers such as `on_press` and `on_select` remain callbacks. Ordinary
+Lua rendering helpers can return descriptions without owning state. Use
+`ouro.component` when a reusable component needs its own mounted state and
+signal dependencies:
+
+```lua
+local Counter = ouro.component(function(props)
+  -- Initialize once for each mounted instance.
+  local count = ouro.signal(props.initial or 0)
+  local function increment()
+    count:set(count() + 1)
+  end
+
+  -- Rebuild the description when its inputs change.
+  return function()
+    return ouro.column {
+      key = "counter",
+      gap = 12,
+      ouro.label { key = "value", text = props.title .. ": " .. count() },
+      ouro.button { key = "increment", label = "Increment", on_press = increment },
+    }
+  end
+end)
+
+-- Inside a window or story's content function:
+return ouro.row {
+  key = "counters",
+  gap = 24,
+  Counter { key = "first", title = "First", initial = 0 },
+  Counter { key = "second", title = "Second", initial = 100 },
+}
+```
+
+Calling `Counter { ... }` creates a description, not a mounted instance. The
+outer initializer runs when reconciliation mounts that component. Its returned
+function rebuilds UI descriptions; keep it free of side effects, signal writes,
+and yielding operations. Keep state creation outside the rebuild function.
+Define component constructors outside rebuild functions too, so their definition
+identity remains stable. Initialization is provisional until the build commits;
+a failed build can discard it and retry. Initializers must also avoid external
+side effects, signal writes, and yielding operations.
+
+Props are read through the stable, read-only `props` userdata captured by the
+initializer. Read changing props inside the rebuild function or event handler;
+copying a scalar such as `local title = props.title` during initialization
+captures only its initial value. An `initial` prop is an ordinary application
+convention, not a special property that resets state on later parent updates.
+Prop comparisons are shallow: replace a table-valued prop when its contents
+change rather than mutating it in place. Nested tables, including
+`props.children`, are not frozen; treat them as read-only too.
+
+Keys identify component instances within their parent. Reordering the same
+keyed component preserves its state. Removing it unmounts it; showing it again
+initializes a new instance. Replacing a component definition at the same key
+also creates a new instance. Rebuilding descriptions does not recreate retained
+native widgets whose identities remain unchanged. A mounted component returning
+nil hides its UI without unmounting the component itself.
+
+Signal dependencies belong to the component render that reads them. A changed
+signal schedules its owning window, but only affected Lua renders execute;
+clean components reuse their retained descriptions. Native lowering and
+reconciliation still consume a complete window snapshot. This is component-level
+Lua rebuilding, not property-level bindings or partial native-tree updates.
+
+Children supplied to a component are available as `props.children`. A wrapper
+can forward them to a native container without knowing their widget types:
+
+```lua
+local Card = ouro.component(function(props)
+  return function()
+    return ouro.box {
+      key = "body",
+      padding = 16,
+      children = props.children,
+    }
+  end
+end)
 ```
 
 Desktop components use a distinct layer-shell declaration rather than a mode
@@ -80,7 +179,7 @@ ouro.layer_surface {
   margins = { top = 0, right = 0, bottom = 0, left = 0 },
   keyboard_interactivity = "none", -- none, exclusive, or on_demand
   content = function()
-    ouro.label { key = "clock", text = "12:00" }
+    return ouro.label { key = "clock", text = "12:00" }
   end,
 }
 ```
@@ -256,20 +355,24 @@ constructs typed descriptors; successful completion records the applied
 revision, while failure can explicitly retain the work for retry. Window
 removal unregisters the owner and removes queued stale work.
 
-Mounted components now have a separate language-neutral build-owner registry.
-A build owner has keyed identity, parent/child ownership, a component scope,
+Mounted UI builds have a separate language-neutral build-owner registry.
+A build owner has keyed identity, parent/child ownership, a resource scope,
 and requested/building/built revisions, but no render-object fields. New owners
 queue an initial build; later invalidation targets the owner directly instead
 of searching the retained tree. Stabilization is bounded by passes rather than
-total component count, so many independent dirty components remain one pass
+total owner count, so many independent dirty owners remain one pass
 while state writes during builds schedule subsequent passes. Descriptor
 reconciliation must succeed before the build revision commits. Retiring a
-component recursively removes pending descendant work and queues its scope for
-safe-point cancellation.
+build owner recursively removes pending descendant work and queues its scope for
+safe-point cancellation. Production windows retain one native build owner;
+generation-owned Lua component readers distinguish dependency sets and cached
+render output beneath that owner. This keeps component updates compatible with
+whole-window reconciliation and isolated source-reload candidates.
 
 The initial signal primitive is deliberately narrower than a general reactive
 runtime. Lua owns each signal value. A bounded native edge table associates
-generation-checked signals with reads made by the currently building owner.
+generation-checked signals with reads made by the current owner and component
+reader.
 Dependencies remain provisional until normalized descriptor reconciliation
 succeeds; rollback leaves the prior set intact. Changed writes only dirty
 subscribed owners. A state-only build-owner sink queues the owning window unless
@@ -300,11 +403,13 @@ permanent arbitrary table parser based on repeated string `type` dispatch.
 The eventual component schema should generate Lua constructors, compact Zig
 bindings/decoding into this normalized snapshot, Lua language-server types,
 documentation, and cross-language validation. The constructor-specific bridge
-proves this route end to end: a protected non-yielding mounted Lua build emits
-Box/Stack/Label descriptors directly into bounded native storage, which the
-existing transactional reconciler validates. It has no generic string `type`
-parser or application-facing descriptor escape hatch. The constructors maintain
-a bounded native parent stack: `ouro.row` and `ouro.column` normalize to Flex,
+proves this route end to end: a protected non-yielding mounted Lua build returns
+an opaque description tree. During reconciliation, native lowering traverses
+that returned tree in child order and produces typed descriptors in bounded
+storage for transactional validation. Constructors do not emit descriptors
+during Lua evaluation, and unattached descriptions do not become UI. There is
+no generic string `type` parser or application-facing descriptor escape hatch.
+During lowering, `ouro.row` and `ouro.column` normalize to Flex,
 `ouro.scroll` normalizes to a single-child Scroll viewport, `ouro.label`
 normalizes to Label, and `ouro.button` normalizes to Box plus Label. The
 single-selection `ouro.listbox` composes a vertical Flex with direct
@@ -316,6 +421,39 @@ state across reconciliation. Default options use accent steps 3 and 5 for hover
 and selection. `appearance = "sidebar"` instead uses gray steps 3 and 5 plus a
 medium selected label for navigation catalogs without introducing a separate
 widget.
+
+Large, generic vertical viewports use `ouro.virtual_list`:
+
+```lua
+ouro.virtual_list {
+  key = "people",
+  item_count = 10000,
+  item_key = function(index) return "person-" .. index end,
+  item_height = 40,
+  render_item = function(index)
+    return ouro.label { key = "name", text = "Person " .. index }
+  end,
+}
+```
+
+Provide exactly one positive sizing field: `item_height` for fixed rows or
+`estimated_item_height` for variable rows. `width` and `height` accept a number
+or `"fill"` and default to `"fill"`; `flex` is also supported. Item keys must be
+stable, unique, non-empty strings. The list key, item key, and keys within the
+returned description form each row's semantic target path.
+
+Each build evaluates `item_key` for all items and retains O(N) key and provider
+metadata, but calls `render_item` and mounts native nodes only for the visible
+rows plus a two-row buffer on each side. Variable rows replace their estimate
+with measured native height (at least one pixel), preserving the scroll anchor
+by item key as measurements or width change. A focused row remains mounted even
+when it moves outside that range.
+
+The viewport handles wheel scrolling and Up/Down, Home/End, and Page Up/Page
+Down. It is a generic viewport, not a listbox: it has no selection model. Data
+providers are synchronous; virtual lists do not perform asynchronous loading.
+Rows unmount outside the viewport, so durable per-row state belongs in external
+application state keyed by `item_key`, rather than in the row description.
 Applications provide stable local keys but no numeric IDs or parent links.
 Their visual defaults come from generated Radix-derived semantic tokens and
 documented component recipes, with no Lua theme mirror. Buttons are
@@ -330,7 +468,7 @@ window owners also read one shared signal, proving dependency identity across
 separate per-window registries sharing one VM.
 
 For the benchmark slice, `ouro.button` owns composition and input policy while
-emitting only Box and Label render objects. Button is not a render object. Its
+lowering to only Box and Label render objects. Button is not a render object. Its
 stable string key is normalized into domain-separated semantic IDs; duplicate
 or colliding IDs are rejected by snapshot validation rather than silently
 aliasing instances. A language-neutral widget registry retains enabled,

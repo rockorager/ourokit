@@ -100,6 +100,8 @@ fn logicalKey(keysym: u32) platform.LogicalKey {
         c.XKB_KEY_Down => .arrow_down,
         c.XKB_KEY_Home, c.XKB_KEY_KP_Home => .home,
         c.XKB_KEY_End, c.XKB_KEY_KP_End => .end,
+        c.XKB_KEY_Page_Up, c.XKB_KEY_KP_Page_Up => .page_up,
+        c.XKB_KEY_Page_Down, c.XKB_KEY_KP_Page_Down => .page_down,
         c.XKB_KEY_BackSpace => .backspace,
         c.XKB_KEY_Delete, c.XKB_KEY_KP_Delete => .delete,
         c.XKB_KEY_a, c.XKB_KEY_A => .key_a,

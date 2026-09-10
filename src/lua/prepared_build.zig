@@ -49,6 +49,8 @@ pub const Option = struct {
 pub const PreparedBuild = struct {
     allocator: std.mem.Allocator,
     state: *c.State,
+    description_reference: c_int = c.no_reference,
+    virtual_lists: @import("../ui/widget/virtual_list.zig").Snapshot = .{},
     shapes: ?*text.ParagraphSourceCache,
     descriptor_storage: []instance.Descriptor,
     descriptor_count: usize = 0,
@@ -124,6 +126,9 @@ pub const PreparedBuild = struct {
     }
 
     pub fn reset(self: *PreparedBuild) void {
+        c.luaL_unref(self.state, c.registry_index, self.description_reference);
+        self.description_reference = c.no_reference;
+        self.virtual_lists = .{};
         for (self.handlers[0..self.handler_count]) |handler|
             c.luaL_unref(self.state, c.registry_index, handler.reference);
         for (self.text_inputs[0..self.text_input_count]) |*text_input_value|

@@ -29,6 +29,7 @@ const Slot = struct {
     scope: ScopeHandle = .invalid,
     building_revision: u64 = 0,
     built_revision: u64 = 0,
+    invalidation_revision: u64 = 1,
     retire_mark: bool = false,
 };
 
@@ -126,10 +127,22 @@ pub const BuildOwners = struct {
     }
 
     pub fn markDirty(self: *BuildOwners, owner: BuildOwnerHandle) !u64 {
+        const slot = try self.activeSlot(owner);
+        slot.invalidation_revision +%= 1;
+        return self.markReaderDirty(owner);
+    }
+
+    /// A language reader invalidates only its own cached output. Host marks
+    /// through markDirty also invalidate the window content callback.
+    pub fn markReaderDirty(self: *BuildOwners, owner: BuildOwnerHandle) !u64 {
         _ = try self.activeSlot(owner);
         const revision = try self.dirty.markDirty(owner);
         if (self.dirty_sink) |sink| try sink.notify(sink.context);
         return revision;
+    }
+
+    pub fn invalidationRevision(self: *BuildOwners, owner: BuildOwnerHandle) !u64 {
+        return (try self.activeSlot(owner)).invalidation_revision;
     }
 
     pub fn setDirtySink(self: *BuildOwners, sink: DirtySink) void {

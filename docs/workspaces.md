@@ -14,21 +14,25 @@ local function content()
     return ouro.label { key = "unavailable", text = "Workspaces unavailable" }
   end
 
+  local children = {}
+  for index, workspace in ipairs(state.workspaces) do
+    children[#children + 1] = ouro.button {
+      key = workspace.id or tostring(index),
+      label = workspace.name,
+      enabled = workspace.can_activate and not workspace.active,
+      on_press = workspace.activate,
+    }
+  end
   return ouro.row {
     key = "workspaces",
-    children = function()
-      for index, workspace in ipairs(state.workspaces) do
-        ouro.button {
-          key = workspace.id or tostring(index),
-          label = workspace.name,
-          enabled = workspace.can_activate and not workspace.active,
-          on_press = workspace.activate,
-        }
-      end
-    end,
+    children = children,
   }
 end
 ```
+
+The content function returns one root description. The loop builds a dense,
+ordered child table; widget constructors return descriptions rather than
+emitting UI. Native lowering consumes the returned tree during reconciliation.
 
 The session is callable. Each call returns the latest complete protocol
 snapshot and subscribes the current UI build like an Ouro signal. Changes are

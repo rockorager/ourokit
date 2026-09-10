@@ -1,5 +1,8 @@
 const std = @import("std");
 const c = @import("c.zig");
+const Description = @import("description.zig").Description;
+const Components = @import("components.zig").Components;
+const virtual_list = @import("../ui/widget/virtual_list.zig");
 const CallbackRegistry = @import("callbacks.zig").CallbackRegistry;
 const PreparedBuild = @import("prepared_build.zig").PreparedBuild;
 const Vm = @import("vm.zig").Vm;
@@ -53,7 +56,7 @@ const PendingTextInput = struct {
 };
 
 const ParentKind = enum { box, flex, stack, scroll, listbox };
-const BuildParent = struct { id: u64, kind: ParentKind };
+const BuildParent = struct { id: u64, kind: ParentKind, semantic_id: ?u64 = null };
 
 pub const Argument = union(enum) {
     number: f64,
@@ -71,14 +74,17 @@ pub const ActiveBuildOwner = struct {
     handle: build_owner.BuildOwnerHandle,
 };
 
-/// Constructor-specific Lua boundary. Build callbacks append already-typed
-/// normalized descriptors; there is no `{ type = "..." }` parser, numeric-ID
-/// escape hatch, or renderer access. A future schema generator may produce
-/// this binding while preserving the native contract.
+/// Lowers returned Lua descriptions into typed native descriptors, parent first.
+/// Constructor evaluation has no UI side effects. Contextual layout, theme, and
+/// widget policy remain here, not in the description constructors.
 pub const UiBuild = struct {
     state: *c.State,
     storage: []instance.Descriptor,
     count: usize = 0,
+    root_reference: c_int = c.no_reference,
+    components: Components = .{},
+    component_namespace: u64 = 0,
+    virtual_lists: virtual_list.Snapshot = .{},
     semantic_storage: []SemanticDescriptor = &.{},
     semantic_count: usize = 0,
     active_owner: ?ActiveBuildOwner = null,
@@ -139,16 +145,8 @@ pub const UiBuild = struct {
         else
             c.lua_getglobal(state, "ouro");
         if (api_type != c.type_table) return error.OuroApiMissing;
-        try self.install("label", emitLabel);
-        try self.install("button", emitButton);
-        try self.install("text_input", emitTextInput);
-        try self.install("listbox", emitListBox);
-        try self.install("option", emitOption);
-        try self.install("box", emitBox);
-        try self.install("row", emitRow);
-        try self.install("column", emitColumn);
-        try self.install("scroll", emitScroll);
-        try self.install("theme", emitTheme);
+        Description.install(state);
+        try self.components.init(state);
     }
 
     /// Executes a non-yielding mounted build callback in the reconciliation
@@ -176,6 +174,14 @@ pub const UiBuild = struct {
         self.discardSources();
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
+        c.luaL_unref(self.state, c.registry_index, self.root_reference);
+        self.root_reference = c.no_reference;
+        // Builds without an attached signal graph may discard borrowed output
+        // simply by starting another build. Never retain an abandoned proposal.
+        if (self.signals == null) try self.components.call("rollback");
+        try self.components.begin(owners, work.owner);
+        errdefer self.components.call("rollback") catch unreachable;
+        self.components.push("root");
         const callback_type = switch (callback) {
             .global => |name| c.lua_getglobal(self.state, name),
             .reference => |reference| c.lua_rawgeti(self.state, c.registry_index, reference),
@@ -186,6 +192,8 @@ pub const UiBuild = struct {
         self.semantic_count = 0;
         self.parent_count = 0;
         self.theme_count = 0;
+        self.component_namespace = 0;
+        self.virtual_lists = .{};
         self.pending_button_count = 0;
         self.pending_text_input_count = 0;
         self.pending_listbox_count = 0;
@@ -216,7 +224,23 @@ pub const UiBuild = struct {
             .integer => |value| c.lua_pushinteger(self.state, value),
             .boolean => |value| c.lua_pushboolean(self.state, @intFromBool(value)),
         };
-        const status = c.lua_pcallk(self.state, @intCast(arguments.len), 0, 0, 0, null);
+        var status = c.lua_pcallk(self.state, @intCast(arguments.len + 1), 1, 0, 0, null);
+        if (status == c.ok) {
+            c.lua_pushvalue(self.state, -1);
+            self.root_reference = c.luaL_ref(self.state, c.registry_index);
+            c.lua_pushlightuserdata(self.state, self);
+            c.lua_pushcclosure(self.state, lowerDescription, 1);
+            c.lua_pushvalue(self.state, -2);
+            status = c.lua_pcallk(self.state, 1, 0, 0, 0, null);
+        }
+        if (status == c.ok) {
+            self.components.push("finish");
+            status = c.lua_pcallk(self.state, 0, 1, 0, 0, null);
+            if (status == c.ok) {
+                c.luaL_unref(self.state, c.registry_index, self.root_reference);
+                self.root_reference = c.luaL_ref(self.state, c.registry_index);
+            }
+        }
         if (status != c.ok) {
             self.discardHandlers();
             self.pending_button_count = 0;
@@ -232,15 +256,13 @@ pub const UiBuild = struct {
         return self.storage[0..self.count];
     }
 
-    /// Commits the staged Lua references only after instance reconciliation.
-    /// Bindings omitted by the new build are removed, and all replaced or
-    /// removed registry references are released explicitly.
-    pub fn commitBindings(
+    /// Reserve callback storage and validate capacity before the native tree
+    /// changes. The generated handler targets are validated by reconciliation.
+    pub fn validateBindings(
         self: *UiBuild,
         bindings: *PointerBindings,
         buttons: *Buttons,
         text_inputs: *TextInputs,
-        listboxes: *ListBoxes,
         tree: *instance.Tree,
         owner: build_owner.BuildOwnerHandle,
     ) !void {
@@ -259,6 +281,22 @@ pub const UiBuild = struct {
             if (self.pending_handler_count > reclaimable)
                 try registry.ensureAvailable(self.pending_handler_count - reclaimable);
         }
+    }
+
+    /// Commits the staged Lua references only after instance reconciliation.
+    /// Bindings omitted by the new build are removed, and all replaced or
+    /// removed registry references are released explicitly.
+    pub fn commitBindings(
+        self: *UiBuild,
+        bindings: *PointerBindings,
+        buttons: *Buttons,
+        text_inputs: *TextInputs,
+        listboxes: *ListBoxes,
+        tree: *instance.Tree,
+        owner: build_owner.BuildOwnerHandle,
+    ) !void {
+        try self.validateBindings(bindings, buttons, text_inputs, tree, owner);
+        const callbacks = self.callbacks;
         for (self.pending_handlers[0..self.pending_handler_count]) |pending|
             if (tree.handleForId(pending.id) == null) return error.PointerHandlerInstanceMissing;
         for (self.pending_buttons[0..self.pending_button_count]) |pending|
@@ -379,8 +417,11 @@ pub const UiBuild = struct {
         }
 
         prepared.reset();
+        _ = c.lua_rawgeti(self.state, c.registry_index, self.root_reference);
+        prepared.description_reference = c.luaL_ref(self.state, c.registry_index);
         @memcpy(prepared.descriptor_storage[0..descriptors.len], descriptors);
         prepared.descriptor_count = descriptors.len;
+        prepared.virtual_lists = self.virtual_lists;
         var text_offset: usize = 0;
         for (
             self.semantic_storage[0..self.semantic_count],
@@ -479,6 +520,7 @@ pub const UiBuild = struct {
             .{ .owners = owners, .handle = work.owner },
             work.revision,
         );
+        self.components.call("commit") catch unreachable;
     }
 
     /// Preserves the previous dependency set when descriptor reconciliation
@@ -492,6 +534,13 @@ pub const UiBuild = struct {
             .{ .owners = owners, .handle = work.owner },
             work.revision,
         );
+        self.components.call("rollback") catch unreachable;
+    }
+
+    pub fn disposeOwner(self: *UiBuild, owners: *build_owner.BuildOwners, owner: build_owner.BuildOwnerHandle) void {
+        self.components.dispose(owners, owner);
+        c.luaL_unref(self.state, c.registry_index, self.root_reference);
+        self.root_reference = c.no_reference;
     }
 
     pub fn activeOwner(self: *const UiBuild) ?ActiveBuildOwner {
@@ -501,6 +550,7 @@ pub const UiBuild = struct {
     pub fn attachSignals(self: *UiBuild, signals: *Signals) void {
         std.debug.assert(self.active_owner == null and self.signals == null);
         self.signals = signals;
+        self.components.signals = signals;
     }
 
     pub fn attachCallbacks(
@@ -549,10 +599,144 @@ pub const UiBuild = struct {
         return self.semantic_storage[0..self.semantic_count];
     }
 
-    fn install(self: *UiBuild, name: [*:0]const u8, function: c.CFunction) !void {
-        c.lua_pushlightuserdata(self.state, self);
-        c.lua_pushcclosure(self.state, function, 1);
-        c.lua_setfield(self.state, -2, name);
+    fn lowerDescription(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (c.lua_type(state, 1) == c.type_nil) return 0;
+        const description = Description.get(state, 1) orelse
+            return luaError(state, "build must return a widget description or nil");
+        const emit: c.CFunction = switch (description.kind) {
+            .label => emitLabel,
+            .button => emitButton,
+            .text_input => emitTextInput,
+            .listbox => emitListBox,
+            .option => emitOption,
+            .box => emitBox,
+            .row => emitRow,
+            .column => emitColumn,
+            .scroll => emitScroll,
+            .theme => emitTheme,
+            .component => return self.lowerComponent(state),
+            .virtual_list => return self.lowerVirtualList(state),
+        };
+        c.lua_pushlightuserdata(state, self);
+        _ = c.lua_getiuservalue(state, 1, 2);
+        c.lua_pushcclosure(state, emit, 2);
+        _ = c.lua_getiuservalue(state, 1, 1);
+        if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) return c.lua_error(state);
+        return 0;
+    }
+
+    fn lowerComponent(self: *UiBuild, state: *c.State) c_int {
+        const parent = self.currentParent() orelse return luaError(state, "component requires a widget parent");
+        _ = c.lua_getiuservalue(state, 1, 1);
+        const key = tableString(state, -1, "key") orelse return luaError(state, "component key is required");
+        if (key.len == 0) return luaError(state, "component key is required");
+        c.lua_settop(state, 1);
+        self.components.push("render");
+        _ = c.lua_getiuservalue(state, 1, 3);
+        _ = c.lua_getiuservalue(state, 1, 1);
+        _ = c.lua_getiuservalue(state, 1, 2);
+        c.lua_pushinteger(state, @bitCast(self.component_namespace));
+        c.lua_pushinteger(state, @bitCast(parent.id));
+        if (c.lua_pcallk(state, 5, 2, 0, 0, null) != c.ok) return c.lua_error(state);
+        var number: c_int = 0;
+        const token: u64 = @intCast(c.lua_tointegerx(state, -1, &number));
+        c.lua_settop(state, -2);
+        const group = semanticId("component", token ^ @as(u64, @intFromPtr(state)));
+        self.appendSemantic(.{ .id = group, .parent = semanticParent(parent), .role = .group, .key = key }) catch
+            return luaError(state, "cannot append component semantics");
+        self.pushParent(.{ .id = parent.id, .kind = parent.kind, .semantic_id = group }) catch
+            return luaError(state, "component nesting is too deep");
+        const previous = self.component_namespace;
+        self.component_namespace = group;
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, lowerDescription, 1);
+        c.lua_pushvalue(state, -2);
+        const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
+        self.component_namespace = previous;
+        self.popParent();
+        if (status != c.ok) return c.lua_error(state);
+        return 0;
+    }
+
+    fn lowerVirtualList(self: *UiBuild, state: *c.State) c_int {
+        const parent = self.currentParent() orelse return luaError(state, "virtual_list requires a parent");
+        _ = c.lua_getiuservalue(state, 1, 1);
+        const props: c_int = 2;
+        const key = tableString(state, props, "key") orelse return luaError(state, "virtual_list key is required");
+        const count = tableRequiredInteger(state, props, "item_count") orelse return luaError(state, "item_count must be an integer");
+        if (count < 0 or count > std.math.maxInt(i32)) return luaError(state, "invalid item_count");
+        inline for (.{ "item_key", "render_item" }) |name| {
+            const kind = c.lua_getfield(state, props, name);
+            c.lua_settop(state, -2);
+            if (kind != c.type_function) return luaError(state, "item_key and render_item must be functions");
+        }
+        const fixed = tableOptionalNullableExtent(state, props, "item_height") orelse return luaError(state, "invalid item_height");
+        const estimated = tableOptionalNullableExtent(state, props, "estimated_item_height") orelse return luaError(state, "invalid estimated_item_height");
+        if ((fixed.value == null) == (estimated.value == null))
+            return luaError(state, "provide exactly one of item_height and estimated_item_height");
+        const estimate = fixed.value orelse estimated.value.?;
+        if (estimate <= 0) return luaError(state, "item height must be positive");
+        const width = tableOptionalSize(state, props, "width", .fill) orelse return luaError(state, "invalid virtual_list width");
+        const height = tableOptionalSize(state, props, "height", .fill) orelse return luaError(state, "invalid virtual_list height");
+        const parent_data = declarativeParentData(self, state, props) catch |err| return luaError(state, parentDataErrorMessage(err));
+        const outer = semanticId(key, 0x7669727475616c ^ parent.id ^ self.component_namespace);
+        const id = semanticId("viewport", outer);
+        const extent = semanticId("extent", id);
+        const stack = semanticId("rows", id);
+        self.components.push("virtual");
+        c.lua_pushvalue(state, props);
+        c.lua_pushinteger(state, @bitCast(id));
+        if (c.lua_pcallk(state, 2, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        const plan: c_int = 3;
+        const total = tableRequiredExtent(state, plan, "total") orelse return luaError(state, "virtual list extent is too large");
+        if (self.virtual_lists.count == self.virtual_lists.lists.len) return luaError(state, "virtual list capacity exceeded");
+        const list_index = self.virtual_lists.count;
+        self.virtual_lists.count += 1;
+        self.virtual_lists.lists[list_index] = .{
+            .id = id,
+            .width = tableRequiredExtent(state, plan, "width").?,
+            .viewport = tableRequiredExtent(state, plan, "viewport").?,
+            .offset = tableRequiredExtent(state, plan, "offset").?,
+            .total = total,
+            .estimate = estimate,
+            .fixed = fixed.value != null,
+            .row_start = self.virtual_lists.row_count,
+            .row_count = 0,
+        };
+        self.append(.{ .id = outer, .parent = parent.id, .parent_data = parent_data, .object = .{ .box = .{ .width = width.extent(), .fill_width = width.isFill(), .height = height.extent(), .fill_height = height.isFill() } } }) catch return luaError(state, "cannot append virtual list");
+        self.append(.{ .id = id, .parent = outer, .focusable = true, .object = .{ .scroll = .{} } }) catch return luaError(state, "cannot append virtual viewport");
+        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .group, .key = key }) catch return luaError(state, "cannot append virtual semantics");
+        self.append(.{ .id = extent, .parent = id, .object = .{ .box = .{ .height = total, .fill_width = true } } }) catch return luaError(state, "cannot append virtual extent");
+        self.append(.{ .id = stack, .parent = extent, .object = .{ .stack = .{ .unbounded_height = true } } }) catch return luaError(state, "cannot append virtual rows");
+        _ = c.lua_getfield(state, plan, "rows");
+        const rows: c_int = 4;
+        const row_count = c.lua_rawlen(state, rows);
+        // Reserve this list's contiguous feedback before lowering nested lists.
+        if (self.virtual_lists.row_count + row_count > self.virtual_lists.rows.len) return luaError(state, "virtual row capacity exceeded");
+        const row_start = self.virtual_lists.row_count;
+        self.virtual_lists.row_count += row_count;
+        self.virtual_lists.lists[list_index].row_count = row_count;
+        for (0..row_count) |index| {
+            _ = c.lua_rawgeti(state, rows, @intCast(index + 1));
+            const row: c_int = 5;
+            const row_key = tableString(state, row, "key").?;
+            const row_id = virtual_list.rowId(id, row_key);
+            const y = tableRequiredExtent(state, row, "y").?;
+            const row_height = tableRequiredExtent(state, row, "height").?;
+            self.virtual_lists.rows[row_start + index] = .{ .id = row_id, .y = y, .height = row_height };
+            self.append(.{ .id = row_id, .parent = stack, .parent_data = .{ .stack = .{ .y = y } }, .object = .{ .box = .{ .fill_width = true, .height = fixed.value, .min_height = if (fixed.value == null) 1 else 0, .clip = true } } }) catch return luaError(state, "cannot append virtual row");
+            self.appendSemantic(.{ .id = row_id, .parent = id, .role = .group, .key = row_key }) catch return luaError(state, "cannot append virtual row semantics");
+            self.pushParent(.{ .id = row_id, .kind = .box }) catch return luaError(state, "virtual row nesting too deep");
+            c.lua_pushlightuserdata(state, self);
+            c.lua_pushcclosure(state, lowerDescription, 1);
+            _ = c.lua_getfield(state, row, "description");
+            const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
+            self.popParent();
+            if (status != c.ok) return c.lua_error(state);
+            c.lua_settop(state, rows);
+        }
+        return 0;
     }
 
     fn append(self: *UiBuild, descriptor: instance.Descriptor) !void {
@@ -628,7 +812,7 @@ pub const UiBuild = struct {
         ) orelse return luaError(state, "invalid button height");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
-        const button_id = semanticId(key, 0x627574746f6e ^ parent.id);
+        const button_id = semanticId(key, 0x627574746f6e ^ parent.id ^ self.component_namespace);
         const label_id = semanticId(key, 0x6c6162656c ^ button_id);
         const style: ButtonStyle = .{
             .idle = theme.primary,
@@ -743,7 +927,7 @@ pub const UiBuild = struct {
             return luaError(state, "text_input enabled must be a boolean");
         const read_only = tableOptionalBoolean(state, 1, "read_only", false) orelse
             return luaError(state, "text_input read_only must be a boolean");
-        const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id);
+        const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id ^ self.component_namespace);
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
         self.append(.{
             .id = target_id,
@@ -845,7 +1029,7 @@ pub const UiBuild = struct {
             return luaError(state, "invalid listbox gap");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
-        const id = semanticId(key, 0x6c697374626f78 ^ parent.id);
+        const id = semanticId(key, 0x6c697374626f78 ^ parent.id ^ self.component_namespace);
         self.append(.{
             .id = id,
             .parent = parent.id,
@@ -885,7 +1069,7 @@ pub const UiBuild = struct {
         };
         self.pending_handler_count += 1;
         c.lua_settop(state, -2);
-        return self.emitChildren(state, .{ .id = id, .kind = .listbox }, "listbox children function is required");
+        return self.emitChildren(state, .{ .id = id, .kind = .listbox });
     }
 
     fn emitOption(state: *c.State) callconv(.c) c_int {
@@ -899,7 +1083,7 @@ pub const UiBuild = struct {
         const label = tableString(state, 1, "label") orelse return luaError(state, "option label is required");
         const value = tableRequiredInteger(state, 1, "value") orelse
             return luaError(state, "option value must be an integer");
-        const option_id = semanticId(key, 0x6f7074696f6e ^ parent.id);
+        const option_id = semanticId(key, 0x6f7074696f6e ^ parent.id ^ self.component_namespace);
         const label_id = semanticId(key, 0x6c6162656c ^ option_id);
         const listbox = blk: {
             for (self.pending_listboxes[0..self.pending_listbox_count]) |candidate|
@@ -973,7 +1157,7 @@ pub const UiBuild = struct {
         self.pending_option_count += 1;
         self.appendSemantic(.{
             .id = option_id,
-            .parent = parent.id,
+            .parent = semanticParent(parent),
             .role = .option,
             .key = key,
             .label = label,
@@ -1011,7 +1195,7 @@ pub const UiBuild = struct {
             .candidates = self.label_candidates,
             .configuration_revision = self.label_configuration_revision,
         }) catch return luaError(state, "cannot retain label text");
-        const id = semanticId(key, 0x6c6162656c ^ parent.id);
+        const id = semanticId(key, 0x6c6162656c ^ parent.id ^ self.component_namespace);
         self.append(.{
             .id = id,
             .parent = parent.id,
@@ -1073,7 +1257,7 @@ pub const UiBuild = struct {
             return luaError(state, "box surface must be 'background', 'card', 'popover', or 'sidebar'");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
-        const id = semanticId(key, 0x626f78 ^ parent.id);
+        const id = semanticId(key, 0x626f78 ^ parent.id ^ self.component_namespace);
         self.append(.{
             .id = id,
             .parent = parent.id,
@@ -1096,7 +1280,7 @@ pub const UiBuild = struct {
             .role = .group,
             .key = key,
         }) catch return luaError(state, "cannot append box semantics");
-        return self.emitChildren(state, .{ .id = id, .kind = .box }, "box children function is required");
+        return self.emitChildren(state, .{ .id = id, .kind = .box });
     }
 
     fn emitTheme(state: *c.State) callconv(.c) c_int {
@@ -1109,7 +1293,7 @@ pub const UiBuild = struct {
         const theme = tableTheme(state, 1) orelse return luaError(state, "invalid theme color_scheme");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
-        const id = semanticId(key, 0x7468656d65 ^ parent.id);
+        const id = semanticId(key, 0x7468656d65 ^ parent.id ^ self.component_namespace);
         self.append(.{
             .id = id,
             .parent = parent.id,
@@ -1124,24 +1308,24 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append theme semantics");
         self.pushTheme(theme) catch return luaError(state, "widget nesting is too deep");
         defer self.popTheme();
-        return self.emitChildren(state, .{ .id = id, .kind = .box }, "theme children function is required");
+        return self.emitChildren(state, .{ .id = id, .kind = .box });
     }
 
     fn emitChildren(
         self: *UiBuild,
         state: *c.State,
         parent: BuildParent,
-        missing_message: [*:0]const u8,
     ) c_int {
-        if (c.lua_getfield(state, 1, "children") != c.type_function) {
-            c.lua_settop(state, -2);
-            return luaError(state, missing_message);
+        self.pushParent(parent) catch return luaError(state, "widget nesting is too deep");
+        const children = c.upvalueIndex(2);
+        var status: c_int = c.ok;
+        for (0..c.lua_rawlen(state, children)) |index| {
+            c.lua_pushlightuserdata(state, self);
+            c.lua_pushcclosure(state, lowerDescription, 1);
+            _ = c.lua_rawgeti(state, children, @intCast(index + 1));
+            status = c.lua_pcallk(state, 1, 0, 0, 0, null);
+            if (status != c.ok) break;
         }
-        self.pushParent(parent) catch {
-            c.lua_settop(state, -2);
-            return luaError(state, "widget nesting is too deep");
-        };
-        const status = c.lua_pcallk(state, 0, 0, 0, 0, null);
         self.popParent();
         if (status != c.ok) return c.lua_error(state);
         return 0;
@@ -1158,7 +1342,7 @@ pub const UiBuild = struct {
             return luaError(state, "invalid scroll axis");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
-        const id = semanticId(key, 0x7363726f6c6c ^ parent.id);
+        const id = semanticId(key, 0x7363726f6c6c ^ parent.id ^ self.component_namespace);
         self.append(.{
             .id = id,
             .parent = parent.id,
@@ -1171,18 +1355,7 @@ pub const UiBuild = struct {
             .role = .group,
             .key = key,
         }) catch return luaError(state, "cannot append scroll semantics");
-        if (c.lua_getfield(state, 1, "children") != c.type_function) {
-            c.lua_settop(state, -2);
-            return luaError(state, "scroll children function is required");
-        }
-        self.pushParent(.{ .id = id, .kind = .scroll }) catch {
-            c.lua_settop(state, -2);
-            return luaError(state, "widget nesting is too deep");
-        };
-        const status = c.lua_pcallk(state, 0, 0, 0, 0, null);
-        self.popParent();
-        if (status != c.ok) return c.lua_error(state);
-        return 0;
+        return self.emitChildren(state, .{ .id = id, .kind = .scroll });
     }
 
     fn discardHandlers(self: *UiBuild) void {
@@ -1228,7 +1401,7 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         return luaError(state, parentDataErrorMessage(err));
     const id = semanticId(
         key,
-        (if (axis == .horizontal) @as(u64, 0x726f77) else @as(u64, 0x636f6c756d6e)) ^ parent.id,
+        (if (axis == .horizontal) @as(u64, 0x726f77) else @as(u64, 0x636f6c756d6e)) ^ parent.id ^ self.component_namespace,
     );
     self.append(.{
         .id = id,
@@ -1247,18 +1420,7 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         .role = .group,
         .key = key,
     }) catch return luaError(state, "cannot append container semantics");
-    if (c.lua_getfield(state, 1, "children") != c.type_function) {
-        c.lua_settop(state, -2);
-        return luaError(state, "container children function is required");
-    }
-    self.pushParent(.{ .id = id, .kind = .flex }) catch {
-        c.lua_settop(state, -2);
-        return luaError(state, "widget nesting is too deep");
-    };
-    const status = c.lua_pcallk(state, 0, 0, 0, 0, null);
-    self.popParent();
-    if (status != c.ok) return c.lua_error(state);
-    return 0;
+    return self.emitChildren(state, .{ .id = id, .kind = .flex });
 }
 
 fn bridge(state: *c.State) ?*UiBuild {
@@ -1559,12 +1721,19 @@ fn semanticId(key: []const u8, domain: u64) u64 {
 }
 
 fn semanticParent(parent: BuildParent) ?u64 {
+    if (parent.semantic_id) |id| return id;
     return if (parent.id == 2) null else parent.id;
 }
 
 fn requiredExtent(state: *c.State, index: c_int) ?f32 {
     const value = finiteFloat(state, index) orelse return null;
     return if (value >= 0) value else null;
+}
+
+fn tableRequiredExtent(state: *c.State, table: c_int, field: [*:0]const u8) ?f32 {
+    _ = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    return requiredExtent(state, -1);
 }
 
 fn finiteFloat(state: *c.State, index: c_int) ?f32 {
@@ -1637,16 +1806,14 @@ test "declarative text input separates focus identity from editable render conte
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
         \\function build()
-        \\  ouro.column {
+        \\  return ouro.column {
         \\    key = "content",
-        \\    children = function()
-        \\      ouro.text_input {
-        \\        key = "query",
-        \\        text = "Initial",
-        \\        read_only = true,
-        \\        on_change = function(value) changed = value end,
-        \\      }
-        \\    end,
+        \\    ouro.text_input {
+        \\      key = "query",
+        \\      text = "Initial",
+        \\      read_only = true,
+        \\      on_change = function(value) changed = value end,
+        \\    },
         \\  }
         \\end
     );
@@ -1737,15 +1904,13 @@ test "declarative sidebar listbox uses paired active visuals" {
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
         \\function build()
-        \\  ouro.listbox {
+        \\  return ouro.listbox {
         \\    key = "navigation",
         \\    appearance = "sidebar",
         \\    selected = 2,
         \\    on_select = function() end,
-        \\    children = function()
-        \\      ouro.option { key = "first", value = 1, label = "First" }
-        \\      ouro.option { key = "second", value = 2, label = "Second" }
-        \\    end,
+        \\    ouro.option { key = "first", value = 1, label = "First" },
+        \\    ouro.option { key = "second", value = 2, label = "Second" },
         \\  }
         \\end
     );
@@ -1812,13 +1977,11 @@ test "declarative flex is contextual child data and containers expose cross alig
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
         \\function build()
-        \\  ouro.row {
+        \\  return ouro.row {
         \\    key = "layout",
         \\    cross_alignment = "stretch",
-        \\    children = function()
-        \\      ouro.box { key = "fixed", width = 40, children = function() end }
-        \\      ouro.box { key = "expanded", flex = 2, children = function() end }
-        \\    end,
+        \\    ouro.box { key = "fixed", width = 40 },
+        \\    ouro.box { key = "expanded", flex = 2 },
         \\  }
         \\end
     );
@@ -1914,18 +2077,16 @@ test "declarative Lua label flows through layout scene and software glyph cache"
 
     try execute(state,
         \\function build()
-        \\  ouro.column {
+        \\  return ouro.column {
         \\    key = "content",
-        \\    children = function()
-        \\      ouro.label {
-        \\        key = "benchmark",
-        \\        text = "Benchmark حفظ",
-        \\        size = 18,
-        \\        alignment = "center",
-        \\        max_lines = 1,
-        \\        overflow = "ellipsis",
-        \\      }
-        \\    end,
+        \\    ouro.label {
+        \\      key = "benchmark",
+        \\      text = "Benchmark حفظ",
+        \\      size = 18,
+        \\      alignment = "center",
+        \\      max_lines = 1,
+        \\      overflow = "ellipsis",
+        \\    },
         \\  }
         \\end
     );
@@ -2021,7 +2182,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     ui.enableDeclarativeWidgets(design.tokens.light);
     try execute(state,
         \\function build()
-        \\  ouro.box {
+        \\  return ouro.box {
         \\    key = "frame",
         \\    width = 320,
         \\    height = 200,
@@ -2029,30 +2190,22 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
         \\    min_height = 160,
         \\    padding = 8,
         \\    alignment = "center",
-        \\    children = function()
-        \\      ouro.theme {
-        \\        key = "dark",
-        \\        color_scheme = "dark",
-        \\        children = function()
-        \\          ouro.column {
-        \\            key = "content",
-        \\            children = function()
-        \\              ouro.label { key = "title", text = "Controls" }
-        \\              ouro.row {
-        \\                key = "actions",
-        \\                children = function()
-        \\                  ouro.button {
-        \\                    key = "benchmark",
-        \\                    label = "Benchmark",
-        \\                    on_press = function() end,
-        \\                  }
-        \\                end,
-        \\              }
-        \\            end,
-        \\          }
-        \\        end,
-        \\      }
-        \\    end,
+        \\    ouro.theme {
+        \\      key = "dark",
+        \\      color_scheme = "dark",
+        \\      ouro.column {
+        \\        key = "content",
+        \\        ouro.label { key = "title", text = "Controls" },
+        \\        ouro.row {
+        \\          key = "actions",
+        \\          ouro.button {
+        \\            key = "benchmark",
+        \\            label = "Benchmark",
+        \\            on_press = function() end,
+        \\          },
+        \\        },
+        \\      },
+        \\    },
         \\  }
         \\end
     );
@@ -2125,7 +2278,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try scheduler.destroyScope(window_scope);
 }
 
-test "Lua constructors reject calls outside the mounted build phase" {
+test "Lua constructors are pure and reject callback children" {
     const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
     defer c.lua_close(state);
     c.lua_createtable(state, 0, 3);
@@ -2133,10 +2286,183 @@ test "Lua constructors reject calls outside the mounted build phase" {
     var storage: [1]instance.Descriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    try std.testing.expectError(
-        error.LuaChunkFailed,
-        execute(state, "ouro.column { key = 'content', children = function() end }"),
+    try execute(state, "description = ouro.column { key = 'content', ouro.box { key = 'child' } }");
+    try std.testing.expectEqual(@as(usize, 0), ui.count);
+    try std.testing.expectEqual(@as(usize, 0), ui.pending_handler_count);
+    for ([_][]const u8{
+        "ouro.column { key = 'content', children = function() end }",
+        "ouro.column { children = {}, ouro.box { key = 'child' } }",
+        "ouro.column { [0] = ouro.box { key = 'child' } }",
+        "ouro.column { [2] = ouro.box { key = 'child' } }",
+        "ouro.column { children = { [2] = ouro.box { key = 'child' } } }",
+        "ouro.column { children = { named = ouro.box { key = 'child' } } }",
+        "ouro.column { {} }",
+        "ouro.column { false }",
+        "ouro.label { key = 'leaf', text = 'Hello', ouro.box { key = 'child' } }",
+        "ouro.button { key = 'leaf', label = 'Hello', children = {} }",
+    }) |source| try std.testing.expectError(error.LuaChunkFailed, execute(state, source));
+}
+
+test "returned descriptions snapshot props forward children and preserve keyed instances" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+    const RenderTree = @import("../ui/render_object/root.zig").Tree;
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 4);
+    c.lua_setglobal(state, "ouro");
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 16, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: build_owner.BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var renders: RenderTree = undefined;
+    try renders.init(std.testing.allocator, 8);
+    defer renders.deinit();
+    var instances: instance.Tree = undefined;
+    try instances.init(std.testing.allocator, &scheduler, &renders, scope, 8);
+    defer instances.deinit();
+    var storage: [8]instance.Descriptor = undefined;
+    var semantics: [6]SemanticDescriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    try ui.attachSemantics(&semantics);
+    ui.enableDeclarativeWidgets(design.tokens.light);
+    try execute(state,
+        \\local function Card(props)
+        \\  return ouro.column { key = props.key, gap = 7, children = props.children }
+        \\end
+        \\local props = { key = "first", width = 37 }
+        \\local first = ouro.box(props)
+        \\props.width = 999
+        \\local second = ouro.box { key = "second", width = 61 }
+        \\local children = { first, second }
+        \\local card = Card { key = "card", children = children }
+        \\children[1] = second
+        \\local ignored = ouro.box { key = "unattached", width = 1000 }
+        \\function build() return card end
+        \\function reordered()
+        \\  return Card { key = "card", children = { second, first } }
+        \\end
+        \\function invalid_root() return { card } end
+        \\function empty() return nil end
     );
+    try std.testing.expectEqual(@as(usize, 0), ui.count);
+    var cycle = owners.beginCycle();
+    const first = (try cycle.take()).?;
+    const initial = try ui.build(&owners, first, "build", &.{});
+    try std.testing.expectEqual(@as(usize, 5), initial.len);
+    try std.testing.expectEqual(@as(f32, 7), initial[2].object.flex.gap);
+    try std.testing.expectEqual(@as(?f32, 37), initial[3].object.box.width);
+    try std.testing.expectEqual(@as(?f32, 61), initial[4].object.box.width);
+    try std.testing.expectEqual(initial[2].id, initial[3].parent.?);
+    const first_id = initial[3].id;
+    const second_id = initial[4].id;
+    try instances.reconcile(initial);
+    const first_handle = instances.handleForId(first_id).?;
+    const second_handle = instances.handleForId(second_id).?;
+    ui.rollbackHandlers();
+    try owners.complete(first);
+
+    _ = try owners.markDirty(owner);
+    var next = owners.beginCycle();
+    const work = (try next.take()).?;
+    const reordered = try ui.build(&owners, work, "reordered", &.{});
+    try std.testing.expectEqual(second_id, reordered[3].id);
+    try std.testing.expectEqual(first_id, reordered[4].id);
+    try instances.reconcile(reordered);
+    try std.testing.expectEqual(first_handle, instances.handleForId(first_id).?);
+    try std.testing.expectEqual(second_handle, instances.handleForId(second_id).?);
+    ui.rollbackHandlers();
+    try owners.complete(work);
+
+    _ = try owners.markDirty(owner);
+    var failing = owners.beginCycle();
+    const invalid_work = (try failing.take()).?;
+    try std.testing.expectError(error.LuaBuildFailed, ui.build(&owners, invalid_work, "invalid_root", &.{}));
+    try owners.retry(invalid_work);
+    var recovery = owners.beginCycle();
+    const empty_work = (try recovery.take()).?;
+    const empty = try ui.build(&owners, empty_work, "empty", &.{});
+    try std.testing.expectEqual(@as(usize, 2), empty.len);
+    try instances.reconcile(empty);
+    try std.testing.expect(instances.handleForId(first_id) == null);
+    ui.rollbackHandlers();
+    try owners.complete(empty_work);
+
+    try instances.reconcile(&.{});
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
+    try instances.collectRetired();
+    try owners.collectRetired();
+    try scheduler.destroyScope(scope);
+}
+
+test "prepared descriptions stay alive across builds and release on reset" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 4);
+    c.lua_setglobal(state, "ouro");
+    c.lua_createtable(state, 1, 0);
+    c.lua_createtable(state, 0, 1);
+    _ = c.lua_pushstring(state, "v");
+    c.lua_setfield(state, -2, "__mode");
+    _ = c.lua_setmetatable(state, -2);
+    c.lua_setglobal(state, "weak");
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: build_owner.BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var storage: [3]instance.Descriptor = undefined;
+    var semantics: [1]SemanticDescriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    try ui.attachSemantics(&semantics);
+    ui.enableDeclarativeWidgets(design.tokens.light);
+    try execute(state,
+        \\function build()
+        \\  local result = ouro.box { key = "prepared", width = 73 }
+        \\  weak[1] = result
+        \\  return result
+        \\end
+        \\function empty() end
+    );
+    var prepared: PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, state, null, 3, 64);
+    defer prepared.deinit();
+    var cycle = owners.beginCycle();
+    const work = (try cycle.take()).?;
+    const descriptors = try ui.build(&owners, work, "build", &.{});
+    try ui.capturePrepared(&prepared, descriptors);
+    try owners.complete(work);
+    _ = try owners.markDirty(owner);
+    var next = owners.beginCycle();
+    const next_work = (try next.take()).?;
+    _ = try ui.build(&owners, next_work, "empty", &.{});
+    try owners.complete(next_work);
+    _ = c.lua_gc(state, 2); // LUA_GCCOLLECT
+    _ = c.lua_getglobal(state, "weak");
+    _ = c.lua_rawgeti(state, -1, 1);
+    try std.testing.expect(Description.get(state, -1) != null);
+    c.lua_settop(state, 0);
+    try std.testing.expectEqual(@as(?f32, 73), prepared.descriptors()[2].object.box.width);
+    try std.testing.expectEqualStrings("prepared", prepared.semanticDescriptors()[0].key);
+    prepared.reset();
+    _ = c.lua_gc(state, 2);
+    _ = c.lua_getglobal(state, "weak");
+    try std.testing.expectEqual(c.type_nil, c.lua_rawgeti(state, -1, 1));
+    c.lua_settop(state, 0);
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
+    try owners.collectRetired();
+    try scheduler.destroyScope(scope);
 }
 
 fn execute(state: *c.State, source: []const u8) !void {
@@ -2203,16 +2529,15 @@ test "signals dirty only dependent mounted builds and replace dependencies trans
         \\  local gap = other()
         \\  if choose_count() then gap = count() end
         \\  if mutate() then count:set(99) end
-        \\  ouro.column {
+        \\  local children = { ouro.row { key = "child" } }
+        \\  if duplicate() then
+        \\    late()
+        \\    children[#children + 1] = ouro.row { key = "child" }
+        \\  end
+        \\  return ouro.column {
         \\    key = "content",
         \\    gap = gap,
-        \\    children = function()
-        \\      ouro.row { key = "child", children = function() end }
-        \\      if duplicate() then
-        \\        late()
-        \\        ouro.row { key = "child", children = function() end }
-        \\      end
-        \\    end,
+        \\    children = children,
         \\  }
         \\end
     ;

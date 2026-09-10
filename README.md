@@ -18,9 +18,12 @@ The first headless UI kernel adds logical box constraints, typed Box/Flex/Stack
 render objects, cached allocation-free layout, ordered scene construction, and
 hit testing. A separate keyed instance layer now reconciles normalized typed
 snapshots into scoped render objects, and a bounded pointer router targets
-instances without callbacks. Mounted build owners provide scoped component
+instances without callbacks. Mounted build owners provide scoped UI build
 lifecycle and direct dirty scheduling. A provisional constructor-specific Lua
-bridge proves non-yielding component builds into typed normalized descriptors.
+bridge lowers returned opaque UI descriptions into typed normalized descriptors
+during reconciliation. `ouro.component` separates one-time initialization from
+signal-driven rebuilds and retains keyed component state. Clean components reuse
+their descriptions; native reconciliation still consumes a window snapshot.
 The first ergonomic constructor composes `ouro.button` from Box and Label while
 the eventual generated constructor ABI remains intentionally unfrozen. A
 minimal Lua signal primitive tracks per-build-owner dependencies
@@ -165,7 +168,13 @@ its current box constraints, and rasterizes through a backend-owned FreeType
 glyph cache. It supports Unicode itemization, bidi, fallback shaping, and
 wrapping; unchanged constraints perform no layout acquisition or allocation.
 `ouro.row`, `ouro.column`, `ouro.scroll`, and `ouro.label` provide nested composition without
-application-managed numeric IDs or parent links. `ouro.button` composes a Box
+application-managed numeric IDs or parent links. Each widget constructor takes
+one props table and returns an opaque description; it does not emit UI when
+called. A window or story's `content` function returns one root description, or
+nil for empty content. Containers take ordered array entries in the props table
+or an explicit dense `children = { ... }` table, never both or a child callback.
+Use a structural parent such as a row or column for multiple widgets and keep
+stable local `key` values. `ouro.button` composes a Box
 and Label using generated design tokens and retains hover, pressed, and disabled
 state in the widget layer. Buttons activate on press; release clears their
 pressed visual state. Buttons are content-sized by default, use token-derived
@@ -175,6 +184,10 @@ within those padded bounds, separately from paragraph alignment. Button is not
 a renderer primitive. `ouro.listbox` and its direct `ouro.option` children
 provide a controlled single-selection list with one Tab stop and
 Up/Down/Home/End navigation.
+For large generic collections, `ouro.virtual_list { key = "people",
+item_count = 10000, item_key = person_key, item_height = 40, render_item =
+render_person }` mounts only viewport rows; see
+[`examples/virtual-list.lua`](examples/virtual-list.lua).
 Direction-aware alignment, whole-line clipping, and shaped ellipsis
 remain text-layer policy; renderers never inject the ellipsis. Editing and
 selection remain deferred. Software and Vulkan consume the identical positioned
@@ -266,7 +279,7 @@ Text inputs support an explicit controlled or retained-value contract. Use
 ```lua
 local query = ouro.signal("")
 
-ouro.text_input {
+return ouro.text_input {
   key = "query",
   text = query(),
   on_change = function(value)
@@ -296,6 +309,11 @@ The browser is an ordinary Ourokit application: its catalog scrolls through
 the normal pointer input path, selection uses a signal, and the selected story
 is mounted as live content at its declared viewport and color scheme. Force a
 renderer with `--software` or `--vulkan`.
+
+For retained Lua components, run `examples/components.lua` instead. Its counters
+show independent rebuild counts, state-preserving prop changes and reordering,
+and state reset after unmount/remount. See the
+[component authoring contract](docs/application-model.md#declarative-surfaces).
 
 List a catalog for people or tools with:
 
@@ -346,25 +364,25 @@ making snapshots timing dependent. The interactive Storybook browser is
 available through `storybook run`; deterministic actions remain a snapshot
 playback contract while the live browser accepts ordinary user input.
 
-Constrained and themed composition use the same nested callback convention as
-rows, columns, and scroll views:
+Constrained and themed composition use the same returned descriptions as rows,
+columns, and scroll views. A content function can return this tree:
 
 ```lua
-ouro.theme {
+return ouro.theme {
   key = "dark-preview",
   color_scheme = "dark",
-  children = function()
+  children = {
     ouro.box {
       key = "viewport",
       width = 640,
       height = 480,
       padding = 12,
       alignment = "center",
-      children = function()
-        ouro.button { key = "action", label = "Continue" }
-      end,
-    }
-  end,
+      children = {
+        ouro.button { key = "action", label = "Continue" },
+      },
+    },
+  },
 }
 ```
 

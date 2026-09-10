@@ -14,7 +14,7 @@ return ouro.app {
         exclusive_zone = 36,
         keyboard_interactivity = "none",
         content = function()
-          ouro.label { key = "title", text = "Ourokit layer-shell panel" }
+          return ouro.label { key = "title", text = "Ourokit layer-shell panel" }
         end,
       },
     } }

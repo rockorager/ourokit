@@ -53,48 +53,38 @@ return ouro.app {
         content = function()
           local values = contacts()
           local person = values[selected()]
-          ouro.box {
+          local options = {}
+          for i = 1, #values do
+            options[#options + 1] = ouro.option { key = values[i].id, value = i, label = values[i].name }
+          end
+          return ouro.box {
             key = "app", padding = 24,
-            children = function()
-              ouro.column {
-                key = "body", gap = 24, cross_alignment = "stretch",
-                children = function()
-                  ouro.label { key = "title", text = "Contacts", size = 28 }
-                  ouro.label { key = "subtitle", text = "One address book. With or without a window." }
-                  ouro.row {
-                    key = "panels", gap = 24, cross_alignment = "stretch",
-                    children = function()
-                      ouro.box {
-                        key = "sidebar", width = 240, padding = 12, surface = "sidebar",
-                        children = function()
-                          ouro.listbox {
-                            key = "people", gap = 6, selected = selected(),
-                            on_select = function(index) selected:set(index) end,
-                            children = function()
-                              for i = 1, #values do
-                                ouro.option { key = values[i].id, value = i, label = values[i].name }
-                              end
-                            end,
-                          }
-                        end,
-                      }
-                      ouro.column {
-                        key = "details", gap = 16, flex = 1,
-                        children = function()
-                          ouro.label { key = "name", text = person.name, size = 22 }
-                          ouro.label { key = "email", text = person.email }
-                          ouro.label { key = "note", text = "Changes through Varlink appear here." }
-                          ouro.button {
-                            key = "quit", label = "Quit", width = 100, height = 40,
-                            on_press = function() ouro.exit(0) end,
-                          }
-                        end,
-                      }
-                    end,
-                  }
-                end,
-              }
-            end,
+            ouro.column {
+              key = "body", gap = 24, cross_alignment = "stretch",
+              ouro.label { key = "title", text = "Contacts", size = 28 },
+              ouro.label { key = "subtitle", text = "One address book. With or without a window." },
+              ouro.row {
+                key = "panels", gap = 24, cross_alignment = "stretch",
+                ouro.box {
+                  key = "sidebar", width = 240, padding = 12, surface = "sidebar",
+                  ouro.listbox {
+                    key = "people", gap = 6, selected = selected(),
+                    on_select = function(index) selected:set(index) end,
+                    children = options,
+                  },
+                },
+                ouro.column {
+                  key = "details", gap = 16, flex = 1,
+                  ouro.label { key = "name", text = person.name, size = 22 },
+                  ouro.label { key = "email", text = person.email },
+                  ouro.label { key = "note", text = "Changes through Varlink appear here." },
+                  ouro.button {
+                    key = "quit", label = "Quit", width = 100, height = 40,
+                    on_press = function() ouro.exit(0) end,
+                  },
+                },
+              },
+            },
           }
         end,
       },

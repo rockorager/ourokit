@@ -195,7 +195,7 @@ return o.app {
   },
   run = function() return {windows={o.window {
     id='main', title='Lifecycle test', width=300, height=100,
-    content=function() o.label{key='title', text=title()} end,
+    content=function() return o.label{key='title', text=title()} end,
   }}} end,
 }
 """)

@@ -19,7 +19,11 @@ const Edge = struct {
     active: bool = false,
     signal: SignalHandle = .invalid,
     owner: OwnerRef = undefined,
+    reader: u64 = 0,
+    dirty: bool = false,
 };
+
+const Read = struct { signal: SignalHandle, reader: u64 };
 
 const Phase = enum { idle, evaluating, awaiting_commit };
 
@@ -38,8 +42,11 @@ pub const Signals = struct {
     state: *c.State,
     slots: []SignalSlot,
     edges: []Edge,
-    pending: []SignalHandle,
+    pending: []Read,
     pending_count: usize = 0,
+    readers: []u64,
+    reader_count: usize = 0,
+    current_reader: u64 = 0,
     phase: Phase = .idle,
     evaluation_owner: ?OwnerRef = null,
     evaluation_revision: u64 = 0,
@@ -96,8 +103,10 @@ pub const Signals = struct {
         errdefer allocator.free(slots);
         const edges = try allocator.alloc(Edge, subscription_capacity);
         errdefer allocator.free(edges);
-        const pending = try allocator.alloc(SignalHandle, dependency_capacity);
+        const pending = try allocator.alloc(Read, dependency_capacity);
         errdefer allocator.free(pending);
+        const readers = try allocator.alloc(u64, subscription_capacity);
+        errdefer allocator.free(readers);
         @memset(slots, .{});
         @memset(edges, .{});
         self.* = .{
@@ -106,6 +115,7 @@ pub const Signals = struct {
             .slots = slots,
             .edges = edges,
             .pending = pending,
+            .readers = readers,
         };
         try self.install(api_reference);
     }
@@ -116,6 +126,7 @@ pub const Signals = struct {
         std.debug.assert(self.phase == .idle);
         for (self.slots) |slot| std.debug.assert(!slot.active);
         for (self.edges) |edge| std.debug.assert(!edge.active);
+        self.allocator.free(self.readers);
         self.allocator.free(self.pending);
         self.allocator.free(self.edges);
         self.allocator.free(self.slots);
@@ -129,6 +140,36 @@ pub const Signals = struct {
         self.evaluation_owner = owner;
         self.evaluation_revision = revision;
         self.phase = .evaluating;
+        self.reader_count = 0;
+        try self.selectReader(0);
+    }
+
+    /// Readers share a native scheduling owner but replace dependencies
+    /// independently. Selection happens between non-yielding Lua callbacks.
+    pub fn selectReader(self: *Signals, reader: u64) !void {
+        if (self.phase != .evaluating) return error.SignalEvaluationNotActive;
+        self.current_reader = reader;
+        if (self.readerEvaluated(reader)) return;
+        if (self.reader_count == self.readers.len) return error.DependencyCapacityExceeded;
+        self.readers[self.reader_count] = reader;
+        self.reader_count += 1;
+    }
+
+    pub fn preserveRoot(self: *Signals) void {
+        std.debug.assert(self.phase == .evaluating and self.pending_count == 0);
+        self.reader_count = 0;
+    }
+
+    pub fn readerDirty(self: *Signals, reader: ?u64) bool {
+        const owner = self.evaluation_owner orelse return false;
+        for (self.edges) |edge| if (edge.active and edge.dirty and sameOwner(edge.owner, owner) and
+            (reader == null or edge.reader == reader.?)) return true;
+        return false;
+    }
+
+    fn readerEvaluated(self: *Signals, reader: u64) bool {
+        for (self.readers[0..self.reader_count]) |evaluated| if (evaluated == reader) return true;
+        return false;
     }
 
     pub fn finishEvaluation(self: *Signals, owner: OwnerRef, revision: u64) !void {
@@ -148,21 +189,22 @@ pub const Signals = struct {
         var old_count: usize = 0;
         var free_count: usize = 0;
         for (self.edges) |edge| {
-            if (!edge.active) free_count += 1 else if (sameOwner(edge.owner, owner)) old_count += 1;
+            if (!edge.active) free_count += 1 else if (sameOwner(edge.owner, owner) and
+                self.readerEvaluated(edge.reader)) old_count += 1;
         }
         if (self.pending_count > free_count + old_count) return error.SubscriptionCapacityExceeded;
-        for (self.pending[0..self.pending_count]) |signal| _ = try self.signalSlot(signal);
+        for (self.pending[0..self.pending_count]) |read| _ = try self.signalSlot(read.signal);
     }
 
     pub fn commit(self: *Signals, owner: OwnerRef, revision: u64) !void {
         try self.validateCommit(owner, revision);
 
         for (self.edges) |*edge| {
-            if (edge.active and sameOwner(edge.owner, owner)) edge.* = .{};
+            if (edge.active and sameOwner(edge.owner, owner) and self.readerEvaluated(edge.reader)) edge.* = .{};
         }
-        for (self.pending[0..self.pending_count]) |signal| {
+        for (self.pending[0..self.pending_count]) |read| {
             for (self.edges) |*edge| if (!edge.active) {
-                edge.* = .{ .active = true, .signal = signal, .owner = owner };
+                edge.* = .{ .active = true, .signal = read.signal, .owner = owner, .reader = read.reader };
                 break;
             };
         }
@@ -252,9 +294,9 @@ pub const Signals = struct {
         if (self.phase == .idle) return;
         if (self.phase != .evaluating) return error.SignalCommitPending;
         for (self.pending[0..self.pending_count]) |existing|
-            if (sameHandle(existing, signal)) return;
+            if (existing.reader == self.current_reader and sameHandle(existing.signal, signal)) return;
         if (self.pending_count == self.pending.len) return error.DependencyCapacityExceeded;
-        self.pending[self.pending_count] = signal;
+        self.pending[self.pending_count] = .{ .signal = signal, .reader = self.current_reader };
         self.pending_count += 1;
     }
 
@@ -263,7 +305,8 @@ pub const Signals = struct {
         _ = try self.signalSlot(signal);
         for (self.edges) |*edge| {
             if (!edge.active or !sameHandle(edge.signal, signal)) continue;
-            _ = edge.owner.owners.markDirty(edge.owner.handle) catch |err| switch (err) {
+            edge.dirty = true;
+            _ = edge.owner.owners.markReaderDirty(edge.owner.handle) catch |err| switch (err) {
                 error.StaleBuildOwner => {
                     edge.* = .{};
                     continue;

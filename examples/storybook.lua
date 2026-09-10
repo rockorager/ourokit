@@ -2,47 +2,48 @@ local ouro = require("ouro")
 local count = ouro.signal(0)
 
 local function button_story(label, enabled)
-  ouro.column {
+  return ouro.column {
     key = "content",
     gap = 12,
-    children = function()
-      ouro.label { key = "heading", text = label, size = 18 }
-      ouro.button { key = "button", label = "Continue", enabled = enabled }
-    end,
+    children = {
+      ouro.label { key = "heading", text = label, size = 18 },
+      ouro.button { key = "button", label = "Continue", enabled = enabled },
+    },
   }
 end
 
 local function scroll_story()
-  ouro.scroll {
+  local children = {
+    ouro.label { key = "heading", text = "Application settings", size = 18 },
+  }
+  for index = 1, 12 do
+    children[#children + 1] = ouro.button {
+      key = "setting-" .. index,
+      label = "Setting " .. index,
+    }
+  end
+  return ouro.scroll {
     key = "settings-scroll",
-    children = function()
+    children = {
       ouro.column {
         key = "settings",
         gap = 10,
-        children = function()
-          ouro.label { key = "heading", text = "Application settings", size = 18 }
-          for index = 1, 12 do
-            ouro.button {
-              key = "setting-" .. index,
-              label = "Setting " .. index,
-            }
-          end
-        end,
-      }
-    end,
+        children = children,
+      },
+    },
   }
 end
 
 local function listbox_story()
-  ouro.listbox {
+  return ouro.listbox {
     key = "options",
     selected = 2,
     on_select = function() end,
-    children = function()
-      ouro.option { key = "first", value = 1, label = "First option" }
-      ouro.option { key = "second", value = 2, label = "Selected option" }
-      ouro.option { key = "third", value = 3, label = "Hovered option" }
-    end,
+    children = {
+      ouro.option { key = "first", value = 1, label = "First option" },
+      ouro.option { key = "second", value = 2, label = "Selected option" },
+      ouro.option { key = "third", value = 3, label = "Hovered option" },
+    },
   }
 end
 
@@ -55,11 +56,11 @@ return ouro.storybook {
       name = "Default",
       viewport = { width = 360, height = 160 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
-          children = function()
-            ouro.label { key = "label", text = "A default Ourokit label" }
-          end,
+          children = {
+            ouro.label { key = "label", text = "A default Ourokit label" },
+          },
         }
       end,
     },
@@ -69,14 +70,14 @@ return ouro.storybook {
       name = "Sizes",
       viewport = { width = 360, height = 180 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 8,
-          children = function()
-            ouro.label { key = "small", text = "Small label", size = 12 }
-            ouro.label { key = "body", text = "Body label", size = 14 }
-            ouro.label { key = "heading", text = "Heading label", size = 18 }
-          end,
+          children = {
+            ouro.label { key = "small", text = "Small label", size = 12 },
+            ouro.label { key = "body", text = "Body label", size = 14 },
+            ouro.label { key = "heading", text = "Heading label", size = 18 },
+          },
         }
       end,
     },
@@ -86,16 +87,16 @@ return ouro.storybook {
       name = "Constraint-aware wrapping",
       viewport = { width = 280, height = 220 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 8,
-          children = function()
-            ouro.label { key = "heading", text = "Wrapped paragraph", size = 18 }
+          children = {
+            ouro.label { key = "heading", text = "Wrapped paragraph", size = 18 },
             ouro.label {
               key = "paragraph",
               text = "Ourokit lays this label out from the width supplied by its parent and reuses the positioned paragraph until those constraints change.",
-            }
-          end,
+            },
+          },
         }
       end,
     },
@@ -105,16 +106,16 @@ return ouro.storybook {
       name = "Mixed direction and fallback",
       viewport = { width = 320, height = 200 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 8,
-          children = function()
-            ouro.label { key = "heading", text = "English and العربية", size = 18 }
+          children = {
+            ouro.label { key = "heading", text = "English and العربية", size = 18 },
             ouro.label {
               key = "paragraph",
               text = "Save حفظ now, then continue متابعة the workflow.",
-            }
-          end,
+            },
+          },
         }
       end,
     },
@@ -124,24 +125,24 @@ return ouro.storybook {
       name = "Paragraph alignment",
       viewport = { width = 420, height = 240 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 10,
-          children = function()
-            ouro.label { key = "start", text = "Start aligned", alignment = "start" }
-            ouro.label { key = "center", text = "Center aligned", alignment = "center" }
-            ouro.label { key = "end", text = "End aligned", alignment = "end" }
+          children = {
+            ouro.label { key = "start", text = "Start aligned", alignment = "start" },
+            ouro.label { key = "center", text = "Center aligned", alignment = "center" },
+            ouro.label { key = "end", text = "End aligned", alignment = "end" },
             ouro.label {
               key = "rtl-start",
               text = "بداية الفقرة العربية",
               alignment = "start",
-            }
+            },
             ouro.label {
               key = "justified",
               text = "Justified labels expand eligible spaces on every soft-wrapped line except the final line.",
               alignment = "justify",
-            }
-          end,
+            },
+          },
         }
       end,
     },
@@ -151,23 +152,23 @@ return ouro.storybook {
       name = "Maximum lines",
       viewport = { width = 300, height = 180 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 10,
-          children = function()
+          children = {
             ouro.label {
               key = "limited",
               text = "This paragraph is deliberately long enough to wrap beyond two visible lines while the retained layout clips the remaining lines.",
               max_lines = 2,
               overflow = "ellipsis",
-            }
+            },
             ouro.label {
               key = "rtl-limited",
               text = "احفظ هذا المستند ثم تابع إلى خطوة سير العمل التالية",
               max_lines = 1,
               overflow = "ellipsis",
-            }
-          end,
+            },
+          },
         }
       end,
     },
@@ -177,21 +178,21 @@ return ouro.storybook {
       name = "Row",
       viewport = { width = 560, height = 180 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 12,
-          children = function()
-            ouro.label { key = "heading", text = "Horizontal row", size = 18 }
+          children = {
+            ouro.label { key = "heading", text = "Horizontal row", size = 18 },
             ouro.row {
               key = "items",
               gap = 8,
-              children = function()
-                ouro.button { key = "first", label = "First" }
-                ouro.button { key = "second", label = "Second" }
-                ouro.button { key = "third", label = "Third" }
-              end,
-            }
-          end,
+              children = {
+                ouro.button { key = "first", label = "First" },
+                ouro.button { key = "second", label = "Second" },
+                ouro.button { key = "third", label = "Third" },
+              },
+            },
+          },
         }
       end,
     },
@@ -201,15 +202,15 @@ return ouro.storybook {
       name = "Column",
       viewport = { width = 360, height = 260 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 8,
-          children = function()
-            ouro.label { key = "heading", text = "Vertical column", size = 18 }
-            ouro.button { key = "first", label = "First" }
-            ouro.button { key = "second", label = "Second" }
-            ouro.button { key = "third", label = "Third" }
-          end,
+          children = {
+            ouro.label { key = "heading", text = "Vertical column", size = 18 },
+            ouro.button { key = "first", label = "First" },
+            ouro.button { key = "second", label = "Second" },
+            ouro.button { key = "third", label = "Third" },
+          },
         }
       end,
     },
@@ -219,15 +220,15 @@ return ouro.storybook {
       name = "Constrained box",
       viewport = { width = 360, height = 200 },
       content = function()
-        ouro.box {
+        return ouro.box {
           key = "frame",
           width = 320,
           height = 160,
           padding = 20,
           alignment = "center",
-          children = function()
-            ouro.button { key = "centered", label = "Centered" }
-          end,
+          children = {
+            ouro.button { key = "centered", label = "Centered" },
+          },
         }
       end,
     },
@@ -237,7 +238,7 @@ return ouro.storybook {
       name = "Scrollable settings list",
       viewport = { width = 380, height = 280 },
       content = function()
-        scroll_story()
+        return scroll_story()
       end,
     },
     ouro.story {
@@ -249,7 +250,7 @@ return ouro.storybook {
         { type = "scroll", target = "settings-scroll", delta = 180 },
       },
       content = function()
-        scroll_story()
+        return scroll_story()
       end,
     },
     ouro.story {
@@ -258,20 +259,20 @@ return ouro.storybook {
       name = "Dark scope",
       viewport = { width = 360, height = 200 },
       content = function()
-        ouro.theme {
+        return ouro.theme {
           key = "dark-theme",
           color_scheme = "dark",
-          children = function()
+          children = {
             ouro.box {
               key = "surface",
               width = 336,
               height = 176,
               alignment = "center",
-              children = function()
-                ouro.button { key = "button", label = "Dark theme" }
-              end,
-            }
-          end,
+              children = {
+                ouro.button { key = "button", label = "Dark theme" },
+              },
+            },
+          },
         }
       end,
     },
@@ -281,25 +282,25 @@ return ouro.storybook {
       name = "Editable, read-only, and disabled",
       viewport = { width = 420, height = 240 },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 10,
-          children = function()
+          children = {
             ouro.text_input {
               key = "editable",
               default_text = "Editable value",
-            }
+            },
             ouro.text_input {
               key = "read-only",
               default_text = "Read-only value",
               read_only = true,
-            }
+            },
             ouro.text_input {
               key = "disabled",
               default_text = "Disabled value",
               enabled = false,
-            }
-          end,
+            },
+          },
         }
       end,
     },
@@ -312,7 +313,7 @@ return ouro.storybook {
         { type = "hover", target = "options/third" },
       },
       content = function()
-        listbox_story()
+        return listbox_story()
       end,
     },
     ouro.story {
@@ -321,7 +322,7 @@ return ouro.storybook {
       name = "Default",
       viewport = { width = 360, height = 180 },
       content = function()
-        button_story("Default button", true)
+        return button_story("Default button", true)
       end,
     },
     ouro.story {
@@ -333,7 +334,7 @@ return ouro.storybook {
         { type = "hover", target = "content/button" },
       },
       content = function()
-        button_story("Hovered button", true)
+        return button_story("Hovered button", true)
       end,
     },
     ouro.story {
@@ -345,7 +346,7 @@ return ouro.storybook {
         { type = "pointer_down", target = "content/button" },
       },
       content = function()
-        button_story("Pressed button", true)
+        return button_story("Pressed button", true)
       end,
     },
     ouro.story {
@@ -354,7 +355,7 @@ return ouro.storybook {
       name = "Disabled",
       viewport = { width = 360, height = 180 },
       content = function()
-        button_story("Disabled button", false)
+        return button_story("Disabled button", false)
       end,
     },
     ouro.story {
@@ -365,7 +366,7 @@ return ouro.storybook {
       snapshot_scale = 2,
       color_scheme = "dark",
       content = function()
-        button_story("Disabled dark button", false)
+        return button_story("Disabled dark button", false)
       end,
     },
     ouro.story {
@@ -377,23 +378,23 @@ return ouro.storybook {
         { type = "click", target = "content/button" },
       },
       content = function()
-        ouro.column {
+        return ouro.column {
           key = "content",
           gap = 12,
-          children = function()
+          children = {
             ouro.label {
               key = "count",
               text = "Pressed " .. count() .. " times",
               size = 18,
-            }
+            },
             ouro.button {
               key = "button",
               label = "Increment",
               on_press = function()
                 count:set(count() + 1)
               end,
-            }
-          end,
+            },
+          },
         }
       end,
     },

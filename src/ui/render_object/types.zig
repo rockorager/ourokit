@@ -49,6 +49,9 @@ pub const Flex = struct {
 
 pub const Stack = struct {
     clip: bool = false,
+    /// Virtual rows measure intrinsically even while their estimated extent
+    /// is smaller than a newly materialized row.
+    unbounded_height: bool = false,
 };
 
 /// A single-child viewport. Offset is retained by the corresponding instance,

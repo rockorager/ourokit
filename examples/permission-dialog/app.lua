@@ -27,42 +27,36 @@ return ouro.app {
         width = 520,
         height = 300,
         content = function()
-          ouro.box {
+          return ouro.box {
             key = "dialog",
             padding = 28,
-            children = function()
-              ouro.column {
-                key = "body",
-                gap = 20,
-                cross_alignment = "stretch",
-                children = function()
-                  ouro.label { key = "title", text = "Allow a screenshot?", size = 24 }
-                  ouro.label {
-                    key = "requester",
-                    text = (request.app_name or "An application") .. " wants to capture your screen.",
-                  }
-                  ouro.label {
-                    key = "privacy",
-                    text = "Your screen may contain private information.",
-                  }
-                  ouro.label { key = "scope", text = "This permission applies to one screenshot." }
-                  ouro.row {
-                    key = "buttons",
-                    gap = 12,
-                    children = function()
-                      ouro.button {
-                        key = "deny", label = "Don't allow", width = 218, height = 44,
-                        on_press = function() decide(false) end,
-                      }
-                      ouro.button {
-                        key = "allow", label = "Allow screenshot", width = 218, height = 44,
-                        on_press = function() decide(true) end,
-                      }
-                    end,
-                  }
-                end,
-              }
-            end,
+            ouro.column {
+              key = "body",
+              gap = 20,
+              cross_alignment = "stretch",
+              ouro.label { key = "title", text = "Allow a screenshot?", size = 24 },
+              ouro.label {
+                key = "requester",
+                text = (request.app_name or "An application") .. " wants to capture your screen.",
+              },
+              ouro.label {
+                key = "privacy",
+                text = "Your screen may contain private information.",
+              },
+              ouro.label { key = "scope", text = "This permission applies to one screenshot." },
+              ouro.row {
+                key = "buttons",
+                gap = 12,
+                ouro.button {
+                  key = "deny", label = "Don't allow", width = 218, height = 44,
+                  on_press = function() decide(false) end,
+                },
+                ouro.button {
+                  key = "allow", label = "Allow screenshot", width = 218, height = 44,
+                  on_press = function() decide(true) end,
+                },
+              },
+            },
           }
         end,
       },

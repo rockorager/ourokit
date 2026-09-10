@@ -11,19 +11,17 @@ return ouro.app {
         width = 480,
         height = 320,
         content = function()
-          ouro.column {
+          return ouro.column {
             key = "content",
-            children = function()
-              ouro.button {
-                key = "benchmark",
-                label = clicked() and "Clicked" or "Benchmark",
-                width = 160,
-                height = 44,
-                on_press = function()
-                  clicked:set(not clicked())
-                end,
-              }
-            end,
+            ouro.button {
+              key = "benchmark",
+              label = clicked() and "Clicked" or "Benchmark",
+              width = 160,
+              height = 44,
+              on_press = function()
+                clicked:set(not clicked())
+              end,
+            },
           }
         end,
       },

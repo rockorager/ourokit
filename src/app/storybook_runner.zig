@@ -125,11 +125,13 @@ pub fn describe(init: std.process.Init, source: []const u8) !Description {
 /// runtime, then encodes the software-rendered pixels as PNG.
 pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8) !Snapshot {
     if (!renderer.software.has_freetype) return error.FreeTypeDisabled;
+    const config: @import("window_runtime.zig").Config = .{};
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 8, 1);
     defer loop.deinit();
     var scheduler: task.Scheduler = undefined;
-    try scheduler.init(init.gpa, 32, 8, 8);
+    // One scope per instance, plus the application, window and build owner.
+    try scheduler.init(init.gpa, config.node_capacity + 3, 8, 8);
     defer scheduler.deinit();
     var vm: lua.Vm = undefined;
     try vm.init(init.gpa, &scheduler, &loop);
@@ -173,7 +175,6 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
 
-    const config: @import("window_runtime.zig").Config = .{};
     var callbacks: lua.CallbackRegistry = undefined;
     try callbacks.init(init.gpa, config.node_capacity);
     defer callbacks.deinit();
@@ -338,10 +339,12 @@ fn dispatchAndSettle(
     story: *const lua.StorybookStory,
 ) !void {
     try runtime.dispatchInput(callbacks);
+    try scheduler.applyQueuedCancellations();
     while (scheduler.takeRunnable()) |handle| switch (try vm.resumeRunnable(handle)) {
         .completed, .canceled => {},
         .waiting => return error.StoryActionDidNotSettle,
     };
+    try runtime.collectRetired();
     try runtime.reconcile(
         .{ .width = story.viewport.width, .height = story.viewport.height },
         lua_ui,

@@ -34,6 +34,7 @@ pub const StorybookActionKind = @import("storybook.zig").ActionKind;
 test {
     _ = @import("application.zig");
     _ = @import("callbacks.zig");
+    _ = @import("components_test.zig");
     _ = @import("diagnostic.zig");
     _ = @import("prepared_build.zig");
     _ = @import("signals.zig");
@@ -42,6 +43,7 @@ test {
     _ = @import("varlink_client.zig");
     _ = @import("stdio.zig");
     _ = @import("storybook.zig");
+    _ = @import("virtual_list_test.zig");
     _ = @import("vm.zig");
     _ = @import("ui_build.zig");
 }

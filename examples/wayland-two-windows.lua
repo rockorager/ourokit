@@ -5,9 +5,9 @@ return ouro.app {
   run = function()
     local clicked = ouro.signal(false)
     local function content()
-      ouro.column {
+      return ouro.column {
         key = "content",
-        children = function()
+        children = {
           ouro.button {
             key = "benchmark",
             label = clicked() and "Clicked" or "Benchmark",
@@ -16,8 +16,8 @@ return ouro.app {
             on_press = function()
               clicked:set(not clicked())
             end,
-          }
-        end,
+          },
+        },
       }
     end
     return { windows = {

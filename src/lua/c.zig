@@ -26,6 +26,7 @@ pub extern fn luaL_testudata(state: *State, index: c_int, name: [*:0]const u8) ?
 pub extern fn luaL_ref(state: *State, table_index: c_int) c_int;
 pub extern fn luaL_unref(state: *State, table_index: c_int, reference: c_int) void;
 pub extern fn lua_close(state: *State) void;
+pub extern fn lua_gc(state: *State, what: c_int, ...) c_int;
 pub extern fn lua_newthread(state: *State) ?*State;
 pub extern fn lua_closethread(state: *State, from: ?*State) c_int;
 pub extern fn luaL_loadbufferx(state: *State, buffer: [*]const u8, size: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int;
@@ -57,6 +58,7 @@ pub extern fn lua_settable(state: *State, index: c_int) void;
 pub extern fn lua_rawlen(state: *State, index: c_int) usize;
 pub extern fn lua_next(state: *State, index: c_int) c_int;
 pub extern fn lua_settop(state: *State, index: c_int) void;
+pub extern fn lua_rotate(state: *State, index: c_int, count: c_int) void;
 pub extern fn lua_newuserdatauv(state: *State, size: usize, user_value_count: c_int) ?*anyopaque;
 pub extern fn lua_getiuservalue(state: *State, index: c_int, user_value: c_int) c_int;
 pub extern fn lua_setiuservalue(state: *State, index: c_int, user_value: c_int) c_int;

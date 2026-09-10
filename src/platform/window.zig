@@ -88,6 +88,8 @@ pub const LogicalKey = enum {
     arrow_down,
     home,
     end,
+    page_up,
+    page_down,
     backspace,
     delete,
     key_a,

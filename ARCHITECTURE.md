@@ -233,13 +233,16 @@ objects. Ourokit will avoid repeated parsing of arbitrary `{ type = "..." }`
 tables; component schemas should eventually generate Lua constructors, compact
 Zig decoding, language-server types, documentation, and validation tests. That
 generator is not part of milestone one, and no permanent widget ABI is frozen.
-The first constructor-specific decoders prove the intended seam. `ouro.row`
-and `ouro.column` emit Flex descriptors, `ouro.scroll` emits a single-child
-viewport descriptor with instance-retained offset, `ouro.label` emits Label, and
-`ouro.button` emits Box plus Label descriptors and a typed widget binding.
-A bounded nested build context derives native identity and parent links from
-stable local keys, so applications never manage numeric IDs. These constructors
-do not add a Button render object or duplicate theme defaults in Lua.
+The constructor-specific decoders prove the intended seam. Constructors return
+opaque descriptions holding shallow snapshots of their property tables and
+ordered children; unattached descriptions have no UI effects. Builds return one
+root description or nil. Containers accept array entries or an explicit dense
+`children` table, never callback children. Native lowering walks the returned
+tree parent-first: rows and columns become Flex, scroll becomes a single-child
+viewport with instance-retained offset, labels become Label, and buttons become
+Box plus Label and a typed widget binding. A bounded lowering context derives
+identity and parent links from stable local keys and resolves inherited themes
+and parent data. No Button render object or Lua theme mirror is introduced.
 
 Layout uses one-way Flutter-style box constraints in logical `f32` units. A
 parent passes minimum/maximum width and height, each child returns one finite
@@ -591,19 +594,27 @@ It never calls `luaL_openlibs`. The only initial global is the Ouro-owned table
 containing `sleep`; the proof test verifies `print`, `package`, and `coroutine`
 are absent.
 
-Mounted UI builds may install constructor-specific Ouro functions into that
-same table. They append compact typed descriptors only while a build owner is
-actively reconciling; calls outside that phase fail. Build callbacks execute
-under protected, non-yielding calls, and their descriptor storage is bounded
-and borrowed only until the next build. Applications use stable string keys and
-constructor tables; numeric descriptor IDs, parent links, and renderer objects
-are not exposed. A future schema generator may produce these constructors and
-bindings without introducing generic string `type` dispatch.
+The UI bridge installs description constructors into that same table. These
+functions may run outside a build and cannot touch native UI. Build callbacks
+and subsequent description lowering execute under protected, non-yielding
+calls. Typed descriptor storage is bounded and borrowed until the next build;
+the returned Lua tree stays anchored for that lifetime. Prepared reload builds
+retain their own description reference across later window builds. Applications
+use stable string keys and constructor tables; numeric descriptor IDs, parent
+links, and renderer objects are not exposed. Reusable rendering helpers are
+ordinary Lua functions returning descriptions. `ouro.component` additionally
+retains an initializer's returned rebuild function, stable props, and keyed
+instance identity. Component descriptions do not initialize until mounted.
+Production windows retain one native build owner; component readers beneath it
+track independent Lua dependencies and retain clean render output. Dirty readers
+wake the window without rerunning clean Lua components. Native lowering still
+normalizes the complete returned tree. Component state belongs to the source
+generation, so preparing a reload candidate cannot replace live component state.
 
 `ouro.signal(initial)` is the first reactive primitive. Calling its userdata
 reads the value and `signal:set(value)` changes it. Dependency tracking belongs
-to the active mounted build owner and commits transactionally with that owner's
-descriptors; raw-equal writes are suppressed.
+to the active mounted build owner and component reader and commits transactionally
+with that owner's descriptors; raw-equal writes are suppressed.
 
 The isolated VM owns growable stable-address slabs of generation-checked
 coroutines. Growth occurs only during task creation; existing slots do not move

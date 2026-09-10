@@ -12,19 +12,19 @@ return ouro.app {
         width = 560,
         height = 360,
         content = function()
-          ouro.column {
+          return ouro.column {
             key = "gallery",
             gap = 12,
-            children = function()
+            children = {
               ouro.label {
                 key = "heading",
                 text = "Ourokit controls",
                 size = 18,
-              }
+              },
               ouro.label {
                 key = "count",
                 text = "Pressed " .. count() .. " times",
-              }
+              },
               ouro.text_input {
                 key = "query",
                 text = query(),
@@ -32,26 +32,26 @@ return ouro.app {
                 on_change = function(value)
                   query:set(value)
                 end,
-              }
+              },
               ouro.row {
                 key = "actions",
                 gap = 8,
-                children = function()
+                children = {
                   ouro.button {
                     key = "increment",
                     label = "Increment",
                     on_press = function()
                       count:set(count() + 1)
                     end,
-                  }
+                  },
                   ouro.button {
                     key = "disabled",
                     label = "Disabled",
                     enabled = false,
-                  }
-                end,
-              }
-            end,
+                  },
+                },
+              },
+            },
           }
         end,
       },

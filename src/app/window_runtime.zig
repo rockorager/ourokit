@@ -10,6 +10,7 @@ const scene = @import("../scene/root.zig");
 const task = @import("../task/root.zig");
 const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
+const virtual_list = @import("../ui/widget/virtual_list.zig");
 
 pub const Config = struct {
     node_capacity: usize = 256,
@@ -70,6 +71,9 @@ pub const WindowRuntime = struct {
     clipboard: ?*clipboard_module.Coordinator = null,
     reconciling: bool = false,
     text_input_commit_permitted: bool = true,
+    virtual_lists: virtual_list.Snapshot = .{},
+    virtual_work: bool = false,
+    virtual_offsets_pending: bool = false,
 
     pub fn init(
         self: *WindowRuntime,
@@ -185,12 +189,16 @@ pub const WindowRuntime = struct {
                 .owners = &self.build_owners,
                 .handle = self.root_owner,
             });
+            lua_ui.disposeOwner(&self.build_owners, self.root_owner);
             try self.build_owners.retire(self.root_owner);
         }
         if (self.ready) try self.instances.reconcile(&.{});
         self.ready = false;
         self.command_count = 0;
         self.frame_state = .{};
+        self.virtual_lists = .{};
+        self.virtual_work = false;
+        self.virtual_offsets_pending = false;
     }
 
     /// Builds and validates one candidate generation into owned storage
@@ -219,6 +227,10 @@ pub const WindowRuntime = struct {
             .{ .integer = encodedColor(self.accent_color) },
             .{ .integer = encodedColor(self.content_color) },
         };
+        lua_ui.components.instances = &self.instances;
+        lua_ui.components.focused = self.focus.current();
+        lua_ui.components.native_update = false;
+        defer lua_ui.components.instances = null;
         const descriptors = try lua_ui.buildCallback(
             &self.build_owners,
             work,
@@ -403,6 +415,9 @@ pub const WindowRuntime = struct {
         _ = self.frame_state.configure(prepared.size.?) catch unreachable;
         self.frame_state.invalidatePaint();
         self.ready = true;
+        self.virtual_lists = prepared.virtual_lists;
+        self.virtual_offsets_pending = true;
+        if (self.virtual_lists.count != 0) self.queueVirtualBuild() catch unreachable;
         prepared.reset();
     }
 
@@ -419,9 +434,13 @@ pub const WindowRuntime = struct {
         if (size_changed and self.ready) _ = try self.build_owners.markDirty(self.root_owner);
         const width: f32 = @floatFromInt(size.width);
         const height: f32 = @floatFromInt(size.height);
+        lua_ui.components.instances = &self.instances;
+        defer lua_ui.components.instances = null;
         var builds = self.build_owners.beginCycle();
         while (try builds.take()) |work| {
             std.debug.assert(sameHandle(work.owner, self.root_owner));
+            lua_ui.components.focused = self.focus.current();
+            lua_ui.components.native_update = self.virtual_work;
             const arguments = [_]lua.UiBuildArgument{
                 .{ .number = width },
                 .{ .number = height },
@@ -438,7 +457,13 @@ pub const WindowRuntime = struct {
                 try self.build_owners.retry(work);
                 return err;
             };
-            self.instances.reconcile(descriptors) catch |err| {
+            self.instances.collectRetired() catch |err| {
+                lua_ui.rollbackHandlers();
+                try lua_ui.rollbackDependencies(&self.build_owners, work);
+                try self.build_owners.retry(work);
+                return err;
+            };
+            const plan = self.instances.prepareReconcile(descriptors) catch |err| {
                 lua_ui.rollbackHandlers();
                 try lua_ui.rollbackDependencies(&self.build_owners, work);
                 try self.build_owners.retry(work);
@@ -456,7 +481,20 @@ pub const WindowRuntime = struct {
                 try self.build_owners.retry(work);
                 return err;
             };
+            lua_ui.validateBindings(
+                &self.pointer_bindings,
+                &self.buttons,
+                &self.text_inputs,
+                &self.instances,
+                work.owner,
+            ) catch |err| {
+                lua_ui.rollbackHandlers();
+                try lua_ui.rollbackDependencies(&self.build_owners, work);
+                try self.build_owners.retry(work);
+                return err;
+            };
             self.semantics.stage(lua_ui.semanticDescriptors());
+            self.instances.applyReconcile(plan) catch unreachable;
             self.buttons.removeInactive(&self.instances);
             self.listboxes.removeInactive(&self.instances);
             self.text_inputs.removeInactive(&self.instances);
@@ -486,7 +524,12 @@ pub const WindowRuntime = struct {
                 if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
             try self.refreshListBoxVisuals();
             try self.applyFocusVisual(null, self.focus.current());
+            self.virtual_lists = lua_ui.virtual_lists;
+            self.virtual_offsets_pending = true;
+            self.virtual_work = false;
             try self.build_owners.complete(work);
+            // Native layout feeds the next bounded build pass; it never calls Lua.
+            try self.prepareFrame(self.output_scale);
         }
         try self.prepareFrame(self.output_scale);
         self.ready = true;
@@ -512,6 +555,7 @@ pub const WindowRuntime = struct {
             try self.instances.syncScrollOffsets();
             try self.frame_state.layoutComplete();
         }
+        try self.updateVirtualLayout();
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
             self.frame_state.invalidatePaint();
             var builder = try ui.render_object.Builder.init(self.commands, self.output_scale);
@@ -519,6 +563,33 @@ pub const WindowRuntime = struct {
             self.command_count = builder.displayList().commands.len;
             _ = try self.frame_state.sceneBuilt();
         }
+    }
+
+    fn queueVirtualBuild(self: *WindowRuntime) !void {
+        if (self.virtual_work) return;
+        self.virtual_work = true;
+        _ = try self.build_owners.markReaderDirty(self.root_owner);
+    }
+
+    fn updateVirtualLayout(self: *WindowRuntime) !void {
+        var changed = false;
+        for (self.virtual_lists.lists[0..self.virtual_lists.count]) |list| {
+            const target = self.instances.handleForId(list.id) orelse continue;
+            const size = try self.tree.nodeSize(try self.instances.renderObject(target));
+            if (self.virtual_offsets_pending) {
+                if (try self.instances.scrollBy(target, list.offset - try self.instances.scrollOffset(target)))
+                    self.frame_state.invalidatePaint();
+            }
+            if (@abs(size.width - list.width) > 0.01 or @abs(size.height - list.viewport) > 0.01)
+                changed = true;
+            if (!list.fixed) for (self.virtual_lists.rows[list.row_start..][0..list.row_count]) |row| {
+                const handle = self.instances.handleForId(row.id) orelse continue;
+                const measured = try self.tree.nodeSize(try self.instances.renderObject(handle));
+                if (@abs(measured.height - row.height) > 0.01) changed = true;
+            };
+        }
+        self.virtual_offsets_pending = false;
+        if (changed) try self.queueVirtualBuild();
     }
 
     pub fn textInputStatus(self: *WindowRuntime) !?TextInputStatus {
@@ -599,6 +670,21 @@ pub const WindowRuntime = struct {
             if (!self.instances.isActive(target)) continue;
             try self.updateTextInputPointer(target, event);
             const activated_button = try self.updateButtonState(event);
+            if (event == .pointer and event.pointer.event == .button and
+                event.pointer.event.button.button == 0x110 and event.pointer.event.button.state == .pressed)
+            {
+                var ancestor: ?ui.instance.InstanceHandle = target;
+                while (ancestor) |handle| {
+                    if (self.virtual_lists.find(try self.instances.semanticId(handle)) != null) {
+                        const previous = self.focus.current();
+                        _ = try self.focus.request(&self.instances, handle);
+                        try self.applyFocusVisual(previous, self.focus.current());
+                        break;
+                    }
+                    if (self.instances.isFocusable(handle)) break;
+                    ancestor = try self.instances.parentOf(handle);
+                }
+            }
             try self.updateListBoxHover(event);
             if (try self.applyScrollEvent(target, event)) continue;
             var bound_target = target;
@@ -665,6 +751,7 @@ pub const WindowRuntime = struct {
                 if (key.translated.modifiers.shift) .backward else .forward,
             );
             try self.applyFocusVisual(previous, self.focus.current());
+            if (self.focus.current()) |focused| try self.ensureOptionVisible(focused);
             return;
         }
         if (self.focus.current()) |focused| if (self.text_inputs.contains(focused) and
@@ -714,6 +801,29 @@ pub const WindowRuntime = struct {
                     try self.notifyTextInputChanged(callback_service, focused);
             }
             if (intent != null) return;
+        };
+        if (key.state != .released) if (self.focus.current()) |focused| {
+            if (!self.listboxes.contains(focused)) if (try self.instances.nearestScroll(focused, .vertical)) |scroll| {
+                if (self.virtual_lists.find(try self.instances.semanticId(scroll))) |list| {
+                    const offset = try self.instances.scrollOffset(scroll);
+                    const delta: ?f32 = switch (key.translated.logical) {
+                        .home => -offset,
+                        .end => list.total,
+                        .page_up => -list.viewport,
+                        .page_down => list.viewport,
+                        .arrow_up => -list.estimate,
+                        .arrow_down => list.estimate,
+                        else => null,
+                    };
+                    if (delta) |amount| {
+                        if (try self.instances.scrollBy(scroll, amount)) {
+                            self.frame_state.invalidatePaint();
+                            try self.queueVirtualBuild();
+                        }
+                        return;
+                    }
+                }
+            };
         };
         if ((key.translated.logical == .arrow_up or key.translated.logical == .arrow_down or
             key.translated.logical == .home or key.translated.logical == .end) and
@@ -820,8 +930,11 @@ pub const WindowRuntime = struct {
             y + option_size.height - viewport.height
         else
             0;
-        if (delta != 0 and try self.instances.scrollBy(scroll, delta))
+        if (delta != 0 and try self.instances.scrollBy(scroll, delta)) {
             self.frame_state.invalidatePaint();
+            if (self.virtual_lists.find(try self.instances.semanticId(scroll)) != null)
+                try self.queueVirtualBuild();
+        }
     }
 
     fn spawnCallback(
@@ -879,7 +992,11 @@ pub const WindowRuntime = struct {
         var current: ?ui.instance.InstanceHandle = target;
         while (current) |start| {
             const scroll = (try self.instances.nearestScroll(start, axis)) orelse return false;
-            if (try self.instances.scrollBy(scroll, axis_event.delta)) return true;
+            if (try self.instances.scrollBy(scroll, axis_event.delta)) {
+                if (self.virtual_lists.find(try self.instances.semanticId(scroll)) != null)
+                    try self.queueVirtualBuild();
+                return true;
+            }
             current = try self.instances.parentOf(scroll);
         }
         return false;

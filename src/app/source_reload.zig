@@ -850,15 +850,18 @@ test "a later window build failure leaves every retained window on the active ge
 
     const initial_two_windows =
         \\local ouro = require("ouro")
-        \\local function content(label)
+        \\local Panel = ouro.component(function(props)
+        \\  local label = ouro.signal(props.label)
         \\  return function()
-        \\    ouro.column {
-        \\      key = "content",
-        \\      children = function()
-        \\        ouro.label { key = "label", text = label }
-        \\      end,
+        \\    return ouro.virtual_list {
+        \\      key = "content", item_count = 1, estimated_item_height = 48,
+        \\      item_key = function() return "item" end,
+        \\      render_item = function() return ouro.label { key = "label", text = label() } end,
         \\    }
         \\  end
+        \\end)
+        \\local function content(label)
+        \\  return function() return Panel { key = "panel", label = label } end
         \\end
         \\return ouro.app {
         \\  id = "dev.ouro.atomic-window-test",
@@ -870,6 +873,17 @@ test "a later window build failure leaves every retained window on the active ge
     ;
     const failing_second_window =
         \\local ouro = require("ouro")
+        \\local Panel = ouro.component(function(props)
+        \\  local label = ouro.signal(props.label)
+        \\  return function()
+        \\    if props.fail then return false end
+        \\    return ouro.virtual_list {
+        \\      key = "content", item_count = 1, estimated_item_height = 48,
+        \\      item_key = function() return "item" end,
+        \\      render_item = function() return ouro.label { key = "label", text = label() } end,
+        \\    }
+        \\  end
+        \\end)
         \\return ouro.app {
         \\  id = "dev.ouro.atomic-window-test",
         \\  windows = {
@@ -877,18 +891,13 @@ test "a later window build failure leaves every retained window on the active ge
         \\      id = "first",
         \\      title = "Changed first",
         \\      content = function()
-        \\        ouro.column {
-        \\          key = "content",
-        \\          children = function()
-        \\            ouro.label { key = "label", text = "Candidate first" }
-        \\          end,
-        \\        }
+        \\        return Panel { key = "panel", label = "Candidate first" }
         \\      end,
         \\    },
         \\    ouro.window {
         \\      id = "second",
         \\      title = "Changed second",
-        \\      content = function() error("candidate second failed") end,
+        \\      content = function() return Panel { key = "panel", label = "Candidate second", fail = true } end,
         \\    },
         \\  },
         \\}
@@ -913,7 +922,7 @@ test "a later window build failure leaves every retained window on the active ge
     try loop.init(std.testing.allocator, 16, 4);
     defer loop.deinit();
     var scheduler: task.Scheduler = undefined;
-    try scheduler.init(std.testing.allocator, 24, 4, 4);
+    try scheduler.init(std.testing.allocator, 64, 4, 4);
     defer scheduler.deinit();
     var callbacks: lua.CallbackRegistry = undefined;
     try callbacks.init(std.testing.allocator, 16);
@@ -937,8 +946,8 @@ test "a later window build failure leaves every retained window on the active ge
         .callbacks = &callbacks,
     };
     const config: source_generation.Config = .{
-        .node_capacity = 8,
-        .semantic_text_capacity = 128,
+        .node_capacity = 16,
+        .semantic_text_capacity = 256,
     };
 
     const snapshot = try provider.snapshot(std.testing.io, std.testing.allocator);
@@ -980,7 +989,7 @@ test "a later window build failure leaves every retained window on the active ge
             &initial.signals,
             &paragraph_sources,
             &paragraphs,
-            .{ .node_capacity = 8, .command_capacity = 16 },
+            .{ .node_capacity = 16, .command_capacity = 16 },
         );
         try runtime.reconcile(
             .{ .width = 320, .height = 200 },
@@ -988,10 +997,13 @@ test "a later window build failure leaves every retained window on the active ge
             initial.application.windows[index].content_reference,
         );
     }
-    try std.testing.expectEqualStrings("Active first", (try runtimes[0].semantics.node(1)).label);
-    try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.node(1)).label);
+    try std.testing.expectEqualStrings("Active first", (try runtimes[0].semantics.findPath("panel/content/item/label")).label);
+    try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.findPath("panel/content/item/label")).label);
     const first_instance_count = runtimes[0].instances.activeCount();
     const second_instance_count = runtimes[1].instances.activeCount();
+    const first_id = (try runtimes[0].semantics.findPath("panel/content/item/label")).id;
+    const first_list = runtimes[0].virtual_lists.lists[0];
+    const available_scopes = scheduler.availableScopeCapacity();
 
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = "app.lua",
@@ -1013,11 +1025,35 @@ test "a later window build failure leaves every retained window on the active ge
     try std.testing.expect(runtimes[1].signals == &initial.signals);
     try std.testing.expectEqual(first_instance_count, runtimes[0].instances.activeCount());
     try std.testing.expectEqual(second_instance_count, runtimes[1].instances.activeCount());
-    try std.testing.expectEqualStrings("Active first", (try runtimes[0].semantics.node(1)).label);
-    try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.node(1)).label);
+    try std.testing.expectEqualStrings("Active first", (try runtimes[0].semantics.findPath("panel/content/item/label")).label);
+    try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.findPath("panel/content/item/label")).label);
+    try std.testing.expectEqual(first_id, (try runtimes[0].semantics.findPath("panel/content/item/label")).id);
+    try std.testing.expectEqualDeep(first_list, runtimes[0].virtual_lists.lists[0]);
+    try std.testing.expectEqual(available_scopes, scheduler.availableScopeCapacity());
     try std.testing.expectEqual(lua.DiagnosticPhase.build, reload.lastDiagnostic().?.phase);
 
-    for (&runtimes) |*runtime| try runtime.clear(&initial.ui_build);
+    // Retry with two valid component windows. Preparation must still allocate
+    // no native scopes, while commit must replace the old component mounts.
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = initial_two_windows });
+    try reload.prepare();
+    const candidate = reload.candidate.?;
+    try reload.prepareApplication(&targets);
+    try std.testing.expectEqual(available_scopes, scheduler.availableScopeCapacity());
+    _ = try reload.commitApplication(&targets, &callbacks);
+    try std.testing.expect(reload.active() == candidate);
+    try std.testing.expect(first_id != (try runtimes[0].semantics.findPath("panel/content/item/label")).id);
+    try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.findPath("panel/content/item/label")).label);
+    try reload.beginRetirement();
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+
+    for (&runtimes, 0..) |*runtime, index| {
+        try runtime.reconcile(.{ .width = 320, .height = 200 }, &candidate.ui_build, candidate.application.windows[index].content_reference);
+        try std.testing.expectEqual(@as(usize, 1), runtime.virtual_lists.count);
+        try std.testing.expectEqual(first_list.total, runtime.virtual_lists.lists[0].total);
+        try std.testing.expectEqual(@as(f32, 176), runtime.virtual_lists.lists[0].viewport);
+    }
+
+    for (&runtimes) |*runtime| try runtime.clear(&candidate.ui_build);
     try scheduler.applyQueuedCancellations();
     for (&runtimes) |*runtime| {
         try runtime.collectRetired();
