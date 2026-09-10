@@ -3,6 +3,7 @@ const linux = std.os.linux;
 const wayring = @import("wayring");
 const varlink = @import("../varlink/root.zig");
 const control = @import("control_server.zig");
+const socket_activation = @import("socket_activation.zig");
 
 pub const Diagnostic = struct {
     phase: []u8,
@@ -54,47 +55,36 @@ pub const Application = struct {
     }
 };
 
-/// Finds exactly one running Ouro application by its declared application ID.
-/// PID-scoped socket names allow multiple unrelated applications to coexist.
+/// Resolves the application's well-known address. Connecting can activate its
+/// systemd service; discovering the owner never scans unrelated sockets.
 pub fn findApplication(
     io: std.Io,
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
     application_id: []const u8,
 ) !Application {
-    const runtime_directory = std.process.Environ.getPosix(environ, "XDG_RUNTIME_DIR") orelse
-        return error.MissingRuntimeDirectory;
-    const directory = try std.Io.Dir.openDirAbsolute(io, runtime_directory, .{ .iterate = true });
-    defer directory.close(io);
-    var iterator = directory.iterateAssumeFirstIteration();
-    var found: ?Application = null;
-    errdefer if (found) |*application| application.deinit(allocator);
-    while (try iterator.next(io)) |entry| {
-        if (!std.mem.startsWith(u8, entry.name, "ouro-") or
-            !std.mem.endsWith(u8, entry.name, ".varlink")) continue;
-        const path = try std.fs.path.join(allocator, &.{ runtime_directory, entry.name });
-        var status = statusAt(allocator, path) catch |err| {
-            allocator.free(path);
-            if (err == error.OutOfMemory) return err;
-            continue;
-        };
-        if (!std.mem.eql(u8, status.application_id, application_id)) {
-            status.deinit(allocator);
-            allocator.free(path);
-            continue;
-        }
-        if (found != null) {
-            status.deinit(allocator);
-            allocator.free(path);
-            return error.MultipleApplications;
-        }
-        found = .{ .path = path, .status = status };
-    }
-    return found orelse error.ApplicationNotFound;
+    _ = io;
+    const socket_path = try socket_activation.socketPath(allocator, environ, application_id);
+    defer allocator.free(socket_path);
+    const path = try allocator.dupe(u8, socket_path);
+    errdefer allocator.free(path);
+    var status = try statusAt(allocator, path);
+    errdefer status.deinit(allocator);
+    if (!std.mem.eql(u8, status.application_id, application_id)) return error.ApplicationIdMismatch;
+    return .{ .path = path, .status = status };
+}
+
+pub fn activateAt(allocator: std.mem.Allocator, path: []const u8, token: ?[]const u8) !void {
+    var parameters = std.json.ObjectMap.empty;
+    defer parameters.deinit(allocator);
+    if (token) |value| try parameters.put(allocator, "activationToken", .{ .string = value });
+    var reply = try call(allocator, path, control.interface_name ++ ".Activate", .{ .object = parameters });
+    defer reply.deinit();
+    if (reply.error_name != null) return error.ActivationFailed;
 }
 
 pub fn statusAt(allocator: std.mem.Allocator, path: []const u8) !Status {
-    var reply = try call(allocator, path, control.status_method);
+    var reply = try call(allocator, path, control.status_method, null);
     defer reply.deinit();
     if (reply.error_name != null) return error.StatusFailed;
     const parameters = reply.parameters orelse return error.InvalidStatusReply;
@@ -120,7 +110,7 @@ pub fn statusAt(allocator: std.mem.Allocator, path: []const u8) !Status {
 }
 
 pub fn reloadAt(allocator: std.mem.Allocator, path: []const u8) !ReloadResult {
-    var reply = try call(allocator, path, control.reload_method);
+    var reply = try call(allocator, path, control.reload_method, null);
     defer reply.deinit();
     const parameters = reply.parameters orelse return error.InvalidReloadReply;
     const object = switch (parameters) {
@@ -139,12 +129,13 @@ fn call(
     allocator: std.mem.Allocator,
     path: []const u8,
     method: []const u8,
+    parameters: ?std.json.Value,
 ) !varlink.Reply {
     const fd = try wayring.unix_socket.connect(path);
     defer _ = linux.close(fd);
     var client = try varlink.Client.init(allocator, .{});
     defer client.deinit();
-    _ = try client.call(.{ .method = method });
+    _ = try client.call(.{ .method = method, .parameters = parameters });
     while (client.takeTransmit()) |transmit_value| {
         var transmit = transmit_value;
         defer transmit.deinit();

@@ -1,0 +1,6 @@
+[Unit]
+Description=Ourokit Contacts
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/ouroctl run %h/.local/share/ourokit/contacts/ouro.json

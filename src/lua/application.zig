@@ -4,6 +4,8 @@ const diagnostic = @import("diagnostic.zig");
 const platform = @import("../platform/window.zig");
 const task = @import("../task/root.zig");
 const vm_module = @import("vm.zig");
+const varlink_json = @import("varlink_client.zig");
+const varlink = @import("../varlink/root.zig");
 
 pub const Window = struct {
     declaration: platform.SurfaceDeclaration,
@@ -14,6 +16,7 @@ pub const Definition = struct {
     allocator: std.mem.Allocator,
     state: *c.State,
     id: []u8,
+    action_schema: ?varlink.Service = null,
     actions_reference: c_int = c.no_reference,
     run_reference: c_int = c.no_reference,
     legacy_windows: ?[]Window = null,
@@ -31,6 +34,7 @@ pub const Definition = struct {
     }
 
     pub fn deinit(self: *Definition) void {
+        if (self.action_schema) |*schema| schema.deinit();
         if (self.legacy_windows) |windows| {
             for (windows) |window| deinitWindow(self.allocator, self.state, window);
             self.allocator.free(windows);
@@ -48,11 +52,13 @@ pub const Definition = struct {
             .allocator = self.allocator,
             .state = self.state,
             .id = self.id,
+            .action_schema = self.action_schema,
             .actions_reference = self.actions_reference,
             .run_reference = self.run_reference,
             .windows = windows,
         };
         self.id = self.id[0..0];
+        self.action_schema = null;
         self.actions_reference = c.no_reference;
         self.run_reference = c.no_reference;
         self.legacy_windows = null;
@@ -69,6 +75,7 @@ pub const Bootstrap = struct {
     scope: task.ScopeHandle,
     definition: ?Definition = null,
     phase: enum { entry, run } = .entry,
+    defer_run: bool = false,
 
     pub fn start(
         allocator: std.mem.Allocator,
@@ -96,6 +103,14 @@ pub const Bootstrap = struct {
         switch (self.phase) {
             .entry => {
                 var definition = try Definition.parseStack(self.allocator, self.vm.state);
+                if (self.defer_run) {
+                    errdefer definition.deinit();
+                    if (definition.legacy_windows) |windows| {
+                        if (definition.hasActions()) return error.EagerWindowsInHeadlessApplication;
+                        return definition.finish(windows);
+                    }
+                    return definition.finish(try self.allocator.alloc(Window, 0));
+                }
                 if (definition.legacy_windows) |windows| {
                     definition.legacy_windows = null;
                     return definition.finish(windows);
@@ -144,6 +159,7 @@ pub const Application = struct {
     allocator: std.mem.Allocator,
     state: *c.State,
     id: []u8,
+    action_schema: ?varlink.Service = null,
     actions_reference: c_int,
     run_reference: c_int,
     windows: []Window,
@@ -290,7 +306,99 @@ pub const Application = struct {
         return self.actions_reference != c.no_reference;
     }
 
+    pub fn hasRun(self: *const Application) bool {
+        return self.run_reference != c.no_reference;
+    }
+
+    pub fn customInterface(self: *const Application) ?*const varlink.Interface {
+        const schema = &(self.action_schema orelse return null);
+        return &schema.interfaces.items[1];
+    }
+
+    pub fn startUi(self: *const Application, vm: *vm_module.Vm, scope: task.ScopeHandle, instance_id: []const u8) !vm_module.TaskHandle {
+        if (vm.state != self.state) return error.ApplicationVmMismatch;
+        if (!self.hasRun()) return error.ApplicationRunRequired;
+        if (self.windows.len != 0) return error.ApplicationUiAlreadyStarted;
+        return vm.spawnRetainedRun(scope, self.run_reference, instance_id);
+    }
+
+    pub fn finishUi(self: *Application, vm: *vm_module.Vm, handle: vm_module.TaskHandle) !void {
+        if (vm.state != self.state) return error.ApplicationVmMismatch;
+        const top = c.lua_gettop(self.state);
+        defer c.lua_settop(self.state, top);
+        try vm.takeRetainedResult(handle);
+        const windows = try parseRunWindows(self.allocator, self.state);
+        for (self.windows) |window| deinitWindow(self.allocator, self.state, window);
+        self.allocator.free(self.windows);
+        self.windows = windows;
+    }
+
+    /// Schedules a custom action without executing Lua. Arguments are copied
+    /// before the transport releases its request, and belong to the task.
+    pub fn startAction(
+        self: *const Application,
+        vm: *vm_module.Vm,
+        scope: task.ScopeHandle,
+        name: []const u8,
+        parameters: ?std.json.Value,
+    ) !vm_module.TaskHandle {
+        const top = c.lua_gettop(self.state);
+        defer c.lua_settop(self.state, top);
+        if (!self.hasActions()) return error.ActionNotFound;
+        _ = c.lua_rawgeti(self.state, c.registry_index, self.actions_reference);
+        // Names have already been checked against the native IDL methods.
+        _ = c.lua_pushlstring(self.state, name.ptr, name.len);
+        if (c.lua_rawget(self.state, -2) != c.type_function) return error.ActionNotFound;
+        const reference = c.luaL_ref(self.state, c.registry_index);
+        defer c.luaL_unref(self.state, c.registry_index, reference);
+        if (parameters) |value| {
+            if (value != .null) {
+                try varlink_json.pushJson(self.state, value);
+            } else c.lua_createtable(self.state, 0, 0);
+        } else c.lua_createtable(self.state, 0, 0);
+        const argument = c.luaL_ref(self.state, c.registry_index);
+        defer c.luaL_unref(self.state, c.registry_index, argument);
+        return vm.spawnRetainedReference(scope, reference, &.{.{ .registry = argument }});
+    }
+
+    /// Converts the first action return value to arena-owned JSON and releases
+    /// the retained coroutine, even when the returned value cannot be encoded.
+    pub const ActionResult = union(enum) {
+        output: std.json.Value,
+        declared_error: struct { name: []const u8, parameters: std.json.Value },
+    };
+
+    pub fn takeActionResult(
+        vm: *vm_module.Vm,
+        handle: vm_module.TaskHandle,
+        arena: std.mem.Allocator,
+    ) !ActionResult {
+        const top = c.lua_gettop(vm.state);
+        defer c.lua_settop(vm.state, top);
+        try vm.takeRetainedValue(handle);
+        // No Lua return value is an empty output object. The method schema
+        // still rejects it if required output fields are missing.
+        if (c.lua_type(vm.state, -1) == c.type_nil)
+            return .{ .output = .{ .object = .empty } };
+        if (c.lua_type(vm.state, -1) != c.type_table) return error.ActionOutputTableRequired;
+        var count: usize = 0;
+        _ = c.lua_getfield(vm.state, -1, "__ouro_action_error");
+        const is_error = c.lua_touserdata(vm.state, -1) == @as(?*anyopaque, &action_error_tag);
+        c.lua_settop(vm.state, -2);
+        if (is_error) {
+            _ = c.lua_getfield(vm.state, -1, "name");
+            var length: usize = 0;
+            const name = c.lua_tolstring(vm.state, -1, &length) orelse return error.InvalidActionError;
+            const owned_name = try arena.dupe(u8, name[0..length]);
+            c.lua_settop(vm.state, -2);
+            _ = c.lua_getfield(vm.state, -1, "parameters");
+            return .{ .declared_error = .{ .name = owned_name, .parameters = try varlink_json.luaToJson(vm.state, -1, arena, 0, &count) } };
+        }
+        return .{ .output = try varlink_json.luaToJson(vm.state, -1, arena, 0, &count) };
+    }
+
     pub fn deinit(self: *Application) void {
+        if (self.action_schema) |*schema| schema.deinit();
         for (self.windows) |window| deinitWindow(self.allocator, self.state, window);
         self.allocator.free(self.windows);
         if (self.run_reference != c.no_reference)
@@ -309,6 +417,8 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     const actions_reference = try optionalActions(state, -1);
     errdefer if (actions_reference != c.no_reference)
         c.luaL_unref(state, c.registry_index, actions_reference);
+    var action_schema = try parseActionSchema(allocator, state, actions_reference);
+    errdefer if (action_schema) |*schema| schema.deinit();
     const run_reference = try optionalFunction(state, -1, "run");
     errdefer if (run_reference != c.no_reference)
         c.luaL_unref(state, c.registry_index, run_reference);
@@ -323,10 +433,44 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
         .allocator = allocator,
         .state = state,
         .id = id,
+        .action_schema = action_schema,
         .actions_reference = actions_reference,
         .run_reference = run_reference,
         .legacy_windows = legacy_windows,
     };
+}
+
+fn parseActionSchema(allocator: std.mem.Allocator, state: *c.State, actions: c_int) !?varlink.Service {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    const description = try optionalString(allocator, state, -1, "interface");
+    defer if (description) |value| allocator.free(value);
+    var schema: ?varlink.Service = null;
+    errdefer if (schema) |*value| value.deinit();
+    if (description) |source| {
+        schema = try varlink.Service.init(allocator, .{ .vendor = "Ourokit", .product = "Application", .version = "1", .url = "https://github.com/rockorager/ourokit" }, 2);
+        try schema.?.addInterface(source);
+        if (std.mem.eql(u8, schema.?.interfaces.items[1].name, "dev.ourokit.runtime")) return error.ReservedApplicationInterface;
+    }
+    var handler_count: usize = 0;
+    if (actions != c.no_reference) {
+        _ = c.lua_rawgeti(state, c.registry_index, actions);
+        c.lua_pushnil(state);
+        while (c.lua_next(state, -2) != 0) {
+            handler_count += 1;
+            const interface = if (schema) |*value| &value.interfaces.items[1] else return error.ActionInterfaceRequired;
+            var length: usize = 0;
+            const name = c.lua_tolstring(state, -2, &length).?;
+            if (interface.method(name[0..length]) == null) return error.ActionMethodMismatch;
+            c.lua_settop(state, -2);
+        }
+    }
+    var method_count: usize = 0;
+    if (schema) |*value| for (value.interfaces.items[1].members) |member| {
+        if (member == .method) method_count += 1;
+    };
+    if (method_count != handler_count) return error.ActionMethodMismatch;
+    return schema;
 }
 
 fn invokeRun(
@@ -479,6 +623,13 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
                 break :blk .{ .layer_surface = layer_surface };
             },
         };
+        errdefer switch (declaration) {
+            .toplevel => |value| allocator.free(value.title),
+            .layer_surface => |value| {
+                allocator.free(value.namespace);
+                if (value.output) |output| allocator.free(output);
+            },
+        };
         if (c.lua_getfield(state, -1, "content") != c.type_function)
             return error.WindowContentRequired;
         const content_reference = c.luaL_ref(state, c.registry_index);
@@ -506,6 +657,23 @@ fn installConstructors(state: *c.State, api_reference: ?c_int) !void {
     c.lua_setfield(state, -2, "window");
     c.lua_pushcclosure(state, layerSurfaceTable, 0);
     c.lua_setfield(state, -2, "layer_surface");
+    c.lua_pushcclosure(state, actionError, 0);
+    c.lua_setfield(state, -2, "action_error");
+}
+
+var action_error_tag: u8 = 0;
+
+fn actionError(state: *c.State) callconv(.c) c_int {
+    if (c.lua_gettop(state) != 2 or c.lua_type(state, 1) != c.type_string or c.lua_type(state, 2) != c.type_table)
+        return luaError(state, "action_error expects an error name and parameters table");
+    c.lua_createtable(state, 0, 3);
+    c.lua_pushlightuserdata(state, &action_error_tag);
+    c.lua_setfield(state, -2, "__ouro_action_error");
+    c.lua_pushvalue(state, 1);
+    c.lua_setfield(state, -2, "name");
+    c.lua_pushvalue(state, 2);
+    c.lua_setfield(state, -2, "parameters");
+    return 1;
 }
 
 fn identityTable(state: *c.State) callconv(.c) c_int {
@@ -825,8 +993,10 @@ test "application actions remain headless while run builds one UI generation" {
     var application = try Application.load(std.testing.allocator, state,
         \\return ouro.app {
         \\  id = "dev.ouro.contacts",
+        \\  interface = [[interface dev.ouro.contacts
+        \\    method GetContacts() -> (name: string)]],
         \\  actions = {
-        \\    get_contacts = function() return "Ada" end,
+        \\    GetContacts = function() return {name = "Ada"} end,
         \\  },
         \\  run = function(context)
         \\    return { windows = {
@@ -842,6 +1012,27 @@ test "application actions remain headless while run builds one UI generation" {
     defer application.deinit();
     try std.testing.expect(application.hasActions());
     try std.testing.expectEqualStrings("Contacts", application.windows[0].declaration.toplevel.title);
+}
+
+test "application actions opt in by table presence, including an empty table" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 2);
+    c.lua_setglobal(state, "ouro");
+    const cases = [_]struct { field: []const u8, enabled: bool }{
+        .{ .field = "", .enabled = false },
+        .{ .field = "actions = nil,", .enabled = false },
+        .{ .field = "actions = {},", .enabled = true },
+        .{ .field = "interface = [[interface dev.ouro.test method Ping() -> ()]], actions = { Ping = function() return {} end },", .enabled = true },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "return ouro.app {{ id = 'dev.ouro.test', {s} windows = {{ ouro.window {{ id = 'main', title = 'Test', content = function() end }} }} }}", .{case.field});
+        defer std.testing.allocator.free(source);
+        var application = try Application.load(std.testing.allocator, state, source);
+        defer application.deinit();
+        try std.testing.expectEqual(case.enabled, application.hasActions());
+    }
+    try std.testing.expectError(error.InvalidActionsDeclaration, Application.load(std.testing.allocator, state, "return ouro.app { id = 'dev.ouro.test', actions = false, windows = {} }"));
 }
 
 test "application rejects malformed action declarations" {
@@ -882,4 +1073,103 @@ test "named application load reports structured Lua diagnostics" {
     try std.testing.expectEqual(diagnostic.Phase.compile, failure.?.phase);
     try std.testing.expectEqualStrings("broken/app.lua", failure.?.source_name);
     try std.testing.expect(failure.?.message.len != 0);
+}
+
+test "typed application requires exact native method and handler agreement" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 2);
+    c.lua_setglobal(state, "ouro");
+    const cases = [_]struct { fields: []const u8, expected: anyerror }{
+        .{ .fields = "actions = { Ping = function() return {} end },", .expected = error.ActionInterfaceRequired },
+        .{ .fields = "interface = [[interface dev.test.actions method Ping() -> ()]], actions = {},", .expected = error.ActionMethodMismatch },
+        .{ .fields = "interface = [[interface dev.test.actions method Ping() -> ()]], actions = { Pong = function() return {} end },", .expected = error.ActionMethodMismatch },
+        .{ .fields = "interface = [[interface dev.test.actions method Ping() -> ()]],", .expected = error.ActionMethodMismatch },
+        .{ .fields = "interface = [[interface dev.ourokit.runtime error Rejected()]], actions = {},", .expected = error.ReservedApplicationInterface },
+        .{ .fields = "interface = [[interface org.varlink.service error Rejected()]], actions = {},", .expected = error.DuplicateInterface },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "return ouro.app {{ id = 'dev.test.app', {s} run = function() return {{windows = {{}}}} end }}", .{case.fields});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(case.expected, Application.load(std.testing.allocator, state, source));
+    }
+}
+
+test "deferred application retains actions and transactionally starts UI in the same VM" {
+    const loop_module = @import("../loop/root.zig");
+    var loop: loop_module.Loop = undefined;
+    try loop.init(std.testing.allocator, 16, 8);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 4, 4);
+    defer scheduler.deinit();
+    var vm: vm_module.Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    var bootstrap = try Bootstrap.start(std.testing.allocator, &vm, scheduler.application_scope,
+        \\local ouro = require('ouro')
+        \\local attempts = 0
+        \\return ouro.app {
+        \\ id = 'dev.test.deferred', actions = {},
+        \\ run = function(context)
+        \\   run_called = true
+        \\   attempts = attempts + 1
+        \\   if attempts == 1 then
+        \\     return {windows = {
+        \\       ouro.window {id='first', title='First', content=function() end},
+        \\       ouro.window {id='invalid', title='Invalid'},
+        \\     }}
+        \\   end
+        \\   return {windows = {ouro.window {id='main', title=context.instance_id, content=function() end}}}
+        \\ end,
+        \\}
+    , "@deferred");
+    defer bootstrap.deinit();
+    bootstrap.defer_run = true;
+    try std.testing.expectEqual(vm_module.ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    var application = (try bootstrap.advance("not yet")).?;
+    defer application.deinit();
+    try std.testing.expect(application.hasRun() and application.hasActions());
+    try std.testing.expectEqual(@as(usize, 0), application.windows.len);
+    try std.testing.expect(!vm.globalBoolean("run_called"));
+    const first = try application.startUi(&vm, scheduler.application_scope, "first");
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    try std.testing.expectError(error.WindowContentRequired, application.finishUi(&vm, first));
+    try std.testing.expectEqual(@as(usize, 0), application.windows.len);
+    try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
+    const second = try application.startUi(&vm, scheduler.application_scope, "retained VM");
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    try application.finishUi(&vm, second);
+    try std.testing.expectEqualStrings("retained VM", application.windows[0].declaration.toplevel.title);
+    try std.testing.expect(vm.globalBoolean("run_called"));
+    try std.testing.expectError(error.ApplicationUiAlreadyStarted, application.startUi(&vm, scheduler.application_scope, "duplicate"));
+}
+
+test "deferred application permits legacy standalone windows but rejects eager service windows" {
+    const loop_module = @import("../loop/root.zig");
+    var loop: loop_module.Loop = undefined;
+    try loop.init(std.testing.allocator, 16, 8);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 4, 4);
+    defer scheduler.deinit();
+    var vm: vm_module.Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    for ([_]bool{ false, true }) |service| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "local ouro = require('ouro'); return ouro.app {{ id='dev.test.legacy', {s} windows = {{ouro.window {{id='main', title='Legacy', content=function() end}}}} }}", .{if (service) "actions = {}," else ""});
+        defer std.testing.allocator.free(source);
+        var bootstrap = try Bootstrap.start(std.testing.allocator, &vm, scheduler.application_scope, source, "@legacy");
+        defer bootstrap.deinit();
+        bootstrap.defer_run = true;
+        _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+        if (service) {
+            try std.testing.expectError(error.EagerWindowsInHeadlessApplication, bootstrap.advance("main"));
+        } else {
+            var application = (try bootstrap.advance("main")).?;
+            defer application.deinit();
+            try std.testing.expect(!application.hasRun());
+            try std.testing.expectEqual(@as(usize, 1), application.windows.len);
+        }
+    }
 }

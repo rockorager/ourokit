@@ -8,6 +8,7 @@ const source_reload_module = @import("source_reload.zig");
 const SourceReload = source_reload_module.SourceReload;
 const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
 const ControlServer = @import("control_server.zig").ControlServer;
+const socket_activation = @import("socket_activation.zig");
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const WindowRuntimeConfig = @import("window_runtime.zig").Config;
 const core = @import("../core/root.zig");
@@ -23,6 +24,8 @@ const ui = @import("../ui/root.zig");
 
 pub const Options = struct {
     exit_after_first_frame: bool = false,
+    /// Receives the Lua-requested exit status after all resources are drained.
+    exit_code: ?*u8 = null,
     vulkan: bool = renderer.has_vulkan,
     /// Optional process-lifetime control edge. Any thread may call `request`;
     /// this runner consumes and commits requests only at its safe point.
@@ -90,7 +93,7 @@ fn runSourceWithFontconfig(
     init: std.process.Init,
     provider: *const bundle.SourceProvider,
     options: Options,
-) !void {
+) anyerror!void {
     var diagnostic: ?lua.Diagnostic = null;
     defer if (diagnostic) |*value| value.deinit();
     var snapshot = provider.snapshot(init.io, init.gpa) catch |err| {
@@ -137,6 +140,92 @@ fn runSourceWithFontconfig(
     );
     defer workspaces.deinit();
 
+    const generation_config: source_generation.Config = .{
+        .node_capacity = options.window.node_capacity,
+        .semantic_text_capacity = options.window.semantic_text_capacity,
+        .signal_capacity = options.signal_capacity,
+        .subscription_capacity = options.subscription_capacity,
+        .dependency_capacity = options.dependency_capacity,
+        .defer_run = true,
+    };
+    // SourceGeneration consumes the snapshot on both success and failure.
+    snapshot_owned = false;
+    const initial_generation = if (module_root) |directory|
+        try SourceGeneration.createBootstrap(
+            init.gpa,
+            &scheduler,
+            &loop,
+            snapshot,
+            directory.handle,
+            null,
+            generation_config,
+            &diagnostic,
+        )
+    else
+        try SourceGeneration.create(
+            init.gpa,
+            &scheduler,
+            &loop,
+            snapshot,
+            null,
+            generation_config,
+            &diagnostic,
+        );
+    var initial_generation_owned = true;
+    defer if (initial_generation_owned) {
+        drainInitialGeneration(initial_generation, &scheduler, &loop) catch |err|
+            std.debug.panic("could not drain bootstrap: {s}", .{@errorName(err)});
+        initial_generation.destroy();
+    };
+    if (!initial_generation.application_ready)
+        try finishInitialBootstrap(initial_generation, &scheduler, &loop, &diagnostic);
+    if (initial_generation.vm.exit_code) |code| {
+        if (options.exit_code) |result| result.* = code;
+        return;
+    }
+    var source_reload: SourceReload = undefined;
+    source_reload.init(
+        init.gpa,
+        init.io,
+        provider,
+        &scheduler,
+        &loop,
+        null,
+        generation_config,
+        initial_generation,
+    );
+    if (module_root) |directory| source_reload.attachModuleRoot(directory.handle);
+    initial_generation_owned = false;
+    var sources_destroyed = false;
+    defer if (!sources_destroyed) {
+        drainSources(&source_reload, &loop, null, null) catch |err|
+            std.debug.panic("could not drain application: {s}", .{@errorName(err)});
+        source_reload.deinit();
+    };
+    var runtime_reload_requests: ReloadRequests = .{};
+    const reload_requests = options.reload_requests orelse &runtime_reload_requests;
+    var control_storage: ControlServer = undefined;
+    const control: ?*ControlServer = if (source_reload.active().application.hasActions()) &control_storage else null;
+    const inherited = try socket_activation.listener(init.minimal.environ);
+    if (inherited != null and control == null) return error.SocketActivationRequiresActions;
+    if (control) |server| {
+        try server.init(init.gpa, &loop, init.minimal.environ, source_reload.active().application.id, source_reload.generation, reload_requests);
+        std.log.info("application socket: {s}", .{server.socketPath()});
+    }
+    var control_destroyed = false;
+    defer if (!control_destroyed) if (control) |server|
+        shutdownControl(server, &loop, null, &source_reload);
+    if (control) |server| try server.setApplication(&source_reload.active().application, &source_reload.active().vm);
+    if (inherited != null) {
+        if (!(try runHeadless(&source_reload, control.?, &callbacks, reload_requests, &loop, &scheduler))) {
+            if (options.exit_code) |code| code.* = source_reload.active().vm.exit_code orelse 0;
+            return;
+        }
+    }
+    errdefer |err| if (!control_destroyed) {
+        failActivation(control, &source_reload, &loop, null, err) catch {};
+    };
+
     var database = try text.discovery.Database.init();
     defer database.deinit();
     var configured_fonts = try database.candidates(init.gpa, .{
@@ -172,7 +261,6 @@ fn runSourceWithFontconfig(
     var vulkan_glyphs: renderer.vulkan.GlyphCache = undefined;
     if (options.vulkan) vulkan_glyphs = try renderer.vulkan.GlyphCache.init(init.gpa, &fonts, &vulkan_renderer);
     defer if (options.vulkan) vulkan_glyphs.deinit();
-
     const theme = design.tokens.light;
     const services: source_generation.UiServices = .{
         .paragraph_sources = &paragraph_sources,
@@ -183,60 +271,30 @@ fn runSourceWithFontconfig(
         .callbacks = &callbacks,
         .workspaces = &workspaces,
     };
-    const generation_config: source_generation.Config = .{
-        .node_capacity = options.window.node_capacity,
-        .semantic_text_capacity = options.window.semantic_text_capacity,
-        .signal_capacity = options.signal_capacity,
-        .subscription_capacity = options.subscription_capacity,
-        .dependency_capacity = options.dependency_capacity,
+    // Generations must release their text resources before the caches above.
+    defer {
+        if (!control_destroyed) if (control) |server| shutdownControl(server, &loop, null, &source_reload);
+        control_destroyed = true;
+        drainSources(&source_reload, &loop, null, null) catch |err|
+            std.debug.panic("could not drain application: {s}", .{@errorName(err)});
+        source_reload.deinit();
+        sources_destroyed = true;
+    }
+    errdefer |err| if (!control_destroyed) {
+        failActivation(control, &source_reload, &loop, null, err) catch {};
     };
-    // SourceGeneration consumes the snapshot on both success and failure.
-    snapshot_owned = false;
-    const initial_generation = if (module_root) |directory|
-        try SourceGeneration.createBootstrap(
-            init.gpa,
-            &scheduler,
-            &loop,
-            snapshot,
-            directory.handle,
-            services,
-            generation_config,
-            &diagnostic,
-        )
-    else
-        try SourceGeneration.create(
-            init.gpa,
-            &scheduler,
-            &loop,
-            snapshot,
-            services,
-            generation_config,
-            &diagnostic,
-        );
-    var initial_generation_owned = true;
-    errdefer if (initial_generation_owned) initial_generation.destroy();
-    if (!initial_generation.application_ready)
-        try finishInitialBootstrap(initial_generation, &scheduler, &loop, &diagnostic);
-    var source_reload: SourceReload = undefined;
-    source_reload.init(
-        init.gpa,
-        init.io,
-        provider,
-        &scheduler,
-        &loop,
-        services,
-        generation_config,
-        initial_generation,
-    );
-    if (module_root) |directory| source_reload.attachModuleRoot(directory.handle);
-    initial_generation_owned = false;
-    defer source_reload.deinit();
+    try source_reload.active().attachUi(services);
+    source_reload.services = services;
+    source_reload.config.defer_run = false;
+    try source_reload.active().startUi();
+    try finishUiBootstrap(&source_reload, control, &loop, &scheduler);
     const application = &source_reload.active().application;
     if (application.windows.len > options.application_window_capacity)
         return error.WindowCapacityExceeded;
 
     var window_set: windows_module.WindowSet = undefined;
     var host: platform.wayland.Host = undefined;
+    var startup_io: StartupIo = .{ .reload = &source_reload, .loop = &loop, .control = control };
     try host.init(
         init.gpa,
         &loop,
@@ -248,6 +306,7 @@ fn runSourceWithFontconfig(
             .output_capacity = options.output_capacity,
             .workspaces = &workspaces,
             .workspace_capacity = options.workspace_capacity,
+            .startup_completions = .{ .context = &startup_io, .dispatch = StartupIo.dispatch },
             .vulkan = if (options.vulkan) &vulkan_renderer else null,
         },
     );
@@ -284,22 +343,17 @@ fn runSourceWithFontconfig(
         options.application_window_capacity,
     );
     defer init.gpa.free(reload_targets);
-    var runtime_reload_requests: ReloadRequests = .{};
-    const reload_requests = options.reload_requests orelse &runtime_reload_requests;
-    var control: ControlServer = undefined;
-    try control.init(
-        init.gpa,
-        &loop,
-        init.minimal.environ,
-        provider.applicationId() orelse application.id,
-        source_reload.generation,
-        reload_requests,
-    );
-    defer shutdownControl(&control, &loop, &host, &source_reload);
-    std.log.info("runtime control socket: {s}", .{control.socketPath()});
+    defer {
+        if (control) |server| shutdownControl(server, &loop, &host, &source_reload);
+        control_destroyed = true;
+        drainSources(&source_reload, &loop, null, null) catch |err|
+            std.debug.panic("could not drain application: {s}", .{@errorName(err)});
+    }
+    errdefer |err| failActivation(control, &source_reload, &loop, &host, err) catch {};
     var disconnect_started = false;
     var active_reload_sequence: ?u64 = null;
     var queued_reload_sequence: ?u64 = null;
+    var initial_activation_token = std.process.Environ.getPosix(init.minimal.environ, "XDG_ACTIVATION_TOKEN");
 
     while (true) {
         const active_generation = source_reload.active();
@@ -372,9 +426,12 @@ fn runSourceWithFontconfig(
         // Task safe point: platform and CQE dispatch only changed state.
         try host.enableWorkspacesIf(active_generation.workspacesRequested());
         try active_generation.syncWorkspaces();
-        control.collectClosed();
+        if (control) |server| {
+            server.collectClosed();
+            try server.setApplication(active_application, &active_generation.vm);
+            try server.serviceRequests();
+        }
         try source_reload.collectCanceledVarlink();
-        try control.serviceRequests();
         try scheduler.applyQueuedCancellations();
         for (runtime_slots) |*slot| try slot.runtime.collectRetired();
         for (runtime_slots) |*slot| if (slot.runtime.ready)
@@ -394,7 +451,24 @@ fn runSourceWithFontconfig(
             try clipboard.releaseCompletion(completion.request);
         }
         try clipboard.collectCanceled();
-        while (scheduler.takeRunnable()) |handle| _ = try source_reload.resumeRunnable(handle);
+        while (scheduler.takeRunnable()) |handle| {
+            if (control) |server| if (try server.resumeRunnable(handle)) continue;
+            try source_reload.resumeRunnable(handle);
+        }
+        if (control) |server| {
+            server.collectClosed();
+            try server.serviceRequests();
+        }
+
+        if (active_generation.vm.exit_code) |code| {
+            if (options.exit_code) |result| result.* = code;
+            if (!active_generation.stdio.hasPendingOutput()) {
+                for (runtime_slots) |*slot| if (slot.desired) {
+                    slot.desired = false;
+                    desired_changed = true;
+                };
+            }
+        }
 
         try host.serviceWorkspaceActions();
 
@@ -426,9 +500,14 @@ fn runSourceWithFontconfig(
             current_storage[current_count] = window.declaration;
             current_count += 1;
         }
-        if (!disconnect_started and current_count == 0) {
+        const calls_pending = if (control) |server| server.hasPendingCalls() else false;
+        if (!disconnect_started and current_count == 0 and
+            (!calls_pending or active_generation.vm.exit_code != null) and
+            !active_generation.stdio.hasPendingOutput())
+        {
             try host.beginShutdown();
-            try control.beginShutdown();
+            if (control) |server| try server.beginShutdown();
+            try source_reload.active().vm.requestCancellation();
             disconnect_started = true;
         }
         try window_set.reconcile(current_storage[0..current_count]);
@@ -482,7 +561,7 @@ fn runSourceWithFontconfig(
                 window.content_reference,
             ) catch |err| {
                 try dirty.retry(work);
-                return err;
+                return @as(anyerror!void, err);
             };
             slot.configured_size = null;
             try dirty.complete(work);
@@ -490,7 +569,7 @@ fn runSourceWithFontconfig(
 
         if (reload_requests.take()) |sequence| {
             if (active_reload_sequence == null) {
-                if (try beginReload(&source_reload, &control, sequence))
+                if (try beginReload(&source_reload, control, sequence))
                     active_reload_sequence = sequence;
             } else {
                 queued_reload_sequence = sequence;
@@ -498,7 +577,7 @@ fn runSourceWithFontconfig(
         }
         if (active_reload_sequence) |sequence| {
             if (source_reload.takeCandidateFailure()) |err| {
-                try reportReloadFailure(&source_reload, &control, sequence, err);
+                try reportReloadFailure(&source_reload, control, sequence, err);
                 active_reload_sequence = null;
             } else if (source_reload.candidateReady()) {
                 try servicePreparedReload(
@@ -506,7 +585,7 @@ fn runSourceWithFontconfig(
                     runtime_slots,
                     reload_targets,
                     &callbacks,
-                    &control,
+                    control,
                     sequence,
                 );
                 active_reload_sequence = null;
@@ -514,10 +593,10 @@ fn runSourceWithFontconfig(
         }
         if (active_reload_sequence == null) if (queued_reload_sequence) |sequence| {
             queued_reload_sequence = null;
-            if (try beginReload(&source_reload, &control, sequence))
+            if (try beginReload(&source_reload, control, sequence))
                 active_reload_sequence = sequence;
         };
-        control.setReloading(active_reload_sequence != null or queued_reload_sequence != null);
+        if (control) |server| server.setReloading(active_reload_sequence != null or queued_reload_sequence != null);
         source_reload.beginRetirement() catch |err|
             std.log.err("could not begin source-generation retirement: {s}", .{@errorName(err)});
         _ = source_reload.collectRetired();
@@ -578,12 +657,35 @@ fn runSourceWithFontconfig(
                     ),
                 }) catch |err| {
                     try host.discardFrame(frame_buffer);
-                    return err;
+                    return @as(anyerror!void, err);
                 };
                 try host.present(frame_buffer);
                 try slot.runtime.frameSubmitted();
             };
             slot.frames_seen = @max(slot.frames_seen, try host.framesPresented(handle));
+        }
+
+        if (control) |server| {
+            var presented = false;
+            for (runtime_slots) |slot| presented = presented or slot.frames_seen > 0;
+            if (presented) {
+                _ = server.takeActivation();
+                if (server.activationToken() orelse initial_activation_token) |token| {
+                    for (runtime_slots) |slot| if (slot.desired and slot.runtime.initialized) {
+                        try host.activate(slot.runtime.window, token);
+                        break;
+                    };
+                }
+                initial_activation_token = null;
+                server.setActivated(true);
+                try server.activationSucceeded();
+            }
+        } else if (initial_activation_token) |token| {
+            for (runtime_slots) |slot| if (slot.desired and slot.frames_seen > 0) {
+                try host.activate(slot.runtime.window, token);
+                initial_activation_token = null;
+                break;
+            };
         }
 
         if (options.exit_after_first_frame) {
@@ -601,20 +703,26 @@ fn runSourceWithFontconfig(
 
         const serial_before_flush = window_set.changeSerial();
         try host.flush();
-        if (host.quiescent() and window_set.retainedCount() == 0 and control.quiescent() and
+        // Varlink and Lua timers can enqueue I/O while Wayland is idle.
+        _ = try loop.submit();
+        if (scheduler.hasPendingWork()) continue;
+        const control_quiescent = if (control) |server| server.quiescent() else true;
+        if (host.quiescent() and window_set.retainedCount() == 0 and control_quiescent and
             !loop.hasPendingTimerKernelWork() and !loop.hasPendingOperations()) break;
         if (desired_changed or window_set.changeSerial() != serial_before_flush) continue;
-        if (host.quiescent() and control.quiescent() and
+        if (host.quiescent() and control_quiescent and
             !loop.hasPendingTimerKernelWork() and !loop.hasPendingOperations()) continue;
 
         const completion = try loop.wait();
         switch (loop.dispatch(completion)) {
             .file => |file| if (!(try host.dispatchClipboardFile(file)))
                 try source_reload.markFileCompleted(file),
-            .socket => |socket| if (!(try control.dispatch(socket)))
-                try source_reload.markSocketCompleted(socket),
+            .socket => |socket| {
+                if (control) |server| if (try server.dispatch(socket)) continue;
+                try source_reload.markSocketCompleted(socket);
+            },
             .operation_cancel => {
-                control.collectClosed();
+                if (control) |server| server.collectClosed();
                 try source_reload.collectCanceledVarlink();
             },
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
@@ -625,7 +733,153 @@ fn runSourceWithFontconfig(
             .stale => return error.StaleCompletion,
         }
     }
-    if (host.failure) |failure| return failure;
+    if (host.failure) |failure| return @as(anyerror!void, failure);
+}
+
+/// Deliver a failed activation before the normal teardown closes its socket.
+fn failActivation(control: ?*ControlServer, reload: *SourceReload, loop: *io_loop.Loop, host: ?*platform.wayland.Host, err: anyerror) !void {
+    const server = control orelse return;
+    if (!server.activating) return;
+    try server.activationFailed(err);
+    while (server.hasPendingOutput()) {
+        _ = try loop.submit();
+        _ = try dispatchApplication(reload, loop, server, host, null);
+        try server.serviceRequests();
+    }
+}
+
+/// Runs only application tasks and IPC. No font, renderer or Wayland state
+/// exists yet. An accepted Activate transfers control to UI initialization.
+fn runHeadless(
+    reload: *SourceReload,
+    control: *ControlServer,
+    callbacks: *lua.CallbackRegistry,
+    requests: *ReloadRequests,
+    loop: *io_loop.Loop,
+    scheduler: *task.Scheduler,
+) !bool {
+    var sequence: ?u64 = null;
+    var idle_timer: ?io_loop.OperationHandle = null;
+    defer if (idle_timer) |timer| loop.prepareCancel(timer) catch {};
+    while (true) {
+        control.collectClosed();
+        try control.setApplication(&reload.active().application, &reload.active().vm);
+        try control.serviceRequests();
+        try reload.collectCanceledVarlink();
+        try scheduler.applyQueuedCancellations();
+        while (scheduler.takeRunnable()) |handle| {
+            if (try control.resumeRunnable(handle)) continue;
+            try reload.resumeRunnable(handle);
+        }
+        try control.serviceRequests();
+        if (reload.active().vm.exit_code != null and !reload.active().stdio.hasPendingOutput()) return false;
+        if (sequence == null) if (requests.take()) |value| {
+            if (try beginReload(reload, control, value)) sequence = value;
+        };
+        if (sequence) |value| {
+            if (reload.takeCandidateFailure()) |err| {
+                try reportReloadFailure(reload, control, value, err);
+                sequence = null;
+            } else if (reload.candidateReady()) {
+                try servicePreparedReload(reload, &.{}, &.{}, callbacks, control, value);
+                sequence = null;
+            }
+        }
+        try reload.beginRetirement();
+        _ = reload.collectRetired();
+        if (sequence == null and control.takeActivation()) {
+            if (reload.active().application.hasRun()) return true;
+            try control.activationFailed(error.ApplicationRunRequired);
+        }
+        const busy = control.hasClients() or sequence != null or reload.active().vm.activeTaskCount() != 0;
+        if (busy) {
+            if (idle_timer) |timer| try loop.prepareCancel(timer);
+            idle_timer = null;
+        } else if (idle_timer == null) {
+            idle_timer = try loop.prepareTimeout(30 * std.time.ns_per_s);
+        }
+        _ = try loop.submit();
+        if (scheduler.hasPendingWork()) continue;
+        if (try dispatchApplication(reload, loop, control, null, &idle_timer)) return false;
+    }
+}
+
+fn finishUiBootstrap(reload: *SourceReload, control: ?*ControlServer, loop: *io_loop.Loop, scheduler: *task.Scheduler) !void {
+    while (reload.active().ui_task != null) {
+        if (control) |server| try server.serviceRequests();
+        while (scheduler.takeRunnable()) |handle| {
+            if (control) |server| if (try server.resumeRunnable(handle)) continue;
+            try reload.resumeRunnable(handle);
+        }
+        if (reload.active().vm.exit_code != null) return error.ApplicationExitedBeforeUi;
+        if (reload.active().ui_task == null) return;
+        _ = try loop.submit();
+        _ = try dispatchApplication(reload, loop, control, null, null);
+    }
+}
+
+const StartupIo = struct {
+    reload: *SourceReload,
+    loop: *io_loop.Loop,
+    control: ?*ControlServer,
+
+    fn dispatch(context: *anyopaque, completion: std.os.linux.io_uring_cqe) anyerror!void {
+        const self: *StartupIo = @ptrCast(@alignCast(context));
+        _ = try dispatchApplicationCompletion(self.reload, self.loop, self.control, null, null, completion);
+    }
+};
+
+fn dispatchApplication(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlServer, host: ?*platform.wayland.Host, idle_timer: ?*?io_loop.OperationHandle) !bool {
+    return dispatchApplicationCompletion(reload, loop, control, host, idle_timer, try loop.wait());
+}
+
+fn dispatchApplicationCompletion(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlServer, host: ?*platform.wayland.Host, idle_timer: ?*?io_loop.OperationHandle, completion: std.os.linux.io_uring_cqe) !bool {
+    var idle_expired = false;
+    switch (loop.dispatch(completion)) {
+        .file => |file| {
+            if (host) |value| if (try value.dispatchClipboardFile(file)) return false;
+            try reload.markFileCompleted(file);
+        },
+        .socket => |socket| {
+            if (control) |server| if (try server.dispatch(socket)) return false;
+            try reload.markSocketCompleted(socket);
+        },
+        .operation_cancel => {
+            if (control) |server| server.collectClosed();
+            try reload.collectCanceledVarlink();
+        },
+        .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
+            if (idle_timer) |timer| if (timer.*) |handle| {
+                if (std.meta.eql(handle, timeout.operation)) {
+                    timer.* = null;
+                    idle_expired = true;
+                    continue;
+                }
+            };
+            if (host) |value| if (try value.dispatchTimer(timeout.operation)) continue;
+            try reload.markTimeoutCompleted(timeout.operation);
+        },
+        .foreign => if (host) |value| try value.dispatchOne(completion) else return error.UnownedIoCompletion,
+        .stale => return error.StaleCompletion,
+    }
+    return idle_expired;
+}
+
+fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlServer, host: ?*platform.wayland.Host) !void {
+    try reload.active().vm.requestCancellation();
+    if (reload.candidate) |candidate| try candidate.vm.requestCancellation();
+    try reload.beginRetirement();
+    while (true) {
+        try reload.scheduler.applyQueuedCancellations();
+        while (reload.scheduler.takeRunnable()) |handle| {
+            if (control) |server| if (try server.resumeRunnable(handle)) continue;
+            try reload.resumeRunnable(handle);
+        }
+        try reload.collectCanceledVarlink();
+        _ = try loop.submit();
+        if (!loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork()) break;
+        _ = try dispatchApplication(reload, loop, control, host, null);
+    }
 }
 
 fn finishInitialBootstrap(
@@ -646,7 +900,8 @@ fn finishInitialBootstrap(
                 );
                 return err;
             };
-        if (generation.application_ready) return;
+        if (generation.application_ready or
+            (generation.vm.exit_code != null and !generation.stdio.hasPendingOutput())) return;
         _ = try loop.submit();
         switch (loop.dispatch(try loop.wait())) {
             .file => |completion| if (!(try generation.dispatchFile(completion)))
@@ -654,6 +909,27 @@ fn finishInitialBootstrap(
             .socket => |completion| if (!(try generation.dispatchSocket(completion)))
                 return error.UnownedIoCompletion,
             .operation_cancel => try generation.collectCanceledVarlink(),
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
+                try generation.vm.markTimeoutCompleted(timeout.operation),
+            else => return error.UnexpectedBootstrapCompletion,
+        }
+    }
+}
+
+fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Scheduler, loop: *io_loop.Loop) !void {
+    try generation.vm.requestCancellation();
+    while (true) {
+        try scheduler.applyQueuedCancellations();
+        while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+        try generation.collectCanceledVarlink();
+        _ = try loop.submit();
+        if (!loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork()) return;
+        switch (loop.dispatch(try loop.wait())) {
+            .file => |completion| if (!(try generation.dispatchFile(completion))) return error.UnownedIoCompletion,
+            .socket => |completion| if (!(try generation.dispatchSocket(completion))) return error.UnownedIoCompletion,
+            .operation_cancel => try generation.collectCanceledVarlink(),
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
+                try generation.vm.markTimeoutCompleted(timeout.operation),
             else => return error.UnexpectedBootstrapCompletion,
         }
     }
@@ -664,14 +940,14 @@ fn finishInitialBootstrap(
 /// generation and its last good frames remain authoritative.
 fn beginReload(
     reload: *SourceReload,
-    control: *ControlServer,
+    control: ?*ControlServer,
     request_sequence: u64,
 ) !bool {
     reload.prepare() catch |err| {
         try reportReloadFailure(reload, control, request_sequence, err);
         return false;
     };
-    control.setReloading(true);
+    if (control) |server| server.setReloading(true);
     return true;
 }
 
@@ -680,7 +956,7 @@ fn servicePreparedReload(
     slots: []RuntimeSlot,
     target_storage: []source_reload_module.WindowTarget,
     callbacks: *lua.CallbackRegistry,
-    control: *ControlServer,
+    control: ?*ControlServer,
     request_sequence: u64,
 ) !void {
     var candidate_pending = true;
@@ -713,12 +989,23 @@ fn servicePreparedReload(
         try reportReloadFailure(reload, control, request_sequence, err);
         return;
     };
+    var prepared_control: ?ControlServer.PreparedApplication = if (control) |server|
+        server.prepareApplication(&candidate.application, &candidate.vm) catch |err| {
+            try reportReloadFailure(reload, control, request_sequence, err);
+            return;
+        }
+    else
+        null;
+    defer if (prepared_control) |*prepared| prepared.deinit();
     const committed = reload.commitApplication(targets, callbacks) catch |err| {
         try reportReloadFailure(reload, control, request_sequence, err);
         return;
     };
     candidate_pending = false;
-    try control.reloadSucceeded(request_sequence, committed.generation);
+    if (control) |server| {
+        server.commitApplication(&prepared_control.?);
+        try server.reloadSucceeded(request_sequence, committed.generation);
+    }
     std.log.info(
         "source reload request {d} committed generation {d}",
         .{ request_sequence, committed.generation },
@@ -727,7 +1014,7 @@ fn servicePreparedReload(
 
 fn reportReloadFailure(
     reload: *const SourceReload,
-    control: *ControlServer,
+    control: ?*ControlServer,
     request_sequence: u64,
     err: anyerror,
 ) !void {
@@ -741,25 +1028,35 @@ fn reportReloadFailure(
                 diagnostic.message,
             },
         );
-        try control.reloadFailed(request_sequence, diagnostic, err);
+        if (control) |server| try server.reloadFailed(request_sequence, diagnostic, err);
     } else {
         std.log.err(
             "source reload request {d} failed: {s}",
             .{ request_sequence, @errorName(err) },
         );
-        try control.reloadFailed(request_sequence, null, err);
+        if (control) |server| try server.reloadFailed(request_sequence, null, err);
     }
 }
 
 fn shutdownControl(
     control: *ControlServer,
     loop: *io_loop.Loop,
-    host: *platform.wayland.Host,
+    host: ?*platform.wayland.Host,
     source_reload: *SourceReload,
 ) void {
     control.beginShutdown() catch |err|
         std.debug.panic("could not stop runtime control server: {s}", .{@errorName(err)});
     while (!control.quiescent()) {
+        source_reload.scheduler.applyQueuedCancellations() catch |err|
+            std.debug.panic("could not cancel action tasks: {s}", .{@errorName(err)});
+        while (source_reload.scheduler.takeRunnable()) |handle| {
+            if (control.resumeRunnable(handle) catch |err|
+                std.debug.panic("could not drain action task: {s}", .{@errorName(err)})) continue;
+            source_reload.resumeRunnable(handle) catch |err|
+                std.debug.panic("could not drain source task: {s}", .{@errorName(err)});
+        }
+        control.collectClosed();
+        if (control.quiescent()) break;
         _ = loop.submit() catch |err|
             std.debug.panic("could not submit control shutdown: {s}", .{@errorName(err)});
         const completion = loop.wait() catch |err|
@@ -770,19 +1067,24 @@ fn shutdownControl(
             .socket => |socket| {
                 if (!(control.dispatch(socket) catch |err|
                     std.debug.panic("could not drain control I/O: {s}", .{@errorName(err)})))
-                    std.debug.panic("unowned socket completion during shutdown", .{});
+                    source_reload.markSocketCompleted(socket) catch |err|
+                        std.debug.panic("could not drain source socket: {s}", .{@errorName(err)});
             },
-            .operation_cancel => control.collectClosed(),
+            .operation_cancel => {
+                control.collectClosed();
+                source_reload.collectCanceledVarlink() catch |err|
+                    std.debug.panic("could not drain source cancellation: {s}", .{@errorName(err)});
+            },
             .timer_wakeup, .timer_control => while (loop.takeExpired() catch |err|
                 std.debug.panic("could not drain timer: {s}", .{@errorName(err)})) |timeout|
             {
-                if (host.dispatchTimer(timeout.operation) catch |err|
+                if (host) |value| if (value.dispatchTimer(timeout.operation) catch |err|
                     std.debug.panic("could not drain host timer: {s}", .{@errorName(err)})) continue;
                 source_reload.markTimeoutCompleted(timeout.operation) catch |err|
                     std.debug.panic("could not drain source timer: {s}", .{@errorName(err)});
             },
-            .foreign => host.dispatchOne(completion) catch |err|
-                std.debug.panic("could not drain host I/O: {s}", .{@errorName(err)}),
+            .foreign => if (host) |value| value.dispatchOne(completion) catch |err|
+                std.debug.panic("could not drain host I/O: {s}", .{@errorName(err)}) else std.debug.panic("unowned host I/O", .{}),
             .stale => std.debug.panic("stale completion during control shutdown", .{}),
         }
         control.collectClosed();

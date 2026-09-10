@@ -118,12 +118,19 @@ state machines, `.varlink` interface parsing and schema validation, standard
 address parsing, and the mandatory `org.varlink.service` implementation. See
 [the Varlink transport and ownership contract](docs/varlink.md).
 
-Every running Ouro application also exposes a same-user Varlink runtime socket
-under `$XDG_RUNTIME_DIR`. `ouroctl` discovers it by application ID, and an
-explicit reload waits for the transaction to commit or fail:
+An application opts into a same-user Varlink socket at
+`$XDG_RUNTIME_DIR/ourokit/apps/<application-id>` by declaring `actions`. An empty
+table enables `Status`, `Reload`, `Activate` and introspection; custom handlers
+implement methods declared in the app's `interface` IDL. Systemd socket activation
+starts the application headlessly. Only `Activate` initializes its UI. Omitting
+`actions` starts no inbound server; small subprocess dialogs can instead use
+async stdin/stdout/stderr and `ouro.exit`. See the runnable
+[Contacts service](examples/contacts/README.md) and
+[permission dialog](examples/permission-dialog/README.md).
 
 ```sh
 ouroctl status dev.example.app
+ouroctl activate dev.example.app
 ouroctl reload dev.example.app
 ```
 

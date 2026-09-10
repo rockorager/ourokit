@@ -165,6 +165,18 @@ pub const SourceReload = struct {
             );
             return error.ApplicationIdChanged;
         }
+        if (candidate_generation.application_ready and
+            candidate_generation.application.hasActions() != self.active_generation.application.hasActions())
+        {
+            lua.recordDiagnosticError(
+                &self.diagnostic,
+                self.allocator,
+                .declaration,
+                candidate_generation.snapshot.entry_name,
+                error.ApplicationActionsChanged,
+            );
+            return error.ApplicationActionsChanged;
+        }
         self.candidate = candidate_generation;
     }
 
@@ -321,10 +333,25 @@ pub const SourceReload = struct {
                 self.candidate = null;
                 self.candidate_failure = err;
             }
+            if (self.candidate != null and candidate.application_ready and
+                candidate.application.hasActions() != self.active_generation.application.hasActions())
+            {
+                const err = error.ApplicationActionsChanged;
+                lua.recordDiagnosticError(
+                    &self.diagnostic,
+                    self.allocator,
+                    .declaration,
+                    candidate.snapshot.entry_name,
+                    err,
+                );
+                candidate.destroy();
+                self.candidate = null;
+                self.candidate_failure = err;
+            }
             return;
         };
         if (self.active_generation.vm.ownsSchedulerTask(handle)) {
-            _ = try self.active_generation.vm.resumeRunnable(handle);
+            _ = try self.active_generation.resumeRunnable(handle, &self.diagnostic);
             return;
         }
         for (self.retiring_generations) |entry| if (entry) |retiring|
@@ -365,6 +392,8 @@ pub const SourceReload = struct {
         self: *SourceReload,
         operation: io_loop.OperationHandle,
     ) !void {
+        if (self.candidate) |candidate| if (candidate.vm.ownsOperation(operation))
+            return candidate.vm.markTimeoutCompleted(operation);
         if (self.active_generation.vm.ownsOperation(operation))
             return self.active_generation.vm.markTimeoutCompleted(operation);
         for (self.retiring_generations) |entry| if (entry) |retiring|
@@ -453,6 +482,99 @@ const changed_identity_source =
     \\  },
     \\}
 ;
+
+fn expectActionReload(initial_actions: []const u8, candidate_actions: []const u8, allowed: bool, asynchronous: bool) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const prefix =
+        \\local ouro = require("ouro")
+        \\return ouro.app {
+        \\  id = "dev.ouro.actions-reload-test",
+    ;
+    const suffix =
+        \\  windows = { ouro.window { id = "main", title = "Actions", content = function() end } },
+        \\}
+    ;
+    const initial_text = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, initial_actions, "\n", suffix });
+    defer std.testing.allocator.free(initial_text);
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = initial_text });
+    const path = try std.fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &temporary.sub_path,
+        "app.lua",
+    });
+    defer std.testing.allocator.free(path);
+    var provider = try bundle.SourceProvider.initDisk(std.testing.allocator, path);
+    defer provider.deinit();
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 2, 2);
+    defer scheduler.deinit();
+    const snapshot = try provider.snapshot(std.testing.io, std.testing.allocator);
+    const initial = try SourceGeneration.create(
+        std.testing.allocator,
+        &scheduler,
+        &loop,
+        snapshot,
+        null,
+        .{ .node_capacity = 8 },
+        null,
+    );
+    var reload: SourceReload = undefined;
+    reload.init(
+        std.testing.allocator,
+        std.testing.io,
+        &provider,
+        &scheduler,
+        &loop,
+        null,
+        .{ .node_capacity = 8 },
+        initial,
+    );
+    defer reload.deinit();
+
+    const candidate_text = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, candidate_actions, "\n", suffix });
+    defer std.testing.allocator.free(candidate_text);
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = candidate_text });
+    if (asynchronous) {
+        reload.attachModuleRoot(temporary.dir.handle);
+        try reload.prepare();
+        try std.testing.expect(!reload.candidateReady());
+        while (scheduler.takeRunnable()) |handle| try reload.resumeRunnable(handle);
+        if (allowed) {
+            try std.testing.expect(reload.candidateReady());
+            try std.testing.expect(reload.candidate.?.application.hasActions());
+        } else {
+            try std.testing.expectEqual(error.ApplicationActionsChanged, reload.takeCandidateFailure().?);
+            try std.testing.expect(reload.active() == initial);
+            try std.testing.expect(reload.candidate == null);
+            try std.testing.expectEqual(lua.DiagnosticPhase.declaration, reload.lastDiagnostic().?.phase);
+        }
+        return;
+    }
+    if (allowed) {
+        try reload.prepare();
+        try std.testing.expect(reload.candidateReady());
+        try std.testing.expect(reload.candidate.?.application.hasActions());
+    } else {
+        try std.testing.expectError(error.ApplicationActionsChanged, reload.prepare());
+        try std.testing.expect(reload.active() == initial);
+        try std.testing.expect(reload.candidate == null);
+        try std.testing.expectEqual(lua.DiagnosticPhase.declaration, reload.lastDiagnostic().?.phase);
+    }
+}
+
+test "source reload validates process-lifetime application action enablement" {
+    for ([_]bool{ false, true }) |asynchronous| {
+        try expectActionReload("actions = {},", "", false, asynchronous);
+        try expectActionReload("", "actions = {},", false, asynchronous);
+        try expectActionReload("actions = {},", "interface = [[interface dev.ouro.actions\nmethod Ping() -> (reply: string)]], " ++
+            "actions = { Ping = function() return {reply = 'pong'} end },", true, asynchronous);
+    }
+}
 
 test "failed candidates preserve active generation and valid source commits" {
     var temporary = std.testing.tmpDir(.{});

@@ -39,12 +39,16 @@ parameters table must represent a JSON object: string-keyed tables become
 objects, non-empty consecutive integer-keyed tables become arrays, and values
 may be booleans, finite numbers, strings, nested tables, or
 `ouro.varlink.null`. The same sentinel represents JSON null in replies. Empty
-tables are objects.
+plain tables are objects. Decoded arrays retain their array identity; use
+`ouro.json.array()` to construct an empty array explicitly.
 
 The runtime currently accepts standard filesystem and abstract Unix addresses,
 `unix:/path` and `unix:@name`, including ignored Varlink address properties.
 TCP and device transports, streaming calls (`more`), one-way calls, and protocol
 upgrades are not exposed by this initial Lua API.
+
+Outbound `ouro.varlink.call` is available whether or not the application opts
+into an inbound server.
 
 Each source generation owns a fixed-capacity call adapter (16 concurrent calls
 by default), and each call uses bounded 64 KiB inbound and outbound records,
@@ -54,6 +58,78 @@ descriptor or blocks a runtime thread. Calls register as scheduler resources
 under the current task's scope. Scope or source-generation cancellation cancels
 the active ring operation, waits for both operation and cancellation CQEs, then
 closes the coroutine without running its continuation.
+
+## Application action server
+
+The `actions` field on `ouro.app` controls the inbound server. Omitted/nil means
+no inbound socket. An empty table enables native `Status`, `Reload`, `Activate`
+and `org.varlink.service` introspection. Custom actions require an IDL declaration:
+
+```lua
+return ouro.app {
+  id = "dev.example.app",
+  interface = [[
+    interface dev.example.app
+    method Greet(name: ?string) -> (greeting: string)
+  ]],
+  actions = {
+    Greet = function(parameters)
+      return { greeting = "Hello, " .. (parameters.name or "world") }
+    end,
+  },
+  run = function(context) return { windows = { ... } } end,
+}
+```
+
+For example, these raw records show the terminating NUL as `\u0000`:
+
+```text
+{"method":"dev.example.app.Greet","parameters":{"name":"Ada"}}\u0000
+{"parameters":{"greeting":"Hello, Ada"}}\u0000
+```
+
+The IDL is parsed when the declaration loads. Declared method names and handler
+keys must match exactly. The custom interface is registered separately from
+`dev.ourokit.runtime`; `GetInfo` lists both and `GetInterfaceDescription` serves
+each original IDL document. Native built-ins cannot be replaced by custom methods.
+
+Each function receives one parameter table and returns an output-fields table;
+there is no `result` envelope. A method with no output fields may return nothing.
+Inputs and outputs are checked against the method's schema. To return a declared
+error, use `return ouro.action_error("ErrorName", { field = value })`; the name is
+resolved within the application's interface and the error fields are validated.
+Arguments and results use the same JSON conversion rules and null sentinel as
+the outbound client.
+
+Action coroutines may yield, sleep, and make outbound Varlink calls. Each call
+is owned by the source generation that accepted it; cancellation during reload
+returns `ActionFailed`. A Lua error is isolated to that call and also returns
+`ActionFailed`, without taking down the server or application. Unknown names
+return `org.varlink.service.MethodNotFound` (or `InterfaceNotFound` for an
+unknown interface).
+
+Reload validates and replaces the IDL and handlers transactionally. In-flight
+calls retain the schema of their accepting generation. Changing server enablement
+between nil/omitted and a table requires a process restart.
+
+## Systemd socket activation
+
+The application address is `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`.
+Use a user socket unit with `Accept=no`, `FileDescriptorName=varlink`, and
+`ListenStream=%t/ourokit/apps/<application-id>`. Ourokit validates the inherited
+AF_UNIX stream listener and uses it without binding or unlinking its pathname.
+The `.service` executes `ouroctl run /path/to/ouro.json`. See the complete
+[Contacts example units](../examples/contacts/README.md).
+
+Inherited-socket startup is headless: only declaration/action initialization runs.
+`dev.ourokit.runtime.Activate(activationToken: ?string) -> ()` initializes the UI;
+later activations present the existing UI. A service without a `run` factory
+returns `ActivateFailed`. `Status` includes `uiActive`. The launcher forwards
+`XDG_ACTIVATION_TOKEN`; the compositor decides whether to grant focus.
+
+For direct development runs, an opted-in app can bind the same well-known socket
+itself. Existing socket nodes are never removed during startup; stale self-owned
+development sockets require explicit cleanup. Systemd is the production activator.
 
 ## Transport contract
 

@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "id": "dev.ourokit.permission-dialog",
+  "entry": "app.lua"
+}

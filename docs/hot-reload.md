@@ -43,9 +43,9 @@ the same diagnostic is available to the in-app development surface and control
 client. Reload failure is not a process-fatal error.
 
 Production bundles use the same generation machinery with an immutable source
-provider. Every application still owns the runtime Varlink server; an immutable
-provider can expose status and future application-defined commands without
-granting source mutation.
+provider. An application owns an inbound runtime Varlink server only when it
+declares an `actions` table; this opt-in is independent of source mutability and
+of outbound `ouro.varlink.call`.
 
 ## Lifetime model
 
@@ -89,6 +89,11 @@ The application ID is process identity. A candidate whose application ID does
 not match the active generation is rejected with `ApplicationIdChanged`; that
 change requires a restart.
 
+Inbound-server enablement is also process-lifetime configuration. Changing
+`actions` between nil/omitted and a table during source reload is rejected with
+`ApplicationActionsChanged` and requires a restart. The contents of an enabled
+table may change between generations.
+
 ## Source and modules
 
 `app.runWayland` accepts immutable embedded bytes, while the executable passes
@@ -113,10 +118,10 @@ Every module is loaded at most once per generation, while every generation has
 a fresh module cache.
 
 Imports must be resolved while preparing the entry point and its top-level
-module dependency closure. First-time lazy imports from a later event callback
-are rejected. This keeps the active generation backed by a complete immutable
-snapshot and guarantees that all source in the dependency closure compiled
-before commit.
+module dependency closure. After UI initialization, first-time lazy imports from
+a later event callback are rejected. Headless services keep the module loader
+available until the deferred UI factory finishes, so that factory can load its
+UI dependencies. Loaded modules remain cached within their source generation.
 
 Each file read records canonical path, bytes, content hash, and filesystem
 identity. After candidate preparation, the disk provider revalidates every
@@ -393,7 +398,7 @@ fixed `Application` and `Vm`. The implemented ownership boundary includes:
   coroutines, with cache misses yielding opaquely through asynchronous
   capability-relative whole-file reads; and
 - `require("ouro")` resolves the runtime-owned built-in module synchronously,
-  while the disk module closure freezes when entry evaluation completes.
+  while the disk module closure freezes when UI initialization completes.
 
 The first runner integration deliberately accepts only an unchanged window-ID
 set. Added and removed windows still require transactional native-host
@@ -409,11 +414,14 @@ bindings, UI owns prepared typed snapshots, and `app` orders their transaction.
 
 ## Development control interface
 
-Each running application exposes a PID-scoped per-user control endpoint under
-`$XDG_RUNTIME_DIR`. The server authenticates the Unix peer UID, uses Ourokit's
-bounded sans-I/O Varlink state machines, and submits accept, receive, and send
-operations through disjoint tags in the shared `io_uring` loop. `ouroctl`
-discovers sockets by calling `Status` and matching the application ID.
+An application with a non-nil `actions` table exposes a well-known per-user
+endpoint at `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`; omitted/nil actions means no inbound
+server. An empty table is sufficient to enable the default methods and standard
+`org.varlink.service` introspection. The server authenticates the Unix peer UID,
+uses Ourokit's bounded sans-I/O Varlink state machines, and submits accept,
+receive, and send operations through disjoint tags in the shared `io_uring`
+loop. Systemd may own the listening socket and activate the application without
+UI. `ouroctl` addresses the application by ID rather than scanning PID sockets.
 
 The built-in `dev.ourokit.runtime` interface is:
 
@@ -421,9 +429,19 @@ The built-in `dev.ourokit.runtime` interface is:
 type Diagnostic (phase: string, source: string, message: string)
 Reload() -> (generation: int)
 Status() -> (applicationId: string, activeGeneration: int,
-             reloading: bool, diagnostic: ?Diagnostic)
+             reloading: bool, uiActive: bool, diagnostic: ?Diagnostic)
+Activate(activationToken: ?string) -> ()
 error ReloadFailed(phase: string, source: string, message: string)
+error ActivateFailed(message: string)
+error ActionFailed(message: string)
 ```
+
+Custom actions are methods of a separately registered application interface;
+they cannot replace runtime methods. IDL and Lua handlers are validated before
+commit and replaced together. A headless reload does not invoke the UI factory.
+Calls belong to the source generation that
+accepted them. Reload cancellation returns `ActionFailed` rather than allowing
+a retiring coroutine to resume, and a Lua error fails only that call.
 
 The CLI discovers an app by application ID and calls this endpoint. The server
 keeps the `Reload` call pending without blocking the event loop until the newest

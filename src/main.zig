@@ -11,16 +11,22 @@ pub fn main(init: std.process.Init) !void {
         try writeStdout(init, cli.usage);
         std.process.exit(2);
     };
-    execute(init, command) catch |err| {
+    const exit_code = execute(init, command) catch |err| {
         try writeError(init, @errorName(err));
         std.process.exit(1);
     };
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn execute(init: std.process.Init, command: cli.Command) !void {
+fn execute(init: std.process.Init, command: cli.Command) !u8 {
     switch (command) {
         .help => try writeStdout(init, cli.usage),
         .version => try writeStdout(init, "ouroctl " ++ version ++ "\n"),
+        .activate => |target| {
+            const path = try ourokit.app.socket_activation.socketPath(init.gpa, init.minimal.environ, target.application_id);
+            defer init.gpa.free(path);
+            try ourokit.app.control_client.activateAt(init.gpa, path, std.process.Environ.getPosix(init.minimal.environ, "XDG_ACTIVATION_TOKEN"));
+        },
         .status => |target| try statusApplication(init, target.application_id),
         .reload => |target| try reloadApplication(init, target.application_id),
         .run => |options| {
@@ -43,11 +49,33 @@ fn execute(init: std.process.Init, command: cli.Command) !void {
                 );
             } else try ourokit.bundle.SourceProvider.initDisk(init.gpa, path);
             defer provider.deinit();
+            if (try ourokit.app.socket_activation.listener(init.minimal.environ) == null and
+                std.process.Environ.getPosix(init.minimal.environ, "XDG_RUNTIME_DIR") != null)
+            {
+                if (provider.applicationId()) |id| {
+                    const socket_path = try ourokit.app.socket_activation.socketPath(init.gpa, init.minimal.environ, id);
+                    defer init.gpa.free(socket_path);
+                    const exists = blk: {
+                        std.Io.Dir.accessAbsolute(init.io, socket_path, .{}) catch |err| switch (err) {
+                            error.FileNotFound => break :blk false,
+                            else => return err,
+                        };
+                        break :blk true;
+                    };
+                    if (exists) {
+                        try ourokit.app.control_client.activateAt(init.gpa, socket_path, std.process.Environ.getPosix(init.minimal.environ, "XDG_ACTIVATION_TOKEN"));
+                        return 0;
+                    }
+                }
+            }
+            var exit_code: u8 = 0;
             var run_options: ourokit.app.WaylandRunOptions = .{
                 .exit_after_first_frame = options.exit_after_first_frame,
+                .exit_code = &exit_code,
             };
             if (options.vulkan) |vulkan| run_options.vulkan = vulkan;
             try ourokit.app.runWaylandSource(init, &provider, run_options);
+            return exit_code;
         },
         .storybook => |storybook| switch (storybook) {
             .run => |options| {
@@ -63,6 +91,7 @@ fn execute(init: std.process.Init, command: cli.Command) !void {
             .snapshot => |options| try snapshotStories(init, options),
         },
     }
+    return 0;
 }
 
 fn statusApplication(init: std.process.Init, application_id: []const u8) !void {

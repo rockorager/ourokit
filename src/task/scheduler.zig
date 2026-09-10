@@ -112,6 +112,13 @@ pub const Scheduler = struct {
         return null;
     }
 
+    /// The event loop must revisit the task safe point before blocking on I/O.
+    pub fn hasPendingWork(self: *const Scheduler) bool {
+        for (self.tasks) |slot| if (slot.state == .runnable) return true;
+        for (self.scopes) |slot| if (slot.active and slot.cancellation_queued) return true;
+        return false;
+    }
+
     pub fn wait(self: *Scheduler, handle: TaskHandle) !void {
         const slot = try self.taskSlot(handle);
         if (slot.state != .running) return error.InvalidTaskTransition;

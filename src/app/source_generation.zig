@@ -16,6 +16,7 @@ pub const Config = struct {
     dependency_capacity: usize = 256,
     module_capacity: usize = 64,
     varlink_call_capacity: usize = 16,
+    defer_run: bool = false,
 };
 
 pub const UiServices = struct {
@@ -36,6 +37,7 @@ pub const SourceGeneration = struct {
     snapshot: bundle.SourceSnapshot,
     vm: lua.Vm,
     varlink_client: lua.VarlinkClient,
+    stdio: lua.Stdio,
     signals: lua.Signals,
     shell_workspaces: ?lua.ShellWorkspaces = null,
     descriptor_storage: []ui.instance.Descriptor,
@@ -48,6 +50,7 @@ pub const SourceGeneration = struct {
     prepared_builds: []lua.PreparedBuild,
     module_loader: ?lua.ModuleLoader = null,
     bootstrap: ?lua.ApplicationBootstrap = null,
+    ui_task: ?lua.TaskHandle = null,
     application_ready: bool = false,
     services: ?UiServices = null,
     config: Config = .{},
@@ -153,11 +156,13 @@ pub const SourceGeneration = struct {
         self.module_loader = null;
         self.shell_workspaces = null;
         self.bootstrap = null;
+        self.ui_task = null;
         self.application_ready = false;
         self.services = services;
         self.config = config;
         var vm_initialized = false;
         var varlink_client_initialized = false;
+        var stdio_initialized = false;
         var signals_initialized = false;
         var shell_workspaces_initialized = false;
         var descriptor_storage: ?[]ui.instance.Descriptor = null;
@@ -173,6 +178,7 @@ pub const SourceGeneration = struct {
             }
             if (application_initialized) self.application.deinit();
             if (module_loader_initialized) self.module_loader.?.deinit();
+            if (stdio_initialized) self.stdio.deinit();
             if (varlink_client_initialized) self.varlink_client.deinit();
             if (vm_initialized) self.vm.deinit();
             if (shell_workspaces_initialized) self.shell_workspaces.?.deinit();
@@ -219,6 +225,8 @@ pub const SourceGeneration = struct {
             return err;
         };
         varlink_client_initialized = true;
+        try self.stdio.init(allocator, &self.vm, loop, config.varlink_call_capacity);
+        stdio_initialized = true;
         self.signals.initWithApi(
             allocator,
             self.vm.state,
@@ -375,6 +383,19 @@ pub const SourceGeneration = struct {
                 );
                 return err;
             };
+            self.bootstrap.?.defer_run = config.defer_run;
+            return;
+        }
+
+        if (config.defer_run) {
+            self.bootstrap = try lua.ApplicationBootstrap.start(
+                allocator,
+                &self.vm,
+                scheduler.application_scope,
+                self.snapshot.bytes,
+                self.snapshot.chunk_name,
+            );
+            self.bootstrap.?.defer_run = true;
             return;
         }
 
@@ -438,13 +459,63 @@ pub const SourceGeneration = struct {
         scheduler_handle: task.TaskHandle,
         diagnostic: ?*?lua.Diagnostic,
     ) !lua.ResumeResult {
-        const result = try self.vm.resumeRunnable(scheduler_handle);
+        const is_ui = if (self.ui_task) |handle|
+            std.meta.eql(try self.vm.schedulerHandle(handle), scheduler_handle)
+        else
+            false;
+        const result = self.vm.resumeRunnable(scheduler_handle) catch |err| {
+            if (is_ui) self.ui_task = null;
+            return err;
+        };
+        if (result == .canceled and is_ui) self.ui_task = null;
         if (result == .completed and self.bootstrap != null)
             try self.finishBootstrap(diagnostic);
+        if (result == .completed and is_ui) {
+            const handle = self.ui_task.?;
+            self.ui_task = null;
+            try self.application.finishUi(&self.vm, handle);
+            for (self.prepared_builds) |*prepared| prepared.deinit();
+            self.allocator.free(self.prepared_builds);
+            self.prepared_builds = &.{};
+            const builds = try self.allocator.alloc(lua.PreparedBuild, self.application.windows.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (builds[0..initialized]) |*prepared| prepared.deinit();
+                self.allocator.free(builds);
+            }
+            for (builds) |*prepared| {
+                try prepared.init(self.allocator, self.vm.state, if (self.services) |value| value.paragraph_sources else null, self.config.node_capacity, self.config.semantic_text_capacity);
+                initialized += 1;
+            }
+            self.prepared_builds = builds;
+            if (self.module_loader) |*loader| loader.freeze();
+        }
         return result;
     }
 
+    pub fn startUi(self: *SourceGeneration) !void {
+        if (self.ui_task != null) return error.UiActivationInProgress;
+        if (!self.application.hasRun() and self.application.windows.len != 0) return;
+        self.ui_task = try self.application.startUi(&self.vm, self.vm.scheduler.application_scope, "default");
+    }
+
+    pub fn attachUi(self: *SourceGeneration, services: UiServices) !void {
+        self.services = services;
+        self.callbacks = services.callbacks;
+        self.ui_build.attachCallbacks(services.callbacks, &self.vm);
+        self.font_candidates = .{services.primary_font};
+        self.medium_font_candidates = .{services.medium_font};
+        try self.ui_build.attachLabelText(services.paragraph_sources, &self.font_candidates, 1);
+        try self.ui_build.attachMediumText(&self.medium_font_candidates);
+        self.ui_build.enableDeclarativeWidgets(services.theme);
+        if (services.workspaces) |store| {
+            self.shell_workspaces = @as(lua.ShellWorkspaces, undefined);
+            try self.shell_workspaces.?.init(self.vm.state, &self.signals, store, self.vm.apiReference());
+        }
+    }
+
     pub fn dispatchFile(self: *SourceGeneration, completion: io_loop.FileCompletion) !bool {
+        if (try self.stdio.dispatch(completion)) return true;
         if (self.module_loader) |*loader| return loader.dispatch(completion);
         return false;
     }
@@ -455,6 +526,7 @@ pub const SourceGeneration = struct {
 
     pub fn collectCanceledVarlink(self: *SourceGeneration) !void {
         try self.varlink_client.collectCanceled();
+        try self.stdio.collectCanceled();
     }
 
     pub fn workspacesRequested(self: *const SourceGeneration) bool {
@@ -480,7 +552,7 @@ pub const SourceGeneration = struct {
         var application = application_optional.?;
         self.bootstrap.?.deinit();
         self.bootstrap = null;
-        self.module_loader.?.freeze();
+        if (!self.config.defer_run) if (self.module_loader) |*loader| loader.freeze();
         errdefer application.deinit();
         self.application = application;
         try self.validateApplicationIdentity(diagnostic);
@@ -553,6 +625,7 @@ pub const SourceGeneration = struct {
             if (self.bootstrap) |*bootstrap| bootstrap.deinit();
         }
         if (self.module_loader) |*loader| loader.deinit();
+        self.stdio.deinit();
         self.varlink_client.deinit();
         self.vm.deinit();
         if (self.shell_workspaces) |*binding| binding.deinit();
@@ -657,7 +730,7 @@ test "source generation bootstrap retains async module closure before becoming r
         \\local ouro = require("ouro")
         \\return ouro.app {
         \\  id = "dev.ouro.async-generation",
-        \\  actions = { ping = function() return "pong" end },
+        \\  actions = {},
         \\  run = function(context)
         \\    local title = require("title")
         \\    return { windows = {
@@ -739,4 +812,59 @@ test "source generation bootstrap retains async module closure before becoming r
         error.LuaRuntimeError,
         generation.vm.resumeRunnable(scheduler.takeRunnable().?),
     );
+}
+
+test "headless source generation preserves action state when UI is activated later" {
+    const allocator = std.testing.allocator;
+    const snapshot = try bundle.SourceSnapshot.initApplication(allocator, "headless.lua",
+        \\local ouro = require('ouro')
+        \\local title = ouro.signal('before')
+        \\return ouro.app {
+        \\  id = 'dev.ouro.headless',
+        \\  interface = [[interface dev.ouro.headless
+        \\    method Change() -> ()]],
+        \\  actions = { Change = function() title:set('after action') end },
+        \\  run = function()
+        \\    ui_started = true
+        \\    ouro.sleep(1)
+        \\    return { windows = { ouro.window {
+        \\      id = 'main', title = title(), content = function() end,
+        \\    } } }
+        \\  end,
+        \\}
+    , "dev.ouro.headless");
+    var loop: io_loop.Loop = undefined;
+    try loop.init(allocator, 32, 16);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(allocator, 8, 4, 8);
+    defer scheduler.deinit();
+    const generation = try SourceGeneration.create(allocator, &scheduler, &loop, snapshot, null, .{ .defer_run = true }, null);
+    defer generation.destroy();
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    try std.testing.expect(generation.application_ready);
+    try std.testing.expectEqual(@as(usize, 0), generation.application.windows.len);
+    try std.testing.expect(!generation.vm.hasGlobal("ui_started"));
+    try std.testing.expect(generation.services == null);
+    const action = try generation.application.startAction(&generation.vm, scheduler.application_scope, "Change", null);
+    _ = try generation.vm.resumeRunnable(scheduler.takeRunnable().?);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const reply = try lua.Application.takeActionResult(&generation.vm, action, arena.allocator());
+    try std.testing.expect(reply == .output);
+    try std.testing.expect(!generation.vm.hasGlobal("ui_started"));
+    try generation.startUi();
+    while (generation.ui_task != null) {
+        while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+        if (generation.ui_task == null) break;
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
+                try generation.vm.markTimeoutCompleted(timeout.operation),
+            else => return error.UnexpectedCompletion,
+        }
+    }
+    try std.testing.expect(generation.vm.globalBoolean("ui_started"));
+    try std.testing.expectEqualStrings("after action", generation.application.windows[0].declaration.toplevel.title);
+    try std.testing.expectError(error.ApplicationUiAlreadyStarted, generation.startUi());
 }

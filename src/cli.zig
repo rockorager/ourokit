@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Command = union(enum) {
     help,
     version,
+    activate: RuntimeTarget,
     reload: RuntimeTarget,
     status: RuntimeTarget,
     run: Run,
@@ -46,6 +47,7 @@ pub const Snapshot = struct {
 pub const usage =
     \\Usage:
     \\  ouroctl run [application.lua|ouro.json] [--vulkan|--software] [--exit-after-first-frame]
+    \\  ouroctl activate <application-id>
     \\  ouroctl reload <application-id>
     \\  ouroctl status <application-id>
     \\  ouroctl storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
@@ -64,6 +66,8 @@ pub fn parse(args: []const []const u8) !Command {
         return if (args.len == 2) .help else error.UnexpectedArgument;
     if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version"))
         return if (args.len == 2) .version else error.UnexpectedArgument;
+    if (std.mem.eql(u8, command, "activate"))
+        return .{ .activate = try parseRuntimeTarget(args[2..]) };
     if (std.mem.eql(u8, command, "reload"))
         return .{ .reload = try parseRuntimeTarget(args[2..]) };
     if (std.mem.eql(u8, command, "status"))

@@ -13,6 +13,7 @@ pub const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
 pub const control = @import("control_server.zig");
 pub const ControlServer = control.ControlServer;
 pub const control_client = @import("control_client.zig");
+pub const socket_activation = @import("socket_activation.zig");
 pub const runWayland = @import("wayland_runner.zig").run;
 pub const runWaylandSource = @import("wayland_runner.zig").runSource;
 pub const WaylandRunOptions = @import("wayland_runner.zig").Options;

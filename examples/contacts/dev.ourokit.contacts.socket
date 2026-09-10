@@ -1,0 +1,13 @@
+[Unit]
+Description=Ourokit Contacts socket
+
+[Socket]
+ListenStream=%t/ourokit/apps/dev.ourokit.contacts
+FileDescriptorName=varlink
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

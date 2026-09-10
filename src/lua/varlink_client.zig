@@ -315,7 +315,9 @@ pub const VarlinkClient = struct {
     }
 };
 
-fn luaToJson(
+/// Converts a Lua value into arena-owned JSON, including strings and keys.
+/// The caller restores the Lua stack on failure and releases the arena.
+pub fn luaToJson(
     state: *c.State,
     index: c_int,
     allocator: std.mem.Allocator,
@@ -324,6 +326,7 @@ fn luaToJson(
 ) anyerror!std.json.Value {
     if (depth >= max_value_depth or value_count.* >= max_value_count)
         return error.ValueLimitExceeded;
+    if (c.lua_checkstack(state, 4) == 0) return error.LuaStackCapacityExceeded;
     value_count.* += 1;
     return switch (c.lua_type(state, index)) {
         c.type_nil => .null,
@@ -347,7 +350,7 @@ fn luaToJson(
         c.type_string => blk: {
             var length: usize = 0;
             const string = c.lua_tolstring(state, index, &length).?;
-            break :blk .{ .string = string[0..length] };
+            break :blk .{ .string = try allocator.dupe(u8, string[0..length]) };
         },
         c.type_table => try luaTableToJson(state, index, allocator, depth, value_count),
         else => error.UnsupportedValue,
@@ -363,7 +366,8 @@ fn luaTableToJson(
 ) anyerror!std.json.Value {
     const absolute_index = if (index < 0) c.lua_gettop(state) + index + 1 else index;
     const array_length = c.lua_rawlen(state, absolute_index);
-    if (array_length != 0) {
+    if (array_length != 0 or isJsonArray(state, absolute_index)) {
+        try validateArray(state, absolute_index, array_length);
         var array = std.json.Array.init(allocator);
         try array.ensureTotalCapacity(array_length);
         for (1..array_length + 1) |item_index| {
@@ -371,13 +375,6 @@ fn luaTableToJson(
             defer c.lua_settop(state, -2);
             try array.append(try luaToJson(state, -1, allocator, depth + 1, value_count));
         }
-        c.lua_pushnil(state);
-        var count: usize = 0;
-        while (c.lua_next(state, absolute_index) != 0) {
-            count += 1;
-            c.lua_settop(state, -2);
-        }
-        if (count != array_length) return error.MixedTable;
         return .{ .array = array };
     }
 
@@ -388,7 +385,7 @@ fn luaTableToJson(
         if (c.lua_type(state, -2) != c.type_string) return error.NonStringObjectKey;
         var key_length: usize = 0;
         const key = c.lua_tolstring(state, -2, &key_length).?;
-        try object.put(allocator, key[0..key_length], try luaToJson(
+        try object.put(allocator, try allocator.dupe(u8, key[0..key_length]), try luaToJson(
             state,
             -1,
             allocator,
@@ -399,7 +396,44 @@ fn luaTableToJson(
     return .{ .object = object };
 }
 
-fn pushJson(state: *c.State, value: std.json.Value) !void {
+const array_metatable = "ouro.json.array";
+
+/// Marks a dense Lua sequence as a JSON array, preserving [] versus {} even
+/// when empty. Validation also runs at encode time, since tables are mutable.
+pub fn markJsonArray(state: *c.State, index: c_int) !void {
+    if (c.lua_checkstack(state, 2) == 0) return error.LuaStackCapacityExceeded;
+    const absolute_index = if (index < 0) c.lua_gettop(state) + index + 1 else index;
+    try validateArray(state, absolute_index, c.lua_rawlen(state, absolute_index));
+    _ = c.luaL_newmetatable(state, array_metatable);
+    _ = c.lua_setmetatable(state, absolute_index);
+}
+
+fn isJsonArray(state: *c.State, index: c_int) bool {
+    if (c.lua_getmetatable(state, index) == 0) return false;
+    _ = c.luaL_newmetatable(state, array_metatable);
+    const matches = c.lua_rawequal(state, -1, -2) != 0;
+    c.lua_settop(state, -3);
+    return matches;
+}
+
+fn validateArray(state: *c.State, index: c_int, length: usize) !void {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    c.lua_pushnil(state);
+    var count: usize = 0;
+    while (c.lua_next(state, index) != 0) {
+        if (c.lua_isinteger(state, -2) == 0) return error.MixedTable;
+        var valid: c_int = 0;
+        const key = c.lua_tointegerx(state, -2, &valid);
+        if (key <= 0 or key > length) return error.MixedTable;
+        count += 1;
+        c.lua_settop(state, -2);
+    }
+    if (count != length) return error.SparseArray;
+}
+
+pub fn pushJson(state: *c.State, value: std.json.Value) !void {
+    if (c.lua_checkstack(state, 4) == 0) return error.LuaStackCapacityExceeded;
     switch (value) {
         .null => c.lua_pushlightuserdata(state, &json_null),
         .bool => |boolean| c.lua_pushboolean(state, @intFromBool(boolean)),
@@ -417,6 +451,7 @@ fn pushJson(state: *c.State, value: std.json.Value) !void {
         .string => |string| _ = c.lua_pushlstring(state, string.ptr, string.len),
         .array => |array| {
             c.lua_createtable(state, @intCast(array.items.len), 0);
+            try markJsonArray(state, -1);
             for (array.items, 1..) |item, index| {
                 try pushJson(state, item);
                 c.lua_rawseti(state, -2, @intCast(index));
@@ -495,7 +530,7 @@ const TestServer = struct {
             self.request_length += result;
             if (std.mem.indexOfScalar(u8, self.request[0..self.request_length], 0) != null) break;
         }
-        const reply = "{\"parameters\":{\"answer\":42,\"nested\":[true,\"ok\",null]}}\x00";
+        const reply = "{\"parameters\":{\"answer\":42,\"nested\":[true,\"ok\",null],\"empty\":[]}}\x00";
         var written: usize = 0;
         while (written < reply.len) {
             const result = linux.write(accepted, reply[written..].ptr, reply.len - written);
@@ -552,10 +587,11 @@ test "Lua Varlink call uses runtime transport and converts JSON values" {
         std.testing.allocator,
         "local ouro = require('ouro'); " ++
             "local reply = ouro.varlink.call('unix:@{s}', 'org.example.Echo', " ++
-            "{{ value = 7, list = {{ 1, true, ouro.varlink.null }} }}); " ++
+            "{{ value = 7, list = {{ 1, true, ouro.varlink.null }}, empty = ouro.json.array() }}); " ++
             "varlink_ok = reply.error == nil and reply.parameters.answer == 42 " ++
             "and reply.parameters.nested[1] == true and reply.parameters.nested[2] == 'ok' " ++
-            "and reply.parameters.nested[3] == ouro.varlink.null",
+            "and reply.parameters.nested[3] == ouro.varlink.null " ++
+            "and ouro.json.encode(reply.parameters.empty) == '[]'",
         .{name},
     );
     defer std.testing.allocator.free(source);
@@ -581,6 +617,11 @@ test "Lua Varlink call uses runtime transport and converts JSON values" {
         u8,
         server.request[0..server.request_length],
         "\"value\":7",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        server.request[0..server.request_length],
+        "\"empty\":[]",
     ) != null);
 }
 

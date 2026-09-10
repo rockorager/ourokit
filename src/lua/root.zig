@@ -22,6 +22,7 @@ pub const DiagnosticPhase = @import("diagnostic.zig").Phase;
 pub const recordDiagnosticError = @import("diagnostic.zig").recordError;
 pub const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 pub const VarlinkClient = @import("varlink_client.zig").VarlinkClient;
+pub const Stdio = @import("stdio.zig").Stdio;
 pub const ShellWorkspaces = @import("shell_workspaces.zig").Binding;
 pub const Storybook = @import("storybook.zig").Storybook;
 pub const StorybookStory = @import("storybook.zig").Story;
@@ -39,6 +40,7 @@ test {
     _ = @import("module_loader.zig");
     _ = @import("shell_workspaces.zig");
     _ = @import("varlink_client.zig");
+    _ = @import("stdio.zig");
     _ = @import("storybook.zig");
     _ = @import("vm.zig");
     _ = @import("ui_build.zig");

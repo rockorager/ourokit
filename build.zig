@@ -528,6 +528,7 @@ fn addWaylandProtocol(
     const generate = b.addRunArtifact(scanner);
     generate.addFileArg(wayland.path("protocol/wayland.xml"));
     generate.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
+    generate.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate.addFileArg(wlr_protocols.path("unstable/wlr-layer-shell-unstable-v1.xml"));
     generate.addFileArg(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     generate.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));

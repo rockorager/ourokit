@@ -3,6 +3,7 @@ const c = @import("c.zig");
 const Handle = @import("../core/handle.zig").Handle;
 const io = @import("../loop/io_uring.zig");
 const task = @import("../task/scheduler.zig");
+const json = @import("varlink_client.zig");
 
 pub const TaskHandle = Handle;
 
@@ -17,12 +18,14 @@ pub const Argument = union(enum) {
     integer: i64,
     boolean: bool,
     string: []const u8,
+    registry: c_int,
 };
 
 const YieldRequest = enum {
     none,
     sleep,
     external,
+    exit,
 };
 
 const Slot = struct {
@@ -64,6 +67,9 @@ pub const Vm = struct {
     operation_tasks: []?TaskHandle,
     running: ?TaskHandle = null,
     sleep_enabled: bool = true,
+    /// First explicit exit request. The host drains output, cancels tasks,
+    /// and tears down; this VM never exits the process or resumes user Lua.
+    exit_code: ?u8 = null,
 
     pub fn init(
         self: *Vm,
@@ -85,6 +91,21 @@ pub const Vm = struct {
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, sleep, 1);
         c.lua_setfield(state, -2, "sleep");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, requestExit, 1);
+        c.lua_setfield(state, -2, "exit");
+        c.lua_createtable(state, 0, 4);
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, jsonEncode, 1);
+        c.lua_setfield(state, -2, "encode");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, jsonDecode, 1);
+        c.lua_setfield(state, -2, "decode");
+        c.lua_pushcclosure(state, jsonArray, 0);
+        c.lua_setfield(state, -2, "array");
+        try json.pushJson(state, .null);
+        c.lua_setfield(state, -2, "null");
+        c.lua_setfield(state, -2, "json");
         const api_reference = c.luaL_ref(state, c.registry_index);
 
         self.* = .{
@@ -226,6 +247,7 @@ pub const Vm = struct {
             .integer => |value| c.lua_pushinteger(thread, value),
             .boolean => |value| c.lua_pushboolean(thread, @intFromBool(value)),
             .string => |value| _ = c.lua_pushlstring(thread, value.ptr, value.len),
+            .registry => |reference| _ = c.lua_rawgeti(thread, c.registry_index, reference),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -270,6 +292,7 @@ pub const Vm = struct {
             .integer => |value| c.lua_pushinteger(thread, value),
             .boolean => |value| c.lua_pushboolean(thread, @intFromBool(value)),
             .string => |value| _ = c.lua_pushlstring(thread, value.ptr, value.len),
+            .registry => |value| _ = c.lua_rawgeti(thread, c.registry_index, value),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -292,6 +315,22 @@ pub const Vm = struct {
         reserved = false;
         scheduler_created = false;
         return handle;
+    }
+
+    /// Invokes a callback as a task, retaining its return values for the caller.
+    pub fn spawnRetainedReference(
+        self: *Vm,
+        scope: task.ScopeHandle,
+        reference: c_int,
+        arguments: []const Argument,
+    ) !TaskHandle {
+        const handle = try self.spawnReference(scope, reference, arguments);
+        (try self.activeSlot(handle)).retain_result = true;
+        return handle;
+    }
+
+    pub fn schedulerHandle(self: *Vm, handle: TaskHandle) !task.TaskHandle {
+        return (try self.activeSlot(handle)).scheduler_handle;
     }
 
     /// Candidate `ouro.app.run(context)` invocation. The sole return value is
@@ -364,6 +403,11 @@ pub const Vm = struct {
             return .canceled;
         }
 
+        if (self.exit_code != null) {
+            try self.scheduler.wait(scheduler_handle);
+            return .waiting;
+        }
+
         slot.yield_request = .none;
         var result_count: c_int = 0;
         const resume_arguments = slot.resume_arguments;
@@ -411,6 +455,7 @@ pub const Vm = struct {
                         self.operation_tasks[operation.slot] = handle;
                     },
                     .external => slot.external_pending = true,
+                    .exit => {},
                 }
                 try self.scheduler.wait(scheduler_handle);
                 return .waiting;
@@ -506,6 +551,17 @@ pub const Vm = struct {
         if (self.closeTask(handle) != c.ok) return error.LuaThreadCloseFailed;
     }
 
+    /// Action calls use Lua's single-value convention: no return becomes nil,
+    /// and additional return values are discarded. Always releases the task.
+    pub fn takeRetainedValue(self: *Vm, handle: TaskHandle) !void {
+        const slot = try self.activeSlot(handle);
+        if (!slot.retain_result or slot.completed_result_count == null)
+            return error.LuaTaskNotCompleted;
+        c.lua_settop(slot.thread.?, 1);
+        c.lua_xmove(slot.thread.?, self.state, 1);
+        if (self.closeTask(handle) != c.ok) return error.LuaThreadCloseFailed;
+    }
+
     pub fn hasGlobal(self: *Vm, name: [*:0]const u8) bool {
         const value_type = c.lua_getglobal(self.state, name);
         c.lua_settop(self.state, -2);
@@ -525,6 +581,13 @@ pub const Vm = struct {
             count += 1;
         };
         return count;
+    }
+
+    /// External adapters may discard a published result when its task was
+    /// canceled before consuming it, including after the task was released.
+    pub fn taskCancellationRequested(self: *Vm, handle: TaskHandle) bool {
+        const slot = self.activeSlot(handle) catch return true;
+        return self.scheduler.cancellationRequested(slot.scheduler_handle) catch true;
     }
 
     pub fn ownsSchedulerTask(self: *Vm, handle: task.TaskHandle) bool {
@@ -644,6 +707,72 @@ pub const Vm = struct {
         const slot = try self.activeSlot(handle);
         if (!same(slot.scheduler_handle, scheduler_handle)) return error.StaleTask;
         return handle;
+    }
+
+    fn requestExit(state: *c.State) callconv(.c) c_int {
+        const self: *Vm = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
+        const handle = self.running orelse return luaError(state, "exit called outside a task");
+        const slot = self.activeSlot(handle) catch return luaError(state, "stale Ouro task");
+        if (slot.thread != state) return luaError(state, "wrong Ouro task");
+        var code: c.Integer = 0;
+        if (c.lua_gettop(state) != 0) {
+            if (c.lua_gettop(state) != 1 or c.lua_isinteger(state, 1) == 0)
+                return luaError(state, "ouro.exit expects an optional integer code from 0 to 255");
+            var valid: c_int = 0;
+            code = c.lua_tointegerx(state, 1, &valid);
+            if (code < 0 or code > 255)
+                return luaError(state, "ouro.exit expects an optional integer code from 0 to 255");
+        }
+        if (self.exit_code == null) self.exit_code = @intCast(code);
+        slot.yield_request = .exit;
+        return c.lua_yieldk(state, 0, 0, sleepContinuation);
+    }
+
+    fn jsonArray(state: *c.State) callconv(.c) c_int {
+        if (c.lua_gettop(state) == 0) {
+            c.lua_createtable(state, 0, 0);
+        } else if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table) {
+            return luaError(state, "ouro.json.array expects an optional dense sequence table");
+        }
+        json.markJsonArray(state, 1) catch
+            return luaError(state, "JSON arrays must contain only contiguous integer keys starting at 1");
+        return 1;
+    }
+
+    fn jsonEncode(state: *c.State) callconv(.c) c_int {
+        if (c.lua_gettop(state) != 1) return luaError(state, "ouro.json.encode expects one value");
+        const self: *Vm = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var count: usize = 0;
+        const value = json.luaToJson(state, 1, arena.allocator(), 0, &count) catch {
+            arena.deinit();
+            c.lua_settop(state, 1);
+            return luaError(state, "value cannot be encoded as JSON");
+        };
+        const bytes = std.json.Stringify.valueAlloc(arena.allocator(), value, .{}) catch {
+            arena.deinit();
+            return luaError(state, "could not encode JSON");
+        };
+        _ = c.lua_pushlstring(state, bytes.ptr, bytes.len);
+        arena.deinit();
+        return 1;
+    }
+
+    fn jsonDecode(state: *c.State) callconv(.c) c_int {
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_string)
+            return luaError(state, "ouro.json.decode expects one JSON string");
+        const self: *Vm = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
+        var length: usize = 0;
+        const bytes = c.lua_tolstring(state, 1, &length).?;
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes[0..length], .{}) catch
+            return luaError(state, "invalid JSON");
+        json.pushJson(state, parsed.value) catch {
+            parsed.deinit();
+            c.lua_settop(state, 1);
+            return luaError(state, "JSON cannot be represented in Lua");
+        };
+        parsed.deinit();
+        return 1;
     }
 
     fn sleep(state: *c.State) callconv(.c) c_int {
@@ -871,4 +1000,104 @@ test "callback string arguments preserve UTF-8 bytes and embedded NUL" {
     var length: usize = 0;
     const received = c.lua_tolstring(vm.state, -1, &length).?;
     try std.testing.expectEqualStrings(value, received[0..length]);
+}
+
+test "Lua JSON API preserves nested values, null, integers, and binary escapes" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 1, 1);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+
+    _ = try vm.spawnApplication(
+        \\local j = require('ouro').json
+        \\local v = j.decode(' {"a":[true,null,-7,2.5],"n":9007199254740993,"s":"a\\u0000b","é":"ok"} ')
+        \\json_ok = v.a[1] == true and v.a[2] == j.null and v.a[3] == -7 and v.a[4] == 2.5
+        \\    and v.n == 9007199254740993 and v.s == 'a\0b' and v['é'] == 'ok'
+        \\local r = j.decode(j.encode(v))
+        \\roundtrip_ok = r.a[2] == j.null and r.n == 9007199254740993 and r.s == 'a\0b'
+        \\encode_ok = j.encode({true, j.null, -7, 'x'}) == '[true,null,-7,"x"]'
+        \\    and j.encode(nil) == 'null' and j.encode({}) == '{}'
+        \\arrays_ok = j.encode(j.decode('[]')) == '[]' and j.encode(j.decode('{}')) == '{}'
+        \\    and j.encode(j.decode('[[],{},[null,[]]]')) == '[[],{},[null,[]]]'
+        \\    and j.encode(j.array()) == '[]' and j.encode(j.array({})) == '[]'
+        \\local a = {1, j.null, 3}; local marked = j.array(a)
+        \\arrays_ok = arrays_ok and a == marked and j.encode(marked) == '[1,null,3]'
+        \\a[1] = nil; a[2] = nil; a[3] = nil
+        \\arrays_ok = arrays_ok and j.encode(a) == '[]'
+    );
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("json_ok"));
+    try std.testing.expect(vm.globalBoolean("roundtrip_ok"));
+    try std.testing.expect(vm.globalBoolean("encode_ok"));
+    try std.testing.expect(vm.globalBoolean("arrays_ok"));
+
+    for ([_][]const u8{
+        "require('ouro').json.decode('{')",
+        "require('ouro').json.decode('true false')",
+        "require('ouro').json.decode(7)",
+        "require('ouro').json.encode(function() end)",
+        "require('ouro').json.encode({1, a=2})",
+        "require('ouro').json.encode(0/0)",
+        "local t = {}; t.self = t; require('ouro').json.encode(t)",
+        "require('ouro').json.array(false)",
+        "require('ouro').json.array({}, {})",
+        "require('ouro').json.array({extra = true})",
+        "require('ouro').json.array({[0] = true})",
+        "require('ouro').json.array({[-1] = true})",
+        "require('ouro').json.array({[1.5] = true})",
+        "require('ouro').json.array({[1] = true, [3] = true})",
+        "require('ouro').json.encode({true, nil, true, extra = true})",
+        "local j = require('ouro').json; local a = j.array(); a.extra = true; j.encode(a)",
+        "local j = require('ouro').json; local a = j.array({1,2,3}); a[2] = nil; j.encode(a)",
+    }) |source| {
+        _ = try vm.spawnApplication(source);
+        try std.testing.expectError(error.LuaRuntimeError, vm.resumeRunnable(scheduler.takeRunnable().?));
+        try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
+        try std.testing.expectEqual(@as(c_int, 0), c.lua_gettop(vm.state));
+    }
+}
+
+test "Lua exit validates codes, defaults to zero, and never continues callbacks" {
+    for ([_][]const u8{ "", "255" }, [_]u8{ 0, 255 }) |argument, expected| {
+        var scheduler: task.Scheduler = undefined;
+        try scheduler.init(std.testing.allocator, 1, 2, 1);
+        defer scheduler.deinit();
+        var loop: io.Loop = undefined;
+        try loop.init(std.testing.allocator, 8, 4);
+        defer loop.deinit();
+        var vm: Vm = undefined;
+        try vm.init(std.testing.allocator, &scheduler, &loop);
+        defer vm.deinit();
+        for ([_][]const u8{
+            "require('ouro').exit(-1)",
+            "require('ouro').exit(256)",
+            "require('ouro').exit(1.5)",
+            "require('ouro').exit('2')",
+            "require('ouro').exit(0, 1)",
+        }) |source| {
+            _ = try vm.spawnApplication(source);
+            try std.testing.expectError(error.LuaRuntimeError, vm.resumeRunnable(scheduler.takeRunnable().?));
+            try std.testing.expect(vm.exit_code == null);
+        }
+        const source = try std.fmt.allocPrint(std.testing.allocator, "require('ouro').exit({s}); continued = true", .{argument});
+        defer std.testing.allocator.free(source);
+        _ = try vm.spawnApplication(source);
+        _ = try vm.spawnApplication("other_continued = true; require('ouro').exit(99)");
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try std.testing.expectEqual(@as(?u8, expected), vm.exit_code);
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try std.testing.expectEqual(@as(?u8, expected), vm.exit_code);
+        try std.testing.expect(!vm.globalBoolean("continued"));
+        try std.testing.expect(!vm.globalBoolean("other_continued"));
+        try std.testing.expect(!loop.hasPendingOperations());
+        try vm.requestCancellation();
+        while (scheduler.takeRunnable()) |runnable|
+            try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(runnable));
+        try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
+    }
 }

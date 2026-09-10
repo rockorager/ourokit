@@ -17,8 +17,12 @@ local ouro = require("ouro")
 
 return ouro.app {
   id = "dev.ouro.example",
+  interface = [[
+    interface dev.ouro.example
+    method Ping() -> (reply: string)
+  ]],
   actions = {
-    ping = function() return "pong" end,
+    Ping = function() return { reply = "pong" } end,
   },
   run = function(context)
     local clicked = ouro.signal(false)
@@ -104,10 +108,60 @@ Namespace, output, and surface role are immutable for a retained ID, while
 size, layer, anchors, exclusive zone and edge, margins, and keyboard
 interactivity update transactionally.
 
-Application actions belong to the headless application service and do not call
-`run` or initialize a native UI. A UI runtime invokes `run(context)` once for
-each candidate source generation. Reload therefore prepares a fresh run and
-atomically replaces the active run only after all returned windows validate.
+## Application lifetime and UI activation
+
+An application can run without windows. Its entry module declares shared state,
+the optional Varlink interface and action handlers. `run(context)` initializes
+the UI only when requested. Actions and window callbacks share the same Lua VM
+and closures; invoking a method never implicitly initializes Wayland.
+
+Omitting `actions` (or using nil) starts no server. `actions = {}` enables
+`dev.ourokit.runtime` (`Status`, `Reload`, `Activate`) and standard introspection.
+A populated table requires native Varlink IDL in `interface`; each declared
+method must have exactly one handler. The application's interface is registered
+separately from the runtime interface on the same socket.
+
+Service applications use `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`.
+Systemd socket activation (`Accept=no`, `FileDescriptorName=varlink`) passes an
+already-listening socket through `LISTEN_FDS`. Ourokit loads only the application
+declaration and serves requests until `Activate` asks for UI. It never unlinks
+the systemd-owned socket. With no connections or tasks, the headless service
+exits after 30 seconds; systemd retains the socket for the next request.
+
+Direct `ouroctl run` launches the UI. For a manifest whose well-known socket
+already exists, it forwards `Activate` to the owner instead. `ouroctl activate
+<application-id>` explicitly activates an installed socket-backed application.
+Activation can carry a Wayland activation token; focus remains compositor policy.
+Repeated activation does not rerun the UI factory or create duplicate windows.
+Closing the last window drains accepted calls/output and exits. Explicit
+`ouro.exit(code)` drains stdio output, cancels remaining tasks and exits.
+Lua state is process-local, not persistent storage.
+
+Headless reload validates a fresh declaration without invoking `run`. UI reload
+prepares a fresh UI in a candidate source generation and atomically replaces the
+active generation only after its windows, interface and handlers validate.
+Reload resets Lua state. Server enablement remains restart-only.
+
+## Standalone subprocess dialogs
+
+No service is needed for a small dialog. A parent process can send a request on
+stdin, close that pipe to delimit the request, and read a decision from stdout.
+`ouro.stdin.read(max_bytes)` returns a byte string or nil at EOF.
+`ouro.stdout.write(bytes)` and `ouro.stderr.write(bytes)` complete all bytes;
+all three operations yield only the calling task, including under backpressure.
+Runtime diagnostics use stderr. `ouro.json.encode`, `ouro.json.decode` and
+`ouro.json.null` provide JSON conversion independently of any Varlink server.
+Decoded arrays preserve their array identity, even when empty. Use
+`ouro.json.array()` for a new empty array or `ouro.json.array(sequence)` to mark
+a dense sequence explicitly. Plain `{}` encodes as an object.
+
+Exit is separate from serialization: write the result, then call `ouro.exit(0)`.
+The parent should treat a crash, window close without a decision, or malformed
+output as no permission granted, and cancel the child when its request ends.
+See the [permission dialog](../examples/permission-dialog/app.lua) and
+[Contacts service](../examples/contacts/app.lua).
+
+Outbound `ouro.varlink.call` is available independently of inbound server opt-in.
 
 The public surface is deliberately small and its cross-language descriptor ABI
 remains unfrozen. Constructors are specific native decoders, not one generic

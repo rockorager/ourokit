@@ -34,12 +34,20 @@ const buffer_count = 3;
 const presentation_feedback_capacity = 8;
 const fractional_scale_denominator = 120;
 
+pub const StartupCompletions = struct {
+    context: *anyopaque,
+    dispatch: *const fn (*anyopaque, linux.io_uring_cqe) anyerror!void,
+};
+
 pub const Config = struct {
     app_id: []const u8,
     window_capacity: usize = 8,
     output_capacity: usize = 16,
     workspaces: ?*ShellWorkspaces.Store = null,
     workspace_capacity: usize = 32,
+    /// Other owners may already have I/O on the shared ring during startup.
+    /// This callback routes completions only; it must not enter application Lua.
+    startup_completions: ?StartupCompletions = null,
     /// Prefer Vulkan linux-dmabuf presentation when compositor feedback and
     /// the selected Vulkan device share a renderable ARGB8888 modifier.
     vulkan: ?*Vulkan = null,
@@ -649,6 +657,7 @@ pub const Host = struct {
     fractional_scale_manager: ?Handle = null,
     sync_manager: ?Handle = null,
     wm_base: ?Handle = null,
+    activation: ?Handle = null,
     layer_shell: ?Handle = null,
     layer_shell_version: u32 = 0,
     text_input_manager: ?Handle = null,
@@ -721,6 +730,7 @@ pub const Host = struct {
         self.fractional_scale_manager = null;
         self.sync_manager = null;
         self.wm_base = null;
+        self.activation = null;
         self.layer_shell = null;
         self.layer_shell_version = 0;
         self.text_input_manager = null;
@@ -768,14 +778,14 @@ pub const Host = struct {
             },
         );
         self.driver = Driver.init(&self.connection);
-        self.finishStartup() catch |err| {
-            try self.abortStartup();
+        self.finishStartup(config.startup_completions) catch |err| {
+            try self.abortStartup(config.startup_completions);
             self.clipboard.abandonProtocol();
             return err;
         };
     }
 
-    fn finishStartup(self: *Host) !void {
+    fn finishStartup(self: *Host, other: ?StartupCompletions) !void {
         const actor = try self.connection.actor();
         self.registry = try Core.getRegistry(&self.connection.objects, &actor.transmit, null);
 
@@ -783,14 +793,14 @@ pub const Host = struct {
         _ = try roundtrip.begin();
         try self.flush();
         while (!roundtrip.settled()) {
-            try self.dispatch(try self.loop.wait(), &roundtrip);
+            try self.dispatchStartup(try self.loop.wait(), &roundtrip, other);
             try self.flushRoundtrip(&roundtrip);
         }
         // A receive can settle the roundtrip before the earlier send CQE is
         // reaped. Do not hand the connection to the application with a stale
         // active-send gate, or newly queued window requests cannot be armed.
         while ((try self.connection.actor()).transmit.sendActive()) {
-            try self.dispatch(try self.loop.wait(), self);
+            try self.dispatchStartup(try self.loop.wait(), self, other);
             try self.flush();
         }
         if (self.dmabuf != null) {
@@ -806,7 +816,7 @@ pub const Host = struct {
             _ = try dmabuf_roundtrip.begin();
             try self.flush();
             while (!dmabuf_roundtrip.settled()) {
-                try self.dispatch(try self.loop.wait(), &dmabuf_roundtrip);
+                try self.dispatchStartup(try self.loop.wait(), &dmabuf_roundtrip, other);
                 try self.flushRoundtrip(&dmabuf_roundtrip);
             }
         }
@@ -815,7 +825,7 @@ pub const Host = struct {
             return error.RequiredWaylandGlobalMissing;
     }
 
-    fn abortStartup(self: *Host) !void {
+    fn abortStartup(self: *Host, other: ?StartupCompletions) !void {
         const actor = try self.connection.actor();
         if (actor.lifecycle == .open) {
             if (try self.connection.prepareClose()) self.submission_pending = true;
@@ -824,10 +834,18 @@ pub const Host = struct {
         _ = try self.driver.schedule();
         while (!(try self.connection.actor()).canDeinit()) {
             try self.flushHandler(self);
-            try self.dispatch(try self.loop.wait(), self);
+            try self.dispatchStartup(try self.loop.wait(), self, other);
         }
         try self.connection.deinit(self.allocator);
         self.releaseDmabufFormatTable();
+    }
+
+    fn dispatchStartup(self: *Host, completion: linux.io_uring_cqe, handler: anytype, other: ?StartupCompletions) !void {
+        if (self.adapter.route(completion) == null) {
+            const sink = other orelse return error.InvalidCompletion;
+            return sink.dispatch(sink.context, completion);
+        }
+        try self.dispatch(completion, handler);
     }
 
     pub fn deinit(self: *Host) void {
@@ -912,6 +930,24 @@ pub const Host = struct {
         if (window.state == .waiting_output or window.recreate) return;
         if (window.state != .open) return error.WindowClosing;
         window.pending_redraw = true;
+    }
+
+    /// Requests activation of an existing toplevel with a caller-supplied token.
+    /// The compositor decides whether to focus it; missing protocol support is
+    /// a no-op. The token is copied into the outgoing request before returning.
+    pub fn activate(self: *Host, window: WindowHandle, token: []const u8) !void {
+        const target = try self.windowFor(window);
+        if (target.state != .open) return error.WindowClosing;
+        if (target.toplevel == null) return error.NotToplevel;
+        const activation = self.activation orelse return;
+        try wayring.client.sendRequest(
+            protocol.xdg_activation_v1,
+            &self.connection.objects,
+            try self.queue(),
+            activation,
+            .{ .activate = .{ .token = token, .surface = target.surface.?.id } },
+        );
+        _ = try self.driver.schedule();
     }
 
     pub fn outputScale(self: *Host, handle: WindowHandle) !f32 {
@@ -2257,6 +2293,16 @@ pub const Host = struct {
                 @min(global.version, 5),
                 null,
             );
+        } else if (std.mem.eql(u8, global.interface, protocol.xdg_activation_v1.info.name)) {
+            self.activation = try Core.bind(
+                objects,
+                transmit,
+                self.registry,
+                global.name,
+                &protocol.xdg_activation_v1.info,
+                1,
+                null,
+            );
         } else if (std.mem.eql(u8, global.interface, protocol.zwlr_layer_shell_v1.info.name)) {
             const version = @min(global.version, 5);
             self.layer_shell = try Core.bind(
@@ -2976,6 +3022,102 @@ test "Wayland host frame tokens retain generation-checked window identity" {
     try std.testing.expect(@hasDecl(Host, "nativeHost"));
     try std.testing.expect(@hasDecl(Host, "acquireFrame"));
     try std.testing.expect(@hasDecl(Host, "present"));
+}
+
+test "Wayland activation validates windows and tolerates missing protocol" {
+    var windows = [_]Window{.{
+        .state = .open,
+        .handle = .{ .slot = 3, .generation = 7 },
+        .surface = .{ .id = 11, .generation = 1 },
+        .toplevel = .{ .id = 13, .generation = 1 },
+    }};
+    var host: Host = undefined;
+    host.windows = &windows;
+    host.activation = null;
+    // No connection or driver is needed when the optional global is absent.
+    try host.activate(windows[0].handle, "caller-token");
+    try std.testing.expectError(error.StaleWindow, host.activate(.{ .slot = 3, .generation = 6 }, "token"));
+    windows[0].state = .closing;
+    try std.testing.expectError(error.WindowClosing, host.activate(windows[0].handle, "token"));
+    windows[0].state = .open;
+    windows[0].toplevel = null;
+    try std.testing.expectError(error.NotToplevel, host.activate(windows[0].handle, "token"));
+    windows[0].state = .free;
+    try std.testing.expectError(error.StaleWindow, host.activate(windows[0].handle, "token"));
+}
+
+test "Wayland activation binds version one and queues the supplied token and surface" {
+    const allocator = std.testing.allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 8 }, (Config{ .app_id = "test" }).reactor);
+    defer reactor.deinit(allocator);
+    const socket_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket_result) != .SUCCESS) return error.SocketFailed;
+    const socket: linux.fd_t = @intCast(socket_result);
+    // Attach without starting I/O: inspect the real host's outgoing queue.
+    const peer = try reactor.attach(socket, .{
+        .received_fd_budget = 0,
+        .transmit_byte_budget = 4096,
+        .transmit_fd_budget = 0,
+    });
+    defer reactor.destroyPeer(peer) catch unreachable;
+    var host: Host = undefined;
+    host.connection = .{
+        .reactor = &reactor,
+        .peer = peer,
+        .objects = try wayring.objects.ClientObjects.init(allocator, 16, 16, &protocol.wl_display.info, null),
+    };
+    defer host.connection.objects.deinit(allocator);
+    host.driver = Driver.init(&host.connection);
+    host.vulkan = null;
+    host.activation = null;
+    const objects = &host.connection.objects;
+    host.registry = try objects.createLocal(&protocol.wl_registry.info, 1, null);
+    try host.bindGlobal(.{ .name = 47, .interface = "xdg_activation_v1", .version = 3 });
+    const activation = host.activation.?;
+    const transmit = try host.queue();
+    const binding = try transmit.snapshot(&.{}, &.{});
+    const bind_message = (try wayring.wire.Message.decode(binding.first)).?;
+    try std.testing.expectEqual(host.registry.id, bind_message.header.object_id);
+    try std.testing.expectEqual(@as(u16, 0), bind_message.header.opcode);
+    var bind_args = bind_message.arguments();
+    try std.testing.expectEqual(@as(u32, 47), try bind_args.uint());
+    try std.testing.expectEqualStrings("xdg_activation_v1", (try bind_args.string()).?);
+    try std.testing.expectEqual(@as(u32, 1), try bind_args.uint());
+    try std.testing.expectEqual(activation.id, try bind_args.uint());
+    try bind_args.finish();
+    try transmit.begin(binding);
+    try transmit.complete(binding.byteCount());
+
+    var windows = [_]Window{
+        .{
+            .state = .open,
+            .handle = .{ .slot = 5, .generation = 8 },
+            .surface = try objects.createLocal(&protocol.wl_surface.info, 1, null),
+            .toplevel = try objects.createLocal(&protocol.xdg_toplevel.info, 1, null),
+        },
+        .{
+            .state = .open,
+            .handle = .{ .slot = 2, .generation = 9 },
+            .surface = try objects.createLocal(&protocol.wl_surface.info, 1, null),
+            .toplevel = try objects.createLocal(&protocol.xdg_toplevel.info, 1, null),
+        },
+    };
+    host.windows = &windows;
+    var token = "opaque-token-47".*;
+    try host.activate(windows[1].handle, &token);
+    @memset(&token, 'x');
+    try std.testing.expect(host.driver.scheduled);
+    const request = try transmit.snapshot(&.{}, &.{});
+    const message = (try wayring.wire.Message.decode(request.first)).?;
+    try std.testing.expectEqual(activation.id, message.header.object_id);
+    try std.testing.expectEqual(@as(u16, 2), message.header.opcode);
+    try std.testing.expectEqual(@as(usize, message.header.size), transmit.queuedBytes());
+    try std.testing.expectEqual(@as(usize, 0), request.descriptor_count);
+    var args = message.arguments();
+    try std.testing.expectEqualStrings("opaque-token-47", (try args.string()).?);
+    try std.testing.expectEqual(windows[1].surface.?.id, try args.uint());
+    try args.finish();
 }
 
 test "layer state owns output identity across hotplug recreation" {
