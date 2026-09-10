@@ -4,6 +4,23 @@ One Lua application with typed Varlink methods and an optional UI. The sample
 address book and selection are in memory; they reset after exit or source reload.
 No real address-book storage or portal integration is implied.
 
+The list contains 500 synthetic contacts with three different note lengths.
+`ouro.virtual_list` measures row heights and mounts only the visible range plus
+its buffer. Ada and Grace have original illustrated PNG avatars; contacts with
+no avatar metadata use seeded initials. This is not an image-load-error fallback.
+The source SVGs are included; regenerate PNGs with `magick -background none
+assets/ada.svg assets/ada.png` (and the equivalent Grace command).
+
+Select a contact, edit its name, and click Apply name. Selection and edits live
+outside row lifetimes, so scrolling rows out of view does not discard them.
+Terminal style toggles font, colors, and control geometry around the same tree.
+The generic viewport handles wheel/Up/Down/Home/End/Page Up/Page Down scrolling;
+Tab and Enter operate the row buttons. Unlike the original three-item listbox,
+arrow keys scroll rather than change the selected contact.
+
+`mail.svg` and `log-out.svg` are Lucide 0.468.0 icons, distributed with
+`assets/LUCIDE-LICENSE`. Avatar artwork follows this repository's license.
+
 ## Direct development run
 
 ```sh
@@ -22,6 +39,7 @@ Install the example into your own account (run these commands from the repo):
 install -Dm755 zig-out/bin/ouroctl "$HOME/.local/bin/ouroctl"
 mkdir -p "$HOME/.local/share/ourokit/contacts" "$HOME/.config/systemd/user"
 cp examples/contacts/{app.lua,ouro.json} "$HOME/.local/share/ourokit/contacts/"
+cp -R examples/contacts/assets "$HOME/.local/share/ourokit/contacts/"
 cp examples/contacts/dev.ourokit.contacts.{socket,service} "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 systemctl --user import-environment WAYLAND_DISPLAY
