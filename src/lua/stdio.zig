@@ -24,7 +24,7 @@ const Slot = struct {
 
 /// Stable-address, generation-owned adapter. File descriptors are borrowed:
 /// do not close or change them until operations drain. Blocking pipes are
-/// handled by io_uring workers, never by the Lua/UI thread. Nonblocking file
+/// handled by io_uring readiness polling, never by the Lua/UI thread. Nonblocking file
 /// errors (including EAGAIN) are reported to Lua. Concurrent writes are not
 /// atomic with respect to other writers; await each write to preserve order.
 pub const Stdio = struct {
@@ -394,23 +394,27 @@ test "stdio backpressured stdout and stderr do not block scheduling and drain af
 }
 
 test "stdio cancellation drains blocked reads and writes and discards ready results" {
-    inline for (.{ "stdin.read(17)", "stdout.write('blocked')", "stderr.write('blocked')" }) |operation| {
-        const pipe = try testPipe(false);
-        defer _ = linux.close(pipe[0]);
-        defer _ = linux.close(pipe[1]);
-        if (comptime !std.mem.startsWith(u8, operation, "stdin")) {
-            try std.testing.expectEqual(@as(usize, 4096), linux.fcntl(pipe[1], linux.F.SETPIPE_SZ, 4096));
-            const filler: [4096]u8 = @splat('x');
-            try std.testing.expectEqual(filler.len, linux.write(pipe[1], &filler, filler.len));
+    // Exercise the race between submission and cancellation repeatedly: forcing
+    // blocking pipe I/O onto io-wq can leave the original operation uncancelable.
+    for (0..32) |_| {
+        inline for (.{ "stdin.read(17)", "stdout.write('blocked')", "stderr.write('blocked')" }) |operation| {
+            const pipe = try testPipe(false);
+            defer _ = linux.close(pipe[0]);
+            defer _ = linux.close(pipe[1]);
+            if (comptime !std.mem.startsWith(u8, operation, "stdin")) {
+                try std.testing.expectEqual(@as(usize, 4096), linux.fcntl(pipe[1], linux.F.SETPIPE_SZ, 4096));
+                const filler: [4096]u8 = @splat('x');
+                try std.testing.expectEqual(filler.len, linux.write(pipe[1], &filler, filler.len));
+            }
+            var runtime: TestRuntime = .{};
+            try runtime.init(.{ .stdin = pipe[0], .stdout = pipe[1], .stderr = pipe[1] });
+            defer runtime.deinit();
+            _ = try runtime.start("require('ouro')." ++ operation ++ "; continued = true");
+            _ = try runtime.loop.submit();
+            try runtime.cancel();
+            try std.testing.expect(!runtime.vm.globalBoolean("continued"));
+            for (runtime.stdio.slots) |slot| try std.testing.expectEqual(State.free, slot.state);
         }
-        var runtime: TestRuntime = .{};
-        try runtime.init(.{ .stdin = pipe[0], .stdout = pipe[1], .stderr = pipe[1] });
-        defer runtime.deinit();
-        _ = try runtime.start("require('ouro')." ++ operation ++ "; continued = true");
-        _ = try runtime.loop.submit();
-        try runtime.cancel();
-        try std.testing.expect(!runtime.vm.globalBoolean("continued"));
-        for (runtime.stdio.slots) |slot| try std.testing.expectEqual(State.free, slot.state);
     }
     const pipe = try testPipe(false);
     defer _ = linux.close(pipe[0]);

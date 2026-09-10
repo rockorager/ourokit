@@ -243,7 +243,7 @@ pub const Loop = struct {
     ) !OperationHandle {
         if (buffer.len == 0) return error.EmptyReadBuffer;
         const reserved = try self.reserve(.read);
-        const sqe = self.ring.read(
+        _ = self.ring.read(
             encodeFile(.read, reserved.handle),
             fd,
             .{ .buffer = buffer },
@@ -252,7 +252,8 @@ pub const Loop = struct {
             reserved.slot.active = false;
             return err;
         };
-        sqe.flags |= linux.IOSQE_ASYNC;
+        // Let io_uring poll pipes. Forcing a blocking io-wq read can make
+        // cancellation return EALREADY while the original never completes.
         return reserved.handle;
     }
 
@@ -267,7 +268,7 @@ pub const Loop = struct {
     ) !OperationHandle {
         if (buffer.len == 0) return error.EmptyWriteBuffer;
         const reserved = try self.reserve(.write);
-        const sqe = self.ring.write(
+        _ = self.ring.write(
             encodeFile(.write, reserved.handle),
             fd,
             buffer,
@@ -276,7 +277,6 @@ pub const Loop = struct {
             reserved.slot.active = false;
             return err;
         };
-        sqe.flags |= linux.IOSQE_ASYNC;
         return reserved.handle;
     }
 
