@@ -350,6 +350,10 @@ fn runSourceWithFontconfig(
         },
     );
     defer host.deinit();
+    try application.extractOutputTemplates();
+    for (host.outputs) |output| if (output.name) |name| {
+        _ = try application.expandOutput(name, options.application_window_capacity);
+    };
     try window_set.init(
         init.gpa,
         &scheduler,
@@ -409,6 +413,12 @@ fn runSourceWithFontconfig(
             },
         };
         var desired_changed = false;
+        if (!disconnect_started and host.failure == null and shutdown_signal == null and active_generation.vm.exit_code == null) {
+            for (host.outputs) |output| if (output.name) |name| {
+                if (try active_application.expandOutput(name, runtime_slots.len)) desired_changed = true;
+            };
+            if (desired_changed) try syncRuntimeSlots(init.gpa, runtime_slots, active_application.windows);
+        }
         clipboard.setPlatformAvailable(host.clipboardAvailable());
         while (host.takeClipboardCompletion()) |completion| {
             if (completion.canceled)
@@ -553,6 +563,7 @@ fn runSourceWithFontconfig(
         }
         const calls_pending = if (control) |server| server.hasPendingCalls() else false;
         if (!disconnect_started and current_count == 0 and
+            (active_application.windows.len != 0 or active_application.output_templates.len == 0 or active_generation.vm.exit_code != null or shutdown_signal != null or host.failure != null) and
             (!calls_pending or active_generation.vm.exit_code != null or shutdown_signal != null) and
             (!active_generation.stdio.hasPendingOutput() or shutdown_signal != null))
         {
@@ -592,6 +603,8 @@ fn runSourceWithFontconfig(
                     &paragraphs,
                     options.window,
                 );
+                // Desktop surfaces own their entire configured rectangle.
+                if (window.?.declaration == .layer_surface) slot.runtime.root_padding = 0;
                 try dirty.register(handle);
                 slot.runtime.registered = true;
                 slot.runtime.setDirtyWindowQueue(&dirty);
@@ -1037,6 +1050,18 @@ fn servicePreparedReload(
     defer if (candidate_pending) reload.discard();
 
     const candidate = reload.candidate.?;
+    // Include disconnected outputs retained by the active generation, keeping
+    // reload's window identities aligned with the host's hotplug lifetimes.
+    candidate.application.extractOutputTemplates() catch |err| {
+        try reportReloadFailure(reload, control, request_sequence, err);
+        return;
+    };
+    for (reload.active().application.windows) |window| if (window.template_id != null) {
+        _ = candidate.application.expandOutput(window.declaration.layer_surface.output.?, slots.len) catch |err| {
+            try reportReloadFailure(reload, control, request_sequence, err);
+            return;
+        };
+    };
     var target_count: usize = 0;
     for (candidate.application.windows) |window| {
         const slot = runtimeSlotForId(slots, window.declaration.id()) orelse {

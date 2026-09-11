@@ -7,11 +7,26 @@
 #include "lbaselib.c"
 #include "lmathlib.c"
 #include "lstrlib.c"
+#include "loslib.c"
 
 /* Lua's documented alternative to consulting OS entropy during table.sort. */
 #define l_randomizePivot(L) (~0u)
 #include "ltablib.c"
 #include "lutf8lib.c"
+
+/* Expose only the two clock functions, not luaopen_os or its process/filesystem API. */
+int ouro_os_time(lua_State *L) {
+    if (lua_gettop(L) != 0)
+        return luaL_error(L, "ouro.time expects no arguments");
+    return os_time(L);
+}
+
+int ouro_os_date(lua_State *L) {
+    int arguments = lua_gettop(L);
+    if ((arguments != 1 && arguments != 2) || lua_type(L, 1) != LUA_TSTRING)
+        return luaL_error(L, "ouro.date expects a format and optional timestamp");
+    return os_date(L);
+}
 
 static const luaL_Reg ouro_base[] = {
     {"assert", luaB_assert},

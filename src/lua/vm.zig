@@ -90,10 +90,17 @@ pub const Vm = struct {
         errdefer allocator.free(operation_tasks);
         @memset(scheduler_tasks, null);
         @memset(operation_tasks, null);
-        c.lua_createtable(state, 0, 1);
+        c.lua_createtable(state, 0, 5);
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, sleep, 1);
         c.lua_setfield(state, -2, "sleep");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, spawnChild, 1);
+        c.lua_setfield(state, -2, "spawn");
+        c.lua_pushcclosure(state, c.ouro_os_time, 0);
+        c.lua_setfield(state, -2, "time");
+        c.lua_pushcclosure(state, c.ouro_os_date, 0);
+        c.lua_setfield(state, -2, "date");
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, requestExit, 1);
         c.lua_setfield(state, -2, "exit");
@@ -819,6 +826,26 @@ pub const Vm = struct {
         return c.lua_yieldk(state, 0, 0, sleepContinuation);
     }
 
+    fn spawnChild(state: *c.State) callconv(.c) c_int {
+        const pointer = c.lua_touserdata(state, c.upvalueIndex(1)) orelse
+            return luaError(state, "missing Ouro VM");
+        const self: *Vm = @ptrCast(@alignCast(pointer));
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_function)
+            return luaError(state, "ouro.spawn expects exactly one function");
+        const parent = self.running orelse return luaError(state, "ouro.spawn called outside a task");
+        const slot = self.activeSlot(parent) catch return luaError(state, "stale Ouro task");
+        if (slot.thread != state) return luaError(state, "wrong Ouro task");
+
+        c.lua_pushvalue(state, 1);
+        const reference = c.luaL_ref(state, c.registry_index);
+        _ = self.spawnReference(slot.scope, reference, &.{}) catch {
+            c.luaL_unref(state, c.registry_index, reference);
+            return luaError(state, "could not spawn Ouro task");
+        };
+        c.luaL_unref(state, c.registry_index, reference);
+        return 0;
+    }
+
     fn sleepContinuation(_: *c.State, _: c_int, _: c.KContext) callconv(.c) c_int {
         return 0;
     }
@@ -1037,6 +1064,65 @@ test "safe Lua libraries expose only computation helpers with standard UTF-8 sem
     );
     try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
     try std.testing.expect(vm.globalBoolean("libraries_ok"));
+}
+
+test "Ouro clock and spawned coroutine APIs are scoped and asynchronous" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 4, 4);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 8);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+
+    _ = try vm.spawnApplication(
+        \\local ouro = require('ouro')
+        \\assert(ouro.date('!%Y-%m-%d %H:%M:%S', 0) == '1970-01-01 00:00:00')
+        \\local now = ouro.time(); assert(math.type(now) == 'integer' and now > 1700000000)
+        \\assert(os == nil and execute == nil and remove == nil and package == nil)
+        \\assert(not pcall(ouro.spawn) and not pcall(ouro.spawn, 1))
+        \\assert(not pcall(ouro.spawn, function() end, function() end))
+        \\assert(not pcall(ouro.date) and not pcall(ouro.date, 1))
+        \\outside_fn = function() end
+        \\ouro.spawn(function()
+        \\  child_started = true
+        \\  ouro.sleep(0)
+        \\  child_finished = true
+        \\end)
+        \\assert(child_started == nil)
+        \\parent_finished = true
+    );
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("parent_finished"));
+    try std.testing.expect(!vm.hasGlobal("child_started"));
+    vm.pushApi(vm.state);
+    _ = c.lua_getfield(vm.state, -1, "spawn");
+    _ = c.lua_getglobal(vm.state, "outside_fn");
+    try std.testing.expect(c.lua_pcallk(vm.state, 1, 0, 0, 0, null) != c.ok);
+    c.lua_settop(vm.state, 0);
+
+    const child_scheduler = scheduler.takeRunnable().?;
+    try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(child_scheduler));
+    try std.testing.expect(vm.globalBoolean("child_started"));
+    try std.testing.expect(!vm.hasGlobal("child_finished"));
+    try vm.markTimeoutCompleted((try loop.takeExpired()).?.operation);
+    try std.testing.expect(!vm.hasGlobal("child_finished"));
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("child_finished"));
+
+    _ = try vm.spawnApplication(
+        \\local ouro = require('ouro')
+        \\ouro.spawn(function() ouro.sleep(0); canceled_continuation = true end)
+    );
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    const canceled_scheduler = scheduler.takeRunnable().?;
+    try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(canceled_scheduler));
+    try vm.markTimeoutCompleted((try loop.takeExpired()).?.operation);
+    try scheduler.requestTaskCancellation(canceled_scheduler);
+    try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(!vm.hasGlobal("canceled_continuation"));
 }
 
 test "safe Lua protected calls yield through Ouro and cannot catch cancellation" {

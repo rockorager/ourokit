@@ -163,7 +163,8 @@ end)
 ```
 
 Desktop components use a distinct layer-shell declaration rather than a mode
-bit on `ouro.window`:
+bit on `ouro.window`. Layer-surface content fills the configured rectangle
+without the default window inset; add padding explicitly inside the content:
 
 ```lua
 ouro.layer_surface {
@@ -202,6 +203,26 @@ while preserving its declarative identity and UI runtime. Wayland guarantees
 these names are unique for one compositor instance, but not persistent across
 sessions, so application configuration may need to follow compositor naming.
 Omit `output` to retain compositor-selected placement.
+
+For a panel on every output, use `outputs = "all"` instead of `output`. The
+native runner creates an independent window/UI instance for each discovered
+output and calls `content(output_name)` for that instance. New outputs are
+added automatically; disconnected outputs retain their identities for
+reconnection and source reload. The clock or other application-level state can
+still be shared across all content callbacks. Each materialized surface counts
+toward the application's window capacity (16 by default, including retained
+disconnected names). `output` and `outputs` cannot be specified together.
+
+```lua
+ouro.layer_surface {
+  id = "panel", namespace = "shell-panel", outputs = "all",
+  layer = "top", height = 40, anchors = { "top", "left", "right" },
+  exclusive_zone = 40,
+  content = function(output_name)
+    return ouro.text { key = "output", text = output_name }
+  end,
+}
+```
 
 Namespace, output, and surface role are immutable for a retained ID, while
 size, layer, anchors, exclusive zone and edge, margins, and keyboard

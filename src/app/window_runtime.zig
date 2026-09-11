@@ -64,6 +64,7 @@ pub const WindowRuntime = struct {
     command_count: usize = 0,
     frame_state: frame.State = .{},
     output_scale: f32 = 1,
+    root_padding: f32 = @import("../design/root.zig").tokens.foundation.spacing_3,
     signals: *lua.Signals = undefined,
     paragraph_sources: *text.ParagraphSourceCache = undefined,
     paragraphs: *text.ParagraphCache = undefined,
@@ -242,6 +243,7 @@ pub const WindowRuntime = struct {
         lua_ui.components.focused = self.focus.current();
         lua_ui.components.native_update = false;
         lua_ui.image_scale = self.output_scale;
+        lua_ui.root_padding = self.root_padding;
         if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
         defer lua_ui.components.instances = null;
         const descriptors = try lua_ui.buildCallback(
@@ -459,6 +461,7 @@ pub const WindowRuntime = struct {
         const height: f32 = @floatFromInt(size.height);
         lua_ui.components.instances = &self.instances;
         lua_ui.image_scale = self.output_scale;
+        lua_ui.root_padding = self.root_padding;
         if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
         defer lua_ui.components.instances = null;
         var builds = self.build_owners.beginCycle();
@@ -2360,6 +2363,9 @@ test "candidate source build prepares owned output without changing retained UI"
         .{ .node_capacity = 4, .semantic_text_capacity = 64 },
         null,
     );
+    try std.testing.expectEqual(@as(f32, 12), runtime.root_padding);
+    runtime.root_padding = 0;
+    candidate.ui_build.enableDeclarativeWidgets(@import("../design/root.zig").tokens.light);
     try runtime.prepareSourceBuild(
         .{ .width = 320, .height = 200 },
         &candidate.ui_build,
@@ -2368,6 +2374,7 @@ test "candidate source build prepares owned output without changing retained UI"
         2,
     );
     try std.testing.expect(candidate.prepared_builds[0].reconcile_plan != null);
+    try std.testing.expectEqual(@as(f32, 0), candidate.prepared_builds[0].descriptors()[0].object.box.padding.top);
     try std.testing.expectEqual(@as(usize, 0), runtime.instances.activeCount());
     try runtime.validatePreparedSourceCommit(&candidate.prepared_builds[0]);
     runtime.commitPreparedSource(

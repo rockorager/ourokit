@@ -22,6 +22,8 @@ pub fn upvalueIndex(index: c_int) c_int {
 
 pub extern fn luaL_newstate() ?*State;
 pub extern fn ouro_open_safe_libraries(state: *State) callconv(.c) c_int;
+pub extern fn ouro_os_time(state: *State) callconv(.c) c_int;
+pub extern fn ouro_os_date(state: *State) callconv(.c) c_int;
 pub extern fn luaL_newmetatable(state: *State, name: [*:0]const u8) c_int;
 pub extern fn luaL_testudata(state: *State, index: c_int, name: [*:0]const u8) ?*anyopaque;
 pub extern fn luaL_ref(state: *State, table_index: c_int) c_int;

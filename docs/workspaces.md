@@ -44,6 +44,8 @@ false when the compositor does not advertise `ext_workspace_manager_v1`.
 `state.workspaces` contains workspace tables with:
 
 - `id` (optional stable string), `name`, and `coordinates`;
+- `outputs`, a dense array of `wl_output.name` strings for every output in the
+  workspace's group (empty until an output has supplied a name);
 - `active`, `urgent`, and `hidden` state flags;
 - `can_activate`, `can_deactivate`, and `can_remove` capability flags;
 - `activate()`, `deactivate()`, and `remove()` request functions.
@@ -53,6 +55,8 @@ followed by `ext_workspace_manager_v1.commit`. The compositor may ignore a
 request; applications should use the corresponding capability flag when
 deciding whether to expose an action.
 
-The first API intentionally omits workspace-group creation and assignment.
-Those require a useful Lua representation for output/group identity rather
-than leaking transient Wayland object IDs.
+Output and workspace membership changes become visible together at the
+workspace manager's `done` boundary. Output discovery, renaming, and removal
+also refresh snapshots; names are copied and no transient Wayland object IDs
+are exposed. The API intentionally omits workspace-group creation and
+assignment.

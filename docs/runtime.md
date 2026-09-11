@@ -76,7 +76,13 @@ Library tables belong to each VM and are available as ordinary Lua globals:
 No `io`, `os`, `package`, `debug`, or `coroutine` library is exposed. Base I/O
 (`print`, `warn`, `dofile`, `loadfile`), dynamic `load`, raw/metatable accessors,
 and `collectgarbage` are also absent. Output, file access, module loading,
-process exit and asynchronous task lifetimes remain Ouro-owned. The existing
+process exit and asynchronous task lifetimes remain Ouro-owned. The two clock
+operations exposed under the Ouro API do not install an ambient `os` table.
+`ouro.time()` synchronously returns the current Unix timestamp as an integer;
+`ouro.date(format[, timestamp])` synchronously formats local time, or UTC when
+`format` starts with Lua's `!` prefix. They use the host process timezone and
+the pinned Lua release's `os.time`/`os.date` implementations. No process or
+filesystem operations from Lua's OS library are exposed. The existing
 `require` implementation is preserved: it exposes `ouro`, and bundled hosts
 add their scoped application-module loader, not Lua's package/native loader.
 
@@ -112,7 +118,11 @@ or bypassing scope cancellation.
 
 The runtime API is a built-in module loaded with `local ouro = require("ouro")`;
 it is not installed as an ambient global and cannot be shadowed by application
-source. The proof async API currently exposes `ouro.sleep(milliseconds)`. Its C
+source. The async API exposes `ouro.sleep(milliseconds)` and
+`ouro.spawn(function)`. Spawn queues a non-retained child coroutine under the
+currently running task's ownership scope and returns no handle; the child does
+not run inline, and normal scope cancellation (including reload and shutdown)
+owns its lifetime. It is rejected outside task-phase execution. The sleep C
 callback
 uses the VM's current generation-checked task, records the request, and calls
 `lua_yieldk`. After `lua_resume` reports a yield, Zig registers the timer under

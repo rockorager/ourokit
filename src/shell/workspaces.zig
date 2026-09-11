@@ -23,6 +23,7 @@ pub const Snapshot = struct {
     id: ?[]u8 = null,
     name: []u8,
     coordinates: []u32,
+    outputs: [][]u8,
     state: State = .{},
     capabilities: Capabilities = .{},
 
@@ -32,11 +33,14 @@ pub const Snapshot = struct {
         const name = try allocator.dupe(u8, self.name);
         errdefer allocator.free(name);
         const coordinates = try allocator.dupe(u32, self.coordinates);
+        errdefer allocator.free(coordinates);
+        const outputs = try cloneStrings(allocator, self.outputs);
         return .{
             .handle = self.handle,
             .id = id,
             .name = name,
             .coordinates = coordinates,
+            .outputs = outputs,
             .state = self.state,
             .capabilities = self.capabilities,
         };
@@ -46,6 +50,7 @@ pub const Snapshot = struct {
         if (self.id) |id| allocator.free(id);
         allocator.free(self.name);
         allocator.free(self.coordinates);
+        freeStrings(allocator, self.outputs);
         self.* = undefined;
     }
 };
@@ -116,6 +121,8 @@ pub const Store = struct {
             const name = try self.allocator.alloc(u8, 0);
             errdefer self.allocator.free(name);
             const coordinates = try self.allocator.alloc(u32, 0);
+            errdefer self.allocator.free(coordinates);
+            const outputs = try self.allocator.alloc([]u8, 0);
             slot.* = .{
                 .generation = generation,
                 .active = true,
@@ -123,6 +130,7 @@ pub const Store = struct {
                     .handle = handle,
                     .name = name,
                     .coordinates = coordinates,
+                    .outputs = outputs,
                 },
             };
             return handle;
@@ -149,6 +157,14 @@ pub const Store = struct {
         const replacement = try self.allocator.dupe(u32, value);
         self.allocator.free(workspace.coordinates);
         workspace.coordinates = replacement;
+    }
+
+    /// Replaces pending output membership with independently owned names.
+    pub fn setOutputs(self: *Store, handle: WorkspaceHandle, value: []const []const u8) !void {
+        const workspace = &(try self.activeSlot(handle)).pending;
+        const replacement = try cloneStrings(self.allocator, value);
+        freeStrings(self.allocator, workspace.outputs);
+        workspace.outputs = replacement;
     }
 
     pub fn setState(self: *Store, handle: WorkspaceHandle, value: State) !void {
@@ -231,6 +247,25 @@ pub const Store = struct {
     }
 };
 
+fn cloneStrings(allocator: std.mem.Allocator, values: anytype) ![][]u8 {
+    const result = try allocator.alloc([]u8, values.len);
+    var count: usize = 0;
+    errdefer {
+        for (result[0..count]) |value| allocator.free(value);
+        allocator.free(result);
+    }
+    for (values, 0..) |value, index| {
+        result[index] = try allocator.dupe(u8, value);
+        count += 1;
+    }
+    return result;
+}
+
+fn freeStrings(allocator: std.mem.Allocator, values: [][]u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
+}
+
 fn sameHandle(a: WorkspaceHandle, b: WorkspaceHandle) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
@@ -250,4 +285,20 @@ test "workspace state publishes only at protocol done boundaries" {
     try std.testing.expectEqualStrings("One", store.snapshot()[0].name);
     try store.commit();
     try std.testing.expectEqualStrings("Two", store.snapshot()[0].name);
+}
+
+test "workspace output snapshots own names and publish atomically" {
+    var store: Store = undefined;
+    try store.init(std.testing.allocator, 2, 2);
+    defer store.deinit();
+    const workspace = try store.create();
+    var name = [_]u8{ 'D', 'P', '-', '1' };
+    try store.setOutputs(workspace, &.{name[0..]});
+    name[0] = 'X';
+    try store.commit();
+    try std.testing.expectEqualStrings("DP-1", store.snapshot()[0].outputs[0]);
+    try store.setOutputs(workspace, &.{});
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot()[0].outputs.len);
+    try store.commit();
+    try std.testing.expectEqual(@as(usize, 0), store.snapshot()[0].outputs.len);
 }

@@ -80,7 +80,7 @@ pub const Binding = struct {
         c.lua_setfield(state, -2, "available");
         c.lua_createtable(state, @intCast(snapshot.len), 0);
         for (snapshot, 0..) |workspace, index| {
-            c.lua_createtable(state, 0, 13);
+            c.lua_createtable(state, 0, 14);
             if (workspace.id) |id| {
                 _ = c.lua_pushlstring(state, id.ptr, id.len);
             } else c.lua_pushnil(state);
@@ -93,6 +93,12 @@ pub const Binding = struct {
                 c.lua_rawseti(state, -2, @intCast(coordinate_index + 1));
             }
             c.lua_setfield(state, -2, "coordinates");
+            c.lua_createtable(state, @intCast(workspace.outputs.len), 0);
+            for (workspace.outputs, 0..) |output, output_index| {
+                _ = c.lua_pushlstring(state, output.ptr, output.len);
+                c.lua_rawseti(state, -2, @intCast(output_index + 1));
+            }
+            c.lua_setfield(state, -2, "outputs");
             setBoolean(state, "active", workspace.state.active);
             setBoolean(state, "urgent", workspace.state.urgent);
             setBoolean(state, "hidden", workspace.state.hidden);
@@ -236,6 +242,7 @@ test "workspace connection exposes snapshots and queues actions" {
     try store.setId(workspace, "persistent-one");
     try store.setName(workspace, "One");
     try store.setCoordinates(workspace, &.{ 2, 3 });
+    try store.setOutputs(workspace, &.{ "DP-1", "HDMI-A-1" });
     try store.setState(workspace, .{ .active = true });
     try store.setCapabilities(workspace, .{ .activate = true });
     try store.commit();
@@ -265,6 +272,7 @@ test "workspace connection exposes snapshots and queues actions" {
         \\local workspace = snapshot.workspaces[1]
         \\workspace_ok = snapshot.available and workspace.id == "persistent-one"
         \\  and workspace.name == "One" and workspace.coordinates[1] == 2
+        \\  and workspace.outputs[1] == "DP-1" and workspace.outputs[2] == "HDMI-A-1"
         \\  and workspace.active and workspace.can_activate
         \\workspace.activate()
     );

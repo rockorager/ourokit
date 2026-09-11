@@ -11,6 +11,8 @@ const theming = @import("theme.zig");
 pub const Window = struct {
     declaration: platform.SurfaceDeclaration,
     content_reference: c_int,
+    all_outputs: bool = false,
+    template_id: ?[]const u8 = null,
 };
 
 pub const Definition = struct {
@@ -170,6 +172,87 @@ pub const Application = struct {
     actions_reference: c_int,
     run_reference: c_int,
     windows: []Window,
+    output_templates: []Window = &.{},
+
+    /// Materialize each all-output declaration once per output name. Retain
+    /// disconnected names so the native host can recreate their surfaces and
+    /// preserve UI identity when they return.
+    pub fn expandOutput(self: *Application, name: []const u8, capacity: usize) !bool {
+        try self.extractOutputTemplates();
+        var changed = false;
+        for (self.output_templates) |template| {
+            var found = false;
+            for (self.windows) |window| {
+                if (window.template_id) |id| {
+                    if (std.mem.eql(u8, id, template.declaration.id()) and
+                        std.mem.eql(u8, window.declaration.layer_surface.output.?, name))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (found) continue;
+            if (self.windows.len >= capacity) return error.WindowCapacityExceeded;
+            var layer = template.declaration.layer_surface;
+            layer.id = try std.fmt.allocPrint(self.allocator, "{s}@{d}:{s}", .{ layer.id, name.len, name });
+            errdefer self.allocator.free(layer.id);
+            layer.namespace = try self.allocator.dupe(u8, layer.namespace);
+            errdefer self.allocator.free(layer.namespace);
+            layer.output = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(layer.output.?);
+            for (self.windows) |window| if (std.mem.eql(u8, window.declaration.id(), layer.id))
+                return error.DuplicateWindowId;
+            const windows = try self.allocator.realloc(self.windows, self.windows.len + 1);
+            self.windows = windows;
+            _ = c.lua_rawgeti(self.state, c.registry_index, template.content_reference);
+            _ = c.lua_pushlstring(self.state, name.ptr, name.len);
+            c.lua_pushcclosure(self.state, outputContent, 2);
+            windows[windows.len - 1] = .{
+                .declaration = .{ .layer_surface = layer },
+                .content_reference = c.luaL_ref(self.state, c.registry_index),
+                .template_id = template.declaration.id(),
+            };
+            changed = true;
+        }
+        return changed;
+    }
+
+    pub fn extractOutputTemplates(self: *Application) !void {
+        var count: usize = 0;
+        for (self.windows) |window| if (window.all_outputs) {
+            count += 1;
+        };
+        if (count == 0) return;
+        for (self.windows, 0..) |window, index| {
+            for (self.windows[0..index]) |prior| if (std.mem.eql(u8, window.declaration.id(), prior.declaration.id()))
+                return error.DuplicateWindowId;
+        }
+        const templates = try self.allocator.alloc(Window, count);
+        errdefer self.allocator.free(templates);
+        const windows = try self.allocator.alloc(Window, self.windows.len - count);
+        var ti: usize = 0;
+        var wi: usize = 0;
+        for (self.windows) |window| {
+            if (window.all_outputs) {
+                templates[ti] = window;
+                ti += 1;
+            } else {
+                windows[wi] = window;
+                wi += 1;
+            }
+        }
+        self.allocator.free(self.windows);
+        self.windows = windows;
+        self.output_templates = templates;
+    }
+
+    fn outputContent(state: *c.State) callconv(.c) c_int {
+        c.lua_pushvalue(state, c.upvalueIndex(1));
+        c.lua_pushvalue(state, c.upvalueIndex(2));
+        if (c.lua_pcallk(state, 1, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        return 1;
+    }
 
     pub fn resolvedTheme(self: *const Application, base: @import("../design/root.zig").tokens.Theme) theming.Theme {
         var result = self.theme orelse return .{ .colors = base };
@@ -417,6 +500,8 @@ pub const Application = struct {
         if (self.action_schema) |*schema| schema.deinit();
         for (self.windows) |window| deinitWindow(self.allocator, self.state, window);
         self.allocator.free(self.windows);
+        for (self.output_templates) |window| deinitWindow(self.allocator, self.state, window);
+        self.allocator.free(self.output_templates);
         if (self.run_reference != c.no_reference)
             c.luaL_unref(self.state, c.registry_index, self.run_reference);
         if (self.actions_reference != c.no_reference)
@@ -605,6 +690,13 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
         const window_id = try requiredString(allocator, state, -1, "id");
         errdefer allocator.free(window_id);
         const role = try surfaceRole(state, -1);
+        const outputs_type = c.lua_getfield(state, -1, "outputs");
+        var outputs_length: usize = 0;
+        const all_outputs = outputs_type == c.type_string and
+            std.mem.eql(u8, c.lua_tolstring(state, -1, &outputs_length).?[0..outputs_length], "all");
+        c.lua_settop(state, -2);
+        if (outputs_type != c.type_nil and (!all_outputs or role != .layer_surface))
+            return error.InvalidOutputSelector;
         const declaration: platform.SurfaceDeclaration = switch (role) {
             .toplevel => blk: {
                 const title = try requiredString(allocator, state, -1, "title");
@@ -629,6 +721,7 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
                 errdefer allocator.free(namespace);
                 const output = try optionalString(allocator, state, -1, "output");
                 errdefer if (output) |value| allocator.free(value);
+                if (all_outputs and output != null) return error.ConflictingOutputSelectors;
                 const layer_surface: platform.LayerSurfaceDeclaration = .{
                     .id = window_id,
                     .namespace = namespace,
@@ -665,6 +758,7 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
         window.* = .{
             .declaration = declaration,
             .content_reference = content_reference,
+            .all_outputs = all_outputs,
         };
         initialized += 1;
         c.lua_settop(state, -2);
@@ -1201,4 +1295,43 @@ test "deferred application permits legacy standalone windows but rejects eager s
             try std.testing.expectEqual(@as(usize, 1), application.windows.len);
         }
     }
+}
+
+test "all-output layers materialize stable independent callbacks and retain disconnected names" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 2);
+    c.lua_setglobal(state, "ouro");
+    var application = try Application.load(std.testing.allocator, state,
+        \\return ouro.app { id='dev.test.outputs', windows={
+        \\ ouro.layer_surface {id='panel', namespace='test', outputs='all',
+        \\   layer='top', height=40, anchors={'top','left','right'},
+        \\   content=function(output) return output end},
+        \\ ouro.window {id='settings', title='Settings', content=function() return 'settings' end},
+        \\} }
+    );
+    defer application.deinit();
+    try application.extractOutputTemplates();
+    try std.testing.expectEqual(@as(usize, 1), application.windows.len);
+    try std.testing.expectEqual(@as(usize, 1), application.output_templates.len);
+    try std.testing.expect(try application.expandOutput("DP-1", 4));
+    const first_reference = application.windows[1].content_reference;
+    try std.testing.expect(try application.expandOutput("eDP-1", 4));
+    try std.testing.expect(!(try application.expandOutput("DP-1", 4)));
+    try std.testing.expectEqual(first_reference, application.windows[1].content_reference);
+    for (application.windows[1..], [_][]const u8{ "DP-1", "eDP-1" }) |window, expected| {
+        try std.testing.expectEqualStrings(expected, window.declaration.layer_surface.output.?);
+        _ = c.lua_rawgeti(state, c.registry_index, window.content_reference);
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 1, 0, 0, null));
+        var length: usize = 0;
+        const value = c.lua_tolstring(state, -1, &length).?;
+        try std.testing.expectEqualStrings(expected, value[0..length]);
+        c.lua_settop(state, -2);
+    }
+    // Seeing only the remaining output does not discard the disconnected one.
+    try std.testing.expect(!(try application.expandOutput("eDP-1", 4)));
+    try std.testing.expectEqual(@as(usize, 3), application.windows.len);
+    try std.testing.expectError(error.WindowCapacityExceeded, application.expandOutput("HDMI-A-1", 3));
+    try std.testing.expect(try application.expandOutput("HDMI-A-1", 4));
+    try std.testing.expectEqualStrings("panel@8:HDMI-A-1", application.windows[3].declaration.id());
 }

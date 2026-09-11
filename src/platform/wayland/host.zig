@@ -2038,7 +2038,10 @@ pub const Host = struct {
                     window.pending_redraw = true;
                     try self.sink.configured(window.handle, window.width, window.height);
                 },
-                .closed => if (window.recreate) {
+                // A named surface remains desired across hotplug. The layer
+                // closed event may precede wl_registry.global_remove.
+                .closed => if (window.recreate or window.layer_state.?.output != null) {
+                    window.recreate = true;
                     window.state = .closing;
                     window.pending_redraw = false;
                 } else try self.sink.closeRequested(window.handle),
@@ -2396,6 +2399,7 @@ pub const Host = struct {
         const owned = try self.allocator.dupe(u8, name);
         if (output.name) |old| self.allocator.free(old);
         output.name = owned;
+        if (self.workspaces) |*client| try client.nameOutput(output.handle.?, name);
         std.log.info("Wayland output available: {s}", .{name});
         try self.resumeWaitingOutputs();
     }
@@ -2408,6 +2412,7 @@ pub const Host = struct {
                 window.recreate = true;
                 window.pending_redraw = false;
             }
+            if (self.workspaces) |*client| try client.removeOutput(output.handle.?);
             try wayring.client.sendRequest(
                 protocol.wl_output,
                 &self.connection.objects,
@@ -2824,7 +2829,10 @@ pub const Host = struct {
             // A frame terminates the preceding logical group. In particular,
             // it can follow leave, after that event has cleared focus.
             .frame => if (self.pointer_focus) |window| try self.sink.pointer(.{ .frame = window }),
-            .axis_relative_direction, .warp => return error.UnsupportedPointerEventVersion,
+            // Version 9 describes physical direction separately. Scroll views
+            // use the compositor-adjusted axis delta, including natural scroll.
+            .axis_relative_direction => {},
+            .warp => return error.UnsupportedPointerEventVersion,
         }
     }
 

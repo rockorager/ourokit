@@ -100,6 +100,7 @@ pub const UiBuild = struct {
     medium_candidates: []const text.FontHandle = &.{},
     text_configuration_revision: u64 = 0,
     widget_theme: ?theming.Theme = null,
+    root_padding: f32 = design.tokens.foundation.spacing_3,
     theme_fonts: ?*ThemeFonts = null,
     images: ?*image_service.Service = null,
     image_scale: f32 = 1,
@@ -215,7 +216,7 @@ pub const UiBuild = struct {
                 .id = 1,
                 .parent = null,
                 .object = .{ .box = .{
-                    .padding = .all(design.tokens.foundation.spacing_3),
+                    .padding = .all(self.root_padding),
                     .background = theme.colors.background,
                 } },
             });

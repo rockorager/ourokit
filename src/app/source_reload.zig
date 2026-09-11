@@ -160,7 +160,7 @@ pub const SourceReload = struct {
             );
         const prepared = candidate catch |err| return err;
         const candidate_generation = prepared;
-        errdefer candidate_generation.destroy();
+        self.candidate = candidate_generation;
         if (candidate_generation.application_ready and
             !std.mem.eql(u8, candidate_generation.application.id, self.active_generation.application.id))
         {
@@ -171,6 +171,7 @@ pub const SourceReload = struct {
                 candidate_generation.snapshot.entry_name,
                 error.ApplicationIdChanged,
             );
+            self.discard();
             return error.ApplicationIdChanged;
         }
         if (candidate_generation.application_ready and
@@ -183,15 +184,24 @@ pub const SourceReload = struct {
                 candidate_generation.snapshot.entry_name,
                 error.ApplicationActionsChanged,
             );
+            self.discard();
             return error.ApplicationActionsChanged;
         }
-        self.candidate = candidate_generation;
     }
 
+    /// Rejects a candidate without dropping ownership of its pending work.
+    /// `prepare` reserves retirement capacity before creating the candidate.
     pub fn discard(self: *SourceReload) void {
         const candidate = self.candidate orelse return;
-        candidate.destroy();
-        self.candidate = null;
+        for (&self.retiring_generations) |*entry| if (entry.* == null) {
+            entry.* = .{
+                .generation = candidate,
+                .native_state_detached = true,
+            };
+            self.candidate = null;
+            return;
+        };
+        @panic("source candidate discard without retirement capacity");
     }
 
     /// Prepares every retained window against the candidate generation. The
@@ -203,6 +213,21 @@ pub const SourceReload = struct {
             self.recordBuildError(error.SourceWindowSetChanged);
             self.discard();
             return error.SourceWindowSetChanged;
+        }
+        if (candidate.prepared_builds.len != targets.len) {
+            const builds = try self.allocator.alloc(lua.PreparedBuild, targets.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (builds[0..initialized]) |*prepared| prepared.deinit();
+                self.allocator.free(builds);
+            }
+            for (builds) |*prepared| {
+                try prepared.init(self.allocator, candidate.vm.state, if (candidate.services) |services| services.paragraph_sources else null, candidate.config.node_capacity, candidate.config.semantic_text_capacity);
+                initialized += 1;
+            }
+            for (candidate.prepared_builds) |*prepared| prepared.deinit();
+            self.allocator.free(candidate.prepared_builds);
+            candidate.prepared_builds = builds;
         }
         for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
             const target = findWindowTarget(targets, window.declaration.id()) orelse {
@@ -322,8 +347,7 @@ pub const SourceReload = struct {
                     candidate.snapshot.entry_name,
                     err,
                 );
-                candidate.destroy();
-                self.candidate = null;
+                self.discard();
                 self.candidate_failure = err;
                 return;
             };
@@ -338,8 +362,7 @@ pub const SourceReload = struct {
                     candidate.snapshot.entry_name,
                     err,
                 );
-                candidate.destroy();
-                self.candidate = null;
+                self.discard();
                 self.candidate_failure = err;
             }
             if (self.candidate != null and candidate.application_ready and
@@ -353,8 +376,7 @@ pub const SourceReload = struct {
                     candidate.snapshot.entry_name,
                     err,
                 );
-                candidate.destroy();
-                self.candidate = null;
+                self.discard();
                 self.candidate_failure = err;
             }
             return;
@@ -679,8 +701,75 @@ test "failed candidates preserve active generation and valid source commits" {
     try std.testing.expect(reload.active().vm.globalBoolean("active_ran"));
     try std.testing.expectEqual(@as(usize, 0), active.vm.activeTaskCount());
     reload.markRetiringNativeStateDetached(committed.retired);
-    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+    try std.testing.expectEqual(@as(usize, 2), reload.collectRetired());
     try std.testing.expectEqual(@as(usize, 0), reload.retiringCount());
+}
+
+test "rejected candidate retains ownership while a waiting sleep is canceled" {
+    var provider = try bundle.SourceProvider.initEmbedded(
+        std.testing.allocator,
+        "candidate.lua",
+        replacement_source,
+    );
+    defer provider.deinit();
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 2, 2);
+    defer scheduler.deinit();
+    const initial_snapshot = try bundle.SourceProvider.initEmbedded(
+        std.testing.allocator,
+        "initial.lua",
+        initial_source,
+    );
+    var initial_provider = initial_snapshot;
+    defer initial_provider.deinit();
+    const initial = try SourceGeneration.create(
+        std.testing.allocator,
+        &scheduler,
+        &loop,
+        try initial_provider.snapshot(std.testing.io, std.testing.allocator),
+        null,
+        .{ .node_capacity = 8 },
+        null,
+    );
+    var reload: SourceReload = undefined;
+    reload.init(std.testing.allocator, std.testing.io, &provider, &scheduler, &loop, null, .{ .node_capacity = 8 }, initial);
+    defer reload.deinit();
+
+    try reload.prepare();
+    const rejected = reload.candidate.?;
+    _ = try rejected.vm.spawnApplication("local ouro = require('ouro'); ouro.sleep(60000)");
+    while (scheduler.takeRunnable()) |handle| try reload.resumeRunnable(handle);
+    try std.testing.expectEqual(@as(usize, 1), rejected.vm.activeTaskCount());
+    var runtime: WindowRuntime = .{};
+    const targets = [_]WindowTarget{.{
+        .id = "main",
+        .runtime = &runtime,
+        .size = .{ .width = 320, .height = 200 },
+    }};
+    try std.testing.expectError(
+        error.WindowRuntimeNotReadyForSourcePreparation,
+        reload.prepareApplication(&targets),
+    );
+    try std.testing.expect(reload.active() == initial);
+    try std.testing.expect(reload.candidate == null);
+    try std.testing.expectEqual(@as(usize, 1), reload.retiringCount());
+
+    try reload.beginRetirement();
+    try scheduler.applyQueuedCancellations();
+    while (loop.hasPendingTimerKernelWork()) {
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .operation_cancel => {},
+            else => return error.UnexpectedCompletion,
+        }
+    }
+    while (scheduler.takeRunnable()) |handle| try reload.resumeRunnable(handle);
+    try std.testing.expectEqual(@as(usize, 0), rejected.vm.activeTaskCount());
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+    try std.testing.expect(reload.active() == initial);
 }
 
 test "disk reload keeps active generation while candidate requires modules" {
@@ -1084,7 +1173,7 @@ test "a later window build failure leaves every retained window on the active ge
     try std.testing.expect(first_id != (try runtimes[0].semantics.findPath("panel/content/item/label")).id);
     try std.testing.expectEqualStrings("Active second", (try runtimes[1].semantics.findPath("panel/content/item/label")).label);
     try reload.beginRetirement();
-    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+    try std.testing.expectEqual(@as(usize, 2), reload.collectRetired());
 
     for (&runtimes, 0..) |*runtime, index| {
         try runtime.reconcile(.{ .width = 320, .height = 200 }, &candidate.ui_build, candidate.application.windows[index].content_reference);
