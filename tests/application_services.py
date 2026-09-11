@@ -41,7 +41,7 @@ def request(path, method, params=None):
             if not chunk:
                 raise AssertionError(f"connection closed before {method} replied")
             response.extend(chunk)
-            assert len(response) <= 256 * 1024
+            assert len(response) <= 4 * 1024 * 1024
         value = json.loads(response.split(b"\n", 1)[0])
         assert value["jsonrpc"] == "2.0" and value["id"] == 1, value
         if "result" in value:
@@ -76,7 +76,7 @@ class RpcStream:
             self.buffer.extend(chunk)
         line, _, remaining = self.buffer.partition(b"\n")
         self.buffer = bytearray(remaining)
-        assert len(line) < 256 * 1024
+        assert len(line) < 4 * 1024 * 1024
         return json.loads(line)
 
     def quiet(self):
@@ -494,7 +494,7 @@ return o.app {
                     oversized.settimeout(8)
                     oversized.connect(str(path))
                     try:
-                        oversized.sendall(b" " * (256 * 1024) + b"\n")
+                        oversized.sendall(b" " * (4 * 1024 * 1024) + b"\n")
                         assert oversized.recv(1) == b""
                     except (BrokenPipeError, ConnectionResetError):
                         pass

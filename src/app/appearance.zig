@@ -4,7 +4,7 @@ const io = @import("../loop/io_uring.zig");
 const mcp = @import("../mcp/root.zig");
 
 const receive_capacity = 16 * 1024;
-const message_capacity = 256 * 1024;
+const message_capacity = mcp.max_message_bytes;
 const resource_uri = "ouro://settings/appearance/color_scheme";
 const subscription_id_key = "io.modelcontextprotocol/subscriptionId";
 const retry_min_ns = 250 * std.time.ns_per_ms;
@@ -558,7 +558,7 @@ test "appearance rejects uncorrelated replies and terminal subscription results"
     }
 }
 
-test "appearance accepts 256 KiB including newline and rejects one extra byte" {
+test "appearance accepts 4 MiB including newline and rejects one extra byte" {
     for ([_]usize{ 0, 1 }) |extra| {
         var store: Store = .{ .current = .{ .color_scheme = .dark } };
         var client: Client = .{ .allocator = std.testing.allocator, .store = &store };
@@ -573,7 +573,7 @@ test "appearance accepts 256 KiB including newline and rejects one extra byte" {
             \\{"revision":"1","exists":true,"value":"light"}
         );
         defer std.testing.allocator.free(reply);
-        const padded = try std.testing.allocator.alloc(u8, 256 * 1024 + extra);
+        const padded = try std.testing.allocator.alloc(u8, message_capacity + extra);
         defer std.testing.allocator.free(padded);
         @memset(padded, ' ');
         @memcpy(padded[0 .. reply.len - 1], reply[0 .. reply.len - 1]);
@@ -737,7 +737,7 @@ fn testSocketRequest(fd: linux.fd_t, method: []const u8) !u64 {
 }
 
 fn testRequest(bytes: []const u8, method: []const u8) !u64 {
-    try std.testing.expect(bytes.len <= 256 * 1024);
+    try std.testing.expect(bytes.len <= message_capacity);
     try std.testing.expectEqual(@as(u8, '\n'), bytes[bytes.len - 1]);
     try std.testing.expect(std.mem.indexOfScalar(u8, bytes, 0) == null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(bytes));

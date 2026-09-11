@@ -34,7 +34,7 @@ def request(address, method, params):
             block = connection.recv(65536)
             assert block, "daemon closed before reply"
             wire.extend(block)
-            assert len(wire) <= 256 * 1024
+            assert len(wire) <= 4 * 1024 * 1024
         reply = json.loads(wire)
         assert reply["id"] == 73 and "error" not in reply, reply
         assert reply["result"]["resultType"] == "complete", reply

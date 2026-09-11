@@ -46,7 +46,7 @@ class Bridge:
             if b"\n" in self.buffer:
                 wire, _, tail = self.buffer.partition(b"\n")
                 self.buffer = bytearray(tail)
-                assert len(wire) + 1 <= 256 * 1024
+                assert len(wire) + 1 <= 4 * 1024 * 1024
                 message = json.loads(wire)
                 assert message["jsonrpc"] == "2.0", message
                 self.pending.append(message)

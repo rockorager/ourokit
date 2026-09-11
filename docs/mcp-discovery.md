@@ -92,7 +92,7 @@ Forward tool calls with bridge-owned downstream IDs; correlate and translate
 cancellation and subscription IDs. Never automatically retry tool calls.
 
 Only complete results are supported; absent `resultType` falls back to complete.
-Enforce the 256 KiB wire bound and bounded requests, subscriptions and output.
+Enforce the 4 MiB wire bound and bounded requests, subscriptions and output.
 Return honest errors for disconnected apps, stale removed tools, capacity
 limits and unsupported protocol versions. One slow peer must not create
 unbounded queues or affect another bridge process.

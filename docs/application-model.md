@@ -272,7 +272,7 @@ Successful catalog-changing reloads invalidate cached lists immediately;
 unchanged catalogs and rejected candidates do not. See the
 [discovery contract](mcp-discovery.md) for offline export and runtime publication.
 
-Records are newline-delimited JSON-RPC and bounded to 256 KiB including newline.
+Records are newline-delimited JSON-RPC and bounded to 4 MiB including newline.
 Replies correlate by request ID and can arrive out of order. Each connection
 allows one custom action in flight; a second receives a `Busy` tool error.
 Runtime status and cancellation remain available while an action sleeps.

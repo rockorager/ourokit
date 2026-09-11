@@ -9,9 +9,10 @@ const std = @import("std");
 pub const Value = std.json.Value;
 pub const schema = @import("schema.zig");
 pub const protocol_version = "2026-07-28";
+pub const max_message_bytes = 4 * 1024 * 1024;
 pub const Config = struct {
-    max_message_bytes: usize = 256 * 1024,
-    max_outbound_message_bytes: usize = 256 * 1024,
+    max_message_bytes: usize = max_message_bytes,
+    max_outbound_message_bytes: usize = max_message_bytes,
     max_pending_calls: usize = 32,
     max_events: usize = 32,
     max_transmits: usize = 32,
@@ -149,7 +150,7 @@ fn Peer(comptime server: bool) type {
 
         pub fn init(a: std.mem.Allocator, config: Config) !Self {
             if (config.max_message_bytes == 0 or config.max_outbound_message_bytes == 0 or config.max_pending_calls == 0 or config.max_events == 0 or config.max_transmits == 0) return error.InvalidCapacity;
-            if (config.max_message_bytes > 256 * 1024 or config.max_outbound_message_bytes > 256 * 1024) return error.InvalidCapacity;
+            if (config.max_message_bytes > max_message_bytes or config.max_outbound_message_bytes > max_message_bytes) return error.InvalidCapacity;
             return .{ .allocator = a, .config = config, .input = .init(a), .events = .init(a), .transmits = .init(a), .pending = .init(a) };
         }
         pub fn deinit(self: *Self) void {
@@ -177,13 +178,17 @@ fn Peer(comptime server: bool) type {
         }
         fn enqueue(self: *Self, value: anytype) !void {
             if (self.transmits.items.len == self.config.max_transmits) return error.TransmitCapacityExceeded;
-            const storage = try self.allocator.alloc(u8, self.config.max_outbound_message_bytes);
-            defer self.allocator.free(storage);
-            var writer: std.Io.Writer = .fixed(storage);
-            std.json.Stringify.value(value, .{}, &writer) catch return error.MessageTooLarge;
-            writer.writeByte('\n') catch return error.MessageTooLarge;
-            const bytes = try self.allocator.dupe(u8, writer.buffered());
+            var count_buffer: [1024]u8 = undefined;
+            var counter: std.Io.Writer.Discarding = .init(&count_buffer);
+            std.json.Stringify.value(value, .{}, &counter.writer) catch return error.MessageTooLarge;
+            counter.writer.writeByte('\n') catch return error.MessageTooLarge;
+            const length = counter.fullCount();
+            if (length > self.config.max_outbound_message_bytes) return error.MessageTooLarge;
+            const bytes = try self.allocator.alloc(u8, @intCast(length));
             errdefer self.allocator.free(bytes);
+            var writer: std.Io.Writer = .fixed(bytes);
+            std.json.Stringify.value(value, .{}, &writer) catch unreachable;
+            writer.writeByte('\n') catch unreachable;
             try self.transmits.append(.{ .allocator = self.allocator, .bytes = bytes });
         }
         fn sendRequest(self: *Self, method: []const u8, params: ?Value, id: ?Value) !void {
@@ -511,6 +516,72 @@ test "failed outbound serialization is bounded and leaves call state unchanged" 
     try std.testing.expectError(error.MessageTooLarge, client.call(.{ .method = "tools/list" }));
     try std.testing.expectEqual(0, client.pendingCallCount());
     try std.testing.expect(client.takeTransmit() == null);
+}
+
+test "4 MiB bounds are newline inclusive, asymmetric, and account for JSON escaping" {
+    const a = std.testing.allocator;
+    const old_limit = 256 * 1024;
+
+    var receiver = try Server.init(a, .{ .max_message_bytes = max_message_bytes, .max_outbound_message_bytes = 1024 });
+    defer receiver.deinit();
+    const inbound = try a.alloc(u8, old_limit + 1);
+    defer a.free(inbound);
+    @memset(inbound, ' ');
+    @memcpy(inbound[0..2], "{}");
+    inbound[inbound.len - 1] = '\n';
+    try std.testing.expectEqual(inbound.len, try receiver.feed(inbound));
+
+    var sender = try Client.init(a, .{ .max_message_bytes = 1024, .max_outbound_message_bytes = max_message_bytes });
+    defer sender.deinit();
+    const escaped = try a.alloc(u8, old_limit);
+    defer a.free(escaped);
+    for (escaped, 0..) |*byte, i| byte.* = if (i % 2 == 0) '"' else '\\';
+    var escaped_params = try object(a, .{.{ "value", string(escaped) }});
+    defer escaped_params.object.deinit(a);
+    try sender.notify("test/escaped", escaped_params);
+    var escaped_tx = sender.takeTransmit().?;
+    defer escaped_tx.deinit();
+    try std.testing.expect(escaped_tx.bytes.len > old_limit);
+    try std.testing.expect(escaped_tx.bytes.len <= max_message_bytes);
+    const decoded = try std.json.parseFromSlice(Value, a, escaped_tx.bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(escaped, decoded.value.object.get("params").?.object.get("value").?.string);
+
+    var probe_params = try object(a, .{.{ "value", string("") }});
+    defer probe_params.object.deinit(a);
+    const prefix = "{\"jsonrpc\":\"2.0\",\"method\":\"test/exact\",\"params\":{\"value\":\"";
+    const suffix = "\"}}\n";
+    const payload = try a.alloc(u8, max_message_bytes - prefix.len - suffix.len);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    probe_params.object.getPtr("value").?.* = string(payload);
+    try sender.notify("test/exact", probe_params);
+    var exact = sender.takeTransmit().?;
+    defer exact.deinit();
+    try std.testing.expectEqual(max_message_bytes, exact.bytes.len);
+    try std.testing.expectEqualStrings(prefix, exact.bytes[0..prefix.len]);
+    try std.testing.expectEqualStrings(payload, exact.bytes[prefix.len .. exact.bytes.len - suffix.len]);
+    try std.testing.expectEqualStrings(suffix, exact.bytes[exact.bytes.len - suffix.len ..]);
+    probe_params.object.getPtr("value").?.* = string(payload[0 .. payload.len - 1]);
+    try sender.notify("test/exact", probe_params);
+    var under = sender.takeTransmit().?;
+    under.deinit();
+    const over = try a.alloc(u8, payload.len + 1);
+    defer a.free(over);
+    @memset(over, 'x');
+    probe_params.object.getPtr("value").?.* = string(over);
+    try std.testing.expectError(error.MessageTooLarge, sender.notify("test/exact", probe_params));
+}
+
+test "tiny outbound frames do not allocate the configured maximum" {
+    var storage: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&storage);
+    var client = try Client.init(fba.allocator(), .{});
+    defer client.deinit();
+    try client.notify("test/tiny", null);
+    var tx = client.takeTransmit().?;
+    defer tx.deinit();
+    try std.testing.expect(tx.bytes.len < storage.len);
 }
 
 fn allocationLifecycle(a: std.mem.Allocator) !void {

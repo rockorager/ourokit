@@ -11,7 +11,7 @@ multi-instance application routing remain separate from discovery metadata.
 Use MCP revision `2026-07-28`, JSON-RPC 2.0, and UTF-8 JSON records terminated by
 one newline over Unix stream sockets. A connection may carry concurrent requests
 and resource subscriptions; correlate replies by request ID, not wire order.
-Bound records to 256 KiB including the delimiter. Preserve each host's existing
+Bound records to 4 MiB including the delimiter. Preserve each host's existing
 event-loop ownership, peer checks, short-write handling, and cancellation rules.
 
 Every request carries `params._meta` with
@@ -199,7 +199,7 @@ prints the current color scheme.
 
 Every source generation owns 16 concurrent client slots by default, shared by
 requests and subscriptions. Each uses an independent Unix connection, bounded
-256 KiB records and a 64 KiB receive chunk. Scope cancellation, reload, and exit
+4 MiB records and a 64 KiB receive chunk. Scope cancellation, reload, and exit
 cancel and drain active `io_uring` operations before releasing their buffers;
 this also covers a callback suspended on another resource. Outbound clients
 are available regardless of whether the app enables an inbound server.
