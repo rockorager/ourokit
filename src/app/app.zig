@@ -13,7 +13,7 @@ pub const App = struct {
     loop: IoLoop,
     scheduler: Scheduler,
     lua_vm: LuaVm,
-    varlink_client: @import("../lua/root.zig").VarlinkClient,
+    mcp_client: @import("../lua/root.zig").McpClient,
     turn: turn.Coordinator = .{},
 
     pub fn init(self: *App, allocator: std.mem.Allocator) !void {
@@ -23,12 +23,12 @@ pub const App = struct {
         errdefer self.scheduler.deinit();
         try self.lua_vm.init(allocator, &self.scheduler, &self.loop);
         errdefer self.lua_vm.deinit();
-        try self.varlink_client.init(allocator, &self.lua_vm, &self.loop, 16);
+        try self.mcp_client.init(allocator, &self.lua_vm, &self.loop, 16);
         self.turn = .{};
     }
 
     pub fn deinit(self: *App) void {
-        self.varlink_client.deinit();
+        self.mcp_client.deinit();
         self.lua_vm.deinit();
         self.scheduler.deinit();
         self.loop.deinit();
@@ -76,9 +76,9 @@ pub const App = struct {
     fn dispatchCompletion(self: *App, completion: std.os.linux.io_uring_cqe) !void {
         switch (self.loop.dispatch(completion)) {
             .file, .signal_wakeup => return error.UnownedIoCompletion,
-            .socket => |socket| if (!(try self.varlink_client.dispatch(socket)))
+            .socket => |socket| if (!(try self.mcp_client.dispatch(socket)))
                 return error.UnownedIoCompletion,
-            .operation_cancel => try self.varlink_client.collectCanceled(),
+            .operation_cancel => try self.mcp_client.collectCanceled(),
             .timer_wakeup, .timer_control => while (try self.loop.takeExpired()) |timeout|
                 try self.lua_vm.markTimeoutCompleted(timeout.operation),
             .foreign => return error.ForeignCompletion,

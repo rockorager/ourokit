@@ -21,7 +21,7 @@ src/
   ourokit.zig              library exports
   main.zig                 generic declarative Lua application host
   core/                    dependency-light values and handles
-  varlink/                 sans-I/O client/server protocol state machines
+  mcp/                     sans-I/O MCP client/server and JSON Schema validation
   loop/                    raw io_uring ownership and operations
   fs/                      language-neutral asynchronous file operations
   task/                    language-neutral tasks, scopes, resources

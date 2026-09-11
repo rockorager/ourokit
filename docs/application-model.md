@@ -17,12 +17,16 @@ local ouro = require("ouro")
 
 return ouro.app {
   id = "dev.ouro.example",
-  interface = [[
-    interface dev.ouro.example
-    method Ping() -> (reply: string)
-  ]],
   actions = {
-    Ping = function() return { reply = "pong" } end,
+    Ping = {
+      description = "Return a greeting without opening the UI.",
+      inputSchema = { type = "object", additionalProperties = false },
+      outputSchema = {
+        type = "object", properties = { reply = { type = "string" } },
+        required = { "reply" }, additionalProperties = false,
+      },
+      handler = function() return { reply = "pong" } end,
+    },
   },
   run = function(context)
     local clicked = ouro.signal(false)
@@ -231,18 +235,51 @@ interactivity update transactionally.
 ## Application lifetime and UI activation
 
 An application can run without windows. Its entry module declares shared state,
-the optional Varlink interface and action handlers. `run(context)` initializes
+the optional MCP tools and action handlers. `run(context)` initializes
 the UI only when requested. Actions and window callbacks share the same Lua VM
 and closures; invoking a method never implicitly initializes Wayland.
 
 Omitting `actions` (or using nil) starts no server. `actions = {}` enables
-`dev.ourokit.runtime` (`Status`, `Reload`, `Activate`) and standard introspection.
-A populated table requires native Varlink IDL in `interface`; each declared
-method must have exactly one handler. The application's interface is registered
-separately from the runtime interface on the same socket.
+`runtime.status`, `runtime.reload`, `runtime.activate`, `server/discover`, and
+`tools/list`. Each action has a description, `inputSchema`, `outputSchema`, and
+handler. The table key is the exact tool name; `runtime.` names are reserved.
+Use `tools/call` with `{name, arguments}`. There is no `interface` field, IDL,
+qualified-method alias, initialization handshake, or old wire protocol.
+
+Schemas are validated before a candidate generation can commit. The supported
+JSON Schema subset is deliberately closed: `type` (one type or an array of
+types), `properties`, `required`, `additionalProperties` (boolean or schema),
+`items`, `enum`, `anyOf`, `title`, `description`, and boolean schemas. Types are
+`object`, `array`, `string`, `number`, `integer`, `boolean`, and `null`. Input and
+output roots must declare `type = "object"`. Unknown keywords, including `$ref`,
+`format`, numeric bounds, and string patterns, reject the declaration rather
+than being silently ignored. Nesting is bounded to 64 levels. Numeric validation
+compares decimal lexemes exactly; integers include `1.0` and `1e0`, but not a
+fraction rounded by floating point. Numeric exponent/normalized scale values
+outside signed 64-bit range fail numeric constraints. Native callers must run
+`mcp.schema.check` before `validate`.
+
+Successful action output must match its declared schema and is returned in
+`structuredContent`, with the same JSON in a text content block. A nil Lua
+return means `{}`. `ouro.action_error(code, parameters)` produces `isError: true`
+with `structuredContent = {error = {code, message, parameters}}`; errors need no
+IDL declaration. Lua exceptions and invalid output become `ActionFailed` tool
+errors. Discovery wraps each success output schema with an `anyOf` branch for
+this common error envelope. Unknown tools and invalid arguments use JSON-RPC
+errors instead. Lists/discovery use `ttlMs: 0` and `cacheScope: "private"`.
+
+Records are newline-delimited JSON-RPC and bounded to 256 KiB including newline.
+Replies correlate by request ID and can arrive out of order. Each connection
+allows one custom action in flight; a second receives a `Busy` tool error.
+Runtime status and cancellation remain available while an action sleeps.
+`notifications/cancelled` with `requestId` cancels that action; its terminal tool
+error retires the request. Disconnect and source-generation retirement also
+cancel actions without resuming their old Lua continuations. The server admits
+at most eight same-UID peers and owns separate bounded read/write operations.
+See the [MCP contract](mcp.md) for request metadata and result-type rules.
 
 Service applications use `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`.
-Systemd socket activation (`Accept=no`, `FileDescriptorName=varlink`) passes an
+Systemd socket activation (`Accept=no`, `FileDescriptorName=mcp`) passes an
 already-listening socket through `LISTEN_FDS`. Ourokit loads only the application
 declaration and serves requests until `Activate` asks for UI. It never unlinks
 the systemd-owned socket. With no connections or tasks, the headless service
@@ -268,7 +305,7 @@ thread's previous mask after teardown and preserves ignored signal dispositions.
 
 Headless reload validates a fresh declaration without invoking `run`. UI reload
 prepares a fresh UI in a candidate source generation and atomically replaces the
-active generation only after its windows, interface and handlers validate.
+active generation only after its windows, schemas and handlers validate.
 Reload resets Lua state. Server enablement remains restart-only.
 
 ## Standalone subprocess dialogs
@@ -279,7 +316,7 @@ stdin, close that pipe to delimit the request, and read a decision from stdout.
 `ouro.stdout.write(bytes)` and `ouro.stderr.write(bytes)` complete all bytes;
 all three operations yield only the calling task, including under backpressure.
 Runtime diagnostics use stderr. `ouro.json.encode`, `ouro.json.decode` and
-`ouro.json.null` provide JSON conversion independently of any Varlink server.
+`ouro.json.null` provide JSON conversion independently of any MCP server.
 Decoded arrays preserve their array identity, even when empty. Use
 `ouro.json.array()` for a new empty array or `ouro.json.array(sequence)` to mark
 a dense sequence explicitly. Plain `{}` encodes as an object.
@@ -290,7 +327,11 @@ output as no permission granted, and cancel the child when its request ends.
 See the [permission dialog](../examples/permission-dialog/app.lua) and
 [Contacts service](../examples/contacts/app.lua).
 
-Outbound `ouro.varlink.call` is available independently of inbound server opt-in.
+Outbound `ouro.mcp.call(address, toolName, arguments)` is available independently
+of inbound server opt-in. It returns `{result, error}`: `result` is the complete
+MCP result (including `structuredContent` and `isError`), while `error` is a
+JSON-RPC error. Use `ouro.mcp.request` for ordinary non-tool requests and
+`ouro.mcp.subscribe` for resource notifications. There are no automatic retries.
 
 The public surface is deliberately small and its cross-language descriptor ABI
 remains unfrozen. Constructors are specific native decoders, not one generic

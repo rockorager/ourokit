@@ -43,9 +43,9 @@ the same diagnostic is available to the in-app development surface and control
 client. Reload failure is not a process-fatal error.
 
 Production bundles use the same generation machinery with an immutable source
-provider. An application owns an inbound runtime Varlink server only when it
+provider. An application owns an inbound runtime MCP server only when it
 declares an `actions` table; this opt-in is independent of source mutability and
-of outbound `ouro.varlink.call`.
+of outbound `ouro.mcp.call`.
 
 ## Lifetime model
 
@@ -402,7 +402,7 @@ fixed `Application` and `Vm`. The implemented ownership boundary includes:
 
 The first runner integration deliberately accepts only an unchanged window-ID
 set. Added and removed windows still require transactional native-host
-preparation. The process-lifetime Varlink control transport now wakes the shared
+preparation. The process-lifetime MCP control transport now wakes the shared
 event loop and submits the same in-process request used by other producers.
 Module dependency revalidation before commit, stale-candidate supersession,
 persistent state, component-family identity, and post-commit lifecycle hooks
@@ -416,47 +416,41 @@ bindings, UI owns prepared typed snapshots, and `app` orders their transaction.
 
 An application with a non-nil `actions` table exposes a well-known per-user
 endpoint at `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`; omitted/nil actions means no inbound
-server. An empty table is sufficient to enable the default methods and standard
-`org.varlink.service` introspection. The server authenticates the Unix peer UID,
-uses Ourokit's bounded sans-I/O Varlink state machines, and submits accept,
+server. An empty table enables the runtime tools, `server/discover`, and
+`tools/list`. The server authenticates the Unix peer UID,
+uses Ourokit's bounded sans-I/O MCP state machines, and submits accept,
 receive, and send operations through disjoint tags in the shared `io_uring`
 loop. Systemd may own the listening socket and activate the application without
 UI. `ouroctl` addresses the application by ID rather than scanning PID sockets.
 
-The built-in `dev.ourokit.runtime` interface is:
+The built-in tools are `runtime.reload` (returns the committed generation),
+`runtime.status` (returns application ID, active generation, reload/UI state,
+and an optional diagnostic), and `runtime.activate` (accepts an optional
+activation token). Their JSON Schemas are available through `tools/list`.
+Tool execution failures use `isError: true` and a structured error; malformed
+RPC requests and unknown tools use JSON-RPC errors.
 
-```text
-type Diagnostic (phase: string, source: string, message: string)
-Reload() -> (generation: int)
-Status() -> (applicationId: string, activeGeneration: int,
-             reloading: bool, uiActive: bool, diagnostic: ?Diagnostic)
-Activate(activationToken: ?string) -> ()
-error ReloadFailed(phase: string, source: string, message: string)
-error ActivateFailed(message: string)
-error ActionFailed(message: string)
-```
-
-Custom actions are methods of a separately registered application interface;
-they cannot replace runtime methods. IDL and Lua handlers are validated before
+Custom actions are named MCP tools; they cannot replace runtime tools.
+JSON Schemas and Lua handlers are validated before
 commit and replaced together. A headless reload does not invoke the UI factory.
 Calls belong to the source generation that
 accepted them. Reload cancellation returns `ActionFailed` rather than allowing
 a retiring coroutine to resume, and a Lua error fails only that call.
 
 The CLI discovers an app by application ID and calls this endpoint. The server
-keeps the `Reload` call pending without blocking the event loop until the newest
+keeps the `runtime.reload` call pending without blocking the event loop until the newest
 coalesced request either commits or fails. Every caller waiting on that request
 receives the committed generation or the same structured `ReloadFailed` error,
 so `ouroctl reload` has useful shell exit status without polling. Requests that
 arrive during preparation remain queued for the next transaction and cannot be
 satisfied by the in-flight candidate. Discarding that now-stale in-flight
 candidate before commit remains a separate optimization and correctness polish.
-`Status` remains available for development surfaces that observe reload without
+`runtime.status` remains available for development surfaces that observe reload without
 initiating it. The future built-in command will call the same in-process request
 API and will not depend on the control socket.
 
 Automatic watching is optional policy on top. An inotify watcher may debounce
-changes and enqueue `Reload`, but it receives no privileged fast path and
+changes and enqueue a reload, but it receives no privileged fast path and
 cannot weaken snapshot or transactional guarantees.
 
 ## Required verification

@@ -61,7 +61,7 @@ def stop(process):
 
 def contacts(env, directory, artifacts):
     address = directory / "contacts.socket"
-    process = subprocess.Popen(["systemd-socket-activate", f"--listen={address}", "--fdname=varlink",
+    process = subprocess.Popen(["systemd-socket-activate", f"--listen={address}", "--fdname=mcp",
                                 "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY",
                                 str(BINARY), "run", str(ROOT / "examples/contacts/ouro.json"), "--software"],
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -71,22 +71,22 @@ def contacts(env, directory, artifacts):
             if address.exists():
                 break
             time.sleep(.02)
-        people = call(address, "dev.ourokit.contacts.GetContacts")["parameters"]["contacts"]
+        people = call(address, "GetContacts")["structuredContent"]["contacts"]
         assert len(people) == 500 and people[0]["id"] == "ada" and people[-1]["id"] == "person-500"
-        assert call(address, "dev.ourokit.runtime.Status")["parameters"]["uiActive"] is False
-        assert call(address, "dev.ourokit.contacts.SelectContact", {"id": "alan"}) == {"parameters": {}}
-        assert call(address, "dev.ourokit.runtime.Activate") == {"parameters": {}}
+        assert call(address, "runtime.status")["structuredContent"]["uiActive"] is False
+        assert call(address, "SelectContact", {"id": "alan"})["structuredContent"] == {}
+        assert call(address, "runtime.activate")["structuredContent"] == {}
         origin = window(process, 940)
         time.sleep(.4)
         capture(artifacts, "contacts-fallback", origin, (940, 650))
-        assert call(address, "dev.ourokit.contacts.SelectContact", {"id": "ada"}) == {"parameters": {}}
+        assert call(address, "SelectContact", {"id": "ada"})["structuredContent"] == {}
         time.sleep(.3)
         capture(artifacts, "contacts-light", origin, (940, 650))
         pointer(origin, 560, 348)
         type_text("Ada Byron")
         capture(artifacts, "contacts-editing", origin, (940, 650))
         pointer(origin, 650, 400)
-        actual = call(address, "dev.ourokit.contacts.GetContacts")["parameters"]["contacts"][0]["name"]
+        actual = call(address, "GetContacts")["structuredContent"]["contacts"][0]["name"]
         assert actual == "Ada Byron", actual
         if artifacts:
             recorder = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-y", "-f", "x11grab",
@@ -101,21 +101,21 @@ def contacts(env, directory, artifacts):
             subprocess.run(["xdotool", "click", "5"], check=True)
             time.sleep(.04)
         capture(artifacts, "contacts-scrolled", origin, (940, 650))
-        assert call(address, "dev.ourokit.contacts.SelectContact", {"id": "person-480"}) == {"parameters": {}}
-        changed = call(address, "dev.ourokit.contacts.RenameContact", {"id": "person-480", "name": "Distant contact"})
-        assert changed["parameters"]["contact"]["name"] == "Distant contact"
+        assert call(address, "SelectContact", {"id": "person-480"})["structuredContent"] == {}
+        changed = call(address, "RenameContact", {"id": "person-480", "name": "Distant contact"})
+        assert changed["structuredContent"]["contact"]["name"] == "Distant contact"
         time.sleep(.8)
         pointer(origin, 840, 50)
         capture(artifacts, "contacts-terminal", origin, (940, 650))
         if recorder:
             assert recorder.wait(timeout=15) == 0
-        assert call(address, "dev.ourokit.contacts.SelectContact", {"id": "ada"}) == {"parameters": {}}
-        assert call(address, "dev.ourokit.contacts.GetContacts")["parameters"]["contacts"][0]["name"] == "Ada Byron"
+        assert call(address, "SelectContact", {"id": "ada"})["structuredContent"] == {}
+        assert call(address, "GetContacts")["structuredContent"]["contacts"][0]["name"] == "Ada Byron"
         time.sleep(.2)
         pointer(origin, 500, 505)
         out, errors = process.communicate(timeout=8)
         assert process.returncode == 0 and out == b"" and b"panic" not in errors, errors
-        print("PASS: 500 headless contacts, activation, UI rename, scrolling, distant Varlink edit, themes, clean Quit")
+        print("PASS: 500 headless contacts, activation, UI rename, scrolling, distant MCP edit, themes, clean Quit")
     finally:
         if recorder and recorder.poll() is None:
             recorder.terminate()

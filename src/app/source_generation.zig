@@ -17,7 +17,7 @@ pub const Config = struct {
     subscription_capacity: usize = 1024,
     dependency_capacity: usize = 256,
     module_capacity: usize = 64,
-    varlink_call_capacity: usize = 16,
+    mcp_call_capacity: usize = 16,
     /// Borrowed for the generation/config lifetime; copied into each Lua VM.
     runtime_dir: ?[]const u8 = null,
     defer_run: bool = false,
@@ -43,7 +43,7 @@ pub const SourceGeneration = struct {
     allocator: std.mem.Allocator,
     snapshot: bundle.SourceSnapshot,
     vm: lua.Vm,
-    varlink_client: lua.VarlinkClient,
+    mcp_client: lua.McpClient,
     stdio: lua.Stdio,
     signals: lua.Signals,
     shell_workspaces: ?lua.ShellWorkspaces = null,
@@ -172,7 +172,7 @@ pub const SourceGeneration = struct {
         self.services = services;
         self.config = config;
         var vm_initialized = false;
-        var varlink_client_initialized = false;
+        var mcp_client_initialized = false;
         var stdio_initialized = false;
         var signals_initialized = false;
         var shell_workspaces_initialized = false;
@@ -191,7 +191,7 @@ pub const SourceGeneration = struct {
             if (module_loader_initialized) self.module_loader.?.deinit();
             if (self.images) |*images| images.deinit();
             if (stdio_initialized) self.stdio.deinit();
-            if (varlink_client_initialized) self.varlink_client.deinit();
+            if (mcp_client_initialized) self.mcp_client.deinit();
             if (vm_initialized) self.vm.deinit();
             if (shell_workspaces_initialized) self.shell_workspaces.?.deinit();
             if (signals_initialized) self.signals.deinit();
@@ -221,11 +221,11 @@ pub const SourceGeneration = struct {
             return err;
         };
         vm_initialized = true;
-        self.varlink_client.init(
+        self.mcp_client.init(
             allocator,
             &self.vm,
             loop,
-            config.varlink_call_capacity,
+            config.mcp_call_capacity,
         ) catch |err| {
             lua.recordDiagnosticError(
                 diagnostic,
@@ -236,8 +236,8 @@ pub const SourceGeneration = struct {
             );
             return err;
         };
-        varlink_client_initialized = true;
-        try self.stdio.init(allocator, &self.vm, loop, config.varlink_call_capacity);
+        mcp_client_initialized = true;
+        try self.stdio.init(allocator, &self.vm, loop, config.mcp_call_capacity);
         stdio_initialized = true;
         self.signals.initWithApi(
             allocator,
@@ -569,11 +569,11 @@ pub const SourceGeneration = struct {
     }
 
     pub fn dispatchSocket(self: *SourceGeneration, completion: io_loop.SocketCompletion) !bool {
-        return self.varlink_client.dispatch(completion);
+        return self.mcp_client.dispatch(completion);
     }
 
-    pub fn collectCanceledVarlink(self: *SourceGeneration) !void {
-        try self.varlink_client.collectCanceled();
+    pub fn collectCanceledMcp(self: *SourceGeneration) !void {
+        try self.mcp_client.collectCanceled();
         try self.stdio.collectCanceled();
     }
 
@@ -690,7 +690,7 @@ pub const SourceGeneration = struct {
         if (self.module_loader) |*loader| loader.deinit();
         if (self.images) |*images| images.deinit();
         self.stdio.deinit();
-        self.varlink_client.deinit();
+        self.mcp_client.deinit();
         self.vm.deinit();
         if (self.shell_workspaces) |*binding| binding.deinit();
         self.signals.deinit();
@@ -887,9 +887,12 @@ test "headless source generation preserves action state when UI is activated lat
         \\local title = ouro.signal('before')
         \\return ouro.app {
         \\  id = 'dev.ouro.headless',
-        \\  interface = [[interface dev.ouro.headless
-        \\    method Change() -> ()]],
-        \\  actions = { Change = function() title:set('after action') end },
+        \\  actions = { Change = {
+        \\    description = 'Change the title',
+        \\    inputSchema = {type='object', additionalProperties=false},
+        \\    outputSchema = {type='object', additionalProperties=false},
+        \\    handler = function() title:set('after action'); return {} end,
+        \\  } },
         \\  run = function()
         \\    ui_started = true
         \\    ouro.sleep(1)

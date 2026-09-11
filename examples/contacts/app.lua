@@ -61,7 +61,7 @@ local function content()
           ouro.text { key = "title", text = "Contacts", size = 30, flex = 1 },
           ouro.button { key = "theme", label = dark and "Light style" or "Terminal style", on_press = function() terminal:set(not terminal()) end },
         },
-        ouro.text { key = "subtitle", text = "500 contacts. Variable-height rows. One shared Varlink address book." },
+        ouro.text { key = "subtitle", text = "500 contacts. Variable-height rows. One shared MCP address book." },
         ouro.row { key = "panels", gap = 28, cross_alignment = "stretch",
           ouro.virtual_list {
             key = "people", width = 380, height = 440, item_count = #values, estimated_item_height = 132,
@@ -90,7 +90,7 @@ local function content()
             ouro.text { key = "note", text = notes[(current - 1) % #notes + 1] },
             ouro.text_input { key = "rename", text = draft(), on_change = function(value) draft:set(value) end },
             ouro.button { key = "save", label = "Apply name", enabled = draft() ~= "" and draft() ~= person.name, on_press = function() rename(selected(), draft()) end },
-            ouro.text { key = "hint", text = "Selection and names survive scrolling. Varlink edits update this same state." },
+            ouro.text { key = "hint", text = "Selection and names survive scrolling. MCP edits update this same state." },
             ouro.row { key = "exit", gap = 10, cross_alignment = "center",
               ouro.icon { key = "icon", src = "assets/log-out.svg", width = 20, height = 20 },
               ouro.button { key = "quit", label = "Quit", on_press = function() ouro.exit(0) end },
@@ -102,29 +102,42 @@ local function content()
   }
 end
 
+local contact_schema = {
+  type = "object",
+  properties = { id = { type = "string" }, name = { type = "string" }, email = { type = "string" } },
+  required = { "id", "name", "email" }, additionalProperties = false,
+}
+local empty_schema = { type = "object", additionalProperties = false }
+
 return ouro.app {
   id = "dev.ourokit.contacts",
-  interface = [[
-    # A sample address book, available without opening a window.
-    interface dev.ourokit.contacts
-    type Contact (id: string, name: string, email: string)
-    method GetContacts() -> (contacts: []Contact)
-    method SelectContact(id: string) -> ()
-    method RenameContact(id: string, name: string) -> (contact: Contact)
-    error ContactNotFound(id: string)
-  ]],
   actions = {
-    GetContacts = function() return { contacts = contacts() } end,
-    SelectContact = function(params)
-      local index = index_of(params.id)
-      if index == nil then return ouro.action_error("ContactNotFound", { id = params.id }) end
-      select(index)
-    end,
-    RenameContact = function(params)
-      local index = index_of(params.id)
-      if index == nil then return ouro.action_error("ContactNotFound", { id = params.id }) end
-      return { contact = rename(index, params.name) }
-    end,
+    GetContacts = {
+      description = "Read the in-memory address book without opening a window.",
+      inputSchema = empty_schema,
+      outputSchema = { type = "object", properties = { contacts = { type = "array", items = contact_schema } }, required = { "contacts" }, additionalProperties = false },
+      handler = function() return { contacts = contacts() } end,
+    },
+    SelectContact = {
+      description = "Select a contact, updating the UI if it is active.",
+      inputSchema = { type = "object", properties = { id = { type = "string" } }, required = { "id" }, additionalProperties = false },
+      outputSchema = empty_schema,
+      handler = function(params)
+        local index = index_of(params.id)
+        if index == nil then return ouro.action_error("ContactNotFound", { id = params.id }) end
+        select(index)
+      end,
+    },
+    RenameContact = {
+      description = "Replace a contact's name in memory and update the shared UI state.",
+      inputSchema = { type = "object", properties = { id = { type = "string" }, name = { type = "string" } }, required = { "id", "name" }, additionalProperties = false },
+      outputSchema = { type = "object", properties = { contact = contact_schema }, required = { "contact" }, additionalProperties = false },
+      handler = function(params)
+        local index = index_of(params.id)
+        if index == nil then return ouro.action_error("ContactNotFound", { id = params.id }) end
+        return { contact = rename(index, params.name) }
+      end,
+    },
   },
   run = function()
     return { windows = { ouro.window { id = "main", title = "Contacts", width = 940, height = 650, content = content } } }

@@ -412,12 +412,12 @@ pub const SourceReload = struct {
         return error.UnownedSourceOperation;
     }
 
-    pub fn collectCanceledVarlink(self: *SourceReload) !void {
+    pub fn collectCanceledMcp(self: *SourceReload) !void {
         if (self.appearance) |client| try client.collectCanceled();
-        if (self.candidate) |candidate| try candidate.collectCanceledVarlink();
-        try self.active_generation.collectCanceledVarlink();
+        if (self.candidate) |candidate| try candidate.collectCanceledMcp();
+        try self.active_generation.collectCanceledMcp();
         for (self.retiring_generations) |entry| if (entry) |retiring|
-            try retiring.generation.collectCanceledVarlink();
+            try retiring.generation.collectCanceledMcp();
     }
 
     /// Routes completion-phase state to the VM that prepared the operation.
@@ -606,8 +606,9 @@ test "source reload validates process-lifetime application action enablement" {
     for ([_]bool{ false, true }) |asynchronous| {
         try expectActionReload("actions = {},", "", false, asynchronous);
         try expectActionReload("", "actions = {},", false, asynchronous);
-        try expectActionReload("actions = {},", "interface = [[interface dev.ouro.actions\nmethod Ping() -> (reply: string)]], " ++
-            "actions = { Ping = function() return {reply = 'pong'} end },", true, asynchronous);
+        try expectActionReload("actions = {},", "actions = { Ping = {description='Ping', " ++
+            "inputSchema={type='object'}, outputSchema={type='object', properties={reply={type='string'}}, required={'reply'}}, " ++
+            "handler=function() return {reply='pong'} end} },", true, asynchronous);
     }
 }
 

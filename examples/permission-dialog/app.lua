@@ -59,7 +59,7 @@ end
 
 return ouro.app {
   id = "dev.ourokit.permission-dialog",
-  -- No actions or interface: no listening socket, service, or IPC discovery.
+  -- No actions: no listening socket, service, or IPC discovery.
   run = function()
     return { windows = { ouro.window { id = "permission", title = "Screenshot permission", width = 620, height = 420, content = content } } }
   end,

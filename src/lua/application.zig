@@ -4,9 +4,23 @@ const diagnostic = @import("diagnostic.zig");
 const platform = @import("../platform/window.zig");
 const task = @import("../task/root.zig");
 const vm_module = @import("vm.zig");
-const varlink_json = @import("varlink_client.zig");
-const varlink = @import("../varlink/root.zig");
+const mcp_json = @import("mcp_client.zig");
+const mcp = @import("../mcp/root.zig");
 const theming = @import("theme.zig");
+
+pub const ActionSchema = struct {
+    arena: std.heap.ArenaAllocator,
+    tools: std.json.ObjectMap,
+
+    pub fn deinit(self: *ActionSchema) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn tool(self: *const ActionSchema, name: []const u8) ?std.json.Value {
+        return self.tools.get(name);
+    }
+};
 
 pub const Window = struct {
     declaration: platform.SurfaceDeclaration,
@@ -21,7 +35,7 @@ pub const Definition = struct {
     id: []u8,
     theme: ?theming.Theme = null,
     inherited_colors: theming.ColorFields = .initEmpty(),
-    action_schema: ?varlink.Service = null,
+    action_schema: ?ActionSchema = null,
     actions_reference: c_int = c.no_reference,
     run_reference: c_int = c.no_reference,
     legacy_windows: ?[]Window = null,
@@ -168,7 +182,7 @@ pub const Application = struct {
     id: []u8,
     theme: ?theming.Theme = null,
     inherited_colors: theming.ColorFields = .initEmpty(),
-    action_schema: ?varlink.Service = null,
+    action_schema: ?ActionSchema = null,
     actions_reference: c_int,
     run_reference: c_int,
     windows: []Window,
@@ -409,9 +423,9 @@ pub const Application = struct {
         return self.run_reference != c.no_reference;
     }
 
-    pub fn customInterface(self: *const Application) ?*const varlink.Interface {
+    pub fn actionTool(self: *const Application, name: []const u8) ?std.json.Value {
         const schema = &(self.action_schema orelse return null);
-        return &schema.interfaces.items[1];
+        return schema.tool(name);
     }
 
     pub fn startUi(self: *const Application, vm: *vm_module.Vm, scope: task.ScopeHandle, instance_id: []const u8) !vm_module.TaskHandle {
@@ -445,14 +459,15 @@ pub const Application = struct {
         defer c.lua_settop(self.state, top);
         if (!self.hasActions()) return error.ActionNotFound;
         _ = c.lua_rawgeti(self.state, c.registry_index, self.actions_reference);
-        // Names have already been checked against the native IDL methods.
+        // Names and arguments have already been checked against native schemas.
         _ = c.lua_pushlstring(self.state, name.ptr, name.len);
-        if (c.lua_rawget(self.state, -2) != c.type_function) return error.ActionNotFound;
+        if (c.lua_rawget(self.state, -2) != c.type_table) return error.ActionNotFound;
+        if (c.lua_getfield(self.state, -1, "handler") != c.type_function) return error.ActionNotFound;
         const reference = c.luaL_ref(self.state, c.registry_index);
         defer c.luaL_unref(self.state, c.registry_index, reference);
         if (parameters) |value| {
             if (value != .null) {
-                try varlink_json.pushJson(self.state, value);
+                try mcp_json.pushJson(self.state, value);
             } else c.lua_createtable(self.state, 0, 0);
         } else c.lua_createtable(self.state, 0, 0);
         const argument = c.luaL_ref(self.state, c.registry_index);
@@ -491,9 +506,9 @@ pub const Application = struct {
             const owned_name = try arena.dupe(u8, name[0..length]);
             c.lua_settop(vm.state, -2);
             _ = c.lua_getfield(vm.state, -1, "parameters");
-            return .{ .declared_error = .{ .name = owned_name, .parameters = try varlink_json.luaToJson(vm.state, -1, arena, 0, &count) } };
+            return .{ .declared_error = .{ .name = owned_name, .parameters = try mcp_json.luaToJson(vm.state, -1, arena, 0, &count) } };
         }
-        return .{ .output = try varlink_json.luaToJson(vm.state, -1, arena, 0, &count) };
+        return .{ .output = try mcp_json.luaToJson(vm.state, -1, arena, 0, &count) };
     }
 
     pub fn deinit(self: *Application) void {
@@ -554,36 +569,38 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     };
 }
 
-fn parseActionSchema(allocator: std.mem.Allocator, state: *c.State, actions: c_int) !?varlink.Service {
+fn parseActionSchema(allocator: std.mem.Allocator, state: *c.State, actions: c_int) !?ActionSchema {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    const description = try optionalString(allocator, state, -1, "interface");
-    defer if (description) |value| allocator.free(value);
-    var schema: ?varlink.Service = null;
-    errdefer if (schema) |*value| value.deinit();
-    if (description) |source| {
-        schema = try varlink.Service.init(allocator, .{ .vendor = "Ourokit", .product = "Application", .version = "1", .url = "https://github.com/rockorager/ourokit" }, 2);
-        try schema.?.addInterface(source);
-        if (std.mem.eql(u8, schema.?.interfaces.items[1].name, "dev.ourokit.runtime")) return error.ReservedApplicationInterface;
-    }
-    var handler_count: usize = 0;
-    if (actions != c.no_reference) {
-        _ = c.lua_rawgeti(state, c.registry_index, actions);
-        c.lua_pushnil(state);
-        while (c.lua_next(state, -2) != 0) {
-            handler_count += 1;
-            const interface = if (schema) |*value| &value.interfaces.items[1] else return error.ActionInterfaceRequired;
-            var length: usize = 0;
-            const name = c.lua_tolstring(state, -2, &length).?;
-            if (interface.method(name[0..length]) == null) return error.ActionMethodMismatch;
+    if (c.lua_getfield(state, -1, "interface") != c.type_nil) return error.UnsupportedApplicationInterface;
+    c.lua_settop(state, -2);
+    if (actions == c.no_reference) return null;
+    var schema: ActionSchema = .{ .arena = .init(allocator), .tools = .empty };
+    errdefer schema.deinit();
+    const a = schema.arena.allocator();
+    _ = c.lua_rawgeti(state, c.registry_index, actions);
+    c.lua_pushnil(state);
+    while (c.lua_next(state, -2) != 0) {
+        var length: usize = 0;
+        const raw_name = c.lua_tolstring(state, -2, &length).?;
+        const name = try a.dupe(u8, raw_name[0..length]);
+        if (std.mem.startsWith(u8, name, "runtime.")) return error.ReservedActionName;
+        if (name.len > 128) return error.InvalidActionDeclaration;
+        for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return error.InvalidActionDeclaration;
+        const description = try requiredString(a, state, -1, "description");
+        var tool = try mcp.object(a, .{ .{ "name", mcp.string(name) }, .{ "description", mcp.string(description) } });
+        inline for (.{ "inputSchema", "outputSchema" }) |field| {
+            _ = c.lua_getfield(state, -1, field);
+            var count: usize = 0;
+            const value = try mcp_json.luaToJson(state, -1, a, 0, &count);
             c.lua_settop(state, -2);
+            try mcp.schema.check(value);
+            if (!mcp.isString(mcp.get(value, "type"), "object")) return error.ActionSchemaMustBeObject;
+            try tool.object.put(a, field, value);
         }
+        try schema.tools.put(a, name, tool);
+        c.lua_settop(state, -2);
     }
-    var method_count: usize = 0;
-    if (schema) |*value| for (value.interfaces.items[1].members) |member| {
-        if (member == .method) method_count += 1;
-    };
-    if (method_count != handler_count) return error.ActionMethodMismatch;
     return schema;
 }
 
@@ -616,7 +633,7 @@ fn optionalActions(state: *c.State, table: c_int) !c_int {
     c.lua_pushnil(state);
     while (c.lua_next(state, -2) != 0) {
         if (c.lua_type(state, -2) != c.type_string or
-            c.lua_type(state, -1) != c.type_function)
+            c.lua_type(state, -1) != c.type_table)
         {
             c.lua_settop(state, -3);
             c.lua_settop(state, -2);
@@ -625,6 +642,13 @@ fn optionalActions(state: *c.State, table: c_int) !c_int {
         var name_length: usize = 0;
         _ = c.lua_tolstring(state, -2, &name_length);
         if (name_length == 0) {
+            c.lua_settop(state, -3);
+            c.lua_settop(state, -2);
+            return error.InvalidActionDeclaration;
+        }
+        const handler_type = c.lua_getfield(state, -1, "handler");
+        c.lua_settop(state, -2);
+        if (handler_type != c.type_function) {
             c.lua_settop(state, -3);
             c.lua_settop(state, -2);
             return error.InvalidActionDeclaration;
@@ -1116,10 +1140,10 @@ test "application actions remain headless while run builds one UI generation" {
     var application = try Application.load(std.testing.allocator, state,
         \\return ouro.app {
         \\  id = "dev.ouro.contacts",
-        \\  interface = [[interface dev.ouro.contacts
-        \\    method GetContacts() -> (name: string)]],
         \\  actions = {
-        \\    GetContacts = function() return {name = "Ada"} end,
+        \\    GetContacts = { description = 'Get contacts', inputSchema = {type='object'},
+        \\      outputSchema = {type='object', properties={name={type='string'}}, required={'name'}},
+        \\      handler = function() return {name = "Ada"} end },
         \\  },
         \\  run = function(context)
         \\    return { windows = {
@@ -1146,7 +1170,7 @@ test "application actions opt in by table presence, including an empty table" {
         .{ .field = "", .enabled = false },
         .{ .field = "actions = nil,", .enabled = false },
         .{ .field = "actions = {},", .enabled = true },
-        .{ .field = "interface = [[interface dev.ouro.test method Ping() -> ()]], actions = { Ping = function() return {} end },", .enabled = true },
+        .{ .field = "actions = { Ping = {description='Ping', inputSchema={type='object'}, outputSchema={type='object'}, handler=function() return {} end} },", .enabled = true },
     };
     for (cases) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "return ouro.app {{ id = 'dev.ouro.test', {s} windows = {{ ouro.window {{ id = 'main', title = 'Test', content = function() end }} }} }}", .{case.field});
@@ -1198,18 +1222,18 @@ test "named application load reports structured Lua diagnostics" {
     try std.testing.expect(failure.?.message.len != 0);
 }
 
-test "typed application requires exact native method and handler agreement" {
+test "typed application requires supported schemas and handlers without legacy declarations" {
     const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
     defer c.lua_close(state);
     c.lua_createtable(state, 0, 2);
     c.lua_setglobal(state, "ouro");
     const cases = [_]struct { fields: []const u8, expected: anyerror }{
-        .{ .fields = "actions = { Ping = function() return {} end },", .expected = error.ActionInterfaceRequired },
-        .{ .fields = "interface = [[interface dev.test.actions method Ping() -> ()]], actions = {},", .expected = error.ActionMethodMismatch },
-        .{ .fields = "interface = [[interface dev.test.actions method Ping() -> ()]], actions = { Pong = function() return {} end },", .expected = error.ActionMethodMismatch },
-        .{ .fields = "interface = [[interface dev.test.actions method Ping() -> ()]],", .expected = error.ActionMethodMismatch },
-        .{ .fields = "interface = [[interface dev.ourokit.runtime error Rejected()]], actions = {},", .expected = error.ReservedApplicationInterface },
-        .{ .fields = "interface = [[interface org.varlink.service error Rejected()]], actions = {},", .expected = error.DuplicateInterface },
+        .{ .fields = "actions = { Ping = function() return {} end },", .expected = error.InvalidActionDeclaration },
+        .{ .fields = "interface = 'obsolete', actions = {},", .expected = error.UnsupportedApplicationInterface },
+        .{ .fields = "actions = { Ping = {description='Ping', inputSchema={type='object', minimum=2}, outputSchema={type='object'}, handler=function() end} },", .expected = error.UnsupportedSchemaKeyword },
+        .{ .fields = "actions = { Ping = {description='Ping', inputSchema={type='object'}, outputSchema={type='array'}, handler=function() end} },", .expected = error.ActionSchemaMustBeObject },
+        .{ .fields = "actions = { ['runtime.status'] = {description='bad', inputSchema={type='object'}, outputSchema={type='object'}, handler=function() end} },", .expected = error.ReservedActionName },
+        .{ .fields = "actions = { Ping = {description='Ping', inputSchema={type='object'}, outputSchema={type='object'}} },", .expected = error.InvalidActionDeclaration },
     };
     for (cases) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "return ouro.app {{ id = 'dev.test.app', {s} run = function() return {{windows = {{}}}} end }}", .{case.fields});

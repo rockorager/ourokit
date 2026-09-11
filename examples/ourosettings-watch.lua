@@ -4,16 +4,17 @@ local ouro = require("ouro")
 -- Writes the initial color scheme and each change; Ctrl+C stops the process.
 local ok, err = pcall(function()
   local runtime = assert(ouro.xdg.runtime_dir, "XDG_RUNTIME_DIR is unset or empty")
-  ouro.varlink.subscribe(
-    "unix:" .. runtime .. "/ouro/settings.sock",
-    "dev.rockorager.ouro.Settings.WatchPath",
-    { path = "/appearance/color_scheme" },
-    function(reply)
-      if reply.error then error(reply.error) end
-      local selection = reply.parameters
-      if selection.exists then
-        ouro.stdout.write(ouro.json.decode(selection.value_json) .. "\n")
-      end
+  local address = "unix:" .. runtime .. "/ouro/settings.mcp.sock"
+  local uri = "ouro://settings/appearance/color_scheme"
+  ouro.mcp.subscribe(address, uri, function(notification)
+      if notification.error then error(notification.error.message) end
+      if not notification.method then error("subscription ended") end
+      -- The acknowledgment establishes the subscription before the first read.
+      -- Updates invalidate this URI; they do not contain the settings value.
+      local reply = ouro.mcp.request(address, "resources/read", { uri = uri })
+      if reply.error then error(reply.error.message) end
+      local selection = ouro.json.decode(reply.result.contents[1].text)
+      ouro.stdout.write((selection.exists and selection.value or "default") .. "\n")
     end
   )
 end)

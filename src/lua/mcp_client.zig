@@ -2,7 +2,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
-const varlink = @import("../varlink/root.zig");
+const mcp = @import("../mcp/root.zig");
 const c = @import("c.zig");
 const vm_module = @import("vm.zig");
 
@@ -12,38 +12,42 @@ const max_value_count = 4096;
 var json_null: u8 = 0;
 
 const State = enum { free, connecting, sending, receiving, ready };
+const CallKind = enum { tool, request, subscription };
 
 const Slot = struct {
-    owner: *VarlinkClient = undefined,
+    owner: *McpClient = undefined,
     state: State = .free,
     fd: linux.fd_t = -1,
-    protocol: varlink.Client = undefined,
+    protocol: mcp.Client = undefined,
     protocol_initialized: bool = false,
-    transmit: ?varlink.Transmit = null,
-    reply: ?varlink.Reply = null,
+    transmit: ?mcp.Transmit = null,
+    event: ?mcp.ClientEvent = null,
     operation: ?io.OperationHandle = null,
     operation_terminal: bool = false,
     task_handle: vm_module.TaskHandle = .invalid,
     failure: ?[]const u8 = null,
     cancellation_requested: bool = false,
     streaming: bool = false,
+    subscription: ?mcp.CallHandle = null,
+    uri: ?[]u8 = null,
+    acknowledged: bool = false,
     guard: ?*?*Slot = null,
     received: usize = 0,
     consumed: usize = 0,
     receive_buffer: [receive_capacity]u8 = undefined,
 };
 
-/// VM-generation-owned asynchronous Varlink adapter. Lua only declares calls;
+/// VM-generation-owned asynchronous MCP adapter. Lua only declares calls;
 /// this adapter owns Unix sockets, protocol buffers, ring operations, and the
 /// scheduler resource that ties each call to its coroutine scope.
-pub const VarlinkClient = struct {
+pub const McpClient = struct {
     allocator: std.mem.Allocator,
     vm: *vm_module.Vm,
     loop: *io.Loop,
     slots: []Slot,
 
     pub fn init(
-        self: *VarlinkClient,
+        self: *McpClient,
         allocator: std.mem.Allocator,
         vm: *vm_module.Vm,
         loop: *io.Loop,
@@ -61,15 +65,18 @@ pub const VarlinkClient = struct {
         c.lua_pushcclosure(vm.state, call, 1);
         c.lua_setfield(vm.state, -2, "call");
         c.lua_pushlightuserdata(vm.state, self);
+        c.lua_pushcclosure(vm.state, request, 1);
+        c.lua_setfield(vm.state, -2, "request");
+        c.lua_pushlightuserdata(vm.state, self);
         c.lua_pushcclosure(vm.state, subscribe, 1);
         c.lua_setfield(vm.state, -2, "subscribe");
         c.lua_pushlightuserdata(vm.state, &json_null);
         c.lua_setfield(vm.state, -2, "null");
-        c.lua_setfield(vm.state, -2, "varlink");
+        c.lua_setfield(vm.state, -2, "mcp");
         c.lua_settop(vm.state, -2);
     }
 
-    pub fn deinit(self: *VarlinkClient) void {
+    pub fn deinit(self: *McpClient) void {
         for (self.slots) |slot| std.debug.assert(slot.state == .free);
         self.allocator.free(self.slots);
         self.* = undefined;
@@ -77,7 +84,7 @@ pub const VarlinkClient = struct {
 
     /// Routes one socket CQE without entering Lua. Completion only publishes
     /// the reply or failure and marks the owning task runnable.
-    pub fn dispatch(self: *VarlinkClient, completion: io.SocketCompletion) !bool {
+    pub fn dispatch(self: *McpClient, completion: io.SocketCompletion) !bool {
         for (self.slots) |*slot| {
             const operation = slot.operation orelse continue;
             if (!same(operation, completion.operation)) continue;
@@ -89,7 +96,7 @@ pub const VarlinkClient = struct {
             slot.operation = null;
             slot.operation_terminal = false;
             if (completion.result < 0) {
-                try self.finish(slot, "Varlink transport operation failed");
+                try self.finish(slot, "MCP transport operation failed");
                 return true;
             }
             switch (slot.state) {
@@ -100,7 +107,7 @@ pub const VarlinkClient = struct {
                 },
                 .sending => {
                     if (completion.kind != .send or completion.result == 0) {
-                        try self.finish(slot, "Varlink connection closed while sending");
+                        try self.finish(slot, "MCP connection closed while sending");
                         return true;
                     }
                     var transmit = &(slot.transmit orelse return error.MissingSocketTransmit);
@@ -114,13 +121,13 @@ pub const VarlinkClient = struct {
                 },
                 .receiving => {
                     if (completion.kind != .recv or completion.result == 0) {
-                        try self.finish(slot, "Varlink connection closed before a reply");
+                        try self.finish(slot, "MCP connection closed before a reply");
                         return true;
                     }
                     slot.received = @intCast(completion.result);
                     slot.consumed = 0;
                     const ready = readReply(slot) catch {
-                        try self.finish(slot, "invalid Varlink reply");
+                        try self.finish(slot, "invalid MCP reply");
                         return true;
                     };
                     if (ready) {
@@ -139,12 +146,12 @@ pub const VarlinkClient = struct {
     /// Called after operation-cancel CQEs, and harmless at every task safe
     /// point. Storage is released only once both original and cancel CQEs are
     /// terminal, so the kernel never retains pointers into a reused slot.
-    pub fn collectCanceled(self: *VarlinkClient) !void {
+    pub fn collectCanceled(self: *McpClient) !void {
         for (self.slots) |*slot| if (slot.cancellation_requested)
             try self.collectCanceledSlot(slot);
     }
 
-    fn collectCanceledSlot(self: *VarlinkClient, slot: *Slot) !void {
+    fn collectCanceledSlot(self: *McpClient, slot: *Slot) !void {
         const operation = slot.operation orelse return;
         if (!slot.operation_terminal or self.loop.operationPending(operation)) return;
         slot.operation = null;
@@ -153,21 +160,21 @@ pub const VarlinkClient = struct {
         self.release(slot);
     }
 
-    fn prepareNext(self: *VarlinkClient, slot: *Slot) !void {
+    fn prepareNext(self: *McpClient, slot: *Slot) !void {
         slot.operation = switch (slot.state) {
             .sending => self.loop.prepareSend(slot.fd, slot.transmit.?.remaining()),
             .receiving => self.loop.prepareRecv(slot.fd, &slot.receive_buffer),
-            else => return error.InvalidVarlinkClientState,
+            else => return error.InvalidMcpClientState,
         } catch {
-            try self.finish(slot, "could not prepare Varlink transport operation");
+            try self.finish(slot, "could not prepare MCP transport operation");
             return;
         };
     }
 
-    fn finish(self: *VarlinkClient, slot: *Slot, failure: ?[]const u8) !void {
+    fn finish(self: *McpClient, slot: *Slot, failure: ?[]const u8) !void {
         slot.failure = failure;
         slot.state = .ready;
-        if (slot.fd >= 0 and (failure != null or !slot.streaming or !slot.reply.?.continues)) {
+        if (slot.fd >= 0 and (failure != null or !slot.streaming or slot.event.? == .reply)) {
             _ = linux.close(slot.fd);
             slot.fd = -1;
         }
@@ -177,58 +184,74 @@ pub const VarlinkClient = struct {
     /// Stop at the first record. Coalesced later records stay in receive_buffer
     /// until the callback has finished, including across callback yields.
     fn readReply(slot: *Slot) !bool {
-        const remaining = slot.receive_buffer[slot.consumed..slot.received];
-        if (remaining.len == 0) return false;
-        const end = if (std.mem.indexOfScalar(u8, remaining, 0)) |index| index + 1 else remaining.len;
-        const count = try slot.protocol.feed(remaining[0..end]);
-        if (count != end) return error.UnexpectedBackpressure;
-        slot.consumed += count;
-        if (slot.protocol.takeEvent()) |event| {
-            slot.reply = event.reply.message;
-            return true;
+        while (slot.consumed < slot.received) {
+            const remaining = slot.receive_buffer[slot.consumed..slot.received];
+            const end = if (std.mem.indexOfScalar(u8, remaining, '\n')) |index| index + 1 else remaining.len;
+            const count = try slot.protocol.feed(remaining[0..end]);
+            if (count != end) return error.UnexpectedBackpressure;
+            slot.consumed += count;
+            if (slot.protocol.takeEvent()) |value| {
+                var event = value;
+                errdefer event.deinit();
+                if (event == .notification) {
+                    if (!slot.streaming) {
+                        event.deinit();
+                        continue;
+                    }
+                    try validateNotification(slot, event.notification.message);
+                }
+                slot.event = event;
+                return true;
+            }
         }
         return false;
     }
 
-    fn available(self: *VarlinkClient) ?*Slot {
+    fn available(self: *McpClient) ?*Slot {
         for (self.slots) |*slot| if (slot.state == .free) return slot;
         return null;
     }
 
-    fn release(self: *VarlinkClient, slot: *Slot) void {
+    fn release(self: *McpClient, slot: *Slot) void {
         std.debug.assert(slot.operation == null);
         if (slot.guard) |guard| guard.* = null;
         if (slot.fd >= 0) _ = linux.close(slot.fd);
-        if (slot.reply) |*reply| reply.deinit();
+        if (slot.event) |*event| event.deinit();
         if (slot.transmit) |*transmit| transmit.deinit();
+        if (slot.uri) |uri| self.allocator.free(uri);
         if (slot.protocol_initialized) slot.protocol.deinit();
         slot.* = .{ .owner = self };
     }
 
     fn call(state: *c.State) callconv(.c) c_int {
-        return start(state, false);
+        return start(state, .tool);
+    }
+
+    fn request(state: *c.State) callconv(.c) c_int {
+        return start(state, .request);
     }
 
     fn subscribe(state: *c.State) callconv(.c) c_int {
-        return start(state, true);
+        return start(state, .subscription);
     }
 
-    fn start(state: *c.State, streaming: bool) c_int {
+    fn start(state: *c.State, kind: CallKind) c_int {
+        const streaming = kind == .subscription;
         const self = clientFromUpvalue(state) orelse
-            return luaError(state, "missing Ouro Varlink client");
+            return luaError(state, "missing Ouro MCP client");
         const argument_count = c.lua_gettop(state);
-        if (streaming and (argument_count != 4 or c.lua_type(state, 4) != c.type_function))
-            return luaError(state, "ouro.varlink.subscribe expects address, method, parameters table, and callback");
+        if (streaming and (argument_count != 3 or c.lua_type(state, 3) != c.type_function))
+            return luaError(state, "ouro.mcp.subscribe expects address, resource URI, and callback");
         if ((!streaming and argument_count != 2 and argument_count != 3) or
             c.lua_type(state, 1) != c.type_string or c.lua_type(state, 2) != c.type_string or
-            (argument_count >= 3 and c.lua_type(state, 3) != c.type_table))
-            return luaError(state, "Varlink expects address, method, and a parameters table");
+            (!streaming and argument_count >= 3 and c.lua_type(state, 3) != c.type_table))
+            return luaError(state, "MCP expects address, name, and a parameters table");
 
         // A C-stack to-be-closed guard covers errors, exit, and cancellation
         // even while a subscription callback is yielding on another resource.
         const guard: *?*Slot = @ptrCast(@alignCast(c.lua_newuserdatauv(state, @sizeOf(?*Slot), 0).?));
         guard.* = null;
-        _ = c.luaL_newmetatable(state, "ouro.varlink.guard");
+        _ = c.luaL_newmetatable(state, "ouro.mcp.guard");
         c.lua_pushcclosure(state, closeGuard, 0);
         c.lua_setfield(state, -2, "__close");
         _ = c.lua_setmetatable(state, -2);
@@ -236,18 +259,15 @@ pub const VarlinkClient = struct {
 
         var address_length: usize = 0;
         const address_pointer = c.lua_tolstring(state, 1, &address_length).?;
-        const parsed_address = varlink.Address.parse(address_pointer[0..address_length]) catch
-            return luaError(state, "invalid Varlink address");
-        const unix_address = switch (parsed_address) {
-            .unix => |address| address,
-            else => return luaError(state, "ouro.varlink currently supports only unix: addresses"),
-        };
+        const parsed_address = mcp.Address.parse(address_pointer[0..address_length]) catch
+            return luaError(state, "invalid MCP Unix address");
+        const unix_address = parsed_address.unix;
         var socket_address: linux.sockaddr.un = .{ .path = undefined };
         @memset(&socket_address.path, 0);
         const prefix: usize = if (unix_address.abstract) 1 else 0;
         const terminator: usize = @intFromBool(!unix_address.abstract);
         if (unix_address.name.len + prefix + terminator > socket_address.path.len)
-            return luaError(state, "Varlink Unix address is too long");
+            return luaError(state, "MCP Unix address is too long");
         @memcpy(socket_address.path[prefix..][0..unix_address.name.len], unix_address.name);
         const socket_address_len: linux.socklen_t = @intCast(
             @offsetOf(linux.sockaddr.un, "path") + prefix + unix_address.name.len + terminator,
@@ -255,38 +275,49 @@ pub const VarlinkClient = struct {
 
         var method_length: usize = 0;
         const method_pointer = c.lua_tolstring(state, 2, &method_length).?;
-        const slot = self.available() orelse return luaError(state, "Varlink call capacity exceeded");
+        const slot = self.available() orelse return luaError(state, "MCP call capacity exceeded");
         slot.streaming = streaming;
         slot.guard = guard;
         guard.* = slot;
-        slot.protocol = varlink.Client.init(self.allocator, .{
-            .max_message_bytes = receive_capacity,
-            .max_outbound_message_bytes = receive_capacity,
+        slot.protocol = mcp.Client.init(self.allocator, .{
             .max_pending_calls = 1,
             .max_events = 1,
             .max_transmits = 1,
-        }) catch return luaError(state, "could not allocate Varlink call");
+        }) catch {
+            self.release(slot);
+            return luaError(state, "could not allocate MCP call");
+        };
         slot.protocol_initialized = true;
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         var value_count: usize = 0;
-        const parameters: ?std.json.Value = if (argument_count >= 3)
+        const parameters: ?std.json.Value = if (!streaming and argument_count >= 3)
             luaToJson(state, 3, arena.allocator(), 0, &value_count) catch {
                 arena.deinit();
                 self.release(slot);
-                return luaError(state, "Varlink parameters must be a finite JSON object");
+                return luaError(state, "MCP parameters must be a finite JSON object");
             }
         else
             null;
-        _ = slot.protocol.call(.{
-            .method = method_pointer[0..method_length],
-            .parameters = parameters,
-            .more = streaming,
-        }) catch {
+        const name = method_pointer[0..method_length];
+        const outgoing = prepareCall(arena.allocator(), name, parameters, kind) catch {
             arena.deinit();
             self.release(slot);
-            return luaError(state, "invalid Varlink call");
+            return luaError(state, "could not encode MCP call");
         };
+        const handle = slot.protocol.call(outgoing) catch {
+            arena.deinit();
+            self.release(slot);
+            return luaError(state, "invalid MCP call");
+        };
+        if (streaming) {
+            slot.subscription = handle;
+            slot.uri = self.allocator.dupe(u8, name) catch {
+                arena.deinit();
+                self.release(slot);
+                return luaError(state, "could not allocate MCP subscription URI");
+            };
+        }
         arena.deinit();
         slot.transmit = slot.protocol.takeTransmit().?;
 
@@ -297,7 +328,7 @@ pub const VarlinkClient = struct {
         );
         if (linux.errno(socket_result) != .SUCCESS) {
             self.release(slot);
-            return luaError(state, "could not create Varlink Unix socket");
+            return luaError(state, "could not create MCP Unix socket");
         }
         slot.fd = @intCast(socket_result);
         slot.state = .connecting;
@@ -308,7 +339,7 @@ pub const VarlinkClient = struct {
             &resource_lifecycle,
         ) catch {
             self.release(slot);
-            return luaError(state, "could not park Varlink call");
+            return luaError(state, "could not park MCP call");
         };
         slot.operation = self.loop.prepareUnixConnect(
             slot.fd,
@@ -317,7 +348,7 @@ pub const VarlinkClient = struct {
         ) catch {
             self.vm.abortExternalWait(state, slot.task_handle) catch unreachable;
             self.release(slot);
-            return luaError(state, "could not prepare Varlink connection");
+            return luaError(state, "could not prepare MCP connection");
         };
         return c.lua_yieldk(state, 0, contextFor(slot), callContinuation);
     }
@@ -329,22 +360,14 @@ pub const VarlinkClient = struct {
             return luaErrorSlice(state, failure);
         }
         if (slot.streaming) return runSubscription(state, context, null);
-        const reply = &(slot.reply orelse {
+        const event = slot.event orelse {
             slot.owner.release(slot);
-            return luaError(state, "Varlink call completed without a reply");
-        });
-        c.lua_createtable(state, 0, 2);
-        if (reply.parameters) |parameters| {
-            pushJson(state, parameters) catch {
-                slot.owner.release(slot);
-                return luaError(state, "Varlink reply could not be represented in Lua");
-            };
-            c.lua_setfield(state, -2, "parameters");
-        }
-        if (reply.error_name) |name| {
-            _ = c.lua_pushlstring(state, name.ptr, name.len);
-            c.lua_setfield(state, -2, "error");
-        }
+            return luaError(state, "MCP call completed without a reply");
+        };
+        pushEvent(state, event) catch {
+            slot.owner.release(slot);
+            return luaError(state, "MCP reply could not be represented in Lua");
+        };
         slot.owner.release(slot);
         return 1;
     }
@@ -362,40 +385,29 @@ pub const VarlinkClient = struct {
                 if (result != c.ok and result != c.yield) return c.lua_error(state);
                 const stop = c.lua_type(state, -1) == c.type_boolean and c.lua_toboolean(state, -1) == 0;
                 c.lua_settop(state, -2);
-                const final = !slot.reply.?.continues;
-                slot.reply.?.deinit();
-                slot.reply = null;
+                const final = slot.event.? == .reply;
+                slot.event.?.deinit();
+                slot.event = null;
                 if (stop or final) {
                     self.release(slot);
                     return 0;
                 }
             }
-            if (slot.reply == null) {
-                const ready = readReply(slot) catch return luaError(state, "invalid Varlink reply");
+            if (slot.event == null) {
+                const ready = readReply(slot) catch return luaError(state, "invalid MCP reply");
                 if (!ready) {
                     slot.state = .receiving;
                     slot.task_handle = self.vm.beginExternalWait(state, .operation, slot, &resource_lifecycle) catch
-                        return luaError(state, "could not park Varlink subscription");
+                        return luaError(state, "could not park MCP subscription");
                     slot.operation = self.loop.prepareRecv(slot.fd, &slot.receive_buffer) catch {
                         self.vm.abortExternalWait(state, slot.task_handle) catch unreachable;
-                        return luaError(state, "could not prepare Varlink subscription receive");
+                        return luaError(state, "could not prepare MCP subscription receive");
                     };
                     return c.lua_yieldk(state, 0, context, callContinuation);
                 }
             }
-            c.lua_pushvalue(state, 4);
-            c.lua_createtable(state, 0, 3);
-            const reply = &slot.reply.?;
-            if (reply.parameters) |parameters| {
-                pushJson(state, parameters) catch return luaError(state, "Varlink reply could not be represented in Lua");
-                c.lua_setfield(state, -2, "parameters");
-            }
-            if (reply.error_name) |name| {
-                _ = c.lua_pushlstring(state, name.ptr, name.len);
-                c.lua_setfield(state, -2, "error");
-            }
-            c.lua_pushboolean(state, @intFromBool(reply.continues));
-            c.lua_setfield(state, -2, "continues");
+            c.lua_pushvalue(state, 3);
+            pushEvent(state, slot.event.?) catch return luaError(state, "MCP notification could not be represented in Lua");
             status = c.lua_pcallk(state, 1, 1, 0, context, subscriptionContinuation);
         }
     }
@@ -406,6 +418,73 @@ pub const VarlinkClient = struct {
         return 0;
     }
 };
+
+fn prepareCall(allocator: std.mem.Allocator, name: []const u8, parameters: ?std.json.Value, kind: CallKind) !mcp.OutgoingCall {
+    if (kind == .request) return .{ .method = name, .params = parameters };
+    var params = std.json.ObjectMap.empty;
+    if (kind == .tool) {
+        try params.put(allocator, "name", .{ .string = name });
+        try params.put(allocator, "arguments", parameters orelse .{ .object = .empty });
+        return .{ .method = "tools/call", .params = .{ .object = params } };
+    }
+    var uris = std.json.Array.init(allocator);
+    try uris.append(.{ .string = name });
+    var notifications = std.json.ObjectMap.empty;
+    try notifications.put(allocator, "resourceSubscriptions", .{ .array = uris });
+    try params.put(allocator, "notifications", .{ .object = notifications });
+    return .{ .method = "subscriptions/listen", .params = .{ .object = params }, .subscription = true };
+}
+
+fn validateNotification(slot: *Slot, notification: mcp.Request) !void {
+    const params = notification.params orelse return error.InvalidSubscriptionNotification;
+    if (params != .object) return error.InvalidSubscriptionNotification;
+    const meta = params.object.get("_meta") orelse return error.InvalidSubscriptionNotification;
+    if (meta != .object) return error.InvalidSubscriptionNotification;
+    const id = meta.object.get("io.modelcontextprotocol/subscriptionId") orelse return error.InvalidSubscriptionNotification;
+    const number: u64 = switch (id) {
+        .integer => |n| std.math.cast(u64, n) orelse return error.InvalidSubscriptionNotification,
+        .number_string => |s| std.fmt.parseInt(u64, s, 10) catch return error.InvalidSubscriptionNotification,
+        else => return error.InvalidSubscriptionNotification,
+    };
+    if (number != slot.subscription.?.value) return error.InvalidSubscriptionNotification;
+    if (std.mem.eql(u8, notification.method, "notifications/subscriptions/acknowledged")) {
+        if (slot.acknowledged) return error.InvalidSubscriptionNotification;
+        const filter = params.object.get("notifications") orelse return error.InvalidSubscriptionNotification;
+        if (filter != .object) return error.InvalidSubscriptionNotification;
+        const uris = filter.object.get("resourceSubscriptions") orelse return error.InvalidSubscriptionNotification;
+        if (uris != .array or uris.array.items.len != 1) return error.InvalidSubscriptionNotification;
+        const uri = uris.array.items[0];
+        if (uri != .string or !std.mem.eql(u8, uri.string, slot.uri.?)) return error.InvalidSubscriptionNotification;
+        slot.acknowledged = true;
+    } else if (std.mem.eql(u8, notification.method, "notifications/resources/updated")) {
+        const uri = params.object.get("uri") orelse return error.InvalidSubscriptionNotification;
+        if (!slot.acknowledged or uri != .string or !std.mem.eql(u8, uri.string, slot.uri.?)) return error.InvalidSubscriptionNotification;
+    } else return error.InvalidSubscriptionNotification;
+}
+
+fn pushEvent(state: *c.State, event: mcp.ClientEvent) !void {
+    c.lua_createtable(state, 0, 2);
+    switch (event) {
+        .reply => |reply| {
+            if (reply.message.result) |result| {
+                try pushJson(state, result);
+                c.lua_setfield(state, -2, "result");
+            }
+            if (reply.message.rpc_error) |rpc_error| {
+                try pushJson(state, rpc_error);
+                c.lua_setfield(state, -2, "error");
+            }
+        },
+        .notification => |notification| {
+            _ = c.lua_pushlstring(state, notification.message.method.ptr, notification.message.method.len);
+            c.lua_setfield(state, -2, "method");
+            if (notification.message.params) |params| {
+                try pushJson(state, params);
+                c.lua_setfield(state, -2, "params");
+            }
+        },
+    }
+}
 
 /// Converts a Lua value into arena-owned JSON, including strings and keys.
 /// The caller restores the Lua stack on failure and releases the arena.
@@ -525,6 +604,13 @@ fn validateArray(state: *c.State, index: c_int, length: usize) !void {
 }
 
 pub fn pushJson(state: *c.State, value: std.json.Value) !void {
+    var count: usize = 0;
+    return pushJsonAt(state, value, 0, &count);
+}
+
+fn pushJsonAt(state: *c.State, value: std.json.Value, depth: usize, count: *usize) anyerror!void {
+    if (depth >= max_value_depth or count.* >= max_value_count) return error.ValueLimitExceeded;
+    count.* += 1;
     if (c.lua_checkstack(state, 4) == 0) return error.LuaStackCapacityExceeded;
     switch (value) {
         .null => c.lua_pushlightuserdata(state, &json_null),
@@ -545,7 +631,7 @@ pub fn pushJson(state: *c.State, value: std.json.Value) !void {
             c.lua_createtable(state, @intCast(array.items.len), 0);
             try markJsonArray(state, -1);
             for (array.items, 1..) |item, index| {
-                try pushJson(state, item);
+                try pushJsonAt(state, item, depth + 1, count);
                 c.lua_rawseti(state, -2, @intCast(index));
             }
         },
@@ -554,7 +640,7 @@ pub fn pushJson(state: *c.State, value: std.json.Value) !void {
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
                 _ = c.lua_pushlstring(state, entry.key_ptr.*.ptr, entry.key_ptr.*.len);
-                try pushJson(state, entry.value_ptr.*);
+                try pushJsonAt(state, entry.value_ptr.*, depth + 1, count);
                 c.lua_settable(state, -3);
             }
         },
@@ -574,7 +660,7 @@ const resource_lifecycle: task.ResourceLifecycle = .{
     .destroy = destroyResource,
 };
 
-fn clientFromUpvalue(state: *c.State) ?*VarlinkClient {
+fn clientFromUpvalue(state: *c.State) ?*McpClient {
     const pointer = c.lua_touserdata(state, c.upvalueIndex(1)) orelse return null;
     return @ptrCast(@alignCast(pointer));
 }
@@ -603,7 +689,7 @@ fn luaErrorSlice(state: *c.State, message: []const u8) c_int {
 
 const TestServer = struct {
     listener: linux.fd_t,
-    reply: []const u8 = "{\"parameters\":{\"answer\":42,\"nested\":[true,\"ok\",null],\"empty\":[]}}\x00",
+    reply: []const u8 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false,\"structuredContent\":{\"answer\":42,\"nested\":[true,\"ok\",null],\"empty\":[]}}}\n",
     request: [512]u8 = undefined,
     request_length: usize = 0,
     succeeded: bool = false,
@@ -621,7 +707,7 @@ const TestServer = struct {
             );
             if (linux.errno(result) != .SUCCESS or result == 0) return;
             self.request_length += result;
-            if (std.mem.indexOfScalar(u8, self.request[0..self.request_length], 0) != null) break;
+            if (std.mem.indexOfScalar(u8, self.request[0..self.request_length], '\n') != null) break;
         }
         var written: usize = 0;
         while (written < self.reply.len) {
@@ -654,9 +740,9 @@ fn testListener(name: []const u8) !linux.fd_t {
     return listener;
 }
 
-test "Lua Varlink call uses runtime transport and converts JSON values" {
+test "Lua MCP tool call uses runtime transport and converts JSON values" {
     var name_buffer: [64]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buffer, "ouro-lua-varlink-{d}", .{linux.getpid()});
+    const name = try std.fmt.bufPrint(&name_buffer, "ouro-lua-mcp-{d}", .{linux.getpid()});
     const listener = try testListener(name);
     defer _ = linux.close(listener);
     var server: TestServer = .{ .listener = listener };
@@ -671,19 +757,20 @@ test "Lua Varlink call uses runtime transport and converts JSON values" {
     var vm: vm_module.Vm = undefined;
     try vm.init(std.testing.allocator, &scheduler, &loop);
     defer vm.deinit();
-    var client: VarlinkClient = undefined;
+    var client: McpClient = undefined;
     try client.init(std.testing.allocator, &vm, &loop, 1);
     defer client.deinit();
 
     const source = try std.fmt.allocPrint(
         std.testing.allocator,
         "local ouro = require('ouro'); " ++
-            "local reply = ouro.varlink.call('unix:@{s}', 'org.example.Echo', " ++
-            "{{ value = 7, list = {{ 1, true, ouro.varlink.null }}, empty = ouro.json.array() }}); " ++
-            "varlink_ok = reply.error == nil and reply.parameters.answer == 42 " ++
-            "and reply.parameters.nested[1] == true and reply.parameters.nested[2] == 'ok' " ++
-            "and reply.parameters.nested[3] == ouro.varlink.null " ++
-            "and ouro.json.encode(reply.parameters.empty) == '[]'",
+            "local reply = ouro.mcp.call('unix:@{s}', 'echo', " ++
+            "{{ value = 7, list = {{ 1, true, ouro.mcp.null }}, empty = ouro.json.array() }}); " ++
+            "local result = reply.result.structuredContent; " ++
+            "mcp_ok = reply.error == nil and reply.result.isError == false and result.answer == 42 " ++
+            "and result.nested[1] == true and result.nested[2] == 'ok' " ++
+            "and result.nested[3] == ouro.mcp.null " ++
+            "and ouro.json.encode(result.empty) == '[]'",
         .{name},
     );
     defer std.testing.allocator.free(source);
@@ -698,12 +785,12 @@ test "Lua Varlink call uses runtime transport and converts JSON values" {
         if (scheduler.takeRunnable()) |runnable| _ = try vm.resumeRunnable(runnable);
     }
     server_thread.join();
-    try std.testing.expect(vm.globalBoolean("varlink_ok"));
+    try std.testing.expect(vm.globalBoolean("mcp_ok"));
     try std.testing.expect(server.succeeded);
     try std.testing.expect(std.mem.indexOf(
         u8,
         server.request[0..server.request_length],
-        "\"method\":\"org.example.Echo\"",
+        "\"method\":\"tools/call\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -717,17 +804,17 @@ test "Lua Varlink call uses runtime transport and converts JSON values" {
     ) != null);
 }
 
-test "canceling a Lua Varlink call drains ring operations before releasing its slot" {
+test "canceling a Lua MCP call drains ring operations before releasing its slot" {
     try testCancelReceive(false);
 }
 
-test "canceling a Lua Varlink subscription drains its pending receive" {
+test "canceling a Lua MCP subscription drains its pending receive" {
     try testCancelReceive(true);
 }
 
 fn testCancelReceive(streaming: bool) !void {
     var name_buffer: [64]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buffer, "ouro-lua-varlink-cancel-{d}", .{linux.getpid()});
+    const name = try std.fmt.bufPrint(&name_buffer, "ouro-lua-mcp-cancel-{d}", .{linux.getpid()});
     const listener = try testListener(name);
     defer _ = linux.close(listener);
 
@@ -740,7 +827,7 @@ fn testCancelReceive(streaming: bool) !void {
     var vm: vm_module.Vm = undefined;
     try vm.init(std.testing.allocator, &scheduler, &loop);
     defer vm.deinit();
-    var client: VarlinkClient = undefined;
+    var client: McpClient = undefined;
     try client.init(std.testing.allocator, &vm, &loop, 1);
     defer client.deinit();
 
@@ -748,9 +835,9 @@ fn testCancelReceive(streaming: bool) !void {
     const source = try std.fmt.allocPrint(
         std.testing.allocator,
         "local ouro = require('ouro'); canceled_call_continued = false; " ++
-            "ouro.varlink.{s}('unix:@{s}', 'org.example.Wait'{s}); " ++
+            "ouro.mcp.{s}('unix:@{s}', 'ouro://test'{s}); " ++
             "canceled_call_continued = true",
-        .{ if (streaming) "subscribe" else "call", name, if (streaming) ", {}, function() canceled_call_continued = true end" else "" },
+        .{ if (streaming) "subscribe" else "call", name, if (streaming) ", function() canceled_call_continued = true end" else "" },
     );
     defer std.testing.allocator.free(source);
     _ = try vm.spawn(scope, source);
@@ -780,32 +867,34 @@ fn testCancelReceive(streaming: bool) !void {
     try scheduler.destroyScope(scope);
 }
 
-const continued_reply = "{\"parameters\":{\"value\":7},\"continues\":true}\x00";
-const final_reply = "{\"parameters\":{\"value\":19}}\x00";
+const acknowledged_reply = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"notifications\":{\"resourceSubscriptions\":[\"ouro://test\"]}}}\n";
+const updated_reply = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"uri\":\"ouro://test\"}}\n";
+const final_reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\"}}\n";
 
-test "Lua Varlink subscription delivers ordered replies across yielding callbacks" {
-    try testSubscription(continued_reply ++ final_reply,
+test "Lua MCP subscription delivers acknowledgments and updates across yielding callbacks" {
+    try testSubscription(acknowledged_reply ++ updated_reply ++ final_reply,
         \\local values = {}
         \\watch(function(reply)
         \\  ouro.sleep(1)
-        \\  values[#values + 1] = reply.parameters.value
-        \\  assert(reply.continues == (#values == 1))
+        \\  values[#values + 1] = reply.method or reply.result.resultType
+        \\  if reply.method == 'notifications/resources/updated' then assert(reply.params.uri == 'ouro://test') end
         \\end)
-        \\subscription_ok = #values == 2 and values[1] == 7 and values[2] == 19
+        \\subscription_ok = #values == 3 and values[1] == 'notifications/subscriptions/acknowledged'
+        \\  and values[2] == 'notifications/resources/updated' and values[3] == 'complete'
     , .none);
 }
 
-test "Lua Varlink subscription stops before buffered replies and propagates callback errors" {
-    try testSubscription(continued_reply ++ final_reply,
+test "Lua MCP subscription stops before buffered notifications and propagates callback errors" {
+    try testSubscription(acknowledged_reply ++ updated_reply ++ final_reply,
         \\local count = 0
         \\watch(function(reply)
         \\  count = count + 1
-        \\  assert(reply.parameters.value == 7)
+        \\  assert(reply.method == 'notifications/subscriptions/acknowledged')
         \\  return false
         \\end)
         \\subscription_ok = count == 1
     , .none);
-    try testSubscription(continued_reply ++ final_reply,
+    try testSubscription(acknowledged_reply ++ final_reply,
         \\local ok, err = pcall(watch, function()
         \\  ouro.sleep(1)
         \\  error('callback failed')
@@ -814,19 +903,19 @@ test "Lua Varlink subscription stops before buffered replies and propagates call
     , .none);
 }
 
-test "Lua Varlink subscription exposes final service errors and rejects broken streams" {
-    try testSubscription(continued_reply ++ "{\"error\":\"org.example.Denied\",\"parameters\":{\"reason\":\"no\"}}\x00",
+test "Lua MCP subscription exposes terminal RPC errors and rejects broken streams" {
+    try testSubscription(acknowledged_reply ++ "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"denied\"}}\n",
         \\local count = 0
         \\watch(function(reply)
         \\  count = count + 1
         \\  if count == 2 then
-        \\    assert(reply.error == 'org.example.Denied' and reply.parameters.reason == 'no')
-        \\    assert(reply.continues == false)
+        \\    assert(reply.error.code == -32602 and reply.error.message == 'denied')
+        \\    assert(reply.method == nil)
         \\  end
         \\end)
         \\subscription_ok = count == 2
     , .none);
-    for ([_][]const u8{ continued_reply, continued_reply ++ "{", continued_reply ++ "invalid\x00" }) |replies| {
+    for ([_][]const u8{ acknowledged_reply, acknowledged_reply ++ "{", acknowledged_reply ++ "invalid\n" }) |replies| {
         try testSubscription(replies,
             \\local count = 0
             \\local ok = pcall(watch, function() count = count + 1 end)
@@ -835,11 +924,30 @@ test "Lua Varlink subscription exposes final service errors and rejects broken s
     }
 }
 
-test "Lua Varlink subscription cancellation closes ready replies and yielding callbacks" {
-    try testSubscription(continued_reply,
+test "Lua MCP subscription validates acknowledgment ordering, URI, and subscription ID" {
+    for ([_][]const u8{
+        updated_reply,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2},\"notifications\":{\"resourceSubscriptions\":[\"ouro://test\"]}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"notifications\":{\"resourceSubscriptions\":[\"ouro://other\"]}}}\n",
+    }) |wire| {
+        try testSubscription(wire,
+            \\local count = 0
+            \\local ok = pcall(watch, function() count = count + 1 end)
+            \\subscription_ok = not ok and count == 0
+        , .none);
+    }
+    try testSubscription(acknowledged_reply ++ acknowledged_reply,
+        \\local count = 0
+        \\local ok = pcall(watch, function() count = count + 1 end)
+        \\subscription_ok = not ok and count == 1
+    , .none);
+}
+
+test "Lua MCP subscription cancellation closes ready notifications and yielding callbacks" {
+    try testSubscription(acknowledged_reply,
         \\watch(function() subscription_ran = true end)
     , .ready);
-    try testSubscription(continued_reply ++ final_reply,
+    try testSubscription(acknowledged_reply ++ final_reply,
         \\watch(function()
         \\  ouro.sleep(60)
         \\  subscription_ran = true
@@ -861,14 +969,14 @@ fn testSubscription(replies: []const u8, body: []const u8, cancel: enum { none, 
     var vm: vm_module.Vm = undefined;
     try vm.init(std.testing.allocator, &scheduler, &loop);
     defer vm.deinit();
-    var client: VarlinkClient = undefined;
+    var client: McpClient = undefined;
     try client.init(std.testing.allocator, &vm, &loop, 1);
     defer client.deinit();
     const source = try std.fmt.allocPrint(
         std.testing.allocator,
         "local ouro = require('ouro'); " ++
-            "local function watch(callback) ouro.varlink.subscribe('unix:@{s}', " ++
-            "'org.example.Watch', {{path='/appearance/color_scheme'}}, callback) end; {s}",
+            "local function watch(callback) ouro.mcp.subscribe('unix:@{s}', " ++
+            "'ouro://test', callback) end; {s}",
         .{ name, body },
     );
     defer std.testing.allocator.free(source);
@@ -887,9 +995,10 @@ fn testSubscription(replies: []const u8, body: []const u8, cancel: enum { none, 
     const request = server.request[0 .. server.request_length - 1];
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("more").?.bool);
-    try std.testing.expectEqualStrings("org.example.Watch", parsed.value.object.get("method").?.string);
-    try std.testing.expectEqualStrings("/appearance/color_scheme", parsed.value.object.get("parameters").?.object.get("path").?.string);
+    try std.testing.expectEqualStrings("subscriptions/listen", parsed.value.object.get("method").?.string);
+    const params = parsed.value.object.get("params").?.object;
+    try std.testing.expectEqualStrings("ouro://test", params.get("notifications").?.object.get("resourceSubscriptions").?.array.items[0].string);
+    try std.testing.expectEqualStrings("2026-07-28", params.get("_meta").?.object.get("io.modelcontextprotocol/protocolVersion").?.string);
 
     var canceled = false;
     while (vm.activeTaskCount() != 0) {
@@ -927,25 +1036,52 @@ fn testSubscription(replies: []const u8, body: []const u8, cancel: enum { none, 
     }
 }
 
-test "Lua Varlink subscription decoder retains fragmented and coalesced records" {
-    var slot: Slot = .{};
-    slot.protocol = try varlink.Client.init(std.testing.allocator, .{ .max_events = 1 });
+test "Lua MCP subscription decoder retains fragmented and coalesced records" {
+    var slot: Slot = .{ .streaming = true, .uri = try std.testing.allocator.dupe(u8, "ouro://test") };
+    defer std.testing.allocator.free(slot.uri.?);
+    slot.protocol = try mcp.Client.init(std.testing.allocator, .{ .max_events = 1 });
     defer slot.protocol.deinit();
-    _ = try slot.protocol.call(.{ .method = "org.example.Watch", .more = true });
-    const split = continued_reply.len - 4;
-    @memcpy(slot.receive_buffer[0..split], continued_reply[0..split]);
+    slot.subscription = try slot.protocol.call(.{ .method = "subscriptions/listen", .subscription = true });
+    const split = acknowledged_reply.len - 4;
+    @memcpy(slot.receive_buffer[0..split], acknowledged_reply[0..split]);
     slot.received = split;
-    try std.testing.expect(!try VarlinkClient.readReply(&slot));
-    const rest = continued_reply[split..] ++ final_reply;
+    try std.testing.expect(!try McpClient.readReply(&slot));
+    const rest = acknowledged_reply[split..] ++ updated_reply;
     @memcpy(slot.receive_buffer[0..rest.len], rest);
     slot.received = rest.len;
     slot.consumed = 0;
-    for ([_][]const u8{ "7", "19" }) |expected| {
-        try std.testing.expect(try VarlinkClient.readReply(&slot));
-        try std.testing.expectEqualStrings(expected, slot.reply.?.parameters.?.object.get("value").?.number_string);
-        slot.reply.?.deinit();
-        slot.reply = null;
+    for ([_][]const u8{ "notifications/subscriptions/acknowledged", "notifications/resources/updated" }) |expected| {
+        try std.testing.expect(try McpClient.readReply(&slot));
+        try std.testing.expectEqualStrings(expected, slot.event.?.notification.message.method);
+        slot.event.?.deinit();
+        slot.event = null;
     }
     try std.testing.expectEqual(slot.received, slot.consumed);
-    try std.testing.expect(!try VarlinkClient.readReply(&slot));
+    try std.testing.expect(!try McpClient.readReply(&slot));
+}
+
+test "Lua MCP JSON conversion bounds incoming nesting and value count" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var array = std.json.Array.init(arena.allocator());
+    try array.appendNTimes(.{ .integer = 19 }, 4095);
+    try pushJson(state, .{ .array = array });
+    try std.testing.expectEqual(@as(usize, 4095), c.lua_rawlen(state, -1));
+    c.lua_settop(state, 0);
+    try array.append(.{ .integer = 7 });
+    try std.testing.expectError(error.ValueLimitExceeded, pushJson(state, .{ .array = array }));
+    c.lua_settop(state, 0);
+    var nested: std.json.Value = .{ .bool = true };
+    for (0..31) |_| {
+        var wrapper = std.json.Array.init(arena.allocator());
+        try wrapper.append(nested);
+        nested = .{ .array = wrapper };
+    }
+    try pushJson(state, nested);
+    c.lua_settop(state, 0);
+    var wrapper = std.json.Array.init(arena.allocator());
+    try wrapper.append(nested);
+    try std.testing.expectError(error.ValueLimitExceeded, pushJson(state, .{ .array = wrapper }));
 }

@@ -3,25 +3,24 @@ const linux = std.os.linux;
 const wayring = @import("wayring");
 const io_loop = @import("../loop/root.zig");
 const lua = @import("../lua/root.zig");
-const varlink = @import("../varlink/root.zig");
+const mcp = @import("../mcp/root.zig");
 const task = @import("../task/root.zig");
 const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
 pub const socket_activation = @import("socket_activation.zig");
 
-pub const interface_name = "dev.ourokit.runtime";
-pub const reload_method = interface_name ++ ".Reload";
-pub const status_method = interface_name ++ ".Status";
-pub const activate_method = interface_name ++ ".Activate";
+pub const reload_method = "runtime.reload";
+pub const status_method = "runtime.status";
+pub const activate_method = "runtime.activate";
 
-pub const interface_description =
-    \\interface dev.ourokit.runtime
-    \\type Diagnostic (phase: string, source: string, message: string)
-    \\method Reload() -> (generation: int)
-    \\method Status() -> (applicationId: string, activeGeneration: int, reloading: bool, uiActive: bool, diagnostic: ?Diagnostic)
-    \\method Activate(activationToken: ?string) -> ()
-    \\error ActivateFailed(message: string)
-    \\error ReloadFailed(phase: string, source: string, message: string)
-    \\error ActionFailed(message: string)
+const builtin_tools =
+    \\[
+    \\{"name":"runtime.status","description":"Read application status without activating UI.","inputSchema":{"type":"object","additionalProperties":false},"outputSchema":{"type":"object","properties":{"applicationId":{"type":"string"},"activeGeneration":{"type":"integer"},"reloading":{"type":"boolean"},"uiActive":{"type":"boolean"},"diagnostic":{"type":["object","null"]}},"required":["applicationId","activeGeneration","reloading","uiActive","diagnostic"],"additionalProperties":false}},
+    \\{"name":"runtime.reload","description":"Validate a candidate source generation and commit it atomically; resets Lua state.","inputSchema":{"type":"object","additionalProperties":false},"outputSchema":{"type":"object","properties":{"generation":{"type":"integer"}},"required":["generation"],"additionalProperties":false}},
+    \\{"name":"runtime.activate","description":"Initialize or present the application UI. Focus remains compositor policy.","inputSchema":{"type":"object","properties":{"activationToken":{"type":["string","null"]}},"additionalProperties":false},"outputSchema":{"type":"object","additionalProperties":false}}
+    \\]
+;
+const failure_schema =
+    \\{"type":"object","properties":{"error":{"type":"object","properties":{"code":{"type":"string"},"message":{"type":"string"},"parameters":{}},"required":["code","message"],"additionalProperties":false}},"required":["error"],"additionalProperties":false}
 ;
 
 const client_capacity = 8;
@@ -29,14 +28,14 @@ const receive_capacity = 64 * 1024;
 
 const Waiter = struct {
     sequence: u64,
-    call: varlink.CallHandle,
+    call: mcp.CallHandle,
 };
 
 const Action = struct {
     vm: *lua.Vm,
     handle: lua.TaskHandle,
     scope: task.ScopeHandle,
-    call: ?varlink.CallHandle,
+    call: ?mcp.CallHandle,
     application: *const lua.Application,
     method: []u8,
 };
@@ -56,20 +55,22 @@ const Failure = struct {
 
 const Client = struct {
     fd: linux.fd_t,
-    protocol: varlink.Server,
+    protocol: mcp.Server,
     waiters: std.array_list.Managed(Waiter),
     operation: ?io_loop.OperationHandle = null,
     operation_terminal: bool = false,
-    transmit: ?varlink.Transmit = null,
+    read_operation: ?io_loop.OperationHandle = null,
+    read_terminal: bool = false,
+    transmit: ?mcp.Transmit = null,
     received: usize = 0,
     consumed: usize = 0,
     action: ?Action = null,
-    activation: ?varlink.CallHandle = null,
+    activation: ?mcp.CallHandle = null,
     closing: bool = false,
     receive_buffer: [receive_capacity]u8 = undefined,
 
     fn init(allocator: std.mem.Allocator, fd: linux.fd_t) !Client {
-        var protocol = try varlink.Server.init(allocator, .{});
+        var protocol = try mcp.Server.init(allocator, .{});
         errdefer protocol.deinit();
         return .{
             .fd = fd,
@@ -88,14 +89,13 @@ const Client = struct {
     }
 };
 
-/// Process-lifetime Varlink transport and built-in runtime control interface.
+/// Process-lifetime MCP transport and built-in runtime tools.
 /// It shares Ourokit's io_uring but owns a disjoint operation namespace, so
 /// socket completions can be routed without exposing Wayring's reactor tags.
 pub const ControlServer = struct {
     allocator: std.mem.Allocator,
     loop: *io_loop.Loop,
     requests: *ReloadRequests,
-    service: varlink.Service,
     application_id: []u8,
     path: [:0]u8,
     listener: linux.fd_t,
@@ -136,14 +136,6 @@ pub const ControlServer = struct {
         errdefer allocator.free(path);
         const owned_id = try allocator.dupe(u8, application_id);
         errdefer allocator.free(owned_id);
-        var service = try varlink.Service.init(allocator, .{
-            .vendor = "Ourokit",
-            .product = "Ourokit application runtime",
-            .version = "0.1.0",
-            .url = "https://github.com/rockorager/ourokit",
-        }, 3);
-        errdefer service.deinit();
-        try service.addInterface(interface_description);
         if (inherited == null) try socket_activation.makeParentDirectories(allocator, path);
         const listener = inherited orelse try wayring.unix_socket.listen(path, 16);
         errdefer if (inherited == null) {
@@ -157,7 +149,6 @@ pub const ControlServer = struct {
             .allocator = allocator,
             .loop = loop,
             .requests = requests,
-            .service = service,
             .application_id = owned_id,
             .path = path,
             .listener = listener,
@@ -175,7 +166,6 @@ pub const ControlServer = struct {
         if (self.owned_path) |identity| identity.unlink(self.path);
         if (self.activation_token) |token| self.allocator.free(token);
         if (self.failure) |*failure| failure.deinit(self.allocator);
-        self.service.deinit();
         self.allocator.free(self.path);
         self.allocator.free(self.application_id);
         self.* = undefined;
@@ -199,12 +189,10 @@ pub const ControlServer = struct {
     }
 
     pub const PreparedApplication = struct {
-        service: ?varlink.Service,
         application: *const lua.Application,
         vm: *lua.Vm,
 
         pub fn deinit(self: *PreparedApplication) void {
-            if (self.service) |*service| service.deinit();
             self.* = undefined;
         }
     };
@@ -215,18 +203,11 @@ pub const ControlServer = struct {
         if (!std.mem.eql(u8, self.application_id, application.id)) return error.ApplicationIdChanged;
         if (!application.hasActions()) return error.ApplicationActionsDisabled;
         if (vm.state != application.state) return error.ApplicationVmMismatch;
-        var replacement = try varlink.Service.init(self.allocator, .{ .vendor = "Ourokit", .product = "Ourokit application runtime", .version = "0.1.0", .url = "https://github.com/rockorager/ourokit" }, 3);
-        errdefer replacement.deinit();
-        try replacement.addInterface(interface_description);
-        if (application.customInterface()) |interface| try replacement.addInterface(interface.source);
-        return .{ .service = replacement, .application = application, .vm = vm };
+        return .{ .application = application, .vm = vm };
     }
 
     /// No allocation or failure after the parent's UI generation commit.
     pub fn commitApplication(self: *ControlServer, prepared: *PreparedApplication) void {
-        self.service.deinit();
-        self.service = prepared.service.?;
-        prepared.service = null;
         self.application = prepared.application;
         self.vm = prepared.vm;
     }
@@ -254,7 +235,7 @@ pub const ControlServer = struct {
     /// Already-produced replies, excluding actions and idle socket reads.
     pub fn hasPendingOutput(self: *const ControlServer) bool {
         for (self.clients) |entry| if (entry) |client| {
-            if (client.transmit != null or client.protocol.transmits.len() != 0) return true;
+            if (client.transmit != null or client.protocol.transmits.items.len != 0) return true;
         };
         return false;
     }
@@ -265,8 +246,8 @@ pub const ControlServer = struct {
         for (self.clients) |entry| if (entry) |client| {
             if (client.action != null or client.activation != null or client.waiters.items.len != 0 or
                 client.transmit != null or client.protocol.pending.items.len != 0 or
-                client.protocol.buffered.items.len != 0 or client.protocol.events.len() != 0 or
-                client.protocol.transmits.len() != 0 or client.consumed < client.received) return true;
+                client.protocol.events.items.len != 0 or
+                client.protocol.transmits.items.len != 0 or client.consumed < client.received) return true;
         };
         return false;
     }
@@ -279,11 +260,14 @@ pub const ControlServer = struct {
         self.activation_queued = false;
         for (&self.clients) |*entry| if (entry.*) |*client| {
             if (client.activation) |call| {
-                if (!client.closing and !self.shutting_down) try client.protocol.sendReply(call, .{ .object = .empty });
+                if (!client.closing and !self.shutting_down) sendToolResult(&client.protocol, call, .{ .object = .empty }, false) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try self.closeClient(client);
+                };
                 client.activation = null;
             }
-            try self.pumpClient(client);
         };
+        try self.serviceRequests();
     }
 
     pub fn activationFailed(self: *ControlServer, err: anyerror) !void {
@@ -293,15 +277,18 @@ pub const ControlServer = struct {
         self.activation_queued = false;
         for (&self.clients) |*entry| if (entry.*) |*client| {
             if (client.activation) |call| {
-                if (!client.closing and !self.shutting_down) try sendFieldError(self.allocator, &client.protocol, call, interface_name ++ ".ActivateFailed", "message", @errorName(err));
+                if (!client.closing and !self.shutting_down) sendToolError(&client.protocol, call, "ActivateFailed", @errorName(err), null) catch |send_err| {
+                    if (send_err == error.OutOfMemory) return send_err;
+                    try self.closeClient(client);
+                };
                 client.activation = null;
             }
-            try self.pumpClient(client);
         };
+        try self.serviceRequests();
     }
 
     /// Consumes scheduler grants for custom actions, isolating Lua failures to
-    /// their Varlink caller instead of terminating the application.
+    /// their MCP caller instead of terminating the application.
     pub fn resumeRunnable(self: *ControlServer, handle: task.TaskHandle) !bool {
         for (&self.clients) |*entry| if (entry.*) |*client| {
             const action = client.action orelse continue;
@@ -331,20 +318,17 @@ pub const ControlServer = struct {
                 return true;
             };
             if (!client.closing) if (action.call) |call| {
-                const schema = &action.application.action_schema.?;
+                const tool = action.application.actionTool(action.method).?;
                 switch (value) {
                     .output => |parameters| {
-                        if (schema.validateMethodOutput(action.method, parameters) != .valid) {
+                        if (!mcp.schema.validate(mcp.get(tool, "outputSchema").?, parameters)) {
                             try self.sendActionFailure(client, call, "invalid action output");
-                        } else client.protocol.sendReply(call, parameters) catch |err|
+                        } else sendToolResult(&client.protocol, call, parameters, false) catch |err|
                             try self.sendActionFailure(client, call, @errorName(err));
                     },
                     .declared_error => |failure| {
-                        const interface = action.application.customInterface().?;
-                        const qualified = try std.fmt.allocPrint(arena.allocator(), "{s}.{s}", .{ interface.name, failure.name });
-                        if (interface.errorDefinition(failure.name) == null or schema.validateError(qualified, failure.parameters) != .valid) {
-                            try self.sendActionFailure(client, call, "invalid declared action error");
-                        } else try client.protocol.sendError(call, qualified, failure.parameters);
+                        sendToolError(&client.protocol, call, failure.name, failure.name, failure.parameters) catch |err|
+                            try self.sendActionFailure(client, call, @errorName(err));
                     },
                 }
             };
@@ -353,8 +337,11 @@ pub const ControlServer = struct {
         return false;
     }
 
-    fn sendActionFailure(self: *ControlServer, client: *Client, call: varlink.CallHandle, message: []const u8) !void {
-        try sendFieldError(self.allocator, &client.protocol, call, interface_name ++ ".ActionFailed", "message", message);
+    fn sendActionFailure(self: *ControlServer, client: *Client, call: mcp.CallHandle, message: []const u8) !void {
+        sendToolError(&client.protocol, call, "ActionFailed", message, null) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try self.closeClient(client);
+        };
     }
 
     pub fn reloadSucceeded(self: *ControlServer, sequence: u64, generation: u64) !void {
@@ -369,11 +356,14 @@ pub const ControlServer = struct {
                     index += 1;
                     continue;
                 }
-                if (!self.shutting_down) try sendGeneration(client, waiter.call, generation);
+                if (!self.shutting_down and !client.closing) sendGeneration(client, waiter.call, generation) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try self.closeClient(client);
+                };
                 _ = client.waiters.orderedRemove(index);
             }
-            if (!self.shutting_down) try self.pumpClient(client);
         };
+        try self.serviceRequests();
     }
 
     pub fn reloadFailed(
@@ -393,16 +383,24 @@ pub const ControlServer = struct {
                     index += 1;
                     continue;
                 }
-                if (!self.shutting_down) try sendReloadFailure(client, waiter.call, failure.*);
+                if (!self.shutting_down and !client.closing) sendReloadFailure(client, waiter.call, failure.*) catch |send_err| {
+                    if (send_err == error.OutOfMemory) return send_err;
+                    try self.closeClient(client);
+                };
                 _ = client.waiters.orderedRemove(index);
             }
-            if (!self.shutting_down) try self.pumpClient(client);
         };
+        try self.serviceRequests();
     }
 
     pub fn serviceRequests(self: *ControlServer) !void {
         if (self.shutting_down) return;
-        for (&self.clients) |*entry| if (entry.*) |*client| try self.pumpClient(client);
+        for (&self.clients) |*entry| if (entry.*) |*client| {
+            self.pumpClient(client) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try self.closeClient(client);
+            };
+        };
     }
 
     pub fn dispatch(self: *ControlServer, completion: io_loop.SocketCompletion) !bool {
@@ -431,9 +429,10 @@ pub const ControlServer = struct {
         };
 
         for (&self.clients) |*entry| if (entry.*) |*client| {
-            const operation = client.operation orelse continue;
-            if (!same(operation, completion.operation)) continue;
-            client.operation_terminal = true;
+            const reading = if (client.read_operation) |op| same(op, completion.operation) else false;
+            const writing = if (client.operation) |op| same(op, completion.operation) else false;
+            if (!reading and !writing) continue;
+            if (reading) client.read_terminal = true else client.operation_terminal = true;
             if (self.shutting_down or client.closing) {
                 self.collectClosed();
                 return true;
@@ -441,13 +440,13 @@ pub const ControlServer = struct {
             switch (completion.kind) {
                 .recv => {
                     if (completion.result <= 0) {
-                        client.operation = null;
+                        client.read_operation = null;
                         try self.closeClient(client);
                         self.collectClosed();
                         return true;
                     }
-                    client.operation = null;
-                    client.operation_terminal = false;
+                    client.read_operation = null;
+                    client.read_terminal = false;
                     client.received = @intCast(completion.result);
                     client.consumed = 0;
                 },
@@ -489,6 +488,7 @@ pub const ControlServer = struct {
         client.closing = true;
         if (client.action) |action| try action.vm.scheduler.queueScopeCancellation(action.scope);
         if (client.operation) |operation| try self.loop.prepareCancel(operation);
+        if (client.read_operation) |operation| try self.loop.prepareCancel(operation);
     }
 
     pub fn collectClosed(self: *ControlServer) void {
@@ -506,6 +506,10 @@ pub const ControlServer = struct {
             if (client.operation) |operation| {
                 if (!client.operation_terminal or self.loop.operationPending(operation)) continue;
                 client.operation = null;
+            }
+            if (client.read_operation) |operation| {
+                if (!client.read_terminal or self.loop.operationPending(operation)) continue;
+                client.read_operation = null;
             }
             if (client.action == null) {
                 client.deinit();
@@ -537,9 +541,9 @@ pub const ControlServer = struct {
     }
 
     fn pumpClient(self: *ControlServer, client: *Client) !void {
-        if (client.operation != null or self.shutting_down or client.closing) return;
+        if (self.shutting_down or client.closing) return;
         while (true) {
-            while (client.action == null and client.activation == null) {
+            while (client.protocol.transmits.items.len < client.protocol.config.max_transmits) {
                 const event_value = client.protocol.takeEvent() orelse break;
                 var event = event_value;
                 defer event.deinit();
@@ -547,26 +551,27 @@ pub const ControlServer = struct {
                     .call => |*call| try self.handleCall(client, call.handle, &call.request),
                 }
             }
-            if (client.action == null and client.activation == null and client.consumed < client.received) {
+            if (client.consumed < client.received) {
                 const consumed = try client.protocol.feed(
                     client.receive_buffer[client.consumed..client.received],
                 );
                 client.consumed += consumed;
                 if (consumed != 0) continue;
             }
-            if (client.transmit == null) client.transmit = client.protocol.takeTransmit();
-            if (client.transmit) |*transmit| {
-                client.operation = try self.loop.prepareSend(client.fd, transmit.remaining());
-                return;
+            if (client.operation == null) {
+                if (client.transmit == null) client.transmit = client.protocol.takeTransmit();
+                if (client.transmit) |*transmit| {
+                    client.operation = try self.loop.prepareSend(client.fd, transmit.remaining());
+                    client.operation_terminal = false;
+                }
             }
-            if (client.action != null or client.consumed != client.received) return;
+            if (client.consumed != client.received or client.read_operation != null) return;
             client.received = 0;
             client.consumed = 0;
-            // Varlink replies are ordered and non-multiplexed. Do not leave a
-            // receive occupying this client's sole operation slot while a
-            // long-running Reload call is waiting for its terminal reply.
-            if (client.waiters.items.len != 0 or client.activation != null) return;
-            client.operation = try self.loop.prepareRecv(client.fd, &client.receive_buffer);
+            // Reads and writes own independent operations: a sleeping action
+            // never prevents status, reload, or cancellation on this connection.
+            client.read_operation = try self.loop.prepareRecv(client.fd, &client.receive_buffer);
+            client.read_terminal = false;
             return;
         }
     }
@@ -574,103 +579,78 @@ pub const ControlServer = struct {
     fn handleCall(
         self: *ControlServer,
         client: *Client,
-        call: varlink.CallHandle,
-        request: *const varlink.Request,
+        call: mcp.CallHandle,
+        request: *const mcp.Request,
     ) !void {
-        if (try self.service.handle(&client.protocol, call, request)) return;
-        if (request.upgrade or request.more) {
-            if (!request.oneway) try sendFieldError(
-                self.allocator,
-                &client.protocol,
-                call,
-                "org.varlink.service.MethodNotImplemented",
-                "method",
-                request.method,
-            );
+        if (request.id == null) {
+            if (std.mem.eql(u8, request.method, "notifications/cancelled")) {
+                const id = mcp.get(request.params orelse return, "requestId") orelse return;
+                const target = client.protocol.handleForId(id) orelse return;
+                if (client.action) |action| if (action.call != null and action.call.?.value == target.value) {
+                    try action.vm.scheduler.queueScopeCancellation(action.scope);
+                };
+            }
             return;
         }
-        switch (self.service.validateRequest(request)) {
-            .valid => {},
-            .interface_not_found => |name| {
-                if (!request.oneway) try sendFieldError(
-                    self.allocator,
-                    &client.protocol,
-                    call,
-                    "org.varlink.service.InterfaceNotFound",
-                    "interface",
-                    name,
-                );
-                return;
-            },
-            .member_not_found => {
-                if (!request.oneway) try sendFieldError(
-                    self.allocator,
-                    &client.protocol,
-                    call,
-                    "org.varlink.service.MethodNotFound",
-                    "method",
-                    request.method,
-                );
-                return;
-            },
-            .invalid_parameter => |name| {
-                if (!request.oneway) try sendFieldError(
-                    self.allocator,
-                    &client.protocol,
-                    call,
-                    "org.varlink.service.InvalidParameter",
-                    "parameter",
-                    name,
-                );
-                return;
-            },
+        if (std.mem.eql(u8, request.method, "server/discover")) {
+            var doc = try std.json.parseFromSlice(mcp.Value, self.allocator,
+                \\{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"ourokit","version":"0.1.0"}},"ttlMs":0,"cacheScope":"private"}
+            , .{});
+            defer doc.deinit();
+            return client.protocol.sendResult(call, doc.value);
         }
+        if (std.mem.eql(u8, request.method, "tools/list")) return self.sendTools(client, call);
+        if (!std.mem.eql(u8, request.method, "tools/call")) return client.protocol.sendError(call, -32601, "Method not found", null);
+        const params = request.params orelse return client.protocol.sendError(call, -32602, "Missing tool parameters", null);
+        const name_value = mcp.get(params, "name") orelse return client.protocol.sendError(call, -32602, "Missing tool name", null);
+        if (name_value != .string) return client.protocol.sendError(call, -32602, "Invalid tool name", null);
+        const name = name_value.string;
+        const arguments = mcp.get(params, "arguments") orelse mcp.Value{ .object = .empty };
+        var builtins = try std.json.parseFromSlice(mcp.Value, self.allocator, builtin_tools, .{});
+        defer builtins.deinit();
+        const tool = for (builtins.value.array.items) |item| {
+            if (mcp.isString(mcp.get(item, "name"), name)) break item;
+        } else (if (self.application) |app| app.actionTool(name) else null) orelse
+            return client.protocol.sendError(call, -32602, "Unknown tool", null);
+        if (!mcp.schema.validate(mcp.get(tool, "inputSchema").?, arguments))
+            return client.protocol.sendError(call, -32602, "Invalid tool arguments", null);
 
-        if (std.mem.eql(u8, request.method, reload_method)) {
+        if (std.mem.eql(u8, name, reload_method)) {
             const sequence = self.requests.request();
             self.reloading = true;
-            if (!request.oneway) {
-                if (client.waiters.items.len == client.waiters.capacity)
-                    return error.ReloadWaiterCapacityExceeded;
-                client.waiters.appendAssumeCapacity(.{ .sequence = sequence, .call = call });
-            }
-        } else if (std.mem.eql(u8, request.method, status_method)) {
-            if (!request.oneway) try self.sendStatus(client, call);
-        } else if (std.mem.eql(u8, request.method, activate_method)) {
-            if (request.parameters) |parameters| if (parameters.object.get("activationToken")) |value| {
+            if (client.waiters.items.len == client.waiters.capacity) return error.ReloadWaiterCapacityExceeded;
+            client.waiters.appendAssumeCapacity(.{ .sequence = sequence, .call = call });
+        } else if (std.mem.eql(u8, name, status_method)) {
+            try self.sendStatus(client, call);
+        } else if (std.mem.eql(u8, name, activate_method)) {
+            if (client.activation != null) return sendToolError(&client.protocol, call, "Busy", "Activation already pending", null);
+            if (arguments.object.get("activationToken")) |value| {
                 if (value == .string) {
                     const token = try self.allocator.dupe(u8, value.string);
                     if (self.activation_token) |old| self.allocator.free(old);
                     self.activation_token = token;
                 }
-            };
+            }
             if (!self.activating) {
                 self.activating = true;
                 self.activation_queued = true;
             }
             // Even an active UI needs the host to present/focus its window.
-            if (!request.oneway) client.activation = call;
+            client.activation = call;
         } else {
-            const name = request.method[(std.mem.lastIndexOfScalar(u8, request.method, '.') orelse unreachable) + 1 ..];
-            const application = self.application orelse {
-                if (!request.oneway) try self.sendActionFailure(client, call, "application not installed");
-                return;
-            };
+            if (client.action != null) return sendToolError(&client.protocol, call, "Busy", "One custom action per connection", null);
+            const application = self.application.?;
             const vm = self.vm.?;
-            const owned_method = try self.allocator.dupe(u8, request.method);
+            const owned_method = try self.allocator.dupe(u8, name);
             var transferred = false;
             defer if (!transferred) self.allocator.free(owned_method);
             const scope = try vm.scheduler.createScope(vm.scheduler.application_scope);
-            const handle = application.startAction(vm, scope, name, request.parameters) catch |err| {
+            const handle = application.startAction(vm, scope, name, arguments) catch |err| {
                 try vm.scheduler.destroyScope(scope);
-                if (!request.oneway) {
-                    if (err == error.ActionNotFound) {
-                        try sendFieldError(self.allocator, &client.protocol, call, "org.varlink.service.MethodNotFound", "method", request.method);
-                    } else try self.sendActionFailure(client, call, @errorName(err));
-                }
+                try self.sendActionFailure(client, call, @errorName(err));
                 return;
             };
-            client.action = .{ .vm = vm, .handle = handle, .scope = scope, .call = if (request.oneway) null else call, .application = application, .method = owned_method };
+            client.action = .{ .vm = vm, .handle = handle, .scope = scope, .call = call, .application = application, .method = owned_method };
             transferred = true;
         }
     }
@@ -678,7 +658,7 @@ pub const ControlServer = struct {
     fn sendStatus(
         self: *ControlServer,
         client: *Client,
-        call: varlink.CallHandle,
+        call: mcp.CallHandle,
     ) !void {
         var parameters = std.json.ObjectMap.empty;
         defer parameters.deinit(self.allocator);
@@ -701,11 +681,38 @@ pub const ControlServer = struct {
             try diagnostic.put(self.allocator, "source", .{ .string = failure.source });
             try diagnostic.put(self.allocator, "message", .{ .string = failure.message });
             try parameters.put(self.allocator, "diagnostic", .{ .object = diagnostic });
-            try client.protocol.sendReply(call, .{ .object = parameters });
+            try sendToolResult(&client.protocol, call, .{ .object = parameters }, false);
         } else {
             try parameters.put(self.allocator, "diagnostic", .null);
-            try client.protocol.sendReply(call, .{ .object = parameters });
+            try sendToolResult(&client.protocol, call, .{ .object = parameters }, false);
         }
+    }
+
+    fn sendTools(self: *ControlServer, client: *Client, call: mcp.CallHandle) !void {
+        var arena: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const builtins = try std.json.parseFromSlice(mcp.Value, a, builtin_tools, .{});
+        const failure = try std.json.parseFromSlice(mcp.Value, a, failure_schema, .{});
+        var tools = std.array_list.Managed(mcp.Value).init(a);
+        try tools.appendSlice(builtins.value.array.items);
+        if (self.application) |app| if (app.action_schema) |schema| {
+            var it = schema.tools.iterator();
+            while (it.next()) |entry| try tools.append(entry.value_ptr.*);
+        };
+        // Declarations describe success; every advertised output also covers
+        // the runtime's structured execution-error envelope.
+        for (tools.items) |*tool| {
+            var copy = try mcp.object(a, .{});
+            var it = tool.object.iterator();
+            while (it.next()) |entry| try copy.object.put(a, entry.key_ptr.*, entry.value_ptr.*);
+            var choices = std.array_list.Managed(mcp.Value).init(a);
+            try choices.append(mcp.get(copy, "outputSchema").?);
+            try choices.append(failure.value);
+            try copy.object.put(a, "outputSchema", try mcp.object(a, .{ .{ "type", mcp.string("object") }, .{ "anyOf", mcp.Value{ .array = choices } } }));
+            tool.* = copy;
+        }
+        try client.protocol.sendResult(call, try mcp.object(a, .{ .{ "tools", mcp.Value{ .array = tools } }, .{ "ttlMs", mcp.Value{ .integer = 0 } }, .{ "cacheScope", mcp.string("private") } }));
     }
 
     fn replaceFailure(
@@ -734,7 +741,7 @@ pub const ControlServer = struct {
     }
 };
 
-fn sendGeneration(client: *Client, call: varlink.CallHandle, generation: u64) !void {
+fn sendGeneration(client: *Client, call: mcp.CallHandle, generation: u64) !void {
     var parameters = std.json.ObjectMap.empty;
     defer parameters.deinit(client.protocol.allocator);
     try parameters.put(
@@ -742,50 +749,51 @@ fn sendGeneration(client: *Client, call: varlink.CallHandle, generation: u64) !v
         "generation",
         .{ .integer = @intCast(generation) },
     );
-    try client.protocol.sendReply(call, .{ .object = parameters });
+    try sendToolResult(&client.protocol, call, .{ .object = parameters }, false);
 }
 
-fn sendReloadFailure(client: *Client, call: varlink.CallHandle, failure: Failure) !void {
+fn sendReloadFailure(client: *Client, call: mcp.CallHandle, failure: Failure) !void {
     var parameters = std.json.ObjectMap.empty;
     defer parameters.deinit(client.protocol.allocator);
     try parameters.put(client.protocol.allocator, "phase", .{ .string = failure.phase });
     try parameters.put(client.protocol.allocator, "source", .{ .string = failure.source });
     try parameters.put(client.protocol.allocator, "message", .{ .string = failure.message });
-    try client.protocol.sendError(
-        call,
-        interface_name ++ ".ReloadFailed",
-        .{ .object = parameters },
-    );
+    try sendToolError(&client.protocol, call, "ReloadFailed", failure.message, .{ .object = parameters });
 }
 
-fn sendFieldError(
-    allocator: std.mem.Allocator,
-    server: *varlink.Server,
-    call: varlink.CallHandle,
-    error_name: []const u8,
-    field: []const u8,
-    value: []const u8,
-) !void {
-    var parameters = std.json.ObjectMap.empty;
-    defer parameters.deinit(allocator);
-    try parameters.put(allocator, field, .{ .string = value });
-    try server.sendError(call, error_name, .{ .object = parameters });
+fn sendToolError(server: *mcp.Server, call: mcp.CallHandle, code: []const u8, message: []const u8, parameters: ?mcp.Value) !void {
+    var arena: std.heap.ArenaAllocator = .init(server.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var detail = try mcp.object(a, .{ .{ "code", mcp.string(code) }, .{ "message", mcp.string(message) } });
+    if (parameters) |value| try detail.object.put(a, "parameters", value);
+    try sendToolResult(server, call, try mcp.object(a, .{.{ "error", detail }}), true);
+}
+
+fn sendToolResult(server: *mcp.Server, call: mcp.CallHandle, value: mcp.Value, is_error: bool) !void {
+    var arena: std.heap.ArenaAllocator = .init(server.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try std.json.Stringify.valueAlloc(a, value, .{});
+    var content = std.array_list.Managed(mcp.Value).init(a);
+    try content.append(try mcp.object(a, .{ .{ "type", mcp.string("text") }, .{ "text", mcp.string(text) } }));
+    try server.sendResult(call, try mcp.object(a, .{ .{ "structuredContent", value }, .{ "content", mcp.Value{ .array = content } }, .{ "isError", mcp.Value{ .bool = is_error } } }));
 }
 
 fn same(first: io_loop.OperationHandle, second: io_loop.OperationHandle) bool {
     return first.slot == second.slot and first.generation == second.generation;
 }
 
-test "runtime interface is accepted by the Varlink schema parser" {
-    var service = try varlink.Service.init(std.testing.allocator, .{
-        .vendor = "test",
-        .product = "test",
-        .version = "1",
-        .url = "https://example.invalid",
-    }, 2);
-    defer service.deinit();
-    try service.addInterface(interface_description);
-    try std.testing.expect(service.findInterface(interface_name) != null);
+test "runtime tool schemas use the supported JSON Schema subset" {
+    var tools = try std.json.parseFromSlice(mcp.Value, std.testing.allocator, builtin_tools, .{});
+    defer tools.deinit();
+    for (tools.value.array.items) |tool| {
+        try mcp.schema.check(mcp.get(tool, "inputSchema").?);
+        try mcp.schema.check(mcp.get(tool, "outputSchema").?);
+    }
+    var failure = try std.json.parseFromSlice(mcp.Value, std.testing.allocator, failure_schema, .{});
+    defer failure.deinit();
+    try mcp.schema.check(failure.value);
 }
 
 test "runtime server holds Reload reply until the generation commits" {
@@ -799,7 +807,7 @@ test "runtime server holds Reload reply until the generation commits" {
 
     const expected_path = try std.fmt.allocPrint(
         std.testing.allocator,
-        "/tmp/ouro-{d}.varlink",
+        "/tmp/ouro-{d}.mcp",
         .{linux.getpid()},
     );
     defer std.testing.allocator.free(expected_path);
@@ -815,46 +823,35 @@ test "runtime server holds Reload reply until the generation commits" {
     var vm: lua.Vm = undefined;
     try vm.init(std.testing.allocator, &scheduler, &loop);
     defer vm.deinit();
-    var outbound: lua.VarlinkClient = undefined;
+    var outbound: lua.McpClient = undefined;
     try outbound.init(std.testing.allocator, &vm, &loop, 2);
     defer outbound.deinit();
     var application = try lua.Application.loadNamedWithApi(std.testing.allocator, vm.state,
         \\local ouro = require('ouro')
+        \\local empty = {type='object', additionalProperties=false}
+        \\local function obj(props, required) return {type='object', properties=props, required=required, additionalProperties=false} end
+        \\local int, str = {type='integer'}, {type='string'}
+        \\local function action(input, output, handler) return {description='Test action', inputSchema=input, outputSchema=output, handler=handler} end
         \\return ouro.app {
         \\  id = 'dev.ourokit.test',
         \\  windows = { ouro.window { id = 'main', title = 'Test', content = function() end } },
-        \\  interface = [[interface dev.ourokit.test
-        \\    method Subtract(left: int, right: int) -> (difference: int)
-        \\    method Echo(values: ?[]?any) -> (values: ?[]?any)
-        \\    method Nothing() -> ()
-        \\    method Broken() -> ()
-        \\    method Invalid() -> (value: int)
-        \\    method Cycle() -> (self: object)
-        \\    method Delayed(delay: int, value: int) -> (value: int)
-        \\    method Outbound(address: string) -> (applicationId: string)
-        \\    method Oneway() -> ()
-        \\    method Status() -> (status: string)
-        \\    method Fail(code: int) -> ()
-        \\    error Rejected(code: int)
-        \\  ]],
         \\  actions = {
-        \\    Subtract = function(p) return {difference = p.left - p.right} end,
-        \\    Echo = function(p) return p end,
-        \\    Nothing = function() return {} end,
-        \\    Broken = function() return missing_function() end,
-        \\    Invalid = function() return {value = 'wrong type'} end,
-        \\    Cycle = function() local t = {}; t.self = t; return t end,
-        \\    Delayed = function(p) ouro.sleep(p.delay); return {value = p.value} end,
-        \\    Outbound = function(p)
-        \\      return {applicationId = ouro.varlink.call(p.address, 'dev.ourokit.runtime.Status').parameters.applicationId}
-        \\    end,
-        \\    Oneway = function() action_ran = true; return {} end,
-        \\    Status = function() return {status = 'custom status'} end,
-        \\    Fail = function(p)
+        \\    Subtract = action(obj({left=int,right=int},{'left','right'}), obj({difference=int},{'difference'}), function(p) return {difference=p.left-p.right} end),
+        \\    Echo = action({type='object'}, {type='object'}, function(p) return p end),
+        \\    Nothing = action(empty, empty, function() return {} end),
+        \\    Broken = action(empty, empty, function() return missing_function() end),
+        \\    Invalid = action(empty, obj({value=int},{'value'}), function() return {value='wrong type'} end),
+        \\    Cycle = action(empty, {type='object'}, function() local t={}; t.self=t; return t end),
+        \\    Delayed = action(obj({delay=int,value=int},{'delay','value'}), obj({value=int},{'value'}), function(p) ouro.sleep(p.delay); return {value=p.value} end),
+        \\    Outbound = action(obj({address=str},{'address'}), obj({applicationId=str},{'applicationId'}), function(p)
+        \\      return {applicationId=ouro.mcp.call(p.address,'runtime.status').result.structuredContent.applicationId}
+        \\    end),
+        \\    Status = action(empty, obj({status=str},{'status'}), function() return {status='custom status'} end),
+        \\    Fail = action(obj({code=int},{'code'}), empty, function(p)
         \\      if p.code == 1 then return ouro.action_error('Rejected', {code = 19}) end
         \\      if p.code == 2 then return ouro.action_error('Rejected', {code = 'wrong'}) end
         \\      return ouro.action_error('NotDeclared', {})
-        \\    end,
+        \\    end),
         \\  },
         \\}
     , "@actions-test", null, vm.apiReference());
@@ -883,8 +880,9 @@ test "runtime server holds Reload reply until the generation commits" {
     try control.serviceRequests();
 
     _ = try loop.submit();
-    const request = "{\"method\":\"dev.ourokit.runtime.Reload\"}\x00";
-    try std.testing.expectEqual(request.len, linux.write(client, request, request.len));
+    const request = try testRequest(reload_method, "{}");
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqual(request.len, linux.write(client, request.ptr, request.len));
     switch (loop.dispatch(try loop.wait())) {
         .socket => |completion| try std.testing.expect(try control.dispatch(completion)),
         else => return error.UnexpectedCompletion,
@@ -898,16 +896,17 @@ test "runtime server holds Reload reply until the generation commits" {
         .socket => |completion| try std.testing.expect(try control.dispatch(completion)),
         else => return error.UnexpectedCompletion,
     }
-    var reply: [256]u8 = undefined;
+    var reply: [2048]u8 = undefined;
     const reply_len = linux.read(client, &reply, reply.len);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(reply_len));
     try std.testing.expect(std.mem.indexOf(u8, reply[0..reply_len], "\"generation\":2") != null);
     try control.serviceRequests();
 
-    const status_request = "{\"method\":\"dev.ourokit.runtime.Status\"}\x00";
+    const status_request = try testRequest(status_method, "{}");
+    defer std.testing.allocator.free(status_request);
     try std.testing.expectEqual(
         status_request.len,
-        linux.write(client, status_request, status_request.len),
+        linux.write(client, status_request.ptr, status_request.len),
     );
     _ = try loop.submit();
     switch (loop.dispatch(try loop.wait())) {
@@ -931,10 +930,8 @@ test "runtime server holds Reload reply until the generation commits" {
     // Activation replies wait for the host, including presentation of an
     // already-active UI. A failed first attempt can be retried without reload.
     for (0..3) |attempt| {
-        const activation_request = if (attempt == 1)
-            "{\"method\":\"dev.ourokit.runtime.Activate\",\"parameters\":{\"activationToken\":\"test-token\"}}\x00"
-        else
-            "{\"method\":\"dev.ourokit.runtime.Activate\"}\x00";
+        const activation_request = try testRequest(activate_method, if (attempt == 1) "{\"activationToken\":\"test-token\"}" else "{}");
+        defer std.testing.allocator.free(activation_request);
         try std.testing.expectEqual(activation_request.len, linux.write(client, activation_request.ptr, activation_request.len));
         while (!control.activation_queued) {
             try testService(&control, &vm);
@@ -944,71 +941,63 @@ test "runtime server holds Reload reply until the generation commits" {
         try std.testing.expect(control.hasClients() and control.hasPendingCalls());
         try std.testing.expect(control.takeActivation());
         try std.testing.expect(!control.takeActivation());
-        try std.testing.expect(control.clients[0].?.protocol.transmits.len() == 0);
+        try std.testing.expect(control.clients[0].?.protocol.transmits.items.len == 0);
         if (attempt == 1) try std.testing.expectEqualStrings("test-token", control.activationToken().?);
         if (attempt == 0) try control.activationFailed(error.UiUnavailable) else try control.activationSucceeded();
         try std.testing.expect(control.activationToken() == null);
-        var activation_response: [256]u8 = undefined;
+        var activation_response: [2048]u8 = undefined;
         const bytes = try testReceive(&control, &vm, &outbound, client, &activation_response);
         if (attempt == 0) {
             try std.testing.expect(std.mem.indexOf(u8, bytes, "ActivateFailed") != null);
             try std.testing.expect(!control.ui_active);
         } else {
-            try std.testing.expectEqualStrings("{\"parameters\":{}}", bytes);
+            try std.testing.expect(std.mem.indexOf(u8, bytes, "\"structuredContent\":{}") != null);
             try std.testing.expect(control.ui_active);
         }
     }
 
     const cases = [_]struct { method: []const u8, parameters: []const u8 = "{}", expected: []const u8 }{
-        .{ .method = "Subtract", .parameters = "{\"left\":19,\"right\":7}", .expected = "{\"parameters\":{\"difference\":12}}" },
-        .{ .method = "Nothing", .expected = "{\"parameters\":{}}" },
-        .{ .method = "Echo", .expected = "{\"parameters\":{}}" },
-        .{ .method = "Echo", .parameters = "{\"values\":[false,7,\"hi\",null]}", .expected = "{\"parameters\":{\"values\":[false,7,\"hi\",null]}}" },
+        .{ .method = "Subtract", .parameters = "{\"left\":19,\"right\":7}", .expected = "\"structuredContent\":{\"difference\":12}" },
+        .{ .method = "Nothing", .expected = "\"structuredContent\":{}" },
+        .{ .method = "Echo", .expected = "\"structuredContent\":{}" },
+        .{ .method = "Echo", .parameters = "{\"values\":[false,7,\"hi\",null]}", .expected = "\"structuredContent\":{\"values\":[false,7,\"hi\",null]}" },
         .{ .method = "Broken", .expected = "LuaRuntimeError" },
         .{ .method = "Invalid", .expected = "invalid action output" },
         .{ .method = "Cycle", .expected = "ValueLimitExceeded" },
-        .{ .method = "Missing", .expected = "org.varlink.service.MethodNotFound" },
-        .{ .method = "Subtract", .parameters = "{\"left\":19,\"right\":\"7\"}", .expected = "org.varlink.service.InvalidParameter" },
-        .{ .method = "Subtract", .parameters = "{\"left\":19}", .expected = "org.varlink.service.InvalidParameter" },
-        .{ .method = "Nothing", .parameters = "{\"extra\":1}", .expected = "org.varlink.service.InvalidParameter" },
-        .{ .method = "Status", .expected = "{\"parameters\":{\"status\":\"custom status\"}}" },
-        .{ .method = "Delayed", .parameters = "{\"delay\":1,\"value\":23}", .expected = "{\"parameters\":{\"value\":23}}" },
-        .{ .method = "Fail", .parameters = "{\"code\":1}", .expected = "{\"parameters\":{\"code\":19},\"error\":\"dev.ourokit.test.Rejected\"}" },
-        .{ .method = "Fail", .parameters = "{\"code\":2}", .expected = "invalid declared action error" },
-        .{ .method = "Fail", .parameters = "{\"code\":3}", .expected = "invalid declared action error" },
+        .{ .method = "Missing", .expected = "Unknown tool" },
+        .{ .method = "Subtract", .parameters = "{\"left\":19,\"right\":\"7\"}", .expected = "Invalid tool arguments" },
+        .{ .method = "Subtract", .parameters = "{\"left\":19}", .expected = "Invalid tool arguments" },
+        .{ .method = "Nothing", .parameters = "{\"extra\":1}", .expected = "Invalid tool arguments" },
+        .{ .method = "Status", .expected = "\"structuredContent\":{\"status\":\"custom status\"}" },
+        .{ .method = "Delayed", .parameters = "{\"delay\":1,\"value\":23}", .expected = "\"structuredContent\":{\"value\":23}" },
+        .{ .method = "Fail", .parameters = "{\"code\":1}", .expected = "\"parameters\":{\"code\":19}" },
+        .{ .method = "Fail", .parameters = "{\"code\":2}", .expected = "\"parameters\":{\"code\":\"wrong\"}" },
+        .{ .method = "Fail", .parameters = "{\"code\":3}", .expected = "NotDeclared" },
     };
     for (cases) |case| {
-        const message = try std.fmt.allocPrint(std.testing.allocator, "{{\"method\":\"dev.ourokit.test.{s}\",\"parameters\":{s}}}\x00", .{ case.method, case.parameters });
+        const message = try testRequest(case.method, case.parameters);
         defer std.testing.allocator.free(message);
         try std.testing.expectEqual(message.len, linux.write(client, message.ptr, message.len));
         var response: [2048]u8 = undefined;
         const bytes = try testReceive(&control, &vm, &outbound, client, &response);
-        if (case.expected[0] == '{') {
-            try std.testing.expectEqualStrings(case.expected, bytes);
-        } else {
-            try std.testing.expect(std.mem.indexOf(u8, bytes, case.expected) != null);
-        }
+        try std.testing.expect(std.mem.indexOf(u8, bytes, case.expected) != null);
         try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
     }
 
     // An action can call another connection to the same server without blocking
     // its task phase. This also verifies native Status survives a custom name.
-    const outbound_request = try std.fmt.allocPrint(std.testing.allocator, "{{\"method\":\"dev.ourokit.test.Outbound\",\"parameters\":{{\"address\":\"unix:{s}\"}}}}\x00", .{control.socketPath()});
+    const outbound_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"address\":\"unix:{s}\"}}", .{control.socketPath()});
+    defer std.testing.allocator.free(outbound_args);
+    const outbound_request = try testRequest("Outbound", outbound_args);
     defer std.testing.allocator.free(outbound_request);
     try std.testing.expectEqual(outbound_request.len, linux.write(client, outbound_request.ptr, outbound_request.len));
     var response: [2048]u8 = undefined;
-    try std.testing.expectEqualStrings("{\"parameters\":{\"applicationId\":\"dev.ourokit.test\"}}", try testReceive(&control, &vm, &outbound, client, &response));
-
-    // Pipelined oneway + ordinary call must run in order and emit no extra reply.
-    const pipelined = "{\"method\":\"dev.ourokit.test.Oneway\",\"oneway\":true}\x00" ++
-        "{\"method\":\"dev.ourokit.test.Nothing\"}\x00";
-    try std.testing.expectEqual(pipelined.len, linux.write(client, pipelined, pipelined.len));
-    try std.testing.expectEqualStrings("{\"parameters\":{}}", try testReceive(&control, &vm, &outbound, client, &response));
-    try std.testing.expect(vm.globalBoolean("action_ran"));
+    try std.testing.expect(std.mem.indexOf(u8, try testReceive(&control, &vm, &outbound, client, &response), "\"structuredContent\":{\"applicationId\":\"dev.ourokit.test\"}") != null);
 
     // Generation retirement cancels an action without resuming its continuation.
-    const delayed = "{\"method\":\"dev.ourokit.test.Delayed\",\"parameters\":{\"delay\":60000,\"value\":99}}\x00";
-    try std.testing.expectEqual(delayed.len, linux.write(client, delayed, delayed.len));
+    const delayed = try testRequest("Delayed", "{\"delay\":60000,\"value\":99}");
+    defer std.testing.allocator.free(delayed);
+    try std.testing.expectEqual(delayed.len, linux.write(client, delayed.ptr, delayed.len));
     while (control.clients[0].?.action == null) {
         try testService(&control, &vm);
         if (control.clients[0].?.action != null) break;
@@ -1016,11 +1005,11 @@ test "runtime server holds Reload reply until the generation commits" {
     }
     try vm.requestCancellation();
     const canceled = try testReceive(&control, &vm, &outbound, client, &response);
-    try std.testing.expect(std.mem.indexOf(u8, canceled, "dev.ourokit.runtime.ActionFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, canceled, "ActionFailed") != null);
     try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
 
     // Shutdown also drains a suspended action and its cancellation completion.
-    try std.testing.expectEqual(delayed.len, linux.write(client, delayed, delayed.len));
+    try std.testing.expectEqual(delayed.len, linux.write(client, delayed.ptr, delayed.len));
     while (control.clients[0].?.action == null) {
         try testService(&control, &vm);
         if (control.clients[0].?.action != null) break;
@@ -1090,7 +1079,11 @@ fn testService(control: *ControlServer, vm: *lua.Vm) !void {
     try control.serviceRequests();
 }
 
-fn testDispatch(control: *ControlServer, vm: *lua.Vm, outbound: *lua.VarlinkClient) !void {
+fn testRequest(name: []const u8, arguments: []const u8) ![]u8 {
+    return std.fmt.allocPrint(std.testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{s},\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{{}}}}}}}}\n", .{ name, arguments });
+}
+
+fn testDispatch(control: *ControlServer, vm: *lua.Vm, outbound: *lua.McpClient) !void {
     _ = try control.loop.submit();
     switch (control.loop.dispatch(try control.loop.wait())) {
         .socket => |completion| if (!(try control.dispatch(completion))) {
@@ -1106,7 +1099,7 @@ fn testDispatch(control: *ControlServer, vm: *lua.Vm, outbound: *lua.VarlinkClie
     }
 }
 
-fn testReceive(control: *ControlServer, vm: *lua.Vm, outbound: *lua.VarlinkClient, fd: linux.fd_t, buffer: []u8) ![]const u8 {
+fn testReceive(control: *ControlServer, vm: *lua.Vm, outbound: *lua.McpClient, fd: linux.fd_t, buffer: []u8) ![]const u8 {
     var received: usize = 0;
     while (true) {
         try testService(control, vm);
@@ -1116,7 +1109,7 @@ fn testReceive(control: *ControlServer, vm: *lua.Vm, outbound: *lua.VarlinkClien
             .SUCCESS => {
                 if (count == 0) return error.ConnectionClosed;
                 received += count;
-                if (std.mem.indexOfScalar(u8, buffer[0..received], 0)) |end| return buffer[0..end];
+                if (std.mem.indexOfScalar(u8, buffer[0..received], '\n')) |end| return buffer[0..end];
                 if (received == buffer.len) return error.ReplyTooLarge;
             },
             .AGAIN => {},

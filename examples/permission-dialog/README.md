@@ -1,6 +1,6 @@
 # Permission dialog
 
-A standalone UI subprocess. No `actions`, Varlink socket, or systemd service.
+A standalone UI subprocess. No `actions`, MCP socket, or systemd service.
 It reads one JSON document up to EOF on stdin and writes one JSON decision on
 stdout. Reads and both stdout/stderr writes are asynchronous.
 

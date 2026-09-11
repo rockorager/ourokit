@@ -1,7 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const wayring = @import("wayring");
-const varlink = @import("../varlink/root.zig");
+const mcp = @import("../mcp/root.zig");
 const control = @import("control_server.zig");
 const socket_activation = @import("socket_activation.zig");
 
@@ -78,16 +78,16 @@ pub fn activateAt(allocator: std.mem.Allocator, path: []const u8, token: ?[]cons
     var parameters = std.json.ObjectMap.empty;
     defer parameters.deinit(allocator);
     if (token) |value| try parameters.put(allocator, "activationToken", .{ .string = value });
-    var reply = try call(allocator, path, control.interface_name ++ ".Activate", .{ .object = parameters });
+    var reply = try call(allocator, path, control.activate_method, .{ .object = parameters });
     defer reply.deinit();
-    if (reply.error_name != null) return error.ActivationFailed;
+    if (try failed(reply)) return error.ActivationFailed;
 }
 
 pub fn statusAt(allocator: std.mem.Allocator, path: []const u8) !Status {
     var reply = try call(allocator, path, control.status_method, null);
     defer reply.deinit();
-    if (reply.error_name != null) return error.StatusFailed;
-    const parameters = reply.parameters orelse return error.InvalidStatusReply;
+    if (try failed(reply)) return error.StatusFailed;
+    const parameters = mcp.get(reply.result.?, "structuredContent") orelse return error.InvalidStatusReply;
     const object = switch (parameters) {
         .object => |value| value,
         else => return error.InvalidStatusReply,
@@ -112,17 +112,29 @@ pub fn statusAt(allocator: std.mem.Allocator, path: []const u8) !Status {
 pub fn reloadAt(allocator: std.mem.Allocator, path: []const u8) !ReloadResult {
     var reply = try call(allocator, path, control.reload_method, null);
     defer reply.deinit();
-    const parameters = reply.parameters orelse return error.InvalidReloadReply;
+    if (reply.rpc_error != null) return error.ReloadFailed;
+    const result = reply.result orelse return error.InvalidReloadReply;
+    const parameters = mcp.get(result, "structuredContent") orelse return error.InvalidReloadReply;
     const object = switch (parameters) {
         .object => |value| value,
         else => return error.InvalidReloadReply,
     };
-    if (reply.error_name) |name| {
-        if (!std.mem.eql(u8, name, control.interface_name ++ ".ReloadFailed"))
-            return error.ReloadFailed;
-        return .{ .failed = try diagnosticFromObject(allocator, object) };
+    if (try failed(reply)) {
+        const detail = object.get("error") orelse return error.InvalidReloadReply;
+        if (!mcp.isString(mcp.get(detail, "code"), "ReloadFailed")) return error.ReloadFailed;
+        const diagnostic = mcp.get(detail, "parameters") orelse return error.InvalidReloadReply;
+        if (diagnostic != .object) return error.InvalidReloadReply;
+        return .{ .failed = try diagnosticFromObject(allocator, diagnostic.object) };
     }
     return .{ .committed = try unsignedField(object, "generation") };
+}
+
+fn failed(reply: mcp.Reply) !bool {
+    if (reply.rpc_error != null) return true;
+    const result = reply.result orelse return error.InvalidToolReply;
+    const flag = mcp.get(result, "isError") orelse return false;
+    if (flag != .bool) return error.InvalidToolReply;
+    return flag.bool;
 }
 
 fn call(
@@ -130,12 +142,14 @@ fn call(
     path: []const u8,
     method: []const u8,
     parameters: ?std.json.Value,
-) !varlink.Reply {
+) !mcp.Reply {
     const fd = try wayring.unix_socket.connect(path);
     defer _ = linux.close(fd);
-    var client = try varlink.Client.init(allocator, .{});
+    var client = try mcp.Client.init(allocator, .{});
     defer client.deinit();
-    _ = try client.call(.{ .method = method, .parameters = parameters });
+    var params = try mcp.object(allocator, .{ .{ "name", mcp.string(method) }, .{ "arguments", parameters orelse mcp.Value{ .object = .empty } } });
+    defer params.object.deinit(allocator);
+    const handle = try client.call(.{ .method = "tools/call", .params = params });
     while (client.takeTransmit()) |transmit_value| {
         var transmit = transmit_value;
         defer transmit.deinit();
@@ -169,14 +183,19 @@ fn call(
                     consumed += count;
                     if (client.takeEvent()) |event_value| {
                         var event = event_value;
-                        return switch (event) {
-                            .reply => |*reply| blk: {
+                        switch (event) {
+                            .reply => |*reply| {
+                                if (reply.call.value != handle.value) {
+                                    event.deinit();
+                                    return error.UnexpectedReply;
+                                }
                                 const message = reply.message;
                                 reply.message = undefined;
                                 event = undefined;
-                                break :blk message;
+                                return message;
                             },
-                        };
+                            .notification => event.deinit(),
+                        }
                     }
                     if (count == 0) return error.ClientEventCapacityExceeded;
                 }

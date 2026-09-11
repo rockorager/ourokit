@@ -3,7 +3,7 @@
 The Contacts and permission-dialog examples exercise images, icons, themes,
 retained state, and asynchronous application I/O together. Contacts also uses a
 variable-height virtual list with 500 synthetic records. Both retain their
-existing application protocols: Contacts exposes typed Varlink methods, and the
+application roles: Contacts exposes schema-validated MCP tools, and the
 dialog reads one EOF-delimited JSON request and writes one JSON decision.
 
 ## More behavior, not necessarily less code
@@ -30,7 +30,7 @@ which responsibilities remain outside application code:
 
 - The virtual list measures heights, tracks its visible range and mounts rows.
   Selection and editable contact data stay in application signals, outside row
-  lifetimes. UI and Varlink actions call the same state-changing functions.
+  lifetimes. UI and MCP actions call the same state-changing functions.
 - Images load asynchronously; decoding, resource leases, clipping and rendering
   need no application-side worker or cache code.
 - A root theme changes colors, typography and control geometry without
@@ -74,7 +74,7 @@ python3 tests/demo_apps.py
 
 Optionally set `OUROKIT_DEMO_ARTIFACTS` to a capture directory. The test checks
 headless Contacts calls, native activation and editing, scrolling, distant
-Varlink updates, theme retention, dialog validation, backpressured single-decision
+MCP updates, theme retention, dialog validation, backpressured single-decision
 output, denial, malformed input, and clean exits. It captures representative
 windows and a Contacts scrolling/theme-switch video for visual inspection.
 These demo checks use the software renderer; they do not verify hardware

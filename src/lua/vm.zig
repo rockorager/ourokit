@@ -3,7 +3,7 @@ const c = @import("c.zig");
 const Handle = @import("../core/handle.zig").Handle;
 const io = @import("../loop/io_uring.zig");
 const task = @import("../task/scheduler.zig");
-const json = @import("varlink_client.zig");
+const json = @import("mcp_client.zig");
 
 pub const TaskHandle = Handle;
 

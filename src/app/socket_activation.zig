@@ -1,7 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-/// Detect, but never consume or close, systemd's named Varlink listener.
+/// Detect, but never consume or close, systemd's named MCP listener.
 /// Repeated calls return the same descriptor. Ownership transfers only after
 /// ControlServer initialization succeeds.
 pub fn listener(environ: std.process.Environ) !?linux.fd_t {
@@ -18,15 +18,15 @@ pub fn listener(environ: std.process.Environ) !?linux.fd_t {
         var iterator = std.mem.splitScalar(u8, names, ':');
         for (0..count) |index| {
             const name = iterator.next() orelse return error.InvalidListenFdNames;
-            if (std.mem.eql(u8, name, "varlink")) {
-                if (selected != null) return error.AmbiguousVarlinkListener;
+            if (std.mem.eql(u8, name, "mcp")) {
+                if (selected != null) return error.AmbiguousMcpListener;
                 selected = @intCast(index + 3);
             }
         }
         if (iterator.next() != null) return error.InvalidListenFdNames;
     } else if (count == 1) {
         selected = 3;
-    } else return error.AmbiguousVarlinkListener;
+    } else return error.AmbiguousMcpListener;
     const fd = selected orelse return null;
     try validate(fd);
     return fd;
@@ -130,7 +130,7 @@ test "systemd listener detection is repeatable and validates descriptor type" {
     var names: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer names.deinit();
     for (3..@intCast(fd)) |_| try names.writer.writeAll("other:");
-    try names.writer.writeAll("varlink");
+    try names.writer.writeAll("mcp");
     try map.put("LISTEN_PID", pid);
     try map.put("LISTEN_FDS", count);
     try map.put("LISTEN_FDNAMES", names.written());

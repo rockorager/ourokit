@@ -1,10 +1,12 @@
 const std = @import("std");
 const linux = std.os.linux;
 const io = @import("../loop/io_uring.zig");
-const varlink = @import("../varlink/client.zig");
-const message = @import("../varlink/message.zig");
+const mcp = @import("../mcp/root.zig");
 
 const receive_capacity = 16 * 1024;
+const message_capacity = 256 * 1024;
+const resource_uri = "ouro://settings/appearance/color_scheme";
+const subscription_id_key = "io.modelcontextprotocol/subscriptionId";
 const retry_min_ns = 250 * std.time.ns_per_ms;
 const retry_max_ns = 10 * std.time.ns_per_s;
 
@@ -39,7 +41,7 @@ pub const Store = struct {
 
 const State = enum { disabled, waiting, connecting, sending, receiving, stopping, stopped };
 
-/// Host-owned WatchPath subscription. The host routes socket CQEs, expired
+/// Host-owned MCP appearance subscription. The host routes socket CQEs, expired
 /// logical timers, and operation-cancel CQEs to this object.
 pub const Client = struct {
     allocator: std.mem.Allocator = undefined,
@@ -53,9 +55,13 @@ pub const Client = struct {
     cancellation_requested: bool = false,
     timer: ?io.OperationHandle = null,
     retry_ns: u64 = retry_min_ns,
-    protocol: varlink.Client = undefined,
+    protocol: mcp.Client = undefined,
     protocol_initialized: bool = false,
-    transmit: ?message.Transmit = null,
+    transmit: ?mcp.Transmit = null,
+    subscription: ?mcp.CallHandle = null,
+    acknowledged: bool = false,
+    read: ?mcp.CallHandle = null,
+    dirty: bool = false,
     received: usize = 0,
     consumed: usize = 0,
     receive_buffer: [receive_capacity]u8 = undefined,
@@ -192,26 +198,33 @@ pub const Client = struct {
     }
 
     fn initProtocol(self: *Client) !void {
-        self.protocol = try varlink.Client.init(self.allocator, .{
-            .max_message_bytes = receive_capacity,
-            .max_outbound_message_bytes = receive_capacity,
-            .max_pending_calls = 1,
+        self.protocol = try mcp.Client.init(self.allocator, .{
+            .max_message_bytes = message_capacity,
+            .max_outbound_message_bytes = message_capacity,
+            .max_pending_calls = 2,
             .max_events = 1,
             .max_transmits = 1,
         });
         self.protocol_initialized = true;
-        var parameters = try std.json.ObjectMap.init(self.allocator, &.{}, &.{});
-        defer parameters.deinit(self.allocator);
-        try parameters.put(self.allocator, "path", .{ .string = "/appearance/color_scheme" });
-        _ = try self.protocol.call(.{
-            .method = "dev.rockorager.ouro.Settings.WatchPath",
-            .parameters = .{ .object = parameters },
-            .more = true,
+        const params = try std.json.parseFromSlice(mcp.Value, self.allocator,
+            \\{"notifications":{"resourceSubscriptions":["ouro://settings/appearance/color_scheme"]}}
+        , .{});
+        defer params.deinit();
+        self.subscription = try self.protocol.call(.{
+            .method = "subscriptions/listen",
+            .params = params.value,
+            .subscription = true,
         });
         self.transmit = self.protocol.takeTransmit().?;
     }
 
     fn prepareNext(self: *Client) !void {
+        // Drain each received batch before sending queued calls. A subscription
+        // and its read share this single socket operation slot.
+        if (self.state == .receiving and self.transmit == null) {
+            self.transmit = self.protocol.takeTransmit();
+            if (self.transmit != null) self.state = .sending;
+        }
         self.operation = switch (self.state) {
             .sending => self.loop.prepareSend(self.fd, self.transmit.?.remaining()),
             .receiving => self.loop.prepareRecv(self.fd, &self.receive_buffer),
@@ -230,33 +243,84 @@ pub const Client = struct {
             while (self.protocol.takeEvent()) |event_value| {
                 var event = event_value;
                 defer event.deinit();
-                const reply = event.reply.message;
-                if (!reply.continues or reply.error_name != null) return error.SubscriptionEnded;
-                const parameters = reply.parameters orelse return error.InvalidWatchReply;
-                const object = switch (parameters) {
-                    .object => |value| value,
-                    else => return error.InvalidWatchReply,
-                };
-                _ = switch (object.get("revision") orelse return error.InvalidWatchReply) {
-                    .string => |value| value,
-                    else => return error.InvalidWatchReply,
-                };
-                const exists = switch (object.get("exists") orelse return error.InvalidWatchReply) {
-                    .bool => |value| value,
-                    else => return error.InvalidWatchReply,
-                };
-                const encoded = switch (object.get("value_json") orelse return error.InvalidWatchReply) {
-                    .string => |value| value,
-                    else => return error.InvalidWatchReply,
-                };
-                const scheme = if (exists)
-                    parseScheme(self.allocator, encoded) orelse return error.InvalidColorScheme
-                else
-                    .default;
-                self.store.update(.{ .color_scheme = scheme });
-                self.retry_ns = retry_min_ns;
+                switch (event) {
+                    .notification => |notification| try self.acceptNotification(notification.message),
+                    .reply => |reply| {
+                        if (reply.call.value == self.subscription.?.value) return error.SubscriptionEnded;
+                        const read = self.read orelse return error.UnexpectedReadReply;
+                        if (reply.call.value != read.value) return error.UnexpectedReadReply;
+                        if (reply.message.rpc_error != null) return error.ReadFailed;
+                        const scheme = try self.readScheme(reply.message.result orelse return error.InvalidReadReply);
+                        self.read = null;
+                        self.store.update(.{ .color_scheme = scheme });
+                        self.retry_ns = retry_min_ns;
+                        if (self.dirty) try self.requestRead();
+                    },
+                }
             }
         }
+    }
+
+    fn acceptNotification(self: *Client, notification: mcp.Request) !void {
+        const params = notification.params orelse return error.InvalidNotification;
+        if (params != .object) return error.InvalidNotification;
+        const meta = params.object.get("_meta") orelse return error.InvalidNotification;
+        if (meta != .object) return error.InvalidNotification;
+        const id = meta.object.get(subscription_id_key) orelse return error.InvalidNotification;
+        const subscription_id = switch (id) {
+            .number_string => |number| std.fmt.parseInt(u64, number, 10) catch return,
+            else => return,
+        };
+        if (subscription_id != self.subscription.?.value) return;
+        if (std.mem.eql(u8, notification.method, "notifications/subscriptions/acknowledged")) {
+            if (self.acknowledged) return error.DuplicateAcknowledgment;
+            const notifications = params.object.get("notifications") orelse return error.InvalidAcknowledgment;
+            if (notifications != .object) return error.InvalidAcknowledgment;
+            const resources = notifications.object.get("resourceSubscriptions") orelse return error.InvalidAcknowledgment;
+            if (resources != .array) return error.InvalidAcknowledgment;
+            for (resources.array.items) |uri| {
+                if (uri == .string and std.mem.eql(u8, uri.string, resource_uri)) {
+                    self.acknowledged = true;
+                    try self.requestRead();
+                    return;
+                }
+            }
+            return error.InvalidAcknowledgment;
+        }
+        if (std.mem.eql(u8, notification.method, "notifications/resources/updated")) {
+            if (!self.acknowledged) return error.UpdateBeforeAcknowledgment;
+            const uri = params.object.get("uri") orelse return error.InvalidNotification;
+            if (uri != .string) return error.InvalidNotification;
+            if (!std.mem.eql(u8, uri.string, resource_uri)) return;
+            if (self.read != null) {
+                self.dirty = true;
+            } else try self.requestRead();
+        }
+    }
+
+    fn requestRead(self: *Client) !void {
+        std.debug.assert(self.acknowledged and self.read == null);
+        const params = try std.json.parseFromSlice(mcp.Value, self.allocator,
+            \\{"uri":"ouro://settings/appearance/color_scheme"}
+        , .{});
+        defer params.deinit();
+        self.read = try self.protocol.call(.{ .method = "resources/read", .params = params.value });
+        self.dirty = false;
+    }
+
+    fn readScheme(self: *Client, result: mcp.Value) !ColorScheme {
+        if (result != .object) return error.InvalidReadReply;
+        const contents = result.object.get("contents") orelse return error.InvalidReadReply;
+        if (contents != .array or contents.array.items.len != 1) return error.InvalidReadReply;
+        const content = contents.array.items[0];
+        if (content != .object) return error.InvalidReadReply;
+        const uri = content.object.get("uri") orelse return error.InvalidReadReply;
+        if (uri != .string or !std.mem.eql(u8, uri.string, resource_uri)) return error.InvalidReadReply;
+        const mime = content.object.get("mimeType") orelse return error.InvalidReadReply;
+        if (mime != .string or !std.mem.eql(u8, mime.string, "application/json")) return error.InvalidReadReply;
+        const text = content.object.get("text") orelse return error.InvalidReadReply;
+        if (text != .string) return error.InvalidReadReply;
+        return parseSelection(self.allocator, text.string);
     }
 
     fn connectionLost(self: *Client) !void {
@@ -279,6 +343,10 @@ pub const Client = struct {
         self.transmit = null;
         if (self.protocol_initialized) self.protocol.deinit();
         self.protocol_initialized = false;
+        self.subscription = null;
+        self.acknowledged = false;
+        self.read = null;
+        self.dirty = false;
         self.received = 0;
         self.consumed = 0;
     }
@@ -289,10 +357,23 @@ pub const Client = struct {
     }
 };
 
-fn parseScheme(allocator: std.mem.Allocator, encoded: []const u8) ?ColorScheme {
-    const parsed = std.json.parseFromSlice(ColorScheme, allocator, encoded, .{}) catch return null;
+fn parseSelection(allocator: std.mem.Allocator, encoded: []const u8) !ColorScheme {
+    const parsed = try std.json.parseFromSlice(mcp.Value, allocator, encoded, .{});
     defer parsed.deinit();
-    return parsed.value;
+    if (parsed.value != .object) return error.InvalidSelection;
+    const object = parsed.value.object;
+    const revision = object.get("revision") orelse return error.InvalidRevision;
+    if (revision != .string or revision.string.len == 0 or revision.string.len > 128 or
+        !std.unicode.utf8ValidateSlice(revision.string)) return error.InvalidRevision;
+    const exists = object.get("exists") orelse return error.InvalidSelection;
+    if (exists != .bool) return error.InvalidSelection;
+    const value = object.get("value") orelse return error.InvalidSelection;
+    if (!exists.bool) {
+        if (value != .null) return error.InvalidSelection;
+        return .default;
+    }
+    if (value != .string) return error.InvalidColorScheme;
+    return std.meta.stringToEnum(ColorScheme, value.string) orelse error.InvalidColorScheme;
 }
 
 fn same(a: io.OperationHandle, b: io.OperationHandle) bool {
@@ -310,38 +391,205 @@ test "Store suppresses equality and coalesces changes" {
     try std.testing.expect(store.takeEvent() == null);
 }
 
-test "color scheme JSON is strict" {
+test "appearance selection distinguishes missing from null and validates opaque revisions" {
     const allocator = std.testing.allocator;
-    try std.testing.expectEqual(ColorScheme.default, parseScheme(allocator, "\"default\"").?);
-    try std.testing.expectEqual(ColorScheme.light, parseScheme(allocator, "\"light\"").?);
-    try std.testing.expectEqual(ColorScheme.dark, parseScheme(allocator, " \"d\\u0061rk\" ").?);
-    try std.testing.expect(parseScheme(allocator, "dark") == null);
-    try std.testing.expect(parseScheme(allocator, "\"unknown\"") == null);
+    try std.testing.expectEqual(ColorScheme.default, try parseSelection(allocator,
+        \\{"revision":"opaque","exists":false,"value":null}
+    ));
+    try std.testing.expectEqual(ColorScheme.default, try parseSelection(allocator,
+        \\{"revision":"opaque","exists":true,"value":"default"}
+    ));
+    try std.testing.expectEqual(ColorScheme.dark, try parseSelection(allocator,
+        \\{"revision":"not-a-counter","exists":true,"value":"d\u0061rk"}
+    ));
+    try std.testing.expectError(error.InvalidColorScheme, parseSelection(allocator,
+        \\{"revision":"1","exists":true,"value":null}
+    ));
+    try std.testing.expectError(error.InvalidSelection, parseSelection(allocator,
+        \\{"revision":"1","exists":false,"value":"dark"}
+    ));
+    try std.testing.expectError(error.InvalidSelection, parseSelection(allocator,
+        \\{"revision":"1","exists":false}
+    ));
+    try std.testing.expectError(error.InvalidColorScheme, parseSelection(allocator,
+        \\{"revision":"1","exists":true,"value":"unknown"}
+    ));
+    try std.testing.expectError(error.InvalidRevision, parseSelection(allocator,
+        \\{"revision":"","exists":true,"value":"light"}
+    ));
+    try std.testing.expectError(error.InvalidRevision, parseSelection(allocator,
+        \\{"revision":1,"exists":true,"value":"light"}
+    ));
+    const prefix = "{\"revision\":\"";
+    const suffix = "\",\"exists\":true,\"value\":\"light\"}";
+    try std.testing.expectEqual(ColorScheme.light, try parseSelection(allocator, prefix ++ "é" ** 64 ++ suffix));
+    try std.testing.expectError(error.InvalidRevision, parseSelection(allocator, prefix ++ "é" ** 64 ++ "x" ++ suffix));
+    if (parseSelection(allocator, prefix ++ "\xff" ++ suffix)) |_| return error.AcceptedInvalidUtf8 else |_| {}
 }
 
-test "WatchPath replies parse across fragments and coalesce records" {
+test "appearance subscribes before read and coalesces dirty invalidations across fragmented records" {
     var store: Store = .{};
     var client: Client = .{ .allocator = std.testing.allocator, .store = &store };
     try client.initProtocol();
     defer client.releaseConnection();
-    client.transmit.?.deinit();
-    client.transmit = null;
-    const input =
-        "{\"parameters\":{\"revision\":\"1\",\"exists\":true,\"value_json\":\"\\\"light\\\"\"},\"continues\":true}\x00" ++
-        "{\"parameters\":{\"revision\":\"2\",\"exists\":true,\"value_json\":\"\\\"dark\\\"\"},\"continues\":true}\x00";
-    const split = input.len / 3;
-    @memcpy(client.receive_buffer[0..split], input[0..split]);
-    client.received = split;
-    try client.consumeReceived();
+    const subscription = try testTakeRequest(&client, "subscriptions/listen");
+    try std.testing.expect(client.protocol.takeTransmit() == null);
+    try std.testing.expect(client.read == null);
+    const ack = try testNotification(subscription, true, resource_uri);
+    defer std.testing.allocator.free(ack);
+    const split = ack.len / 3;
+    try testReceive(&client, ack[0..split]);
     try std.testing.expect(store.takeEvent() == null);
-    @memcpy(client.receive_buffer[0 .. input.len - split], input[split..]);
-    client.received = input.len - split;
-    client.consumed = 0;
-    try client.consumeReceived();
+    try std.testing.expect(client.read == null);
+    try testReceive(&client, ack[split..]);
+    const first_read = try testTakeRequest(&client, "resources/read");
+    try std.testing.expectEqual(@as(usize, 2), client.protocol.pendingCallCount());
+    const update = try testNotification(subscription, false, resource_uri);
+    defer std.testing.allocator.free(update);
+    const first_reply = try testReply(first_read, resource_uri,
+        \\{"revision":"z","exists":true,"value":"light"}
+    );
+    defer std.testing.allocator.free(first_reply);
+    const batch = try std.mem.concat(std.testing.allocator, u8, &.{ update, update, first_reply, update });
+    defer std.testing.allocator.free(batch);
+    try testReceive(&client, batch);
+    try std.testing.expectEqual(ColorScheme.light, store.current.color_scheme);
+    const second_read = try testTakeRequest(&client, "resources/read");
+    try std.testing.expect(second_read != first_read);
+    try std.testing.expect(client.protocol.takeTransmit() == null);
+    try std.testing.expectEqual(@as(usize, 2), client.protocol.pendingCallCount());
+    // The final notification in the batch belongs to the second read, not
+    // the completed first read, so it must cause one more read afterwards.
+    try std.testing.expect(client.dirty);
+    const second_reply = try testReply(second_read, resource_uri,
+        \\{"revision":"a","exists":true,"value":"dark"}
+    );
+    defer std.testing.allocator.free(second_reply);
+    try testReceive(&client, second_reply[0 .. second_reply.len - 1]);
+    try std.testing.expectEqual(ColorScheme.light, store.current.color_scheme);
+    try testReceive(&client, second_reply[second_reply.len - 1 ..]);
     try std.testing.expectEqual(ColorScheme.dark, store.takeEvent().?.appearance_changed.color_scheme);
+    const third_read = try testTakeRequest(&client, "resources/read");
+    const third_reply = try testReply(third_read, resource_uri,
+        \\{"revision":"same-selection","exists":true,"value":"dark"}
+    );
+    defer std.testing.allocator.free(third_reply);
+    try testReceive(&client, third_reply);
+    try std.testing.expect(store.takeEvent() == null);
+    try std.testing.expect(client.read == null and !client.dirty);
+    try std.testing.expectEqual(@as(usize, 1), client.protocol.pendingCallCount());
+    try std.testing.expect(client.protocol.takeTransmit() == null);
+    try testReceive(&client, update);
+    _ = try testTakeRequest(&client, "resources/read");
 }
 
-test "native appearance retries unavailable settings and retains state on disconnect" {
+test "appearance ignores unrelated subscription IDs and URIs but rejects wrong acknowledgment and order" {
+    var store: Store = .{ .current = .{ .color_scheme = .dark } };
+    var client: Client = .{ .allocator = std.testing.allocator, .store = &store };
+    try client.initProtocol();
+    defer client.releaseConnection();
+    const subscription = try testTakeRequest(&client, "subscriptions/listen");
+    const wrong_id = try testNotification(subscription + 99, true, resource_uri);
+    defer std.testing.allocator.free(wrong_id);
+    try testReceive(&client, wrong_id);
+    try std.testing.expect(!client.acknowledged and client.read == null);
+    const wrong_uri = try testNotification(subscription, true, "ouro://settings/other");
+    defer std.testing.allocator.free(wrong_uri);
+    try std.testing.expectError(error.InvalidAcknowledgment, testReceive(&client, wrong_uri));
+    const update = try testNotification(subscription, false, resource_uri);
+    defer std.testing.allocator.free(update);
+    try std.testing.expectError(error.UpdateBeforeAcknowledgment, testReceive(&client, update));
+    const ack = try testNotification(subscription, true, resource_uri);
+    defer std.testing.allocator.free(ack);
+    try testReceive(&client, ack);
+    _ = try testTakeRequest(&client, "resources/read");
+    const unrelated_uri = try testNotification(subscription, false, "ouro://settings/other");
+    defer std.testing.allocator.free(unrelated_uri);
+    try testReceive(&client, unrelated_uri);
+    const unrelated_id = try testNotification(subscription + 99, false, resource_uri);
+    defer std.testing.allocator.free(unrelated_id);
+    try testReceive(&client, unrelated_id);
+    try std.testing.expect(!client.dirty);
+    try std.testing.expect(client.protocol.takeTransmit() == null);
+    try std.testing.expectEqual(ColorScheme.dark, store.current.color_scheme);
+    try std.testing.expect(store.takeEvent() == null);
+}
+
+test "appearance invalid replies retain last good state" {
+    const cases = .{
+        .{ resource_uri, "{\"revision\":\"\",\"exists\":true,\"value\":\"light\"}" },
+        .{ resource_uri, "{\"revision\":\"1\",\"exists\":true,\"value\":null}" },
+        .{ resource_uri, "{\"revision\":\"1\",\"exists\":true,\"value\":\"unknown\"}" },
+        .{ resource_uri, "{\"revision\":\"1\",\"exists\":false,\"value\":\"light\"}" },
+        .{ "ouro://settings/other", "{\"revision\":\"1\",\"exists\":true,\"value\":\"light\"}" },
+    };
+    inline for (cases) |case| {
+        var store: Store = .{ .current = .{ .color_scheme = .dark } };
+        var client: Client = .{ .allocator = std.testing.allocator, .store = &store };
+        try client.initProtocol();
+        defer client.releaseConnection();
+        const subscription = try testTakeRequest(&client, "subscriptions/listen");
+        const ack = try testNotification(subscription, true, resource_uri);
+        defer std.testing.allocator.free(ack);
+        try testReceive(&client, ack);
+        const read = try testTakeRequest(&client, "resources/read");
+        const reply = try testReply(read, case[0], case[1]);
+        defer std.testing.allocator.free(reply);
+        if (testReceive(&client, reply)) |_| return error.AcceptedInvalidReply else |_| {}
+        try std.testing.expectEqual(ColorScheme.dark, store.current.color_scheme);
+        try std.testing.expect(store.takeEvent() == null);
+    }
+}
+
+test "appearance rejects uncorrelated replies and terminal subscription results" {
+    for ([_]bool{ false, true }) |terminal| {
+        var store: Store = .{ .current = .{ .color_scheme = .dark } };
+        var client: Client = .{ .allocator = std.testing.allocator, .store = &store };
+        try client.initProtocol();
+        defer client.releaseConnection();
+        const subscription = try testTakeRequest(&client, "subscriptions/listen");
+        const reply = try testReply(if (terminal) subscription else subscription + 99, resource_uri,
+            \\{"revision":"1","exists":true,"value":"light"}
+        );
+        defer std.testing.allocator.free(reply);
+        if (testReceive(&client, reply)) |_| return error.AcceptedUnexpectedReply else |_| {}
+        try std.testing.expectEqual(ColorScheme.dark, store.current.color_scheme);
+        try std.testing.expect(store.takeEvent() == null);
+    }
+}
+
+test "appearance accepts 256 KiB including newline and rejects one extra byte" {
+    for ([_]usize{ 0, 1 }) |extra| {
+        var store: Store = .{ .current = .{ .color_scheme = .dark } };
+        var client: Client = .{ .allocator = std.testing.allocator, .store = &store };
+        try client.initProtocol();
+        defer client.releaseConnection();
+        const subscription = try testTakeRequest(&client, "subscriptions/listen");
+        const ack = try testNotification(subscription, true, resource_uri);
+        defer std.testing.allocator.free(ack);
+        try testReceive(&client, ack);
+        const read = try testTakeRequest(&client, "resources/read");
+        const reply = try testReply(read, resource_uri,
+            \\{"revision":"1","exists":true,"value":"light"}
+        );
+        defer std.testing.allocator.free(reply);
+        const padded = try std.testing.allocator.alloc(u8, 256 * 1024 + extra);
+        defer std.testing.allocator.free(padded);
+        @memset(padded, ' ');
+        @memcpy(padded[0 .. reply.len - 1], reply[0 .. reply.len - 1]);
+        padded[padded.len - 1] = '\n';
+        if (extra == 0) {
+            try testReceive(&client, padded);
+            try std.testing.expectEqual(ColorScheme.light, store.takeEvent().?.appearance_changed.color_scheme);
+        } else {
+            try std.testing.expectError(error.MessageTooLarge, testReceive(&client, padded));
+            try std.testing.expectEqual(ColorScheme.dark, store.current.color_scheme);
+            try std.testing.expect(store.takeEvent() == null);
+        }
+    }
+}
+
+test "native appearance retries and reconnects with subscribe ack read then drains receive cancellation" {
     const unix = @import("wayring").unix_socket;
     const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/ouro-appearance-{d}.sock", .{linux.getpid()});
     defer std.testing.allocator.free(path);
@@ -363,25 +611,57 @@ test "native appearance retries unavailable settings and retains state on discon
     const accepted_raw = linux.accept(listener, null, null);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(accepted_raw));
     const accepted: linux.fd_t = @intCast(accepted_raw);
-    var request: [512]u8 = undefined;
-    const length = linux.read(accepted, &request, request.len);
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(length));
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request[0 .. length - 1], .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("more").?.bool);
-    try std.testing.expectEqualStrings("dev.rockorager.ouro.Settings.WatchPath", parsed.value.object.get("method").?.string);
-    try std.testing.expectEqualStrings("/appearance/color_scheme", parsed.value.object.get("parameters").?.object.get("path").?.string);
-    const reply = "{\"parameters\":{\"revision\":\"1\",\"exists\":true,\"value_json\":\"\\\"dark\\\"\"},\"continues\":true}\x00";
-    try std.testing.expectEqual(reply.len, linux.write(accepted, reply, reply.len));
+    const subscription = try testSocketRequest(accepted, "subscriptions/listen");
+    const ack = try testNotification(subscription, true, resource_uri);
+    defer std.testing.allocator.free(ack);
+    try std.testing.expectEqual(ack.len, linux.write(accepted, ack.ptr, ack.len));
+    try testDispatch(&client);
+    while (client.state != .receiving) try testDispatch(&client);
+    try std.testing.expect(store.takeEvent() == null);
+    const read = try testSocketRequest(accepted, "resources/read");
+    const reply = try testReply(read, resource_uri,
+        \\{"revision":"1","exists":true,"value":"dark"}
+    );
+    defer std.testing.allocator.free(reply);
+    try std.testing.expectEqual(reply.len, linux.write(accepted, reply.ptr, reply.len));
     try testDispatch(&client);
     try std.testing.expectEqual(ColorScheme.dark, store.takeEvent().?.appearance_changed.color_scheme);
+    const retired_operation = client.operation.?;
     _ = linux.close(accepted);
     while (client.state != .waiting) try testDispatch(&client);
     try std.testing.expectEqual(ColorScheme.dark, store.current.color_scheme);
     try std.testing.expect(store.takeEvent() == null);
+    while (client.state != .receiving) try testDispatch(&client);
+    try std.testing.expect(!same(retired_operation, client.operation.?));
+    try std.testing.expect(!try client.dispatch(.{ .operation = retired_operation, .kind = .recv, .result = 0 }));
+    const reconnected_raw = linux.accept(listener, null, null);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(reconnected_raw));
+    const reconnected: linux.fd_t = @intCast(reconnected_raw);
+    defer _ = linux.close(reconnected);
+    const resubscription = try testSocketRequest(reconnected, "subscriptions/listen");
+    try std.testing.expect(!client.acknowledged and client.read == null and !client.dirty);
+    const reack = try testNotification(resubscription, true, resource_uri);
+    defer std.testing.allocator.free(reack);
+    try std.testing.expectEqual(reack.len, linux.write(reconnected, reack.ptr, reack.len));
+    try testDispatch(&client);
+    while (client.state != .receiving) try testDispatch(&client);
+    const reread = try testSocketRequest(reconnected, "resources/read");
+    const missing = try testReply(reread, resource_uri,
+        \\{"revision":"2","exists":false,"value":null}
+    );
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectEqual(missing.len, linux.write(reconnected, missing.ptr, missing.len));
+    try testDispatch(&client);
+    try std.testing.expectEqual(ColorScheme.default, store.takeEvent().?.appearance_changed.color_scheme);
+    // A receive is pending at stop. Keep all protocol/socket storage alive
+    // until both the operation's terminal CQE and cancel CQE are drained.
+    try std.testing.expect(client.operation != null);
     try client.stop();
+    try std.testing.expectEqual(State.stopping, client.state);
+    try std.testing.expect(client.protocol_initialized);
     while (loop.hasPendingOperations() or loop.hasPendingTimerKernelWork()) try testDispatch(&client);
     try std.testing.expectEqual(State.stopped, client.state);
+    try std.testing.expect(store.takeEvent() == null);
 }
 
 test "native appearance stop drains an in-flight connect without publishing" {
@@ -390,13 +670,96 @@ test "native appearance stop drains an in-flight connect without publishing" {
     defer loop.deinit();
     var store: Store = .{};
     var client: Client = undefined;
-    try client.init(std.testing.allocator, &loop, &store, "/missing/ourosettings.sock");
+    try client.init(std.testing.allocator, &loop, &store, "/missing/settings.mcp.sock");
     defer client.deinit();
     try client.stop();
     try client.stop();
     while (loop.hasPendingOperations() or loop.hasPendingTimerKernelWork()) try testDispatch(&client);
     try std.testing.expectEqual(State.stopped, client.state);
     try std.testing.expect(store.takeEvent() == null);
+}
+
+// These fixtures use JSON directly, never an MCP server or its encoders.
+fn testNotification(id: u64, ack: bool, uri: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{d}}},{s}\"{s}\"{s}}}}}\n",
+        .{
+            if (ack) "notifications/subscriptions/acknowledged" else "notifications/resources/updated",
+            id,
+            if (ack) "\"notifications\":{\"resourceSubscriptions\":[" else "\"uri\":",
+            uri,
+            if (ack) "]}" else "",
+        },
+    );
+}
+
+fn testReply(id: u64, uri: []const u8, selection: []const u8) ![]u8 {
+    const text = try std.json.Stringify.valueAlloc(std.testing.allocator, selection, .{});
+    defer std.testing.allocator.free(text);
+    return std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"ttlMs\":0,\"cacheScope\":\"private\",\"contents\":[{{\"uri\":\"{s}\",\"mimeType\":\"application/json\",\"text\":{s}}}]}}}}\n",
+        .{ id, uri, text },
+    );
+}
+
+fn testReceive(client: *Client, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const count = @min(bytes.len - offset, client.receive_buffer.len);
+        @memcpy(client.receive_buffer[0..count], bytes[offset..][0..count]);
+        client.received = count;
+        client.consumed = 0;
+        try client.consumeReceived();
+        offset += count;
+    }
+}
+
+fn testTakeRequest(client: *Client, method: []const u8) !u64 {
+    var transmit = if (client.transmit) |transmit| transmit else client.protocol.takeTransmit() orelse return error.MissingRequest;
+    client.transmit = null;
+    defer transmit.deinit();
+    return testRequest(transmit.remaining(), method);
+}
+
+fn testSocketRequest(fd: linux.fd_t, method: []const u8) !u64 {
+    var request: [2048]u8 = undefined;
+    var length: usize = 0;
+    while (length < request.len) {
+        const count = linux.read(fd, request[length..].ptr, request.len - length);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(count));
+        try std.testing.expect(count > 0);
+        length += count;
+        if (std.mem.indexOfScalar(u8, request[0..length], '\n') != null) break;
+    }
+    return testRequest(request[0..length], method);
+}
+
+fn testRequest(bytes: []const u8, method: []const u8) !u64 {
+    try std.testing.expect(bytes.len <= 256 * 1024);
+    try std.testing.expectEqual(@as(u8, '\n'), bytes[bytes.len - 1]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, 0) == null);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(bytes));
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes[0 .. bytes.len - 1], .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("2.0", object.get("jsonrpc").?.string);
+    try std.testing.expectEqualStrings(method, object.get("method").?.string);
+    try std.testing.expect(object.get("more") == null and object.get("parameters") == null);
+    const params = object.get("params").?.object;
+    const meta = params.get("_meta").?.object;
+    try std.testing.expectEqualStrings("2026-07-28", meta.get("io.modelcontextprotocol/protocolVersion").?.string);
+    try std.testing.expectEqual(@as(usize, 0), meta.get("io.modelcontextprotocol/clientCapabilities").?.object.count());
+    try std.testing.expect(meta.get("io.modelcontextprotocol/clientInfo").?.object.get("name").?.string.len > 0);
+    if (std.mem.eql(u8, method, "subscriptions/listen")) {
+        const resources = params.get("notifications").?.object.get("resourceSubscriptions").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), resources.len);
+        try std.testing.expectEqualStrings(resource_uri, resources[0].string);
+    } else {
+        try std.testing.expectEqualStrings(resource_uri, params.get("uri").?.string);
+    }
+    return @intCast(object.get("id").?.integer);
 }
 
 fn testDispatch(client: *Client) !void {

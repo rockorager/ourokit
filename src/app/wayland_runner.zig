@@ -205,7 +205,7 @@ fn runSourceWithFontconfig(
     const appearance = options.appearance orelse &appearance_store;
     const settings_path = if (options.appearance == null and generation_config.runtime_dir != null and
         generation_config.runtime_dir.?.len != 0)
-        try std.fmt.allocPrint(init.gpa, "{s}/ouro/settings.sock", .{generation_config.runtime_dir.?})
+        try std.fmt.allocPrint(init.gpa, "{s}/ouro/settings.mcp.sock", .{generation_config.runtime_dir.?})
     else
         null;
     defer if (settings_path) |path| init.gpa.free(path);
@@ -492,7 +492,7 @@ fn runSourceWithFontconfig(
             try server.setApplication(active_application, &active_generation.vm);
             try server.serviceRequests();
         }
-        try source_reload.collectCanceledVarlink();
+        try source_reload.collectCanceledMcp();
         try scheduler.applyQueuedCancellations();
         for (runtime_slots) |*slot| try slot.runtime.collectRetired();
         for (runtime_slots) |*slot| if (slot.runtime.ready)
@@ -771,7 +771,7 @@ fn runSourceWithFontconfig(
 
         const serial_before_flush = window_set.changeSerial();
         try host.flush();
-        // Varlink and Lua timers can enqueue I/O while Wayland is idle.
+        // MCP and Lua timers can enqueue I/O while Wayland is idle.
         _ = try loop.submit();
         if (scheduler.hasPendingWork()) continue;
         const control_quiescent = if (control) |server| server.quiescent() else true;
@@ -791,7 +791,7 @@ fn runSourceWithFontconfig(
             },
             .operation_cancel => {
                 if (control) |server| server.collectClosed();
-                try source_reload.collectCanceledVarlink();
+                try source_reload.collectCanceledMcp();
             },
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
                 if (try host.dispatchTimer(timeout.operation)) continue;
@@ -835,7 +835,7 @@ fn runHeadless(
         control.collectClosed();
         try control.setApplication(&reload.active().application, &reload.active().vm);
         try control.serviceRequests();
-        try reload.collectCanceledVarlink();
+        try reload.collectCanceledMcp();
         try scheduler.applyQueuedCancellations();
         while (scheduler.takeRunnable()) |handle| {
             if (try control.resumeRunnable(handle)) continue;
@@ -918,7 +918,7 @@ fn dispatchApplicationCompletion(reload: *SourceReload, loop: *io_loop.Loop, con
         },
         .operation_cancel => {
             if (control) |server| server.collectClosed();
-            try reload.collectCanceledVarlink();
+            try reload.collectCanceledMcp();
         },
         .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
             if (idle_timer) |timer| if (timer.*) |handle| {
@@ -951,7 +951,7 @@ fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlSe
             if (control) |server| if (try server.resumeRunnable(handle)) continue;
             try reload.resumeRunnable(handle);
         }
-        try reload.collectCanceledVarlink();
+        try reload.collectCanceledMcp();
         _ = try loop.submit();
         if (!loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork()) break;
         _ = try dispatchApplication(reload, loop, control, host, null);
@@ -992,7 +992,7 @@ fn finishInitialBootstrap(
                 return error.UnownedIoCompletion,
             .socket => |completion| if (!(try generation.dispatchSocket(completion)))
                 return error.UnownedIoCompletion,
-            .operation_cancel => try generation.collectCanceledVarlink(),
+            .operation_cancel => try generation.collectCanceledMcp(),
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
                 try generation.vm.markTimeoutCompleted(timeout.operation),
             .signal_wakeup => {},
@@ -1007,13 +1007,13 @@ fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Schedu
     while (true) {
         try scheduler.applyQueuedCancellations();
         while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
-        try generation.collectCanceledVarlink();
+        try generation.collectCanceledMcp();
         _ = try loop.submit();
         if (!loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork()) return;
         switch (loop.dispatch(try loop.wait())) {
             .file => |completion| if (!(try generation.dispatchFile(completion))) return error.UnownedIoCompletion,
             .socket => |completion| if (!(try generation.dispatchSocket(completion))) return error.UnownedIoCompletion,
-            .operation_cancel => try generation.collectCanceledVarlink(),
+            .operation_cancel => try generation.collectCanceledMcp(),
             .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
                 try generation.vm.markTimeoutCompleted(timeout.operation),
             .signal_wakeup => {},
@@ -1171,7 +1171,7 @@ fn shutdownControl(
             },
             .operation_cancel => {
                 control.collectClosed();
-                source_reload.collectCanceledVarlink() catch |err|
+                source_reload.collectCanceledMcp() catch |err|
                     std.debug.panic("could not drain source cancellation: {s}", .{@errorName(err)});
             },
             .timer_wakeup, .timer_control => while (loop.takeExpired() catch |err|

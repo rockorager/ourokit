@@ -121,18 +121,17 @@ renderer. A consumer-only smoke test can be run independently with:
 zig build test-ourokit-ui-consumer
 ```
 
-The public `ourokit.varlink` module provides bounded sans-I/O client and server
-state machines, `.varlink` interface parsing and schema validation, standard
-address parsing, and the mandatory `org.varlink.service` implementation. See
-[the Varlink transport and ownership contract](docs/varlink.md).
+The public `ourokit.mcp` module provides bounded sans-I/O MCP client and server
+state machines, literal Unix address parsing, and JSON Schema validation. See
+[the MCP transport and Lua API](docs/mcp.md).
 
-An application opts into a same-user Varlink socket at
+An application opts into a same-user MCP socket at
 `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>` by declaring `actions`. An empty
-table enables `Status`, `Reload`, `Activate` and introspection; custom handlers
-implement methods declared in the app's `interface` IDL. Systemd socket activation
-starts the application headlessly. Only `Activate` initializes its UI. Omitting
-`actions` starts no inbound server; small subprocess dialogs can instead use
-async stdin/stdout/stderr and `ouro.exit`. See the runnable
+table enables `runtime.status`, `runtime.reload`, `runtime.activate` and tool
+discovery; custom actions declare JSON Schemas beside their Lua handlers.
+Systemd socket activation starts the application headlessly. Only activation
+initializes its UI. Omitting `actions` starts no inbound server; small subprocess
+dialogs can instead use async stdin/stdout/stderr and `ouro.exit`. See the runnable
 [Contacts service](examples/contacts/README.md) and
 [permission dialog](examples/permission-dialog/README.md).
 

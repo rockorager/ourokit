@@ -20,18 +20,42 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "zig-out/bin/ouroctl"
 
 
-def call(path, method, parameters=None):
+def record(method, params=None, request_id=1):
+    params = dict(params or {})
+    params["_meta"] = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "ourokit-test", "version": "1"},
+    }
+    return json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}).encode() + b"\n"
+
+
+def request(path, method, params=None):
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(8)
         client.connect(str(path))
-        client.sendall(json.dumps({"method": method, "parameters": parameters or {}}).encode() + b"\0")
+        client.sendall(record(method, params))
         response = bytearray()
-        while b"\0" not in response:
+        while b"\n" not in response:
             chunk = client.recv(65536)
             if not chunk:
                 raise AssertionError(f"connection closed before {method} replied")
             response.extend(chunk)
-        return json.loads(response.split(b"\0", 1)[0])
+            assert len(response) <= 256 * 1024
+        value = json.loads(response.split(b"\n", 1)[0])
+        assert value["jsonrpc"] == "2.0" and value["id"] == 1, value
+        if "result" in value:
+            assert value["result"]["resultType"] == "complete", value
+        return value
+
+
+def call(path, name, arguments=None):
+    response = request(path, "tools/call", {"name": name, "arguments": arguments or {}})
+    if "error" in response:
+        return {"rpcError": response["error"]}
+    result = response["result"]
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+    return result
 
 
 def check_signal_shutdown(directory, env):
@@ -75,7 +99,7 @@ return o.app {
                 child_env["WAYLAND_DISPLAY"] = os.environ["OUROKIT_TEST_WAYLAND_DISPLAY"]
             if inherited:
                 path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                args = ["systemd-socket-activate", f"--listen={path}", "--fdname=varlink",
+                args = ["systemd-socket-activate", f"--listen={path}", "--fdname=mcp",
                         "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY"] + args
             process = subprocess.Popen(args, env=child_env, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -89,7 +113,7 @@ return o.app {
                         assert process.poll() is None, process.stderr.read().decode()
                         assert time.monotonic() < deadline, "server never became ready"
                         if path.exists():
-                            status = call(path, "dev.ourokit.runtime.Status")["parameters"]
+                            status = call(path, "runtime.status")["structuredContent"]
                             if inherited or status["uiActive"]:
                                 break
                         time.sleep(.01)
@@ -117,6 +141,10 @@ return o.app {
 
 
 def main():
+    # Noninteractive launchers may ignore SIGINT. The runtime deliberately
+    # preserves that disposition; these tests need enabled shutdown signals.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     with tempfile.TemporaryDirectory(prefix="ourokit-services-") as temp:
         directory = Path(temp)
         env = os.environ.copy()
@@ -152,22 +180,22 @@ o.exit(7)
         source = """
 local o = require('ouro')
 local value = 'initial'
+local empty = {type='object', additionalProperties=false}
+local str, int = {type='string'}, {type='integer'}
+local function obj(properties, required)
+  return {type='object', properties=properties, required=required, additionalProperties=false}
+end
+local function action(input, output, handler)
+  return {description='Service test action', inputSchema=input, outputSchema=output, handler=handler}
+end
 return o.app {
   id = 'dev.ourokit.servicetest',
-  interface = [[interface dev.ourokit.servicetest
-    method Get() -> (value: string, empty: []string)
-    method Set(value: string) -> ()
-    method Delayed() -> (value: string)
-    method Invalid() -> (value: int)
-    method Fail() -> ()
-    error Rejected(reason: string)
-  ]],
   actions = {
-    Get = function() return {value = value, empty = o.json.array()} end,
-    Set = function(p) value = p.value end,
-    Delayed = function() o.sleep(30000); return {value = value} end,
-    Invalid = function() return {value = 'not an integer'} end,
-    Fail = function() return o.action_error('Rejected', {reason = 'test'}) end,
+    Get = action(empty, obj({value=str, empty={type='array',items=str}}, {'value','empty'}), function() return {value=value, empty=o.json.array()} end),
+    Set = action(obj({value=str}, {'value'}), empty, function(p) value=p.value end),
+    Delayed = action(empty, obj({value=str}, {'value'}), function() o.sleep(30000); return {value=value} end),
+    Invalid = action(empty, obj({value=int}, {'value'}), function() return {value='not an integer'} end),
+    Fail = action(empty, empty, function() return o.action_error('Rejected', {reason='test'}) end),
   },
 }
 """
@@ -178,7 +206,7 @@ return o.app {
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         log = directory / "service.log"
         with log.open("wb") as errors:
-            process = subprocess.Popen(["systemd-socket-activate", f"--listen={path}", "--fdname=varlink",
+            process = subprocess.Popen(["systemd-socket-activate", f"--listen={path}", "--fdname=mcp",
                                         "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY",
                                         str(BINARY), "run", str(manifest), "--software"],
                                        env=env, stdout=subprocess.DEVNULL, stderr=errors)
@@ -189,38 +217,73 @@ return o.app {
                     if process.poll() is not None:
                         raise AssertionError(log.read_text())
                     time.sleep(.01)
-                status = call(path, "dev.ourokit.runtime.Status")["parameters"]
+                status = call(path, "runtime.status")["structuredContent"]
                 assert status["uiActive"] is False
-                info = call(path, "org.varlink.service.GetInfo")["parameters"]
-                assert set(info["interfaces"]) == {"org.varlink.service", "dev.ourokit.runtime", "dev.ourokit.servicetest"}
-                description = call(path, "org.varlink.service.GetInterfaceDescription",
-                                   {"interface": "dev.ourokit.servicetest"})["parameters"]["description"]
-                assert "method Get()" in description and "CallAction" not in description
-                assert call(path, "dev.ourokit.servicetest.Set", {"value": "changed"}) == {"parameters": {}}
-                assert call(path, "dev.ourokit.servicetest.Get")["parameters"] == {"value": "changed", "empty": []}
-                assert call(path, "dev.ourokit.servicetest.Set", {"value": 23})["error"] == "org.varlink.service.InvalidParameter"
-                assert call(path, "dev.ourokit.servicetest.Invalid")["error"] == "dev.ourokit.runtime.ActionFailed"
-                assert call(path, "dev.ourokit.servicetest.Fail") == {
-                    "error": "dev.ourokit.servicetest.Rejected", "parameters": {"reason": "test"}}
-                assert call(path, "dev.ourokit.runtime.Activate")["error"] == "dev.ourokit.runtime.ActivateFailed"
-                assert call(path, "dev.ourokit.runtime.Status")["parameters"]["uiActive"] is False
+                info = request(path, "server/discover")["result"]
+                assert info["supportedVersions"] == ["2026-07-28"] and info["capabilities"] == {"tools": {}}
+                assert info["ttlMs"] == 0 and info["cacheScope"] == "private"
+                tools = request(path, "tools/list")["result"]
+                assert {t["name"] for t in tools["tools"]} == {"runtime.status", "runtime.reload", "runtime.activate", "Get", "Set", "Delayed", "Invalid", "Fail"}
+                assert tools["ttlMs"] == 0 and tools["cacheScope"] == "private"
+                assert all("inputSchema" in t and "outputSchema" in t and t["description"] for t in tools["tools"])
+                assert call(path, "Set", {"value": "changed"})["structuredContent"] == {}
+                assert call(path, "Get")["structuredContent"] == {"value": "changed", "empty": []}
+                assert call(path, "Set", {"value": 23})["rpcError"]["code"] == -32602
+                assert call(path, "Missing")["rpcError"]["code"] == -32602
+                assert request(path, "initialize")["error"]["code"] == -32601
+                invalid = call(path, "Invalid")
+                assert invalid["isError"] is True and invalid["structuredContent"]["error"]["code"] == "ActionFailed"
+                failure = call(path, "Fail")
+                assert failure["isError"] is True and failure["structuredContent"] == {
+                    "error": {"code": "Rejected", "message": "Rejected", "parameters": {"reason": "test"}}}
+                assert call(path, "runtime.activate")["structuredContent"]["error"]["code"] == "ActivateFailed"
+                assert call(path, "runtime.status")["structuredContent"]["uiActive"] is False
                 print("PASS: inherited listener, headless calls/introspection, typed inputs/outputs/errors, no-UI activation error")
+
+                with socket.socket(socket.AF_UNIX) as cancel:
+                    cancel.settimeout(8)
+                    cancel.connect(str(path))
+                    cancel.sendall(record("tools/call", {"name": "Delayed"}, "cancel-me"))
+                    cancel.sendall(b'{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-me"}}\n')
+                    with cancel.makefile("rb") as stream:
+                        terminal = json.loads(stream.readline())
+                        assert terminal["id"] == "cancel-me" and terminal["result"]["isError"] is True
+                        cancel.sendall(record("tools/call", {"name": "Get"}, "after-cancel"))
+                        after = json.loads(stream.readline())
+                        assert after["id"] == "after-cancel" and after["result"]["structuredContent"]["value"] == "changed"
+                with socket.socket(socket.AF_UNIX) as oversized:
+                    oversized.settimeout(8)
+                    oversized.connect(str(path))
+                    try:
+                        oversized.sendall(b" " * (256 * 1024) + b"\n")
+                        assert oversized.recv(1) == b""
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                assert call(path, "runtime.status")["structuredContent"]["uiActive"] is False
+                print("PASS: explicit cancellation keeps connection usable; oversized peer cannot terminate server")
 
                 delayed = socket.socket(socket.AF_UNIX)
                 delayed.settimeout(8)
                 delayed.connect(str(path))
-                delayed.sendall(b'{"method":"dev.ourokit.servicetest.Delayed"}\0')
+                delayed.sendall(record("tools/call", {"name": "Delayed"}, "delayed"))
                 # A second connection remains responsive while this task sleeps.
-                assert call(path, "dev.ourokit.servicetest.Get")["parameters"]["value"] == "changed"
+                assert call(path, "Get")["structuredContent"]["value"] == "changed"
+                # Status completes ahead of the sleeping action on the SAME connection.
+                delayed.sendall(record("tools/call", {"name": "runtime.status"}, "status"))
+                stream = delayed.makefile("rb")
+                status_response = json.loads(stream.readline())
+                assert status_response["id"] == "status" and status_response["result"]["structuredContent"]["uiActive"] is False
                 app.write_text(source.replace("'initial'", "'reloaded'"))
-                assert call(path, "dev.ourokit.runtime.Reload")["parameters"]["generation"] == 2
-                assert b"ActionFailed" in delayed.recv(65536)
+                assert call(path, "runtime.reload")["structuredContent"]["generation"] == 2
+                cancelled = json.loads(stream.readline())
+                assert cancelled["id"] == "delayed" and cancelled["result"]["isError"] is True
+                stream.close()
                 delayed.close()
-                assert call(path, "dev.ourokit.servicetest.Get")["parameters"]["value"] == "reloaded"
-                app.write_text(source.replace("method Get()", "method Missing()"))
-                assert call(path, "dev.ourokit.runtime.Reload")["error"] == "dev.ourokit.runtime.ReloadFailed"
-                assert call(path, "dev.ourokit.servicetest.Get")["parameters"]["value"] == "reloaded"
-                assert call(path, "dev.ourokit.runtime.Status")["parameters"]["uiActive"] is False
+                assert call(path, "Get")["structuredContent"]["value"] == "reloaded"
+                app.write_text(source.replace("type='integer'", "type='integer', minimum=0"))
+                assert call(path, "runtime.reload")["structuredContent"]["error"]["code"] == "ReloadFailed"
+                assert call(path, "Get")["structuredContent"]["value"] == "reloaded"
+                assert call(path, "runtime.status")["structuredContent"]["uiActive"] is False
                 print("PASS: headless reload, pending-call cancellation, invalid declaration rollback")
 
                 assert process.wait(timeout=40) == 0, log.read_text()
@@ -250,8 +313,8 @@ return o.app {
                         if failure_path.exists():
                             break
                         time.sleep(.01)
-                    response = call(failure_path, "dev.ourokit.runtime.Activate")
-                    assert response["error"] == "dev.ourokit.runtime.ActivateFailed", response
+                    response = call(failure_path, "runtime.activate")
+                    assert response["structuredContent"]["error"]["code"] == "ActivateFailed", response
                     assert process.wait(timeout=8) == 1, log.read_text()
                     assert "panic" not in log.read_text() and "leaked" not in log.read_text(), log.read_text()
                     print(f"PASS: {name} returns ActivateFailed before clean teardown")
@@ -271,13 +334,9 @@ local o = require('ouro')
 local title = o.signal('Initial')
 return o.app {
   id = 'dev.ourokit.servicetest',
-  interface = [[interface dev.ourokit.servicetest
-    method Set(title: string) -> ()
-    method Stop() -> ()
-  ]],
   actions = {
-    Set = function(p) title:set(p.title) end,
-    Stop = function() o.stdout.write('finished\\n'); o.exit(9) end,
+    Set = {description='Set title', inputSchema={type='object', properties={title={type='string'}}, required={'title'}, additionalProperties=false}, outputSchema={type='object'}, handler=function(p) title:set(p.title) end},
+    Stop = {description='Exit', inputSchema={type='object'}, outputSchema={type='object'}, handler=function() o.stdout.write('finished\\n'); o.exit(9) end},
   },
   run = function() return {windows={o.window {
     id='main', title='Lifecycle test', width=300, height=100,
@@ -296,16 +355,16 @@ return o.app {
                         if native_path.exists():
                             break
                         time.sleep(.01)
-                    assert call(native_path, "dev.ourokit.runtime.Status")["parameters"]["uiActive"] is False
-                    assert call(native_path, "dev.ourokit.servicetest.Set", {"title": "Before activation"}) == {"parameters": {}}
-                    activation = call(native_path, "dev.ourokit.runtime.Activate")
-                    assert activation == {"parameters": {}}, activation
-                    assert call(native_path, "dev.ourokit.runtime.Status")["parameters"]["uiActive"] is True
-                    assert call(native_path, "dev.ourokit.runtime.Activate") == {"parameters": {}}
-                    assert call(native_path, "dev.ourokit.servicetest.Set", {"title": "While running"}) == {"parameters": {}}
+                    assert call(native_path, "runtime.status")["structuredContent"]["uiActive"] is False
+                    assert call(native_path, "Set", {"title": "Before activation"})["structuredContent"] == {}
+                    activation = call(native_path, "runtime.activate")
+                    assert activation["structuredContent"] == {}, activation
+                    assert call(native_path, "runtime.status")["structuredContent"]["uiActive"] is True
+                    assert call(native_path, "runtime.activate")["structuredContent"] == {}
+                    assert call(native_path, "Set", {"title": "While running"})["structuredContent"] == {}
                     with socket.socket(socket.AF_UNIX) as stop:
                         stop.connect(str(native_path))
-                        stop.sendall(b'{"method":"dev.ourokit.servicetest.Stop"}\0')
+                        stop.sendall(record("tools/call", {"name": "Stop"}))
                         stdout, _ = process.communicate(timeout=8)
                     assert process.returncode == 9 and stdout == b"finished\n", log.read_text()
                     assert native_path.exists()
