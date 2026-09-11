@@ -41,6 +41,8 @@ mkdir -p "$HOME/.local/share/ourokit/contacts" "$HOME/.config/systemd/user"
 cp examples/contacts/{app.lua,ouro.json} "$HOME/.local/share/ourokit/contacts/"
 cp -R examples/contacts/assets "$HOME/.local/share/ourokit/contacts/"
 cp examples/contacts/dev.ourokit.contacts.{socket,service} "$HOME/.config/systemd/user/"
+"$HOME/.local/bin/ouroctl" mcp export "$HOME/.local/share/ourokit/contacts/ouro.json" \
+  --output "${XDG_DATA_HOME:-$HOME/.local/share}/ouro/mcp/apps/dev.ourokit.contacts.json"
 systemctl --user daemon-reload
 systemctl --user import-environment WAYLAND_DISPLAY
 systemctl --user enable --now dev.ourokit.contacts.socket
@@ -50,6 +52,13 @@ The manager must have the current session's `WAYLAND_DISPLAY`. The service's
 `XDG_RUNTIME_DIR` is supplied by the user manager. Headless requests do not need
 a compositor; only `Activate` does. Start the socket, not the service, to let
 systemd activate the process on the first connection.
+
+The exported descriptor lets the standalone `ouro-mcp` stdio bridge list tools
+without activating Contacts. Regenerate it when installing an updated version.
+The running service publishes a runtime catalog and sends standard MCP
+tool-list invalidations after successful catalog-changing reloads. Export only
+evaluates the declaration; it does not call the UI factory or action handlers.
+Declaration stdout is redirected to stderr, and declaration stdin is EOF.
 
 Invoke tools from a standalone Ourokit Lua script (for example, `/tmp/contacts-call.lua`):
 

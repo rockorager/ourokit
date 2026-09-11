@@ -8,10 +8,16 @@ pub const Command = union(enum) {
     status: RuntimeTarget,
     run: Run,
     storybook: Storybook,
+    mcp_export: Export,
 };
 
 pub const RuntimeTarget = struct {
     application_id: []const u8,
+};
+
+pub const Export = struct {
+    path: []const u8,
+    output_path: ?[]const u8 = null,
 };
 
 pub const Run = struct {
@@ -50,6 +56,7 @@ pub const usage =
     \\  ouroctl activate <application-id>
     \\  ouroctl reload <application-id>
     \\  ouroctl status <application-id>
+    \\  ouroctl mcp export <application.lua|ouro.json> [--output <file>]
     \\  ouroctl storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
     \\  ouroctl storybook list <stories.lua> [--json]
     \\  ouroctl storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
@@ -75,7 +82,32 @@ pub fn parse(args: []const []const u8) !Command {
     if (std.mem.eql(u8, command, "run")) return .{ .run = try parseRun(args[2..]) };
     if (std.mem.eql(u8, command, "storybook"))
         return .{ .storybook = try parseStorybook(args[2..]) };
+    if (std.mem.eql(u8, command, "mcp")) {
+        if (args.len < 3 or !std.mem.eql(u8, args[2], "export")) return error.ExpectedMcpExport;
+        return .{ .mcp_export = try parseExport(args[3..]) };
+    }
     return error.UnknownCommand;
+}
+
+fn parseExport(args: []const []const u8) !Export {
+    var path: ?[]const u8 = null;
+    var output: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const argument = args[index];
+        if (try optionValue(args, &index, argument, "--output")) |value| {
+            if (output != null) return error.DuplicateOption;
+            if (std.mem.startsWith(u8, value, "--")) return error.ExpectedOptionValue;
+            output = value;
+        } else if (std.mem.startsWith(u8, argument, "--")) {
+            return error.UnknownOption;
+        } else if (argument.len == 0) {
+            return error.ExpectedApplicationPath;
+        } else if (path == null) {
+            path = argument;
+        } else return error.UnexpectedArgument;
+    }
+    return .{ .path = path orelse return error.ExpectedApplicationPath, .output_path = output };
 }
 
 fn parseRuntimeTarget(args: []const []const u8) !RuntimeTarget {
@@ -261,4 +293,15 @@ test "CLI rejects malformed commands and options" {
     try std.testing.expectError(error.DuplicateOption, parse(&.{
         "ouroctl", "storybook", "snapshot", "stories.lua", "--story", "one", "--story", "two",
     }));
+}
+
+test "CLI parses explicit MCP catalog exports and rejects ambiguous output" {
+    try std.testing.expectEqualDeep(Command{ .mcp_export = .{ .path = "app.lua" } }, try parse(&.{ "ouroctl", "mcp", "export", "app.lua" }));
+    try std.testing.expectEqualDeep(Command{ .mcp_export = .{ .path = "ouro.json", .output_path = "app.json" } }, try parse(&.{ "ouroctl", "mcp", "export", "--output=app.json", "ouro.json" }));
+    try std.testing.expectError(error.ExpectedMcpExport, parse(&.{ "ouroctl", "mcp" }));
+    try std.testing.expectError(error.ExpectedApplicationPath, parse(&.{ "ouroctl", "mcp", "export" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "ouroctl", "mcp", "export", "app.lua", "--json" }));
+    try std.testing.expectError(error.ExpectedOptionValue, parse(&.{ "ouroctl", "mcp", "export", "app.lua", "--output" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "ouroctl", "mcp", "export", "a.lua", "b.lua" }));
+    try std.testing.expectError(error.DuplicateOption, parse(&.{ "ouroctl", "mcp", "export", "a.lua", "--output=a.json", "--output=b.json" }));
 }

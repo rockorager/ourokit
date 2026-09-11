@@ -6,25 +6,23 @@ const lua = @import("../lua/root.zig");
 const mcp = @import("../mcp/root.zig");
 const task = @import("../task/root.zig");
 const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
+const catalog = @import("catalog.zig");
+const Publication = @import("catalog_publication.zig").Publication;
 pub const socket_activation = @import("socket_activation.zig");
 
 pub const reload_method = "runtime.reload";
 pub const status_method = "runtime.status";
 pub const activate_method = "runtime.activate";
 
-const builtin_tools =
-    \\[
-    \\{"name":"runtime.status","description":"Read application status without activating UI.","inputSchema":{"type":"object","additionalProperties":false},"outputSchema":{"type":"object","properties":{"applicationId":{"type":"string"},"activeGeneration":{"type":"integer"},"reloading":{"type":"boolean"},"uiActive":{"type":"boolean"},"diagnostic":{"type":["object","null"]}},"required":["applicationId","activeGeneration","reloading","uiActive","diagnostic"],"additionalProperties":false}},
-    \\{"name":"runtime.reload","description":"Validate a candidate source generation and commit it atomically; resets Lua state.","inputSchema":{"type":"object","additionalProperties":false},"outputSchema":{"type":"object","properties":{"generation":{"type":"integer"}},"required":["generation"],"additionalProperties":false}},
-    \\{"name":"runtime.activate","description":"Initialize or present the application UI. Focus remains compositor policy.","inputSchema":{"type":"object","properties":{"activationToken":{"type":["string","null"]}},"additionalProperties":false},"outputSchema":{"type":"object","additionalProperties":false}}
-    \\]
-;
-const failure_schema =
-    \\{"type":"object","properties":{"error":{"type":"object","properties":{"code":{"type":"string"},"message":{"type":"string"},"parameters":{}},"required":["code","message"],"additionalProperties":false}},"required":["error"],"additionalProperties":false}
-;
-
 const client_capacity = 8;
 const receive_capacity = 64 * 1024;
+const subscription_capacity = 32;
+
+const Subscription = struct {
+    call: mcp.CallHandle,
+    id: std.json.Parsed(mcp.Value),
+    dirty: bool = false,
+};
 
 const Waiter = struct {
     sequence: u64,
@@ -66,6 +64,7 @@ const Client = struct {
     consumed: usize = 0,
     action: ?Action = null,
     activation: ?mcp.CallHandle = null,
+    subscriptions: [subscription_capacity]?Subscription = @splat(null),
     closing: bool = false,
     receive_buffer: [receive_capacity]u8 = undefined,
 
@@ -82,6 +81,7 @@ const Client = struct {
     fn deinit(self: *Client) void {
         std.debug.assert(self.action == null);
         if (self.transmit) |*transmit| transmit.deinit();
+        for (&self.subscriptions) |*entry| if (entry.*) |*subscription| subscription.id.deinit();
         self.waiters.deinit();
         self.protocol.deinit();
         _ = linux.close(self.fd);
@@ -113,6 +113,9 @@ pub const ControlServer = struct {
     activation_queued: bool = false,
     activating: bool = false,
     activation_token: ?[]u8 = null,
+    tools_json: []u8,
+    publication: ?Publication = null,
+    publication_dirty: bool = false,
 
     pub fn init(
         self: *ControlServer,
@@ -136,6 +139,8 @@ pub const ControlServer = struct {
         errdefer allocator.free(path);
         const owned_id = try allocator.dupe(u8, application_id);
         errdefer allocator.free(owned_id);
+        const tools_json = try catalog.tools(allocator, null);
+        errdefer allocator.free(tools_json);
         if (inherited == null) try socket_activation.makeParentDirectories(allocator, path);
         const listener = inherited orelse try wayring.unix_socket.listen(path, 16);
         errdefer if (inherited == null) {
@@ -155,6 +160,8 @@ pub const ControlServer = struct {
             .owned_path = owned_path,
             .listener_operation = operation,
             .generation = generation,
+            .tools_json = tools_json,
+            .publication = Publication.init(allocator, environ, application_id, path) catch null,
         };
     }
 
@@ -166,6 +173,8 @@ pub const ControlServer = struct {
         if (self.owned_path) |identity| identity.unlink(self.path);
         if (self.activation_token) |token| self.allocator.free(token);
         if (self.failure) |*failure| failure.deinit(self.allocator);
+        if (self.publication) |*publication| publication.deinit();
+        self.allocator.free(self.tools_json);
         self.allocator.free(self.path);
         self.allocator.free(self.application_id);
         self.* = undefined;
@@ -191,8 +200,12 @@ pub const ControlServer = struct {
     pub const PreparedApplication = struct {
         application: *const lua.Application,
         vm: *lua.Vm,
+        allocator: std.mem.Allocator,
+        tools_json: []u8,
+        changed: bool,
 
         pub fn deinit(self: *PreparedApplication) void {
+            self.allocator.free(self.tools_json);
             self.* = undefined;
         }
     };
@@ -203,13 +216,23 @@ pub const ControlServer = struct {
         if (!std.mem.eql(u8, self.application_id, application.id)) return error.ApplicationIdChanged;
         if (!application.hasActions()) return error.ApplicationActionsDisabled;
         if (vm.state != application.state) return error.ApplicationVmMismatch;
-        return .{ .application = application, .vm = vm };
+        const tools_json = try catalog.tools(self.allocator, application);
+        return .{ .application = application, .vm = vm, .allocator = self.allocator, .tools_json = tools_json, .changed = !std.mem.eql(u8, self.tools_json, tools_json) };
     }
 
     /// No allocation or failure after the parent's UI generation commit.
     pub fn commitApplication(self: *ControlServer, prepared: *PreparedApplication) void {
+        self.publication_dirty = self.publication_dirty or self.application == null or prepared.changed;
         self.application = prepared.application;
         self.vm = prepared.vm;
+        if (prepared.changed) {
+            std.mem.swap([]u8, &self.tools_json, &prepared.tools_json);
+            for (&self.clients) |*entry| if (entry.*) |*client| {
+                for (&client.subscriptions) |*slot| if (slot.*) |*subscription| {
+                    subscription.dirty = true;
+                };
+            };
+        }
     }
 
     pub fn takeActivation(self: *ControlServer) bool {
@@ -395,6 +418,12 @@ pub const ControlServer = struct {
 
     pub fn serviceRequests(self: *ControlServer) !void {
         if (self.shutting_down) return;
+        if (self.publication_dirty) {
+            self.publication_dirty = false;
+            // Retry on the next catalog change, not every event-loop turn.
+            // A best-effort discovery hint must never roll back a generation.
+            if (self.publication) |*publication| publication.publish(self.application_id, self.tools_json) catch {};
+        }
         for (&self.clients) |*entry| if (entry.*) |*client| {
             self.pumpClient(client) catch |err| {
                 if (err == error.OutOfMemory) return err;
@@ -558,6 +587,12 @@ pub const ControlServer = struct {
                 client.consumed += consumed;
                 if (consumed != 0) continue;
             }
+            self.notifyCatalog(client) catch {
+                // The generation is already committed. Failure to publish an
+                // invalidation retires this peer, never the application.
+                try self.closeClient(client);
+                return;
+            };
             if (client.operation == null) {
                 if (client.transmit == null) client.transmit = client.protocol.takeTransmit();
                 if (client.transmit) |*transmit| {
@@ -576,6 +611,19 @@ pub const ControlServer = struct {
         }
     }
 
+    fn notifyCatalog(self: *ControlServer, client: *Client) !void {
+        // Acknowledgments are queued before registration. Coalescing only
+        // dirty invalidations bounds slow listeners without losing the
+        // subscribe-then-list race: later commits dirty them again.
+        for (&client.subscriptions) |*entry| if (entry.*) |*subscription| {
+            if (!subscription.dirty or client.protocol.transmits.items.len == client.protocol.config.max_transmits) continue;
+            var arena: std.heap.ArenaAllocator = .init(self.allocator);
+            defer arena.deinit();
+            try client.protocol.sendNotification("notifications/tools/list_changed", try subscriptionParams(arena.allocator(), subscription.id.value));
+            subscription.dirty = false;
+        };
+    }
+
     fn handleCall(
         self: *ControlServer,
         client: *Client,
@@ -586,6 +634,15 @@ pub const ControlServer = struct {
             if (std.mem.eql(u8, request.method, "notifications/cancelled")) {
                 const id = mcp.get(request.params orelse return, "requestId") orelse return;
                 const target = client.protocol.handleForId(id) orelse return;
+                for (&client.subscriptions) |*entry| if (entry.*) |*subscription| {
+                    if (subscription.call.value != target.value) continue;
+                    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+                    defer arena.deinit();
+                    try client.protocol.sendResult(target, try subscriptionParams(arena.allocator(), subscription.id.value));
+                    subscription.id.deinit();
+                    entry.* = null;
+                    return;
+                };
                 if (client.action) |action| if (action.call != null and action.call.?.value == target.value) {
                     try action.vm.scheduler.queueScopeCancellation(action.scope);
                 };
@@ -594,19 +651,40 @@ pub const ControlServer = struct {
         }
         if (std.mem.eql(u8, request.method, "server/discover")) {
             var doc = try std.json.parseFromSlice(mcp.Value, self.allocator,
-                \\{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"ourokit","version":"0.1.0"}},"ttlMs":0,"cacheScope":"private"}
+                \\{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"ourokit","version":"0.1.0"}},"ttlMs":60000,"cacheScope":"private"}
             , .{});
             defer doc.deinit();
             return client.protocol.sendResult(call, doc.value);
         }
         if (std.mem.eql(u8, request.method, "tools/list")) return self.sendTools(client, call);
+        if (std.mem.eql(u8, request.method, "subscriptions/listen")) {
+            const notifications = mcp.get(request.params orelse return client.protocol.sendError(call, -32602, "Missing subscription filter", null), "notifications") orelse
+                return client.protocol.sendError(call, -32602, "Missing subscription filter", null);
+            const changed = mcp.get(notifications, "toolsListChanged") orelse return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
+            if (changed != .bool or !changed.bool) return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
+            const slot = for (&client.subscriptions) |*entry| {
+                if (entry.* == null) break entry;
+            } else return client.protocol.sendError(call, -32000, "Subscription capacity exceeded", null);
+            const bytes = try std.json.Stringify.valueAlloc(self.allocator, request.id.?, .{});
+            defer self.allocator.free(bytes);
+            var id = try std.json.parseFromSlice(mcp.Value, self.allocator, bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
+            errdefer id.deinit();
+            var arena: std.heap.ArenaAllocator = .init(self.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var params = try subscriptionParams(a, id.value);
+            try params.object.put(a, "notifications", try mcp.object(a, .{.{ "toolsListChanged", mcp.Value{ .bool = true } }}));
+            try client.protocol.sendNotification("notifications/subscriptions/acknowledged", params);
+            slot.* = .{ .call = call, .id = id };
+            return;
+        }
         if (!std.mem.eql(u8, request.method, "tools/call")) return client.protocol.sendError(call, -32601, "Method not found", null);
         const params = request.params orelse return client.protocol.sendError(call, -32602, "Missing tool parameters", null);
         const name_value = mcp.get(params, "name") orelse return client.protocol.sendError(call, -32602, "Missing tool name", null);
         if (name_value != .string) return client.protocol.sendError(call, -32602, "Invalid tool name", null);
         const name = name_value.string;
         const arguments = mcp.get(params, "arguments") orelse mcp.Value{ .object = .empty };
-        var builtins = try std.json.parseFromSlice(mcp.Value, self.allocator, builtin_tools, .{});
+        var builtins = try std.json.parseFromSlice(mcp.Value, self.allocator, catalog.builtin_tools, .{});
         defer builtins.deinit();
         const tool = for (builtins.value.array.items) |item| {
             if (mcp.isString(mcp.get(item, "name"), name)) break item;
@@ -692,27 +770,8 @@ pub const ControlServer = struct {
         var arena: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const builtins = try std.json.parseFromSlice(mcp.Value, a, builtin_tools, .{});
-        const failure = try std.json.parseFromSlice(mcp.Value, a, failure_schema, .{});
-        var tools = std.array_list.Managed(mcp.Value).init(a);
-        try tools.appendSlice(builtins.value.array.items);
-        if (self.application) |app| if (app.action_schema) |schema| {
-            var it = schema.tools.iterator();
-            while (it.next()) |entry| try tools.append(entry.value_ptr.*);
-        };
-        // Declarations describe success; every advertised output also covers
-        // the runtime's structured execution-error envelope.
-        for (tools.items) |*tool| {
-            var copy = try mcp.object(a, .{});
-            var it = tool.object.iterator();
-            while (it.next()) |entry| try copy.object.put(a, entry.key_ptr.*, entry.value_ptr.*);
-            var choices = std.array_list.Managed(mcp.Value).init(a);
-            try choices.append(mcp.get(copy, "outputSchema").?);
-            try choices.append(failure.value);
-            try copy.object.put(a, "outputSchema", try mcp.object(a, .{ .{ "type", mcp.string("object") }, .{ "anyOf", mcp.Value{ .array = choices } } }));
-            tool.* = copy;
-        }
-        try client.protocol.sendResult(call, try mcp.object(a, .{ .{ "tools", mcp.Value{ .array = tools } }, .{ "ttlMs", mcp.Value{ .integer = 0 } }, .{ "cacheScope", mcp.string("private") } }));
+        const list = try std.json.parseFromSlice(mcp.Value, a, self.tools_json, .{ .parse_numbers = false });
+        try client.protocol.sendResult(call, try mcp.object(a, .{ .{ "tools", list.value }, .{ "ttlMs", mcp.Value{ .integer = 60000 } }, .{ "cacheScope", mcp.string("private") } }));
     }
 
     fn replaceFailure(
@@ -780,20 +839,23 @@ fn sendToolResult(server: *mcp.Server, call: mcp.CallHandle, value: mcp.Value, i
     try server.sendResult(call, try mcp.object(a, .{ .{ "structuredContent", value }, .{ "content", mcp.Value{ .array = content } }, .{ "isError", mcp.Value{ .bool = is_error } } }));
 }
 
+fn subscriptionParams(a: std.mem.Allocator, id: mcp.Value) !mcp.Value {
+    return mcp.object(a, .{.{ "_meta", try mcp.object(a, .{.{ "io.modelcontextprotocol/subscriptionId", id }}) }});
+}
+
 fn same(first: io_loop.OperationHandle, second: io_loop.OperationHandle) bool {
     return first.slot == second.slot and first.generation == second.generation;
 }
 
 test "runtime tool schemas use the supported JSON Schema subset" {
-    var tools = try std.json.parseFromSlice(mcp.Value, std.testing.allocator, builtin_tools, .{});
+    const bytes = try catalog.tools(std.testing.allocator, null);
+    defer std.testing.allocator.free(bytes);
+    var tools = try std.json.parseFromSlice(mcp.Value, std.testing.allocator, bytes, .{});
     defer tools.deinit();
     for (tools.value.array.items) |tool| {
         try mcp.schema.check(mcp.get(tool, "inputSchema").?);
         try mcp.schema.check(mcp.get(tool, "outputSchema").?);
     }
-    var failure = try std.json.parseFromSlice(mcp.Value, std.testing.allocator, failure_schema, .{});
-    defer failure.deinit();
-    try mcp.schema.check(failure.value);
 }
 
 test "runtime server holds Reload reply until the generation commits" {
@@ -869,6 +931,35 @@ test "runtime server holds Reload reply until the generation commits" {
     );
     try control.setApplication(&application, &vm);
     try std.testing.expect(!control.hasClients() and !control.hasPendingCalls());
+    try control.serviceRequests();
+
+    // Preparing a catalog is not publishing it. A later candidate UI failure
+    // must leave the active app, serialized catalog and publication bit intact.
+    {
+        const before = try std.testing.allocator.dupe(u8, control.tools_json);
+        defer std.testing.allocator.free(before);
+        var candidate = try lua.Application.loadNamedWithApi(std.testing.allocator, vm.state,
+            \\local o = require('ouro')
+            \\return o.app {id='dev.ourokit.test', actions={}, windows={o.window{id='candidate',title='Candidate',content=function() end}}}
+        , "@discarded-catalog", null, vm.apiReference());
+        defer candidate.deinit();
+        var prepared = try control.prepareApplication(&candidate, &vm);
+        defer prepared.deinit();
+        try std.testing.expect(prepared.changed);
+        try std.testing.expectEqualStrings(before, control.tools_json);
+        try std.testing.expect(control.application == &application and !control.publication_dirty);
+
+        const exported = try catalog.descriptor(std.testing.allocator, &application);
+        defer std.testing.allocator.free(exported);
+        var descriptor = try std.json.parseFromSlice(mcp.Value, std.testing.allocator, exported, .{});
+        defer descriptor.deinit();
+        try std.testing.expectEqual(@as(i64, 1), mcp.get(descriptor.value, "schema_version").?.integer);
+        try std.testing.expect(mcp.isString(mcp.get(descriptor.value, "application_id"), "dev.ourokit.test"));
+        try std.testing.expect(mcp.isString(mcp.get(mcp.get(descriptor.value, "endpoint").?, "runtime_path"), "ourokit/apps/dev.ourokit.test"));
+        const exported_tools = try catalog.serialize(std.testing.allocator, mcp.get(descriptor.value, "tools").?);
+        defer std.testing.allocator.free(exported_tools);
+        try std.testing.expectEqualStrings(before, exported_tools);
+    }
 
     _ = try loop.submit();
     const client = try wayring.unix_socket.connect(control.socketPath());

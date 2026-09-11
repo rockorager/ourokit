@@ -141,6 +141,18 @@ ouroctl activate dev.example.app
 ouroctl reload dev.example.app
 ```
 
+Export an installed tool catalog without opening the UI or connecting to a
+running application:
+
+```sh
+ouroctl mcp export examples/contacts/ouro.json --output dev.ourokit.contacts.json
+```
+
+Install the result under `$XDG_DATA_HOME/ouro/mcp/apps` for a user application,
+or `$datadir/ouro/mcp/apps` for a system package. The separate `ouro-mcp` bridge
+reads these descriptors without starting every service. See the
+[XDG discovery and runtime-catalog contract](docs/mcp-discovery.md).
+
 See [transactional source reload](docs/hot-reload.md) for the generation and
 failure-preservation guarantees.
 

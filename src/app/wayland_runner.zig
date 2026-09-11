@@ -100,6 +100,45 @@ pub fn runSource(
     return error.FontconfigDisabled;
 }
 
+/// Evaluates only the declaration for packaging. No listener, appearance
+/// connection, renderer, or UI factory is started. Declaration output goes to
+/// stderr so the caller can reserve stdout for the exported JSON descriptor.
+pub fn exportCatalog(init: std.process.Init, provider: *const bundle.SourceProvider) ![]u8 {
+    var diagnostic: ?lua.Diagnostic = null;
+    defer if (diagnostic) |*value| value.deinit();
+    const module_root = try provider.openModuleRoot(init.io);
+    defer if (module_root) |directory| directory.close(init.io);
+    var loop: io_loop.Loop = undefined;
+    try loop.init(init.gpa, 128, 32);
+    defer loop.deinit();
+    try loop.watchSignals(&.{ .INT, .TERM });
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(init.gpa, 1024, 8, 1024);
+    defer scheduler.deinit();
+    const input = try std.Io.Dir.openFileAbsolute(init.io, "/dev/null", .{});
+    defer input.close(init.io);
+    const snapshot = try provider.snapshot(init.io, init.gpa);
+    // SourceGeneration consumes the snapshot, including on setup failure.
+    const config: source_generation.Config = .{
+        .defer_run = true,
+        .runtime_dir = std.process.Environ.getPosix(init.minimal.environ, "XDG_RUNTIME_DIR"),
+    };
+    const generation = if (module_root) |directory|
+        try SourceGeneration.createBootstrap(init.gpa, &scheduler, &loop, snapshot, directory.handle, null, config, &diagnostic)
+    else
+        try SourceGeneration.create(init.gpa, &scheduler, &loop, snapshot, null, config, &diagnostic);
+    defer {
+        drainInitialGeneration(generation, &scheduler, &loop) catch |err|
+            std.debug.panic("could not drain catalog export: {s}", .{@errorName(err)});
+        generation.destroy();
+    }
+    generation.stdio.files = .{ .stdin = input.handle, .stdout = 2, .stderr = 2 };
+    try finishInitialBootstrap(generation, &scheduler, &loop, &diagnostic);
+    if (generation.vm.exit_code != null or !generation.application_ready) return error.ApplicationCatalogUnavailable;
+    if (!generation.application.hasActions()) return error.ApplicationActionsDisabled;
+    return @import("catalog.zig").descriptor(init.gpa, &generation.application);
+}
+
 fn runSourceWithFontconfig(
     init: std.process.Init,
     provider: *const bundle.SourceProvider,

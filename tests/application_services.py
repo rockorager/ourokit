@@ -58,6 +58,244 @@ def call(path, name, arguments=None):
     return result
 
 
+class RpcStream:
+    """Unbuffered socket reader so quiet checks also inspect already-read bytes."""
+    def __init__(self, path):
+        self.socket = socket.socket(socket.AF_UNIX)
+        self.socket.settimeout(8)
+        self.socket.connect(str(path))
+        self.buffer = bytearray()
+
+    def close(self):
+        self.socket.close()
+
+    def read(self):
+        while b"\n" not in self.buffer:
+            chunk = self.socket.recv(65536)
+            assert chunk, "peer closed before reply"
+            self.buffer.extend(chunk)
+        line, _, remaining = self.buffer.partition(b"\n")
+        self.buffer = bytearray(remaining)
+        assert len(line) < 256 * 1024
+        return json.loads(line)
+
+    def quiet(self):
+        assert not self.buffer and not select.select([self.socket], [], [], .12)[0], "unexpected catalog notification"
+
+    def cancel(self, request_id):
+        self.socket.sendall(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                       "params": {"requestId": request_id}}).encode() + b"\n")
+        assert self.read() == {"jsonrpc": "2.0", "id": request_id, "result": {
+            "resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": request_id}}}
+
+
+def check_catalog_changes(directory, path, app, source, process):
+    published = directory / "ouro/mcp/apps/dev.ourokit.servicetest.json"
+    initial = published.read_bytes()
+    descriptor = json.loads(initial)
+    assert set(descriptor) == {"schema_version", "application_id", "endpoint", "tools", "runtime"}
+    assert descriptor["schema_version"] == 1 and descriptor["application_id"] == "dev.ourokit.servicetest"
+    assert descriptor["endpoint"] == {"runtime_path": "ourokit/apps/dev.ourokit.servicetest"}
+    assert descriptor["tools"] == request(path, "tools/list")["result"]["tools"]
+    names = [tool["name"] for tool in descriptor["tools"]]
+    assert names == sorted(names)
+    assert descriptor["runtime"] == {"pid": process.pid, "start_ticks":
+                                     Path(f"/proc/{process.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]}
+    assert published.stat().st_mode & 0o777 == 0o600
+    assert published.stat().st_uid == os.getuid()
+
+    stream = RpcStream(path)
+    try:
+        for invalid in ({}, {"resourcesListChanged": True}, {"toolsListChanged": False}, {"toolsListChanged": 1}):
+            stream.socket.sendall(record("subscriptions/listen", {"notifications": invalid}, "bad"))
+            assert stream.read()["error"]["code"] == -32602
+        ids = ["catalog-a", 9007199254740993]
+        for request_id in ids:
+            stream.socket.sendall(record("subscriptions/listen", {"notifications": {
+                "toolsListChanged": True, "resourcesListChanged": True}}, request_id))
+            ack = stream.read()
+            assert ack == {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": {
+                "notifications": {"toolsListChanged": True}, "_meta": {"io.modelcontextprotocol/subscriptionId": request_id}}}
+        stream.socket.sendall(record("tools/list", request_id="after-ack"))
+        assert stream.read()["id"] == "after-ack"
+        stream.quiet()
+
+        def reload(candidate, changed, fails=False):
+            before = published.stat()
+            before_bytes = published.read_bytes()
+            app.write_text(candidate)
+            stream.socket.sendall(record("tools/call", {"name": "runtime.reload"}, "reload"))
+            response = stream.read()
+            # Runtime reply and notifications can complete in either order.
+            messages = [response]
+            for _ in range(len(ids) if changed else 0):
+                messages.append(stream.read())
+            replies = [m for m in messages if m.get("id") == "reload"]
+            assert len(replies) == 1 and replies[0]["result"]["isError"] == fails, messages
+            updates = [m for m in messages if m.get("method") == "notifications/tools/list_changed"]
+            assert {m["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] for m in updates} == (set(ids) if changed else set())
+            after = published.stat()
+            if changed:
+                assert after.st_ino != before.st_ino
+            else:
+                assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+                assert published.read_bytes() == before_bytes
+            assert json.loads(published.read_bytes())["tools"] == request(path, "tools/list")["result"]["tools"]
+            stream.quiet()
+
+        # Handler state and recursive object/declaration ordering are not catalog changes.
+        reload(source.replace("'initial'", "'handler-only'"), False)
+        reordered = source.replace("type='object', additionalProperties=false", "additionalProperties=false, type='object'")
+        reordered = reordered.replace("properties=properties, required=required", "required=required, properties=properties")
+        lines = reordered.splitlines()
+        first = next(i for i, line in enumerate(lines) if line.startswith("    Get ="))
+        second = next(i for i, line in enumerate(lines) if line.startswith("    Set ="))
+        lines[first], lines[second] = lines[second], lines[first]
+        reload("\n".join(lines), False)
+        # Each independent catalog dimension must invalidate subscribers.
+        described = source.replace("Service test action", "Changed description")
+        reload(described, True)
+        schema = described.replace("local str, int = {type='string'}, {type='integer'}", "local str, int = {type='string'}, {type='number'}")
+        reload(schema, True)
+        renamed = schema.replace("    Invalid =", "    Renamed =")
+        reload(renamed, True)
+        reload(renamed.replace("type='number'", "type='number', minimum=0"), False, fails=True)
+        assert call(path, "runtime.status")["structuredContent"]["diagnostic"] is not None
+        stream.cancel(ids.pop())
+        reload(source, True)
+        stream.cancel(ids.pop())
+        stream.quiet()
+    finally:
+        stream.close()
+
+    # Saturated pending calls must still admit a cancellation notification.
+    saturated = RpcStream(path)
+    try:
+        for i in range(32):
+            saturated.socket.sendall(record("subscriptions/listen", {"notifications": {"toolsListChanged": True}}, i))
+            assert saturated.read()["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == i
+        saturated.socket.sendall(record("tools/list", request_id="over-capacity"))
+        assert saturated.read()["error"]["code"] == -32000
+        saturated.cancel(17)
+        saturated.socket.sendall(record("tools/list", request_id="available"))
+        assert saturated.read()["id"] == "available"
+        assert call(path, "runtime.status")["isError"] is False
+    finally:
+        saturated.close()
+
+    # A nonreading subscriber with large IDs fills its bounded output queue;
+    # another peer must still reload and observe each committed catalog.
+    slow = RpcStream(path)
+    observer = RpcStream(path)
+    try:
+        slow.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+        for i in range(32):
+            slow.socket.sendall(record("subscriptions/listen", {"notifications": {"toolsListChanged": True}}, str(i) + "x" * 8192))
+        observer.socket.sendall(record("subscriptions/listen", {"notifications": {"toolsListChanged": True}}, "healthy"))
+        assert observer.read()["method"] == "notifications/subscriptions/acknowledged"
+        for i in range(6):
+            app.write_text(source.replace("Service test action", f"Slow subscriber round {i}"))
+            assert call(path, "runtime.reload")["isError"] is False
+            assert observer.read()["method"] == "notifications/tools/list_changed"
+        observer.cancel("healthy")
+    finally:
+        observer.close()
+        slow.close()
+    print("PASS: catalog startup/identity, deterministic reloads, changed-only subscription invalidation, rollback, cancellation, saturation and slow-peer isolation")
+
+
+def check_publication_safety(directory, env):
+    for mode in ("normal", "trailing", "replacement", "crash", "outside", "symlink-dir", "symlink-file", "writable-dir", "writable-file"):
+        runtime = directory / mode
+        runtime.mkdir(mode=0o700)
+        app = runtime / "app.lua"
+        source = """
+local o = require('ouro')
+return o.app {id='dev.test.catalog', actions={
+  Probe={description='Probe', inputSchema={type='object'}, outputSchema={type='object'}, handler=function() return {} end}
+}}
+"""
+        app.write_text(source)
+        manifest = runtime / "ouro.json"
+        manifest.write_text(json.dumps({"schema_version": 1, "id": "dev.test.catalog", "entry": "app.lua"}))
+        published = runtime / "ouro/mcp/apps/dev.test.catalog.json"
+        victim = runtime / "victim"
+        victim.write_text("preserve victim")
+        if mode == "symlink-dir":
+            (runtime / "elsewhere").mkdir()
+            (runtime / "ouro").symlink_to(runtime / "elsewhere", target_is_directory=True)
+        elif mode in ("symlink-file", "writable-dir", "writable-file"):
+            published.parent.mkdir(parents=True, mode=0o700)
+            if mode == "symlink-file":
+                published.symlink_to(victim)
+            elif mode == "writable-dir":
+                published.parent.chmod(0o777)
+            else:
+                published.write_text("preserve unsafe file")
+                published.chmod(0o666)
+        endpoint = directory / "outside.sock" if mode == "outside" else runtime / "overridden.sock"
+        local_env = dict(env, XDG_RUNTIME_DIR=str(runtime))
+        listener_path = str(endpoint)
+        if mode == "trailing":
+            local_env["XDG_RUNTIME_DIR"] += "///"
+            endpoint = runtime / "ourokit/apps/dev.test.catalog"
+            endpoint.parent.mkdir(parents=True, mode=0o700)
+            listener_path = local_env["XDG_RUNTIME_DIR"] + "/ourokit/apps/dev.test.catalog"
+        log = runtime / "log"
+        with log.open("wb") as errors:
+            process = subprocess.Popen(["systemd-socket-activate", f"--listen={listener_path}", "--fdname=mcp",
+                                        "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY",
+                                        str(BINARY), "run", str(manifest), "--software"],
+                                       env=local_env, stdout=subprocess.DEVNULL, stderr=errors)
+            try:
+                for _ in range(200):
+                    if endpoint.exists():
+                        break
+                    assert process.poll() is None, log.read_text()
+                    time.sleep(.01)
+                assert call(endpoint, "Probe")["isError"] is False
+                safe = mode in ("normal", "trailing", "replacement", "crash")
+                if safe:
+                    descriptor = json.loads(published.read_bytes())
+                    expected_path = "ourokit/apps/dev.test.catalog" if mode == "trailing" else "overridden.sock"
+                    assert descriptor["endpoint"] == {"runtime_path": expected_path}
+                    assert descriptor["runtime"]["pid"] == process.pid
+                if mode == "replacement":
+                    replacement = runtime / "replacement.json"
+                    replacement.write_text("replacement stays")
+                    replacement.replace(published)
+                # Publication failures, including a safe inode replaced by its
+                # owner, cannot invalidate this successfully committed reload.
+                app.write_text(source.replace("description='Probe'", "description='Changed'"))
+                assert call(endpoint, "runtime.reload")["isError"] is False
+                assert next(t for t in request(endpoint, "tools/list")["result"]["tools"] if t["name"] == "Probe")["description"] == "Changed"
+                if mode == "trailing":
+                    assert json.loads(published.read_bytes())["endpoint"] == {"runtime_path": "ourokit/apps/dev.test.catalog"}
+                if mode == "crash":
+                    process.kill()
+                else:
+                    process.terminate()
+                process.wait(timeout=8)
+                if mode in ("normal", "trailing"):
+                    assert not published.exists()
+                elif mode == "replacement":
+                    assert published.read_text() == "replacement stays"
+                elif mode == "crash":
+                    assert published.exists() and not Path(f"/proc/{process.pid}").exists()
+                elif mode == "symlink-file":
+                    assert published.is_symlink() and victim.read_text() == "preserve victim"
+                elif mode == "writable-file":
+                    assert published.read_text() == "preserve unsafe file"
+                else:
+                    assert not published.exists()
+                assert "panic" not in log.read_text() and "leaked" not in log.read_text(), log.read_text()
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=8)
+    print("PASS: runtime publication is best effort, normalizes trailing runtime slashes, uses actual endpoints, rejects symlink/unsafe paths, preserves replacement inodes, cleans graceful shutdown and identifies crash residue")
+
+
 def check_signal_shutdown(directory, env):
     manifest = directory / "interrupt" / "ouro.json"
     manifest.parent.mkdir()
@@ -175,6 +413,7 @@ o.exit(7)
         print("PASS: async stdin/stdout/stderr, JSON array/null roundtrip, explicit exit, no UI/socket")
 
         check_signal_shutdown(directory, env)
+        check_publication_safety(directory, env)
 
         app = directory / "app.lua"
         source = """
@@ -220,11 +459,11 @@ return o.app {
                 status = call(path, "runtime.status")["structuredContent"]
                 assert status["uiActive"] is False
                 info = request(path, "server/discover")["result"]
-                assert info["supportedVersions"] == ["2026-07-28"] and info["capabilities"] == {"tools": {}}
-                assert info["ttlMs"] == 0 and info["cacheScope"] == "private"
+                assert info["supportedVersions"] == ["2026-07-28"] and info["capabilities"] == {"tools": {"listChanged": True}}
+                assert info["ttlMs"] == 60000 and info["cacheScope"] == "private"
                 tools = request(path, "tools/list")["result"]
                 assert {t["name"] for t in tools["tools"]} == {"runtime.status", "runtime.reload", "runtime.activate", "Get", "Set", "Delayed", "Invalid", "Fail"}
-                assert tools["ttlMs"] == 0 and tools["cacheScope"] == "private"
+                assert tools["ttlMs"] == 60000 and tools["cacheScope"] == "private"
                 assert all("inputSchema" in t and "outputSchema" in t and t["description"] for t in tools["tools"])
                 assert call(path, "Set", {"value": "changed"})["structuredContent"] == {}
                 assert call(path, "Get")["structuredContent"] == {"value": "changed", "empty": []}
@@ -286,8 +525,10 @@ return o.app {
                 assert call(path, "runtime.status")["structuredContent"]["uiActive"] is False
                 print("PASS: headless reload, pending-call cancellation, invalid declaration rollback")
 
+                check_catalog_changes(directory, path, app, source, process)
                 assert process.wait(timeout=40) == 0, log.read_text()
                 assert path.exists(), "application unlinked inherited socket"
+                assert not (directory / "ouro/mcp/apps/dev.ourokit.servicetest.json").exists()
                 print("PASS: 30-second headless idle exit retains inherited socket pathname")
             except Exception:
                 print(log.read_text())

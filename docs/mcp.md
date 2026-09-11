@@ -2,8 +2,9 @@
 
 Ourokit, ourosettings, and the Ouro compositor use MCP over local Unix sockets.
 This document defines their transport contract and Ourokit's Lua client API.
-Desktop-wide discovery, instance registration, agent authorization,
-and an assistant-facing stdio bridge follow separately.
+The [discovery contract](mcp-discovery.md) defines installed and runtime
+catalogs for the separate `ouro-mcp` stdio bridge. Agent authorization and
+multi-instance application routing remain separate from discovery metadata.
 
 ## Local transport
 
@@ -25,10 +26,11 @@ absent `resultType`, treating it as `"complete"`; present but malformed or unkno
 values are invalid. This does not add support for legacy version negotiation.
 
 Servers implement `server/discover` and the discovery methods for advertised
-capabilities. During this slice, list/discovery results and resource reads use
-`ttlMs: 0` and `cacheScope: "private"`. The future assistant bridge must select
-its compatibility policy against real host support; local clients do not claim
-support for initialization-based MCP revisions.
+capabilities. Ourokit app discovery and tool lists use `ttlMs: 60000` and
+`cacheScope: "private"`; settings discovery and resource reads retain `ttlMs: 0`.
+Tool-list notifications invalidate fresh cache entries immediately. TTL is a
+freshness bound checked on access, not an app-waking polling interval. Local
+clients and the first bridge do not support initialization-based MCP revisions.
 
 ## Settings resources
 
@@ -209,8 +211,18 @@ Declaring `actions = {}` enables `runtime.status`, `runtime.reload`, and
 `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`. Custom actions declare
 `description`, `inputSchema`, `outputSchema`, and `handler` together. See
 [the application model](application-model.md) and the runnable
-[Contacts service](../examples/contacts/README.md). Discovery is local to each
-endpoint; it does not yet register the app with a desktop-wide broker.
+[Contacts service](../examples/contacts/README.md). Installed descriptors and
+process-identified runtime catalogs allow offline discovery without a broker.
+
+App servers advertise `tools.listChanged: true`. Clients request
+`subscriptions/listen` with `notifications: {toolsListChanged: true}`, verify
+the accepted acknowledgment, then fetch `tools/list`. A successful reload that
+changes tool names, descriptions or schemas emits `notifications/tools/list_changed`.
+Handler-only changes and failed reloads do not invalidate the catalog. Each
+notification carries the listen request ID in subscription metadata. Canceling
+the listen yields a terminal complete result; disconnect discards its state.
+The resource-only Lua `subscribe` helper is unchanged; catalog subscriptions
+are handled by the bridge and native MCP clients.
 
 Use `FileDescriptorName=mcp` for systemd socket activation. The host checks
 same-user peer credentials and retains existing listener/pathname ownership

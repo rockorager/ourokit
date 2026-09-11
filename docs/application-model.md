@@ -266,7 +266,11 @@ with `structuredContent = {error = {code, message, parameters}}`; errors need no
 IDL declaration. Lua exceptions and invalid output become `ActionFailed` tool
 errors. Discovery wraps each success output schema with an `anyOf` branch for
 this common error envelope. Unknown tools and invalid arguments use JSON-RPC
-errors instead. Lists/discovery use `ttlMs: 0` and `cacheScope: "private"`.
+errors instead. Lists/discovery use `ttlMs: 60000` and `cacheScope: "private"`.
+Clients can subscribe to `toolsListChanged` using `subscriptions/listen`.
+Successful catalog-changing reloads invalidate cached lists immediately;
+unchanged catalogs and rejected candidates do not. See the
+[discovery contract](mcp-discovery.md) for offline export and runtime publication.
 
 Records are newline-delimited JSON-RPC and bounded to 256 KiB including newline.
 Replies correlate by request ID and can arrive out of order. Each connection

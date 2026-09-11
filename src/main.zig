@@ -29,6 +29,19 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
         },
         .status => |target| try statusApplication(init, target.application_id),
         .reload => |target| try reloadApplication(init, target.application_id),
+        .mcp_export => |options| {
+            var provider = if (std.mem.eql(u8, std.fs.path.basename(options.path), ourokit.bundle.manifest_file_name)) blk: {
+                var manifest = try ourokit.bundle.Manifest.load(init.io, init.gpa, options.path);
+                defer manifest.deinit();
+                break :blk try ourokit.bundle.SourceProvider.initDiskApplication(init.gpa, manifest.entry_path, manifest.id);
+            } else try ourokit.bundle.SourceProvider.initDisk(init.gpa, options.path);
+            defer provider.deinit();
+            const bytes = try ourokit.app.exportCatalog(init, &provider);
+            defer init.gpa.free(bytes);
+            if (options.output_path) |path| {
+                try writeAtomic(init, path, bytes);
+            } else try writeStdout(init, bytes);
+        },
         .run => |options| {
             const path = options.path orelse ourokit.bundle.manifest_file_name;
             var provider = if (std.mem.eql(
