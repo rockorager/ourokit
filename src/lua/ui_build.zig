@@ -915,6 +915,8 @@ pub const UiBuild = struct {
             return luaError(state, "ouro.button expects one declaration table");
         const key = tableString(state, 1, "key") orelse return luaError(state, "button key is required");
         const label = tableString(state, 1, "label") orelse return luaError(state, "button label is required");
+        const child_count = c.lua_rawlen(state, c.upvalueIndex(2));
+        if (child_count > 1) return luaError(state, "button accepts one content child");
         const parent = self.currentParent() orelse return luaError(state, "button requires a widget parent");
         const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
             return luaError(state, "invalid button enabled state");
@@ -959,32 +961,34 @@ pub const UiBuild = struct {
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append button descriptor");
 
-        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
-        const source = sources.acquire(.{
-            .utf8 = label,
-            .language = "und",
-            .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
-            .candidates = self.themedFonts(true) catch |err| return luaError(state, @errorName(err)),
-            .configuration_revision = self.text_configuration_revision,
-        }) catch return luaError(state, "cannot retain button label");
-        self.append(.{
-            .id = label_id,
-            .parent = button_id,
-            .object = .{ .text = .{
-                .source = source,
-                .color = if (enabled)
-                    visual.foreground orelse theme.primary_foreground
-                else
-                    visual.disabled_foreground orelse theme.disabled_foreground,
-                .alignment = .center,
-                .max_lines = 1,
-                .overflow = .ellipsis,
-            } },
-        }) catch {
-            sources.release(source) catch unreachable;
-            return luaError(state, "cannot append button label descriptor");
-        };
-        self.sources_staged = true;
+        if (child_count == 0) {
+            const sources = self.text_sources orelse return luaError(state, "text service unavailable");
+            const source = sources.acquire(.{
+                .utf8 = label,
+                .language = "und",
+                .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
+                .candidates = self.themedFonts(true) catch |err| return luaError(state, @errorName(err)),
+                .configuration_revision = self.text_configuration_revision,
+            }) catch return luaError(state, "cannot retain button label");
+            self.append(.{
+                .id = label_id,
+                .parent = button_id,
+                .object = .{ .text = .{
+                    .source = source,
+                    .color = if (enabled)
+                        visual.foreground orelse theme.primary_foreground
+                    else
+                        visual.disabled_foreground orelse theme.disabled_foreground,
+                    .alignment = .center,
+                    .max_lines = 1,
+                    .overflow = .ellipsis,
+                } },
+            }) catch {
+                sources.release(source) catch unreachable;
+                return luaError(state, "cannot append button label descriptor");
+            };
+            self.sources_staged = true;
+        }
         if (self.pending_button_count == self.pending_buttons.len)
             return luaError(state, "button capacity exceeded");
         self.pending_buttons[self.pending_button_count] = .{
@@ -1002,6 +1006,7 @@ pub const UiBuild = struct {
             .enabled = enabled,
         }) catch return luaError(state, "cannot append button semantics");
 
+        if (child_count != 0) _ = self.emitChildren(state, .{ .id = button_id, .kind = .box });
         const callback_type = c.lua_getfield(state, 1, "on_press");
         defer c.lua_settop(state, -2);
         if (callback_type == c.type_nil) return 0;
@@ -2424,6 +2429,56 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try scheduler.destroyScope(window_scope);
 }
 
+test "buttons retain semantics and input bindings with custom content" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 3);
+    c.lua_setglobal(state, "ouro");
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: build_owner.BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var storage: [4]instance.Descriptor = undefined;
+    var semantics: [2]SemanticDescriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    try ui.attachSemantics(&semantics);
+    ui.enableDeclarativeWidgets(design.tokens.dark);
+    try execute(state,
+        \\function build()
+        \\  return ouro.button {
+        \\    key = "launch", label = "Launch application", height = 44,
+        \\    on_press = function() end,
+        \\    children = { ouro.box { key = "content", width = 28, height = 24 } },
+        \\  }
+        \\end
+    );
+    var cycle = owners.beginCycle();
+    const work = (try cycle.take()).?;
+    const descriptors = try ui.build(&owners, work, "build", &.{});
+    try std.testing.expectEqual(@as(usize, 4), descriptors.len);
+    try std.testing.expect(descriptors[2].focusable);
+    try std.testing.expectEqual(descriptors[2].id, descriptors[3].parent.?);
+    try std.testing.expectEqual(@as(?f32, 28), descriptors[3].object.box.width);
+    try std.testing.expectEqual(@as(usize, 1), ui.pending_button_count);
+    try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
+    try std.testing.expectEqual(.button, ui.pending_handlers[0].kind);
+    try std.testing.expectEqual(descriptors[2].id, ui.pending_handlers[0].id);
+    try std.testing.expectEqual(.button, ui.semanticDescriptors()[0].role);
+    try std.testing.expectEqualStrings("Launch application", ui.semanticDescriptors()[0].label);
+    ui.rollbackHandlers();
+    try owners.complete(work);
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
+    try owners.collectRetired();
+    try scheduler.destroyScope(scope);
+}
+
 test "Lua constructors are pure and reject callback children" {
     const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
     defer c.lua_close(state);
@@ -2445,7 +2500,7 @@ test "Lua constructors are pure and reject callback children" {
         "ouro.column { {} }",
         "ouro.column { false }",
         "ouro.text { key = 'leaf', text = 'Hello', ouro.box { key = 'child' } }",
-        "ouro.button { key = 'leaf', label = 'Hello', children = {} }",
+        "ouro.text_input { key = 'leaf', text = 'Hello', children = {} }",
     }) |source| try std.testing.expectError(error.LuaChunkFailed, execute(state, source));
 }
 

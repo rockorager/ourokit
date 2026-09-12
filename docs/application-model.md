@@ -602,6 +602,11 @@ compact pointer event ABI are not exposed. Build references commit only after
 descriptor reconciliation succeeds; rollback, replacement, removal, and window
 teardown release them.
 
+Buttons may supply one `children` description instead of the generated label
+text, for example a row containing an icon and text. `label` remains required
+as the button's accessible name. The button still owns focus, hover, and
+activation over its entire bounds; custom content owns its text styling.
+
 Padding is Box layout policy rather than a wrapper render object. Theme, keyed
 identity, focus, shortcuts, and stateful components are instance/widget policy,
 not render-object variants. There will be no universal generic node and no
@@ -618,7 +623,7 @@ during Lua evaluation, and unattached descriptions do not become UI. There is
 no generic string `type` parser or application-facing descriptor escape hatch.
 During lowering, `ouro.row` and `ouro.column` normalize to Flex,
 `ouro.scroll` normalizes to a single-child Scroll viewport, `ouro.text`
-normalizes to Text, and `ouro.button` normalizes to Box plus Text. The
+normalizes to Text, and `ouro.button` normalizes to Box plus Text or its supplied content. The
 single-selection `ouro.listbox` composes a vertical Flex with direct
 `ouro.option` Box/Text children. It is one focus stop, uses integer values,
 and calls `on_select(value)` on primary-button press or Up/Down/Home/End navigation;
