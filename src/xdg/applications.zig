@@ -116,7 +116,9 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, id: []const u8, pa
         const equal = std.mem.indexOfScalar(u8, line, '=') orelse return error.MalformedDesktopEntry;
         const key = std.mem.trim(u8, line[0..equal], " \t");
         const value = std.mem.trim(u8, line[equal + 1 ..], " \t");
-        if (!validKey(key) or groups.items[index].pairs.contains(key)) return error.MalformedDesktopEntry;
+        if (!validKey(key)) return error.MalformedDesktopEntry;
+        // Packaged entries can repeat keys (Chrome repeats StartupWMClass).
+        // Match GLib key files: the last value in this group wins.
         try groups.items[index].pairs.put(allocator, key, value);
     }
     const main = findGroup(groups.items, "Desktop Entry") orelse return error.MalformedDesktopEntry;
@@ -547,6 +549,34 @@ test "XDG applications malformed shadow NoDisplay locale lists and keywords" {
     try std.testing.expectEqualStrings("Fallback", entry.name);
     try std.testing.expect(entry.no_display and !entry.visible);
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "one;two", "slash\\end", "space word" }), entry.keywords);
+}
+
+test "XDG applications accepts duplicate keys with group-local last-value precedence" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const entry = (try parse(arena.allocator(),
+        \\[Desktop Entry]
+        \\Type=Application
+        \\Name=Old name
+        \\Name=Google Chrome
+        \\Exec=old-command
+        \\Exec=/usr/bin/google-chrome-stable %U
+        \\StartupWMClass=Google-chrome
+        \\StartupWMClass=google-chrome
+        \\NoDisplay=true
+        \\NoDisplay=false
+        \\Actions=new-window;
+        \\[Desktop Action new-window]
+        \\Name=New Window
+        \\Exec=/usr/bin/google-chrome-stable
+        \\StartupWMClass=Google-chrome
+    , "google-chrome.desktop", "/test/google-chrome.desktop", &.{ .roots = &.{} })).?;
+    try std.testing.expect(entry.visible);
+    try std.testing.expectEqualStrings("Google Chrome", entry.name);
+    try std.testing.expectEqualStrings("/usr/bin/google-chrome-stable %U", entry.exec.?);
+    try std.testing.expectEqual(@as(usize, 1), entry.actions.len);
+    try std.testing.expectEqualStrings("New Window", entry.actions[0].name);
+    try std.testing.expectEqualStrings("/usr/bin/google-chrome-stable", entry.actions[0].exec.?);
 }
 
 test "XDG applications preserves TryExec without filtering missing or nonexecutable targets" {
