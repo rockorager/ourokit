@@ -682,6 +682,20 @@ pub fn positionLinesWithOptions(
 
         var metrics: api.Metrics = .{ .ascender = 0, .descender = 0, .line_gap = 0 };
         for (fragments.items) |*fragment| mergeMetrics(&metrics, fragment.result().metrics);
+        if (fragments.items.len == 0) {
+            // Empty lines have no shaped fragments, but still occupy a font
+            // line and need a full-height insertion caret.
+            if (shaped.candidates.len == 0) return error.NoFallbackCandidates;
+            var empty = try shaped.candidates[0].font.shape(allocator, .{
+                .paragraph = "",
+                .direction = if (selected_line.base_level & 1 == 0) .left_to_right else .right_to_left,
+                .script = .latin,
+                .language = shaped.language,
+                .logical_size = shaped.logical_size,
+            });
+            defer empty.deinit();
+            metrics = empty.metrics;
+        }
         const line_height = @max(0, metrics.ascender - metrics.descender + metrics.line_gap);
         if (!std.math.isFinite(line_height) or !std.math.isFinite(line_top))
             return error.InvalidShaping;
@@ -1248,6 +1262,36 @@ test "mixed-script selected lines become positioned visual glyph spans" {
 test "unsafe shaping changes demand line reflow" {
     const fixture = @import("positioned_lines_test.zig");
     try fixture.testUnsafeReflow(positionLines);
+}
+
+test "empty lines retain font height for layout and insertion carets" {
+    const Fixture = @import("positioned_lines_test.zig").Fixture;
+    for ([_][]const u8{ "", "\n", "a\n\nb" }) |utf8| {
+        var fixture: Fixture = undefined;
+        try fixture.init(utf8, 200);
+        defer fixture.deinit();
+        var reference = try fixture.latin.shape(std.testing.allocator, .{
+            .paragraph = "Ag",
+            .direction = .left_to_right,
+            .script = .latin,
+            .language = "und",
+            .logical_size = 16,
+        });
+        defer reference.deinit();
+        const height = reference.metrics.ascender - reference.metrics.descender;
+        const advance = height + reference.metrics.line_gap;
+        try std.testing.expect(height > 1);
+        var positioned = try positionLines(std.testing.allocator, utf8, &fixture.shaped, &fixture.selected);
+        defer positioned.deinit();
+        try std.testing.expect(positioned.lines.len > 0);
+        for (positioned.lines, 0..) |line, index| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(index)) * advance, line.top, 0.001);
+            const caret = try positioned.caretRectangle(index, line.byte_start, .downstream, 1);
+            try std.testing.expectApproxEqAbs(height, caret.height, 0.001);
+            try std.testing.expectEqual(@as(f32, 1), caret.width);
+        }
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(positioned.lines.len)) * advance, positioned.height(), 0.001);
+    }
 }
 
 test "caret stops preserve graphemes, ligatures, and bidi affinity" {
