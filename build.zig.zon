@@ -13,8 +13,8 @@
             .hash = "N-V-__8AAGkrewARcKiSyLfJKsaW0ZoqHh4hzi4mTGwekxjk",
         },
         .wayring = .{
-            .url = "https://github.com/rockorager/wayring/archive/700b194fff32adc619c6ebdae5199223f87f9fc0.tar.gz",
-            .hash = "wayring-0.1.0-N0pph2HsEwAW-8708IpDnSEpqNL-ajkaEZeXzOEjcLrB",
+            .url = "https://github.com/rockorager/wayring/archive/bbd6ef0b30e5341139ed99cd988599f939583417.tar.gz",
+            .hash = "wayring-0.1.0-N0pph23kFAAPeaNDM7XjoC4SCfI8IwF82YXXQhckHVMK",
         },
         .lua = .{
             .url = "https://www.lua.org/ftp/lua-5.5.1.tar.gz",

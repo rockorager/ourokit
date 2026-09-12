@@ -901,9 +901,9 @@ pub const Host = struct {
     }
 
     /// Stops the connection without publishing per-object destructors. This
-    /// is the final-application shutdown path: retiring objects locally while
-    /// receive dispatch remains active can reject already-in-flight Wayland
-    /// events that still name those objects.
+    /// final-application path drains transport ownership without waiting for
+    /// per-window protocol teardown. Individual window removal keeps the
+    /// connection alive and uses Wayring's destroyed-object tombstones.
     pub fn beginShutdown(self: *Host) !void {
         if (self.disconnect_started) return;
         if ((try self.connection.actor()).lifecycle == .open and
@@ -1511,7 +1511,10 @@ pub const Host = struct {
             if (sameWindow(focus, window.handle)) self.pointer_focus = null;
         }
         if (self.keyboard_focus) |focus| {
-            if (sameWindow(focus, window.handle)) self.keyboard_focus = null;
+            if (sameWindow(focus, window.handle)) {
+                try self.keyboard_repeat.stop(self.loop);
+                self.keyboard_focus = null;
+            }
         }
         const objects = &self.connection.objects;
         const transmit = try self.queue();
@@ -2608,6 +2611,7 @@ pub const Host = struct {
                 try self.xkb.installKeymap(keymap.fd, keymap.size);
             },
             .enter => |enter| {
+                if (enter.surface == 0) return; // Destroyed surface, still in flight.
                 const window = try self.windowForSurface(enter.surface);
                 self.keyboard_focus = window.handle;
                 try self.sink.keyboard(.{ .enter = .{
@@ -2616,6 +2620,7 @@ pub const Host = struct {
                 } });
             },
             .leave => |leave| {
+                if (leave.surface == 0) return;
                 const window = try self.windowForSurface(leave.surface);
                 try self.keyboard_repeat.stop(self.loop);
                 try self.sink.keyboard(.{ .leave = .{
@@ -2627,7 +2632,7 @@ pub const Host = struct {
                 }
             },
             .key => |key| {
-                const window = self.keyboard_focus orelse return error.KeyboardWithoutFocus;
+                const window = self.keyboard_focus orelse return;
                 const state = try keyboardKeyState(key.state);
                 try self.sink.keyboard(.{ .key = .{
                     .window = window,
@@ -2676,12 +2681,14 @@ pub const Host = struct {
             fds,
         )) {
             .enter => |enter| {
+                if (enter.surface == 0) return;
                 const window = try self.windowForSurface(enter.surface);
                 self.text_input_active = null;
                 self.text_input_pending.enter(window.handle);
                 try self.sink.textInput(.{ .enter = window.handle });
             },
             .leave => |leave| {
+                if (leave.surface == 0) return;
                 const window = try self.windowForSurface(leave.surface);
                 self.text_input_active = null;
                 if (self.text_input_pending.leave(window.handle))
@@ -2769,8 +2776,11 @@ pub const Host = struct {
             message,
             fds,
         );
+        // Input queued before local surface destruction can precede leave.
+        if (self.pointer_focus == null and pointer_event != .enter and pointer_event != .leave) return;
         switch (pointer_event) {
             .enter => |enter| {
+                if (enter.surface == 0) return;
                 const window = try self.windowForSurface(enter.surface);
                 self.pointer_focus = window.handle;
                 try self.sink.pointer(.{ .enter = .{
@@ -2780,6 +2790,7 @@ pub const Host = struct {
                 } });
             },
             .leave => |leave| {
+                if (leave.surface == 0) return;
                 const window = try self.windowForSurface(leave.surface);
                 try self.sink.pointer(.{ .leave = .{
                     .window = window.handle,
@@ -2841,6 +2852,7 @@ pub const Host = struct {
     }
 
     pub fn eventError(self: *Host, _: wayring.io_uring.Peer, failure: Core.EventFailure) void {
+        std.log.err("Wayland event for object {?d}: {s}", .{ failure.object_id, @errorName(failure.cause) });
         self.failure = failure.cause;
         self.transport_lost = true;
         self.disconnect_started = true;

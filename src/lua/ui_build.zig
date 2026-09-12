@@ -1047,6 +1047,8 @@ pub const UiBuild = struct {
             return luaError(state, "text_input enabled must be a boolean");
         const read_only = tableOptionalBoolean(state, 1, "read_only", false) orelse
             return luaError(state, "text_input read_only must be a boolean");
+        const autofocus = tableOptionalBoolean(state, 1, "autofocus", false) orelse
+            return luaError(state, "text_input autofocus must be a boolean");
         const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id ^ self.component_namespace);
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
         const border_width = visual.border_width orelse defaults.controls.border_width orelse design.tokens.foundation.border_width_default;
@@ -1104,7 +1106,7 @@ pub const UiBuild = struct {
             .target_id = target_id,
             .content_id = content_id,
             .mode = mode,
-            .behavior = .{ .enabled = enabled, .read_only = read_only, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
+            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
             .session = TextInputSession.init(self.text_sources.?.allocator, initial) catch
                 return luaError(state, "cannot create text_input session"),
         };
@@ -1118,20 +1120,25 @@ pub const UiBuild = struct {
             .enabled = enabled,
         }) catch return luaError(state, "cannot append text_input semantics");
 
-        const callback_type = c.lua_getfield(state, 1, "on_change");
-        defer c.lua_settop(state, -2);
-        if (callback_type == c.type_nil) return 0;
-        if (callback_type != c.type_function)
-            return luaError(state, "text_input on_change must be a function");
-        if (self.pending_handler_count == self.pending_handlers.len)
-            return luaError(state, "input handler capacity exceeded");
-        c.lua_pushvalue(state, -1);
-        self.pending_handlers[self.pending_handler_count] = .{
-            .id = target_id,
-            .reference = c.luaL_ref(state, c.registry_index),
-            .kind = .text_input_change,
+        const names = [_]struct { name: [*:0]const u8, kind: @import("../ui/input/bindings.zig").HandlerKind }{
+            .{ .name = "on_change", .kind = .text_input_change },
+            .{ .name = "on_command", .kind = .text_input_command },
         };
-        self.pending_handler_count += 1;
+        for (names) |callback| {
+            const callback_type = c.lua_getfield(state, 1, callback.name);
+            defer c.lua_settop(state, -2);
+            if (callback_type == c.type_nil) continue;
+            if (callback_type != c.type_function) return luaError(state, "text_input callback must be a function");
+            if (self.pending_handler_count == self.pending_handlers.len)
+                return luaError(state, "input handler capacity exceeded");
+            c.lua_pushvalue(state, -1);
+            self.pending_handlers[self.pending_handler_count] = .{
+                .id = target_id,
+                .reference = c.luaL_ref(state, c.registry_index),
+                .kind = callback.kind,
+            };
+            self.pending_handler_count += 1;
+        }
         return 0;
     }
 

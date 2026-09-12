@@ -67,6 +67,36 @@ return ouro.app {
 }
 ```
 
+`run` may also return a reactive window declaration function:
+
+```lua
+local launcher_open = ouro.signal(false)
+-- An action or input callback calls launcher_open:set(not launcher_open()).
+-- Inside run, after creating the persistent panel declaration:
+return { windows = function()
+  local windows = { panel }
+  if launcher_open() then
+    windows[#windows + 1] = ouro.layer_surface {
+      id = "launcher", namespace = "launcher", layer = "overlay",
+      width = 640, height = 480, keyboard_interactivity = "exclusive",
+      content = launcher_content,
+    }
+  end
+  return windows
+end }
+```
+
+Signal reads in `windows()` use the same dependency graph as widget builds.
+The function is non-yielding and must not write signals or perform effects;
+create state in `run` or application initialization. New IDs mount native
+surfaces, omitted IDs retire them, and retained IDs preserve their widget
+runtime. Reopening a removed ID mounts fresh widgets after teardown drains.
+An empty reactive list keeps the application alive for later state changes.
+Evaluation and parsing failures retain the last valid list. `outputs = "all"` still
+expands to stable per-output IDs. Source reload currently requires the same
+window ID set, so dismiss transient windows before reloading a source whose
+initial state does not declare them.
+
 Widget constructors take one props table and return an opaque description;
 calling a constructor does not emit UI. A window, layer surface, or story's
 `content` function must return one root description, or nil for empty content.
@@ -470,6 +500,13 @@ The supported defaults are:
 | `widgets.option` | Same as button except `disabled`, `disabled_foreground`, and `focus`; `pressed` is the selected background |
 | `widgets.text` | `foreground`, `font_size` |
 
+`ouro.text_input` accepts `autofocus = true` to focus a newly mounted, enabled
+input once (retained rebuilds do not reclaim focus). `on_command(command)` runs
+in the owning task scope for unmodified `Enter` (`"submit"`), `Escape`
+(`"cancel"`), `ArrowUp` (`"previous"`), and `ArrowDown` (`"next"`). Navigation
+may repeat; submit/cancel only fire on the initial press. Commands are withheld
+during IME preedit. `on_command` and `on_change` may be used together.
+
 Widget defaults override shared controls/typography values. Explicit widget
 fields override those defaults; a text node's existing `size` prop takes precedence
 over `font_size`. Font sizes and theme heights must be positive; other metrics
@@ -791,6 +828,10 @@ delete it. The Wayland adapter owns each resulting `wl_data_source` and serves
 UTF-8/plain-text send requests with short-write-aware `io_uring` operations.
 Wayland offer/source pipe I/O never runs in a blocking protocol callback or an
 in-process clipboard substitute.
+
+Printable `wl_keyboard` events also insert text when text-input-v3 is available:
+the protocol being advertised does not mean an input method is supplying
+commits. Active preedit and command modifiers suppress direct text insertion.
 
 Primary-button text selection stores its bidi-aware anchor in the retained edit
 session. The input router keeps delivering motion to the captured instance even

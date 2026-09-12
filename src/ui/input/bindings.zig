@@ -3,7 +3,7 @@ const Handle = @import("../../core/handle.zig").Handle;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const HandlerKind = enum { pointer, button, text_input_change, listbox };
+pub const HandlerKind = enum { pointer, button, text_input_change, text_input_command, listbox };
 
 pub const Handler = struct {
     id: Handle,
@@ -34,7 +34,15 @@ pub const PointerBindings = struct {
     }
 
     pub fn get(self: *const PointerBindings, target: instance.InstanceHandle) ?Handler {
-        for (self.entries) |entry| if (same(entry.target, target)) return entry.handler;
+        for (self.entries) |entry| if (same(entry.target, target) and entry.handler != null and
+            entry.handler.?.kind != .text_input_change and entry.handler.?.kind != .text_input_command)
+            return entry.handler;
+        return null;
+    }
+
+    pub fn getKind(self: *const PointerBindings, target: instance.InstanceHandle, kind: HandlerKind) ?Handler {
+        for (self.entries) |entry| if (same(entry.target, target) and entry.handler != null and
+            entry.handler.?.kind == kind) return entry.handler;
         return null;
     }
 
@@ -44,7 +52,9 @@ pub const PointerBindings = struct {
         target: instance.InstanceHandle,
         handler: Handler,
     ) !?Handler {
-        for (self.entries) |*entry| if (same(entry.target, target)) {
+        for (self.entries) |*entry| if (same(entry.target, target) and entry.handler != null and
+            sameBindingKind(entry.handler.?.kind, handler.kind))
+        {
             const old = entry.handler;
             entry.owner = owner;
             entry.handler = handler;
@@ -128,6 +138,13 @@ fn same(a: instance.InstanceHandle, b: instance.InstanceHandle) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
+fn sameBindingKind(a: HandlerKind, b: HandlerKind) bool {
+    if (a == .text_input_change or a == .text_input_command or
+        b == .text_input_change or b == .text_input_command)
+        return a == b;
+    return true;
+}
+
 test "pointer bindings replace, clean removal, and reject stale generations" {
     const Scheduler = @import("../../task/scheduler.zig").Scheduler;
     const RenderTree = @import("../render_object/root.zig").Tree;
@@ -143,7 +160,7 @@ test "pointer bindings replace, clean removal, and reject stale generations" {
     try tree.init(std.testing.allocator, &scheduler, &renders, window_scope, 1);
     defer tree.deinit();
     var bindings: PointerBindings = undefined;
-    try bindings.init(std.testing.allocator, 1);
+    try bindings.init(std.testing.allocator, 2);
     defer bindings.deinit();
 
     try tree.reconcile(&.{.{ .id = 1, .parent = null, .object = .{ .box = .{} } }});
@@ -174,4 +191,23 @@ test "pointer bindings replace, clean removal, and reject stale generations" {
     try scheduler.applyQueuedCancellations();
     try tree.collectRetired();
     try scheduler.destroyScope(window_scope);
+}
+
+test "text input callback kinds coexist and retire independently" {
+    var bindings: PointerBindings = undefined;
+    try bindings.init(std.testing.allocator, 2);
+    defer bindings.deinit();
+    const owner: BuildOwnerHandle = .{ .slot = 2, .generation = 3 };
+    const target: instance.InstanceHandle = .{ .slot = 4, .generation = 5 };
+    const change: Handler = .{ .id = .{ .slot = 6, .generation = 7 }, .kind = .text_input_change };
+    const command: Handler = .{ .id = .{ .slot = 8, .generation = 9 }, .kind = .text_input_command };
+
+    try std.testing.expect((try bindings.set(owner, target, change)) == null);
+    try std.testing.expect((try bindings.set(owner, target, command)) == null);
+    try std.testing.expectEqual(change, bindings.getKind(target, .text_input_change).?);
+    try std.testing.expectEqual(command, bindings.getKind(target, .text_input_command).?);
+    try std.testing.expect(bindings.get(target) == null);
+    try std.testing.expect(bindings.takeOwner(owner) != null);
+    try std.testing.expect(bindings.takeOwner(owner) != null);
+    try std.testing.expect(bindings.takeOwner(owner) == null);
 }

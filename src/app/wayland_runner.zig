@@ -195,13 +195,17 @@ fn runSourceWithFontconfig(
     );
     defer workspaces.deinit();
 
+    var applications = try @import("../xdg/applications.zig").Config.init(init.gpa, init.minimal.environ);
+    defer applications.deinit();
     const generation_config: source_generation.Config = .{
         .node_capacity = options.window.node_capacity,
+        .window_capacity = options.application_window_capacity,
         .semantic_text_capacity = options.window.semantic_text_capacity,
         .signal_capacity = options.signal_capacity,
         .subscription_capacity = options.subscription_capacity,
         .dependency_capacity = options.dependency_capacity,
         .runtime_dir = std.process.Environ.getPosix(init.minimal.environ, "XDG_RUNTIME_DIR"),
+        .applications = &applications,
         .defer_run = true,
     };
     // SourceGeneration consumes the snapshot on both success and failure.
@@ -498,10 +502,7 @@ fn runSourceWithFontconfig(
                 },
                 .keyboard => |keyboard| {
                     if (slotForNativeHandle(&window_set, runtime_slots, keyboardWindow(keyboard))) |slot|
-                        if (slot.runtime.ready) {
-                            slot.runtime.keyboard_text_fallback = !host.textInputAvailable();
-                            try slot.runtime.routeKeyboard(keyboard);
-                        };
+                        if (slot.runtime.ready) try slot.runtime.routeKeyboard(keyboard);
                 },
                 .text_input => |text_input_event| switch (text_input_event) {
                     .enter => |handle| if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
@@ -560,6 +561,23 @@ fn runSourceWithFontconfig(
             try server.serviceRequests();
         }
 
+        if (!disconnect_started and host.failure == null and shutdown_signal == null and active_generation.vm.exit_code == null) {
+            const rebuilt = active_generation.refreshWindows() catch |err| blk: {
+                std.log.err("window declaration failed: {s}", .{@errorName(err)});
+                break :blk false;
+            };
+            if (rebuilt) {
+                for (host.outputs) |output| if (output.name) |name| {
+                    _ = try active_application.expandOutput(name, runtime_slots.len);
+                };
+                try syncRuntimeSlots(init.gpa, runtime_slots, active_application.windows);
+                for (runtime_slots) |*slot| if (slot.runtime.ready and slot.desired) {
+                    _ = try slot.runtime.build_owners.markDirty(slot.runtime.root_owner);
+                };
+                desired_changed = true;
+            }
+        }
+
         if (active_generation.vm.exit_code) |code| {
             if (options.exit_code) |result| result.* = code;
             if (!active_generation.stdio.hasPendingOutput()) {
@@ -602,6 +620,7 @@ fn runSourceWithFontconfig(
         }
         const calls_pending = if (control) |server| server.hasPendingCalls() else false;
         if (!disconnect_started and current_count == 0 and
+            (active_generation.window_owners == null or active_generation.vm.exit_code != null or shutdown_signal != null or host.failure != null or options.exit_after_first_frame) and
             (active_application.windows.len != 0 or active_application.output_templates.len == 0 or active_generation.vm.exit_code != null or shutdown_signal != null or host.failure != null) and
             (!calls_pending or active_generation.vm.exit_code != null or shutdown_signal != null) and
             (!active_generation.stdio.hasPendingOutput() or shutdown_signal != null))
@@ -616,15 +635,34 @@ fn runSourceWithFontconfig(
 
         for (runtime_slots) |*slot| {
             const window = applicationWindowForId(active_application.windows, slot.id orelse continue);
-            if (window == null or !slot.desired) {
+            const active_handle = window_set.activeHandleForId(slot.id.?);
+            if (window == null or !slot.desired or active_handle == null) {
                 if (slot.runtime.registered) {
                     try dirty.unregister(slot.runtime.window);
                     slot.runtime.registered = false;
                 }
                 try slot.runtime.clear(lua_ui);
+                slot.configured_size = null;
+                slot.text_input_enabled = false;
+                slot.text_input_surface_focused = false;
+                slot.text_input_revision = null;
+                if (window_set.handleForId(slot.id.?) == null) {
+                    slot.runtime.deinit();
+                    slot.runtime = .{};
+                    if (!slot.declared) {
+                        init.gpa.free(slot.id.?);
+                        slot.* = .{};
+                    }
+                }
                 continue;
             }
-            const handle = window_set.handleForId(window.?.declaration.id()).?;
+            const handle = active_handle.?;
+            if (slot.runtime.initialized and !sameHandle(slot.runtime.window, handle)) {
+                // The old native scope can disappear only after its widgets
+                // and build owners have drained. Reopening mounts fresh UI.
+                slot.runtime.deinit();
+                slot.runtime = .{};
+            }
             if (!slot.runtime.initialized) {
                 const window_theme = lua_ui.widget_theme.?.colors;
                 try slot.runtime.init(
@@ -737,12 +775,12 @@ fn runSourceWithFontconfig(
         };
 
         for (runtime_slots) |*slot| {
-            if (!slot.desired or !slot.runtime.initialized) continue;
+            if (!slot.desired or !slot.runtime.registered) continue;
             if (slot.runtime.wantsSubmission()) try host.requestRedraw(slot.runtime.window);
         }
 
         for (runtime_slots) |*slot| {
-            if (!slot.desired or !slot.runtime.initialized) continue;
+            if (!slot.desired or !slot.runtime.registered) continue;
             const handle = slot.runtime.window;
             if (slot.runtime.wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
                 const list = try slot.runtime.displayList();

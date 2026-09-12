@@ -32,6 +32,7 @@ const Role = enum { toplevel, layer_surface };
 const Slot = struct {
     generation: u32 = 0,
     state: State = .free,
+    dropped: bool = false,
     id: ?[]u8 = null,
     title: ?[]u8 = null,
     namespace: ?[]u8 = null,
@@ -99,7 +100,10 @@ pub const WindowSet = struct {
     pub fn reconcile(self: *WindowSet, declarations: []const SurfaceDeclaration) !void {
         try validateDeclarations(declarations);
         try self.validateTransitions(declarations);
-        try self.collectClosed(declarations);
+        for (self.slots) |*slot| if (slot.state != .free and findDeclaration(declarations, slot.id.?) == null) {
+            slot.dropped = true;
+        };
+        try self.collectClosed();
         try self.ensureCreateCapacity(declarations);
 
         for (self.slots, 0..) |*slot, index| {
@@ -227,6 +231,12 @@ pub const WindowSet = struct {
         return null;
     }
 
+    pub fn activeHandleForId(self: *WindowSet, id: []const u8) ?WindowHandle {
+        for (self.slots, 0..) |*slot, index|
+            if (slot.state == .active and std.mem.eql(u8, slot.id.?, id)) return handleFor(slot, index);
+        return null;
+    }
+
     pub fn changeSerial(self: *const WindowSet) u64 {
         return self.change_serial;
     }
@@ -291,9 +301,11 @@ pub const WindowSet = struct {
         }
     }
 
-    fn collectClosed(self: *WindowSet, declarations: []const SurfaceDeclaration) !void {
+    fn collectClosed(self: *WindowSet) !void {
         for (self.slots) |*slot| {
-            if (slot.state != .closed or findDeclaration(declarations, slot.id.?) != null) continue;
+            // A native close does not reopen an unchanged declaration. A
+            // dropped-and-restored declaration does, after teardown drains.
+            if (slot.state != .closed or !slot.dropped) continue;
             self.scheduler.destroyScope(slot.scope) catch |err| switch (err) {
                 error.ScopeNotEmpty => continue,
                 else => return err,
@@ -774,6 +786,41 @@ test "platform close requests are queued as data and stale declarations stay sup
 
     try windows.reconcile(&.{});
     try scheduler.applyQueuedCancellations();
+    try windows.markClosed(replacement);
+    try windows.reconcile(&.{});
+}
+
+test "restoring a dropped window while it closes remounts after scope drainage" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 5, 1, 0);
+    defer scheduler.deinit();
+    var host: FakeHost = .{};
+    var windows: WindowSet = undefined;
+    try windows.init(std.testing.allocator, &scheduler, host.interface(), 2, 2);
+    defer windows.deinit();
+    const declarations = [_]SurfaceDeclaration{
+        .{ .toplevel = .{ .id = "bar", .title = "Bar" } },
+        .{ .toplevel = .{ .id = "launcher", .title = "Launcher" } },
+    };
+    try windows.reconcile(&declarations);
+    const bar = windows.activeHandleForId("bar").?;
+    const original = windows.activeHandleForId("launcher").?;
+    const child = try scheduler.createScope(try windows.scope(original));
+    try windows.reconcile(declarations[0..1]);
+    try windows.reconcile(&declarations);
+    try std.testing.expect(windows.activeHandleForId("launcher") == null);
+    try scheduler.applyQueuedCancellations();
+    try windows.markClosed(original);
+    try windows.reconcile(&declarations);
+    try std.testing.expect(windows.activeHandleForId("launcher") == null);
+    try scheduler.destroyScope(child);
+    try windows.reconcile(&declarations);
+    const replacement = windows.activeHandleForId("launcher").?;
+    try std.testing.expect(!std.meta.eql(original, replacement));
+    try std.testing.expectEqual(bar, windows.activeHandleForId("bar").?);
+    try windows.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try windows.markClosed(bar);
     try windows.markClosed(replacement);
     try windows.reconcile(&.{});
 }

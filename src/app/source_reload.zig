@@ -209,10 +209,26 @@ pub const SourceReload = struct {
     /// window changes will use reserved runtime slots in a subsequent step.
     pub fn prepareApplication(self: *SourceReload, targets: []const WindowTarget) !void {
         const candidate = self.candidate orelse return error.SourceCandidateNotPrepared;
-        if (targets.len != candidate.application.windows.len) {
+        if (targets.len != candidate.application.windows.len or
+            candidate.application.windows.len != self.active().application.windows.len)
+        {
             self.recordBuildError(error.SourceWindowSetChanged);
             self.discard();
             return error.SourceWindowSetChanged;
+        }
+        for (candidate.application.windows) |window| {
+            var retained = false;
+            for (self.active().application.windows) |active_window| {
+                if (std.mem.eql(u8, window.declaration.id(), active_window.declaration.id())) {
+                    retained = true;
+                    break;
+                }
+            }
+            if (!retained) {
+                self.recordBuildError(error.SourceWindowSetChanged);
+                self.discard();
+                return error.SourceWindowSetChanged;
+            }
         }
         if (candidate.prepared_builds.len != targets.len) {
             const builds = try self.allocator.alloc(lua.PreparedBuild, targets.len);

@@ -158,3 +158,61 @@ finalizers cannot reach freed runtime state.
 Every future standard-library capability requires an explicit review of
 blocking behavior, allocation/performance, sandbox/capability effects, and
 whether an asynchronous Ouro API should own the operation instead.
+
+## Application discovery
+
+Wayland source hosts expose `ouro.xdg.applications.list()` inside Ouro tasks.
+It yields a fresh desktop-entry snapshot, sorted by desktop-file ID. Only one
+scan per source generation may run at a time; concurrent calls raise
+`ApplicationDiscoveryBusy`. Export/deterministic hosts do not scan the machine
+and raise `ApplicationDiscoveryUnavailable` instead.
+
+```lua
+local ouro = require("ouro")
+local entries = ouro.xdg.applications.list()
+for _, entry in ipairs(entries) do
+    if entry.visible then
+        -- Store/search/display the entry in the shell.
+        local ok, launch = pcall(ouro.xdg.applications.prepare_launch, entry)
+        if ok then
+            -- launch.argv is an array; launch.cwd is a path or ouro.json.null.
+            -- Preparation does not spawn anything.
+        end
+    end
+end
+```
+
+Roots come from `XDG_DATA_HOME` (default `$HOME/.local/share`) followed by
+`XDG_DATA_DIRS` (default `/usr/local/share:/usr/share`). Relative roots are
+ignored. The process copies the roots, `XDG_CURRENT_DESKTOP`, and
+`LC_ALL`/`LC_MESSAGES`/`LANG` once; reloading source does not change that
+environment. Nested filenames become hyphenated desktop IDs. The first root
+wins, including hidden or malformed overrides. Ordinary symlinks are followed,
+directory cycles are skipped, and magic links are rejected.
+
+Each entry has `id`, `path`, localized `name`, `generic_name`, `comment`, `icon`,
+`keywords`, `exec`, `try_exec`, `working_directory`, `actions`, and the booleans
+`hidden`, `no_display`, `terminal`, `dbus_activatable`, `visible`. Actions contain
+`id`, localized `name`, `exec`, and `icon`. Missing optional fields use
+`ouro.json.null`; empty lists remain arrays. `visible` combines Hidden,
+NoDisplay, and OnlyShowIn/NotShowIn. `TryExec` is retained as metadata but ignored
+for visibility; discovery does not look up its target or check permissions.
+Invalid entries are skipped; I/O and capacity errors fail the scan rather than
+returning an indistinguishable partial snapshot. Limits are 1 MiB per desktop
+file, 64 MiB of file contents, 65,536 directory entries, and 32 nested directories.
+
+`prepare_launch(entry[, {action = id, terminal_argv = {"terminal", "-e"}}])`
+prepares Exec as literal argv without a shell. It expands `%c`, `%k`, `%i`, and
+`%%`, removes file/URL placeholders because no documents are supplied, and
+rejects invalid field codes. Terminal entries require an explicit argument
+prefix. D-Bus-only entries/actions without Exec raise `NoExec`; this is not a
+D-Bus activation API. The shell owns launching, search/ranking, refresh timing,
+history, and UI.
+
+Native callers use `xdg.applications.Scan` on their existing `loop.Loop`.
+Open, stat, read, and close operations use io_uring. Directory enumeration
+(`getdents64`) is synchronous because Linux has no ring opcode for it.
+Parsing also runs on the loop thread. There
+is no worker, private ring, polling, watcher, or persistent cache. Cancellation
+drains in-flight operations and closes owned descriptors before retiring the
+task; only the task-phase continuation can publish the result to Lua.

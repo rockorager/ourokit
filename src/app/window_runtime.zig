@@ -72,8 +72,6 @@ pub const WindowRuntime = struct {
     clipboard: ?*clipboard_module.Coordinator = null,
     reconciling: bool = false,
     text_input_commit_permitted: bool = true,
-    /// The host enables direct XKB text only when text-input-v3 is unavailable.
-    keyboard_text_fallback: bool = false,
     virtual_lists: virtual_list.Snapshot = .{},
     virtual_work: bool = false,
     virtual_offsets_pending: bool = false,
@@ -429,6 +427,11 @@ pub const WindowRuntime = struct {
         self.text_inputs.finishOwner(self.root_owner);
 
         self.focus.reconcile(&self.instances);
+        if (self.text_inputs.takeAutofocus()) |target| {
+            const previous = self.focus.current();
+            _ = self.focus.request(&self.instances, target) catch unreachable;
+            self.applyFocusVisual(previous, self.focus.current()) catch unreachable;
+        }
         if (self.focus.current()) |target| self.setFocusBorder(target, true) catch unreachable;
         self.signals.disposeOwner(.{
             .owners = &self.build_owners,
@@ -548,6 +551,11 @@ pub const WindowRuntime = struct {
             };
             self.semantics.commitStaged();
             self.focus.reconcile(&self.instances);
+            if (self.text_inputs.takeAutofocus()) |target| {
+                const previous = self.focus.current();
+                _ = try self.focus.request(&self.instances, target);
+                try self.applyFocusVisual(previous, self.focus.current());
+            }
             for (0..self.buttons.slotCount()) |index|
                 if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
             try self.refreshListBoxVisuals();
@@ -744,7 +752,7 @@ pub const WindowRuntime = struct {
                 try self.spawnListBoxCallback(callback_service, binding.id, selection);
                 continue;
             }
-            if (binding.kind == .text_input_change) continue;
+            if (binding.kind == .text_input_change or binding.kind == .text_input_command) continue;
             const values = inputValues(event);
             const arguments = [_]lua.TaskArgument{
                 .{ .integer = values.kind },
@@ -788,6 +796,14 @@ pub const WindowRuntime = struct {
         {
             const session = try self.text_inputs.session(focused);
             const behavior = try self.text_inputs.getBehavior(focused);
+            if (behavior.enabled and session.preedit() == null) {
+                if (textInputCommand(key)) |command| {
+                    if (self.pointer_bindings.getKind(focused, .text_input_command)) |binding| {
+                        try self.spawnCallback(callback_service, binding.id, try self.instances.scope(focused), &.{.{ .string = command }});
+                        return;
+                    }
+                }
+            }
             if (key.state == .pressed) {
                 if (textInputClipboardShortcut(key.translated)) |command| {
                     if (!behavior.enabled or (behavior.read_only and command != .copy)) return;
@@ -831,7 +847,10 @@ pub const WindowRuntime = struct {
             }
             if (intent != null) return;
             const translated = key.translated;
-            if (self.keyboard_text_fallback and behavior.enabled and !behavior.read_only and
+            // A wl_keyboard key reaching the client was not consumed by the
+            // input method. Advertising text-input-v3 alone does not own text
+            // entry; ordinary typing must also work without an active IME.
+            if (behavior.enabled and !behavior.read_only and
                 session.preedit() == null and !translated.modifiers.control and
                 !translated.modifiers.alt and !translated.modifiers.logo and
                 translated.unicode >= 0x20 and translated.unicode <= 0x10ffff and
@@ -1003,8 +1022,7 @@ pub const WindowRuntime = struct {
         callback_service: anytype,
         target: ui.instance.InstanceHandle,
     ) !void {
-        const binding = self.pointer_bindings.get(target) orelse return;
-        if (binding.kind != .text_input_change) return;
+        const binding = self.pointer_bindings.getKind(target, .text_input_change) orelse return;
         const value = (try self.text_inputs.session(target)).model.text();
         try self.spawnCallback(
             callback_service,
@@ -2046,12 +2064,6 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .state = .pressed,
         .translated = .{ .keycode = 30, .unicode = 'Ω' },
     } };
-    const before_keyboard = try std.testing.allocator.dupe(u8, editing.model.text());
-    defer std.testing.allocator.free(before_keyboard);
-    try runtime.routeKeyboard(character);
-    try runtime.dispatchInput(&callbacks);
-    try std.testing.expectEqualStrings(before_keyboard, editing.model.text()); // IME owns commits.
-    runtime.keyboard_text_fallback = true;
     try runtime.routeKeyboard(character);
     try runtime.dispatchInput(&callbacks);
     try std.testing.expectEqualStrings("Ω", editing.model.text());
@@ -2150,6 +2162,41 @@ fn textInputIntent(key: platform.TranslatedKey) ?ui.text_input.EditIntent {
         .end => .{ .move = .{ .destination = .line_end, .extend = extend } },
         else => null,
     };
+}
+
+fn textInputCommand(key: anytype) ?[]const u8 {
+    if (key.state == .released or key.translated.modifiers.shift or
+        key.translated.modifiers.control or key.translated.modifiers.alt or
+        key.translated.modifiers.logo) return null;
+    return switch (key.translated.logical) {
+        .enter => if (key.state == .pressed) "submit" else null,
+        .escape => if (key.state == .pressed) "cancel" else null,
+        .arrow_up => "previous",
+        .arrow_down => "next",
+        else => null,
+    };
+}
+
+test "text input commands ignore releases modifiers and non-navigation repeats" {
+    const Key = @TypeOf(@as(platform.KeyboardEvent, undefined).key);
+    const base: Key = .{
+        .window = .invalid,
+        .serial = 1,
+        .time_ms = 2,
+        .state = .pressed,
+        .translated = .{ .keycode = 28, .logical = .enter },
+    };
+    try std.testing.expectEqualStrings("submit", textInputCommand(base).?);
+    var key = base;
+    key.state = .repeated;
+    try std.testing.expect(textInputCommand(key) == null);
+    key.translated.logical = .arrow_up;
+    try std.testing.expectEqualStrings("previous", textInputCommand(key).?);
+    key.state = .released;
+    try std.testing.expect(textInputCommand(key) == null);
+    key.state = .pressed;
+    key.translated.modifiers.control = true;
+    try std.testing.expect(textInputCommand(key) == null);
 }
 
 fn intentEditsText(intent: ui.text_input.EditIntent) bool {

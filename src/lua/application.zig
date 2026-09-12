@@ -38,6 +38,7 @@ pub const Definition = struct {
     action_schema: ?ActionSchema = null,
     actions_reference: c_int = c.no_reference,
     run_reference: c_int = c.no_reference,
+    windows_reference: c_int = c.no_reference,
     legacy_windows: ?[]Window = null,
 
     pub fn parseStack(allocator: std.mem.Allocator, state: *c.State) !Definition {
@@ -54,6 +55,8 @@ pub const Definition = struct {
 
     pub fn deinit(self: *Definition) void {
         if (self.action_schema) |*schema| schema.deinit();
+        if (self.windows_reference != c.no_reference)
+            c.luaL_unref(self.state, c.registry_index, self.windows_reference);
         if (self.legacy_windows) |windows| {
             for (windows) |window| deinitWindow(self.allocator, self.state, window);
             self.allocator.free(windows);
@@ -76,12 +79,14 @@ pub const Definition = struct {
             .action_schema = self.action_schema,
             .actions_reference = self.actions_reference,
             .run_reference = self.run_reference,
+            .windows_reference = self.windows_reference,
             .windows = windows,
         };
         self.id = self.id[0..0];
         self.action_schema = null;
         self.actions_reference = c.no_reference;
         self.run_reference = c.no_reference;
+        self.windows_reference = c.no_reference;
         self.legacy_windows = null;
         return application;
     }
@@ -159,6 +164,7 @@ pub const Bootstrap = struct {
                 return definition.finish(try parseRunWindows(
                     self.allocator,
                     self.vm.state,
+                    &definition.windows_reference,
                 ));
             },
         }
@@ -185,8 +191,27 @@ pub const Application = struct {
     action_schema: ?ActionSchema = null,
     actions_reference: c_int,
     run_reference: c_int,
+    windows_reference: c_int = c.no_reference,
     windows: []Window,
     output_templates: []Window = &.{},
+
+    /// Evaluate desired windows without changing the last valid declaration.
+    /// The caller tracks signal reads and commits only after validation.
+    pub fn evaluateWindows(self: *Application, capacity: usize) ![]Window {
+        const top = c.lua_gettop(self.state);
+        defer c.lua_settop(self.state, top);
+        _ = c.lua_rawgeti(self.state, c.registry_index, self.windows_reference);
+        if (c.lua_pcallk(self.state, 0, 1, 0, 0, null) != c.ok)
+            return error.LuaWindowsFailed;
+        if (c.lua_type(self.state, -1) != c.type_table) return error.InvalidWindowsDeclaration;
+        if (c.lua_rawlen(self.state, -1) > capacity) return error.WindowCapacityExceeded;
+        return parseWindowsTable(self.allocator, self.state);
+    }
+
+    pub fn releaseWindows(self: *Application, windows: []Window) void {
+        for (windows) |window| deinitWindow(self.allocator, self.state, window);
+        self.allocator.free(windows);
+    }
 
     /// Materialize each all-output declaration once per output name. Retain
     /// disconnected names so the native host can recreate their surfaces and
@@ -372,6 +397,7 @@ pub const Application = struct {
             state,
             definition.run_reference,
             "default",
+            &definition.windows_reference,
         ) catch |err| {
             if (err == error.LuaApplicationRunFailed) {
                 diagnostic.recordLuaStack(
@@ -412,6 +438,7 @@ pub const Application = struct {
             state,
             definition.run_reference,
             "default",
+            &definition.windows_reference,
         ));
     }
 
@@ -431,7 +458,7 @@ pub const Application = struct {
     pub fn startUi(self: *const Application, vm: *vm_module.Vm, scope: task.ScopeHandle, instance_id: []const u8) !vm_module.TaskHandle {
         if (vm.state != self.state) return error.ApplicationVmMismatch;
         if (!self.hasRun()) return error.ApplicationRunRequired;
-        if (self.windows.len != 0) return error.ApplicationUiAlreadyStarted;
+        if (self.windows.len != 0 or self.windows_reference != c.no_reference) return error.ApplicationUiAlreadyStarted;
         return vm.spawnRetainedRun(scope, self.run_reference, instance_id);
     }
 
@@ -440,7 +467,7 @@ pub const Application = struct {
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
         try vm.takeRetainedResult(handle);
-        const windows = try parseRunWindows(self.allocator, self.state);
+        const windows = try parseRunWindows(self.allocator, self.state, &self.windows_reference);
         for (self.windows) |window| deinitWindow(self.allocator, self.state, window);
         self.allocator.free(self.windows);
         self.windows = windows;
@@ -513,6 +540,8 @@ pub const Application = struct {
 
     pub fn deinit(self: *Application) void {
         if (self.action_schema) |*schema| schema.deinit();
+        if (self.windows_reference != c.no_reference)
+            c.luaL_unref(self.state, c.registry_index, self.windows_reference);
         for (self.windows) |window| deinitWindow(self.allocator, self.state, window);
         self.allocator.free(self.windows);
         for (self.output_templates) |window| deinitWindow(self.allocator, self.state, window);
@@ -609,6 +638,7 @@ fn invokeRun(
     state: *c.State,
     reference: c_int,
     instance_id: []const u8,
+    windows_reference: *c_int,
 ) ![]Window {
     if (c.lua_rawgeti(state, c.registry_index, reference) != c.type_function)
         return error.ApplicationRunMissing;
@@ -617,7 +647,7 @@ fn invokeRun(
     c.lua_setfield(state, -2, "instance_id");
     if (c.lua_pcallk(state, 1, 1, 0, 0, null) != c.ok)
         return error.LuaApplicationRunFailed;
-    return parseRunWindows(allocator, state);
+    return parseRunWindows(allocator, state, windows_reference);
 }
 
 fn optionalActions(state: *c.State, table: c_int) !c_int {
@@ -693,9 +723,15 @@ fn optionalWindows(
     return @as(?[]Window, try parseWindowsTable(allocator, state));
 }
 
-fn parseRunWindows(allocator: std.mem.Allocator, state: *c.State) ![]Window {
+fn parseRunWindows(allocator: std.mem.Allocator, state: *c.State, reference: *c_int) ![]Window {
     if (c.lua_type(state, -1) != c.type_table) return error.ApplicationRunDeclarationRequired;
-    if (c.lua_getfield(state, -1, "windows") != c.type_table)
+    const kind = c.lua_getfield(state, -1, "windows");
+    if (kind == c.type_function) {
+        const windows = try allocator.alloc(Window, 0);
+        reference.* = c.luaL_ref(state, c.registry_index);
+        return windows;
+    }
+    if (kind != c.type_table)
         return error.WindowsDeclarationRequired;
     defer c.lua_settop(state, -2);
     return parseWindowsTable(allocator, state);
@@ -703,7 +739,6 @@ fn parseRunWindows(allocator: std.mem.Allocator, state: *c.State) ![]Window {
 
 fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
     const count = c.lua_rawlen(state, -1);
-    if (count == 0) return error.ApplicationRequiresWindow;
     const windows = try allocator.alloc(Window, count);
     errdefer allocator.free(windows);
     var initialized: usize = 0;
@@ -713,6 +748,8 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
             return error.InvalidWindowDeclaration;
         const window_id = try requiredString(allocator, state, -1, "id");
         errdefer allocator.free(window_id);
+        for (windows[0..initialized]) |prior| if (std.mem.eql(u8, window_id, prior.declaration.id()))
+            return error.DuplicateWindowId;
         const role = try surfaceRole(state, -1);
         const outputs_type = c.lua_getfield(state, -1, "outputs");
         var outputs_length: usize = 0;

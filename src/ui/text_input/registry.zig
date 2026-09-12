@@ -8,6 +8,7 @@ pub const ValueMode = enum { uncontrolled, controlled };
 pub const Behavior = struct {
     enabled: bool = true,
     read_only: bool = false,
+    autofocus: bool = false,
     border_color: ?@import("../../core/color.zig").Color = null,
     focus_color: ?@import("../../core/color.zig").Color = null,
 };
@@ -20,6 +21,7 @@ const Entry = struct {
     behavior: Behavior = .{},
     active: bool = false,
     seen: bool = false,
+    autofocus_pending: bool = false,
 };
 
 /// Retained TextInput state keyed by generation-checked instance identity.
@@ -127,6 +129,7 @@ pub const Registry = struct {
                 .behavior = behavior,
                 .active = true,
                 .seen = true,
+                .autofocus_pending = behavior.enabled and behavior.autofocus,
             };
             prepared.* = null;
             return;
@@ -182,6 +185,15 @@ pub const Registry = struct {
 
     pub fn slotCount(self: *const Registry) usize {
         return self.entries.len;
+    }
+
+    /// Returns autofocus once, only for a newly mounted input.
+    pub fn takeAutofocus(self: *Registry) ?instance.InstanceHandle {
+        for (self.entries) |*entry| if (entry.active and entry.autofocus_pending) {
+            entry.autofocus_pending = false;
+            return entry.target;
+        };
+        return null;
     }
 
     fn destroy(entry: *Entry) void {
@@ -242,6 +254,25 @@ test "prepared mount moves new sessions and leaves rediscovered state untouched"
     try registry.mountPrepared(owner, target, content, .uncontrolled, .{}, &replacement);
     try std.testing.expect(replacement != null);
     try std.testing.expectEqualStrings("initial retained", (try registry.session(target)).model.text());
+    registry.clear();
+}
+
+test "autofocus is offered once for a newly mounted enabled input" {
+    var registry: Registry = undefined;
+    try registry.init(std.testing.allocator, 1);
+    defer registry.deinit();
+    const owner: build_owner.BuildOwnerHandle = .{ .slot = 1, .generation = 2 };
+    const target: instance.InstanceHandle = .{ .slot = 3, .generation = 4 };
+    const content: instance.InstanceHandle = .{ .slot = 5, .generation = 6 };
+    var initial: ?Session = try Session.init(std.testing.allocator, "initial");
+    try registry.mountPrepared(owner, target, content, .uncontrolled, .{ .autofocus = true }, &initial);
+    try std.testing.expectEqual(target, registry.takeAutofocus().?);
+    try std.testing.expect(registry.takeAutofocus() == null);
+
+    var rebuilt: ?Session = try Session.init(std.testing.allocator, "rebuilt");
+    defer if (rebuilt) |*session| session.deinit();
+    try registry.mountPrepared(owner, target, content, .uncontrolled, .{ .autofocus = true }, &rebuilt);
+    try std.testing.expect(registry.takeAutofocus() == null);
     registry.clear();
 }
 

@@ -24,6 +24,7 @@ pub const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 pub const McpClient = @import("mcp_client.zig").McpClient;
 pub const Stdio = @import("stdio.zig").Stdio;
 pub const ShellWorkspaces = @import("shell_workspaces.zig").Binding;
+pub const Applications = @import("applications.zig").Binding;
 pub const Storybook = @import("storybook.zig").Storybook;
 pub const StorybookStory = @import("storybook.zig").Story;
 pub const StorybookViewport = @import("storybook.zig").Viewport;
@@ -33,6 +34,7 @@ pub const StorybookActionKind = @import("storybook.zig").ActionKind;
 
 test {
     _ = @import("application.zig");
+    _ = @import("applications.zig");
     _ = @import("callbacks.zig");
     _ = @import("components_test.zig");
     _ = @import("diagnostic.zig");
