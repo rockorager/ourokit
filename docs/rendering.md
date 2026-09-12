@@ -7,12 +7,19 @@ balanced rectangular clip stack. A borrowed `DisplayList` supports immediate
 consumption. An owning `Frame` copies command and damage storage so worker
 threads and asynchronous backends can safely retain it through completion.
 
-Scene and design `Color` values are straight-alpha, 8-bit sRGB. The first
-storage contract is premultiplied 8-bit encoded-sRGB, with deterministic
-Porter-Duff source and source-over operations. This intentionally matches
-`wl_shm` ARGB and common Pixman paths. A future linear-light, wide-gamut, or HDR
-surface will use a distinct tagged format; it will not silently change these
-bytes' meaning.
+Scene and design `Color` values are straight-alpha, 8-bit sRGB. Renderers decode
+RGB with the piecewise sRGB transfer function, premultiply in linear light, and
+apply Porter-Duff source/source-over there. Alpha and A8 glyph/geometry coverage
+are linear quantities, never gamma-decoded. Image texels are unpremultiplied and
+decoded before bilinear filtering, then filtered and composited in premultiplied
+linear light.
+
+Presentation and image-cache bytes remain premultiplied 8-bit **encoded** sRGB.
+Output conversion unpremultiplies linear RGB, sRGB-encodes it, and premultiplies
+the encoded result. This preserves the `wl_shm` ARGB and ordinary dma-buf contract
+even for transparent surfaces. No compositor high-precision format or color
+management protocol is required. This is SDR sRGB, not wide gamut or HDR;
+blending a translucent surface with other windows remains the compositor's job.
 
 Integer device-pixel geometry gives clear first rasterization rules. Rectangular
 damage regions must not overlap, preventing source-over commands from being
@@ -40,16 +47,24 @@ validates target extent, clip-stack balance, and damage invariants; clips
 geometry; preserves row padding; and writes premultiplied pixels. Deterministic
 tests and reusable backend-conformance fixtures assert exact bytes.
 
+Each render call allocates an RGBA16 UNORM working buffer (8 bytes/pixel) using
+the target's allocator. All draws in that call blend at 16-bit precision; only
+damaged pixels are encoded back to presentation storage. A leading clear avoids
+reading caller storage; otherwise damaged pixels are imported from the existing
+8-bit output. Precision persists across draws, not across separate render calls.
+Opaque output conversion uses an exact 64 KiB sRGB lookup table.
+
 Ourokit owns this backend and its lowering policy. Direct paths handle clear and
 opaque rectangles. Pixman is pinned as a lazy, benchmark-only dependency while
-the scene vocabulary is small. It is the selected private implementation for
-future masks, images, gradients, and complex source-over composition when those
-commands land; no Pixman type may cross the software-backend boundary.
+the scene vocabulary is small; no Pixman type crosses the software-backend
+boundary. Any future Pixman lowering must preserve linear-light semantics.
 
-`zig build bench-renderers -Doptimize=ReleaseFast` compares output-identical
-1920×1080 mixed rectangle scenes against Pixman 0.46.4. Benchmarks are evidence,
-not permanent thresholds: record CPU/target details when using results to alter
-lowering or batching.
+`zig build bench-renderers -Doptimize=ReleaseFast` measures 1920×1080 mixed
+rectangle scenes against legacy encoded-8-bit Pixman 0.46.4. The two outputs
+intentionally differ and are independently checked against their respective
+color math. Ourokit's timing includes linear working storage and presentation
+conversion; this is not an output-identical speed comparison. Record CPU/target
+details when using results to alter lowering or batching.
 
 ## Wayland shared-memory presentation
 
@@ -90,22 +105,23 @@ The Vulkan backend is a peer of software and consumes equivalent scenes.
 It owns a Vulkan instance/device/compute queue, pipeline, command resources,
 synchronization, and host-visible storage targets. It lowers clear, solid
 rectangle, rectangular clip, damage, source, and source-over operations with
-the same integer color arithmetic as software. Its synchronous headless target
-and explicit readback make backend conformance testable without a window
-system. Renderer calls are currently serialized and wait for GPU completion.
+the same linear RGBA16 integer color arithmetic as software. Its synchronous
+headless target and explicit readback make backend conformance testable without
+a window system. Compute calls serialize and wait for GPU completion.
 
 Vulkan is enabled by default and is the default runtime renderer when compiled
 in. `-Dvulkan=false` produces a software-only build that neither compiles Vulkan
 shaders nor discovers or links the Vulkan loader. Both configurations preserve
 the same renderer-neutral scene boundary.
 
-The presentation profile renders directly into exportable
-`B8G8R8A8_UNORM` modifier images with a graphics pipeline and fixed-function
-premultiplied source-over blending. Clear/source writes, integer coverage,
-clipping, channel order, and untouched pixels remain exact. Vulkan does not
-guarantee the reference backend's integer division rounding for fixed-function
-UNORM blending, so each blend-affected channel may differ by one LSB per blend
-step. Software and headless compute remain the exact-byte reference profile.
+The presentation profile blends into a persistent `R16G16B16A16_SFLOAT`
+attachment owned by each target. Scene draws honor damage; a second subpass
+converts the entire attachment into an exportable `B8G8R8A8_UNORM` modifier image.
+The high-precision attachment is private to Vulkan, not shared with the
+compositor. Missing FP16 color/blend/transfer support disables dma-buf graphics
+and preserves the existing SHM/software fallback. FP16 blending can differ
+slightly from the integer reference; graphics fixtures allow one byte of output
+error. Software and headless compute remain the exact-byte reference profile.
 
 It will not use `VK_KHR_wayland_surface`: that API requires libwayland
 `wl_display*` and `wl_surface*` objects, which Wayring handles are not.
@@ -147,6 +163,14 @@ Text is shaped above both renderers by the shared HarfBuzz-backed `text` module.
 The scene receives common positioned glyph runs; each backend may own
 atlas/image caching, hinting, and rasterization details. Neither backend exposes
 a `measureText` operation, chooses fonts, performs bidi, or reshapes strings.
+
+The shared FreeType glyph cache explicitly selects Adobe hinting and enables
+its default size-dependent stem darkening for available CFF, Type 1, and CID
+drivers. This gives the bundled Source families suitable small-size weight for
+linear-light blending without altering shaping advances. Native TrueType
+hinting remains enabled for fallback fonts; experimental auto-hinter darkening
+is not forced. Glyph atlases remain A8 grayscale coverage, independent of text
+color, background polarity, and display subpixel layout.
 
 Retained Text nodes emit a `paragraph` command referencing an immutable width-
 specific `ParagraphLayout`. That layout already contains line tops, baselines,

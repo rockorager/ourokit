@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
 
     try renderOuro(&commands, ouro_pixels);
     try renderPixman(image, &opaque_boxes, &alpha_boxes);
-    try std.testing.expectEqualSlices(u8, ouro_pixels, pixman_pixels);
+    try validateOutput(ouro_pixels, pixman_pixels, &opaque_boxes, &alpha_boxes);
 
     const ouro_start = nanoTime();
     for (0..iterations) |_| try renderOuro(&commands, ouro_pixels);
@@ -48,11 +48,8 @@ pub fn main(init: std.process.Init) !void {
     std.mem.doNotOptimizeAway(ouro_pixels[0]);
     std.mem.doNotOptimizeAway(pixman_pixels[0]);
 
-    printResult("ouro-direct", ouro_ns);
-    printResult("pixman-0.46.4", pixman_ns);
-    std.debug.print("ratio pixman/ouro: {d:.3}\n", .{
-        @as(f64, @floatFromInt(pixman_ns)) / @as(f64, @floatFromInt(ouro_ns)),
-    });
+    printResult("Ouro linear-premultiplied RGBA16 + BGRA8 presentation", ouro_ns);
+    printResult("legacy Pixman encoded-premultiplied BGRA8", pixman_ns);
 }
 
 fn nanoTime() u64 {
@@ -139,6 +136,70 @@ fn renderPixman(
         @intCast(alpha_boxes.len),
         alpha_boxes.ptr,
     ) == 0) return error.PixmanFillFailed;
+}
+
+fn validateOutput(
+    ouro_pixels: []const u8,
+    pixman_pixels: []const u8,
+    opaque_boxes: []const pixman.pixman_box32_t,
+    alpha_boxes: []const pixman.pixman_box32_t,
+) !void {
+    const background = [3]u8{ 247, 247, 248 };
+    const opaque_rgb = [3]u8{ 36, 107, 219 };
+    const translucent = [3]u8{ 200, 50, 40 };
+    const alpha = 128.0 / 255.0;
+
+    for (0..height) |y| for (0..width) |x| {
+        var destination = background;
+        for (opaque_boxes) |box| {
+            if (contains(box, x, y)) {
+                destination = opaque_rgb;
+                break;
+            }
+        }
+        var covered = false;
+        for (alpha_boxes) |box| {
+            if (contains(box, x, y)) {
+                try std.testing.expect(!covered);
+                covered = true;
+            }
+        }
+
+        var expected_ouro = destination;
+        var expected_pixman = destination;
+        if (covered) for (0..3) |channel| {
+            const source_encoded = @as(f64, @floatFromInt(translucent[channel])) / 255.0;
+            const destination_encoded = @as(f64, @floatFromInt(destination[channel])) / 255.0;
+            expected_ouro[channel] = quantize8(encodeSrgb(
+                decodeSrgb(source_encoded) * alpha + decodeSrgb(destination_encoded) * (1.0 - alpha),
+            ));
+            expected_pixman[channel] = quantize8(source_encoded * alpha + destination_encoded * (1.0 - alpha));
+        };
+
+        const offset = (y * width + x) * 4;
+        const ouro_expected_bgra = [4]u8{ expected_ouro[2], expected_ouro[1], expected_ouro[0], 255 };
+        const pixman_expected_bgra = [4]u8{ expected_pixman[2], expected_pixman[1], expected_pixman[0], 255 };
+        try std.testing.expectEqualSlices(u8, &ouro_expected_bgra, ouro_pixels[offset..][0..4]);
+        try std.testing.expectEqualSlices(u8, &pixman_expected_bgra, pixman_pixels[offset..][0..4]);
+    };
+}
+
+fn contains(box: pixman.pixman_box32_t, x: usize, y: usize) bool {
+    const signed_x: i32 = @intCast(x);
+    const signed_y: i32 = @intCast(y);
+    return signed_x >= box.x1 and signed_x < box.x2 and signed_y >= box.y1 and signed_y < box.y2;
+}
+
+fn decodeSrgb(value: f64) f64 {
+    return if (value <= 0.04045) value / 12.92 else std.math.pow(f64, (value + 0.055) / 1.055, 2.4);
+}
+
+fn encodeSrgb(value: f64) f64 {
+    return if (value <= 0.0031308) value * 12.92 else 1.055 * std.math.pow(f64, value, 1.0 / 2.4) - 0.055;
+}
+
+fn quantize8(value: f64) u8 {
+    return @intFromFloat(@round(std.math.clamp(value, 0.0, 1.0) * 255.0));
 }
 
 fn printResult(name: []const u8, total_ns: u64) void {

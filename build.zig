@@ -363,11 +363,13 @@ fn addVulkan(b: *std.Build, module: *std.Build.Module) void {
     const solid_vertex = compileShader(b, "src/renderer/vulkan/solid.vert", "ourokit-vulkan-solid-vertex.spv");
     const solid_fragment = compileShader(b, "src/renderer/vulkan/solid.frag", "ourokit-vulkan-solid-fragment.spv");
     const glyph_fragment = compileShader(b, "src/renderer/vulkan/glyph.frag", "ourokit-vulkan-glyph-fragment.spv");
+    const conversion_fragment = compileShader(b, "src/renderer/vulkan/convert.frag", "ourokit-vulkan-convert-fragment.spv");
     module.addAnonymousImport("ourokit_vulkan_fill", .{ .root_source_file = fill });
     module.addAnonymousImport("ourokit_vulkan_glyph", .{ .root_source_file = glyph });
     module.addAnonymousImport("ourokit_vulkan_solid_vertex", .{ .root_source_file = solid_vertex });
     module.addAnonymousImport("ourokit_vulkan_solid_fragment", .{ .root_source_file = solid_fragment });
     module.addAnonymousImport("ourokit_vulkan_glyph_fragment", .{ .root_source_file = glyph_fragment });
+    module.addAnonymousImport("ourokit_vulkan_conversion_fragment", .{ .root_source_file = conversion_fragment });
     module.linkSystemLibrary("vulkan", .{});
 }
 

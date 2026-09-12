@@ -1,6 +1,7 @@
 const std = @import("std");
 const Color = @import("../../core/color.zig").Color;
 const PremultipliedSrgba8 = @import("../../core/color.zig").PremultipliedSrgba8;
+const LinearRgba16 = @import("../../core/color.zig").LinearRgba16;
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const text = @import("../../text/root.zig");
@@ -31,6 +32,9 @@ pub const Target = struct {
     height: u32,
     stride: usize,
     format: PixelFormat,
+    /// Allocates the RGBA16 working buffer for a render call. Presentation
+    /// bytes retain their existing encoded-premultiplied sRGB representation.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn validate(self: Target) !void {
         const row_bytes = std.math.mul(usize, self.width, 4) catch return error.InvalidTarget;
@@ -38,6 +42,12 @@ pub const Target = struct {
         const required = std.math.mul(usize, self.stride, self.height) catch return error.InvalidTarget;
         if (self.pixels.len < required) return error.InvalidTarget;
     }
+};
+
+const RasterTarget = struct {
+    pixels: []LinearRgba16,
+    width: u32,
+    height: u32,
 };
 
 const max_clip_depth = scene.max_clip_depth;
@@ -92,20 +102,52 @@ pub fn renderResources(
         .image => |value| _ = try (images orelse return error.ImageResourcesRequired).get(value.image),
         else => {},
     };
+    if (list.commands.len == 0 or target.width == 0 or target.height == 0) return;
+    if (list.damage == .regions and list.damage.regions.len == 0) return;
+    const pixels = try target.allocator.alloc(LinearRgba16, try std.math.mul(usize, target.width, target.height));
+    defer target.allocator.free(pixels);
+    const working: RasterTarget = .{ .pixels = pixels, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => try renderRegion(list.commands, target, targetBounds(target), glyphs, shapes, paragraphs, images),
+        .full => try renderOutputRegion(list.commands, target, working, targetBounds(target), glyphs, shapes, paragraphs, images),
         .regions => |regions| {
             for (regions) |region| {
                 const clipped = RectI.intersect(region, targetBounds(target));
-                if (!clipped.isEmpty()) try renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, images);
+                if (!clipped.isEmpty()) try renderOutputRegion(list.commands, target, working, clipped, glyphs, shapes, paragraphs, images);
             }
         },
     }
 }
 
+fn renderOutputRegion(
+    commands: []const scene.Command,
+    output: Target,
+    working: RasterTarget,
+    damage: RectI,
+    glyphs: ?*GlyphCache,
+    shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
+    images: ?*const ImageCache,
+) !void {
+    const left: usize = @intCast(damage.x);
+    const top: usize = @intCast(damage.y);
+    // A leading clear supplies every damaged pixel; never decode undefined
+    // caller storage in the normal full-scene rendering path.
+    if (commands[0] != .clear) {
+        for (top..top + damage.height) |y| for (left..left + damage.width) |x| {
+            const offset = y * output.stride + x * 4;
+            working.pixels[y * working.width + x] = LinearRgba16.fromSrgba8(readPixel(output.format, output.pixels[offset..][0..4]));
+        };
+    }
+    try renderRegion(commands, working, damage, glyphs, shapes, paragraphs, images);
+    for (top..top + damage.height) |y| for (left..left + damage.width) |x| {
+        const offset = y * output.stride + x * 4;
+        writePixel(output.format, output.pixels[offset..][0..4], working.pixels[y * working.width + x].toSrgba8());
+    };
+}
+
 fn renderRegion(
     commands: []const scene.Command,
-    target: Target,
+    target: RasterTarget,
     damage: RectI,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
@@ -142,9 +184,8 @@ fn renderRegion(
             const top: usize = @intCast(bounds.y);
             for (top..top + bounds.height) |y| for (left..left + bounds.width) |x| {
                 const source = placement.sample(bitmap, x, y) orelse continue;
-                const offset = y * target.stride + x * 4;
-                const destination = readPixel(target.format, target.pixels[offset..][0..4]);
-                writePixel(target.format, target.pixels[offset..][0..4], sourceOver(source, destination));
+                const offset = y * target.width + x;
+                target.pixels[offset] = source.over(target.pixels[offset]);
             };
         },
         .glyph_run => |run| {
@@ -174,7 +215,7 @@ fn renderRegion(
 
 fn drawGlyphRun(
     command: scene.GlyphRun,
-    target: Target,
+    target: RasterTarget,
     clip: RectI,
     cache: *GlyphCache,
     shapes: *const text.ShapeCache,
@@ -206,7 +247,7 @@ fn drawGlyphRun(
 
 fn drawParagraph(
     command: scene.Paragraph,
-    target: Target,
+    target: RasterTarget,
     clip: RectI,
     cache: *GlyphCache,
     paragraphs: *const text.ParagraphCache,
@@ -241,7 +282,7 @@ fn drawParagraph(
 }
 
 fn drawMask(
-    target: Target,
+    target: RasterTarget,
     clip: RectI,
     x: i32,
     y: i32,
@@ -255,7 +296,7 @@ fn drawMask(
         .height = bitmap.height,
     });
     if (bounds.isEmpty()) return;
-    const source_color = color.premultiplied();
+    const source_color = LinearRgba16.fromColor(color);
     const source_x: usize = @intCast(bounds.x - x);
     const source_y: usize = @intCast(bounds.y - y);
     const width: usize = bounds.width;
@@ -264,31 +305,18 @@ fn drawMask(
         for (0..width) |column| {
             const coverage = bitmap.pixels[(source_y + row) * bitmap.width + source_x + column];
             if (coverage == 0) continue;
-            const source: PremultipliedSrgba8 = .{
-                .r = multiply(source_color.r, coverage),
-                .g = multiply(source_color.g, coverage),
-                .b = multiply(source_color.b, coverage),
-                .a = multiply(source_color.a, coverage),
-            };
-            const destination_offset = (@as(usize, @intCast(bounds.y)) + row) * target.stride +
-                (@as(usize, @intCast(bounds.x)) + column) * 4;
-            const destination = readPixel(
-                target.format,
-                target.pixels[destination_offset..][0..4],
-            );
-            writePixel(
-                target.format,
-                target.pixels[destination_offset..][0..4],
-                sourceOver(source, destination),
-            );
+            const source = source_color.scaled(@as(u16, coverage) * 257);
+            const destination_offset = (@as(usize, @intCast(bounds.y)) + row) * target.width +
+                @as(usize, @intCast(bounds.x)) + column;
+            target.pixels[destination_offset] = source.over(target.pixels[destination_offset]);
         }
     }
 }
 
-fn fill(target: Target, bounds: RectI, color: Color, blend: scene.BlendMode) void {
+fn fill(target: RasterTarget, bounds: RectI, color: Color, blend: scene.BlendMode) void {
     if (bounds.isEmpty()) return;
-    const source = color.premultiplied();
-    if (blend == .source or source.a == 255) {
+    const source = LinearRgba16.fromColor(color);
+    if (blend == .source or source.a == 65535) {
         fillSource(target, bounds, source);
         return;
     }
@@ -298,15 +326,14 @@ fn fill(target: Target, bounds: RectI, color: Color, blend: scene.BlendMode) voi
     const bottom: u32 = @intCast(@as(i64, bounds.y) + bounds.height);
     for (top..bottom) |y| {
         for (left..right) |x| {
-            const offset = y * target.stride + x * 4;
-            const destination = readPixel(target.format, target.pixels[offset..][0..4]);
-            writePixel(target.format, target.pixels[offset..][0..4], sourceOver(source, destination));
+            const offset = y * target.width + x;
+            target.pixels[offset] = source.over(target.pixels[offset]);
         }
     }
 }
 
 fn drawDecoratedRectangle(
-    target: Target,
+    target: RasterTarget,
     clipped_bounds: RectI,
     rectangle: scene.DecoratedRectangle,
 ) void {
@@ -341,8 +368,7 @@ fn drawDecoratedRectangle(
                 0;
             const coverage = addSaturating(border_coverage, background_coverage);
             if (coverage == 0) continue;
-            const source = addPixels(
-                coveredColor(rectangle.border_color, border_coverage),
+            const source = coveredColor(rectangle.border_color, border_coverage).plus(
                 coveredColor(rectangle.background, background_coverage),
             );
             blendCoveredPixel(target, x, y, source, coverage, rectangle.blend);
@@ -370,79 +396,40 @@ fn roundedRectangleCoverage(bounds: RectI, radius_value: u32, x: usize, y: usize
     return @intFromFloat(@floor(coverage * 255 + 0.5));
 }
 
-fn coveredColor(color: ?Color, coverage: u8) PremultipliedSrgba8 {
-    const source = if (color) |value| value.premultiplied() else return .{ .r = 0, .g = 0, .b = 0, .a = 0 };
-    return .{
-        .r = multiply(source.r, coverage),
-        .g = multiply(source.g, coverage),
-        .b = multiply(source.b, coverage),
-        .a = multiply(source.a, coverage),
-    };
-}
-
-fn addPixels(a: PremultipliedSrgba8, b: PremultipliedSrgba8) PremultipliedSrgba8 {
-    return .{
-        .r = addSaturating(a.r, b.r),
-        .g = addSaturating(a.g, b.g),
-        .b = addSaturating(a.b, b.b),
-        .a = addSaturating(a.a, b.a),
-    };
+fn coveredColor(color: ?Color, coverage: u8) LinearRgba16 {
+    const source = if (color) |value| LinearRgba16.fromColor(value) else return LinearRgba16.transparent;
+    return source.scaled(@as(u16, coverage) * 257);
 }
 
 fn blendCoveredPixel(
-    target: Target,
+    target: RasterTarget,
     x: usize,
     y: usize,
-    source: PremultipliedSrgba8,
+    source: LinearRgba16,
     coverage: u8,
     blend: scene.BlendMode,
 ) void {
-    const offset = y * target.stride + x * 4;
-    if (coverage == 255 and (blend == .source or source.a == 255)) {
-        writePixel(target.format, target.pixels[offset..][0..4], source);
+    const offset = y * target.width + x;
+    if (coverage == 255 and (blend == .source or source.a == 65535)) {
+        target.pixels[offset] = source;
         return;
     }
-    const destination = readPixel(target.format, target.pixels[offset..][0..4]);
+    const destination = target.pixels[offset];
     const result = if (blend == .source)
-        addPixels(source, .{
-            .r = multiply(destination.r, 255 - coverage),
-            .g = multiply(destination.g, 255 - coverage),
-            .b = multiply(destination.b, 255 - coverage),
-            .a = multiply(destination.a, 255 - coverage),
-        })
+        source.plus(destination.scaled(@as(u16, 255 - coverage) * 257))
     else
-        sourceOver(source, destination);
-    writePixel(target.format, target.pixels[offset..][0..4], result);
+        source.over(destination);
+    target.pixels[offset] = result;
 }
 
-fn fillSource(target: Target, bounds: RectI, source: PremultipliedSrgba8) void {
+fn fillSource(target: RasterTarget, bounds: RectI, source: LinearRgba16) void {
     const left: usize = @intCast(bounds.x);
     const top: usize = @intCast(bounds.y);
     const right: usize = @intCast(@as(i64, bounds.x) + bounds.width);
     const bottom: usize = @intCast(@as(i64, bounds.y) + bounds.height);
-    const bytes = pixelBytes(target.format, source);
-    const row_bytes = (right - left) * 4;
     for (top..bottom) |y| {
-        const offset = y * target.stride + left * 4;
-        const row = target.pixels[offset..][0..row_bytes];
-        @memcpy(row[0..4], &bytes);
-        var initialized: usize = 4;
-        while (initialized < row.len) {
-            const count = @min(initialized, row.len - initialized);
-            @memcpy(row[initialized..][0..count], row[0..count]);
-            initialized += count;
-        }
+        @memset(target.pixels[y * target.width + left .. y * target.width + right], source);
     }
-}
-
-fn sourceOver(source: PremultipliedSrgba8, destination: PremultipliedSrgba8) PremultipliedSrgba8 {
-    const inverse_alpha = 255 - source.a;
-    return .{
-        .r = addSaturating(source.r, multiply(destination.r, inverse_alpha)),
-        .g = addSaturating(source.g, multiply(destination.g, inverse_alpha)),
-        .b = addSaturating(source.b, multiply(destination.b, inverse_alpha)),
-        .a = addSaturating(source.a, multiply(destination.a, inverse_alpha)),
-    };
 }
 
 fn multiply(channel: u8, alpha: u8) u8 {
@@ -471,7 +458,7 @@ fn pixelBytes(format: PixelFormat, pixel: PremultipliedSrgba8) [4]u8 {
     };
 }
 
-fn targetBounds(target: Target) RectI {
+fn targetBounds(target: anytype) RectI {
     return .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
 }
 
@@ -495,7 +482,7 @@ test "clear and clipped rectangle produce deterministic premultiplied pixels" {
     });
 
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 255, 1, 2, 3, 255, 1, 2, 3, 255 }, pixels[0..12]);
-    try std.testing.expectEqualSlices(u8, &.{ 10, 21, 31, 255, 10, 21, 31, 255, 1, 2, 3, 255 }, pixels[14..26]);
+    try std.testing.expectEqualSlices(u8, &.{ 12, 27, 42, 255, 12, 27, 42, 255, 1, 2, 3, 255 }, pixels[14..26]);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa }, pixels[12..14]);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa }, pixels[26..28]);
 }
@@ -715,4 +702,44 @@ test "positioned mixed-script paragraphs rasterize through leased scene resource
     // The backend glyph cache independently leases rasterized faces.
     _ = try fonts.get(latin);
     _ = try fonts.get(arabic);
+}
+
+test "repeated faint blends retain linear precision until presentation" {
+    var commands: [101]scene.Command = undefined;
+    commands[0] = .{ .clear = Color.rgba(255, 255, 255, 255) };
+    for (commands[1..]) |*command| command.* = .{ .solid_rectangle = .{
+        .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .color = Color.rgba(0, 0, 0, 1),
+    } };
+    var pixel: [4]u8 = undefined;
+    try render(.{ .commands = &commands }, .{ .pixels = &pixel, .width = 1, .height = 1, .stride = 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
+    // Encode((254/255)^100) = 214.372, unlike per-draw 8-bit encoding.
+    try std.testing.expectEqualSlices(u8, &.{ 214, 214, 214, 255 }, &pixel);
+}
+
+test "glyph masks are linear coverage in both polarities and transparent output" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    var mask_pixels = [_]u8{128};
+    const mask: GlyphBitmap = .{ .pixels = &mask_pixels, .width = 1, .height = 1, .left = 0, .top = 0 };
+    var pixels: [1]LinearRgba16 = undefined;
+    const target: RasterTarget = .{ .pixels = &pixels, .width = 1, .height = 1 };
+    const bounds: RectI = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+    const black = Color.rgba(0, 0, 0, 255);
+    const white = Color.rgba(255, 255, 255, 255);
+    for ([_]Color{ black, white }) |background| {
+        pixels[0] = LinearRgba16.fromColor(background);
+        drawMask(target, bounds, 0, 0, &mask, if (background.r == 0) white else black);
+        // A8 coverage is not sRGB-decoded: both polarities are near 188,
+        // not 128 (encoded blending) or 229 (decoded black coverage).
+        const expected: u8 = if (background.r == 0) 188 else 187;
+        try std.testing.expectEqual(PremultipliedSrgba8{ .r = expected, .g = expected, .b = expected, .a = 255 }, pixels[0].toSrgba8());
+    }
+    pixels[0] = LinearRgba16.transparent;
+    drawMask(target, bounds, 0, 0, &mask, white);
+    try std.testing.expectEqual(PremultipliedSrgba8{ .r = 128, .g = 128, .b = 128, .a = 128 }, pixels[0].toSrgba8());
+
+    // Masked source replacement retains (1-coverage), not (1-source alpha).
+    pixels[0] = LinearRgba16.fromColor(white);
+    blendCoveredPixel(target, 0, 0, .transparent, 128, .source);
+    try std.testing.expectEqual(PremultipliedSrgba8{ .r = 127, .g = 127, .b = 127, .a = 127 }, pixels[0].toSrgba8());
 }

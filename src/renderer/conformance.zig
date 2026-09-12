@@ -35,17 +35,19 @@ const decorated_commands = [_]scene.Command{
 
 const red = [_]u8{ 200, 0, 0, 255 };
 const green = [_]u8{ 0, 200, 0, 255 };
-const corner_red = [_]u8{ 76, 0, 0, 255 };
-const edge_red = [_]u8{ 184, 0, 0, 255 };
-const edge_mix = [_]u8{ 42, 158, 0, 255 };
+// sRGB encode(decode(200/255) * coverage), with geometric coverage
+// 97/255, 234/255, and border/background weights 53/255 and 202/255.
+const corner_red = [_]u8{ 129, 0, 0, 255 };
+const edge_red = [_]u8{ 192, 0, 0, 255 };
+const edge_mix = [_]u8{ 97, 180, 0, 255 };
 
 pub const fixtures = [_]Fixture{
     .{
-        .name = "premultiplied encoded-srgb source-over",
+        .name = "premultiplied linear-light source-over",
         .width = 2,
         .height = 1,
         .commands = &alpha_commands,
-        .expected_rgba = &.{ 110, 70, 55, 255, 20, 40, 60, 255 },
+        .expected_rgba = &.{ 147, 77, 55, 255, 20, 40, 60, 255 },
     },
     .{
         .name = "rounded background and border",

@@ -11,6 +11,7 @@ layout(push_constant) uniform Push {
     ivec4 bounds;
     uint has_background;
     uint has_border;
+    uint coverage_only;
 };
 
 float roundedRectangleCoverage(vec2 point, vec4 rectangle, float radius_value) {
@@ -37,4 +38,5 @@ void main() {
     float border_coverage = has_border != 0u ? outer_coverage * (1.0 - inner_coverage) : 0.0;
     float background_coverage = has_background != 0u ? outer_coverage * inner_coverage : 0.0;
     target_color = border * border_coverage + background * background_coverage;
+    if (coverage_only != 0u) target_color = vec4(0.0, 0.0, 0.0, border_coverage + background_coverage);
 }

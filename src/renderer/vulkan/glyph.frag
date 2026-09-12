@@ -26,8 +26,7 @@ layout(location = 0) out vec4 target_color;
 
 void main() {
     if (image_mode != 0u) {
-        uint sampled = imageSample(gl_FragCoord.xy);
-        target_color = vec4(sampled & 255u, (sampled >> 8u) & 255u, (sampled >> 16u) & 255u, sampled >> 24u) / 255.0;
+        target_color = vec4(imageSampleLinear(gl_FragCoord.xy)) / 65535.0;
         return;
     }
     uvec2 local = uvec2(ivec2(gl_FragCoord.xy) - bounds.xy);

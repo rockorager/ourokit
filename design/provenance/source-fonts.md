@@ -38,6 +38,7 @@ Native API consumers selecting italics must supply suitable fallback candidates.
 The current UI distinguishes regular text from emphasized controls; the latter
 use the bundled Semibold face. The native text API additionally exposes Bold
 and real italics through `text.bundled.acquire`. This does not add weight/style
-properties to Lua widgets. Bundling these fonts does not enable stem darkening
-or change the renderer's encoded-sRGB blending contract; those changes must be
-implemented and evaluated together.
+properties to Lua widgets. The renderer pairs Adobe's size-dependent CFF stem
+darkening with linear-light compositing, preserving A8 masks as coverage and
+using high-precision internal buffers. Presentation remains ordinary encoded
+sRGB; see [rendering](../../docs/rendering.md) for the color and buffer contract.

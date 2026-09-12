@@ -3,7 +3,7 @@
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) buffer Target {
-    uint pixels[];
+    uvec2 pixels[];
 };
 
 layout(push_constant) uniform Push {
@@ -16,33 +16,35 @@ layout(push_constant) uniform Push {
     int shape_top;
     int shape_right;
     int shape_bottom;
-    uint background;
-    uint border;
+    uvec2 background;
+    uvec2 border;
     uint corner_radius;
     uint border_width;
     uint flags;
     uint source_over;
 };
 
-uint channel(uint pixel, uint shift) {
-    return (pixel >> shift) & 255u;
+uint channel16(uvec2 pixel, uint channel) {
+    return channel < 2u ? ((pixel.x >> (channel * 16u)) & 65535u) : ((pixel.y >> ((channel - 2u) * 16u)) & 65535u);
 }
 
-uint sourceOver(uint source, uint destination) {
-    uint inverse_alpha = 255u - channel(source, 24u);
-    uint result = 0u;
-    for (uint shift = 0u; shift <= 24u; shift += 8u) {
-        uint value = channel(source, shift) +
-            (channel(destination, shift) * inverse_alpha + 127u) / 255u;
-        result |= min(value, 255u) << shift;
+uvec2 pack16(uvec4 value) {
+    return uvec2(value.x | value.y << 16u, value.z | value.w << 16u);
+}
+
+uvec2 sourceOver(uvec2 source, uvec2 destination) {
+    uint inverse_alpha = 65535u - channel16(source, 3u);
+    uvec4 result;
+    for (uint i = 0u; i < 4u; ++i) {
+        result[i] = min(channel16(source, i) + (channel16(destination, i) * inverse_alpha + 32767u) / 65535u, 65535u);
     }
-    return result;
+    return pack16(result);
 }
 
 float roundedRectangleCoverage(vec2 point, vec4 bounds, float radius_value) {
     vec2 size = bounds.zw - bounds.xy;
     if (size.x <= 0.0 || size.y <= 0.0) return 0.0;
-    float radius = min(radius_value, min(size.x, size.y) * 0.5);
+    float radius = min(radius_value, floor(min(size.x, size.y) * 0.5));
     if (radius == 0.0) return all(greaterThanEqual(point, bounds.xy)) && all(lessThan(point, bounds.zw)) ? 1.0 : 0.0;
     vec2 half_size = size * 0.5;
     vec2 delta = abs(point - (bounds.xy + bounds.zw) * 0.5) - (half_size - radius);
@@ -50,20 +52,20 @@ float roundedRectangleCoverage(vec2 point, vec4 bounds, float radius_value) {
     return clamp(0.5 - distance, 0.0, 1.0);
 }
 
-uint scalePixel(uint pixel, uint coverage) {
-    uint result = 0u;
-    for (uint shift = 0u; shift <= 24u; shift += 8u) {
-        result |= ((channel(pixel, shift) * coverage + 127u) / 255u) << shift;
+uvec2 scalePixel(uvec2 pixel, uint coverage) {
+    uvec4 result;
+    for (uint i = 0u; i < 4u; ++i) {
+        result[i] = (channel16(pixel, i) * (coverage * 257u) + 32767u) / 65535u;
     }
-    return result;
+    return pack16(result);
 }
 
-uint addPixels(uint a, uint b) {
-    uint result = 0u;
-    for (uint shift = 0u; shift <= 24u; shift += 8u) {
-        result |= min(channel(a, shift) + channel(b, shift), 255u) << shift;
+uvec2 addPixels(uvec2 a, uvec2 b) {
+    uvec4 result;
+    for (uint i = 0u; i < 4u; ++i) {
+        result[i] = min(channel16(a, i) + channel16(b, i), 65535u);
     }
-    return result;
+    return pack16(result);
 }
 
 void main() {
@@ -92,10 +94,10 @@ void main() {
         : 0u;
     uint coverage = min(border_coverage + background_coverage, 255u);
     if (coverage == 0u) return;
-    uint source = addPixels(scalePixel(border, border_coverage), scalePixel(background, background_coverage));
+    uvec2 source = addPixels(scalePixel(border, border_coverage), scalePixel(background, background_coverage));
     uint offset = y * target_width + x;
     if (source_over != 0u) {
-        pixels[offset] = channel(source, 24u) != 255u ? sourceOver(source, pixels[offset]) : source;
+        pixels[offset] = channel16(source, 3u) != 65535u ? sourceOver(source, pixels[offset]) : source;
     } else if (coverage == 255u) {
         pixels[offset] = source;
     } else {

@@ -40,6 +40,18 @@ pub const GlyphCache = struct {
     pub fn init(allocator: std.mem.Allocator, fonts: *text.FontCache) !GlyphCache {
         var library: c.FT_Library = null;
         if (c.FT_Init_FreeType(&library) != 0) return error.FreeTypeInitializationFailed;
+        errdefer _ = c.FT_Done_FreeType(library);
+        // Adobe's size-dependent darkening compensates for linear-light
+        // coverage blending. Keep native TrueType hinting; do not force the
+        // experimental auto-hinter darkening onto fallback fonts.
+        const engine: c.FT_UInt = c.FT_HINTING_ADOBE;
+        const no_darkening: c.FT_Bool = 0;
+        for ([_][:0]const u8{ "cff", "type1", "t1cid" }) |module| {
+            if (c.FT_Get_Module(library, module.ptr) == null) continue;
+            if (c.FT_Property_Set(library, module.ptr, "hinting-engine", &engine) != 0 or
+                c.FT_Property_Set(library, module.ptr, "no-stem-darkening", &no_darkening) != 0)
+                return error.FreeTypeConfigurationFailed;
+        }
         return .{ .allocator = allocator, .fonts = fonts, .library = library };
     }
 
@@ -210,5 +222,30 @@ test "bundled CFF faces rasterize grayscale outlines in every weight and style" 
                 }
             }
         }
+    }
+}
+
+test "stem darkening increases small bundled CFF glyph coverage without changing advances" {
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    var darkened = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer darkened.deinit();
+    var plain = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer plain.deinit();
+    const no_darkening: c.FT_Bool = 1;
+    try std.testing.expectEqual(@as(c.FT_Error, 0), c.FT_Property_Set(plain.library, "cff", "no-stem-darkening", &no_darkening));
+    for (std.enums.values(text.bundled.Family)) |family| {
+        const handle = try text.bundled.acquire(&fonts, family, .regular, .roman);
+        defer fonts.release(handle) catch unreachable;
+        const font = try fonts.get(handle);
+        const glyph = font.nominalGlyph('m').?;
+        const dark = try darkened.get(handle, glyph, 12);
+        const light = try plain.get(handle, glyph, 12);
+        var dark_coverage: u64 = 0;
+        var light_coverage: u64 = 0;
+        for (dark.pixels) |value| dark_coverage += value;
+        for (light.pixels) |value| light_coverage += value;
+        try std.testing.expect(dark_coverage > light_coverage);
+        try std.testing.expectEqual((try plain.face(handle)).*.glyph.*.advance.x, (try darkened.face(handle)).*.glyph.*.advance.x);
     }
 }

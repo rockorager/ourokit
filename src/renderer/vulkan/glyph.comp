@@ -4,7 +4,7 @@
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) buffer Target {
-    uint pixels[];
+    uvec2 pixels[];
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer Atlas {
@@ -14,7 +14,7 @@ layout(set = 0, binding = 1, std430) readonly buffer Atlas {
 layout(push_constant) uniform Push {
     uint target_width;
     uint atlas_width;
-    uint source;
+    uvec2 source;
     int left;
     int top;
     int right;
@@ -31,19 +31,21 @@ layout(push_constant) uniform Push {
 
 #include "image.glsl"
 
-uint channel(uint pixel, uint shift) {
-    return (pixel >> shift) & 255u;
+uint channel16(uvec2 pixel, uint channel) {
+    return channel < 2u ? ((pixel.x >> (channel * 16u)) & 65535u) : ((pixel.y >> ((channel - 2u) * 16u)) & 65535u);
 }
 
-uint sourceOver(uint source, uint destination) {
-    uint inverse_alpha = 255u - channel(source, 24u);
-    uint result = 0u;
-    for (uint shift = 0u; shift <= 24u; shift += 8u) {
-        uint value = channel(source, shift) +
-            (channel(destination, shift) * inverse_alpha + 127u) / 255u;
-        result |= min(value, 255u) << shift;
+uvec2 pack16(uvec4 value) {
+    return uvec2(value.x | value.y << 16u, value.z | value.w << 16u);
+}
+
+uvec2 sourceOver(uvec2 source_value, uvec2 destination) {
+    uint inverse_alpha = 65535u - channel16(source_value, 3u);
+    uvec4 result;
+    for (uint i = 0u; i < 4u; ++i) {
+        result[i] = min(channel16(source_value, i) + (channel16(destination, i) * inverse_alpha + 32767u) / 65535u, 65535u);
     }
-    return result;
+    return pack16(result);
 }
 
 void main() {
@@ -56,17 +58,17 @@ void main() {
     uint y = index / width;
     uint target_index = uint(top + int(y)) * target_width + uint(left + int(x));
     if (image_mode != 0u) {
-        uint sampled = imageSample(vec2(left + int(x), top + int(y)) + vec2(0.5));
-        if (source != 0u) sampled = (sampled & 0xff00ff00u) | ((sampled & 255u) << 16u) | ((sampled >> 16u) & 255u);
+        uvec2 sampled = pack16(imageSampleLinear(vec2(left + int(x), top + int(y)) + vec2(0.5)));
         pixels[target_index] = sourceOver(sampled, pixels[target_index]);
         return;
     }
     uint atlas_index = (atlas_y + y) * atlas_width + atlas_x + x;
     uint coverage = (masks[atlas_index / 4u] >> ((atlas_index % 4u) * 8u)) & 255u;
     if (coverage == 0u) return;
-    uint covered = 0u;
-    for (uint shift = 0u; shift <= 24u; shift += 8u) {
-        covered |= ((channel(source, shift) * coverage + 127u) / 255u) << shift;
+    uvec4 covered_channels;
+    for (uint i = 0u; i < 4u; ++i) {
+        covered_channels[i] = (channel16(source, i) * (coverage * 257u) + 32767u) / 65535u;
     }
+    uvec2 covered = pack16(covered_channels);
     pixels[target_index] = sourceOver(covered, pixels[target_index]);
 }

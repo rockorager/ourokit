@@ -18,7 +18,7 @@ pub const Image = struct {
 pub const BlendMode = enum {
     /// Replace destination pixels with the premultiplied source.
     source,
-    /// Premultiplied Porter-Duff source-over in encoded sRGB channels.
+    /// Premultiplied Porter-Duff source-over in linear-light sRGB.
     source_over,
 };
 

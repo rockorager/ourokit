@@ -2,13 +2,14 @@
 //!
 //! Exact headless `Target` rendering is synchronous and uses integer compute.
 //! Presentation targets use an asynchronous graphics pipeline and render
-//! directly into modifier-selected exportable images.
+//! in linear RGBA16F before encoding into modifier-selected BGRA8 images.
 
 const Renderer = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Color = @import("../../core/color.zig").Color;
+const LinearRgba16 = @import("../../core/color.zig").LinearRgba16;
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const text = @import("../../text/root.zig");
@@ -66,6 +67,11 @@ presentation_pipeline_layout: c.VkPipelineLayout,
 presentation_pipeline: c.VkPipeline,
 presentation_glyph_pipeline_layout: c.VkPipelineLayout,
 presentation_glyph_pipeline: c.VkPipeline,
+presentation_erase_pipeline: c.VkPipeline,
+presentation_add_pipeline: c.VkPipeline,
+conversion_descriptor_layout: c.VkDescriptorSetLayout,
+conversion_pipeline_layout: c.VkPipelineLayout,
+conversion_pipeline: c.VkPipeline,
 descriptor_pool: c.VkDescriptorPool,
 command_pool: c.VkCommandPool,
 command_buffer: c.VkCommandBuffer,
@@ -324,7 +330,7 @@ pub const Target = struct {
     fn initBuffer(renderer: *Renderer, width: u32, height: u32, format: StorageFormat, limit: u64) !Target {
         const pixel_count = std.math.mul(u64, width, height) catch return error.InvalidExtent;
         if (pixel_count == 0 or pixel_count > limit) return error.InvalidExtent;
-        const byte_size_u64 = std.math.mul(u64, pixel_count, 4) catch return error.InvalidExtent;
+        const byte_size_u64 = std.math.mul(u64, pixel_count, if (format == .encoded_rgba) 4 else 8) catch return error.InvalidExtent;
         const byte_size = std.math.cast(usize, byte_size_u64) orelse return error.InvalidExtent;
 
         var buffer_info: c.VkBufferCreateInfo = .{
@@ -385,34 +391,22 @@ pub const Target = struct {
         if (stride < row_bytes) return error.InvalidReadback;
         const required = std.math.mul(usize, stride, self.height) catch return error.InvalidReadback;
         if (pixels.len < required) return error.InvalidReadback;
-        const source: [*]const u8 = @ptrCast(self.mapping);
+        const source: [*]const LinearRgba16 = @ptrCast(@alignCast(self.mapping));
         for (0..self.height) |y| {
-            const source_row = source[y * row_bytes ..][0..row_bytes];
             const destination = pixels[y * stride ..][0..row_bytes];
-            switch (self.format) {
-                .rgba => switch (format) {
-                    .rgba8_unorm => @memcpy(destination, source_row),
-                    .bgra8_unorm => swapRedBlue(destination, source_row, self.width),
-                },
-                .bgra => switch (format) {
-                    .rgba8_unorm => swapRedBlue(destination, source_row, self.width),
-                    .bgra8_unorm => @memcpy(destination, source_row),
-                },
+            for (0..self.width) |x| {
+                const encoded = source[y * self.width + x].toSrgba8();
+                const offset = x * 4;
+                destination[offset + 0] = if (format == .rgba8_unorm) encoded.r else encoded.b;
+                destination[offset + 1] = encoded.g;
+                destination[offset + 2] = if (format == .rgba8_unorm) encoded.b else encoded.r;
+                destination[offset + 3] = encoded.a;
             }
-        }
-    }
-
-    fn swapRedBlue(destination: []u8, source: []const u8, width: u32) void {
-        for (0..width) |x| {
-            destination[x * 4 + 0] = source[x * 4 + 2];
-            destination[x * 4 + 1] = source[x * 4 + 1];
-            destination[x * 4 + 2] = source[x * 4 + 0];
-            destination[x * 4 + 3] = source[x * 4 + 3];
         }
     }
 };
 
-const StorageFormat = enum { rgba, bgra };
+const StorageFormat = enum { rgba, encoded_rgba };
 
 /// Immutable upload copies, independent of the thread-confined decode cache.
 /// A dma-buf target owns these until its submission fence signals.
@@ -466,7 +460,7 @@ const ImageUploads = struct {
     fn upload(renderer: *Renderer, bitmap: *const @import("../../image/pixels.zig").Bitmap, target: ?*const Target) !Resource {
         // Source images are storage-limited, not dispatch-limited: a
         // large image can be drawn into a much smaller destination.
-        var pixels = try Target.initBuffer(renderer, bitmap.width, bitmap.height, .rgba, renderer.max_image_pixels);
+        var pixels = try Target.initBuffer(renderer, bitmap.width, bitmap.height, .encoded_rgba, renderer.max_image_pixels);
         errdefer pixels.deinit(renderer);
         @memcpy(@as([*]u8, @ptrCast(pixels.mapping))[0..pixels.byte_size], bitmap.pixels);
         var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
@@ -526,6 +520,100 @@ pub const DmabufPlane = struct {
     stride: u32,
 };
 
+/// Private persistent linear storage. Only the BGRA8 image is shared with the
+/// compositor; this image and its conversion descriptor belong to one slot.
+const LinearAttachment = struct {
+    image: c.VkImage,
+    memory: c.VkDeviceMemory,
+    view: c.VkImageView,
+    descriptor_pool: c.VkDescriptorPool,
+    descriptor: c.VkDescriptorSet,
+
+    const range: c.VkImageSubresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 };
+    const usage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | c.VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | c.VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    fn init(renderer: *Renderer, width: u32, height: u32) !LinearAttachment {
+        if (renderer.presentation_render_pass == null) return error.LinearAttachmentUnavailable;
+        var properties: c.VkImageFormatProperties = undefined;
+        try vk(c.vkGetPhysicalDeviceImageFormatProperties(renderer.physical_device, c.VK_FORMAT_R16G16B16A16_SFLOAT, c.VK_IMAGE_TYPE_2D, c.VK_IMAGE_TILING_OPTIMAL, usage, 0, &properties), error.LinearAttachmentUnavailable);
+        if (width == 0 or height == 0 or width > properties.maxExtent.width or height > properties.maxExtent.height) return error.InvalidExtent;
+        var info: c.VkImageCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = c.VK_IMAGE_TYPE_2D,
+            .format = c.VK_FORMAT_R16G16B16A16_SFLOAT,
+            .extent = .{ .width = width, .height = height, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = c.VK_SAMPLE_COUNT_1_BIT,
+            .tiling = c.VK_IMAGE_TILING_OPTIMAL,
+            .usage = usage,
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        var image: c.VkImage = undefined;
+        try vk(c.vkCreateImage(renderer.device, &info, null, &image), error.CreateLinearImageFailed);
+        errdefer c.vkDestroyImage(renderer.device, image, null);
+        var requirements: c.VkMemoryRequirements = undefined;
+        c.vkGetImageMemoryRequirements(renderer.device, image, &requirements);
+        const memory_type = renderer.findMemoryType(requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) orelse return error.LinearAttachmentMemoryUnavailable;
+        var allocate: c.VkMemoryAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = requirements.size, .memoryTypeIndex = memory_type };
+        var memory: c.VkDeviceMemory = undefined;
+        try vk(c.vkAllocateMemory(renderer.device, &allocate, null, &memory), error.AllocateMemoryFailed);
+        errdefer c.vkFreeMemory(renderer.device, memory, null);
+        try vk(c.vkBindImageMemory(renderer.device, image, memory, 0), error.BindMemoryFailed);
+        var view_info: c.VkImageViewCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = image,
+            .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+            .format = c.VK_FORMAT_R16G16B16A16_SFLOAT,
+            .subresourceRange = range,
+        };
+        var view: c.VkImageView = undefined;
+        try vk(c.vkCreateImageView(renderer.device, &view_info, null, &view), error.CreateImageViewFailed);
+        errdefer c.vkDestroyImageView(renderer.device, view, null);
+        var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .descriptorCount = 1 };
+        var pool_info: c.VkDescriptorPoolCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &pool_size };
+        var pool: c.VkDescriptorPool = undefined;
+        try vk(c.vkCreateDescriptorPool(renderer.device, &pool_info, null, &pool), error.CreateDescriptorPoolFailed);
+        errdefer c.vkDestroyDescriptorPool(renderer.device, pool, null);
+        var set_info: c.VkDescriptorSetAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &renderer.conversion_descriptor_layout };
+        var descriptor: c.VkDescriptorSet = undefined;
+        try vk(c.vkAllocateDescriptorSets(renderer.device, &set_info, &descriptor), error.AllocateDescriptorFailed);
+        var image_info: c.VkDescriptorImageInfo = .{ .imageView = view, .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        var write: c.VkWriteDescriptorSet = .{ .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = descriptor, .dstBinding = 0, .descriptorCount = 1, .descriptorType = c.VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = &image_info };
+        c.vkUpdateDescriptorSets(renderer.device, 1, &write, 0, null);
+        return .{ .image = image, .memory = memory, .view = view, .descriptor_pool = pool, .descriptor = descriptor };
+    }
+
+    fn deinit(self: LinearAttachment, renderer: *Renderer) void {
+        c.vkDestroyDescriptorPool(renderer.device, self.descriptor_pool, null);
+        c.vkDestroyImageView(renderer.device, self.view, null);
+        c.vkDestroyImage(renderer.device, self.image, null);
+        c.vkFreeMemory(renderer.device, self.memory, null);
+    }
+
+    fn initialize(self: LinearAttachment, command: c.VkCommandBuffer) void {
+        var barrier: c.VkImageMemoryBarrier = .{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .image = self.image,
+            .subresourceRange = range,
+        };
+        c.vkCmdPipelineBarrier(command, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &barrier);
+        const clear: c.VkClearColorValue = .{ .float32 = .{ 0, 0, 0, 0 } };
+        c.vkCmdClearColorImage(command, self.image, c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+        barrier.srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        c.vkCmdPipelineBarrier(command, c.VK_PIPELINE_STAGE_TRANSFER_BIT, c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, null, 0, null, 1, &barrier);
+    }
+};
+
 /// Exportable BGRA render target. Command and fence state is per target so
 /// separate presentation slots can execute concurrently.
 pub const DmabufTarget = struct {
@@ -533,6 +621,7 @@ pub const DmabufTarget = struct {
     memory: c.VkDeviceMemory,
     view: c.VkImageView,
     framebuffer: c.VkFramebuffer,
+    linear: LinearAttachment,
     command_pool: c.VkCommandPool,
     command_buffer: c.VkCommandBuffer,
     fence: c.VkFence,
@@ -663,13 +752,16 @@ pub const DmabufTarget = struct {
         var view: c.VkImageView = undefined;
         try vk(c.vkCreateImageView(renderer.device, &view_info, null, &view), error.CreateDmabufViewFailed);
         errdefer c.vkDestroyImageView(renderer.device, view, null);
+        const linear = try LinearAttachment.init(renderer, width, height);
+        errdefer linear.deinit(renderer);
+        var attachments = [_]c.VkImageView{ linear.view, view };
         var framebuffer_info: c.VkFramebufferCreateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             .pNext = null,
             .flags = 0,
             .renderPass = renderer.presentation_render_pass,
-            .attachmentCount = 1,
-            .pAttachments = &view,
+            .attachmentCount = attachments.len,
+            .pAttachments = &attachments,
             .width = width,
             .height = height,
             .layers = 1,
@@ -727,6 +819,7 @@ pub const DmabufTarget = struct {
             .memory = memory,
             .view = view,
             .framebuffer = framebuffer,
+            .linear = linear,
             .command_pool = command_pool,
             .command_buffer = command_buffer,
             .fence = fence,
@@ -747,6 +840,7 @@ pub const DmabufTarget = struct {
         c.vkDestroyFence(renderer.device, self.fence, null);
         c.vkDestroyCommandPool(renderer.device, self.command_pool, null);
         c.vkDestroyFramebuffer(renderer.device, self.framebuffer, null);
+        self.linear.deinit(renderer);
         c.vkDestroyImageView(renderer.device, self.view, null);
         c.vkDestroyImage(renderer.device, self.image, null);
         c.vkFreeMemory(renderer.device, self.memory, null);
@@ -816,6 +910,7 @@ const PresentationPush = extern struct {
     bounds: [4]i32,
     has_background: u32,
     has_border: u32,
+    coverage_only: u32 = 0,
 };
 
 const Push = extern struct {
@@ -828,8 +923,9 @@ const Push = extern struct {
     shape_top: i32,
     shape_right: i32,
     shape_bottom: i32,
-    background: u32,
-    border: u32,
+    padding: u32 = 0, // GLSL uvec2 has eight-byte alignment.
+    background: [2]u32,
+    border: [2]u32,
     corner_radius: u32,
     border_width: u32,
     flags: u32,
@@ -839,7 +935,7 @@ const Push = extern struct {
 const GlyphPush = extern struct {
     target_width: u32,
     atlas_width_value: u32,
-    source: u32,
+    source: [2]u32,
     left: i32,
     top: i32,
     right: i32,
@@ -875,8 +971,18 @@ const PresentationObjects = struct {
     pipeline: c.VkPipeline,
     glyph_layout: c.VkPipelineLayout,
     glyph_pipeline: c.VkPipeline,
+    erase_pipeline: c.VkPipeline,
+    add_pipeline: c.VkPipeline,
+    conversion_descriptor_layout: c.VkDescriptorSetLayout,
+    conversion_layout: c.VkPipelineLayout,
+    conversion_pipeline: c.VkPipeline,
 
     fn deinit(self: PresentationObjects, device: c.VkDevice) void {
+        c.vkDestroyPipeline(device, self.conversion_pipeline, null);
+        c.vkDestroyPipelineLayout(device, self.conversion_layout, null);
+        c.vkDestroyDescriptorSetLayout(device, self.conversion_descriptor_layout, null);
+        c.vkDestroyPipeline(device, self.erase_pipeline, null);
+        c.vkDestroyPipeline(device, self.add_pipeline, null);
         c.vkDestroyPipeline(device, self.glyph_pipeline, null);
         c.vkDestroyPipelineLayout(device, self.glyph_layout, null);
         c.vkDestroyPipeline(device, self.pipeline, null);
@@ -886,9 +992,9 @@ const PresentationObjects = struct {
 };
 
 fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSetLayout) !PresentationObjects {
-    var attachment: c.VkAttachmentDescription = .{
+    const attachment: c.VkAttachmentDescription = .{
         .flags = 0,
-        .format = c.VK_FORMAT_B8G8R8A8_UNORM,
+        .format = c.VK_FORMAT_R16G16B16A16_SFLOAT,
         .samples = c.VK_SAMPLE_COUNT_1_BIT,
         .loadOp = c.VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = c.VK_ATTACHMENT_STORE_OP_STORE,
@@ -897,11 +1003,14 @@ fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSe
         .initialLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .finalLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
     };
+    var attachments = [_]c.VkAttachmentDescription{ attachment, attachment };
+    attachments[1].format = c.VK_FORMAT_B8G8R8A8_UNORM;
+    attachments[1].loadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     var attachment_reference: c.VkAttachmentReference = .{
         .attachment = 0,
         .layout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
     };
-    var subpass: c.VkSubpassDescription = .{
+    const subpass: c.VkSubpassDescription = .{
         .flags = 0,
         .pipelineBindPoint = c.VK_PIPELINE_BIND_POINT_GRAPHICS,
         .inputAttachmentCount = 0,
@@ -913,16 +1022,53 @@ fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSe
         .preserveAttachmentCount = 0,
         .pPreserveAttachments = null,
     };
+    var input_reference: c.VkAttachmentReference = .{ .attachment = 0, .layout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    var export_reference: c.VkAttachmentReference = .{ .attachment = 1, .layout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    var subpasses = [_]c.VkSubpassDescription{ subpass, subpass };
+    subpasses[1].inputAttachmentCount = 1;
+    subpasses[1].pInputAttachments = &input_reference;
+    subpasses[1].pColorAttachments = &export_reference;
+    // Also synchronize the persistent attachment against the previous frame's
+    // input reads and final layout transition. Export ownership is separate.
+    var dependencies = [_]c.VkSubpassDependency{
+        .{
+            .srcSubpass = c.VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            .dstStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | c.VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+            .dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dependencyFlags = c.VK_DEPENDENCY_BY_REGION_BIT,
+        },
+        .{
+            .srcSubpass = 0,
+            .dstSubpass = 1,
+            .srcStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            .srcAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = c.VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+            .dependencyFlags = c.VK_DEPENDENCY_BY_REGION_BIT,
+        },
+        .{
+            .srcSubpass = 1,
+            .dstSubpass = c.VK_SUBPASS_EXTERNAL,
+            .srcStageMask = c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = c.VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dependencyFlags = c.VK_DEPENDENCY_BY_REGION_BIT,
+        },
+    };
     var render_pass_info: c.VkRenderPassCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .attachmentCount = 1,
-        .pAttachments = &attachment,
-        .subpassCount = 1,
-        .pSubpasses = &subpass,
-        .dependencyCount = 0,
-        .pDependencies = null,
+        .attachmentCount = attachments.len,
+        .pAttachments = &attachments,
+        .subpassCount = subpasses.len,
+        .pSubpasses = &subpasses,
+        .dependencyCount = dependencies.len,
+        .pDependencies = &dependencies,
     };
     var render_pass: c.VkRenderPass = undefined;
     try vk(c.vkCreateRenderPass(device, &render_pass_info, null, &render_pass), error.CreateRenderPassFailed);
@@ -1077,6 +1223,23 @@ fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSe
     try vk(c.vkCreateGraphicsPipelines(device, null, 1, &pipeline_info, null, &pipeline), error.CreatePipelineFailed);
     errdefer c.vkDestroyPipeline(device, pipeline, null);
 
+    // Source replaces destination according to geometric coverage, not source
+    // alpha. Erase that coverage first, then add the premultiplied source.
+    blend_attachment.srcColorBlendFactor = c.VK_BLEND_FACTOR_ZERO;
+    blend_attachment.srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ZERO;
+    var erase_pipeline: c.VkPipeline = undefined;
+    try vk(c.vkCreateGraphicsPipelines(device, null, 1, &pipeline_info, null, &erase_pipeline), error.CreatePipelineFailed);
+    errdefer c.vkDestroyPipeline(device, erase_pipeline, null);
+    blend_attachment.srcColorBlendFactor = c.VK_BLEND_FACTOR_ONE;
+    blend_attachment.srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE;
+    blend_attachment.dstColorBlendFactor = c.VK_BLEND_FACTOR_ONE;
+    blend_attachment.dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE;
+    var add_pipeline: c.VkPipeline = undefined;
+    try vk(c.vkCreateGraphicsPipelines(device, null, 1, &pipeline_info, null, &add_pipeline), error.CreatePipelineFailed);
+    errdefer c.vkDestroyPipeline(device, add_pipeline, null);
+    blend_attachment.dstColorBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend_attachment.dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+
     var glyph_push_range: c.VkPushConstantRange = .{
         .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
@@ -1097,12 +1260,50 @@ fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSe
     pipeline_info.layout = glyph_layout;
     var glyph_pipeline: c.VkPipeline = undefined;
     try vk(c.vkCreateGraphicsPipelines(device, null, 1, &pipeline_info, null, &glyph_pipeline), error.CreatePipelineFailed);
+    errdefer c.vkDestroyPipeline(device, glyph_pipeline, null);
+
+    var conversion_binding: c.VkDescriptorSetLayoutBinding = .{
+        .binding = 0,
+        .descriptorType = c.VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+        .descriptorCount = 1,
+        .stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+    var descriptor_info: c.VkDescriptorSetLayoutCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &conversion_binding,
+    };
+    var conversion_descriptor_layout: c.VkDescriptorSetLayout = undefined;
+    try vk(c.vkCreateDescriptorSetLayout(device, &descriptor_info, null, &conversion_descriptor_layout), error.CreateDescriptorLayoutFailed);
+    errdefer c.vkDestroyDescriptorSetLayout(device, conversion_descriptor_layout, null);
+    var conversion_layout_info: c.VkPipelineLayoutCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &conversion_descriptor_layout,
+    };
+    var conversion_layout: c.VkPipelineLayout = undefined;
+    try vk(c.vkCreatePipelineLayout(device, &conversion_layout_info, null, &conversion_layout), error.CreatePipelineLayoutFailed);
+    errdefer c.vkDestroyPipelineLayout(device, conversion_layout, null);
+    const conversion_bytes align(@alignOf(u32)) = @embedFile("ourokit_vulkan_conversion_fragment").*;
+    const conversion_fragment = try createShader(device, &conversion_bytes);
+    defer c.vkDestroyShaderModule(device, conversion_fragment, null);
+    stages[1].module = conversion_fragment;
+    pipeline_info.layout = conversion_layout;
+    pipeline_info.subpass = 1;
+    blend_attachment.blendEnable = c.VK_FALSE;
+    var conversion_pipeline: c.VkPipeline = undefined;
+    try vk(c.vkCreateGraphicsPipelines(device, null, 1, &pipeline_info, null, &conversion_pipeline), error.CreatePipelineFailed);
     return .{
         .render_pass = render_pass,
         .layout = layout,
         .pipeline = pipeline,
         .glyph_layout = glyph_layout,
         .glyph_pipeline = glyph_pipeline,
+        .erase_pipeline = erase_pipeline,
+        .add_pipeline = add_pipeline,
+        .conversion_descriptor_layout = conversion_descriptor_layout,
+        .conversion_layout = conversion_layout,
+        .conversion_pipeline = conversion_pipeline,
     };
 }
 
@@ -1150,7 +1351,15 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     c.vkGetPhysicalDeviceMemoryProperties(selection.physical_device, &memory_properties);
     var properties: c.VkPhysicalDeviceProperties = undefined;
     c.vkGetPhysicalDeviceProperties(selection.physical_device, &properties);
-    const dmabuf_enabled = try supportsDeviceExtensions(allocator, selection.physical_device, &dmabuf_extensions);
+    var linear_properties: c.VkFormatProperties = undefined;
+    c.vkGetPhysicalDeviceFormatProperties(selection.physical_device, c.VK_FORMAT_R16G16B16A16_SFLOAT, &linear_properties);
+    const required_linear_features = c.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | c.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    var linear_image_properties: c.VkImageFormatProperties = undefined;
+    const linear_supported = linear_properties.optimalTilingFeatures & required_linear_features == required_linear_features and
+        c.vkGetPhysicalDeviceImageFormatProperties(selection.physical_device, c.VK_FORMAT_R16G16B16A16_SFLOAT, c.VK_IMAGE_TYPE_2D, c.VK_IMAGE_TILING_OPTIMAL, LinearAttachment.usage, 0, &linear_image_properties) == c.VK_SUCCESS;
+    // Capability loss must select the host's existing SHM/software fallback,
+    // not make renderer initialization fatal. Integer compute remains usable.
+    const dmabuf_enabled = linear_supported and try supportsDeviceExtensions(allocator, selection.physical_device, &dmabuf_extensions);
     var drm_properties: c.VkPhysicalDeviceDrmPropertiesEXT = .{
         .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
         .pNext = null,
@@ -1319,7 +1528,10 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     try vk(c.vkCreateDescriptorSetLayout(device, &atlas_layout_info, null, &atlas_descriptor_layout), error.CreateDescriptorLayoutFailed);
     errdefer c.vkDestroyDescriptorSetLayout(device, atlas_descriptor_layout, null);
 
-    const presentation = try createPresentationPipeline(device, atlas_descriptor_layout);
+    const presentation = if (linear_supported)
+        try createPresentationPipeline(device, atlas_descriptor_layout)
+    else
+        std.mem.zeroes(PresentationObjects);
     errdefer presentation.deinit(device);
 
     var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
@@ -1392,12 +1604,17 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
         .presentation_pipeline = presentation.pipeline,
         .presentation_glyph_pipeline_layout = presentation.glyph_layout,
         .presentation_glyph_pipeline = presentation.glyph_pipeline,
+        .presentation_erase_pipeline = presentation.erase_pipeline,
+        .presentation_add_pipeline = presentation.add_pipeline,
+        .conversion_descriptor_layout = presentation.conversion_descriptor_layout,
+        .conversion_pipeline_layout = presentation.conversion_layout,
+        .conversion_pipeline = presentation.conversion_pipeline,
         .descriptor_pool = descriptor_pool,
         .command_pool = command_pool,
         .command_buffer = command_buffer,
         .fence = fence,
         .max_pixels = @min(
-            @as(u64, properties.limits.maxStorageBufferRange) / 4,
+            @as(u64, properties.limits.maxStorageBufferRange) / 8,
             @as(u64, properties.limits.maxComputeWorkGroupCount[0]) * local_size,
         ),
         .max_image_pixels = @as(u64, properties.limits.maxStorageBufferRange) / 4,
@@ -1409,6 +1626,11 @@ pub fn deinit(self: *Renderer) void {
     c.vkDestroyFence(self.device, self.fence, null);
     c.vkDestroyCommandPool(self.device, self.command_pool, null);
     c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
+    c.vkDestroyPipeline(self.device, self.conversion_pipeline, null);
+    c.vkDestroyPipelineLayout(self.device, self.conversion_pipeline_layout, null);
+    c.vkDestroyDescriptorSetLayout(self.device, self.conversion_descriptor_layout, null);
+    c.vkDestroyPipeline(self.device, self.presentation_erase_pipeline, null);
+    c.vkDestroyPipeline(self.device, self.presentation_add_pipeline, null);
     c.vkDestroyPipeline(self.device, self.presentation_glyph_pipeline, null);
     c.vkDestroyPipelineLayout(self.device, self.presentation_glyph_pipeline_layout, null);
     c.vkDestroyPipeline(self.device, self.presentation_pipeline, null);
@@ -1686,6 +1908,21 @@ pub fn renderDmabufResources(
     paragraphs: ?*const text.ParagraphCache,
     images: ?*const ImageCache,
 ) !void {
+    return self.renderGraphicsResources(list, target, glyphs, shapes, paragraphs, images, true);
+}
+
+/// The host-readback destination is used by compositor-free graphics tests.
+/// Both destinations execute the same per-target asynchronous submission.
+fn renderGraphicsResources(
+    self: *Renderer,
+    list: scene.DisplayList,
+    target: *DmabufTarget,
+    glyphs: ?*GlyphCache,
+    shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
+    images: ?*const ImageCache,
+    comptime export_image: bool,
+) !void {
     try list.validate();
     try validateClipDepth(list.commands, glyphs != null and shapes != null, glyphs != null and paragraphs != null);
     if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
@@ -1704,6 +1941,7 @@ pub fn renderDmabufResources(
         glyphs.?.recordUpload(target.command_buffer, c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
     else
         false;
+    if (target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED) target.linear.initialize(target.command_buffer);
     var image_barrier: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = null,
@@ -1711,11 +1949,11 @@ pub fn renderDmabufResources(
         .dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
         .oldLayout = target.layout,
         .newLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .srcQueueFamilyIndex = if (target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED)
+        .srcQueueFamilyIndex = if (!export_image or target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED)
             c.VK_QUEUE_FAMILY_IGNORED
         else
             c.VK_QUEUE_FAMILY_FOREIGN_EXT,
-        .dstQueueFamilyIndex = if (target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED)
+        .dstQueueFamilyIndex = if (!export_image or target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED)
             c.VK_QUEUE_FAMILY_IGNORED
         else
             self.queue_family,
@@ -1772,18 +2010,19 @@ pub fn renderDmabufResources(
             if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads);
         },
     }
+    self.convertPresentation(target);
     c.vkCmdEndRenderPass(target.command_buffer);
 
     image_barrier.srcAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    image_barrier.dstAccessMask = 0;
+    image_barrier.dstAccessMask = if (export_image) 0 else c.VK_ACCESS_HOST_READ_BIT;
     image_barrier.oldLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     image_barrier.newLayout = c.VK_IMAGE_LAYOUT_GENERAL;
-    image_barrier.srcQueueFamilyIndex = self.queue_family;
-    image_barrier.dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_FOREIGN_EXT;
+    image_barrier.srcQueueFamilyIndex = if (export_image) self.queue_family else c.VK_QUEUE_FAMILY_IGNORED;
+    image_barrier.dstQueueFamilyIndex = if (export_image) c.VK_QUEUE_FAMILY_FOREIGN_EXT else c.VK_QUEUE_FAMILY_IGNORED;
     c.vkCmdPipelineBarrier(
         target.command_buffer,
         c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        if (export_image) c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT else c.VK_PIPELINE_STAGE_HOST_BIT,
         0,
         0,
         null,
@@ -1825,6 +2064,19 @@ pub fn renderDmabufResources(
         target.acquire_point = acquire_point;
         target.release_point = acquire_point + 1;
     }
+}
+
+fn convertPresentation(self: *Renderer, target: *const DmabufTarget) void {
+    c.vkCmdNextSubpass(target.command_buffer, c.VK_SUBPASS_CONTENTS_INLINE);
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.conversion_pipeline);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.conversion_pipeline_layout, 0, 1, &target.linear.descriptor, 0, null);
+    // Conversion rewrites the export image, but never reads it back into the
+    // working image. Undamaged linear pixels survive every submission.
+    var viewport: c.VkViewport = .{ .x = 0, .y = 0, .width = @floatFromInt(target.width), .height = @floatFromInt(target.height), .minDepth = 0, .maxDepth = 1 };
+    var scissor: c.VkRect2D = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = target.width, .height = target.height } };
+    c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
+    c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
+    c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
 }
 
 fn renderPresentationRegion(
@@ -1890,7 +2142,7 @@ fn presentationFill(
 ) void {
     if (bounds.isEmpty()) return;
     c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_pipeline);
-    const source = color.premultiplied();
+    const source = LinearRgba16.fromColor(color);
     const rectangle: c.VkClearRect = .{
         .rect = .{
             .offset = .{ .x = bounds.x, .y = bounds.y },
@@ -1899,16 +2151,11 @@ fn presentationFill(
         .baseArrayLayer = 0,
         .layerCount = 1,
     };
-    if (blend == .source or source.a == 255) {
+    if (blend == .source or source.a == 65535) {
         var attachment: c.VkClearAttachment = .{
             .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
             .colorAttachment = 0,
-            .clearValue = .{ .color = .{ .float32 = .{
-                @as(f32, @floatFromInt(source.r)) / 255,
-                @as(f32, @floatFromInt(source.g)) / 255,
-                @as(f32, @floatFromInt(source.b)) / 255,
-                @as(f32, @floatFromInt(source.a)) / 255,
-            } } },
+            .clearValue = .{ .color = .{ .float32 = normalizedColor(source) } },
         };
         c.vkCmdClearAttachments(target.command_buffer, 1, &attachment, 1, &rectangle);
         return;
@@ -1927,12 +2174,7 @@ fn presentationFill(
     const right = @as(i64, bounds.x) + bounds.width;
     const bottom = @as(i64, bounds.y) + bounds.height;
     const push: PresentationPush = .{
-        .background = .{
-            @as(f32, @floatFromInt(source.r)) / 255,
-            @as(f32, @floatFromInt(source.g)) / 255,
-            @as(f32, @floatFromInt(source.b)) / 255,
-            @as(f32, @floatFromInt(source.a)) / 255,
-        },
+        .background = normalizedColor(source),
         .border = .{ 0, 0, 0, 0 },
         .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
         .corner_radius = 0,
@@ -1974,11 +2216,11 @@ fn presentationDecoratedRectangle(
     };
     c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
     c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
-    const background = if (rectangle.background) |color| color.premultiplied() else Color.rgba(0, 0, 0, 0).premultiplied();
-    const border = if (rectangle.border_color) |color| color.premultiplied() else Color.rgba(0, 0, 0, 0).premultiplied();
+    const background = if (rectangle.background) |color| LinearRgba16.fromColor(color) else LinearRgba16.transparent;
+    const border = if (rectangle.border_color) |color| LinearRgba16.fromColor(color) else LinearRgba16.transparent;
     const right = @as(i64, rectangle.bounds.x) + rectangle.bounds.width;
     const bottom = @as(i64, rectangle.bounds.y) + rectangle.bounds.height;
-    const push: PresentationPush = .{
+    var push: PresentationPush = .{
         .background = normalizedColor(background),
         .border = normalizedColor(border),
         .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
@@ -1988,6 +2230,14 @@ fn presentationDecoratedRectangle(
         .has_background = @intFromBool(rectangle.background != null),
         .has_border = @intFromBool(rectangle.border_color != null),
     };
+    if (rectangle.blend == .source) {
+        push.coverage_only = 1;
+        c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_erase_pipeline);
+        c.vkCmdPushConstants(target.command_buffer, self.presentation_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(PresentationPush), &push);
+        c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
+        push.coverage_only = 0;
+        c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_add_pipeline);
+    }
     c.vkCmdPushConstants(
         target.command_buffer,
         self.presentation_pipeline_layout,
@@ -2080,7 +2330,7 @@ fn drawImage(self: *Renderer, target: *const Target, bounds: RectI, placement: I
     const push: GlyphPush = .{
         .target_width = target.width,
         .atlas_width_value = image.pixels.width,
-        .source = @intFromBool(target.format == .bgra),
+        .source = .{ 0, 0 },
         .left = bounds.x,
         .top = bounds.y,
         .right = @intCast(@as(i64, bounds.x) + bounds.width),
@@ -2143,7 +2393,7 @@ fn drawPresentationImage(self: *Renderer, target: *const DmabufTarget, bounds: R
 fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, blend: scene.BlendMode) void {
     if (bounds.isEmpty()) return;
     c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-    const source = color.premultiplied();
+    const source = LinearRgba16.fromColor(color);
     const push: Push = .{
         .target_width = target.width,
         .left = bounds.x,
@@ -2154,12 +2404,12 @@ fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, ble
         .shape_top = bounds.y,
         .shape_right = @intCast(@as(i64, bounds.x) + bounds.width),
         .shape_bottom = @intCast(@as(i64, bounds.y) + bounds.height),
-        .background = packedColor(source, target.format),
-        .border = 0,
+        .background = packedLinear(source),
+        .border = .{ 0, 0 },
         .corner_radius = 0,
         .border_width = 0,
         .flags = 1,
-        .source_over = @intFromBool(blend == .source_over and source.a != 255),
+        .source_over = @intFromBool(blend == .source_over and source.a != 65535),
     };
     c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
     const count = @as(u64, bounds.width) * bounds.height;
@@ -2192,8 +2442,8 @@ fn decoratedRectangle(
 ) void {
     if (clipped_bounds.isEmpty()) return;
     c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-    const background = if (rectangle.background) |color| color.premultiplied() else Color.rgba(0, 0, 0, 0).premultiplied();
-    const border = if (rectangle.border_color) |color| color.premultiplied() else Color.rgba(0, 0, 0, 0).premultiplied();
+    const background = if (rectangle.background) |color| LinearRgba16.fromColor(color) else LinearRgba16.fromColor(Color.rgba(0, 0, 0, 0));
+    const border = if (rectangle.border_color) |color| LinearRgba16.fromColor(color) else LinearRgba16.fromColor(Color.rgba(0, 0, 0, 0));
     const push: Push = .{
         .target_width = target.width,
         .left = clipped_bounds.x,
@@ -2204,8 +2454,8 @@ fn decoratedRectangle(
         .shape_top = rectangle.bounds.y,
         .shape_right = @intCast(@as(i64, rectangle.bounds.x) + rectangle.bounds.width),
         .shape_bottom = @intCast(@as(i64, rectangle.bounds.y) + rectangle.bounds.height),
-        .background = packedColor(background, target.format),
-        .border = packedColor(border, target.format),
+        .background = packedLinear(background),
+        .border = packedLinear(border),
         .corner_radius = rectangle.corner_radius,
         .border_width = rectangle.border_width,
         .flags = @as(u32, @intFromBool(rectangle.background != null)) |
@@ -2235,19 +2485,19 @@ fn decoratedRectangle(
     );
 }
 
-fn packedColor(source: @import("../../core/color.zig").PremultipliedSrgba8, format: StorageFormat) u32 {
-    return @as(u32, if (format == .rgba) source.r else source.b) |
-        (@as(u32, source.g) << 8) |
-        (@as(u32, if (format == .rgba) source.b else source.r) << 16) |
-        (@as(u32, source.a) << 24);
+fn packedLinear(source: LinearRgba16) [2]u32 {
+    return .{
+        @as(u32, source.r) | (@as(u32, source.g) << 16),
+        @as(u32, source.b) | (@as(u32, source.a) << 16),
+    };
 }
 
-fn normalizedColor(source: @import("../../core/color.zig").PremultipliedSrgba8) [4]f32 {
+fn normalizedColor(source: LinearRgba16) [4]f32 {
     return .{
-        @as(f32, @floatFromInt(source.r)) / 255,
-        @as(f32, @floatFromInt(source.g)) / 255,
-        @as(f32, @floatFromInt(source.b)) / 255,
-        @as(f32, @floatFromInt(source.a)) / 255,
+        @as(f32, @floatFromInt(source.r)) / 65535,
+        @as(f32, @floatFromInt(source.g)) / 65535,
+        @as(f32, @floatFromInt(source.b)) / 65535,
+        @as(f32, @floatFromInt(source.a)) / 65535,
     };
 }
 
@@ -2289,11 +2539,7 @@ fn drawGlyphRun(
 ) void {
     if (!has_freetype) unreachable;
     const shaped = shapes.get(command.shape) catch unreachable;
-    const source_color = command.color.premultiplied();
-    const source = @as(u32, if (target.format == .rgba) source_color.r else source_color.b) |
-        (@as(u32, source_color.g) << 8) |
-        (@as(u32, if (target.format == .rgba) source_color.b else source_color.r) << 16) |
-        (@as(u32, source_color.a) << 24);
+    const source = packedLinear(LinearRgba16.fromColor(command.color));
     var pen = command.origin;
     for (shaped.spans) |span| for (span.run.glyphs) |glyph| {
         const atlas = cache.get(span.font, glyph.id, shaped.logical_size * command.scale) catch unreachable;
@@ -2345,7 +2591,7 @@ fn drawPresentationGlyphRun(
 ) void {
     if (!has_freetype) unreachable;
     const shaped = shapes.get(command.shape) catch unreachable;
-    const color = command.color.premultiplied();
+    const color = LinearRgba16.fromColor(command.color);
     var pen = command.origin;
     for (shaped.spans) |span| for (span.run.glyphs) |glyph| {
         const atlas = cache.get(span.font, glyph.id, shaped.logical_size * command.scale) catch unreachable;
@@ -2376,12 +2622,7 @@ fn drawPresentationGlyphRun(
             c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
             c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
             const push: PresentationGlyphPush = .{
-                .color = .{
-                    @as(f32, @floatFromInt(color.r)) / 255,
-                    @as(f32, @floatFromInt(color.g)) / 255,
-                    @as(f32, @floatFromInt(color.b)) / 255,
-                    @as(f32, @floatFromInt(color.a)) / 255,
-                },
+                .color = normalizedColor(color),
                 .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
                 .bounds = .{
                     glyph_bounds.x,
@@ -2410,7 +2651,7 @@ fn drawPresentationParagraph(
 ) void {
     if (!has_freetype) unreachable;
     const layout = paragraphs.get(command.layout) catch unreachable;
-    const color = command.color.premultiplied();
+    const color = LinearRgba16.fromColor(command.color);
     for (layout.positioned.lines) |line| {
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
@@ -2638,11 +2879,7 @@ fn drawParagraph(
 ) void {
     if (!has_freetype) unreachable;
     const layout = paragraphs.get(command.layout) catch unreachable;
-    const source_color = command.color.premultiplied();
-    const source = @as(u32, if (target.format == .rgba) source_color.r else source_color.b) |
-        (@as(u32, source_color.g) << 8) |
-        (@as(u32, if (target.format == .rgba) source_color.b else source_color.r) << 16) |
-        (@as(u32, source_color.a) << 24);
+    const source = packedLinear(LinearRgba16.fromColor(command.color));
     for (layout.positioned.lines) |line| {
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
@@ -2745,6 +2982,13 @@ test "Vulkan glyph atlas matches exact software text rendering" {
     var actual = [_]u8{0} ** expected.len;
     try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);
+    var graphics = try GraphicsReadback.init(&renderer, 160, 36);
+    defer graphics.deinit(&renderer);
+    try renderer.renderGraphicsResources(list, &graphics.target, &glyphs, &shapes, null, null, false);
+    try graphics.target.wait(&renderer);
+    for (0..36) |y| for (0..160) |x| {
+        try graphics.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
+    };
 }
 
 test "Vulkan positioned paragraphs match exact software text rendering" {
@@ -2809,6 +3053,13 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
     var actual = [_]u8{0} ** expected.len;
     try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);
+    var graphics = try GraphicsReadback.init(&renderer, 160, 72);
+    defer graphics.deinit(&renderer);
+    try renderer.renderGraphicsResources(list, &graphics.target, &glyphs, null, &paragraphs, null, false);
+    try graphics.target.wait(&renderer);
+    for (0..72) |y| for (0..160) |x| {
+        try graphics.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
+    };
 }
 
 test "Vulkan clipping, damage, and BGRA readback preserve untouched pixels" {
@@ -2917,11 +3168,14 @@ test "graphics image sampling matches software and upload copies outlive source 
     var view: c.VkImageView = undefined;
     try vk(c.vkCreateImageView(renderer.device, &view_info, null, &view), error.CreateImageViewFailed);
     defer c.vkDestroyImageView(renderer.device, view, null);
+    const linear = try LinearAttachment.init(&renderer, 32, 12);
+    defer linear.deinit(&renderer);
+    var attachments = [_]c.VkImageView{ linear.view, view };
     var framebuffer_info: c.VkFramebufferCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .renderPass = renderer.presentation_render_pass,
-        .attachmentCount = 1,
-        .pAttachments = &view,
+        .attachmentCount = attachments.len,
+        .pAttachments = &attachments,
         .width = 32,
         .height = 12,
         .layers = 1,
@@ -2959,6 +3213,7 @@ test "graphics image sampling matches software and upload copies outlive source 
         .memory = memory,
         .view = view,
         .framebuffer = framebuffer,
+        .linear = linear,
         .command_pool = renderer.command_pool,
         .command_buffer = renderer.command_buffer,
         .fence = renderer.fence,
@@ -2972,6 +3227,7 @@ test "graphics image sampling matches software and upload copies outlive source 
     try vk(c.vkResetCommandPool(renderer.device, renderer.command_pool, 0), error.ResetCommandPoolFailed);
     var begin: c.VkCommandBufferBeginInfo = .{ .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     try vk(c.vkBeginCommandBuffer(renderer.command_buffer, &begin), error.BeginCommandBufferFailed);
+    linear.initialize(renderer.command_buffer);
     var barrier: c.VkImageMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -2991,6 +3247,7 @@ test "graphics image sampling matches software and upload copies outlive source 
     };
     c.vkCmdBeginRenderPass(renderer.command_buffer, &pass, c.VK_SUBPASS_CONTENTS_INLINE);
     renderer.renderPresentationRegion(&commands, &target, .{ .x = 0, .y = 0, .width = 32, .height = 12 }, null, null, null, &uploads);
+    renderer.convertPresentation(&target);
     c.vkCmdEndRenderPass(renderer.command_buffer);
     barrier.srcAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barrier.dstAccessMask = c.VK_ACCESS_HOST_READ_BIT;
@@ -3008,9 +3265,250 @@ test "graphics image sampling matches software and upload copies outlive source 
     const bytes: [*]const u8 = @ptrCast(mapping.?);
     for (0..12) |y| for (0..128) |x| {
         const actual = bytes[layout.offset + y * layout.rowPitch + x];
-        // Fixed-function UNORM blending may round one channel differently.
+        // FP16 working storage and final UNORM conversion can differ by one.
         try std.testing.expect(@abs(@as(i16, actual) - @as(i16, expected[y * 128 + x])) <= 1);
     };
+}
+
+/// Host-visible export substitute, with the same private working attachment
+/// and per-slot command/fence resources as a dma-buf target.
+const GraphicsReadback = struct {
+    target: DmabufTarget,
+    mapping: [*]const u8,
+    layout: c.VkSubresourceLayout,
+
+    fn init(renderer: *Renderer, width: u32, height: u32) !GraphicsReadback {
+        if (renderer.presentation_render_pass == null) return error.SkipZigTest;
+        var properties: c.VkFormatProperties = undefined;
+        c.vkGetPhysicalDeviceFormatProperties(renderer.physical_device, c.VK_FORMAT_B8G8R8A8_UNORM, &properties);
+        if (properties.linearTilingFeatures & c.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT == 0) return error.SkipZigTest;
+        var image_info: c.VkImageCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = c.VK_IMAGE_TYPE_2D,
+            .format = c.VK_FORMAT_B8G8R8A8_UNORM,
+            .extent = .{ .width = width, .height = height, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = c.VK_SAMPLE_COUNT_1_BIT,
+            .tiling = c.VK_IMAGE_TILING_LINEAR,
+            .usage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        var image: c.VkImage = undefined;
+        try vk(c.vkCreateImage(renderer.device, &image_info, null, &image), error.CreateImageFailed);
+        errdefer c.vkDestroyImage(renderer.device, image, null);
+        var requirements: c.VkMemoryRequirements = undefined;
+        c.vkGetImageMemoryRequirements(renderer.device, image, &requirements);
+        const memory_type = renderer.findMemoryType(requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) orelse return error.SkipZigTest;
+        var allocate: c.VkMemoryAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = requirements.size, .memoryTypeIndex = memory_type };
+        var memory: c.VkDeviceMemory = undefined;
+        try vk(c.vkAllocateMemory(renderer.device, &allocate, null, &memory), error.AllocateMemoryFailed);
+        errdefer c.vkFreeMemory(renderer.device, memory, null);
+        try vk(c.vkBindImageMemory(renderer.device, image, memory, 0), error.BindMemoryFailed);
+        var mapping: ?*anyopaque = null;
+        try vk(c.vkMapMemory(renderer.device, memory, 0, requirements.size, 0, &mapping), error.MapMemoryFailed);
+        errdefer c.vkUnmapMemory(renderer.device, memory);
+        var view_info: c.VkImageViewCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image, .viewType = c.VK_IMAGE_VIEW_TYPE_2D, .format = c.VK_FORMAT_B8G8R8A8_UNORM, .subresourceRange = LinearAttachment.range };
+        var view: c.VkImageView = undefined;
+        try vk(c.vkCreateImageView(renderer.device, &view_info, null, &view), error.CreateImageViewFailed);
+        errdefer c.vkDestroyImageView(renderer.device, view, null);
+        const linear = try LinearAttachment.init(renderer, width, height);
+        errdefer linear.deinit(renderer);
+        var attachments = [_]c.VkImageView{ linear.view, view };
+        var framebuffer_info: c.VkFramebufferCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = renderer.presentation_render_pass, .attachmentCount = attachments.len, .pAttachments = &attachments, .width = width, .height = height, .layers = 1 };
+        var framebuffer: c.VkFramebuffer = undefined;
+        try vk(c.vkCreateFramebuffer(renderer.device, &framebuffer_info, null, &framebuffer), error.CreateFramebufferFailed);
+        errdefer c.vkDestroyFramebuffer(renderer.device, framebuffer, null);
+        var pool_info: c.VkCommandPoolCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = renderer.queue_family };
+        var pool: c.VkCommandPool = undefined;
+        try vk(c.vkCreateCommandPool(renderer.device, &pool_info, null, &pool), error.CreateCommandPoolFailed);
+        errdefer c.vkDestroyCommandPool(renderer.device, pool, null);
+        var command_info: c.VkCommandBufferAllocateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        var command: c.VkCommandBuffer = undefined;
+        try vk(c.vkAllocateCommandBuffers(renderer.device, &command_info, &command), error.AllocateCommandBufferFailed);
+        var fence_info: c.VkFenceCreateInfo = .{ .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        var fence: c.VkFence = undefined;
+        try vk(c.vkCreateFence(renderer.device, &fence_info, null, &fence), error.CreateFenceFailed);
+        const subresource: c.VkImageSubresource = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .arrayLayer = 0 };
+        var layout: c.VkSubresourceLayout = undefined;
+        c.vkGetImageSubresourceLayout(renderer.device, image, &subresource, &layout);
+        return .{
+            .target = .{ .image = image, .memory = memory, .view = view, .framebuffer = framebuffer, .linear = linear, .command_pool = pool, .command_buffer = command, .fence = fence, .timeline = null, .width = width, .height = height, .modifier = 0, .planes = undefined, .plane_count = 0 },
+            .mapping = @ptrCast(mapping.?),
+            .layout = layout,
+        };
+    }
+
+    fn deinit(self: *GraphicsReadback, renderer: *Renderer) void {
+        self.target.wait(renderer) catch {};
+        c.vkUnmapMemory(renderer.device, self.target.memory);
+        self.target.deinit(renderer);
+    }
+
+    fn pixel(self: *const GraphicsReadback, x: usize, y: usize) [4]u8 {
+        const bytes = self.mapping[self.layout.offset + y * self.layout.rowPitch + x * 4 ..][0..4];
+        return .{ bytes[2], bytes[1], bytes[0], bytes[3] };
+    }
+
+    fn expectPixel(self: *const GraphicsReadback, x: usize, y: usize, expected: [4]u8) !void {
+        const actual = self.pixel(x, y);
+        for (actual, expected) |a, e| {
+            if (@abs(@as(i16, a) - @as(i16, e)) > 1) {
+                std.debug.print("graphics pixel ({d},{d}): expected {any}, actual {any}\n", .{ x, y, expected, actual });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+};
+
+test "Vulkan graphics linear light, transparent encoding and persistent damaged slots" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var first = try GraphicsReadback.init(&renderer, 6, 2);
+    defer first.deinit(&renderer);
+    var second = try GraphicsReadback.init(&renderer, 6, 2);
+    defer second.deinit(&renderer);
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(0, 0, 0, 0) },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(0, 0, 0, 255) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(255, 255, 255, 128) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 1, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(255, 255, 255, 255) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 1, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(0, 0, 0, 128) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 2, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(17, 84, 211, 255) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 2, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(0, 0, 0, 128), .blend = .source } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 3, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(255, 255, 255, 128) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 4, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(200, 100, 50, 128) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 5, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(20, 40, 60, 255) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 5, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(200, 100, 50, 128) } },
+    };
+    try renderer.renderGraphicsResources(.{ .commands = &commands }, &first.target, null, null, null, null, false);
+    // Submit a different slot before waiting: no renderer-global command,
+    // descriptor, working attachment or fence may be reused between them.
+    try renderer.renderGraphicsResources(.{ .commands = &.{.{ .clear = Color.rgba(11, 43, 97, 255) }} }, &second.target, null, null, null, null, false);
+    try std.testing.expect(first.target.gpu_pending and second.target.gpu_pending);
+    try first.target.wait(&renderer);
+    try second.target.wait(&renderer);
+    const expected = [_][4]u8{ .{ 188, 188, 188, 255 }, .{ 187, 187, 187, 255 }, .{ 0, 0, 0, 128 }, .{ 128, 128, 128, 128 }, .{ 100, 50, 25, 128 }, .{ 147, 77, 55, 255 } };
+    for (expected, 0..) |pixel, x| try first.expectPixel(x, 0, pixel);
+    try first.expectPixel(0, 1, .{ 0, 0, 0, 0 });
+    try second.expectPixel(4, 1, .{ 11, 43, 97, 255 });
+
+    const untouched = first.pixel(5, 0);
+    const damage = [_]RectI{.{ .x = 1, .y = 0, .width = 2, .height = 2 }};
+    const update = [_]scene.Command{
+        .{ .clear = Color.rgba(255, 255, 255, 128) },
+        .{ .push_clip_rect = .{ .x = 2, .y = 1, .width = 1, .height = 1 } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 6, .height = 2 }, .color = Color.rgba(0, 0, 0, 0), .blend = .source } },
+        .pop_clip,
+    };
+    try renderer.renderGraphicsResources(.{ .commands = &update, .damage = .{ .regions = &damage } }, &first.target, null, null, null, null, false);
+    try first.target.wait(&renderer);
+    try first.expectPixel(1, 0, .{ 128, 128, 128, 128 });
+    try first.expectPixel(2, 1, .{ 0, 0, 0, 0 });
+    try std.testing.expectEqual(untouched, first.pixel(5, 0));
+    try second.expectPixel(4, 1, .{ 11, 43, 97, 255 });
+    // An empty damage list still converts from the persistent attachment.
+    try renderer.renderGraphicsResources(.{ .commands = &commands, .damage = .{ .regions = &.{} } }, &first.target, null, null, null, null, false);
+    try first.target.wait(&renderer);
+    try first.expectPixel(1, 0, .{ 128, 128, 128, 128 });
+    try std.testing.expectEqual(untouched, first.pixel(5, 0));
+
+    // Integer compute must expose the same encoded-premultiplied contract.
+    var compute = try Target.init(&renderer, 6, 2);
+    defer compute.deinit(&renderer);
+    try renderer.render(.{ .commands = &commands }, &compute);
+    var bytes: [48]u8 = undefined;
+    try compute.readPixels(&bytes, 24, .rgba8_unorm);
+    for (expected, 0..) |pixel, x| try std.testing.expectEqualSlices(u8, &pixel, bytes[x * 4 ..][0..4]);
+
+    try renderer.renderGraphicsResources(.{ .commands = &.{.{ .clear = Color.rgba(255, 255, 255, 255) }} }, &second.target, null, null, null, null, false);
+    const faint = [_]scene.Command{.{ .solid_rectangle = .{
+        .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .color = Color.rgba(0, 0, 0, 1),
+    } }};
+    for (0..20) |_| {
+        try second.target.wait(&renderer);
+        try renderer.renderGraphicsResources(.{ .commands = &faint }, &second.target, null, null, null, null, false);
+    }
+    try second.target.wait(&renderer);
+    // Encode((254/255)^20) = 246.334. Reimporting the 8-bit export after
+    // every submission would round each faint blend back to 255 instead.
+    try second.expectPixel(0, 0, .{ 246, 246, 246, 255 });
+    try second.expectPixel(1, 0, .{ 255, 255, 255, 255 });
+}
+
+test "Vulkan graphics decorated source replaces by coverage rather than alpha" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var target = try GraphicsReadback.init(&renderer, 9, 5);
+    defer target.deinit(&renderer);
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(255, 255, 255, 255) },
+        .{ .decorated_rectangle = .{
+            .bounds = .{ .x = 0, .y = 0, .width = 5, .height = 5 },
+            .background = Color.rgba(0, 0, 0, 0),
+            .corner_radius = 2,
+            .blend = .source,
+        } },
+        .{ .decorated_rectangle = .{
+            .bounds = .{ .x = 5, .y = 0, .width = 4, .height = 5 },
+            .background = Color.rgba(200, 100, 50, 128),
+            .border_color = Color.rgba(0, 0, 0, 64),
+            .border_width = 1,
+            .blend = .source,
+        } },
+    };
+    try renderer.renderGraphicsResources(.{ .commands = &commands }, &target.target, null, null, null, null, false);
+    try target.target.wait(&renderer);
+    try target.expectPixel(2, 2, .{ 0, 0, 0, 0 });
+    // Outer coverage = 2.5 - sqrt(4.5); the unfilled white destination
+    // contributes (1-coverage)*255 = 158.44 to RGB and alpha.
+    try target.expectPixel(0, 0, .{ 158, 158, 158, 158 });
+    try target.expectPixel(5, 2, .{ 0, 0, 0, 64 });
+    try target.expectPixel(6, 2, .{ 100, 50, 25, 128 });
+
+    // Compute retains the CPU's integer radius clamp for odd extents.
+    var compute = try Target.init(&renderer, 3, 3);
+    defer compute.deinit(&renderer);
+    try renderer.render(.{ .commands = &.{
+        .{ .clear = Color.rgba(255, 255, 255, 255) },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 3, .height = 3 }, .background = Color.rgba(0, 0, 0, 0), .corner_radius = 99, .blend = .source } },
+    } }, &compute);
+    var bytes: [36]u8 = undefined;
+    try compute.readPixels(&bytes, 12, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &.{ 53, 53, 53, 53 }, bytes[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, bytes[16..20]);
+}
+
+test "Vulkan graphics decodes transparent image texels before filtering" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var target = try GraphicsReadback.init(&renderer, 4, 1);
+    defer target.deinit(&renderer);
+    var cache = try ImageCache.init(std.testing.allocator, 1);
+    defer cache.deinit();
+    const pixels = try std.testing.allocator.dupe(u8, &.{ 0, 0, 0, 255, 128, 64, 0, 128 });
+    const handle = try cache.insert(.{ .allocator = std.testing.allocator, .pixels = pixels, .width = 2, .height = 1, .intrinsic_width = 2, .intrinsic_height = 1 });
+    const commands = [_]scene.Command{.{ .image = .{ .image = handle, .bounds = .{ .x = 0, .y = 0, .width = 3, .height = 1 }, .fit = .fill } }};
+    try renderer.renderGraphicsResources(.{ .commands = &commands }, &target.target, null, null, null, &cache, false);
+    try cache.release(handle); // In-flight uploads own copies, not cache leases.
+    try target.target.wait(&renderer);
+    try target.expectPixel(0, 0, .{ 0, 0, 0, 255 });
+    // At the midpoint alpha is 191.5/255 and straight linear RGB is
+    // (64/191.5, decode(0.5)*64/191.5, 0), then encoded and premultiplied.
+    try target.expectPixel(1, 0, .{ 118, 57, 0, 192 });
+    try target.expectPixel(2, 0, .{ 128, 64, 0, 128 });
+    try target.expectPixel(3, 0, .{ 0, 0, 0, 0 });
 }
 
 test "image uploads deduplicate repeated handles and bound unique bytes per submission" {

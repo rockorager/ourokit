@@ -525,7 +525,11 @@ destructive/reversible metadata. Widgets may contribute contextual entries.
 The current software backend consumes the same display list contract intended
 for Vulkan and writes premultiplied encoded-sRGB RGBA/BGRA bytes into
 caller-provided dimensions and stride. Scene colors remain straight-alpha sRGB;
-the backend owns conversion and deterministic source/source-over composition.
+the backend decodes and premultiplies them into linear RGBA16 UNORM working
+storage for source/source-over composition, then converts damaged pixels back
+to encoded presentation bytes once per render call. Vulkan graphics uses a
+persistent per-target RGBA16F attachment with a final encoded-BGRA8 subpass;
+high-precision storage is internal and requires no special compositor format.
 Tests cover clipping, damage, alpha, format, row padding, clear, rectangles, and
 reusable conformance fixtures.
 
@@ -537,7 +541,9 @@ and neither compiles shaders nor discovers or links the Vulkan loader.
 Native software text rendering optionally links system FreeType. Backend-owned
 face entries retain FontCache handles and preserve face/named-instance identity
 plus variable-axis assignments. Glyph masks are cached by font generation,
-glyph ID, and device size, then blended through the same premultiplied path.
+glyph ID, and device size, then blended as linear A8 coverage through the same
+linear-light path. Available CFF/Type1/CID drivers use Adobe hinting with
+size-dependent stem darkening; fallback TrueType fonts retain native hinting.
 FreeType objects and mask storage do not cross into scene or UI types. Builds
 without text rasterization use `-Dfreetype=false`; cross builds disable it by
 default. Eviction and LCD/subpixel policy await benchmark evidence.
@@ -555,10 +561,10 @@ semantics are established; transforms, subpixel coverage, paths, layers, and
 advanced color spaces remain open until both real backends validate them.
 
 Ourokit owns software lowering. Direct paths remain for clear and opaque
-rectangles. Pinned Pixman is an optional benchmark dependency and the selected
-private engine for future masks, transformed images, gradients, regions, and
-complex composition. Pixman types never enter scene, UI, or platform APIs, and
-default headless builds do not fetch or link it.
+rectangles. Pinned Pixman is an optional legacy encoded-8-bit benchmark
+dependency. Future lowering must preserve linear-light semantics. Pixman types
+never enter scene, UI, or platform APIs, and default headless builds do not
+fetch or link it.
 
 The Vulkan peer will own instance/device/queue selection, command buffers,
 exportable images and memory, synchronization, and pipeline/cache state.
