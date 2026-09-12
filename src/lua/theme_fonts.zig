@@ -56,20 +56,31 @@ pub const ThemeFonts = struct {
             else => return err,
         };
         defer candidates.deinit();
-        for (candidates.faces) |face| {
+        try self.appendFaces(candidates.faces, handles);
+    }
+
+    fn appendFaces(self: *ThemeFonts, faces: []const text.discovery.Face, handles: *std.ArrayList(text.FontHandle)) !void {
+        for (faces) |face| {
             const file = try std.Io.Dir.openFileAbsolute(self.io, face.file, .{});
             defer file.close(self.io);
             var buffer: [8192]u8 = undefined;
             var reader = file.reader(self.io, &buffer);
             const bytes = try reader.interface.allocRemaining(self.allocator, .limited(64 * 1024 * 1024));
             defer self.allocator.free(bytes);
-            const handle = try self.fonts.acquire(.{
+            const handle = self.fonts.acquire(.{
                 .key = .{ .file = face.file, .index = face.index, .variations = face.variations },
                 .bytes = bytes,
-            });
+            }) catch |err| switch (err) {
+                // Fontconfig can offer formats the shaping backend cannot
+                // read, such as WOFF2. One unusable fallback must not discard
+                // the bundled face or later usable system candidates.
+                error.InvalidFont => continue,
+                else => return err,
+            };
             errdefer self.fonts.release(handle) catch unreachable;
             try handles.append(self.allocator, handle);
         }
+        if (handles.items.len == 0) return error.NoMatch;
     }
 };
 
@@ -89,13 +100,7 @@ test "bundled theme families lead system fallbacks and reuse cached faces" {
             const expected = try text.bundled.acquire(&fonts, @enumFromInt(index), .regular, .roman);
             defer fonts.release(expected) catch unreachable;
             try std.testing.expectEqual(expected, regular[0]);
-            if (text.has_fontconfig) {
-                var database = try text.discovery.Database.init();
-                defer database.deinit();
-                var candidates = try database.candidates(std.testing.allocator, .{ .family = name });
-                defer candidates.deinit();
-                try std.testing.expectEqual(candidates.faces.len + 1, regular.len);
-            } else {
+            if (!text.has_fontconfig) {
                 try std.testing.expectEqual(@as(usize, 1), regular.len);
             }
         }
@@ -104,6 +109,51 @@ test "bundled theme families lead system fallbacks and reuse cached faces" {
         if (!text.has_fontconfig) try std.testing.expectError(error.FontconfigDisabled, themes.get("DejaVu Sans", false));
     }
     try std.testing.expectEqual(@as(usize, 0), fonts.active_count);
+}
+
+test "theme fallbacks skip invalid faces without losing usable fonts or their order" {
+    if (!text.has_fontconfig) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const latin = @embedFile("ourokit_test_font_static");
+    const arabic = @embedFile("ourokit_arabic_test_font");
+    const names = [_][]const u8{ "bad-first", "latin", "bad-middle", "arabic" };
+    const contents = [_][]const u8{ "not a font", latin, "wOF2invalid compressed font", arabic };
+    var faces: [4]text.discovery.Face = undefined;
+    var paths: [4][:0]const u8 = undefined;
+    var count: usize = 0;
+    defer for (paths[0..count]) |path| allocator.free(path);
+    for (names, contents, 0..) |name, bytes, index| {
+        try temporary.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+        paths[index] = try temporary.dir.realPathFileAlloc(io, name, allocator);
+        count += 1;
+        faces[index] = .{ .family = name, .file = paths[index], .index = 0, .variable = false, .variations = null, .coverage = null };
+    }
+    var fonts = text.FontCache.init(allocator);
+    defer fonts.deinit();
+    var themes: ThemeFonts = .{ .allocator = allocator, .io = io, .fonts = &fonts };
+    defer themes.deinit();
+    var handles: std.ArrayList(text.FontHandle) = .empty;
+    defer {
+        for (handles.items) |handle| fonts.release(handle) catch unreachable;
+        handles.deinit(allocator);
+    }
+    try themes.appendFaces(&faces, &handles);
+    try std.testing.expectEqual(@as(usize, 2), handles.items.len);
+    try std.testing.expectEqualSlices(u8, latin, (try fonts.get(handles.items[0])).raster_bytes);
+    try std.testing.expectEqualSlices(u8, arabic, (try fonts.get(handles.items[1])).raster_bytes);
+    for (handles.items) |handle| try fonts.release(handle);
+    handles.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), fonts.active_count);
+
+    try std.testing.expectError(error.NoMatch, themes.appendFaces(faces[0..1], &handles));
+    try std.testing.expectEqual(@as(usize, 0), handles.items.len);
+    const primary = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
+    try handles.append(allocator, primary);
+    try themes.appendFaces(faces[0..1], &handles);
+    try std.testing.expectEqualSlices(text.FontHandle, &.{primary}, handles.items);
 }
 
 test "bundled Latin font retains Arabic fallback shaping" {
