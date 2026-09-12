@@ -157,15 +157,9 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     defer fonts.deinit();
     var theme_fonts: @import("../lua/theme_fonts.zig").ThemeFonts = .{ .allocator = init.gpa, .io = init.io, .fonts = &fonts };
     defer theme_fonts.deinit();
-    const primary_font = try fonts.acquire(.{
-        .key = .{ .file = "/ourokit/storybook/Inter-Regular.ttf", .index = 0 },
-        .bytes = @embedFile("ourokit_storybook_font"),
-    });
+    const primary_font = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
     defer fonts.release(primary_font) catch unreachable;
-    const medium_font = try fonts.acquire(.{
-        .key = .{ .file = "/ourokit/storybook/Inter-Medium.ttf", .index = 0 },
-        .bytes = @embedFile("ourokit_storybook_medium_font"),
-    });
+    const medium_font = try text.bundled.acquire(&fonts, .sans, .semibold, .roman);
     defer fonts.release(medium_font) catch unreachable;
     const arabic_font = try fonts.acquire(.{
         .key = .{ .file = "/ourokit/storybook/NotoSansArabic.ttf", .index = 0 },

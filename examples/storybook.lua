@@ -47,9 +47,52 @@ local function listbox_story()
   }
 end
 
+local function bundled_fonts_story()
+  local names = { "Source Sans 3", "Source Serif 4", "Source Code Pro" }
+  local families = { "sans-serif", "serif", "monospace" }
+  local children = {}
+  for index = 1, 3 do
+    children[#children + 1] = ouro.theme {
+      key = families[index],
+      typography = { family = families[index] },
+      children = {
+        ouro.column {
+          key = "samples",
+          gap = 8,
+          children = {
+            ouro.text { key = "family", text = names[index], size = 24 },
+            ouro.text { key = "small", text = "12px: The quick brown fox. 0O 1Il {} []", size = 12 },
+            ouro.text { key = "body", text = "16px: Café — Ελληνικά — Кириллица", size = 16 },
+            ouro.button { key = "emphasis", label = "Semibold control" },
+          },
+        },
+      },
+    }
+  end
+  return ouro.column { key = "content", gap = 24, children = children }
+end
+
 return ouro.storybook {
   title = "Ourokit built-in widgets",
   stories = {
+    ouro.story {
+      id = "text/bundled-fonts-light",
+      group = "Text",
+      name = "Bundled fonts (light)",
+      viewport = { width = 600, height = 520 },
+      snapshot_scale = 2,
+      color_scheme = "light",
+      content = bundled_fonts_story,
+    },
+    ouro.story {
+      id = "text/bundled-fonts-dark",
+      group = "Text",
+      name = "Bundled fonts (dark)",
+      viewport = { width = 600, height = 520 },
+      snapshot_scale = 2,
+      color_scheme = "dark",
+      content = bundled_fonts_story,
+    },
     ouro.story {
       id = "text/default",
       group = "Text",

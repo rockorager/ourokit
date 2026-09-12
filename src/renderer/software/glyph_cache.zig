@@ -187,3 +187,28 @@ fn copyBitmap(destination: []u8, source: c.FT_Bitmap) void {
         }
     }
 }
+
+test "bundled CFF faces rasterize grayscale outlines in every weight and style" {
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    var glyphs = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer glyphs.deinit();
+    for (std.enums.values(text.bundled.Family)) |family| {
+        for (std.enums.values(text.bundled.Weight)) |weight| {
+            for (std.enums.values(text.bundled.Style)) |style| {
+                const handle = try text.bundled.acquire(&fonts, family, weight, style);
+                defer fonts.release(handle) catch unreachable;
+                const font = try fonts.get(handle);
+                for ([_]f32{ 12, 24 }) |size| {
+                    const bitmap = try glyphs.get(handle, font.nominalGlyph('S').?, size);
+                    try std.testing.expect(bitmap.width > 0 and bitmap.height > 0);
+                    var has_partial_coverage = false;
+                    for (bitmap.pixels) |coverage| {
+                        has_partial_coverage = has_partial_coverage or (coverage > 0 and coverage < 255);
+                    }
+                    try std.testing.expect(has_partial_coverage);
+                }
+            }
+        }
+    }
+}

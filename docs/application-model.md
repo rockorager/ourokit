@@ -514,12 +514,16 @@ are non-negative logical pixels. A zero border width disables the border,
 including its focus-color treatment. A theme does not change widget behavior,
 container gaps, application layout, or explicit dimensions.
 
-`typography.family` selects an installed family (including `serif`, `sans-serif`,
-and `monospace`) through Fontconfig. Names are copied, not retained Lua strings;
-the host caches loaded font candidates. Family overrides require a
-Fontconfig-enabled build and a host font service. Omit the family to retain the
-host's fonts, including the pinned fonts in deterministic Storybook snapshots.
-Snapshots with an explicit family depend on the installed system fonts.
+`typography.family` selects bundled Source Sans 3 (`sans-serif`), Source Serif 4
+(`serif`), or Source Code Pro (`monospace`). Exact Source family names also work.
+These families do not require Fontconfig. Other names select installed families
+through Fontconfig, which also supplies missing-character fallbacks when enabled.
+Names are copied, not retained Lua strings; the host caches loaded candidates.
+Family overrides require a host font service. Omit the family to retain the
+host's fonts: the standard runner defaults to Source Sans 3 with system fallback,
+and Storybook uses Source Sans 3 with pinned Noto Sans Arabic fallback.
+Explicit-family snapshots can depend on system fonts for fallback characters
+or non-bundled families.
 
 The app declaration is a fixed default, copied at load/reload. For a reactive
 override, return `ouro.theme { key = "local", controls = { radius = radius() },

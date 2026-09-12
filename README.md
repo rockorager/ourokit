@@ -361,7 +361,7 @@ zig-out/bin/ouroctl storybook snapshot examples/storybook.lua \
 Each story declares a fixed logical viewport, optional `snapshot_scale`, color
 scheme, and ordinary Ourokit content callback. Snapshot scale affects PNG
 raster dimensions only; the interactive browser uses its window's native
-output scale. Snapshots use pinned Inter and Noto Sans Arabic fixtures, write
+output scale. Snapshots use bundled Source Sans 3 and pinned Noto Sans Arabic, write
 PNG files atomically beneath the output directory, and report SHA-256 hashes. A
 fresh Lua VM and retained UI runtime are created for each PNG so signals,
 globals, tasks, and widget state cannot leak between stories. Slash-separated

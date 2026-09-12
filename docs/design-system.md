@@ -50,9 +50,11 @@ Exact source/version/license and transformation details are recorded in
 `design/provenance/radix.md`. Spectrum 2 and shadcn/ui informed earlier design
 iterations and remain attributed under `design/provenance`, but neither is the
 current source of truth.
-The canonical typography family is generic `sans-serif`; on Linux the text
-service resolves it through Fontconfig so user and system configuration remain
-authoritative. Pinned Inter and Noto files are deterministic shaping fixtures,
-not production defaults; their source and license provenance are recorded under
-`design/provenance`. Component schemas and constructor generation remain future
-work.
+The canonical typography family is generic `sans-serif`, backed by bundled
+Source Sans 3. Generic `serif` and `monospace` select bundled Source Serif 4
+and Source Code Pro. Regular text uses Regular and emphasized controls use
+Semibold. Other explicit family names and missing-character fallback use
+Fontconfig on Linux. Source font revisions and licenses are recorded in
+`design/provenance/source-fonts.md`. Inter remains a shaping-test fixture;
+Noto Sans Arabic supplies deterministic complex-script fallback in snapshots.
+Component schemas and constructor generation remain future work.

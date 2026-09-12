@@ -337,9 +337,12 @@ fallback. Output contains
 paragraph-relative clusters, glyph IDs, advances, offsets, font metrics, and
 unsafe-break flags in logical `f32` units.
 
-The canonical design family is generic `sans-serif`. Native Linux builds enable
-a focused Fontconfig discovery capability by default; minimal/headless and cross
-builds may disable it. One application-owned database holds an explicit
+The canonical design family is generic `sans-serif`, resolved to bundled
+Source Sans 3. `serif` and `monospace` resolve to bundled Source Serif 4 and
+Source Code Pro. The native host prepends the bundled face to system fallback
+candidates; other explicit family names still use Fontconfig. Native Linux
+builds enable Fontconfig discovery by default; minimal/headless and cross
+builds may disable it while retaining bundled fonts. A database holds an explicit
 configuration snapshot. Queries apply config and default substitutions, then
 retain `FcFontSort`'s configured, coverage-trimmed order as owned face metadata:
 family, file, complete face/named-instance index, variable status, variations,

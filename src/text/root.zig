@@ -17,6 +17,7 @@ const word_break = @import("word_break.zig");
 
 pub const has_fontconfig = api.has_fontconfig;
 pub const discovery = api.discovery;
+pub const bundled = @import("bundled.zig");
 pub const Direction = api.Direction;
 pub const Script = api.Script;
 pub const Glyph = api.Glyph;
@@ -84,6 +85,7 @@ pub const ParagraphCache = paragraph_cache.ParagraphCache;
 
 test {
     _ = word_break;
+    _ = bundled;
 }
 pub const ParagraphSourceHandle = paragraph_source_cache.ParagraphSourceHandle;
 pub const ParagraphSource = paragraph_source_cache.ParagraphSource;

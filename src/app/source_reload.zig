@@ -1069,8 +1069,8 @@ test "a later window build failure leaves every retained window on the active ge
     const services: source_generation.UiServices = .{
         .paragraph_sources = &paragraph_sources,
         .paragraphs = &paragraphs,
-        .primary_font = font,
-        .medium_font = font,
+        .font_candidates = &.{font},
+        .medium_font_candidates = &.{font},
         .theme = design.tokens.light,
         .callbacks = &callbacks,
         .images = &images,

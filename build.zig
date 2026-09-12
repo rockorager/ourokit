@@ -190,11 +190,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(library);
     b.installFile("tools/image/THIRD_PARTY_NOTICES.txt", "share/licenses/ourokit/image-codecs.txt");
     b.installFile("tools/image/RUST_LIBRARY_LICENSES.html", "share/licenses/ourokit/rust-library.html");
+    inline for (.{ "SourceSans3", "SourceSerif4", "SourceCodePro" }) |family| {
+        b.installFile("src/text/fonts/" ++ family ++ "-LICENSE.md", "share/licenses/ourokit/" ++ family ++ ".md");
+    }
 
     const storybook_font = b.lazyDependency("inter", .{}) orelse return;
-    ourokit.addAnonymousImport("ourokit_storybook_font", .{
-        .root_source_file = storybook_font.path("extras/ttf/Inter-Regular.ttf"),
-    });
+    // Retained for existing widget weight-selection fixtures, not host defaults.
     ourokit.addAnonymousImport("ourokit_storybook_medium_font", .{
         .root_source_file = storybook_font.path("extras/ttf/Inter-Medium.ttf"),
     });

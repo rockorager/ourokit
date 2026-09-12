@@ -152,9 +152,18 @@ word-wise editor navigation and deletion.
 
 ## Fonts and fallback
 
-The canonical UI request is generic `sans-serif`, not a hard-coded face.
-Fontconfig applies the user's configured aliases and substitutions and returns
-an ordered, coverage-trimmed fallback candidate set. Ourokit copies each
+The standard UI host uses bundled Source Sans 3 for `sans-serif`, Source Serif 4
+for `serif`, and Source Code Pro for `monospace`. Exact Source family names also
+select the bundled files. Each family supplies static CFF Regular, Semibold,
+and Bold faces with matching italics. `text.bundled.acquire` loads these into
+a caller-owned font cache without filesystem access or Fontconfig; the caller
+releases the returned handle. The current UI's emphasized controls use Semibold.
+See [font provenance](../design/provenance/source-fonts.md) for pinned revisions
+and redistribution notices.
+
+For other installed family names and fallback after a bundled face, Fontconfig
+applies the user's configured aliases and substitutions and returns an ordered,
+coverage-trimmed candidate set. Ourokit copies each
 candidate's family, file, complete face/named-instance index, variable-font
 metadata, variation string, and charset coverage out of Fontconfig-owned
 patterns. The database is an explicit application-owned configuration snapshot;
@@ -169,10 +178,10 @@ Arabic joining context and combining/emoji sequences therefore survive a
 necessary face boundary. An unresolved grapheme is retained as the primary
 face's `.notdef` and reported rather than silently omitted.
 
-Zig fetches exact Inter 4.1 and Noto Sans Arabic 2.013 releases only for
-deterministic Latin and complex-script shaping tests; normal library artifacts
-do not embed them. Their source, version, and SIL Open Font License provenance
-are under `design/provenance`.
+Zig also fetches exact Inter 4.1 and Noto Sans Arabic 2.013 releases for
+deterministic shaping tests. Storybook snapshots use bundled Source Sans 3
+with pinned Noto Sans Arabic fallback. Their source, version, and SIL Open Font
+License provenance are under `design/provenance`.
 
 The `Font` API owns a copied font blob and exposes nominal cmap coverage.
 Fontconfig's full index is preserved for collection/named-instance selection;

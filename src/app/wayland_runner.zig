@@ -92,12 +92,10 @@ pub fn runSource(
     provider: *const bundle.SourceProvider,
     options: Options,
 ) !void {
-    if (comptime text.has_fontconfig) {
-        return runSourceWithFontconfig(init, provider, options) catch |err| {
-            if (err != error.ApplicationInterrupted) return err;
-        };
-    }
-    return error.FontconfigDisabled;
+    if (!renderer.software.has_freetype) return error.FreeTypeDisabled;
+    return runSourceInternal(init, provider, options) catch |err| {
+        if (err != error.ApplicationInterrupted) return err;
+    };
 }
 
 /// Evaluates only the declaration for packaging. No listener, appearance
@@ -139,7 +137,7 @@ pub fn exportCatalog(init: std.process.Init, provider: *const bundle.SourceProvi
     return @import("catalog.zig").descriptor(init.gpa, &generation.application);
 }
 
-fn runSourceWithFontconfig(
+fn runSourceInternal(
     init: std.process.Init,
     provider: *const bundle.SourceProvider,
     options: Options,
@@ -299,31 +297,12 @@ fn runSourceWithFontconfig(
         failActivation(control, &source_reload, &loop, null, err) catch {};
     };
 
-    var database = try text.discovery.Database.init();
-    defer database.deinit();
-    var configured_fonts = try database.candidates(init.gpa, .{
-        .family = "sans-serif",
-        .language = "en",
-        .pixel_size = 14,
-    });
-    defer configured_fonts.deinit();
-    if (configured_fonts.faces.len == 0) return error.ConfiguredSansSerifNotFound;
-    var configured_medium_fonts = try database.candidates(init.gpa, .{
-        .family = "sans-serif",
-        .language = "en",
-        .pixel_size = 14,
-        .weight = .medium,
-    });
-    defer configured_medium_fonts.deinit();
-    if (configured_medium_fonts.faces.len == 0) return error.ConfiguredSansSerifMediumNotFound;
     var fonts = text.FontCache.init(init.gpa);
     defer fonts.deinit();
     var theme_fonts: @import("../lua/theme_fonts.zig").ThemeFonts = .{ .allocator = init.gpa, .io = init.io, .fonts = &fonts };
     defer theme_fonts.deinit();
-    const primary_font = try loadFont(init, &fonts, configured_fonts.faces[0]);
-    defer fonts.release(primary_font) catch unreachable;
-    const medium_font = try loadFont(init, &fonts, configured_medium_fonts.faces[0]);
-    defer fonts.release(medium_font) catch unreachable;
+    const font_candidates = try theme_fonts.get("sans-serif", false);
+    const medium_font_candidates = try theme_fonts.get("sans-serif", true);
     var paragraph_sources = text.ParagraphSourceCache.init(init.gpa, &fonts);
     defer paragraph_sources.deinit();
     var paragraphs = text.ParagraphCache.init(init.gpa, &fonts);
@@ -344,8 +323,8 @@ fn runSourceWithFontconfig(
     const services: source_generation.UiServices = .{
         .paragraph_sources = &paragraph_sources,
         .paragraphs = &paragraphs,
-        .primary_font = primary_font,
-        .medium_font = medium_font,
+        .font_candidates = font_candidates,
+        .medium_font_candidates = medium_font_candidates,
         .theme = theme,
         .callbacks = &callbacks,
         .theme_fonts = &theme_fonts,
@@ -1267,23 +1246,6 @@ fn shutdownControl(
         control.collectClosed();
     }
     control.deinit();
-}
-
-fn loadFont(
-    init: std.process.Init,
-    cache: *text.FontCache,
-    face: text.discovery.Face,
-) !text.FontHandle {
-    const file = try std.Io.Dir.openFileAbsolute(init.io, face.file, .{});
-    defer file.close(init.io);
-    var buffer: [8192]u8 = undefined;
-    var reader = file.reader(init.io, &buffer);
-    const bytes = try reader.interface.allocRemaining(init.gpa, .limited(64 * 1024 * 1024));
-    defer init.gpa.free(bytes);
-    return cache.acquire(.{
-        .key = .{ .file = face.file, .index = face.index, .variations = face.variations },
-        .bytes = bytes,
-    });
 }
 
 fn syncRuntimeSlots(

@@ -29,8 +29,9 @@ pub const Config = struct {
 pub const UiServices = struct {
     paragraph_sources: *text.ParagraphSourceCache,
     paragraphs: *text.ParagraphCache,
-    primary_font: text.FontHandle,
-    medium_font: text.FontHandle,
+    /// Ordered candidates borrowed from the host for the services' lifetime.
+    font_candidates: []const text.FontHandle,
+    medium_font_candidates: []const text.FontHandle,
     theme: design.tokens.Theme,
     callbacks: *lua.CallbackRegistry,
     theme_fonts: ?*@import("../lua/theme_fonts.zig").ThemeFonts = null,
@@ -55,8 +56,6 @@ pub const SourceGeneration = struct {
     shell_workspaces: ?lua.ShellWorkspaces = null,
     descriptor_storage: []ui.instance.Descriptor,
     semantic_storage: []ui.semantics.Descriptor,
-    font_candidates: [1]text.FontHandle,
-    medium_font_candidates: [1]text.FontHandle,
     callbacks: ?*lua.CallbackRegistry,
     ui_build: lua.UiBuild,
     application: lua.Application,
@@ -347,9 +346,7 @@ pub const SourceGeneration = struct {
         if (services) |value| {
             self.callbacks = value.callbacks;
             self.ui_build.attachCallbacks(value.callbacks, &self.vm);
-            self.font_candidates = .{value.primary_font};
-            self.medium_font_candidates = .{value.medium_font};
-            self.ui_build.attachText(value.paragraph_sources, &self.font_candidates, 1) catch |err| {
+            self.ui_build.attachText(value.paragraph_sources, value.font_candidates, 1) catch |err| {
                 lua.recordDiagnosticError(
                     diagnostic,
                     allocator,
@@ -359,7 +356,7 @@ pub const SourceGeneration = struct {
                 );
                 return err;
             };
-            self.ui_build.attachMediumText(&self.medium_font_candidates) catch |err| {
+            self.ui_build.attachMediumText(value.medium_font_candidates) catch |err| {
                 lua.recordDiagnosticError(
                     diagnostic,
                     allocator,
@@ -536,10 +533,8 @@ pub const SourceGeneration = struct {
         self.services = services;
         self.callbacks = services.callbacks;
         self.ui_build.attachCallbacks(services.callbacks, &self.vm);
-        self.font_candidates = .{services.primary_font};
-        self.medium_font_candidates = .{services.medium_font};
-        try self.ui_build.attachText(services.paragraph_sources, &self.font_candidates, 1);
-        try self.ui_build.attachMediumText(&self.medium_font_candidates);
+        try self.ui_build.attachText(services.paragraph_sources, services.font_candidates, 1);
+        try self.ui_build.attachMediumText(services.medium_font_candidates);
         self.ui_build.enableDeclarativeWidgets(services.theme);
         self.ui_build.widget_theme = self.application.resolvedTheme(services.theme);
         self.ui_build.theme_fonts = services.theme_fonts;
