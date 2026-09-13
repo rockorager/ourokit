@@ -470,14 +470,25 @@ pub const Loop = struct {
             .timer_update => {
                 if (decoded.generation != self.alarm_generation) return .stale;
                 if (self.control != .update) return .stale;
-                if (cqe.res == 0) self.alarm_deadline_ns = self.control_deadline_ns;
+                if (cqe.res == 0) {
+                    self.alarm_deadline_ns = self.control_deadline_ns;
+                } else if (cqe.res == -@as(i32, @intFromEnum(linux.E.NOENT)) and self.alarm_active) {
+                    // The alarm expired before the update reached it. Its CQE
+                    // is still pending; retire this generation instead of
+                    // submitting an immediately failing update every turn.
+                    self.alarm_active = false;
+                    self.retired_alarm_generation = self.alarm_generation;
+                }
                 self.control = .none;
                 return .timer_control;
             },
             .timer_remove => {
                 if (decoded.generation != self.alarm_generation) return .stale;
                 if (self.control != .remove) return .stale;
-                if (cqe.res == 0) {
+                if (cqe.res == 0 or (cqe.res == -@as(i32, @intFromEnum(linux.E.NOENT)) and self.alarm_active)) {
+                    // ENOENT means the alarm already fired, but its CQE can be
+                    // behind this control CQE. Treat both outcomes as retired
+                    // so synchronizeAlarm cannot flood the CQ with retries.
                     self.alarm_active = false;
                     self.retired_alarm_generation = self.alarm_generation;
                 }
@@ -737,6 +748,65 @@ test "logical cancellation invalidates immediately and removes the kernel alarm"
     try std.testing.expectError(error.StaleOperation, loop.prepareCancel(operation));
     try drainKernelTimer(&loop);
     try std.testing.expect((try loop.takeExpired()) == null);
+}
+
+test "missing kernel alarm control retires generation without retrying" {
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 1);
+    defer loop.deinit();
+
+    const operation = try loop.prepareTimeout(std.time.ns_per_s);
+    _ = try loop.submit();
+    try loop.prepareCancel(operation);
+    try loop.synchronizeAlarm();
+    try std.testing.expectEqual(Control.remove, loop.control);
+
+    const generation = loop.alarm_generation;
+    try std.testing.expectEqual(Dispatch.timer_control, loop.dispatch(.{
+        .user_data = encode(.timer_remove, generation),
+        .res = -@as(i32, @intFromEnum(linux.E.NOENT)),
+        .flags = 0,
+    }));
+    try std.testing.expect(!loop.alarm_active);
+    try std.testing.expectEqual(generation, loop.retired_alarm_generation.?);
+
+    // The next submit must not enqueue another remove while the original
+    // alarm CQE is pending. Consuming that CQE completes retirement.
+    const pending_before = loop.ring.sq.sqe_tail - loop.ring.sq.sqe_head;
+    try loop.synchronizeAlarm();
+    try std.testing.expectEqual(pending_before, loop.ring.sq.sqe_tail - loop.ring.sq.sqe_head);
+    try std.testing.expectEqual(Dispatch.timer_control, loop.dispatch(.{
+        .user_data = encode(.timer_alarm, generation),
+        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .flags = 0,
+    }));
+    try std.testing.expect(loop.retired_alarm_generation == null);
+    try std.testing.expect(!loop.hasPendingTimerKernelWork());
+}
+
+test "missing alarm control after consumed expiry does not wait for another alarm CQE" {
+    for ([_]Control{ .remove, .update }) |control| {
+        var loop: Loop = undefined;
+        try loop.init(std.testing.allocator, 8, 1);
+        defer loop.deinit();
+        const operation = try loop.prepareTimeout(std.time.ns_per_s);
+        _ = try loop.submit();
+        try loop.prepareCancel(operation);
+        loop.control = control;
+        const generation = loop.alarm_generation;
+        try std.testing.expectEqual(Dispatch.timer_wakeup, loop.dispatch(.{
+            .user_data = encode(.timer_alarm, generation),
+            .res = -@as(i32, @intFromEnum(linux.E.TIME)),
+            .flags = 0,
+        }));
+        try std.testing.expectEqual(Dispatch.timer_control, loop.dispatch(.{
+            .user_data = encode(if (control == .remove) .timer_remove else .timer_update, generation),
+            .res = -@as(i32, @intFromEnum(linux.E.NOENT)),
+            .flags = 0,
+        }));
+        try std.testing.expect(loop.retired_alarm_generation == null);
+        try std.testing.expect(!loop.hasPendingTimerKernelWork());
+    }
 }
 
 test "socket operations accept receive and send on a Unix socket" {

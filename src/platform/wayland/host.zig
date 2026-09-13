@@ -501,6 +501,7 @@ const LayerState = struct {
     exclusive_edge: ?platform_window.Edge,
     margins: platform_window.Margins,
     keyboard_interactivity: platform_window.KeyboardInteractivity,
+    background_effect: ?platform_window.BackgroundEffect,
 
     fn init(allocator: std.mem.Allocator, declaration: platform_window.LayerSurfaceDeclaration) !LayerState {
         const namespace = try allocator.dupe(u8, declaration.namespace);
@@ -517,6 +518,7 @@ const LayerState = struct {
             .exclusive_edge = declaration.exclusive_edge,
             .margins = declaration.margins,
             .keyboard_interactivity = declaration.keyboard_interactivity,
+            .background_effect = declaration.background_effect,
         };
     }
 
@@ -533,6 +535,7 @@ const LayerState = struct {
             .exclusive_edge = self.exclusive_edge,
             .margins = self.margins,
             .keyboard_interactivity = self.keyboard_interactivity,
+            .background_effect = self.background_effect,
         };
     }
 
@@ -545,6 +548,7 @@ const LayerState = struct {
         self.exclusive_edge = declaration.exclusive_edge;
         self.margins = declaration.margins;
         self.keyboard_interactivity = declaration.keyboard_interactivity;
+        self.background_effect = declaration.background_effect;
     }
 
     fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
@@ -562,6 +566,7 @@ const Window = struct {
     xdg_surface: ?Handle = null,
     toplevel: ?Handle = null,
     layer_surface: ?Handle = null,
+    background_effect: ?Handle = null,
     layer_state: ?LayerState = null,
     output_global_name: ?u32 = null,
     recreate: bool = false,
@@ -625,11 +630,6 @@ const Window = struct {
             if (feedback.* != null and feedback.*.?.id == object_id) return feedback;
         return null;
     }
-
-    fn hasPresentationFeedback(self: *const Window) bool {
-        for (self.presentation_feedbacks) |feedback| if (feedback != null) return true;
-        return false;
-    }
 };
 
 pub const Host = struct {
@@ -655,6 +655,9 @@ pub const Host = struct {
     presentation_clock_id: ?u32 = null,
     viewporter: ?Handle = null,
     fractional_scale_manager: ?Handle = null,
+    background_effect_manager: ?Handle = null,
+    background_effect_global_name: ?u32 = null,
+    blur_supported: bool = false,
     sync_manager: ?Handle = null,
     wm_base: ?Handle = null,
     activation: ?Handle = null,
@@ -728,6 +731,9 @@ pub const Host = struct {
         self.presentation_clock_id = null;
         self.viewporter = null;
         self.fractional_scale_manager = null;
+        self.background_effect_manager = null;
+        self.background_effect_global_name = null;
+        self.blur_supported = false;
         self.sync_manager = null;
         self.wm_base = null;
         self.activation = null;
@@ -906,6 +912,10 @@ pub const Host = struct {
     /// connection alive and uses Wayring's destroyed-object tombstones.
     pub fn beginShutdown(self: *Host) !void {
         if (self.disconnect_started) return;
+        // No release or leave may arrive after the transport starts closing.
+        // Retire repeat ownership before publishing closed windows so an
+        // already-due logical timer cannot target a stale window handle.
+        try self.keyboard_repeat.stop(self.loop);
         if ((try self.connection.actor()).lifecycle == .open and
             try self.connection.prepareClose()) self.submission_pending = true;
         self.disconnect_started = true;
@@ -1437,8 +1447,7 @@ pub const Host = struct {
 
     fn maintainWindows(self: *Host) !void {
         for (self.windows) |*window| {
-            if (window.state == .closing and window.frame_callback == null and !window.hasPresentationFeedback())
-                try self.destroySurfaces(window);
+            if (window.state == .closing) try self.destroySurfaces(window);
             if (window.state != .surfaces_destroyed) continue;
             const objects = &self.connection.objects;
             const transmit = try self.queue();
@@ -1503,7 +1512,6 @@ pub const Host = struct {
     }
 
     fn destroySurfaces(self: *Host, window: *Window) !void {
-        std.debug.assert(window.frame_callback == null);
         if (self.text_input_active) |active|
             if (sameWindow(active, window.handle)) try self.disableTextInput(window.handle);
         _ = self.text_input_pending.leave(window.handle);
@@ -1518,8 +1526,21 @@ pub const Host = struct {
         }
         const objects = &self.connection.objects;
         const transmit = try self.queue();
+        // These callback-only proxies need no wire destructor. Hidden outputs
+        // may never deliver frame/presentation events; waiting prevents close
+        // and reopening. Tombstones discard late events until delete_id.
+        if (window.frame_callback) |handle| {
+            _ = try objects.retireLocal(handle);
+            window.frame_callback = null;
+        }
+        for (&window.presentation_feedbacks) |*feedback| if (feedback.*) |handle| {
+            _ = try objects.retireLocal(handle);
+            feedback.* = null;
+        };
         if (window.fractional_scale) |handle|
             try wayring.client.sendRequest(protocol.wp_fractional_scale_v1, objects, transmit, handle, .{ .destroy = .{} });
+        if (window.background_effect) |handle|
+            try wayring.client.sendRequest(protocol.ext_background_effect_surface_v1, objects, transmit, handle, .{ .destroy = .{} });
         if (window.viewport) |handle|
             try wayring.client.sendRequest(protocol.wp_viewport, objects, transmit, handle, .{ .destroy = .{} });
         if (window.toplevel) |handle|
@@ -1541,6 +1562,7 @@ pub const Host = struct {
         window.toplevel = null;
         window.xdg_surface = null;
         window.layer_surface = null;
+        window.background_effect = null;
         window.output_global_name = null;
         window.fractional_scale = null;
         window.viewport = null;
@@ -1766,6 +1788,7 @@ pub const Host = struct {
             declaration.height,
             fractional_scale_denominator,
         );
+        try setBackgroundEffect(objects, transmit, self.compositor.?, self.background_effect_manager, self.blur_supported, surface, &window.background_effect, declaration.background_effect);
         try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
         window.state = .open;
         window.surface = surface;
@@ -1849,6 +1872,7 @@ pub const Host = struct {
                 window.layer != declaration.layer,
                 self.layer_shell_version,
             );
+            try setBackgroundEffect(objects, transmit, self.compositor.?, self.background_effect_manager, self.blur_supported, window.surface.?, &window.background_effect, declaration.background_effect);
             try wayring.client.sendRequest(
                 protocol.wl_surface,
                 objects,
@@ -1909,6 +1933,20 @@ pub const Host = struct {
                     if (self.text_input_manager_global_name != null and
                         self.text_input_manager_global_name.? == removed.name)
                         try self.releaseTextInputManager();
+                    if (self.background_effect_global_name == removed.name) {
+                        self.blur_supported = false;
+                        try self.refreshBackgroundEffects();
+                        try wayring.client.sendRequest(protocol.ext_background_effect_manager_v1, objects, try self.queue(), self.background_effect_manager.?, .{ .destroy = .{} });
+                        self.background_effect_manager = null;
+                        self.background_effect_global_name = null;
+                    }
+                },
+            }
+        } else if (interface == &protocol.ext_background_effect_manager_v1.info) {
+            switch (try wayring.client.decodeEvent(protocol.ext_background_effect_manager_v1, objects, self.background_effect_manager.?, message, fds)) {
+                .capabilities => |value| {
+                    self.blur_supported = value.flags.toInt() & 1 != 0;
+                    try self.refreshBackgroundEffects();
                 },
             }
         } else if (interface == &protocol.wl_output.info) {
@@ -2208,6 +2246,17 @@ pub const Host = struct {
         return .continue_dispatch;
     }
 
+    fn refreshBackgroundEffects(self: *Host) !void {
+        const objects = &self.connection.objects;
+        const transmit = try self.queue();
+        for (self.windows) |*window| {
+            if (window.state != .open or window.layer_state == null) continue;
+            try setBackgroundEffect(objects, transmit, self.compositor.?, self.background_effect_manager, self.blur_supported, window.surface.?, &window.background_effect, window.layer_state.?.background_effect);
+            try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, window.surface.?, .{ .commit = .{} });
+        }
+        _ = try self.driver.schedule();
+    }
+
     fn bindGlobal(self: *Host, global: protocol.wl_registry.Event_global) !void {
         const objects = &self.connection.objects;
         const transmit = try self.queue();
@@ -2263,6 +2312,9 @@ pub const Host = struct {
                 1,
                 null,
             );
+        } else if (std.mem.eql(u8, global.interface, protocol.ext_background_effect_manager_v1.info.name)) {
+            self.background_effect_manager = try Core.bind(objects, transmit, self.registry, global.name, &protocol.ext_background_effect_manager_v1.info, 1, null);
+            self.background_effect_global_name = global.name;
         } else if (self.vulkan != null and
             std.mem.eql(u8, global.interface, protocol.wp_linux_drm_syncobj_manager_v1.info.name))
         {
@@ -2929,6 +2981,47 @@ fn edgeValue(edge: platform_window.Edge) protocol.zwlr_layer_surface_v1.anchor {
     };
 }
 
+/// A positive surface-local region covering every representable surface size.
+/// The protocol clips it to the surface, including after resize/scale changes.
+/// NULL means no blur, not an infinite region. Region state is copied and
+/// double buffered; the caller commits the surface after this request.
+fn setBackgroundEffect(
+    objects: *wayring.objects.ClientObjects,
+    transmit: *wayring.tx.Queue,
+    compositor: Handle,
+    manager: ?Handle,
+    blur_supported: bool,
+    surface: Handle,
+    effect: *?Handle,
+    requested: ?platform_window.BackgroundEffect,
+) !void {
+    if (manager == null or !blur_supported or requested == null) {
+        if (effect.*) |handle| {
+            try wayring.client.sendRequest(protocol.ext_background_effect_surface_v1, objects, transmit, handle, .{ .destroy = .{} });
+            effect.* = null;
+        }
+        return;
+    }
+    if (effect.* != null) return;
+    effect.* = (try protocol.ext_background_effect_manager_v1.construct_get_background_effect(
+        objects,
+        transmit,
+        manager.?,
+        .{ .surface = surface.id },
+    )).id;
+    const region = (try protocol.wl_compositor.construct_create_region(objects, transmit, compositor, .{})).id;
+    try wayring.client.sendRequest(protocol.wl_region, objects, transmit, region, .{ .add = .{
+        .x = 0,
+        .y = 0,
+        .width = std.math.maxInt(i32),
+        .height = std.math.maxInt(i32),
+    } });
+    try wayring.client.sendRequest(protocol.ext_background_effect_surface_v1, objects, transmit, effect.*.?, .{
+        .set_blur_region = .{ .region = region.id },
+    });
+    try wayring.client.sendRequest(protocol.wl_region, objects, transmit, region, .{ .destroy = .{} });
+}
+
 fn setLayerSurfaceState(
     objects: *wayring.objects.ClientObjects,
     transmit: *wayring.tx.Queue,
@@ -3140,6 +3233,141 @@ test "Wayland activation binds version one and queues the supplied token and sur
     try args.finish();
 }
 
+test "layer background teardown retires pending callbacks and destroys effect before surface" {
+    const allocator = std.testing.allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 8 }, (Config{ .app_id = "test" }).reactor);
+    defer reactor.deinit(allocator);
+    const socket_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket_result) != .SUCCESS) return error.SocketFailed;
+    const peer = try reactor.attach(@intCast(socket_result), .{
+        .received_fd_budget = 0,
+        .transmit_byte_budget = 4096,
+        .transmit_fd_budget = 0,
+    });
+    defer reactor.destroyPeer(peer) catch unreachable;
+    var host: Host = undefined;
+    host.connection = .{
+        .reactor = &reactor,
+        .peer = peer,
+        .objects = try wayring.objects.ClientObjects.init(allocator, 16, 16, &protocol.wl_display.info, null),
+    };
+    defer host.connection.objects.deinit(allocator);
+    host.driver = Driver.init(&host.connection);
+    host.text_input_active = null;
+    host.text_input_pending = TextInput.Pending.init(allocator);
+    defer host.text_input_pending.deinit();
+    host.pointer_focus = null;
+    host.keyboard_focus = null;
+    const objects = &host.connection.objects;
+    const surface = try objects.createLocal(&protocol.wl_surface.info, 4, null);
+    const layer = try objects.createLocal(&protocol.zwlr_layer_surface_v1.info, 4, null);
+    const effect = try objects.createLocal(&protocol.ext_background_effect_surface_v1.info, 1, null);
+    const callback = try objects.createLocal(&protocol.wl_callback.info, 1, null);
+    const feedback = try objects.createLocal(&protocol.wp_presentation_feedback.info, 1, null);
+    var window: Window = .{
+        .state = .closing,
+        .surface = surface,
+        .layer_surface = layer,
+        .background_effect = effect,
+        .frame_callback = callback,
+    };
+    try std.testing.expect(window.addPresentationFeedback(feedback));
+    try host.destroySurfaces(&window);
+    try std.testing.expectEqual(WindowState.surfaces_destroyed, window.state);
+    try std.testing.expectEqual(null, window.background_effect);
+    try std.testing.expectEqual(null, window.frame_callback);
+    try std.testing.expectEqual(null, window.presentation_feedbacks[0]);
+    for ([_]Handle{ effect, layer, surface, callback, feedback }) |handle|
+        try std.testing.expect(objects.namespace.resolve(handle).?.destroyed);
+    const snapshot = try (try host.queue()).snapshot(&.{}, &.{});
+    var bytes = snapshot.first;
+    // Callback/feedback retirement is local; only these three have requests.
+    for ([_]Handle{ effect, layer, surface }, [_]u16{ 0, 7, 0 }) |handle, opcode| {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(handle.id, message.header.object_id);
+        try std.testing.expectEqual(opcode, message.header.opcode);
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+}
+
+test "layer background effect wire requests cover fallback removal and recreation" {
+    const allocator = std.testing.allocator;
+    var objects = try wayring.objects.ClientObjects.init(allocator, 32, 32, &protocol.wl_display.info, null);
+    defer objects.deinit(allocator);
+    var blocks = try wayring.pool.SharedBlocks.init(allocator, 4096, 1);
+    defer blocks.deinit(allocator);
+    var fds = try wayring.pool.SharedFds.init(allocator, 1);
+    defer fds.deinit(allocator);
+    var transmit = wayring.tx.Queue.init(&blocks, 4096, &fds, 0);
+    defer transmit.deinit();
+    const compositor = try objects.createLocal(&protocol.wl_compositor.info, 4, null);
+    const manager = try objects.createLocal(&protocol.ext_background_effect_manager_v1.info, 1, null);
+    const surface = try objects.createLocal(&protocol.wl_surface.info, 4, null);
+    var effect: ?Handle = null;
+    try setBackgroundEffect(&objects, &transmit, compositor, null, true, surface, &effect, .blur);
+    try setBackgroundEffect(&objects, &transmit, compositor, manager, false, surface, &effect, .blur);
+    try std.testing.expectEqual(@as(usize, 0), transmit.queuedBytes());
+    try std.testing.expectEqual(null, effect);
+
+    // Disable via declaration, then capability loss. Each re-enable must use
+    // a new live object, never issue a second factory request for one surface.
+    for (0..2) |cycle| {
+        try setBackgroundEffect(&objects, &transmit, compositor, manager, true, surface, &effect, .blur);
+        const created = effect.?;
+        const size = transmit.queuedBytes();
+        try setBackgroundEffect(&objects, &transmit, compositor, manager, true, surface, &effect, .blur);
+        try std.testing.expectEqual(size, transmit.queuedBytes());
+        const snapshot = try transmit.snapshot(&.{}, &.{});
+        var bytes = snapshot.first;
+        var region_id: u32 = 0;
+        // Factory, region factory, region add, set blur region, region destroy.
+        for ([_]u16{ 1, 1, 1, 1, 0 }, 0..) |opcode, index| {
+            const message = (try wayring.wire.Message.decode(bytes)).?;
+            try std.testing.expectEqual(opcode, message.header.opcode);
+            var args = message.arguments();
+            switch (index) {
+                0 => {
+                    try std.testing.expectEqual(manager.id, message.header.object_id);
+                    try std.testing.expectEqual(created.id, try args.uint());
+                    try std.testing.expectEqual(surface.id, try args.uint());
+                },
+                1 => {
+                    try std.testing.expectEqual(compositor.id, message.header.object_id);
+                    region_id = try args.uint();
+                },
+                2 => {
+                    try std.testing.expectEqual(region_id, message.header.object_id);
+                    try std.testing.expectEqual(@as(i32, 0), try args.int());
+                    try std.testing.expectEqual(@as(i32, 0), try args.int());
+                    try std.testing.expectEqual(std.math.maxInt(i32), try args.int());
+                    try std.testing.expectEqual(std.math.maxInt(i32), try args.int());
+                },
+                3 => {
+                    try std.testing.expectEqual(created.id, message.header.object_id);
+                    try std.testing.expectEqual(region_id, try args.uint());
+                },
+                4 => try std.testing.expectEqual(region_id, message.header.object_id),
+                else => unreachable,
+            }
+            try args.finish();
+            bytes = bytes[message.header.size..];
+        }
+        try std.testing.expectEqual(@as(usize, 0), bytes.len);
+        try transmit.begin(snapshot);
+        try transmit.complete(snapshot.byteCount());
+        try setBackgroundEffect(&objects, &transmit, compositor, manager, cycle == 0, surface, &effect, if (cycle == 0) null else .blur);
+        try std.testing.expectEqual(null, effect);
+        const removal = try transmit.snapshot(&.{}, &.{});
+        const message = (try wayring.wire.Message.decode(removal.first)).?;
+        try std.testing.expectEqual(created.id, message.header.object_id);
+        try std.testing.expectEqual(@as(u16, 0), message.header.opcode);
+        try transmit.begin(removal);
+        try transmit.complete(removal.byteCount());
+    }
+}
+
 test "layer state owns output identity across hotplug recreation" {
     var state = try LayerState.init(std.testing.allocator, .{
         .id = "panel",
@@ -3157,9 +3385,11 @@ test "layer state owns output identity across hotplug recreation" {
     var updated = state.asDeclaration();
     updated.height = 40;
     updated.exclusive_zone = 40;
+    updated.background_effect = .blur;
     state.update(updated);
     try std.testing.expectEqual(@as(u32, 40), state.height);
     try std.testing.expectEqual(@as(i32, 40), state.exclusive_zone);
+    try std.testing.expectEqual(platform_window.BackgroundEffect.blur, state.asDeclaration().background_effect.?);
 }
 
 test "damage history expands a stale slot and falls back when age is unknown" {

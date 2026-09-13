@@ -72,6 +72,75 @@ local function bundled_fonts_story()
   return ouro.column { key = "content", gap = 24, children = children }
 end
 
+local function placeholder_story()
+  return ouro.column {
+    key = "content", gap = 12,
+    ouro.box {
+      key = "panel", width = "fill", padding = 16,
+      surface = "card", border_width = 1, radius = 12,
+      ouro.column {
+        key = "fields", gap = 10,
+        ouro.text { key = "heading", text = "Display hints, not input values", size = 18 },
+        ouro.text_input {
+          key = "focused", text = "", label = "Application query",
+          placeholder = "Search applications...", autofocus = true,
+        },
+        ouro.text_input {
+          key = "filled", text = "Terminal", label = "Filled query",
+          placeholder = "This hint must not appear",
+        },
+        ouro.text_input {
+          key = "readonly", default_text = "", read_only = true,
+          label = "Read-only query", placeholder = "Read-only hint",
+        },
+        ouro.text_input {
+          key = "disabled", text = "", enabled = false,
+          label = "Disabled query", placeholder = "Disabled hint",
+        },
+        ouro.text_input {
+          key = "narrow", text = "", width = 180,
+          placeholder = "A long hint stays on one line and truncates",
+        },
+      },
+    },
+    ouro.box {
+      key = "explicit", width = "fill", padding = 12, surface = "sidebar",
+      background = "#24486a", border = "#80baff", border_width = 2, radius = 8,
+      ouro.text { key = "caption", text = "Explicit background wins over surface", foreground = "#ffffff" },
+    },
+    ouro.box {
+      key = "default", width = "fill", padding = 12,
+      ouro.text { key = "caption", text = "Default box: transparent, square, no border" },
+    },
+  }
+end
+
+local vignette_activated = ouro.signal(false)
+local function vignette_story()
+  return ouro.box {
+    key = "canvas", width = "fill", height = "fill", background = "#9eafc4",
+    ouro.stack {
+      key = "layers",
+      ouro.image {
+        key = "fade", src = "images/vignette.svg",
+        width = "fill", height = "fill", fit = "fill",
+      },
+      ouro.box {
+        key = "foreground", width = "fill", height = "fill", alignment = "center",
+        ouro.column {
+          key = "controls", gap = 12, cross_alignment = "center",
+          ouro.text { key = "heading", text = "SVG fade behind a control", foreground = "#ffffff", size = 18 },
+          ouro.button {
+            key = "activate", width = 160,
+            label = vignette_activated() and "Activated" or "Activate",
+            on_press = function() vignette_activated:set(true) end,
+          },
+        },
+      },
+    },
+  }
+end
+
 return ouro.storybook {
   title = "Ourokit built-in widgets",
   stories = {
@@ -364,6 +433,32 @@ return ouro.storybook {
           },
         }
       end,
+    },
+    ouro.story {
+      id = "text-input/placeholders-light", group = "Text input",
+      name = "Placeholders and styled boxes (light)",
+      viewport = { width = 460, height = 410 }, snapshot_scale = 2,
+      color_scheme = "light", content = placeholder_story,
+    },
+    ouro.story {
+      id = "text-input/placeholders-dark", group = "Text input",
+      name = "Placeholders and styled boxes (dark)",
+      viewport = { width = 460, height = 410 }, snapshot_scale = 2,
+      color_scheme = "dark", content = placeholder_story,
+    },
+    ouro.story {
+      id = "stack/vignette-small", group = "Stack",
+      name = "SVG fill behind interactive content (small)",
+      viewport = { width = 360, height = 240 }, snapshot_scale = 2,
+      color_scheme = "dark", content = vignette_story,
+      actions = { { type = "click", target = "canvas/layers/foreground/controls/activate" } },
+    },
+    ouro.story {
+      id = "stack/vignette-large", group = "Stack",
+      name = "SVG fill behind interactive content (large)",
+      viewport = { width = 640, height = 360 }, snapshot_scale = 2,
+      color_scheme = "dark", content = vignette_story,
+      actions = { { type = "click", target = "canvas/layers/foreground/controls/activate" } },
     },
     ouro.story {
       id = "listbox/states",

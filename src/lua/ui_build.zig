@@ -59,7 +59,7 @@ const PendingTextInput = struct {
     session: ?TextInputSession,
 };
 
-const ParentKind = enum { box, flex, stack, scroll, listbox };
+const ParentKind = enum { box, flex, stack, overlay, scroll, listbox };
 const BuildParent = struct { id: u64, kind: ParentKind, semantic_id: ?u64 = null };
 
 pub const Argument = union(enum) {
@@ -101,6 +101,7 @@ pub const UiBuild = struct {
     text_configuration_revision: u64 = 0,
     widget_theme: ?theming.Theme = null,
     root_padding: f32 = design.tokens.foundation.spacing_3,
+    root_background: ?@import("../core/color.zig").Color = null,
     theme_fonts: ?*ThemeFonts = null,
     images: ?*image_service.Service = null,
     image_scale: f32 = 1,
@@ -217,7 +218,7 @@ pub const UiBuild = struct {
                 .parent = null,
                 .object = .{ .box = .{
                     .padding = .all(self.root_padding),
-                    .background = theme.colors.background,
+                    .background = self.root_background orelse theme.colors.background,
                 } },
             });
             self.parent_stack[0] = .{ .id = 2, .kind = .stack };
@@ -630,6 +631,7 @@ pub const UiBuild = struct {
             .listbox => emitListBox,
             .option => emitOption,
             .box => emitBox,
+            .stack => emitStack,
             .row => emitRow,
             .column => emitColumn,
             .scroll => emitScroll,
@@ -847,12 +849,13 @@ pub const UiBuild = struct {
         if ((!icon and name.present) or (icon_theme.present and !name.present) or
             @as(u8, @intFromBool(path.present)) + @as(u8, @intFromBool(bytes.present)) + @as(u8, @intFromBool(name.present)) != 1)
             return luaError(state, "image expects exactly one src or bytes; icons also accept name and optional theme");
-        const width = tableOptionalNullableExtent(state, 1, "width") orelse
+        const width = tableOptionalSize(state, 1, "width", if (icon) .{ .exact = 24 } else .auto) orelse
             return luaError(state, "invalid image width");
-        const height = tableOptionalNullableExtent(state, 1, "height") orelse
+        const height = tableOptionalSize(state, 1, "height", if (icon) .{ .exact = 24 } else .auto) orelse
             return luaError(state, "invalid image height");
-        const logical_width = width.value orelse if (icon) @as(?f32, 24) else null;
-        const logical_height = height.value orelse if (icon) @as(?f32, 24) else null;
+        if (icon and (width.isFill() or height.isFill())) return luaError(state, "icon dimensions must be numeric");
+        const logical_width = width.extent();
+        const logical_height = height.extent();
         var fit: image_pixels.Fit = .contain;
         const fit_type = c.lua_getfield(state, 1, "fit");
         if (fit_type != c.type_nil) {
@@ -889,7 +892,14 @@ pub const UiBuild = struct {
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .object = .{ .image = .{ .image = handle, .width = logical_width, .height = logical_height, .fit = fit } },
+            .object = .{ .image = .{
+                .image = handle,
+                .width = logical_width,
+                .height = logical_height,
+                .fill_width = width.isFill(),
+                .fill_height = height.isFill(),
+                .fit = fit,
+            } },
             .parent_data = parent_data,
         }) catch {
             if (handle) |value| images.cache.release(value) catch unreachable;
@@ -1036,6 +1046,10 @@ pub const UiBuild = struct {
             return luaError(state, "text_input text must be a string");
         const uncontrolled = tableOptionalString(state, 1, "default_text") orelse
             return luaError(state, "text_input default_text must be a string");
+        const placeholder = tableOptionalString(state, 1, "placeholder") orelse
+            return luaError(state, "text_input placeholder must be a string");
+        const label = tableOptionalString(state, 1, "label") orelse
+            return luaError(state, "text_input label must be a string");
         if (controlled.present == uncontrolled.present)
             return luaError(state, "text_input requires exactly one of text or default_text");
         const mode: TextInputValueMode = if (controlled.present) .controlled else .uncontrolled;
@@ -1087,11 +1101,23 @@ pub const UiBuild = struct {
             .candidates = self.themedFonts(false) catch |err| return luaError(state, @errorName(err)),
             .configuration_revision = self.text_configuration_revision,
         }) catch return luaError(state, "cannot retain text_input text");
+        const placeholder_source = if (placeholder.present and placeholder.value.len != 0) sources.acquire(.{
+            .utf8 = placeholder.value,
+            .language = "und",
+            .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
+            .candidates = (sources.get(source) catch unreachable).candidates,
+            .configuration_revision = self.text_configuration_revision,
+        }) catch {
+            sources.release(source) catch unreachable;
+            return luaError(state, "cannot retain text_input placeholder");
+        } else null;
         self.append(.{
             .id = content_id,
             .parent = target_id,
             .object = .{ .text_input = .{
                 .source = source,
+                .placeholder = placeholder_source,
+                .placeholder_color = theme.muted_foreground,
                 .color = if (enabled) visual.foreground orelse theme.foreground else visual.disabled_foreground orelse theme.disabled_foreground,
                 .selection_color = theme.selection,
                 .caret_color = visual.foreground orelse theme.foreground,
@@ -1101,6 +1127,7 @@ pub const UiBuild = struct {
                 .preedit_color = null,
             } },
         }) catch {
+            if (placeholder_source) |hint| sources.release(hint) catch unreachable;
             sources.release(source) catch unreachable;
             return luaError(state, "cannot append text_input content");
         };
@@ -1121,7 +1148,7 @@ pub const UiBuild = struct {
             .parent = semanticParent(parent),
             .role = .text_field,
             .key = key,
-            .label = initial,
+            .label = if (label.present) label.value else initial,
             .enabled = enabled,
         }) catch return luaError(state, "cannot append text_input semantics");
 
@@ -1367,6 +1394,33 @@ pub const UiBuild = struct {
         return emitFlexContainer(state, .vertical);
     }
 
+    fn emitStack(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.stack expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "stack requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "stack key is required");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
+        const id = semanticId(key, 0x737461636b ^ parent.id ^ self.component_namespace);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .stack = .{} },
+            .parent_data = parent_data,
+        }) catch return luaError(state, "cannot append stack descriptor");
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .group,
+            .key = key,
+        }) catch return luaError(state, "cannot append stack semantics");
+        // Public stacks overlay children at the origin; the internal root's
+        // legacy positioned edge metadata is not part of this constructor.
+        return self.emitChildren(state, .{ .id = id, .kind = .overlay });
+    }
+
     fn emitBox(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1392,6 +1446,17 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box alignment");
         const surface = tableOptionalSurface(state, 1, theme) orelse
             return luaError(state, "box surface must be 'background', 'card', 'popover', or 'sidebar'");
+        var visual: theming.Overrides = .{};
+        inline for (.{ "background", "border", "border_width", "radius" }) |field| {
+            if (c.lua_getfield(state, 1, field) != c.type_nil) {
+                @field(visual, field) = if (@TypeOf(@field(visual, field)) == ?f32)
+                    theming.extent(state, -1, false) catch |err| return luaError(state, @errorName(err))
+                else
+                    theming.color(state, -1) catch |err| return luaError(state, @errorName(err));
+            }
+            c.lua_settop(state, -2);
+        }
+        const border_width = visual.border_width orelse 0;
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x626f78 ^ parent.id ^ self.component_namespace);
@@ -1407,7 +1472,10 @@ pub const UiBuild = struct {
                 .min_height = min_height,
                 .padding = .all(padding),
                 .alignment = alignment.value,
-                .background = surface.value,
+                .background = visual.background orelse surface.value,
+                .border_color = if (border_width > 0) visual.border orelse theme.border else null,
+                .border_width = border_width,
+                .corner_radius = visual.radius orelse 0,
             } },
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append box descriptor");
@@ -1515,7 +1583,10 @@ pub const UiBuild = struct {
         self.images_staged = false;
         if (self.sources_staged) for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
             .text => |value| self.text_sources.?.release(value.source) catch unreachable,
-            .text_input => |input| self.text_sources.?.release(input.source) catch unreachable,
+            .text_input => |input| {
+                self.text_sources.?.release(input.source) catch unreachable;
+                if (input.placeholder) |placeholder| self.text_sources.?.release(placeholder) catch unreachable;
+            },
             else => {},
         };
         self.sources_staged = false;
@@ -1827,7 +1898,7 @@ fn declarativeParentData(
     const flex = try tableOptionalFlexFactor(state, table);
     return switch (parent.kind) {
         .flex => if (flex) |factor| .{ .flex = .{ .factor = factor } } else .none,
-        .box, .scroll, .listbox => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
+        .box, .overlay, .scroll, .listbox => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
         .stack => stack: {
             if (flex != null) return error.FlexRequiresRowOrColumnParent;
             const x = tableOptionalExtent(state, table, "x", 0) orelse return error.InvalidPosition;
@@ -1914,12 +1985,12 @@ test "Lua UI exposes only declarative constructors without standard libraries" {
 
     try std.testing.expectEqual(c.type_table, c.lua_getglobal(state, "ouro"));
     inline for (.{
-        "text", "button", "text_input", "listbox", "option", "box", "row", "column", "scroll", "theme",
+        "text", "button", "text_input", "listbox", "option", "box", "stack", "row", "column", "scroll", "theme",
     }) |name| {
         try std.testing.expectEqual(c.type_function, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
-    inline for (.{ "label", "padded_box", "stack", "positioned_box", "on_pointer" }) |name| {
+    inline for (.{ "label", "padded_box", "positioned_box", "on_pointer" }) |name| {
         try std.testing.expectEqual(c.type_nil, c.lua_getfield(state, -1, name));
         c.lua_settop(state, -2);
     }
@@ -1962,6 +2033,8 @@ test "declarative text input separates focus identity from editable render conte
         \\    ouro.text_input {
         \\      key = "query",
         \\      text = "Initial",
+        \\      placeholder = "Search",
+        \\      label = "Query",
         \\      read_only = true,
         \\      on_change = function(value) changed = value end,
         \\    },
@@ -1993,7 +2066,8 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
     try std.testing.expectEqual(.text_input_change, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(.text_field, ui.semanticDescriptors()[1].role);
-    try std.testing.expectEqualStrings("Initial", ui.semanticDescriptors()[1].label);
+    try std.testing.expectEqualStrings("Query", ui.semanticDescriptors()[1].label);
+    try std.testing.expectEqualStrings("Search", (try sources.get(descriptors[4].object.text_input.placeholder.?)).utf8);
     var prepared: PreparedBuild = undefined;
     try prepared.init(std.testing.allocator, state, &sources, 5, 64);
     defer prepared.deinit();

@@ -97,6 +97,147 @@ const Fixture = struct {
     }
 };
 
+test "Lua stack keeps ordered children and keyed foreground identity" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\reverse = ouro.signal(false)
+        \\function build()
+        \\  local back = ouro.box { key='back', width=140, height=70, background='#102030' }
+        \\  local front = ouro.box { key='front', width=60, height=25, background='#abcdef' }
+        \\  return ouro.stack { key='layers', children=reverse() and {front, back} or {back, front} }
+        \\end
+    );
+    try f.build();
+    const stack = try f.handle("layers");
+    const front = try f.handle("layers/front");
+    const back = try f.handle("layers/back");
+    const render = try f.runtime.instances.renderObject(stack);
+    try std.testing.expect((try f.object("layers")) == .stack);
+    try std.testing.expectEqual(.group, (try f.runtime.semantics.findPath("layers")).role);
+    try std.testing.expectEqual(try f.runtime.instances.renderObject(front), (try f.runtime.tree.hitTest(render, .{ .x = 10, .y = 10 })).?);
+    try f.exec("reverse:set(true)");
+    try f.build();
+    try std.testing.expectEqual(front, try f.handle("layers/front"));
+    try std.testing.expectEqual(back, try f.handle("layers/back"));
+    try std.testing.expectEqual(try f.runtime.instances.renderObject(back), (try f.runtime.tree.hitTest(render, .{ .x = 10, .y = 10 })).?);
+}
+
+test "Lua box decoration preserves defaults and explicit background overrides surface" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\function build() return ouro.column { key = 'root',
+        \\  ouro.box { key = 'default', width = 'fill', height = 20 },
+        \\  ouro.box { key = 'surface', surface = 'sidebar', height = 20 },
+        \\  ouro.box { key = 'styled', surface = 'card', background = '#12345680',
+        \\    border = '#abcdef', border_width = 2.5, radius = 7, height = 30 },
+        \\  ouro.box { key = 'border', border_width = 1, height = 20 },
+        \\  ouro.box { key = 'zero', border = '#abcdef', border_width = 0, radius = 0 },
+        \\} end
+    );
+    try f.build();
+    const tokens = @import("../design/root.zig").tokens;
+    const plain = (try f.object("root/default")).box;
+    try std.testing.expect(plain.background == null and plain.border_color == null);
+    try std.testing.expectEqual(@as(f32, 0), plain.border_width);
+    try std.testing.expectEqual(@as(f32, 0), plain.corner_radius);
+    try std.testing.expect(plain.fill_width);
+    try std.testing.expectEqual(tokens.light.sidebar, (try f.object("root/surface")).box.background.?);
+    const styled = (try f.object("root/styled")).box;
+    try std.testing.expectEqual(core.Color.rgba(0x12, 0x34, 0x56, 0x80), styled.background.?);
+    try std.testing.expectEqual(core.Color.rgba(0xab, 0xcd, 0xef, 255), styled.border_color.?);
+    try std.testing.expectEqual(@as(f32, 2.5), styled.border_width);
+    try std.testing.expectEqual(@as(f32, 7), styled.corner_radius);
+    try std.testing.expectEqual(tokens.light.border, (try f.object("root/border")).box.border_color.?);
+    try std.testing.expect((try f.object("root/zero")).box.border_color == null);
+    f.ui.widget_theme.?.colors = tokens.dark;
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(styled.background, (try f.object("root/styled")).box.background);
+    try std.testing.expectEqual(tokens.dark.sidebar, (try f.object("root/surface")).box.background.?);
+}
+
+test "Lua decoration, stack and input hints reject invalid declarations atomically" {
+    const declarations = [_][]const u8{
+        "ouro.box {key='bad', background='#xyzxyz'}",
+        "ouro.box {key='bad', border='#12345'}",
+        "ouro.box {key='bad', background=123}",
+        "ouro.box {key='bad', border_width=-1}",
+        "ouro.box {key='bad', radius=0/0}",
+        "ouro.box {key='bad', radius=1/0}",
+        "ouro.box {key='bad', border_width=1e100}",
+        "ouro.box {key='bad', radius=1e-100}",
+        "ouro.box {key='bad', border_width='2'}",
+        "ouro.box {key='bad', surface='invalid', background='#123456'}",
+        "ouro.text_input {key='bad', text='', placeholder=3}",
+        "ouro.text_input {key='bad', default_text='', label=false}",
+        "ouro.stack {}",
+        "ouro.stack {key='bad', ouro.box {key='child', flex=1}}",
+        "ouro.stack {key='bad', children=false}",
+        "ouro.stack {key='bad', [2]=ouro.box {key='child'}}",
+        "ouro.stack {key='bad', ouro.box {key='child'}, children={}}",
+    };
+    for (declarations) |declaration| {
+        const f = try Fixture.create();
+        defer f.destroy();
+        try f.exec("function build() return ouro.box {key='good', background='#123456'} end");
+        try f.build();
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(source);
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(core.Color.rgba(0x12, 0x34, 0x56, 255), (try f.object("good")).box.background.?);
+    }
+}
+
+test "Lua placeholder and accessible label remain independent of retained input values" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\value = ouro.signal('')
+        \\hint = ouro.signal('Search applications')
+        \\function build() return ouro.column { key = 'root',
+        \\  ouro.text_input {key='controlled', text=value(), placeholder=hint(), label='Application query'},
+        \\  ouro.text_input {key='retained', default_text='', placeholder=hint(), label='Retained query'},
+        \\  ouro.text_input {key='readonly', text='', placeholder=hint(), read_only=true},
+        \\  ouro.text_input {key='disabled', text='', placeholder=hint(), enabled=false},
+        \\  ouro.text_input {key='legacy', text='Legacy value'},
+        \\} end
+    );
+    try f.build();
+    for ([_][]const u8{ "root/controlled", "root/retained", "root/readonly", "root/disabled" }) |path| {
+        const target = try f.handle(path);
+        const session = try f.runtime.text_inputs.session(target);
+        try std.testing.expectEqualStrings("", session.model.text());
+        const render = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(target));
+        const input = (try f.runtime.tree.objectAt(render)).text_input;
+        try std.testing.expectEqualStrings("", (try f.sources.get(input.source)).utf8);
+        try std.testing.expectEqualStrings("Search applications", (try f.sources.get(input.placeholder.?)).utf8);
+        try std.testing.expectEqual(@as(usize, 0), input.caret_offset);
+        try std.testing.expectEqual(@import("../design/root.zig").tokens.light.muted_foreground, input.placeholder_color);
+    }
+    try std.testing.expectEqualStrings("Application query", (try f.runtime.semantics.findPath("root/controlled")).label);
+    try std.testing.expectEqualStrings("", (try f.runtime.semantics.findPath("root/readonly")).label);
+    try std.testing.expectEqualStrings("Legacy value", (try f.runtime.semantics.findPath("root/legacy")).label);
+    const retained = try f.handle("root/retained");
+    const session = try f.runtime.text_inputs.session(retained);
+    _ = try session.apply(.{ .commit = .{ .text = "typed" } });
+    try f.exec("value:set('actual'); hint:set('Different hint')");
+    try f.build();
+    try std.testing.expectEqual(retained, try f.handle("root/retained"));
+    try std.testing.expectEqualStrings("typed", (try f.runtime.text_inputs.session(retained)).model.text());
+    try std.testing.expectEqualStrings("actual", (try f.runtime.text_inputs.session(try f.handle("root/controlled"))).model.text());
+    try std.testing.expectEqualStrings("Application query", (try f.runtime.semantics.findPath("root/controlled")).label);
+    try f.exec("value:set(''); hint:set('')");
+    try f.build();
+    const render = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(try f.handle("root/controlled")));
+    const input = (try f.runtime.tree.objectAt(render)).text_input;
+    try std.testing.expect(input.placeholder == null);
+    try std.testing.expectEqualStrings("", (try f.sources.get(input.source)).utf8);
+}
+
 test "Lua tokens work in theme and widget props and preserve button defaults" {
     const f = try Fixture.create();
     defer f.destroy();

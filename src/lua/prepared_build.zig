@@ -138,7 +138,10 @@ pub const PreparedBuild = struct {
         if (self.owns_shapes) for (self.descriptor_storage[0..self.descriptor_count]) |descriptor|
             switch (descriptor.object) {
                 .text => |value| self.shapes.?.release(value.source) catch unreachable,
-                .text_input => |text_input_value| self.shapes.?.release(text_input_value.source) catch unreachable,
+                .text_input => |value| {
+                    self.shapes.?.release(value.source) catch unreachable;
+                    if (value.placeholder) |placeholder| self.shapes.?.release(placeholder) catch unreachable;
+                },
                 else => {},
             };
         if (self.owns_images) for (self.descriptor_storage[0..self.descriptor_count]) |descriptor|

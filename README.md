@@ -309,6 +309,8 @@ local query = ouro.signal("")
 return ouro.text_input {
   key = "query",
   text = query(),
+  label = "Application query",
+  placeholder = "Search applications...",
   on_change = function(value)
     query:set(value)
   end,
@@ -322,6 +324,12 @@ input protocol callback; selection-only changes do not invoke it. `enabled =
 false` removes the field from focus traversal and rejects all interaction.
 `read_only = true` keeps focus, selection, navigation, and copy available while
 rejecting text-input commits, deletion, cut, and paste.
+
+Optional `placeholder` is a muted display-only hint for empty fields without
+active IME preedit; it never enters the value or `on_change` data. Optional
+`label` provides an independent semantic accessible name, not a visible label.
+See the [input and box API](docs/application-model.md#inherited-visual-defaults)
+for styling, precedence, and accessibility limitations.
 
 ## Storybook
 

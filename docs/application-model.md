@@ -213,6 +213,8 @@ ouro.layer_surface {
   exclusive_edge = "top", -- optional v5 disambiguation: top, bottom, left, or right
   margins = { top = 0, right = 0, bottom = 0, left = 0 },
   keyboard_interactivity = "none", -- none, exclusive, or on_demand
+  background = "#111820B8", -- optional #RRGGBB or #RRGGBBAA
+  background_effect = "blur", -- optional compositor backdrop blur
   content = function()
     return ouro.text { key = "clock", text = "12:00" }
   end,
@@ -258,9 +260,26 @@ ouro.layer_surface {
 }
 ```
 
+`background` replaces the implicit root background across the entire native
+surface. Alpha is preserved: the tint is painted once over a transparent clear,
+not over an opaque theme background. It does not change widget theme colors;
+opaque content can still cover it. Omit it (or set it to `nil`) for the existing
+theme background behavior. Both `#RRGGBB` and `#RRGGBBAA` use the same color
+validation as theme colors.
+
+`background_effect = "blur"` requests real compositor backdrop blur over the
+whole surface using `ext-background-effect-v1`. Blur strength and algorithm are
+compositor policy; there is no radius property. If the protocol or blur
+capability is unavailable, the specified background still renders normally.
+Omit it (or set it to `nil`) to remove the effect. The blur region follows native
+resizes and output scaling. Closing/reopening or reconnecting an output creates
+a fresh effect object, and capability changes are handled without changing the
+tint.
+
 Namespace, output, and surface role are immutable for a retained ID, while
-size, layer, anchors, exclusive zone and edge, margins, and keyboard
-interactivity update transactionally.
+size, layer, anchors, exclusive zone and edge, margins, keyboard interactivity,
+background, and background effect update transactionally, including on source
+reload. Invalid color/effect values reject the new declaration.
 
 ## Application lifetime and UI activation
 
@@ -429,10 +448,48 @@ a direct row or column child. `cross_alignment = "start" | "center" | "end" |
 "stretch"` controls the container's cross axis; flex children use tight fitting
 and divide the remaining bounded main-axis space according to their factors.
 Boxes may opt into generated theme surfaces with `surface = "background" |
-"card" | "popover" | "sidebar"`; omitting it leaves the Box transparent.
+"card" | "popover" | "sidebar"`. Explicit `background` overrides `surface`,
+including a fully transparent color; omitting both leaves the Box transparent.
+`background` and `border` accept `#RRGGBB` or `#RRGGBBAA` (including color
+values from `ouro.tokens`), using the same validation as buttons and inputs.
+`border_width` and `radius` are finite, non-negative logical pixels, defaulting
+to zero. A positive border width uses `border` or the inherited theme's `border`
+color; zero hides it even if `border` is supplied. Border width participates in
+layout alongside padding. Boxes do not inherit control geometry or introduce a
+new widget-default section. An invalid `surface` remains an error even when
+`background` is supplied.
 `width` and `height` accept a non-negative number or `"fill"`; omitted values
 remain intrinsic. Optional `min_width` and `min_height` participate in the same
 one-way constraints and yield when a parent supplies a tighter maximum.
+
+`ouro.stack { key = "layers", ... }` overlays an ordered array of children at
+the same origin. It also accepts `children = { ... }`, following the same dense
+array and key conventions as rows and columns. Children paint in declaration
+order; hit testing starts with the last child. Put decorative backgrounds first
+and foreground controls last so the background cannot intercept their hits.
+This is rectangular hit testing, not alpha-based click-through.
+
+Stack uses the existing native layout: children receive loose parent bounds,
+and its size is their maximum extent constrained by the parent. Fill children
+expand it to bounded space; unbounded axes remain intrinsic. Use a fill Box to
+center foreground content without a positioning API:
+
+```lua
+ouro.stack {
+  key = "layers",
+  ouro.image {
+    key = "fade", src = "images/vignette.svg",
+    width = "fill", height = "fill", fit = "fill",
+  },
+  ouro.box {
+    key = "foreground", width = "fill", height = "fill", alignment = "center",
+    ouro.button { key = "action", label = "Activate", on_press = activate },
+  },
+}
+```
+
+Stack adds no offset, gradient, or decoration properties. Its own `flex` property
+works only when its parent is a row or column; stack children cannot use `flex`.
 
 ### Inherited visual defaults
 
@@ -505,6 +562,29 @@ The supported defaults are:
 | `widgets.text_input` | Same as button except `hover` and `pressed` |
 | `widgets.option` | Same as button except `disabled`, `disabled_foreground`, and `focus`; `pressed` is the selected background |
 | `widgets.text` | `foreground`, `font_size` |
+
+`ouro.text_input` accepts optional string props `placeholder` and `label`:
+
+```lua
+ouro.text_input {
+  key = "query", text = query(), label = "Application query",
+  placeholder = "Search applications...",
+  on_change = function(value) query:set(value) end,
+}
+```
+
+The placeholder is a single-line display hint, ellipsized to the available width,
+using the input typography and inherited `muted_foreground` color. It appears
+only for an empty value with no active IME preedit, including in read-only and
+disabled fields. It never becomes editable text, selection, clipboard contents,
+IME surrounding text, or `on_change` data. Empty or omitted placeholders paint
+nothing. The same rules apply to controlled `text` and retained `default_text`.
+
+`label` sets the semantic accessible name independently of the value and hint;
+it does not render a visible label. Omission preserves the existing semantic
+label derived from the declared value. The semantic snapshot supports headless
+assertions and future accessibility protocol translation; this does not add an
+OS accessibility bridge. Neither prop changes editing or focus behavior.
 
 `ouro.text_input` accepts `autofocus = true` to focus a newly mounted, enabled
 input once (retained rebuilds do not reclaim focus). `on_command(command)` runs
@@ -673,6 +753,19 @@ Use an enclosing box for a placeholder surface. Missing dimensions use the loade
 intrinsic size; one declared dimension preserves aspect ratio, subject to parent
 constraints. Failed sources remain failed until eviction or source reload.
 
+`ouro.image` also accepts `width = "fill"` and `height = "fill"` independently.
+Each fills its bounded incoming layout axis, including while loading or failed;
+an unbounded fill axis falls back to intrinsic sizing. Two bounded fill axes
+occupy the complete available rectangle. Numeric dimensions retain their existing
+behavior. Icons keep numeric dimensions and their 24×24 defaults.
+
+Fill is a layout request, not a raster-resolution hint. Numeric dimensions still
+provide SVG raster hints; with no numeric dimensions, SVG rasterization uses its
+intrinsic viewport times output scale. Resizing a fill image updates its layout
+bounds and resamples the cached bitmap, without rerasterizing at every new size.
+Use a suitably sized SVG viewport for the intended display range. SVG raster hints
+preserve intrinsic aspect ratio; `fit` determines final placement and stretching.
+
 `fit` defaults to `contain` (centered, aspect-preserving). `cover` fills the box
 and crops; `fill` stretches. `tint` applies a color through the decoded alpha mask;
 without it, images preserve their colors. `ouro.icon` supplies a 24×24 logical size
@@ -690,6 +783,8 @@ pixels per submission; persistent GPU texture caching is not implemented.
 See `examples/images.lua` for file-backed formats, byte-backed icons, fit modes,
 theme inheritance, interaction, and failed assets. Storybook snapshots wait for
 asset completion before capturing pixels.
+The `stack/vignette-small` and `stack/vignette-large` stories compose a static SVG
+opacity fade behind a centered button and replay a click through normal input.
 
 ### XDG named icons use the system icon themes
 

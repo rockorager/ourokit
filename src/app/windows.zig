@@ -48,6 +48,8 @@ const Slot = struct {
     exclusive_edge: ?platform_window.Edge = null,
     margins: platform_window.Margins = .{},
     keyboard_interactivity: platform_window.KeyboardInteractivity = .none,
+    background: ?@import("../core/color.zig").Color = null,
+    background_effect: ?platform_window.BackgroundEffect = null,
     scope: ScopeHandle = .invalid,
 };
 
@@ -528,6 +530,8 @@ fn layerStateEqual(slot: *const Slot, declaration: LayerSurfaceDeclaration) bool
         slot.exclusive_zone == declaration.exclusive_zone and
         slot.exclusive_edge == declaration.exclusive_edge and
         std.meta.eql(slot.margins, declaration.margins) and
+        std.meta.eql(slot.background, declaration.background) and
+        slot.background_effect == declaration.background_effect and
         slot.keyboard_interactivity == declaration.keyboard_interactivity;
 }
 
@@ -540,6 +544,8 @@ fn setLayerState(slot: *Slot, declaration: LayerSurfaceDeclaration) void {
     slot.exclusive_edge = declaration.exclusive_edge;
     slot.margins = declaration.margins;
     slot.keyboard_interactivity = declaration.keyboard_interactivity;
+    slot.background = declaration.background;
+    slot.background_effect = declaration.background_effect;
 }
 
 fn handleFor(slot: *const Slot, index: usize) WindowHandle {
@@ -715,6 +721,19 @@ test "layer surface declarations retain identity and update role-specific state"
         windows.reconcile(&.{changed_output}),
     );
     try std.testing.expectEqual(@as(usize, 2), host.count);
+
+    updated.layer_surface.background = .rgba(17, 24, 32, 184);
+    try windows.reconcile(&.{updated});
+    try std.testing.expectEqual(handle, host.actions[2].update_layer_surface);
+    updated.layer_surface.background_effect = .blur;
+    try windows.reconcile(&.{updated});
+    try std.testing.expectEqual(handle, host.actions[3].update_layer_surface);
+    try windows.reconcile(&.{updated});
+    try std.testing.expectEqual(@as(usize, 4), host.count);
+    updated.layer_surface.background = null;
+    updated.layer_surface.background_effect = null;
+    try windows.reconcile(&.{updated});
+    try std.testing.expectEqual(handle, host.actions[4].update_layer_surface);
 
     try windows.reconcile(&.{});
     try scheduler.applyQueuedCancellations();

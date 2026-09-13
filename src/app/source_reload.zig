@@ -251,6 +251,10 @@ pub const SourceReload = struct {
                 self.discard();
                 return error.SourceWindowSetChanged;
             };
+            candidate.ui_build.root_background = switch (window.declaration) {
+                .layer_surface => |layer| layer.background,
+                .toplevel => null,
+            };
             target.runtime.prepareSourceBuild(
                 target.size,
                 &candidate.ui_build,
@@ -290,6 +294,10 @@ pub const SourceReload = struct {
 
         for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
             const target = findWindowTarget(targets, window.declaration.id()).?;
+            target.runtime.background = switch (window.declaration) {
+                .layer_surface => |layer| layer.background,
+                .toplevel => null,
+            };
             target.runtime.commitPreparedSource(
                 prepared,
                 callbacks,

@@ -581,6 +581,7 @@ fn addWaylandProtocol(
     generate.addFileArg(wayland_protocols.path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
     generate.addFileArg(wayland_protocols.path("unstable/text-input/text-input-unstable-v3.xml"));
     generate.addFileArg(wayland_protocols.path("staging/ext-workspace/ext-workspace-v1.xml"));
+    generate.addFileArg(wayland_protocols.path("staging/ext-background-effect/ext-background-effect-v1.xml"));
     const generated = generate.addOutputFileArg("ourokit-wayland-protocol.zig");
     return b.createModule(.{
         .root_source_file = generated,

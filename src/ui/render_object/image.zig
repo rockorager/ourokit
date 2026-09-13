@@ -8,23 +8,31 @@ pub fn validate(image: Image) !void {
         if (dimension) |value| if (!std.math.isFinite(value) or value < 0)
             return error.InvalidImageSize;
     }
+    if ((image.width != null and image.fill_width) or (image.height != null and image.fill_height))
+        return error.ConflictingExtent;
 }
 
 /// Keep the intrinsic ratio when at least one dimension is undeclared. Parent
 /// constraints win when their permitted aspect ratios exclude the image ratio.
-pub fn layout(image: Image, intrinsic: ?SizeF, constraints: Constraints) SizeF {
+/// Fill resolves bounded axes at layout time; unbounded fill remains intrinsic.
+pub fn layout(image: Image, intrinsic: ?SizeF, incoming: Constraints) SizeF {
+    var constraints = incoming;
+    const declared_width = if (image.fill_width and constraints.hasBoundedWidth()) constraints.max_width else image.width;
+    const declared_height = if (image.fill_height and constraints.hasBoundedHeight()) constraints.max_height else image.height;
+    if (image.fill_width and constraints.hasBoundedWidth()) constraints.min_width = constraints.max_width;
+    if (image.fill_height and constraints.hasBoundedHeight()) constraints.min_height = constraints.max_height;
     const size = intrinsic orelse return constraints.constrain(.{
-        .width = image.width orelse 0,
-        .height = image.height orelse 0,
+        .width = declared_width orelse 0,
+        .height = declared_height orelse 0,
     });
-    if (image.width != null and image.height != null)
-        return constraints.constrain(.{ .width = image.width.?, .height = image.height.? });
+    if (declared_width != null and declared_height != null)
+        return constraints.constrain(.{ .width = declared_width.?, .height = declared_height.? });
 
     const width: f64 = size.width;
     const height: f64 = size.height;
-    const preferred = if (image.width) |value|
+    const preferred = if (declared_width) |value|
         value / width
-    else if (image.height) |value|
+    else if (declared_height) |value|
         value / height
     else
         1;
@@ -74,5 +82,23 @@ test "image layout rejects negative and nonfinite declarations" {
     try std.testing.expectError(error.InvalidImageSize, validate(.{ .width = -1 }));
     try std.testing.expectError(error.InvalidImageSize, validate(.{ .height = std.math.inf(f32) }));
     try std.testing.expectError(error.InvalidImageSize, validate(.{ .width = std.math.nan(f32) }));
+    try std.testing.expectError(error.ConflictingExtent, validate(.{ .width = 0, .fill_width = true }));
+    try std.testing.expectError(error.ConflictingExtent, validate(.{ .height = 10, .fill_height = true }));
     try validate(.{ .width = 0, .height = 0 });
+}
+
+test "image fill resolves each bounded axis for pending and loaded images" {
+    const intrinsic: SizeF = .{ .width = 120, .height = 40 };
+    const bounds: Constraints = .{ .max_width = 210, .max_height = 95 };
+    const both: Image = .{ .fill_width = true, .fill_height = true };
+    try std.testing.expectEqual(SizeF{ .width = 210, .height = 95 }, layout(both, null, bounds));
+    try std.testing.expectEqual(SizeF{ .width = 210, .height = 95 }, layout(both, intrinsic, bounds));
+    try std.testing.expectEqual(SizeF{ .width = 210, .height = 70 }, layout(.{ .fill_width = true }, intrinsic, bounds));
+    try std.testing.expectEqual(SizeF{ .width = 210, .height = 23 }, layout(.{ .fill_width = true, .height = 23 }, intrinsic, bounds));
+    try std.testing.expectEqual(SizeF{ .width = 17, .height = 95 }, layout(.{ .width = 17, .fill_height = true }, intrinsic, bounds));
+    try std.testing.expectEqual(SizeF{ .width = 210, .height = 30 }, layout(.{ .fill_width = true }, intrinsic, .{ .max_width = 210, .max_height = 30 }));
+    try std.testing.expectEqual(intrinsic, layout(both, intrinsic, .{}));
+    try std.testing.expectEqual(SizeF{ .width = 0, .height = 0 }, layout(both, null, .{}));
+    try std.testing.expectEqual(SizeF{ .width = 285, .height = 95 }, layout(both, intrinsic, .{ .max_height = 95 }));
+    try std.testing.expectEqual(SizeF{ .width = 0, .height = 0 }, layout(both, intrinsic, Constraints.tight(.{ .width = 0, .height = 0 })));
 }

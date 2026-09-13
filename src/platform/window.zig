@@ -1,6 +1,7 @@
 const Handle = @import("../core/handle.zig").Handle;
 const PointF = @import("../core/geometry.zig").PointF;
 const ScopeHandle = @import("../task/scheduler.zig").ScopeHandle;
+const Color = @import("../core/color.zig").Color;
 
 pub const WindowHandle = Handle;
 
@@ -250,6 +251,8 @@ pub const Margins = struct {
     left: i32 = 0,
 };
 
+pub const BackgroundEffect = enum { blur };
+
 /// Language-neutral desired state for one wlr-layer-shell surface. A null
 /// output delegates placement to the compositor; otherwise the name selects
 /// one active wl_output for the lifetime of this declaration identity.
@@ -265,6 +268,8 @@ pub const LayerSurfaceDeclaration = struct {
     exclusive_edge: ?Edge = null,
     margins: Margins = .{},
     keyboard_interactivity: KeyboardInteractivity = .none,
+    background: ?Color = null,
+    background_effect: ?BackgroundEffect = null,
 
     pub fn validate(self: LayerSurfaceDeclaration) !void {
         if (self.id.len == 0) return error.EmptyWindowId;

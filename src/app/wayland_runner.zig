@@ -666,6 +666,10 @@ fn runSourceInternal(
                 slot.runtime.setDirtyWindowQueue(&dirty);
                 slot.runtime.setClipboardCoordinator(&clipboard);
             }
+            try slot.runtime.setBackground(switch (window.?.declaration) {
+                .layer_surface => |layer| layer.background,
+                .toplevel => null,
+            });
             if (slot.configured_size != null and !(try dirty.hasPending(handle)))
                 _ = try dirty.markDirty(handle);
         }
@@ -837,26 +841,41 @@ fn runSourceInternal(
         if (host.quiescent() and control_quiescent and
             !loop.hasPendingTimerKernelWork() and !loop.hasPendingOperations()) continue;
 
-        const completion = try loop.wait();
-        switch (loop.dispatch(completion)) {
-            .file => |file| if (!(try host.dispatchClipboardFile(file)))
-                try source_reload.markFileCompleted(file),
-            .socket => |socket| {
-                if (control) |server| if (try server.dispatch(socket)) continue;
-                try source_reload.markSocketCompleted(socket);
-            },
-            .operation_cancel => {
-                if (control) |server| server.collectClosed();
-                try source_reload.collectCanceledMcp();
-            },
-            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
-                if (try host.dispatchTimer(timeout.operation)) continue;
-                try source_reload.markTimeoutCompleted(timeout.operation);
-            },
-            .foreign => try host.dispatchOne(completion),
-            .stale => return error.StaleCompletion,
-            .signal_wakeup => {},
+        var completion = try loop.wait();
+        var timers_due = false;
+        // Timer and socket CQEs have no cross-stream ordering guarantee. Drain
+        // the ready batch before firing timers so an already-received keyboard
+        // release cancels repeat even when a slow render delayed dispatch.
+        while (true) {
+            switch (loop.dispatch(completion)) {
+                .file => |file| if (!(try host.dispatchClipboardFile(file)))
+                    try source_reload.markFileCompleted(file),
+                .socket => |socket| {
+                    const handled = if (control) |server| try server.dispatch(socket) else false;
+                    if (!handled) try source_reload.markSocketCompleted(socket);
+                },
+                .operation_cancel => {
+                    if (control) |server| server.collectClosed();
+                    try source_reload.collectCanceledMcp();
+                },
+                .timer_wakeup, .timer_control => timers_due = true,
+                .foreign => try host.dispatchOne(completion),
+                .stale => return error.StaleCompletion,
+                .signal_wakeup => {},
+            }
+            // Dispatch may rearm receives. Submit them and run deferred kernel
+            // task work without waiting before deciding the input batch ended.
+            // cq_ready alone cannot see work behind IORING_SETUP_DEFER_TASKRUN.
+            // Do not resynchronize the alarm until due timers are consumed.
+            _ = try loop.ring.submit();
+            _ = try loop.ring.enter(0, 0, std.os.linux.IORING_ENTER_GETEVENTS);
+            if (loop.ring.cq_ready() == 0) break;
+            completion = try loop.wait();
         }
+        if (timers_due) while (try loop.takeExpired()) |timeout| {
+            if (try host.dispatchTimer(timeout.operation)) continue;
+            try source_reload.markTimeoutCompleted(timeout.operation);
+        };
     }
     if (host.failure) |failure| return @as(anyerror!void, failure);
 }

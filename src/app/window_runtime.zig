@@ -56,6 +56,7 @@ pub const WindowRuntime = struct {
     focus: ui.focus.Manager = .{},
     semantics: ui.semantics.Snapshot = undefined,
     surface_color: core.Color = undefined,
+    background: ?core.Color = null,
     accent_color: core.Color = undefined,
     content_color: core.Color = undefined,
     border_color: core.Color = undefined,
@@ -160,6 +161,12 @@ pub const WindowRuntime = struct {
         if (self.ready) _ = try self.build_owners.markDirty(self.root_owner);
     }
 
+    pub fn setBackground(self: *WindowRuntime, background: ?core.Color) !void {
+        if (std.meta.eql(self.background, background)) return;
+        self.background = background;
+        if (self.ready) _ = try self.build_owners.markDirty(self.root_owner);
+    }
+
     pub fn setClipboardCoordinator(self: *WindowRuntime, clipboard: *clipboard_module.Coordinator) void {
         self.clipboard = clipboard;
     }
@@ -233,7 +240,7 @@ pub const WindowRuntime = struct {
         const arguments = [_]lua.UiBuildArgument{
             .{ .number = width },
             .{ .number = height },
-            .{ .integer = encodedColor(self.surface_color) },
+            .{ .integer = encodedColor(lua_ui.root_background orelse self.surface_color) },
             .{ .integer = encodedColor(self.accent_color) },
             .{ .integer = encodedColor(self.content_color) },
         };
@@ -336,7 +343,7 @@ pub const WindowRuntime = struct {
             }
         }
         const plan = try self.instances.prepareReconcile(prepared.descriptors());
-        try self.validatePreparedFrame(prepared.descriptors(), size);
+        try self.validatePreparedFrame(prepared.descriptors(), size, lua_ui.root_background != null);
         try lua_ui.commitDependencies(&self.build_owners, work);
         dependencies_pending = false;
         prepared.reconcile_plan = plan;
@@ -465,6 +472,7 @@ pub const WindowRuntime = struct {
         lua_ui.components.instances = &self.instances;
         lua_ui.image_scale = self.output_scale;
         lua_ui.root_padding = self.root_padding;
+        lua_ui.root_background = self.background;
         if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
         defer lua_ui.components.instances = null;
         var builds = self.build_owners.beginCycle();
@@ -475,7 +483,7 @@ pub const WindowRuntime = struct {
             const arguments = [_]lua.UiBuildArgument{
                 .{ .number = width },
                 .{ .number = height },
-                .{ .integer = encodedColor(self.surface_color) },
+                .{ .integer = encodedColor(self.background orelse self.surface_color) },
                 .{ .integer = encodedColor(self.accent_color) },
                 .{ .integer = encodedColor(self.content_color) },
             };
@@ -596,6 +604,9 @@ pub const WindowRuntime = struct {
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
             self.frame_state.invalidatePaint();
             var builder = try ui.render_object.Builder.init(self.commands, self.output_scale);
+            // The root paints the tint once. Reset reused buffers so a
+            // translucent root never blends with the previous frame.
+            if (self.background != null) try builder.clear(core.Color.rgba(0, 0, 0, 0));
             try self.tree.buildScene(root, &builder);
             self.command_count = builder.displayList().commands.len;
             _ = try self.frame_state.sceneBuilt();
@@ -1460,6 +1471,7 @@ pub const WindowRuntime = struct {
         self: *WindowRuntime,
         descriptors: []const ui.instance.Descriptor,
         size: core.SizeU,
+        transparent_clear: bool,
     ) !void {
         if (descriptors.len == 0) return;
         var tree: ui.render_object.Tree = undefined;
@@ -1486,6 +1498,7 @@ pub const WindowRuntime = struct {
         const commands = try self.allocator.alloc(scene.Command, self.commands.len);
         defer self.allocator.free(commands);
         var builder = try ui.render_object.Builder.init(commands, self.output_scale);
+        if (transparent_clear) try builder.clear(core.Color.rgba(0, 0, 0, 0));
         try tree.buildScene(handles[root_index], &builder);
     }
 
@@ -1771,6 +1784,14 @@ test "text input protocol batches mutate retained sessions only at the input saf
         .candidates = &.{font},
         .configuration_revision = 1,
     });
+    const placeholder = try sources.acquire(.{
+        .utf8 = "Search applications",
+        .language = "und",
+        .logical_size = 14,
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    defer sources.release(placeholder) catch unreachable;
 
     var runtime: WindowRuntime = .{};
     try runtime.tree.init(std.testing.allocator, 2);
@@ -1826,6 +1847,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
         },
         .{ .id = 2, .parent = 1, .object = .{ .text_input = .{
             .source = source,
+            .placeholder = placeholder,
             .color = core.Color.rgba(10, 10, 10, 255),
             .selection_color = core.Color.rgba(20, 40, 200, 100),
             .caret_color = core.Color.rgba(10, 10, 10, 255),
@@ -2098,6 +2120,43 @@ test "text input protocol batches mutate retained sessions only at the input saf
 
     while (scheduler.takeRunnable()) |runnable|
         _ = try callback_vm.resumeRunnable(runnable);
+    // Clearing a hinted field emits the empty value, never its display hint.
+    _ = editing.model.selectAll();
+    try runtime.routeKeyboard(.{ .key = .{
+        .window = window,
+        .serial = 12,
+        .time_ms = 13,
+        .state = .pressed,
+        .translated = .{ .keycode = 14, .logical = .backspace },
+    } });
+    try runtime.dispatchInput(&callbacks);
+    while (scheduler.takeRunnable()) |runnable|
+        _ = try callback_vm.resumeRunnable(runnable);
+    try std.testing.expectEqualStrings("", editing.model.text());
+    try std.testing.expectEqual(lua_c.type_string, lua_c.lua_getglobal(callback_vm.state, "changed_text"));
+    const empty_changed = lua_c.lua_tolstring(callback_vm.state, -1, &changed_length).?;
+    try std.testing.expectEqualStrings("", empty_changed[0..changed_length]);
+    lua_c.lua_settop(callback_vm.state, -2);
+    _ = try runtime.tree.layout((try runtime.instances.rootRenderObject()).?, ui.layout.Constraints.tight(.{ .width = 160, .height = 32 }));
+    try std.testing.expectEqualStrings("", (try runtime.textInputStatus()).?.state.surrounding.?.text);
+    // Preedit is visible presentation only; it does not dispatch on_change.
+    try runtime.routeTextInput(.{ .batch = .{
+        .window = window,
+        .serial = 13,
+        .serial_matches_state = true,
+        .delete_surrounding = null,
+        .commit = null,
+        .preedit = .{ .text = "候", .cursor_begin = 3, .cursor_end = 3 },
+    } });
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings("", editing.model.text());
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    const composing_input = (try runtime.tree.objectAt(render)).text_input;
+    try std.testing.expectEqualStrings("候", (try sources.get(composing_input.source)).utf8);
+    try std.testing.expect(composing_input.preedit != null);
+    try std.testing.expectEqual(placeholder, composing_input.placeholder.?);
+    _ = try editing.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+    try runtime.syncTextInputVisuals();
     var read_only_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(
         std.testing.allocator,
         "ignored",
@@ -2337,7 +2396,7 @@ fn descriptorRootIndex(descriptors: []const ui.instance.Descriptor) ?usize {
     return null;
 }
 
-test "candidate source build prepares owned output without changing retained UI" {
+test "candidate source build preserves layer background alpha without changing retained UI" {
     const bundle = @import("../bundle/root.zig");
     const io_loop = @import("../loop/root.zig");
     const SourceGeneration = @import("source_generation.zig").SourceGeneration;
@@ -2413,6 +2472,8 @@ test "candidate source build prepares owned output without changing retained UI"
     try std.testing.expectEqual(@as(f32, 12), runtime.root_padding);
     runtime.root_padding = 0;
     candidate.ui_build.enableDeclarativeWidgets(@import("../design/root.zig").tokens.light);
+    const tint = core.Color.rgba(17, 24, 32, 184);
+    candidate.ui_build.root_background = tint;
     try runtime.prepareSourceBuild(
         .{ .width = 320, .height = 200 },
         &candidate.ui_build,
@@ -2422,8 +2483,11 @@ test "candidate source build prepares owned output without changing retained UI"
     );
     try std.testing.expect(candidate.prepared_builds[0].reconcile_plan != null);
     try std.testing.expectEqual(@as(f32, 0), candidate.prepared_builds[0].descriptors()[0].object.box.padding.top);
+    try std.testing.expectEqual(tint, candidate.prepared_builds[0].descriptors()[0].object.box.background.?);
+    try std.testing.expectEqual(null, runtime.background);
     try std.testing.expectEqual(@as(usize, 0), runtime.instances.activeCount());
     try runtime.validatePreparedSourceCommit(&candidate.prepared_builds[0]);
+    runtime.background = tint;
     runtime.commitPreparedSource(
         &candidate.prepared_builds[0],
         &callbacks,
@@ -2432,6 +2496,30 @@ test "candidate source build prepares owned output without changing retained UI"
     );
     try std.testing.expect(candidate.prepared_builds[0].reconcile_plan == null);
     try std.testing.expect(runtime.signals == &candidate.signals);
+
+    // Resize and fractional scaling must preserve the tint at every pixel.
+    // Repaint the same nonzero storage twice to detect alpha accumulation.
+    _ = try runtime.frame_state.configure(.{ .width = 13, .height = 7 });
+    try runtime.prepareFrame(1.5);
+    var pixels: [20 * 11 * 4]u8 = @splat(255);
+    for (0..2) |_| {
+        try @import("../renderer/software/root.zig").render(try runtime.displayList(), .{
+            .pixels = &pixels,
+            .width = 20,
+            .height = 11,
+            .stride = 80,
+            .format = .bgra8_unorm,
+        });
+        var offset: usize = 0;
+        while (offset < pixels.len) : (offset += 4)
+            try std.testing.expectEqualSlices(u8, &.{ 23, 17, 12, 184 }, pixels[offset..][0..4]);
+    }
+    try runtime.setTheme(@import("../design/root.zig").tokens.dark);
+    try runtime.reconcile(.{ .width = 13, .height = 7 }, &candidate.ui_build, candidate.application.windows[0].content_reference);
+    try std.testing.expectEqual(tint, candidate.ui_build.storage[0].object.box.background.?);
+    try runtime.setBackground(null);
+    try runtime.reconcile(.{ .width = 13, .height = 7 }, &candidate.ui_build, candidate.application.windows[0].content_reference);
+    try std.testing.expectEqual(candidate.ui_build.widget_theme.?.colors.background, candidate.ui_build.storage[0].object.box.background.?);
 
     try runtime.clear(&candidate.ui_build);
     try scheduler.applyQueuedCancellations();

@@ -56,6 +56,7 @@ const Slot = struct {
     needs_paint: bool = true,
     layout_count: usize = 0,
     paragraph_layout: ?text.ParagraphHandle = null,
+    placeholder_layout: ?text.ParagraphHandle = null,
     scroll_offset: f32 = 0,
     scroll_extent: f32 = 0,
 };
@@ -154,6 +155,11 @@ pub const Tree = struct {
             .text => |value| {
                 const cache = self.paragraph_sources orelse return error.TextCacheRequired;
                 try cache.validateRetain(value.source);
+            },
+            .text_input => |value| {
+                const cache = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
+                try cache.validateRetain(value.source);
+                if (value.placeholder) |placeholder| try cache.validateRetain(placeholder);
             },
             .image => |value| if (value.image) |image| {
                 const cache = self.images orelse return error.ImageResourcesRequired;
@@ -563,7 +569,10 @@ pub const Tree = struct {
                         .height = rectangle.height,
                     }, value.selection_color);
                 }
-                try builder.paragraph(paragraph_handle, origin, value.color);
+                if (target.placeholder_layout) |placeholder|
+                    try builder.paragraph(placeholder, origin, value.placeholder_color)
+                else
+                    try builder.paragraph(paragraph_handle, origin, value.color);
                 if (value.preedit) |range| {
                     var rectangles = try paragraph_layout.positioned.selectionRectangleIterator(.{
                         .start = range.start,
@@ -774,10 +783,33 @@ pub const Tree = struct {
         if (input.preedit) |range| if (!hasCaretBoundary(&paragraph_layout.positioned, range.start) or
             !hasCaretBoundary(&paragraph_layout.positioned, range.end))
             return error.InvalidTextInputRange;
-        const result = constraints.constrain(paragraph_layout.size);
+        var placeholder_layout: ?text.ParagraphHandle = null;
+        errdefer if (placeholder_layout) |value| paragraphs.release(value) catch unreachable;
+        var content_size = paragraph_layout.size;
+        if (source.utf8.len == 0 and input.preedit == null) {
+            if (input.placeholder) |placeholder| {
+                const hint = sources.get(placeholder) catch return error.StaleParagraphSource;
+                const hint_layout = paragraphs.acquire(.{
+                    .utf8 = hint.utf8,
+                    .base_direction = hint.base_direction,
+                    .language = hint.language,
+                    .logical_size = hint.logical_size,
+                    .max_width = if (constraints.hasBoundedWidth()) constraints.max_width else std.math.floatMax(f32),
+                    .candidates = hint.candidates,
+                    .configuration_revision = hint.configuration_revision,
+                    .style = .{ .alignment = input.alignment, .max_lines = 1, .overflow = .ellipsis },
+                }) catch return error.ParagraphLayoutFailed;
+                placeholder_layout = hint_layout;
+                const hint_size = (paragraphs.get(hint_layout) catch return error.StaleParagraph).size;
+                content_size.width = @max(content_size.width, hint_size.width);
+                content_size.height = @max(content_size.height, hint_size.height);
+            }
+        }
+        const result = constraints.constrain(content_size);
         const target = try self.slot(handle);
         self.releaseParagraphLayout(target);
         target.paragraph_layout = layout_handle;
+        target.placeholder_layout = placeholder_layout;
         return result;
     }
 
@@ -807,6 +839,8 @@ pub const Tree = struct {
             .text_input => |input| {
                 const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
                 try sources.retain(input.source);
+                errdefer sources.release(input.source) catch unreachable;
+                if (input.placeholder) |placeholder| try sources.retain(placeholder);
             },
             else => {},
         }
@@ -816,7 +850,10 @@ pub const Tree = struct {
         switch (object) {
             .image => |value| if (value.image) |image| self.images.?.release(image) catch unreachable,
             .text => |value| self.paragraph_sources.?.release(value.source) catch unreachable,
-            .text_input => |input| self.paragraph_sources.?.release(input.source) catch unreachable,
+            .text_input => |input| {
+                self.paragraph_sources.?.release(input.source) catch unreachable;
+                if (input.placeholder) |placeholder| self.paragraph_sources.?.release(placeholder) catch unreachable;
+            },
             else => {},
         }
     }
@@ -825,6 +862,9 @@ pub const Tree = struct {
         if (slot_value.paragraph_layout) |paragraph_handle|
             self.paragraphs.?.release(paragraph_handle) catch unreachable;
         slot_value.paragraph_layout = null;
+        if (slot_value.placeholder_layout) |placeholder|
+            self.paragraphs.?.release(placeholder) catch unreachable;
+        slot_value.placeholder_layout = null;
     }
 };
 
@@ -886,12 +926,15 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .stack => false,
         .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
         .image => |old_image| !std.meta.eql(old_image.image, new.image.image) or
-            old_image.width != new.image.width or old_image.height != new.image.height,
+            old_image.width != new.image.width or old_image.height != new.image.height or
+            old_image.fill_width != new.image.fill_width or old_image.fill_height != new.image.fill_height,
         .text => |old_text| !sameSource(old_text.source, new.text.source) or
             old_text.alignment != new.text.alignment or
             old_text.max_lines != new.text.max_lines or
             old_text.overflow != new.text.overflow,
         .text_input => |old_input| !sameSource(old_input.source, new.text_input.source) or
+            !std.meta.eql(old_input.placeholder, new.text_input.placeholder) or
+            (old_input.placeholder != null and (old_input.preedit == null) != (new.text_input.preedit == null)) or
             old_input.alignment != new.text_input.alignment,
     };
 }
@@ -1308,6 +1351,94 @@ test "text input paints selection, text, and caret from interactive paragraph ge
     try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
 }
 
+test "text input placeholder paints separately from caret and preedit geometry" {
+    const scene = @import("../../scene/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const empty = try sources.acquire(.{
+        .utf8 = "",
+        .language = "und",
+        .logical_size = 18,
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    const hint = try sources.acquire(.{
+        .utf8 = "Find an application by name",
+        .language = "und",
+        .logical_size = 18,
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    tree.attachTextCaches(&sources, &paragraphs);
+    defer tree.deinit();
+    var object: types.Object = .{ .text_input = .{
+        .source = empty,
+        .color = Color.rgba(1, 2, 3, 255),
+        .placeholder = hint,
+        .placeholder_color = Color.rgba(100, 110, 120, 255),
+        .caret_color = Color.rgba(20, 40, 80, 255),
+        .selection_color = Color.rgba(80, 120, 240, 120),
+        .selection_start = 0,
+        .selection_end = 0,
+        .caret_offset = 0,
+        .show_caret = true,
+    } };
+    const input = try tree.create(object);
+    try sources.release(empty);
+    try sources.release(hint);
+    const constraints: Constraints = .{ .max_width = 100, .max_height = 40 };
+    const size = try tree.layout(input, constraints);
+    try std.testing.expect(size.width > 0 and size.width <= 100);
+    const caret = try tree.textCaretRectangle(input);
+    // Clicking the far end of a long hint must still address empty value offset 0.
+    try std.testing.expectEqual(@as(usize, 0), (try tree.hitTestText(input, .{ .x = 90, .y = 5 })).caret.byte_offset);
+    var commands: [16]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(input, &builder);
+    try std.testing.expectEqual(@as(usize, 4), builder.displayList().commands.len);
+    try std.testing.expectEqual(object.text_input.placeholder_color, builder.displayList().commands[1].paragraph.color);
+    try std.testing.expectEqual(@as(i32, 0), builder.displayList().commands[2].solid_rectangle.bounds.x);
+
+    // Even an empty active preedit hides the hint without changing the source.
+    object.text_input.preedit = .{ .start = 0, .end = 0 };
+    object.text_input.preedit_color = object.text_input.caret_color;
+    try tree.update(input, object);
+    try std.testing.expect(try tree.layoutDirty(input));
+    _ = try tree.layout(input, constraints);
+    try std.testing.expect((try tree.slot(input)).placeholder_layout == null);
+    try std.testing.expectEqual(caret, try tree.textCaretRectangle(input));
+    object.text_input.preedit = null;
+    object.text_input.preedit_color = null;
+    try tree.update(input, object);
+    _ = try tree.layout(input, constraints);
+    try std.testing.expect((try tree.slot(input)).placeholder_layout != null);
+
+    // Real text suppresses the hint even if it exactly equals the hint text.
+    object.text_input.source = hint;
+    object.text_input.selection_end = "Find an application by name".len;
+    object.text_input.caret_offset = object.text_input.selection_end;
+    try tree.update(input, object);
+    _ = try tree.layout(input, constraints);
+    try std.testing.expect((try tree.slot(input)).placeholder_layout == null);
+    builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(input, &builder);
+    try std.testing.expect(builder.displayList().commands[1] == .solid_rectangle);
+    try tree.destroy(input);
+    try std.testing.expectEqual(@as(usize, 0), sources.count());
+    try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
+}
+
 test "render-object topology rejects cycles and stale generations" {
     var tree: Tree = undefined;
     try tree.init(std.testing.allocator, 2);
@@ -1425,6 +1556,53 @@ test "image tree retains intrinsic resources and emits scaled clipped native com
 
     try tree.destroy(leaf);
     try std.testing.expectError(error.StaleImageHandle, images.get(image));
+}
+
+test "stack fill image resizes behind centered foreground and cannot steal its hits" {
+    const scene = @import("../../scene/root.zig");
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try images.insert(.{
+        .allocator = std.testing.allocator,
+        .pixels = try std.testing.allocator.dupe(u8, &.{ 0, 0, 0, 128 }),
+        .width = 1,
+        .height = 1,
+        .intrinsic_width = 90,
+        .intrinsic_height = 30,
+    });
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    defer tree.deinit();
+    tree.attachImageCache(&images);
+    const root = try tree.create(.{ .stack = .{} });
+    const background = try tree.create(.{ .image = .{ .image = image, .fit = .fill } });
+    try images.release(image);
+    const foreground = try tree.create(.{ .box = .{ .fill_width = true, .fill_height = true, .alignment = .center } });
+    const control = try tree.create(.{ .box = .{ .width = 60, .height = 24, .background = Color.rgba(20, 60, 100, 255) } });
+    try tree.appendChild(root, background, .none);
+    try tree.appendChild(root, foreground, .none);
+    try tree.appendChild(foreground, control, .none);
+    _ = try tree.layout(root, .{ .max_width = 240, .max_height = 100 });
+    try std.testing.expectEqual(SizeF{ .width = 90, .height = 30 }, try tree.nodeSize(background));
+    try tree.update(background, .{ .image = .{ .image = image, .fill_width = true, .fill_height = true, .fit = .fill } });
+    try std.testing.expect(try tree.layoutDirty(root));
+    for ([_]SizeF{ .{ .width = 240, .height = 100 }, .{ .width = 370, .height = 180 } }) |size_value| {
+        // Loose bounded constraints are deliberate: filling cannot depend on
+        // receiving a tight window rectangle or using the window's dimensions.
+        _ = try tree.layout(root, .{ .max_width = size_value.width, .max_height = size_value.height });
+        try std.testing.expectEqual(size_value, try tree.nodeSize(root));
+        try std.testing.expectEqual(size_value, try tree.nodeSize(background));
+        try std.testing.expectEqual(PointF{ .x = (size_value.width - 60) / 2, .y = (size_value.height - 24) / 2 }, try tree.nodeOffset(control));
+        try std.testing.expectEqual(control, (try tree.hitTest(root, .{ .x = size_value.width / 2, .y = size_value.height / 2 })).?);
+        var commands: [2]scene.Command = undefined;
+        var builder = try scene_builder.Builder.init(&commands, 2);
+        try tree.buildScene(root, &builder);
+        try std.testing.expectEqual(@as(usize, 2), builder.count);
+        try std.testing.expect(commands[0] == .image and commands[1] == .solid_rectangle);
+        try std.testing.expectEqual(@as(u32, @intFromFloat(size_value.width * 2)), commands[0].image.bounds.width);
+        try std.testing.expectEqual(@as(u32, @intFromFloat(size_value.height * 2)), commands[0].image.bounds.height);
+        try std.testing.expectEqual(@as(u32, 1), (try images.get(image)).width);
+    }
 }
 
 test "image tree rejects stale replacements and children without changing ownership" {

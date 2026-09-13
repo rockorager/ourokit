@@ -794,6 +794,8 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
                     .exclusive_zone = try optionalSignedInteger(state, -1, "exclusive_zone", 0, -1),
                     .exclusive_edge = try optionalNullableEnum(platform.Edge, state, -1, "exclusive_edge"),
                     .margins = try optionalMargins(state, -1),
+                    .background = try optionalBackground(state, -1),
+                    .background_effect = try optionalNullableEnum(platform.BackgroundEffect, state, -1, "background_effect"),
                     .keyboard_interactivity = try optionalEnum(
                         platform.KeyboardInteractivity,
                         state,
@@ -931,6 +933,13 @@ fn optionalNullableEnum(
     var length: usize = 0;
     const value = c.lua_tolstring(state, -1, &length) orelse return error.InvalidEnumValue;
     return std.meta.stringToEnum(Enum, value[0..length]) orelse error.InvalidEnumValue;
+}
+
+fn optionalBackground(state: *c.State, table: c_int) !?@import("../core/color.zig").Color {
+    const value_type = c.lua_getfield(state, table, "background");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return null;
+    return try theming.color(state, -1);
 }
 
 fn optionalAnchors(state: *c.State, table: c_int) !platform.Anchors {
@@ -1129,6 +1138,8 @@ test "layer surface constructor parses shell policy into a distinct declaration"
         \\    exclusive_edge = "top",
         \\    margins = { top = 1, right = 2, bottom = 3, left = 4 },
         \\    keyboard_interactivity = "on_demand",
+        \\    background = "#111820B8",
+        \\    background_effect = "blur",
         \\    content = function() end,
         \\  } },
         \\}
@@ -1148,6 +1159,30 @@ test "layer surface constructor parses shell policy into a distinct declaration"
     try std.testing.expectEqual(platform.Edge.top, declaration.exclusive_edge.?);
     try std.testing.expectEqual(@as(i32, 4), declaration.margins.left);
     try std.testing.expectEqual(platform.KeyboardInteractivity.on_demand, declaration.keyboard_interactivity);
+    try std.testing.expectEqual(@import("../core/color.zig").Color.rgba(17, 24, 32, 184), declaration.background.?);
+    try std.testing.expectEqual(platform.BackgroundEffect.blur, declaration.background_effect.?);
+}
+
+test "layer surface background defaults and validation" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 3);
+    c.lua_setglobal(state, "ouro");
+    const prefix = "return ouro.app { id='test', windows={ouro.layer_surface {id='panel', namespace='test', layer='top', width=90, height=30, content=function() end,";
+    const suffix = "}}}";
+    var application = try Application.load(std.testing.allocator, state, prefix ++ suffix);
+    defer application.deinit();
+    try std.testing.expectEqual(null, application.windows[0].declaration.layer_surface.background);
+    try std.testing.expectEqual(null, application.windows[0].declaration.layer_surface.background_effect);
+    inline for (.{
+        .{ "background='#12345'", error.InvalidThemeColor },
+        .{ "background='#112233gg'", error.InvalidThemeColor },
+        .{ "background=false", error.InvalidThemeType },
+        .{ "background_effect='frost'", error.InvalidEnumValue },
+        .{ "background_effect=true", error.InvalidEnumValue },
+    }) |case| {
+        try std.testing.expectError(case[1], Application.load(std.testing.allocator, state, prefix ++ case[0] ++ suffix));
+    }
 }
 
 test "window minimum dimensions cannot exceed the initial size" {

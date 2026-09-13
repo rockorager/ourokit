@@ -10,6 +10,7 @@ pub const Kind = enum {
     listbox,
     option,
     box,
+    stack,
     row,
     column,
     scroll,
@@ -19,7 +20,7 @@ pub const Kind = enum {
 
     fn acceptsChildren(self: Kind) bool {
         return switch (self) {
-            .button, .listbox, .box, .row, .column, .scroll, .theme, .component => true,
+            .button, .listbox, .box, .stack, .row, .column, .scroll, .theme, .component => true,
             else => false,
         };
     }

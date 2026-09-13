@@ -66,6 +66,8 @@ pub const Image = struct {
     image: ?@import("../../image/cache.zig").ImageHandle = null,
     width: ?f32 = null,
     height: ?f32 = null,
+    fill_width: bool = false,
+    fill_height: bool = false,
     fit: @import("../../image/pixels.zig").Fit = .contain,
 };
 
@@ -90,6 +92,10 @@ pub const TextRange = struct {
 pub const TextInput = struct {
     source: ParagraphSourceHandle,
     color: Color,
+    /// Display-only hint, shaped separately from the editable paragraph. It is
+    /// visible only when source is empty and no IME preedit is active.
+    placeholder: ?ParagraphSourceHandle = null,
+    placeholder_color: Color = Color.rgba(128, 128, 128, 255),
     selection_color: Color,
     caret_color: Color,
     selection_start: usize,

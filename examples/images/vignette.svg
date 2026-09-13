@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="fade" r="0.7">
+      <stop offset="0" stop-color="#111720" stop-opacity="0.96"/>
+      <stop offset="0.35" stop-color="#111720" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#111720" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#fade)"/>
+</svg>
