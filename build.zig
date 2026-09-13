@@ -235,6 +235,21 @@ pub fn build(b: *std.Build) void {
     ourokit.addAnonymousImport("ourokit_arabic_test_font", .{
         .root_source_file = arabic_test_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
     });
+    const comparison = b.addExecutable(.{
+        .name = "font-comparison",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/rendering/font_comparison.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+        }),
+    });
+    comparison.root_module.addAnonymousImport("arabic_font", .{
+        .root_source_file = arabic_test_font.path("NotoSansArabic/unhinted/slim-variable-ttf/NotoSansArabic[wght].ttf"),
+    });
+    const run_comparison = b.addRunArtifact(comparison);
+    if (b.args) |args| run_comparison.addArgs(args);
+    b.step("compare-fonts", "Render matched Adobe font samples with software and Vulkan").dependOn(&run_comparison.step);
     const test_filters: []const []const u8 = if (b.option(
         []const u8,
         "test-filter",

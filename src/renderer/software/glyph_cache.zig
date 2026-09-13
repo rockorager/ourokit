@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("freetype_c.zig").ft;
 const text = @import("../../text/root.zig");
+const Phase = @import("../glyph_position.zig").Phase;
 
 pub const GlyphBitmap = struct {
     pixels: []u8,
@@ -15,11 +16,22 @@ const FaceKey = extern struct {
     generation: u32,
 };
 
-const GlyphKey = extern struct {
+/// Shared by the CPU mask cache and the Vulkan atlas.
+pub const GlyphKey = struct {
     font_slot: u32,
     font_generation: u32,
     glyph: u32,
     size_26_6: i32,
+    phase: Phase,
+
+    pub fn init(handle: text.FontHandle, glyph: u32, pixel_size: f32, phase: Phase) !GlyphKey {
+        if (!std.math.isFinite(pixel_size) or pixel_size <= 0) return error.InvalidGlyphSize;
+        const scaled = pixel_size * 64.0;
+        if (@as(f64, scaled) > std.math.maxInt(i32)) return error.InvalidGlyphSize;
+        const size_26_6: i32 = @intFromFloat(@round(scaled));
+        if (size_26_6 <= 0) return error.InvalidGlyphSize;
+        return .{ .font_slot = handle.slot, .font_generation = handle.generation, .glyph = glyph, .size_26_6 = size_26_6, .phase = phase };
+    }
 };
 
 const FaceEntry = struct {
@@ -36,14 +48,15 @@ pub const GlyphCache = struct {
     library: c.FT_Library,
     faces: std.AutoHashMapUnmanaged(FaceKey, *FaceEntry) = .empty,
     glyphs: std.AutoHashMapUnmanaged(GlyphKey, *GlyphBitmap) = .empty,
+    pixel_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, fonts: *text.FontCache) !GlyphCache {
         var library: c.FT_Library = null;
         if (c.FT_Init_FreeType(&library) != 0) return error.FreeTypeInitializationFailed;
         errdefer _ = c.FT_Done_FreeType(library);
         // Adobe's size-dependent darkening compensates for linear-light
-        // coverage blending. Keep native TrueType hinting; do not force the
-        // experimental auto-hinter darkening onto fallback fonts.
+        // coverage blending. Do not force experimental auto-hinter darkening
+        // onto fallback fonts.
         const engine: c.FT_UInt = c.FT_HINTING_ADOBE;
         const no_darkening: c.FT_Bool = 0;
         for ([_][:0]const u8{ "cff", "type1", "t1cid" }) |module| {
@@ -56,11 +69,7 @@ pub const GlyphCache = struct {
     }
 
     pub fn deinit(self: *GlyphCache) void {
-        var glyph_iterator = self.glyphs.valueIterator();
-        while (glyph_iterator.next()) |glyph| {
-            self.allocator.free(glyph.*.pixels);
-            self.allocator.destroy(glyph.*);
-        }
+        self.clear();
         self.glyphs.deinit(self.allocator);
         var face_iterator = self.faces.valueIterator();
         while (face_iterator.next()) |entry| {
@@ -73,30 +82,40 @@ pub const GlyphCache = struct {
         self.* = undefined;
     }
 
+    fn clear(self: *GlyphCache) void {
+        var glyph_iterator = self.glyphs.valueIterator();
+        while (glyph_iterator.next()) |glyph| {
+            self.allocator.free(glyph.*.pixels);
+            self.allocator.destroy(glyph.*);
+        }
+        self.glyphs.clearRetainingCapacity();
+        self.pixel_bytes = 0;
+    }
+
+    /// Returned masks remain valid until the next cache lookup or deinit.
     pub fn get(
         self: *GlyphCache,
         handle: text.FontHandle,
         glyph: u32,
         pixel_size: f32,
     ) !*const GlyphBitmap {
-        if (!std.math.isFinite(pixel_size) or pixel_size <= 0) return error.InvalidGlyphSize;
-        const scaled = pixel_size * 64.0;
-        if (@as(f64, scaled) > std.math.maxInt(i32)) return error.InvalidGlyphSize;
-        const size_26_6: i32 = @intFromFloat(@round(scaled));
-        if (size_26_6 <= 0) return error.InvalidGlyphSize;
-        const key: GlyphKey = .{
-            .font_slot = handle.slot,
-            .font_generation = handle.generation,
-            .glyph = glyph,
-            .size_26_6 = size_26_6,
-        };
+        return self.getPhase(handle, glyph, pixel_size, .{});
+    }
+
+    pub fn getPhase(self: *GlyphCache, handle: text.FontHandle, glyph: u32, pixel_size: f32, phase: Phase) !*const GlyphBitmap {
+        const key = try GlyphKey.init(handle, glyph, pixel_size, phase);
         if (self.glyphs.get(key)) |cached| return cached;
 
         const face_value = try self.face(handle);
-        if (c.FT_Set_Char_Size(face_value, 0, size_26_6, 72, 72) != 0)
+        if (c.FT_Set_Char_Size(face_value, 0, key.size_26_6, 72, 72) != 0)
             return error.GlyphSizeFailed;
-        if (c.FT_Load_Glyph(face_value, glyph, c.FT_LOAD_DEFAULT) != 0)
+        const flags = c.FT_LOAD_TARGET_LIGHT | c.FT_LOAD_NO_BITMAP;
+        if (c.FT_Load_Glyph(face_value, glyph, flags) != 0)
             return error.GlyphLoadFailed;
+        // Translate the loaded/hinted outline, before coverage rasterization.
+        // Bearings include this translation; callers add only integer anchors.
+        if (face_value.*.glyph.*.format == c.FT_GLYPH_FORMAT_OUTLINE)
+            c.FT_Outline_Translate(&face_value.*.glyph.*.outline, phase.x, -@as(c.FT_Pos, phase.y));
         if (c.FT_Render_Glyph(face_value.*.glyph, c.FT_RENDER_MODE_NORMAL) != 0)
             return error.GlyphRenderFailed;
         const source = face_value.*.glyph.*.bitmap;
@@ -105,7 +124,13 @@ pub const GlyphCache = struct {
 
         const width: u32 = source.width;
         const height: u32 = source.rows;
-        const pixels = try self.allocator.alloc(u8, try std.math.mul(usize, width, height));
+        const bytes = try std.math.mul(usize, width, height);
+        // Only demanded phases are cached. Bound phase churn (including empty
+        // glyphs) without holding 4096 variants per glyph indefinitely.
+        const max_bytes = 16 * 1024 * 1024;
+        if (bytes > max_bytes) return error.GlyphTooLarge;
+        if (self.pixel_bytes + bytes > max_bytes or self.glyphs.count() >= 16384) self.clear();
+        const pixels = try self.allocator.alloc(u8, bytes);
         errdefer self.allocator.free(pixels);
         copyBitmap(pixels, source);
         const bitmap = try self.allocator.create(GlyphBitmap);
@@ -118,6 +143,7 @@ pub const GlyphCache = struct {
             .top = face_value.*.glyph.*.bitmap_top,
         };
         try self.glyphs.put(self.allocator, key, bitmap);
+        self.pixel_bytes += bytes;
         return bitmap;
     }
 
@@ -248,4 +274,73 @@ test "stem darkening increases small bundled CFF glyph coverage without changing
         try std.testing.expect(dark_coverage > light_coverage);
         try std.testing.expectEqual((try plain.face(handle)).*.glyph.*.advance.x, (try darkened.face(handle)).*.glyph.*.advance.x);
     }
+}
+
+test "glyph phases match full signed FreeType translation and retain distinct cache identities" {
+    const Position = @import("../glyph_position.zig").Position;
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const handle = try text.bundled.acquire(&fonts, .serif, .regular, .italic);
+    defer fonts.release(handle) catch unreachable;
+    var cache = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    var reference = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer reference.deinit();
+    const glyph = (try fonts.get(handle)).nominalGlyph('R').?;
+    const zero = try cache.get(handle, glyph, 19.375);
+    const x_only = try cache.getPhase(handle, glyph, 19.375, .{ .x = 13 });
+    const y_only = try cache.getPhase(handle, glyph, 19.375, .{ .y = 13 });
+    try std.testing.expect(zero != x_only and zero != y_only and x_only != y_only);
+    try std.testing.expect(!std.mem.eql(u8, zero.pixels, x_only.pixels));
+    try std.testing.expect(!std.mem.eql(u8, zero.pixels, y_only.pixels));
+    try std.testing.expectEqual(x_only, try cache.getPhase(handle, glyph, 19.375, .{ .x = 13 }));
+    try std.testing.expect(x_only != try cache.getPhase(handle, glyph, 19.5, .{ .x = 13 }));
+
+    // An independent FreeType face translates by the *whole* signed origin,
+    // rather than calling split or translating by the cache's phase.
+    const face_value = try reference.face(handle);
+    for ([_][2]i32{ .{ 205, -147 }, .{ -147, 205 }, .{ -1, -33 } }) |origin| {
+        const position = Position.init(@as(f32, @floatFromInt(origin[0])) / 64, @as(f32, @floatFromInt(origin[1])) / 64);
+        const bitmap = try cache.getPhase(handle, glyph, 19.375, position.phase);
+        var delta: c.FT_Vector = .{ .x = origin[0], .y = -origin[1] };
+        c.FT_Set_Transform(face_value, null, &delta);
+        try std.testing.expectEqual(@as(c.FT_Error, 0), c.FT_Set_Char_Size(face_value, 0, 1240, 72, 72));
+        const flags = c.FT_LOAD_TARGET_LIGHT | c.FT_LOAD_NO_BITMAP;
+        try std.testing.expectEqual(@as(c.FT_Error, 0), c.FT_Load_Glyph(face_value, glyph, flags));
+        try std.testing.expectEqual(@as(c.FT_Error, 0), c.FT_Render_Glyph(face_value.*.glyph, c.FT_RENDER_MODE_NORMAL));
+        const slot = face_value.*.glyph;
+        try std.testing.expectEqual(slot.*.bitmap_left, position.x + bitmap.left);
+        try std.testing.expectEqual(-slot.*.bitmap_top, position.y - bitmap.top);
+        try std.testing.expectEqual(slot.*.bitmap.width, bitmap.width);
+        try std.testing.expectEqual(slot.*.bitmap.rows, bitmap.height);
+        const pixels = try std.testing.allocator.alloc(u8, bitmap.pixels.len);
+        defer std.testing.allocator.free(pixels);
+        copyBitmap(pixels, slot.*.bitmap);
+        try std.testing.expectEqualSlices(u8, pixels, bitmap.pixels);
+    }
+    // Equal slot numbers from different font generations must not alias.
+    const key = try GlyphKey.init(handle, glyph, 19.375, .{ .x = 13 });
+    var other = key;
+    other.font_generation += 1;
+    try std.testing.expect(!std.meta.eql(key, other));
+}
+
+test "glyph mask budget clears demanded phases and rerasterizes without changing pixels" {
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const handle = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
+    defer fonts.release(handle) catch unreachable;
+    var cache = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    const glyph = (try fonts.get(handle)).nominalGlyph('S').?;
+    const original = try cache.getPhase(handle, glyph, 21.375, .{ .x = 7, .y = 41 });
+    const pixels = try std.testing.allocator.dupe(u8, original.pixels);
+    defer std.testing.allocator.free(pixels);
+    // Simulate an exhausted byte budget, then miss with a different phase.
+    cache.pixel_bytes = 16 * 1024 * 1024;
+    _ = try cache.getPhase(handle, glyph, 21.375, .{ .x = 8, .y = 41 });
+    try std.testing.expectEqual(@as(u32, 1), cache.glyphs.count());
+    try std.testing.expect(cache.pixel_bytes < 16 * 1024 * 1024);
+    const again = try cache.getPhase(handle, glyph, 21.375, .{ .x = 7, .y = 41 });
+    try std.testing.expectEqualSlices(u8, pixels, again.pixels);
 }

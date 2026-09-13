@@ -16,6 +16,8 @@ const text = @import("../../text/root.zig");
 const build_options = @import("ourokit_build_options");
 const ImageCache = @import("../../image/cache.zig").Cache;
 const ImagePlacement = @import("../image_sampling.zig").Placement;
+const GlyphPosition = @import("../glyph_position.zig").Position;
+const Phase = @import("../glyph_position.zig").Phase;
 
 pub const has_freetype = build_options.freetype;
 const RasterCache = if (has_freetype)
@@ -83,12 +85,7 @@ const atlas_width = 2048;
 const atlas_height = 2048;
 const atlas_bytes = atlas_width * atlas_height;
 
-const AtlasKey = extern struct {
-    font_slot: u32,
-    font_generation: u32,
-    glyph: u32,
-    size_26_6: i32,
-};
+const AtlasKey = if (has_freetype) @import("../software/glyph_cache.zig").GlyphKey else struct {};
 
 const AtlasGlyph = struct {
     x: u32,
@@ -232,26 +229,19 @@ const RealGlyphCache = struct {
         self.* = undefined;
     }
 
-    fn get(self: *RealGlyphCache, handle: text.FontHandle, glyph_id: u32, pixel_size: f32) !AtlasGlyph {
-        if (!std.math.isFinite(pixel_size) or pixel_size <= 0) return error.InvalidGlyphSize;
-        const scaled = pixel_size * 64;
-        if (@as(f64, scaled) > std.math.maxInt(i32)) return error.InvalidGlyphSize;
-        const size_26_6: i32 = @intFromFloat(@round(scaled));
-        const key: AtlasKey = .{
-            .font_slot = handle.slot,
-            .font_generation = handle.generation,
-            .glyph = glyph_id,
-            .size_26_6 = size_26_6,
-        };
+    fn get(self: *RealGlyphCache, handle: text.FontHandle, glyph_id: u32, pixel_size: f32, phase: Phase) !AtlasGlyph {
+        const key = try AtlasKey.init(handle, glyph_id, pixel_size, phase);
         if (self.entries.get(key)) |entry| return entry;
-        const bitmap = try self.raster.get(handle, glyph_id, pixel_size);
+        if (self.entries.count() >= 16384) return error.GlyphAtlasFull;
+        const bitmap = try self.raster.getPhase(handle, glyph_id, pixel_size, phase);
         var x = self.next_x;
         var y = self.next_y;
+        var row_height = self.row_height;
         if (bitmap.width > atlas_width or bitmap.height > atlas_height) return error.GlyphAtlasFull;
         if (x + bitmap.width > atlas_width) {
             x = 0;
-            y += self.row_height;
-            self.row_height = 0;
+            y += row_height;
+            row_height = 0;
         }
         if (y + bitmap.height > atlas_height) return error.GlyphAtlasFull;
         const destination: [*]u8 = @ptrCast(self.mapping);
@@ -272,8 +262,25 @@ const RealGlyphCache = struct {
         try self.entries.put(self.allocator, key, entry);
         self.next_x = x + bitmap.width;
         self.next_y = y;
-        self.row_height = @max(self.row_height, bitmap.height);
+        self.row_height = @max(row_height, bitmap.height);
         return entry;
+    }
+
+    /// Drawing cannot allocate a new phase after the upload was recorded.
+    fn prepared(self: *const RealGlyphCache, handle: text.FontHandle, glyph_id: u32, pixel_size: f32, phase: Phase) AtlasGlyph {
+        const key = AtlasKey.init(handle, glyph_id, pixel_size, phase) catch unreachable;
+        return self.entries.get(key) orelse unreachable;
+    }
+
+    /// Reclaim only between frames, never while building a frame's draw calls.
+    /// Presentation targets can still reference old atlas/staging storage.
+    fn reset(self: *RealGlyphCache) !void {
+        try vk(c.vkDeviceWaitIdle(self.renderer.device), error.DeviceLost);
+        self.entries.clearRetainingCapacity();
+        self.next_x = 0;
+        self.next_y = 0;
+        self.row_height = 0;
+        self.uploaded();
     }
 
     fn recordUpload(self: *const RealGlyphCache, command_buffer_value: c.VkCommandBuffer, destination_stage: c.VkPipelineStageFlags) bool {
@@ -2508,21 +2515,43 @@ fn prepareText(
     paragraphs: ?*const text.ParagraphCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
+    prepareTextPass(commands, glyphs, shapes, paragraphs) catch |err| {
+        if (err != error.GlyphAtlasFull) return err;
+        // Discard old frames' phases and pack just this frame once. A frame
+        // exceeding the fixed budget fails before recording/uploading, rather
+        // than evicting masks already referenced by this frame's draws.
+        try glyphs.reset();
+        try prepareTextPass(commands, glyphs, shapes, paragraphs);
+    };
+}
+
+fn prepareTextPass(
+    commands: []const scene.Command,
+    glyphs: *GlyphCache,
+    shapes: ?*const text.ShapeCache,
+    paragraphs: ?*const text.ParagraphCache,
+) !void {
     for (commands) |command| switch (command) {
         .glyph_run => |run| {
             const shaped = try (shapes orelse return error.TextResourcesRequired).get(run.shape);
+            var pen = run.origin;
             for (shaped.spans) |span| {
                 for (span.run.glyphs) |glyph| {
-                    _ = try glyphs.get(span.font, glyph.id, shaped.logical_size * run.scale);
+                    const position = GlyphPosition.init(pen.x + glyph.offset.x * run.scale, pen.y - glyph.offset.y * run.scale);
+                    _ = try glyphs.get(span.font, glyph.id, shaped.logical_size * run.scale, position.phase);
+                    pen.x += glyph.advance.x * run.scale;
+                    pen.y -= glyph.advance.y * run.scale;
                 }
             }
         },
-        .paragraph => |paragraph_command| {
-            const layout = try (paragraphs orelse return error.TextResourcesRequired).get(paragraph_command.layout);
-            for (layout.positioned.spans) |span| {
-                for (layout.positioned.glyphsFor(span)) |glyph| {
-                    _ = try glyphs.get(span.font, glyph.id, layout.logical_size * paragraph_command.scale);
-                }
+        .paragraph => |value| {
+            const layout = try (paragraphs orelse return error.TextResourcesRequired).get(value.layout);
+            for (layout.positioned.lines) |line| {
+                const baseline = value.origin.y + (line.top + line.baseline) * value.scale;
+                for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
+                    const position = GlyphPosition.init(value.origin.x + (line.left + glyph.origin.x) * value.scale, baseline + glyph.origin.y * value.scale);
+                    _ = try glyphs.get(span.font, glyph.id, layout.logical_size * value.scale, position.phase);
+                };
             }
         },
         else => {},
@@ -2542,12 +2571,11 @@ fn drawGlyphRun(
     const source = packedLinear(LinearRgba16.fromColor(command.color));
     var pen = command.origin;
     for (shaped.spans) |span| for (span.run.glyphs) |glyph| {
-        const atlas = cache.get(span.font, glyph.id, shaped.logical_size * command.scale) catch unreachable;
-        const left: i32 = @intFromFloat(@round(pen.x + glyph.offset.x * command.scale));
-        const baseline: i32 = @intFromFloat(@round(pen.y - glyph.offset.y * command.scale));
+        const position = GlyphPosition.init(pen.x + glyph.offset.x * command.scale, pen.y - glyph.offset.y * command.scale);
+        const atlas = cache.prepared(span.font, glyph.id, shaped.logical_size * command.scale, position.phase);
         const glyph_bounds: RectI = .{
-            .x = left + atlas.left,
-            .y = baseline - atlas.top,
+            .x = position.x + atlas.left,
+            .y = position.y - atlas.top,
             .width = atlas.width,
             .height = atlas.height,
         };
@@ -2594,12 +2622,11 @@ fn drawPresentationGlyphRun(
     const color = LinearRgba16.fromColor(command.color);
     var pen = command.origin;
     for (shaped.spans) |span| for (span.run.glyphs) |glyph| {
-        const atlas = cache.get(span.font, glyph.id, shaped.logical_size * command.scale) catch unreachable;
-        const left: i32 = @intFromFloat(@round(pen.x + glyph.offset.x * command.scale));
-        const baseline: i32 = @intFromFloat(@round(pen.y - glyph.offset.y * command.scale));
+        const position = GlyphPosition.init(pen.x + glyph.offset.x * command.scale, pen.y - glyph.offset.y * command.scale);
+        const atlas = cache.prepared(span.font, glyph.id, shaped.logical_size * command.scale, position.phase);
         const glyph_bounds: RectI = .{
-            .x = left + atlas.left,
-            .y = baseline - atlas.top,
+            .x = position.x + atlas.left,
+            .y = position.y - atlas.top,
             .width = atlas.width,
             .height = atlas.height,
         };
@@ -2655,12 +2682,11 @@ fn drawPresentationParagraph(
     for (layout.positioned.lines) |line| {
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
-            const atlas = cache.get(span.font, glyph.id, layout.logical_size * command.scale) catch unreachable;
-            const left: i32 = @intFromFloat(@round(command.origin.x + (line.left + glyph.origin.x) * command.scale));
-            const glyph_baseline: i32 = @intFromFloat(@round(baseline + glyph.origin.y * command.scale));
+            const position = GlyphPosition.init(command.origin.x + (line.left + glyph.origin.x) * command.scale, baseline + glyph.origin.y * command.scale);
+            const atlas = cache.prepared(span.font, glyph.id, layout.logical_size * command.scale, position.phase);
             const glyph_bounds: RectI = .{
-                .x = left + atlas.left,
-                .y = glyph_baseline - atlas.top,
+                .x = position.x + atlas.left,
+                .y = position.y - atlas.top,
                 .width = atlas.width,
                 .height = atlas.height,
             };
@@ -2883,12 +2909,11 @@ fn drawParagraph(
     for (layout.positioned.lines) |line| {
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
-            const atlas = cache.get(span.font, glyph.id, layout.logical_size * command.scale) catch unreachable;
-            const left: i32 = @intFromFloat(@round(command.origin.x + (line.left + glyph.origin.x) * command.scale));
-            const glyph_baseline: i32 = @intFromFloat(@round(baseline + glyph.origin.y * command.scale));
+            const position = GlyphPosition.init(command.origin.x + (line.left + glyph.origin.x) * command.scale, baseline + glyph.origin.y * command.scale);
+            const atlas = cache.prepared(span.font, glyph.id, layout.logical_size * command.scale, position.phase);
             const glyph_bounds: RectI = .{
-                .x = left + atlas.left,
-                .y = glyph_baseline - atlas.top,
+                .x = position.x + atlas.left,
+                .y = position.y - atlas.top,
                 .width = atlas.width,
                 .height = atlas.height,
             };
@@ -2924,22 +2949,18 @@ fn drawParagraph(
 test "Vulkan glyph atlas matches exact software text rendering" {
     if (comptime !has_freetype) return error.SkipZigTest;
     const software = @import("../software/root.zig");
-    const font_bytes = @embedFile("ourokit_test_font_static");
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
-    const font = try fonts.acquire(.{
-        .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 },
-        .bytes = font_bytes,
-    });
+    const font = try text.bundled.acquire(&fonts, .sans, .regular, .italic);
     var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
     defer shapes.deinit();
     const shape = try shapes.acquire(.{
         .spec = .{
-            .paragraph = "Vulkan atlas",
+            .paragraph = "Wa\u{0301}\u{0323} x\u{0302} atlas",
             .direction = .left_to_right,
             .script = .latin,
             .language = "en",
-            .logical_size = 18,
+            .logical_size = 18.25,
         },
         .candidates = &.{font},
         .configuration_revision = 1,
@@ -2951,8 +2972,8 @@ test "Vulkan glyph atlas matches exact software text rendering" {
         .{ .push_clip_rect = .{ .x = 8, .y = 3, .width = 140, .height = 30 } },
         .{ .glyph_run = .{
             .shape = shape,
-            .origin = .{ .x = 4, .y = 25 },
-            .scale = 1,
+            .origin = .{ .x = -2.296875, .y = 25.203125 },
+            .scale = 1.5,
             .color = Color.rgba(20, 40, 80, 211),
         } },
         .pop_clip,
@@ -2978,7 +2999,17 @@ test "Vulkan glyph atlas matches exact software text rendering" {
     defer glyphs.deinit();
     var target = try Target.init(&renderer, 160, 36);
     defer target.deinit(&renderer);
+    // Simulate a cache filled by previous frames, including a stale phase.
+    _ = try glyphs.get(font, (try fonts.get(font)).nominalGlyph('W').?, 18.25, .{});
+    glyphs.next_x = atlas_width;
+    glyphs.next_y = atlas_height;
+    glyphs.row_height = 0;
     try renderer.renderText(list, &target, &glyphs, &shapes);
+    try std.testing.expect(glyphs.next_y < atlas_height);
+    const count = glyphs.entries.count();
+    try prepareText(list.commands, &glyphs, &shapes, null);
+    try std.testing.expectEqual(count, glyphs.entries.count());
+    try std.testing.expectEqual(@as(usize, atlas_bytes), glyphs.dirty_start);
     var actual = [_]u8{0} ** expected.len;
     try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);
@@ -2989,6 +3020,14 @@ test "Vulkan glyph atlas matches exact software text rendering" {
     for (0..36) |y| for (0..160) |x| {
         try graphics.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
     };
+    var oversized = commands;
+    oversized[2].glyph_run.scale = 200;
+    try std.testing.expectError(error.GlyphAtlasFull, renderer.renderText(.{ .commands = &oversized }, &target, &glyphs, &shapes));
+    try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    try renderer.renderText(list, &target, &glyphs, &shapes);
+    try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
 test "Vulkan positioned paragraphs match exact software text rendering" {
@@ -2996,10 +3035,7 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
     const software = @import("../software/root.zig");
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
-    const latin = try fonts.acquire(.{
-        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
-        .bytes = @embedFile("ourokit_test_font"),
-    });
+    const latin = try text.bundled.acquire(&fonts, .serif, .regular, .roman);
     const arabic = try fonts.acquire(.{
         .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_arabic_test_font"),
@@ -3007,10 +3043,10 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
     var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
     defer paragraphs.deinit();
     const layout = try paragraphs.acquire(.{
-        .utf8 = "Save حفظ now and continue",
+        .utf8 = "Save حفظ a\u{0301}\u{0323} now and continue",
         .language = "und",
-        .logical_size = 18,
-        .max_width = 120,
+        .logical_size = 14.25,
+        .max_width = 86,
         .candidates = &.{ latin, arabic },
         .configuration_revision = 1,
     });
@@ -3022,8 +3058,8 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
         .{ .push_clip_rect = .{ .x = 8, .y = 3, .width = 130, .height = 66 } },
         .{ .paragraph = .{
             .layout = layout,
-            .origin = .{ .x = 4, .y = 4 },
-            .scale = 1,
+            .origin = .{ .x = -1.203125, .y = -2.296875 },
+            .scale = 1.5,
             .color = Color.rgba(20, 40, 80, 211),
         } },
         .pop_clip,

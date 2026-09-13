@@ -8,6 +8,7 @@ const text = @import("../../text/root.zig");
 const build_options = @import("ourokit_build_options");
 const ImageCache = @import("../../image/cache.zig").Cache;
 const ImagePlacement = @import("../image_sampling.zig").Placement;
+const GlyphPosition = @import("../glyph_position.zig").Position;
 
 pub const has_freetype = build_options.freetype;
 pub const GlyphCache = if (has_freetype)
@@ -224,18 +225,18 @@ fn drawGlyphRun(
     var pen = command.origin;
     for (shaped.spans) |span| {
         for (span.run.glyphs) |glyph| {
-            const bitmap = try cache.get(
+            const position = GlyphPosition.init(pen.x + glyph.offset.x * command.scale, pen.y - glyph.offset.y * command.scale);
+            const bitmap = try cache.getPhase(
                 span.font,
                 glyph.id,
                 shaped.logical_size * command.scale,
+                position.phase,
             );
-            const left: i32 = @intFromFloat(@round(pen.x + glyph.offset.x * command.scale));
-            const baseline: i32 = @intFromFloat(@round(pen.y - glyph.offset.y * command.scale));
             drawMask(
                 target,
                 clip,
-                left + bitmap.left,
-                baseline - bitmap.top,
+                position.x + bitmap.left,
+                position.y - bitmap.top,
                 bitmap,
                 command.color,
             );
@@ -257,22 +258,21 @@ fn drawParagraph(
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| {
             for (layout.positioned.glyphsFor(span)) |glyph| {
-                const bitmap = try cache.get(
+                const position = GlyphPosition.init(
+                    command.origin.x + (line.left + glyph.origin.x) * command.scale,
+                    baseline + glyph.origin.y * command.scale,
+                );
+                const bitmap = try cache.getPhase(
                     span.font,
                     glyph.id,
                     layout.logical_size * command.scale,
+                    position.phase,
                 );
-                const left: i32 = @intFromFloat(@round(
-                    command.origin.x + (line.left + glyph.origin.x) * command.scale,
-                ));
-                const glyph_baseline: i32 = @intFromFloat(@round(
-                    baseline + glyph.origin.y * command.scale,
-                ));
                 drawMask(
                     target,
                     clip,
-                    left + bitmap.left,
-                    glyph_baseline - bitmap.top,
+                    position.x + bitmap.left,
+                    position.y - bitmap.top,
                     bitmap,
                     command.color,
                 );
@@ -563,6 +563,40 @@ test "BGRA storage, target validation, and clip balance are explicit" {
             .pop_clip,
         },
     }, .{ .pixels = &pixel, .width = 1, .height = 1, .stride = 4, .format = .rgba8_unorm }));
+}
+
+test "glyph runs scale offsets and accumulate fractional advances before raster placement" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
+    defer fonts.release(font) catch unreachable;
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    const shape = try shapes.acquire(.{
+        .spec = .{ .paragraph = "Ri", .direction = .left_to_right, .script = .latin, .language = "en", .logical_size = 13.25 },
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    defer shapes.release(shape) catch unreachable;
+    // Synthetic shaped metrics make each coordinate independently calculable.
+    const run = (try shapes.get(shape)).spans[0].run;
+    run.glyphs[0].offset = .{ .x = -0.5, .y = 0.25 };
+    run.glyphs[0].advance = .{ .x = 6.25, .y = 0.5 };
+    run.glyphs[1].offset = .{ .x = 0.75, .y = -0.375 };
+    var cache = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    var actual = [_]LinearRgba16{LinearRgba16.fromColor(Color.rgba(255, 255, 255, 255))} ** (40 * 30);
+    var expected = actual;
+    const clip: RectI = .{ .x = 0, .y = 1, .width = 39, .height = 28 };
+    const color = Color.rgba(19, 47, 83, 211);
+    try drawGlyphRun(.{ .shape = shape, .origin = .{ .x = -2.25, .y = 20.125 }, .scale = 1.5, .color = color }, .{ .pixels = &actual, .width = 40, .height = 30 }, clip, &cache, &shapes);
+    // Expected origins: (-3, 19.75), (8.25, 19.9375), size 19.875.
+    const first = try cache.getPhase(font, run.glyphs[0].id, 19.875, .{ .x = 0, .y = 48 });
+    drawMask(.{ .pixels = &expected, .width = 40, .height = 30 }, clip, -3 + first.left, 19 - first.top, first, color);
+    const second = try cache.getPhase(font, run.glyphs[1].id, 19.875, .{ .x = 16, .y = 60 });
+    drawMask(.{ .pixels = &expected, .width = 40, .height = 30 }, clip, 8 + second.left, 19 - second.top, second, color);
+    try std.testing.expectEqualSlices(LinearRgba16, &expected, &actual);
 }
 
 test "HarfBuzz glyph runs rasterize deterministically through backend cache" {

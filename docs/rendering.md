@@ -167,10 +167,30 @@ a `measureText` operation, chooses fonts, performs bidi, or reshapes strings.
 The shared FreeType glyph cache explicitly selects Adobe hinting and enables
 its default size-dependent stem darkening for available CFF, Type 1, and CID
 drivers. This gives the bundled Source families suitable small-size weight for
-linear-light blending without altering shaping advances. Native TrueType
-hinting remains enabled for fallback fonts; experimental auto-hinter darkening
-is not forced. Glyph atlases remain A8 grayscale coverage, independent of text
+linear-light blending without altering shaping advances. Outlines load with
+`FT_LOAD_TARGET_LIGHT | FT_LOAD_NO_BITMAP` and render with
+`FT_RENDER_MODE_NORMAL`; experimental auto-hinter darkening is not forced.
+This phase-aware, light-hinted, Adobe-darkened mode (B) is the sole rendering
+policy. Historical unhinted comparisons are not selectable build modes.
+Glyph atlases remain A8 grayscale coverage, independent of text
 color, background polarity, and display subpixel layout.
+
+The renderers accumulate fractional advances and offsets in device space.
+Only the final glyph origin is quantized to 1/64 pixel, then split into an
+integer anchor and nonnegative X/Y raster phases using floor semantics.
+FreeType translates the loaded outline by that phase before rasterization
+(negating scene Y for FreeType's Y-up axis). Bitmap bearings include the
+phase; placement adds only the integer anchor. Software and Vulkan share
+the phase-bearing cache key, including font generation and fractional size.
+
+Only requested phases are cached. CPU masks are bounded to 16 MiB and 16,384
+entries; a miss that exceeds either budget clears old masks. Returned mask
+pointers must be consumed before the next cache lookup. Vulkan retains its
+2048×2048 atlas and a 16,384-entry limit. Preflight visits the same positions
+as drawing; if full, it waits for outstanding GPU work, clears the atlas,
+and retries once with only the current scene. A scene that still cannot fit
+returns `GlyphAtlasFull` before recording or uploading its frame. It does not
+evict live frame entries or eagerly allocate all 64×64 phase combinations.
 
 Retained Text nodes emit a `paragraph` command referencing an immutable width-
 specific `ParagraphLayout`. That layout already contains line tops, baselines,

@@ -4,4 +4,5 @@ pub const ft = @cImport({
     @cInclude("freetype/ftmm.h");
     @cInclude("freetype/ftmodapi.h");
     @cInclude("freetype/ftdriver.h");
+    @cInclude("freetype/ftoutln.h");
 });
