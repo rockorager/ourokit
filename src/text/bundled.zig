@@ -22,19 +22,25 @@ pub const Family = enum {
     }
 };
 
-pub const Weight = enum { regular, semibold, bold };
+pub const Weight = enum { regular, semibold, bold, medium };
 pub const Style = enum { roman, italic };
 
 const Asset = struct { path: []const u8, bytes: []const u8 };
-const assets = [_][6]Asset{
-    familyAssets("SourceSans3"),
-    familyAssets("SourceSerif4"),
-    familyAssets("SourceCodePro"),
+const assets = [_][8]Asset{
+    familyAssets("SourceSans3", true),
+    familyAssets("SourceSerif4", false),
+    familyAssets("SourceCodePro", true),
 };
 
-fn familyAssets(comptime prefix: []const u8) [6]Asset {
-    var result: [6]Asset = undefined;
-    for (.{ "Regular", "It", "Semibold", "SemiboldIt", "Bold", "BoldIt" }, 0..) |suffix, index| {
+fn familyAssets(comptime prefix: []const u8, comptime has_medium: bool) [8]Asset {
+    var result: [8]Asset = undefined;
+    // Static Source Serif 4 has no 500 face. For requests between 400 and
+    // 500, prefer 400 before weights above 500 (CSS weight matching order).
+    // Alias the real Regular asset, including its cache identity; do not
+    // relabel Semibold 600 or manufacture a font instance.
+    const medium = if (has_medium) "Medium" else "Regular";
+    const medium_italic = if (has_medium) "MediumIt" else "It";
+    for (.{ "Regular", "It", "Semibold", "SemiboldIt", "Bold", "BoldIt", medium, medium_italic }, 0..) |suffix, index| {
         const path = "fonts/" ++ prefix ++ "-" ++ suffix ++ ".otf";
         result[index] = .{ .path = "ourokit:bundled/" ++ path, .bytes = @embedFile(path) };
     }
@@ -42,6 +48,7 @@ fn familyAssets(comptime prefix: []const u8) [6]Asset {
 }
 
 /// The returned handle owns one cache reference, released by the caller.
+/// Source Serif's absent Medium maps to the actual Regular (400) face.
 pub fn acquire(cache: *api.FontCache, family: Family, weight: Weight, style: Style) !api.FontHandle {
     const asset = assets[@intFromEnum(family)][@as(usize, @intFromEnum(weight)) * 2 + @intFromEnum(style)];
     return cache.acquire(.{ .key = .{ .file = asset.path, .index = 0 }, .bytes = asset.bytes });
@@ -57,7 +64,7 @@ test "bundled families resolve generic and exact names without capturing system 
 test "bundled faces are distinct static CFF fonts with real weights and italics" {
     var cache = api.FontCache.init(std.testing.allocator);
     defer cache.deinit();
-    var handles: [18]api.FontHandle = undefined;
+    var handles: [24]api.FontHandle = undefined;
     var count: usize = 0;
     for (assets, 0..) |family, family_index| {
         for (family, 0..) |asset, index| {
@@ -70,7 +77,7 @@ test "bundled faces are distinct static CFF fonts with real weights and italics"
                 try std.testing.expect(!std.mem.eql(u8, tag, "fvar"));
                 if (std.mem.eql(u8, tag, "OS/2")) {
                     const offset = std.mem.readInt(u32, asset.bytes[12 + table * 16 + 8 ..][0..4], .big);
-                    const expected_weights = [_]u16{ 400, 600, 700 };
+                    const expected_weights = [_]u16{ 400, 600, 700, if (family_index == @intFromEnum(Family.serif)) 400 else 500 };
                     try std.testing.expectEqual(expected_weights[index / 2], std.mem.readInt(u16, asset.bytes[offset + 4 ..][0..2], .big));
                     const selection = std.mem.readInt(u16, asset.bytes[offset + 62 ..][0..2], .big);
                     try std.testing.expectEqual(index % 2 == 1, selection & 1 != 0);
@@ -78,7 +85,11 @@ test "bundled faces are distinct static CFF fonts with real weights and italics"
             }
             try std.testing.expect(has_cff);
             const handle = try acquire(&cache, @enumFromInt(family_index), @enumFromInt(index / 2), @enumFromInt(index % 2));
-            for (handles[0..count]) |previous| try std.testing.expect(!std.meta.eql(previous, handle));
+            if (family_index == @intFromEnum(Family.serif) and index >= 6) {
+                try std.testing.expectEqual(handles[family_index * 8 + index % 2], handle);
+            } else {
+                for (handles[0..count]) |previous| try std.testing.expect(!std.meta.eql(previous, handle));
+            }
             handles[count] = handle;
             count += 1;
             const font = try cache.get(handle);

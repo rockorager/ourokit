@@ -87,7 +87,8 @@ current source of truth.
 The canonical typography family is generic `sans-serif`, backed by bundled
 Source Sans 3. Generic `serif` and `monospace` select bundled Source Serif 4
 and Source Code Pro. Regular text uses Regular and emphasized controls use
-Semibold. Other explicit family names and missing-character fallback use
+Medium 500 (Source Serif's absent static Medium falls back to Regular 400).
+Explicit Semibold 600 remains available. Other explicit family names and missing-character fallback use
 Fontconfig on Linux. Source font revisions and licenses are recorded in
 `design/provenance/source-fonts.md`. Inter remains a shaping-test fixture;
 Noto Sans Arabic supplies deterministic complex-script fallback in snapshots.

@@ -155,9 +155,12 @@ word-wise editor navigation and deletion.
 The standard UI host uses bundled Source Sans 3 for `sans-serif`, Source Serif 4
 for `serif`, and Source Code Pro for `monospace`. Exact Source family names also
 select the bundled files. Each family supplies static CFF Regular, Semibold,
-and Bold faces with matching italics. `text.bundled.acquire` loads these into
+and Bold faces with matching italics; Sans and Code also supply Medium.
+`text.bundled.acquire` loads these into
 a caller-owned font cache without filesystem access or Fontconfig; the caller
-releases the returned handle. The current UI's emphasized controls use Semibold.
+releases the returned handle. The UI's emphasized controls request Medium 500.
+Source Serif has no static Medium and explicitly falls back to Regular 400;
+explicit Semibold 600 selection is unchanged.
 See [font provenance](../design/provenance/source-fonts.md) for pinned revisions
 and redistribution notices.
 

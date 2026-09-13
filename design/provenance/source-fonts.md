@@ -11,6 +11,9 @@ branches. The exact upstream revisions are:
 
 For each family, `src/text/fonts` contains the upstream `OTF/` files with
 suffixes `Regular`, `It`, `Semibold`, `SemiboldIt`, `Bold`, and `BoldIt`.
+Source Sans 3 and Source Code Pro also include `Medium` and `MediumIt` from
+the same revisions above. Internal versions are Sans 3.052, Serif 4.005,
+and Code 2.042 upright / 1.062 italic; all are static CFF outlines.
 Source Serif uses the default text optical design, not Caption or Display.
 No outlines, names, metadata, hinting, or character coverage have been modified.
 Do not regenerate these from TTF, subset them, or substitute variable builds
@@ -36,8 +39,13 @@ faces. None of the three families replaces global-script or emoji fallback.
 Native API consumers selecting italics must supply suitable fallback candidates.
 
 The current UI distinguishes regular text from emphasized controls; the latter
-use the bundled Semibold face. The native text API additionally exposes Bold
-and real italics through `text.bundled.acquire`. This does not add weight/style
+request Medium (500), matching the system Fontconfig request. Sans and Code
+select their authentic Medium faces. Static Source Serif 4 has no Medium:
+its 500 request explicitly falls back to Regular (400), preferring 400 before
+weights above 500 as in CSS weight matching. This aliases the actual Regular
+asset and cache identity, not a relabelled 600 face or a generated instance.
+Explicit Semibold (600), Bold (700), and real italics remain available through
+`text.bundled.acquire`. This does not add weight/style
 properties to Lua widgets. The renderer pairs Adobe's size-dependent CFF stem
 darkening with linear-light compositing, preserving A8 masks as coverage and
 using high-precision internal buffers. Presentation remains ordinary encoded

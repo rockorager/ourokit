@@ -63,7 +63,7 @@ local function bundled_fonts_story()
             ouro.text { key = "family", text = names[index], size = 24 },
             ouro.text { key = "small", text = "12px: The quick brown fox. 0O 1Il {} []", size = 12 },
             ouro.text { key = "body", text = "16px: Café — Ελληνικά — Кириллица", size = 16 },
-            ouro.button { key = "emphasis", label = "Semibold control" },
+            ouro.button { key = "emphasis", label = "Medium control" },
           },
         },
       },

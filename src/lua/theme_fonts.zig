@@ -32,7 +32,7 @@ pub const ThemeFonts = struct {
             handles.deinit(self.allocator);
         }
         if (text.bundled.Family.fromName(family)) |bundled_family| {
-            const handle = try text.bundled.acquire(self.fonts, bundled_family, if (medium) .semibold else .regular, .roman);
+            const handle = try text.bundled.acquire(self.fonts, bundled_family, if (medium) .medium else .regular, .roman);
             errdefer self.fonts.release(handle) catch unreachable;
             try handles.append(self.allocator, handle);
         }
@@ -96,7 +96,27 @@ test "bundled theme families lead system fallbacks and reuse cached faces" {
             const repeated = try themes.get(name, false);
             try std.testing.expectEqual(regular.ptr, repeated.ptr);
             const medium = try themes.get(name, true);
-            try std.testing.expect(!std.meta.eql(regular[0], medium[0]));
+            const family: text.bundled.Family = @enumFromInt(index);
+            // Inspect the selected bytes, not just two different handles.
+            // Serif's documented absent-500 fallback is the real Regular face.
+            const semibold = try text.bundled.acquire(&fonts, family, .semibold, .roman);
+            defer fonts.release(semibold) catch unreachable;
+            for ([_]text.FontHandle{ regular[0], medium[0], semibold }, [_]u16{ 400, if (family == .serif) 400 else 500, 600 }) |handle, weight| {
+                const bytes = (try fonts.get(handle)).rasterSource().bytes;
+                const table_count = std.mem.readInt(u16, bytes[4..6], .big);
+                var found_weight = false;
+                for (0..table_count) |table| {
+                    const record = bytes[12 + table * 16 ..][0..16];
+                    if (!std.mem.eql(u8, record[0..4], "OS/2")) continue;
+                    const offset = std.mem.readInt(u32, record[8..12], .big);
+                    try std.testing.expectEqual(weight, std.mem.readInt(u16, bytes[offset + 4 ..][0..2], .big));
+                    found_weight = true;
+                }
+                try std.testing.expect(found_weight);
+            }
+            const expected_medium = try text.bundled.acquire(&fonts, family, .medium, .roman);
+            defer fonts.release(expected_medium) catch unreachable;
+            try std.testing.expectEqual(expected_medium, medium[0]);
             const expected = try text.bundled.acquire(&fonts, @enumFromInt(index), .regular, .roman);
             defer fonts.release(expected) catch unreachable;
             try std.testing.expectEqual(expected, regular[0]);
