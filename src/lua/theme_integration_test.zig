@@ -97,6 +97,54 @@ const Fixture = struct {
     }
 };
 
+test "Lua tokens work in theme and widget props and preserve button defaults" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\local t = ouro.tokens
+        \\function build()
+        \\  return ouro.theme { key = 'scope',
+        \\    colors = { primary = t.dark.secondary },
+        \\    controls = { radius = t.foundation.radius_3, border_width = t.foundation.border_width_strong },
+        \\    ouro.column { key = 'root', gap = t.foundation.spacing_5,
+        \\      ouro.button { key = 'default', label = 'Default' },
+        \\      ouro.text_input { key = 'input', text = 'Tokens', font_size = t.foundation.typography_4,
+        \\        foreground = t.palette.light.indigo.step_11 },
+        \\      ouro.button { key = 'alpha', label = 'Alpha', background = t.palette.overlay.black.step_5 },
+        \\    },
+        \\  }
+        \\end
+    );
+    try f.build();
+    const button = try f.handle("scope/root/default");
+    const box = (try f.object("scope/root/default")).box;
+    try std.testing.expectEqual(@as(f32, 6), box.corner_radius);
+    try std.testing.expectEqual(@as(f32, 2), box.border_width);
+    try std.testing.expectEqual(core.Color.rgba(33, 34, 37, 255), box.background.?);
+    const input = try f.handle("scope/root/input");
+    const content = try f.runtime.text_inputs.content(input);
+    const object = try f.runtime.tree.objectAt(try f.runtime.instances.renderObject(content));
+    try std.testing.expectEqual(@as(f32, 18), (try f.sources.get(object.text_input.source)).logical_size);
+    try std.testing.expectEqual(core.Color.rgba(0, 0, 0, 77), (try f.object("scope/root/alpha")).box.background.?);
+    // The button's label remains on the built-in 14px token.
+    const button_id = (try f.runtime.semantics.findPath("scope/root/default")).id;
+    var found_label = false;
+    for (f.ui.storage[0..f.ui.count]) |descriptor| {
+        if (descriptor.parent == button_id and descriptor.object == .text) {
+            try std.testing.expectEqual(@as(f32, 14), (try f.sources.get(descriptor.object.text.source)).logical_size);
+            found_label = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_label);
+    // A catalog reference is an explicit color; changing the host scheme must
+    // not reinterpret it or remount the control.
+    f.ui.widget_theme.?.colors = @import("../design/root.zig").tokens.dark;
+    try f.build();
+    try std.testing.expectEqual(button, try f.handle("scope/root/default"));
+    try std.testing.expectEqual(box.background, (try f.object("scope/root/default")).box.background);
+}
+
 test "theme inheritance and explicit precedence retheme clean components without remounting" {
     const f = try Fixture.create();
     defer f.destroy();

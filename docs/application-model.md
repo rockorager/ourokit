@@ -464,6 +464,12 @@ palette, then explicit `colors` apply; it does not reset typography or metrics.
 Colors use the generated semantic token names and `#RRGGBB` or `#RRGGBBAA`.
 Unknown theme fields and invalid colors/metrics are errors, not ignored typos.
 
+Use the [Lua token catalog](design-system.md#lua-token-catalog) to reference
+generated values instead of repeating literals: `ouro.tokens.foundation.spacing_3`,
+`ouro.tokens.foundation.typography_2`, or `ouro.tokens.palette.light.indigo.step_9`.
+`ouro.tokens.light` and `ouro.tokens.dark` provide fixed semantic palettes, not
+the currently inherited theme; their colors act as explicit overrides.
+
 The standard runner follows [ourosettings](https://github.com/rockorager/ourosettings)'
 `appearance.color_scheme` automatically. Omit `theme.color_scheme` to follow the
 system; typography, metrics, and individual color overrides still apply. Set

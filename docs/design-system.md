@@ -22,8 +22,42 @@ excluded until Ourokit has an explicit wide-gamut color pipeline; native sRGB
 values are preserved directly rather than converted from P3.
 
 Runtime theme selection chooses one pre-resolved generated `Theme` value. It
-does not repeatedly traverse references. Any future Lua representation must be
-generated from the same source rather than manually mirrored.
+does not repeatedly traverse references. Lua's `ouro.tokens` catalog reflects
+the generated Zig data, so token names and values have the same source of truth.
+
+## Lua token catalog
+
+After `local ouro = require('ouro')`, application and Storybook code can use:
+
+| Namespace | Contents |
+| --- | --- |
+| `ouro.tokens.foundation` | `typography_1`–`9`, `typography_family`, `line_height_1`–`9`, `spacing_1`–`9`, `radius_1`–`6`, `border_width_default`, `border_width_strong` |
+| `ouro.tokens.palette` | `black`, `white`, `transparent`; `light` and `dark` color families (including `_alpha` families); `overlay.black` and `overlay.white` |
+| `ouro.tokens.light`, `ouro.tokens.dark` | Semantic colors such as `primary`, `foreground`, `background`, and `sidebar` |
+
+Names match the generated Zig API. Each palette family contains `step_1` through
+`step_12`, for example `ouro.tokens.palette.dark.indigo.step_9`. Metrics are
+numbers in logical pixels, the font family is a string, and colors are
+`#RRGGBBAA` strings accepted by existing theme and widget properties.
+
+```lua
+local ouro = require('ouro')
+local f = ouro.tokens.foundation
+
+return ouro.column { key = 'content', gap = f.spacing_3,
+  ouro.text { key = 'heading', text = 'Settings', size = f.typography_5 },
+  ouro.button { key = 'save', label = 'Save', radius = f.radius_2 },
+}
+```
+
+The tables are Lua-owned copies of the fixed catalog, not a live resolved theme
+or a way to change native defaults. Treat them as constants. Assigning
+`ouro.tokens.light.primary` to a color prop pins that color just like a literal;
+it does not follow host appearance or enclosing theme overrides. Omit color
+overrides to retain normal theme following. Token exposure does not add new
+widget properties: for example, line-height tokens are available as numbers,
+but do not introduce a `line_height` text prop. Existing widget defaults remain
+unchanged, including 14px button labels and 16px text.
 
 ## Widget design guidance
 

@@ -39,6 +39,7 @@ pub const Description = struct {
 
     /// The Ouro API table is on top of the stack.
     pub fn install(state: *c.State) void {
+        @import("tokens.zig").install(state);
         _ = c.luaL_newmetatable(state, metatable);
         c.lua_settop(state, -2);
         inline for (std.meta.fields(Kind)) |field| {
