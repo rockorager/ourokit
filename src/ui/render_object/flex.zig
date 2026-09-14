@@ -8,62 +8,82 @@ pub fn validate(value: types.Flex) !void {
     if (!std.math.isFinite(value.gap) or value.gap < 0) return error.InvalidGap;
 }
 
-pub fn layout(value: types.Flex, context: anytype, node: anytype, constraints: Constraints) !SizeF {
-    const child_count = context.childCount(node);
-    const total_gap = if (child_count > 1) value.gap * @as(f32, @floatFromInt(child_count - 1)) else 0;
-    var occupied_main = total_gap;
-    var cross_extent: f32 = 0;
-    var total_flex: u64 = 0;
+pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Constraints) !SizeF {
+    var constraints = incoming;
+    while (true) {
+        const child_count = context.childCount(node);
+        const total_gap = if (child_count > 1) value.gap * @as(f32, @floatFromInt(child_count - 1)) else 0;
+        var occupied_main = total_gap;
+        var cross_extent: f32 = 0;
+        var total_flex: u64 = 0;
 
-    var child = context.firstChild(node);
-    while (child) |handle| : (child = context.nextSibling(handle)) {
-        const data = try flexData(try context.parentData(handle));
-        if (data.factor != 0) {
-            total_flex += data.factor;
-            continue;
+        var child = context.firstChild(node);
+        while (child) |handle| : (child = context.nextSibling(handle)) {
+            const data = try flexData(try context.parentData(handle));
+            if (data.factor != 0) {
+                total_flex += data.factor;
+                continue;
+            }
+            const size = try context.layoutChild(handle, nonFlexConstraints(value, constraints));
+            occupied_main += mainExtent(value.axis, size);
+            cross_extent = @max(cross_extent, crossExtent(value.axis, size));
         }
-        const size = try context.layoutChild(handle, nonFlexConstraints(value, constraints));
-        occupied_main += mainExtent(value.axis, size);
-        cross_extent = @max(cross_extent, crossExtent(value.axis, size));
-    }
 
-    const bounded_main = mainBounded(value.axis, constraints);
-    if (total_flex != 0 and !bounded_main) return error.FlexInUnboundedAxis;
-    const available_main = mainMaximum(value.axis, constraints);
-    const remaining = if (bounded_main) @max(0, available_main - occupied_main) else 0;
+        const bounded_main = mainBounded(value.axis, constraints);
+        if (total_flex != 0 and !bounded_main) return error.FlexInUnboundedAxis;
+        const available_main = mainMaximum(value.axis, constraints);
+        const remaining = if (bounded_main) @max(0, available_main - occupied_main) else 0;
 
-    child = context.firstChild(node);
-    while (child) |handle| : (child = context.nextSibling(handle)) {
-        const data = try flexData(try context.parentData(handle));
-        if (data.factor == 0) continue;
-        const allocation = remaining * @as(f32, @floatFromInt(data.factor)) /
-            @as(f32, @floatFromInt(total_flex));
-        const size = try context.layoutChild(
-            handle,
-            flexConstraints(value, constraints, allocation, data.fit),
-        );
-        occupied_main += mainExtent(value.axis, size);
-        cross_extent = @max(cross_extent, crossExtent(value.axis, size));
-    }
+        child = context.firstChild(node);
+        while (child) |handle| : (child = context.nextSibling(handle)) {
+            const data = try flexData(try context.parentData(handle));
+            if (data.factor == 0) continue;
+            const allocation = remaining * @as(f32, @floatFromInt(data.factor)) /
+                @as(f32, @floatFromInt(total_flex));
+            const size = try context.layoutChild(
+                handle,
+                flexConstraints(value, constraints, allocation, data.fit),
+            );
+            occupied_main += mainExtent(value.axis, size);
+            cross_extent = @max(cross_extent, crossExtent(value.axis, size));
+        }
 
-    var desired = fromExtents(value.axis, occupied_main, cross_extent);
-    if (value.main_axis_size == .max and bounded_main)
-        setMainExtent(value.axis, &desired, available_main);
-    const size = constraints.constrain(desired);
+        var desired = fromExtents(value.axis, occupied_main, cross_extent);
+        if (value.main_axis_size == .max and bounded_main)
+            setMainExtent(value.axis, &desired, available_main);
+        const size = constraints.constrain(desired);
 
-    var cursor: f32 = 0;
-    child = context.firstChild(node);
-    while (child) |handle| : (child = context.nextSibling(handle)) {
-        const child_size = try context.size(handle);
-        const cross_offset = switch (value.cross_axis_alignment) {
-            .start, .stretch => 0,
-            .center => (crossExtent(value.axis, size) - crossExtent(value.axis, child_size)) / 2,
-            .end => crossExtent(value.axis, size) - crossExtent(value.axis, child_size),
+        // Stretch needs a finite cross-axis extent. When the parent cannot supply
+        // one, measure it from the children, then lay them out against that size.
+        // Only explicit stretch takes this extra pass; ordinary intrinsic flex
+        // remains one-pass. The resolved bound guarantees the next pass is final.
+        if (value.cross_axis_alignment == .stretch) switch (value.axis) {
+            .horizontal => if (!constraints.hasBoundedHeight()) {
+                constraints.min_height = size.height;
+                constraints.max_height = size.height;
+                continue;
+            },
+            .vertical => if (!constraints.hasBoundedWidth()) {
+                constraints.min_width = size.width;
+                constraints.max_width = size.width;
+                continue;
+            },
         };
-        try context.setChildOffset(handle, pointFromExtents(value.axis, cursor, cross_offset));
-        cursor += mainExtent(value.axis, child_size) + value.gap;
+
+        var cursor: f32 = 0;
+        child = context.firstChild(node);
+        while (child) |handle| : (child = context.nextSibling(handle)) {
+            const child_size = try context.size(handle);
+            const cross_offset = switch (value.cross_axis_alignment) {
+                .start, .stretch => 0,
+                .center => (crossExtent(value.axis, size) - crossExtent(value.axis, child_size)) / 2,
+                .end => crossExtent(value.axis, size) - crossExtent(value.axis, child_size),
+            };
+            try context.setChildOffset(handle, pointFromExtents(value.axis, cursor, cross_offset));
+            cursor += mainExtent(value.axis, child_size) + value.gap;
+        }
+        return size;
     }
-    return size;
 }
 
 const FlexData = struct { factor: u16, fit: types.FlexFit };

@@ -121,8 +121,8 @@ pub const Builder = struct {
         return .{
             .x = @intFromFloat(left64),
             .y = @intFromFloat(top64),
-            .width = @intFromFloat(@max(0, right64 - left64)),
-            .height = @intFromFloat(@max(0, bottom64 - top64)),
+            .width = if (bounds.width == 0) 0 else @intFromFloat(@max(0, right64 - left64)),
+            .height = if (bounds.height == 0) 0 else @intFromFloat(@max(0, bottom64 - top64)),
         };
     }
 
@@ -163,4 +163,43 @@ test "scene lowering scales logical rectangles conservatively" {
     const decorated = builder.displayList().commands[1].decorated_rectangle;
     try std.testing.expectEqual(@as(u32, 1), decorated.border_width);
     try std.testing.expectEqual(@as(u32, 5), decorated.corner_radius);
+}
+
+test "device rectangles preserve exact empty dimensions" {
+    var commands: [1]scene.Command = undefined;
+    const builder = try Builder.init(&commands, 1.5);
+
+    try std.testing.expectEqual(
+        RectI{ .x = 0, .y = 0, .width = 0, .height = 4 },
+        try builder.deviceRect(.{ .x = 0.25, .y = 0.5, .width = 0, .height = 2 }),
+    );
+    try std.testing.expectEqual(
+        RectI{ .x = 1, .y = 0, .width = 2, .height = 0 },
+        try builder.deviceRect(.{ .x = 1.25, .y = 0.25, .width = 0.5, .height = 0 }),
+    );
+    try std.testing.expectEqual(
+        RectI{ .x = -1, .y = -2, .width = 0, .height = 0 },
+        try builder.deviceRect(.{ .x = -0.25, .y = -1.25, .width = 0, .height = 0 }),
+    );
+}
+
+test "device rectangles conservatively retain positive subpixel extents" {
+    var commands: [1]scene.Command = undefined;
+    const builder = try Builder.init(&commands, 1.5);
+
+    try std.testing.expectEqual(
+        RectI{ .x = 0, .y = 1, .width = 1, .height = 1 },
+        try builder.deviceRect(.{ .x = 0.25, .y = 1.25, .width = 0.01, .height = 0.01 }),
+    );
+}
+
+test "empty logical clips remain empty at fractional origins" {
+    var commands: [1]scene.Command = undefined;
+    var builder = try Builder.init(&commands, 1.5);
+
+    try builder.pushClip(.{ .x = 0.25, .y = 1.25, .width = 0, .height = 3 });
+
+    const clip = builder.displayList().commands[0].push_clip_rect;
+    try std.testing.expect(clip.isEmpty());
+    try std.testing.expectEqual(RectI{ .x = 0, .y = 1, .width = 0, .height = 6 }, clip);
 }

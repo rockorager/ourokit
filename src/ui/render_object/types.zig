@@ -38,6 +38,9 @@ pub const Box = struct {
 
 pub const Axis = enum { horizontal, vertical };
 pub const MainAxisSize = enum { min, max };
+/// Stretch uses the parent's bounded cross axis, or measures the largest child
+/// first when unbounded. The latter takes an extra child-layout pass; prefer
+/// bounded constraints for deeply nested stretch containers.
 pub const CrossAxisAlignment = enum { start, center, end, stretch };
 
 pub const Flex = struct {

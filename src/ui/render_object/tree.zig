@@ -1017,6 +1017,88 @@ test "flex layout is bounded, cached, and separates paint invalidation" {
     try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(root));
 }
 
+test "unbounded cross-axis stretch resolves intrinsic siblings and caches the result" {
+    for ([_]types.Axis{ .vertical, .horizontal }) |axis| {
+        var tree: Tree = undefined;
+        try tree.init(std.testing.allocator, 3);
+        defer tree.deinit();
+        const vertical = axis == .vertical;
+        const root = try tree.create(.{ .flex = .{
+            .axis = axis,
+            .main_axis_size = .min,
+            .cross_axis_alignment = .stretch,
+            .gap = 3,
+        } });
+        const label = try tree.create(.{ .box = .{
+            .width = if (vertical) 73 else 17,
+            .height = if (vertical) 17 else 73,
+        } });
+        const line = try tree.create(.{ .box = .{
+            .width = if (vertical) null else 2,
+            .height = if (vertical) 2 else null,
+            .fill_width = vertical,
+            .fill_height = !vertical,
+        } });
+        try tree.appendChild(root, label, .none);
+        try tree.appendChild(root, line, .none);
+        const constraints: Constraints = if (vertical)
+            .{ .min_width = 37, .max_height = 100 }
+        else
+            .{ .max_width = 100, .min_height = 37 };
+        for ([_]f32{ 73, 21 }) |extent| {
+            try tree.update(label, .{ .box = .{
+                .width = if (vertical) extent else 17,
+                .height = if (vertical) 17 else extent,
+            } });
+            const cross = @max(extent, 37);
+            try std.testing.expectEqual(SizeF{
+                .width = if (vertical) cross else 22,
+                .height = if (vertical) 22 else cross,
+            }, try tree.layout(root, constraints));
+            try std.testing.expectEqual(SizeF{
+                .width = if (vertical) cross else 2,
+                .height = if (vertical) 2 else cross,
+            }, try tree.nodeSize(line));
+            try std.testing.expectEqual(PointF{
+                .x = if (vertical) 0 else 20,
+                .y = if (vertical) 20 else 0,
+            }, try tree.nodeOffset(line));
+            const count = try tree.layoutCount(line);
+            _ = try tree.layout(root, constraints);
+            try std.testing.expectEqual(count, try tree.layoutCount(line));
+        }
+    }
+}
+
+test "unbounded cross-axis start does not imply intrinsic stretch" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 3);
+    defer tree.deinit();
+    const root = try tree.create(.{ .flex = .{ .axis = .vertical, .main_axis_size = .min } });
+    const label = try tree.create(.{ .box = .{ .width = 73, .height = 17 } });
+    const line = try tree.create(.{ .box = .{ .fill_width = true, .height = 2 } });
+    try tree.appendChild(root, label, .none);
+    try tree.appendChild(root, line, .none);
+    try std.testing.expectEqual(SizeF{ .width = 73, .height = 19 }, try tree.layout(root, .{}));
+    try std.testing.expectEqual(SizeF{ .width = 0, .height = 2 }, try tree.nodeSize(line));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(label));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(line));
+}
+
+test "intrinsic cross-axis stretch retains main-axis flex allocation" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 3);
+    defer tree.deinit();
+    const root = try tree.create(.{ .flex = .{ .cross_axis_alignment = .stretch, .gap = 3 } });
+    const fixed = try tree.create(.{ .box = .{ .width = 17, .height = 37 } });
+    const expanded = try tree.create(.{ .box = .{ .fill_height = true } });
+    try tree.appendChild(root, fixed, .none);
+    try tree.appendChild(root, expanded, .{ .flex = .{ .factor = 1 } });
+    try std.testing.expectEqual(SizeF{ .width = 101, .height = 37 }, try tree.layout(root, .{ .max_width = 101 }));
+    try std.testing.expectEqual(SizeF{ .width = 81, .height = 37 }, try tree.nodeSize(expanded));
+    try std.testing.expectEqual(PointF{ .x = 20, .y = 0 }, try tree.nodeOffset(expanded));
+}
+
 test "stack paints in order and hit tests front to back" {
     const scene = @import("../../scene/root.zig");
     var tree: Tree = undefined;
