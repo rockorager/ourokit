@@ -92,7 +92,18 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn save(init: std.process.Init, directory: []const u8, backend: []const u8, scale: f32, dark: bool, width: u32, height: u32, pixels: []u8) !void {
-    const bytes = try ok.renderer.png.encode(init.gpa, pixels, width, height, width * 4);
+    const srgb = try init.gpa.alloc(u8, pixels.len);
+    defer init.gpa.free(srgb);
+    for (0..width * height) |index| {
+        const offset = index * 4;
+        srgb[offset..][0..4].* = ok.core.gamma22ToStraightSrgba8(.{
+            .r = pixels[offset],
+            .g = pixels[offset + 1],
+            .b = pixels[offset + 2],
+            .a = pixels[offset + 3],
+        });
+    }
+    const bytes = try ok.renderer.png.encode(init.gpa, srgb, width, height, width * 4);
     defer init.gpa.free(bytes);
     const path = try std.fmt.allocPrint(init.gpa, "{s}/{s}-{d}-{s}.png", .{ directory, backend, @as(u32, @intFromFloat(scale * 100)), if (dark) "dark" else "light" });
     defer init.gpa.free(path);

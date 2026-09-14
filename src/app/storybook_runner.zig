@@ -1,4 +1,5 @@
 const std = @import("std");
+const core = @import("../core/root.zig");
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const design = @import("../design/root.zig");
 const io_loop = @import("../loop/root.zig");
@@ -270,7 +271,17 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         .stride = stride,
         .format = .rgba8_unorm,
     }, &glyphs, null, &paragraphs, &images);
-    unpremultiply(pixels);
+    // Snapshot PNG is explicit sRGB interchange, not the gamma-2.2 Wayland
+    // presentation representation produced by the renderer.
+    for (0..pixel_height) |y| for (0..pixel_width) |x| {
+        const offset = y * stride + x * 4;
+        pixels[offset..][0..4].* = core.gamma22ToStraightSrgba8(.{
+            .r = pixels[offset],
+            .g = pixels[offset + 1],
+            .b = pixels[offset + 2],
+            .a = pixels[offset + 3],
+        });
+    };
     const png = try renderer.png.encode(init.gpa, pixels, pixel_width, pixel_height, stride);
     errdefer init.gpa.free(png);
     const id = try init.gpa.dupe(u8, story.id);
@@ -413,30 +424,7 @@ fn physicalDimension(logical: u32, scale: f32) !u32 {
     return @intFromFloat(value);
 }
 
-fn unpremultiply(pixels: []u8) void {
-    var index: usize = 0;
-    while (index < pixels.len) : (index += 4) {
-        const alpha = pixels[index + 3];
-        if (alpha == 0) {
-            pixels[index] = 0;
-            pixels[index + 1] = 0;
-            pixels[index + 2] = 0;
-        } else if (alpha != 255) {
-            inline for (0..3) |channel| {
-                const straight = (@as(u16, pixels[index + channel]) * 255 + alpha / 2) / alpha;
-                pixels[index + channel] = @intCast(@min(straight, 255));
-            }
-        }
-    }
-}
-
 test "physical story dimensions round up after scaling" {
     try std.testing.expectEqual(@as(u32, 480), try physicalDimension(320, 1.5));
     try std.testing.expectEqual(@as(u32, 2), try physicalDimension(1, 1.1));
-}
-
-test "premultiplied pixels convert to straight RGBA" {
-    var pixels = [_]u8{ 100, 50, 25, 128, 9, 8, 7, 0, 1, 2, 3, 255 };
-    unpremultiply(&pixels);
-    try std.testing.expectEqualSlices(u8, &.{ 199, 100, 50, 128, 0, 0, 0, 0, 1, 2, 3, 255 }, &pixels);
 }

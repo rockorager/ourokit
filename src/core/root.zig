@@ -1,4 +1,5 @@
 pub const Color = @import("color.zig").Color;
+pub const gamma22ToStraightSrgba8 = @import("color.zig").gamma22ToStraightSrgba8;
 pub const Insets = @import("geometry.zig").Insets;
 pub const PointF = @import("geometry.zig").PointF;
 pub const RectF = @import("geometry.zig").RectF;

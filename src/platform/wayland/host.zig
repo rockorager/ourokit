@@ -1456,11 +1456,17 @@ pub const Host = struct {
             if (window.retired_buffers.mapping != null and !window.retired_buffers.anyBusy())
                 try window.retired_buffers.destroy(objects, transmit);
             if (self.vulkan) |renderer| {
-                if (window.dmabuf_buffers.slots[0].target != null and !window.dmabuf_buffers.anyBusy())
-                    try window.dmabuf_buffers.destroy(renderer, objects, transmit);
-                if (window.retired_dmabuf_buffers.slots[0].target != null and
-                    !window.retired_dmabuf_buffers.anyBusy())
-                    try window.retired_dmabuf_buffers.destroy(renderer, objects, transmit);
+                for ([_]*DmabufBuffers{ &window.dmabuf_buffers, &window.retired_dmabuf_buffers }) |pool| {
+                    if (pool.slots[0].target == null) continue;
+                    // The surface is gone and this storage will not be reused.
+                    // The compositor retains its own dma-buf and syncobj refs;
+                    // explicit sync does not guarantee wl_buffer.release.
+                    for (&pool.slots) |*slot| {
+                        if (slot.target) |*target| try target.wait(renderer);
+                        slot.busy = false;
+                    }
+                    try pool.destroy(renderer, objects, transmit);
+                }
             }
             if (window.buffers.mapping != null or window.retired_buffers.mapping != null or
                 window.dmabuf_buffers.slots[0].target != null or
@@ -3292,6 +3298,88 @@ test "layer background teardown retires pending callbacks and destroys effect be
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
 }
 
+test "destroyed surfaces close without dma-buf release events" {
+    if (!build_options.vulkan) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var renderer = Vulkan.init(allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    if (!renderer.dmabuf_enabled) return error.SkipZigTest;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 8 }, (Config{ .app_id = "test" }).reactor);
+    defer reactor.deinit(allocator);
+    const socket_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket_result) != .SUCCESS) return error.SocketFailed;
+    const peer = try reactor.attach(@intCast(socket_result), .{
+        .received_fd_budget = 0,
+        .transmit_byte_budget = 4096,
+        .transmit_fd_budget = 0,
+    });
+    defer reactor.destroyPeer(peer) catch unreachable;
+    var host: Host = undefined;
+    host.connection = .{
+        .reactor = &reactor,
+        .peer = peer,
+        .objects = try wayring.objects.ClientObjects.init(allocator, 16, 16, &protocol.wl_display.info, null),
+    };
+    defer host.connection.objects.deinit(allocator);
+    host.vulkan = &renderer;
+    var windows = [_]Window{.{
+        .state = .surfaces_destroyed,
+        .handle = .{ .slot = 2, .generation = 7 },
+        .next_pool_generation = 17,
+    }};
+    host.windows = &windows;
+    const closed_handle = windows[0].handle;
+    const Recorder = struct {
+        handle: ?WindowHandle = null,
+        fn closed(context: *anyopaque, handle: WindowHandle) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqual(null, self.handle);
+            self.handle = handle;
+        }
+    };
+    var recorder: Recorder = .{};
+    var vtable: platform_window.EventSink.VTable = undefined;
+    vtable.closed = Recorder.closed;
+    host.sink = .{ .context = &recorder, .vtable = &vtable };
+    const objects = &host.connection.objects;
+    var proxies: [4]Handle = undefined;
+    const pools = [_]*DmabufBuffers{ &windows[0].dmabuf_buffers, &windows[0].retired_dmabuf_buffers };
+    defer for (pools) |pool| pool.releaseLocal(&renderer);
+    for (pools, 0..) |pool, index| {
+        const slot = &pool.slots[0];
+        slot.target = try Vulkan.DmabufTarget.init(&renderer, 2, 1, 0);
+        const fd = try slot.target.?.exportSyncobjFd(&renderer);
+        _ = linux.close(fd);
+        slot.handle = try objects.createLocal(&protocol.wl_buffer.info, 1, null);
+        slot.timeline = try objects.createLocal(&protocol.wp_linux_drm_syncobj_timeline_v1.info, 1, null);
+        proxies[index * 2] = slot.handle.?;
+        proxies[index * 2 + 1] = slot.timeline.?;
+        try renderer.renderDmabuf(.{ .commands = &.{.{ .clear = @import("../../core/color.zig").Color.rgba(1, 2, 3, 255) }} }, &slot.target.?);
+        slot.busy = true;
+        try std.testing.expect(slot.target.?.gpu_pending);
+        // No compositor signals the release point or sends wl_buffer.release.
+        try std.testing.expectEqual(@as(u64, 2), slot.target.?.syncPoints().release);
+    }
+    try host.maintainWindows();
+    try std.testing.expectEqual(@as(?WindowHandle, closed_handle), recorder.handle);
+    try std.testing.expectEqual(WindowState.free, windows[0].state);
+    try std.testing.expectEqual(@as(u32, 17), windows[0].next_pool_generation);
+    const snapshot = try (try host.queue()).snapshot(&.{}, &.{});
+    var bytes = snapshot.first;
+    for (proxies) |handle| {
+        try std.testing.expect(objects.namespace.resolve(handle).?.destroyed);
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(handle.id, message.header.object_id);
+        try std.testing.expectEqual(@as(u16, 0), message.header.opcode);
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+}
+
 test "layer background effect wire requests cover fallback removal and recreation" {
     const allocator = std.testing.allocator;
     var objects = try wayring.objects.ClientObjects.init(allocator, 32, 32, &protocol.wl_display.info, null);
@@ -3412,6 +3500,119 @@ test "fractional scale rounds buffer extents up" {
     try std.testing.expectEqual(@as(u32, 800), try scaledExtent(640, 150));
     try std.testing.expectEqual(@as(u32, 2), try scaledExtent(1, 150));
     try std.testing.expectEqual(@as(u32, 640), try scaledExtent(640, 120));
+}
+
+test "scene damage repairs alternating buffers but presents only the logical change" {
+    const allocator = std.testing.allocator;
+    const Color = @import("../../core/color.zig").Color;
+    const software = @import("../../renderer/software/root.zig");
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 8 }, (Config{ .app_id = "test" }).reactor);
+    defer reactor.deinit(allocator);
+    const socket = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket) != .SUCCESS) return error.SocketFailed;
+    const peer = try reactor.attach(@intCast(socket), .{
+        .received_fd_budget = 0,
+        .transmit_byte_budget = 4096,
+        .transmit_fd_budget = 0,
+    });
+    defer reactor.destroyPeer(peer) catch unreachable;
+    var host: Host = undefined;
+    host.connection = .{
+        .reactor = &reactor,
+        .peer = peer,
+        .objects = try wayring.objects.ClientObjects.init(allocator, 32, 32, &protocol.wl_display.info, null),
+    };
+    defer host.connection.objects.deinit(allocator);
+    host.driver = Driver.init(&host.connection);
+    host.presentation = null;
+    const objects = &host.connection.objects;
+    var windows = [_]Window{.{
+        .state = .open,
+        .handle = .{ .slot = 1, .generation = 1 },
+        .surface = try objects.createLocal(&protocol.wl_surface.info, 4, null),
+    }};
+    host.windows = &windows;
+    for (&windows[0].buffers.slots) |*slot|
+        slot.handle = try objects.createLocal(&protocol.wl_buffer.info, 1, null);
+    var tracker = try scene.DamageTracker.init(allocator, 2);
+    defer tracker.deinit();
+    const bounds: RectI = .{ .x = 0, .y = 0, .width = 40, .height = 16 };
+    var buffers: [2][40 * 16 * 4]u8 = @splat(@splat(0xaa));
+    var expected: [40 * 16 * 4]u8 = undefined;
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(0, 0, 0, 0) },
+        .{ .decorated_rectangle = .{
+            .bounds = .{ .x = 2, .y = 3, .width = 5, .height = 7 },
+            .background = Color.rgba(80, 120, 200, 128),
+            .corner_radius = 2,
+        } },
+    };
+    const positions = [_]i32{ 2, 11, 23, 23 };
+    for (positions, 0..) |x, index| {
+        commands[1].decorated_rectangle.bounds.x = x;
+        const current = if (index == 3) commands[0..1] else &commands;
+        const logical = try tracker.compare(current, bounds);
+        const slot_index = index % buffers.len;
+        const slot = &windows[0].buffers.slots[slot_index];
+        slot.busy = false;
+        slot.acquired = true;
+        var frame_buffer: Frame = .{
+            .window = windows[0].handle,
+            .pool_generation = 0,
+            .slot = @intCast(slot_index),
+            .width = 40,
+            .height = 16,
+            .target = .{ .software = .{ .pixels = &buffers[slot_index], .stride = 160 } },
+        };
+        try host.prepareFrameDamage(&frame_buffer, logical);
+        if (index == 1) {
+            try std.testing.expect(frame_buffer.damage() == .full);
+            try std.testing.expectEqual(RectI{ .x = 2, .y = 3, .width = 14, .height = 7 }, frame_buffer.requested_damage.bounds);
+        }
+        if (index == 2) {
+            try std.testing.expectEqual(RectI{ .x = 2, .y = 3, .width = 26, .height = 7 }, frame_buffer.damage().regions[0]);
+            try std.testing.expectEqual(RectI{ .x = 11, .y = 3, .width = 17, .height = 7 }, frame_buffer.requested_damage.bounds);
+        }
+        try software.render(.{ .commands = current, .damage = frame_buffer.damage() }, .{
+            .pixels = &buffers[slot_index],
+            .width = 40,
+            .height = 16,
+            .stride = 160,
+            .format = .bgra8_unorm,
+        });
+        try software.render(.{ .commands = current }, .{
+            .pixels = &expected,
+            .width = 40,
+            .height = 16,
+            .stride = 160,
+            .format = .bgra8_unorm,
+        });
+        try std.testing.expectEqualSlices(u8, &expected, &buffers[slot_index]);
+        try host.present(frame_buffer);
+        tracker.submitted();
+    }
+    // Decode actual present requests without connecting to a compositor.
+    const snapshot = try (try host.queue()).snapshot(&.{}, &.{});
+    var bytes = snapshot.first;
+    var damage_index: usize = 0;
+    const expected_damage = [_]RectI{
+        .{ .x = 0, .y = 0, .width = std.math.maxInt(i32), .height = std.math.maxInt(i32) },
+        .{ .x = 2, .y = 3, .width = 14, .height = 7 },
+        .{ .x = 11, .y = 3, .width = 17, .height = 7 },
+        .{ .x = 23, .y = 3, .width = 5, .height = 7 },
+    };
+    while (bytes.len != 0) {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        if (message.header.object_id == windows[0].surface.?.id and message.header.opcode == 9) {
+            var args = message.arguments();
+            const actual: RectI = .{ .x = try args.int(), .y = try args.int(), .width = @intCast(try args.int()), .height = @intCast(try args.int()) };
+            try std.testing.expectEqual(expected_damage[damage_index], actual);
+            damage_index += 1;
+        }
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(expected_damage.len, damage_index);
 }
 
 test "fractional viewport source excludes rounded buffer padding" {

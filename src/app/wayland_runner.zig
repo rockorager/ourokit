@@ -765,8 +765,12 @@ fn runSourceInternal(
         for (runtime_slots) |*slot| {
             if (!slot.desired or !slot.runtime.registered) continue;
             const handle = slot.runtime.window;
-            if (slot.runtime.wantsSubmission()) if (try host.acquireFrame(handle)) |frame_buffer| {
-                const list = try slot.runtime.displayList();
+            if (slot.runtime.wantsSubmission()) if (try host.acquireFrame(handle)) |acquired| {
+                var frame_buffer = acquired;
+                errdefer host.discardFrame(frame_buffer) catch {};
+                var list = try slot.runtime.displayList();
+                try host.prepareFrameDamage(&frame_buffer, list.damage);
+                list.damage = frame_buffer.damage();
                 (switch (frame_buffer.target) {
                     .software => |target| renderer.software.renderResources(list, .{
                         .pixels = target.pixels,
@@ -784,7 +788,6 @@ fn runSourceInternal(
                         &images,
                     ),
                 }) catch |err| {
-                    try host.discardFrame(frame_buffer);
                     return @as(anyerror!void, err);
                 };
                 try host.present(frame_buffer);

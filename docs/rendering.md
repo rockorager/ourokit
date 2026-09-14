@@ -7,19 +7,28 @@ balanced rectangular clip stack. A borrowed `DisplayList` supports immediate
 consumption. An owning `Frame` copies command and damage storage so worker
 threads and asynchronous backends can safely retain it through completion.
 
-Scene and design `Color` values are straight-alpha, 8-bit sRGB. Renderers decode
-RGB with the piecewise sRGB transfer function, premultiply in linear light, and
+Scene and design `Color` values are straight-alpha, 8-bit ordinary desktop
+colors: sRGB/BT.709 primaries with a pure gamma-2.2 display response. Renderers
+decode RGB with that transfer, premultiply in linear light, and
 apply Porter-Duff source/source-over there. Alpha and A8 glyph/geometry coverage
 are linear quantities, never gamma-decoded. Image texels are unpremultiplied and
 decoded before bilinear filtering, then filtered and composited in premultiplied
 linear light.
 
-Presentation and image-cache bytes remain premultiplied 8-bit **encoded** sRGB.
-Output conversion unpremultiplies linear RGB, sRGB-encodes it, and premultiplies
-the encoded result. This preserves the `wl_shm` ARGB and ordinary dma-buf contract
-even for transparent surfaces. No compositor high-precision format or color
-management protocol is required. This is SDR sRGB, not wide gamut or HDR;
+Presentation bytes are premultiplied 8-bit gamma-2.2 ordinary desktop colors.
+Output conversion unpremultiplies linear RGB, gamma-2.2 encodes it, and
+premultiplies the encoded result. This preserves the `wl_shm` ARGB and ordinary
+untagged dma-buf contract even for transparent surfaces; alpha is never encoded.
+No compositor high-precision format or color-management protocol is required.
+This is SDR with sRGB/BT.709 primaries, not wide gamut or HDR;
 blending a translucent surface with other windows remains the compositor's job.
+
+Decoded PNG, JPEG, WebP, and SVG image-cache bytes remain explicitly piecewise
+sRGB. Texels are sRGB-decoded into the shared linear-light working space, so
+images and gamma-2.2 UI colors compose without encoded-space blending. Storybook
+and renderer-review PNG exports convert gamma-2.2 presentation pixels back to
+straight piecewise sRGB; PNG files are therefore interchange images, not dumps
+of Wayland buffer encoding.
 
 Integer device-pixel geometry gives clear first rasterization rules. Rectangular
 damage regions must not overlap, preventing source-over commands from being
@@ -52,7 +61,11 @@ the target's allocator. All draws in that call blend at 16-bit precision; only
 damaged pixels are encoded back to presentation storage. A leading clear avoids
 reading caller storage; otherwise damaged pixels are imported from the existing
 8-bit output. Precision persists across draws, not across separate render calls.
-Opaque output conversion uses an exact 64 KiB sRGB lookup table.
+Opaque output conversion uses an exact 64 KiB gamma-2.2 lookup table. The
+piecewise sRGB table remains separate for image interchange and PNG export.
+UNORM16 cannot represent every near-black gamma-2.2 value: opaque code 1
+rounds to linear zero. Conversion uses nearest quantization without a special
+transfer-function exception; encoded round trips can differ by one byte level.
 
 Ourokit owns this backend and its lowering policy. Direct paths handle clear and
 opaque rectangles. Pixman is pinned as a lazy, benchmark-only dependency while

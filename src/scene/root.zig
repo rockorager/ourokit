@@ -9,6 +9,8 @@ const ShapeCache = @import("../text/shape_cache.zig").ShapeCache;
 const ImageHandle = @import("../image/cache.zig").ImageHandle;
 const ImageCache = @import("../image/cache.zig").Cache;
 
+pub const DamageTracker = @import("damage.zig").Tracker;
+
 pub const Image = struct {
     image: ImageHandle,
     bounds: RectI,

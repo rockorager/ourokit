@@ -35,13 +35,13 @@ test "image fit centers contain and cover, fill uses bilinear premultiplied sour
     commands[1].image.fit = .cover;
     try software.renderResources(.{ .commands = &commands }, target, null, null, null, &cache);
     // Cover renders 9x6, cropping 1.5 pixels at each horizontal edge.
-    try std.testing.expectEqualSlices(u8, &.{ 221, 83, 12, 255 }, pixels[(1 * 8 + 1) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 220, 83, 19, 255 }, pixels[(1 * 8 + 1) * 4 ..][0..4]);
     commands[1].image.fit = .fill;
     commands[1].image.bounds.height = 4;
     try software.renderResources(.{ .commands = &commands }, target, null, null, null, &cache);
     // Unpremultiply and decode each texel, premultiply in linear light,
-    // weight by 9/16, 3/16, 3/16, 1/16, composite, then sRGB encode.
-    try std.testing.expectEqualSlices(u8, &.{ 189, 89, 95, 255 }, pixels[(2 * 8 + 2) * 4 ..][0..4]);
+    // weight by 9/16, 3/16, 3/16, 1/16, composite, then gamma-2.2 encode.
+    try std.testing.expectEqualSlices(u8, &.{ 187, 89, 95, 255 }, pixels[(2 * 8 + 2) * 4 ..][0..4]);
     // Fully transparent upper-right texel preserves the background.
     try std.testing.expectEqualSlices(u8, &.{ 20, 40, 60, 255 }, pixels[(1 * 8 + 6) * 4 ..][0..4]);
 }
@@ -60,7 +60,7 @@ test "software images honor clipping, damage, BGRA padding and reject stale reso
     var pixels = [_]u8{0xaa} ** (8 * 36);
     const target: software.Target = .{ .pixels = &pixels, .width = 8, .height = 8, .stride = 36, .format = .bgra8_unorm };
     try software.renderResources(list, target, null, null, null, &cache);
-    try std.testing.expectEqualSlices(u8, &.{ 95, 89, 189, 255 }, pixels[2 * 36 + 2 * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 95, 89, 187, 255 }, pixels[2 * 36 + 2 * 4 ..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 60, 40, 20, 255 }, pixels[2 * 36 + 1 * 4 ..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 60, 40, 20, 255 }, pixels[2 * 36 + 5 * 4 ..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa, 0xaa, 0xaa }, pixels[1 * 36 + 2 * 4 ..][0..4]);

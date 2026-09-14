@@ -63,6 +63,7 @@ pub const WindowRuntime = struct {
     focus_color: core.Color = undefined,
     commands: []scene.Command = &.{},
     command_count: usize = 0,
+    damage_tracker: scene.DamageTracker = undefined,
     frame_state: frame.State = .{},
     output_scale: f32 = 1,
     root_padding: f32 = @import("../design/root.zig").tokens.foundation.spacing_3,
@@ -116,6 +117,8 @@ pub const WindowRuntime = struct {
         errdefer self.semantics.deinit();
         const commands = try allocator.alloc(scene.Command, config.command_capacity);
         errdefer allocator.free(commands);
+        var damage_tracker = try scene.DamageTracker.init(allocator, config.command_capacity);
+        errdefer damage_tracker.deinit();
         self.root_owner = try self.build_owners.mount(null, 1);
         self.* = .{
             .allocator = allocator,
@@ -138,6 +141,7 @@ pub const WindowRuntime = struct {
             .border_color = border_color,
             .focus_color = focus_color,
             .commands = commands,
+            .damage_tracker = damage_tracker,
             .signals = signals,
             .paragraph_sources = paragraph_sources,
             .paragraphs = paragraphs,
@@ -175,6 +179,7 @@ pub const WindowRuntime = struct {
         if (!self.initialized) return;
         std.debug.assert(self.pointer_bindings.takeAny() == null);
         self.allocator.free(self.commands);
+        self.damage_tracker.deinit();
         self.semantics.deinit();
         self.text_inputs.deinit();
         self.listboxes.deinit();
@@ -213,6 +218,7 @@ pub const WindowRuntime = struct {
         self.ready = false;
         self.command_count = 0;
         self.frame_state = .{};
+        self.damage_tracker.invalidate();
         self.virtual_lists = .{};
         self.virtual_work = false;
         self.virtual_offsets_pending = false;
@@ -449,6 +455,7 @@ pub const WindowRuntime = struct {
         while (self.router.takeEvent() != null) {}
         _ = self.frame_state.configure(prepared.size.?) catch unreachable;
         self.frame_state.invalidatePaint();
+        self.damage_tracker.invalidate();
         self.ready = true;
         self.virtual_lists = prepared.virtual_lists;
         self.virtual_offsets_pending = true;
@@ -585,6 +592,7 @@ pub const WindowRuntime = struct {
         if (self.output_scale != output_scale) {
             self.output_scale = output_scale;
             self.frame_state.invalidatePaint();
+            self.damage_tracker.invalidate();
             _ = try self.build_owners.markDirty(self.root_owner);
         }
         const root = (try self.instances.rootRenderObject()) orelse return;
@@ -1078,7 +1086,17 @@ pub const WindowRuntime = struct {
 
     pub fn displayList(self: *WindowRuntime) !scene.DisplayList {
         if (!self.frame_state.readyForSubmission()) return error.FrameNotReady;
-        return .{ .commands = self.commands[0..self.command_count] };
+        const size = self.frame_state.size.?;
+        const commands = self.commands[0..self.command_count];
+        return .{
+            .commands = commands,
+            .damage = try self.damage_tracker.compare(commands, .{
+                .x = 0,
+                .y = 0,
+                .width = @intFromFloat(@ceil(@as(f64, @floatFromInt(size.width)) * self.output_scale)),
+                .height = @intFromFloat(@ceil(@as(f64, @floatFromInt(size.height)) * self.output_scale)),
+            }),
+        };
     }
 
     /// Resolves a retained semantic key path into the logical center used by
@@ -1120,7 +1138,9 @@ pub const WindowRuntime = struct {
     }
 
     pub fn frameSubmitted(self: *WindowRuntime) !void {
+        _ = try self.displayList();
         try self.frame_state.submitted();
+        self.damage_tracker.submitted();
     }
 
     fn notifyDirtyWindow(context: *anyopaque) !void {
@@ -1608,6 +1628,8 @@ test "resize lays out a clean render tree before rebuilding its scene" {
     var commands: [1]scene.Command = undefined;
     runtime.initialized = true;
     runtime.commands = &commands;
+    runtime.damage_tracker = try scene.DamageTracker.init(std.testing.allocator, commands.len);
+    defer runtime.damage_tracker.deinit();
     try runtime.instances.reconcile(&.{.{
         .id = 1,
         .parent = null,
@@ -1616,10 +1638,16 @@ test "resize lays out a clean render tree before rebuilding its scene" {
 
     _ = try runtime.frame_state.configure(.{ .width = 100, .height = 80 });
     try runtime.prepareFrame(1);
+    try std.testing.expect((try runtime.displayList()).damage == .full);
     try runtime.frameSubmitted();
     const root = (try runtime.instances.rootRenderObject()).?;
     const initial_layout_count = try runtime.tree.layoutCount(root);
     try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
+
+    _ = try runtime.frame_state.configure(.{ .width = 100, .height = 80 });
+    try runtime.prepareFrame(1);
+    try std.testing.expectEqual(@as(usize, 0), (try runtime.displayList()).damage.regions.len);
+    try runtime.frameSubmitted();
 
     _ = try runtime.frame_state.configure(.{ .width = 120, .height = 80 });
     try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
@@ -1627,6 +1655,7 @@ test "resize lays out a clean render tree before rebuilding its scene" {
 
     try std.testing.expectEqual(initial_layout_count + 1, try runtime.tree.layoutCount(root));
     try std.testing.expect(runtime.wantsSubmission());
+    try std.testing.expect((try runtime.displayList()).damage == .full);
 }
 
 test "queued pointer axis scrolls retained instance only during input dispatch" {
@@ -1819,6 +1848,36 @@ test "text input protocol batches mutate retained sessions only at the input saf
     runtime.paragraph_sources = &sources;
     runtime.border_color = core.Color.rgba(90, 90, 90, 255);
     runtime.focus_color = core.Color.rgba(20, 80, 220, 255);
+    var commands: [32]scene.Command = undefined;
+    runtime.commands = &commands;
+    runtime.background = core.Color.rgba(0, 0, 0, 0);
+    runtime.damage_tracker = try scene.DamageTracker.init(std.testing.allocator, commands.len);
+    defer runtime.damage_tracker.deinit();
+    const PaintCheck = struct {
+        pixels: [160 * 32 * 4]u8 = @splat(0xaa),
+        fn check(self: *@This(), value: *WindowRuntime, font_cache: *text.FontCache, paragraph_cache: *text.ParagraphCache, initial: bool) !void {
+            const software = @import("../renderer/software/root.zig");
+            if (!software.has_freetype) return;
+            try value.prepareFrame(1);
+            const list = try value.displayList();
+            if (initial) {
+                try std.testing.expect(list.damage == .full);
+            } else {
+                try std.testing.expect(list.damage == .regions and list.damage.regions.len == 1);
+                try std.testing.expect(list.damage.regions[0].width < 160);
+            }
+            var glyphs = try software.GlyphCache.init(std.testing.allocator, font_cache);
+            defer glyphs.deinit();
+            var destination: software.Target = .{ .pixels = &self.pixels, .width = 160, .height = 32, .stride = 640, .format = .rgba8_unorm };
+            try software.renderParagraphs(list, destination, &glyphs, paragraph_cache);
+            var expected: [160 * 32 * 4]u8 = undefined;
+            destination.pixels = &expected;
+            try software.renderParagraphs(.{ .commands = list.commands }, destination, &glyphs, paragraph_cache);
+            try std.testing.expectEqualSlices(u8, &expected, &self.pixels);
+            try value.frameSubmitted();
+        }
+    };
+    var paint_check: PaintCheck = .{};
     defer {
         runtime.text_inputs.clear();
         runtime.text_inputs.deinit();
@@ -1900,6 +1959,8 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try std.testing.expectEqual(runtime.focus_color, focused_box.border_color.?);
     try std.testing.expectEqual(@as(f32, 1), focused_box.border_width);
     try std.testing.expect(focused_box.outline_color == null);
+    _ = try runtime.frame_state.configure(.{ .width = 160, .height = 32 });
+    try paint_check.check(&runtime, &fonts, &paragraphs, true);
 
     var commit = [_]u8{'!'};
     try runtime.routeTextInput(.{ .batch = .{
@@ -1927,6 +1988,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
     const render = try runtime.instances.renderObject(content);
     const object = try runtime.tree.objectAt(render);
     try std.testing.expectEqualStrings("hello!", (try sources.get(object.text_input.source)).utf8);
+    try paint_check.check(&runtime, &fonts, &paragraphs, false);
 
     try runtime.routeTextInput(.{ .batch = .{
         .window = window,
@@ -1985,6 +2047,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
     const extended = (try runtime.text_inputs.session(target)).model.selection;
     try std.testing.expectEqual(after_left.anchor, extended.anchor);
     try std.testing.expect(!extended.isCollapsed());
+    try paint_check.check(&runtime, &fonts, &paragraphs, false);
 
     const expected_home = try runtime.tree.textLineBoundary(
         render,
@@ -2005,6 +2068,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try std.testing.expectEqual(expected_home.affinity, after_home.model.selection.extent_affinity);
     try std.testing.expect(after_home.model.selection.isCollapsed());
     try std.testing.expect(after_home.preferred_x == null);
+    try paint_check.check(&runtime, &fonts, &paragraphs, false);
 
     try runtime.routeKeyboard(.{ .key = .{
         .window = window,

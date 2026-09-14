@@ -402,7 +402,7 @@ pub const Target = struct {
         for (0..self.height) |y| {
             const destination = pixels[y * stride ..][0..row_bytes];
             for (0..self.width) |x| {
-                const encoded = source[y * self.width + x].toSrgba8();
+                const encoded = source[y * self.width + x].toGamma22Rgba8();
                 const offset = x * 4;
                 destination[offset + 0] = if (format == .rgba8_unorm) encoded.r else encoded.b;
                 destination[offset + 1] = encoded.g;
@@ -3122,7 +3122,7 @@ test "Vulkan clipping, damage, and BGRA readback preserve untouched pixels" {
     }, &target);
     var pixels = [_]u8{0xcc} ** 28;
     try target.readPixels(&pixels, 14, .bgra8_unorm);
-    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa, 0xaa, 0xaa, 60, 40, 20, 255, 3, 2, 1, 255 }, pixels[0..12]);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa, 0xaa, 0xaa, 60, 40, 20, 255, 3, 2, 0, 255 }, pixels[0..12]);
     try std.testing.expectEqualSlices(u8, &([_]u8{0xaa} ** 12), pixels[14..26]);
     try std.testing.expectEqualSlices(u8, &.{ 0xcc, 0xcc }, pixels[12..14]);
     try std.testing.expectEqualSlices(u8, &.{ 0xcc, 0xcc }, pixels[26..28]);
@@ -3428,7 +3428,7 @@ test "Vulkan graphics linear light, transparent encoding and persistent damaged 
     try std.testing.expect(first.target.gpu_pending and second.target.gpu_pending);
     try first.target.wait(&renderer);
     try second.target.wait(&renderer);
-    const expected = [_][4]u8{ .{ 188, 188, 188, 255 }, .{ 187, 187, 187, 255 }, .{ 0, 0, 0, 128 }, .{ 128, 128, 128, 128 }, .{ 100, 50, 25, 128 }, .{ 147, 77, 55, 255 } };
+    const expected = [_][4]u8{ .{ 186, 186, 186, 255 }, .{ 186, 186, 186, 255 }, .{ 0, 0, 0, 128 }, .{ 128, 128, 128, 128 }, .{ 100, 50, 25, 128 }, .{ 147, 77, 55, 255 } };
     for (expected, 0..) |pixel, x| try first.expectPixel(x, 0, pixel);
     try first.expectPixel(0, 1, .{ 0, 0, 0, 0 });
     try second.expectPixel(4, 1, .{ 11, 43, 97, 255 });
@@ -3541,8 +3541,9 @@ test "Vulkan graphics decodes transparent image texels before filtering" {
     try target.target.wait(&renderer);
     try target.expectPixel(0, 0, .{ 0, 0, 0, 255 });
     // At the midpoint alpha is 191.5/255 and straight linear RGB is
-    // (64/191.5, decode(0.5)*64/191.5, 0), then encoded and premultiplied.
-    try target.expectPixel(1, 0, .{ 118, 57, 0, 192 });
+    // (64/191.5, sRGB-decode(0.5)*64/191.5, 0), then gamma-2.2 encoded
+    // and premultiplied. The one-byte tolerance covers FP16 rounding.
+    try target.expectPixel(1, 0, .{ 116, 58, 0, 192 });
     try target.expectPixel(2, 0, .{ 128, 64, 0, 128 });
     try target.expectPixel(3, 0, .{ 0, 0, 0, 0 });
 }
@@ -3594,4 +3595,44 @@ test "image uploads deduplicate repeated handles and bound unique bytes per subm
     try cache.release(second);
     try std.testing.expectError(error.StaleImageHandle, cache.get(first));
     try std.testing.expectError(error.StaleImageHandle, cache.get(second));
+}
+
+test "Vulkan scene damage matches full graphics rendering after move and removal" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var partial = try GraphicsReadback.init(&renderer, 40, 16);
+    defer partial.deinit(&renderer);
+    var full = try GraphicsReadback.init(&renderer, 40, 16);
+    defer full.deinit(&renderer);
+    var tracker = try scene.DamageTracker.init(std.testing.allocator, 4);
+    defer tracker.deinit();
+    const viewport: RectI = .{ .x = 0, .y = 0, .width = 40, .height = 16 };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(0, 0, 0, 0) },
+        .{ .push_clip_rect = .{ .x = 4, .y = 2, .width = 30, .height = 12 } },
+        .{ .decorated_rectangle = .{
+            .bounds = .{ .x = 2, .y = 3, .width = 8, .height = 7 },
+            .background = Color.rgba(80, 120, 200, 128),
+            .border_color = Color.rgba(200, 40, 60, 180),
+            .border_width = 1,
+            .corner_radius = 2,
+        } },
+        .pop_clip,
+    };
+    for ([_]i32{ 2, 23, 23 }, 0..) |x, index| {
+        commands[2].decorated_rectangle.bounds.x = x;
+        const current = if (index == 2) commands[0..1] else &commands;
+        const damage = try tracker.compare(current, viewport);
+        if (index != 0) try std.testing.expect(damage == .regions and damage.regions[0].width < viewport.width);
+        try renderer.renderGraphicsResources(.{ .commands = current, .damage = damage }, &partial.target, null, null, null, null, false);
+        try renderer.renderGraphicsResources(.{ .commands = current }, &full.target, null, null, null, null, false);
+        try partial.target.wait(&renderer);
+        try full.target.wait(&renderer);
+        for (0..16) |y| for (0..40) |pixel_x|
+            try partial.expectPixel(pixel_x, y, full.pixel(pixel_x, y));
+        tracker.submitted();
+    }
 }
