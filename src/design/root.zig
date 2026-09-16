@@ -33,5 +33,6 @@ test "semantic tokens are consumable by renderer-neutral scenes" {
         .stride = 4,
         .format = .rgba8_unorm,
     });
-    try std.testing.expectEqualSlices(u8, &.{ 0x3e, 0x63, 0xdd, 0xff }, &pixel);
+    // Opaque Radix indigo 9 (#3e63dd) round-trips through linear light.
+    try std.testing.expectEqualSlices(u8, &.{ 62, 99, 221, 255 }, &pixel);
 }

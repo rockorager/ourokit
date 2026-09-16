@@ -152,20 +152,12 @@ word-wise editor navigation and deletion.
 
 ## Fonts and fallback
 
-The standard UI host uses bundled Source Sans 3 for `sans-serif`, Source Serif 4
-for `serif`, and Source Code Pro for `monospace`. Exact Source family names also
-select the bundled files. Each family supplies static CFF Regular, Semibold,
-and Bold faces with matching italics; Sans and Code also supply Medium.
-`text.bundled.acquire` loads these into
-a caller-owned font cache without filesystem access or Fontconfig; the caller
-releases the returned handle. The UI's emphasized controls request Medium 500.
-Source Serif has no static Medium and explicitly falls back to Regular 400;
-explicit Semibold 600 selection is unchanged.
-See [font provenance](../design/provenance/source-fonts.md) for pinned revisions
-and redistribution notices.
+The standard UI host and Storybook use Fontconfig for every family, including
+`sans-serif`, `serif`, `monospace`, and explicit installed family names. No font
+files are embedded in production runners. Regular text requests Regular and
+emphasized controls request Medium; Fontconfig chooses the actual face.
 
-For other installed family names and fallback after a bundled face, Fontconfig
-applies the user's configured aliases and substitutions and returns an ordered,
+Fontconfig applies the user's configured aliases and substitutions and returns an ordered,
 coverage-trimmed candidate set. Ourokit copies each
 candidate's family, file, complete face/named-instance index, variable-font
 metadata, variation string, and charset coverage out of Fontconfig-owned
@@ -181,25 +173,29 @@ Arabic joining context and combining/emoji sequences therefore survive a
 necessary face boundary. An unresolved grapheme is retained as the primary
 face's `.notdef` and reported rather than silently omitted.
 
-Zig also fetches exact Inter 4.1 and Noto Sans Arabic 2.013 releases for
-deterministic shaping tests. Storybook snapshots use bundled Source Sans 3
-with pinned Noto Sans Arabic fallback. Their source, version, and SIL Open Font
-License provenance are under `design/provenance`.
+Tests embed pinned Inter, Noto Sans Arabic, and Source CFF fixtures; these are
+not application defaults. Their provenance is under `design/provenance`.
+Storybook snapshots use the system fonts, so reproducible snapshots require
+the same font files and Fontconfig configuration on each machine.
 
 The `Font` API owns a copied font blob and exposes nominal cmap coverage.
 Fontconfig's full index is preserved for collection/named-instance selection;
 its special variable-face sentinel is stripped before HarfBuzz interprets it,
 and `FC_FONT_VARIATIONS` assignments override named-instance defaults. Fallback
-inputs carry cache-owned font pointers only for the duration of shaping; output
-retains generation-checked font handles.
+inputs resolve cache-owned faces as they are probed; output retains
+generation-checked font handles.
 
-`FontCache` owns initialized HarfBuzz faces in growable stable-address slabs.
-It does not open Fontconfig paths itself: the Ouro I/O layer supplies bytes, so
-font loading can join the same raw `io_uring` scheduler rather than introducing
-blocking text-library calls. File, full index, variations, and a caller-provided
+`FontCache` owns loaded faces and deferred file identities in growable
+stable-address slabs. `acquire` accepts explicit bytes for native embedding;
+`acquireFile` registers a path without reading it. Theme resolution loads only
+the first usable face for primary metrics. Later candidates are read through
+the supplied `std.Io` when the owning thread first probes them during shaping;
+renderers use faces already selected by shaping. Unsupported font formats are
+remembered and skipped, while other load failures remain retryable.
+File, full index, variations, and a caller-provided
 source revision form the identity. Repeated acquisition deduplicates that key;
 retain/release controls lifetime; final release increments the slot generation
-before reuse. Resolving a valid handle is O(1), while dedupe remains a cold-path
+before reuse. Resolving a loaded handle is O(1), while dedupe remains a cold-path
 linear scan until benchmark evidence warrants another index.
 
 Fallback probing allocates temporary shaped runs and now sits behind an

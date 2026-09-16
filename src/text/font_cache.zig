@@ -1,8 +1,8 @@
 const std = @import("std");
 
 /// Instantiate a stable-address, generation-checked cache for a shaping font
-/// type. File bytes are supplied by the caller; this cache never performs
-/// blocking I/O.
+/// type. Faces can be supplied as bytes or registered by file identity for
+/// deferred loading on the owning thread when shaping first needs them.
 pub fn Cache(comptime Font: type, comptime Handle: type) type {
     return struct {
         allocator: std.mem.Allocator,
@@ -37,7 +37,9 @@ pub fn Cache(comptime Font: type, comptime Handle: type) type {
             index: u32 = 0,
             variations: ?[]u8 = null,
             source_revision: u64 = 0,
-            font: Font = undefined,
+            font: ?Font = null,
+            file_io: ?std.Io = null,
+            invalid_font: bool = false,
         };
 
         const Slab = [slab_size]Slot;
@@ -61,25 +63,40 @@ pub fn Cache(comptime Font: type, comptime Handle: type) type {
         /// bytes. Dedupe is linear over loaded faces; font loading is cold-path
         /// work and unchanged shaping resolves handles in O(1).
         pub fn acquire(self: *Self, load: Load) !Handle {
-            if (load.key.file.len == 0) return error.InvalidFaceKey;
+            if (try self.acquireExisting(load.key)) |handle| return handle;
+            var font = try Font.initConfigured(load.bytes, load.key.index, load.key.variations);
+            errdefer font.deinit();
+            return self.insert(load.key, font, null);
+        }
+
+        /// Registers a candidate without opening its file. The key is copied;
+        /// the supplied I/O implementation must outlive the cache entry.
+        pub fn acquireFile(self: *Self, io: std.Io, key: FaceKey) !Handle {
+            if (try self.acquireExisting(key)) |handle| return handle;
+            return self.insert(key, null, io);
+        }
+
+        fn acquireExisting(self: *Self, key: FaceKey) !?Handle {
+            if (key.file.len == 0) return error.InvalidFaceKey;
             for (self.slabs.items, 0..) |slab, slab_index| {
                 for (slab, 0..) |*slot, offset| {
-                    if (!slot.active or !keyMatches(slot, load.key)) continue;
+                    if (!slot.active or !keyMatches(slot, key)) continue;
                     if (slot.references == std.math.maxInt(u32)) return error.ReferenceOverflow;
                     slot.references += 1;
                     return makeHandle(slab_index, offset, slot.generation);
                 }
             }
+            return null;
+        }
 
-            const file = try self.allocator.dupe(u8, load.key.file);
+        fn insert(self: *Self, key: FaceKey, font: ?Font, file_io: ?std.Io) !Handle {
+            const file = try self.allocator.dupe(u8, key.file);
             errdefer self.allocator.free(file);
-            const variations = if (load.key.variations) |value|
+            const variations = if (key.variations) |value|
                 try self.allocator.dupe(u8, value)
             else
                 null;
             errdefer if (variations) |value| self.allocator.free(value);
-            var font = try Font.initConfigured(load.bytes, load.key.index, load.key.variations);
-            errdefer font.deinit();
 
             const slot_index = try self.takeSlot();
             const slot = self.slotAt(slot_index).?;
@@ -88,10 +105,11 @@ pub fn Cache(comptime Font: type, comptime Handle: type) type {
                 .active = true,
                 .references = 1,
                 .file = file,
-                .index = load.key.index,
+                .index = key.index,
                 .variations = variations,
-                .source_revision = load.key.source_revision,
+                .source_revision = key.source_revision,
                 .font = font,
+                .file_io = file_io,
             };
             self.active_count += 1;
             return .{ .slot = slot_index, .generation = slot.generation };
@@ -117,7 +135,28 @@ pub fn Cache(comptime Font: type, comptime Handle: type) type {
         }
 
         pub fn get(self: *const Self, handle: Handle) !*const Font {
-            return &(try self.requireConst(handle)).font;
+            const slot = try self.require(handle);
+            if (slot.invalid_font) return error.InvalidFont;
+            if (slot.font == null) {
+                const io = slot.file_io.?;
+                const file = try std.Io.Dir.openFileAbsolute(io, slot.file, .{});
+                defer file.close(io);
+                var buffer: [8192]u8 = undefined;
+                var reader = file.reader(io, &buffer);
+                const bytes = try reader.interface.allocRemaining(self.allocator, .limited(64 * 1024 * 1024));
+                defer self.allocator.free(bytes);
+                slot.font = Font.initConfigured(bytes, slot.index, slot.variations) catch |err| {
+                    // Do not repeatedly reopen unsupported formats during
+                    // whole-run and per-grapheme fallback. Other errors retry.
+                    if (err == error.InvalidFont) slot.invalid_font = true;
+                    return err;
+                };
+            }
+            return &slot.font.?;
+        }
+
+        pub fn isLoaded(self: *const Self, handle: Handle) !bool {
+            return (try self.requireConst(handle)).font != null;
         }
 
         pub fn count(self: *const Self) usize {
@@ -149,7 +188,7 @@ pub fn Cache(comptime Font: type, comptime Handle: type) type {
             return first;
         }
 
-        fn require(self: *Self, handle: Handle) !*Slot {
+        fn require(self: *const Self, handle: Handle) !*Slot {
             const slot = self.slotAt(handle.slot) orelse return error.StaleFont;
             if (!slot.active or slot.generation != handle.generation) return error.StaleFont;
             return slot;
@@ -161,7 +200,7 @@ pub fn Cache(comptime Font: type, comptime Handle: type) type {
             return slot;
         }
 
-        fn slotAt(self: *Self, index: u32) ?*Slot {
+        fn slotAt(self: *const Self, index: u32) ?*Slot {
             const slab_index: usize = index / slab_size;
             if (slab_index >= self.slabs.items.len) return null;
             return &self.slabs.items[slab_index][index % slab_size];
@@ -174,7 +213,7 @@ pub fn Cache(comptime Font: type, comptime Handle: type) type {
         }
 
         fn destroySlot(self: *Self, slot: *Slot) void {
-            slot.font.deinit();
+            if (slot.font) |*font| font.deinit();
             if (slot.variations) |variations| self.allocator.free(variations);
             self.allocator.free(slot.file);
             slot.active = false;

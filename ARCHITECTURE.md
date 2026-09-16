@@ -523,7 +523,7 @@ destructive/reversible metadata. Widgets may contribute contextual entries.
 ## Rendering backends
 
 The current software backend consumes the same display list contract intended
-for Vulkan and writes premultiplied encoded-sRGB RGBA/BGRA bytes into
+for Vulkan and writes premultiplied gamma-2.2 RGBA/BGRA bytes into
 caller-provided dimensions and stride. Scene colors remain straight-alpha sRGB;
 the backend decodes and premultiplies them into linear RGBA16 UNORM working
 storage for source/source-over composition, then converts damaged pixels back

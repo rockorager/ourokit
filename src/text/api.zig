@@ -353,11 +353,25 @@ pub const Grapheme = struct {
 pub const FontHandle = Handle;
 pub const FontCache = @import("font_cache.zig").Cache(Font, FontHandle);
 
-/// A cache-owned font in Fontconfig candidate order. The cache retains `font`
-/// for the entire shaping call; shaped output stores only its stable handle.
+/// A font in configured candidate order. Cache-backed candidates resolve only
+/// when probed; direct fonts support callers that own their shaping resources.
 pub const FallbackCandidate = struct {
     handle: FontHandle,
-    font: *const Font,
+    font: ?*const Font = null,
+    cache: ?*const FontCache = null,
+
+    pub fn resolve(self: FallbackCandidate) !*const Font {
+        if (self.font) |font| return font;
+        return (self.cache orelse return error.InvalidFontHandle).get(self.handle);
+    }
+
+    fn probe(self: FallbackCandidate, allocator: std.mem.Allocator, spec: RunSpec) !?ShapedRun {
+        const font = self.resolve() catch |err| switch (err) {
+            error.InvalidFont => return null,
+            else => return err,
+        };
+        return try font.shape(allocator, spec);
+    }
 };
 
 pub const ShapedSpan = struct {
@@ -429,7 +443,7 @@ pub fn shapeWithFallback(
     }
 
     for (candidates) |candidate| {
-        var run = try candidate.font.shape(allocator, spec);
+        var run = (try candidate.probe(allocator, spec)) orelse continue;
         if (!hasMissingGlyph(run.glyphs))
             return singleSpanResult(allocator, candidate.handle, run, spec.logical_size, false);
         run.deinit();
@@ -447,7 +461,7 @@ pub fn shapeWithFallback(
         var selected: usize = 0;
         var found = false;
         for (candidates, 0..) |candidate, index| {
-            var probe = try candidate.font.shape(allocator, withRange(spec, grapheme.byte_start, grapheme.byte_end));
+            var probe = (try candidate.probe(allocator, withRange(spec, grapheme.byte_start, grapheme.byte_end))) orelse continue;
             defer probe.deinit();
             if (!hasMissingGlyph(probe.glyphs)) {
                 selected = index;
@@ -479,7 +493,7 @@ pub fn shapeWithFallback(
     var metrics: Metrics = .{ .ascender = 0, .descender = 0, .line_gap = 0 };
     for (selections.items) |selection| {
         const candidate = candidates[selection.candidate_index];
-        var run = try candidate.font.shape(
+        var run = try (try candidate.resolve()).shape(
             allocator,
             withRange(spec, selection.byte_start, selection.byte_end),
         );
@@ -755,4 +769,36 @@ test "font cache source revisions prevent stale file reuse" {
     try std.testing.expect(old.slot != updated.slot);
     try cache.release(old);
     try cache.release(updated);
+}
+
+test "deferred font cache retries I/O errors and shares loaded faces until final release" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    // Obtain an absolute identity, then remove the file before registration.
+    try temporary.dir.writeFile(io, .{ .sub_path = "font.ttf", .data = "" });
+    const path = try temporary.dir.realPathFileAlloc(io, "font.ttf", allocator);
+    defer allocator.free(path);
+    try temporary.dir.deleteFile(io, "font.ttf");
+    var fonts = FontCache.init(allocator);
+    defer fonts.deinit();
+    const handle = try fonts.acquireFile(io, .{ .file = path, .index = 0 });
+    const duplicate = try fonts.acquireFile(io, .{ .file = path, .index = 0 });
+    try std.testing.expectEqual(handle, duplicate);
+    try std.testing.expect(!(try fonts.isLoaded(handle)));
+    try std.testing.expectError(error.FileNotFound, fonts.get(handle));
+    const bytes = @embedFile("ourokit_test_font_static");
+    try temporary.dir.writeFile(io, .{ .sub_path = "font.ttf", .data = bytes });
+    const font = try fonts.get(handle);
+    try std.testing.expectEqualSlices(u8, bytes, font.raster_bytes);
+    try temporary.dir.deleteFile(io, "font.ttf");
+    try fonts.release(handle);
+    try std.testing.expectEqual(font, try fonts.get(duplicate));
+    try fonts.release(duplicate);
+    try std.testing.expectError(error.StaleFont, fonts.get(handle));
+    const replacement = try fonts.acquireFile(io, .{ .file = path, .index = 0, .source_revision = 2 });
+    try std.testing.expect(replacement.generation != handle.generation);
+    try std.testing.expect(!(try fonts.isLoaded(replacement)));
+    try fonts.release(replacement);
 }

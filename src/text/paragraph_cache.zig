@@ -159,7 +159,7 @@ pub const ParagraphCache = struct {
         errdefer for (request.candidates[0..retained]) |handle|
             self.font_cache.release(handle) catch unreachable;
         for (request.candidates, fallback_candidates) |handle, *candidate| {
-            candidate.* = .{ .handle = handle, .font = try self.font_cache.get(handle) };
+            candidate.* = .{ .handle = handle, .cache = self.font_cache };
             try self.font_cache.retain(handle);
             retained += 1;
         }

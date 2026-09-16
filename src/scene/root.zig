@@ -88,6 +88,47 @@ pub const DisplayList = struct {
         return .{ .commands = commands };
     }
 
+    /// Conservative proof for a reconstructed scene, independent of damage.
+    /// A clear or full opaque rectangle establishes every pixel. Source-over
+    /// preserves opacity; source replacement can punch holes in it.
+    /// This is not a promise about an incremental batch over unknown storage.
+    pub fn isOpaque(self: DisplayList, bounds: RectI) bool {
+        if (bounds.isEmpty()) return false;
+        var result = false;
+        var clips: [max_clip_depth + 1]RectI = undefined;
+        clips[0] = bounds;
+        var depth: usize = 0;
+        for (self.commands) |command| switch (command) {
+            .clear => |color| {
+                if (depth != 0) return false;
+                result = color.a == 255;
+            },
+            .push_clip_rect => |clip| {
+                if (depth == max_clip_depth) return false;
+                clips[depth + 1] = RectI.intersect(clips[depth], clip);
+                depth += 1;
+            },
+            .pop_clip => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .solid_rectangle => |rect| {
+                if (rect.blend == .source and rect.color.a != 255) result = false;
+                if (rect.color.a == 255 and std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
+            },
+            .decorated_rectangle => |rect| {
+                if (rect.blend == .source) result = false;
+                // Rounded corners and translucent borders do not cover every
+                // pixel. Do not infer opacity from just the background alpha.
+                if (rect.corner_radius == 0 and rect.background != null and rect.background.?.a == 255 and
+                    (rect.border_color == null or rect.border_color.?.a == 255) and
+                    std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
+            },
+            .glyph_run, .paragraph, .image => {},
+        };
+        return result and depth == 0;
+    }
+
     pub fn validate(self: DisplayList) !void {
         var depth: usize = 0;
         for (self.commands) |command| switch (command) {
@@ -483,4 +524,55 @@ test "frame owns image leases and rolls back partial resource acquisition" {
 fn exerciseImageFrameAllocationFailure(allocator: std.mem.Allocator, cache: *ImageCache, commands: []const Command) !void {
     var frame = try Frame.initWithResources(allocator, commands, .full, .{ .images = cache });
     defer frame.deinit();
+}
+
+test "opacity proof rejects source holes regardless of damage" {
+    const bounds: RectI = .{ .x = 3, .y = 1, .width = 2, .height = 4 };
+    const extent: RectI = .{ .x = 0, .y = 0, .width = 9, .height = 7 };
+    var commands = [_]Command{
+        .{ .clear = Color.rgba(19, 27, 41, 255) },
+        .{ .push_clip_rect = bounds },
+        .{ .solid_rectangle = .{ .bounds = bounds, .color = Color.rgba(200, 71, 5, 128) } },
+        .{ .decorated_rectangle = .{ .bounds = bounds, .background = Color.rgba(20, 40, 80, 64), .corner_radius = 1 } },
+        .pop_clip,
+    };
+    const list: DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{} } };
+    try std.testing.expect(list.isOpaque(extent));
+    try std.testing.expect(!(DisplayList{ .commands = commands[1..] }).isOpaque(extent));
+    commands[2].solid_rectangle.blend = .source;
+    try std.testing.expect(!list.isOpaque(extent));
+    commands[2].solid_rectangle.color.a = 255;
+    try std.testing.expect(list.isOpaque(extent));
+    commands[3].decorated_rectangle.blend = .source;
+    try std.testing.expect(!list.isOpaque(extent));
+    commands[3].decorated_rectangle.blend = .source_over;
+    commands[0].clear.a = 254;
+    try std.testing.expect(!list.isOpaque(extent));
+    commands[0].clear.a = 0;
+    try std.testing.expect(!list.isOpaque(extent));
+}
+
+test "opacity proof recognizes retained root coverage but not gaps clips or rounded corners" {
+    const extent: RectI = .{ .x = 0, .y = 0, .width = 13, .height = 7 };
+    var commands = [_]Command{
+        .{ .clear = Color.rgba(0, 0, 0, 0) },
+        .{ .push_clip_rect = extent },
+        .{ .solid_rectangle = .{ .bounds = extent, .color = Color.rgba(254, 247, 255, 255) } },
+        .pop_clip,
+    };
+    const list: DisplayList = .{ .commands = &commands };
+    try std.testing.expect(list.isOpaque(extent));
+    try std.testing.expect((DisplayList{ .commands = commands[1..] }).isOpaque(extent));
+    commands[1].push_clip_rect.width -= 1;
+    try std.testing.expect(!list.isOpaque(extent));
+    commands[1].push_clip_rect = extent;
+    commands[2].solid_rectangle.bounds.y = 1;
+    try std.testing.expect(!list.isOpaque(extent));
+    commands[2] = .{ .decorated_rectangle = .{ .bounds = extent, .background = Color.rgba(254, 247, 255, 255), .corner_radius = 1 } };
+    try std.testing.expect(!list.isOpaque(extent));
+    commands[2].decorated_rectangle.corner_radius = 0;
+    try std.testing.expect(list.isOpaque(extent));
+    commands[2].decorated_rectangle.border_width = 1;
+    commands[2].decorated_rectangle.border_color = Color.rgba(1, 2, 3, 254);
+    try std.testing.expect(!list.isOpaque(extent));
 }

@@ -7,28 +7,33 @@ balanced rectangular clip stack. A borrowed `DisplayList` supports immediate
 consumption. An owning `Frame` copies command and damage storage so worker
 threads and asynchronous backends can safely retain it through completion.
 
-Scene and design `Color` values are straight-alpha, 8-bit ordinary desktop
-colors: sRGB/BT.709 primaries with a pure gamma-2.2 display response. Renderers
-decode RGB with that transfer, premultiply in linear light, and
+Scene and design `Color` values, including Lua hex literals and Radix tokens,
+are straight-alpha, 8-bit sRGB. Renderers decode RGB with the piecewise sRGB
+transfer, premultiply in linear light, and
 apply Porter-Duff source/source-over there. Alpha and A8 glyph/geometry coverage
 are linear quantities, never gamma-decoded. Image texels are unpremultiplied and
 decoded before bilinear filtering, then filtered and composited in premultiplied
 linear light.
 
-Presentation bytes are premultiplied 8-bit gamma-2.2 ordinary desktop colors.
-Output conversion unpremultiplies linear RGB, gamma-2.2 encodes it, and
+Presentation bytes are premultiplied 8-bit piecewise sRGB desktop colors.
+Output conversion unpremultiplies linear RGB, sRGB-encodes it, and
 premultiplies the encoded result. This preserves the `wl_shm` ARGB and ordinary
 untagged dma-buf contract even for transparent surfaces; alpha is never encoded.
 No compositor high-precision format or color-management protocol is required.
 This is SDR with sRGB/BT.709 primaries, not wide gamut or HDR;
 blending a translucent surface with other windows remains the compositor's job.
 
+The direct-presentation prototype deliberately replaces the earlier gamma-2.2
+output transfer across software, compute readback, and graphics presentation.
+Opaque scene RGB now round-trips to the same sRGB codes, including dark colors.
+This changes display bytes, especially near black; it is not a byte-compatible
+optimization. Explicitly named gamma-2.2 core helpers remain for older captures.
+
 Decoded PNG, JPEG, WebP, and SVG image-cache bytes remain explicitly piecewise
 sRGB. Texels are sRGB-decoded into the shared linear-light working space, so
-images and gamma-2.2 UI colors compose without encoded-space blending. Storybook
-and renderer-review PNG exports convert gamma-2.2 presentation pixels back to
-straight piecewise sRGB; PNG files are therefore interchange images, not dumps
-of Wayland buffer encoding.
+images and UI colors compose without encoded-space blending. Storybook
+and renderer-review PNG exports unassociate presentation pixels without another
+transfer; PNG files contain straight sRGB rather than Wayland premultiplied RGB.
 
 Integer device-pixel geometry gives clear first rasterization rules. Rectangular
 damage regions must not overlap, preventing source-over commands from being
@@ -61,11 +66,9 @@ the target's allocator. All draws in that call blend at 16-bit precision; only
 damaged pixels are encoded back to presentation storage. A leading clear avoids
 reading caller storage; otherwise damaged pixels are imported from the existing
 8-bit output. Precision persists across draws, not across separate render calls.
-Opaque output conversion uses an exact 64 KiB gamma-2.2 lookup table. The
-piecewise sRGB table remains separate for image interchange and PNG export.
-UNORM16 cannot represent every near-black gamma-2.2 value: opaque code 1
-rounds to linear zero. Conversion uses nearest quantization without a special
-transfer-function exception; encoded round trips can differ by one byte level.
+Opaque output conversion uses an exact 64 KiB piecewise sRGB lookup table,
+also used for image interchange. All 256 opaque gray codes survive import and
+export. Alpha-bearing pixels still incur ordinary premultiplied quantization.
 
 Ourokit owns this backend and its lowering policy. Direct paths handle clear and
 opaque rectangles. Pixman is pinned as a lazy, benchmark-only dependency while
@@ -127,14 +130,44 @@ in. `-Dvulkan=false` produces a software-only build that neither compiles Vulkan
 shaders nor discovers or links the Vulkan loader. Both configurations preserve
 the same renderer-neutral scene boundary.
 
-The presentation profile blends into a persistent `R16G16B16A16_SFLOAT`
-attachment owned by each target. Scene draws honor damage; a second subpass
-converts the entire attachment into an exportable `B8G8R8A8_UNORM` modifier image.
-The high-precision attachment is private to Vulkan, not shared with the
-compositor. Missing FP16 color/blend/transfer support disables dma-buf graphics
-and preserves the existing SHM/software fallback. FP16 blending can differ
-slightly from the integer reference; graphics fixtures allow one byte of output
-error. Software and headless compute remain the exact-byte reference profile.
+For a provably opaque reconstructed scene, the presentation prototype blends
+directly into the exported `B8G8R8A8_SRGB` modifier image. Vulkan decodes the
+destination RGB before blending and encodes RGB on attachment writes; alpha
+remains linear. There is no working image, conversion subpass, copy, aliasing,
+or feedback loop. Eight-bit storage quantizes after each draw, unlike FP16.
+Ordinary damaged UI pixels are reconstructed, not accumulated indefinitely.
+Reconstruction prevents temporal accumulation but cannot recover sub-code
+contributions within a frame: twenty alpha-1 black overlays over white produce
+255 on llvmpipe and 251 on Intel Lunar Lake, versus 246 with FP16. Fixed-function
+sRGB precision is implementation-dependent; regression tests require stable
+reconstruction rather than one driver's accumulated rounding result. In the
+representative text/overlap/dark-ramp capture, direct and converted sRGB differed
+by at most one channel code; that bound is not guaranteed for arbitrary scenes.
+
+`DisplayList.isOpaque` conservatively requires a full opaque clear or rectangle
+and rejects later source replacements that could introduce transparency.
+Rounded rectangles do not establish full coverage. The Wayland runner calls
+`Host.prepareScene` before acquisition; a changed proof retires the old pool
+through the same generation-safe lifecycle as resize. Callers that omit this
+step retain alpha-capable storage. Rendering an unproven scene to a direct
+target fails before submission. The selected modifier must independently
+support sRGB export, color attachment blending, and its reported plane layout;
+otherwise even an opaque scene uses the converted path.
+
+Transparent and unproven scenes blend into the supplied persistent
+`R16G16B16A16_SFLOAT` attachment shared by a window's slots. A second subpass
+converts it to an exported `B8G8R8A8_UNORM` image. This private working image
+preserves alpha correctness: half-white over transparent exports RGB128/A128,
+not the RGB188/A128 that direct sRGB attachment storage would produce.
+Missing FP16 color/blend/transfer support still disables dma-buf graphics and
+preserves SHM/software fallback. FP16 fixtures retain their precision checks;
+focused direct fixtures allow only measured quantization differences.
+Software and headless compute remain the exact-byte reference profile.
+
+These rules follow Vulkan's [sRGB framebuffer blending specification](https://docs.vulkan.org/spec/latest/chapters/framebuffer.html)
+and [DRM modifier extension](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_image_drm_format_modifier.html):
+DRM format names do not distinguish Vulkan UNORM and sRGB transfers. Actual
+format/modifier support is queried rather than inferred from the DRM name.
 
 It will not use `VK_KHR_wayland_surface`: that API requires libwayland
 `wl_display*` and `wl_surface*` objects, which Wayring handles are not.
@@ -147,11 +180,17 @@ version 3 falls back to an advertised renderable linear modifier. No common
 choice falls back to `wl_shm`.
 
 Without libwayland there is no Vulkan swapchain or WSI frame scheduler. The
-Wayring host supplies that lifecycle itself: three persistent slots,
+Wayring host supplies that lifecycle itself: up to three persistent slots,
 `wl_surface.frame` redraw throttling, `wl_buffer.release` reuse gating, and
-generation-safe resize retirement, all driven by Ourokit's io_uring loop. Each
-slot owns independent command/fence state, so queue submission no longer waits
-on the CPU. Reuse requires both GPU completion and `wl_buffer.release`.
+generation-safe resize retirement, all driven by Ourokit's io_uring loop.
+Only the first slot is allocated initially; the pool grows when all existing
+slots are unavailable. Each slot owns its export image and command/fence state.
+Converted slots retain the same high-precision working image; direct slots
+have no working allocation. Render-pass dependencies on
+the single graphics queue order working-image writes after earlier conversion
+reads without a CPU wait between slots. Reuse requires both GPU completion and
+`wl_buffer.release`. Resize creates a new working image; retired storage lives
+until its slots finish using it.
 
 When available, linux-drm-syncobj pairs each slot with an exported Vulkan
 timeline semaphore. Vulkan signals the acquire point, the compositor signals
@@ -162,15 +201,96 @@ compositor's clock ID, presentation timestamp, refresh interval, sequence, and
 hardware/vsync/zero-copy flags through `Host.takePresentationTiming`. Neither
 path uses libwayland or Vulkan Wayland WSI.
 
-The host supplies buffer age for both SHM and dma-buf slots. Each successful
-commit records the current scene damage and the slot's presentation serial.
-Before rendering a reused slot, `prepareFrameDamage` expands current damage by
-all intervening records; new slots and ages older than retained history repaint
-fully. Regions are conservatively coalesced to one bounding rectangle. The
-renderer receives expanded buffer damage while `wl_surface.damage_buffer`
-reports only the current visible change. This prevents stale pixels without
-forcing every rotating buffer to repaint fully. Device-loss recovery, richer
-region coalescing, and larger descriptor/resource caches remain future work.
+The host tracks buffer age per SHM/direct slot and per converted Vulkan working image. Each
+successful commit records the current scene damage and the corresponding
+presentation serial. `prepareFrameDamage` expands damage by intervening records;
+new storage and ages older than retained history repaint fully. A newly added
+converted Vulkan slot uses the existing working image's history, so it does
+not require a full scene redraw. A new direct slot always reconstructs fully,
+even if requested damage is empty. Discard invalidates the converted pool's
+shared age or the affected direct slot's age, respectively.
+Regions are conservatively coalesced to one bounding rectangle. The renderer
+receives expanded damage while `wl_surface.damage_buffer` reports only the
+current visible change. Device-loss recovery, richer region coalescing, and
+larger descriptor/resource caches remain future work.
+
+### Reproducing the presentation comparison
+
+Build with Zig 0.16 and run the executable directly:
+
+```sh
+zig build build-presentation-probe -Doptimize=ReleaseFast
+zig-out/bin/presentation-probe /tmp/presentation 2844 1704
+# Optional: compositor-selected modifier in decimal or 0x-prefixed hex.
+zig-out/bin/presentation-probe /tmp/presentation-native 2844 1704 MODIFIER
+```
+
+The probe compares converted opaque, direct opaque, and converted transparent
+scenes using two slots, 8 warmups, and 60 measured submissions per case. It
+reports actual image memory requirements, Vulkan timestamp median/p95, and
+CPU submit-plus-wait median/p95 for full and 128×64 damage. Without a modifier,
+linear mapped attachments permit PNG captures of text, dark ramps, and overlap.
+With a modifier, it tests native export allocation/rendering but does **not**
+hand buffers to a compositor or measure compositor frame times. Unsupported
+modifiers are reported, not silently substituted. The baseline probe uses the
+same workload and instrumentation against the supplied FP16/gamma-2.2 snapshot.
+
+Orb llvmpipe measurements at 2844×1704: two export images require 38,823,936
+bytes; the shared FP16 image also requires 38,823,936 bytes. Direct removes the
+latter: window image allocations fall from 74.05 to 37.03 MiB. This is not
+driver-resident accounting and does not predict Intel compression or modifiers.
+Measured software-Vulkan timestamp medians (full / partial, milliseconds) were
+32.826 / 26.135 for the supplied baseline, 31.824 / 25.257 for converted sRGB,
+and 2.724 / 0.558 for direct sRGB. These are executed software-driver costs,
+not Intel performance claims or compositor frame-time measurements.
+
+Local Intel Lunar Lake testing with native modifier 0 at the same extent and
+two slots reports 38,769,408 exported bytes plus 39,370,752 working bytes for
+converted rendering; direct retains only the exported bytes. Release-build
+GPU timestamp medians (full / partial, milliseconds) are 0.918 / 0.742 for the
+FP16 gamma-2.2 baseline, 0.883 / 0.736 for converted sRGB, and 0.864 / 0.016
+for direct sRGB. Removing the full-window conversion primarily benefits small
+damage, not full redraws. These are command timestamps, not presentation latency.
+The 960×540 direct-versus-converted sRGB capture differs by at most one channel
+code, with mean RGB delta 0.001410 and 1,612 differing pixels out of 518,400.
+
+On an isolated Intel-backed Sway Vulkan compositor, a transparent layer fixture
+passes 40 alternating opacity changes with rapid output resizes, followed by
+opaque/transparent/opaque captures and clean application exit. Synchronization
+validation reports no diagnostics. Its half-white output over black matches
+the software reference; all captured RGB channels differ by at most two codes.
+The local full suite passes all 511 tests, and running the 483-test root executable
+directly under synchronization validation also passes without diagnostics.
+
+Matched hello-world processes on that compositor, created at 2844×1704 physical
+pixels (1.5× scale) without subsequent resizing, report the following after
+10 seconds settling and a 30-second idle sample:
+
+| Renderer | PSS (MiB) | DRM resident (MiB) | Threads |
+| --- | ---: | ---: | ---: |
+| Ourokit shared FP16 baseline | 12.57 | 114.10 | 3 |
+| Ourokit direct sRGB | 12.62 | 76.10 | 3 |
+| Qt Quick OpenGL | 49.19 | 97.63 | 10 |
+
+All three consumed zero additional CPU ticks during the idle sample. DRM
+clients are deduplicated by PCI device and client ID; GPU residency is not
+added to PSS. These are process residency observations, not just image memory
+requirements. Compositor/modifier choice and resize history affect residency:
+the earlier Qt result on the Ouro desktop was lower, so this Sway comparison
+does not establish an across-compositor ranking.
+
+Still check the installed Ouro compositor's explicit-sync handoff and actual
+presentation latency before treating these command-time results as end-to-end
+performance. Record `/proc/PID/fdinfo` DRM resident totals deduplicated by device
+and client ID separately from PSS, at matched sizes and slot counts. The orb has
+no Intel DRM device; the hardware results above come from the local runner.
+
+For validation, set `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` and
+`VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`
+when running the probe or compiled root test executable **directly**. Do not
+inject validation into Zig's `--listen` test protocol. The standalone
+`test-ourokit-ui-consumer` image mismatch predates this prototype; it is not
+part of the passing root suite or evidence of direct-path correctness.
 
 Text is shaped above both renderers by the shared HarfBuzz-backed `text` module.
 The scene receives common positioned glyph runs; each backend may own

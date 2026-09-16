@@ -35,11 +35,11 @@ const decorated_commands = [_]scene.Command{
 
 const red = [_]u8{ 200, 0, 0, 255 };
 const green = [_]u8{ 0, 200, 0, 255 };
-// Gamma-2.2 encode(decode(200/255) * coverage), with geometric coverage
+// sRGB encode(sRGB-decode(200/255) * coverage), with geometric coverage
 // 97/255, 234/255, and border/background weights 53/255 and 202/255.
 const corner_red = [_]u8{ 129, 0, 0, 255 };
 const edge_red = [_]u8{ 192, 0, 0, 255 };
-const edge_mix = [_]u8{ 98, 180, 0, 255 };
+const edge_mix = [_]u8{ 97, 180, 0, 255 };
 
 pub const fixtures = [_]Fixture{
     .{

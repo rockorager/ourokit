@@ -174,7 +174,9 @@ override.
 
 Native Linux builds enable Fontconfig by default. Minimal/headless builds and
 cross-compilation can omit that system capability with `-Dfontconfig=false`;
-deterministic shaping and rendering tests remain available.
+deterministic shaping and rendering tests remain available. Application and
+Storybook runners require Fontconfig and installed fonts; embedded native hosts
+can still supply their own font bytes explicitly.
 
 Software glyph rasterization is also optional (`-Dfreetype=false`) and disabled
 by default for cross targets. The
@@ -369,8 +371,9 @@ zig-out/bin/ouroctl storybook snapshot examples/storybook.lua \
 Each story declares a fixed logical viewport, optional `snapshot_scale`, color
 scheme, and ordinary Ourokit content callback. Snapshot scale affects PNG
 raster dimensions only; the interactive browser uses its window's native
-output scale. Snapshots use bundled Source Sans 3 and pinned Noto Sans Arabic, write
-PNG files atomically beneath the output directory, and report SHA-256 hashes. A
+output scale. Snapshots use Fontconfig's system fonts, write
+PNG files atomically beneath the output directory, and report SHA-256 hashes.
+Pin the font files and Fontconfig configuration for reproducible snapshots. A
 fresh Lua VM and retained UI runtime are created for each PNG so signals,
 globals, tasks, and widget state cannot leak between stories. Slash-separated
 story IDs create corresponding output subdirectories; unsafe path segments are

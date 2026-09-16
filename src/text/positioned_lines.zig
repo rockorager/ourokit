@@ -686,7 +686,7 @@ pub fn positionLinesWithOptions(
             // Empty lines have no shaped fragments, but still occupy a font
             // line and need a full-height insertion caret.
             if (shaped.candidates.len == 0) return error.NoFallbackCandidates;
-            var empty = try shaped.candidates[0].font.shape(allocator, .{
+            var empty = try (try shaped.candidates[0].resolve()).shape(allocator, .{
                 .paragraph = "",
                 .direction = if (selected_line.base_level & 1 == 0) .left_to_right else .right_to_left,
                 .script = .latin,
@@ -921,7 +921,7 @@ fn appendClusterCarets(
     try ligature_positions.resize(allocator, internal_count);
     var use_font_positions = false;
     if (internal_count != 0 and cluster_glyphs.len == 1) {
-        const font = fontForHandle(shaped.candidates, span.font) orelse
+        const font = (try fontForHandle(shaped.candidates, span.font)) orelse
             return error.InvalidFontHandle;
         const total = try font.ligatureCarets(
             span.direction,
@@ -1021,9 +1021,9 @@ fn firstGraphemeEndingAfter(graphemes: []const api.Grapheme, byte_offset: usize)
 fn fontForHandle(
     candidates: []const api.FallbackCandidate,
     handle: api.FontHandle,
-) ?*const api.Font {
+) !?*const api.Font {
     for (candidates) |candidate| if (candidate.handle.slot == handle.slot and
-        candidate.handle.generation == handle.generation) return candidate.font;
+        candidate.handle.generation == handle.generation) return try candidate.resolve();
     return null;
 }
 

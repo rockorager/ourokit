@@ -96,7 +96,7 @@ fn save(init: std.process.Init, directory: []const u8, backend: []const u8, scal
     defer init.gpa.free(srgb);
     for (0..width * height) |index| {
         const offset = index * 4;
-        srgb[offset..][0..4].* = ok.core.gamma22ToStraightSrgba8(.{
+        srgb[offset..][0..4].* = ok.core.srgba8ToStraight(.{
             .r = pixels[offset],
             .g = pixels[offset + 1],
             .b = pixels[offset + 2],

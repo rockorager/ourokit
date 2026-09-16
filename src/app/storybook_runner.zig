@@ -158,15 +158,8 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     defer fonts.deinit();
     var theme_fonts: @import("../lua/theme_fonts.zig").ThemeFonts = .{ .allocator = init.gpa, .io = init.io, .fonts = &fonts };
     defer theme_fonts.deinit();
-    const primary_font = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
-    defer fonts.release(primary_font) catch unreachable;
-    const medium_font = try text.bundled.acquire(&fonts, .sans, .semibold, .roman);
-    defer fonts.release(medium_font) catch unreachable;
-    const arabic_font = try fonts.acquire(.{
-        .key = .{ .file = "/ourokit/storybook/NotoSansArabic.ttf", .index = 0 },
-        .bytes = @embedFile("ourokit_storybook_arabic_font"),
-    });
-    defer fonts.release(arabic_font) catch unreachable;
+    const font_candidates = try theme_fonts.get("sans-serif", false);
+    const medium_font_candidates = try theme_fonts.get("sans-serif", true);
     var paragraph_sources = text.ParagraphSourceCache.init(init.gpa, &fonts);
     defer paragraph_sources.deinit();
     var paragraphs = text.ParagraphCache.init(init.gpa, &fonts);
@@ -198,8 +191,8 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     lua_ui.images = &assets;
     lua_ui.attachSignals(&signals);
     lua_ui.attachCallbacks(&callbacks, &vm);
-    try lua_ui.attachText(&paragraph_sources, &.{ primary_font, arabic_font }, 1);
-    try lua_ui.attachMediumText(&.{ medium_font, arabic_font });
+    try lua_ui.attachText(&paragraph_sources, font_candidates, 1);
+    try lua_ui.attachMediumText(medium_font_candidates);
     try lua_ui.attachSemantics(semantic_storage);
 
     var book = try lua.Storybook.loadWithApi(
@@ -271,11 +264,10 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
         .stride = stride,
         .format = .rgba8_unorm,
     }, &glyphs, null, &paragraphs, &images);
-    // Snapshot PNG is explicit sRGB interchange, not the gamma-2.2 Wayland
-    // presentation representation produced by the renderer.
+    // PNG stores straight sRGB; presentation stores premultiplied sRGB.
     for (0..pixel_height) |y| for (0..pixel_width) |x| {
         const offset = y * stride + x * 4;
-        pixels[offset..][0..4].* = core.gamma22ToStraightSrgba8(.{
+        pixels[offset..][0..4].* = core.srgba8ToStraight(.{
             .r = pixels[offset],
             .g = pixels[offset + 1],
             .b = pixels[offset + 2],

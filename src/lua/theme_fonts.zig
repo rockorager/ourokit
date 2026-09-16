@@ -1,9 +1,8 @@
 const std = @import("std");
 const text = @import("../text/root.zig");
 
-/// Host-owned cache. Generic and Source family names select bundled fonts;
-/// other names and missing-character fallbacks use Fontconfig. Loading happens
-/// at a build safe point, not during native layout.
+/// Host-owned Fontconfig candidate lists. The first usable face is loaded for
+/// primary metrics; fallback files are loaded only when shaping reaches them.
 pub const ThemeFonts = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -22,6 +21,7 @@ pub const ThemeFonts = struct {
     }
 
     pub fn get(self: *ThemeFonts, family: []const u8, medium: bool) ![]const text.FontHandle {
+        if (!text.has_fontconfig) return error.FontconfigDisabled;
         for (self.entries.items) |entry|
             if (entry.medium == medium and std.mem.eql(u8, entry.family, family)) return entry.handles;
         const name = try self.allocator.dupe(u8, family);
@@ -31,14 +31,7 @@ pub const ThemeFonts = struct {
             for (handles.items) |handle| self.fonts.release(handle) catch unreachable;
             handles.deinit(self.allocator);
         }
-        if (text.bundled.Family.fromName(family)) |bundled_family| {
-            const handle = try text.bundled.acquire(self.fonts, bundled_family, if (medium) .medium else .regular, .roman);
-            errdefer self.fonts.release(handle) catch unreachable;
-            try handles.append(self.allocator, handle);
-        }
-        if (text.has_fontconfig) {
-            try self.appendSystemFonts(family, medium, &handles);
-        } else if (handles.items.len == 0) return error.FontconfigDisabled;
+        try self.appendSystemFonts(family, medium, &handles);
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         const owned = try handles.toOwnedSlice(self.allocator);
         self.entries.appendAssumeCapacity(.{ .family = name, .medium = medium, .handles = owned });
@@ -48,90 +41,83 @@ pub const ThemeFonts = struct {
     fn appendSystemFonts(self: *ThemeFonts, family: []const u8, medium: bool, handles: *std.ArrayList(text.FontHandle)) !void {
         var database = try text.discovery.Database.init();
         defer database.deinit();
-        var candidates = database.candidates(self.allocator, .{
+        var candidates = try database.candidates(self.allocator, .{
             .family = family,
             .weight = if (medium) .medium else .regular,
-        }) catch |err| switch (err) {
-            error.NoMatch => if (handles.items.len != 0) return else return err,
-            else => return err,
-        };
+        });
         defer candidates.deinit();
         try self.appendFaces(candidates.faces, handles);
     }
 
     fn appendFaces(self: *ThemeFonts, faces: []const text.discovery.Face, handles: *std.ArrayList(text.FontHandle)) !void {
         for (faces) |face| {
-            const file = try std.Io.Dir.openFileAbsolute(self.io, face.file, .{});
-            defer file.close(self.io);
-            var buffer: [8192]u8 = undefined;
-            var reader = file.reader(self.io, &buffer);
-            const bytes = try reader.interface.allocRemaining(self.allocator, .limited(64 * 1024 * 1024));
-            defer self.allocator.free(bytes);
-            const handle = self.fonts.acquire(.{
-                .key = .{ .file = face.file, .index = face.index, .variations = face.variations },
-                .bytes = bytes,
-            }) catch |err| switch (err) {
-                // Fontconfig can offer formats the shaping backend cannot
-                // read, such as WOFF2. One unusable fallback must not discard
-                // the bundled face or later usable system candidates.
-                error.InvalidFont => continue,
-                else => return err,
-            };
+            const handle = try self.fonts.acquireFile(self.io, .{
+                .file = face.file,
+                .index = face.index,
+                .variations = face.variations,
+            });
             errdefer self.fonts.release(handle) catch unreachable;
+            if (handles.items.len == 0) {
+                // Keep a usable primary for empty lines and .notdef output.
+                _ = self.fonts.get(handle) catch |err| switch (err) {
+                    error.InvalidFont => {
+                        self.fonts.release(handle) catch unreachable;
+                        continue;
+                    },
+                    else => return err,
+                };
+            }
             try handles.append(self.allocator, handle);
         }
         if (handles.items.len == 0) return error.NoMatch;
     }
 };
 
-test "bundled theme families lead system fallbacks and reuse cached faces" {
+test "theme families follow Fontconfig and reuse candidate identities" {
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
     {
         var themes: ThemeFonts = .{ .allocator = std.testing.allocator, .io = std.testing.io, .fonts = &fonts };
         defer themes.deinit();
-        const names = [_][]const u8{ "sans-serif", "serif", "monospace" };
-        for (names, 0..) |name, index| {
-            const regular = try themes.get(name, false);
-            const repeated = try themes.get(name, false);
-            try std.testing.expectEqual(regular.ptr, repeated.ptr);
-            const medium = try themes.get(name, true);
-            const family: text.bundled.Family = @enumFromInt(index);
-            // Inspect the selected bytes, not just two different handles.
-            // Serif's documented absent-500 fallback is the real Regular face.
-            const semibold = try text.bundled.acquire(&fonts, family, .semibold, .roman);
-            defer fonts.release(semibold) catch unreachable;
-            for ([_]text.FontHandle{ regular[0], medium[0], semibold }, [_]u16{ 400, if (family == .serif) 400 else 500, 600 }) |handle, weight| {
-                const bytes = (try fonts.get(handle)).rasterSource().bytes;
-                const table_count = std.mem.readInt(u16, bytes[4..6], .big);
-                var found_weight = false;
-                for (0..table_count) |table| {
-                    const record = bytes[12 + table * 16 ..][0..16];
-                    if (!std.mem.eql(u8, record[0..4], "OS/2")) continue;
-                    const offset = std.mem.readInt(u32, record[8..12], .big);
-                    try std.testing.expectEqual(weight, std.mem.readInt(u16, bytes[offset + 4 ..][0..2], .big));
-                    found_weight = true;
+        if (!text.has_fontconfig) {
+            try std.testing.expectError(error.FontconfigDisabled, themes.get("sans-serif", false));
+            return;
+        }
+        var database = try text.discovery.Database.init();
+        defer database.deinit();
+        for ([_][]const u8{ "sans-serif", "serif", "monospace", "Source Sans 3" }) |name| {
+            for ([_]bool{ false, true }) |medium| {
+                const handles = try themes.get(name, medium);
+                try std.testing.expectEqual(handles.ptr, (try themes.get(name, medium)).ptr);
+                var candidates = try database.candidates(std.testing.allocator, .{
+                    .family = name,
+                    .weight = if (medium) .medium else .regular,
+                });
+                defer candidates.deinit();
+                // Compare the configured face identity, not a hardcoded family.
+                var expected_primary: ?text.FontHandle = null;
+                for (candidates.faces) |face| {
+                    const expected = try fonts.acquireFile(std.testing.io, .{
+                        .file = face.file,
+                        .index = face.index,
+                        .variations = face.variations,
+                    });
+                    defer fonts.release(expected) catch unreachable;
+                    _ = fonts.get(expected) catch |err| switch (err) {
+                        error.InvalidFont => continue,
+                        else => return err,
+                    };
+                    expected_primary = expected;
+                    break;
                 }
-                try std.testing.expect(found_weight);
-            }
-            const expected_medium = try text.bundled.acquire(&fonts, family, .medium, .roman);
-            defer fonts.release(expected_medium) catch unreachable;
-            try std.testing.expectEqual(expected_medium, medium[0]);
-            const expected = try text.bundled.acquire(&fonts, @enumFromInt(index), .regular, .roman);
-            defer fonts.release(expected) catch unreachable;
-            try std.testing.expectEqual(expected, regular[0]);
-            if (!text.has_fontconfig) {
-                try std.testing.expectEqual(@as(usize, 1), regular.len);
+                try std.testing.expectEqual(expected_primary.?, handles[0]);
             }
         }
-        const named = try themes.get("Source Serif 4", false);
-        try std.testing.expectEqual((try themes.get("serif", false))[0], named[0]);
-        if (!text.has_fontconfig) try std.testing.expectError(error.FontconfigDisabled, themes.get("DejaVu Sans", false));
     }
     try std.testing.expectEqual(@as(usize, 0), fonts.active_count);
 }
 
-test "theme fallbacks skip invalid faces without losing usable fonts or their order" {
+test "theme fallbacks load on demand and skip invalid faces without losing order" {
     if (!text.has_fontconfig) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -161,25 +147,66 @@ test "theme fallbacks skip invalid faces without losing usable fonts or their or
         handles.deinit(allocator);
     }
     try themes.appendFaces(&faces, &handles);
-    try std.testing.expectEqual(@as(usize, 2), handles.items.len);
+    try std.testing.expectEqual(@as(usize, 3), handles.items.len);
     try std.testing.expectEqualSlices(u8, latin, (try fonts.get(handles.items[0])).raster_bytes);
-    try std.testing.expectEqualSlices(u8, arabic, (try fonts.get(handles.items[1])).raster_bytes);
+    try std.testing.expect(!(try fonts.isLoaded(handles.items[1])));
+    try std.testing.expect(!(try fonts.isLoaded(handles.items[2])));
+    const candidates = [_]text.FallbackCandidate{
+        .{ .handle = handles.items[0], .cache = &fonts },
+        .{ .handle = handles.items[1], .cache = &fonts },
+        .{ .handle = handles.items[2], .cache = &fonts },
+    };
+    var hello = try text.shapeWithFallback(allocator, &candidates, .{
+        .paragraph = "Hello, world!",
+        .direction = .left_to_right,
+        .script = .latin,
+        .language = "en",
+        .logical_size = 32,
+    });
+    defer hello.deinit();
+    try std.testing.expect(!hello.has_missing_glyphs);
+    try std.testing.expectEqual(handles.items[0], hello.spans[0].font);
+    try std.testing.expect(!(try fonts.isLoaded(handles.items[1])));
+    try std.testing.expect(!(try fonts.isLoaded(handles.items[2])));
+    var arabic_run = try text.shapeWithFallback(allocator, &candidates, .{
+        .paragraph = "سلام",
+        .direction = .right_to_left,
+        .script = .arabic,
+        .language = "ar",
+        .logical_size = 32,
+    });
+    defer arabic_run.deinit();
+    try std.testing.expect(!arabic_run.has_missing_glyphs);
+    try std.testing.expectEqual(@as(usize, 1), arabic_run.spans.len);
+    try std.testing.expectEqual(handles.items[2], arabic_run.spans[0].font);
+    try std.testing.expectEqualSlices(u8, arabic, (try fonts.get(handles.items[2])).raster_bytes);
+    // Loaded and rejected faces must not be reopened on later runs.
+    try temporary.dir.deleteFile(io, names[2]);
+    try temporary.dir.deleteFile(io, names[3]);
+    var repeated = try text.shapeWithFallback(allocator, &candidates, .{
+        .paragraph = "سلام",
+        .direction = .right_to_left,
+        .script = .arabic,
+        .language = "ar",
+        .logical_size = 32,
+    });
+    defer repeated.deinit();
+    try std.testing.expectEqual(arabic_run.advance, repeated.advance);
     for (handles.items) |handle| try fonts.release(handle);
     handles.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 0), fonts.active_count);
 
     try std.testing.expectError(error.NoMatch, themes.appendFaces(faces[0..1], &handles));
     try std.testing.expectEqual(@as(usize, 0), handles.items.len);
-    const primary = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
-    try handles.append(allocator, primary);
-    try themes.appendFaces(faces[0..1], &handles);
-    try std.testing.expectEqualSlices(text.FontHandle, &.{primary}, handles.items);
 }
 
-test "bundled Latin font retains Arabic fallback shaping" {
+test "explicit Latin font retains Arabic fallback shaping without Fontconfig" {
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
-    const primary = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
+    const primary = try fonts.acquire(.{
+        .key = .{ .file = "fixture:Inter", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font_static"),
+    });
     defer fonts.release(primary) catch unreachable;
     const fallback = try fonts.acquire(.{
         .key = .{ .file = "fixture:NotoSansArabic", .index = 0 },
@@ -201,4 +228,47 @@ test "bundled Latin font retains Arabic fallback shaping" {
     try std.testing.expect(!run.has_missing_glyphs);
     try std.testing.expectEqual(@as(usize, 1), run.spans.len);
     try std.testing.expectEqual(fallback, run.spans[0].font);
+}
+
+test "paragraph and shape caches retain deferred candidates without opening unused files" {
+    const allocator = std.testing.allocator;
+    var fonts = text.FontCache.init(allocator);
+    defer fonts.deinit();
+    const primary = try fonts.acquire(.{
+        .key = .{ .file = "fixture:Inter", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font_static"),
+    });
+    const unused = try fonts.acquireFile(std.testing.io, .{ .file = "/ourokit-test/unused.ttf", .index = 0 });
+    var shapes = text.ShapeCache.init(allocator, &fonts);
+    defer shapes.deinit();
+    var paragraphs = text.ParagraphCache.init(allocator, &fonts);
+    defer paragraphs.deinit();
+    const candidates = [_]text.FontHandle{ primary, unused };
+    const shape = try shapes.acquire(.{
+        .spec = .{ .paragraph = "office", .direction = .left_to_right, .script = .latin, .language = "en", .logical_size = 20 },
+        .candidates = &candidates,
+        .configuration_revision = 1,
+    });
+    const paragraph = try paragraphs.acquire(.{
+        .utf8 = "office\n\nWi",
+        .language = "en",
+        .logical_size = 20,
+        .max_width = 200,
+        .include_caret_stops = true,
+        .candidates = &candidates,
+        .configuration_revision = 1,
+    });
+    try std.testing.expect(!(try fonts.isLoaded(unused)));
+    try std.testing.expectEqual(primary, (try shapes.get(shape)).spans[0].font);
+    const layout = try paragraphs.get(paragraph);
+    try std.testing.expect(layout.positioned.glyphs.len > 0);
+    try std.testing.expect(layout.positioned.carets.len > 0);
+    try std.testing.expectEqual(@as(usize, 3), layout.positioned.lines.len);
+    try fonts.release(primary);
+    try fonts.release(unused);
+    try shapes.release(shape);
+    try std.testing.expect(!(try fonts.isLoaded(unused)));
+    try paragraphs.release(paragraph);
+    try std.testing.expectEqual(@as(usize, 0), fonts.count());
+    try std.testing.expectError(error.StaleFont, fonts.get(unused));
 }

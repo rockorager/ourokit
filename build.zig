@@ -190,9 +190,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(library);
     b.installFile("tools/image/THIRD_PARTY_NOTICES.txt", "share/licenses/ourokit/image-codecs.txt");
     b.installFile("tools/image/RUST_LIBRARY_LICENSES.html", "share/licenses/ourokit/rust-library.html");
-    inline for (.{ "SourceSans3", "SourceSerif4", "SourceCodePro" }) |family| {
-        b.installFile("src/text/fonts/" ++ family ++ "-LICENSE.md", "share/licenses/ourokit/" ++ family ++ ".md");
-    }
 
     const storybook_font = b.lazyDependency("inter", .{}) orelse return;
     // Retained for existing widget weight-selection fixtures, not host defaults.
@@ -250,6 +247,23 @@ pub fn build(b: *std.Build) void {
     const run_comparison = b.addRunArtifact(comparison);
     if (b.args) |args| run_comparison.addArgs(args);
     b.step("compare-fonts", "Render matched Adobe font samples with software and Vulkan").dependOn(&run_comparison.step);
+    if (enable_vulkan) {
+        const probe = b.addExecutable(.{
+            .name = "presentation-probe",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/rendering/presentation_probe.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+            }),
+        });
+        probe.root_module.addAnonymousImport("probe_font", .{ .root_source_file = b.path("src/text/fonts/SourceSans3-Regular.otf") });
+        probe.root_module.linkSystemLibrary("vulkan", .{});
+        const run = b.addRunArtifact(probe);
+        if (b.args) |args| run.addArgs(args);
+        b.step("probe-presentation", "Capture and time direct/converted Vulkan graphics (no compositor)").dependOn(&run.step);
+        b.step("build-presentation-probe", "Build the presentation probe for direct validation-layer execution").dependOn(&b.addInstallArtifact(probe, .{}).step);
+    }
     const test_filters: []const []const u8 = if (b.option(
         []const u8,
         "test-filter",

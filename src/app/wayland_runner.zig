@@ -759,7 +759,10 @@ fn runSourceInternal(
 
         for (runtime_slots) |*slot| {
             if (!slot.desired or !slot.runtime.registered) continue;
-            if (slot.runtime.wantsSubmission()) try host.requestRedraw(slot.runtime.window);
+            if (slot.runtime.wantsSubmission()) {
+                try host.prepareScene(slot.runtime.window, try slot.runtime.displayList());
+                try host.requestRedraw(slot.runtime.window);
+            }
         }
 
         for (runtime_slots) |*slot| {

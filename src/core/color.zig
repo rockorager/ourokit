@@ -1,5 +1,4 @@
-/// Unassociated (straight-alpha), 8-bit desktop color. RGB uses BT.709/sRGB
-/// primaries and a pure gamma-2.2 display transfer; alpha is linear.
+/// Unassociated (straight-alpha), 8-bit sRGB color; alpha is linear.
 ///
 /// Scene and design values use this representation. Raster backends convert it
 /// to premultiplied linear-light working storage before compositing; this type is
@@ -14,7 +13,7 @@ pub const Color = packed struct(u32) {
         return .{ .r = r, .g = g, .b = b, .a = a };
     }
 
-    pub fn premultiplied(self: Color) PremultipliedGamma22Rgba8 {
+    pub fn premultiplied(self: Color) PremultipliedSrgba8 {
         return .{
             .r = multiply(self.r, self.a),
             .g = multiply(self.g, self.a),
@@ -24,8 +23,8 @@ pub const Color = packed struct(u32) {
     }
 };
 
-/// Premultiplied encoded-sRGB interchange pixels, not a blending space. This is
-/// retained for decoded images and other explicitly sRGB interchange data.
+/// Premultiplied encoded-sRGB presentation and interchange pixels, not a
+/// blending space. RGB is encoded before premultiplication; alpha is linear.
 pub const PremultipliedSrgba8 = struct {
     r: u8,
     g: u8,
@@ -33,8 +32,27 @@ pub const PremultipliedSrgba8 = struct {
     a: u8,
 };
 
-/// Premultiplied gamma-2.2 desktop presentation pixels. Wayland buffers use
-/// this untagged ordinary-graphics representation.
+/// Unassociate presentation bytes for PNG export, without another transfer.
+pub fn srgba8ToStraight(pixel: PremultipliedSrgba8) [4]u8 {
+    if (pixel.a == 0) return .{ 0, 0, 0, 0 };
+    const alpha: f64 = @floatFromInt(pixel.a);
+    return .{
+        quantize8(@as(f64, @floatFromInt(pixel.r)) / alpha),
+        quantize8(@as(f64, @floatFromInt(pixel.g)) / alpha),
+        quantize8(@as(f64, @floatFromInt(pixel.b)) / alpha),
+        pixel.a,
+    };
+}
+
+test "sRGB presentation PNG export unassociates without a second transfer" {
+    try std.testing.expectEqual([4]u8{ 1, 17, 128, 255 }, srgba8ToStraight(.{ .r = 1, .g = 17, .b = 128, .a = 255 }));
+    try std.testing.expectEqual([4]u8{ 36, 109, 219, 7 }, srgba8ToStraight(.{ .r = 1, .g = 3, .b = 6, .a = 7 }));
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 128 }, srgba8ToStraight(.{ .r = 128, .g = 128, .b = 128, .a = 128 }));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, srgba8ToStraight(.{ .r = 5, .g = 8, .b = 3, .a = 0 }));
+}
+
+/// Legacy gamma-2.2 pixels. Kept for explicit conversion of older captures;
+/// renderers now export PremultipliedSrgba8.
 pub const PremultipliedGamma22Rgba8 = struct {
     r: u8,
     g: u8,
@@ -42,7 +60,7 @@ pub const PremultipliedGamma22Rgba8 = struct {
     a: u8,
 };
 
-/// Converts desktop presentation storage to straight sRGB interchange bytes,
+/// Converts legacy gamma-2.2 storage to straight sRGB interchange bytes,
 /// suitable for PNG export. Alpha is only unassociated, never transferred.
 pub fn gamma22ToStraightSrgba8(pixel: PremultipliedGamma22Rgba8) [4]u8 {
     if (pixel.a == 0) return .{ 0, 0, 0, 0 };
@@ -70,9 +88,9 @@ pub const LinearRgba16 = extern struct {
     pub fn fromColor(color: Color) LinearRgba16 {
         const alpha = @as(f64, @floatFromInt(color.a)) / 255;
         return .{
-            .r = quantize16(decoded_gamma22[color.r] * alpha),
-            .g = quantize16(decoded_gamma22[color.g] * alpha),
-            .b = quantize16(decoded_gamma22[color.b] * alpha),
+            .r = quantize16(decoded_srgb[color.r] * alpha),
+            .g = quantize16(decoded_srgb[color.g] * alpha),
+            .b = quantize16(decoded_srgb[color.b] * alpha),
             .a = @as(u16, color.a) * 257,
         };
     }
@@ -80,9 +98,9 @@ pub const LinearRgba16 = extern struct {
     pub fn fromSrgba8(pixel: PremultipliedSrgba8) LinearRgba16 {
         if (pixel.a == 0) return transparent;
         if (pixel.a == 255) return .{
-            .r = decoded_srgb[pixel.r],
-            .g = decoded_srgb[pixel.g],
-            .b = decoded_srgb[pixel.b],
+            .r = quantize16(decoded_srgb[pixel.r]),
+            .g = quantize16(decoded_srgb[pixel.g]),
+            .b = quantize16(decoded_srgb[pixel.b]),
             .a = 65535,
         };
         const alpha: f64 = @floatFromInt(pixel.a);
@@ -108,7 +126,12 @@ pub const LinearRgba16 = extern struct {
 
     pub fn fromGamma22Rgba8(pixel: PremultipliedGamma22Rgba8) LinearRgba16 {
         if (pixel.a == 0) return transparent;
-        if (pixel.a == 255) return fromColor(Color.rgba(pixel.r, pixel.g, pixel.b, 255));
+        if (pixel.a == 255) return .{
+            .r = quantize16(decoded_gamma22[pixel.r]),
+            .g = quantize16(decoded_gamma22[pixel.g]),
+            .b = quantize16(decoded_gamma22[pixel.b]),
+            .a = 65535,
+        };
         const alpha: f64 = @floatFromInt(pixel.a);
         return .{
             .r = quantize16(decodeGamma22(@min(@as(f64, @floatFromInt(pixel.r)) / alpha, 1)) * alpha / 255),
@@ -161,12 +184,12 @@ fn encodeGamma22(linear: f64) f64 {
     return std.math.pow(f64, linear, 1.0 / 2.2);
 }
 
-// Keep opaque image sampling lookup-based after separating image and UI
-// transfers; four bilinear texels must not introduce twelve pow() calls.
+// Keep design colors and opaque image sampling lookup-based. Retain full
+// precision until alpha is applied, then quantize into working storage once.
 const decoded_srgb = blk: {
     @setEvalBranchQuota(100000);
-    var values: [256]u16 = undefined;
-    for (&values, 0..) |*value, i| value.* = quantize16(decodeSrgb(@as(f64, @floatFromInt(i)) / 255));
+    var values: [256]f64 = undefined;
+    for (&values, 0..) |*value, i| value.* = decodeSrgb(@as(f64, @floatFromInt(i)) / 255);
     break :blk values;
 };
 
@@ -231,12 +254,25 @@ fn multiply(channel: u8, alpha: u8) u8 {
 
 test "straight color converts to rounded premultiplied storage" {
     try std.testing.expectEqual(
-        PremultipliedGamma22Rgba8{ .r = 100, .g = 50, .b = 25, .a = 128 },
+        PremultipliedSrgba8{ .r = 100, .g = 50, .b = 25, .a = 128 },
         Color.rgba(199, 100, 50, 128).premultiplied(),
     );
 }
 
-test "desktop compositing applies gamma 2.2 to RGB but not alpha or coverage" {
+test "design colors decode sRGB and legacy conversion encodes gamma 2.2" {
+    // Independent sRGB reference values, including both sides of the linear
+    // toe (8-bit codes 10 and 11). Alpha scales linear light, not input bytes.
+    try std.testing.expectEqual(LinearRgba16{ .r = 100, .g = 110, .b = 762, .a = 32896 }, LinearRgba16.fromColor(Color.rgba(10, 11, 42, 128)));
+    const background = LinearRgba16.fromColor(Color.rgba(25, 33, 42, 255));
+    try std.testing.expectEqual(LinearRgba16{ .r = 637, .g = 997, .b = 1517, .a = 65535 }, background);
+    try std.testing.expectEqual(PremultipliedGamma22Rgba8{ .r = 31, .g = 38, .b = 46, .a = 255 }, background.toGamma22Rgba8());
+    // An 8-bit presentation round trip can cost one sRGB level.
+    try std.testing.expectEqual([4]u8{ 25, 33, 42, 255 }, gamma22ToStraightSrgba8(background.toGamma22Rgba8()));
+    const selected = LinearRgba16.fromColor(Color.rgba(37, 57, 116, 255));
+    try std.testing.expectEqual(PremultipliedGamma22Rgba8{ .r = 42, .g = 60, .b = 115, .a = 255 }, selected.toGamma22Rgba8());
+}
+
+test "legacy conversion applies gamma 2.2 to RGB but not alpha or coverage" {
     const black = LinearRgba16.fromColor(Color.rgba(0, 0, 0, 255));
     const white = LinearRgba16.fromColor(Color.rgba(255, 255, 255, 255));
     const half_white = white.scaled(32768);
@@ -247,7 +283,7 @@ test "desktop compositing applies gamma 2.2 to RGB but not alpha or coverage" {
     try std.testing.expectEqual(PremultipliedGamma22Rgba8{ .r = 128, .g = 128, .b = 128, .a = 128 }, half_white.toGamma22Rgba8());
     const foreground = LinearRgba16.fromColor(Color.rgba(200, 100, 50, 128));
     const background = LinearRgba16.fromColor(Color.rgba(20, 40, 60, 255));
-    try std.testing.expectEqual(PremultipliedGamma22Rgba8{ .r = 147, .g = 77, .b = 55, .a = 255 }, foreground.over(background).toGamma22Rgba8());
+    try std.testing.expectEqual(PremultipliedGamma22Rgba8{ .r = 146, .g = 78, .b = 58, .a = 255 }, foreground.over(background).toGamma22Rgba8());
 }
 
 test "sRGB interchange conversion remains piecewise and preserves dark shades" {
@@ -275,7 +311,7 @@ test "gamma 2.2 presentation quantizes linear light and preserves alpha" {
     };
     // Code 1 is below half a UNORM16 step; do not distort the transfer
     // function to claim a lossless round trip at the darkest values.
-    const dark = LinearRgba16.fromColor(Color.rgba(1, 2, 3, 255));
+    const dark = LinearRgba16.fromGamma22Rgba8(.{ .r = 1, .g = 2, .b = 3, .a = 255 });
     try std.testing.expectEqual(LinearRgba16{ .r = 0, .g = 2, .b = 4, .a = 65535 }, dark);
     try std.testing.expectEqual(LinearRgba16.transparent, LinearRgba16.fromGamma22Rgba8(.{ .r = 255, .g = 10, .b = 20, .a = 0 }));
 }

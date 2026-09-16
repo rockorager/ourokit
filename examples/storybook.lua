@@ -47,8 +47,8 @@ local function listbox_story()
   }
 end
 
-local function bundled_fonts_story()
-  local names = { "Source Sans 3", "Source Serif 4", "Source Code Pro" }
+local function system_fonts_story()
+  local names = { "System sans-serif", "System serif", "System monospace" }
   local families = { "sans-serif", "serif", "monospace" }
   local children = {}
   for index = 1, 3 do
@@ -147,38 +147,38 @@ return ouro.storybook {
     ouro.story {
       id = "text/bundled-fonts-light",
       group = "Text",
-      name = "Bundled fonts (light)",
+      name = "System fonts (light)",
       viewport = { width = 600, height = 520 },
       snapshot_scale = 2,
       color_scheme = "light",
-      content = bundled_fonts_story,
+      content = system_fonts_story,
     },
     ouro.story {
       id = "text/bundled-fonts-dark",
       group = "Text",
-      name = "Bundled fonts (dark)",
+      name = "System fonts (dark)",
       viewport = { width = 600, height = 520 },
       snapshot_scale = 2,
       color_scheme = "dark",
-      content = bundled_fonts_story,
+      content = system_fonts_story,
     },
     ouro.story {
       id = "text/bundled-fonts-light-1x",
       group = "Text",
-      name = "Bundled fonts (light, 1x)",
+      name = "System fonts (light, 1x)",
       viewport = { width = 600, height = 520 },
       snapshot_scale = 1,
       color_scheme = "light",
-      content = bundled_fonts_story,
+      content = system_fonts_story,
     },
     ouro.story {
       id = "text/bundled-fonts-dark-1x",
       group = "Text",
-      name = "Bundled fonts (dark, 1x)",
+      name = "System fonts (dark, 1x)",
       viewport = { width = 600, height = 520 },
       snapshot_scale = 1,
       color_scheme = "dark",
-      content = bundled_fonts_story,
+      content = system_fonts_story,
     },
     ouro.story {
       id = "text/default",

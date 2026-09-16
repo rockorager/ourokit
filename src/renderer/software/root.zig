@@ -1,6 +1,6 @@
 const std = @import("std");
 const Color = @import("../../core/color.zig").Color;
-const PremultipliedGamma22Rgba8 = @import("../../core/color.zig").PremultipliedGamma22Rgba8;
+const PremultipliedSrgba8 = @import("../../core/color.zig").PremultipliedSrgba8;
 const LinearRgba16 = @import("../../core/color.zig").LinearRgba16;
 const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
@@ -20,7 +20,7 @@ const GlyphBitmap = if (has_freetype)
 else
     struct {};
 
-/// Both formats store premultiplied gamma-2.2 desktop-presentation channels.
+/// Both formats store premultiplied sRGB desktop-presentation channels.
 /// The names describe byte order, not the scene color representation.
 pub const PixelFormat = enum {
     rgba8_unorm,
@@ -34,7 +34,7 @@ pub const Target = struct {
     stride: usize,
     format: PixelFormat,
     /// Allocates the RGBA16 working buffer for a render call. Presentation
-    /// bytes retain their existing encoded-premultiplied gamma-2.2 representation.
+    /// bytes store encoded-premultiplied sRGB, never linear-premultiplied sRGB.
     allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn validate(self: Target) !void {
@@ -136,13 +136,13 @@ fn renderOutputRegion(
     if (commands[0] != .clear) {
         for (top..top + damage.height) |y| for (left..left + damage.width) |x| {
             const offset = y * output.stride + x * 4;
-            working.pixels[y * working.width + x] = LinearRgba16.fromGamma22Rgba8(readPixel(output.format, output.pixels[offset..][0..4]));
+            working.pixels[y * working.width + x] = LinearRgba16.fromSrgba8(readPixel(output.format, output.pixels[offset..][0..4]));
         };
     }
     try renderRegion(commands, working, damage, glyphs, shapes, paragraphs, images);
     for (top..top + damage.height) |y| for (left..left + damage.width) |x| {
         const offset = y * output.stride + x * 4;
-        writePixel(output.format, output.pixels[offset..][0..4], working.pixels[y * working.width + x].toGamma22Rgba8());
+        writePixel(output.format, output.pixels[offset..][0..4], working.pixels[y * working.width + x].toSrgba8());
     };
 }
 
@@ -440,18 +440,18 @@ fn addSaturating(a: u8, b: u8) u8 {
     return @intCast(@min(@as(u16, a) + b, 255));
 }
 
-fn readPixel(format: PixelFormat, bytes: *const [4]u8) PremultipliedGamma22Rgba8 {
+fn readPixel(format: PixelFormat, bytes: *const [4]u8) PremultipliedSrgba8 {
     return switch (format) {
         .rgba8_unorm => .{ .r = bytes[0], .g = bytes[1], .b = bytes[2], .a = bytes[3] },
         .bgra8_unorm => .{ .r = bytes[2], .g = bytes[1], .b = bytes[0], .a = bytes[3] },
     };
 }
 
-fn writePixel(format: PixelFormat, destination: *[4]u8, pixel: PremultipliedGamma22Rgba8) void {
+fn writePixel(format: PixelFormat, destination: *[4]u8, pixel: PremultipliedSrgba8) void {
     destination.* = pixelBytes(format, pixel);
 }
 
-fn pixelBytes(format: PixelFormat, pixel: PremultipliedGamma22Rgba8) [4]u8 {
+fn pixelBytes(format: PixelFormat, pixel: PremultipliedSrgba8) [4]u8 {
     return switch (format) {
         .rgba8_unorm => .{ pixel.r, pixel.g, pixel.b, pixel.a },
         .bgra8_unorm => .{ pixel.b, pixel.g, pixel.r, pixel.a },
@@ -481,9 +481,9 @@ test "clear and clipped rectangle produce deterministic premultiplied pixels" {
         .format = .rgba8_unorm,
     });
 
-    // Gamma-2.2 code 1 rounds below the first UNORM16 linear-light step.
-    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 3, 255, 0, 2, 3, 255, 0, 2, 3, 255 }, pixels[0..12]);
-    try std.testing.expectEqualSlices(u8, &.{ 15, 29, 44, 255, 15, 29, 44, 255, 0, 2, 3, 255 }, pixels[14..26]);
+    // sRGB round-trips opaque colors, but blends in linear light.
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 255, 1, 2, 3, 255, 1, 2, 3, 255 }, pixels[0..12]);
+    try std.testing.expectEqualSlices(u8, &.{ 12, 27, 42, 255, 12, 27, 42, 255, 1, 2, 3, 255 }, pixels[14..26]);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa }, pixels[12..14]);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xaa }, pixels[26..28]);
 }
@@ -502,7 +502,7 @@ test "damage preserves pixels outside non-overlapping regions" {
         .stride = 12,
         .format = .rgba8_unorm,
     });
-    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 3, 255, 0xaa, 0xaa, 0xaa, 0xaa, 0, 2, 3, 255 }, &pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 255, 0xaa, 0xaa, 0xaa, 0xaa, 1, 2, 3, 255 }, &pixels);
     try std.testing.expectError(error.OverlappingDamage, render(.{
         .commands = &commands,
         .damage = .{ .regions = &.{
@@ -748,8 +748,8 @@ test "repeated faint blends retain linear precision until presentation" {
     } };
     var pixel: [4]u8 = undefined;
     try render(.{ .commands = &commands }, .{ .pixels = &pixel, .width = 1, .height = 1, .stride = 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
-    // Gamma22-encode((254/255)^100) = 213.249, unlike per-draw encoding.
-    try std.testing.expectEqualSlices(u8, &.{ 213, 213, 213, 255 }, &pixel);
+    // sRGB-encode((254/255)^100) = 214.372, unlike per-draw encoding.
+    try std.testing.expectEqualSlices(u8, &.{ 214, 214, 214, 255 }, &pixel);
 }
 
 test "glyph masks are linear coverage in both polarities and transparent output" {
@@ -764,17 +764,17 @@ test "glyph masks are linear coverage in both polarities and transparent output"
     for ([_]Color{ black, white }) |background| {
         pixels[0] = LinearRgba16.fromColor(background);
         drawMask(target, bounds, 0, 0, &mask, if (background.r == 0) white else black);
-        // A8 coverage is not gamma-decoded: both polarities are near 186,
+        // A8 coverage is not gamma-decoded: both polarities are near 188,
         // not 128 (encoded blending) or 229 (decoded black coverage).
-        const expected: u8 = 186;
-        try std.testing.expectEqual(PremultipliedGamma22Rgba8{ .r = expected, .g = expected, .b = expected, .a = 255 }, pixels[0].toGamma22Rgba8());
+        const expected: u8 = if (background.r == 0) 188 else 187;
+        try std.testing.expectEqual(PremultipliedSrgba8{ .r = expected, .g = expected, .b = expected, .a = 255 }, pixels[0].toSrgba8());
     }
     pixels[0] = LinearRgba16.transparent;
     drawMask(target, bounds, 0, 0, &mask, white);
-    try std.testing.expectEqual(PremultipliedGamma22Rgba8{ .r = 128, .g = 128, .b = 128, .a = 128 }, pixels[0].toGamma22Rgba8());
+    try std.testing.expectEqual(PremultipliedSrgba8{ .r = 128, .g = 128, .b = 128, .a = 128 }, pixels[0].toSrgba8());
 
     // Masked source replacement retains (1-coverage), not (1-source alpha).
     pixels[0] = LinearRgba16.fromColor(white);
     blendCoveredPixel(target, 0, 0, .transparent, 128, .source);
-    try std.testing.expectEqual(PremultipliedGamma22Rgba8{ .r = 127, .g = 127, .b = 127, .a = 127 }, pixels[0].toGamma22Rgba8());
+    try std.testing.expectEqual(PremultipliedSrgba8{ .r = 127, .g = 127, .b = 127, .a = 127 }, pixels[0].toSrgba8());
 }

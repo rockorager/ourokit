@@ -167,6 +167,9 @@ fn validateOutput(
 
         var expected_ouro = destination;
         var expected_pixman = destination;
+        for (0..3) |channel| {
+            expected_ouro[channel] = quantize8(encodeSrgb(decodeSrgb(@as(f64, @floatFromInt(destination[channel])) / 255.0)));
+        }
         if (covered) for (0..3) |channel| {
             const source_encoded = @as(f64, @floatFromInt(translucent[channel])) / 255.0;
             const destination_encoded = @as(f64, @floatFromInt(destination[channel])) / 255.0;

@@ -17,7 +17,8 @@ const word_break = @import("word_break.zig");
 
 pub const has_fontconfig = api.has_fontconfig;
 pub const discovery = api.discovery;
-pub const bundled = @import("bundled.zig");
+// CFF fixtures are compiled only into tests, never into application runners.
+pub const bundled = if (@import("builtin").is_test) @import("bundled.zig") else struct {};
 pub const Direction = api.Direction;
 pub const Script = api.Script;
 pub const Glyph = api.Glyph;

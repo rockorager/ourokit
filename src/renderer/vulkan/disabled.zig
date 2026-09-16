@@ -38,8 +38,17 @@ pub const DmabufTarget = struct {
     plane_count: u32 = 0,
     modifier: u64 = 0,
     gpu_pending: bool = false,
+    direct: bool = false,
 
     pub fn init(_: *Renderer, _: u32, _: u32, _: u64) !DmabufTarget {
+        return error.VulkanDisabled;
+    }
+
+    pub fn initOpaque(_: *Renderer, _: u32, _: u32, _: u64) !DmabufTarget {
+        return error.VulkanDisabled;
+    }
+
+    pub fn initShared(_: *Renderer, _: *const DmabufTarget) !DmabufTarget {
         return error.VulkanDisabled;
     }
 
@@ -71,6 +80,10 @@ pub fn init(_: std.mem.Allocator) !Renderer {
 }
 
 pub fn deinit(_: *Renderer) void {}
+
+pub fn supportsDirectModifier(_: *const Renderer, _: u64) bool {
+    return false;
+}
 
 pub fn renderResources(
     _: *Renderer,

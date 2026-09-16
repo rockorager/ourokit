@@ -1,4 +1,4 @@
-//! Pinned, unmodified CFF fonts. No filesystem or Fontconfig is required.
+//! Test-only pinned CFF fixtures. Application fonts come from Fontconfig.
 const std = @import("std");
 const api = @import("api.zig");
 

@@ -334,6 +334,9 @@ const DmabufBuffers = struct {
     width: u32 = 0,
     height: u32 = 0,
     generation: u32 = 0,
+    direct: bool = false,
+    // Converted slots share working contents. Direct slots age independently.
+    last_present_serial: u64 = 0,
 
     fn matches(self: *const DmabufBuffers, width: u32, height: u32) bool {
         return self.slots[0].target != null and self.width == width and self.height == height;
@@ -355,7 +358,7 @@ const DmabufBuffers = struct {
         return false;
     }
 
-    fn create(
+    fn createSlot(
         self: *DmabufBuffers,
         renderer: *Vulkan,
         objects: *wayring.objects.ClientObjects,
@@ -366,87 +369,104 @@ const DmabufBuffers = struct {
         width: u32,
         height: u32,
         generation: u32,
+        index: usize,
+        direct: bool,
     ) !void {
-        std.debug.assert(self.slots[0].target == null);
+        const slot = &self.slots[index];
+        std.debug.assert(slot.target == null);
         if (width > std.math.maxInt(i32) or height > std.math.maxInt(i32))
             return error.BufferPoolTooLarge;
-        var initialized: usize = 0;
-        errdefer for (self.slots[0..initialized]) |*slot| {
+        errdefer {
             if (slot.target) |*target| target.deinit(renderer);
             slot.* = .{};
-        };
-        for (&self.slots) |*slot| {
-            slot.target = try Vulkan.DmabufTarget.init(renderer, width, height, modifier);
-            initialized += 1;
-            const target = &slot.target.?;
-            if (sync_manager) |manager| {
-                const fd = try target.exportSyncobjFd(renderer);
-                var fd_owned = true;
-                errdefer {
-                    if (fd_owned) _ = linux.close(fd);
-                }
-                slot.timeline = (try protocol.wp_linux_drm_syncobj_manager_v1.construct_import_timeline(
-                    objects,
-                    transmit,
-                    manager,
-                    .{ .fd = fd },
-                )).id;
-                fd_owned = false;
+        }
+        slot.target = if (index == 0)
+            if (direct) try Vulkan.DmabufTarget.initOpaque(renderer, width, height, modifier) else try Vulkan.DmabufTarget.init(renderer, width, height, modifier)
+        else
+            try Vulkan.DmabufTarget.initShared(renderer, &self.slots[0].target.?);
+        const target = &slot.target.?;
+        if (sync_manager) |manager| {
+            const fd = try target.exportSyncobjFd(renderer);
+            var fd_owned = true;
+            errdefer {
+                if (fd_owned) _ = linux.close(fd);
             }
-            const params = (try protocol.zwp_linux_dmabuf_v1.construct_create_params(
+            slot.timeline = (try protocol.wp_linux_drm_syncobj_manager_v1.construct_import_timeline(
                 objects,
                 transmit,
-                dmabuf,
-                .{},
-            )).params_id;
-            for (target.planes[0..target.plane_count], 0..) |plane, plane_index| {
-                const fd = try target.exportFd(renderer);
-                var fd_owned = true;
-                errdefer {
-                    if (fd_owned) _ = linux.close(fd);
-                }
-                wayring.client.sendRequest(
-                    protocol.zwp_linux_buffer_params_v1,
-                    objects,
-                    transmit,
-                    params,
-                    .{ .add = .{
-                        .fd = fd,
-                        .plane_idx = @intCast(plane_index),
-                        .offset = plane.offset,
-                        .stride = plane.stride,
-                        .modifier_hi = @truncate(target.modifier >> 32),
-                        .modifier_lo = @truncate(target.modifier),
-                    } },
-                ) catch |err| {
-                    _ = linux.close(fd);
-                    fd_owned = false;
-                    return err;
-                };
-                fd_owned = false;
+                manager,
+                .{ .fd = fd },
+            )).id;
+            fd_owned = false;
+        }
+        const params = (try protocol.zwp_linux_dmabuf_v1.construct_create_params(
+            objects,
+            transmit,
+            dmabuf,
+            .{},
+        )).params_id;
+        for (target.planes[0..target.plane_count], 0..) |plane, plane_index| {
+            const fd = try target.exportFd(renderer);
+            var fd_owned = true;
+            errdefer {
+                if (fd_owned) _ = linux.close(fd);
             }
-            slot.handle = (try protocol.zwp_linux_buffer_params_v1.construct_create_immed(
-                objects,
-                transmit,
-                params,
-                .{
-                    .width = @intCast(width),
-                    .height = @intCast(height),
-                    .format = drm_format_argb8888,
-                    .flags = .fromInt(0),
-                },
-            )).buffer_id;
-            try wayring.client.sendRequest(
+            wayring.client.sendRequest(
                 protocol.zwp_linux_buffer_params_v1,
                 objects,
                 transmit,
                 params,
-                .{ .destroy = .{} },
-            );
+                .{ .add = .{
+                    .fd = fd,
+                    .plane_idx = @intCast(plane_index),
+                    .offset = plane.offset,
+                    .stride = plane.stride,
+                    .modifier_hi = @truncate(target.modifier >> 32),
+                    .modifier_lo = @truncate(target.modifier),
+                } },
+            ) catch |err| {
+                _ = linux.close(fd);
+                fd_owned = false;
+                return err;
+            };
+            fd_owned = false;
         }
+        slot.handle = (try protocol.zwp_linux_buffer_params_v1.construct_create_immed(
+            objects,
+            transmit,
+            params,
+            .{
+                .width = @intCast(width),
+                .height = @intCast(height),
+                .format = drm_format_argb8888,
+                .flags = .fromInt(0),
+            },
+        )).buffer_id;
+        try wayring.client.sendRequest(
+            protocol.zwp_linux_buffer_params_v1,
+            objects,
+            transmit,
+            params,
+            .{ .destroy = .{} },
+        );
         self.width = width;
         self.height = height;
         self.generation = generation;
+        self.direct = direct;
+    }
+
+    /// Reuse allocated storage before growing, even when an earlier slot is empty.
+    fn acquireSlot(self: *DmabufBuffers, renderer: *Vulkan) !?usize {
+        var empty: ?usize = null;
+        for (&self.slots, 0..) |*slot, index| {
+            if (slot.busy or slot.acquired) continue;
+            if (slot.target) |*target| {
+                if (try target.ready(renderer)) return index;
+            } else if (empty == null) {
+                empty = index;
+            }
+        }
+        return empty;
     }
 
     fn destroy(
@@ -581,6 +601,7 @@ const Window = struct {
     retired_buffers: ShmBuffers = .{},
     dmabuf_buffers: DmabufBuffers = .{},
     retired_dmabuf_buffers: DmabufBuffers = .{},
+    direct_presentation: bool = false,
     width: u32 = 0,
     height: u32 = 0,
     pending_width: u32 = 0,
@@ -651,6 +672,7 @@ pub const Host = struct {
     dmabuf_modifier: ?u64 = null,
     dmabuf_tranche_device_matches: bool = false,
     dmabuf_linear_argb8888: bool = false,
+    dmabuf_direct_supported: bool = false,
     presentation: ?Handle = null,
     presentation_clock_id: ?u32 = null,
     viewporter: ?Handle = null,
@@ -727,6 +749,7 @@ pub const Host = struct {
         self.dmabuf_modifier = null;
         self.dmabuf_tranche_device_matches = false;
         self.dmabuf_linear_argb8888 = false;
+        self.dmabuf_direct_supported = false;
         self.presentation = null;
         self.presentation_clock_id = null;
         self.viewporter = null;
@@ -979,6 +1002,16 @@ pub const Host = struct {
         }
     }
 
+    /// Select storage before acquisition. A changed opacity proof retires the
+    /// old pool just like a resize; no exported image is reinterpreted in place.
+    /// Callers that omit this keep the alpha-capable conversion path.
+    pub fn prepareScene(self: *Host, handle: WindowHandle, list: scene.DisplayList) !void {
+        const window = try self.windowFor(handle);
+        const bounds: RectI = .{ .x = 0, .y = 0, .width = try scaledExtent(window.width, window.scale_120), .height = try scaledExtent(window.height, window.scale_120) };
+        window.direct_presentation = self.usingDmabuf() and list.isOpaque(bounds) and
+            self.dmabuf_direct_supported;
+    }
+
     /// Borrows one persistent presentation slot during frame submission. CPU
     /// access or Vulkan queue submission must finish with `present` or
     /// `discardFrame` before completion dispatch resumes; Vulkan execution may
@@ -991,21 +1024,20 @@ pub const Host = struct {
         const pixel_height = try scaledExtent(window.height, window.scale_120);
         try self.prepareBuffers(window);
         if (self.usingDmabuf()) {
-            if (!window.dmabuf_buffers.matches(pixel_width, pixel_height)) return null;
-            for (&window.dmabuf_buffers.slots, 0..) |*slot, index| {
-                if (slot.busy or slot.acquired) continue;
-                if (!try slot.target.?.ready(self.vulkan.?)) continue;
-                slot.acquired = true;
-                return .{
-                    .target = .{ .vulkan = &slot.target.? },
-                    .width = pixel_width,
-                    .height = pixel_height,
-                    .window = handle,
-                    .pool_generation = window.dmabuf_buffers.generation,
-                    .slot = @intCast(index),
-                };
-            }
-            return null;
+            if (!window.dmabuf_buffers.matches(pixel_width, pixel_height) or
+                window.dmabuf_buffers.direct != window.direct_presentation) return null;
+            const index = try window.dmabuf_buffers.acquireSlot(self.vulkan.?) orelse return null;
+            const slot = &window.dmabuf_buffers.slots[index];
+            if (slot.target == null) try self.createDmabufSlot(window, index, pixel_width, pixel_height);
+            slot.acquired = true;
+            return .{
+                .target = .{ .vulkan = &slot.target.? },
+                .width = pixel_width,
+                .height = pixel_height,
+                .window = handle,
+                .pool_generation = window.dmabuf_buffers.generation,
+                .slot = @intCast(index),
+            };
         }
         if (!window.buffers.matches(pixel_width, pixel_height)) return null;
         for (&window.buffers.slots, 0..) |*slot, index| {
@@ -1027,9 +1059,9 @@ pub const Host = struct {
         return null;
     }
 
-    /// Expands current scene damage by the changes committed since this slot
-    /// was last presented. Render `frame.damage()` rather than the original
-    /// damage, while `present` reports only the current change to Wayland.
+    /// Repairs aged software slots or the shared Vulkan working image.
+    /// Render `frame.damage()` rather than the original damage, while
+    /// `present` reports only the current change to Wayland.
     pub fn prepareFrameDamage(self: *Host, frame: *Frame, requested: scene.Damage) !void {
         const window = try self.windowFor(frame.window);
         const slot_serial = switch (frame.target) {
@@ -1041,7 +1073,7 @@ pub const Host = struct {
             .vulkan => blk: {
                 const slot = try self.dmabufFrameSlot(frame.*);
                 if (!slot.acquired) return error.StaleFrame;
-                break :blk slot.last_present_serial;
+                break :blk if (window.dmabuf_buffers.direct) slot.last_present_serial else window.dmabuf_buffers.last_present_serial;
             },
         };
         const bounds: RectI = .{ .x = 0, .y = 0, .width = frame.width, .height = frame.height };
@@ -1077,6 +1109,11 @@ pub const Host = struct {
                 if (!slot.acquired) return error.StaleFrame;
                 try slot.target.?.wait(self.vulkan.?);
                 slot.acquired = false;
+                // A submitted but unpresented frame may have changed shared
+                // pixels. Reconstruct the whole scene on the next submission.
+                const window = try self.windowFor(frame.window);
+                window.dmabuf_buffers.last_present_serial = 0;
+                slot.last_present_serial = 0;
             },
         }
     }
@@ -1167,9 +1204,10 @@ pub const Host = struct {
                 const slot = try self.dmabufFrameSlot(frame);
                 slot.acquired = false;
                 slot.busy = true;
-                slot.last_present_serial = window.damage_history.commit(
+                window.dmabuf_buffers.last_present_serial = window.damage_history.commit(
                     if (frame.damage_prepared) frame.requested_damage else .full,
                 );
+                slot.last_present_serial = window.dmabuf_buffers.last_present_serial;
             },
         }
         window.pending_redraw = false;
@@ -1406,7 +1444,8 @@ pub const Host = struct {
         if (window.retired_dmabuf_buffers.slots[0].target != null and
             !window.retired_dmabuf_buffers.anyBusy())
             try window.retired_dmabuf_buffers.destroy(renderer, objects, transmit);
-        if (window.dmabuf_buffers.matches(pixel_width, pixel_height)) return;
+        if (window.dmabuf_buffers.matches(pixel_width, pixel_height) and
+            window.dmabuf_buffers.direct == window.direct_presentation) return;
         if (window.retired_dmabuf_buffers.slots[0].target != null) return;
         if (window.dmabuf_buffers.slots[0].target != null) {
             if (window.dmabuf_buffers.anyBusy()) {
@@ -1418,18 +1457,24 @@ pub const Host = struct {
         }
         window.next_pool_generation +%= 1;
         if (window.next_pool_generation == 0) window.next_pool_generation = 1;
-        try window.dmabuf_buffers.create(
-            renderer,
-            objects,
-            transmit,
+        try self.createDmabufSlot(window, 0, pixel_width, pixel_height);
+        _ = try self.driver.schedule();
+    }
+
+    fn createDmabufSlot(self: *Host, window: *Window, index: usize, width: u32, height: u32) !void {
+        try window.dmabuf_buffers.createSlot(
+            self.vulkan.?,
+            &self.connection.objects,
+            try self.queue(),
             self.dmabuf.?,
             self.sync_manager,
             self.selectedDmabufModifier().?,
-            pixel_width,
-            pixel_height,
+            width,
+            height,
             window.next_pool_generation,
+            index,
+            window.direct_presentation,
         );
-        _ = try self.driver.schedule();
     }
 
     fn usingDmabuf(self: *const Host) bool {
@@ -2183,8 +2228,13 @@ pub const Host = struct {
             switch (try wayring.client.decodeEvent(protocol.zwp_linux_dmabuf_v1, objects, self.dmabuf.?, message, fds)) {
                 .modifier => |modifier| {
                     const value = (@as(u64, modifier.modifier_hi) << 32) | modifier.modifier_lo;
-                    if (modifier.format == drm_format_argb8888 and value == drm_format_modifier_linear)
+                    if (modifier.format == drm_format_argb8888 and value == drm_format_modifier_linear) {
                         self.dmabuf_linear_argb8888 = true;
+                        if (self.dmabuf_version < 4) {
+                            if (self.vulkan) |renderer|
+                                self.dmabuf_direct_supported = renderer.supportsDirectModifier(value);
+                        }
+                    }
                 },
                 .format => {},
             }
@@ -2233,6 +2283,7 @@ pub const Host = struct {
                             const modifier = std.mem.readInt(u64, table[entry_offset + 8 ..][0..8], .little);
                             if (format == drm_format_argb8888 and self.vulkan.?.supportsDmabufModifier(modifier)) {
                                 self.dmabuf_modifier = modifier;
+                                self.dmabuf_direct_supported = self.vulkan.?.supportsDirectModifier(modifier);
                                 break;
                             }
                         }
@@ -3296,6 +3347,143 @@ test "layer background teardown retires pending callbacks and destroys effect be
         bytes = bytes[message.header.size..];
     }
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
+}
+
+test "Vulkan dma-buf slots grow on demand and reuse released storage" {
+    if (!build_options.vulkan) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var renderer = Vulkan.init(allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    if (!renderer.supportsDmabufModifier(0)) return error.SkipZigTest;
+    var objects = try wayring.objects.ClientObjects.init(allocator, 64, 64, &protocol.wl_display.info, null);
+    defer objects.deinit(allocator);
+    var blocks = try wayring.pool.SharedBlocks.init(allocator, 16384, 1);
+    defer blocks.deinit(allocator);
+    var fds = try wayring.pool.SharedFds.init(allocator, 16);
+    defer fds.deinit(allocator);
+    var transmit = wayring.tx.Queue.init(&blocks, 16384, &fds, 16);
+    defer transmit.deinit();
+    const dmabuf = try objects.createLocal(&protocol.zwp_linux_dmabuf_v1.info, 3, null);
+    const sync_manager = try objects.createLocal(&protocol.wp_linux_drm_syncobj_manager_v1.info, 1, null);
+    var pool: DmabufBuffers = .{};
+    defer pool.releaseLocal(&renderer);
+    try pool.createSlot(&renderer, &objects, &transmit, dmabuf, sync_manager, 0, 7, 3, 9, 0, false);
+    try std.testing.expect(pool.matches(7, 3));
+    try std.testing.expect(pool.slots[1].target == null and pool.slots[2].target == null);
+    try std.testing.expectEqual(@as(?usize, 0), try pool.acquireSlot(&renderer));
+    for (1..3) |index| {
+        pool.slots[index - 1].busy = true; // Compositor has not released it.
+        try std.testing.expectEqual(@as(?usize, index), try pool.acquireSlot(&renderer));
+        try pool.createSlot(&renderer, &objects, &transmit, dmabuf, sync_manager, 0, 7, 3, 9, index, false);
+        try std.testing.expect(pool.slots[index].target.?.linear == pool.slots[0].target.?.linear);
+    }
+    pool.slots[2].busy = true;
+    try std.testing.expectEqual(null, try pool.acquireSlot(&renderer));
+    pool.slots[1].busy = false;
+    try std.testing.expectEqual(@as(?usize, 1), try pool.acquireSlot(&renderer));
+    pool.slots[1].acquired = true;
+    try std.testing.expectEqual(null, try pool.acquireSlot(&renderer));
+    pool.slots[1].acquired = false;
+    {
+        // Its newly created fence is unsignaled: a compositor release alone
+        // cannot authorize reuse while the GPU is still working.
+        pool.slots[1].target.?.gpu_pending = true;
+        defer pool.slots[1].target.?.gpu_pending = false;
+        try std.testing.expectEqual(null, try pool.acquireSlot(&renderer));
+    }
+    var retired = pool;
+    pool = .{};
+    defer retired.releaseLocal(&renderer);
+    try pool.createSlot(&renderer, &objects, &transmit, dmabuf, null, 0, 3, 9, 10, 0, false);
+    try std.testing.expect(pool.matches(3, 9));
+    try std.testing.expect(retired.matches(7, 3));
+    try std.testing.expect(pool.slots[0].target.?.linear != retired.slots[0].target.?.linear);
+    try std.testing.expect(pool.slots[1].target == null);
+    try renderer.renderDmabuf(.{ .commands = &.{.{ .clear = @import("../../core/color.zig").Color.rgba(1, 2, 3, 255) }} }, &retired.slots[1].target.?);
+    try retired.slots[1].target.?.wait(&renderer);
+}
+
+test "Vulkan damage follows shared contents and discarded frames force repair" {
+    if (!build_options.vulkan) return error.SkipZigTest;
+    var renderer = Vulkan.init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    if (!renderer.supportsDmabufModifier(0)) return error.SkipZigTest;
+    var windows = [_]Window{.{ .state = .open, .handle = .{ .slot = 0, .generation = 1 } }};
+    const window = &windows[0];
+    const pool = &window.dmabuf_buffers;
+    defer pool.releaseLocal(&renderer);
+    pool.generation = 2;
+    pool.slots[0].target = try Vulkan.DmabufTarget.init(&renderer, 7, 3, 0);
+    pool.slots[1].target = try Vulkan.DmabufTarget.initShared(&renderer, &pool.slots[0].target.?);
+    pool.slots[1].acquired = true;
+    var host: Host = undefined;
+    host.windows = &windows;
+    host.vulkan = &renderer;
+    const patch: RectI = .{ .x = 2, .y = 1, .width = 3, .height = 1 };
+    var frame: Frame = .{ .target = .{ .vulkan = &pool.slots[1].target.? }, .width = 7, .height = 3, .window = window.handle, .pool_generation = 2, .slot = 1 };
+    try host.prepareFrameDamage(&frame, .{ .regions = &.{patch} });
+    try std.testing.expectEqual(RectI{ .x = 0, .y = 0, .width = 7, .height = 3 }, frame.damage_regions[0]);
+    pool.last_present_serial = window.damage_history.commit(.full);
+    // This presentation slot has never been used, but the working image has.
+    try host.prepareFrameDamage(&frame, .{ .regions = &.{patch} });
+    try std.testing.expectEqual(patch, frame.damage_regions[0]);
+    try std.testing.expectEqual(patch, frame.requested_damage.bounds);
+    try renderer.renderDmabuf(.{ .commands = &.{.{ .clear = @import("../../core/color.zig").Color.rgba(255, 0, 0, 128) }} }, &pool.slots[1].target.?);
+    try host.discardFrame(frame);
+    try std.testing.expectEqual(@as(u64, 0), pool.last_present_serial);
+    pool.slots[1].acquired = true;
+    try host.prepareFrameDamage(&frame, .{ .regions = &.{patch} });
+    try std.testing.expectEqual(RectI{ .x = 0, .y = 0, .width = 7, .height = 3 }, frame.damage_regions[0]);
+    frame.pool_generation = 1;
+    try std.testing.expectError(error.StaleFrame, host.prepareFrameDamage(&frame, .full));
+}
+
+test "direct Vulkan damage uses slot age and discard invalidates only that slot" {
+    var windows = [_]Window{.{ .state = .open, .handle = .{ .slot = 0, .generation = 1 } }};
+    const window = &windows[0];
+    const pool = &window.dmabuf_buffers;
+    pool.direct = true;
+    pool.generation = 7;
+    // Damage bookkeeping does not touch Vulkan handles. No dma-buf extension
+    // is needed to exercise it on software Vulkan or software-only builds.
+    pool.slots[0].target = std.mem.zeroes(Vulkan.DmabufTarget);
+    pool.slots[1].target = std.mem.zeroes(Vulkan.DmabufTarget);
+    pool.slots[1].acquired = true;
+    var host: Host = undefined;
+    host.windows = &windows;
+    const full: RectI = .{ .x = 0, .y = 0, .width = 17, .height = 9 };
+    const earlier: RectI = .{ .x = 1, .y = 2, .width = 2, .height = 1 };
+    const current: RectI = .{ .x = 8, .y = 4, .width = 3, .height = 2 };
+    pool.last_present_serial = window.damage_history.commit(.full);
+    pool.slots[0].last_present_serial = pool.last_present_serial;
+    var frame: Frame = .{ .target = .{ .vulkan = &pool.slots[1].target.? }, .width = 17, .height = 9, .window = window.handle, .pool_generation = 7, .slot = 1 };
+    try host.prepareFrameDamage(&frame, .{ .regions = &.{current} });
+    try std.testing.expectEqual(full, frame.damage_regions[0]);
+    pool.slots[1].last_present_serial = pool.last_present_serial;
+    pool.last_present_serial = window.damage_history.commit(.{ .bounds = earlier });
+    try host.prepareFrameDamage(&frame, .{ .regions = &.{current} });
+    try std.testing.expectEqual(RectI{ .x = 1, .y = 2, .width = 10, .height = 4 }, frame.damage_regions[0]);
+    try std.testing.expectEqual(current, frame.requested_damage.bounds);
+    // A slot can miss a discarded submission even when the present serial did
+    // not advance. Its next repaint must not trust the old age.
+    if (build_options.vulkan) {
+        var renderer: Vulkan = undefined;
+        host.vulkan = &renderer;
+        // gpu_pending is false, so wait does not access device handles.
+        try host.discardFrame(frame);
+        pool.slots[1].acquired = true;
+    } else pool.slots[1].last_present_serial = 0;
+    try host.prepareFrameDamage(&frame, .{ .regions = &.{current} });
+    try std.testing.expectEqual(full, frame.damage_regions[0]);
+    try std.testing.expectEqual(@as(u64, 1), pool.slots[0].last_present_serial);
+    frame.pool_generation = 6;
+    try std.testing.expectError(error.StaleFrame, host.prepareFrameDamage(&frame, .full));
 }
 
 test "destroyed surfaces close without dma-buf release events" {
