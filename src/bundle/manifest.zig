@@ -3,10 +3,13 @@ const std = @import("std");
 pub const file_name = "ouro.json";
 const max_manifest_bytes = 64 * 1024;
 
+pub const NativeModule = struct { name: []const u8, path: []const u8 };
+
 const Document = struct {
     schema_version: u32,
     id: []const u8,
     entry: []const u8,
+    native_modules: []const NativeModule = &.{},
 };
 
 /// Package identity needed before application Lua is evaluated. Socket
@@ -16,6 +19,7 @@ pub const Manifest = struct {
     allocator: std.mem.Allocator,
     id: []u8,
     entry_path: []u8,
+    native_modules: []NativeModule,
 
     pub fn load(
         io: std.Io,
@@ -48,14 +52,38 @@ pub const Manifest = struct {
         const id = try allocator.dupe(u8, parsed.value.id);
         errdefer allocator.free(id);
         const parent = std.fs.path.dirname(path) orelse ".";
+        const modules = try allocator.alloc(NativeModule, parsed.value.native_modules.len);
+        errdefer allocator.free(modules);
+        var count: usize = 0;
+        errdefer for (modules[0..count]) |module| {
+            allocator.free(module.name);
+            allocator.free(module.path);
+        };
+        for (parsed.value.native_modules, modules, 0..) |module, *owned, index| {
+            try @import("module_name.zig").validate(module.name);
+            if (std.mem.eql(u8, module.name, "ouro")) return error.ReservedNativeModule;
+            try validateEntry(module.path);
+            for (modules[0..index]) |previous| if (std.mem.eql(u8, previous.name, module.name))
+                return error.DuplicateNativeModule;
+            const name = try allocator.dupe(u8, module.name);
+            errdefer allocator.free(name);
+            owned.* = .{ .name = name, .path = try std.fs.path.join(allocator, &.{ parent, module.path }) };
+            count += 1;
+        }
         return .{
             .allocator = allocator,
             .id = id,
             .entry_path = try std.fs.path.join(allocator, &.{ parent, parsed.value.entry }),
+            .native_modules = modules,
         };
     }
 
     pub fn deinit(self: *Manifest) void {
+        for (self.native_modules) |module| {
+            self.allocator.free(module.path);
+            self.allocator.free(module.name);
+        }
+        self.allocator.free(self.native_modules);
         self.allocator.free(self.entry_path);
         self.allocator.free(self.id);
         self.* = undefined;
@@ -118,4 +146,38 @@ test "manifest rejects unsafe identity and entry metadata" {
     try std.testing.expectError(error.InvalidApplicationId, validateApplicationId("dev..contacts"));
     try std.testing.expectError(error.InvalidApplicationEntry, validateEntry("../app.lua"));
     try std.testing.expectError(error.InvalidApplicationEntry, validateEntry("/app.lua"));
+}
+
+test "manifest resolves explicit native modules without executing libraries" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &temporary.sub_path, file_name });
+    defer std.testing.allocator.free(path);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = file_name,
+        .data =
+        \\{"schema_version":1,"id":"dev.ouro.native","entry":"src/app.lua",
+        \\ "native_modules":[{"name":"example.counter","path":"lib/counter.so"}]}
+        ,
+    });
+    var manifest = try Manifest.load(std.testing.io, std.testing.allocator, path);
+    defer manifest.deinit();
+    try std.testing.expectEqual(1, manifest.native_modules.len);
+    try std.testing.expectEqualStrings("example.counter", manifest.native_modules[0].name);
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &temporary.sub_path, "lib/counter.so" });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, manifest.native_modules[0].path);
+
+    const invalid = .{
+        .{ "[{\"name\":\"ouro\",\"path\":\"a.so\"}]", error.ReservedNativeModule },
+        .{ "[{\"name\":\"x\",\"path\":\"../a.so\"}]", error.InvalidApplicationEntry },
+        .{ "[{\"name\":\"x\",\"path\":\"a.so\"},{\"name\":\"x\",\"path\":\"b.so\"}]", error.DuplicateNativeModule },
+    };
+    inline for (invalid) |case| {
+        try temporary.dir.writeFile(std.testing.io, .{
+            .sub_path = file_name,
+            .data = "{\"schema_version\":1,\"id\":\"dev.ouro.native\",\"entry\":\"app.lua\",\"native_modules\":" ++ case[0] ++ "}",
+        });
+        try std.testing.expectError(case[1], Manifest.load(std.testing.io, std.testing.allocator, path));
+    }
 }

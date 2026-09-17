@@ -137,6 +137,9 @@ pub const ModuleLoader = struct {
             self.vm.pushApi(state);
             return 1;
         }
+        // Native modules are explicitly registered before bootstrap. They are
+        // available after freeze without opening mutable code from disk.
+        if (self.vm.pushNativeModule(state, name)) return 1;
 
         for (self.slots) |*slot| {
             if (slot.state == .free or !std.mem.eql(u8, slot.paths.?.canonical, name)) continue;

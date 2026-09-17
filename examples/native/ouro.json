@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "id": "dev.ouro.native",
+  "entry": "app.lua",
+  "native_modules": [
+    { "name": "example.counter", "path": "libcounter.so" }
+  ]
+}

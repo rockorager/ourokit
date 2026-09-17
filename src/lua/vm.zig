@@ -56,6 +56,8 @@ const invalid_slot = std.math.maxInt(u32);
 /// Ouro-owned C closures and resource lifecycle records reference it. Only
 /// allowlisted computation libraries are exposed; Ouro owns I/O and scheduling.
 pub const Vm = struct {
+    pub const NativeModule = struct { name: []const u8, reference: c_int };
+
     allocator: std.mem.Allocator,
     scheduler: *task.Scheduler,
     loop: *io.Loop,
@@ -70,6 +72,8 @@ pub const Vm = struct {
     /// First explicit exit request. The host drains output, cancels tasks,
     /// and tears down; this VM never exits the process or resumes user Lua.
     exit_code: ?u8 = null,
+    /// Borrowed registration table; its native contexts outlive lua_close.
+    native_modules: []const NativeModule = &.{},
 
     pub fn init(
         self: *Vm,
@@ -857,6 +861,14 @@ pub const Vm = struct {
         return 0;
     }
 
+    pub fn pushNativeModule(self: *Vm, state: *c.State, name: []const u8) bool {
+        for (self.native_modules) |module| if (std.mem.eql(u8, module.name, name)) {
+            _ = c.lua_rawgeti(state, c.registry_index, module.reference);
+            return true;
+        };
+        return false;
+    }
+
     fn builtinRequire(state: *c.State) callconv(.c) c_int {
         const pointer = c.lua_touserdata(state, c.upvalueIndex(1)) orelse
             return luaError(state, "missing Ouro VM");
@@ -866,6 +878,7 @@ pub const Vm = struct {
         var length: usize = 0;
         const name = c.lua_tolstring(state, 1, &length) orelse
             return luaError(state, "require expects one module name");
+        if (self.pushNativeModule(state, name[0..length])) return 1;
         if (!std.mem.eql(u8, name[0..length], "ouro"))
             return luaError(state, "application module loading is unavailable");
         self.pushApi(state);

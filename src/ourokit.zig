@@ -12,6 +12,7 @@ pub const fs = @import("fs/root.zig");
 pub const task = @import("task/root.zig");
 pub const bundle = @import("bundle/root.zig");
 pub const lua = @import("lua/root.zig");
+pub const native = @import("native/root.zig");
 pub const scene = @import("scene/root.zig");
 pub const renderer = @import("renderer/root.zig");
 pub const ui = @import("ui/root.zig");
@@ -32,6 +33,7 @@ test {
     _ = task;
     _ = bundle;
     _ = lua;
+    _ = native;
     _ = scene;
     _ = renderer;
     _ = ui;

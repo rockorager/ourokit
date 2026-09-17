@@ -94,6 +94,18 @@ identity, fallback output, retained candidate lifetimes, stable growth, and
 stale shape handles.
 The normal library build does not embed either font.
 
+## Native plugins
+
+The default runner supports experimental C-ABI plugins declared in an
+application manifest's `native_modules` list. C and Zig shared libraries can
+register Lua-facing functions and native state backed by existing Ourokit
+signals, without linking Lua or writing a custom launcher. Run
+`zig build build-native-example`, then
+`zig-out/bin/ouroctl run zig-out/examples/native/ouro.json` after building the
+runner. See [the native plugin API](docs/native-plugins.md) for ownership,
+reload, and trust rules. Custom rendering/widgets and asynchronous native
+operations are subsequent stages, not capabilities of this initial ABI.
+
 ## Native UI embedding
 
 The `ourokit_ui` Zig module is the platform-neutral embedding boundary for
@@ -473,6 +485,7 @@ and shared-memory/dma-buf presentation paths.
 - [Generic D-Bus client](docs/dbus.md)
 - [Application model](docs/application-model.md)
 - [Transactional source reload](docs/hot-reload.md)
+- [Native plugins](docs/native-plugins.md)
 
 Instance-adjacent typed pointer bindings now replace proof-wide global event
 dispatch. Widget-specific callbacks such as `ouro.button { on_press = ... }`

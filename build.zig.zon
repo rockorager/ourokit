@@ -68,6 +68,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "include",
         "design",
         "tools",
         "tests",

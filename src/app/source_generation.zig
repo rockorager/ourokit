@@ -9,8 +9,11 @@ const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
 const image_service = @import("../image/service.zig");
 const ImageCache = @import("../image/cache.zig").Cache;
+const native = @import("../native/root.zig");
 
 pub const Config = struct {
+    /// Code and names remain borrowed through destruction of all generations.
+    native_modules: []const native.Module = &.{},
     node_capacity: usize = 256,
     window_capacity: usize = 16,
     semantic_text_capacity: usize = 16 * 1024,
@@ -54,6 +57,7 @@ pub const SourceGeneration = struct {
     stdio: lua.Stdio,
     applications: lua.Applications,
     signals: lua.Signals,
+    native_modules: ?native.Registry = null,
     window_owners: ?ui.instance.BuildOwners = null,
     window_owner: ui.instance.BuildOwnerHandle = .invalid,
     shell_workspaces: ?lua.ShellWorkspaces = null,
@@ -171,6 +175,7 @@ pub const SourceGeneration = struct {
         self.allocator = allocator;
         self.snapshot = snapshot;
         self.module_loader = null;
+        self.native_modules = null;
         self.images = null;
         self.asset_root = module_root;
         self.shell_workspaces = null;
@@ -208,6 +213,7 @@ pub const SourceGeneration = struct {
             if (dbus_initialized) self.dbus.deinit();
             if (mcp_client_initialized) self.mcp_client.deinit();
             if (vm_initialized) self.vm.deinit();
+            if (self.native_modules) |*modules| modules.deinit();
             if (shell_workspaces_initialized) self.shell_workspaces.?.deinit();
             if (signals_initialized) self.signals.deinit();
             if (semantic_storage) |storage| allocator.free(storage);
@@ -274,6 +280,14 @@ pub const SourceGeneration = struct {
             return err;
         };
         signals_initialized = true;
+        if (config.native_modules.len != 0) {
+            var modules: native.Registry = undefined;
+            modules.init(allocator, &self.vm, &self.signals, config.native_modules) catch |err| {
+                lua.recordDiagnosticError(diagnostic, allocator, .setup, self.snapshot.entry_name, err);
+                return err;
+            };
+            self.native_modules = modules;
+        }
         if (services) |value| if (value.workspaces) |store| {
             self.shell_workspaces = @as(lua.ShellWorkspaces, undefined);
             self.shell_workspaces.?.init(
@@ -786,6 +800,7 @@ pub const SourceGeneration = struct {
         self.dbus.deinit();
         self.mcp_client.deinit();
         self.vm.deinit();
+        if (self.native_modules) |*modules| modules.deinit();
         if (self.shell_workspaces) |*binding| binding.deinit();
         self.signals.deinit();
         self.allocator.free(self.semantic_storage);

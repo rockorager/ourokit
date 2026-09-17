@@ -24,6 +24,7 @@ const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
 
 pub const Options = struct {
+    native_modules: []const @import("../native/root.zig").Module = &.{},
     exit_after_first_frame: bool = false,
     /// Receives the Lua-requested exit status after all resources are drained.
     exit_code: ?*u8 = null,
@@ -102,6 +103,10 @@ pub fn runSource(
 /// connection, renderer, or UI factory is started. Declaration output goes to
 /// stderr so the caller can reserve stdout for the exported JSON descriptor.
 pub fn exportCatalog(init: std.process.Init, provider: *const bundle.SourceProvider) ![]u8 {
+    return exportCatalogWithModules(init, provider, &.{});
+}
+
+pub fn exportCatalogWithModules(init: std.process.Init, provider: *const bundle.SourceProvider, modules: []const @import("../native/root.zig").Module) ![]u8 {
     var diagnostic: ?lua.Diagnostic = null;
     defer if (diagnostic) |*value| value.deinit();
     const module_root = try provider.openModuleRoot(init.io);
@@ -119,6 +124,7 @@ pub fn exportCatalog(init: std.process.Init, provider: *const bundle.SourceProvi
     // SourceGeneration consumes the snapshot, including on setup failure.
     const config: source_generation.Config = .{
         .defer_run = true,
+        .native_modules = modules,
         .runtime_dir = std.process.Environ.getPosix(init.minimal.environ, "XDG_RUNTIME_DIR"),
     };
     const generation = if (module_root) |directory|
@@ -196,6 +202,7 @@ fn runSourceInternal(
     var applications = try @import("../xdg/applications.zig").Config.init(init.gpa, init.minimal.environ);
     defer applications.deinit();
     const generation_config: source_generation.Config = .{
+        .native_modules = options.native_modules,
         .node_capacity = options.window.node_capacity,
         .window_capacity = options.application_window_capacity,
         .semantic_text_capacity = options.window.semantic_text_capacity,

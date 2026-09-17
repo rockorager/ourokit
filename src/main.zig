@@ -30,13 +30,16 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
         .status => |target| try statusApplication(init, target.application_id),
         .reload => |target| try reloadApplication(init, target.application_id),
         .mcp_export => |options| {
+            var manifest: ?ourokit.bundle.Manifest = null;
+            defer if (manifest) |*value| value.deinit();
             var provider = if (std.mem.eql(u8, std.fs.path.basename(options.path), ourokit.bundle.manifest_file_name)) blk: {
-                var manifest = try ourokit.bundle.Manifest.load(init.io, init.gpa, options.path);
-                defer manifest.deinit();
-                break :blk try ourokit.bundle.SourceProvider.initDiskApplication(init.gpa, manifest.entry_path, manifest.id);
+                manifest = try ourokit.bundle.Manifest.load(init.io, init.gpa, options.path);
+                break :blk try ourokit.bundle.SourceProvider.initDiskApplication(init.gpa, manifest.?.entry_path, manifest.?.id);
             } else try ourokit.bundle.SourceProvider.initDisk(init.gpa, options.path);
             defer provider.deinit();
-            const bytes = try ourokit.app.exportCatalog(init, &provider);
+            var libraries = try openNativeModules(init.gpa, manifest);
+            defer libraries.deinit();
+            const bytes = try ourokit.app.exportCatalogWithModules(init, &provider, libraries.modules);
             defer init.gpa.free(bytes);
             if (options.output_path) |path| {
                 try writeAtomic(init, path, bytes);
@@ -44,21 +47,22 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
         },
         .run => |options| {
             const path = options.path orelse ourokit.bundle.manifest_file_name;
+            var manifest: ?ourokit.bundle.Manifest = null;
+            defer if (manifest) |*value| value.deinit();
             var provider = if (std.mem.eql(
                 u8,
                 std.fs.path.basename(path),
                 ourokit.bundle.manifest_file_name,
             )) blk: {
-                var manifest = ourokit.bundle.Manifest.load(init.io, init.gpa, path) catch |err| {
+                manifest = ourokit.bundle.Manifest.load(init.io, init.gpa, path) catch |err| {
                     if (options.path == null and err == error.FileNotFound)
                         return error.ApplicationManifestNotFound;
                     return err;
                 };
-                defer manifest.deinit();
                 break :blk try ourokit.bundle.SourceProvider.initDiskApplication(
                     init.gpa,
-                    manifest.entry_path,
-                    manifest.id,
+                    manifest.?.entry_path,
+                    manifest.?.id,
                 );
             } else try ourokit.bundle.SourceProvider.initDisk(init.gpa, path);
             defer provider.deinit();
@@ -81,8 +85,12 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
                     }
                 }
             }
+            // An activation-only invocation must not execute library constructors.
+            var libraries = try openNativeModules(init.gpa, manifest);
+            defer libraries.deinit();
             var exit_code: u8 = 0;
             var run_options: ourokit.app.WaylandRunOptions = .{
+                .native_modules = libraries.modules,
                 .exit_after_first_frame = options.exit_after_first_frame,
                 .exit_code = &exit_code,
             };
@@ -112,6 +120,14 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
         },
     }
     return 0;
+}
+
+fn openNativeModules(allocator: std.mem.Allocator, manifest: ?ourokit.bundle.Manifest) !ourokit.native.Libraries {
+    const modules = if (manifest) |value| value.native_modules else &.{};
+    const paths = try allocator.alloc(ourokit.native.LibraryPath, modules.len);
+    defer allocator.free(paths);
+    for (modules, paths) |module, *path| path.* = .{ .name = module.name, .path = module.path };
+    return ourokit.native.Libraries.open(allocator, paths);
 }
 
 fn statusApplication(init: std.process.Init, application_id: []const u8) !void {

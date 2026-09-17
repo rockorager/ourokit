@@ -18,6 +18,7 @@ pub const socket_activation = @import("socket_activation.zig");
 pub const runWayland = @import("wayland_runner.zig").run;
 pub const runWaylandSource = @import("wayland_runner.zig").runSource;
 pub const exportCatalog = @import("wayland_runner.zig").exportCatalog;
+pub const exportCatalogWithModules = @import("wayland_runner.zig").exportCatalogWithModules;
 pub const WaylandRunOptions = @import("wayland_runner.zig").Options;
 pub const storybook = @import("storybook_runner.zig");
 pub const runStorybook = @import("storybook_browser.zig").run;

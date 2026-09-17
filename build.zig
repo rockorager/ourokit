@@ -140,6 +140,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     addLua(ourokit, lua);
+    ourokit.addIncludePath(b.path("include"));
+    b.installFile("include/ourokit/plugin.h", "include/ourokit/plugin.h");
     addHarfBuzz(ourokit, harfbuzz);
     addSheenBidi(ourokit, sheenbidi);
     if (enable_vulkan) addVulkan(b, ourokit);
@@ -294,6 +296,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_ui_tests.step);
     test_step.dependOn(&run_codec_tests.step);
+    test_step.dependOn(addNativePlugins(b, target, optimize, ourokit));
 
     const ui_test_step = b.step("test-ourokit-ui", "Run platform-neutral UI integration tests");
     ui_test_step.dependOn(&run_ui_tests.step);
@@ -311,6 +314,41 @@ pub fn build(b: *std.Build) void {
         "Build and run an external package importing only ourokit_ui",
     );
     consumer_smoke_step.dependOn(&consumer_smoke.step);
+}
+
+fn addNativePlugins(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, ourokit: *std.Build.Module) *std.Build.Step {
+    const counter_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    counter_module.addIncludePath(b.path("include"));
+    counter_module.addCSourceFile(.{ .file = b.path("examples/native/counter.c"), .flags = &.{ "-std=c99", "-Wall", "-Wextra", "-Werror" } });
+    const counter = b.addLibrary(.{ .name = "counter", .linkage = .dynamic, .root_module = counter_module });
+    const echo_module = b.createModule(.{ .root_source_file = b.path("examples/native/echo.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    echo_module.addIncludePath(b.path("include"));
+    const echo = b.addLibrary(.{ .name = "echo", .linkage = .dynamic, .root_module = echo_module });
+    const paths = b.addOptions();
+    paths.addOptionPath("counter", counter.getEmittedBin());
+    paths.addOptionPath("echo", echo.getEmittedBin());
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("tests/native_plugins.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+    });
+    test_module.addOptions("native_plugin_paths", paths);
+    const tests = b.addTest(.{ .root_module = test_module });
+    const run = b.addRunArtifact(tests);
+    const test_step = b.step("test-native-plugins", "Load C and Zig shared libraries and verify native ABI, signals and lifetimes");
+    test_step.dependOn(&run.step);
+
+    const example = b.step("build-native-example", "Install the native counter application under zig-out/examples/native");
+    const install_counter = b.addInstallFile(counter.getEmittedBin(), "examples/native/libcounter.so");
+    const install_echo = b.addInstallFile(echo.getEmittedBin(), "examples/native/libecho.so");
+    example.dependOn(&install_counter.step);
+    example.dependOn(&install_echo.step);
+    inline for (.{ "app.lua", "ouro.json" }) |file| {
+        const install = b.addInstallFile(b.path("examples/native/" ++ file), "examples/native/" ++ file);
+        example.dependOn(&install.step);
+    }
+    return test_step;
 }
 
 fn addUucodeConfig(b: *std.Build, unicode_ucd: *std.Build.Dependency) std.Build.LazyPath {
