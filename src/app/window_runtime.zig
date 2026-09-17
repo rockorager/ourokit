@@ -54,6 +54,9 @@ pub const WindowRuntime = struct {
     listboxes: ui.widget.ListBoxes = .{},
     text_inputs: ui.text_input.Registry = undefined,
     focus: ui.focus.Manager = .{},
+    clicks: ui.input.Clicks = .{},
+    selection_pointer: ?core.PointF = null,
+    selection_tick_ns: ?u64 = null,
     semantics: ui.semantics.Snapshot = undefined,
     surface_color: core.Color = undefined,
     background: ?core.Color = null,
@@ -205,6 +208,9 @@ pub const WindowRuntime = struct {
         self.listboxes.clear();
         self.text_inputs.clear();
         self.focus.clear();
+        self.clicks.reset();
+        self.selection_pointer = null;
+        self.selection_tick_ns = null;
         while (self.router.takeEvent()) |event| self.router.releaseEvent(event);
         if (self.build_owners.isActive(self.root_owner)) {
             try self.signals.disposeOwner(.{
@@ -795,12 +801,17 @@ pub const WindowRuntime = struct {
             .enter => return,
             .leave => {
                 try self.applyButtonUpdate(self.buttons.release());
-                if (self.focus.current()) |target| if (self.text_inputs.contains(target))
-                    (try self.text_inputs.session(target)).model.breakUndoGroup();
+                self.clicks.reset();
+                if (self.focus.current()) |target| if (self.text_inputs.contains(target)) {
+                    const session = try self.text_inputs.session(target);
+                    session.model.breakUndoGroup();
+                    session.endSelectionDrag();
+                };
                 return;
             },
             .key => |value| value,
         };
+        if (key.state != .released) self.clicks.reset();
         if (self.focus.current()) |focused| if (self.text_inputs.contains(focused) and
             key.state != .released)
         {
@@ -1171,33 +1182,100 @@ pub const WindowRuntime = struct {
         };
         switch (pointer.event) {
             .button => |button| {
-                if (button.button != 0x110) return;
-                const input = (try self.textInputAncestor(target)) orelse return;
+                if (button.button != 0x110) {
+                    self.clicks.reset();
+                    return;
+                }
+                const input = (try self.textInputAncestor(target)) orelse {
+                    self.clicks.reset();
+                    return;
+                };
                 if (!(try self.text_inputs.getBehavior(input)).enabled) return;
                 const session = try self.text_inputs.session(input);
+                if (session.preedit() != null) return;
                 switch (button.state) {
                     .pressed => {
                         // Resolve the click against what was visible before
                         // focus starts revealing the retained caret.
                         const caret = try self.textCaretAtPointer(input, pointer.position);
-                        _ = try session.beginSelectionDrag(caret.byte_offset, caret.affinity);
+                        if (button.modifiers.shift) self.clicks.reset();
+                        const count = self.clicks.press(input, pointer.position, button.time_ms);
+                        _ = try session.beginPointerSelection(caret.byte_offset, caret.affinity, switch (count) {
+                            2 => .word,
+                            3 => .line,
+                            else => .character,
+                        }, button.modifiers.shift);
+                        self.selection_pointer = pointer.position;
+                        self.selection_tick_ns = null;
                         const previous = self.focus.current();
                         _ = try self.focus.request(&self.instances, input);
                         try self.applyFocusVisual(previous, self.focus.current());
                     },
-                    .released => session.endSelectionDrag(),
+                    .released => {
+                        session.endSelectionDrag();
+                        self.selection_pointer = null;
+                        try self.syncTextInputVisuals();
+                    },
                 }
             },
             .motion => {
+                self.clicks.motion(pointer.position);
                 const input = (try self.textInputAncestor(target)) orelse return;
                 const session = try self.text_inputs.session(input);
                 if (!session.isSelecting()) return;
-                const caret = try self.textCaretAtPointer(input, pointer.position);
+                self.selection_pointer = pointer.position;
+                const caret = try self.textCaretAtPointer(input, try self.clampSelectionPointer(input, pointer.position));
                 if (try session.updateSelectionDrag(caret.byte_offset, caret.affinity))
                     try self.syncTextInputVisuals();
             },
             else => {},
         }
+    }
+
+    fn clampSelectionPointer(self: *WindowRuntime, input: ui.instance.InstanceHandle, position: core.PointF) !core.PointF {
+        const content = try self.text_inputs.content(input);
+        const origin = try self.instanceOrigin(content);
+        const size = try self.tree.nodeSize(try self.instances.renderObject(content));
+        return .{ .x = std.math.clamp(position.x, origin.x, origin.x + size.width), .y = origin.y + size.height / 2 };
+    }
+
+    const SelectionScroll = struct { input: ui.instance.InstanceHandle, render: ui.render_object.NodeHandle, speed: f32 };
+
+    fn selectionScroll(self: *WindowRuntime) !?SelectionScroll {
+        if (!self.initialized) return null;
+        const position = self.selection_pointer orelse return null;
+        const input = self.focus.current() orelse return null;
+        if (!self.instances.isActive(input) or !self.text_inputs.contains(input)) return null;
+        const session = try self.text_inputs.session(input);
+        if (!session.isSelecting() or session.preedit() != null or session.drag_anchor.?.granularity == .line or
+            !(try self.text_inputs.getBehavior(input)).enabled) return null;
+        const edge = try self.clampSelectionPointer(input, position);
+        const distance = position.x - edge.x;
+        if (distance == 0) return null;
+        const speed = std.math.sign(distance) * std.math.clamp(@abs(distance) * 12, 40, 800);
+        const render = try self.instances.renderObject(try self.text_inputs.content(input));
+        if (try self.tree.textScrollDelta(render, speed) == 0) return null;
+        return .{ .input = input, .render = render, .speed = speed };
+    }
+
+    /// Only active edge dragging needs wakeups; the native host owns the timer.
+    pub fn animationDelay(self: *WindowRuntime) !?u64 {
+        return if (try self.selectionScroll() != null) 16 * std.time.ns_per_ms else null;
+    }
+
+    pub fn advanceAnimations(self: *WindowRuntime, now_ns: u64) !void {
+        const scroll = (try self.selectionScroll()) orelse {
+            self.selection_tick_ns = null;
+            return;
+        };
+        const previous = self.selection_tick_ns orelse now_ns;
+        self.selection_tick_ns = now_ns;
+        const elapsed: f32 = @floatFromInt(@min(now_ns -| previous, 50 * std.time.ns_per_ms));
+        if (!try self.tree.scrollTextInput(scroll.render, scroll.speed * elapsed / std.time.ns_per_s)) return;
+        const session = try self.text_inputs.session(scroll.input);
+        const caret = try self.textCaretAtPointer(scroll.input, try self.clampSelectionPointer(scroll.input, self.selection_pointer.?));
+        _ = try session.updateSelectionDrag(caret.byte_offset, caret.affinity);
+        try self.syncTextInputVisuals();
     }
 
     fn textCaretAtPointer(
@@ -1552,8 +1630,11 @@ pub const WindowRuntime = struct {
     ) !void {
         if (!self.initialized) return;
         if (!std.meta.eql(previous, current)) {
-            if (previous) |target| if (self.text_inputs.contains(target))
-                (try self.text_inputs.session(target)).model.breakUndoGroup();
+            if (previous) |target| if (self.text_inputs.contains(target)) {
+                const session = try self.text_inputs.session(target);
+                session.model.breakUndoGroup();
+                session.endSelectionDrag();
+            };
             if (current) |target| if (self.text_inputs.contains(target))
                 (try self.text_inputs.session(target)).model.breakUndoGroup();
         }
@@ -1616,7 +1697,7 @@ pub const WindowRuntime = struct {
             object.text_input.selection_end = presentation.selection.end;
             object.text_input.caret_offset = presentation.caret_offset;
             object.text_input.caret_affinity = presentation.caret_affinity;
-            object.text_input.reveal_caret = optionalSameHandle(self.focus.current(), mounted.target);
+            object.text_input.reveal_caret = optionalSameHandle(self.focus.current(), mounted.target) and !mounted.session.isSelecting();
             object.text_input.show_caret = presentation.show_caret and object.text_input.reveal_caret;
             object.text_input.preedit = if (presentation.preedit) |range| .{
                 .start = range.start,

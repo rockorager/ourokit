@@ -48,6 +48,7 @@ pub const PointerEvent = union(enum) {
         time_ms: u32,
         button: u32,
         state: PointerButtonState,
+        modifiers: Modifiers = .{},
     },
     axis: struct {
         window: WindowHandle,

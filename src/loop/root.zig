@@ -1,4 +1,5 @@
 pub const Loop = @import("io_uring.zig").Loop;
+pub const monotonicNow = @import("io_uring.zig").monotonicNow;
 pub const OperationHandle = @import("io_uring.zig").OperationHandle;
 pub const Completion = @import("io_uring.zig").Completion;
 pub const FileCompletion = @import("io_uring.zig").FileCompletion;

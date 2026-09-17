@@ -78,12 +78,17 @@ pub const Keyboard = struct {
             .keysym = keysym,
             .logical = logical,
             .unicode = c.xkb_state_key_get_utf32(state, xkb_keycode),
-            .modifiers = .{
-                .shift = modifierActive(state, c.XKB_MOD_NAME_SHIFT),
-                .control = modifierActive(state, c.XKB_MOD_NAME_CTRL),
-                .alt = modifierActive(state, c.XKB_MOD_NAME_ALT),
-                .logo = modifierActive(state, c.XKB_MOD_NAME_LOGO),
-            },
+            .modifiers = self.modifiers(),
+        };
+    }
+
+    pub fn modifiers(self: *const Keyboard) platform.Modifiers {
+        const state = self.state orelse return .{};
+        return .{
+            .shift = modifierActive(state, c.XKB_MOD_NAME_SHIFT),
+            .control = modifierActive(state, c.XKB_MOD_NAME_CTRL),
+            .alt = modifierActive(state, c.XKB_MOD_NAME_ALT),
+            .logo = modifierActive(state, c.XKB_MOD_NAME_LOGO),
         };
     }
 

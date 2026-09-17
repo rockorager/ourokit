@@ -281,6 +281,23 @@ pub const Tree = struct {
             return error.TextPositionNotFound;
     }
 
+    /// Signed remaining horizontal scroll, clamped to the requested delta.
+    pub fn textScrollDelta(self: *Tree, handle: NodeHandle, delta: f32) !f32 {
+        const target = try self.ensureTextLayout(handle);
+        const paragraph_layout = try self.paragraphs.?.get(target.paragraph_layout.?);
+        const minimum = @min(0, target.size.width - paragraph_layout.size.width - target.object.text_input.caret_width);
+        if (minimum == 0) return 0;
+        return target.text_offset_x - std.math.clamp(target.text_offset_x - delta, minimum, 0);
+    }
+
+    pub fn scrollTextInput(self: *Tree, handle: NodeHandle, delta: f32) !bool {
+        const actual = try self.textScrollDelta(handle, delta);
+        if (actual == 0) return false;
+        (try self.slot(handle)).text_offset_x -= actual;
+        self.markNeedsPaint(handle);
+        return true;
+    }
+
     pub fn textCaretRectangle(self: *Tree, handle: NodeHandle) !RectF {
         const target = try self.slot(handle);
         if (target.object != .text_input) return error.NotTextInputObject;

@@ -327,6 +327,20 @@ pub const Model = struct {
         return self.replaceRange(.{ .start = start, .end = end }, "");
     }
 
+    /// The Unicode segment touching this insertion edge. Unlike word
+    /// navigation, selection includes whitespace and punctuation segments.
+    pub fn wordRangeAt(self: *const Model, offset: usize, affinity: CaretAffinity) Range {
+        if (self.bytes.items.len == 0) return .{ .start = 0, .end = 0 };
+        const at = @min(offset, self.bytes.items.len);
+        var index = lowerBound(self.word_boundaries.items, at);
+        if (index == self.word_boundaries.items.len - 1 or
+            (index != 0 and (self.word_boundaries.items[index] != at or affinity == .upstream))) index -= 1;
+        return .{
+            .start = self.boundaryAtOrBefore(self.word_boundaries.items[index]),
+            .end = self.boundaryAtOrAfter(self.word_boundaries.items[index + 1]),
+        };
+    }
+
     fn rebuildBoundaries(self: *Model) void {
         self.boundaries.clearRetainingCapacity();
         self.boundaries.appendAssumeCapacity(0);

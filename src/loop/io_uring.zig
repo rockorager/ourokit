@@ -713,7 +713,7 @@ fn timespec(nanoseconds: u64) linux.kernel_timespec {
     };
 }
 
-fn monotonicNow() !u64 {
+pub fn monotonicNow() !u64 {
     var value: linux.timespec = undefined;
     switch (linux.errno(linux.clock_gettime(.MONOTONIC, &value))) {
         .SUCCESS => {},

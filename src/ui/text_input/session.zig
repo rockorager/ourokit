@@ -37,9 +37,12 @@ pub const Surrounding = struct {
     anchor: usize,
 };
 
+pub const SelectionGranularity = enum { character, word, line };
+
 const DragAnchor = struct {
-    byte_offset: usize,
+    range: model_module.Range,
     affinity: CaretAffinity,
+    granularity: SelectionGranularity,
 };
 
 /// Retained editing state independent of Wayland, Lua, and rendering. Preedit
@@ -92,10 +95,29 @@ pub const Session = struct {
         byte_offset: usize,
         affinity: CaretAffinity,
     ) !bool {
-        const changed = try self.model.setSelection(.collapsedAt(byte_offset, affinity));
-        self.preferred_x = null;
-        self.drag_anchor = .{ .byte_offset = byte_offset, .affinity = affinity };
-        return changed;
+        return self.beginPointerSelection(byte_offset, affinity, .character, false);
+    }
+
+    pub fn beginPointerSelection(
+        self: *Session,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+        granularity: SelectionGranularity,
+        extend: bool,
+    ) !bool {
+        const range = switch (granularity) {
+            .character => model_module.Range{ .start = byte_offset, .end = byte_offset },
+            .word => self.model.wordRangeAt(byte_offset, affinity),
+            .line => model_module.Range{ .start = 0, .end = self.model.text().len },
+        };
+        const previous = self.drag_anchor;
+        errdefer self.drag_anchor = previous;
+        self.drag_anchor = .{
+            .range = if (extend) .{ .start = self.model.selection.anchor, .end = self.model.selection.anchor } else range,
+            .affinity = if (extend) self.model.selection.anchor_affinity else affinity,
+            .granularity = if (extend) .character else granularity,
+        };
+        return self.updateSelectionDrag(byte_offset, affinity);
     }
 
     pub fn updateSelectionDrag(
@@ -104,12 +126,23 @@ pub const Session = struct {
         affinity: CaretAffinity,
     ) !bool {
         const anchor = self.drag_anchor orelse return false;
-        const changed = try self.model.setSelection(.{
-            .anchor = anchor.byte_offset,
-            .extent = byte_offset,
-            .anchor_affinity = anchor.affinity,
-            .extent_affinity = affinity,
-        });
+        const selected: model_module.Selection = switch (anchor.granularity) {
+            .character => .{
+                .anchor = anchor.range.start,
+                .extent = byte_offset,
+                .anchor_affinity = anchor.affinity,
+                .extent_affinity = affinity,
+            },
+            .word => blk: {
+                const range = self.model.wordRangeAt(byte_offset, affinity);
+                break :blk if (range.start < anchor.range.start)
+                    .{ .anchor = anchor.range.end, .extent = range.start, .anchor_affinity = .upstream }
+                else
+                    .{ .anchor = anchor.range.start, .extent = @max(anchor.range.end, range.end), .extent_affinity = .upstream };
+            },
+            .line => .{ .anchor = 0, .extent = self.model.text().len, .extent_affinity = .upstream },
+        };
+        const changed = try self.model.setSelection(selected);
         self.preferred_x = null;
         return changed;
     }
@@ -392,4 +425,46 @@ test "invalid protocol ranges leave session unchanged" {
     }));
     try std.testing.expectEqualStrings("AéB", session.model.text());
     try std.testing.expect(session.preedit() == null);
+}
+
+test "pointer word selection respects Unicode segments and reverses by whole words" {
+    var session = try Session.init(std.testing.allocator, "one Ωtwo 👩‍💻 end");
+    defer session.deinit();
+    _ = try session.beginPointerSelection(6, .downstream, .word, false);
+    try std.testing.expectEqualStrings("Ωtwo", session.model.text()[session.model.selection.range().start..session.model.selection.range().end]);
+    _ = try session.updateSelectionDrag(10, .downstream);
+    try std.testing.expectEqual(@as(usize, 4), session.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 21), session.model.selection.extent);
+    _ = try session.updateSelectionDrag(1, .downstream);
+    try std.testing.expectEqual(@as(usize, 9), session.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 0), session.model.selection.extent);
+    _ = try session.updateSelectionDrag(6, .downstream);
+    try std.testing.expectEqual(@as(usize, 4), session.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 9), session.model.selection.extent);
+    _ = try session.beginPointerSelection(9, .downstream, .word, false);
+    try std.testing.expectEqualStrings(" ", session.model.text()[session.model.selection.range().start..session.model.selection.range().end]);
+    _ = try session.beginPointerSelection(9, .upstream, .word, false);
+    try std.testing.expectEqual(@as(usize, 4), session.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 9), session.model.selection.extent);
+}
+
+test "shift click retains directional anchor and triple click keeps the entire line" {
+    var session = try Session.init(std.testing.allocator, "AéB words");
+    defer session.deinit();
+    _ = try session.model.setSelection(.{ .anchor = 9, .extent = 3, .anchor_affinity = .upstream });
+    _ = try session.beginPointerSelection(1, .downstream, .word, true);
+    try std.testing.expectEqual(@as(usize, 9), session.model.selection.anchor);
+    try std.testing.expectEqual(CaretAffinity.upstream, session.model.selection.anchor_affinity);
+    try std.testing.expectEqual(@as(usize, 1), session.model.selection.extent);
+    const anchor = session.drag_anchor;
+    session.preferred_x = 42;
+    try std.testing.expectError(error.InvalidGraphemeBoundary, session.beginSelectionDrag(2, .downstream));
+    try std.testing.expectEqualDeep(anchor, session.drag_anchor);
+    try std.testing.expectEqual(@as(?f32, 42), session.preferred_x);
+    _ = try session.beginPointerSelection(3, .downstream, .line, false);
+    _ = try session.updateSelectionDrag(0, .downstream);
+    try std.testing.expectEqual(@as(usize, 0), session.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 10), session.model.selection.extent);
+    session.endSelectionDrag();
+    try std.testing.expect(!session.isSelecting());
 }

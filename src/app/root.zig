@@ -25,6 +25,7 @@ pub const runStorybook = @import("storybook_browser.zig").run;
 
 test {
     _ = @import("app.zig");
+    _ = @import("animation_timer.zig");
     _ = @import("appearance.zig");
     _ = @import("clipboard.zig");
     _ = @import("frame.zig");

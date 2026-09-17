@@ -95,6 +95,13 @@ const Fixture = struct {
         var unused: Vm = undefined;
         try self.runtime.dispatchInput(&unused);
     }
+
+    fn pointer(self: *Fixture, event: @import("../platform/window.zig").PointerEvent) !void {
+        try self.runtime.routePointer(event);
+        var unused: Vm = undefined;
+        try self.runtime.dispatchInput(&unused);
+        try self.runtime.prepareFrame(1);
+    }
 };
 
 test "Lua stack keeps ordered children and keyed foreground identity" {
@@ -598,5 +605,100 @@ test "app and field keymaps dispatch edits and clipboard actions across retained
         } });
         try f.runtime.dispatchInput(&unused);
         try std.testing.expectEqualStrings(case.expected, session.model.text());
+    }
+}
+
+test "native input dispatch selects words lines and shift anchored ranges" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("function build() return ouro.text_input {key = 'input', default_text = 'one two three'} end");
+    try f.build();
+    try f.runtime.prepareFrame(1);
+    const session = try f.runtime.text_inputs.session(try f.handle("input"));
+    try f.pointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = .{ .x = 14, .y = 16 } } });
+    for (1..4) |count| {
+        try f.pointer(.{ .button = .{ .window = f.runtime.window, .serial = 2, .time_ms = @intCast(count * 100), .button = 0x110, .state = .pressed } });
+        if (count == 1) try std.testing.expect(session.model.selection.isCollapsed());
+        if (count == 2) {
+            try std.testing.expectEqual(@as(usize, 0), session.model.selection.anchor);
+            try std.testing.expectEqual(@as(usize, 3), session.model.selection.extent);
+        }
+        if (count == 3) try std.testing.expectEqual(@as(usize, 13), session.model.selection.extent);
+        try f.pointer(.{ .button = .{ .window = f.runtime.window, .serial = 3, .time_ms = @intCast(count * 100 + 1), .button = 0x110, .state = .released } });
+    }
+    _ = try session.model.setSelection(.{ .anchor = 13, .extent = 4, .anchor_affinity = .upstream });
+    try f.pointer(.{ .button = .{ .window = f.runtime.window, .serial = 4, .time_ms = 400, .button = 0x110, .state = .pressed, .modifiers = .{ .shift = true } } });
+    try std.testing.expectEqual(@as(usize, 13), session.model.selection.anchor);
+    try std.testing.expectEqual(text.CaretAffinity.upstream, session.model.selection.anchor_affinity);
+    try std.testing.expect(session.model.selection.extent < 3);
+}
+
+test "stationary edge dragging scrolls to both limits and stops on release" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    f.runtime.root_padding = 0;
+    try f.exec("function build() return ouro.column {key = 'root', ouro.text_input {key = 'input', width = 140, default_text = 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen'}} end");
+    try f.build();
+    try f.runtime.prepareFrame(1);
+    const input = try f.handle("root/input");
+    const session = try f.runtime.text_inputs.session(input);
+    const render = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(input));
+    try f.pointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = .{ .x = 9, .y = 16 } } });
+    try f.pointer(.{ .button = .{ .window = f.runtime.window, .serial = 2, .time_ms = 1, .button = 0x110, .state = .pressed } });
+    try f.pointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 2, .position = .{ .x = 200, .y = 16 } } });
+    const initial_extent = session.model.selection.extent;
+    try std.testing.expect((try f.runtime.animationDelay()) != null);
+    for (0..100) |tick| {
+        try f.runtime.advanceAnimations(tick * 16 * std.time.ns_per_ms);
+        try f.runtime.prepareFrame(1);
+    }
+    try std.testing.expect(session.model.selection.extent > initial_extent);
+    try std.testing.expectEqual(session.model.text().len, session.model.selection.extent);
+    try std.testing.expectEqual(@as(f32, 0), try f.runtime.tree.textScrollDelta(render, 100));
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    try f.pointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 3, .position = .{ .x = -80, .y = 16 } } });
+    for (100..200) |tick| {
+        try f.runtime.advanceAnimations(tick * 16 * std.time.ns_per_ms);
+        try f.runtime.prepareFrame(1);
+    }
+    try std.testing.expectEqual(@as(usize, 0), session.model.selection.extent);
+    try std.testing.expectEqual(@as(f32, 0), try f.runtime.tree.textScrollDelta(render, -100));
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    try f.pointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 4, .position = .{ .x = 200, .y = 16 } } });
+    try std.testing.expect((try f.runtime.animationDelay()) != null);
+    try f.pointer(.{ .button = .{ .window = f.runtime.window, .serial = 3, .time_ms = 5, .button = 0x110, .state = .released } });
+    try std.testing.expect(!session.isSelecting());
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+}
+
+test "edge scrolling stops for composition focus loss disabled and removed inputs" {
+    for (0..4) |reason| {
+        const f = try Fixture.create();
+        defer f.destroy();
+        f.runtime.root_padding = 0;
+        try f.exec("enabled = true; show = true; function build() return ouro.column {key = 'root', show and ouro.text_input {key = 'input', enabled = enabled, width = 100, default_text = 'one two three four five six seven eight nine ten'} or ouro.text {key = 'empty', text = 'Removed'}} end");
+        try f.build();
+        try f.pointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = .{ .x = 10, .y = 16 } } });
+        try f.pointer(.{ .button = .{ .window = f.runtime.window, .serial = 2, .time_ms = 1, .button = 0x110, .state = .pressed } });
+        try f.pointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 2, .position = .{ .x = 200, .y = 16 } } });
+        try std.testing.expect((try f.runtime.animationDelay()) != null);
+        switch (reason) {
+            0 => {
+                const session = try f.runtime.text_inputs.session(try f.handle("root/input"));
+                _ = try session.apply(.{ .preedit = .{ .text = "é", .cursor = null } });
+            },
+            1 => {
+                try f.runtime.routeKeyboard(.{ .leave = .{ .window = f.runtime.window, .serial = 3 } });
+                var unused: Vm = undefined;
+                try f.runtime.dispatchInput(&unused);
+            },
+            else => {
+                try f.exec(if (reason == 2) "enabled = false" else "show = false");
+                _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+                try f.build();
+            },
+        }
+        try f.runtime.advanceAnimations(16 * std.time.ns_per_ms);
+        try std.testing.expect((try f.runtime.animationDelay()) == null);
     }
 }

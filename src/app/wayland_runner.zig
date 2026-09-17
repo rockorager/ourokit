@@ -427,6 +427,8 @@ fn runSourceInternal(
     var active_reload_sequence: ?u64 = null;
     var queued_reload_sequence: ?u64 = null;
     var initial_activation_token = std.process.Environ.getPosix(init.minimal.environ, "XDG_ACTIVATION_TOKEN");
+    var animation_timer: @import("animation_timer.zig").Timer = .{};
+    defer animation_timer.stop(&loop) catch unreachable;
 
     while (true) {
         const shutdown_signal = try loop.receivedSignal();
@@ -735,8 +737,17 @@ fn runSourceInternal(
             std.log.err("could not begin source-generation retirement: {s}", .{@errorName(err)});
         _ = source_reload.collectRetired();
 
-        for (runtime_slots) |*slot| if (slot.runtime.ready)
-            try slot.runtime.prepareFrame(try host.outputScale(slot.runtime.window));
+        const animation_now = try io_loop.monotonicNow();
+        var animation_delay: ?u64 = null;
+        for (runtime_slots) |*slot| if (slot.desired and slot.runtime.ready) {
+            const scale = try host.outputScale(slot.runtime.window);
+            try slot.runtime.prepareFrame(scale);
+            try slot.runtime.advanceAnimations(animation_now);
+            try slot.runtime.prepareFrame(scale);
+            if (try slot.runtime.animationDelay()) |delay|
+                animation_delay = @min(animation_delay orelse delay, delay);
+        };
+        try animation_timer.update(&loop, animation_now, animation_delay);
         try source_reload.active().pumpImages();
 
         if (host.textInputAvailable()) for (runtime_slots) |*slot| {
@@ -888,6 +899,7 @@ fn runSourceInternal(
             completion = try loop.wait();
         }
         if (timers_due) while (try loop.takeExpired()) |timeout| {
+            if (animation_timer.fired(timeout.operation)) continue;
             if (try host.dispatchTimer(timeout.operation)) continue;
             try source_reload.markTimeoutCompleted(timeout.operation);
         };

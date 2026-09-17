@@ -2920,6 +2920,7 @@ pub const Host = struct {
                 .time_ms = button.time,
                 .button = button.button,
                 .state = try pointerButtonState(button.state),
+                .modifiers = self.xkb.modifiers(),
             } }),
             .axis => |axis| try self.sink.pointer(.{ .axis = .{
                 .window = try self.focusedWindow(),

@@ -1036,6 +1036,14 @@ testing clamps that motion to a valid line and caret. Release clears the gesture
 without changing the selected anchor/extent. Gesture state never enters the
 render object or scene.
 
+Double-click selects a Unicode word, whitespace, or punctuation segment;
+dragging after it extends by whole segments in either direction. Triple-click
+selects the entire single-line value. Shift-click extends from the existing
+directional anchor. While a captured pointer rests beyond the horizontal
+viewport, a demand-driven native timer scrolls and extends selection without
+requiring more motion events. It stops at the content limit or when selection
+ends. Active composition owns selection instead of accepting pointer edits.
+
 Commands live in an authoritative registry independent of the retained render
 tree. Entries need stable semantic IDs plus revisioned invocation handles,
 scope, title/category/aliases, enabled state and reason, state, argument schema,
