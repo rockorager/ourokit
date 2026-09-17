@@ -510,6 +510,13 @@ pub const Vm = struct {
         try self.scheduler.markRunnable(slot.scheduler_handle);
     }
 
+    /// Returns the scope of the currently running Lua coroutine.
+    pub fn currentScope(self: *Vm, state: *c.State) !task.ScopeHandle {
+        const slot = try self.activeSlot(self.running orelse return error.LuaTaskNotRunning);
+        if (slot.thread != state) return error.WrongLuaTask;
+        return slot.scope;
+    }
+
     /// Registers externally-owned asynchronous work for the running Lua task.
     /// The caller must immediately yield from `state`; the scheduler then owns
     /// cancellation through `lifecycle`. This function never submits I/O.

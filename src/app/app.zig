@@ -14,9 +14,14 @@ pub const App = struct {
     scheduler: Scheduler,
     lua_vm: LuaVm,
     mcp_client: @import("../lua/root.zig").McpClient,
+    dbus: @import("../lua/root.zig").Dbus,
     turn: turn.Coordinator = .{},
 
     pub fn init(self: *App, allocator: std.mem.Allocator) !void {
+        return self.initWithEnvironment(allocator, .empty);
+    }
+
+    pub fn initWithEnvironment(self: *App, allocator: std.mem.Allocator, environ: std.process.Environ) !void {
         try self.loop.init(allocator, 32, 16);
         errdefer self.loop.deinit();
         try self.scheduler.init(allocator, 8, 16, 32);
@@ -24,10 +29,13 @@ pub const App = struct {
         try self.lua_vm.init(allocator, &self.scheduler, &self.loop);
         errdefer self.lua_vm.deinit();
         try self.mcp_client.init(allocator, &self.lua_vm, &self.loop, 16);
+        errdefer self.mcp_client.deinit();
+        try self.dbus.init(allocator, &self.lua_vm, &self.loop, environ);
         self.turn = .{};
     }
 
     pub fn deinit(self: *App) void {
+        self.dbus.deinit();
         self.mcp_client.deinit();
         self.lua_vm.deinit();
         self.scheduler.deinit();
@@ -76,11 +84,15 @@ pub const App = struct {
     fn dispatchCompletion(self: *App, completion: std.os.linux.io_uring_cqe) !void {
         switch (self.loop.dispatch(completion)) {
             .file, .signal_wakeup => return error.UnownedIoCompletion,
-            .socket => |socket| if (!(try self.mcp_client.dispatch(socket)))
+            .socket => |socket| if (!(try self.dbus.dispatch(socket)) and !(try self.mcp_client.dispatch(socket)))
                 return error.UnownedIoCompletion,
-            .operation_cancel => try self.mcp_client.collectCanceled(),
-            .timer_wakeup, .timer_control => while (try self.loop.takeExpired()) |timeout|
-                try self.lua_vm.markTimeoutCompleted(timeout.operation),
+            .operation_cancel => {
+                try self.dbus.collectCanceled();
+                try self.mcp_client.collectCanceled();
+            },
+            .timer_wakeup, .timer_control => while (try self.loop.takeExpired()) |timeout| {
+                if (!(try self.dbus.dispatchTimer(timeout.operation))) try self.lua_vm.markTimeoutCompleted(timeout.operation);
+            },
             .foreign => return error.ForeignCompletion,
             .stale => return error.StaleCompletion,
         }
@@ -124,6 +136,7 @@ pub const App = struct {
 
     fn flush(context: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(context));
+        try self.dbus.collectCanceled();
         _ = try self.loop.submit();
     }
 };

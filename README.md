@@ -470,6 +470,7 @@ and shared-memory/dma-buf presentation paths.
 - [Text shaping](docs/text.md)
 - [Rendering](docs/rendering.md)
 - [Runtime, tasks, Lua, and io_uring](docs/runtime.md)
+- [Generic D-Bus client](docs/dbus.md)
 - [Application model](docs/application-model.md)
 - [Transactional source reload](docs/hot-reload.md)
 

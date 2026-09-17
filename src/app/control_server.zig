@@ -496,7 +496,7 @@ pub const ControlServer = struct {
                         client.transmit = null;
                     }
                 },
-                .accept, .connect => return error.UnexpectedSocketCompletion,
+                .accept, .connect, .recvmsg, .sendmsg => return error.UnexpectedSocketCompletion,
             }
             // Parsing and Lua task creation happen only in serviceRequests.
             return true;

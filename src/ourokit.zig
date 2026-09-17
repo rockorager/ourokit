@@ -6,6 +6,7 @@ pub const text = @import("text/root.zig");
 pub const image = @import("image/root.zig");
 pub const xdg = @import("xdg/root.zig");
 pub const mcp = @import("mcp/root.zig");
+pub const dbus = @import("dbus/root.zig");
 pub const loop = @import("loop/root.zig");
 pub const fs = @import("fs/root.zig");
 pub const task = @import("task/root.zig");
@@ -25,6 +26,7 @@ test {
     _ = image;
     _ = xdg;
     _ = mcp;
+    _ = dbus;
     _ = loop;
     _ = fs;
     _ = task;

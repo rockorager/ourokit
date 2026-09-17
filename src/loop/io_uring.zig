@@ -19,6 +19,8 @@ const Operation = enum(u8) {
     send = 0xab,
     connect = 0xac,
     signal_poll = 0xad,
+    recvmsg = 0xae,
+    sendmsg = 0xaf,
 };
 
 pub const OperationKind = enum {
@@ -34,6 +36,8 @@ pub const SocketOperationKind = enum {
     recv,
     send,
     connect,
+    recvmsg,
+    sendmsg,
 };
 
 pub const OpenHow = extern struct {
@@ -385,6 +389,28 @@ pub const Loop = struct {
         return reserved.handle;
     }
 
+    /// `message`, its iovecs, buffers, and control storage must remain stable
+    /// until the terminal completion is dispatched.
+    pub fn prepareRecvMsg(self: *Loop, fd: linux.fd_t, message: *linux.msghdr) !OperationHandle {
+        const reserved = try self.reserve(.recvmsg);
+        _ = self.ring.recvmsg(encodeFile(.recvmsg, reserved.handle), fd, message, linux.MSG.CMSG_CLOEXEC) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        return reserved.handle;
+    }
+
+    /// `message`, its iovecs, buffers, and control storage must remain stable
+    /// until the terminal completion is dispatched.
+    pub fn prepareSendMsg(self: *Loop, fd: linux.fd_t, message: *const linux.msghdr_const) !OperationHandle {
+        const reserved = try self.reserve(.sendmsg);
+        _ = self.ring.sendmsg(encodeFile(.sendmsg, reserved.handle), fd, message, linux.MSG.NOSIGNAL) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        return reserved.handle;
+    }
+
     /// Copies a Unix address into stable operation storage before preparing
     /// the asynchronous connect. The caller may release its address value as
     /// soon as this function returns.
@@ -524,7 +550,7 @@ pub const Loop = struct {
                     .result = cqe.res,
                 } };
             },
-            .accept, .recv, .send, .connect => |operation| {
+            .accept, .recv, .send, .connect, .recvmsg, .sendmsg => |operation| {
                 const handle = decoded.handle orelse return .stale;
                 if (handle.slot >= self.slots.len) return .stale;
                 const slot = &self.slots[handle.slot];
@@ -538,6 +564,8 @@ pub const Loop = struct {
                         .recv => .recv,
                         .send => .send,
                         .connect => .connect,
+                        .recvmsg => .recvmsg,
+                        .sendmsg => .sendmsg,
                         else => unreachable,
                     },
                     .result = cqe.res,
@@ -651,6 +679,8 @@ fn decode(value: u64) ?Decoded {
         @intFromEnum(Operation.recv) => .recv,
         @intFromEnum(Operation.send) => .send,
         @intFromEnum(Operation.connect) => .connect,
+        @intFromEnum(Operation.recvmsg) => .recvmsg,
+        @intFromEnum(Operation.sendmsg) => .sendmsg,
         @intFromEnum(Operation.timer_alarm) => .timer_alarm,
         @intFromEnum(Operation.timer_update) => .timer_update,
         @intFromEnum(Operation.timer_remove) => .timer_remove,
@@ -659,7 +689,7 @@ fn decode(value: u64) ?Decoded {
     };
     const generation: u32 = @truncate(value >> 32);
     const handle = switch (operation) {
-        .openat2, .statx, .read, .write, .close, .operation_cancel, .accept, .recv, .send, .connect => OperationHandle{
+        .openat2, .statx, .read, .write, .close, .operation_cancel, .accept, .recv, .send, .connect, .recvmsg, .sendmsg => OperationHandle{
             .slot = @truncate((value >> 8) & 0x00ff_ffff),
             .generation = generation,
         },

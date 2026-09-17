@@ -21,6 +21,8 @@ pub const Config = struct {
     mcp_call_capacity: usize = 16,
     /// Borrowed for the generation/config lifetime; copied into each Lua VM.
     runtime_dir: ?[]const u8 = null,
+    /// Borrowed process environment; the D-Bus adapter copies bus addresses.
+    environ: std.process.Environ = .empty,
     /// Immutable process configuration; absent in deterministic/export hosts.
     applications: ?*const @import("../xdg/applications.zig").Config = null,
     defer_run: bool = false,
@@ -48,6 +50,7 @@ pub const SourceGeneration = struct {
     snapshot: bundle.SourceSnapshot,
     vm: lua.Vm,
     mcp_client: lua.McpClient,
+    dbus: lua.Dbus,
     stdio: lua.Stdio,
     applications: lua.Applications,
     signals: lua.Signals,
@@ -180,6 +183,7 @@ pub const SourceGeneration = struct {
         self.config = config;
         var vm_initialized = false;
         var mcp_client_initialized = false;
+        var dbus_initialized = false;
         var stdio_initialized = false;
         var applications_initialized = false;
         var signals_initialized = false;
@@ -201,6 +205,7 @@ pub const SourceGeneration = struct {
             if (self.images) |*images| images.deinit();
             if (applications_initialized) self.applications.deinit();
             if (stdio_initialized) self.stdio.deinit();
+            if (dbus_initialized) self.dbus.deinit();
             if (mcp_client_initialized) self.mcp_client.deinit();
             if (vm_initialized) self.vm.deinit();
             if (shell_workspaces_initialized) self.shell_workspaces.?.deinit();
@@ -247,6 +252,8 @@ pub const SourceGeneration = struct {
             return err;
         };
         mcp_client_initialized = true;
+        try self.dbus.init(allocator, &self.vm, loop, config.environ);
+        dbus_initialized = true;
         try self.stdio.init(allocator, &self.vm, loop, config.mcp_call_capacity);
         stdio_initialized = true;
         self.signals.initWithApi(
@@ -580,10 +587,19 @@ pub const SourceGeneration = struct {
     }
 
     pub fn dispatchSocket(self: *SourceGeneration, completion: io_loop.SocketCompletion) !bool {
+        if (try self.dbus.dispatch(completion)) return true;
         return self.mcp_client.dispatch(completion);
     }
 
+    pub fn dispatchTimer(self: *SourceGeneration, operation: io_loop.OperationHandle) !bool {
+        if (try self.dbus.dispatchTimer(operation)) return true;
+        if (!self.vm.ownsOperation(operation)) return false;
+        try self.vm.markTimeoutCompleted(operation);
+        return true;
+    }
+
     pub fn collectCanceledMcp(self: *SourceGeneration) !void {
+        try self.dbus.collectCanceled();
         try self.mcp_client.collectCanceled();
         try self.stdio.collectCanceled();
         try self.applications.collectCanceled();
@@ -767,6 +783,7 @@ pub const SourceGeneration = struct {
         if (self.images) |*images| images.deinit();
         self.applications.deinit();
         self.stdio.deinit();
+        self.dbus.deinit();
         self.mcp_client.deinit();
         self.vm.deinit();
         if (self.shell_workspaces) |*binding| binding.deinit();
@@ -1005,8 +1022,9 @@ test "headless source generation preserves action state when UI is activated lat
         if (generation.ui_task == null) break;
         _ = try loop.submit();
         switch (loop.dispatch(try loop.wait())) {
-            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
-                try generation.vm.markTimeoutCompleted(timeout.operation),
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
+                if (!(try generation.dispatchTimer(timeout.operation))) return error.UnownedSourceOperation;
+            },
             else => return error.UnexpectedCompletion,
         }
     }

@@ -22,6 +22,7 @@ pub const DiagnosticPhase = @import("diagnostic.zig").Phase;
 pub const recordDiagnosticError = @import("diagnostic.zig").recordError;
 pub const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 pub const McpClient = @import("mcp_client.zig").McpClient;
+pub const Dbus = @import("dbus.zig").Binding;
 pub const Stdio = @import("stdio.zig").Stdio;
 pub const ShellWorkspaces = @import("shell_workspaces.zig").Binding;
 pub const Applications = @import("applications.zig").Binding;
@@ -44,6 +45,8 @@ test {
     _ = @import("module_loader.zig");
     _ = @import("shell_workspaces.zig");
     _ = @import("mcp_client.zig");
+    _ = @import("dbus.zig");
+    _ = @import("dbus_values.zig");
     _ = @import("stdio.zig");
     _ = @import("storybook.zig");
     _ = @import("theme_integration_test.zig");

@@ -203,6 +203,7 @@ fn runSourceInternal(
         .subscription_capacity = options.subscription_capacity,
         .dependency_capacity = options.dependency_capacity,
         .runtime_dir = std.process.Environ.getPosix(init.minimal.environ, "XDG_RUNTIME_DIR"),
+        .environ = init.minimal.environ,
         .applications = &applications,
         .defer_run = true,
     };
@@ -838,6 +839,7 @@ fn runSourceInternal(
         const serial_before_flush = window_set.changeSerial();
         try host.flush();
         // MCP and Lua timers can enqueue I/O while Wayland is idle.
+        try source_reload.collectCanceledMcp();
         _ = try loop.submit();
         if (scheduler.hasPendingWork()) continue;
         const control_quiescent = if (control) |server| server.quiescent() else true;
@@ -949,6 +951,7 @@ fn runHeadless(
         } else if (idle_timer == null) {
             idle_timer = try loop.prepareTimeout(30 * std.time.ns_per_s);
         }
+        try reload.collectCanceledMcp();
         _ = try loop.submit();
         if (scheduler.hasPendingWork()) continue;
         if (try dispatchApplication(reload, loop, control, null, &idle_timer)) return false;
@@ -965,6 +968,7 @@ fn finishUiBootstrap(reload: *SourceReload, control: ?*ControlServer, loop: *io_
         }
         if (reload.active().vm.exit_code != null) return error.ApplicationExitedBeforeUi;
         if (reload.active().ui_task == null) return;
+        try reload.collectCanceledMcp();
         _ = try loop.submit();
         _ = try dispatchApplication(reload, loop, control, null, null);
     }
@@ -1023,6 +1027,8 @@ fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlSe
     if (reload.appearance) |client| try client.stop();
     reload.active().shutdownImages();
     if (reload.candidate) |candidate| candidate.shutdownImages();
+    reload.active().dbus.shutdown();
+    if (reload.candidate) |candidate| candidate.dbus.shutdown();
     try reload.active().vm.requestCancellation();
     if (reload.candidate) |candidate| try candidate.vm.requestCancellation();
     try reload.beginRetirement();
@@ -1067,6 +1073,7 @@ fn finishInitialBootstrap(
             };
         if (generation.application_ready or
             (generation.vm.exit_code != null and !generation.stdio.hasPendingOutput())) return;
+        try generation.collectCanceledMcp();
         _ = try loop.submit();
         switch (loop.dispatch(try loop.wait())) {
             .file => |completion| if (!(try generation.dispatchFile(completion)))
@@ -1074,8 +1081,9 @@ fn finishInitialBootstrap(
             .socket => |completion| if (!(try generation.dispatchSocket(completion)))
                 return error.UnownedIoCompletion,
             .operation_cancel => try generation.collectCanceledMcp(),
-            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
-                try generation.vm.markTimeoutCompleted(timeout.operation),
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
+                if (!(try generation.dispatchTimer(timeout.operation))) return error.UnownedIoCompletion;
+            },
             .signal_wakeup => {},
             else => return error.UnexpectedBootstrapCompletion,
         }
@@ -1084,6 +1092,7 @@ fn finishInitialBootstrap(
 
 fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Scheduler, loop: *io_loop.Loop) !void {
     generation.shutdownImages();
+    generation.dbus.shutdown();
     try generation.vm.requestCancellation();
     while (true) {
         try scheduler.applyQueuedCancellations();
@@ -1095,8 +1104,9 @@ fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Schedu
             .file => |completion| if (!(try generation.dispatchFile(completion))) return error.UnownedIoCompletion,
             .socket => |completion| if (!(try generation.dispatchSocket(completion))) return error.UnownedIoCompletion,
             .operation_cancel => try generation.collectCanceledMcp(),
-            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout|
-                try generation.vm.markTimeoutCompleted(timeout.operation),
+            .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timeout| {
+                if (!(try generation.dispatchTimer(timeout.operation))) return error.UnownedIoCompletion;
+            },
             .signal_wakeup => {},
             else => return error.UnexpectedBootstrapCompletion,
         }

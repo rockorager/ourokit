@@ -339,6 +339,7 @@ pub const SourceReload = struct {
             if (retiring.cancellation_started) continue;
             try retiring.generation.vm.requestCancellation();
             retiring.generation.shutdownImages();
+            retiring.generation.dbus.shutdown();
             retiring.cancellation_started = true;
         }
     }
@@ -450,13 +451,10 @@ pub const SourceReload = struct {
         operation: io_loop.OperationHandle,
     ) !void {
         if (self.appearance) |client| if (try client.dispatchTimer(operation)) return;
-        if (self.candidate) |candidate| if (candidate.vm.ownsOperation(operation))
-            return candidate.vm.markTimeoutCompleted(operation);
-        if (self.active_generation.vm.ownsOperation(operation))
-            return self.active_generation.vm.markTimeoutCompleted(operation);
+        if (self.candidate) |candidate| if (try candidate.dispatchTimer(operation)) return;
+        if (try self.active_generation.dispatchTimer(operation)) return;
         for (self.retiring_generations) |entry| if (entry) |retiring|
-            if (retiring.generation.vm.ownsOperation(operation))
-                return retiring.generation.vm.markTimeoutCompleted(operation);
+            if (try retiring.generation.dispatchTimer(operation)) return;
         return error.UnownedSourceOperation;
     }
 
@@ -469,6 +467,7 @@ pub const SourceReload = struct {
             if (!retiring.native_state_detached or
                 retiring.generation.vm.activeTaskCount() != 0) continue;
             if (!retiring.generation.imagesQuiescent()) continue;
+            if (!retiring.generation.dbus.canDeinit()) continue;
             if (self.services) |services|
                 if (services.callbacks.countForVm(&retiring.generation.vm) != 0) continue;
             retiring.generation.destroy();
@@ -795,6 +794,69 @@ test "rejected candidate retains ownership while a waiting sleep is canceled" {
     try std.testing.expectEqual(@as(usize, 0), rejected.vm.activeTaskCount());
     try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
     try std.testing.expect(reload.active() == initial);
+}
+
+test "D-Bus retirement closes idle generation connections without canceling retained scopes" {
+    if (std.testing.environ.getPosix("OURO_DBUS_INTEGRATION") == null) return error.SkipZigTest;
+    var provider = try bundle.SourceProvider.initEmbedded(std.testing.allocator, "app.lua", initial_source);
+    defer provider.deinit();
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 32, 16);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 16, 4, 16);
+    defer scheduler.deinit();
+    const config: source_generation.Config = .{ .node_capacity = 8, .environ = std.testing.environ };
+    const initial = try SourceGeneration.create(std.testing.allocator, &scheduler, &loop, try provider.snapshot(std.testing.io, std.testing.allocator), null, config, null);
+    var reload: SourceReload = undefined;
+    reload.init(std.testing.allocator, std.testing.io, &provider, &scheduler, &loop, null, config, initial);
+    defer reload.deinit();
+    try reload.prepare();
+    const rejected = reload.candidate.?;
+    const connect_source = "bus = assert(require('ouro').dbus.connect('session')); connected = true";
+    _ = try initial.vm.spawnApplication(connect_source);
+    _ = try rejected.vm.spawnApplication(connect_source);
+    try pumpDbusReloadTest(&reload, null);
+    try std.testing.expect(initial.vm.globalBoolean("connected"));
+    try std.testing.expect(rejected.vm.globalBoolean("connected"));
+    try std.testing.expectEqual(@as(usize, 0), rejected.vm.activeTaskCount());
+    try std.testing.expect(!rejected.dbus.canDeinit());
+
+    reload.discard();
+    try reload.beginRetirement();
+    try pumpDbusReloadTest(&reload, rejected);
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+    try std.testing.expect(reload.active() == initial);
+    _ = try initial.vm.spawnApplication(
+        \\local reply = assert(bus:call {destination='org.freedesktop.DBus', path='/org/freedesktop/DBus', interface='org.freedesktop.DBus', member='ListNames', signature='', args={}})
+        \\assert(reply.signature == 'as' and #reply.args[1] >= 2)
+        \\survived = true
+    );
+    try pumpDbusReloadTest(&reload, null);
+    try std.testing.expect(initial.vm.globalBoolean("survived"));
+    initial.dbus.shutdown();
+    try pumpDbusReloadTest(&reload, initial);
+}
+
+fn pumpDbusReloadTest(reload: *SourceReload, draining: ?*SourceGeneration) !void {
+    while (true) {
+        try reload.scheduler.applyQueuedCancellations();
+        while (reload.scheduler.takeRunnable()) |handle| try reload.resumeRunnable(handle);
+        try reload.collectCanceledMcp();
+        _ = try reload.loop.submit();
+        const candidate_tasks = if (reload.candidate) |candidate| candidate.vm.activeTaskCount() else 0;
+        if (reload.active().vm.activeTaskCount() == 0 and candidate_tasks == 0 and
+            (if (draining) |generation| generation.dbus.canDeinit() else true) and
+            !reload.loop.hasPendingTimerKernelWork()) return;
+        switch (reload.loop.dispatch(try reload.loop.wait())) {
+            .socket => |completion| try reload.markSocketCompleted(completion),
+            .operation_cancel => {},
+            .timer_wakeup, .timer_control => while (try reload.loop.takeExpired()) |timeout| {
+                try reload.markTimeoutCompleted(timeout.operation);
+            },
+            else => return error.UnexpectedCompletion,
+        }
+    }
 }
 
 test "disk reload keeps active generation while candidate requires modules" {
