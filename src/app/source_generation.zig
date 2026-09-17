@@ -510,16 +510,28 @@ pub const SourceGeneration = struct {
         scheduler_handle: task.TaskHandle,
         diagnostic: ?*?lua.Diagnostic,
     ) !lua.ResumeResult {
+        const is_bootstrap = if (self.bootstrap) |bootstrap|
+            std.meta.eql(try self.vm.schedulerHandle(bootstrap.task_handle), scheduler_handle)
+        else
+            false;
         const is_ui = if (self.ui_task) |handle|
             std.meta.eql(try self.vm.schedulerHandle(handle), scheduler_handle)
         else
             false;
         const result = self.vm.resumeRunnable(scheduler_handle) catch |err| {
+            if (is_bootstrap) {
+                self.bootstrap.?.deinit();
+                self.bootstrap = null;
+            }
             if (is_ui) self.ui_task = null;
             return err;
         };
+        if (result == .canceled and is_bootstrap) {
+            self.bootstrap.?.deinit();
+            self.bootstrap = null;
+        }
         if (result == .canceled and is_ui) self.ui_task = null;
-        if (result == .completed and self.bootstrap != null)
+        if (result == .completed and is_bootstrap)
             try self.finishBootstrap(diagnostic);
         if (result == .completed and is_ui) {
             const handle = self.ui_task.?;
@@ -701,6 +713,10 @@ pub const SourceGeneration = struct {
     }
 
     fn finishBootstrap(self: *SourceGeneration, diagnostic: ?*?lua.Diagnostic) !void {
+        errdefer if (self.bootstrap) |*bootstrap| {
+            bootstrap.deinit();
+            self.bootstrap = null;
+        };
         const application_optional = self.bootstrap.?.advance("default") catch |err| {
             lua.recordDiagnosticError(
                 diagnostic,
@@ -916,6 +932,7 @@ test "source generation bootstrap retains async module closure before becoming r
         \\  id = "dev.ouro.async-generation",
         \\  actions = {},
         \\  run = function(context)
+        \\    ouro.spawn(function() child_completed = true end)
         \\    local title = require("title")
         \\    return { windows = {
         \\      ouro.window {
@@ -991,11 +1008,38 @@ test "source generation bootstrap retains async module closure before becoming r
         generation.application.windows[0].declaration.toplevel.title,
     );
     try std.testing.expect(generation.application.hasActions());
+    try std.testing.expect(generation.vm.globalBoolean("child_completed"));
     _ = try generation.vm.spawnApplication("require('late')");
     try std.testing.expectError(
         error.LuaRuntimeError,
         generation.vm.resumeRunnable(scheduler.takeRunnable().?),
     );
+}
+
+test "source generation drains sibling tasks after bootstrap cancellation or failure" {
+    const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    for ([_]?anyerror{ null, error.LuaRuntimeError, error.ApplicationDeclarationRequired }) |failure| {
+        const source = if (failure != null and failure.? == error.ApplicationDeclarationRequired) "return 42" else "error('bootstrap failed')";
+        const snapshot = try bundle.SourceSnapshot.initApplication(allocator, "cancel.lua", source, "dev.ouro.cancel");
+        var loop: io_loop.Loop = undefined;
+        try loop.init(allocator, 32, 16);
+        defer loop.deinit();
+        var scheduler: task.Scheduler = undefined;
+        try scheduler.init(allocator, 8, 4, 8);
+        defer scheduler.deinit();
+        const generation = try SourceGeneration.createBootstrap(allocator, &scheduler, &loop, snapshot, temporary.dir.handle, null, .{ .node_capacity = 8 }, null);
+        defer generation.destroy();
+        _ = try generation.vm.spawnApplication("sibling_ran = true");
+        if (failure) |err| try std.testing.expectError(err, generation.resumeRunnable(scheduler.takeRunnable().?, null));
+        try generation.vm.requestCancellation();
+        try scheduler.applyQueuedCancellations();
+        while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+        try std.testing.expect(generation.bootstrap == null);
+        try std.testing.expectEqual(@as(usize, 0), generation.vm.activeTaskCount());
+        try std.testing.expect(!generation.vm.globalBoolean("sibling_ran"));
+    }
 }
 
 test "headless source generation preserves action state when UI is activated later" {

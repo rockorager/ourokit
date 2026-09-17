@@ -1,6 +1,7 @@
-# D-Bus client
+# D-Bus
 
-`ouro.dbus` is a generic Linux D-Bus client. It uses ourokit's shared `io_uring`
+`ouro.dbus` supports Linux D-Bus clients and services on the same connection.
+It uses ourokit's shared `io_uring`
 loop, with no libdbus, GIO, subprocess bridge, or new package dependency. The
 wire codec derives from [Monstar](https://github.com/rockorager/monstar); its MIT
 license is retained in `src/dbus/LICENSE`.
@@ -80,6 +81,88 @@ Each stream has one consumer: a second simultaneous `next` returns an error.
 `next` waits indefinitely when its queue is empty. `stream:close()` unregisters
 the match and wakes its waiter; `bus:close()` closes all its streams and calls.
 
+## Export a service
+
+A service connects to the existing bus, exports interfaces, and acquires a
+well-known name. It does not create a bus daemon or listen on another socket.
+Register exports before acquiring the name so callers cannot race registration.
+
+```lua
+local service <close> = assert(bus:export {
+  path = "/dev/ourokit/Example",
+  interface = "dev.ourokit.Example",
+  methods = {
+    Echo = {
+      input = "s", output = "s",
+      handler = function(request)
+        ouro.sleep(10) -- Handlers may yield, including calling another service.
+        return {request.args[1] .. "!"}
+      end,
+    },
+  },
+  signals = { Changed = "us" }, -- Optional introspection declarations.
+})
+local name <close> = assert(bus:own_name("dev.ourokit.Example"))
+-- Keep this scope alive while serving, or retain handles in application state.
+```
+
+`export` returns immediately with a closeable handle. Each declaration requires
+an explicit `input` signature, `output` signature, and `handler` function.
+Declarations are copied: editing the original tables does not change an export.
+Multiple interfaces can share a path, but duplicate path/interface pairs fail.
+`org.freedesktop.DBus.Introspectable.Introspect` is supplied automatically at
+exported paths, using the method and optional signal declarations.
+
+A handler receives the same message table shape as a signal, including `sender`
+and positional `args`. It returns a positional argument table matching `output`;
+use `{}` for an empty reply. Return `nil, {name="dev.example.Error", message="..."}`
+for an application error. Exceptions, invalid results, and invalid error tables
+produce `org.freedesktop.DBus.Error.Failed`; exception text is not sent to peers.
+Wrong input signatures produce `InvalidArgs` without invoking the handler.
+Missing objects/methods produce `UnknownObject`/`UnknownMethod`. Calls omitting
+an interface are accepted only when the method resolves unambiguously.
+
+Handlers run concurrently in child tasks, so replies may finish out of order.
+The binding directs each reply to the original sender and call serial, at most
+once. Calls with `NO_REPLY_EXPECTED` still invoke the handler but send no reply
+or error. A caller timing out does not cancel work already running in the service.
+
+`own_name` waits up to two seconds for `RequestName`, with `DO_NOT_QUEUE` and
+without replacement. If another connection owns the name it returns
+`nil, error_table` with `name = "NameUnavailable"`. Name handles and exports
+belong to their creating scope and keep the connection reachable. Closing a
+name schedules `ReleaseName`; closing an export unregisters its methods, cancels
+its dispatcher and handler scope, and fails outstanding requests while the
+connection remains usable. Closing the bus or retiring its source generation
+closes both. Canceling name acquisition schedules release even if acquisition
+was already sent. Do not mix raw `RequestName`/`ReleaseName` calls with managed
+ownership of the same name.
+
+An active dispatcher retains its export handle, so use `<close>`, explicit
+`:close()`, or scope cancellation rather than relying on GC to stop a service.
+Handler-created tasks and resources share the export's child scope. They can
+outlive a single method call, but are canceled when the export closes.
+
+Emit signals from an ouro task using explicit wire types:
+
+```lua
+assert(bus:emit {
+  path = "/dev/ourokit/Example", interface = "dev.ourokit.Example",
+  member = "Changed", signature = "us", args = {42, "updated"},
+})
+```
+
+`emit` returns `true` once the signal is queued, or `nil, error_table`.
+An optional `destination` sends a directed signal instead of a broadcast.
+Emission does not require an export; signal declarations describe introspection
+and do not constrain `emit`. There is no delivery acknowledgment.
+
+[`examples/dbus_notifications.lua`](../examples/dbus_notifications.lua) implements
+the four notification methods, IDs, replacement, expiration, and
+`NotificationClosed`. It prints notifications instead of rendering windows;
+it does not advertise actions, icons, or markup support. Test on a private bus
+before using it in a desktop session with an existing notification daemon.
+
 ## Values follow the supplied signature
 
 | D-Bus type | Lua representation |
@@ -148,7 +231,13 @@ There is no automatic reconnect.
 
 ## Bounds and current scope
 
-Per Lua generation: 8 connections, 64 subscriptions, and 128 outstanding waits.
+Per Lua generation: 8 connections, 64 subscriptions/exports combined, 64 owned
+names, and 128 outstanding waits. Each export uses one child scope and an idle
+dispatcher wait. An export accepts at most 128 methods and 128 signal declarations.
+There are at most 128 pending incoming calls per generation, and at most 64
+calls or 1 MiB of wire data per export, including queued and running requests.
+Excess calls receive `LimitsExceeded`. If the transmit queue cannot accept an
+automatic reply/error, the connection closes rather than dropping replies.
 Each signal queue holds at most 64 messages or 1 MiB; overflow closes that
 stream rather than silently dropping events. Each native transmit queue holds
 at most 256 messages or 4 MiB. Incoming messages are limited to 16 MiB and
@@ -157,10 +246,9 @@ Lua encoding/decoding allows at most 4096 values and 32 nesting levels; a
 binary string counts as one value. These are implementation limits, not
 configurable API knobs.
 
-This is a client, not an object server: no exported Lua methods, signal
-emission API, automatic proxies, introspection cache, TCP transport, or
-cookie authentication. It can call introspection and property methods like
-any other D-Bus method using explicit signatures.
+There are no automatic proxies, introspection cache, automatic Properties or
+ObjectManager implementation, TCP transport, or cookie authentication.
+Properties and other interfaces can be called or exported with explicit methods.
 
 ## Native embedding and tests
 
@@ -179,6 +267,7 @@ The example needs no compositor:
 ```sh
 zig build -Dvulkan=false
 dbus-run-session -- zig-out/bin/ouroctl run examples/dbus.lua
+dbus-run-session -- zig-out/bin/ouroctl run examples/dbus_notifications.lua
 dbus-run-session -- env OURO_DBUS_INTEGRATION=1 zig build test -Dvulkan=false
 ```
 
