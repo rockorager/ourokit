@@ -25,6 +25,14 @@ typedef struct ouro_call ouro_call;
 typedef struct ouro_api_v1 ouro_api_v1;
 typedef uint64_t ouro_signal;
 
+/* Logical-pixel coordinates, straight-alpha RGBA8 desktop colors (gamma 2.2).
+   Rectangles paint in array order using source-over blending. */
+typedef struct ouro_rectangle {
+    float x, y, width, height;
+    uint8_t r, g, b, a;
+    float corner_radius;
+} ouro_rectangle;
+
 /* Only the field selected by type is used. Strings are length-delimited. */
 typedef struct ouro_value {
     uint32_t type;
@@ -61,6 +69,15 @@ struct ouro_api_v1 {
     int32_t (*signal_create)(ouro_context *, ouro_signal *out);
     int32_t (*signal_read)(ouro_context *, ouro_signal);
     int32_t (*signal_publish)(ouro_context *, ouro_signal);
+
+    /* Copies at most 4096 rectangles into an immutable host-owned Lua drawing.
+       Replaces the call result; use ouro.canvas { key=..., drawing=result }.
+       Width/height are the preferred logical size. Layout may constrain it;
+       painting is clipped to the canvas, never stretched. All coordinates must
+       be finite; dimensions/radii must be nonnegative. No plugin pointers are
+       retained. On error the previous result is unchanged. */
+    int32_t (*set_drawing_result)(ouro_call *, float width, float height,
+                                  const ouro_rectangle *, size_t count);
 };
 
 typedef struct ouro_plugin_descriptor {

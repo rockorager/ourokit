@@ -4,6 +4,8 @@ const c = @import("../lua/c.zig");
 const Vm = @import("../lua/vm.zig").Vm;
 const Signals = @import("../lua/signals.zig").Signals;
 const Handle = @import("../core/handle.zig").Handle;
+const drawing = @import("../ui/render_object/drawing.zig");
+const lua_drawing = @import("../lua/drawing.zig");
 
 pub const Module = struct {
     name: []const u8,
@@ -52,9 +54,11 @@ const Call = struct {
     failed: bool = false,
     result: abi.ouro_value = std.mem.zeroes(abi.ouro_value),
     result_bytes: ?[]u8 = null,
+    result_drawing: ?*drawing.Drawing = null,
     message: ?[]u8 = null,
 
     fn deinit(self: *Call) void {
+        if (self.result_drawing) |value| value.release();
         if (self.result_bytes) |bytes| self.context.allocator.free(bytes);
         if (self.message) |bytes| self.context.allocator.free(bytes);
     }
@@ -174,6 +178,10 @@ fn pushResult(state: *c.State) callconv(.c) c_int {
         _ = c.lua_pushlstring(state, message.ptr, message.len);
         return c.lua_error(state);
     }
+    if (call.result_drawing) |value| {
+        lua_drawing.push(state, value);
+        return 1;
+    }
     switch (call.result.type) {
         abi.OURO_NIL => c.lua_pushnil(state),
         abi.OURO_BOOLEAN => c.lua_pushboolean(state, @intFromBool(call.result.integer != 0)),
@@ -256,8 +264,33 @@ fn setResult(raw: ?*abi.ouro_call, input: [*c]const abi.ouro_value) callconv(.c)
         break :blk call.context.allocator.dupe(u8, if (value.length == 0) "" else value.bytes[0..value.length]) catch return abi.OURO_ERROR;
     } else null;
     if (call.result_bytes) |previous| call.context.allocator.free(previous);
+    if (call.result_drawing) |previous| previous.release();
+    call.result_drawing = null;
     call.result_bytes = bytes;
     call.result = value.*;
+    return abi.OURO_OK;
+}
+
+fn setDrawingResult(raw: ?*abi.ouro_call, width: f32, height: f32, input: [*c]const abi.ouro_rectangle, count: usize) callconv(.c) i32 {
+    const call = getCall(raw) orelse return abi.OURO_ERROR;
+    if (count > drawing.Drawing.max_rectangles or (input == null and count != 0)) return abi.OURO_ERROR;
+    const allocator = call.context.allocator;
+    const rectangles = allocator.alloc(drawing.Rectangle, count) catch return abi.OURO_ERROR;
+    defer allocator.free(rectangles);
+    for (rectangles, 0..) |*rectangle, index| {
+        const value = input[index];
+        rectangle.* = .{
+            .bounds = .{ .x = value.x, .y = value.y, .width = value.width, .height = value.height },
+            .color = .{ .r = value.r, .g = value.g, .b = value.b, .a = value.a },
+            .corner_radius = value.corner_radius,
+        };
+    }
+    const value = drawing.Drawing.create(allocator, .{ .width = width, .height = height }, rectangles) catch return abi.OURO_ERROR;
+    if (call.result_drawing) |previous| previous.release();
+    if (call.result_bytes) |previous| allocator.free(previous);
+    call.result_bytes = null;
+    call.result_drawing = value;
+    call.result = std.mem.zeroes(abi.ouro_value);
     return abi.OURO_OK;
 }
 
@@ -327,4 +360,5 @@ const api: abi.ouro_api_v1 = .{
     .signal_create = signalCreate,
     .signal_read = signalRead,
     .signal_publish = signalPublish,
+    .set_drawing_result = setDrawingResult,
 };

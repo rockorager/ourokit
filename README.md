@@ -99,12 +99,14 @@ The normal library build does not embed either font.
 The default runner supports experimental C-ABI plugins declared in an
 application manifest's `native_modules` list. C and Zig shared libraries can
 register Lua-facing functions and native state backed by existing Ourokit
-signals, without linking Lua or writing a custom launcher. Run
+signals, without linking Lua or writing a custom launcher. Native functions can
+return immutable rectangle drawings for `ouro.canvas`; the example surrounds a
+C-painted meter with ordinary widgets. Run
 `zig build build-native-example`, then
 `zig-out/bin/ouroctl run zig-out/examples/native/ouro.json` after building the
 runner. See [the native plugin API](docs/native-plugins.md) for ownership,
-reload, and trust rules. Custom rendering/widgets and asynchronous native
-operations are subsequent stages, not capabilities of this initial ABI.
+reload, and trust rules. Direct native widget hooks, external CPU/GPU buffers,
+and asynchronous native operations remain subsequent stages.
 
 ## Native UI embedding
 

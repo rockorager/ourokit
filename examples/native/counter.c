@@ -32,6 +32,20 @@ static int32_t set(void *user, const ouro_api_v1 *api,
     return api->set_result(call, &value);
 }
 
+static int32_t paint(void *user, const ouro_api_v1 *api,
+                     ouro_context *context, ouro_call *call) {
+    counter *self = user;
+    if (api->signal_read(context, self->changed) != OURO_OK) return OURO_ERROR;
+    ouro_rectangle rectangles[] = {
+        { .width = 300, .height = 32, .r = 40, .g = 44, .b = 52, .a = 255, .corner_radius = 6 },
+        { .x = 4, .y = 4, .width = (float)self->value * 2.92f, .height = 24,
+          .r = 61, .g = 190, .b = 160, .a = 255, .corner_radius = 3 },
+        { .x = 149, .y = 0, .width = 2, .height = 32, .r = 240, .g = 240, .b = 240, .a = 160 },
+    };
+    return api->set_drawing_result(call, 300, 32, rectangles,
+                                    sizeof(rectangles) / sizeof(rectangles[0]));
+}
+
 static int32_t initialize(const ouro_api_v1 *api, ouro_context *context) {
     if (api->abi_version != OURO_ABI_VERSION || api->struct_size < sizeof(*api))
         return OURO_ERROR;
@@ -43,6 +57,8 @@ static int32_t initialize(const ouro_api_v1 *api, ouro_context *context) {
     }
     if (api->signal_create(context, &self->changed) != OURO_OK) return OURO_ERROR;
     if (api->register_function(context, "get", 3, OURO_FUNCTION_READ_ONLY, get, self) != OURO_OK)
+        return OURO_ERROR;
+    if (api->register_function(context, "paint", 5, OURO_FUNCTION_READ_ONLY, paint, self) != OURO_OK)
         return OURO_ERROR;
     return api->register_function(context, "set", 3, 0, set, self);
 }

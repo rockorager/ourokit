@@ -5,12 +5,11 @@ libraries. Plugins register synchronous Lua-facing functions and native-backed
 dependencies in Ourokit's existing signal graph. Both C and Zig plugins use
 `include/ourokit/plugin.h`; neither links Lua nor imports Ourokit's Zig internals.
 
-This is the first implementation stage, not the complete native-component SDK.
-Custom layout/paint/input/semantics hooks, CPU-frame submission, DMA-BUF import,
-Wayland subsurfaces, and scoped asynchronous plugin operations are **not yet
-implemented**. There are no placeholder capability flags claiming support for
-them. Application authors can currently combine native-backed functions/state
-with existing Lua components and widgets.
+Native functions can also return immutable drawings for `ouro.canvas`, composing
+custom-painted content with existing Lua components and widgets. This is not yet
+the complete native-component SDK: custom measurement/input/semantics hooks,
+text/path drawing commands, CPU-frame submission, DMA-BUF import, Wayland
+subsurfaces, and scoped asynchronous plugin operations are **not yet implemented**.
 
 ## Run the examples
 
@@ -23,10 +22,11 @@ zig-out/bin/ouroctl run zig-out/examples/native/ouro.json
 ```
 
 Add `-Dvulkan=false` to both build commands and `--software` to the run command
-for a software-only build. The counter example renders normal Ourokit widgets,
-but its value lives in `counter.c`. Pressing Add 7 calls C, publishes a native
-dependency, and rebuilds the subscribed Lua content. `echo.zig` demonstrates
-scalar/string argument and result exchange through the same header.
+for a software-only build. The counter example renders normal Ourokit widgets
+around a meter painted by `counter.c`, which also owns its value. Pressing Add 7
+calls C, publishes a native dependency, and rebuilds the subscribed Lua content
+and drawing. `echo.zig` demonstrates scalar/string argument and result exchange
+through the same header.
 
 Run the dynamic-library integration suite with `zig build test-native-plugins`.
 It is also part of `zig build test`.
@@ -120,6 +120,52 @@ destroyed. Lua reload does not reload native code or reread the module list.
 Restart the application after changing libraries or native manifest entries;
 replace built library files atomically rather than overwriting a mapped file.
 
+## Custom-painted widgets
+
+A read-only native function can call `set_drawing_result(call, width, height,
+rectangles, count)` instead of `set_result`. The host copies up to 4096
+`ouro_rectangle` values immediately and returns an opaque Lua drawing. It owns
+no plugin pointers or callbacks. Stack-allocated rectangles are safe; check the
+status before returning `OURO_OK`. A failed setter preserves the previous result.
+Successful result setters replace the previous result, including its resources.
+
+```lua
+local ouro, counter = require("ouro"), require("example.counter")
+local Meter = ouro.component(function()
+  return function(props)
+    return ouro.canvas {
+      key = "paint",
+      drawing = counter.paint(),
+      alt = props.label,
+    }
+  end
+end)
+-- Place Meter { key = "level", label = "Output level" } beside ordinary widgets.
+```
+
+Rectangles use logical pixels, straight-alpha RGBA8 desktop colors (gamma 2.2),
+optional corner radii, and source-over blending in array order. Width and height
+set the canvas's preferred size. Parent constraints can shrink or enlarge its
+layout box, but do not stretch the recording: coordinates remain logical pixels.
+Ourokit translates to the canvas origin, applies display scaling, and clips to
+the allocated bounds and ancestor clips. Siblings and stack overlays compose
+normally. `alt` supplies an image-role accessibility label. Canvases are leaves;
+they have no children, focus policy, or input handlers of their own.
+
+Call `signal_read` while producing the drawing to subscribe the current
+component. Publishing that signal schedules a rebuild and a new immutable
+snapshot. Painting does not invoke plugin code, run Lua, or read signals. A
+same-size replacement dirties paint without invalidating layout. To reuse an
+unchanging recording, store the returned drawing in Lua rather than rebuilding
+it on every call.
+
+Lua values, prepared builds, and retained render objects hold independent leases.
+Failed builds release their staged leases without replacing committed drawings.
+Scenes contain only copied commands, so render workers and in-flight frames do
+not depend on Lua, plugin state, or library lifetime. The host's normal scene
+capacity and coordinate limits still apply. This is a command-recording path,
+not a GPU callback, a pixel buffer, or an external Wayland surface.
+
 ## Linked hosts
 
 The registration boundary does not depend on dynamic loading. A Zig host can
@@ -131,12 +177,12 @@ registration and lifecycle; it is not a separate C application-host API.
 
 ## Subsequent rendering and scheduling work
 
-Native components need retained instances, declarative property updates,
-constraint-based measurement, focus/input routing, semantics, and paint hooks.
-Custom-painted widgets should emit scene commands; externally rendered content
-should submit frames through explicit readiness/release ownership. CPU images,
-DMA-BUF imports, and subsurface presentation have different capabilities and
-must be exercised before their interfaces become supported ABI.
+Native components still need direct retained instances, declarative property
+updates, constraint-based measurement, focus/input routing, and richer semantics.
+The current custom-paint path emits scene commands; externally rendered content
+will need to submit frames through explicit readiness/release ownership. CPU
+images, DMA-BUF imports, and subsurface presentation have different capabilities
+and must be exercised before their interfaces become supported ABI.
 
 Similarly, native async operations need scoped cancellation and a completion
 handoff to the owning loop. Those interfaces should share this registration

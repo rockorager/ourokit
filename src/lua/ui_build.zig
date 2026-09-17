@@ -106,6 +106,7 @@ pub const UiBuild = struct {
     images: ?*image_service.Service = null,
     image_scale: f32 = 1,
     images_staged: bool = false,
+    drawings_staged: bool = false,
     theme_stack: [32]theming.Theme = undefined,
     theme_count: usize = 0,
     parent_stack: [32]BuildParent = undefined,
@@ -506,6 +507,8 @@ pub const UiBuild = struct {
         prepared.images = if (self.images) |images| images.cache else null;
         prepared.owns_images = self.images_staged;
         self.images_staged = false;
+        prepared.owns_drawings = self.drawings_staged;
+        self.drawings_staged = false;
     }
 
     pub fn clearHandlers(self: *UiBuild, bindings: *PointerBindings) void {
@@ -625,6 +628,7 @@ pub const UiBuild = struct {
         const emit: c.CFunction = switch (description.kind) {
             .text => emitText,
             .image => emitImage,
+            .canvas => emitCanvas,
             .icon => emitIcon,
             .button => emitButton,
             .text_input => emitTextInput,
@@ -830,6 +834,33 @@ pub const UiBuild = struct {
 
     fn emitImage(state: *c.State) callconv(.c) c_int {
         return emitImageKind(state, false);
+    }
+
+    fn emitCanvas(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const parent = self.currentParent() orelse return luaError(state, "canvas requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "canvas key is required");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
+        _ = c.lua_getfield(state, 1, "drawing");
+        const drawing = @import("drawing.zig").get(state, -1) orelse return luaError(state, "canvas drawing must be a native drawing");
+        const id = semanticId(key, 0x63616e766173 ^ parent.id ^ self.component_namespace);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .canvas = drawing },
+            .parent_data = parent_data,
+        }) catch return luaError(state, "cannot append canvas descriptor");
+        drawing.retain();
+        self.drawings_staged = true;
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .image,
+            .key = key,
+            .label = tableString(state, 1, "alt") orelse "",
+        }) catch return luaError(state, "cannot append canvas semantics");
+        return 0;
     }
 
     fn emitIcon(state: *c.State) callconv(.c) c_int {
@@ -1576,6 +1607,11 @@ pub const UiBuild = struct {
     }
 
     fn discardSources(self: *UiBuild) void {
+        if (self.drawings_staged) for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
+            .canvas => |value| value.release(),
+            else => {},
+        };
+        self.drawings_staged = false;
         if (self.images_staged) for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
             .image => |value| if (value.image) |handle| self.images.?.cache.release(handle) catch unreachable,
             else => {},

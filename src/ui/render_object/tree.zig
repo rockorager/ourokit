@@ -480,6 +480,7 @@ pub const Tree = struct {
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
             .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
             .image => |value| try self.layoutImage(value, constraints),
+            .canvas => |value| constraints.constrain(value.size),
             .text => try self.layoutText(handle, object.text, constraints),
             .text_input => try self.layoutTextInput(handle, object.text_input, constraints),
         };
@@ -544,6 +545,10 @@ pub const Tree = struct {
             .scroll => true,
             .image => |value| paint: {
                 if (value.image) |image| try builder.image(image, bounds, value.fit);
+                break :paint false;
+            },
+            .canvas => |value| paint: {
+                try value.paint(builder, bounds);
                 break :paint false;
             },
             .text => |value| paint: {
@@ -828,6 +833,7 @@ pub const Tree = struct {
 
     fn retainObject(self: *Tree, object: types.Object) !void {
         switch (object) {
+            .canvas => |value| value.retain(),
             .image => |value| if (value.image) |image| {
                 const cache = self.images orelse return error.ImageResourcesRequired;
                 try cache.retain(image);
@@ -848,6 +854,7 @@ pub const Tree = struct {
 
     fn releaseObject(self: *Tree, object: types.Object) void {
         switch (object) {
+            .canvas => |value| value.release(),
             .image => |value| if (value.image) |image| self.images.?.release(image) catch unreachable,
             .text => |value| self.paragraph_sources.?.release(value.source) catch unreachable,
             .text_input => |input| {
@@ -875,6 +882,7 @@ fn validateObject(object: types.Object) !void {
         .stack => {},
         .scroll => {},
         .image => |value| try image_impl.validate(value),
+        .canvas => {}, // Drawing.create validates the immutable snapshot.
         .text => |value| {
             if (value.max_lines == 0) return error.InvalidMaxLines;
             if (value.overflow == .ellipsis and value.max_lines == null)
@@ -907,6 +915,7 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
         },
         .scroll => if (data != .none) return error.InvalidParentData,
         .image => return error.ImageHasChildren,
+        .canvas => return error.CanvasHasChildren,
         .text => return error.TextHasChildren,
         .text_input => return error.TextInputHasChildren,
     }
@@ -928,6 +937,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .image => |old_image| !std.meta.eql(old_image.image, new.image.image) or
             old_image.width != new.image.width or old_image.height != new.image.height or
             old_image.fill_width != new.image.fill_width or old_image.fill_height != new.image.fill_height,
+        .canvas => |old_drawing| !std.meta.eql(old_drawing.size, new.canvas.size),
         .text => |old_text| !sameSource(old_text.source, new.text.source) or
             old_text.alignment != new.text.alignment or
             old_text.max_lines != new.text.max_lines or

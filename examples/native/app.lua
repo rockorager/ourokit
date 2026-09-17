@@ -7,7 +7,7 @@ return ouro.app {
   run = function()
     return { windows = {
       ouro.window {
-        id = "main", title = "Native C counter", width = 420, height = 220,
+        id = "main", title = "Native C counter", width = 420, height = 280,
         content = function()
           local value = counter.get()
           return ouro.box {
@@ -15,6 +15,7 @@ return ouro.app {
             ouro.column {
               key = "content", gap = 16,
               ouro.text { key = "value", text = "Native value: " .. value, size = 24 },
+              ouro.canvas { key = "meter", drawing = counter.paint(), alt = "Native meter: " .. value .. "%" },
               ouro.button {
                 key = "increment", label = "Add 7",
                 on_press = function() counter.set((counter.get() + 7) % 101) end,

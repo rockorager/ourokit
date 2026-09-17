@@ -122,6 +122,7 @@ pub const Object = union(enum) {
     stack: Stack,
     scroll: Scroll,
     image: Image,
+    canvas: *@import("drawing.zig").Drawing,
     text: Text,
     text_input: TextInput,
 };

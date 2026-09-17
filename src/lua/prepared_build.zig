@@ -54,6 +54,7 @@ pub const PreparedBuild = struct {
     shapes: ?*text.ParagraphSourceCache,
     images: ?*@import("../image/cache.zig").Cache = null,
     owns_images: bool = false,
+    owns_drawings: bool = false,
     descriptor_storage: []instance.Descriptor,
     descriptor_count: usize = 0,
     semantic_storage: []semantics.Descriptor,
@@ -149,6 +150,12 @@ pub const PreparedBuild = struct {
                 .image => |value| if (value.image) |handle| self.images.?.release(handle) catch unreachable,
                 else => {},
             };
+        if (self.owns_drawings) for (self.descriptor_storage[0..self.descriptor_count]) |descriptor|
+            switch (descriptor.object) {
+                .canvas => |value| value.release(),
+                else => {},
+            };
+        self.owns_drawings = false;
         self.owns_images = false;
         self.descriptor_count = 0;
         self.semantic_count = 0;
