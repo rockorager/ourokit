@@ -669,6 +669,7 @@ fn runSourceInternal(
                     &paragraphs,
                     options.window,
                 );
+                slot.runtime.keyboard_focused = false;
                 // Desktop surfaces own their entire configured rectangle.
                 if (window.?.declaration == .layer_surface) slot.runtime.root_padding = 0;
                 try dirty.register(handle);

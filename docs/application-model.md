@@ -1044,6 +1044,14 @@ viewport, a demand-driven native timer scrolls and extends selection without
 requiring more motion events. It stops at the content limit or when selection
 ends. Active composition owns selection instead of accepting pointer edits.
 
+The focused editable caret blinks on monotonic deadlines without triggering Lua
+rebuilds. Typing, navigation, pointer selection, and input-method updates restart
+the visible phase; unrelated rebuilds do not. Composition keeps its caret steady,
+and selection, read-only inputs, or loss of native keyboard focus suspend blink
+wakeups. Native keyboard focus loss also hides the caret. Horizontal caret reveal
+is independent of blink visibility. `WindowRuntimeConfig.caret_blink_interval_ns`
+sets each phase duration (500 ms by default); zero disables blinking.
+
 Commands live in an authoritative registry independent of the retained render
 tree. Entries need stable semantic IDs plus revisioned invocation handles,
 scope, title/category/aliases, enabled state and reason, state, argument schema,

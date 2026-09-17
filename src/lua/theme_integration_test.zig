@@ -102,6 +102,26 @@ const Fixture = struct {
         try self.runtime.dispatchInput(&unused);
         try self.runtime.prepareFrame(1);
     }
+
+    fn pixels(self: *Fixture) ![]u8 {
+        const software = @import("../renderer/software/root.zig");
+        if (!software.has_freetype) return error.SkipZigTest;
+        try self.runtime.prepareFrame(1);
+        const size = self.runtime.frame_state.size.?;
+        const result = try std.testing.allocator.alloc(u8, size.width * size.height * 4);
+        errdefer std.testing.allocator.free(result);
+        var glyphs = try software.GlyphCache.init(std.testing.allocator, &self.fonts);
+        defer glyphs.deinit();
+        const list = try self.runtime.displayList();
+        try software.renderParagraphs(.{ .commands = list.commands }, .{
+            .pixels = result,
+            .width = size.width,
+            .height = size.height,
+            .stride = size.width * 4,
+            .format = .rgba8_unorm,
+        }, &glyphs, &self.paragraphs);
+        return result;
+    }
 };
 
 test "Lua stack keeps ordered children and keyed foreground identity" {
@@ -701,4 +721,119 @@ test "edge scrolling stops for composition focus loss disabled and removed input
         try f.runtime.advanceAnimations(16 * std.time.ns_per_ms);
         try std.testing.expect((try f.runtime.animationDelay()) == null);
     }
+}
+
+test "caret blink deadlines survive rebuilds and only caret pixels change" {
+    const ms = std.time.ns_per_ms;
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("function build() return ouro.column {key = 'root', ouro.text_input {key = 'input', width = 300, autofocus = true, default_text = 'A long line that scrolls horizontally while editing should feel natural.'}} end");
+    try f.build();
+    const input = try f.handle("root/input");
+    const session = try f.runtime.text_inputs.session(input);
+    _ = try session.model.setSelection(.collapsed(session.model.text().len));
+    try f.runtime.advanceAnimations(0);
+    const on = try f.pixels();
+    defer std.testing.allocator.free(on);
+    const caret = (try f.runtime.textInputStatus()).?.state.cursor_rectangle.?;
+    const revision = session.model.revision;
+    try std.testing.expectEqual(@as(?u64, 500 * ms), try f.runtime.animationDelay());
+    try f.runtime.advanceAnimations(499 * ms);
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expect(f.runtime.caret_visible);
+    try std.testing.expectEqual(@as(?u64, ms), try f.runtime.animationDelay());
+    try f.runtime.advanceAnimations(500 * ms);
+    try std.testing.expect(!f.runtime.caret_visible);
+    const off = try f.pixels();
+    defer std.testing.allocator.free(off);
+    try std.testing.expectEqualDeep(caret, (try f.runtime.textInputStatus()).?.state.cursor_rectangle.?);
+    try std.testing.expectEqual(revision, session.model.revision);
+    var changed: usize = 0;
+    for (on, off, 0..) |a, b, index| {
+        if (a == b) continue;
+        changed += 1;
+        const x: i32 = @intCast((index / 4) % 600);
+        const y: i32 = @intCast((index / 4) / 600);
+        try std.testing.expect(x >= caret.x and x < caret.x + caret.width);
+        // A fractional origin can cover an extra row beyond the IME height.
+        try std.testing.expect(y >= caret.y and y <= caret.y + caret.height);
+    }
+    try std.testing.expect(changed > 0);
+    // Missing two deadlines must preserve the phase, not toggle just once.
+    try f.runtime.advanceAnimations(1750 * ms);
+    try std.testing.expect(!f.runtime.caret_visible);
+    try std.testing.expectEqual(@as(?u64, 250 * ms), try f.runtime.animationDelay());
+    try f.runtime.advanceAnimations(2000 * ms);
+    try std.testing.expect(f.runtime.caret_visible);
+    try f.runtime.advanceAnimations(2500 * ms);
+    try std.testing.expect(!f.runtime.caret_visible);
+    // An interaction at the existing boundary still resets blinking.
+    try f.runtime.routeKeyboard(.{ .key = .{ .window = f.runtime.window, .serial = 1, .time_ms = 2600, .state = .pressed, .translated = .{ .keycode = 0, .logical = .end } } });
+    var unused: Vm = undefined;
+    try f.runtime.dispatchInput(&unused);
+    try std.testing.expect(f.runtime.caret_visible);
+    try f.runtime.advanceAnimations(2600 * ms);
+    try f.runtime.advanceAnimations(3099 * ms);
+    try std.testing.expect(f.runtime.caret_visible);
+    try f.runtime.advanceAnimations(3100 * ms);
+    try std.testing.expect(!f.runtime.caret_visible);
+    f.runtime.caret_blink_interval_ns = 0;
+    try f.runtime.advanceAnimations(3200 * ms);
+    try std.testing.expect(f.runtime.caret_visible);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+}
+
+test "caret stays steady for composition and pauses for selection and window focus" {
+    const ms = std.time.ns_per_ms;
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("enabled = true; read_only = false; function build() return ouro.text_input {key = 'input', default_text = 'Typing', autofocus = true, enabled = enabled, read_only = read_only} end");
+    try f.build();
+    const input = try f.handle("input");
+    const session = try f.runtime.text_inputs.session(input);
+    const render = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(input));
+    try f.runtime.advanceAnimations(0);
+    try f.runtime.advanceAnimations(500 * ms);
+    try std.testing.expect(!(try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    var unused: Vm = undefined;
+    for (0..3) |tick| {
+        try f.runtime.routeKeyboard(.{ .key = .{ .window = f.runtime.window, .serial = 1, .time_ms = 600, .state = .pressed, .translated = .{ .keycode = 0, .unicode = 'x' } } });
+        try f.runtime.dispatchInput(&unused);
+        try f.runtime.advanceAnimations((600 + tick * 300) * ms);
+        try std.testing.expect((try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    }
+    try std.testing.expectEqualStrings("Typingxxx", session.model.text());
+    _ = try session.apply(.{ .preedit = .{ .text = "é", .cursor = .{ .start = 2, .end = 2 } } });
+    try f.runtime.advanceAnimations(2000 * ms);
+    try f.runtime.advanceAnimations(9000 * ms);
+    try std.testing.expect((try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    _ = try session.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+    _ = session.model.selectAll();
+    try f.runtime.advanceAnimations(9100 * ms);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    _ = try session.model.setSelection(.collapsed(1));
+    try f.runtime.advanceAnimations(9200 * ms);
+    try std.testing.expect((try f.runtime.animationDelay()) != null);
+    try f.runtime.routeKeyboard(.{ .leave = .{ .window = f.runtime.window, .serial = 2 } });
+    try f.runtime.dispatchInput(&unused);
+    try f.runtime.advanceAnimations(9300 * ms);
+    try std.testing.expect(!(try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    try f.runtime.routeKeyboard(.{ .enter = .{ .window = f.runtime.window, .serial = 3 } });
+    try f.runtime.dispatchInput(&unused);
+    try std.testing.expect((try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    try std.testing.expect((try f.runtime.animationDelay()) != null);
+    try f.exec("read_only = true");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try f.runtime.advanceAnimations(9400 * ms);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    try f.exec("read_only = false; enabled = false");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try f.runtime.advanceAnimations(9500 * ms);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    try std.testing.expect(!(try f.runtime.tree.objectAt(render)).text_input.show_caret);
 }

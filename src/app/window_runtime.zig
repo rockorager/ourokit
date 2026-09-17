@@ -18,6 +18,8 @@ pub const Config = struct {
     input_capacity: usize = 128,
     command_capacity: usize = 512,
     semantic_text_capacity: usize = 16 * 1024,
+    /// Duration of each caret phase. Zero keeps the caret steady.
+    caret_blink_interval_ns: u64 = 500 * std.time.ns_per_ms,
 };
 
 pub const SemanticTarget = struct {
@@ -57,6 +59,13 @@ pub const WindowRuntime = struct {
     clicks: ui.input.Clicks = .{},
     selection_pointer: ?core.PointF = null,
     selection_tick_ns: ?u64 = null,
+    // Headless windows act focused; native hosts start false until keyboard enter.
+    keyboard_focused: bool = true,
+    caret_blink_interval_ns: u64 = (Config{}).caret_blink_interval_ns,
+    caret_visible: bool = true,
+    caret_deadline_ns: ?u64 = null,
+    caret_activity: ?CaretActivity = null,
+    animation_now_ns: u64 = 0,
     semantics: ui.semantics.Snapshot = undefined,
     surface_color: core.Color = undefined,
     background: ?core.Color = null,
@@ -137,6 +146,7 @@ pub const WindowRuntime = struct {
             .listboxes = self.listboxes,
             .text_inputs = self.text_inputs,
             .focus = .{},
+            .caret_blink_interval_ns = config.caret_blink_interval_ns,
             .semantics = self.semantics,
             .surface_color = surface,
             .accent_color = accent,
@@ -211,6 +221,8 @@ pub const WindowRuntime = struct {
         self.clicks.reset();
         self.selection_pointer = null;
         self.selection_tick_ns = null;
+        self.caret_activity = null;
+        self.resetCaretBlink();
         while (self.router.takeEvent()) |event| self.router.releaseEvent(event);
         if (self.build_owners.isActive(self.root_owner)) {
             try self.signals.disposeOwner(.{
@@ -350,7 +362,7 @@ pub const WindowRuntime = struct {
                     object.text_input.selection_end = range.end;
                     object.text_input.caret_offset = selection.extent;
                     object.text_input.caret_affinity = selection.extent_affinity;
-                    object.text_input.show_caret = optionalSameHandle(self.focus.current(), target);
+                    object.text_input.show_caret = optionalSameHandle(self.focus.current(), target) and self.keyboard_focused and self.caret_visible;
                 }
             }
         }
@@ -713,7 +725,9 @@ pub const WindowRuntime = struct {
                 self.text_input_commit_permitted = event.text_input.serial_matches_state;
                 const session = try self.text_inputs.session(focused);
                 const model_revision = session.model.revision;
-                if (try session.apply(event.text_input.batch)) try self.syncTextInputVisuals();
+                _ = try session.apply(event.text_input.batch);
+                self.resetCaretBlink();
+                try self.syncTextInputVisuals();
                 if (session.model.revision != model_revision)
                     try self.notifyTextInputChanged(callback_service, focused);
                 continue;
@@ -798,8 +812,15 @@ pub const WindowRuntime = struct {
 
     fn dispatchKeyboard(self: *WindowRuntime, event: platform.KeyboardEvent, callback_service: anytype) !void {
         const key = switch (event) {
-            .enter => return,
+            .enter => {
+                self.keyboard_focused = true;
+                self.resetCaretBlink();
+                try self.syncTextInputVisuals();
+                return;
+            },
             .leave => {
+                self.keyboard_focused = false;
+                self.resetCaretBlink();
                 try self.applyButtonUpdate(self.buttons.release());
                 self.clicks.reset();
                 if (self.focus.current()) |target| if (self.text_inputs.contains(target)) {
@@ -807,11 +828,16 @@ pub const WindowRuntime = struct {
                     session.model.breakUndoGroup();
                     session.endSelectionDrag();
                 };
+                try self.syncTextInputVisuals();
                 return;
             },
             .key => |value| value,
         };
-        if (key.state != .released) self.clicks.reset();
+        if (key.state != .released) {
+            self.clicks.reset();
+            self.resetCaretBlink();
+            try self.syncTextInputVisuals();
+        }
         if (self.focus.current()) |focused| if (self.text_inputs.contains(focused) and
             key.state != .released)
         {
@@ -1205,6 +1231,7 @@ pub const WindowRuntime = struct {
                             3 => .line,
                             else => .character,
                         }, button.modifiers.shift);
+                        self.resetCaretBlink();
                         self.selection_pointer = pointer.position;
                         self.selection_tick_ns = null;
                         const previous = self.focus.current();
@@ -1213,6 +1240,7 @@ pub const WindowRuntime = struct {
                     },
                     .released => {
                         session.endSelectionDrag();
+                        self.resetCaretBlink();
                         self.selection_pointer = null;
                         try self.syncTextInputVisuals();
                     },
@@ -1258,12 +1286,81 @@ pub const WindowRuntime = struct {
         return .{ .input = input, .render = render, .speed = speed };
     }
 
-    /// Only active edge dragging needs wakeups; the native host owns the timer.
+    const CaretActivity = struct {
+        target: ui.instance.InstanceHandle,
+        model_revision: u64,
+        session_revision: u64,
+        selection: ui.text_input.Selection,
+        selecting: bool,
+    };
+
+    fn resetCaretBlink(self: *WindowRuntime) void {
+        self.caret_visible = true;
+        self.caret_deadline_ns = null;
+    }
+
+    // Rebuilds and animation frames must not restart an unchanged caret phase.
+    fn refreshCaretActivity(self: *WindowRuntime) !bool {
+        var activity: ?CaretActivity = null;
+        if (self.focus.current()) |target| if (self.instances.isActive(target) and self.text_inputs.contains(target)) {
+            const session = try self.text_inputs.session(target);
+            activity = .{
+                .target = target,
+                .model_revision = session.model.revision,
+                .session_revision = session.revision,
+                .selection = session.model.selection,
+                .selecting = session.isSelecting(),
+            };
+        };
+        if (std.meta.eql(activity, self.caret_activity)) return false;
+        self.caret_activity = activity;
+        self.resetCaretBlink();
+        return true;
+    }
+
+    fn caretShouldBlink(self: *WindowRuntime) !bool {
+        if (!self.initialized or !self.keyboard_focused or self.caret_blink_interval_ns == 0) return false;
+        const target = self.focus.current() orelse return false;
+        if (!self.instances.isActive(target) or !self.text_inputs.contains(target)) return false;
+        const behavior = try self.text_inputs.getBehavior(target);
+        const session = try self.text_inputs.session(target);
+        return behavior.enabled and !behavior.read_only and session.preedit() == null and
+            !session.isSelecting() and session.model.selection.isCollapsed();
+    }
+
+    /// The native host owns one timer for the earliest requested animation.
     pub fn animationDelay(self: *WindowRuntime) !?u64 {
-        return if (try self.selectionScroll() != null) 16 * std.time.ns_per_ms else null;
+        var delay: ?u64 = if (try self.selectionScroll() != null) 16 * std.time.ns_per_ms else null;
+        if (try self.caretShouldBlink()) {
+            const caret_delay = if (self.caret_deadline_ns) |deadline| deadline -| self.animation_now_ns else self.caret_blink_interval_ns;
+            delay = @min(delay orelse caret_delay, caret_delay);
+        }
+        return delay;
     }
 
     pub fn advanceAnimations(self: *WindowRuntime, now_ns: u64) !void {
+        if (!self.initialized) return;
+        self.animation_now_ns = now_ns;
+        if (try self.refreshCaretActivity()) try self.syncTextInputVisuals();
+        if (try self.caretShouldBlink()) {
+            const interval = self.caret_blink_interval_ns;
+            const deadline = self.caret_deadline_ns orelse now_ns +| interval;
+            self.caret_deadline_ns = deadline;
+            if (now_ns >= deadline) {
+                const phases = (now_ns - deadline) / interval + 1;
+                self.caret_deadline_ns = deadline +| (phases *| interval);
+                if (phases % 2 != 0) {
+                    self.caret_visible = !self.caret_visible;
+                    try self.syncTextInputVisuals();
+                }
+            }
+        } else {
+            self.caret_deadline_ns = null;
+            if (!self.caret_visible) {
+                self.caret_visible = true;
+                try self.syncTextInputVisuals();
+            }
+        }
         const scroll = (try self.selectionScroll()) orelse {
             self.selection_tick_ns = null;
             return;
@@ -1671,6 +1768,7 @@ pub const WindowRuntime = struct {
 
     fn syncTextInputVisuals(self: *WindowRuntime) !void {
         if (!self.initialized) return;
+        _ = try self.refreshCaretActivity();
         for (0..self.text_inputs.slotCount()) |index| {
             const mounted = self.text_inputs.mountedAt(index) orelse continue;
             if (!self.instances.isActive(mounted.target) or
@@ -1698,7 +1796,8 @@ pub const WindowRuntime = struct {
             object.text_input.caret_offset = presentation.caret_offset;
             object.text_input.caret_affinity = presentation.caret_affinity;
             object.text_input.reveal_caret = optionalSameHandle(self.focus.current(), mounted.target) and !mounted.session.isSelecting();
-            object.text_input.show_caret = presentation.show_caret and object.text_input.reveal_caret;
+            object.text_input.show_caret = presentation.show_caret and object.text_input.reveal_caret and
+                self.keyboard_focused and (self.caret_visible or mounted.session.preedit() != null);
             object.text_input.preedit = if (presentation.preedit) |range| .{
                 .start = range.start,
                 .end = range.end,
