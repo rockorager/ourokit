@@ -10,6 +10,7 @@ const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
 const Repeat = @import("repeat.zig");
 const TextInput = @import("text_input.zig");
+const Cursor = @import("cursor.zig").Cursor;
 const WaylandClipboard = @import("clipboard.zig");
 const WaylandWorkspaces = @import("workspaces.zig");
 const ShellWorkspaces = @import("../../shell/workspaces.zig");
@@ -696,6 +697,7 @@ pub const Host = struct {
     seat_global_name: ?u32 = null,
     pointer: ?Handle = null,
     pointer_focus: ?WindowHandle = null,
+    cursor: Cursor = .{},
     keyboard: ?Handle = null,
     keyboard_focus: ?WindowHandle = null,
     keyboard_repeat: Repeat.State = .{},
@@ -780,6 +782,7 @@ pub const Host = struct {
         self.seat_global_name = null;
         self.pointer = null;
         self.pointer_focus = null;
+        self.cursor = .{};
         self.keyboard = null;
         self.keyboard_focus = null;
         self.keyboard_repeat = .{};
@@ -1236,7 +1239,7 @@ pub const Host = struct {
     /// turns raw key metadata into application text. Calling this for a new
     /// target performs the full disable/enable transaction required by
     /// text-input-v3, including moves within one surface.
-    pub fn enableTextInput(self: *Host, handle: WindowHandle, state: platform_window.TextInputState) !void {
+    pub fn enableTextInput(self: *Host, handle: WindowHandle, state: platform_window.TextInputState, generation: u64) !void {
         try state.validate();
         _ = try self.windowFor(handle);
         if (self.text_input == null) return error.TextInputProtocolUnavailable;
@@ -1246,15 +1249,24 @@ pub const Host = struct {
         if (self.text_input_active != null) {
             try self.sendTextInputRequest(.{ .disable = .{} });
             try self.commitTextInputState();
+            self.text_input_pending.disable();
         }
         try self.sendTextInputRequest(.{ .enable = .{} });
         try self.sendTextInputState(state);
         try self.commitTextInputState();
+        self.text_input_pending.enable(generation);
         self.text_input_active = handle;
     }
 
     pub fn textInputAvailable(self: *const Host) bool {
         return self.text_input != null;
+    }
+
+    pub fn setPointerCursor(self: *Host, handle: WindowHandle, shape: platform_window.PointerCursor) !void {
+        const focused = self.pointer_focus orelse return;
+        if (!sameWindow(focused, handle)) return;
+        if (try self.cursor.set(&self.connection.objects, try self.queue(), shape))
+            _ = try self.driver.schedule();
     }
 
     pub fn clipboardAvailable(self: *const Host) bool {
@@ -1315,6 +1327,7 @@ pub const Host = struct {
         if (self.text_input_active == null or !sameWindow(self.text_input_active.?, handle)) return;
         try self.sendTextInputRequest(.{ .disable = .{} });
         try self.commitTextInputState();
+        self.text_input_pending.disable();
         self.text_input_active = null;
     }
 
@@ -1984,6 +1997,10 @@ pub const Host = struct {
                     if (self.text_input_manager_global_name != null and
                         self.text_input_manager_global_name.? == removed.name)
                         try self.releaseTextInputManager();
+                    if (self.cursor.manager_global_name == removed.name) {
+                        try self.cursor.releaseManager(objects, try self.queue());
+                        _ = try self.driver.schedule();
+                    }
                     if (self.background_effect_global_name == removed.name) {
                         self.blur_supported = false;
                         try self.refreshBackgroundEffects();
@@ -2430,6 +2447,10 @@ pub const Host = struct {
                 null,
             );
             self.layer_shell_version = version;
+        } else if (std.mem.eql(u8, global.interface, protocol.wp_cursor_shape_manager_v1.info.name) and self.cursor.manager == null) {
+            self.cursor.manager = try Core.bind(objects, transmit, self.registry, global.name, &protocol.wp_cursor_shape_manager_v1.info, 1, null);
+            self.cursor.manager_global_name = global.name;
+            try self.cursor.ensureDevice(objects, transmit, self.pointer);
         } else if (std.mem.eql(u8, global.interface, protocol.zwp_text_input_manager_v3.info.name) and
             self.text_input_manager == null)
         {
@@ -2600,6 +2621,7 @@ pub const Host = struct {
         );
         self.text_input = null;
         self.text_input_active = null;
+        if (self.text_input_pending.focused) |window| try self.sink.textInput(.{ .leave = window });
         self.text_input_pending.resetObject();
         _ = try self.driver.schedule();
     }
@@ -2628,6 +2650,7 @@ pub const Host = struct {
                 self.seat.?,
                 .{},
             )).id;
+            try self.cursor.ensureDevice(&self.connection.objects, try self.queue(), self.pointer);
             _ = try self.driver.schedule();
         } else if (!available and self.pointer != null) {
             try self.releasePointer();
@@ -2636,6 +2659,8 @@ pub const Host = struct {
 
     fn releasePointer(self: *Host) !void {
         const pointer = self.pointer orelse return;
+        try self.cursor.releaseDevice(&self.connection.objects, try self.queue());
+        self.cursor.leave();
         try wayring.client.sendRequest(
             protocol.wl_pointer,
             &self.connection.objects,
@@ -2892,6 +2917,7 @@ pub const Host = struct {
                 if (enter.surface == 0) return;
                 const window = try self.windowForSurface(enter.surface);
                 self.pointer_focus = window.handle;
+                self.cursor.enter(enter.serial);
                 try self.sink.pointer(.{ .enter = .{
                     .window = window.handle,
                     .serial = enter.serial,
@@ -2906,7 +2932,10 @@ pub const Host = struct {
                     .serial = leave.serial,
                 } });
                 if (self.pointer_focus) |focus| {
-                    if (sameWindow(focus, window.handle)) self.pointer_focus = null;
+                    if (sameWindow(focus, window.handle)) {
+                        self.pointer_focus = null;
+                        self.cursor.leave();
+                    }
                 }
             },
             .motion => |motion| try self.sink.pointer(.{ .motion = .{

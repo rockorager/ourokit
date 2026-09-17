@@ -8,6 +8,7 @@ pub const PresentationTiming = @import("host.zig").PresentationTiming;
 test {
     _ = @import("adapter.zig");
     _ = @import("clipboard.zig");
+    _ = @import("cursor.zig");
     _ = @import("host.zig");
     _ = @import("repeat.zig");
     _ = @import("text_input.zig");

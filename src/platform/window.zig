@@ -7,6 +7,8 @@ pub const WindowHandle = Handle;
 
 pub const LogicalPosition = PointF;
 
+pub const PointerCursor = enum { default, text };
+
 pub const PointerButtonState = enum {
     released,
     pressed,
@@ -243,6 +245,8 @@ pub const TextInputState = struct {
 /// the new preedit and its cursor.
 pub const TextInputBatch = struct {
     window: WindowHandle,
+    /// Editor activation that produced this batch. Null is for headless input.
+    generation: ?u64 = null,
     serial: u32,
     serial_matches_state: bool,
     delete_surrounding: ?struct {

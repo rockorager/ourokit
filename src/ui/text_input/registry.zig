@@ -19,6 +19,7 @@ const Entry = struct {
     target: instance.InstanceHandle = .invalid,
     content: instance.InstanceHandle = .invalid,
     session: ?Session = null,
+    session_generation: u64 = 0,
     behavior: Behavior = .{},
     active: bool = false,
     seen: bool = false,
@@ -119,6 +120,7 @@ pub const Registry = struct {
             )) {
                 entry.session.?.deinit();
                 entry.session = prepared.*.?;
+                entry.session_generation +%= 1;
                 prepared.* = null;
             }
             return;
@@ -168,6 +170,10 @@ pub const Registry = struct {
 
     pub fn getBehavior(self: *const Registry, target: instance.InstanceHandle) !Behavior {
         return (self.find(target) orelse return error.TextInputNotFound).behavior;
+    }
+
+    pub fn sessionGeneration(self: *const Registry, target: instance.InstanceHandle) !u64 {
+        return (self.find(target) orelse return error.TextInputNotFound).session_generation;
     }
 
     pub const Mounted = struct {

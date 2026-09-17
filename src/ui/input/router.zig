@@ -22,9 +22,11 @@ pub const Event = union(enum) {
         event: platform_window.PointerEvent,
     },
     keyboard: platform_window.KeyboardEvent,
+    text_input_focus: bool,
     text_input: struct {
         batch: text_input.EditBatch,
         serial_matches_state: bool,
+        generation: u64,
     },
 };
 
@@ -42,6 +44,7 @@ pub const Router = struct {
     hovered: ?instance.InstanceHandle = null,
     captured: ?instance.InstanceHandle = null,
     pointer_position: PointF = .{},
+    pointer_inside: bool = false,
 
     pub fn init(
         self: *Router,
@@ -78,6 +81,7 @@ pub const Router = struct {
                 self.pointer_position = enter.position;
                 const target = try self.targetAt(enter.position);
                 try self.ensureSpace(transitionCount(self.hovered, target));
+                self.pointer_inside = true;
                 self.transition(target, enter.position, enter.serial);
             },
             .leave => |leave| {
@@ -88,6 +92,7 @@ pub const Router = struct {
                         .serial = leave.serial,
                     } });
                 self.hovered = null;
+                self.pointer_inside = false;
             },
             .motion => |motion| {
                 self.pointer_position = motion.position;
@@ -139,10 +144,16 @@ pub const Router = struct {
         self.enqueueAssumeCapacity(.{ .keyboard = event });
     }
 
+    pub fn routeTextInputFocus(self: *Router, focused: bool) !void {
+        try self.ensureSpace(1);
+        self.enqueueAssumeCapacity(.{ .text_input_focus = focused });
+    }
+
     pub fn routeTextInput(
         self: *Router,
         batch_value: text_input.EditBatch,
         serial_matches_state: bool,
+        generation: u64,
     ) !void {
         try self.ensureSpace(1);
         var batch = batch_value;
@@ -161,6 +172,7 @@ pub const Router = struct {
         self.enqueueAssumeCapacity(.{ .text_input = .{
             .batch = batch,
             .serial_matches_state = serial_matches_state,
+            .generation = generation,
         } });
     }
 
@@ -359,7 +371,7 @@ test "pointer routing hit tests front to back and queues hover transitions" {
     try router.routeTextInput(.{
         .commit = .{ .text = &commit },
         .preedit = .{ .text = &preedit, .cursor = .{ .start = 0, .end = 3 } },
-    }, true);
+    }, true, 1);
     @memset(&commit, 'x');
     @memset(&preedit, 'x');
     const owned = router.takeEvent().?;

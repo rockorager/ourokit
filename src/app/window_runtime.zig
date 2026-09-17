@@ -31,6 +31,7 @@ pub const SemanticTarget = struct {
 
 pub const TextInputStatus = struct {
     state: platform.TextInputState,
+    generation: u64,
     model_revision: u64,
     session_revision: u64,
     scene_revision: u64,
@@ -86,6 +87,9 @@ pub const WindowRuntime = struct {
     clipboard: ?*clipboard_module.Coordinator = null,
     reconciling: bool = false,
     text_input_commit_permitted: bool = true,
+    text_input_surface_focused: bool = true,
+    text_input_owner: ?struct { target: ui.instance.InstanceHandle, session: u64 } = null,
+    text_input_generation: u64 = 0,
     virtual_lists: virtual_list.Snapshot = .{},
     virtual_work: bool = false,
     virtual_offsets_pending: bool = false,
@@ -218,6 +222,8 @@ pub const WindowRuntime = struct {
         self.listboxes.clear();
         self.text_inputs.clear();
         self.focus.clear();
+        self.text_input_owner = null;
+        self.text_input_generation +%= 1;
         self.clicks.reset();
         self.selection_pointer = null;
         self.selection_tick_ns = null;
@@ -667,10 +673,8 @@ pub const WindowRuntime = struct {
     }
 
     pub fn textInputStatus(self: *WindowRuntime) !?TextInputStatus {
-        const focused = self.focus.current() orelse return null;
-        if (!self.text_inputs.contains(focused)) return null;
-        const behavior = try self.text_inputs.getBehavior(focused);
-        if (!behavior.enabled or behavior.read_only) return null;
+        if (try self.refreshTextInputOwner()) try self.syncTextInputVisuals();
+        const focused = (self.text_input_owner orelse return null).target;
         const session = try self.text_inputs.session(focused);
         var state = text_input_coordinator.surroundingState(session);
         const content = try self.text_inputs.content(focused);
@@ -685,6 +689,7 @@ pub const WindowRuntime = struct {
         };
         return .{
             .state = state,
+            .generation = self.text_input_generation,
             .model_revision = session.model.revision,
             .session_revision = session.revision,
             .scene_revision = self.frame_state.scene_revision,
@@ -696,6 +701,20 @@ pub const WindowRuntime = struct {
         try self.router.route(event);
     }
 
+    pub fn pointerCursor(self: *WindowRuntime) !platform.PointerCursor {
+        if (!self.ready or !self.router.pointer_inside) return .default;
+        if (self.router.captured) |captured| if (self.instances.isActive(captured)) {
+            if (try self.textInputAncestor(captured)) |input|
+                if ((try self.text_inputs.session(input)).isSelecting()) return .text;
+        };
+        // Re-hit-test so rebuilding under a stationary pointer updates its shape.
+        const root = (try self.instances.rootRenderObject()) orelse return .default;
+        const render = (try self.tree.hitTest(root, self.router.pointer_position)) orelse return .default;
+        const target = self.instances.instanceForRenderObject(render) orelse return .default;
+        const input = (try self.textInputAncestor(target)) orelse return .default;
+        return if ((try self.text_inputs.getBehavior(input)).enabled) .text else .default;
+    }
+
     pub fn routeKeyboard(self: *WindowRuntime, event: platform.KeyboardEvent) !void {
         try self.router.routeKeyboard(event);
     }
@@ -703,12 +722,16 @@ pub const WindowRuntime = struct {
     pub fn routeTextInput(self: *WindowRuntime, event: platform.TextInputEvent) !void {
         const batch = switch (event) {
             .batch => |value| value,
-            .enter, .leave => return,
+            .enter, .leave => |window| {
+                if (!sameHandle(window, self.window)) return error.WrongWindow;
+                return self.router.routeTextInputFocus(event == .enter);
+            },
         };
         if (!sameHandle(batch.window, self.window)) return error.WrongWindow;
         try self.router.routeTextInput(
             try text_input_coordinator.editBatch(batch),
             batch.serial_matches_state,
+            batch.generation orelse self.text_input_generation,
         );
     }
 
@@ -717,11 +740,15 @@ pub const WindowRuntime = struct {
     pub fn dispatchInput(self: *WindowRuntime, callback_service: anytype) !void {
         while (self.router.takeEvent()) |event| {
             defer self.router.releaseEvent(event);
+            if (event == .text_input_focus) {
+                self.text_input_surface_focused = event.text_input_focus;
+                try self.syncTextInputVisuals();
+                continue;
+            }
             if (event == .text_input) {
-                const focused = self.focus.current() orelse continue;
-                if (!self.text_inputs.contains(focused)) continue;
-                const behavior = try self.text_inputs.getBehavior(focused);
-                if (!behavior.enabled or behavior.read_only) continue;
+                _ = try self.refreshTextInputOwner();
+                const focused = (self.text_input_owner orelse continue).target;
+                if (event.text_input.generation != self.text_input_generation) continue;
                 self.text_input_commit_permitted = event.text_input.serial_matches_state;
                 const session = try self.text_inputs.session(focused);
                 const model_revision = session.model.revision;
@@ -741,7 +768,7 @@ pub const WindowRuntime = struct {
                 .hover_leave => |value| value.target,
                 .pointer => |value| value.target,
                 .keyboard => unreachable,
-                .text_input => unreachable,
+                .text_input, .text_input_focus => unreachable,
             };
             if (!self.instances.isActive(target)) continue;
             try self.updateTextInputPointer(target, event);
@@ -1170,7 +1197,7 @@ pub const WindowRuntime = struct {
                 else => {},
             },
             .keyboard => {},
-            .text_input => unreachable,
+            .text_input, .text_input_focus => unreachable,
         }
         return null;
     }
@@ -1766,8 +1793,30 @@ pub const WindowRuntime = struct {
         self.frame_state.invalidatePaint();
     }
 
+    fn refreshTextInputOwner(self: *WindowRuntime) !bool {
+        var owner: @TypeOf(self.text_input_owner) = null;
+        if (self.keyboard_focused and self.text_input_surface_focused) {
+            if (self.focus.current()) |target| if (self.instances.isActive(target) and self.text_inputs.contains(target)) {
+                const behavior = try self.text_inputs.getBehavior(target);
+                if (behavior.enabled and !behavior.read_only) owner = .{
+                    .target = target,
+                    .session = try self.text_inputs.sessionGeneration(target),
+                };
+            };
+        }
+        if (std.meta.eql(owner, self.text_input_owner)) return false;
+        if (self.text_input_owner) |previous| if (self.text_inputs.contains(previous.target) and
+            previous.session == try self.text_inputs.sessionGeneration(previous.target))
+            (try self.text_inputs.session(previous.target)).cancelComposition();
+        self.text_input_owner = owner;
+        self.text_input_generation +%= 1;
+        self.text_input_commit_permitted = true;
+        return true;
+    }
+
     fn syncTextInputVisuals(self: *WindowRuntime) !void {
         if (!self.initialized) return;
+        _ = try self.refreshTextInputOwner();
         _ = try self.refreshCaretActivity();
         for (0..self.text_inputs.slotCount()) |index| {
             const mounted = self.text_inputs.mountedAt(index) orelse continue;
@@ -2723,7 +2772,7 @@ fn inputValues(event: ui.input.Event) InputValues {
             else => .{ .kind = 6 },
         },
         .keyboard => .{ .kind = 7 },
-        .text_input => unreachable,
+        .text_input, .text_input_focus => unreachable,
     };
 }
 

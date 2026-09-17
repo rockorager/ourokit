@@ -10,6 +10,8 @@ pub const Pending = struct {
     allocator: std.mem.Allocator,
     focused: ?platform.WindowHandle = null,
     commit_count: u32 = 0,
+    enabled_at: ?u32 = null,
+    generation: u64 = 0,
     commit_received: bool = false,
     commit_is_null: bool = false,
     commit_bytes: std.ArrayList(u8) = .empty,
@@ -33,13 +35,13 @@ pub const Pending = struct {
     }
 
     pub fn enter(self: *Pending, window: platform.WindowHandle) void {
-        self.clearBatch();
+        self.disable();
         self.focused = window;
     }
 
     pub fn leave(self: *Pending, window: platform.WindowHandle) bool {
         if (self.focused == null or !sameHandle(self.focused.?, window)) return false;
-        self.clearBatch();
+        self.disable();
         self.focused = null;
         return true;
     }
@@ -48,8 +50,20 @@ pub const Pending = struct {
         self.commit_count +%= 1;
     }
 
-    pub fn resetObject(self: *Pending) void {
+    /// Called after the enable transaction's commit has been sent.
+    pub fn enable(self: *Pending, generation: u64) void {
         self.clearBatch();
+        self.enabled_at = self.commit_count;
+        self.generation = generation;
+    }
+
+    pub fn disable(self: *Pending) void {
+        self.clearBatch();
+        self.enabled_at = null;
+    }
+
+    pub fn resetObject(self: *Pending) void {
+        self.disable();
         self.focused = null;
         self.commit_count = 0;
     }
@@ -91,8 +105,13 @@ pub const Pending = struct {
             return;
         };
         defer self.clearBatch();
+        const start = self.enabled_at orelse return;
+        // Older state within this activation is valid. Older activations and
+        // impossible future serials are not, including across counter wrap.
+        if (serial -% start > self.commit_count -% start) return;
         try sink.textInput(.{ .batch = .{
             .window = window,
+            .generation = self.generation,
             .serial = serial,
             .serial_matches_state = serial == self.commit_count,
             .delete_surrounding = if (self.delete_received) .{
@@ -213,6 +232,9 @@ test "text input fragments become one copied done batch" {
     var pending = Pending.init(std.testing.allocator);
     defer pending.deinit();
     pending.enter(window);
+    pending.commit_count = 6;
+    pending.noteCommit();
+    pending.enable(41);
     pending.noteCommit();
     try pending.setCommit("discarded");
     try pending.setCommit("é");
@@ -231,4 +253,60 @@ test "preedit cursors must be UTF-8 byte boundaries" {
     try std.testing.expectError(error.InvalidPreeditCursor, pending.setPreedit("é", 1, 2));
     try std.testing.expectError(error.InvalidPreeditCursor, pending.setPreedit("text", -1, 0));
     try pending.setPreedit("text", -1, -1);
+}
+
+test "done accepts older state only within the current activation across serial wrap" {
+    const Capture = struct {
+        calls: usize = 0,
+        generation: u64 = 0,
+        matches: bool = false,
+        fn input(context: *anyopaque, event: platform.TextInputEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqualStrings("kept", event.batch.commit.?.text.?);
+            self.generation = event.batch.generation.?;
+            self.matches = event.batch.serial_matches_state;
+            self.calls += 1;
+        }
+    };
+    var capture: Capture = .{};
+    var vtable = TestSink.vtable;
+    vtable.text_input = Capture.input;
+    const sink: platform.EventSink = .{ .context = &capture, .vtable = &vtable };
+    const window: platform.WindowHandle = .{ .slot = 0, .generation = 1 };
+    var pending = Pending.init(std.testing.allocator);
+    defer pending.deinit();
+    pending.enter(window);
+    pending.commit_count = std.math.maxInt(u32) - 1;
+    pending.enable(41);
+    pending.noteCommit();
+    pending.noteCommit();
+    try pending.setCommit("kept");
+    try pending.finishDone(std.math.maxInt(u32) - 1, sink);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 41), capture.generation);
+    try std.testing.expect(!capture.matches);
+    try pending.setCommit("kept");
+    try pending.finishDone(0, sink);
+    try std.testing.expect(capture.matches);
+    pending.noteCommit();
+    pending.disable();
+    try pending.setCommit("kept");
+    try pending.finishDone(0, sink);
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    pending.noteCommit();
+    pending.enable(42);
+    for ([_]u32{ 0, 1, 3, std.math.maxInt(u32) }) |serial| {
+        try pending.setCommit("kept");
+        try pending.finishDone(serial, sink);
+    }
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    try pending.setCommit("kept");
+    try pending.finishDone(2, sink);
+    try std.testing.expectEqual(@as(usize, 3), capture.calls);
+    try std.testing.expectEqual(@as(u64, 42), capture.generation);
+    try std.testing.expect(pending.leave(window));
+    pending.enter(window);
+    try pending.setCommit("kept");
+    try pending.finishDone(2, sink);
+    try std.testing.expectEqual(@as(usize, 3), capture.calls);
 }

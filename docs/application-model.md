@@ -1029,6 +1029,15 @@ Printable `wl_keyboard` events also insert text when text-input-v3 is available:
 the protocol being advertised does not mean an input method is supplying
 commits. Active preedit and command modifiers suppress direct text insertion.
 
+An input-method activation belongs to one retained editor session. Moving focus,
+losing keyboard or text-input surface focus, disabling or making the field
+read-only, replacing its controlled value, or removing it revokes that ownership.
+Uncommitted preedit is discarded, not committed, and its undo group is closed;
+cancellation does not alter committed text or erase undo history. Queued batches
+cannot follow focus to another field or a later activation of the same field.
+Older `done` serials within the current activation still apply edits as required
+by text-input-v3, but do not publish new protocol state.
+
 Primary-button text selection stores its bidi-aware anchor in the retained edit
 session. The input router keeps delivering motion to the captured instance even
 when hover moves over another instance or leaves the window; paragraph hit
@@ -1043,6 +1052,13 @@ directional anchor. While a captured pointer rests beyond the horizontal
 viewport, a demand-driven native timer scrolls and extends selection without
 requiring more motion events. It stops at the content limit or when selection
 ends. Active composition owns selection instead of accepting pointer edits.
+
+Enabled text inputs, including read-only selectable fields, request an I-beam
+pointer. Selection dragging retains it until release; other widgets and disabled
+inputs request the default pointer. Rebuilds update the shape even without pointer
+motion. The Wayland adapter uses `cursor-shape-v1` with the latest pointer-enter
+serial and recreates its device when pointer capability returns. Compositors
+without this optional protocol keep their existing cursor behavior.
 
 The focused editable caret blinks on monotonic deadlines without triggering Lua
 rebuilds. Typing, navigation, pointer selection, and input-method updates restart

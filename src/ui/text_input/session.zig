@@ -82,6 +82,19 @@ pub const Session = struct {
         };
     }
 
+    /// Discard uncommitted composition, never manufacture a text commit.
+    /// Selection replacement remains in history and can be undone normally.
+    pub fn cancelComposition(self: *Session) void {
+        self.model.breakUndoGroup();
+        self.endSelectionDrag();
+        const bytes = self.preedit_bytes orelse return;
+        self.allocator.free(bytes);
+        self.preedit_bytes = null;
+        self.preedit_cursor = null;
+        self.preferred_x = null;
+        self.revision +%= 1;
+    }
+
     pub fn surrounding(self: *const Session) Surrounding {
         return .{
             .text = self.model.text(),
@@ -467,4 +480,26 @@ test "shift click retains directional anchor and triple click keeps the entire l
     try std.testing.expectEqual(@as(usize, 10), session.model.selection.extent);
     session.endSelectionDrag();
     try std.testing.expect(!session.isSelecting());
+}
+
+test "composition cancellation preserves committed text and closes one undo group" {
+    var session = try Session.init(std.testing.allocator, "left old right");
+    defer session.deinit();
+    _ = try session.model.setSelection(.{ .anchor = 5, .extent = 8 });
+    _ = try session.apply(.{ .preedit = .{ .text = "候", .cursor = null } });
+    _ = try session.apply(.{ .commit = .{ .text = "Ω" }, .preedit = .{ .text = "β", .cursor = null } });
+    const revision = session.model.revision;
+    const session_revision = session.revision;
+    session.cancelComposition();
+    try std.testing.expect(session.preedit() == null);
+    try std.testing.expectEqualStrings("left Ω right", session.model.text());
+    try std.testing.expectEqual(revision, session.model.revision);
+    try std.testing.expectEqual(session_revision + 1, session.revision);
+    session.cancelComposition();
+    try std.testing.expectEqual(session_revision + 1, session.revision);
+    _ = try session.typeText("!");
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings("left Ω right", session.model.text());
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings("left old right", session.model.text());
 }

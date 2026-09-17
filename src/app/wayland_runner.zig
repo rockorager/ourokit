@@ -68,7 +68,7 @@ const RuntimeSlot = struct {
     configured_size: ?core.SizeU = null,
     frames_seen: usize = 0,
     runtime: WindowRuntime = .{},
-    text_input_enabled: bool = false,
+    text_input_generation: ?u64 = null,
     text_input_surface_focused: bool = false,
     text_input_revision: ?TextInputRevision = null,
 };
@@ -496,13 +496,15 @@ fn runSourceInternal(
                 .text_input => |text_input_event| switch (text_input_event) {
                     .enter => |handle| if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
                         slot.text_input_surface_focused = true;
-                        slot.text_input_enabled = false;
+                        slot.text_input_generation = null;
                         slot.text_input_revision = null;
+                        if (slot.runtime.ready) try slot.runtime.routeTextInput(text_input_event);
                     },
                     .leave => |handle| if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
                         slot.text_input_surface_focused = false;
-                        slot.text_input_enabled = false;
+                        slot.text_input_generation = null;
                         slot.text_input_revision = null;
+                        if (slot.runtime.ready) try slot.runtime.routeTextInput(text_input_event);
                     },
                     .batch => |batch| {
                         if (slotForNativeHandle(&window_set, runtime_slots, batch.window)) |slot|
@@ -632,7 +634,7 @@ fn runSourceInternal(
                 }
                 try slot.runtime.clear(lua_ui);
                 slot.configured_size = null;
-                slot.text_input_enabled = false;
+                slot.text_input_generation = null;
                 slot.text_input_surface_focused = false;
                 slot.text_input_revision = null;
                 if (window_set.handleForId(slot.id.?) == null) {
@@ -670,6 +672,7 @@ fn runSourceInternal(
                     options.window,
                 );
                 slot.runtime.keyboard_focused = false;
+                slot.runtime.text_input_surface_focused = false;
                 // Desktop surfaces own their entire configured rectangle.
                 if (window.?.declaration == .layer_surface) slot.runtime.root_padding = 0;
                 try dirty.register(handle);
@@ -745,6 +748,7 @@ fn runSourceInternal(
             try slot.runtime.prepareFrame(scale);
             try slot.runtime.advanceAnimations(animation_now);
             try slot.runtime.prepareFrame(scale);
+            try host.setPointerCursor(slot.runtime.window, try slot.runtime.pointerCursor());
             if (try slot.runtime.animationDelay()) |delay|
                 animation_delay = @min(animation_delay orelse delay, delay);
         };
@@ -760,9 +764,9 @@ fn runSourceInternal(
                     .session = value.session_revision,
                     .scene = value.scene_revision,
                 };
-                if (!slot.text_input_enabled) {
-                    try host.enableTextInput(slot.runtime.window, value.state);
-                    slot.text_input_enabled = true;
+                if (slot.text_input_generation != value.generation) {
+                    try host.enableTextInput(slot.runtime.window, value.state, value.generation);
+                    slot.text_input_generation = value.generation;
                     slot.text_input_revision = revision;
                 } else if (value.commit_permitted and
                     !std.meta.eql(slot.text_input_revision.?, revision))
@@ -770,9 +774,9 @@ fn runSourceInternal(
                     try host.updateTextInput(slot.runtime.window, value.state);
                     slot.text_input_revision = revision;
                 }
-            } else if (slot.text_input_enabled) {
+            } else if (slot.text_input_generation != null) {
                 try host.disableTextInput(slot.runtime.window);
-                slot.text_input_enabled = false;
+                slot.text_input_generation = null;
                 slot.text_input_revision = null;
             }
         };

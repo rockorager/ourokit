@@ -456,6 +456,7 @@ fn cloneTextInput(allocator: std.mem.Allocator, event: TextInputEvent) !TextInpu
                 null;
             break :blk .{ .batch = .{
                 .window = batch.window,
+                .generation = batch.generation,
                 .serial = batch.serial,
                 .serial_matches_state = batch.serial_matches_state,
                 .delete_surrounding = batch.delete_surrounding,
@@ -887,6 +888,7 @@ test "text input batches own protocol strings until safe-point translation" {
     var preedit = [_]u8{ 'n', 'e', 'w' };
     try windows.eventSink().textInput(.{ .batch = .{
         .window = handle,
+        .generation = 91,
         .serial = 4,
         .serial_matches_state = true,
         .delete_surrounding = .{ .before_bytes = 1, .after_bytes = 0 },
@@ -898,6 +900,7 @@ test "text input batches own protocol strings until safe-point translation" {
 
     const event = windows.takeEvent().?;
     defer windows.releaseEvent(event);
+    try std.testing.expectEqual(@as(?u64, 91), event.text_input.batch.generation);
     try std.testing.expectEqualStrings("ok", event.text_input.batch.commit.?.text.?);
     try std.testing.expectEqualStrings("new", event.text_input.batch.preedit.?.text.?);
 

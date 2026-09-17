@@ -122,6 +122,24 @@ const Fixture = struct {
         }, &glyphs, &self.paragraphs);
         return result;
     }
+
+    fn queueIme(self: *Fixture, commit: ?[]const u8, preedit: ?[]const u8, generation: ?u64) !void {
+        try self.runtime.routeTextInput(.{ .batch = .{
+            .window = self.runtime.window,
+            .generation = generation,
+            .serial = 7,
+            .serial_matches_state = false,
+            .delete_surrounding = null,
+            .commit = if (commit) |value| .{ .text = value } else null,
+            .preedit = if (preedit) |value| .{ .text = value, .cursor_begin = @intCast(value.len), .cursor_end = @intCast(value.len) } else null,
+        } });
+    }
+
+    fn dispatch(self: *Fixture) !void {
+        var unused: Vm = undefined;
+        try self.runtime.dispatchInput(&unused);
+        try self.runtime.prepareFrame(1);
+    }
 };
 
 test "Lua stack keeps ordered children and keyed foreground identity" {
@@ -836,4 +854,117 @@ test "caret stays steady for composition and pauses for selection and window foc
     try f.runtime.advanceAnimations(9500 * ms);
     try std.testing.expect((try f.runtime.animationDelay()) == null);
     try std.testing.expect(!(try f.runtime.tree.objectAt(render)).text_input.show_caret);
+}
+
+test "queued IME batches cannot follow focus to another field or back to the same field" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("function build() return ouro.column {key = 'root', ouro.text_input {key = 'a', width = 240, default_text = 'Alpha', autofocus = true}, ouro.text_input {key = 'b', width = 240, default_text = 'Bravo'}} end");
+    try f.build();
+    const a = try f.handle("root/a");
+    const b = try f.handle("root/b");
+    const old = (try f.runtime.textInputStatus()).?.generation;
+    try f.queueIme(null, "é", null);
+    try f.dispatch();
+    try std.testing.expect((try f.runtime.text_inputs.session(a)).preedit() != null);
+    // Both events are enqueued before the input safe point changes focus.
+    try f.runtime.routeKeyboard(.{ .key = .{ .window = f.runtime.window, .serial = 1, .time_ms = 1, .state = .pressed, .translated = .{ .keycode = 0, .logical = .tab } } });
+    try f.queueIme("wrong", null, old);
+    try f.dispatch();
+    try std.testing.expectEqual(b, f.runtime.focus.current().?);
+    try std.testing.expect((try f.runtime.text_inputs.session(a)).preedit() == null);
+    try std.testing.expectEqualStrings("Alpha", (try f.runtime.text_inputs.session(a)).model.text());
+    try std.testing.expectEqualStrings("Bravo", (try f.runtime.text_inputs.session(b)).model.text());
+    try f.tab();
+    const current = (try f.runtime.textInputStatus()).?.generation;
+    try std.testing.expect(current != old);
+    try f.queueIme("wrong", null, old);
+    try f.queueIme("!", null, current);
+    try f.dispatch();
+    try std.testing.expectEqualStrings("Alpha!", (try f.runtime.text_inputs.session(a)).model.text());
+    // Serial mismatch alone does not reject valid editor effects.
+    try std.testing.expect(!f.runtime.text_input_commit_permitted);
+}
+
+test "composition is revoked by focus loss disabling replacement and removal" {
+    for (0..6) |reason| {
+        const f = try Fixture.create();
+        defer f.destroy();
+        try f.exec("enabled = true; read_only = false; show = true; value = 'Alpha'; function build() return ouro.column {key = 'root', show and ouro.text_input {key = 'input', text = value, enabled = enabled, read_only = read_only, autofocus = true} or ouro.text {key = 'empty', text = 'Removed'}} end");
+        try f.build();
+        const input = try f.handle("root/input");
+        const old = (try f.runtime.textInputStatus()).?.generation;
+        try f.queueIme(null, "é", old);
+        try f.dispatch();
+        switch (reason) {
+            0 => try f.runtime.routeKeyboard(.{ .leave = .{ .window = f.runtime.window, .serial = 2 } }),
+            1 => try f.runtime.routeTextInput(.{ .leave = f.runtime.window }),
+            else => {
+                try f.exec(switch (reason) {
+                    2 => "enabled = false",
+                    3 => "read_only = true",
+                    4 => "value = 'Beta'",
+                    else => "show = false",
+                });
+                _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+                try f.build();
+            },
+        }
+        try f.dispatch();
+        if (f.runtime.text_inputs.contains(input))
+            try std.testing.expect((try f.runtime.text_inputs.session(input)).preedit() == null);
+        switch (reason) {
+            0 => try f.runtime.routeKeyboard(.{ .enter = .{ .window = f.runtime.window, .serial = 3 } }),
+            1 => try f.runtime.routeTextInput(.{ .enter = f.runtime.window }),
+            else => {
+                try f.exec("enabled = true; read_only = false; show = true");
+                _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+                try f.build();
+                if (f.runtime.focus.current() == null) try f.tab();
+            },
+        }
+        try f.dispatch();
+        try f.queueIme("wrong", "stale", old);
+        try f.dispatch();
+        const current_input = try f.handle("root/input");
+        const session = try f.runtime.text_inputs.session(current_input);
+        try std.testing.expect(session.preedit() == null);
+        try std.testing.expectEqualStrings(if (reason == 4) "Beta" else "Alpha", session.model.text());
+        try std.testing.expect((try f.runtime.textInputStatus()).?.generation != old);
+    }
+}
+
+test "text pointer follows hit testing read-only fields drag capture and stationary rebuilds" {
+    const Cursor = @import("../platform/window.zig").PointerCursor;
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("enabled = true; show = true; function build() return ouro.column {key = 'root', show and ouro.text_input {key = 'input', width = 240, default_text = 'Select text', read_only = true, enabled = enabled} or ouro.text {key = 'empty', text = 'Removed'}, ouro.button {key = 'button', label = 'Button'}} end");
+    try f.build();
+    try std.testing.expectEqual(Cursor.default, try f.runtime.pointerCursor());
+    const center = (try f.runtime.semanticTarget("root/input")).center;
+    const button = (try f.runtime.semanticTarget("root/button")).center;
+    try f.pointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = center } });
+    try std.testing.expectEqual(Cursor.text, try f.runtime.pointerCursor());
+    try f.pointer(.{ .button = .{ .window = f.runtime.window, .serial = 2, .time_ms = 1, .button = 0x110, .state = .pressed } });
+    try f.pointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 2, .position = button } });
+    try std.testing.expectEqual(Cursor.text, try f.runtime.pointerCursor());
+    try f.pointer(.{ .button = .{ .window = f.runtime.window, .serial = 3, .time_ms = 3, .button = 0x110, .state = .released } });
+    try std.testing.expectEqual(Cursor.default, try f.runtime.pointerCursor());
+    try f.pointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 4, .position = center } });
+    try std.testing.expectEqual(Cursor.text, try f.runtime.pointerCursor());
+    try f.exec("enabled = false");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(Cursor.default, try f.runtime.pointerCursor());
+    try f.exec("enabled = true");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(Cursor.text, try f.runtime.pointerCursor());
+    try f.pointer(.{ .leave = .{ .window = f.runtime.window, .serial = 4 } });
+    try std.testing.expectEqual(Cursor.default, try f.runtime.pointerCursor());
+    try f.pointer(.{ .enter = .{ .window = f.runtime.window, .serial = 5, .position = center } });
+    try f.exec("show = false");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(Cursor.default, try f.runtime.pointerCursor());
 }
