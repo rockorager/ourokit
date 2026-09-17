@@ -416,6 +416,13 @@ making snapshots timing dependent. The interactive Storybook browser is
 available through `storybook run`; deterministic actions remain a snapshot
 playback contract while the live browser accepts ordinary user input.
 
+`{ type = "tab", target = "content/control" }` replays a real Tab press and
+asserts that the next focus stop has that semantic path; it does not directly
+assign focus. Click and pointer-down actions also support `ouro.switch`.
+The `switch/*` stories cover light/dark, checked/unchecked, disabled, and
+keyboard-focused states. Switches expose controlled `checked` and
+`on_change(boolean)`; see [the API](docs/application-model.md#controlled-switches).
+
 Application-wide themes override colors, typography, control geometry, and
 per-widget defaults on `ouro.app { theme = { ... }, windows = { ... } }`.
 Nested `ouro.theme` descriptions inherit and override those defaults; explicit

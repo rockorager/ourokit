@@ -76,6 +76,26 @@ also omit extra focus outlines for now. Button pressed state uses the Radix
 hover color but omits its brightness/saturation filter until Ourokit has a
 justified color-filter primitive.
 
+Switch uses the Radix Themes size-2 surface recipe: a 35×20 logical-pixel
+track, 18×18 thumb, 1-pixel inset, and pill radius. Geometry derives from
+`spacing_5` and border-width foundations; `controls.radius` can override the
+radius, but shared button/input height and border-width defaults do not resize
+the switch. The native recipe composes root, track, and thumb Boxes and shares
+the retained button press/focus policy without adding a render-object kind.
+
+`switch_track` and `switch_border` map to Slate alpha steps 3 and 5;
+`switch_thumb` is white and `switch_disabled_thumb` is Slate step 2. Checked
+tracks use `primary`, disabled tracks use `disabled`, and focus uses `ring`.
+All are inherited semantic colors, including app and nested theme overrides.
+The 43×28 hit bounds reserve space for a 2-pixel focus ring and 2-pixel gap,
+so parent clips cannot cut off the ring. Focus changes only the root border
+color, not layout. A 1-pixel `switch_border` thumb edge replaces shadows and
+keeps disabled thumb positions discernible in light mode.
+Unlike Radix's focus-visible selector, Ourokit shows it for pointer focus too.
+State changes are immediate: this first native recipe omits Radix's animation,
+thumb shadows, blend modes, and active filters. Checked borders use `primary`
+rather than compositing Radix's gray inset shadow over the accent track.
+
 Radix Themes has no vertical sidebar row. Ourokit's sidebar ListBox is a
 documented adaptation of Radix scale semantics: transparent idle rows, gray
 step 3 for hover, gray step 5 plus medium text for selection, and no border.

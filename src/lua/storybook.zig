@@ -8,7 +8,7 @@ pub const Viewport = struct {
     height: u32 = 480,
 };
 
-pub const ActionKind = enum { hover, pointer_down, click, scroll };
+pub const ActionKind = enum { hover, pointer_down, click, scroll, tab };
 
 pub const Action = struct {
     kind: ActionKind,
@@ -281,6 +281,8 @@ fn parseActions(allocator: std.mem.Allocator, state: *c.State, table: c_int) ![]
             .click
         else if (std.mem.eql(u8, kind_value, "scroll"))
             .scroll
+        else if (std.mem.eql(u8, kind_value, "tab"))
+            .tab
         else
             return error.InvalidStoryActionType;
         const target = try requiredString(allocator, state, -1, "target");
@@ -365,6 +367,7 @@ test "storybook declarations are owned, defaulted, and selectable" {
         \\        { type = "hover", target = "content/button" },
         \\        { type = "pointer_down", target = "content/button" },
         \\        { type = "scroll", target = "content/list", delta = 120 },
+        \\        { type = "tab", target = "content/switch" },
         \\      },
         \\      content = function() end,
         \\    },
@@ -378,11 +381,13 @@ test "storybook declarations are owned, defaulted, and selectable" {
     try std.testing.expectEqual(@as(u32, 320), story.viewport.width);
     try std.testing.expectEqual(@as(f32, 2), story.snapshot_scale);
     try std.testing.expectEqual(ColorScheme.dark, story.color_scheme);
-    try std.testing.expectEqual(@as(usize, 3), story.actions.len);
+    try std.testing.expectEqual(@as(usize, 4), story.actions.len);
     try std.testing.expectEqual(ActionKind.pointer_down, story.actions[1].kind);
     try std.testing.expectEqualStrings("content/button", story.actions[1].target);
     try std.testing.expectEqual(ActionKind.scroll, story.actions[2].kind);
     try std.testing.expectEqual(@as(f32, 120), story.actions[2].delta);
+    try std.testing.expectEqual(ActionKind.tab, story.actions[3].kind);
+    try std.testing.expectEqualStrings("content/switch", story.actions[3].target);
 }
 
 test "storybook rejects unsafe and duplicate IDs" {

@@ -1,6 +1,27 @@
 local ouro = require("ouro")
 local count = ouro.signal(0)
 
+local switch_checked = ouro.signal(false)
+local function switch_story()
+  local function row(key, label, checked, enabled, on_change)
+    return ouro.row {
+      key = key, gap = ouro.tokens.foundation.spacing_3, cross_alignment = "center",
+      ouro.switch { key = "control", label = label, checked = checked, enabled = enabled, on_change = on_change },
+      ouro.text { key = "label", text = label },
+    }
+  end
+  return ouro.column {
+    key = "content", gap = ouro.tokens.foundation.spacing_4,
+    ouro.text { key = "heading", text = "Native switches", size = ouro.tokens.foundation.typography_5 },
+    row("dnd", "Do Not Disturb", switch_checked(), true, function(value) switch_checked:set(value) end),
+    row("off", "Off", false, true),
+    row("on", "On", true, true),
+    row("disabled-off", "Disabled off", false, false),
+    row("disabled-on", "Disabled on", true, false),
+    ouro.text { key = "hint", text = "Tab to focus. Space or Enter to toggle.", size = ouro.tokens.foundation.typography_2 },
+  }
+end
+
 local function button_story(label, enabled)
   return ouro.column {
     key = "content",
@@ -144,6 +165,34 @@ end
 return ouro.storybook {
   title = "Ourokit built-in widgets",
   stories = {
+    ouro.story {
+      id = "switch/states-light", group = "Switch", name = "States (light)",
+      viewport = { width = 360, height = 320 }, snapshot_scale = 2,
+      color_scheme = "light", content = switch_story,
+    },
+    ouro.story {
+      id = "switch/states-dark", group = "Switch", name = "States (dark)",
+      viewport = { width = 360, height = 320 }, snapshot_scale = 2,
+      color_scheme = "dark", content = switch_story,
+    },
+    ouro.story {
+      id = "switch/focus-light", group = "Switch", name = "Keyboard focus (light)",
+      viewport = { width = 360, height = 320 }, snapshot_scale = 2,
+      color_scheme = "light", content = switch_story,
+      actions = { { type = "tab", target = "content/dnd/control" } },
+    },
+    ouro.story {
+      id = "switch/focus-dark", group = "Switch", name = "Keyboard focus (dark)",
+      viewport = { width = 360, height = 320 }, snapshot_scale = 2,
+      color_scheme = "dark", content = switch_story,
+      actions = { { type = "tab", target = "content/dnd/control" } },
+    },
+    ouro.story {
+      id = "switch/toggled", group = "Switch", name = "Controlled pointer toggle",
+      viewport = { width = 360, height = 320 }, snapshot_scale = 2,
+      color_scheme = "light", content = switch_story,
+      actions = { { type = "click", target = "content/dnd/control" } },
+    },
     ouro.story {
       id = "text/bundled-fonts-light",
       group = "Text",

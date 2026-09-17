@@ -7,6 +7,7 @@ pub const Kind = enum {
     canvas,
     icon,
     button,
+    @"switch",
     text_input,
     listbox,
     option,

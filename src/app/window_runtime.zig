@@ -750,14 +750,9 @@ pub const WindowRuntime = struct {
                 handler = self.pointer_bindings.get(bound_target);
             }
             const binding = handler orelse continue;
-            if (binding.kind == .button) {
+            if (binding.kind == .button or binding.kind == .@"switch") {
                 if (activated_button != null and sameHandle(activated_button.?, bound_target))
-                    try self.spawnCallback(
-                        callback_service,
-                        binding.id,
-                        try self.instances.scope(bound_target),
-                        &.{},
-                    );
+                    try self.spawnButtonCallback(callback_service, bound_target);
                 continue;
             }
             if (binding.kind == .listbox) {
@@ -908,6 +903,14 @@ pub const WindowRuntime = struct {
         focused: ui.instance.InstanceHandle,
     ) !void {
         const binding = self.pointer_bindings.get(focused) orelse return;
+        if (binding.kind == .@"switch") {
+            const semantic = self.semantics.findId(try self.instances.semanticId(focused)) orelse return;
+            if (!semantic.enabled) return;
+            // Read only the committed application value. Rejected requests and
+            // pending callback tasks must not optimistically flip the control.
+            try self.spawnCallback(callback_service, binding.id, try self.instances.scope(focused), &.{.{ .boolean = !semantic.checked }});
+            return;
+        }
         if (binding.kind != .button) return;
         try self.spawnCallback(
             callback_service,

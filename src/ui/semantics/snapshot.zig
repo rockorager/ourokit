@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Role = enum { group, text, button, text_field, listbox, option, image };
+pub const Role = enum { group, text, button, text_field, listbox, option, image, @"switch" };
 
 /// Borrowed normalized semantic data emitted beside render descriptors during
 /// one build. Text is copied into the retained Snapshot before another Lua call.
@@ -12,6 +12,7 @@ pub const Descriptor = struct {
     label: []const u8 = "",
     enabled: bool = true,
     selected: bool = false,
+    checked: bool = false,
 };
 
 const StoredNode = struct {
@@ -24,6 +25,7 @@ const StoredNode = struct {
     label_len: usize,
     enabled: bool,
     selected: bool,
+    checked: bool,
 };
 
 pub const Node = struct {
@@ -34,6 +36,7 @@ pub const Node = struct {
     label: []const u8,
     enabled: bool,
     selected: bool,
+    checked: bool,
 };
 
 /// Double-buffered, allocation-free-after-init semantic snapshot suitable for
@@ -97,7 +100,7 @@ pub const Snapshot = struct {
             if (descriptor.parent) |parent| if (!indexContains(self.validation_index, parent))
                 return error.SemanticParentMustPrecedeChild;
             if (!indexPut(self.validation_index, descriptor.id)) return error.DuplicateSemanticId;
-            if ((descriptor.role == .text or descriptor.role == .button or descriptor.role == .option) and descriptor.label.len == 0)
+            if ((descriptor.role == .text or descriptor.role == .button or descriptor.role == .option or descriptor.role == .@"switch") and descriptor.label.len == 0)
                 return error.SemanticLabelRequired;
         }
     }
@@ -124,6 +127,7 @@ pub const Snapshot = struct {
                 .label_len = descriptor.label.len,
                 .enabled = descriptor.enabled,
                 .selected = descriptor.selected,
+                .checked = descriptor.checked,
             };
             text_count += descriptor.label.len;
         }
@@ -151,6 +155,13 @@ pub const Snapshot = struct {
     pub fn node(self: *const Snapshot, index: usize) !Node {
         if (index >= self.node_count) return error.SemanticNodeOutOfBounds;
         return self.nodeUnchecked(index);
+    }
+
+    pub fn findId(self: *const Snapshot, id: u64) ?Node {
+        for (0..self.node_count) |index| {
+            if (self.nodes[self.active][index].id == id) return self.nodeUnchecked(index);
+        }
+        return null;
     }
 
     /// Resolves slash-separated sibling keys from a semantic root. Raw keys
@@ -187,6 +198,7 @@ pub const Snapshot = struct {
             .label = self.text[self.active][stored.label_start..][0..stored.label_len],
             .enabled = stored.enabled,
             .selected = stored.selected,
+            .checked = stored.checked,
         };
     }
 };
