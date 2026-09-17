@@ -30,7 +30,7 @@ const Fixture = struct {
         self.* = .{ .state = c.luaL_newstate() orelse return error.LuaStateCreationFailed };
         c.lua_createtable(self.state, 0, 4);
         c.lua_setglobal(self.state, "ouro");
-        try self.scheduler.init(std.testing.allocator, 1024, 16, 0);
+        try self.scheduler.init(std.testing.allocator, 1024, 16, 4);
         self.scope = try self.scheduler.createScope(self.scheduler.application_scope);
         try self.signals.init(std.testing.allocator, self.state, 1024, 1024, 1024);
         self.fonts = text.FontCache.init(std.testing.allocator);
@@ -442,4 +442,161 @@ test "host appearance rethemes retained components while app and nested override
     );
     defer pinned.deinit();
     try std.testing.expectEqualDeep(tokens.light, pinned.resolvedTheme(tokens.dark).colors);
+}
+
+test "app and field keymaps dispatch edits and clipboard actions across retained rebuilds" {
+    const platform = @import("../platform/window.zig");
+    const dispatch = struct {
+        fn press(f: *Fixture, logical: platform.LogicalKey, modifiers: platform.Modifiers) !void {
+            try f.runtime.routeKeyboard(.{ .key = .{
+                .window = f.runtime.window,
+                .serial = 37,
+                .time_ms = 1,
+                .state = .pressed,
+                .translated = .{ .keycode = 0, .logical = logical, .modifiers = modifiers },
+            } });
+            var unused: Vm = undefined;
+            try f.runtime.dispatchInput(&unused);
+        }
+    };
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\overrides = {['Alt+R'] = 'select_all'}
+        \\read_only = false
+        \\function build()
+        \\  return ouro.text_input {key = 'input', default_text = 'one Ωtwo',
+        \\    autofocus = true, read_only = read_only, key_bindings = overrides}
+        \\end
+    );
+    var app = try @import("application.zig").Application.load(std.testing.allocator, f.state,
+        \\return ouro.app {
+        \\  id = 'dev.test.keymaps',
+        \\  text_input_bindings = {
+        \\    ['Ctrl+Z'] = false, ['Alt+U'] = 'undo', ['Alt+R'] = 'redo',
+        \\    ['Ctrl+B'] = 'move_word_previous', ['Ctrl+Shift+B'] = 'select_word_previous',
+        \\    ['Alt+D'] = 'delete_word_forward', ['Tab'] = 'select_all',
+        \\    ['Ctrl+X'] = false, ['Alt+X'] = 'cut', ['Alt+C'] = 'copy', ['Alt+V'] = 'paste',
+        \\  },
+        \\  windows = {ouro.window {id = 'main', title = 'Bindings', content = build}},
+        \\}
+    );
+    defer app.deinit();
+    f.ui.text_input_bindings = app.text_input_bindings;
+    try f.build();
+    const target = try f.handle("input");
+    const session = try f.runtime.text_inputs.session(target);
+    _ = try session.typeText("!");
+    try dispatch.press(f, .key_z, .{ .control = true });
+    try std.testing.expectEqualStrings("one Ωtwo!", session.model.text());
+    try dispatch.press(f, .key_u, .{ .alt = true });
+    try std.testing.expectEqualStrings("one Ωtwo", session.model.text());
+    try dispatch.press(f, .key_r, .{ .alt = true });
+    try std.testing.expectEqualStrings("one Ωtwo", session.model.selectedText());
+
+    // Mutating the Lua table alone cannot mutate the mounted native map.
+    try f.exec("overrides['Alt+R'] = nil");
+    _ = try session.model.setSelection(.collapsed(0));
+    try dispatch.press(f, .key_r, .{ .alt = true });
+    try std.testing.expectEqualStrings("one Ωtwo", session.model.selectedText());
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(target, try f.handle("input"));
+    try dispatch.press(f, .key_r, .{ .alt = true });
+    try std.testing.expectEqualStrings("one Ωtwo!", session.model.text());
+    try dispatch.press(f, .key_u, .{ .alt = true });
+    try dispatch.press(f, .key_b, .{ .control = true });
+    try std.testing.expectEqual(@as(usize, 4), session.model.selection.extent);
+    try dispatch.press(f, .key_b, .{ .control = true, .shift = true });
+    try std.testing.expectEqual(@as(usize, 4), session.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 0), session.model.selection.extent);
+    try dispatch.press(f, .key_d, .{ .alt = true });
+    try std.testing.expectEqualStrings("Ωtwo", session.model.text());
+    try dispatch.press(f, .key_u, .{ .alt = true });
+    try dispatch.press(f, .tab, .{});
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    try std.testing.expectEqualStrings("one Ωtwo", session.model.selectedText());
+
+    var clipboard: @import("../app/clipboard.zig").Coordinator = undefined;
+    try clipboard.init(std.testing.allocator, &f.scheduler, 2, 4, 1024);
+    defer clipboard.deinit();
+    clipboard.setPlatformAvailable(true);
+    f.runtime.clipboard = &clipboard;
+    defer f.runtime.clipboard = null;
+    try dispatch.press(f, .key_x, .{ .control = true });
+    try std.testing.expect(clipboard.takeAction() == null);
+    try std.testing.expectEqualStrings("one Ωtwo", session.model.text());
+    for ([_]platform.LogicalKey{ .key_c, .key_x }) |logical| {
+        try dispatch.press(f, logical, .{ .alt = true });
+        const action = clipboard.takeAction().?;
+        defer clipboard.releaseAction(action);
+        try std.testing.expectEqual(@as(u32, 37), action.set_selection.serial);
+        try std.testing.expectEqualStrings("one Ωtwo", action.set_selection.text);
+    }
+    try std.testing.expectEqualStrings("", session.model.text());
+    try dispatch.press(f, .key_v, .{ .alt = true });
+    const request = clipboard.takeAction().?.request_paste;
+    try std.testing.expectEqual(f.runtime.window, request.window);
+    try clipboard.completePaste(request.request, "pasted");
+    const completion = clipboard.takeCompletion().?;
+    try std.testing.expectEqual(target, completion.target.text_input);
+    var unused: Vm = undefined;
+    try std.testing.expect(try f.runtime.applyClipboardPaste(&unused, target, completion.text.?));
+    try clipboard.releaseCompletion(completion.request);
+    try std.testing.expectEqualStrings("pasted", session.model.text());
+
+    // A failed build cannot install even the valid part of a replacement map.
+    try f.exec("overrides = {['Alt+U'] = false, ['Ctrl+'] = 'undo'}");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try dispatch.press(f, .key_u, .{ .alt = true });
+    try std.testing.expectEqualStrings("", session.model.text());
+    try dispatch.press(f, .key_r, .{ .alt = true });
+    try f.exec("overrides = {}; read_only = true");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try dispatch.press(f, .tab, .{});
+    try dispatch.press(f, .key_u, .{ .alt = true });
+    try dispatch.press(f, .key_x, .{ .alt = true });
+    try dispatch.press(f, .key_v, .{ .alt = true });
+    try std.testing.expectEqualStrings("pasted", session.model.text());
+    try std.testing.expect(clipboard.takeAction() == null);
+    try dispatch.press(f, .key_c, .{ .alt = true });
+    const copied = clipboard.takeAction().?;
+    try std.testing.expectEqualStrings("pasted", copied.set_selection.text);
+    clipboard.releaseAction(copied);
+
+    try f.exec("read_only = false");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    _ = try session.model.setSelection(.collapsed(6));
+    _ = try session.apply(.{ .preedit = .{ .text = "候", .cursor = null } });
+    try dispatch.press(f, .key_u, .{ .alt = true });
+    try dispatch.press(f, .key_v, .{ .alt = true });
+    try std.testing.expectEqualStrings("pasted", session.model.text());
+    try std.testing.expectEqualStrings("候", session.preedit().?.text);
+    try std.testing.expect(clipboard.takeAction() == null);
+
+    _ = try session.apply(.{});
+    try f.exec("overrides = {inherit = false, ['A'] = false}");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try dispatch.press(f, .backspace, .{});
+    try dispatch.press(f, .key_z, .{ .control = true });
+    try dispatch.press(f, .key_u, .{ .alt = true });
+    try std.testing.expectEqualStrings("pasted", session.model.text());
+    for ([_]struct { key: platform.LogicalKey, unicode: u32, expected: []const u8 }{
+        .{ .key = .key_a, .unicode = 'a', .expected = "pasted" },
+        .{ .key = .key_b, .unicode = 'b', .expected = "pastedb" },
+    }) |case| {
+        try f.runtime.routeKeyboard(.{ .key = .{
+            .window = f.runtime.window,
+            .serial = 38,
+            .time_ms = 2,
+            .state = .pressed,
+            .translated = .{ .keycode = 0, .logical = case.key, .unicode = case.unicode },
+        } });
+        try f.runtime.dispatchInput(&unused);
+        try std.testing.expectEqualStrings(case.expected, session.model.text());
+    }
 }

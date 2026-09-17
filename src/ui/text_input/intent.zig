@@ -3,6 +3,8 @@
 /// mutating an editable model directly.
 pub const Intent = union(enum) {
     select_all,
+    undo,
+    redo,
     delete_backward,
     delete_forward,
     delete_word_backward,

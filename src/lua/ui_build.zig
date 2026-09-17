@@ -100,6 +100,7 @@ pub const UiBuild = struct {
     medium_candidates: []const text.FontHandle = &.{},
     text_configuration_revision: u64 = 0,
     widget_theme: ?theming.Theme = null,
+    text_input_bindings: @import("key_bindings.zig").Keymap = .{},
     root_padding: f32 = design.tokens.foundation.spacing_3,
     root_background: ?@import("../core/color.zig").Color = null,
     theme_fonts: ?*ThemeFonts = null,
@@ -1098,6 +1099,8 @@ pub const UiBuild = struct {
             return luaError(state, "text_input read_only must be a boolean");
         const autofocus = tableOptionalBoolean(state, 1, "autofocus", false) orelse
             return luaError(state, "text_input autofocus must be a boolean");
+        const bindings = @import("key_bindings.zig").field(state, 1, "key_bindings", self.text_input_bindings) catch |err|
+            return luaError(state, @errorName(err));
         const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id ^ self.component_namespace);
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
         const border_width = visual.border_width orelse defaults.controls.border_width orelse design.tokens.foundation.border_width_default;
@@ -1109,7 +1112,7 @@ pub const UiBuild = struct {
             .target_id = target_id,
             .content_id = content_id,
             .mode = mode,
-            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
+            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
             .session = TextInputSession.init(
                 sources.allocator,
                 if (controlled.present) controlled.value else uncontrolled.value,

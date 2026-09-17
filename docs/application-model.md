@@ -566,13 +566,88 @@ The supported defaults are:
 `ouro.text_input` is a single-line field. Long values scroll horizontally to
 keep the focused caret or selection extent visible, including during IME
 composition and pointer dragging. Resizing clamps the retained scroll offset.
-Enter remains a `"submit"` command rather than inserting a newline.
+Enter defaults to a `"submit"` command rather than inserting a newline.
 
 Declared `text` and `default_text`, pasted text, and IME commits/preedit normalize
 hard line breaks to spaces: CRLF becomes one space; standalone CR, LF, vertical
 tab, form feed, NEL, and Unicode line/paragraph separators each become one space.
 Values reported by `on_change` contain the normalized text. Normalizing an
 initial or externally supplied value does not itself emit `on_change`.
+
+By default, Ctrl+Z undoes an edit; Ctrl+Shift+Z or Ctrl+Y redoes it. Each field
+retains up to 100 undo steps, including the selection before and after each
+edit. Consecutive typing and repeated same-direction character deletions form
+a single step. Selection/navigation, focus changes, commands, or a different
+edit kind end the group. Grouping uses editing boundaries, not elapsed time.
+Paste, cut, and word deletion are separate steps. An IME composition, including
+any initial selection replacement, forms one step instead of one per preedit
+update.
+
+Undo/redo emit the normal `on_change` callback when they restore an edit; an
+empty history does nothing. They are unavailable in disabled/read-only fields
+and during active IME preedit. Controlled rebuilds that echo the current value
+preserve history; a different external `text` value resets it. Uncontrolled
+rebuilds preserve history, and unmounting discards it. Editing after undo
+discards the redo branch.
+
+Text input shortcuts are configurable. `ouro.app.text_input_bindings` supplies
+app-wide overrides; `ouro.text_input.key_bindings` overrides those for one field.
+Both are tables from key chords to semantic action names:
+
+```lua
+return ouro.app {
+  id = "dev.example.search",
+  text_input_bindings = {
+    ["Ctrl+Z"] = false,
+    ["Alt+U"] = "undo",
+    ["Alt+R"] = "redo",
+    ["Ctrl+B"] = "move_word_previous",
+    ["Ctrl+Shift+B"] = "select_word_previous",
+  },
+  windows = {
+    ouro.window {
+      id = "main", title = "Search",
+      content = function()
+        return ouro.text_input {
+          key = "query", default_text = "",
+          key_bindings = { ["Enter"] = false, ["Ctrl+Enter"] = "submit" },
+          on_command = function(command) print(command) end,
+        }
+      end,
+    },
+  },
+}
+```
+
+Omitted bindings inherit the app map, then built-in defaults. `false` consumes
+that exact chord without performing an action; it does not fall back to typing
+or another shortcut. `{ inherit = false, ... }` discards both app and built-in
+bindings before adding the listed entries. An empty table inherits unchanged.
+Maps are copied during declaration and updated on retained rebuilds, without
+resetting the editing session or history. Invalid declarations leave the last
+valid map installed. Up to 64 explicit bindings may be retained per field;
+built-in fallback entries do not count toward this limit.
+
+Chord names are case-insensitive and use `Ctrl`, `Shift`, `Alt`, and `Super`
+modifiers separated by `+`, followed by a logical key. Supported names are
+`A`–`Z`, `0`–`9`, `F1`–`F12`, `Left`, `Right`, `Up`, `Down`, `Home`, `End`,
+`PageUp`, `PageDown`, `Backspace`, `Delete`, `Enter`, `Escape`, `Space`, and `Tab`.
+Modifiers match exactly: `Ctrl+Z` does not also bind `Ctrl+Shift+Z`; letter case
+in the declaration does not imply Shift. Shifted digit keys retain their digit
+identity for bindings without changing the character inserted when unbound.
+Duplicate normalized chords, unknown keys/actions, and invalid value types
+are declaration errors.
+
+Actions are `undo`, `redo`, `select_all`, `delete_backward`, `delete_forward`,
+`delete_word_backward`, `delete_word_forward`, `copy`, `cut`, `paste`, `submit`,
+`cancel`, `previous`, and `next`. Movement actions use `move_` or `select_` plus
+one of `visual_left`, `visual_right`, `word_previous`, `word_next`, `line_up`,
+`line_down`, `line_start`, or `line_end`. For example, `select_line_end` extends
+the selection to the line end. Without `on_command`, `previous` and `next` fall
+back to line-up/down caret movement. Unbound printable keys still enter text;
+unbound Tab/Shift+Tab still traverse focus. Key releases never invoke actions.
+Editing/navigation may repeat; clipboard, submit, and cancel actions fire only
+on the initial press. Remapping does not bypass enabled/read-only or IME guards.
 
 `ouro.text_input` accepts optional string props `placeholder` and `label`:
 
@@ -599,10 +674,11 @@ OS accessibility bridge. Neither prop changes editing or focus behavior.
 
 `ouro.text_input` accepts `autofocus = true` to focus a newly mounted, enabled
 input once (retained rebuilds do not reclaim focus). `on_command(command)` runs
-in the owning task scope for unmodified `Enter` (`"submit"`), `Escape`
-(`"cancel"`), `ArrowUp` (`"previous"`), and `ArrowDown` (`"next"`). Navigation
-may repeat; submit/cancel only fire on the initial press. Commands are withheld
-during IME preedit. `on_command` and `on_change` may be used together.
+in the owning task scope for bound command actions. Defaults are unmodified
+`Enter` (`"submit"`), `Escape` (`"cancel"`), `Up` (`"previous"`), and `Down`
+(`"next"`). Navigation may repeat; submit/cancel only fire on the initial press.
+Commands are withheld during IME preedit. `on_command` and `on_change` may be
+used together.
 
 Widget defaults override shared controls/typography values. Explicit widget
 fields override those defaults; a text node's existing `size` prop takes precedence

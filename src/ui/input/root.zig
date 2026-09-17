@@ -3,6 +3,7 @@ pub const Router = @import("router.zig").Router;
 pub const PointerBindings = @import("bindings.zig").PointerBindings;
 pub const Handler = @import("bindings.zig").Handler;
 pub const HandlerKind = @import("bindings.zig").HandlerKind;
+pub const KeyChord = @import("key_chord.zig").KeyChord;
 
 test {
     _ = @import("router.zig");

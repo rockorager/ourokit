@@ -795,76 +795,22 @@ pub const WindowRuntime = struct {
             .enter => return,
             .leave => {
                 try self.applyButtonUpdate(self.buttons.release());
+                if (self.focus.current()) |target| if (self.text_inputs.contains(target))
+                    (try self.text_inputs.session(target)).model.breakUndoGroup();
                 return;
             },
             .key => |value| value,
         };
-        if (key.translated.logical == .tab and key.state != .released) {
-            try self.applyButtonUpdate(self.buttons.release());
-            const previous = self.focus.current();
-            _ = try self.focus.advance(
-                &self.instances,
-                if (key.translated.modifiers.shift) .backward else .forward,
-            );
-            try self.applyFocusVisual(previous, self.focus.current());
-            if (self.focus.current()) |focused| try self.ensureOptionVisible(focused);
-            return;
-        }
         if (self.focus.current()) |focused| if (self.text_inputs.contains(focused) and
             key.state != .released)
         {
             const session = try self.text_inputs.session(focused);
             const behavior = try self.text_inputs.getBehavior(focused);
-            if (behavior.enabled and session.preedit() == null) {
-                if (textInputCommand(key)) |command| {
-                    if (self.pointer_bindings.getKind(focused, .text_input_command)) |binding| {
-                        try self.spawnCallback(callback_service, binding.id, try self.instances.scope(focused), &.{.{ .string = command }});
-                        return;
-                    }
-                }
+            if (behavior.key_bindings.resolve(key.translated)) |action| {
+                if (key.state == .pressed or action.repeats())
+                    try self.applyTextInputAction(focused, action, key.serial, callback_service);
+                return;
             }
-            if (key.state == .pressed) {
-                if (textInputClipboardShortcut(key.translated)) |command| {
-                    if (!behavior.enabled or (behavior.read_only and command != .copy)) return;
-                    if (session.preedit() != null) return;
-                    session.endSelectionDrag();
-                    const clipboard = self.clipboard orelse return;
-                    if (!clipboard.platformAvailable()) return;
-                    switch (command) {
-                        .copy, .cut => {
-                            const selected = session.model.selectedText();
-                            if (selected.len == 0) return;
-                            try clipboard.setSelection(key.serial, selected);
-                            if (command == .cut) {
-                                session.preferred_x = null;
-                                if (try session.model.replaceSelection("")) {
-                                    try self.syncTextInputVisuals();
-                                    try self.notifyTextInputChanged(callback_service, focused);
-                                }
-                            }
-                        },
-                        .paste => _ = try clipboard.requestPaste(
-                            try self.instances.scope(focused),
-                            .{ .window = self.window, .text_input = focused },
-                        ),
-                    }
-                    return;
-                }
-            }
-            const intent = textInputIntent(key.translated);
-            if (session.preedit() != null and intent != null) return;
-            if (intent) |value| if (!behavior.enabled or
-                (behavior.read_only and intentEditsText(value))) return;
-            const changed = if (intent) |value|
-                try self.applyTextInputIntent(focused, value)
-            else
-                false;
-            if (changed) {
-                try self.syncTextInputVisuals();
-                if (intentEditsText(intent.?))
-                    try self.notifyTextInputChanged(callback_service, focused);
-            }
-            if (intent != null) return;
             const translated = key.translated;
             // A wl_keyboard key reaching the client was not consumed by the
             // input method. Advertising text-input-v3 alone does not own text
@@ -878,13 +824,24 @@ pub const WindowRuntime = struct {
                 var bytes: [4]u8 = undefined;
                 const len = std.unicode.utf8Encode(@intCast(translated.unicode), &bytes) catch return;
                 session.endSelectionDrag();
-                if (try session.apply(.{ .commit = .{ .text = bytes[0..len] } })) {
+                if (try session.typeText(bytes[0..len])) {
                     try self.syncTextInputVisuals();
                     try self.notifyTextInputChanged(callback_service, focused);
                 }
                 return;
             }
         };
+        if (key.translated.logical == .tab and key.state != .released) {
+            try self.applyButtonUpdate(self.buttons.release());
+            const previous = self.focus.current();
+            _ = try self.focus.advance(
+                &self.instances,
+                if (key.translated.modifiers.shift) .backward else .forward,
+            );
+            try self.applyFocusVisual(previous, self.focus.current());
+            if (self.focus.current()) |focused| try self.ensureOptionVisible(focused);
+            return;
+        }
         if (key.state != .released) if (self.focus.current()) |focused| {
             if (!self.listboxes.contains(focused)) if (try self.instances.nearestScroll(focused, .vertical)) |scroll| {
                 if (self.virtual_lists.find(try self.instances.semanticId(scroll))) |list| {
@@ -1257,6 +1214,67 @@ pub const WindowRuntime = struct {
         })).caret;
     }
 
+    fn applyTextInputAction(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        action: ui.text_input.KeyAction,
+        serial: u32,
+        callback_service: anytype,
+    ) !void {
+        const behavior = try self.text_inputs.getBehavior(target);
+        const session = try self.text_inputs.session(target);
+        if (!behavior.enabled or session.preedit() != null) return;
+        const intent: ui.text_input.EditIntent = switch (action) {
+            .none => return,
+            .edit => |value| value,
+            .command => |command| blk: {
+                session.model.breakUndoGroup();
+                if (self.pointer_bindings.getKind(target, .text_input_command)) |binding| {
+                    try self.spawnCallback(callback_service, binding.id, try self.instances.scope(target), &.{.{ .string = @tagName(command) }});
+                    return;
+                }
+                // List-style navigation commands retain caret navigation as
+                // their fallback when the application has no command handler.
+                break :blk switch (command) {
+                    .previous => .{ .move = .{ .destination = .line_up } },
+                    .next => .{ .move = .{ .destination = .line_down } },
+                    .submit, .cancel => return,
+                };
+            },
+            .clipboard => |command| {
+                if (behavior.read_only and command != .copy) return;
+                session.endSelectionDrag();
+                session.model.breakUndoGroup();
+                const clipboard = self.clipboard orelse return;
+                if (!clipboard.platformAvailable()) return;
+                switch (command) {
+                    .copy, .cut => {
+                        const selected = session.model.selectedText();
+                        if (selected.len == 0) return;
+                        try clipboard.setSelection(serial, selected);
+                        if (command == .cut) {
+                            session.preferred_x = null;
+                            if (try session.model.replaceSelection("")) {
+                                try self.syncTextInputVisuals();
+                                try self.notifyTextInputChanged(callback_service, target);
+                            }
+                        }
+                    },
+                    .paste => _ = try clipboard.requestPaste(
+                        try self.instances.scope(target),
+                        .{ .window = self.window, .text_input = target },
+                    ),
+                }
+                return;
+            },
+        };
+        if (behavior.read_only and intentEditsText(intent)) return;
+        if (try self.applyTextInputIntent(target, intent)) {
+            try self.syncTextInputVisuals();
+            if (intentEditsText(intent)) try self.notifyTextInputChanged(callback_service, target);
+        }
+    }
+
     fn applyTextInputIntent(
         self: *WindowRuntime,
         target: ui.instance.InstanceHandle,
@@ -1268,6 +1286,10 @@ pub const WindowRuntime = struct {
             .select_all => blk: {
                 session.preferred_x = null;
                 break :blk session.model.selectAll();
+            },
+            .undo, .redo => blk: {
+                session.preferred_x = null;
+                break :blk if (intent == .undo) session.model.undo() else session.model.redo();
             },
             .delete_backward => blk: {
                 session.preferred_x = null;
@@ -1529,6 +1551,12 @@ pub const WindowRuntime = struct {
         current: ?ui.instance.InstanceHandle,
     ) !void {
         if (!self.initialized) return;
+        if (!std.meta.eql(previous, current)) {
+            if (previous) |target| if (self.text_inputs.contains(target))
+                (try self.text_inputs.session(target)).model.breakUndoGroup();
+            if (current) |target| if (self.text_inputs.contains(target))
+                (try self.text_inputs.session(target)).model.breakUndoGroup();
+        }
         if (previous) |target| if (self.instances.isActive(target)) try self.setFocusBorder(target, false);
         if (current) |target| if (self.instances.isActive(target)) try self.setFocusBorder(target, true);
         try self.syncTextInputVisuals();
@@ -1746,7 +1774,9 @@ test "queued Tab navigation updates retained focus at the input safe point" {
         2,
     );
     try runtime.buttons.init(std.testing.allocator, 3);
+    try runtime.text_inputs.init(std.testing.allocator, 3);
     defer {
+        runtime.text_inputs.deinit();
         runtime.buttons.clear();
         runtime.buttons.deinit();
         runtime.router.deinit();
@@ -1962,6 +1992,18 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try std.testing.expect(focused_box.outline_color == null);
     _ = try runtime.frame_state.configure(.{ .width = 160, .height = 32 });
     try paint_check.check(&runtime, &fonts, &paragraphs, true);
+
+    var history_key: platform.KeyboardEvent = .{ .key = .{
+        .window = window,
+        .serial = 20,
+        .time_ms = 20,
+        .state = .pressed,
+        .translated = .{ .keycode = 44, .logical = .key_z, .modifiers = .{ .control = true } },
+    } };
+    try runtime.routeKeyboard(history_key);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    try std.testing.expectEqualStrings("hello", (try runtime.text_inputs.session(target)).model.text());
 
     var commit = [_]u8{'!'};
     try runtime.routeTextInput(.{ .batch = .{
@@ -2296,8 +2338,123 @@ test "text input protocol batches mutate retained sessions only at the input saf
     status = (try runtime.textInputStatus()).?;
     try std.testing.expectEqual(@as(i32, 158), status.state.cursor_rectangle.?.x);
     try std.testing.expectEqualStrings(normalized, status.state.surrounding.?.text);
+    const composing_revision = editing.model.revision;
+    try runtime.routeKeyboard(history_key);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqual(composing_revision, editing.model.revision);
+    try std.testing.expect(editing.preedit() != null);
+    try std.testing.expect(scheduler.takeRunnable() == null);
     _ = try editing.apply(.{ .preedit = .{ .text = null, .cursor = null } });
     try runtime.syncTextInputVisuals();
+
+    // Undo paste as one step and deliver exactly one normal change callback.
+    try runtime.routeKeyboard(history_key);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings("", editing.model.text());
+    _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    try std.testing.expectEqual(lua_c.type_string, lua_c.lua_getglobal(callback_vm.state, "changed_text"));
+    const undone = lua_c.lua_tolstring(callback_vm.state, -1, &changed_length).?;
+    try std.testing.expectEqualStrings("", undone[0..changed_length]);
+    lua_c.lua_settop(callback_vm.state, -2);
+
+    history_key.key.translated.modifiers.shift = true;
+    try runtime.routeKeyboard(history_key);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings(normalized, editing.model.text());
+    _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    _ = try runtime.tree.layout((try runtime.instances.rootRenderObject()).?, ui.layout.Constraints.tight(.{ .width = 160, .height = 32 }));
+    try std.testing.expectEqual(@as(i32, 158), (try runtime.textInputStatus()).?.state.cursor_rectangle.?.x);
+
+    character.key.state = .pressed;
+    character.key.translated.unicode = 'A';
+    try runtime.routeKeyboard(character);
+    try runtime.dispatchInput(&callbacks);
+    character.key.state = .repeated;
+    character.key.translated.unicode = 'B';
+    try runtime.routeKeyboard(character);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings(normalized ++ "AB", editing.model.text());
+    while (scheduler.takeRunnable()) |runnable| _ = try callback_vm.resumeRunnable(runnable);
+    history_key.key.translated.modifiers.shift = false;
+    try runtime.routeKeyboard(history_key);
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings(normalized, editing.model.text());
+    _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+    try std.testing.expect(scheduler.takeRunnable() == null);
+
+    // Focus loss and submit split typing even without a command callback.
+    for ([_]platform.KeyboardEvent{
+        .{ .leave = .{ .window = window, .serial = 21 } },
+        .{ .key = .{
+            .window = window,
+            .serial = 22,
+            .time_ms = 22,
+            .state = .pressed,
+            .translated = .{ .keycode = 28, .logical = .enter },
+        } },
+    }) |boundary| {
+        character.key.translated.unicode = 'A';
+        try runtime.routeKeyboard(character);
+        try runtime.dispatchInput(&callbacks);
+        try runtime.routeKeyboard(boundary);
+        try runtime.dispatchInput(&callbacks);
+        character.key.translated.unicode = 'B';
+        try runtime.routeKeyboard(character);
+        try runtime.dispatchInput(&callbacks);
+        while (scheduler.takeRunnable()) |runnable| _ = try callback_vm.resumeRunnable(runnable);
+        try runtime.routeKeyboard(history_key);
+        try runtime.dispatchInput(&callbacks);
+        try std.testing.expectEqualStrings(normalized ++ "A", editing.model.text());
+        _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+        try runtime.routeKeyboard(history_key);
+        try runtime.dispatchInput(&callbacks);
+        try std.testing.expectEqualStrings(normalized, editing.model.text());
+        _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+        try std.testing.expect(scheduler.takeRunnable() == null);
+    }
+
+    // Command callbacks use the same configurable map and action-specific
+    // repeat policy; disabled keys cannot reach the old command dispatch.
+    var custom: ui.text_input.Behavior = .{};
+    try custom.key_bindings.set(try ui.input.KeyChord.parse("Enter"), .none);
+    try custom.key_bindings.set(try ui.input.KeyChord.parse("Ctrl+Enter"), .{ .command = .submit });
+    try custom.key_bindings.set(try ui.input.KeyChord.parse("Alt+P"), .{ .command = .previous });
+    var custom_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(std.testing.allocator, "ignored");
+    defer if (custom_candidate) |*value| value.deinit();
+    try runtime.text_inputs.mountPrepared(owner, target, content, .uncontrolled, custom, &custom_candidate);
+    _ = runtime.pointer_bindings.remove(target);
+    _ = try runtime.pointer_bindings.set(owner, target, .{ .id = callback, .kind = .text_input_command });
+    const CommandCase = struct { logical: platform.LogicalKey, modifiers: platform.Modifiers, state: platform.KeyState, expected: ?[]const u8 };
+    for ([_]CommandCase{
+        .{ .logical = .enter, .modifiers = .{}, .state = .pressed, .expected = null },
+        .{ .logical = .enter, .modifiers = .{ .control = true }, .state = .pressed, .expected = "submit" },
+        .{ .logical = .enter, .modifiers = .{ .control = true }, .state = .repeated, .expected = null },
+        .{ .logical = .key_p, .modifiers = .{ .alt = true }, .state = .pressed, .expected = "previous" },
+        .{ .logical = .key_p, .modifiers = .{ .alt = true }, .state = .repeated, .expected = "previous" },
+        .{ .logical = .key_p, .modifiers = .{ .alt = true }, .state = .released, .expected = null },
+    }) |case| {
+        try runtime.routeKeyboard(.{ .key = .{
+            .window = window,
+            .serial = 25,
+            .time_ms = 25,
+            .state = case.state,
+            .translated = .{ .keycode = 0, .logical = case.logical, .modifiers = case.modifiers },
+        } });
+        try runtime.dispatchInput(&callbacks);
+        if (case.expected) |expected| {
+            _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+            _ = lua_c.lua_getglobal(callback_vm.state, "changed_text");
+            const value = lua_c.lua_tolstring(callback_vm.state, -1, &changed_length).?;
+            try std.testing.expectEqualStrings(expected, value[0..changed_length]);
+            lua_c.lua_settop(callback_vm.state, -2);
+        }
+        try std.testing.expect(scheduler.takeRunnable() == null);
+        try std.testing.expectEqualStrings(normalized, editing.model.text());
+    }
+    _ = runtime.pointer_bindings.remove(target);
+    _ = try runtime.pointer_bindings.set(owner, target, .{ .id = callback, .kind = .text_input_change });
 
     var read_only_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(
         std.testing.allocator,
@@ -2329,6 +2486,11 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try runtime.dispatchInput(&callbacks);
     try runtime.routeKeyboard(character);
     try runtime.dispatchInput(&callbacks);
+    try runtime.routeKeyboard(history_key);
+    try runtime.dispatchInput(&callbacks);
+    history_key.key.translated.modifiers.shift = true;
+    try runtime.routeKeyboard(history_key);
+    try runtime.dispatchInput(&callbacks);
     try std.testing.expectEqualStrings(
         before_read_only,
         (try runtime.text_inputs.session(target)).model.text(),
@@ -2341,130 +2503,15 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try fonts.release(font);
 }
 
-fn textInputIntent(key: platform.TranslatedKey) ?ui.text_input.EditIntent {
-    if (key.modifiers.alt or key.modifiers.logo) return null;
-    const extend = key.modifiers.shift;
-    if (key.modifiers.control) return switch (key.logical) {
-        .key_a => .select_all,
-        .backspace => .delete_word_backward,
-        .delete => .delete_word_forward,
-        .arrow_left => .{ .move = .{ .destination = .word_previous, .extend = extend } },
-        .arrow_right => .{ .move = .{ .destination = .word_next, .extend = extend } },
-        else => null,
-    };
-    return switch (key.logical) {
-        .backspace => .delete_backward,
-        .delete => .delete_forward,
-        .arrow_left => .{ .move = .{ .destination = .visual_left, .extend = extend } },
-        .arrow_right => .{ .move = .{ .destination = .visual_right, .extend = extend } },
-        .arrow_up => .{ .move = .{ .destination = .line_up, .extend = extend } },
-        .arrow_down => .{ .move = .{ .destination = .line_down, .extend = extend } },
-        .home => .{ .move = .{ .destination = .line_start, .extend = extend } },
-        .end => .{ .move = .{ .destination = .line_end, .extend = extend } },
-        else => null,
-    };
-}
-
-fn textInputCommand(key: anytype) ?[]const u8 {
-    if (key.state == .released or key.translated.modifiers.shift or
-        key.translated.modifiers.control or key.translated.modifiers.alt or
-        key.translated.modifiers.logo) return null;
-    return switch (key.translated.logical) {
-        .enter => if (key.state == .pressed) "submit" else null,
-        .escape => if (key.state == .pressed) "cancel" else null,
-        .arrow_up => "previous",
-        .arrow_down => "next",
-        else => null,
-    };
-}
-
-test "text input commands ignore releases modifiers and non-navigation repeats" {
-    const Key = @TypeOf(@as(platform.KeyboardEvent, undefined).key);
-    const base: Key = .{
-        .window = .invalid,
-        .serial = 1,
-        .time_ms = 2,
-        .state = .pressed,
-        .translated = .{ .keycode = 28, .logical = .enter },
-    };
-    try std.testing.expectEqualStrings("submit", textInputCommand(base).?);
-    var key = base;
-    key.state = .repeated;
-    try std.testing.expect(textInputCommand(key) == null);
-    key.translated.logical = .arrow_up;
-    try std.testing.expectEqualStrings("previous", textInputCommand(key).?);
-    key.state = .released;
-    try std.testing.expect(textInputCommand(key) == null);
-    key.state = .pressed;
-    key.translated.modifiers.control = true;
-    try std.testing.expect(textInputCommand(key) == null);
-}
-
 fn intentEditsText(intent: ui.text_input.EditIntent) bool {
     return switch (intent) {
-        .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
+        .undo, .redo, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
         .select_all, .move => false,
     };
 }
 
 fn isListBoxActivation(button: u32, state: platform.PointerButtonState) bool {
     return button == 0x110 and state == .pressed;
-}
-
-const ClipboardShortcut = enum { copy, cut, paste };
-
-fn textInputClipboardShortcut(key: platform.TranslatedKey) ?ClipboardShortcut {
-    if (!key.modifiers.control or key.modifiers.alt or key.modifiers.logo) return null;
-    return switch (key.logical) {
-        .key_c => .copy,
-        .key_x => .cut,
-        .key_v => .paste,
-        else => null,
-    };
-}
-
-test "platform keys translate to neutral text editing intents" {
-    try std.testing.expectEqual(
-        ui.text_input.EditIntent{ .move = .{ .destination = .line_up, .extend = true } },
-        textInputIntent(.{
-            .keycode = 1,
-            .logical = .arrow_up,
-            .modifiers = .{ .shift = true },
-        }).?,
-    );
-    try std.testing.expectEqual(
-        ui.text_input.EditIntent{ .move = .{ .destination = .line_start } },
-        textInputIntent(.{ .keycode = 1, .logical = .home }).?,
-    );
-    try std.testing.expectEqual(
-        ui.text_input.EditIntent{ .move = .{ .destination = .word_previous } },
-        textInputIntent(.{
-            .keycode = 1,
-            .logical = .arrow_left,
-            .modifiers = .{ .control = true },
-        }).?,
-    );
-    try std.testing.expectEqual(
-        ui.text_input.EditIntent.select_all,
-        textInputIntent(.{
-            .keycode = 1,
-            .logical = .key_a,
-            .modifiers = .{ .control = true },
-        }).?,
-    );
-    try std.testing.expectEqual(
-        ClipboardShortcut.copy,
-        textInputClipboardShortcut(.{
-            .keycode = 1,
-            .logical = .key_c,
-            .modifiers = .{ .control = true },
-        }).?,
-    );
-    try std.testing.expect(textInputClipboardShortcut(.{
-        .keycode = 1,
-        .logical = .key_v,
-        .modifiers = .{ .control = true, .alt = true },
-    }) == null);
 }
 
 test "listbox pointer activation occurs on primary press" {

@@ -463,6 +463,7 @@ pub const SourceGeneration = struct {
             return err;
         };
         application_initialized = true;
+        self.ui_build.text_input_bindings = self.application.text_input_bindings;
         _ = try self.refreshWindows();
         if (services) |value| {
             self.ui_build.widget_theme = self.application.resolvedTheme(value.theme);
@@ -558,6 +559,7 @@ pub const SourceGeneration = struct {
         try self.ui_build.attachMediumText(services.medium_font_candidates);
         self.ui_build.enableDeclarativeWidgets(services.theme);
         self.ui_build.widget_theme = self.application.resolvedTheme(services.theme);
+        self.ui_build.text_input_bindings = self.application.text_input_bindings;
         self.ui_build.theme_fonts = services.theme_fonts;
         try self.attachImages(services.images, services.icon_roots);
         if (services.workspaces) |store| {
@@ -715,6 +717,7 @@ pub const SourceGeneration = struct {
         self.bootstrap = null;
         if (!self.config.defer_run) if (self.module_loader) |*loader| loader.freeze();
         self.application = application;
+        self.ui_build.text_input_bindings = application.text_input_bindings;
         errdefer {
             self.disposeWindowOwner();
             self.application.deinit();
@@ -823,6 +826,7 @@ test "source generation owns a named snapshot and application Lua state" {
         \\assert(type(ouro.xdg.icon) == "function")
         \\return ouro.app {
         \\  id = "dev.ouro.generation-test",
+        \\  text_input_bindings = {['Alt+R'] = 'redo'},
         \\  windows = {
         \\    ouro.window {
         \\      id = "main",
@@ -860,6 +864,11 @@ test "source generation owns a named snapshot and application Lua state" {
     try std.testing.expectEqualStrings("generation-test.lua", generation.snapshot.entry_name);
     try std.testing.expectEqual(@as(usize, 1), generation.prepared_builds.len);
     try std.testing.expectEqual(@as(usize, 0), generation.prepared_builds[0].descriptors().len);
+    try std.testing.expectEqual(ui.text_input.KeyAction{ .edit = .redo }, generation.ui_build.text_input_bindings.resolve(.{
+        .keycode = 19,
+        .logical = .key_r,
+        .modifiers = .{ .alt = true },
+    }).?);
 }
 
 test "source generation rejects Lua identity that differs from package metadata" {
@@ -996,6 +1005,7 @@ test "headless source generation preserves action state when UI is activated lat
         \\local title = ouro.signal('before')
         \\return ouro.app {
         \\  id = 'dev.ouro.headless',
+        \\  text_input_bindings = {['Alt+U'] = 'undo'},
         \\  actions = { Change = {
         \\    description = 'Change the title',
         \\    inputSchema = {type='object', additionalProperties=false},
@@ -1024,6 +1034,11 @@ test "headless source generation preserves action state when UI is activated lat
     try std.testing.expectEqual(@as(usize, 0), generation.application.windows.len);
     try std.testing.expect(!generation.vm.hasGlobal("ui_started"));
     try std.testing.expect(generation.services == null);
+    try std.testing.expectEqual(ui.text_input.KeyAction{ .edit = .undo }, generation.ui_build.text_input_bindings.resolve(.{
+        .keycode = 22,
+        .logical = .key_u,
+        .modifiers = .{ .alt = true },
+    }).?);
     const action = try generation.application.startAction(&generation.vm, scheduler.application_scope, "Change", null);
     _ = try generation.vm.resumeRunnable(scheduler.takeRunnable().?);
     var arena = std.heap.ArenaAllocator.init(allocator);

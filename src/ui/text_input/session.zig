@@ -123,6 +123,14 @@ pub const Session = struct {
     }
 
     pub fn apply(self: *Session, batch: EditBatch) !bool {
+        return self.applyEdit(batch, .isolated);
+    }
+
+    pub fn typeText(self: *Session, bytes: []const u8) !bool {
+        return self.applyEdit(.{ .commit = .{ .text = bytes } }, .typing);
+    }
+
+    fn applyEdit(self: *Session, batch: EditBatch, kind: model_module.EditKind) !bool {
         var next_preedit: ?[]u8 = null;
         var next_cursor: ?model_module.Range = null;
         var transferred = false;
@@ -161,12 +169,18 @@ pub const Session = struct {
         if (!std.unicode.utf8ValidateSlice(replacement)) return error.InvalidUtf8;
         const has_model_edit = batch.delete_surrounding != null or batch.commit != null or
             (next_preedit != null and replacement_range.start != replacement_range.end);
+        const composing = self.preedit_bytes != null or next_preedit != null;
         const model_changed = if (has_model_edit)
-            try self.model.replaceRange(replacement_range, replacement)
+            try self.model.replaceRangeGrouped(replacement_range, replacement, if (composing) .composition else kind)
         else
             false;
 
         const old_preedit = self.preedit_bytes;
+        // Starting a composition without a selection still ends a typing run.
+        // Selection removal and subsequent commits remain one undo step until
+        // the input method clears preedit (including cancellation).
+        if ((!has_model_edit and old_preedit == null and next_preedit != null) or
+            (composing and next_preedit == null)) self.model.breakUndoGroup();
         const preedit_changed = !optionalTextEqual(old_preedit, next_preedit) or
             (next_preedit != null and !std.meta.eql(self.preedit_cursor, next_cursor));
         self.preedit_bytes = next_preedit;
@@ -209,6 +223,76 @@ test "commit replaces the normalized selection" {
     try std.testing.expectEqual(model_module.Selection.collapsed(12), session.model.selection);
     try std.testing.expect(session.preedit() == null);
     try std.testing.expect(session.preferred_x == null);
+}
+
+test "text input typing undo restores directional selection and separates navigation paste and cut" {
+    var session = try Session.init(std.testing.allocator, "AΩZ");
+    defer session.deinit();
+    const selected: model_module.Selection = .{ .anchor = 3, .extent = 1, .anchor_affinity = .upstream };
+    _ = try session.model.setSelection(selected);
+    _ = try session.typeText("e");
+    _ = try session.typeText("\u{301}");
+    _ = try session.typeText("👩🏽‍🚀");
+    const typed = "Ae\u{301}👩🏽‍🚀Z";
+    try std.testing.expectEqualStrings(typed, session.model.text());
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings("AΩZ", session.model.text());
+    try std.testing.expectEqual(selected, session.model.selection);
+    try std.testing.expect(session.model.redo());
+    try std.testing.expectEqualStrings(typed, session.model.text());
+    try std.testing.expectEqual(model_module.Selection.collapsed(typed.len - 1), session.model.selection);
+
+    // Even a click at the current position terminates a typing run.
+    _ = try session.typeText("!");
+    _ = try session.model.setSelection(session.model.selection);
+    _ = try session.typeText("?");
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings("Ae\u{301}👩🏽‍🚀!Z", session.model.text());
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings(typed, session.model.text());
+
+    _ = try session.apply(.{ .commit = .{ .text = "\r\npaste" } });
+    try std.testing.expect(!session.model.redo());
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings(typed, session.model.text());
+    try std.testing.expect(session.model.redo());
+    const pasted = "Ae\u{301}👩🏽‍🚀 pasteZ";
+    try std.testing.expectEqualStrings(pasted, session.model.text());
+    _ = session.model.selectAll();
+    _ = try session.model.replaceSelection("");
+    try std.testing.expectEqualStrings("", session.model.text());
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings(pasted, session.model.text());
+    try std.testing.expectEqual(model_module.Selection{ .anchor = 0, .extent = pasted.len }, session.model.selection);
+}
+
+test "text input composition undo includes selection removal but not preedit updates" {
+    var session = try Session.init(std.testing.allocator, "abcd");
+    defer session.deinit();
+    const selected: model_module.Selection = .{ .anchor = 3, .extent = 1 };
+    _ = try session.model.setSelection(selected);
+    _ = try session.apply(.{ .preedit = .{ .text = "e", .cursor = null } });
+    _ = try session.apply(.{ .preedit = .{ .text = "é", .cursor = null } });
+    _ = try session.apply(.{ .commit = .{ .text = "Ω" } });
+    try std.testing.expectEqualStrings("aΩd", session.model.text());
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings("abcd", session.model.text());
+    try std.testing.expectEqual(selected, session.model.selection);
+    try std.testing.expect(!session.model.undo());
+    try std.testing.expect(session.model.redo());
+    try std.testing.expectEqualStrings("aΩd", session.model.text());
+    try std.testing.expectEqual(model_module.Selection.collapsed(3), session.model.selection);
+
+    _ = try session.apply(.{ .preedit = .{ .text = "x", .cursor = null } });
+    _ = try session.apply(.{ .commit = .{ .text = "X" } });
+    try std.testing.expectEqualStrings("aΩXd", session.model.text());
+    // Cancelling a preedit with no selected value adds no undo entry.
+    _ = try session.apply(.{ .preedit = .{ .text = "unused", .cursor = null } });
+    _ = try session.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings("aΩd", session.model.text());
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings("abcd", session.model.text());
 }
 
 test "single line IME preedit maps cursors and commits normalized surrounding text" {

@@ -42,6 +42,21 @@ pub const Range = struct {
     end: usize,
 };
 
+pub const EditKind = enum { isolated, typing, delete_backward, delete_forward, composition };
+
+const history_limit = 100;
+const HistoryEntry = struct {
+    before: []u8,
+    after: []u8,
+    selection_before: Selection,
+    selection_after: Selection,
+
+    fn deinit(self: HistoryEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.before);
+        allocator.free(self.after);
+    }
+};
+
 /// Renderer- and platform-independent state for an editable UTF-8 value.
 ///
 /// Caret positions are always Unicode extended-grapheme boundaries. A compact
@@ -56,6 +71,9 @@ pub const Model = struct {
     word_boundaries: std.ArrayList(usize) = .empty,
     selection: Selection = .collapsed(0),
     revision: u64 = 0,
+    history: std.ArrayList(HistoryEntry) = .empty,
+    history_cursor: usize = 0,
+    edit_group: ?EditKind = null,
 
     pub fn init(allocator: std.mem.Allocator, raw: []const u8) !Model {
         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
@@ -75,6 +93,8 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        for (self.history.items) |entry| entry.deinit(self.allocator);
+        self.history.deinit(self.allocator);
         self.word_boundaries.deinit(self.allocator);
         self.boundaries.deinit(self.allocator);
         self.bytes.deinit(self.allocator);
@@ -96,6 +116,7 @@ pub const Model = struct {
     pub fn setSelection(self: *Model, value: Selection) !bool {
         if (!self.isBoundary(value.anchor) or !self.isBoundary(value.extent))
             return error.InvalidGraphemeBoundary;
+        self.breakUndoGroup();
         if (std.meta.eql(self.selection, value)) return false;
         self.selection = value;
         self.bumpRevision();
@@ -106,6 +127,7 @@ pub const Model = struct {
     /// beyond the new value or inside a changed grapheme snap backward to the
     /// nearest valid caret boundary.
     pub fn setSelectionClamped(self: *Model, value: Selection) bool {
+        self.breakUndoGroup();
         const next: Selection = .{
             .anchor = self.boundaryAtOrBefore(@min(value.anchor, self.bytes.items.len)),
             .extent = self.boundaryAtOrBefore(@min(value.extent, self.bytes.items.len)),
@@ -119,6 +141,7 @@ pub const Model = struct {
     }
 
     pub fn selectAll(self: *Model) bool {
+        self.breakUndoGroup();
         const value: Selection = .{ .anchor = 0, .extent = self.bytes.items.len };
         if (std.meta.eql(self.selection, value)) return false;
         self.selection = value;
@@ -137,6 +160,12 @@ pub const Model = struct {
     /// legitimately split an existing grapheme (for example, removing a
     /// combining mark), so the range need not already be a grapheme boundary.
     pub fn replaceRange(self: *Model, range: Range, raw: []const u8) !bool {
+        return self.replaceRangeGrouped(range, raw, .isolated);
+    }
+
+    /// Consecutive edits of one kind share a history entry until an explicit
+    /// boundary or selection movement. IME sessions delimit composition groups.
+    pub fn replaceRangeGrouped(self: *Model, range: Range, raw: []const u8, kind: EditKind) !bool {
         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
         if (range.start > range.end or range.end > self.bytes.items.len)
             return error.InvalidTextRange;
@@ -153,14 +182,31 @@ pub const Model = struct {
         const boundary_capacity = std.math.add(usize, new_len, 1) catch
             return error.OutOfMemory;
 
-        if (removed_len == 0 and replacement.len == 0) return false;
+        if (removed_len == 0 and replacement.len == 0) {
+            if (kind == .isolated) self.breakUndoGroup();
+            return false;
+        }
+
+        const coalesce = kind != .isolated and self.edit_group == kind and
+            self.history_cursor == self.history.items.len and self.history_cursor != 0 and
+            std.meta.eql(self.selection, self.history.items[self.history_cursor - 1].selection_after);
+        const before = if (!coalesce) try self.allocator.dupe(u8, self.text()) else null;
+        errdefer if (before) |bytes| self.allocator.free(bytes);
+        const after = try self.allocator.alloc(u8, new_len);
+        errdefer self.allocator.free(after);
+        @memcpy(after[0..range.start], self.bytes.items[0..range.start]);
+        @memcpy(after[range.start..][0..replacement.len], replacement);
+        @memcpy(after[range.start + replacement.len ..], self.bytes.items[range.end..]);
+        if (!coalesce) try self.history.ensureTotalCapacity(self.allocator, @min(self.history.items.len + 1, history_limit));
 
         // One boundary per byte plus the initial zero is a strict upper bound.
-        // Both allocations happen before the first content mutation.
+        // History and model allocations all precede the first content mutation.
         try self.bytes.ensureTotalCapacity(self.allocator, new_len);
         try self.boundaries.ensureTotalCapacity(self.allocator, boundary_capacity);
         try self.word_boundaries.ensureTotalCapacity(self.allocator, boundary_capacity);
-        self.bytes.replaceRangeAssumeCapacity(range.start, removed_len, replacement);
+        const selection_before = self.selection;
+        self.bytes.clearRetainingCapacity();
+        self.bytes.appendSliceAssumeCapacity(after);
         self.rebuildBoundaries();
 
         // Text on either side may join the replacement's edge into a larger
@@ -168,7 +214,58 @@ pub const Model = struct {
         const requested = range.start + replacement.len;
         self.selection = .collapsed(self.boundaryAtOrAfter(requested));
         self.bumpRevision();
+        if (coalesce) {
+            const last = &self.history.items[self.history_cursor - 1];
+            self.allocator.free(last.after);
+            last.after = after;
+            last.selection_after = self.selection;
+        } else {
+            for (self.history.items[self.history_cursor..]) |entry| entry.deinit(self.allocator);
+            self.history.items.len = self.history_cursor;
+            if (self.history.items.len == history_limit)
+                self.history.orderedRemove(0).deinit(self.allocator);
+            self.history.appendAssumeCapacity(.{
+                .before = before.?,
+                .after = after,
+                .selection_before = selection_before,
+                .selection_after = self.selection,
+            });
+            self.history_cursor = self.history.items.len;
+        }
+        self.edit_group = if (kind == .isolated) null else kind;
         return true;
+    }
+
+    pub fn breakUndoGroup(self: *Model) void {
+        self.edit_group = null;
+    }
+
+    pub fn undo(self: *Model) bool {
+        self.breakUndoGroup();
+        if (self.history_cursor == 0) return false;
+        self.history_cursor -= 1;
+        const entry = self.history.items[self.history_cursor];
+        self.restore(entry.before, entry.selection_before);
+        return true;
+    }
+
+    pub fn redo(self: *Model) bool {
+        self.breakUndoGroup();
+        if (self.history_cursor == self.history.items.len) return false;
+        const entry = self.history.items[self.history_cursor];
+        self.restore(entry.after, entry.selection_after);
+        self.history_cursor += 1;
+        return true;
+    }
+
+    fn restore(self: *Model, bytes: []const u8, selection: Selection) void {
+        // Every snapshot previously fit these buffers; edits never shrink
+        // their capacity. Undo/redo cannot fail or allocate.
+        self.bytes.clearRetainingCapacity();
+        self.bytes.appendSliceAssumeCapacity(bytes);
+        self.rebuildBoundaries();
+        self.selection = selection;
+        self.bumpRevision();
     }
 
     /// Moves to the previous logical grapheme. Visual left/right movement is a
@@ -191,8 +288,7 @@ pub const Model = struct {
         const end = self.selection.extent;
         const start = self.boundaryBefore(end);
         if (start == end) return false;
-        self.selection = .{ .anchor = start, .extent = end };
-        return self.replaceSelection("");
+        return self.replaceRangeGrouped(.{ .start = start, .end = end }, "", .delete_backward);
     }
 
     pub fn deleteForward(self: *Model) !bool {
@@ -200,8 +296,7 @@ pub const Model = struct {
         const start = self.selection.extent;
         const end = self.boundaryAfter(start);
         if (start == end) return false;
-        self.selection = .{ .anchor = start, .extent = end };
-        return self.replaceSelection("");
+        return self.replaceRangeGrouped(.{ .start = start, .end = end }, "", .delete_forward);
     }
 
     pub fn moveWordPrevious(self: *Model, extend: bool) bool {
@@ -221,8 +316,7 @@ pub const Model = struct {
         const end = self.selection.extent;
         const start = self.wordBoundaryBefore(end);
         if (start == end) return false;
-        self.selection = .{ .anchor = start, .extent = end };
-        return self.replaceSelection("");
+        return self.replaceRange(.{ .start = start, .end = end }, "");
     }
 
     pub fn deleteWordForward(self: *Model) !bool {
@@ -230,8 +324,7 @@ pub const Model = struct {
         const start = self.selection.extent;
         const end = self.wordBoundaryAfter(start);
         if (start == end) return false;
-        self.selection = .{ .anchor = start, .extent = end };
-        return self.replaceSelection("");
+        return self.replaceRange(.{ .start = start, .end = end }, "");
     }
 
     fn rebuildBoundaries(self: *Model) void {
@@ -299,6 +392,7 @@ pub const Model = struct {
     }
 
     fn setExtent(self: *Model, extent: usize, extend: bool) bool {
+        self.breakUndoGroup();
         const value: Selection = if (extend)
             .{
                 .anchor = self.selection.anchor,
@@ -477,4 +571,104 @@ test "allocation failure leaves editable content and selection intact" {
     try std.testing.expectEqualStrings("stable", model.text());
     try std.testing.expectEqual(selection, model.selection);
     try std.testing.expectEqual(revision, model.revision);
+}
+
+test "text input undo groups repeated deletions and restores the original caret" {
+    const original = "A👩🏽‍🚀éZ";
+    var model = try Model.init(std.testing.allocator, original);
+    defer model.deinit();
+    _ = try model.deleteBackward();
+    _ = try model.deleteBackward();
+    try std.testing.expectEqualStrings("A👩🏽‍🚀", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings(original, model.text());
+    try std.testing.expectEqual(Selection.collapsed(original.len), model.selection);
+    try std.testing.expect(!model.undo());
+    try std.testing.expect(model.redo());
+    try std.testing.expectEqualStrings("A👩🏽‍🚀", model.text());
+
+    try std.testing.expect(model.undo());
+    _ = try model.setSelection(.collapsed(1));
+    _ = try model.deleteForward();
+    _ = try model.deleteForward();
+    try std.testing.expectEqualStrings("AZ", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings(original, model.text());
+    try std.testing.expectEqual(Selection.collapsed(1), model.selection);
+    try std.testing.expect(model.redo());
+    try std.testing.expectEqualStrings("AZ", model.text());
+    try std.testing.expect(!model.redo());
+}
+
+test "text input undo restores graphemes after codepoint range edits" {
+    var model = try Model.init(std.testing.allocator, "Ae\u{301}B");
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed("Ae\u{301}".len));
+    _ = try model.replaceRange(.{ .start = 2, .end = 4 }, "");
+    try std.testing.expectEqualStrings("AeB", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("Ae\u{301}B", model.text());
+    try std.testing.expectEqual(Selection.collapsed(4), model.selection);
+    try std.testing.expect(model.redo());
+    try std.testing.expectEqual(Selection.collapsed(2), model.selection);
+    _ = model.selectAll();
+    _ = try model.replaceSelection("");
+    try std.testing.expectEqualStrings("", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("AeB", model.text());
+    try std.testing.expectEqual(Selection{ .anchor = 0, .extent = 3 }, model.selection);
+}
+
+test "text input history retains one hundred steps and discards redo after a new edit" {
+    var model = try Model.init(std.testing.allocator, "");
+    defer model.deinit();
+    for (0..101) |_| _ = try model.replaceSelection("x");
+    for (0..100) |_| try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("x", model.text());
+    try std.testing.expect(!model.undo());
+    for (0..100) |_| try std.testing.expect(model.redo());
+    try std.testing.expectEqual(@as(usize, 101), model.text().len);
+    try std.testing.expect(!model.redo());
+    for (0..99) |_| try std.testing.expect(model.undo());
+    _ = try model.replaceSelection("Y");
+    try std.testing.expectEqualStrings("xxY", model.text());
+    try std.testing.expect(!model.redo());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("xx", model.text());
+}
+
+test "text input history survives every edit allocation failure and restores without allocating" {
+    const scenario = struct {
+        fn run(allocator: std.mem.Allocator, coalesce: bool) !void {
+            var model = try Model.init(allocator, "ABCDE");
+            defer model.deinit();
+            _ = try model.replaceRangeGrouped(model.selection.range(), "x", .typing);
+            if (!coalesce) _ = model.undo();
+            const expected_before = if (coalesce) "ABCDEx" else "ABCDE";
+            const selection = model.selection;
+            const revision = model.revision;
+            _ = model.replaceRangeGrouped(model.selection.range(), "\r\nlong replacement with Ω and several words", .typing) catch |err| {
+                try std.testing.expectEqualStrings(expected_before, model.text());
+                try std.testing.expectEqual(selection, model.selection);
+                try std.testing.expectEqual(revision, model.revision);
+                if (coalesce) {
+                    try std.testing.expect(model.undo());
+                    try std.testing.expectEqualStrings("ABCDE", model.text());
+                }
+                try std.testing.expect(model.redo());
+                try std.testing.expectEqualStrings("ABCDEx", model.text());
+                return err;
+            };
+            try std.testing.expect(!model.redo());
+            try std.testing.expect(model.undo());
+            try std.testing.expectEqualStrings("ABCDE", model.text());
+            try std.testing.expect(model.redo());
+            try std.testing.expectEqualStrings(
+                if (coalesce) "ABCDEx long replacement with Ω and several words" else "ABCDE long replacement with Ω and several words",
+                model.text(),
+            );
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.run, .{false});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.run, .{true});
 }

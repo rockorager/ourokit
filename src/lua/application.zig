@@ -7,6 +7,7 @@ const vm_module = @import("vm.zig");
 const mcp_json = @import("mcp_client.zig");
 const mcp = @import("../mcp/root.zig");
 const theming = @import("theme.zig");
+const key_bindings = @import("key_bindings.zig");
 
 pub const ActionSchema = struct {
     arena: std.heap.ArenaAllocator,
@@ -34,6 +35,7 @@ pub const Definition = struct {
     state: *c.State,
     id: []u8,
     theme: ?theming.Theme = null,
+    text_input_bindings: key_bindings.Keymap = .{},
     inherited_colors: theming.ColorFields = .initEmpty(),
     action_schema: ?ActionSchema = null,
     actions_reference: c_int = c.no_reference,
@@ -75,6 +77,7 @@ pub const Definition = struct {
             .state = self.state,
             .id = self.id,
             .theme = self.theme,
+            .text_input_bindings = self.text_input_bindings,
             .inherited_colors = self.inherited_colors,
             .action_schema = self.action_schema,
             .actions_reference = self.actions_reference,
@@ -187,6 +190,7 @@ pub const Application = struct {
     state: *c.State,
     id: []u8,
     theme: ?theming.Theme = null,
+    text_input_bindings: key_bindings.Keymap = .{},
     inherited_colors: theming.ColorFields = .initEmpty(),
     action_schema: ?ActionSchema = null,
     actions_reference: c_int,
@@ -557,6 +561,7 @@ pub const Application = struct {
 
 fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     if (c.lua_type(state, -1) != c.type_table) return error.ApplicationDeclarationRequired;
+    const text_input_bindings = try key_bindings.field(state, -1, "text_input_bindings", .{});
     var inherited_colors = theming.ColorFields.initEmpty();
     const theme = blk: {
         const kind = c.lua_getfield(state, -1, "theme");
@@ -590,6 +595,7 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
         .state = state,
         .id = id,
         .theme = theme,
+        .text_input_bindings = text_input_bindings,
         .inherited_colors = inherited_colors,
         .action_schema = action_schema,
         .actions_reference = actions_reference,

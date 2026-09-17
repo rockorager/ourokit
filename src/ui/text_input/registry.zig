@@ -9,6 +9,7 @@ pub const Behavior = struct {
     enabled: bool = true,
     read_only: bool = false,
     autofocus: bool = false,
+    key_bindings: @import("keymap.zig").Keymap = .{},
     border_color: ?@import("../../core/color.zig").Color = null,
     focus_color: ?@import("../../core/color.zig").Color = null,
 };
@@ -106,6 +107,8 @@ pub const Registry = struct {
         for (self.entries) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.content = content_handle;
+            if (entry.behavior.enabled != behavior.enabled or entry.behavior.read_only != behavior.read_only)
+                entry.session.?.model.breakUndoGroup();
             entry.behavior = behavior;
             if (!behavior.enabled) entry.session.?.endSelectionDrag();
             entry.seen = true;
@@ -283,7 +286,8 @@ test "controlled mounts replace changed values and preserve valid selection" {
     const owner: build_owner.BuildOwnerHandle = .{ .slot = 1, .generation = 2 };
     const target: instance.InstanceHandle = .{ .slot = 3, .generation = 4 };
     const content: instance.InstanceHandle = .{ .slot = 5, .generation = 6 };
-    try registry.mount(owner, target, content, "abcdef");
+    try registry.mount(owner, target, content, "abcde");
+    _ = try (try registry.session(target)).typeText("f");
     _ = try (try registry.session(target)).model.setSelection(.{ .anchor = 2, .extent = 4 });
 
     var equal: ?Session = try Session.init(std.testing.allocator, "abcdef");
@@ -291,6 +295,11 @@ test "controlled mounts replace changed values and preserve valid selection" {
     try registry.prepareMount(target, .controlled, &equal);
     try registry.mountPrepared(owner, target, content, .controlled, .{}, &equal);
     try std.testing.expectEqual(@as(usize, 2), (try registry.session(target)).model.selection.anchor);
+    try std.testing.expect((try registry.session(target)).model.undo());
+    try std.testing.expectEqualStrings("abcde", (try registry.session(target)).model.text());
+    try std.testing.expect((try registry.session(target)).model.redo());
+    try std.testing.expectEqualStrings("abcdef", (try registry.session(target)).model.text());
+    _ = try (try registry.session(target)).model.setSelection(.{ .anchor = 2, .extent = 4 });
 
     var changed: ?Session = try Session.init(std.testing.allocator, "abc");
     defer if (changed) |*session_value| session_value.deinit();
@@ -300,6 +309,8 @@ test "controlled mounts replace changed values and preserve valid selection" {
     try std.testing.expectEqualStrings("abc", retained.model.text());
     try std.testing.expectEqual(@as(usize, 2), retained.model.selection.anchor);
     try std.testing.expectEqual(@as(usize, 3), retained.model.selection.extent);
+    try std.testing.expect(!retained.model.undo());
+    try std.testing.expect(!retained.model.redo());
     registry.clear();
 }
 
