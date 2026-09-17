@@ -107,6 +107,8 @@ pub const TextInput = struct {
     caret_affinity: CaretAffinity = .downstream,
     caret_width: f32 = 1,
     show_caret: bool = false,
+    /// Reveal the selection extent even when a range hides the painted caret.
+    reveal_caret: bool = false,
     preedit: ?TextRange = null,
     preedit_color: ?Color = null,
     preedit_width: f32 = 1,

@@ -2,6 +2,7 @@ const std = @import("std");
 const uucode = @import("uucode");
 const CaretAffinity = @import("../../text/positioned_lines.zig").CaretAffinity;
 const word_break = @import("../../text/word_break.zig");
+const single_line = @import("single_line.zig");
 
 /// A logical selection in UTF-8 byte offsets. Anchor and extent preserve the
 /// direction of an extended selection; `range` returns its normalized bounds.
@@ -56,8 +57,11 @@ pub const Model = struct {
     selection: Selection = .collapsed(0),
     revision: u64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Model {
-        if (!std.unicode.utf8ValidateSlice(initial)) return error.InvalidUtf8;
+    pub fn init(allocator: std.mem.Allocator, raw: []const u8) !Model {
+        if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
+        const normalized = try single_line.normalize(allocator, raw);
+        defer if (normalized) |bytes| allocator.free(bytes);
+        const initial = normalized orelse raw;
         const boundary_capacity = std.math.add(usize, initial.len, 1) catch
             return error.OutOfMemory;
         var self: Model = .{ .allocator = allocator };
@@ -132,13 +136,16 @@ pub const Model = struct {
     /// Input-method deletions are specified at code-point boundaries and may
     /// legitimately split an existing grapheme (for example, removing a
     /// combining mark), so the range need not already be a grapheme boundary.
-    pub fn replaceRange(self: *Model, range: Range, replacement: []const u8) !bool {
-        if (!std.unicode.utf8ValidateSlice(replacement)) return error.InvalidUtf8;
+    pub fn replaceRange(self: *Model, range: Range, raw: []const u8) !bool {
+        if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
         if (range.start > range.end or range.end > self.bytes.items.len)
             return error.InvalidTextRange;
         if (!isUtf8Boundary(self.bytes.items, range.start) or
             !isUtf8Boundary(self.bytes.items, range.end))
             return error.InvalidTextOffset;
+        const normalized = try single_line.normalize(self.allocator, raw);
+        defer if (normalized) |bytes| self.allocator.free(bytes);
+        const replacement = normalized orelse raw;
         const removed_len = range.end - range.start;
         const retained_len = self.bytes.items.len - removed_len;
         const new_len = std.math.add(usize, retained_len, replacement.len) catch
@@ -347,6 +354,17 @@ test "movement and deletion use extended grapheme boundaries" {
     try std.testing.expectEqualStrings("Ae\u{301}Z", model.text());
     try std.testing.expect(try model.deleteBackward());
     try std.testing.expectEqualStrings("AZ", model.text());
+}
+
+test "single line model normalizes initial values and replacements before placing caret" {
+    var model = try Model.init(std.testing.allocator, "a\r\né\u{2029}z");
+    defer model.deinit();
+    try std.testing.expectEqualStrings("a é z", model.text());
+    try std.testing.expectEqual(Selection.collapsed("a é z".len), model.selection);
+    _ = try model.setSelection(.{ .anchor = 2, .extent = 4 });
+    _ = try model.replaceSelection("Ω\r\nB\u{2028}C");
+    try std.testing.expectEqualStrings("a Ω B C z", model.text());
+    try std.testing.expectEqual(Selection.collapsed("a Ω B C".len), model.selection);
 }
 
 test "selection direction is retained and replacement is normalized" {

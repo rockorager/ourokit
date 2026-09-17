@@ -563,6 +563,17 @@ The supported defaults are:
 | `widgets.option` | Same as button except `disabled`, `disabled_foreground`, and `focus`; `pressed` is the selected background |
 | `widgets.text` | `foreground`, `font_size` |
 
+`ouro.text_input` is a single-line field. Long values scroll horizontally to
+keep the focused caret or selection extent visible, including during IME
+composition and pointer dragging. Resizing clamps the retained scroll offset.
+Enter remains a `"submit"` command rather than inserting a newline.
+
+Declared `text` and `default_text`, pasted text, and IME commits/preedit normalize
+hard line breaks to spaces: CRLF becomes one space; standalone CR, LF, vertical
+tab, form feed, NEL, and Unicode line/paragraph separators each become one space.
+Values reported by `on_change` contain the normalized text. Normalizing an
+initial or externally supplied value does not itself emit `on_change`.
+
 `ouro.text_input` accepts optional string props `placeholder` and `label`:
 
 ```lua

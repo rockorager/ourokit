@@ -1220,12 +1220,13 @@ pub const WindowRuntime = struct {
                 const session = try self.text_inputs.session(input);
                 switch (button.state) {
                     .pressed => {
+                        // Resolve the click against what was visible before
+                        // focus starts revealing the retained caret.
+                        const caret = try self.textCaretAtPointer(input, pointer.position);
+                        _ = try session.beginSelectionDrag(caret.byte_offset, caret.affinity);
                         const previous = self.focus.current();
                         _ = try self.focus.request(&self.instances, input);
                         try self.applyFocusVisual(previous, self.focus.current());
-                        const caret = try self.textCaretAtPointer(input, pointer.position);
-                        if (try session.beginSelectionDrag(caret.byte_offset, caret.affinity))
-                            try self.syncTextInputVisuals();
                     },
                     .released => session.endSelectionDrag(),
                 }
@@ -1587,8 +1588,8 @@ pub const WindowRuntime = struct {
             object.text_input.selection_end = presentation.selection.end;
             object.text_input.caret_offset = presentation.caret_offset;
             object.text_input.caret_affinity = presentation.caret_affinity;
-            object.text_input.show_caret = presentation.show_caret and
-                optionalSameHandle(self.focus.current(), mounted.target);
+            object.text_input.reveal_caret = optionalSameHandle(self.focus.current(), mounted.target);
+            object.text_input.show_caret = presentation.show_caret and object.text_input.reveal_caret;
             object.text_input.preedit = if (presentation.preedit) |range| .{
                 .start = range.start,
                 .end = range.end,
@@ -2221,6 +2222,83 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try std.testing.expectEqual(placeholder, composing_input.placeholder.?);
     _ = try editing.apply(.{ .preedit = .{ .text = null, .cursor = null } });
     try runtime.syncTextInputVisuals();
+
+    // Paste is normalized before callbacks, and the IME rectangle follows the
+    // horizontally scrolled caret rather than its unbounded paragraph X.
+    const pasted = "first\r\nsecond with a long editable value ending in Ω";
+    const normalized = "first second with a long editable value ending in Ω";
+    try std.testing.expect(try runtime.applyClipboardPaste(&callbacks, target, pasted));
+    try std.testing.expectEqualStrings(normalized, editing.model.text());
+    while (scheduler.takeRunnable()) |runnable|
+        _ = try callback_vm.resumeRunnable(runnable);
+    try std.testing.expectEqual(lua_c.type_string, lua_c.lua_getglobal(callback_vm.state, "changed_text"));
+    const pasted_change = lua_c.lua_tolstring(callback_vm.state, -1, &changed_length).?;
+    try std.testing.expectEqualStrings(normalized, pasted_change[0..changed_length]);
+    lua_c.lua_settop(callback_vm.state, -2);
+    _ = try runtime.tree.layout((try runtime.instances.rootRenderObject()).?, ui.layout.Constraints.tight(.{ .width = 160, .height = 32 }));
+    var status = (try runtime.textInputStatus()).?;
+    try std.testing.expectEqual(@as(i32, 158), status.state.cursor_rectangle.?.x);
+    try std.testing.expectEqualStrings(normalized, status.state.surrounding.?.text);
+
+    var navigation: platform.KeyboardEvent = .{ .key = .{
+        .window = window,
+        .serial = 14,
+        .time_ms = 15,
+        .state = .pressed,
+        .translated = .{ .keycode = 102, .logical = .home },
+    } };
+    try runtime.routeKeyboard(navigation);
+    try runtime.dispatchInput(&callbacks);
+    status = (try runtime.textInputStatus()).?;
+    try std.testing.expectEqual(@as(i32, 1), status.state.cursor_rectangle.?.x);
+    try std.testing.expectEqual(@as(usize, 0), editing.model.selection.extent);
+
+    // An unfocused field may retain an offscreen caret. Focusing by click must
+    // hit the visible text before revealing that old caret.
+    runtime.focus.clear();
+    try runtime.applyFocusVisual(target, null);
+    _ = try editing.model.setSelection(.collapsed(normalized.len));
+    try runtime.syncTextInputVisuals();
+    try runtime.updateTextInputPointer(target, .{ .pointer = .{
+        .target = target,
+        .hovered = target,
+        .position = .{ .x = 1, .y = 10 },
+        .event = .{ .button = .{
+            .window = window,
+            .serial = 15,
+            .time_ms = 16,
+            .button = 0x110,
+            .state = .pressed,
+        } },
+    } });
+    try std.testing.expectEqual(@as(usize, 0), editing.model.selection.extent);
+    try std.testing.expectEqual(@as(i32, 1), (try runtime.textInputStatus()).?.state.cursor_rectangle.?.x);
+
+    navigation.key.translated.logical = .end;
+    navigation.key.translated.modifiers.shift = true;
+    try runtime.routeKeyboard(navigation);
+    try runtime.dispatchInput(&callbacks);
+    status = (try runtime.textInputStatus()).?;
+    try std.testing.expectEqual(@as(i32, 158), status.state.cursor_rectangle.?.x);
+    try std.testing.expectEqual(@as(usize, 0), editing.model.selection.anchor);
+    try std.testing.expectEqual(normalized.len, editing.model.selection.extent);
+    try std.testing.expect(!(try runtime.tree.objectAt(render)).text_input.show_caret);
+    try std.testing.expect(scheduler.takeRunnable() == null);
+
+    // A long composition is also one line, without committing its value.
+    _ = try editing.model.setSelection(.collapsed(normalized.len));
+    _ = try editing.apply(.{ .preedit = .{ .text = "composition beyond the viewport", .cursor = .{
+        .start = "composition beyond the viewport".len,
+        .end = "composition beyond the viewport".len,
+    } } });
+    try runtime.syncTextInputVisuals();
+    _ = try runtime.tree.layout((try runtime.instances.rootRenderObject()).?, ui.layout.Constraints.tight(.{ .width = 160, .height = 32 }));
+    status = (try runtime.textInputStatus()).?;
+    try std.testing.expectEqual(@as(i32, 158), status.state.cursor_rectangle.?.x);
+    try std.testing.expectEqualStrings(normalized, status.state.surrounding.?.text);
+    _ = try editing.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+    try runtime.syncTextInputVisuals();
+
     var read_only_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(
         std.testing.allocator,
         "ignored",

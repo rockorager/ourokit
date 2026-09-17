@@ -1,6 +1,7 @@
 const std = @import("std");
 const model_module = @import("model.zig");
 const CaretAffinity = @import("../../text/positioned_lines.zig").CaretAffinity;
+const single_line = @import("single_line.zig");
 
 pub const DeleteSurrounding = struct {
     before_bytes: u32,
@@ -131,8 +132,12 @@ pub const Session = struct {
             if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
             if (text.len != 0) {
                 if (update.cursor) |cursor| try validatePreeditCursor(text, cursor);
-                next_preedit = try self.allocator.dupe(u8, text);
-                next_cursor = update.cursor;
+                next_preedit = try single_line.normalize(self.allocator, text) orelse
+                    try self.allocator.dupe(u8, text);
+                next_cursor = if (update.cursor) |cursor| .{
+                    .start = single_line.offset(text, cursor.start),
+                    .end = single_line.offset(text, cursor.end),
+                } else null;
             }
         };
 
@@ -204,6 +209,23 @@ test "commit replaces the normalized selection" {
     try std.testing.expectEqual(model_module.Selection.collapsed(12), session.model.selection);
     try std.testing.expect(session.preedit() == null);
     try std.testing.expect(session.preferred_x == null);
+}
+
+test "single line IME preedit maps cursors and commits normalized surrounding text" {
+    var session = try Session.init(std.testing.allocator, "az");
+    defer session.deinit();
+    _ = try session.model.setSelection(.collapsed(1));
+    _ = try session.apply(.{ .preedit = .{
+        .text = "é\r\n候\u{2028}補",
+        .cursor = .{ .start = "é\r\n".len, .end = "é\r\n候\u{2028}".len },
+    } });
+    try std.testing.expectEqualStrings("é 候 補", session.preedit().?.text);
+    try std.testing.expectEqual(model_module.Range{ .start = "é ".len, .end = "é 候 ".len }, session.preedit().?.cursor.?);
+    try std.testing.expectEqualStrings("az", session.surrounding().text);
+    _ = try session.apply(.{ .commit = .{ .text = "é\r\n候\u{2028}補" } });
+    try std.testing.expectEqualStrings("aé 候 補z", session.surrounding().text);
+    try std.testing.expectEqual("aé 候 補".len, session.surrounding().cursor);
+    try std.testing.expect(session.preedit() == null);
 }
 
 test "preedit removes selection but remains outside committed text" {

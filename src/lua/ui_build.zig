@@ -1084,7 +1084,6 @@ pub const UiBuild = struct {
         if (controlled.present == uncontrolled.present)
             return luaError(state, "text_input requires exactly one of text or default_text");
         const mode: TextInputValueMode = if (controlled.present) .controlled else .uncontrolled;
-        const initial = if (controlled.present) controlled.value else uncontrolled.value;
         const width = tableOptionalSize(state, 1, "width", .fill) orelse
             return luaError(state, "invalid text_input width");
         const height = tableOptionalExtent(
@@ -1102,6 +1101,22 @@ pub const UiBuild = struct {
         const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id ^ self.component_namespace);
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
         const border_width = visual.border_width orelse defaults.controls.border_width orelse design.tokens.foundation.border_width_default;
+        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
+        if (self.pending_text_input_count == self.pending_text_inputs.len)
+            return luaError(state, "text_input capacity exceeded");
+        // Stage ownership before any Lua error can longjmp past Zig cleanup.
+        self.pending_text_inputs[self.pending_text_input_count] = .{
+            .target_id = target_id,
+            .content_id = content_id,
+            .mode = mode,
+            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
+            .session = TextInputSession.init(
+                sources.allocator,
+                if (controlled.present) controlled.value else uncontrolled.value,
+            ) catch return luaError(state, "cannot create text_input session"),
+        };
+        const initial = self.pending_text_inputs[self.pending_text_input_count].session.?.model.text();
+        self.pending_text_input_count += 1;
         self.append(.{
             .id = target_id,
             .parent = parent.id,
@@ -1124,7 +1139,6 @@ pub const UiBuild = struct {
                 return luaError(state, parentDataErrorMessage(err)),
         }) catch return luaError(state, "cannot append text_input descriptor");
 
-        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         const source = sources.acquire(.{
             .utf8 = initial,
             .language = "und",
@@ -1163,17 +1177,6 @@ pub const UiBuild = struct {
             return luaError(state, "cannot append text_input content");
         };
         self.sources_staged = true;
-        if (self.pending_text_input_count == self.pending_text_inputs.len)
-            return luaError(state, "text_input capacity exceeded");
-        self.pending_text_inputs[self.pending_text_input_count] = .{
-            .target_id = target_id,
-            .content_id = content_id,
-            .mode = mode,
-            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
-            .session = TextInputSession.init(self.text_sources.?.allocator, initial) catch
-                return luaError(state, "cannot create text_input session"),
-        };
-        self.pending_text_input_count += 1;
         self.appendSemantic(.{
             .id = target_id,
             .parent = semanticParent(parent),
@@ -2068,7 +2071,7 @@ test "declarative text input separates focus identity from editable render conte
         \\    key = "content",
         \\    ouro.text_input {
         \\      key = "query",
-        \\      text = "Initial",
+        \\      text = "Initial\r\nvalue",
         \\      placeholder = "Search",
         \\      label = "Query",
         \\      read_only = true,
@@ -2104,6 +2107,8 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(.text_field, ui.semanticDescriptors()[1].role);
     try std.testing.expectEqualStrings("Query", ui.semanticDescriptors()[1].label);
     try std.testing.expectEqualStrings("Search", (try sources.get(descriptors[4].object.text_input.placeholder.?)).utf8);
+    try std.testing.expectEqualStrings("Initial value", (try sources.get(descriptors[4].object.text_input.source)).utf8);
+    try std.testing.expectEqual("Initial value".len, descriptors[4].object.text_input.caret_offset);
     var prepared: PreparedBuild = undefined;
     try prepared.init(std.testing.allocator, state, &sources, 5, 64);
     defer prepared.deinit();
@@ -2112,12 +2117,22 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(.controlled, prepared.text_inputs[0].mode);
     try std.testing.expect(prepared.text_inputs[0].behavior.read_only);
     try std.testing.expectEqualStrings(
-        "Initial",
+        "Initial value",
         prepared.text_inputs[0].session.?.model.text(),
     );
     try std.testing.expectEqual(@as(usize, 1), prepared.handler_count);
     try std.testing.expectEqual(.text_input_change, prepared.handlers[0].kind);
     prepared.reset();
+    try std.testing.expectEqual(@as(usize, 0), sources.count());
+    // Failure after session creation must release normalized model storage,
+    // even though Lua errors bypass defers in the C-callable widget emitter.
+    try execute(state,
+        \\function invalid_build()
+        \\  return ouro.text_input { key = "bad", text = "first\nsecond", flex = 0 }
+        \\end
+    );
+    try std.testing.expectError(error.LuaBuildFailed, ui.build(&owners, work, "invalid_build", &.{}));
+    try std.testing.expectEqual(@as(usize, 0), ui.pending_text_input_count);
     try std.testing.expectEqual(@as(usize, 0), sources.count());
     try owners.complete(work);
     try fonts.release(font);

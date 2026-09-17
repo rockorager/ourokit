@@ -441,6 +441,41 @@ return ouro.storybook {
       color_scheme = "light", content = placeholder_story,
     },
     ouro.story {
+      id = "text-input/single-line", group = "Text input",
+      name = "Single-line overflow and caret reveal",
+      viewport = { width = 420, height = 370 }, snapshot_scale = 2,
+      color_scheme = "light",
+      content = function()
+        return ouro.box {
+          key = "panel", width = "fill", padding = 16,
+          ouro.column {
+            key = "fields", gap = 10,
+            ouro.text { key = "heading", text = "Single-line text input", size = 18 },
+            ouro.text { key = "start-label", text = "Unfocused: beginning of the value" },
+            ouro.text_input {
+              key = "start", label = "Long value, unfocused",
+              default_text = "The beginning of a long editable value stays on one line, all the way to the end.",
+            },
+            ouro.text { key = "end-label", text = "Focused: caret at the end stays visible" },
+            ouro.text_input {
+              key = "end", label = "Long value, focused", autofocus = true,
+              default_text = "The beginning of a long editable value stays on one line, all the way to the end.",
+            },
+            ouro.text { key = "rtl-label", text = "Right-to-left value" },
+            ouro.text_input {
+              key = "rtl", label = "Arabic value",
+              default_text = "اللغة العربية نص طويل في حقل إدخال واحد اللغة العربية نص طويل في حقل إدخال واحد",
+            },
+            ouro.text { key = "break-label", text = "Line breaks become spaces" },
+            ouro.text_input {
+              key = "breaks", label = "Normalized value",
+              text = "First line\r\nSecond line\nThird line",
+            },
+          },
+        }
+      end,
+    },
+    ouro.story {
       id = "text-input/placeholders-dark", group = "Text input",
       name = "Placeholders and styled boxes (dark)",
       viewport = { width = 460, height = 410 }, snapshot_scale = 2,

@@ -57,6 +57,8 @@ const Slot = struct {
     layout_count: usize = 0,
     paragraph_layout: ?text.ParagraphHandle = null,
     placeholder_layout: ?text.ParagraphHandle = null,
+    /// Horizontal paragraph translation within a single-line input viewport.
+    text_offset_x: f32 = 0,
     scroll_offset: f32 = 0,
     scroll_extent: f32 = 0,
 };
@@ -226,10 +228,13 @@ pub const Tree = struct {
         if (sourceChanged(previous, object)) self.releaseParagraphLayout(target);
         target.object = object;
         self.releaseObject(previous);
-        if (affects_layout)
-            self.markNeedsLayout(handle)
-        else
+        if (affects_layout) {
+            self.markNeedsLayout(handle);
+        } else {
+            if (object == .text_input and target.has_layout and !target.needs_layout)
+                try self.updateTextInputOffset(target, target.size.width);
             self.markNeedsPaint(handle);
+        }
     }
 
     pub fn objectAt(self: *Tree, handle: NodeHandle) !types.Object {
@@ -269,7 +274,10 @@ pub const Tree = struct {
         const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
         const paragraph_layout = self.paragraphs.?.get(paragraph_handle) catch
             return error.StaleParagraph;
-        return paragraph_layout.positioned.hitTestPoint(point) orelse
+        return paragraph_layout.positioned.hitTestPoint(.{
+            .x = point.x - target.text_offset_x,
+            .y = point.y,
+        }) orelse
             return error.TextPositionNotFound;
     }
 
@@ -281,11 +289,13 @@ pub const Tree = struct {
         const paragraph_layout = self.paragraphs.?.get(paragraph_handle) catch
             return error.StaleParagraph;
         const input = target.object.text_input;
-        return paragraph_layout.positioned.caretRectangleForOffset(
+        var rectangle = try paragraph_layout.positioned.caretRectangleForOffset(
             input.caret_offset,
             input.caret_affinity,
             input.caret_width,
         );
+        rectangle.x += target.text_offset_x;
+        return rectangle;
     }
 
     pub fn textVisualNeighbor(
@@ -561,6 +571,7 @@ pub const Tree = struct {
                 const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
                 const paragraph_layout = self.paragraphs.?.get(paragraph_handle) catch
                     return error.StaleParagraph;
+                const text_origin: PointF = .{ .x = origin.x + target.text_offset_x, .y = origin.y };
                 try builder.pushClip(bounds);
                 if (value.selection_start != value.selection_end) {
                     var rectangles = try paragraph_layout.positioned.selectionRectangleIterator(.{
@@ -568,7 +579,7 @@ pub const Tree = struct {
                         .end = value.selection_end,
                     });
                     while (try rectangles.next()) |rectangle| try builder.solidRectangle(.{
-                        .x = origin.x + rectangle.x,
+                        .x = text_origin.x + rectangle.x,
                         .y = origin.y + rectangle.y,
                         .width = rectangle.width,
                         .height = rectangle.height,
@@ -577,14 +588,14 @@ pub const Tree = struct {
                 if (target.placeholder_layout) |placeholder|
                     try builder.paragraph(placeholder, origin, value.placeholder_color)
                 else
-                    try builder.paragraph(paragraph_handle, origin, value.color);
+                    try builder.paragraph(paragraph_handle, text_origin, value.color);
                 if (value.preedit) |range| {
                     var rectangles = try paragraph_layout.positioned.selectionRectangleIterator(.{
                         .start = range.start,
                         .end = range.end,
                     });
                     while (try rectangles.next()) |rectangle| try builder.solidRectangle(.{
-                        .x = origin.x + rectangle.x,
+                        .x = text_origin.x + rectangle.x,
                         .y = origin.y + rectangle.y + rectangle.height - value.preedit_width,
                         .width = rectangle.width,
                         .height = value.preedit_width,
@@ -597,7 +608,7 @@ pub const Tree = struct {
                         value.caret_width,
                     );
                     try builder.solidRectangle(.{
-                        .x = origin.x + rectangle.x,
+                        .x = text_origin.x + rectangle.x,
                         .y = origin.y + rectangle.y,
                         .width = rectangle.width,
                         .height = rectangle.height,
@@ -770,10 +781,8 @@ pub const Tree = struct {
             .base_direction = source.base_direction,
             .language = source.language,
             .logical_size = source.logical_size,
-            .max_width = if (constraints.hasBoundedWidth())
-                constraints.max_width
-            else
-                std.math.floatMax(f32),
+            // Shape the entire value on one line; the node is the viewport.
+            .max_width = std.math.floatMax(f32),
             .candidates = source.candidates,
             .configuration_revision = source.configuration_revision,
             .style = .{ .alignment = input.alignment },
@@ -810,12 +819,48 @@ pub const Tree = struct {
                 content_size.height = @max(content_size.height, hint_size.height);
             }
         }
+        content_size.width = if (constraints.hasBoundedWidth())
+            constraints.max_width
+        else
+            content_size.width + input.caret_width;
         const result = constraints.constrain(content_size);
         const target = try self.slot(handle);
         self.releaseParagraphLayout(target);
         target.paragraph_layout = layout_handle;
         target.placeholder_layout = placeholder_layout;
+        try self.updateTextInputOffset(target, result.width);
         return result;
+    }
+
+    fn updateTextInputOffset(self: *Tree, target: *Slot, width: f32) LayoutError!void {
+        const paragraph_layout = self.paragraphs.?.get(target.paragraph_layout.?) catch
+            return error.StaleParagraph;
+        const input = target.object.text_input;
+        const remaining = width - paragraph_layout.size.width - input.caret_width;
+        const minimum = @min(0, remaining);
+        if (remaining >= 0 or !target.has_layout) {
+            const rtl = paragraph_layout.positioned.lines[0].base_level & 1 != 0;
+            target.text_offset_x = switch (input.alignment) {
+                .start => if (rtl) remaining else 0,
+                .end => if (rtl) 0 else remaining,
+                .center => remaining / 2,
+                .justify => 0,
+            };
+        } else {
+            target.text_offset_x = std.math.clamp(target.text_offset_x, minimum, 0);
+        }
+        if (!input.reveal_caret and !input.show_caret) return;
+        const caret = paragraph_layout.positioned.caretRectangleForOffset(
+            input.caret_offset,
+            input.caret_affinity,
+            input.caret_width,
+        ) catch return error.InvalidTextInputRange;
+        if (caret.x + target.text_offset_x + caret.width > width)
+            target.text_offset_x = width - caret.x - caret.width;
+        if (caret.x + target.text_offset_x < 0)
+            target.text_offset_x = -caret.x;
+        if (remaining < 0)
+            target.text_offset_x = std.math.clamp(target.text_offset_x, minimum, 0);
     }
 
     fn ensureTextLayout(self: *Tree, handle: NodeHandle) !*Slot {
@@ -1334,6 +1379,106 @@ test "text objects cache width-specific mixed-script paragraphs across unchanged
     try tree.destroy(paragraph);
     try std.testing.expectEqual(@as(usize, 0), sources.count());
     try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
+}
+
+test "text input scrolls one line and shares viewport coordinates with caret hit testing and paint" {
+    const scene = @import("../../scene/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(latin) catch unreachable;
+    const arabic = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_arabic_test_font"),
+    });
+    defer fonts.release(arabic) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    tree.attachTextCaches(&sources, &paragraphs);
+    defer tree.deinit();
+
+    for ([_][]const u8{ "A long editable value with several words", "حفظ اللغة العربية حفظ اللغة العربية" }, 0..) |value, index| {
+        const rtl = index == 1;
+        const source = try sources.acquire(.{
+            .utf8 = value,
+            .language = "und",
+            .logical_size = 18,
+            .candidates = &.{ latin, arabic },
+            .configuration_revision = 1,
+        });
+        var object: types.Object = .{ .text_input = .{
+            .source = source,
+            .color = Color.rgba(10, 20, 30, 255),
+            .selection_color = Color.rgba(80, 120, 240, 120),
+            .caret_color = Color.rgba(20, 40, 80, 255),
+            .selection_start = value.len,
+            .selection_end = value.len,
+            .caret_offset = value.len,
+            .show_caret = true,
+            .reveal_caret = true,
+        } };
+        const input = try tree.create(object);
+        try sources.release(source);
+        _ = try tree.layout(input, .{ .max_width = 91, .max_height = 100 });
+        const layout = (try tree.slot(input)).paragraph_layout.?;
+        try std.testing.expectEqual(@as(usize, 1), (try paragraphs.get(layout)).positioned.lines.len);
+        var caret = try tree.textCaretRectangle(input);
+        try std.testing.expectApproxEqAbs(@as(f32, if (rtl) 0 else 90), caret.x, 0.001);
+        try std.testing.expectEqual(value.len, (try tree.hitTestText(input, .{ .x = caret.x, .y = 5 })).caret.byte_offset);
+
+        // A selection hides the caret, but its moving extent must still reveal.
+        object.text_input.selection_start = 0;
+        object.text_input.caret_offset = 0;
+        object.text_input.show_caret = false;
+        try tree.update(input, object);
+        try std.testing.expect(!(try tree.layoutDirty(input)));
+        try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(input));
+        caret = try tree.textCaretRectangle(input);
+        try std.testing.expectApproxEqAbs(@as(f32, if (rtl) 90 else 0), caret.x, 0.001);
+        try std.testing.expectEqual(@as(usize, 0), (try tree.hitTestText(input, .{ .x = caret.x, .y = 5 })).caret.byte_offset);
+
+        // Dragging outside either edge reaches offscreen text and reveals it.
+        const hit = try tree.hitTestText(input, .{ .x = if (rtl) -1000 else 1000, .y = 5 });
+        try std.testing.expectEqual(value.len, hit.caret.byte_offset);
+        object.text_input.caret_offset = hit.caret.byte_offset;
+        try tree.update(input, object);
+        caret = try tree.textCaretRectangle(input);
+        try std.testing.expectApproxEqAbs(@as(f32, if (rtl) 0 else 90), caret.x, 0.001);
+
+        // Resizing reuses the unwrapped paragraph and clamps the viewport.
+        _ = try tree.layout(input, .{ .max_width = 57, .max_height = 100 });
+        try std.testing.expectEqual(layout, (try tree.slot(input)).paragraph_layout.?);
+        caret = try tree.textCaretRectangle(input);
+        try std.testing.expectApproxEqAbs(@as(f32, if (rtl) 0 else 56), caret.x, 0.001);
+
+        // Preedit underlines and selection rectangles use the same translation.
+        object.text_input.preedit = .{ .start = 0, .end = value.len };
+        object.text_input.preedit_color = object.text_input.caret_color;
+        try tree.update(input, object);
+        var commands: [16]scene.Command = undefined;
+        var builder = try scene_builder.Builder.init(&commands, 1);
+        try tree.buildScene(input, &builder);
+        const painted = builder.displayList().commands;
+        try std.testing.expectEqual(@as(u32, 57), painted[0].push_clip_rect.width);
+        try std.testing.expect(painted[1] == .solid_rectangle);
+        try std.testing.expect(painted[2] == .paragraph);
+        try std.testing.expect(painted[3] == .solid_rectangle);
+        try std.testing.expectEqual(painted[1].solid_rectangle.bounds.x, painted[3].solid_rectangle.bounds.x);
+
+        // Once the whole value fits, no stale negative scroll survives.
+        _ = try tree.layout(input, .{ .max_width = 900, .max_height = 100 });
+        try std.testing.expect((try tree.slot(input)).text_offset_x >= 0);
+        caret = try tree.textCaretRectangle(input);
+        try std.testing.expect(caret.x >= 0 and caret.x + caret.width <= 900);
+        try tree.destroy(input);
+    }
 }
 
 test "text input paints selection, text, and caret from interactive paragraph geometry" {
