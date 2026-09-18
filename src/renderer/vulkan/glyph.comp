@@ -57,9 +57,19 @@ void main() {
     uint x = index % width;
     uint y = index / width;
     uint target_index = uint(top + int(y)) * target_width + uint(left + int(x));
-    if (image_mode != 0u) {
+    if (image_mode == 1u) {
         uvec2 sampled = pack16(imageSampleLinear(vec2(left + int(x), top + int(y)) + vec2(0.5)));
         pixels[target_index] = sourceOver(sampled, pixels[target_index]);
+        return;
+    }
+    if (image_mode == 2u) {
+        uint offset = ((atlas_y + y) * atlas_width + atlas_x + x * 8u) / 4u;
+        uvec2 sampled = uvec2(masks[offset], masks[offset + 1u]);
+        uvec4 channels;
+        for (uint i = 0u; i < 4u; ++i) {
+            channels[i] = (channel16(sampled, i) * channel16(source, 3u) + 32767u) / 65535u;
+        }
+        pixels[target_index] = sourceOver(pack16(channels), pixels[target_index]);
         return;
     }
     uint atlas_index = (atlas_y + y) * atlas_width + atlas_x + x;

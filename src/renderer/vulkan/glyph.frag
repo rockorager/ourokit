@@ -25,11 +25,18 @@ layout(push_constant) uniform Push {
 layout(location = 0) out vec4 target_color;
 
 void main() {
-    if (image_mode != 0u) {
+    if (image_mode == 1u) {
         target_color = vec4(imageSampleLinear(gl_FragCoord.xy)) / 65535.0;
         return;
     }
     uvec2 local = uvec2(ivec2(gl_FragCoord.xy) - bounds.xy);
+    if (image_mode == 2u) {
+        uint offset = ((atlas_origin.y + local.y) * atlas_width + atlas_origin.x + local.x * 8u) / 4u;
+        uvec2 pixel = uvec2(masks[offset], masks[offset + 1u]);
+        uvec4 channels = uvec4(pixel.x & 65535u, pixel.x >> 16u, pixel.y & 65535u, pixel.y >> 16u);
+        target_color = vec4(channels) / 65535.0 * color.a;
+        return;
+    }
     uint index = (atlas_origin.y + local.y) * atlas_width + atlas_origin.x + local.x;
     uint coverage = (masks[index / 4u] >> ((index % 4u) * 8u)) & 255u;
     target_color = color * (float(coverage) / 255.0);

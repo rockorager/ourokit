@@ -303,9 +303,12 @@ fn drawMask(
     const height: usize = bounds.height;
     for (0..height) |row| {
         for (0..width) |column| {
-            const coverage = bitmap.pixels[(source_y + row) * bitmap.width + source_x + column];
-            if (coverage == 0) continue;
-            const source = source_color.scaled(@as(u16, coverage) * 257);
+            const index = (source_y + row) * bitmap.width + source_x + column;
+            const source = if (bitmap.color)
+                bitmap.colorAt(index).scaled(source_color.a)
+            else
+                source_color.scaled(@as(u16, bitmap.pixels[index]) * 257);
+            if (source.a == 0) continue;
             const destination_offset = (@as(usize, @intCast(bounds.y)) + row) * target.width +
                 @as(usize, @intCast(bounds.x)) + column;
             target.pixels[destination_offset] = source.over(target.pixels[destination_offset]);
@@ -777,4 +780,20 @@ test "glyph masks are linear coverage in both polarities and transparent output"
     pixels[0] = LinearRgba16.fromColor(white);
     blendCoveredPixel(target, 0, 0, .transparent, 128, .source);
     try std.testing.expectEqual(PremultipliedSrgba8{ .r = 127, .g = 127, .b = 127, .a = 127 }, pixels[0].toSrgba8());
+}
+
+test "color glyphs preserve their RGB but inherit text opacity and clipping" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    // Opaque red then blue in little-endian linear RGBA16.
+    var bytes = [_]u8{ 255, 255, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255 };
+    const bitmap: GlyphBitmap = .{ .pixels = &bytes, .width = 2, .height = 1, .left = 0, .top = 0, .color = true };
+    var pixels = [_]LinearRgba16{.transparent};
+    const target: RasterTarget = .{ .pixels = &pixels, .width = 1, .height = 1 };
+    const clip: RectI = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+    const tint = Color.rgba(0, 255, 0, 128);
+    drawMask(target, clip, -1, 0, &bitmap, tint);
+    try std.testing.expectEqual(LinearRgba16{ .r = 0, .g = 0, .b = 32896, .a = 32896 }, pixels[0]);
+    pixels[0] = LinearRgba16.fromColor(Color.rgba(255, 255, 255, 255));
+    drawMask(target, clip, 0, 0, &bitmap, tint);
+    try std.testing.expectEqual(LinearRgba16{ .r = 65535, .g = 32639, .b = 32639, .a = 65535 }, pixels[0]);
 }

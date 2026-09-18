@@ -305,21 +305,29 @@ linear-light blending without altering shaping advances. Outlines load with
 `FT_RENDER_MODE_NORMAL`; experimental auto-hinter darkening is not forced.
 This phase-aware, light-hinted, Adobe-darkened mode (B) is the sole rendering
 policy. Historical unhinted comparisons are not selectable build modes.
-Glyph atlases remain A8 grayscale coverage, independent of text
-color, background polarity, and display subpixel layout.
+Outline masks remain A8 grayscale coverage, independent of text color,
+background polarity, and display subpixel layout. Bitmap-only fonts select the
+nearest available strike with `FT_Select_Size` and scale its pixels and bearings
+to the requested size. Color glyphs load with `FT_LOAD_COLOR`; FreeType's
+premultiplied sRGB BGRA pixels are decoded before area filtering in linear
+light. Cached color glyphs use little-endian premultiplied RGBA16, preserve
+their own RGB, and inherit text opacity. Software and Vulkan consume the same
+pixels; the Vulkan atlas packs aligned color texels alongside A8 masks without
+increasing its byte budget.
 
 The renderers accumulate fractional advances and offsets in device space.
 Only the final glyph origin is quantized to 1/64 pixel, then split into an
 integer anchor and nonnegative X/Y raster phases using floor semantics.
 FreeType translates the loaded outline by that phase before rasterization
 (negating scene Y for FreeType's Y-up axis). Bitmap bearings include the
-phase; placement adds only the integer anchor. Software and Vulkan share
+phase; placement adds only the integer anchor. Bitmap filtering includes the
+fractional origin and transparent pixels outside the glyph. Software and Vulkan share
 the phase-bearing cache key, including font generation and fractional size.
 
 Only requested phases are cached. CPU masks are bounded to 16 MiB and 16,384
 entries; a miss that exceeds either budget clears old masks. Returned mask
 pointers must be consumed before the next cache lookup. Vulkan retains its
-2048×2048 atlas and a 16,384-entry limit. Preflight visits the same positions
+2048-byte × 2048-row atlas and a 16,384-entry limit. Preflight visits the same positions
 as drawing; if full, it waits for outstanding GPU work, clears the atlas,
 and retries once with only the current scene. A scene that still cannot fit
 returns `GlyphAtlasFull` before recording or uploading its frame. It does not

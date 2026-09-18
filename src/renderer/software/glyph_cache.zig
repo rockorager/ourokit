@@ -2,13 +2,30 @@ const std = @import("std");
 const c = @import("freetype_c.zig").ft;
 const text = @import("../../text/root.zig");
 const Phase = @import("../glyph_position.zig").Phase;
+const LinearRgba16 = @import("../../core/color.zig").LinearRgba16;
 
 pub const GlyphBitmap = struct {
+    /// A8 coverage, or little-endian premultiplied linear RGBA16 for color glyphs.
     pixels: []u8,
     width: u32,
     height: u32,
     left: i32,
     top: i32,
+    color: bool = false,
+
+    pub fn bytesPerPixel(self: GlyphBitmap) u32 {
+        return if (self.color) 8 else 1;
+    }
+
+    pub fn colorAt(self: GlyphBitmap, index: usize) LinearRgba16 {
+        const pixel = self.pixels[index * 8 ..][0..8];
+        return .{
+            .r = std.mem.readInt(u16, pixel[0..2], .little),
+            .g = std.mem.readInt(u16, pixel[2..4], .little),
+            .b = std.mem.readInt(u16, pixel[4..6], .little),
+            .a = std.mem.readInt(u16, pixel[6..8], .little),
+        };
+    }
 };
 
 const FaceKey = extern struct {
@@ -39,7 +56,7 @@ const FaceEntry = struct {
     face: c.FT_Face,
 };
 
-/// Backend-owned FreeType faces and grayscale glyph masks. Font bytes and
+/// Backend-owned FreeType faces, coverage masks and color glyphs. Font bytes and
 /// shaping identity remain owned by the shared text service; this renderer
 /// retains every face handle it caches.
 pub const GlyphCache = struct {
@@ -107,11 +124,26 @@ pub const GlyphCache = struct {
         if (self.glyphs.get(key)) |cached| return cached;
 
         const face_value = try self.face(handle);
-        if (c.FT_Set_Char_Size(face_value, 0, key.size_26_6, 72, 72) != 0)
+        const scalable = face_value.*.face_flags & c.FT_FACE_FLAG_SCALABLE != 0;
+        var scale: [2]f64 = .{ 1, 1 };
+        if (!scalable and face_value.*.num_fixed_sizes > 0) {
+            const strikes = face_value.*.available_sizes[0..@intCast(face_value.*.num_fixed_sizes)];
+            var selected: usize = 0;
+            for (strikes, 0..) |strike, index| {
+                if (@abs(strike.y_ppem - key.size_26_6) < @abs(strikes[selected].y_ppem - key.size_26_6)) selected = index;
+            }
+            if (c.FT_Select_Size(face_value, @intCast(selected)) != 0) return error.GlyphSizeFailed;
+            scale = .{
+                @as(f64, @floatFromInt(key.size_26_6)) / @as(f64, @floatFromInt(strikes[selected].x_ppem)),
+                @as(f64, @floatFromInt(key.size_26_6)) / @as(f64, @floatFromInt(strikes[selected].y_ppem)),
+            };
+        } else if (c.FT_Set_Char_Size(face_value, 0, key.size_26_6, 72, 72) != 0)
             return error.GlyphSizeFailed;
-        const flags = c.FT_LOAD_TARGET_LIGHT | c.FT_LOAD_NO_BITMAP;
+        const flags: c.FT_Int32 = @intCast(c.FT_LOAD_TARGET_LIGHT | c.FT_LOAD_COLOR |
+            @as(c_long, if (scalable and face_value.*.face_flags & c.FT_FACE_FLAG_COLOR == 0) c.FT_LOAD_NO_BITMAP else 0));
         if (c.FT_Load_Glyph(face_value, glyph, flags) != 0)
             return error.GlyphLoadFailed;
+        const is_bitmap = face_value.*.glyph.*.format == c.FT_GLYPH_FORMAT_BITMAP;
         // Translate the loaded/hinted outline, before coverage rasterization.
         // Bearings include this translation; callers add only integer anchors.
         if (face_value.*.glyph.*.format == c.FT_GLYPH_FORMAT_OUTLINE)
@@ -119,28 +151,40 @@ pub const GlyphCache = struct {
         if (c.FT_Render_Glyph(face_value.*.glyph, c.FT_RENDER_MODE_NORMAL) != 0)
             return error.GlyphRenderFailed;
         const source = face_value.*.glyph.*.bitmap;
-        if (source.pixel_mode != c.FT_PIXEL_MODE_GRAY and source.pixel_mode != c.FT_PIXEL_MODE_MONO)
+        const color = source.pixel_mode == c.FT_PIXEL_MODE_BGRA;
+        if (!color and source.pixel_mode != c.FT_PIXEL_MODE_GRAY and source.pixel_mode != c.FT_PIXEL_MODE_MONO)
             return error.UnsupportedGlyphBitmap;
 
-        const width: u32 = source.width;
-        const height: u32 = source.rows;
-        const bytes = try std.math.mul(usize, width, height);
+        const left = @as(f64, @floatFromInt(face_value.*.glyph.*.bitmap_left)) * scale[0] +
+            (if (is_bitmap) @as(f64, @floatFromInt(phase.x)) / 64 else 0);
+        const top = -@as(f64, @floatFromInt(face_value.*.glyph.*.bitmap_top)) * scale[1] +
+            (if (is_bitmap) @as(f64, @floatFromInt(phase.y)) / 64 else 0);
+        const width_f = @ceil(left + @as(f64, @floatFromInt(source.width)) * scale[0]) - @floor(left);
+        const height_f = @ceil(top + @as(f64, @floatFromInt(source.rows)) * scale[1]) - @floor(top);
         // Only demanded phases are cached. Bound phase churn (including empty
         // glyphs) without holding 4096 variants per glyph indefinitely.
         const max_bytes = 16 * 1024 * 1024;
+        const bpp: u32 = if (color) 8 else 1;
+        if (width_f > max_bytes or height_f > max_bytes) return error.GlyphTooLarge;
+        const width: u32 = @intFromFloat(width_f);
+        const height: u32 = @intFromFloat(height_f);
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, width, height), bpp);
         if (bytes > max_bytes) return error.GlyphTooLarge;
         if (self.pixel_bytes + bytes > max_bytes or self.glyphs.count() >= 16384) self.clear();
         const pixels = try self.allocator.alloc(u8, bytes);
         errdefer self.allocator.free(pixels);
-        copyBitmap(pixels, source);
+        if (color or is_bitmap) {
+            resampleBitmap(pixels, width, height, source, scale, .{ left - @floor(left), top - @floor(top) }, color);
+        } else copyBitmap(pixels, source);
         const bitmap = try self.allocator.create(GlyphBitmap);
         errdefer self.allocator.destroy(bitmap);
         bitmap.* = .{
             .pixels = pixels,
             .width = width,
             .height = height,
-            .left = face_value.*.glyph.*.bitmap_left,
-            .top = face_value.*.glyph.*.bitmap_top,
+            .left = @intFromFloat(@floor(left)),
+            .top = @intFromFloat(-@floor(top)),
+            .color = color,
         };
         try self.glyphs.put(self.allocator, key, bitmap);
         self.pixel_bytes += bytes;
@@ -204,6 +248,48 @@ fn applyVariations(
         return error.VariationWriteFailed;
 }
 
+/// Area-filter bitmap strikes in premultiplied linear light, with transparent
+/// pixels outside the glyph. Include the fractional origin before filtering so
+/// bitmap glyphs follow the same subpixel-position contract as outlines.
+fn resampleBitmap(destination: []u8, width: u32, height: u32, source: c.FT_Bitmap, scale: [2]f64, offset: [2]f64, color: bool) void {
+    for (0..height) |y| for (0..width) |x| {
+        const x0 = (@as(f64, @floatFromInt(x)) - offset[0]) / scale[0];
+        const x1 = (@as(f64, @floatFromInt(x + 1)) - offset[0]) / scale[0];
+        const y0 = (@as(f64, @floatFromInt(y)) - offset[1]) / scale[1];
+        const y1 = (@as(f64, @floatFromInt(y + 1)) - offset[1]) / scale[1];
+        const first_x: usize = @intFromFloat(@max(0, @floor(x0)));
+        const last_x: usize = @intFromFloat(@min(@as(f64, @floatFromInt(source.width)), @ceil(x1)));
+        const first_y: usize = @intFromFloat(@max(0, @floor(y0)));
+        const last_y: usize = @intFromFloat(@min(@as(f64, @floatFromInt(source.rows)), @ceil(y1)));
+        var sum: [4]f64 = .{ 0, 0, 0, 0 };
+        for (first_y..@max(first_y, last_y)) |sy| for (first_x..@max(first_x, last_x)) |sx| {
+            const weight = (@min(x1, @as(f64, @floatFromInt(sx + 1))) - @max(x0, @as(f64, @floatFromInt(sx)))) *
+                (@min(y1, @as(f64, @floatFromInt(sy + 1))) - @max(y0, @as(f64, @floatFromInt(sy)))) * scale[0] * scale[1];
+            const pixel = bitmapPixel(source, sx, sy);
+            for (&sum, pixel) |*value, channel| value.* += @as(f64, @floatFromInt(channel)) * weight;
+        };
+        if (color) {
+            const output = destination[(y * width + x) * 8 ..][0..8];
+            for (sum, 0..) |value, channel| std.mem.writeInt(u16, output[channel * 2 ..][0..2], @intFromFloat(@round(std.math.clamp(value, 0, 65535))), .little);
+        } else destination[y * width + x] = @intFromFloat(@round(std.math.clamp(sum[3] / 257, 0, 255)));
+    };
+}
+
+fn bitmapPixel(source: c.FT_Bitmap, x: usize, y: usize) [4]u16 {
+    const pitch: usize = @intCast(if (source.pitch < 0) -source.pitch else source.pitch);
+    const row_y = if (source.pitch < 0) source.rows - 1 - y else y;
+    const row = source.buffer[row_y * pitch ..][0..pitch];
+    if (source.pixel_mode == c.FT_PIXEL_MODE_BGRA) {
+        const bgra = row[x * 4 ..][0..4];
+        const pixel = LinearRgba16.fromSrgba8(.{ .r = bgra[2], .g = bgra[1], .b = bgra[0], .a = bgra[3] });
+        return .{ pixel.r, pixel.g, pixel.b, pixel.a };
+    }
+    const alpha: u16 = if (source.pixel_mode == c.FT_PIXEL_MODE_MONO)
+        (if (row[x / 8] & (@as(u8, 0x80) >> @intCast(x % 8)) != 0) @as(u16, 65535) else 0)
+    else if (source.num_grays <= 1) 0 else @intCast(@as(u32, row[x]) * 65535 / (source.num_grays - 1));
+    return .{ 0, 0, 0, alpha };
+}
+
 fn copyBitmap(destination: []u8, source: c.FT_Bitmap) void {
     const pitch_abs: usize = @intCast(if (source.pitch < 0) -source.pitch else source.pitch);
     for (0..source.rows) |y| {
@@ -224,6 +310,89 @@ fn copyBitmap(destination: []u8, source: c.FT_Bitmap) void {
             else => unreachable,
         }
     }
+}
+
+test "bitmap emoji strikes scale bearings, colors and phases to requested size" {
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const handle = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/EmojiTest.ttf", .index = 0 },
+        .bytes = @embedFile("../../text/fonts/EmojiTest.ttf"),
+    });
+    defer fonts.release(handle) catch unreachable;
+    var cache = try GlyphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    const face_value = try cache.face(handle);
+    // The original crash: a bitmap-only font cannot accept this outline size.
+    try std.testing.expect(c.FT_Set_Char_Size(face_value, 0, 14 * 64, 72, 72) != 0);
+    const glyph = (try fonts.get(handle)).nominalGlyph('👋').?;
+    const small = try cache.get(handle, glyph, 14);
+    try std.testing.expect(small.color);
+    // The pinned 109 ppem strike has a 136x128 bitmap and top bearing 101.
+    try std.testing.expectEqual(@as(u32, 18), small.width);
+    try std.testing.expectEqual(@as(u32, 17), small.height);
+    try std.testing.expectEqual(@as(i32, 13), small.top);
+    try std.testing.expectEqual(@as(i32, 0), small.left);
+    var colored = false;
+    var partial_alpha = false;
+    for (0..small.width * small.height) |index| {
+        const pixel = small.colorAt(index);
+        colored = colored or (pixel.r > pixel.b and pixel.g > pixel.b);
+        partial_alpha = partial_alpha or (pixel.a > 0 and pixel.a < 65535);
+        try std.testing.expect(pixel.r <= pixel.a and pixel.g <= pixel.a and pixel.b <= pixel.a);
+    }
+    try std.testing.expect(colored and partial_alpha);
+    const shifted = try cache.getPhase(handle, glyph, 14, .{ .x = 32, .y = 16 });
+    try std.testing.expect(shifted != small);
+    try std.testing.expect(!std.mem.eql(u8, small.pixels, shifted.pixels));
+    try std.testing.expectEqual(shifted, try cache.getPhase(handle, glyph, 14, .{ .x = 32, .y = 16 }));
+    const large = try cache.get(handle, glyph, 28);
+    try std.testing.expectEqual(@as(u32, 35), large.width);
+    try std.testing.expectEqual(@as(u32, 33), large.height);
+    try std.testing.expectEqual(@as(i32, 26), large.top);
+}
+
+test "bitmap glyph filtering decodes BGRA before averaging and preserves transparent edges" {
+    // Asymmetric colors, partial alpha, and row padding catch channel swaps,
+    // encoded-space filtering, double premultiplication and pitch mistakes.
+    var bytes = [_]u8{ 0, 0, 255, 255, 0, 128, 0, 128, 99, 99, 99, 99, 255, 0, 0, 255, 0, 0, 0, 0, 88, 88, 88, 88 };
+    var source: c.FT_Bitmap = std.mem.zeroes(c.FT_Bitmap);
+    source.width = 2;
+    source.rows = 2;
+    source.pitch = 12;
+    source.buffer = &bytes;
+    source.pixel_mode = c.FT_PIXEL_MODE_BGRA;
+    var pixels: [32]u8 = undefined;
+    const bitmap: GlyphBitmap = .{ .pixels = &pixels, .width = 2, .height = 2, .left = 0, .top = 0, .color = true };
+    resampleBitmap(&pixels, 2, 2, source, .{ 1, 1 }, .{ 0, 0 }, true);
+    try std.testing.expectEqual(LinearRgba16{ .r = 65535, .g = 0, .b = 0, .a = 65535 }, bitmap.colorAt(0));
+    try std.testing.expectEqual(LinearRgba16{ .r = 0, .g = 32896, .b = 0, .a = 32896 }, bitmap.colorAt(1));
+    source.pitch = -12;
+    resampleBitmap(&pixels, 2, 2, source, .{ 1, 1 }, .{ 0, 0 }, true);
+    try std.testing.expectEqual(LinearRgba16{ .r = 0, .g = 0, .b = 65535, .a = 65535 }, bitmap.colorAt(0));
+    resampleBitmap(pixels[0..8], 1, 1, source, .{ 0.5, 0.5 }, .{ 0, 0 }, true);
+    try std.testing.expectEqual(LinearRgba16{ .r = 16384, .g = 8224, .b = 16384, .a = 40992 }, bitmap.colorAt(0));
+    source.width = 1;
+    source.rows = 1;
+    source.pitch = 4;
+    resampleBitmap(&pixels, 2, 2, source, .{ 1, 1 }, .{ 0.5, 0.25 }, true);
+    const expected = [_]u16{ 24576, 24576, 8192, 8192 };
+    for (expected, 0..) |value, index|
+        try std.testing.expectEqual(LinearRgba16{ .r = value, .g = 0, .b = 0, .a = value }, bitmap.colorAt(index));
+    source.pixel_mode = c.FT_PIXEL_MODE_MONO;
+    source.width = 3;
+    source.pitch = 1;
+    bytes[0] = 0xa0;
+    resampleBitmap(pixels[0..6], 6, 1, source, .{ 2, 1 }, .{ 0, 0 }, false);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 0, 0, 255, 255 }, pixels[0..6]);
+    source.pixel_mode = c.FT_PIXEL_MODE_GRAY;
+    source.width = 2;
+    source.pitch = 2;
+    source.num_grays = 256;
+    bytes[0] = 255;
+    bytes[1] = 0;
+    resampleBitmap(pixels[0..1], 1, 1, source, .{ 0.5, 1 }, .{ 0, 0 }, false);
+    try std.testing.expectEqual(@as(u8, 128), pixels[0]);
 }
 
 test "bundled CFF faces rasterize grayscale outlines in every weight and style" {

@@ -91,12 +91,14 @@ const atlas_bytes = atlas_width * atlas_height;
 const AtlasKey = if (has_freetype) @import("../software/glyph_cache.zig").GlyphKey else struct {};
 
 const AtlasGlyph = struct {
+    // x addresses bytes: A8 coverage or aligned linear RGBA16 color texels.
     x: u32,
     y: u32,
     width: u32,
     height: u32,
     left: i32,
     top: i32,
+    color: bool,
 };
 
 const RealGlyphCache = struct {
@@ -237,11 +239,12 @@ const RealGlyphCache = struct {
         if (self.entries.get(key)) |entry| return entry;
         if (self.entries.count() >= 16384) return error.GlyphAtlasFull;
         const bitmap = try self.raster.getPhase(handle, glyph_id, pixel_size, phase);
-        var x = self.next_x;
+        const row_bytes = bitmap.width * bitmap.bytesPerPixel();
+        var x = std.mem.alignForward(u32, self.next_x, bitmap.bytesPerPixel());
         var y = self.next_y;
         var row_height = self.row_height;
-        if (bitmap.width > atlas_width or bitmap.height > atlas_height) return error.GlyphAtlasFull;
-        if (x + bitmap.width > atlas_width) {
+        if (row_bytes > atlas_width or bitmap.height > atlas_height) return error.GlyphAtlasFull;
+        if (x + row_bytes > atlas_width) {
             x = 0;
             y += row_height;
             row_height = 0;
@@ -250,9 +253,9 @@ const RealGlyphCache = struct {
         const destination: [*]u8 = @ptrCast(self.mapping);
         for (0..bitmap.height) |row| {
             const offset = (y + row) * atlas_width + x;
-            @memcpy(destination[offset..][0..bitmap.width], bitmap.pixels[row * bitmap.width ..][0..bitmap.width]);
+            @memcpy(destination[offset..][0..row_bytes], bitmap.pixels[row * row_bytes ..][0..row_bytes]);
             self.dirty_start = @min(self.dirty_start, offset);
-            self.dirty_end = @max(self.dirty_end, offset + bitmap.width);
+            self.dirty_end = @max(self.dirty_end, offset + row_bytes);
         }
         const entry: AtlasGlyph = .{
             .x = x,
@@ -261,9 +264,10 @@ const RealGlyphCache = struct {
             .height = bitmap.height,
             .left = bitmap.left,
             .top = bitmap.top,
+            .color = bitmap.color,
         };
         try self.entries.put(self.allocator, key, entry);
-        self.next_x = x + bitmap.width;
+        self.next_x = x + row_bytes;
         self.next_y = y;
         self.row_height = @max(row_height, bitmap.height);
         return entry;
@@ -2681,8 +2685,9 @@ fn drawGlyphRun(
                 .top = bounds.y,
                 .right = @intCast(@as(i64, bounds.x) + bounds.width),
                 .bottom = @intCast(@as(i64, bounds.y) + bounds.height),
-                .atlas_x = atlas.x + @as(u32, @intCast(bounds.x - glyph_bounds.x)),
+                .atlas_x = atlas.x + @as(u32, @intCast(bounds.x - glyph_bounds.x)) * @as(u32, if (atlas.color) 8 else 1),
                 .atlas_y = atlas.y + @as(u32, @intCast(bounds.y - glyph_bounds.y)),
+                .image_mode = if (atlas.color) 2 else 0,
             };
             c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
             const count = @as(u64, bounds.width) * bounds.height;
@@ -2750,6 +2755,7 @@ fn drawPresentationGlyphRun(
                 },
                 .atlas_origin = .{ atlas.x, atlas.y },
                 .atlas_width_value = atlas_width,
+                .image_mode = if (atlas.color) 2 else 0,
             };
             c.vkCmdPushConstants(target.command_buffer, self.presentation_glyph_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(PresentationGlyphPush), &push);
             c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
@@ -2810,6 +2816,7 @@ fn drawPresentationParagraph(
                     },
                     .atlas_origin = .{ atlas.x, atlas.y },
                     .atlas_width_value = atlas_width,
+                    .image_mode = if (atlas.color) 2 else 0,
                 };
                 c.vkCmdPushConstants(target.command_buffer, self.presentation_glyph_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(PresentationGlyphPush), &push);
                 c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
@@ -3019,8 +3026,9 @@ fn drawParagraph(
                     .top = bounds.y,
                     .right = @intCast(@as(i64, bounds.x) + bounds.width),
                     .bottom = @intCast(@as(i64, bounds.y) + bounds.height),
-                    .atlas_x = atlas.x + @as(u32, @intCast(bounds.x - glyph_bounds.x)),
+                    .atlas_x = atlas.x + @as(u32, @intCast(bounds.x - glyph_bounds.x)) * @as(u32, if (atlas.color) 8 else 1),
                     .atlas_y = atlas.y + @as(u32, @intCast(bounds.y - glyph_bounds.y)),
+                    .image_mode = if (atlas.color) 2 else 0,
                 };
                 c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
                 const count = @as(u64, bounds.width) * bounds.height;
@@ -3043,17 +3051,22 @@ test "Vulkan glyph atlas matches exact software text rendering" {
     var fonts = text.FontCache.init(std.testing.allocator);
     defer fonts.deinit();
     const font = try text.bundled.acquire(&fonts, .sans, .regular, .italic);
+    const emoji = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/EmojiTest.ttf", .index = 0 },
+        .bytes = @embedFile("../../text/fonts/EmojiTest.ttf"),
+    });
+    defer fonts.release(emoji) catch unreachable;
     var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
     defer shapes.deinit();
     const shape = try shapes.acquire(.{
         .spec = .{
-            .paragraph = "Wa\u{0301}\u{0323} x\u{0302} atlas",
+            .paragraph = "🚀 Wa\u{0301}\u{0323} 👋 x\u{0302} atlas",
             .direction = .left_to_right,
             .script = .latin,
             .language = "en",
             .logical_size = 18.25,
         },
-        .candidates = &.{font},
+        .candidates = &.{ font, emoji },
         .configuration_revision = 1,
     });
     defer shapes.release(shape) catch unreachable;
@@ -3128,7 +3141,7 @@ test "Vulkan glyph atlas matches exact software text rendering" {
         try direct_graphics.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
     };
     var oversized = commands;
-    oversized[2].glyph_run.scale = 200;
+    oversized[2].glyph_run.scale = 20;
     try std.testing.expectError(error.GlyphAtlasFull, renderer.renderText(.{ .commands = &oversized }, &target, &glyphs, &shapes));
     try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);
@@ -3147,21 +3160,26 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
         .key = .{ .file = "/fixtures/NotoSansArabic.ttf", .index = 0 },
         .bytes = @embedFile("ourokit_arabic_test_font"),
     });
+    const emoji = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/EmojiTest.ttf", .index = 0 },
+        .bytes = @embedFile("../../text/fonts/EmojiTest.ttf"),
+    });
+    defer fonts.release(emoji) catch unreachable;
     var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
     defer paragraphs.deinit();
     const layout = try paragraphs.acquire(.{
-        .utf8 = "Save حفظ a\u{0301}\u{0323} now and continue",
+        .utf8 = "🚀 Save حفظ a\u{0301}\u{0323} 👋 now and continue",
         .language = "und",
         .logical_size = 14.25,
         .max_width = 86,
-        .candidates = &.{ latin, arabic },
+        .candidates = &.{ latin, arabic, emoji },
         .configuration_revision = 1,
     });
     defer paragraphs.release(layout) catch unreachable;
     try fonts.release(latin);
     try fonts.release(arabic);
     const commands = [_]scene.Command{
-        .{ .clear = Color.rgba(240, 240, 240, 255) },
+        .{ .clear = Color.rgba(0, 0, 0, 0) },
         .{ .push_clip_rect = .{ .x = 8, .y = 3, .width = 130, .height = 66 } },
         .{ .paragraph = .{
             .layout = layout,
@@ -3202,6 +3220,25 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
     try graphics.target.wait(&renderer);
     for (0..72) |y| for (0..160) |x| {
         try graphics.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
+    };
+    // Direct presentation requires an opaque scene; exercise a dark background
+    // as well as the transparent offscreen path above.
+    var opaque_commands = commands;
+    opaque_commands[0] = .{ .clear = Color.rgba(20, 30, 40, 255) };
+    const opaque_list: scene.DisplayList = .{ .commands = &opaque_commands };
+    try software.renderParagraphs(opaque_list, .{
+        .pixels = &expected,
+        .width = 160,
+        .height = 72,
+        .stride = 160 * 4,
+        .format = .rgba8_unorm,
+    }, &software_glyphs, &paragraphs);
+    var direct = try GraphicsReadback.initMode(&renderer, 160, 72, null, true);
+    defer direct.deinit(&renderer);
+    try renderer.renderGraphicsResources(opaque_list, &direct.target, &glyphs, null, &paragraphs, null, false);
+    try direct.target.wait(&renderer);
+    for (0..72) |y| for (0..160) |x| {
+        try direct.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
     };
 }
 
