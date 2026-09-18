@@ -1044,6 +1044,36 @@ fn appendCaret(
     try carets.append(allocator, caret);
 }
 
+/// Measure with the same full-context fragment reshaping used by assembly.
+/// The paragraph layout owner uses this when provisional wrapping needs reflow.
+pub fn measureReshapedLine(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    shaped: *const shaped_paragraph.ShapedParagraphs,
+    byte_start: usize,
+    byte_len: usize,
+) !f32 {
+    var fragments: std.ArrayList(Fragment) = .empty;
+    defer {
+        for (fragments.items) |*fragment| fragment.deinit();
+        fragments.deinit(allocator);
+    }
+    try buildFragments(allocator, utf8, shaped, .{
+        .byte_start = byte_start,
+        .byte_len = byte_len,
+        .advance = 0,
+        .mandatory = false,
+        .reshape_start = true,
+        .reshape_end = true,
+        .base_level = 0,
+        .visual_run_start = 0,
+        .visual_run_count = 0,
+    }, &fragments);
+    var advance: f32 = 0;
+    for (fragments.items) |*fragment| advance += fragment.result().advance.x;
+    return advance;
+}
+
 fn buildFragments(
     allocator: std.mem.Allocator,
     utf8: []const u8,

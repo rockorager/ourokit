@@ -123,6 +123,12 @@ the provisional line advance, assembly returns `error.ReflowRequired` rather
 than emitting glyphs for stale greedy choices. Any unexpected mismatch at a
 safe boundary is rejected as invalid measurement.
 
+The paragraph layout owner handles `ReflowRequired` by selecting legal breaks
+again using actual reshaped fragment widths, then recomputing line-local bidi
+order and positioning. This slower path preserves full paragraph context and
+oversized unbreakable segments; normal paragraphs retain linear provisional
+selection. Clipping and ellipsis use the corrected line ranges.
+
 The output remains text-owned rather than being squeezed into the current
 single-`ShapeHandle` scene command: wrapped mixed-direction text can contain
 several visual and fallback-font spans. Scene resource leases and Text/render-

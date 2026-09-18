@@ -88,13 +88,14 @@ fn buildPositioned(
         max_width,
     );
     defer selected.deinit();
-    var positioned = try positioned_lines.positionLinesWithOptions(
+    var positioned = try positionWithReflow(
         allocator,
         utf8,
+        base_direction,
         &shaped,
         &selected,
+        breaks.breaks,
         style,
-        if (max_width == std.math.floatMax(f32)) null else max_width,
         include_caret_stops,
     );
     if (style.overflow != .ellipsis or !positioned.truncated) return positioned;
@@ -149,15 +150,119 @@ fn buildPlainPositioned(
         max_width,
     );
     defer selected.deinit();
+    return positionWithReflow(
+        allocator,
+        utf8,
+        base_direction,
+        &shaped,
+        &selected,
+        breaks.breaks,
+        style,
+        include_caret_stops,
+    );
+}
+
+fn positionWithReflow(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    base_direction: paragraph.BaseDirection,
+    shaped: *const shaped_paragraph.ShapedParagraphs,
+    selected: *line_layout.GreedyLines,
+    breaks: []const line_break.LineBreak,
+    style: paragraph_style.Style,
+    include_caret_stops: bool,
+) !positioned_lines.PositionedLines {
+    const width = if (selected.max_width == std.math.floatMax(f32)) null else selected.max_width;
     return positioned_lines.positionLinesWithOptions(
         allocator,
         utf8,
-        &shaped,
-        &selected,
+        shaped,
+        selected,
         style,
-        if (max_width == std.math.floatMax(f32)) null else max_width,
+        width,
         include_caret_stops,
-    );
+    ) catch |err| {
+        if (err != error.ReflowRequired) return err;
+        const reflowed = try reflowLines(allocator, utf8, base_direction, shaped, breaks, selected.max_width);
+        selected.deinit();
+        selected.* = reflowed;
+        return positioned_lines.positionLinesWithOptions(
+            allocator,
+            utf8,
+            shaped,
+            selected,
+            style,
+            width,
+            include_caret_stops,
+        );
+    };
+}
+
+/// Slow path for unsafe breaks whose reshaping changed the provisional width.
+/// Select using actual fragment widths, preserving legal breaks, paragraph
+/// context and oversized unbreakable segments. No retry loop can oscillate
+/// between provisional and reshaped widths.
+fn reflowLines(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    base_direction: paragraph.BaseDirection,
+    shaped: *const shaped_paragraph.ShapedParagraphs,
+    breaks: []const line_break.LineBreak,
+    max_width: f32,
+) !line_layout.GreedyLines {
+    var lines: std.ArrayList(line_layout.Line) = .empty;
+    defer lines.deinit(allocator);
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index < breaks.len) {
+        var next = index;
+        var advance: f32 = 0;
+        while (next < breaks.len) {
+            const candidate = breaks[next];
+            const measured = try positioned_lines.measureReshapedLine(
+                allocator,
+                utf8,
+                shaped,
+                start,
+                candidate.byte_offset - start,
+            );
+            if (measured > max_width and next > index) break;
+            advance = measured;
+            next += 1;
+            if (candidate.kind == .mandatory or measured > max_width) break;
+        }
+        const boundary = breaks[next - 1];
+        try lines.append(allocator, .{
+            .byte_start = start,
+            .byte_len = boundary.byte_offset - start,
+            .advance = advance,
+            .mandatory = boundary.kind == .mandatory,
+            .reshape_start = true,
+            .reshape_end = true,
+            .base_level = 0,
+            .visual_run_start = 0,
+            .visual_run_count = 0,
+        });
+        start = boundary.byte_offset;
+        index = next;
+    }
+    const ranges = try allocator.alloc(paragraph.LineRange, lines.items.len);
+    defer allocator.free(ranges);
+    for (ranges, lines.items) |*range, line| range.* = .{
+        .byte_start = line.byte_start,
+        .byte_len = line.byte_len,
+    };
+    var visual = try paragraph.reorderLines(allocator, utf8, base_direction, ranges);
+    defer visual.deinit();
+    for (lines.items, visual.lines) |*line, visual_line| {
+        line.base_level = visual_line.base_level;
+        line.visual_run_start = visual_line.run_start;
+        line.visual_run_count = visual_line.run_count;
+    }
+    const owned_lines = try lines.toOwnedSlice(allocator);
+    const visual_runs = visual.runs;
+    visual.runs = &.{};
+    return .{ .allocator = allocator, .max_width = max_width, .lines = owned_lines, .visual_runs = visual_runs };
 }
 
 const ellipsis_utf8 = "\xE2\x80\xA6";

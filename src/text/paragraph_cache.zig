@@ -490,6 +490,89 @@ test "ellipsis is shaped in paragraph context and maps to a source boundary" {
     }));
 }
 
+test "paragraph layout reflows Slack-style links at unsafe boundaries" {
+    var fonts = api.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try @import("bundled.zig").acquire(&fonts, .sans, .regular, .roman);
+    defer fonts.release(font) catch unreachable;
+    var cache = ParagraphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    const source = "Workflow ci from <@U1234567890> failed on branch main. Commit: <https://github.com/example/project/commit/0123456789abcdef0123456789abcdef01234567>. Check details: <https://github.com/example/project/actions/runs/12345678901>";
+    var breaks = try @import("line_break.zig").analyzeLineBreaks(std.testing.allocator, source);
+    defer breaks.deinit();
+    for ([_]f32{ 120, 280, 310, 340 }) |width| {
+        const handle = try cache.acquire(.{
+            .utf8 = source,
+            .language = "und",
+            .logical_size = 14,
+            .max_width = width,
+            .candidates = &.{font},
+            .configuration_revision = 1,
+        });
+        defer cache.release(handle) catch unreachable;
+        const layout = try cache.get(handle);
+        var end: usize = 0;
+        for (layout.positioned.lines) |line| {
+            try std.testing.expectEqual(end, line.byte_start);
+            end += line.byte_len;
+            // Independently shape each selected range, rather than trusting
+            // either the provisional measurement or the positioned glyphs.
+            var reference = try (try fonts.get(font)).shape(std.testing.allocator, .{
+                .paragraph = source,
+                .byte_start = line.byte_start,
+                .byte_len = line.byte_len,
+                .direction = .left_to_right,
+                .script = .latin,
+                .language = "und",
+                .logical_size = 14,
+            });
+            defer reference.deinit();
+            try std.testing.expectApproxEqAbs(reference.advance.x, line.advance, 0.001);
+            var internal_breaks: usize = 0;
+            var legal_end = false;
+            for (breaks.breaks) |opportunity| {
+                if (opportunity.byte_offset > line.byte_start and opportunity.byte_offset < end)
+                    internal_breaks += 1;
+                legal_end = legal_end or opportunity.byte_offset == end;
+                if (opportunity.byte_offset > end) {
+                    var extended = try (try fonts.get(font)).shape(std.testing.allocator, .{
+                        .paragraph = source,
+                        .byte_start = line.byte_start,
+                        .byte_len = opportunity.byte_offset - line.byte_start,
+                        .direction = .left_to_right,
+                        .script = .latin,
+                        .language = "und",
+                        .logical_size = 14,
+                    });
+                    defer extended.deinit();
+                    try std.testing.expect(extended.advance.x > width);
+                    break;
+                }
+            }
+            try std.testing.expect(legal_end);
+            try std.testing.expect(line.advance <= width or internal_breaks == 0);
+        }
+        try std.testing.expectEqual(source.len, end);
+        for ([_]paragraph_style.Overflow{ .clip, .ellipsis }) |overflow| {
+            const clipped = try cache.acquire(.{
+                .utf8 = source,
+                .language = "und",
+                .logical_size = 14,
+                .max_width = width,
+                .style = .{ .max_lines = 2, .overflow = overflow },
+                .candidates = &.{font},
+                .configuration_revision = 1,
+            });
+            defer cache.release(clipped) catch unreachable;
+            const limited = try cache.get(clipped);
+            try std.testing.expect(limited.positioned.truncated);
+            try std.testing.expect(limited.positioned.lines.len <= 2);
+            try std.testing.expectEqual(overflow == .ellipsis, limited.positioned.ellipsis_byte_offset != null);
+            try std.testing.expectEqual(layout.positioned.lines[0].byte_len, limited.positioned.lines[0].byte_len);
+        }
+    }
+}
+
 fn exerciseParagraphAllocationFailure(
     allocator: std.mem.Allocator,
     fonts: *api.FontCache,
