@@ -966,7 +966,13 @@ Their visual defaults come from generated Radix-derived semantic tokens and
 documented component recipes, with optional inherited Lua theme overrides. Buttons are
 intrinsically sized with Radix Themes size-2 geometry: 32-pixel height,
 12-pixel horizontal padding, 4-pixel radius, medium label face, primary color
-pair, and one-line ellipsis. Text inputs fill their bounded parent width by
+pair, and one-line ellipsis. A button can set `height = "auto"` to size to its
+content instead of the themed control height. This also works with custom
+content and nested buttons: the nearest button handles the click, so a card
+can own its background action while a nested dismiss button remains separate.
+Set `hover` and `pressed` equal to `background` to keep the surface unchanged
+under the pointer; a positive `border_width` and `focus` color retain visible
+keyboard focus. Text inputs fill their bounded parent width by
 default and use the corresponding 32-pixel height, 8-pixel inset, 4-pixel
 radius, surface, and input-border roles; focus replaces that border color with
 `ring` rather than adding an outline. The Wayland example exercises this actual

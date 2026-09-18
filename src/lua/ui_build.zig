@@ -952,7 +952,7 @@ pub const UiBuild = struct {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.button) catch |err| return luaError(state, @errorName(err));
+        const visual = widgetOverrides(state, defaults.widgets.button, true) catch |err| return luaError(state, @errorName(err));
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.button expects one declaration table");
         const key = tableString(state, 1, "key") orelse return luaError(state, "button key is required");
@@ -964,12 +964,14 @@ pub const UiBuild = struct {
             return luaError(state, "invalid button enabled state");
         const width = tableOptionalNullableExtent(state, 1, "width") orelse
             return luaError(state, "invalid button width");
-        const height = tableOptionalExtent(
+        const auto_height = if (tableString(state, 1, "height")) |value| std.mem.eql(u8, value, "auto") else false;
+        const height: ?f32 = if (auto_height) null else tableOptionalExtent(
             state,
             1,
             "height",
             visual.height orelse defaults.controls.height,
         ) orelse return luaError(state, "invalid button height");
+        if (height) |value| if (value <= 0) return luaError(state, "invalid button height");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const button_id = semanticId(key, 0x627574746f6e ^ parent.id ^ self.component_namespace);
@@ -1069,7 +1071,7 @@ pub const UiBuild = struct {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.text_input) catch |err| return luaError(state, @errorName(err));
+        const visual = widgetOverrides(state, defaults.widgets.text_input, false) catch |err| return luaError(state, @errorName(err));
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.text_input expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "text_input requires a widget parent");
@@ -1273,7 +1275,7 @@ pub const UiBuild = struct {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.option) catch |err| return luaError(state, @errorName(err));
+        const visual = widgetOverrides(state, defaults.widgets.option, false) catch |err| return luaError(state, @errorName(err));
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.option expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "option requires a listbox parent");
@@ -1368,7 +1370,7 @@ pub const UiBuild = struct {
     fn emitDeclarativeText(self: *UiBuild, state: *c.State) c_int {
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.text) catch |err| return luaError(state, @errorName(err));
+        const visual = widgetOverrides(state, defaults.widgets.text, false) catch |err| return luaError(state, @errorName(err));
         const parent = self.currentParent() orelse return luaError(state, "text requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "text key is required");
         const value = tableString(state, 1, "text") orelse return luaError(state, "text content is required");
@@ -1793,11 +1795,13 @@ fn tableOptionalBoxAlignment(state: *c.State, table: c_int) ?OptionalAlignment {
     return .{ .value = .center };
 }
 
-fn widgetOverrides(state: *c.State, inherited: theming.Overrides) !theming.Overrides {
+fn widgetOverrides(state: *c.State, inherited: theming.Overrides, comptime omit_height: bool) !theming.Overrides {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
     var result = inherited;
     inline for (std.meta.fields(theming.Overrides)) |field| {
+        // Buttons parse height as geometry, including the intrinsic "auto" size.
+        if (comptime omit_height and std.mem.eql(u8, field.name, "height")) continue;
         if (c.lua_getfield(state, 1, field.name) != c.type_nil) {
             @field(result, field.name) = if (field.type == ?f32)
                 try theming.extent(state, -1, std.mem.eql(u8, field.name, "height") or std.mem.eql(u8, field.name, "font_size"))
@@ -2557,7 +2561,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try scheduler.destroyScope(window_scope);
 }
 
-test "buttons retain semantics and input bindings with custom content" {
+test "buttons retain semantics and input bindings with intrinsic or fixed custom content" {
     const Scheduler = @import("../task/scheduler.zig").Scheduler;
     const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
     defer c.lua_close(state);
@@ -2578,9 +2582,10 @@ test "buttons retain semantics and input bindings with custom content" {
     try ui.attachSemantics(&semantics);
     ui.enableDeclarativeWidgets(design.tokens.dark);
     try execute(state,
+        \\button_height = "auto"
         \\function build()
         \\  return ouro.button {
-        \\    key = "launch", label = "Launch application", height = 44,
+        \\    key = "launch", label = "Launch application", height = button_height,
         \\    on_press = function() end,
         \\    children = { ouro.box { key = "content", width = 28, height = 24 } },
         \\  }
@@ -2591,6 +2596,7 @@ test "buttons retain semantics and input bindings with custom content" {
     const descriptors = try ui.build(&owners, work, "build", &.{});
     try std.testing.expectEqual(@as(usize, 4), descriptors.len);
     try std.testing.expect(descriptors[2].focusable);
+    try std.testing.expectEqual(@as(?f32, null), descriptors[2].object.box.height);
     try std.testing.expectEqual(descriptors[2].id, descriptors[3].parent.?);
     try std.testing.expectEqual(@as(?f32, 28), descriptors[3].object.box.width);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_button_count);
@@ -2601,6 +2607,19 @@ test "buttons retain semantics and input bindings with custom content" {
     try std.testing.expectEqualStrings("Launch application", ui.semanticDescriptors()[0].label);
     ui.rollbackHandlers();
     try owners.complete(work);
+    for ([_]struct { source: [:0]const u8, height: f32 }{
+        .{ .source = "button_height = 44", .height = 44 },
+        .{ .source = "button_height = nil", .height = 32 },
+    }) |case| {
+        try execute(state, case.source);
+        _ = try owners.markDirty(owner);
+        var next = owners.beginCycle();
+        const update = (try next.take()).?;
+        const fixed = try ui.build(&owners, update, "build", &.{});
+        try std.testing.expectEqual(@as(?f32, case.height), fixed[2].object.box.height);
+        ui.rollbackHandlers();
+        try owners.complete(update);
+    }
     try owners.retire(owner);
     try scheduler.applyQueuedCancellations();
     try owners.collectRetired();
