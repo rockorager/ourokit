@@ -26,6 +26,7 @@ pub const Dbus = @import("dbus.zig").Binding;
 pub const Stdio = @import("stdio.zig").Stdio;
 pub const ShellWorkspaces = @import("shell_workspaces.zig").Binding;
 pub const Applications = @import("applications.zig").Binding;
+pub const ImageImport = @import("image_import.zig").Binding;
 pub const Storybook = @import("storybook.zig").Storybook;
 pub const StorybookStory = @import("storybook.zig").Story;
 pub const StorybookViewport = @import("storybook.zig").Viewport;
@@ -36,6 +37,7 @@ pub const StorybookActionKind = @import("storybook.zig").ActionKind;
 test {
     _ = @import("application.zig");
     _ = @import("applications.zig");
+    _ = @import("image_import.zig");
     _ = @import("callbacks.zig");
     _ = @import("components_test.zig");
     _ = @import("diagnostic.zig");

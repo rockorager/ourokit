@@ -56,6 +56,7 @@ pub const SourceGeneration = struct {
     dbus: lua.Dbus,
     stdio: lua.Stdio,
     applications: lua.Applications,
+    image_import: lua.ImageImport,
     signals: lua.Signals,
     native_modules: ?native.Registry = null,
     window_owners: ?ui.instance.BuildOwners = null,
@@ -191,6 +192,7 @@ pub const SourceGeneration = struct {
         var dbus_initialized = false;
         var stdio_initialized = false;
         var applications_initialized = false;
+        var image_import_initialized = false;
         var signals_initialized = false;
         var shell_workspaces_initialized = false;
         var descriptor_storage: ?[]ui.instance.Descriptor = null;
@@ -209,6 +211,7 @@ pub const SourceGeneration = struct {
             if (module_loader_initialized) self.module_loader.?.deinit();
             if (self.images) |*images| images.deinit();
             if (applications_initialized) self.applications.deinit();
+            if (image_import_initialized) self.image_import.deinit();
             if (stdio_initialized) self.stdio.deinit();
             if (dbus_initialized) self.dbus.deinit();
             if (mcp_client_initialized) self.mcp_client.deinit();
@@ -353,6 +356,8 @@ pub const SourceGeneration = struct {
         self.vm.setRuntimeDirectory(config.runtime_dir);
         self.applications.init(&self.vm, loop, config.applications);
         applications_initialized = true;
+        self.image_import.init(&self.vm, loop);
+        image_import_initialized = true;
         self.ui_build.attachSignals(&self.signals);
         self.ui_build.attachSemantics(self.semantic_storage) catch |err| {
             lua.recordDiagnosticError(
@@ -609,6 +614,7 @@ pub const SourceGeneration = struct {
     pub fn dispatchFile(self: *SourceGeneration, completion: io_loop.FileCompletion) !bool {
         if (self.images) |*images| if (try images.dispatch(completion)) return true;
         if (try self.applications.dispatch(completion)) return true;
+        if (try self.image_import.dispatch(completion)) return true;
         if (try self.stdio.dispatch(completion)) return true;
         if (self.module_loader) |*loader| return loader.dispatch(completion);
         return false;
@@ -631,6 +637,7 @@ pub const SourceGeneration = struct {
         try self.mcp_client.collectCanceled();
         try self.stdio.collectCanceled();
         try self.applications.collectCanceled();
+        self.image_import.collectCanceled();
     }
 
     pub fn workspacesRequested(self: *const SourceGeneration) bool {
@@ -815,6 +822,7 @@ pub const SourceGeneration = struct {
         if (self.module_loader) |*loader| loader.deinit();
         if (self.images) |*images| images.deinit();
         self.applications.deinit();
+        self.image_import.deinit();
         self.stdio.deinit();
         self.dbus.deinit();
         self.mcp_client.deinit();

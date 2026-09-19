@@ -872,6 +872,31 @@ asset completion before capturing pixels.
 The `stack/vignette-small` and `stack/vignette-large` stories compose a static SVG
 opacity fade behind a centered button and replay a click through normal input.
 
+### Asynchronous notification images
+
+`ouro.images.load(options)` yields while importing an image and returns an
+owned PNG byte string, or `nil, { code = ..., message = ... }`. Call it from an
+Ouro task, not a UI build. Pass either `{ path = absolute_local_path }` or
+freedesktop notification image data:
+
+```lua
+local bytes, err = ouro.images.load {
+  data = pixels, width = width, height = height, rowstride = stride,
+  has_alpha = true, bits_per_sample = 8, channels = 4,
+}
+-- Retain bytes in application state and render with ouro.image { bytes = ... }.
+```
+
+Raw data is straight RGB/RGBA8. Row padding is accepted and is optional after
+the final row. Alpha and channel count must agree. Paths must be absolute local
+paths; URI normalization belongs to the caller. Path imports reject symlinks,
+magic links, and non-regular files. Encoded files and raw inputs are limited to
+4 MiB; dimensions are at most 1024 per axis and decoded RGBA storage at most
+4 MiB. Results are downsampled without upscaling to a longest edge of 128 pixels
+and do not retain the source file or input string. At most four imports may be
+outstanding in one application generation; excess calls return `ImageImportBusy`.
+This explicit import does not change the relative-path restrictions on image `src`.
+
 ### XDG named icons use the system icon themes
 
 ```lua
