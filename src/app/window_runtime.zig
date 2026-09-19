@@ -1,6 +1,7 @@
 const std = @import("std");
 const clipboard_module = @import("clipboard.zig");
 const frame = @import("frame.zig");
+const scroll_motion = @import("scroll.zig");
 const text_input_coordinator = @import("text_input.zig");
 const core = @import("../core/root.zig");
 const lua = @import("../lua/root.zig");
@@ -61,6 +62,7 @@ pub const WindowRuntime = struct {
     clicks: ui.input.Clicks = .{},
     selection_pointer: ?core.PointF = null,
     selection_tick_ns: ?u64 = null,
+    scroll_motions: [2]scroll_motion.Motion = @splat(.{}),
     // Headless windows act focused; native hosts start false until keyboard enter.
     keyboard_focused: bool = true,
     caret_blink_interval_ns: u64 = (Config{}).caret_blink_interval_ns,
@@ -231,6 +233,7 @@ pub const WindowRuntime = struct {
         self.clicks.reset();
         self.selection_pointer = null;
         self.selection_tick_ns = null;
+        self.scroll_motions = @splat(.{});
         self.caret_activity = null;
         self.resetCaretBlink();
         while (self.router.takeEvent()) |event| self.router.releaseEvent(event);
@@ -705,6 +708,9 @@ pub const WindowRuntime = struct {
 
     pub fn routePointer(self: *WindowRuntime, event: platform.PointerEvent) !void {
         try self.router.route(event);
+        // A press outside the hit tree is not queued, but must still stop a fling.
+        if (event == .button and event.button.state == .pressed)
+            self.scroll_motions = @splat(.{});
     }
 
     pub fn pointerCursor(self: *WindowRuntime) !platform.PointerCursor {
@@ -789,6 +795,21 @@ pub const WindowRuntime = struct {
                 try self.dispatchKeyboard(event.keyboard, callback_service);
                 continue;
             }
+            if (event == .pointer) switch (event.pointer.event) {
+                .button => |button| if (button.state == .pressed) {
+                    self.scroll_motions = @splat(.{});
+                },
+                .axis => {
+                    for (&self.scroll_motions) |*motion| if (motion.active) {
+                        motion.* = .{};
+                    };
+                },
+                .axis_stop => |stop| {
+                    self.scroll_motions[@intFromEnum(stop.axis)].stop(stop.time_ms);
+                    continue;
+                },
+                else => {},
+            };
             const target = switch (event) {
                 .hover_enter => |value| value.target,
                 .hover_leave => |value| value.target,
@@ -1203,21 +1224,37 @@ pub const WindowRuntime = struct {
             },
             else => return false,
         };
-        const axis: ui.render_object.types.Axis = switch (axis_event.axis) {
+        const scroll = try self.scrollBy(target, axis_event.axis, axis_event.delta);
+        const motion = &self.scroll_motions[@intFromEnum(axis_event.axis)];
+        if (axis_event.source == .finger and scroll != null) {
+            motion.sample(scroll.?, axis_event.delta, axis_event.time_ms);
+        } else {
+            motion.* = .{};
+        }
+        return scroll != null;
+    }
+
+    fn scrollBy(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        pointer_axis: platform.PointerAxis,
+        delta: f32,
+    ) !?ui.instance.InstanceHandle {
+        const axis: ui.render_object.types.Axis = switch (pointer_axis) {
             .vertical => .vertical,
             .horizontal => .horizontal,
         };
         var current: ?ui.instance.InstanceHandle = target;
         while (current) |start| {
-            const scroll = (try self.instances.nearestScroll(start, axis)) orelse return false;
-            if (try self.instances.scrollBy(scroll, axis_event.delta)) {
+            const scroll = (try self.instances.nearestScroll(start, axis)) orelse return null;
+            if (try self.instances.scrollBy(scroll, delta)) {
                 if (self.virtual_lists.find(try self.instances.semanticId(scroll)) != null)
                     try self.queueVirtualBuild();
-                return true;
+                return scroll;
             }
             current = try self.instances.parentOf(scroll);
         }
-        return false;
+        return null;
     }
 
     pub fn displayList(self: *WindowRuntime) !scene.DisplayList {
@@ -1473,6 +1510,9 @@ pub const WindowRuntime = struct {
     /// The native host owns one timer for the earliest requested animation.
     pub fn animationDelay(self: *WindowRuntime) !?u64 {
         var delay: ?u64 = if (try self.selectionScroll() != null) 16 * std.time.ns_per_ms else null;
+        for (self.scroll_motions) |motion| if (motion.active) {
+            delay = @min(delay orelse scroll_motion.interval_ns, scroll_motion.interval_ns);
+        };
         if (try self.caretShouldBlink()) {
             const caret_delay = if (self.caret_deadline_ns) |deadline| deadline -| self.animation_now_ns else self.caret_blink_interval_ns;
             delay = @min(delay orelse caret_delay, caret_delay);
@@ -1483,6 +1523,22 @@ pub const WindowRuntime = struct {
     pub fn advanceAnimations(self: *WindowRuntime, now_ns: u64) !void {
         if (!self.initialized) return;
         self.animation_now_ns = now_ns;
+        for (&self.scroll_motions, 0..) |*motion, index| {
+            if (!motion.active) continue;
+            if (!self.instances.isActive(motion.target.?)) {
+                motion.* = .{};
+                continue;
+            }
+            const delta = motion.advance(now_ns);
+            if (delta == 0) continue;
+            // Start at the retained container, not a recycled virtual-list row
+            // or the current hover target. Preserve ordinary edge chaining.
+            if (try self.scrollBy(motion.target.?, @enumFromInt(index), delta)) |target| {
+                motion.target = target;
+            } else {
+                motion.* = .{};
+            }
+        }
         if (try self.refreshCaretActivity()) try self.syncTextInputVisuals();
         if (try self.caretShouldBlink()) {
             const interval = self.caret_blink_interval_ns;

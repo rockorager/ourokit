@@ -166,6 +166,85 @@ test "virtual fixed rows bound construction, scroll through input, anchor keys a
     try std.testing.expectEqual(@as(usize, 0), f.runtime.virtual_lists.row_count);
 }
 
+test "virtual list scroll momentum survives recycled rows and cancels on input bounds and removal" {
+    const Sink = struct {
+        runtime: *WindowRuntime,
+        pub fn pointer(self: @This(), event: platform.PointerEvent) !void {
+            try self.runtime.routePointer(event);
+        }
+    };
+    for (0..4) |ending| {
+        const f = try Fixture.create();
+        defer f.destroy();
+        try f.exec(fixed_source);
+        try f.build();
+        const window = f.runtime.window;
+        const sink: Sink = .{ .runtime = &f.runtime };
+        var unused: Vm = undefined;
+        const target = try f.runtime.semanticTarget("people");
+        try f.runtime.routePointer(.{ .enter = .{ .window = window, .serial = 1, .position = target.center } });
+        try f.runtime.dispatchInput(&unused);
+        const hovered = f.runtime.router.hovered.?;
+        var pending: @import("../platform/wayland/scroll.zig").Pending = .{};
+        for (0..2) |sample| {
+            pending.push(.{ .axis = .{ .window = window, .axis = .vertical, .time_ms = @intCast(sample * 8), .delta = 80 } });
+            // Source arrives after delta, as permitted by Wayland.
+            pending.push(.{ .axis_source = .{ .window = window, .source = .finger } });
+            try pending.flush(window, sink);
+            try f.runtime.dispatchInput(&unused);
+            try f.build();
+        }
+        try std.testing.expectEqual(@as(f32, 480), try f.offset());
+        try std.testing.expect(!f.runtime.instances.isActive(hovered));
+        pending.push(.{ .axis_stop = .{ .window = window, .axis = .vertical, .time_ms = 9 } });
+        try pending.flush(window, sink);
+        try f.runtime.dispatchInput(&unused);
+        try std.testing.expectEqual(@as(?u64, 8 * std.time.ns_per_ms), try f.runtime.animationDelay());
+        try f.runtime.advanceAnimations(100 * std.time.ns_per_ms);
+        // Moving off the list must not retarget the in-flight gesture.
+        try f.runtime.routePointer(.{ .motion = .{ .window = window, .time_ms = 10, .position = .{ .x = 1, .y = 1 } } });
+        try f.runtime.dispatchInput(&unused);
+        try f.runtime.advanceAnimations(108 * std.time.ns_per_ms);
+        try f.build();
+        try std.testing.expectEqual(@as(f32, 544), try f.offset());
+        _ = try f.handle("people/person-14/row");
+        try std.testing.expect(f.runtime.instances.activeCount() < 32);
+
+        switch (ending) {
+            0 => { // A press on the surrounding padding cancels immediately.
+                try f.runtime.routePointer(.{ .button = .{ .window = window, .serial = 2, .time_ms = 11, .button = 0x110, .state = .pressed } });
+                try f.runtime.dispatchInput(&unused);
+                try f.runtime.advanceAnimations(116 * std.time.ns_per_ms);
+                try std.testing.expectEqual(@as(f32, 544), try f.offset());
+            },
+            1 => { // A new wheel gesture cancels, with no synthetic wheel fling.
+                try f.runtime.routePointer(.{ .enter = .{ .window = window, .serial = 2, .position = target.center } });
+                pending.push(.{ .axis = .{ .window = window, .axis = .vertical, .time_ms = 11, .delta = -3.75 } });
+                pending.push(.{ .axis_steps120 = .{ .window = window, .axis = .vertical, .steps120 = -30 } });
+                pending.push(.{ .axis_source = .{ .window = window, .source = .wheel } });
+                try pending.flush(window, sink);
+                try f.runtime.dispatchInput(&unused);
+                try f.runtime.advanceAnimations(116 * std.time.ns_per_ms);
+                try std.testing.expectEqual(@as(f32, 519), try f.offset());
+            },
+            2 => { // Shrinking the content clamps and disarms momentum at the edge.
+                try f.exec("count:set(2)");
+                try f.build();
+                try f.runtime.advanceAnimations(116 * std.time.ns_per_ms);
+                try std.testing.expectEqual(@as(f32, 0), try f.offset());
+            },
+            3 => {
+                try f.exec("function build() return ouro.box {key = 'replacement'} end");
+                _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+                try f.build();
+                try f.runtime.advanceAnimations(116 * std.time.ns_per_ms);
+            },
+            else => unreachable,
+        }
+        try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    }
+}
+
 test "virtual variable rows measure beyond estimates and preserve anchors through height and width changes" {
     const f = try Fixture.create();
     defer f.destroy();

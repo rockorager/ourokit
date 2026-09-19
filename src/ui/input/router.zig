@@ -133,6 +133,21 @@ pub const Router = struct {
                     .released => null,
                 };
             },
+            .axis, .axis_stop => {
+                // Scrolling can recycle the hovered virtual-list row without
+                // pointer motion. Resolve every gesture event against layout.
+                const hovered = if (self.pointer_inside) try self.targetAt(self.pointer_position) else null;
+                const target = hovered orelse self.captured;
+                try self.ensureSpace(transitionCount(self.hovered, hovered) +
+                    @as(usize, @intFromBool(target != null)));
+                self.transition(hovered, self.pointer_position, null);
+                if (target) |handle| self.enqueueAssumeCapacity(.{ .pointer = .{
+                    .target = handle,
+                    .hovered = hovered,
+                    .position = self.pointer_position,
+                    .event = event,
+                } });
+            },
             else => {
                 const target = self.hovered orelse self.captured orelse return;
                 try self.ensureSpace(1);

@@ -57,6 +57,9 @@ pub const PointerEvent = union(enum) {
         time_ms: u32,
         axis: PointerAxis,
         delta: f32,
+        /// Native source, when known. Deltas have already been normalized to
+        /// logical pixels; source-less scripted input does not launch a fling.
+        source: ?PointerAxisSource = null,
     },
     axis_source: struct {
         window: WindowHandle,

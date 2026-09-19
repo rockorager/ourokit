@@ -823,6 +823,14 @@ fn runSourceInternal(
                 _ = try dirty.markDirty(handle);
         }
 
+        // Momentum can dirty virtual-list builders. Advance before draining
+        // them so the rows for the new offset are present in this frame.
+        const animation_now = try io_loop.monotonicNow();
+        for (runtime_slots) |*slot| if (slot.desired and slot.runtime.ready) {
+            try slot.runtime.prepareFrame(try host.outputScale(slot.runtime.window));
+            try slot.runtime.advanceAnimations(animation_now);
+        };
+
         while (dirty.take()) |work| {
             const slot = runtimeSlotForHandle(runtime_slots, work.owner) orelse
                 return error.UnknownDirtyWindow;
@@ -883,18 +891,15 @@ fn runSourceInternal(
             std.log.err("could not begin source-generation retirement: {s}", .{@errorName(err)});
         _ = source_reload.collectRetired();
 
-        const animation_now = try io_loop.monotonicNow();
         var animation_delay: ?u64 = null;
         for (runtime_slots) |*slot| if (slot.desired and slot.runtime.ready) {
             const scale = try host.outputScale(slot.runtime.window);
-            try slot.runtime.prepareFrame(scale);
-            try slot.runtime.advanceAnimations(animation_now);
             try slot.runtime.prepareFrame(scale);
             try host.setPointerCursor(slot.runtime.window, try slot.runtime.pointerCursor());
             if (try slot.runtime.animationDelay()) |delay|
                 animation_delay = @min(animation_delay orelse delay, delay);
         };
-        try animation_timer.update(&loop, animation_now, animation_delay);
+        try animation_timer.update(&loop, try io_loop.monotonicNow(), animation_delay);
         try source_reload.active().pumpImages();
 
         if (host.textInputAvailable()) for (runtime_slots) |*slot| {

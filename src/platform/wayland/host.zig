@@ -9,6 +9,7 @@ const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
 const Repeat = @import("repeat.zig");
+const Scroll = @import("scroll.zig");
 const Activation = @import("../activation.zig");
 const TextInput = @import("text_input.zig");
 const Cursor = @import("cursor.zig").Cursor;
@@ -710,6 +711,8 @@ pub const Host = struct {
     seat_global_name: ?u32 = null,
     pointer: ?Handle = null,
     pointer_focus: ?WindowHandle = null,
+    pointer_has_frames: bool = true,
+    pointer_scroll: Scroll.Pending = .{},
     popup_input: ?Activation.Input = null,
     cursor: Cursor = .{},
     keyboard: ?Handle = null,
@@ -797,6 +800,8 @@ pub const Host = struct {
         self.seat_global_name = null;
         self.pointer = null;
         self.pointer_focus = null;
+        self.pointer_has_frames = true;
+        self.pointer_scroll = .{};
         self.popup_input = null;
         self.cursor = .{};
         self.keyboard = null;
@@ -2664,6 +2669,7 @@ pub const Host = struct {
                 null,
             );
             self.seat_global_name = global.name;
+            self.pointer_has_frames = global.version >= 5;
             try self.ensureTextInput();
             try self.ensureClipboardDevice();
         } else if (std.mem.eql(u8, global.interface, protocol.ext_workspace_manager_v1.info.name)) {
@@ -2845,6 +2851,7 @@ pub const Host = struct {
         );
         self.pointer = null;
         self.pointer_focus = null;
+        self.pointer_scroll = .{};
         _ = try self.driver.schedule();
     }
 
@@ -3099,6 +3106,7 @@ pub const Host = struct {
             .enter => |enter| {
                 if (enter.surface == 0) return;
                 const window = try self.windowForSurface(enter.surface);
+                self.pointer_scroll = .{};
                 self.pointer_focus = window.handle;
                 self.cursor.enter(enter.serial);
                 try self.sink.pointer(.{ .enter = .{
@@ -3110,6 +3118,7 @@ pub const Host = struct {
             .leave => |leave| {
                 if (leave.surface == 0) return;
                 const window = try self.windowForSurface(leave.surface);
+                try self.pointer_scroll.flush(window.handle, self.sink);
                 try self.sink.pointer(.{ .leave = .{
                     .window = window.handle,
                     .serial = leave.serial,
@@ -3138,39 +3147,48 @@ pub const Host = struct {
                     .modifiers = self.xkb.modifiers(),
                 } });
             },
-            .axis => |axis| try self.sink.pointer(.{ .axis = .{
+            .axis => |axis| try self.queuePointerScroll(.{ .axis = .{
                 .window = try self.focusedWindow(),
                 .time_ms = axis.time,
                 .axis = try pointerAxis(axis.axis),
                 .delta = fixedValue(axis.value),
             } }),
-            .axis_source => |source| try self.sink.pointer(.{ .axis_source = .{
+            .axis_source => |source| try self.queuePointerScroll(.{ .axis_source = .{
                 .window = try self.focusedWindow(),
                 .source = try pointerAxisSource(source.axis_source),
             } }),
-            .axis_stop => |stop| try self.sink.pointer(.{ .axis_stop = .{
+            .axis_stop => |stop| try self.queuePointerScroll(.{ .axis_stop = .{
                 .window = try self.focusedWindow(),
                 .time_ms = stop.time,
                 .axis = try pointerAxis(stop.axis),
             } }),
-            .axis_discrete => |discrete| try self.sink.pointer(.{ .axis_steps = .{
+            .axis_discrete => |discrete| try self.queuePointerScroll(.{ .axis_steps = .{
                 .window = try self.focusedWindow(),
                 .axis = try pointerAxis(discrete.axis),
                 .steps = discrete.discrete,
             } }),
-            .axis_value120 => |value| try self.sink.pointer(.{ .axis_steps120 = .{
+            .axis_value120 => |value| try self.queuePointerScroll(.{ .axis_steps120 = .{
                 .window = try self.focusedWindow(),
                 .axis = try pointerAxis(value.axis),
                 .steps120 = value.value120,
             } }),
             // A frame terminates the preceding logical group. In particular,
             // it can follow leave, after that event has cleared focus.
-            .frame => if (self.pointer_focus) |window| try self.sink.pointer(.{ .frame = window }),
+            .frame => if (self.pointer_focus) |window| {
+                try self.pointer_scroll.flush(window, self.sink);
+                try self.sink.pointer(.{ .frame = window });
+            },
             // Version 9 describes physical direction separately. Scroll views
             // use the compositor-adjusted axis delta, including natural scroll.
             .axis_relative_direction => {},
             .warp => return error.UnsupportedPointerEventVersion,
         }
+    }
+
+    fn queuePointerScroll(self: *Host, pointer_event: platform_window.PointerEvent) !void {
+        self.pointer_scroll.push(pointer_event);
+        if (!self.pointer_has_frames)
+            try self.pointer_scroll.flush(try self.focusedWindow(), self.sink);
     }
 
     fn focusedWindow(self: *Host) !WindowHandle {
