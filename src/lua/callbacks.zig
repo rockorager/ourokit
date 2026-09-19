@@ -23,6 +23,7 @@ pub const CallbackRegistry = struct {
     allocator: std.mem.Allocator,
     slots: []Slot,
     activation_provider: ?activation.Provider = null,
+    popup_provider: ?@import("popup.zig").Provider = null,
 
     pub fn init(
         self: *CallbackRegistry,
@@ -90,6 +91,7 @@ pub const CallbackRegistry = struct {
         const slot = try self.activeSlot(handle);
         const vm = slot.vm.?;
         vm.activation_provider = self.activation_provider;
+        vm.popup_provider = self.popup_provider;
         const spawned = try vm.spawnReference(scope, slot.reference, arguments);
         try vm.setActivationInput(spawned, input);
         return spawned;

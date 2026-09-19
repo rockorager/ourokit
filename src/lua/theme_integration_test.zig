@@ -1228,3 +1228,73 @@ test "interaction observers retain descendant hover and keyboard focus and Escap
     try Input.flush(f);
     try f.exec("assert(not active(), 'replacement observer retained stale active state')");
 }
+
+test "popup anchors accumulate nested layout offsets without changing the parent" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\function build() return ouro.box {key='outer', padding=17,
+        \\  ouro.row {key='row', gap=11,
+        \\    ouro.box {key='spacer', width=43, height=31},
+        \\    ouro.box {key='anchor', width=83, height=31},
+        \\  }} end
+    );
+    try f.build();
+    try f.runtime.prepareFrame(1);
+    const anchor = try f.runtime.anchorRectangle(try f.handle("outer/row/anchor"));
+    // Root padding 12, outer padding 17, preceding width 43 and gap 11.
+    try std.testing.expectEqual(core.RectI{ .x = 83, .y = 29, .width = 83, .height = 31 }, anchor);
+    try std.testing.expectEqual(core.SizeU{ .width = 600, .height = 500 }, f.runtime.frame_state.size.?);
+}
+
+test "popup focus is isolated and selected activation survives visual scope disposal" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const owner = try f.scheduler.createScope(f.scheduler.application_scope);
+    defer f.scheduler.destroyScope(owner) catch unreachable;
+    f.runtime.callback_scope = owner;
+    const Activation = @import("../platform/activation.zig");
+    const Fake = struct {
+        request: ?*Activation.Request = null,
+        canceled: bool = false,
+        fn start(context: *anyopaque, request: *Activation.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.request = request;
+        }
+        fn cancel(context: *anyopaque, _: *Activation.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.canceled = true;
+        }
+    };
+    var fake: Fake = .{};
+    f.callbacks.activation_provider = .{ .context = &fake, .start = Fake.start, .cancel = Fake.cancel };
+    try f.exec(
+        \\function build() return ouro.column {key='menu',
+        \\  ouro.button {key='disabled', label='Unavailable', enabled=false},
+        \\  ouro.button {key='first', label='First', on_press=function() error('wrong item') end},
+        \\  ouro.button {key='second', label='Second', on_press=function()
+        \\    assert(ouro.activation_token() == 'selected-token'); selected=true
+        \\  end},
+        \\} end
+    );
+    try f.build();
+    try f.runtime.prepareFrame(1);
+    try std.testing.expectEqual(try f.handle("menu/first"), f.runtime.focus.current().?);
+    try f.runtime.routeKeyboard(.{ .key = .{ .window = f.runtime.window, .serial = 341, .time_ms = 1, .state = .pressed, .translated = .{ .keycode = 15, .logical = .tab } } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expectEqual(try f.handle("menu/second"), f.runtime.focus.current().?);
+    const physical_parent: core.Handle = .{ .slot = 9, .generation = 4 };
+    try f.runtime.routeKeyboard(.{ .key = .{ .window = f.runtime.window, .source_window = physical_parent, .serial = 342, .time_ms = 2, .state = .pressed, .translated = .{ .keycode = 28, .logical = .enter } } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expectEqual(.waiting, try f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
+    try std.testing.expectEqual(@as(u32, 342), fake.request.?.input.serial);
+    try std.testing.expectEqual(physical_parent, fake.request.?.input.window);
+    try f.runtime.clear(&f.ui);
+    try f.scheduler.queueScopeCancellation(f.scope);
+    try f.scheduler.applyQueuedCancellations();
+    try std.testing.expect(!fake.canceled);
+    try std.testing.expect(f.scheduler.takeRunnable() == null);
+    try fake.request.?.complete(fake.request.?.context, "selected-token");
+    try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
+    try f.exec("assert(selected)");
+}

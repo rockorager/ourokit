@@ -81,6 +81,9 @@ pub const WindowRuntime = struct {
     frame_state: frame.State = .{},
     output_scale: f32 = 1,
     root_padding: f32 = @import("../design/root.zig").tokens.foundation.spacing_3,
+    /// Popup visual disposal must not cancel a selected asynchronous action.
+    callback_scope: ?task.ScopeHandle = null,
+    popup_target: ?ui.instance.InstanceHandle = null,
     signals: *lua.Signals = undefined,
     paragraph_sources: *text.ParagraphSourceCache = undefined,
     paragraphs: *text.ParagraphCache = undefined,
@@ -591,6 +594,8 @@ pub const WindowRuntime = struct {
             };
             self.semantics.commitStaged();
             self.focus.reconcile(&self.instances);
+            if (self.callback_scope != null and self.focus.current() == null)
+                _ = try self.focus.advance(&self.instances, .forward);
             if (self.text_inputs.takeAutofocus()) |target| {
                 const previous = self.focus.current();
                 _ = try self.focus.request(&self.instances, target);
@@ -755,7 +760,11 @@ pub const WindowRuntime = struct {
                 else => null,
             };
             if (serial) |value| {
-                if (value != 0) self.activation_input = .{ .window = self.window, .serial = value };
+                const source = if (event == .keyboard and event.keyboard == .key)
+                    event.keyboard.key.source_window orelse self.window
+                else
+                    self.window;
+                if (value != 0) self.activation_input = .{ .window = source, .serial = value };
             }
             if (event == .text_input_focus) {
                 self.text_input_surface_focused = event.text_input_focus;
@@ -884,7 +893,8 @@ pub const WindowRuntime = struct {
         for (self.pointer_bindings.entries) |entry| {
             const handler = entry.handler orelse continue;
             if (handler.kind != .interaction_change or !self.instances.isActive(entry.target)) continue;
-            const active = try self.containsTarget(entry.target, hovered) or try self.containsTarget(entry.target, focused);
+            const active = try self.containsTarget(entry.target, hovered) or try self.containsTarget(entry.target, focused) or
+                try self.containsTarget(entry.target, self.popup_target);
             if (self.pointer_bindings.interactionChanged(&self.instances, entry.target, active))
                 try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{.{ .boolean = active }});
         }
@@ -1037,6 +1047,13 @@ pub const WindowRuntime = struct {
         callback_service: anytype,
         focused: ui.instance.InstanceHandle,
     ) !void {
+        if (self.activation_input) |*input| {
+            input.target = focused;
+            input.anchor = self.anchorRectangle(focused) catch |err| switch (err) {
+                error.LayoutRequired, error.PopupAnchorNotVisible => null,
+                else => return err,
+            };
+        }
         const binding = self.pointer_bindings.get(focused) orelse return;
         if (binding.kind == .@"switch") {
             const semantic = self.semantics.findId(try self.instances.semanticId(focused)) orelse return;
@@ -1124,10 +1141,35 @@ pub const WindowRuntime = struct {
     ) !void {
         const Service = @typeInfo(@TypeOf(callback_service)).pointer.child;
         if (Service == lua.CallbackRegistry) {
-            _ = try callback_service.spawnInput(callback, scope, arguments, self.activation_input);
+            _ = try callback_service.spawnInput(callback, self.callback_scope orelse scope, arguments, self.activation_input);
         } else {
             return error.CallbackServiceUnavailable;
         }
+    }
+
+    pub fn restorePopupFocus(self: *WindowRuntime, target: ui.instance.InstanceHandle) !void {
+        self.popup_target = null;
+        if (!self.ready or !self.instances.isActive(target)) return;
+        const previous = self.focus.current();
+        _ = try self.focus.request(&self.instances, target);
+        try self.applyFocusVisual(previous, self.focus.current());
+    }
+
+    pub fn anchorRectangle(self: *WindowRuntime, target: ui.instance.InstanceHandle) !core.RectI {
+        const size = try self.tree.nodeSize(try self.instances.renderObject(target));
+        var origin: core.PointF = .{};
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |candidate| {
+            origin = core.PointF.add(origin, try self.tree.nodeOffset(try self.instances.renderObject(candidate)));
+            current = try self.instances.parentOf(candidate);
+        }
+        const viewport = self.frame_state.size orelse return error.WindowNotConfigured;
+        const left = @max(0, @floor(origin.x));
+        const top = @max(0, @floor(origin.y));
+        const right = @min(@as(f32, @floatFromInt(viewport.width)), @ceil(origin.x + size.width));
+        const bottom = @min(@as(f32, @floatFromInt(viewport.height)), @ceil(origin.y + size.height));
+        if (right <= left or bottom <= top) return error.PopupAnchorNotVisible;
+        return .{ .x = @intFromFloat(left), .y = @intFromFloat(top), .width = @intFromFloat(right - left), .height = @intFromFloat(bottom - top) };
     }
 
     fn notifyTextInputChanged(

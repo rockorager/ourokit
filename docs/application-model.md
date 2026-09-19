@@ -281,6 +281,54 @@ size, layer, anchors, exclusive zone and edge, margins, keyboard interactivity,
 background, and background effect update transactionally, including on source
 reload. Invalid color/effect values reject the new declaration.
 
+## User-initiated anchored popups
+
+Call `ouro.popup` synchronously in a button's `on_press`, before yielding. It
+uses that button's current layout rectangle, parent surface, and triggering
+input serial; callers cannot supply an old serial or arbitrary parent.
+
+```lua
+on_press = function()
+  local menu, err = ouro.popup {
+    width = 240, height = 74,
+    content = function()
+      return ouro.button {
+        label = "Open settings",
+        on_press = function() open_settings() end,
+      }
+    end,
+    on_close = function() menu_open:set(false) end,
+  }
+  if menu then menu_open:set(true) end
+end
+```
+
+Dimensions are integer logical pixels from 1 through 16384. The reactive
+content renders in a separate native `xdg_popup`, below and right-aligned to
+the button. The compositor may flip or slide it on either axis, without
+resizing the parent. Only one popup may be open; nesting is not supported.
+Failure returns `nil, { name = ..., message = ... }`.
+
+The first enabled focusable item receives logical focus. Escape, outside
+click, compositor dismissal, `menu:close()`, opener disposal, or parent teardown
+closes the menu. `close()` is idempotent and legal during render: it requests
+closure, and `on_close` runs at the next task safe point. Focus returns to the
+opener before dismissal notification. An unmounted opener cancels its scoped
+tasks, including `on_close`; applications should not depend on that callback
+running after disposal. Selected action tasks belong to the opener, so merely
+dismissing the popup does not cancel a pending activation-token request.
+
+A layer parent with keyboard policy `none` is temporarily promoted to
+`exclusive` only for this explicit user action, then restored to its declared
+policy. Unlike `on_demand`, this requests immediate keyboard focus for an
+already-mapped top/overlay banner. Incoming banners never request keyboard
+focus. Compositors can keep
+physical keyboard focus on the parent; Ourokit routes its keys to the grabbed
+popup and preserves the physical source for activation. Keyboard opening uses
+the actual keyboard serial, never a previous pointer serial. Compositors that
+only accept pointer serials for popup grabs cannot support keyboard opening;
+use an Ouro build with keyboard-initiated popup-grab support.
+
 ## Application lifetime and UI activation
 
 An application can run without windows. Its entry module declares shared state,

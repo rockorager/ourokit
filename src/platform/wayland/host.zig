@@ -587,6 +587,9 @@ const Window = struct {
     surface: ?Handle = null,
     xdg_surface: ?Handle = null,
     toplevel: ?Handle = null,
+    popup: ?Handle = null,
+    popup_parent: ?WindowHandle = null,
+    popup_keyboard_promoted: bool = false,
     layer_surface: ?Handle = null,
     background_effect: ?Handle = null,
     layer_state: ?LayerState = null,
@@ -619,6 +622,7 @@ const Window = struct {
         return (self.surface != null and self.surface.?.id == object_id) or
             (self.xdg_surface != null and self.xdg_surface.?.id == object_id) or
             (self.toplevel != null and self.toplevel.?.id == object_id) or
+            (self.popup != null and self.popup.?.id == object_id) or
             (self.layer_surface != null and self.layer_surface.?.id == object_id) or
             (self.viewport != null and self.viewport.?.id == object_id) or
             (self.fractional_scale != null and self.fractional_scale.?.id == object_id) or
@@ -658,6 +662,7 @@ const Window = struct {
 pub const Host = struct {
     const ActivationSlot = struct {
         request: ?*Activation.Request = null,
+        owner: WindowHandle = .invalid,
         token: Handle = undefined,
         timer: ?@import("../../loop/io_uring.zig").OperationHandle = null,
     };
@@ -705,6 +710,7 @@ pub const Host = struct {
     seat_global_name: ?u32 = null,
     pointer: ?Handle = null,
     pointer_focus: ?WindowHandle = null,
+    popup_input: ?Activation.Input = null,
     cursor: Cursor = .{},
     keyboard: ?Handle = null,
     keyboard_focus: ?WindowHandle = null,
@@ -791,6 +797,7 @@ pub const Host = struct {
         self.seat_global_name = null;
         self.pointer = null;
         self.pointer_focus = null;
+        self.popup_input = null;
         self.cursor = .{};
         self.keyboard = null;
         self.keyboard_focus = null;
@@ -923,6 +930,7 @@ pub const Host = struct {
     }
 
     pub fn flush(self: *Host) !void {
+        self.popup_input = null;
         if (self.transport_lost)
             try self.abandonWindows()
         else
@@ -1021,11 +1029,21 @@ pub const Host = struct {
         errdefer self.loop.prepareCancel(timer) catch {};
         const created = try protocol.xdg_activation_v1.construct_get_activation_token(objects, transmit, manager, .{});
         errdefer wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .destroy = .{} }) catch {};
+        // wlroots layer popups can retain keyboard focus on the parent even
+        // during an explicit pointer grab. Its activation policy requires the
+        // focused ancestor surface, but still the actual selection serial.
+        const source = if (window.popup_parent) |parent|
+            if (self.keyboard_focus != null and sameWindow(self.keyboard_focus.?, parent))
+                try self.windowFor(parent)
+            else
+                window
+        else
+            window;
         try wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .set_serial = .{ .serial = request.input.serial, .seat = seat.id } });
-        try wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .set_surface = .{ .surface = window.surface.?.id } });
+        try wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .set_surface = .{ .surface = source.surface.?.id } });
         try wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .commit = .{} });
         _ = try self.driver.schedule();
-        slot.* = .{ .request = request, .token = created.id, .timer = timer };
+        slot.* = .{ .request = request, .owner = window.popup_parent orelse window.handle, .token = created.id, .timer = timer };
     }
 
     fn cancelActivation(context: *anyopaque, request: *Activation.Request) !void {
@@ -1047,8 +1065,9 @@ pub const Host = struct {
 
     fn finishActivation(self: *Host, slot: *ActivationSlot, result: anyerror![]const u8) !void {
         const request = slot.request.?;
+        const owner = slot.owner;
         try self.releaseActivation(slot);
-        const window = self.windowFor(request.input.window) catch {
+        const window = self.windowFor(owner) catch {
             return request.complete(request.context, error.StaleWindow);
         };
         try request.complete(request.context, if (window.state == .open and !window.recreate) result else error.WindowClosing);
@@ -1639,6 +1658,14 @@ pub const Host = struct {
     }
 
     fn destroySurfaces(self: *Host, window: *Window) !void {
+        // A parent can disappear independently of the Lua declaration. Always
+        // retire its popup role first, including output removal/recreation.
+        for (self.windows) |*child| if (child.popup_parent) |parent| {
+            if (sameWindow(parent, window.handle) and child.surface != null) {
+                try self.sink.closeRequested(child.handle);
+                try self.destroySurfaces(child);
+            }
+        };
         if (self.text_input_active) |active|
             if (sameWindow(active, window.handle)) try self.disableTextInput(window.handle);
         _ = self.text_input_pending.leave(window.handle);
@@ -1672,6 +1699,18 @@ pub const Host = struct {
             try wayring.client.sendRequest(protocol.wp_viewport, objects, transmit, handle, .{ .destroy = .{} });
         if (window.toplevel) |handle|
             try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, handle, .{ .destroy = .{} });
+        if (window.popup) |handle|
+            try wayring.client.sendRequest(protocol.xdg_popup, objects, transmit, handle, .{ .destroy = .{} });
+        if (window.popup_keyboard_promoted) {
+            const parent = self.windowFor(window.popup_parent.?) catch null;
+            if (parent) |value| if (value.state == .open and value.layer_surface != null) {
+                try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, value.layer_surface.?, .{
+                    .set_keyboard_interactivity = .{ .keyboard_interactivity = keyboardInteractivityValue(value.layer_state.?.keyboard_interactivity) },
+                });
+                try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, value.surface.?, .{ .commit = .{} });
+            };
+            window.popup_keyboard_promoted = false;
+        }
         if (window.xdg_surface) |handle|
             try wayring.client.sendRequest(protocol.xdg_surface, objects, transmit, handle, .{ .destroy = .{} });
         if (window.layer_surface) |handle|
@@ -1687,6 +1726,7 @@ pub const Host = struct {
         if (window.surface) |handle|
             try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, handle, .{ .destroy = .{} });
         window.toplevel = null;
+        window.popup = null;
         window.xdg_surface = null;
         window.layer_surface = null;
         window.background_effect = null;
@@ -1718,6 +1758,25 @@ pub const Host = struct {
         const window = slot orelse return error.WindowCapacityExceeded;
         switch (declaration) {
             .toplevel => if (self.wm_base == null) return error.XdgShellUnavailable,
+            .popup => |popup| {
+                try popup.validate();
+                if (self.wm_base == null) return error.XdgShellUnavailable;
+                if (self.seat == null) return error.SeatUnavailable;
+                const input = self.popup_input orelse return error.NoPopupInput;
+                if (input.serial != popup.input.serial or !sameWindow(input.window, popup.input.window))
+                    return error.StalePopupInput;
+                const parent = try self.windowFor(popup.input.window);
+                if (parent.state != .open or !parent.configured or parent.frames_presented == 0)
+                    return error.PopupParentNotMapped;
+                if (parent.popup != null) return error.NestedPopupUnsupported;
+                for (self.windows) |other| if (other.popup != null) return error.PopupAlreadyOpen;
+                const anchor = popup.input.anchor.?;
+                if (@as(u64, @intCast(anchor.x)) + anchor.width > parent.width or
+                    @as(u64, @intCast(anchor.y)) + anchor.height > parent.height)
+                    return error.InvalidPopupAnchor;
+                if (parent.layer_state != null and parent.layer_state.?.keyboard_interactivity == .none and self.layer_shell_version < 4)
+                    return error.LayerShellVersionTooOld;
+            },
             .layer_surface => |value| {
                 if (self.layer_shell == null) return error.LayerShellUnavailable;
                 if (value.keyboard_interactivity == .on_demand and self.layer_shell_version < 4)
@@ -1747,7 +1806,6 @@ pub const Host = struct {
             _ = try self.driver.schedule();
             return;
         }
-        const toplevel_declaration = declaration.toplevel;
         const objects = &self.connection.objects;
         const transmit = try self.queue();
         const surface = (try protocol.wl_compositor.construct_create_surface(
@@ -1762,33 +1820,54 @@ pub const Host = struct {
             self.wm_base.?,
             .{ .surface = surface.id },
         )).id;
-        const toplevel = (try protocol.xdg_surface.construct_get_toplevel(
+        const toplevel = if (declaration == .toplevel) (try protocol.xdg_surface.construct_get_toplevel(
             objects,
             transmit,
             xdg_surface,
             .{},
-        )).id;
-        try wayring.client.sendRequest(
-            protocol.xdg_toplevel,
-            objects,
-            transmit,
-            toplevel,
-            .{ .set_title = .{ .title = toplevel_declaration.title } },
-        );
-        try wayring.client.sendRequest(
-            protocol.xdg_toplevel,
-            objects,
-            transmit,
-            toplevel,
-            .{ .set_app_id = .{ .app_id = self.app_id } },
-        );
-        try setMinimumSize(
-            objects,
-            transmit,
-            toplevel,
-            toplevel_declaration.min_width,
-            toplevel_declaration.min_height,
-        );
+        )).id else null;
+        var popup: ?Handle = null;
+        var promoted = false;
+        if (declaration == .popup) {
+            const value = declaration.popup;
+            const parent = try self.windowFor(value.input.window);
+            if (parent.layer_state != null and parent.layer_state.?.keyboard_interactivity == .none) {
+                // on_demand only permits focus; changing an already mapped
+                // banner does not request it. This explicit user-opened menu
+                // needs keys immediately, and dismissal restores the policy.
+                try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, parent.layer_surface.?, .{
+                    .set_keyboard_interactivity = .{ .keyboard_interactivity = protocol.zwlr_layer_surface_v1.keyboard_interactivity.exclusive },
+                });
+                try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, parent.surface.?, .{ .commit = .{} });
+                promoted = true;
+            }
+            popup = try createPopupRole(objects, transmit, self.wm_base.?, self.seat.?, xdg_surface, parent, value);
+            self.popup_input = null;
+        }
+        if (declaration == .toplevel) {
+            const toplevel_declaration = declaration.toplevel;
+            try wayring.client.sendRequest(
+                protocol.xdg_toplevel,
+                objects,
+                transmit,
+                toplevel.?,
+                .{ .set_title = .{ .title = toplevel_declaration.title } },
+            );
+            try wayring.client.sendRequest(
+                protocol.xdg_toplevel,
+                objects,
+                transmit,
+                toplevel.?,
+                .{ .set_app_id = .{ .app_id = self.app_id } },
+            );
+            try setMinimumSize(
+                objects,
+                transmit,
+                toplevel.?,
+                toplevel_declaration.min_width,
+                toplevel_declaration.min_height,
+            );
+        }
         const viewport = if (self.viewporter) |viewporter|
             (try protocol.wp_viewporter.construct_get_viewport(
                 objects,
@@ -1816,8 +1895,8 @@ pub const Host = struct {
             )).id
         else
             null;
-        const initial_width = toplevel_declaration.initial_width;
-        const initial_height = toplevel_declaration.initial_height;
+        const initial_width = declaration.initialWidth();
+        const initial_height = declaration.initialHeight();
         if (viewport != null and initial_width != 0 and initial_height != 0) try setViewport(
             objects,
             transmit,
@@ -1834,6 +1913,9 @@ pub const Host = struct {
             .surface = surface,
             .xdg_surface = xdg_surface,
             .toplevel = toplevel,
+            .popup = popup,
+            .popup_parent = if (declaration == .popup) declaration.popup.input.window else null,
+            .popup_keyboard_promoted = promoted,
             .viewport = viewport,
             .fractional_scale = fractional_scale,
             .sync_surface = sync_surface,
@@ -1991,11 +2073,20 @@ pub const Host = struct {
         if (window.state == .open and !window.recreate) {
             const objects = &self.connection.objects;
             const transmit = try self.queue();
+            var effective = declaration;
+            // Preserve user-initiated popup keyboard access across reactive
+            // parent updates; retain the declared policy for dismissal.
+            for (self.windows) |*child| if (child.popup_parent) |parent| {
+                if (sameWindow(parent, handle) and child.popup != null and effective.keyboard_interactivity == .none) {
+                    effective.keyboard_interactivity = .exclusive;
+                    child.popup_keyboard_promoted = true;
+                }
+            };
             try setLayerSurfaceState(
                 objects,
                 transmit,
                 window.layer_surface.?,
-                declaration,
+                effective,
                 window.layer != declaration.layer,
                 self.layer_shell_version,
             );
@@ -2150,6 +2241,21 @@ pub const Host = struct {
                 },
                 .close => try self.sink.closeRequested(window.handle),
                 else => {},
+            }
+        } else if (interface == &protocol.xdg_popup.info) {
+            const window = try self.windowForObject(message.header.object_id);
+            switch (try wayring.client.decodeEvent(protocol.xdg_popup, objects, window.popup.?, message, fds)) {
+                .configure => |configure| {
+                    if (configure.width <= 0 or configure.height <= 0) return error.InvalidPopupSize;
+                    window.pending_width = @intCast(configure.width);
+                    window.pending_height = @intCast(configure.height);
+                },
+                .popup_done => {
+                    window.pending_redraw = false;
+                    window.state = .closing;
+                    try self.sink.closeRequested(window.handle);
+                },
+                .repositioned => {},
             }
         } else if (interface == &protocol.xdg_surface.info) {
             const window = try self.windowForObject(message.header.object_id);
@@ -2837,6 +2943,7 @@ pub const Host = struct {
             .key => |key| {
                 const window = self.keyboard_focus orelse return;
                 const state = try keyboardKeyState(key.state);
+                if (state == .pressed) self.popup_input = .{ .window = window, .serial = key.serial };
                 try self.sink.keyboard(.{ .key = .{
                     .window = window,
                     .serial = key.serial,
@@ -3019,14 +3126,18 @@ pub const Host = struct {
                 .time_ms = motion.time,
                 .position = fixedPosition(motion.surface_x, motion.surface_y),
             } }),
-            .button => |button| try self.sink.pointer(.{ .button = .{
-                .window = try self.focusedWindow(),
-                .serial = button.serial,
-                .time_ms = button.time,
-                .button = button.button,
-                .state = try pointerButtonState(button.state),
-                .modifiers = self.xkb.modifiers(),
-            } }),
+            .button => |button| {
+                if (button.state.value == protocol.wl_pointer.button_state.pressed.value)
+                    self.popup_input = .{ .window = try self.focusedWindow(), .serial = button.serial };
+                try self.sink.pointer(.{ .button = .{
+                    .window = try self.focusedWindow(),
+                    .serial = button.serial,
+                    .time_ms = button.time,
+                    .button = button.button,
+                    .state = try pointerButtonState(button.state),
+                    .modifiers = self.xkb.modifiers(),
+                } });
+            },
             .axis => |axis| try self.sink.pointer(.{ .axis = .{
                 .window = try self.focusedWindow(),
                 .time_ms = axis.time,
@@ -3105,6 +3216,43 @@ fn setMinimumSize(
     try wayring.client.sendRequest(protocol.xdg_toplevel, objects, transmit, toplevel, .{
         .set_min_size = .{ .width = @intCast(width), .height = @intCast(height) },
     });
+}
+
+fn createPopupRole(
+    objects: *wayring.objects.ClientObjects,
+    transmit: *wayring.tx.Queue,
+    wm_base: Handle,
+    seat: Handle,
+    xdg_surface: Handle,
+    parent: *const Window,
+    declaration: platform_window.PopupDeclaration,
+) !Handle {
+    const positioner = (try protocol.xdg_wm_base.construct_create_positioner(objects, transmit, wm_base, .{})).id;
+    const anchor = declaration.input.anchor.?;
+    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_size = .{
+        .width = @intCast(declaration.width),
+        .height = @intCast(declaration.height),
+    } });
+    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_anchor_rect = .{
+        .x = anchor.x,
+        .y = anchor.y,
+        .width = @intCast(anchor.width),
+        .height = @intCast(anchor.height),
+    } });
+    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_anchor = .{ .anchor = .bottom_right } });
+    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_gravity = .{ .gravity = .bottom_left } });
+    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_constraint_adjustment = .{
+        .constraint_adjustment = protocol.xdg_positioner.constraint_adjustment.fromInt(15),
+    } });
+    const popup = (try protocol.xdg_surface.construct_get_popup(objects, transmit, xdg_surface, .{
+        .parent = if (parent.xdg_surface) |surface| surface.id else null,
+        .positioner = positioner.id,
+    })).id;
+    // A layer parent must adopt the NULL-parent popup before grab/initial commit.
+    if (parent.layer_surface) |layer| try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer, .{ .get_popup = .{ .popup = popup.id } });
+    try wayring.client.sendRequest(protocol.xdg_popup, objects, transmit, popup, .{ .grab = .{ .seat = seat.id, .serial = declaration.input.serial } });
+    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .destroy = .{} });
+    return popup;
 }
 
 fn layerValue(layer: platform_window.Layer) protocol.zwlr_layer_shell_v1.layer {
@@ -3456,6 +3604,30 @@ test "Wayland activation binds version one and queues the supplied token and sur
     try std.testing.expectEqual(error.WindowClosing, result.failure.?);
     try std.testing.expectError(error.WindowClosing, provider.start(provider.context, &token_request));
     windows[0].state = .open;
+    windows[1].popup_parent = windows[0].handle;
+    token_request.input = .{ .window = windows[1].handle, .serial = 559 };
+    for ([_]WindowHandle{ windows[0].handle, windows[1].handle }, 0..) |focused, index| {
+        host.keyboard_focus = focused;
+        const old = try transmit.snapshot(&.{}, &.{});
+        try transmit.begin(old);
+        try transmit.complete(old.byteCount());
+        result = .{};
+        try provider.start(provider.context, &token_request);
+        const popup_request = try transmit.snapshot(&.{}, &.{});
+        var data = popup_request.first;
+        const create = (try wayring.wire.Message.decode(data)).?;
+        data = data[create.header.size..];
+        const selected = (try wayring.wire.Message.decode(data)).?;
+        var selected_args = selected.arguments();
+        try std.testing.expectEqual(@as(u32, 559), try selected_args.uint());
+        data = data[selected.header.size..];
+        var source_args = (try wayring.wire.Message.decode(data)).?.arguments();
+        try std.testing.expectEqual(windows[index].surface.?.id, try source_args.uint());
+        windows[1].state = .free; // Popup dismissed while token completion waits.
+        try host.finishActivation(&host.activation_requests[0], "issued");
+        try std.testing.expect(result.called and result.failure == null);
+        windows[1].state = .open;
+    }
     host.activation = null;
     try std.testing.expectError(error.ActivationUnavailable, provider.start(provider.context, &token_request));
 }
@@ -3499,6 +3671,7 @@ test "layer background teardown retires pending callbacks and destroys effect be
         .background_effect = effect,
         .frame_callback = callback,
     };
+    host.windows = @as(*[1]Window, @ptrCast(&window));
     try std.testing.expect(window.addPresentationFeedback(feedback));
     try host.destroySurfaces(&window);
     try std.testing.expectEqual(WindowState.surfaces_destroyed, window.state);
@@ -3978,4 +4151,226 @@ test "fractional viewport source excludes rounded buffer padding" {
     try std.testing.expectEqual(@as(i32, 320), try scaledSourceExtent(1, 150));
     try std.testing.expectEqual(@as(i32, 640 * 256), try scaledSourceExtent(640, 120));
     try std.testing.expectEqual(@as(i32, 571 * 256 + 64), try scaledSourceExtent(457, 150));
+}
+
+test "native popup validates input, positions independently and tears down before its parent" {
+    const allocator = std.testing.allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 8 }, (Config{ .app_id = "test" }).reactor);
+    defer reactor.deinit(allocator);
+    const socket = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket) != .SUCCESS) return error.SocketFailed;
+    const peer = try reactor.attach(@intCast(socket), .{ .received_fd_budget = 0, .transmit_byte_budget = 4096, .transmit_fd_budget = 0 });
+    defer reactor.destroyPeer(peer) catch unreachable;
+    var host: Host = undefined;
+    host.connection = .{ .reactor = &reactor, .peer = peer, .objects = try wayring.objects.ClientObjects.init(allocator, 64, 64, &protocol.wl_display.info, null) };
+    defer host.connection.objects.deinit(allocator);
+    host.driver = Driver.init(&host.connection);
+    const objects = &host.connection.objects;
+    host.compositor = try objects.createLocal(&protocol.wl_compositor.info, 4, null);
+    host.wm_base = try objects.createLocal(&protocol.xdg_wm_base.info, 5, null);
+    host.seat = try objects.createLocal(&protocol.wl_seat.info, 9, null);
+    host.layer_shell_version = 4;
+    host.viewporter = null;
+    host.fractional_scale_manager = null;
+    host.sync_manager = null;
+    host.background_effect_manager = null;
+    host.blur_supported = false;
+    host.text_input_active = null;
+    host.text_input_pending = TextInput.Pending.init(allocator);
+    defer host.text_input_pending.deinit();
+    host.pointer_focus = null;
+    host.keyboard_focus = null;
+    const Recorder = struct {
+        closed: bool = false,
+        width: u32 = 0,
+        height: u32 = 0,
+        fn close(context: *anyopaque, _: WindowHandle) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.closed = true;
+        }
+        fn configure(context: *anyopaque, _: WindowHandle, width: u32, height: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.width = width;
+            self.height = height;
+        }
+        fn dispatch(host_: *Host, queue_: *wayring.tx.Queue, fds_: *wayring.ancillary.FdQueue) !void {
+            const snapshot_ = try queue_.snapshot(&.{}, &.{});
+            var bytes_ = snapshot_.first;
+            while (bytes_.len > 0) {
+                const message = (try wayring.wire.Message.decode(bytes_)).?;
+                _ = try host_.event(try host_.connection.objects.namespace.event(message.header.object_id, message.header.opcode), message, fds_);
+                bytes_ = bytes_[message.header.size..];
+            }
+            try queue_.begin(snapshot_);
+            try queue_.complete(snapshot_.byteCount());
+        }
+    };
+    var recorder: Recorder = .{};
+    var sink: platform_window.EventSink.VTable = undefined;
+    sink.close_requested = Recorder.close;
+    sink.configured = Recorder.configure;
+    host.sink = .{ .context = &recorder, .vtable = &sink };
+    var windows = [_]Window{ .{
+        .state = .open,
+        .handle = .{ .slot = 3, .generation = 11 },
+        .surface = try objects.createLocal(&protocol.wl_surface.info, 4, null),
+        .layer_surface = try objects.createLocal(&protocol.zwlr_layer_surface_v1.info, 4, null),
+        .layer_state = try LayerState.init(allocator, .{ .id = "banner", .namespace = "test", .width = 421, .height = 199, .layer = .overlay }),
+        .width = 421,
+        .height = 199,
+        .configured = true,
+        .frames_presented = 1,
+    }, .{}, .{} };
+    defer windows[0].layer_state.?.deinit(allocator);
+    host.windows = &windows;
+    const input: Activation.Input = .{ .window = windows[0].handle, .serial = 347, .anchor = .{ .x = 293, .y = 127, .width = 83, .height = 31 } };
+    const declaration: platform_window.SurfaceDeclaration = .{ .popup = .{ .id = "popup", .input = input, .width = 211, .height = 93 } };
+    const popup_window: WindowHandle = .{ .slot = 8, .generation = 2 };
+    const transmit = try host.queue();
+    host.popup_input = null;
+    try std.testing.expectError(error.NoPopupInput, Host.nativeCreate(&host, popup_window, .invalid, declaration));
+    host.popup_input = .{ .window = input.window, .serial = 348 };
+    try std.testing.expectError(error.StalePopupInput, Host.nativeCreate(&host, popup_window, .invalid, declaration));
+    host.popup_input = input;
+    windows[0].frames_presented = 0;
+    try std.testing.expectError(error.PopupParentNotMapped, Host.nativeCreate(&host, popup_window, .invalid, declaration));
+    try std.testing.expectEqual(@as(usize, 0), transmit.queuedBytes());
+    windows[0].frames_presented = 1;
+    try Host.nativeCreate(&host, popup_window, .invalid, declaration);
+    try std.testing.expectEqual(@as(u32, 421), windows[0].width);
+    try std.testing.expectEqual(@as(u32, 199), windows[0].height);
+    try std.testing.expectEqual(platform_window.KeyboardInteractivity.none, windows[0].layer_state.?.keyboard_interactivity);
+    try std.testing.expect(windows[1].popup_keyboard_promoted and !windows[1].configured);
+    try std.testing.expectEqual(@as(u32, 211), windows[1].width);
+    try std.testing.expectEqual(@as(u32, 93), windows[1].height);
+    try std.testing.expectError(error.NoPopupInput, Host.nativeCreate(&host, .{ .slot = 9, .generation = 2 }, .invalid, declaration));
+    const snapshot = try transmit.snapshot(&.{}, &.{});
+    var bytes = snapshot.first;
+    var requests: [15]wayring.wire.Message = undefined;
+    for (&requests) |*request| {
+        request.* = (try wayring.wire.Message.decode(bytes)).?;
+        bytes = bytes[request.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+    // create wl_surface/xdg_surface; promote+commit parent; positioner rules;
+    // assign popup role with NULL xdg parent; adopt layer; grab; destroy
+    // positioner; only then commit the empty popup surface.
+    const opcodes = [_]u16{ 0, 2, 4, 6, 1, 1, 2, 3, 4, 5, 2, 5, 1, 0, 6 };
+    for (requests, opcodes) |request, opcode| try std.testing.expectEqual(opcode, request.header.opcode);
+    var args = requests[2].arguments();
+    try std.testing.expectEqual(@as(u32, 1), try args.uint()); // explicit keyboard focus for the opened menu
+    args = requests[5].arguments();
+    try std.testing.expectEqual(@as(i32, 211), try args.int());
+    try std.testing.expectEqual(@as(i32, 93), try args.int());
+    args = requests[6].arguments();
+    for ([_]i32{ 293, 127, 83, 31 }) |expected| try std.testing.expectEqual(expected, try args.int());
+    args = requests[7].arguments();
+    try std.testing.expectEqual(@as(u32, 8), try args.uint()); // bottom_right anchor
+    args = requests[8].arguments();
+    try std.testing.expectEqual(@as(u32, 6), try args.uint()); // bottom_left gravity
+    args = requests[9].arguments();
+    try std.testing.expectEqual(@as(u32, 15), try args.uint()); // flip/slide both axes, no resize
+    args = requests[10].arguments();
+    try std.testing.expectEqual(windows[1].popup.?.id, try args.uint());
+    try std.testing.expectEqual(@as(u32, 0), try args.uint());
+    try std.testing.expectEqual(windows[0].layer_surface.?.id, requests[11].header.object_id);
+    args = requests[12].arguments();
+    try std.testing.expectEqual(host.seat.?.id, try args.uint());
+    try std.testing.expectEqual(@as(u32, 347), try args.uint());
+    try std.testing.expectEqual(windows[1].surface.?.id, requests[14].header.object_id);
+    try transmit.begin(snapshot);
+    try transmit.complete(snapshot.byteCount());
+
+    var blocks = try wayring.pool.SharedBlocks.init(allocator, 4096, 1);
+    defer blocks.deinit(allocator);
+    var fd_pool = try wayring.pool.SharedFds.init(allocator, 1);
+    defer fd_pool.deinit(allocator);
+    var incoming = wayring.tx.Queue.init(&blocks, 4096, &fd_pool, 0);
+    defer incoming.deinit();
+    var fds = wayring.ancillary.FdQueue.init(&fd_pool, 0);
+    defer fds.deinit();
+    // Popup geometry is latched only by the following xdg_surface.configure.
+    try protocol.xdg_popup.encodeEvent(&incoming, windows[1].popup.?.id, .{ .configure = .{ .x = -71, .y = 31, .width = 205, .height = 89 } });
+    try Recorder.dispatch(&host, &incoming, &fds);
+    try std.testing.expect(!windows[1].configured);
+    try std.testing.expectEqual(@as(u32, 211), windows[1].width);
+    try std.testing.expectEqual(@as(u32, 0), recorder.width);
+    try protocol.xdg_surface.encodeEvent(&incoming, windows[1].xdg_surface.?.id, .{ .configure = .{ .serial = 88 } });
+    try Recorder.dispatch(&host, &incoming, &fds);
+    try std.testing.expect(windows[1].configured);
+    try std.testing.expectEqual(@as(u32, 205), recorder.width);
+    try std.testing.expectEqual(@as(u32, 89), recorder.height);
+    const ack = try transmit.snapshot(&.{}, &.{});
+    const ack_message = (try wayring.wire.Message.decode(ack.first)).?;
+    try std.testing.expectEqual(windows[1].xdg_surface.?.id, ack_message.header.object_id);
+    try std.testing.expectEqual(@as(u16, 4), ack_message.header.opcode);
+    args = ack_message.arguments();
+    try std.testing.expectEqual(@as(u32, 88), try args.uint());
+    try transmit.begin(ack);
+    try transmit.complete(ack.byteCount());
+
+    // A reactive parent update must not revoke temporary keyboard access.
+    try Host.nativeUpdateLayerSurface(&host, input.window, .{ .id = "banner", .namespace = "test", .width = 421, .height = 199, .layer = .overlay });
+    const update = try transmit.snapshot(&.{}, &.{});
+    bytes = update.first;
+    var keyboard_updates: usize = 0;
+    while (bytes.len > 0) {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        if (message.header.object_id == windows[0].layer_surface.?.id and message.header.opcode == 4) {
+            args = message.arguments();
+            try std.testing.expectEqual(@as(u32, 1), try args.uint());
+            keyboard_updates += 1;
+        }
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 1), keyboard_updates);
+    try std.testing.expectEqual(platform_window.KeyboardInteractivity.none, windows[0].layer_state.?.keyboard_interactivity);
+    try transmit.begin(update);
+    try transmit.complete(update.byteCount());
+    try protocol.xdg_popup.encodeEvent(&incoming, windows[1].popup.?.id, .{ .popup_done = .{} });
+    try Recorder.dispatch(&host, &incoming, &fds);
+    try std.testing.expect(recorder.closed and !windows[1].pending_redraw);
+    try std.testing.expectEqual(WindowState.closing, windows[1].state);
+    try host.destroySurfaces(&windows[1]);
+    const dismissal = try transmit.snapshot(&.{}, &.{});
+    bytes = dismissal.first;
+    keyboard_updates = 0;
+    while (bytes.len > 0) {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        if (message.header.object_id == windows[0].layer_surface.?.id and message.header.opcode == 4) {
+            args = message.arguments();
+            try std.testing.expectEqual(@as(u32, 0), try args.uint());
+            keyboard_updates += 1;
+        }
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 1), keyboard_updates);
+    try transmit.begin(dismissal);
+    try transmit.complete(dismissal.byteCount());
+
+    windows[1] = .{};
+    host.popup_input = input;
+    recorder.closed = false;
+    try Host.nativeCreate(&host, popup_window, .invalid, declaration);
+    const reopened = try transmit.snapshot(&.{}, &.{});
+    try transmit.begin(reopened);
+    try transmit.complete(reopened.byteCount());
+    const popup_id = windows[1].popup.?.id;
+    const xdg_id = windows[1].xdg_surface.?.id;
+    const surface_id = windows[1].surface.?.id;
+    // Closing the parent must destroy the popup role first, even when its
+    // declaration has not yet been removed by the application.
+    windows[0].state = .closing;
+    try host.destroySurfaces(&windows[0]);
+    try std.testing.expect(recorder.closed);
+    try std.testing.expectEqual(WindowState.surfaces_destroyed, windows[1].state);
+    const teardown = try transmit.snapshot(&.{}, &.{});
+    bytes = teardown.first;
+    for ([_]u32{ popup_id, xdg_id, surface_id }) |id| {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(id, message.header.object_id);
+        try std.testing.expectEqual(@as(u16, 0), message.header.opcode);
+        bytes = bytes[message.header.size..];
+    }
 }

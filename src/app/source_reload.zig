@@ -253,7 +253,7 @@ pub const SourceReload = struct {
             };
             candidate.ui_build.root_background = switch (window.declaration) {
                 .layer_surface => |layer| layer.background,
-                .toplevel => null,
+                .toplevel, .popup => null,
             };
             target.runtime.prepareSourceBuild(
                 target.size,
@@ -296,7 +296,7 @@ pub const SourceReload = struct {
             const target = findWindowTarget(targets, window.declaration.id()).?;
             target.runtime.background = switch (window.declaration) {
                 .layer_surface => |layer| layer.background,
-                .toplevel => null,
+                .toplevel, .popup => null,
             };
             target.runtime.commitPreparedSource(
                 prepared,

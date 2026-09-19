@@ -74,6 +74,7 @@ pub const Vm = struct {
     running: ?TaskHandle = null,
     sleep_enabled: bool = true,
     activation_provider: ?platform_activation.Provider = null,
+    popup_provider: ?@import("popup.zig").Provider = null,
     /// First explicit exit request. The host drains output, cancels tasks,
     /// and tears down; this VM never exits the process or resumes user Lua.
     exit_code: ?u8 = null,
@@ -109,6 +110,9 @@ pub const Vm = struct {
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, activation.request, 1);
         c.lua_setfield(state, -2, "activation_token");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, @import("popup.zig").open, 1);
+        c.lua_setfield(state, -2, "popup");
         c.lua_pushcclosure(state, c.ouro_os_time, 0);
         c.lua_setfield(state, -2, "time");
         c.lua_pushcclosure(state, c.ouro_os_date, 0);

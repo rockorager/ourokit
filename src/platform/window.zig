@@ -168,6 +168,9 @@ pub const KeyboardEvent = union(enum) {
     leave: struct { window: WindowHandle, serial: u32 },
     key: struct {
         window: WindowHandle,
+        /// Physical focus source when a layer popup routes parent keyboard
+        /// input to its own logical window. Activation keeps this provenance.
+        source_window: ?WindowHandle = null,
         serial: u32,
         time_ms: u32,
         state: KeyState,
@@ -343,9 +346,27 @@ pub const LayerSurfaceDeclaration = struct {
 
 /// Surface roles remain distinct because their configure and update contracts
 /// are not interchangeable.
+pub const PopupDeclaration = struct {
+    id: []const u8,
+    input: @import("activation.zig").Input,
+    width: u32,
+    height: u32,
+
+    pub fn validate(self: PopupDeclaration) !void {
+        const anchor = self.input.anchor orelse return error.PopupAnchorRequired;
+        if (self.width == 0 or self.height == 0 or self.width > 16384 or self.height > 16384)
+            return error.InvalidPopupSize;
+        if (anchor.x < 0 or anchor.y < 0 or anchor.width == 0 or anchor.height == 0 or
+            anchor.width > @import("std").math.maxInt(i32) or anchor.height > @import("std").math.maxInt(i32))
+            return error.InvalidPopupAnchor;
+        if (self.input.serial == 0) return error.NoPopupInput;
+    }
+};
+
 pub const SurfaceDeclaration = union(enum) {
     toplevel: ToplevelDeclaration,
     layer_surface: LayerSurfaceDeclaration,
+    popup: PopupDeclaration,
 
     pub fn id(self: SurfaceDeclaration) []const u8 {
         return switch (self) {
@@ -357,6 +378,7 @@ pub const SurfaceDeclaration = union(enum) {
         return switch (self) {
             .toplevel => |declaration| declaration.initial_width,
             .layer_surface => |declaration| declaration.width,
+            .popup => |declaration| declaration.width,
         };
     }
 
@@ -364,6 +386,7 @@ pub const SurfaceDeclaration = union(enum) {
         return switch (self) {
             .toplevel => |declaration| declaration.initial_height,
             .layer_surface => |declaration| declaration.height,
+            .popup => |declaration| declaration.height,
         };
     }
 };

@@ -1,7 +1,12 @@
 const Handle = @import("../core/handle.zig").Handle;
 
 /// Provenance of one actual input press, carried by its UI callback only.
-pub const Input = struct { window: Handle, serial: u32 };
+pub const Input = struct {
+    window: Handle,
+    serial: u32,
+    target: Handle = .invalid,
+    anchor: ?@import("../core/geometry.zig").RectI = null,
+};
 
 /// Caller retains stable storage until completion or successful cancellation.
 pub const Request = struct {

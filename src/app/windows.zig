@@ -27,7 +27,7 @@ pub const Event = union(enum) {
 };
 
 const State = enum { free, active, closing, closed };
-const Role = enum { toplevel, layer_surface };
+const Role = enum { toplevel, layer_surface, popup };
 
 const Slot = struct {
     generation: u32 = 0,
@@ -140,6 +140,7 @@ pub const WindowSet = struct {
                     try self.host.updateLayerSurface(handleFor(slot, index), layer_surface);
                     setLayerState(slot, layer_surface);
                 },
+                .popup => {},
             }
         }
 
@@ -247,7 +248,9 @@ pub const WindowSet = struct {
         return .{ .context = self, .vtable = &event_sink_vtable };
     }
 
-    fn create(self: *WindowSet, declaration: SurfaceDeclaration) !void {
+    pub fn create(self: *WindowSet, declaration: SurfaceDeclaration) !void {
+        try validateDeclarations(&.{declaration});
+        if (self.findById(declaration.id()) != null) return error.DuplicateWindowId;
         var free_index: ?usize = null;
         for (self.slots, 0..) |slot, index| if (slot.state == .free) {
             free_index = index;
@@ -258,16 +261,16 @@ pub const WindowSet = struct {
         errdefer self.allocator.free(id);
         const title = switch (declaration) {
             .toplevel => |value| try self.allocator.dupe(u8, value.title),
-            .layer_surface => null,
+            .layer_surface, .popup => null,
         };
         errdefer if (title) |value| self.allocator.free(value);
         const namespace = switch (declaration) {
-            .toplevel => null,
+            .toplevel, .popup => null,
             .layer_surface => |value| try self.allocator.dupe(u8, value.namespace),
         };
         errdefer if (namespace) |value| self.allocator.free(value);
         const output = switch (declaration) {
-            .toplevel => null,
+            .toplevel, .popup => null,
             .layer_surface => |value| if (value.output) |name|
                 try self.allocator.dupe(u8, name)
             else
@@ -300,6 +303,7 @@ pub const WindowSet = struct {
                 slot.min_height = value.min_height;
             },
             .layer_surface => |value| setLayerState(slot, value),
+            .popup => {},
         }
     }
 
@@ -496,6 +500,7 @@ fn validateDeclarations(declarations: []const SurfaceDeclaration) !void {
             .layer_surface => |layer_surface| {
                 try layer_surface.validate();
             },
+            .popup => |popup| try popup.validate(),
         }
         for (declarations[0..index]) |earlier|
             if (std.mem.eql(u8, earlier.id(), declaration.id())) return error.DuplicateWindowId;
@@ -515,6 +520,7 @@ fn declarationRole(declaration: SurfaceDeclaration) Role {
     return switch (declaration) {
         .toplevel => .toplevel,
         .layer_surface => .layer_surface,
+        .popup => .popup,
     };
 }
 

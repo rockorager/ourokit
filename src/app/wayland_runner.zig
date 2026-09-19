@@ -71,6 +71,103 @@ const RuntimeSlot = struct {
     text_input_generation: ?u64 = null,
     text_input_surface_focused: bool = false,
     text_input_revision: ?TextInputRevision = null,
+    popup: ?Popup = null,
+};
+
+const Popup = struct {
+    window: lua.ApplicationWindow,
+    vm: *lua.Vm,
+    owner: task.ScopeHandle,
+    resource: ?task.ResourceHandle,
+    content_lease: lua.CallbackHandle,
+    on_close: c_int,
+    handle: core.Handle,
+    notified: bool = false,
+
+    fn cancel(context: *anyopaque) !void {
+        const slot: *RuntimeSlot = @ptrCast(@alignCast(context));
+        slot.desired = false;
+    }
+    fn destroy(_: *anyopaque) void {}
+    const lifecycle: task.ResourceLifecycle = .{ .request_cancel = cancel, .destroy = destroy };
+};
+
+const PopupHost = struct {
+    allocator: std.mem.Allocator,
+    windows: *windows_module.WindowSet,
+    callbacks: *lua.CallbackRegistry,
+    slots: []RuntimeSlot,
+    sequence: u64 = 0,
+
+    fn open(context: *anyopaque, vm: *lua.Vm, options: @import("../lua/popup.zig").Options) !core.Handle {
+        const self: *PopupHost = @ptrCast(@alignCast(context));
+        const parent = runtimeSlotForHandle(self.slots, options.input.window) orelse return error.StalePopupParent;
+        if (!parent.desired or !parent.runtime.instances.isActive(options.input.target)) return error.StalePopupParent;
+        if (parent.popup != null) return error.NestedPopupUnsupported;
+        for (self.slots) |slot| if (slot.popup != null and slot.desired) return error.PopupAlreadyOpen;
+        const slot = for (self.slots) |*candidate| {
+            if (candidate.id == null) break candidate;
+        } else return error.WindowCapacityExceeded;
+        self.sequence += 1;
+        const id = try std.fmt.allocPrint(self.allocator, "__ouro_popup_{d}", .{self.sequence});
+        errdefer self.allocator.free(id);
+        const resource = try self.windows.scheduler.registerResource(options.scope, .window, slot, &Popup.lifecycle);
+        errdefer self.windows.scheduler.destroyResource(resource) catch unreachable;
+        try self.callbacks.ensureAvailable(1);
+        const declaration: platform.window.SurfaceDeclaration = .{ .popup = .{
+            .id = id,
+            .input = options.input,
+            .width = options.width,
+            .height = options.height,
+        } };
+        try self.windows.create(declaration);
+        const handle = self.windows.activeHandleForId(id).?;
+        slot.* = .{ .id = id, .desired = true, .popup = .{
+            .window = .{ .declaration = declaration, .content_reference = options.content },
+            .vm = vm,
+            .owner = options.scope,
+            .resource = resource,
+            .content_lease = self.callbacks.adoptReference(vm, options.content) catch unreachable,
+            .on_close = options.on_close,
+            .handle = handle,
+        } };
+        parent.runtime.popup_target = options.input.target;
+        return handle;
+    }
+
+    fn close(context: *anyopaque, handle: core.Handle) void {
+        const self: *PopupHost = @ptrCast(@alignCast(context));
+        for (self.slots) |*slot| if (slot.popup) |popup| {
+            if (sameHandle(popup.handle, handle)) slot.desired = false;
+        };
+    }
+
+    fn closing(self: *PopupHost) !void {
+        for (self.slots) |*slot| if (slot.popup) |*popup| {
+            const input = popup.window.declaration.popup.input;
+            const parent = runtimeSlotForHandle(self.slots, input.window);
+            if (parent == null or !parent.?.desired or !parent.?.runtime.instances.isActive(input.target) or
+                self.windows.activeHandleForId(slot.id.?) == null) slot.desired = false;
+            if (slot.desired or popup.notified) continue;
+            popup.notified = true;
+            if (parent) |value| try value.runtime.restorePopupFocus(input.target);
+            if (popup.on_close >= 0) {
+                _ = popup.vm.spawnReference(popup.owner, popup.on_close, &.{}) catch |err| switch (err) {
+                    error.ScopeCanceled => core.Handle.invalid,
+                    else => return err,
+                };
+            }
+        };
+    }
+
+    fn release(self: *PopupHost, slot: *RuntimeSlot) void {
+        const popup = slot.popup orelse return;
+        const c = @import("../lua/c.zig");
+        c.luaL_unref(popup.vm.state, c.registry_index, popup.on_close);
+        self.callbacks.release(popup.content_lease) catch unreachable;
+        if (popup.resource) |resource| self.windows.scheduler.destroyResource(resource) catch unreachable;
+        slot.popup = null;
+    }
 };
 
 /// Runs one declarative Lua application on the production Wayland stack.
@@ -404,6 +501,8 @@ fn runSourceInternal(
         init.gpa.free(runtime_slots);
     }
     try syncRuntimeSlots(init.gpa, runtime_slots, application.windows);
+    var popups: PopupHost = .{ .allocator = init.gpa, .windows = &window_set, .callbacks = &callbacks, .slots = runtime_slots };
+    callbacks.popup_provider = .{ .context = &popups, .open = PopupHost.open, .close = PopupHost.close };
     var dirty: ui.instance.ReconcileQueue = undefined;
     try dirty.init(init.gpa, options.application_window_capacity);
     defer dirty.deinit();
@@ -487,12 +586,37 @@ fn runSourceInternal(
                     }
                 },
                 .pointer => |pointer| {
+                    // Owner-events grabs still deliver pointer events on the
+                    // parent. Dismiss without activating content underneath.
+                    if (pointer == .button and pointer.button.state == .pressed) {
+                        var dismissed = false;
+                        for (runtime_slots) |*candidate| if (candidate.popup != null and candidate.desired and
+                            !sameHandle(candidate.popup.?.handle, pointer.button.window))
+                        {
+                            candidate.desired = false;
+                            dismissed = true;
+                        };
+                        if (dismissed) continue;
+                    }
                     if (slotForNativeHandle(&window_set, runtime_slots, pointerWindow(pointer))) |slot|
-                        if (slot.runtime.ready) try slot.runtime.routePointer(pointer);
+                        if (slot.desired and slot.runtime.ready) try slot.runtime.routePointer(pointer);
                 },
-                .keyboard => |keyboard| {
-                    if (slotForNativeHandle(&window_set, runtime_slots, keyboardWindow(keyboard))) |slot|
-                        if (slot.runtime.ready) try slot.runtime.routeKeyboard(keyboard);
+                .keyboard => |physical_keyboard| {
+                    const keyboard = popupKeyboard(runtime_slots, physical_keyboard);
+                    // Keep the parent's physical focus state accurate even
+                    // when its grab routes input to a popup. In particular,
+                    // wlroots need not send another enter after dismissal.
+                    if (physical_keyboard != .key and !sameHandle(keyboardWindow(keyboard), keyboardWindow(physical_keyboard))) {
+                        if (slotForNativeHandle(&window_set, runtime_slots, keyboardWindow(physical_keyboard))) |parent|
+                            if (parent.desired and parent.runtime.ready) try parent.runtime.routeKeyboard(physical_keyboard);
+                    }
+                    if (slotForNativeHandle(&window_set, runtime_slots, keyboardWindow(keyboard))) |slot| {
+                        if (slot.popup != null and keyboard == .key and keyboard.key.state == .pressed and keyboard.key.translated.logical == .escape) {
+                            slot.desired = false;
+                            continue;
+                        }
+                        if (slot.desired and slot.runtime.ready) try slot.runtime.routeKeyboard(keyboard);
+                    }
                 },
                 .text_input => |text_input_event| switch (text_input_event) {
                     .enter => |handle| if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
@@ -526,8 +650,9 @@ fn runSourceInternal(
         }
         try source_reload.collectCanceledMcp();
         try scheduler.applyQueuedCancellations();
+        try popups.closing();
         for (runtime_slots) |*slot| try slot.runtime.collectRetired();
-        for (runtime_slots) |*slot| if (slot.runtime.ready)
+        for (runtime_slots) |*slot| if (slot.desired and slot.runtime.ready)
             try slot.runtime.dispatchInput(&callbacks);
         while (clipboard.takeCompletion()) |completion| {
             if (completion.text) |bytes| {
@@ -610,6 +735,11 @@ fn runSourceInternal(
             current_storage[current_count] = window.declaration;
             current_count += 1;
         }
+        try popups.closing();
+        for (runtime_slots) |slot| if (slot.popup != null and slot.desired) {
+            current_storage[current_count] = slot.popup.?.window.declaration;
+            current_count += 1;
+        };
         const calls_pending = if (control) |server| server.hasPendingCalls() else false;
         if (!disconnect_started and current_count == 0 and
             (active_generation.window_owners == null or active_generation.vm.exit_code != null or shutdown_signal != null or host.failure != null or options.exit_after_first_frame) and
@@ -626,7 +756,7 @@ fn runSourceInternal(
         try window_set.reconcile(current_storage[0..current_count]);
 
         for (runtime_slots) |*slot| {
-            const window = applicationWindowForId(active_application.windows, slot.id orelse continue);
+            const window = if (slot.popup) |*popup| &popup.window else applicationWindowForId(active_application.windows, slot.id orelse continue);
             const active_handle = window_set.activeHandleForId(slot.id.?);
             if (window == null or !slot.desired or active_handle == null) {
                 if (slot.runtime.registered) {
@@ -641,6 +771,7 @@ fn runSourceInternal(
                 if (window_set.handleForId(slot.id.?) == null) {
                     slot.runtime.deinit();
                     slot.runtime = .{};
+                    popups.release(slot);
                     if (!slot.declared) {
                         init.gpa.free(slot.id.?);
                         slot.* = .{};
@@ -672,10 +803,13 @@ fn runSourceInternal(
                     &paragraphs,
                     options.window,
                 );
-                slot.runtime.keyboard_focused = false;
+                // Grabs are user-initiated. Some layer-shell compositors keep
+                // physical focus on the parent; popupKeyboard routes its keys.
+                slot.runtime.keyboard_focused = slot.popup != null;
                 slot.runtime.text_input_surface_focused = false;
                 // Desktop surfaces own their entire configured rectangle.
-                if (window.?.declaration == .layer_surface) slot.runtime.root_padding = 0;
+                if (window.?.declaration != .toplevel) slot.runtime.root_padding = 0;
+                if (slot.popup) |popup| slot.runtime.callback_scope = popup.owner;
                 try dirty.register(handle);
                 slot.runtime.registered = true;
                 slot.runtime.setDirtyWindowQueue(&dirty);
@@ -683,7 +817,7 @@ fn runSourceInternal(
             }
             try slot.runtime.setBackground(switch (window.?.declaration) {
                 .layer_surface => |layer| layer.background,
-                .toplevel => null,
+                .toplevel, .popup => null,
             });
             if (slot.configured_size != null and !(try dirty.hasPending(handle)))
                 _ = try dirty.markDirty(handle);
@@ -692,7 +826,7 @@ fn runSourceInternal(
         while (dirty.take()) |work| {
             const slot = runtimeSlotForHandle(runtime_slots, work.owner) orelse
                 return error.UnknownDirtyWindow;
-            const window = applicationWindowForId(active_application.windows, slot.id.?) orelse
+            const window = (if (slot.popup) |*popup| &popup.window else applicationWindowForId(active_application.windows, slot.id.?)) orelse
                 return error.UnknownDirtyWindow;
             const size = slot.configured_size orelse
                 slot.runtime.frame_state.size orelse return error.DirtyWindowNotConfigured;
@@ -721,15 +855,22 @@ fn runSourceInternal(
                 try reportReloadFailure(&source_reload, control, sequence, err);
                 active_reload_sequence = null;
             } else if (source_reload.candidateReady()) {
-                try servicePreparedReload(
-                    &source_reload,
-                    runtime_slots,
-                    reload_targets,
-                    &callbacks,
-                    control,
-                    sequence,
-                );
-                active_reload_sequence = null;
+                var popup_retiring = false;
+                for (runtime_slots) |*slot| if (slot.popup != null) {
+                    slot.desired = false;
+                    popup_retiring = true;
+                };
+                if (!popup_retiring) {
+                    try servicePreparedReload(
+                        &source_reload,
+                        runtime_slots,
+                        reload_targets,
+                        &callbacks,
+                        control,
+                        sequence,
+                    );
+                    active_reload_sequence = null;
+                }
             }
         }
         if (active_reload_sequence == null) if (queued_reload_sequence) |sequence| {
@@ -860,6 +1001,13 @@ fn runSourceInternal(
             }
         }
 
+        // :close() is state-only and may run during a content build. Revisit
+        // reconciliation without waiting for unrelated compositor input.
+        for (runtime_slots) |slot| if (slot.popup != null and !slot.desired and
+            window_set.activeHandleForId(slot.id.?) != null)
+        {
+            desired_changed = true;
+        };
         const serial_before_flush = window_set.changeSerial();
         try host.flush();
         // MCP and Lua timers can enqueue I/O while Wayland is idle.
@@ -1333,6 +1481,7 @@ fn syncRuntimeSlots(
         target.next_declared = true;
     }
     for (slots) |*slot| {
+        if (slot.popup != null) continue;
         if (slot.declared and !slot.next_declared) slot.desired = false;
         slot.declared = slot.next_declared;
         slot.next_declared = false;
@@ -1390,6 +1539,25 @@ fn pointerWindow(event: platform.window.PointerEvent) platform.window.WindowHand
     };
 }
 
+fn popupKeyboard(slots: []RuntimeSlot, event: platform.window.KeyboardEvent) platform.window.KeyboardEvent {
+    const source = keyboardWindow(event);
+    for (slots) |slot| if (slot.desired) {
+        const popup = slot.popup orelse continue;
+        if (!sameHandle(popup.window.declaration.popup.input.window, source)) continue;
+        var routed = event;
+        switch (routed) {
+            .enter => |*value| value.window = popup.handle,
+            .leave => |*value| value.window = popup.handle,
+            .key => |*value| {
+                value.source_window = source;
+                value.window = popup.handle;
+            },
+        }
+        return routed;
+    };
+    return event;
+}
+
 fn keyboardWindow(event: platform.window.KeyboardEvent) platform.window.WindowHandle {
     return switch (event) {
         .enter => |value| value.window,
@@ -1434,4 +1602,43 @@ test "runtime slots retain window state by ID across declaration changes" {
     try syncRuntimeSlots(std.testing.allocator, &slots, &initial);
     try std.testing.expect(main.declared and main.desired);
     try std.testing.expectEqual(@as(usize, 0), main.frames_seen);
+}
+
+test "layer popup keyboard routing isolates parent and preserves physical provenance" {
+    const parent: core.Handle = .{ .slot = 3, .generation = 7 };
+    const child: core.Handle = .{ .slot = 9, .generation = 2 };
+    var slots = [_]RuntimeSlot{.{ .desired = true, .popup = .{
+        .window = .{ .declaration = .{ .popup = .{
+            .id = "popup",
+            .input = .{ .window = parent, .serial = 123 },
+            .width = 200,
+            .height = 90,
+        } }, .content_reference = -2 },
+        .vm = undefined,
+        .owner = .invalid,
+        .resource = null,
+        .content_lease = .invalid,
+        .on_close = -2,
+        .handle = child,
+    } }};
+    const key: platform.window.KeyboardEvent = .{ .key = .{
+        .window = parent,
+        .serial = 812,
+        .time_ms = 43,
+        .state = .pressed,
+        .translated = .{ .keycode = 28, .logical = .enter },
+    } };
+    const routed = popupKeyboard(&slots, key);
+    try std.testing.expectEqual(child, routed.key.window);
+    try std.testing.expectEqual(parent, routed.key.source_window.?);
+    try std.testing.expectEqual(@as(u32, 812), routed.key.serial);
+    try std.testing.expectEqual(key.key.translated, routed.key.translated);
+    var unrelated = key;
+    unrelated.key.window.generation += 1;
+    try std.testing.expectEqualDeep(unrelated, popupKeyboard(&slots, unrelated));
+    var direct = key;
+    direct.key.window = child;
+    try std.testing.expectEqualDeep(direct, popupKeyboard(&slots, direct));
+    slots[0].desired = false;
+    try std.testing.expectEqualDeep(key, popupKeyboard(&slots, key));
 }

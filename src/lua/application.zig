@@ -816,6 +816,7 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
         };
         errdefer switch (declaration) {
             .toplevel => |value| allocator.free(value.title),
+            .popup => {},
             .layer_surface => |value| {
                 allocator.free(value.namespace);
                 if (value.output) |output| allocator.free(output);
@@ -1081,6 +1082,7 @@ fn deinitWindow(allocator: std.mem.Allocator, state: *c.State, window: Window) v
             allocator.free(declaration.namespace);
             allocator.free(declaration.id);
         },
+        .popup => |declaration| allocator.free(declaration.id),
     }
 }
 
