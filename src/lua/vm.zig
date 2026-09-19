@@ -4,6 +4,8 @@ const Handle = @import("../core/handle.zig").Handle;
 const io = @import("../loop/io_uring.zig");
 const task = @import("../task/scheduler.zig");
 const json = @import("mcp_client.zig");
+const activation = @import("activation.zig");
+const platform_activation = @import("../platform/activation.zig");
 
 pub const TaskHandle = Handle;
 
@@ -46,6 +48,8 @@ const Slot = struct {
     resume_arguments: c_int = 0,
     retain_result: bool = false,
     completed_result_count: ?c_int = null,
+    activation_input: ?platform_activation.Input = null,
+    activation_job: ?*activation.Job = null,
 };
 
 const slots_per_chunk = 32;
@@ -69,6 +73,7 @@ pub const Vm = struct {
     operation_tasks: []?TaskHandle,
     running: ?TaskHandle = null,
     sleep_enabled: bool = true,
+    activation_provider: ?platform_activation.Provider = null,
     /// First explicit exit request. The host drains output, cancels tasks,
     /// and tears down; this VM never exits the process or resumes user Lua.
     exit_code: ?u8 = null,
@@ -101,6 +106,9 @@ pub const Vm = struct {
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, spawnChild, 1);
         c.lua_setfield(state, -2, "spawn");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, activation.request, 1);
+        c.lua_setfield(state, -2, "activation_token");
         c.lua_pushcclosure(state, c.ouro_os_time, 0);
         c.lua_setfield(state, -2, "time");
         c.lua_pushcclosure(state, c.ouro_os_date, 0);
@@ -365,6 +373,24 @@ pub const Vm = struct {
         return (try self.activeSlot(handle)).scheduler_handle;
     }
 
+    pub fn setActivationInput(self: *Vm, handle: TaskHandle, input: ?platform_activation.Input) !void {
+        (try self.activeSlot(handle)).activation_input = input;
+    }
+
+    pub fn takeActivationInput(self: *Vm, state: *c.State) !platform_activation.Input {
+        const slot = try self.activeSlot(self.running orelse return error.NoActivationInput);
+        if (slot.thread != state) return error.WrongLuaTask;
+        const input = slot.activation_input orelse return error.NoActivationInput;
+        slot.activation_input = null;
+        return input;
+    }
+
+    pub fn retainActivationJob(self: *Vm, handle: TaskHandle, job: *activation.Job) void {
+        const slot = self.activeSlot(handle) catch unreachable;
+        std.debug.assert(slot.activation_job == null);
+        slot.activation_job = job;
+    }
+
     /// Candidate `ouro.app.run(context)` invocation. The sole return value is
     /// retained so native declaration parsing can happen after any opaque
     /// asynchronous yields complete.
@@ -445,6 +471,9 @@ pub const Vm = struct {
         const resume_arguments = slot.resume_arguments;
         slot.resume_arguments = 0;
         const status = c.lua_resume(slot.thread.?, self.state, resume_arguments, &result_count);
+        // Input provenance expires at the callback's first yield; child tasks
+        // and later timer/DBus continuations cannot reuse a press.
+        slot.activation_input = null;
         switch (status) {
             c.ok => {
                 try self.scheduler.complete(scheduler_handle);
@@ -661,6 +690,7 @@ pub const Vm = struct {
         const status = c.lua_closethread(slot.thread.?, null);
         c.lua_settop(slot.thread.?, 0);
         c.luaL_unref(self.state, c.registry_index, slot.thread_reference);
+        if (slot.activation_job) |job| job.deinit();
         if (self.scheduler_tasks[slot.scheduler_handle.slot]) |mapped| {
             if (same(mapped, handle)) self.scheduler_tasks[slot.scheduler_handle.slot] = null;
         }
@@ -1193,6 +1223,84 @@ test "safe Lua protected calls yield through Ouro and cannot catch cancellation"
         try std.testing.expect(!vm.hasGlobal("caught"));
         try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
     }
+}
+
+test "activation tokens preserve callback provenance and cancellation ownership" {
+    const Fake = struct {
+        requests: [2]?*platform_activation.Request = .{ null, null },
+        canceled: usize = 0,
+        fn start(context: *anyopaque, request: *platform_activation.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            for (&self.requests) |*slot| if (slot.* == null) {
+                slot.* = request;
+                return;
+            };
+            return error.Busy;
+        }
+        fn cancel(context: *anyopaque, request: *platform_activation.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            for (&self.requests) |*slot| if (slot.* == request) {
+                slot.* = null;
+                self.canceled += 1;
+                return;
+            };
+        }
+        fn finish(self: *@This(), index: usize, token: []const u8) !void {
+            const request = self.requests[index].?;
+            self.requests[index] = null;
+            try request.complete(request.context, token);
+        }
+    };
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 8, 8);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 8);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    var provider: Fake = .{};
+    const input: platform_activation.Input = .{ .window = .{ .slot = 3, .generation = 7 }, .serial = 191 };
+    _ = try vm.spawnApplication("local t,e = require('ouro').activation_token(); assert(t == nil and e.name == 'NoActivationInput')");
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    const unsupported = try vm.spawnApplication("local t,e = require('ouro').activation_token(); assert(t == nil and e.name == 'ActivationUnavailable')");
+    try vm.setActivationInput(unsupported, input);
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    vm.activation_provider = .{ .context = &provider, .start = Fake.start, .cancel = Fake.cancel };
+    const first = try vm.spawnApplication("local o = require('ouro'); assert(o.activation_token() == 'first'); assert(o.activation_token() == nil)");
+    const second = try vm.spawnApplication("assert(require('ouro').activation_token() == 'second')");
+    try vm.setActivationInput(first, input);
+    const other: platform_activation.Input = .{ .window = .{ .slot = 4, .generation = 9 }, .serial = 273 };
+    try vm.setActivationInput(second, other);
+    try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expectEqual(input, provider.requests[0].?.input);
+    try std.testing.expectEqual(other, provider.requests[1].?.input);
+    try provider.finish(1, "second");
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    try provider.finish(0, "first");
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+
+    const delayed = try vm.spawnApplication("local o=require('ouro'); o.spawn(function() assert(o.activation_token() == nil) end); o.sleep(0); assert(o.activation_token() == nil)");
+    try vm.setActivationInput(delayed, input);
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    try vm.markTimeoutCompleted((try loop.takeExpired()).?.operation);
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+
+    // Both pending cancellation and completion followed by cancellation must
+    // free token storage without resuming user Lua or retaining host pointers.
+    for ([_]bool{ false, true }) |complete_first| {
+        const pending = try vm.spawnApplication("require('ouro').activation_token(); error('must not resume')");
+        try vm.setActivationInput(pending, input);
+        _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+        if (complete_first) try provider.finish(0, "discarded");
+        try vm.requestCancellation();
+        try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
+        try std.testing.expect(provider.requests[0] == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), provider.canceled);
 }
 
 test "external waits resume only in task phase and drain before cancellation" {

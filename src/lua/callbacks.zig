@@ -4,6 +4,7 @@ const Handle = @import("../core/handle.zig").Handle;
 const task = @import("../task/scheduler.zig");
 const Vm = @import("vm.zig").Vm;
 const Argument = @import("vm.zig").Argument;
+const activation = @import("../platform/activation.zig");
 
 pub const CallbackHandle = Handle;
 
@@ -21,6 +22,7 @@ const Slot = struct {
 pub const CallbackRegistry = struct {
     allocator: std.mem.Allocator,
     slots: []Slot,
+    activation_provider: ?activation.Provider = null,
 
     pub fn init(
         self: *CallbackRegistry,
@@ -76,6 +78,21 @@ pub const CallbackRegistry = struct {
     ) !@import("vm.zig").TaskHandle {
         const slot = try self.activeSlot(handle);
         return slot.vm.?.spawnReference(scope, slot.reference, arguments);
+    }
+
+    pub fn spawnInput(
+        self: *CallbackRegistry,
+        handle: CallbackHandle,
+        scope: task.ScopeHandle,
+        arguments: []const Argument,
+        input: ?activation.Input,
+    ) !@import("vm.zig").TaskHandle {
+        const slot = try self.activeSlot(handle);
+        const vm = slot.vm.?;
+        vm.activation_provider = self.activation_provider;
+        const spawned = try vm.spawnReference(scope, slot.reference, arguments);
+        try vm.setActivationInput(spawned, input);
+        return spawned;
     }
 
     pub fn availableCapacity(self: *const CallbackRegistry) usize {

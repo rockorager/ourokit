@@ -109,6 +109,14 @@ pub const Router = struct {
                 } });
             },
             .button => |button| {
+                if (button.state == .pressed and self.pointer_inside) {
+                    // A build may reveal a control under a stationary pointer.
+                    // Resolve the press against current geometry, not the leaf
+                    // cached by the last motion event.
+                    const hovered = try self.targetAt(self.pointer_position);
+                    try self.ensureSpace(transitionCount(self.hovered, hovered) + @as(usize, @intFromBool(hovered != null)));
+                    self.transition(hovered, self.pointer_position, button.serial);
+                }
                 const target = switch (button.state) {
                     .pressed => self.hovered orelse return,
                     .released => self.captured orelse self.hovered orelse return,
@@ -365,6 +373,23 @@ test "pointer routing hit tests front to back and queues hover transitions" {
     try std.testing.expectEqual(back, captured_release.target);
     try std.testing.expect(captured_release.hovered == null);
     try std.testing.expect(router.takeEvent() == null);
+
+    // Rebuild under a stationary pointer: a press must see the newly revealed
+    // front control, even though the old hovered instance still exists.
+    try router.route(.{ .enter = .{ .window = window, .serial = 14, .position = .{ .x = 5, .y = 5 } } });
+    try std.testing.expectEqual(back, router.takeEvent().?.hover_enter.target);
+    try instances.reconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .box = .{ .width = 50, .height = 50 } } },
+        .{ .id = 3, .parent = 1, .object = .{ .box = .{ .width = 20, .height = 20 } } },
+    });
+    _ = try renders.layout((try instances.rootRenderObject()).?, Constraints.tight(.{ .width = 100, .height = 80 }));
+    try router.route(.{ .button = .{ .window = window, .serial = 15, .time_ms = 23, .button = 0x110, .state = .pressed } });
+    try std.testing.expectEqual(back, router.takeEvent().?.hover_leave.target);
+    try std.testing.expectEqual(front, router.takeEvent().?.hover_enter.target);
+    try std.testing.expectEqual(front, router.takeEvent().?.pointer.target);
+    try router.route(.{ .button = .{ .window = window, .serial = 16, .time_ms = 24, .button = 0x110, .state = .released } });
+    try std.testing.expectEqual(front, router.takeEvent().?.pointer.target);
 
     var commit = [_]u8{ 'o', 'k' };
     var preedit = [_]u8{ 'n', 'e', 'w' };

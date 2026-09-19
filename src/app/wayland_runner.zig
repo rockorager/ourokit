@@ -380,6 +380,7 @@ fn runSourceInternal(
         },
     );
     defer host.deinit();
+    callbacks.activation_provider = host.activationProvider();
     try application.extractOutputTemplates();
     for (host.outputs) |output| if (output.name) |name| {
         _ = try application.expandOutput(name, options.application_window_capacity);

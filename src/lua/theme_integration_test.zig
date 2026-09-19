@@ -13,6 +13,9 @@ const WindowRuntime = @import("../app/window_runtime.zig").WindowRuntime;
 
 const Fixture = struct {
     state: *c.State,
+    loop: @import("../loop/io_uring.zig").Loop = undefined,
+    vm: Vm = undefined,
+    callbacks: @import("callbacks.zig").CallbackRegistry = undefined,
     scheduler: task.Scheduler = undefined,
     scope: task.ScopeHandle = undefined,
     signals: Signals = undefined,
@@ -27,10 +30,14 @@ const Fixture = struct {
 
     fn create() !*Fixture {
         const self = try std.testing.allocator.create(Fixture);
-        self.* = .{ .state = c.luaL_newstate() orelse return error.LuaStateCreationFailed };
-        c.lua_createtable(self.state, 0, 4);
-        c.lua_setglobal(self.state, "ouro");
+        self.* = .{ .state = undefined };
+        try self.loop.init(std.testing.allocator, 8, 2);
         try self.scheduler.init(std.testing.allocator, 1024, 16, 4);
+        try self.vm.init(std.testing.allocator, &self.scheduler, &self.loop);
+        self.state = self.vm.state;
+        self.vm.pushApi(self.state);
+        c.lua_setglobal(self.state, "ouro");
+        try self.callbacks.init(std.testing.allocator, 128);
         self.scope = try self.scheduler.createScope(self.scheduler.application_scope);
         try self.signals.init(std.testing.allocator, self.state, 1024, 1024, 1024);
         self.fonts = text.FontCache.init(std.testing.allocator);
@@ -41,6 +48,7 @@ const Fixture = struct {
         self.sources = text.ParagraphSourceCache.init(std.testing.allocator, &self.fonts);
         self.paragraphs = text.ParagraphCache.init(std.testing.allocator, &self.fonts);
         try self.ui.init(self.state, &self.descriptors);
+        self.ui.attachCallbacks(&self.callbacks, &self.vm);
         self.ui.attachSignals(&self.signals);
         try self.ui.attachSemantics(&self.semantic_storage);
         try self.ui.attachText(&self.sources, &self.font, 1);
@@ -56,8 +64,10 @@ const Fixture = struct {
         self.runtime.collectRetired() catch unreachable;
         self.runtime.deinit();
         self.scheduler.destroyScope(self.scope) catch unreachable;
+        self.callbacks.deinit();
+        self.vm.deinit();
         self.scheduler.deinit();
-        c.lua_close(self.state);
+        self.loop.deinit();
         self.signals.deinit();
         self.paragraphs.deinit();
         self.sources.deinit();
@@ -142,6 +152,162 @@ const Fixture = struct {
     }
 };
 
+test "Switch controlled callbacks, pointer and keyboard preserve state and focus" {
+    const platform = @import("../platform/window.zig");
+    const tokens = @import("../design/root.zig").tokens;
+    const input = struct {
+        fn settle(f: *Fixture) !void {
+            try f.runtime.dispatchInput(&f.callbacks);
+            while (f.scheduler.takeRunnable()) |handle| {
+                try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(handle));
+            }
+            try f.build();
+        }
+        fn key(f: *Fixture, logical: platform.LogicalKey, state: platform.KeyState, shift: bool) !void {
+            try f.runtime.routeKeyboard(.{ .key = .{
+                .window = f.runtime.window,
+                .serial = 7,
+                .time_ms = 0,
+                .state = state,
+                .translated = .{ .keycode = 0, .logical = logical, .modifiers = .{ .shift = shift } },
+            } });
+            try settle(f);
+        }
+        fn pointer(f: *Fixture, path: []const u8, button: u32, state: platform.PointerButtonState) !void {
+            const target = try f.runtime.semanticTarget(path);
+            // Hit the thumb as well as the track, rather than targeting an instance directly.
+            try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 0, .position = .{ .x = target.center.x - 10, .y = target.center.y } } });
+            try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 9, .time_ms = 0, .button = button, .state = state } });
+            try settle(f);
+        }
+    };
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\checked, enabled, dark, reverse = ouro.signal(false), ouro.signal(true), ouro.signal(false), ouro.signal(false)
+        \\accept, calls, values = false, 0, ''
+        \\function changed(value)
+        \\  assert(type(value) == 'boolean')
+        \\  calls = calls + 1; values = values .. (value and 'T' or 'F')
+        \\  if accept then checked:set(value) end
+        \\end
+        \\function build()
+        \\  local toggle = ouro.switch {key='dnd', label='Do Not Disturb', checked=checked(), enabled=enabled(), on_change=changed}
+        \\  local other = ouro.switch {key='other', label='Other', checked=true}
+        \\  return ouro.theme {key='theme', color_scheme=dark() and 'dark' or 'light',
+        \\    ouro.column {key='row', gap=12, children=reverse() and {other, toggle} or {toggle, other}}}
+        \\end
+    );
+    try f.build();
+    const path = "theme/row/dnd";
+    const target = try f.handle(path);
+    const semantic = try f.runtime.semantics.findPath(path);
+    try std.testing.expectEqual(.@"switch", semantic.role);
+    try std.testing.expectEqualStrings("Do Not Disturb", semantic.label);
+    try std.testing.expect(!semantic.checked);
+    const track = f.runtime.tree.firstChild(try f.runtime.instances.renderObject(target)).?;
+    const thumb = f.runtime.tree.firstChild(track).?;
+    try std.testing.expectEqual(@as(f32, 43), (try f.object(path)).box.width.?);
+    try std.testing.expectEqual(@as(f32, 35), (try f.runtime.tree.objectAt(track)).box.width.?);
+    try std.testing.expectEqual(@as(f32, 4), (try f.runtime.tree.nodeOffset(track)).x);
+    try input.key(f, .tab, .pressed, false);
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    try std.testing.expectEqual(tokens.light.ring, (try f.object(path)).box.border_color.?);
+    try input.key(f, .space, .pressed, false);
+    try input.key(f, .space, .repeated, false);
+    try input.key(f, .space, .repeated, false);
+    try input.key(f, .space, .released, false);
+    try f.exec("assert(calls == 1 and values == 'T')");
+    try std.testing.expect(!(try f.runtime.semantics.findPath(path)).checked);
+    try std.testing.expectEqual(@as(f32, 1), (try f.runtime.tree.nodeOffset(thumb)).x);
+
+    try f.exec("accept = true");
+    try input.pointer(f, path, 0x111, .pressed);
+    try input.pointer(f, path, 0x111, .released);
+    try f.exec("assert(calls == 1)");
+    try input.pointer(f, path, 0x110, .pressed);
+    try std.testing.expect((try f.runtime.semantics.findPath(path)).checked);
+    try std.testing.expectEqual(@as(f32, 16), (try f.runtime.tree.nodeOffset(thumb)).x);
+    try input.pointer(f, path, 0x110, .released);
+    try f.exec("assert(calls == 2 and values == 'TT')");
+    try input.key(f, .enter, .pressed, false);
+    try input.key(f, .enter, .repeated, false);
+    try input.key(f, .enter, .released, false);
+    try f.exec("assert(calls == 3 and values == 'TTF')");
+    try std.testing.expect(!(try f.runtime.semantics.findPath(path)).checked);
+
+    // External updates, reordering, and theme changes do not invoke on_change or remount.
+    try f.exec("checked:set(true); dark:set(true); reverse:set(true)");
+    try f.build();
+    try std.testing.expectEqual(target, try f.handle(path));
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    try std.testing.expectEqual(tokens.dark.primary, (try f.runtime.tree.objectAt(track)).box.background.?);
+    try std.testing.expectEqual(tokens.dark.ring, (try f.object(path)).box.border_color.?);
+    try f.exec("assert(calls == 3)");
+    try input.key(f, .space, .pressed, false);
+    // Reconciliation happened while Space is held. Repeat must still be ignored.
+    try input.key(f, .space, .repeated, false);
+    try input.key(f, .space, .released, false);
+    try f.exec("assert(calls == 4 and values == 'TTFF')");
+    try input.key(f, .space, .pressed, false);
+    try f.exec("enabled:set(false)");
+    try f.build();
+    try std.testing.expect(f.runtime.focus.current() == null);
+    try std.testing.expect(!(try f.runtime.semantics.findPath(path)).enabled);
+    try std.testing.expect((try f.runtime.semantics.findPath(path)).checked);
+    try std.testing.expectEqual(@as(u8, 0), (try f.object(path)).box.border_color.?.a);
+    try input.key(f, .space, .repeated, false);
+    try input.key(f, .space, .released, false);
+    try input.pointer(f, path, 0x110, .pressed);
+    try input.pointer(f, path, 0x110, .released);
+    try f.exec("assert(calls == 5 and values == 'TTFFT')");
+    try input.key(f, .tab, .pressed, false);
+    const other = try f.handle("theme/row/other");
+    try std.testing.expectEqual(other, f.runtime.focus.current().?);
+    try input.key(f, .tab, .pressed, true);
+    try std.testing.expectEqual(other, f.runtime.focus.current().?);
+    try f.exec("enabled:set(true)");
+    try f.build();
+    try input.key(f, .tab, .pressed, false);
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    // Replace the callback on a retained declaration; no stale closure survives.
+    try f.exec("changed = function(value) assert(value == false); calls = calls + 10 end");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try input.key(f, .enter, .pressed, false);
+    try f.exec("assert(calls == 15)");
+    try std.testing.expect((try f.runtime.semantics.findPath(path)).checked);
+}
+
+test "Switch prepared commits preserve focus and copy checked semantics atomically" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("function build() return ouro.switch {key='dnd', label='Do Not Disturb', checked=true} end");
+    try f.build();
+    const target = try f.handle("dnd");
+    try f.tab();
+    try f.exec("function build() return ouro.switch {key='dnd', label='Quiet mode', checked=false, on_change=function(value) result=value end} end");
+    _ = c.lua_getglobal(f.state, "build");
+    const reference = c.luaL_ref(f.state, c.registry_index);
+    defer c.luaL_unref(f.state, c.registry_index, reference);
+    var prepared: @import("prepared_build.zig").PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, f.state, &f.sources, 128, 1024);
+    defer prepared.deinit();
+    try f.runtime.prepareSourceBuild(.{ .width = 600, .height = 500 }, &f.ui, &prepared, reference, 2);
+    try std.testing.expect((try f.runtime.semantics.findPath("dnd")).checked);
+    try f.callbacks.ensureAvailable(prepared.handler_count);
+    f.runtime.commitPreparedSource(&prepared, &f.callbacks, &f.vm, &f.signals);
+    try std.testing.expectEqual(target, try f.handle("dnd"));
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    try std.testing.expect(!(try f.runtime.semantics.findPath("dnd")).checked);
+    try std.testing.expectEqualStrings("Quiet mode", (try f.runtime.semantics.findPath("dnd")).label);
+    try std.testing.expectEqual(@import("../design/root.zig").tokens.light.ring, (try f.object("dnd")).box.border_color.?);
+    try f.runtime.routeKeyboard(.{ .key = .{ .window = f.runtime.window, .serial = 1, .time_ms = 0, .state = .pressed, .translated = .{ .keycode = 0, .logical = .space } } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    while (f.scheduler.takeRunnable()) |handle| _ = try f.vm.resumeRunnable(handle);
+    try f.exec("assert(result == true)");
+}
+
 test "Lua stack keeps ordered children and keyed foreground identity" {
     const f = try Fixture.create();
     defer f.destroy();
@@ -217,6 +383,13 @@ test "Lua decoration, stack and input hints reject invalid declarations atomical
         "ouro.box {key='bad', surface='invalid', background='#123456'}",
         "ouro.text_input {key='bad', text='', placeholder=3}",
         "ouro.text_input {key='bad', default_text='', label=false}",
+        "ouro.switch {key='bad', label='Missing checked'}",
+        "ouro.switch {key='bad', label='Invalid checked', checked=1}",
+        "ouro.switch {key='bad', checked=false}",
+        "ouro.switch {key='bad', label='', checked=false}",
+        "ouro.switch {key='bad', label='Disabled', checked=true, enabled='false'}",
+        "ouro.switch {key='bad', label='Callback', checked=false, on_change=true}",
+        "ouro.switch {key='bad', label='Children', checked=false, ouro.box {key='child'}}",
         "ouro.stack {}",
         "ouro.stack {key='bad', ouro.box {key='child', flex=1}}",
         "ouro.stack {key='bad', children=false}",
@@ -967,4 +1140,91 @@ test "text pointer follows hit testing read-only fields drag capture and station
     _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
     try f.build();
     try std.testing.expectEqual(Cursor.default, try f.runtime.pointerCursor());
+}
+
+test "interaction observers retain descendant hover and keyboard focus and Escape restores the trigger" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const Input = struct {
+        fn flush(value: *Fixture) !void {
+            try value.runtime.dispatchInput(&value.callbacks);
+            while (value.scheduler.takeRunnable()) |handle| _ = try value.vm.resumeRunnable(handle);
+            try value.build();
+            try value.runtime.prepareFrame(1);
+        }
+        fn key(value: *Fixture, logical: @import("../platform/window.zig").LogicalKey) !void {
+            try value.runtime.routeKeyboard(.{ .key = .{ .window = value.runtime.window, .serial = 1, .time_ms = 1, .state = .pressed, .translated = .{ .keycode = 0, .logical = logical } } });
+            try flush(value);
+        }
+    };
+    try f.exec(
+        \\active, open = ouro.signal(false), ouro.signal(false)
+        \\changes, invoked = '', ''
+        \\function build()
+        \\  return ouro.column { key = 'root', cross_alignment = 'stretch',
+        \\    ouro.box { key = 'region', on_interaction_change = function(value)
+        \\      changes = changes .. (value and 'T' or 'F'); active:set(value)
+        \\    end, ouro.column { key = 'content',
+        \\      ouro.button { key = 'dismiss', label = 'Dismiss' },
+        \\      active() and ouro.button { key = 'options', label = 'Options', height = 'auto',
+        \\        on_press = function() open:set(not open()) end,
+        \\        on_cancel = open() and function() open:set(false) end or nil,
+        \\        ouro.column { key = 'menu', ouro.text { key = 'label', text = 'Options' },
+        \\          open() and ouro.button { key = 'reply', label = 'Reply', on_press = function() invoked = 'reply' end } or
+        \\            ouro.box { key = 'empty' },
+        \\        },
+        \\      } or ouro.box { key = 'hidden', height = 32 },
+        \\    } },
+        \\    ouro.button { key = 'outside', label = 'Outside' },
+        \\  }
+        \\end
+    );
+    try f.build();
+    try Input.flush(f);
+    try f.exec("assert(changes == 'F' and not active()); changes = ''");
+    const dismiss = (try f.runtime.semanticTarget("root/region/content/dismiss")).center;
+    try f.runtime.routePointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = dismiss } });
+    try Input.flush(f);
+    try f.exec("assert(changes == 'T' and active())");
+    // Crossing into the revealed child and replacing callback references must
+    // not send a false leave/enter pair or restart an open menu.
+    const options = (try f.runtime.semanticTarget("root/region/content/options")).center;
+    try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 1, .position = options } });
+    try Input.flush(f);
+    try f.exec("assert(changes == 'T')");
+    try f.runtime.routePointer(.{ .leave = .{ .window = f.runtime.window, .serial = 2 } });
+    try Input.flush(f);
+    try f.exec("assert(changes == 'TF' and not active())");
+    try Input.key(f, .tab); // Dismiss reveals actions without a default action.
+    try f.exec("assert(changes == 'TFT' and active())");
+    try Input.key(f, .tab);
+    const trigger = try f.handle("root/region/content/options");
+    try std.testing.expectEqual(trigger, f.runtime.focus.current().?);
+    try Input.key(f, .enter);
+    try Input.key(f, .tab);
+    try std.testing.expectEqual(try f.handle("root/region/content/options/menu/reply"), f.runtime.focus.current().?);
+    try Input.key(f, .escape);
+    try f.exec("assert(not open() and invoked == '' and changes == 'TFT')");
+    try std.testing.expectEqual(trigger, f.runtime.focus.current().?);
+    try Input.key(f, .enter);
+    try Input.key(f, .tab);
+    try Input.key(f, .enter);
+    try f.exec("assert(open() and invoked == 'reply', 'nested activation also toggled the trigger')");
+    try Input.key(f, .tab);
+    try f.exec("assert(changes == 'TFTF' and not active())");
+    // A pointer-only surface must not retain reveal from pointer-assigned focus.
+    try f.runtime.routePointer(.{ .enter = .{ .window = f.runtime.window, .serial = 3, .position = dismiss } });
+    try Input.flush(f);
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 4, .time_ms = 2, .button = 0x110, .state = .pressed } });
+    try Input.flush(f);
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 5, .time_ms = 3, .button = 0x110, .state = .released } });
+    try f.runtime.routePointer(.{ .leave = .{ .window = f.runtime.window, .serial = 6 } });
+    try f.runtime.routeKeyboard(.{ .leave = .{ .window = f.runtime.window, .serial = 7 } });
+    try Input.flush(f);
+    try f.exec("assert(changes == 'TFTFTF' and not active())");
+    try f.exec("active:set(true); function build() return ouro.box {key = 'replacement', on_interaction_change = function(value) active:set(value) end} end");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try Input.flush(f);
+    try f.exec("assert(not active(), 'replacement observer retained stale active state')");
 }

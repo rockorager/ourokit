@@ -47,6 +47,7 @@ pub const WindowRuntime = struct {
     registered: bool = false,
     ready: bool = false,
     window: platform.WindowHandle = .invalid,
+    activation_input: ?@import("../platform/activation.zig").Input = null,
     tree: ui.render_object.Tree = undefined,
     instances: ui.instance.Tree = undefined,
     build_owners: ui.instance.BuildOwners = undefined,
@@ -740,6 +741,22 @@ pub const WindowRuntime = struct {
     pub fn dispatchInput(self: *WindowRuntime, callback_service: anytype) !void {
         while (self.router.takeEvent()) |event| {
             defer self.router.releaseEvent(event);
+            self.activation_input = null;
+            defer self.activation_input = null;
+            const serial: ?u32 = switch (event) {
+                .pointer => |pointer| switch (pointer.event) {
+                    .button => |button| if (button.state == .pressed) button.serial else null,
+                    else => null,
+                },
+                .keyboard => |keyboard| switch (keyboard) {
+                    .key => |key| if (key.state == .pressed) key.serial else null,
+                    else => null,
+                },
+                else => null,
+            };
+            if (serial) |value| {
+                if (value != 0) self.activation_input = .{ .window = self.window, .serial = value };
+            }
             if (event == .text_input_focus) {
                 self.text_input_surface_focused = event.text_input_focus;
                 try self.syncTextInputVisuals();
@@ -797,14 +814,9 @@ pub const WindowRuntime = struct {
                 handler = self.pointer_bindings.get(bound_target);
             }
             const binding = handler orelse continue;
-            if (binding.kind == .button) {
+            if (binding.kind == .button or binding.kind == .@"switch") {
                 if (activated_button != null and sameHandle(activated_button.?, bound_target))
-                    try self.spawnCallback(
-                        callback_service,
-                        binding.id,
-                        try self.instances.scope(bound_target),
-                        &.{},
-                    );
+                    try self.spawnButtonCallback(callback_service, bound_target);
                 continue;
             }
             if (binding.kind == .listbox) {
@@ -834,6 +846,47 @@ pub const WindowRuntime = struct {
                 try self.instances.scope(bound_target),
                 &arguments,
             );
+        }
+        try self.syncInteractions(callback_service);
+    }
+
+    fn containsTarget(self: *WindowRuntime, ancestor: ui.instance.InstanceHandle, descendant: ?ui.instance.InstanceHandle) !bool {
+        var current = descendant;
+        while (current) |target| {
+            if (!self.instances.isActive(target)) return false;
+            if (sameHandle(target, ancestor)) return true;
+            current = try self.instances.parentOf(target);
+        }
+        return false;
+    }
+
+    fn syncInteractions(self: *WindowRuntime, callback_service: anytype) !void {
+        const observing = for (self.pointer_bindings.entries) |entry| {
+            if (entry.handler != null and entry.handler.?.kind == .interaction_change) break true;
+        } else false;
+        if (!observing) return;
+        // Hit-test current geometry, rather than a leaf which may have been
+        // removed by the preceding build. Descendant transitions stay active.
+        var hovered: ?ui.instance.InstanceHandle = null;
+        if (self.router.pointer_inside) {
+            if (try self.instances.rootRenderObject()) |root| {
+                const hit = self.tree.hitTest(root, self.router.pointer_position) catch |err| switch (err) {
+                    // Input can invalidate layout. Publish after layout has
+                    // caught up, not from obsolete bounds.
+                    error.LayoutRequired => return,
+                    else => return err,
+                };
+                if (hit) |render|
+                    hovered = self.instances.instanceForRenderObject(render);
+            }
+        }
+        const focused = if (self.keyboard_focused) self.focus.current() else null;
+        for (self.pointer_bindings.entries) |entry| {
+            const handler = entry.handler orelse continue;
+            if (handler.kind != .interaction_change or !self.instances.isActive(entry.target)) continue;
+            const active = try self.containsTarget(entry.target, hovered) or try self.containsTarget(entry.target, focused);
+            if (self.pointer_bindings.interactionChanged(&self.instances, entry.target, active))
+                try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{.{ .boolean = active }});
         }
     }
 
@@ -895,6 +948,19 @@ pub const WindowRuntime = struct {
                 return;
             }
         };
+        if (key.translated.logical == .escape and key.state == .pressed) {
+            var current = self.focus.current();
+            while (current) |target| {
+                if (self.pointer_bindings.getKind(target, .cancel)) |handler| {
+                    const previous = self.focus.current();
+                    _ = try self.focus.request(&self.instances, target);
+                    try self.applyFocusVisual(previous, self.focus.current());
+                    try self.spawnCallback(callback_service, handler.id, try self.instances.scope(target), &.{});
+                    return;
+                }
+                current = try self.instances.parentOf(target);
+            }
+        }
         if (key.translated.logical == .tab and key.state != .released) {
             try self.applyButtonUpdate(self.buttons.release());
             const previous = self.focus.current();
@@ -972,6 +1038,14 @@ pub const WindowRuntime = struct {
         focused: ui.instance.InstanceHandle,
     ) !void {
         const binding = self.pointer_bindings.get(focused) orelse return;
+        if (binding.kind == .@"switch") {
+            const semantic = self.semantics.findId(try self.instances.semanticId(focused)) orelse return;
+            if (!semantic.enabled) return;
+            // Read only the committed application value. Rejected requests and
+            // pending callback tasks must not optimistically flip the control.
+            try self.spawnCallback(callback_service, binding.id, try self.instances.scope(focused), &.{.{ .boolean = !semantic.checked }});
+            return;
+        }
         if (binding.kind != .button) return;
         try self.spawnCallback(
             callback_service,
@@ -1048,10 +1122,9 @@ pub const WindowRuntime = struct {
         scope: task.ScopeHandle,
         arguments: []const lua.TaskArgument,
     ) !void {
-        _ = self;
         const Service = @typeInfo(@TypeOf(callback_service)).pointer.child;
         if (Service == lua.CallbackRegistry) {
-            _ = try callback_service.spawn(callback, scope, arguments);
+            _ = try callback_service.spawnInput(callback, scope, arguments, self.activation_input);
         } else {
             return error.CallbackServiceUnavailable;
         }
@@ -1938,6 +2011,8 @@ test "queued pointer axis scrolls retained instance only during input dispatch" 
         window,
         2,
     );
+    try runtime.pointer_bindings.init(std.testing.allocator, 2);
+    defer runtime.pointer_bindings.deinit();
     defer {
         runtime.router.deinit();
         runtime.instances.reconcile(&.{}) catch unreachable;
@@ -2004,6 +2079,8 @@ test "queued Tab navigation updates retained focus at the input safe point" {
     );
     try runtime.buttons.init(std.testing.allocator, 3);
     try runtime.text_inputs.init(std.testing.allocator, 3);
+    try runtime.pointer_bindings.init(std.testing.allocator, 3);
+    defer runtime.pointer_bindings.deinit();
     defer {
         runtime.text_inputs.deinit();
         runtime.buttons.clear();

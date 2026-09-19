@@ -157,6 +157,19 @@ An optional `destination` sends a directed signal instead of a broadcast.
 Emission does not require an export; signal declarations describe introspection
 and do not constrain `emit`. There is no delivery acknowledgment.
 
+For notification actions, call `ouro.activation_token()` directly inside the
+button's input callback, before any other yield. It yields while requesting an
+XDG activation token using that callback's real seat serial and source surface.
+It returns a token string, or `nil, error_table` when unavailable or timed out.
+The input provenance is single-use and does not transfer to spawned tasks;
+timers, key repeats and callbacks without input cannot authorize activation.
+
+Send the token to the notification's original D-Bus sender in a directed
+`ActivationToken` signal before `ActionInvoked`. The receiving application must
+use the token to activate its window. Token acquisition alone does not change
+focus. Revalidate the notification after the yield, since it may have expired
+or been replaced while waiting.
+
 [`examples/dbus_notifications.lua`](../examples/dbus_notifications.lua) implements
 the four notification methods, IDs, replacement, expiration, and
 `NotificationClosed`. It prints notifications instead of rendering windows;

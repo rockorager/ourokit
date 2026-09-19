@@ -9,6 +9,16 @@ default 100% spacing, medium radius,
 typography, Indigo accent, and Slate gray conventions as an Ouro-owned native
 implementation rather than importing React or CSS component source.
 
+The Switch recipe was additionally checked on 2026-09-17 against Themes
+revision `1faff10ac26ae17f09944d418c6949b93fc6b566`:
+[switch.css](https://github.com/radix-ui/themes/blob/1faff10ac26ae17f09944d418c6949b93fc6b566/packages/radix-ui-themes/src/components/switch.css),
+[switch.props.tsx](https://github.com/radix-ui/themes/blob/1faff10ac26ae17f09944d418c6949b93fc6b566/packages/radix-ui-themes/src/components/switch.props.tsx),
+and [radius.css](https://github.com/radix-ui/themes/blob/1faff10ac26ae17f09944d418c6949b93fc6b566/packages/radix-ui-themes/src/styles/tokens/radius.css).
+Controlled state and button-backed switch semantics were checked against
+[Radix Primitives Switch](https://github.com/radix-ui/primitives/blob/f7ecd5ab16f5e1e820eb5786a1419a98a2d594ae/packages/react/switch/src/switch.tsx),
+also MIT licensed. Ourokit retains its native activation-on-press convention;
+visual departures are documented in `docs/design-system.md`.
+
 The raw palette is imported from `@radix-ui/colors` 3.0.0. The pinned npm
 tarball has SHA-512
 `1543ac181907ad827009212d5910887d06d91bbab57ba0e0c4220e7b54944330deffbad75de038eecf320a7e9fb93350023d59ab8a13162f588e9df0cc495cc6`

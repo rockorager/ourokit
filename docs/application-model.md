@@ -563,6 +563,51 @@ The supported defaults are:
 | `widgets.option` | Same as button except `disabled`, `disabled_foreground`, and `focus`; `pressed` is the selected background |
 | `widgets.text` | `foreground`, `font_size` |
 
+### Controlled switches
+
+`ouro.switch` is a native binary control with a required boolean `checked`
+value and non-empty accessible `label`:
+
+```lua
+local dnd = ouro.signal(false)
+
+ouro.switch {
+  key = "do-not-disturb",
+  label = "Do Not Disturb",
+  checked = dnd(),
+  enabled = true,
+  on_change = function(value) dnd:set(value) end,
+}
+```
+
+`enabled` defaults to true. `on_change` is optional and receives the boolean
+inverse of the last committed `checked` value. The application must supply the
+new value on rebuild; the switch never changes it optimistically. Ignoring a
+request leaves the control unchanged. External updates do not emit callbacks.
+There is no `default_checked` or uncontrolled mode. Keep the same `key` to retain
+native identity and focus across state, callback, theme, and sibling-order updates.
+
+Primary-button press, Space, and Enter request a change. Keyboard repeats and
+releases do not emit changes. Enabled switches are one Tab/Shift+Tab focus stop;
+pointer presses focus them too. Disabled switches cannot focus or activate, and
+disabling a focused switch clears focus. Callbacks run as ordinary scoped Lua
+tasks, never during platform dispatch.
+
+`label` is semantic only, not visible text or a larger clickable label. Compose
+an adjacent `ouro.text` in a centered row when a visible label is needed. The
+semantic snapshot records role `switch`, `checked`, `enabled`, and the label;
+as with other widgets, an OS accessibility bridge is not yet implemented.
+
+The fixed size-2 control has a 35×20 track within 43×28 hit bounds that reserve
+space for the focus ring. It uses inherited semantic colors and a pill radius;
+`theme.controls.radius` overrides the radius. It accepts contextual `flex` but
+no children or button-style dimension/visual props. See the
+[native recipe and intentional Radix departures](design-system.md) and
+`switch/*` stories in `examples/storybook.lua` for both palettes, on/off,
+disabled, keyboard focus, and controlled pointer activation.
+
+### Single-line text inputs
+
 `ouro.text_input` is a single-line field. Long values scroll horizontally to
 keep the focused caret or selection extent visible, including during IME
 composition and pointer dragging. Resizing clamps the retained scroll offset.
@@ -1004,6 +1049,21 @@ radius, surface, and input-border roles; focus replaces that border color with
 Lua-build path for both windows. Both mounted
 window owners also read one shared signal, proving dependency identity across
 separate per-window registries sharing one VM.
+
+Boxes and buttons accept `on_interaction_change(active)`. It reports changes
+to the combined pointer-within or keyboard-focus-within state, including
+descendants, without taking focus or consuming their clicks. Moving between
+children does not toggle the state; losing window keyboard focus stops counting
+its retained focus target. Each new observed instance emits its initial state.
+Callbacks run as tasks, not during native input dispatch, and retained instance
+state survives callback replacement. Use a component-owned signal to reveal
+controls while active, with a stable placeholder if layout must not move.
+
+Buttons also accept `on_cancel()`. Escape from that button or a descendant
+invokes the nearest such handler and returns focus to its button before the
+callback runs. This lets a disclosure close its child actions without losing
+keyboard focus. Text-input command bindings take precedence over ancestor
+cancellation. Omitting `on_cancel` leaves Escape unhandled by that button.
 
 For the benchmark slice, `ouro.button` owns composition and input policy while
 lowering to only Box and Text render objects. Button is not a render object. Its

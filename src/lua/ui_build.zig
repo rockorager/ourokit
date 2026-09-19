@@ -632,6 +632,7 @@ pub const UiBuild = struct {
             .canvas => emitCanvas,
             .icon => emitIcon,
             .button => emitButton,
+            .@"switch" => emitSwitch,
             .text_input => emitTextInput,
             .listbox => emitListBox,
             .option => emitOption,
@@ -1051,6 +1052,10 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append button semantics");
 
         if (child_count != 0) _ = self.emitChildren(state, .{ .id = button_id, .kind = .box });
+        self.stageCallback(state, button_id, "on_interaction_change", .interaction_change) catch |err|
+            return luaError(state, @errorName(err));
+        self.stageCallback(state, button_id, "on_cancel", .cancel) catch |err|
+            return luaError(state, @errorName(err));
         const callback_type = c.lua_getfield(state, 1, "on_press");
         defer c.lua_settop(state, -2);
         if (callback_type == c.type_nil) return 0;
@@ -1062,6 +1067,70 @@ pub const UiBuild = struct {
             .id = button_id,
             .reference = c.luaL_ref(state, c.registry_index),
             .kind = .button,
+        };
+        self.pending_handler_count += 1;
+        return 0;
+    }
+
+    fn emitSwitch(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "switch key is required");
+        const label = tableString(state, 1, "label") orelse return luaError(state, "switch label is required");
+        if (key.len == 0 or label.len == 0) return luaError(state, "switch key and label must not be empty");
+        if (c.lua_getfield(state, 1, "checked") != c.type_boolean)
+            return luaError(state, "switch checked must be a boolean");
+        const checked = c.lua_toboolean(state, -1) != 0;
+        c.lua_settop(state, -2);
+        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
+            return luaError(state, "invalid switch enabled state");
+        const parent = self.currentParent() orelse return luaError(state, "switch requires a widget parent");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
+        const id = semanticId(key, 0x737769746368 ^ parent.id ^ self.component_namespace);
+        const track_id = semanticId("track", id);
+        const recipe = @import("../ui/widget/switch.zig").Switch.init(theme, checked, enabled, self.currentStyle().?.controls.radius);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .box = recipe.root },
+            .focusable = enabled,
+            .parent_data = parent_data,
+        }) catch return luaError(state, "cannot append switch descriptor");
+        self.append(.{
+            .id = track_id,
+            .parent = id,
+            .object = .{ .box = recipe.track },
+        }) catch return luaError(state, "cannot append switch track");
+        self.append(.{
+            .id = semanticId("thumb", id),
+            .parent = track_id,
+            .object = .{ .box = recipe.thumb },
+        }) catch return luaError(state, "cannot append switch thumb");
+        if (self.pending_button_count == self.pending_buttons.len)
+            return luaError(state, "button capacity exceeded");
+        self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled, .style = recipe.style };
+        self.pending_button_count += 1;
+        self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .@"switch",
+            .key = key,
+            .label = label,
+            .enabled = enabled,
+            .checked = checked,
+        }) catch return luaError(state, "cannot append switch semantics");
+        const callback_type = c.lua_getfield(state, 1, "on_change");
+        defer c.lua_settop(state, -2);
+        if (callback_type == c.type_nil) return 0;
+        if (callback_type != c.type_function) return luaError(state, "switch on_change must be a function");
+        if (self.pending_handler_count == self.pending_handlers.len)
+            return luaError(state, "pointer handler capacity exceeded");
+        c.lua_pushvalue(state, -1);
+        self.pending_handlers[self.pending_handler_count] = .{
+            .id = id,
+            .reference = c.luaL_ref(state, c.registry_index),
+            .kind = .@"switch",
         };
         self.pending_handler_count += 1;
         return 0;
@@ -1524,7 +1593,24 @@ pub const UiBuild = struct {
             .role = .group,
             .key = key,
         }) catch return luaError(state, "cannot append box semantics");
+        self.stageCallback(state, id, "on_interaction_change", .interaction_change) catch |err|
+            return luaError(state, @errorName(err));
         return self.emitChildren(state, .{ .id = id, .kind = .box });
+    }
+
+    fn stageCallback(self: *UiBuild, state: *c.State, id: u64, name: [*:0]const u8, kind: @import("../ui/input/bindings.zig").HandlerKind) !void {
+        const callback_type = c.lua_getfield(state, 1, name);
+        defer c.lua_settop(state, -2);
+        if (callback_type == c.type_nil) return;
+        if (callback_type != c.type_function) return error.CallbackMustBeFunction;
+        if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+        c.lua_pushvalue(state, -1);
+        self.pending_handlers[self.pending_handler_count] = .{
+            .id = id,
+            .reference = c.luaL_ref(state, c.registry_index),
+            .kind = kind,
+        };
+        self.pending_handler_count += 1;
     }
 
     fn emitTheme(state: *c.State) callconv(.c) c_int {

@@ -3,7 +3,20 @@ const Handle = @import("../../core/handle.zig").Handle;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const HandlerKind = enum { pointer, button, text_input_change, text_input_command, listbox };
+pub const HandlerKind = enum {
+    pointer,
+    button,
+    @"switch",
+    text_input_change,
+    text_input_command,
+    listbox,
+    interaction_change,
+    cancel,
+
+    fn primary(self: HandlerKind) bool {
+        return self == .pointer or self == .button or self == .@"switch" or self == .listbox;
+    }
+};
 
 pub const Handler = struct {
     id: Handle,
@@ -16,28 +29,58 @@ const Entry = struct {
     handler: ?Handler = null,
 };
 
+const InteractionState = struct {
+    target: instance.InstanceHandle = .invalid,
+    active: bool = false,
+};
+
 /// Language-neutral, instance-owned semantic input bindings. Targets are
 /// generation checked; handler IDs are opaque capabilities owned by a bridge.
 pub const PointerBindings = struct {
     allocator: std.mem.Allocator,
     entries: []Entry,
+    interactions: []InteractionState,
 
     pub fn init(self: *PointerBindings, allocator: std.mem.Allocator, capacity: usize) !void {
         const entries = try allocator.alloc(Entry, capacity);
+        errdefer allocator.free(entries);
+        const interactions = try allocator.alloc(InteractionState, capacity);
         @memset(entries, .{});
-        self.* = .{ .allocator = allocator, .entries = entries };
+        @memset(interactions, .{});
+        self.* = .{ .allocator = allocator, .entries = entries, .interactions = interactions };
     }
 
     pub fn deinit(self: *PointerBindings) void {
+        self.allocator.free(self.interactions);
         self.allocator.free(self.entries);
         self.* = undefined;
     }
 
     pub fn get(self: *const PointerBindings, target: instance.InstanceHandle) ?Handler {
         for (self.entries) |entry| if (same(entry.target, target) and entry.handler != null and
-            entry.handler.?.kind != .text_input_change and entry.handler.?.kind != .text_input_command)
+            entry.handler.?.kind.primary())
             return entry.handler;
         return null;
+    }
+
+    /// State survives callback replacement, but never instance removal or reuse.
+    pub fn interactionChanged(self: *PointerBindings, tree: *instance.Tree, target: instance.InstanceHandle, active: bool) bool {
+        var empty: ?*InteractionState = null;
+        for (self.interactions) |*state| {
+            if (!tree.isActive(state.target) or self.getKind(state.target, .interaction_change) == null)
+                state.* = .{};
+            if (same(state.target, target)) {
+                const changed = state.active != active;
+                state.active = active;
+                return changed;
+            }
+            if (same(state.target, .invalid)) empty = state;
+        }
+        // There cannot be more interaction targets than bindings.
+        empty.?.* = .{ .target = target, .active = active };
+        // Publish the initial state too: a retained Lua component can replace
+        // its observed native instance while keeping its previous signal.
+        return true;
     }
 
     pub fn getKind(self: *const PointerBindings, target: instance.InstanceHandle, kind: HandlerKind) ?Handler {
@@ -139,10 +182,7 @@ fn same(a: instance.InstanceHandle, b: instance.InstanceHandle) bool {
 }
 
 fn sameBindingKind(a: HandlerKind, b: HandlerKind) bool {
-    if (a == .text_input_change or a == .text_input_command or
-        b == .text_input_change or b == .text_input_command)
-        return a == b;
-    return true;
+    return a == b or (a.primary() and b.primary());
 }
 
 test "pointer bindings replace, clean removal, and reject stale generations" {

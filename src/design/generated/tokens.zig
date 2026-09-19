@@ -1872,6 +1872,10 @@ pub const Theme = struct {
     sidebar_primary_foreground: Color,
     sidebar_ring: Color,
     surface: Color,
+    switch_border: Color,
+    switch_disabled_thumb: Color,
+    switch_thumb: Color,
+    switch_track: Color,
 };
 
 pub const light: Theme = .{
@@ -1914,6 +1918,10 @@ pub const light: Theme = .{
     .sidebar_primary_foreground = Color.rgba(255, 255, 255, 255),
     .sidebar_ring = Color.rgba(141, 164, 239, 255),
     .surface = Color.rgba(255, 255, 255, 217),
+    .switch_border = Color.rgba(0, 8, 48, 70),
+    .switch_disabled_thumb = Color.rgba(249, 249, 251, 255),
+    .switch_thumb = Color.rgba(255, 255, 255, 255),
+    .switch_track = Color.rgba(0, 9, 50, 31),
 };
 
 pub const dark: Theme = .{
@@ -1956,4 +1964,8 @@ pub const dark: Theme = .{
     .sidebar_primary_foreground = Color.rgba(255, 255, 255, 255),
     .sidebar_ring = Color.rgba(67, 93, 177, 255),
     .surface = Color.rgba(0, 0, 0, 64),
+    .switch_border = Color.rgba(217, 237, 254, 37),
+    .switch_disabled_thumb = Color.rgba(24, 25, 27, 255),
+    .switch_thumb = Color.rgba(255, 255, 255, 255),
+    .switch_track = Color.rgba(221, 234, 248, 20),
 };

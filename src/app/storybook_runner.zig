@@ -307,6 +307,20 @@ fn playAction(
 ) !void {
     const target = try runtime.semanticTarget(action.target);
     const window = runtime.window;
+    if (action.kind == .tab) {
+        try runtime.routeKeyboard(.{ .key = .{
+            .window = window,
+            .serial = 1,
+            .time_ms = 0,
+            .state = .pressed,
+            .translated = .{ .keycode = 0, .logical = .tab },
+        } });
+        try dispatchAndSettle(runtime, vm, callbacks, scheduler, lua_ui, story);
+        const focused = runtime.focus.current() orelse return error.StoryActionTargetNotFocused;
+        if (try runtime.instances.semanticId(focused) != (try runtime.semantics.findPath(action.target)).id)
+            return error.StoryActionTargetNotFocused;
+        return;
+    }
     try runtime.routePointer(.{ .motion = .{
         .window = window,
         .time_ms = 0,
@@ -324,7 +338,7 @@ fn playAction(
         return;
     }
     if (action.kind == .hover) return;
-    if (target.role != .button) return error.StoryActionTargetNotInteractive;
+    if (target.role != .button and target.role != .@"switch") return error.StoryActionTargetNotInteractive;
 
     try runtime.routePointer(.{ .button = .{
         .window = window,

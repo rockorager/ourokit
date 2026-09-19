@@ -9,6 +9,7 @@ const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
 const Repeat = @import("repeat.zig");
+const Activation = @import("../activation.zig");
 const TextInput = @import("text_input.zig");
 const Cursor = @import("cursor.zig").Cursor;
 const WaylandClipboard = @import("clipboard.zig");
@@ -655,6 +656,12 @@ const Window = struct {
 };
 
 pub const Host = struct {
+    const ActivationSlot = struct {
+        request: ?*Activation.Request = null,
+        token: Handle = undefined,
+        timer: ?@import("../../loop/io_uring.zig").OperationHandle = null,
+    };
+
     allocator: std.mem.Allocator,
     loop: *OuroLoop,
     sink: platform_window.EventSink,
@@ -684,6 +691,7 @@ pub const Host = struct {
     sync_manager: ?Handle = null,
     wm_base: ?Handle = null,
     activation: ?Handle = null,
+    activation_requests: [8]ActivationSlot = @splat(.{}),
     layer_shell: ?Handle = null,
     layer_shell_version: u32 = 0,
     text_input_manager: ?Handle = null,
@@ -762,6 +770,7 @@ pub const Host = struct {
         self.sync_manager = null;
         self.wm_base = null;
         self.activation = null;
+        self.activation_requests = @splat(.{});
         self.layer_shell = null;
         self.layer_shell_version = 0;
         self.text_input_manager = null;
@@ -989,6 +998,60 @@ pub const Host = struct {
     pub fn outputScale(self: *Host, handle: WindowHandle) !f32 {
         const scale = (try self.windowFor(handle)).scale_120;
         return @as(f32, @floatFromInt(scale)) / fractional_scale_denominator;
+    }
+
+    pub fn activationProvider(self: *Host) Activation.Provider {
+        return .{ .context = self, .start = startActivation, .cancel = cancelActivation };
+    }
+
+    fn startActivation(context: *anyopaque, request: *Activation.Request) !void {
+        const self: *Host = @ptrCast(@alignCast(context));
+        if (self.disconnect_started or self.failure != null) return error.ActivationUnavailable;
+        const window = try self.windowFor(request.input.window);
+        if (window.state != .open or window.recreate) return error.WindowClosing;
+        const manager = self.activation orelse return error.ActivationUnavailable;
+        const seat = self.seat orelse return error.ActivationUnavailable;
+        if (request.input.serial == 0) return error.NoActivationInput;
+        const slot = for (&self.activation_requests) |*candidate| {
+            if (candidate.request == null) break candidate;
+        } else return error.ActivationCapacityExceeded;
+        const objects = &self.connection.objects;
+        const transmit = try self.queue();
+        const timer = try self.loop.prepareTimeout(2 * std.time.ns_per_s);
+        errdefer self.loop.prepareCancel(timer) catch {};
+        const created = try protocol.xdg_activation_v1.construct_get_activation_token(objects, transmit, manager, .{});
+        errdefer wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .destroy = .{} }) catch {};
+        try wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .set_serial = .{ .serial = request.input.serial, .seat = seat.id } });
+        try wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .set_surface = .{ .surface = window.surface.?.id } });
+        try wayring.client.sendRequest(protocol.xdg_activation_token_v1, objects, transmit, created.id, .{ .commit = .{} });
+        _ = try self.driver.schedule();
+        slot.* = .{ .request = request, .token = created.id, .timer = timer };
+    }
+
+    fn cancelActivation(context: *anyopaque, request: *Activation.Request) !void {
+        const self: *Host = @ptrCast(@alignCast(context));
+        for (&self.activation_requests) |*slot| if (slot.request == request) {
+            try self.releaseActivation(slot);
+            return;
+        };
+    }
+
+    fn releaseActivation(self: *Host, slot: *ActivationSlot) !void {
+        if (!self.disconnect_started) {
+            try wayring.client.sendRequest(protocol.xdg_activation_token_v1, &self.connection.objects, try self.queue(), slot.token, .{ .destroy = .{} });
+            _ = try self.driver.schedule();
+        }
+        if (slot.timer) |timer| try self.loop.prepareCancel(timer);
+        slot.* = .{};
+    }
+
+    fn finishActivation(self: *Host, slot: *ActivationSlot, result: anyerror![]const u8) !void {
+        const request = slot.request.?;
+        try self.releaseActivation(slot);
+        const window = self.windowFor(request.input.window) catch {
+            return request.complete(request.context, error.StaleWindow);
+        };
+        try request.complete(request.context, if (window.state == .open and !window.recreate) result else error.WindowClosing);
     }
 
     pub fn enableWorkspacesIf(self: *Host, requested: bool) !void {
@@ -2045,6 +2108,12 @@ pub const Host = struct {
             }
         } else if (interface == &protocol.wl_pointer.info) {
             try self.pointerEvent(message, fds);
+        } else if (interface == &protocol.xdg_activation_token_v1.info) {
+            for (&self.activation_requests) |*slot| if (slot.request != null and slot.token.id == message.header.object_id) {
+                const event_value = try wayring.client.decodeEvent(protocol.xdg_activation_token_v1, objects, slot.token, message, fds);
+                try self.finishActivation(slot, if (event_value.done.token.len <= 4096) event_value.done.token else error.ActivationTokenTooLong);
+                break;
+            };
         } else if (interface == &protocol.wl_keyboard.info) {
             try self.keyboardEvent(message, fds);
         } else if (interface == &protocol.wl_data_device.info) {
@@ -2886,6 +2955,13 @@ pub const Host = struct {
     /// Routes one expired Ouro logical timer. This remains a state-only CQE
     /// transition: the repeated key is queued for the input safe point.
     pub fn dispatchTimer(self: *Host, timer: @import("../../loop/io_uring.zig").OperationHandle) !bool {
+        for (&self.activation_requests) |*slot| if (slot.timer) |pending| {
+            if (sameWindow(pending, timer)) {
+                slot.timer = null;
+                try self.finishActivation(slot, error.ActivationTimeout);
+                return true;
+            }
+        };
         if (!self.keyboard_repeat.owns(timer)) return false;
         const fire = (try self.keyboard_repeat.fired(self.loop, timer)) orelse return false;
         try self.sink.keyboard(.{ .key = .{
@@ -3318,6 +3394,70 @@ test "Wayland activation binds version one and queues the supplied token and sur
     try std.testing.expectEqualStrings("opaque-token-47", (try args.string()).?);
     try std.testing.expectEqual(windows[1].surface.?.id, try args.uint());
     try args.finish();
+    try transmit.begin(request);
+    try transmit.complete(request.byteCount());
+
+    var loop: OuroLoop = undefined;
+    try loop.init(allocator, 8, 8);
+    defer loop.deinit();
+    host.loop = &loop;
+    host.disconnect_started = false;
+    host.failure = null;
+    host.activation_requests = @splat(.{});
+    host.seat = try objects.createLocal(&protocol.wl_seat.info, 9, null);
+    const Result = struct {
+        called: bool = false,
+        failure: ?anyerror = null,
+        fn complete(context: *anyopaque, result: anyerror![]const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.called = true;
+            if (result) |value| try std.testing.expectEqualStrings("issued", value) else |err| self.failure = err;
+        }
+    };
+    var result: Result = .{};
+    var token_request: Activation.Request = .{
+        .input = .{ .window = windows[0].handle, .serial = 394 },
+        .context = &result,
+        .complete = Result.complete,
+    };
+    const provider = host.activationProvider();
+    try provider.start(provider.context, &token_request);
+    const encoded = try transmit.snapshot(&.{}, &.{});
+    var remaining = encoded.first;
+    const constructor = (try wayring.wire.Message.decode(remaining)).?;
+    try std.testing.expectEqual(activation.id, constructor.header.object_id);
+    try std.testing.expectEqual(@as(u16, 1), constructor.header.opcode);
+    remaining = remaining[constructor.header.size..];
+    const serial_message = (try wayring.wire.Message.decode(remaining)).?;
+    var serial_args = serial_message.arguments();
+    try std.testing.expectEqual(@as(u32, 394), try serial_args.uint());
+    try std.testing.expectEqual(host.seat.?.id, try serial_args.uint());
+    try serial_args.finish();
+    remaining = remaining[serial_message.header.size..];
+    const surface_message = (try wayring.wire.Message.decode(remaining)).?;
+    var surface_args = surface_message.arguments();
+    try std.testing.expectEqual(windows[0].surface.?.id, try surface_args.uint());
+    try surface_args.finish();
+    try host.finishActivation(&host.activation_requests[0], "issued");
+    try std.testing.expect(result.called and result.failure == null);
+    result = .{};
+    try provider.start(provider.context, &token_request);
+    try provider.cancel(provider.context, &token_request);
+    try std.testing.expect(!result.called and host.activation_requests[0].request == null);
+    try provider.start(provider.context, &token_request);
+    const timeout = host.activation_requests[0].timer.?;
+    try loop.prepareCancel(timeout); // Simulate removal from the expired heap.
+    try std.testing.expect(try host.dispatchTimer(timeout));
+    try std.testing.expectEqual(error.ActivationTimeout, result.failure.?);
+    result = .{};
+    try provider.start(provider.context, &token_request);
+    windows[0].state = .closing;
+    try host.finishActivation(&host.activation_requests[0], "issued");
+    try std.testing.expectEqual(error.WindowClosing, result.failure.?);
+    try std.testing.expectError(error.WindowClosing, provider.start(provider.context, &token_request));
+    windows[0].state = .open;
+    host.activation = null;
+    try std.testing.expectError(error.ActivationUnavailable, provider.start(provider.context, &token_request));
 }
 
 test "layer background teardown retires pending callbacks and destroys effect before surface" {
