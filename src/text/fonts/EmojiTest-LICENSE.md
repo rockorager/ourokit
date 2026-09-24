@@ -1,16 +1,17 @@
 # EmojiTest.ttf
 
 Test-only subset of Noto Color Emoji 2.051 (upstream noto-emoji commit
-e92753bfa55fd449e427d4d325f9c8c40408c74e), containing U+1F44B and U+1F680.
+e92753bfa55fd449e427d4d325f9c8c40408c74e), containing U+2615, U+2744,
+U+2764, U+1F44B and U+1F680, with emoji variation mappings preserved.
 The original font SHA-256 is
 `72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b`.
 Generated with fonttools 4.61.1:
 
 ```sh
-pyftsubset NotoColorEmoji.ttf --unicodes=U+1F44B,U+1F680 --output-file=EmojiTest.ttf
+pyftsubset NotoColorEmoji.ttf --unicodes=U+2615,U+2744,U+2764,U+FE0E,U+FE0F,U+1F44B,U+1F680 --output-file=EmojiTest.ttf
 ```
 
-The fixture preserves the original 109 ppem CBDT/CBLC strike. Both glyphs
+The fixture preserves the original 109 ppem CBDT/CBLC strike. The wave and rocket
 have width 136, height 128, bearing (0, 101) and advance 136 in strike pixels.
 
 Copyright 2013 Google LLC

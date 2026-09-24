@@ -113,6 +113,9 @@ pub const tables: []const config.Table = &.{{
     .{{
         .fields = &.{{"word_break"}},
     }},
+    .{{
+        .fields = &.{{ "is_emoji", "is_emoji_presentation", "is_emoji_vs_base" }},
+    }},
 }};
 
 const Range = struct {{ first: u21, last: u21, class: LineBreak }};

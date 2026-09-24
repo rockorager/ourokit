@@ -172,12 +172,19 @@ refresh and dependent cache invalidation happen only at a safe point.
 
 Fontconfig charset coverage is a fast prefilter, not proof that a face can shape
 a cluster correctly. `shapeWithFallback` verifies candidates through actual
-HarfBuzz output. It prefers one face for the complete itemized run. If that is
-impossible, it chooses at uucode extended-grapheme boundaries, merges adjacent
-equal-face choices, and performs final shaping with complete paragraph context.
+HarfBuzz output. It retains the primary face wherever supported, choosing
+fallbacks at uucode extended-grapheme boundaries rather than replacing an
+entire run for one missing symbol. It merges adjacent equal-face choices and
+performs final shaping with complete paragraph context.
 Arabic joining context and combining/emoji sequences therefore survive a
 necessary face boundary. An unresolved grapheme is retained as the primary
 face's `.notdef` and reported rather than silently omitted.
+
+Unicode emoji presentation defaults and FE0E/FE0F selectors prefer monochrome
+or color fonts for the affected grapheme only. Bare text-default symbols such
+as U+2744 SNOWFLAKE remain text; U+2744 FE0F prefers a color emoji. If the
+requested style is unavailable, the first face that can shape the grapheme
+still renders it rather than substituting `.notdef`.
 
 Tests embed pinned Inter, Noto Sans Arabic, and Source CFF fixtures; these are
 not application defaults. Their provenance is under `design/provenance`.

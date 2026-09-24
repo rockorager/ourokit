@@ -209,6 +209,13 @@ pub const Font = struct {
         return if (c.hb_font_get_nominal_glyph(self.base_font, codepoint, &glyph) != 0) glyph else null;
     }
 
+    fn hasColorGlyphs(self: *const Font) bool {
+        return c.hb_ot_color_has_png(self.face) != 0 or
+            c.hb_ot_color_has_layers(self.face) != 0 or
+            c.hb_ot_color_has_paint(self.face) != 0 or
+            c.hb_ot_color_has_svg(self.face) != 0;
+    }
+
     pub fn shape(self: *const Font, allocator: std.mem.Allocator, spec: RunSpec) !ShapedRun {
         if (!std.math.isFinite(spec.logical_size) or spec.logical_size <= 0) return error.InvalidSize;
         if (!std.unicode.utf8ValidateSlice(spec.paragraph)) return error.InvalidUtf8;
@@ -413,10 +420,11 @@ pub fn graphemes(allocator: std.mem.Allocator, utf8: []const u8) ![]Grapheme {
 
 /// Shape an itemized run using configured candidates in priority order.
 ///
-/// A single face is preferred for the entire run. If none succeeds, selection
-/// occurs per extended grapheme and adjacent equal-face selections are merged
-/// before final shaping. Every shape call receives full paragraph context, so
-/// fallback boundaries do not force Arabic characters into isolated forms.
+/// Keep supported text in the primary face. Fallback selection occurs per
+/// extended grapheme, preferring color/text faces for emoji presentation, and
+/// adjacent equal-face selections are merged before final shaping. Every shape
+/// call receives full paragraph context, so fallback boundaries do not force
+/// Arabic characters into isolated forms.
 /// An unresolved grapheme uses the first candidate's `.notdef` and sets
 /// `has_missing_glyphs`; text is never silently omitted.
 pub fn shapeWithFallback(
@@ -442,10 +450,19 @@ pub fn shapeWithFallback(
         try run_graphemes.append(allocator, grapheme);
     }
 
-    for (candidates) |candidate| {
-        var run = (try candidate.probe(allocator, spec)) orelse continue;
-        if (!hasMissingGlyph(run.glyphs))
-            return singleSpanResult(allocator, candidate.handle, run, spec.logical_size, false);
+    // Only the primary may claim a whole run. A broad-coverage fallback must
+    // not replace surrounding text just because it also covers one symbol.
+    const primary = candidates[0];
+    if (try primary.probe(allocator, spec)) |shaped| {
+        var run = shaped;
+        const color = (try primary.resolve()).hasColorGlyphs();
+        const matches_presentation = for (run_graphemes.items) |grapheme| {
+            if (emojiPresentation(spec.paragraph[grapheme.byte_start..grapheme.byte_end])) |presentation| {
+                if (color != (presentation == .emoji)) break false;
+            }
+        } else true;
+        if (!hasMissingGlyph(run.glyphs) and matches_presentation)
+            return singleSpanResult(allocator, primary.handle, run, spec.logical_size, false);
         run.deinit();
     }
 
@@ -458,14 +475,21 @@ pub fn shapeWithFallback(
     defer selections.deinit(allocator);
     var unresolved = false;
     for (run_graphemes.items) |grapheme| {
+        const presentation = emojiPresentation(spec.paragraph[grapheme.byte_start..grapheme.byte_end]);
         var selected: usize = 0;
         var found = false;
         for (candidates, 0..) |candidate, index| {
             var probe = (try candidate.probe(allocator, withRange(spec, grapheme.byte_start, grapheme.byte_end))) orelse continue;
             defer probe.deinit();
             if (!hasMissingGlyph(probe.glyphs)) {
-                selected = index;
+                // Retain the first usable face if none supports the preferred
+                // presentation. A style mismatch must not become .notdef.
+                if (!found) selected = index;
                 found = true;
+                if (presentation) |preferred| {
+                    if ((try candidate.resolve()).hasColorGlyphs() != (preferred == .emoji)) continue;
+                }
+                selected = index;
                 break;
             }
         }
@@ -519,6 +543,29 @@ pub fn shapeWithFallback(
     };
 }
 
+const EmojiPresentation = enum { text, emoji };
+
+/// Presentation belongs to the complete grapheme, not to surrounding Latin
+/// text. Explicit selectors override Unicode's default; keycap, modifier and
+/// ZWJ sequences also request emoji presentation without requiring FE0F.
+fn emojiPresentation(bytes: []const u8) ?EmojiPresentation {
+    var iterator = uucode.utf8.Iterator.init(bytes);
+    const base = iterator.next() orelse return null;
+    if (!uucode.get(.is_emoji, base)) return null;
+    var presentation: EmojiPresentation = if (uucode.get(.is_emoji_presentation, base)) .emoji else .text;
+    var previous = base;
+    while (iterator.next()) |codepoint| {
+        if (uucode.get(.is_emoji_vs_base, previous)) {
+            if (codepoint == 0xFE0E) return .text;
+            if (codepoint == 0xFE0F) return .emoji;
+        }
+        if (codepoint == 0x20E3 or codepoint == 0x200D or uucode.get(.is_emoji_presentation, codepoint))
+            presentation = .emoji;
+        previous = codepoint;
+    }
+    return presentation;
+}
+
 fn singleSpanResult(
     allocator: std.mem.Allocator,
     font: FontHandle,
@@ -568,6 +615,22 @@ test "uucode segments extended grapheme clusters independently of shaping cluste
     try std.testing.expectEqualStrings("a\u{0301}", text[values[0].byte_start..values[0].byte_end]);
     try std.testing.expectEqualStrings("👩🏽‍🚀", text[values[1].byte_start..values[1].byte_end]);
     try std.testing.expectEqualStrings("🇨🇭", text[values[2].byte_start..values[2].byte_end]);
+}
+
+test "emoji presentation distinguishes defaults selectors and joined graphemes" {
+    try std.testing.expectEqual(null, emojiPresentation("a\u{FE0F}"));
+    for ([_][]const u8{ "❄", "❄\u{FE0E}", "☕\u{FE0E}", "7" }) |text|
+        try std.testing.expectEqual(EmojiPresentation.text, emojiPresentation(text).?);
+    for ([_][]const u8{
+        "❄\u{FE0F}",
+        "☕",
+        "7\u{20E3}",
+        "7\u{FE0F}\u{20E3}",
+        "👩🏽‍🚀",
+        "🇨🇭",
+        "👁‍🗨",
+    }) |text|
+        try std.testing.expectEqual(EmojiPresentation.emoji, emojiPresentation(text).?);
 }
 
 test "HarfBuzz performs OpenType ligature, combining, and RTL shaping" {
@@ -677,6 +740,99 @@ test "fallback shaping uses configured order and preserves unresolved text" {
     try std.testing.expectEqual(inter_handle, unresolved.spans[0].font);
     try std.testing.expect(unresolved.has_missing_glyphs);
     try std.testing.expect(unresolved.spans[0].run.glyphs.len != 0);
+}
+
+test "fallback shaping keeps supported text in the primary font" {
+    var primary = try Font.init(@embedFile("fonts/SourceSans3-Regular.otf"), 0);
+    defer primary.deinit();
+    var mono = try Font.init(@embedFile("fonts/SourceCodePro-Regular.otf"), 0);
+    defer mono.deinit();
+    const primary_handle: FontHandle = .{ .slot = 1, .generation = 1 };
+    const mono_handle: FontHandle = .{ .slot = 2, .generation = 1 };
+    // The monospace face covers the entire run, but only the box drawing
+    // character needs it. Keep the trailing combining grapheme intact too.
+    var result = try shapeWithFallback(std.testing.allocator, &.{
+        .{ .handle = primary_handle, .font = &primary },
+        .{ .handle = mono_handle, .font = &mono },
+    }, .{
+        .paragraph = "Wi ─ a\u{0301}",
+        .direction = .left_to_right,
+        .script = .latin,
+        .language = "en",
+        .logical_size = 16,
+    });
+    defer result.deinit();
+    try std.testing.expect(!result.has_missing_glyphs);
+    try std.testing.expectEqual(@as(usize, 3), result.spans.len);
+    for (result.spans, [_]FontHandle{ primary_handle, mono_handle, primary_handle }, [_]usize{ 0, 3, 6 }, [_]usize{ 3, 3, 4 }) |span, handle, start, len| {
+        try std.testing.expectEqual(handle, span.font);
+        try std.testing.expectEqual(start, span.run.byte_start);
+        try std.testing.expectEqual(len, span.run.byte_len);
+    }
+}
+
+test "fallback shaping honors emoji presentation without changing surrounding text" {
+    var primary = try Font.init(@embedFile("fonts/SourceSans3-Regular.otf"), 0);
+    defer primary.deinit();
+    var emoji = try Font.init(@embedFile("fonts/EmojiTest.ttf"), 0);
+    defer emoji.deinit();
+    const primary_handle: FontHandle = .{ .slot = 1, .generation = 1 };
+    const emoji_handle: FontHandle = .{ .slot = 2, .generation = 1 };
+    const primary_candidate: FallbackCandidate = .{ .handle = primary_handle, .font = &primary };
+    const emoji_candidate: FallbackCandidate = .{ .handle = emoji_handle, .font = &emoji };
+    const cases = [_]struct { text: []const u8, color: bool }{
+        .{ .text = "❤", .color = false },
+        .{ .text = "❤\u{FE0E}", .color = false },
+        .{ .text = "❤\u{FE0F}", .color = true },
+        .{ .text = "☕", .color = true },
+        .{ .text = "☕\u{FE0E}", .color = false },
+        .{ .text = "❄\u{FE0F}", .color = true },
+        .{ .text = "🚀", .color = true },
+    };
+    // Both orders matter: the first font can cover an emoji but render the
+    // wrong presentation. Plain ASCII must still choose the text face.
+    for ([_][2]FallbackCandidate{
+        .{ primary_candidate, emoji_candidate },
+        .{ emoji_candidate, primary_candidate },
+    }) |candidates| {
+        for (cases) |case| {
+            const paragraph = try std.fmt.allocPrint(std.testing.allocator, "Wi {s} am", .{case.text});
+            defer std.testing.allocator.free(paragraph);
+            var result = try shapeWithFallback(std.testing.allocator, &candidates, .{
+                .paragraph = paragraph,
+                .direction = .left_to_right,
+                .script = .latin,
+                .language = "en",
+                .logical_size = 16,
+            });
+            defer result.deinit();
+            try std.testing.expect(!result.has_missing_glyphs);
+            try std.testing.expectEqual(@as(usize, if (case.color) 3 else 1), result.spans.len);
+            try std.testing.expectEqual(primary_handle, result.spans[0].font);
+            try std.testing.expectEqual(primary_handle, result.spans[result.spans.len - 1].font);
+            if (case.color) {
+                try std.testing.expectEqual(emoji_handle, result.spans[1].font);
+                try std.testing.expectEqual(@as(usize, 3), result.spans[1].run.byte_start);
+                try std.testing.expectEqual(case.text.len, result.spans[1].run.byte_len);
+            }
+        }
+    }
+
+    // Presentation is a preference, not permission to lose a character when
+    // only the opposite style exists in the configured fonts.
+    for ([_]FallbackCandidate{ primary_candidate, emoji_candidate }, [_][]const u8{ "❤\u{FE0F}", "❤\u{FE0E}" }) |candidate, paragraph| {
+        var result = try shapeWithFallback(std.testing.allocator, &.{candidate}, .{
+            .paragraph = paragraph,
+            .direction = .left_to_right,
+            .script = .latin,
+            .language = "en",
+            .logical_size = 16,
+        });
+        defer result.deinit();
+        try std.testing.expect(!result.has_missing_glyphs);
+        try std.testing.expectEqual(@as(usize, 1), result.spans.len);
+        try std.testing.expectEqual(candidate.handle, result.spans[0].font);
+    }
 }
 
 test "fallback shaping rejects itemized runs that split a grapheme" {
