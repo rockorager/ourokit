@@ -101,6 +101,179 @@ fn node(snapshot: dev.Snapshot, path: []const u8) !dev.Node {
     return error.TestPathMissing;
 }
 
+test "forms checkbox requests remain controlled and disabled controls skip focus" {
+    const f = try Fixture.create(
+        \\requested=false
+        \\function build() return ouro.column {key='form', gap=8,
+        \\ ouro.checkbox {key='check', label='Enabled', checked=false, on_change=function(v) requested=v end},
+        \\ ouro.checkbox {key='disabled', label='Disabled', checked=true, enabled=false},
+        \\ ouro.button {key='after', label='After'},
+        \\} end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "form/check" });
+    _ = c.lua_getglobal(f.vm.state, "requested");
+    try std.testing.expect(c.lua_toboolean(f.vm.state, -1) != 0);
+    c.lua_settop(f.vm.state, -2);
+    try std.testing.expect(!(try f.runtime.semantics.findPath("form/check")).checked);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try std.testing.expectEqual(f.runtime.instances.handleForId((try f.runtime.semantics.findPath("form/after")).id).?, f.runtime.focus.current().?);
+    try std.testing.expectError(error.DevelopmentTargetDisabled, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = "form/disabled" }));
+}
+
+test "forms checkbox accepts toggles without losing its focus identity" {
+    const f = try Fixture.create(
+        \\checked=ouro.signal(false)
+        \\function build() return ouro.checkbox {key='check', label='Check', checked=checked(),
+        \\ on_change=function(v) checked:set(v) end} end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "check" });
+    const focused = f.runtime.focus.current().?;
+    try std.testing.expect((try f.runtime.semantics.findPath("check")).checked);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
+    try std.testing.expect(!(try f.runtime.semantics.findPath("check")).checked);
+    try std.testing.expectEqual(focused, f.runtime.focus.current().?);
+}
+
+test "forms radio navigation wraps and follows reordered declarations" {
+    const f = try Fixture.create(
+        \\selected=ouro.signal(17)
+        \\function build()
+        \\ local a=ouro.radio {key='a', value=17, label='Seventeen'}
+        \\ local b=ouro.radio {key='b', value=29, label='Twenty nine'}
+        \\ local d=ouro.radio {key='d', value=43, label='Forty three'}
+        \\ return ouro.radio_group {key='choices', selected=selected(),
+        \\   on_select=function(v) selected:set(v) end,
+        \\   children=selected()==29 and {d,b,a} or {a,b,d}}
+        \\end
+    );
+    defer f.destroy();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
+    try std.testing.expect((try f.runtime.semantics.findPath("choices/b")).checked);
+    // Now d,b,a: moving right from b must choose a, not its old slot successor d.
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
+    try std.testing.expect((try f.runtime.semantics.findPath("choices/a")).checked);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_left } });
+    try std.testing.expect((try f.runtime.semantics.findPath("choices/d")).checked);
+}
+
+test "forms slider keyboard bounds and captured drag use the declared range" {
+    const f = try Fixture.create(
+        \\value=ouro.signal(-1.25)
+        \\function build() return ouro.slider {key='level', label='Level', width=200,
+        \\ value=value(), min=-2.25, max=3, step=0.5, on_change=function(v) value:set(v) end} end
+    );
+    defer f.destroy();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
+    try std.testing.expectEqual(@as(f64, -0.75), (try f.runtime.semantics.findPath("level")).range.?.value);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .end } });
+    try std.testing.expectEqual(@as(f64, 3), (try f.runtime.semantics.findPath("level")).range.?.value);
+    try f.play(.{ .pointer_down = "level" });
+    try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 1, .position = .{ .x = -80, .y = 180 } } });
+    try f.settle();
+    try std.testing.expectEqual(@as(f64, -2.25), (try f.runtime.semantics.findPath("level")).range.?.value);
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 0, .time_ms = 2, .button = 0x110, .state = .released } });
+    try f.settle();
+    try std.testing.expect(f.runtime.range_drag == null);
+}
+
+test "forms slider thumb follows constrained width not requested width" {
+    const f = try Fixture.create(
+        \\function build() return ouro.box {key='narrow', width=160,
+        \\ ouro.slider {key='level', label='Level', width=300, value=7.5, min=0, max=10, step=0.5}} end
+    );
+    defer f.destroy();
+    const semantic = try f.runtime.semantics.findPath("narrow/level");
+    const render = try f.runtime.instances.renderObject(f.runtime.instances.handleForId(semantic.id).?);
+    const layers = f.runtime.tree.firstChild(render).?;
+    const track = f.runtime.tree.firstChild(layers).?;
+    const rail = f.runtime.tree.nextSibling(track).?;
+    const thumb = f.runtime.tree.nextSibling(f.runtime.tree.firstChild(rail).?).?;
+    try std.testing.expectEqual(@as(f32, 160), (try f.runtime.tree.nodeSize(render)).width);
+    try std.testing.expectApproxEqAbs(@as(f32, 99), (try f.runtime.tree.nodeOffset(thumb)).x, 0.01);
+    try std.testing.expectEqual(@as(f32, 16), (try f.runtime.tree.nodeSize(thumb)).width);
+}
+
+test "forms disabling slider on change cancels the active drag" {
+    const f = try Fixture.create(
+        \\enabled=ouro.signal(true)
+        \\function build() return ouro.slider {key='level', label='Level', width=200,
+        \\ value=0, min=0, max=10, step=1, enabled=enabled(),
+        \\ on_change=function() enabled:set(false) end} end
+    );
+    defer f.destroy();
+    try f.play(.{ .pointer_down = "level" });
+    try std.testing.expect(!(try f.runtime.semantics.findPath("level")).enabled);
+    try std.testing.expect(f.runtime.range_drag == null);
+}
+
+test "forms dialog contains focus and restores opener after escape" {
+    const f = try Fixture.create(
+        \\opened=ouro.signal(false)
+        \\function build()
+        \\ local children={ouro.button {key='open', label='Open', on_press=function() opened:set(true) end}}
+        \\ if opened() then children[2]=ouro.dialog {key='dialog', label='Confirm', width=240,
+        \\   on_cancel=function() opened:set(false) end,
+        \\   ouro.row {key='actions', gap=8,
+        \\     ouro.button {key='first', label='Keep'}, ouro.button {key='last', label='Discard'}}} end
+        \\ return ouro.stack {key='root', children=children}
+        \\end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "root/open" });
+    const first = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("root/dialog/actions/first")).id).?;
+    const last = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("root/dialog/actions/last")).id).?;
+    try std.testing.expectEqual(first, f.runtime.focus.current().?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab, .modifiers = .{ .shift = true } } });
+    try std.testing.expectEqual(last, f.runtime.focus.current().?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try std.testing.expectEqual(first, f.runtime.focus.current().?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .escape } });
+    try std.testing.expect(f.runtime.focus.boundary == null);
+    try std.testing.expectEqual(f.runtime.instances.handleForId((try f.runtime.semantics.findPath("root/open")).id).?, f.runtime.focus.current().?);
+}
+
+test "forms dialog escape bubbles from plain fields but not active composition" {
+    const f = try Fixture.create(
+        \\opened=ouro.signal(true)
+        \\function build() return ouro.stack {key='root',
+        \\ opened() and ouro.dialog {key='dialog', label='Edit', on_cancel=function() opened:set(false) end,
+        \\ ouro.text_input {key='name', default_text='name'}} or ouro.button {key='done', label='Done'}} end
+    );
+    defer f.destroy();
+    const session = try f.runtime.text_inputs.session(f.runtime.focus.current().?);
+    _ = try session.apply(.{ .preedit = .{ .text = "composing", .cursor = null } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .escape } });
+    try std.testing.expect(f.runtime.focus.boundary != null);
+    _ = try session.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .escape } });
+    try std.testing.expect(f.runtime.focus.boundary == null);
+}
+
+test "forms spinbox commits typed drafts and applies native bounds" {
+    const f = try Fixture.create(
+        \\value=ouro.signal(-1.25)
+        \\function build() return ouro.spinbox {key='number', label='Number', value=value(),
+        \\ min=-2.25, max=3, step=0.5, on_change=function(v) value:set(v) end} end
+    );
+    defer f.destroy();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_a, .modifiers = .{ .control = true } } });
+    try f.play(.{ .text = "99" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    try std.testing.expectEqualStrings("3.0", (try node(snapshot, "number/control/value")).value.?);
+    try std.testing.expect(!(try node(snapshot, "number/control/increase")).enabled);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_down } });
+    var changed = try f.snapshot();
+    defer changed.deinit();
+    try std.testing.expectEqualStrings("2.75", (try node(changed, "number/control/value")).value.?);
+}
+
 test "development click releases a button disabled by its own press handler" {
     const f = try Fixture.create(
         \\busy = ouro.signal(false)

@@ -99,6 +99,7 @@ pub const WindowRuntime = struct {
     focus: ui.focus.Manager = .{},
     clicks: ui.input.Clicks = .{},
     selection_pointer: ?core.PointF = null,
+    range_drag: ?ui.instance.InstanceHandle = null,
     selection_tick_ns: ?u64 = null,
     scroll_motions: [2]scroll_motion.Motion = @splat(.{}),
     // Headless windows act focused; native hosts start false until keyboard enter.
@@ -254,6 +255,7 @@ pub const WindowRuntime = struct {
         const root = (try self.instances.rootRenderObject()) orelse return null;
         const render = (try self.tree.hitTest(root, .{ .x = position.x, .y = position.y })) orelse return null;
         var current: ?ui.instance.InstanceHandle = self.instances.instanceForRenderObject(render);
+        if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, current)) return null;
         while (current) |target| {
             if (uri_offer) if (self.pointer_bindings.getKind(target, .drop_uris)) |handler|
                 return .{ .target = target, .handler = handler, .mime = .uri_list };
@@ -267,6 +269,7 @@ pub const WindowRuntime = struct {
     pub fn deliverDrop(self: *WindowRuntime, callbacks: *lua.CallbackRegistry, selection: DropSelection, bytes: []const u8) !bool {
         if (!self.ready) return false;
         if (!self.instances.isActive(selection.target)) return false;
+        if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, selection.target)) return false;
         const kind: ui.input.HandlerKind = if (selection.mime == .text) .drop_text else .drop_uris;
         const current = self.pointer_bindings.getKind(selection.target, kind) orelse return false;
         if (!std.meta.eql(current, selection.handler)) return false;
@@ -306,7 +309,8 @@ pub const WindowRuntime = struct {
         self.buttons.clear();
         self.listboxes.clear();
         self.text_inputs.clear();
-        self.focus.clear();
+        self.focus = .{};
+        self.range_drag = null;
         self.text_input_owner = null;
         self.text_input_generation +%= 1;
         self.clicks.reset();
@@ -565,6 +569,7 @@ pub const WindowRuntime = struct {
         }) catch unreachable;
         self.signals = signals;
         self.semantics.commitStaged();
+        self.syncDialogFocus() catch unreachable;
         while (self.router.takeEvent() != null) {}
         _ = self.frame_state.configure(prepared.size.?) catch unreachable;
         self.frame_state.invalidatePaint();
@@ -679,7 +684,7 @@ pub const WindowRuntime = struct {
                 return err;
             };
             self.semantics.commitStaged();
-            self.focus.reconcile(&self.instances);
+            try self.syncDialogFocus();
             if (self.callback_scope != null and self.focus.current() == null)
                 _ = try self.focus.advance(&self.instances, .forward);
             if (self.text_inputs.takeAutofocus()) |target| {
@@ -914,6 +919,7 @@ pub const WindowRuntime = struct {
                 .text_input, .text_input_focus => unreachable,
             };
             if (!self.instances.isActive(target)) continue;
+            if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, target)) continue;
             try self.updateTextInputPointer(target, event);
             const activated_button = try self.updateButtonState(event);
             if (event == .pointer and event.pointer.event == .button and
@@ -936,10 +942,31 @@ pub const WindowRuntime = struct {
             var bound_target = target;
             var handler = self.pointer_bindings.get(bound_target);
             while (handler == null) {
+                if (self.focus.boundary) |boundary| if (sameHandle(boundary, bound_target)) break;
                 bound_target = (try self.instances.parentOf(bound_target)) orelse break;
                 handler = self.pointer_bindings.get(bound_target);
             }
             const binding = handler orelse continue;
+            if (binding.kind == .range_change) {
+                if (event != .pointer) continue;
+                const pointer = event.pointer;
+                const semantic = self.semantics.findId(try self.instances.semanticId(bound_target)) orelse continue;
+                if (!semantic.enabled) {
+                    self.range_drag = null;
+                    continue;
+                }
+                if (pointer.event == .button and pointer.event.button.button == 0x110) {
+                    self.range_drag = if (pointer.event.button.state == .pressed) bound_target else null;
+                }
+                if (self.range_drag == null or !sameHandle(self.range_drag.?, bound_target)) continue;
+                if (pointer.event != .motion and pointer.event != .button) continue;
+                const origin = try self.instanceOrigin(bound_target);
+                const size = try self.tree.nodeSize(try self.instances.renderObject(bound_target));
+                const range = semantic.range.?;
+                const value = range.atFraction((pointer.position.x - origin.x - 14) / @max(1, size.width - 28));
+                if (value != range.value) try self.spawnCallback(callback_service, binding.id, try self.instances.scope(bound_target), &.{.{ .number = value }});
+                continue;
+            }
             if (binding.kind == .button or binding.kind == .@"switch") {
                 if (activated_button != null and sameHandle(activated_button.?, bound_target))
                     try self.spawnButtonCallback(callback_service, bound_target);
@@ -947,13 +974,16 @@ pub const WindowRuntime = struct {
             }
             if (binding.kind == .listbox) {
                 const selection = try self.listBoxPointerSelection(target, event) orelse continue;
+                const semantic = self.semantics.findId(try self.instances.semanticId(selection.listbox)) orelse continue;
+                if (!semantic.enabled) continue;
                 const previous = self.focus.current();
-                self.listboxes.select(selection);
+                if (semantic.role != .radio_group) self.listboxes.select(selection);
                 try self.refreshListBoxVisuals();
                 _ = try self.focus.request(&self.instances, selection.listbox);
                 try self.applyFocusVisual(previous, self.focus.current());
                 try self.ensureOptionVisible(selection.option);
                 try self.spawnListBoxCallback(callback_service, binding.id, selection);
+                try self.activateSelection(callback_service, selection.listbox, selection.value);
                 continue;
             }
             if (binding.kind == .text_input_change or binding.kind == .text_input_command) continue;
@@ -984,6 +1014,34 @@ pub const WindowRuntime = struct {
             current = try self.instances.parentOf(target);
         }
         return false;
+    }
+
+    fn syncDialogFocus(self: *WindowRuntime) !void {
+        var boundary: ?ui.instance.InstanceHandle = null;
+        for (0..self.semantics.count()) |index| {
+            const node = try self.semantics.node(index);
+            if (node.role == .dialog) boundary = self.instances.handleForId(node.id);
+        }
+        const previous = self.focus.current();
+        const changed = try self.focus.setBoundary(&self.instances, boundary);
+        self.focus.reconcile(&self.instances);
+        if (self.range_drag) |target| {
+            const semantic = if (self.instances.isActive(target))
+                self.semantics.findId(try self.instances.semanticId(target))
+            else
+                null;
+            if (semantic == null or !semantic.?.enabled) self.range_drag = null;
+        }
+        if (changed) {
+            self.range_drag = null;
+            try self.applyButtonUpdate(self.buttons.release());
+        }
+        try self.applyFocusVisual(previous, self.focus.current());
+    }
+
+    fn activateSelection(self: *WindowRuntime, callbacks: anytype, target: ui.instance.InstanceHandle, value: i64) !void {
+        const binding = self.pointer_bindings.getKind(target, .selection_activate) orelse return;
+        try self.spawnCallback(callbacks, binding.id, try self.instances.scope(target), &.{.{ .integer = value }});
     }
 
     fn syncInteractions(self: *WindowRuntime, callback_service: anytype) !void {
@@ -1027,6 +1085,7 @@ pub const WindowRuntime = struct {
             },
             .leave => {
                 self.keyboard_focused = false;
+                self.range_drag = null;
                 self.resetCaretBlink();
                 try self.applyButtonUpdate(self.buttons.release());
                 self.clicks.reset();
@@ -1051,9 +1110,15 @@ pub const WindowRuntime = struct {
             const session = try self.text_inputs.session(focused);
             const behavior = try self.text_inputs.getBehavior(focused);
             if (behavior.key_bindings.resolve(key.translated)) |action| {
-                if (key.state == .pressed or action.repeats())
-                    try self.applyTextInputAction(focused, action, key.serial, callback_service);
-                return;
+                // Composition and explicit field commands own Escape first.
+                // Otherwise a plain field lets its enclosing dialog cancel.
+                const bubble_cancel = action == .command and action.command == .cancel and
+                    session.preedit() == null and self.pointer_bindings.getKind(focused, .text_input_command) == null;
+                if (!bubble_cancel) {
+                    if (key.state == .pressed or action.repeats())
+                        try self.applyTextInputAction(focused, action, key.serial, callback_service);
+                    return;
+                }
             }
             const translated = key.translated;
             // A wl_keyboard key reaching the client was not consumed by the
@@ -1076,7 +1141,7 @@ pub const WindowRuntime = struct {
             }
         };
         if (key.translated.logical == .escape and key.state == .pressed) {
-            var current = self.focus.current();
+            var current = self.focus.current() orelse self.focus.boundary;
             while (current) |target| {
                 if (self.pointer_bindings.getKind(target, .cancel)) |handler| {
                     const previous = self.focus.current();
@@ -1099,6 +1164,28 @@ pub const WindowRuntime = struct {
             if (self.focus.current()) |focused| try self.ensureOptionVisible(focused);
             return;
         }
+        if (key.state != .released) if (self.focus.current()) |focused| {
+            if (self.pointer_bindings.getKind(focused, .range_change)) |binding| {
+                const semantic = self.semantics.findId(try self.instances.semanticId(focused)).?;
+                if (!semantic.enabled) return;
+                const range = semantic.range.?;
+                const value = switch (key.translated.logical) {
+                    .arrow_left, .arrow_down => range.increment(-1),
+                    .arrow_right, .arrow_up => range.increment(1),
+                    .page_down => range.increment(-10),
+                    .page_up => range.increment(10),
+                    .home => range.min,
+                    .end => range.max,
+                    else => return,
+                };
+                if (value != range.value) try self.spawnCallback(callback_service, binding.id, try self.instances.scope(focused), &.{.{ .number = value }});
+                return;
+            }
+            if (self.listboxes.contains(focused) and (key.translated.logical == .enter or key.translated.logical == .space) and key.state == .pressed) {
+                try self.activateSelection(callback_service, focused, self.listboxes.selectedValue(focused).?);
+                return;
+            }
+        };
         if (key.state != .released) if (self.focus.current()) |focused| {
             if (!self.listboxes.contains(focused)) if (try self.instances.nearestScroll(focused, .vertical)) |scroll| {
                 if (self.virtual_lists.find(try self.instances.semanticId(scroll))) |list| {
@@ -1123,18 +1210,30 @@ pub const WindowRuntime = struct {
             };
         };
         if ((key.translated.logical == .arrow_up or key.translated.logical == .arrow_down or
+            key.translated.logical == .arrow_left or key.translated.logical == .arrow_right or
             key.translated.logical == .home or key.translated.logical == .end) and
             key.state != .released)
         {
             const focused = self.focus.current() orelse return;
             if (!self.listboxes.contains(focused)) return;
-            const selection = switch (key.translated.logical) {
+            const semantic = self.semantics.findId(try self.instances.semanticId(focused)).?;
+            const radio = semantic.role == .radio_group;
+            if (!radio and (key.translated.logical == .arrow_left or key.translated.logical == .arrow_right)) return;
+            const old = self.listboxes.selectedValue(focused).?;
+            var selection = switch (key.translated.logical) {
                 .home => self.listboxes.edge(focused, false),
                 .end => self.listboxes.edge(focused, true),
-                .arrow_up => self.listboxes.move(focused, -1),
-                .arrow_down => self.listboxes.move(focused, 1),
+                .arrow_up, .arrow_left => self.listboxes.move(focused, -1),
+                .arrow_down, .arrow_right => self.listboxes.move(focused, 1),
                 else => unreachable,
             } orelse return;
+            if (radio) {
+                if (selection.value == old and key.translated.logical != .home and key.translated.logical != .end)
+                    selection = self.listboxes.edge(focused, key.translated.logical == .arrow_up or key.translated.logical == .arrow_left).?;
+                var restore = selection;
+                restore.value = old;
+                self.listboxes.select(restore);
+            }
             const binding = self.pointer_bindings.get(focused) orelse return;
             if (binding.kind != .listbox) return;
             try self.refreshListBoxVisuals();
@@ -1379,11 +1478,25 @@ pub const WindowRuntime = struct {
         return self.semanticNodeTarget(semantic.id);
     }
 
-    pub fn semanticNodeTarget(self: *WindowRuntime, id: u64) !SemanticTarget {
+    pub fn semanticNodeTarget(self: *WindowRuntime, id: u64) anyerror!SemanticTarget {
         if (!self.ready) return error.WindowRuntimeNotReady;
         const semantic = self.semantics.findId(id) orelse return error.SemanticInstanceMissing;
-        const target = self.instances.handleForId(semantic.id) orelse
-            return error.SemanticInstanceMissing;
+        const target = self.instances.handleForId(semantic.id) orelse {
+            if (semantic.role != .group) return error.SemanticInstanceMissing;
+            // A component is a semantic namespace, not an extra layout box.
+            // Its one returned root supplies geometry; nil has empty bounds.
+            for (0..self.semantics.count()) |index| {
+                const child = try self.semantics.node(index);
+                if (child.parent == id) {
+                    var geometry = try self.semanticNodeTarget(child.id);
+                    geometry.role = .group;
+                    geometry.enabled = semantic.enabled;
+                    geometry.scroll_axis = null;
+                    return geometry;
+                }
+            }
+            return .{ .center = .{}, .bounds = .{ .x = 0, .y = 0, .width = 0, .height = 0 }, .role = .group, .enabled = semantic.enabled, .scroll_axis = null };
+        };
         const render = try self.instances.renderObject(target);
         const scroll_axis: ?platform.PointerAxis = switch (try self.tree.objectAt(render)) {
             .scroll => |scroll| switch (scroll.axis) {
@@ -2044,6 +2157,15 @@ pub const WindowRuntime = struct {
     }
 
     fn setFocusBorder(self: *WindowRuntime, target: ui.instance.InstanceHandle, focused: bool) !void {
+        if (self.listboxes.contains(target)) {
+            for (0..self.listboxes.optionSlots()) |index| {
+                const option = self.listboxes.optionAt(index) orelse continue;
+                const selection = self.listboxes.option(option).?;
+                if (!sameHandle(selection.listbox, target)) continue;
+                try self.setControlBorder(option, self.focus_color, focused and selection.value == self.listboxes.selectedValue(target));
+            }
+            return;
+        }
         const color = if (self.text_inputs.contains(target)) blk: {
             const behavior = try self.text_inputs.getBehavior(target);
             break :blk if (focused) behavior.focus_color orelse self.focus_color else behavior.border_color orelse self.border_color;
@@ -2051,20 +2173,28 @@ pub const WindowRuntime = struct {
             (if (focused) style.focus else style.border) orelse return
         else
             return;
-        try self.setControlBorder(target, color);
+        try self.setControlBorder(target, color, focused);
     }
 
     fn setControlBorder(
         self: *WindowRuntime,
         target: ui.instance.InstanceHandle,
         color: core.Color,
+        focused: bool,
     ) !void {
         const render = try self.instances.renderObject(target);
         var object = try self.tree.objectAt(render);
         if (object != .box) return error.ControlRenderObjectMismatch;
-        if (object.box.border_width == 0) return;
-        if (std.meta.eql(object.box.border_color, color)) return;
-        object.box.border_color = color;
+        if (object.box.border_width == 0 or self.listboxes.option(target) != null) {
+            const outline: ?core.Color = if (focused) color else null;
+            if (std.meta.eql(object.box.outline_color, outline)) return;
+            object.box.outline_width = if (focused) 2 else 0;
+            object.box.outline_gap = if (focused) 2 else 0;
+            object.box.outline_color = outline;
+        } else {
+            if (std.meta.eql(object.box.border_color, color)) return;
+            object.box.border_color = color;
+        }
         try self.tree.update(render, object);
         self.frame_state.invalidatePaint();
     }

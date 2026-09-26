@@ -310,6 +310,7 @@ return o.app{id='dev.ourokit.drag-target',run=function() return {windows={o.wind
         sway(app_env, "seat", "seat0", "cursor", "release", "button1")
         wait_for(lambda: node(app_env, target_ep, "target", "drop/status")["label"] == "two file URIs", "file URI drop did not arrive intact")
         print("PASS synthetic drag rejected; real private-seat two-client text and file-URI drags")
+        forms_test(root, app_env)
     finally:
         terminate(pointer)
         for process in processes:
@@ -317,6 +318,77 @@ return o.app{id='dev.ourokit.drag-target',run=function() return {windows={o.wind
             errors=process.stderr.read()
             assert process.returncode in (0, 143, -15), (process.returncode, errors)
             assert "panic" not in errors and "leaked" not in errors, errors
+
+
+def forms_test(root, env):
+    """Use the real private seat for a dropdown grab; replay other inputs."""
+    runtime = root / 'forms-runtime'
+    runtime.mkdir(mode=0o700)
+    env = dict(env, XDG_RUNTIME_DIR=str(runtime))
+    process = subprocess.Popen([str(BINARY), 'run', str(ROOT / 'examples/forms.lua'), '--dev', '--software'],
+                               env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        endpoint = development_path(runtime, process)
+        wait_for(lambda: inspect(env, endpoint).get('windows'), 'form window unavailable')
+        sway(env, '[app_id="dev.ourokit.forms"]', 'move', 'position', '80', '40')
+
+        def input_action(window, retiring=False, **action):
+            tree = inspect(env, endpoint, window)['windows'][0]
+            body = dict(window=window, token=tree['token'], **action)
+            result = subprocess.run([str(BINARY), 'dev', 'input', str(endpoint), json.dumps(body)],
+                                    env=env, text=True, capture_output=True)
+            # An action may retire its own popup before playback acknowledges
+            # the final key/button release. Accept only that exact outcome;
+            # callers also assert the committed/cancelled parent state below.
+            if result.returncode:
+                assert retiring and json.loads(result.stdout)['error']['code'] == 'StaleDevelopmentTarget', result
+                assert all(w['window'] != window for w in inspect(env, endpoint)['windows'])
+
+        def key(window, name, retiring=False, **modifiers):
+            input_action(window, retiring, action='key', key=name, **modifiers)
+
+        def open_select():
+            bounds = node(env, endpoint, 'main', 'root/form/encoding/trigger')['bounds']
+            x, y = 80 + int(bounds['x'] + bounds['width']/2), 40 + int(bounds['y'] + bounds['height']/2)
+            sway(env, 'seat', 'seat0', 'cursor', 'set', str(x), str(y))
+            sway(env, 'seat', 'seat0', 'cursor', 'press', 'button1')
+            sway(env, 'seat', 'seat0', 'cursor', 'release', 'button1')
+            return wait_for(lambda: next((w['window'] for w in inspect(env, endpoint)['windows']
+                                         if w['window'].startswith('__ouro_popup_')), None), 'select popup unavailable')
+
+        capture(env, endpoint, 'main', 'forms-native.png')
+        popup = open_select()
+        capture(env, endpoint, popup, 'forms-select-open.png')
+        key(popup, 'arrow_down')
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: UTF-16 ▾'
+        key(popup, 'enter', retiring=True)
+        wait_for(lambda: len(inspect(env, endpoint)['windows']) == 1, 'select did not close')
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: ASCII ▾'
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['focused']
+        popup = open_select()
+        key(popup, 'home')
+        key(popup, 'escape', retiring=True)
+        wait_for(lambda: len(inspect(env, endpoint)['windows']) == 1, 'select cancellation did not close')
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: ASCII ▾'
+        popup = open_select()
+        # Pointer selection commits and closes, unlike arrow navigation.
+        input_action(popup, retiring=True, action='click', target='scroll/choices/1')
+        wait_for(lambda: len(inspect(env, endpoint)['windows']) == 1, 'pointer selection did not close')
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: UTF-8 ▾'
+
+        click(env, endpoint, 'main', 'root/form/reset')
+        assert node(env, endpoint, 'main', 'root/confirm/body/actions/cancel')['focused']
+        key('main', 'tab', shift=True)
+        assert node(env, endpoint, 'main', 'root/confirm/body/actions/reset')['focused']
+        capture(env, endpoint, 'main', 'forms-dialog-native.png')
+        key('main', 'escape')
+        assert node(env, endpoint, 'main', 'root/form/reset')['focused']
+        print('PASS native select pointer grab, preview/commit/cancel, modal traversal and focus restoration')
+    finally:
+        terminate(process)
+        errors = process.stderr.read()
+        assert process.returncode in (0, 143, -15), (process.returncode, errors)
+        assert 'panic' not in errors and 'leaked' not in errors, errors
 
 
 def suite(root, env):

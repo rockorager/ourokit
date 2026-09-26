@@ -11,4 +11,5 @@ test {
     _ = @import("buttons.zig");
     _ = @import("switch.zig");
     _ = @import("listboxes.zig");
+    _ = @import("range.zig");
 }

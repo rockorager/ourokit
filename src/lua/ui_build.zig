@@ -42,7 +42,7 @@ const PendingButton = struct {
     style: ButtonStyle,
 };
 const ListBoxAppearance = enum { default, sidebar };
-const PendingListBox = struct { id: u64, selected: i64, appearance: ListBoxAppearance };
+const PendingListBox = struct { id: u64, selected: i64, appearance: ListBoxAppearance, enabled: bool = true };
 const PendingOption = struct {
     id: u64,
     content_id: u64,
@@ -59,7 +59,7 @@ const PendingTextInput = struct {
     session: ?TextInputSession,
 };
 
-const ParentKind = enum { box, flex, stack, overlay, scroll, listbox };
+const ParentKind = enum { box, flex, stack, overlay, scroll, listbox, radio_group };
 const BuildParent = struct { id: u64, kind: ParentKind, semantic_id: ?u64 = null };
 
 pub const Argument = union(enum) {
@@ -159,6 +159,7 @@ pub const UiBuild = struct {
             c.lua_getglobal(state, "ouro");
         if (api_type != c.type_table) return error.OuroApiMissing;
         Description.install(state);
+        try @import("forms.zig").install(state);
         try self.components.init(state);
     }
 
@@ -635,6 +636,11 @@ pub const UiBuild = struct {
             .icon => emitIcon,
             .button => emitButton,
             .@"switch" => emitSwitch,
+            .checkbox => emitCheckbox,
+            .radio_group => emitRadioGroup,
+            .radio => emitOption,
+            .slider => emitSlider,
+            .dialog => emitDialog,
             .text_input => emitTextInput,
             .listbox => emitListBox,
             .option => emitOption,
@@ -1091,6 +1097,70 @@ pub const UiBuild = struct {
     }
 
     fn emitSwitch(state: *c.State) callconv(.c) c_int {
+        return emitToggle(state, false);
+    }
+
+    fn emitCheckbox(state: *c.State) callconv(.c) c_int {
+        return emitToggle(state, true);
+    }
+
+    fn emitSlider(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        const parent = self.currentParent() orelse return luaError(state, "slider requires a parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "slider key required");
+        const label = tableString(state, 1, "label") orelse return luaError(state, "slider label required");
+        const range = @import("forms.zig").readRange(state, 1) catch |err| return luaError(state, @errorName(err));
+        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse return luaError(state, "invalid slider enabled");
+        const width = tableOptionalExtent(state, 1, "width", 200) orelse return luaError(state, "invalid slider width");
+        if (width < 32) return luaError(state, "slider width must be at least 32");
+        const id = semanticId(key, 0x736c69646572 ^ parent.id ^ self.component_namespace);
+        const track = semanticId("track", id);
+        const thumb = semanticId("thumb", id);
+        const layers = semanticId("layers", id);
+        const rail = semanticId("rail", id);
+        const before: u16 = @intFromFloat(@round(range.fraction() * 65535));
+        const transparent = @import("../core/color.zig").Color.rgba(0, 0, 0, 0);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .focusable = enabled,
+            .parent_data = declarativeParentData(self, state, 1) catch |err| return luaError(state, @errorName(err)),
+            .object = .{ .box = .{ .width = width, .height = 28, .padding = .all(4), .border_width = 2, .border_color = transparent, .corner_radius = 4, .alignment = .center } },
+        }) catch return luaError(state, "cannot append slider");
+        self.append(.{ .id = layers, .parent = id, .object = .{ .stack = .{} } }) catch return luaError(state, "cannot append slider layers");
+        self.append(.{ .id = track, .parent = layers, .parent_data = .{ .stack = .{ .y = 6 } }, .object = .{ .box = .{ .fill_width = true, .height = 4, .background = theme.switch_track, .corner_radius = 2 } } }) catch return luaError(state, "cannot append slider track");
+        // Flex spacers position the thumb against actual layout constraints,
+        // including a parent narrower or wider than the requested width.
+        self.append(.{ .id = rail, .parent = layers, .object = .{ .flex = .{} } }) catch return luaError(state, "cannot append slider rail");
+        self.append(.{ .id = semanticId("before", id), .parent = rail, .parent_data = .{ .flex = .{ .factor = before } }, .object = .{ .box = .{ .width = 0 } } }) catch return luaError(state, "cannot append slider spacer");
+        self.append(.{ .id = thumb, .parent = rail, .object = .{ .box = .{ .width = 16, .height = 16, .corner_radius = 8, .background = if (enabled) theme.primary else theme.disabled } } }) catch return luaError(state, "cannot append slider thumb");
+        self.append(.{ .id = semanticId("after", id), .parent = rail, .parent_data = .{ .flex = .{ .factor = 65535 - before } }, .object = .{ .box = .{ .width = 0 } } }) catch return luaError(state, "cannot append slider spacer");
+        if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "control capacity exceeded");
+        self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled, .style = .{ .idle = transparent, .hovered = transparent, .pressed = transparent, .disabled = transparent, .border = transparent, .focus = theme.ring } };
+        self.pending_button_count += 1;
+        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .slider, .key = key, .label = label, .enabled = enabled, .range = range }) catch return luaError(state, "cannot append slider semantics");
+        self.stageCallback(state, id, "on_change", .range_change) catch |err| return luaError(state, @errorName(err));
+        return 0;
+    }
+
+    fn emitDialog(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        const parent = self.currentParent() orelse return luaError(state, "dialog requires a parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "dialog key required");
+        const label = tableString(state, 1, "label") orelse return luaError(state, "dialog label required");
+        const width = tableOptionalExtent(state, 1, "width", 360) orelse return luaError(state, "invalid dialog width");
+        const id = semanticId(key, 0x6469616c6f67 ^ parent.id ^ self.component_namespace);
+        const panel = semanticId("panel", id);
+        self.append(.{ .id = id, .parent = parent.id, .object = .{ .box = .{ .fill_width = true, .fill_height = true, .alignment = .center, .background = @import("../core/color.zig").Color.rgba(0, 0, 0, 110) } } }) catch return luaError(state, "cannot append dialog backdrop");
+        self.append(.{ .id = panel, .parent = id, .object = .{ .box = .{ .width = width, .padding = .all(16), .background = theme.card, .border_color = theme.border, .border_width = 1, .corner_radius = 8 } } }) catch return luaError(state, "cannot append dialog panel");
+        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .dialog, .key = key, .label = label }) catch return luaError(state, "cannot append dialog semantics");
+        self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
+        return self.emitChildren(state, .{ .id = panel, .kind = .box, .semantic_id = id });
+    }
+
+    fn emitToggle(state: *c.State, checkbox: bool) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const key = tableString(state, 1, "key") orelse return luaError(state, "switch key is required");
@@ -1107,7 +1177,20 @@ pub const UiBuild = struct {
             return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x737769746368 ^ parent.id ^ self.component_namespace);
         const track_id = semanticId("track", id);
-        const recipe = @import("../ui/widget/switch.zig").Switch.init(theme, checked, enabled, self.currentStyle().?.controls.radius);
+        var recipe = @import("../ui/widget/switch.zig").Switch.init(theme, checked, enabled, self.currentStyle().?.controls.radius);
+        if (checkbox) {
+            recipe.root.width = recipe.root.height;
+            recipe.root.corner_radius = design.tokens.foundation.radius_2;
+            recipe.track.width = recipe.track.height;
+            recipe.track.corner_radius = design.tokens.foundation.radius_1;
+            recipe.track.alignment = .center;
+            recipe.thumb.width = 10;
+            recipe.thumb.height = 10;
+            recipe.thumb.corner_radius = 1;
+            recipe.thumb.border_width = 0;
+            recipe.thumb.border_color = null;
+            recipe.thumb.background = if (checked) theme.primary_foreground else recipe.track.background;
+        }
         self.append(.{
             .id = id,
             .parent = parent.id,
@@ -1120,7 +1203,25 @@ pub const UiBuild = struct {
             .parent = id,
             .object = .{ .box = recipe.track },
         }) catch return luaError(state, "cannot append switch track");
-        self.append(.{
+        if (checkbox and checked) {
+            const sources = self.text_sources orelse return luaError(state, "text service unavailable");
+            const source = sources.acquire(.{
+                .utf8 = "✓",
+                .language = "und",
+                .logical_size = 16,
+                .candidates = self.themedFonts(true) catch |err| return luaError(state, @errorName(err)),
+                .configuration_revision = self.text_configuration_revision,
+            }) catch return luaError(state, "cannot retain checkbox mark");
+            self.append(.{
+                .id = semanticId("thumb", id),
+                .parent = track_id,
+                .object = .{ .text = .{ .source = source, .color = if (enabled) theme.primary_foreground else theme.disabled_foreground, .max_lines = 1 } },
+            }) catch {
+                sources.release(source) catch unreachable;
+                return luaError(state, "cannot append checkbox mark");
+            };
+            self.sources_staged = true;
+        } else self.append(.{
             .id = semanticId("thumb", id),
             .parent = track_id,
             .object = .{ .box = recipe.thumb },
@@ -1132,7 +1233,7 @@ pub const UiBuild = struct {
         self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
-            .role = .@"switch",
+            .role = if (checkbox) .checkbox else .@"switch",
             .key = key,
             .label = label,
             .enabled = enabled,
@@ -1301,6 +1402,14 @@ pub const UiBuild = struct {
     }
 
     fn emitListBox(state: *c.State) callconv(.c) c_int {
+        return emitSelectionGroup(state, false);
+    }
+
+    fn emitRadioGroup(state: *c.State) callconv(.c) c_int {
+        return emitSelectionGroup(state, true);
+    }
+
+    fn emitSelectionGroup(state: *c.State, radio: bool) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
@@ -1309,6 +1418,8 @@ pub const UiBuild = struct {
         const key = tableString(state, 1, "key") orelse return luaError(state, "listbox key is required");
         const selected = tableRequiredInteger(state, 1, "selected") orelse
             return luaError(state, "listbox selected must be an integer");
+        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
+            return luaError(state, "selection group enabled must be boolean");
         const appearance = tableOptionalListBoxAppearance(state, 1) orelse
             return luaError(state, "listbox appearance must be 'default' or 'sidebar'");
         const gap = tableOptionalExtent(state, 1, "gap", design.tokens.foundation.spacing_1) orelse
@@ -1320,14 +1431,15 @@ pub const UiBuild = struct {
             .id = id,
             .parent = parent.id,
             .object = .{ .flex = .{ .axis = .vertical, .gap = gap, .cross_axis_alignment = .stretch } },
-            .focusable = true,
+            .focusable = enabled,
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append listbox descriptor");
         self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
-            .role = .listbox,
+            .role = if (radio) .radio_group else .listbox,
             .key = key,
+            .enabled = enabled,
         }) catch return luaError(state, "cannot append listbox semantics");
         if (self.pending_listbox_count == self.pending_listboxes.len)
             return luaError(state, "listbox capacity exceeded");
@@ -1335,6 +1447,7 @@ pub const UiBuild = struct {
             .id = id,
             .selected = selected,
             .appearance = appearance,
+            .enabled = enabled,
         };
         self.pending_listbox_count += 1;
 
@@ -1355,7 +1468,9 @@ pub const UiBuild = struct {
         };
         self.pending_handler_count += 1;
         c.lua_settop(state, -2);
-        return self.emitChildren(state, .{ .id = id, .kind = .listbox });
+        self.stageCallback(state, id, "on_activate", .selection_activate) catch |err| return luaError(state, @errorName(err));
+        self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
+        return self.emitChildren(state, .{ .id = id, .kind = if (radio) .radio_group else .listbox });
     }
 
     fn emitOption(state: *c.State) callconv(.c) c_int {
@@ -1366,7 +1481,7 @@ pub const UiBuild = struct {
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.option expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "option requires a listbox parent");
-        if (parent.kind != .listbox) return luaError(state, "option requires a direct listbox parent");
+        if (parent.kind != .listbox and parent.kind != .radio_group) return luaError(state, "option requires a direct selection group parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "option key is required");
         const label = tableString(state, 1, "label") orelse return luaError(state, "option label is required");
         const value = tableRequiredInteger(state, 1, "value") orelse
@@ -1380,6 +1495,10 @@ pub const UiBuild = struct {
             return luaError(state, "option listbox state is missing");
         };
         const selected = listbox.selected == value;
+        for (self.pending_options[0..self.pending_option_count]) |option| {
+            if (option.listbox_id == parent.id and option.value == value)
+                return luaError(state, "selection values must be unique");
+        }
         const idle_foreground = if (listbox.appearance == .sidebar)
             theme.sidebar_foreground
         else
@@ -1393,11 +1512,16 @@ pub const UiBuild = struct {
             theme.sidebar_accent_foreground
         else
             theme.accent_foreground;
-        const style: ListBoxStyle = .{
+        var style: ListBoxStyle = .{
             .idle = .{ .background = visual.background, .foreground = visual.foreground orelse idle_foreground },
             .hovered = .{ .background = visual.hover orelse hovered, .foreground = visual.foreground orelse accent_foreground },
             .selected = .{ .background = visual.pressed orelse selected_background, .foreground = visual.foreground orelse accent_foreground },
         };
+        if (!listbox.enabled) {
+            style.idle.foreground = theme.disabled_foreground;
+            style.hovered.foreground = theme.disabled_foreground;
+            style.selected.foreground = theme.disabled_foreground;
+        }
         self.append(.{
             .id = option_id,
             .parent = parent.id,
@@ -1412,8 +1536,15 @@ pub const UiBuild = struct {
             } },
         }) catch return luaError(state, "cannot append option descriptor");
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
+        if (parent.kind == .radio_group) {
+            const prefix: []const u8 = if (selected) "●  " else "○  ";
+            _ = c.lua_pushlstring(state, prefix.ptr, prefix.len);
+            _ = c.lua_pushlstring(state, label.ptr, label.len);
+            c.lua_concat(state, 2);
+        }
+        const display_label = if (parent.kind == .radio_group) string(state, -1).? else label;
         const source = sources.acquire(.{
-            .utf8 = label,
+            .utf8 = display_label,
             .language = "und",
             .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
             .candidates = self.themedFonts(selected and listbox.appearance == .sidebar) catch |err| return luaError(state, @errorName(err)),
@@ -1424,7 +1555,7 @@ pub const UiBuild = struct {
             .parent = option_id,
             .object = .{ .text = .{
                 .source = source,
-                .color = if (selected) style.selected.foreground else style.idle.foreground,
+                .color = if (!listbox.enabled) theme.disabled_foreground else if (selected) style.selected.foreground else style.idle.foreground,
                 .max_lines = 1,
                 .overflow = .ellipsis,
             } },
@@ -1446,10 +1577,12 @@ pub const UiBuild = struct {
         self.appendSemantic(.{
             .id = option_id,
             .parent = semanticParent(parent),
-            .role = .option,
+            .role = if (parent.kind == .radio_group) .radio else .option,
             .key = key,
             .label = label,
             .selected = selected,
+            .checked = parent.kind == .radio_group and selected,
+            .enabled = listbox.enabled,
         }) catch return luaError(state, "cannot append option semantics");
         return 0;
     }
@@ -2052,7 +2185,7 @@ fn declarativeParentData(
     const flex = try tableOptionalFlexFactor(state, table);
     return switch (parent.kind) {
         .flex => if (flex) |factor| .{ .flex = .{ .factor = factor } } else .none,
-        .box, .overlay, .scroll, .listbox => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
+        .box, .overlay, .scroll, .listbox, .radio_group => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
         .stack => stack: {
             if (flex != null) return error.FlexRequiresRowOrColumnParent;
             const x = tableOptionalExtent(state, table, "x", 0) orelse return error.InvalidPosition;

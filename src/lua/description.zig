@@ -8,6 +8,11 @@ pub const Kind = enum {
     icon,
     button,
     @"switch",
+    checkbox,
+    radio_group,
+    radio,
+    slider,
+    dialog,
     text_input,
     listbox,
     option,
@@ -22,7 +27,7 @@ pub const Kind = enum {
 
     fn acceptsChildren(self: Kind) bool {
         return switch (self) {
-            .button, .listbox, .box, .stack, .row, .column, .scroll, .theme, .component => true,
+            .button, .listbox, .radio_group, .dialog, .box, .stack, .row, .column, .scroll, .theme, .component => true,
             else => false,
         };
     }

@@ -61,6 +61,7 @@ pub const Node = struct {
     selected: bool,
     selected_value: ?i64,
     checked: bool,
+    range: ?@import("../ui/widget/range.zig").Range,
     focused: bool,
     selection: ?ui.text_input.Selection,
     scroll_axis: ?platform.PointerAxis,
@@ -96,7 +97,8 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
     var used: usize = 0;
     for (nodes, 0..) |*node, index| {
         const semantic = try runtime.semantics.node(index);
-        const handle = runtime.instances.handleForId(semantic.id) orelse return error.SemanticInstanceMissing;
+        // Component groups have semantic identity but no layout instance.
+        const handle = runtime.instances.handleForId(semantic.id) orelse ui.instance.InstanceHandle.invalid;
         const target = try runtime.semanticNodeTarget(semantic.id);
         var path: ?[]const u8 = null;
         if (semantic.key.len != 0 and std.mem.indexOfScalar(u8, semantic.key, '/') == null) {
@@ -144,6 +146,7 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             .selected = selected,
             .selected_value = runtime.listboxes.selectedValue(handle),
             .checked = semantic.checked,
+            .range = semantic.range,
             .focused = if (runtime.focus.current()) |focused| std.meta.eql(focused, handle) else false,
             .selection = selection,
             .scroll_axis = target.scroll_axis,
@@ -201,6 +204,7 @@ pub const Playback = struct {
             if (!geometry.enabled and action != .hover) return error.DevelopmentTargetDisabled;
             if ((action == .click or action == .pointer_down) and
                 semantic.role != .button and semantic.role != .@"switch" and
+                semantic.role != .checkbox and semantic.role != .radio and semantic.role != .radio_group and semantic.role != .slider and
                 semantic.role != .text_field and semantic.role != .option and semantic.role != .listbox)
                 return error.DevelopmentTargetNotInteractive;
             if (action == .scroll) {
@@ -256,7 +260,9 @@ pub const Playback = struct {
                 try checkHit(runtime, self.target.?, runtime.router.pointer_position);
                 try runtime.routePointer(.{ .axis = .{ .window = window, .time_ms = 0, .axis = axis, .delta = self.action.scroll.delta } });
             } else {
-                try checkHit(runtime, self.target.?, runtime.router.pointer_position);
+                // A press can open an overlay over its own target. Release
+                // belongs to the captured press, not the newly hit surface.
+                if (self.step == 1) try checkHit(runtime, self.target.?, runtime.router.pointer_position);
                 try runtime.routePointer(.{ .button = .{ .window = window, .serial = 0, .time_ms = 0, .button = 0x110, .state = if (self.step == 1) .pressed else .released } });
             }
         } else switch (self.action) {

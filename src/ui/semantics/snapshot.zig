@@ -1,6 +1,7 @@
 const std = @import("std");
 
-pub const Role = enum { group, text, button, text_field, listbox, option, image, @"switch" };
+pub const Role = enum { group, text, button, text_field, listbox, option, image, @"switch", checkbox, radio_group, radio, slider, dialog };
+const Range = @import("../widget/range.zig").Range;
 
 /// Borrowed normalized semantic data emitted beside render descriptors during
 /// one build. Text is copied into the retained Snapshot before another Lua call.
@@ -13,6 +14,7 @@ pub const Descriptor = struct {
     enabled: bool = true,
     selected: bool = false,
     checked: bool = false,
+    range: ?Range = null,
 };
 
 const StoredNode = struct {
@@ -26,6 +28,7 @@ const StoredNode = struct {
     enabled: bool,
     selected: bool,
     checked: bool,
+    range: ?Range,
 };
 
 pub const Node = struct {
@@ -37,6 +40,7 @@ pub const Node = struct {
     enabled: bool,
     selected: bool,
     checked: bool,
+    range: ?Range,
 };
 
 /// Double-buffered, allocation-free-after-init semantic snapshot suitable for
@@ -90,7 +94,13 @@ pub const Snapshot = struct {
         if (descriptors.len > self.nodes[0].len) return error.SemanticNodeCapacityExceeded;
         @memset(self.validation_index, 0);
         var text_count: usize = 0;
+        var dialog_seen = false;
         for (descriptors) |descriptor| {
+            if (descriptor.role == .dialog) {
+                if (dialog_seen) return error.MultipleDialogsUnsupported;
+                dialog_seen = true;
+            }
+            if (descriptor.range) |range| try range.validate();
             if (descriptor.id == 0) return error.InvalidSemanticId;
             text_count = std.math.add(usize, text_count, descriptor.key.len) catch
                 return error.SemanticTextCapacityExceeded;
@@ -128,6 +138,7 @@ pub const Snapshot = struct {
                 .enabled = descriptor.enabled,
                 .selected = descriptor.selected,
                 .checked = descriptor.checked,
+                .range = descriptor.range,
             };
             text_count += descriptor.label.len;
         }
@@ -199,6 +210,7 @@ pub const Snapshot = struct {
             .enabled = stored.enabled,
             .selected = stored.selected,
             .checked = stored.checked,
+            .range = stored.range,
         };
     }
 };

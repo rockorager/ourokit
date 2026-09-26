@@ -758,6 +758,104 @@ no children or button-style dimension/visual props. See the
 `switch/*` stories in `examples/storybook.lua` for both palettes, on/off,
 disabled, keyboard focus, and controlled pointer activation.
 
+### Checkboxes, radio groups, and selects
+
+`ouro.checkbox` has the same controlled `checked`, `label`, `enabled`,
+`on_change`, and keyboard contract as `ouro.switch`, with a square checkmark.
+Its label is semantic; compose visible text alongside it.
+
+```lua
+ouro.radio_group {
+  key = "reload", selected = mode(), enabled = true,
+  on_select = function(value) mode:set(value) end,
+  ouro.radio { key = "ask", value = 17, label = "Ask before reloading" },
+  ouro.radio { key = "always", value = 29, label = "Always reload" },
+}
+
+ouro.select {
+  key = "encoding", label = "Encoding", selected = encoding(), width = 240,
+  options = {{value=1, label="UTF-8"}, {value=2, label="UTF-16"}},
+  on_select = function(value) encoding:set(value) end,
+}
+```
+
+Radio groups are one focus stop. Arrow keys request the next/previous value in
+declaration order, wrapping at the ends; Home/End request the first/last value.
+Pointer presses request that radio's value. The application must accept the
+request through `selected`; ignoring it leaves the group unchanged. Direct
+children have unique integer `value`s. `enabled=false` disables the entire
+group; individually disabled options and mixed-state checkboxes are not yet
+supported.
+
+`ouro.select` is a shipped Lua composition of a native button, anchored popup,
+scroll viewport, and listbox. `options` must be nonempty, with unique integer
+values and string labels, and `selected` must name an option. Its optional
+`label` prefixes the selected text. Up/Down/Home/End preview inside the popup;
+Enter, Space, or a pointer selection commits through `on_select(value)` and
+closes it. Escape, outside click, and native dismissal cancel the preview.
+Focus returns to the trigger. `enabled=false` disables the trigger and closes
+an open popup. Optional `on_error(error)` handles popup-creation failure.
+This is a non-editable select, not a searchable combobox, and opening requires
+the same genuine input authority as `ouro.popup`.
+
+### Sliders and numeric inputs
+
+```lua
+ouro.slider {
+  key = "size", label = "Text size", width = 300,
+  value = size(), min = 8, max = 32, step = 1,
+  on_change = function(value) size:set(value) end,
+}
+ouro.spinbox {
+  key = "size-number", label = "Text size",
+  value = size(), min = 8, max = 32, step = 1,
+  on_change = function(value) size:set(value) end,
+}
+```
+
+Both require finite numeric `value`, `min`, `max`, and positive `step`, with
+`min < max` and `value` within the bounds. Requests clamp to the bounds and snap
+to steps anchored at `min`; `max` remains reachable even when off-grid.
+Values remain controlled. Both accept `enabled` (default true) and contextual
+`flex`. `label` names the control but does not add a visible label.
+
+The horizontal slider is one focus stop. Press/drag requests values, including
+when the captured pointer leaves its bounds. Left/Down and Right/Up move one
+step, PageDown/PageUp ten, and Home/End to the bounds. Disabling or removing it
+cancels dragging. `width` defaults to 200 and must be at least 32 logical pixels;
+layout may constrain it. Development inspection exposes `range` with all four
+numeric fields.
+
+The spinbox is a shipped Lua composition of a native single-line field and
+decrement/increment buttons, sharing the native range validation and snapping.
+Its `width` controls the field (default 100), excluding buttons. Typed text is
+a draft: Enter parses and commits it, Escape resets it, invalid text resets to
+the controlled value, and blur does not commit. Up/Down and the buttons request
+one step from the controlled value. The controlled value takes precedence over
+a draft based on a different value.
+The field and enabled buttons participate in ordinary Tab traversal.
+
+### In-window modal dialogs
+
+Place an `ouro.dialog` last in a full-area `ouro.stack`, after the normal page
+content. Mount/unmount it from application state. Supply a required semantic
+`label`, an optional card `width` (default 360), and one content child, usually
+a column with visible title, body, and action buttons. `on_cancel()` receives
+Escape; it must update state to dismiss the dialog. Clicking the backdrop does
+not dismiss it automatically.
+
+The native runtime dims and blocks the underlying page, moves focus into the
+dialog, contains Tab/Shift+Tab traversal, and restores the opener on unmount
+if it still exists and is enabled. A text field's explicit command handler or
+active IME composition takes precedence over dialog Escape. Only one dialog
+per window is supported; nested dialogs are rejected. This is an application
+modal surface, not an OS file chooser or a separate native window.
+
+Run `ouroctl run examples/forms.lua` for the interactive settings smoke app,
+or snapshot `examples/forms-storybook.lua` for light, dark, disabled, changed,
+and modal states. These controls reuse Box/Text/Flex/Stack render primitives;
+Lua composes the standard parts and Zig owns input, focus, and range policy.
+
 ### Single-line text inputs
 
 `ouro.text_input` is a single-line field. Long values scroll horizontally to
@@ -997,6 +1095,9 @@ single-selection `ouro.listbox` composes a vertical Flex with direct
 `ouro.option` Box/Text children. It is one focus stop, uses integer values,
 and calls `on_select(value)` on primary-button press or Up/Down/Home/End navigation;
 the application remains the source of truth through the `selected` property.
+Optional `on_activate(value)` distinguishes pointer/Enter/Space activation from
+arrow-key preview; `on_cancel()` receives Escape. `enabled=false` disables the
+group. Option values must be unique within the group.
 Options are transparent over their containing surface at rest and retain hover
 state across reconciliation. Default options use accent steps 3 and 5 for hover
 and selection. `appearance = "sidebar"` instead uses gray steps 3 and 5 plus a

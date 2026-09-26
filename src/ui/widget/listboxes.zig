@@ -23,6 +23,7 @@ const ListBox = struct {
     owner: BuildOwnerHandle = .invalid,
     target: instance.InstanceHandle = .invalid,
     selected: i64 = 0,
+    next_order: usize = 0,
     active: bool = false,
     seen: bool = false,
 };
@@ -33,6 +34,7 @@ const Option = struct {
     target: instance.InstanceHandle = .invalid,
     content: instance.InstanceHandle = .invalid,
     value: i64 = 0,
+    order: usize = 0,
     style: Style = undefined,
     hovered: bool = false,
     active: bool = false,
@@ -80,6 +82,7 @@ pub const ListBoxes = struct {
         for (self.lists) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.selected = selected;
+            entry.next_order = 0;
             entry.seen = true;
             return;
         };
@@ -99,11 +102,15 @@ pub const ListBoxes = struct {
         value: i64,
         style: Style,
     ) !void {
+        const list = self.findListMutable(listbox) orelse return error.ListBoxMissing;
+        const order = list.next_order;
+        list.next_order += 1;
         for (self.options) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.listbox = listbox;
             entry.content = content;
             entry.value = value;
+            entry.order = order;
             entry.style = style;
             entry.seen = true;
             return;
@@ -115,6 +122,7 @@ pub const ListBoxes = struct {
                 .target = target,
                 .content = content,
                 .value = value,
+                .order = order,
                 .style = style,
                 .active = true,
                 .seen = true,
@@ -165,8 +173,8 @@ pub const ListBoxes = struct {
         var last: ?usize = null;
         const selected = self.findListMutable(listbox) orelse return null;
         for (self.options, 0..) |entry, index| if (entry.active and same(entry.listbox, listbox)) {
-            if (first == null) first = index;
-            last = index;
+            if (first == null or entry.order < self.options[first.?].order) first = index;
+            if (last == null or entry.order > self.options[last.?].order) last = index;
             if (entry.value == selected.selected) selected_index = index;
         };
         if (first == null) return null;
@@ -183,8 +191,7 @@ pub const ListBoxes = struct {
         const list = self.findListMutable(listbox) orelse return null;
         var found: ?Option = null;
         for (self.options) |entry| if (entry.active and same(entry.listbox, listbox)) {
-            found = entry;
-            if (!last) break;
+            if (found == null or (if (last) entry.order > found.?.order else entry.order < found.?.order)) found = entry;
         };
         const entry = found orelse return null;
         list.selected = entry.value;
@@ -242,17 +249,18 @@ fn update(option: Option, visual: Visual) VisualUpdate {
 }
 
 fn previousOption(options: []const Option, listbox: instance.InstanceHandle, start: usize) ?usize {
-    var index = start;
-    while (index > 0) {
-        index -= 1;
-        if (options[index].active and same(options[index].listbox, listbox)) return index;
-    }
-    return null;
+    var best: ?usize = null;
+    for (options, 0..) |entry, index| if (entry.active and same(entry.listbox, listbox) and entry.order < options[start].order) {
+        if (best == null or entry.order > options[best.?].order) best = index;
+    };
+    return best;
 }
 fn nextOption(options: []const Option, listbox: instance.InstanceHandle, start: usize) ?usize {
-    var index = start + 1;
-    while (index < options.len) : (index += 1) if (options[index].active and same(options[index].listbox, listbox)) return index;
-    return null;
+    var best: ?usize = null;
+    for (options, 0..) |entry, index| if (entry.active and same(entry.listbox, listbox) and entry.order > options[start].order) {
+        if (best == null or entry.order < options[best.?].order) best = index;
+    };
+    return best;
 }
 fn same(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
