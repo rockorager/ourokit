@@ -104,6 +104,8 @@ pub const WindowRuntime = struct {
     scroll_motions: [2]scroll_motion.Motion = @splat(.{}),
     // Headless windows act focused; native hosts start false until keyboard enter.
     keyboard_focused: bool = true,
+    // Pointer focus still routes keys, but only keyboard navigation draws rings.
+    keyboard_focus_visible: bool = false,
     caret_blink_interval_ns: u64 = (Config{}).caret_blink_interval_ns,
     caret_visible: bool = true,
     caret_deadline_ns: ?u64 = null,
@@ -899,6 +901,10 @@ pub const WindowRuntime = struct {
             if (event == .pointer) switch (event.pointer.event) {
                 .button => |button| if (button.state == .pressed) {
                     self.scroll_motions = @splat(.{});
+                    if (self.keyboard_focus_visible) {
+                        self.keyboard_focus_visible = false;
+                        try self.applyFocusVisual(self.focus.current(), self.focus.current());
+                    }
                 },
                 .axis => {
                     for (&self.scroll_motions) |*motion| if (motion.active) {
@@ -1102,6 +1108,24 @@ pub const WindowRuntime = struct {
         if (key.state != .released) {
             self.clicks.reset();
             self.resetCaretBlink();
+            switch (key.translated.logical) {
+                .tab,
+                .arrow_left,
+                .arrow_right,
+                .arrow_up,
+                .arrow_down,
+                .home,
+                .end,
+                .page_up,
+                .page_down,
+                .space,
+                .enter,
+                => if (!self.keyboard_focus_visible) {
+                    self.keyboard_focus_visible = true;
+                    try self.applyFocusVisual(self.focus.current(), self.focus.current());
+                },
+                else => {},
+            }
             try self.syncTextInputVisuals();
         }
         if (self.focus.current()) |focused| if (self.text_inputs.contains(focused) and
@@ -2186,7 +2210,8 @@ pub const WindowRuntime = struct {
         try self.syncTextInputVisuals();
     }
 
-    fn setFocusBorder(self: *WindowRuntime, target: ui.instance.InstanceHandle, focused: bool) !void {
+    fn setFocusBorder(self: *WindowRuntime, target: ui.instance.InstanceHandle, requested: bool) !void {
+        const focused = requested and (self.keyboard_focus_visible or self.text_inputs.contains(target));
         if (self.listboxes.contains(target)) {
             for (0..self.listboxes.optionSlots()) |index| {
                 const option = self.listboxes.optionAt(index) orelse continue;

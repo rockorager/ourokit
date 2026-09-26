@@ -427,8 +427,62 @@ def forms_test(root, env):
         assert 'panic' not in errors and 'leaked' not in errors, errors
 
 
+def focus_test(root, env):
+    source = root / 'focus.lua'
+    source.write_text('''local ouro=require('ouro')
+local function content() return ouro.row {key='workspaces', gap=12,
+ ouro.button {key='one', label='1', width=48, border_width=0, background='#304055', hover='#304055'},
+ ouro.button {key='two', label='2', width=48, border_width=0, background='#304055', hover='#304055'},
+ ouro.button {key='three', label='3', width=48, border_width=0, background='#304055', hover='#304055'},
+} end
+return ouro.app {id='dev.ourokit.focus-test', run=function() return {windows={
+ ouro.window {id='main', title='Keyboard focus', width=260, height=80, content=content},
+ ouro.layer_surface {id='panel', namespace='focus-test', layer='top',
+   width=260, height=80, keyboard_interactivity='none', content=content},
+}} end}
+''')
+    env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'])
+    process = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--software'],
+                               env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), process)
+        wait_for(lambda: len(inspect(env, endpoint).get('windows', [])) == 2, 'focus windows unavailable')
+        # Capture even without an artifact request: decoded pixels are assertions,
+        # not merely optional screenshots. Flat hover colors isolate the ring.
+        directory = Path(os.environ.get('OUROKIT_TEST_CAPTURE', root / 'focus-captures')).resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+
+        def pixels(window, name):
+            tree = inspect(env, endpoint, window)['windows'][0]
+            path = directory / name
+            run(str(BINARY), 'dev', 'capture', str(endpoint),
+                json.dumps(dict(window=window, token=tree['token'])), '--output', str(path), env=env)
+            return subprocess.check_output(['magick', str(path), '-depth', '8', 'rgba:-'])
+
+        before = pixels('panel', 'focus-panel-before.png')
+        click(env, endpoint, 'panel', 'workspaces/one')
+        assert node(env, endpoint, 'panel', 'workspaces/one')['focused']
+        assert pixels('panel', 'focus-panel-click.png') == before
+        click(env, endpoint, 'main', 'workspaces/one')
+        mouse = pixels('main', 'focus-mouse.png')
+        tree = inspect(env, endpoint, 'main')['windows'][0]
+        run(str(BINARY), 'dev', 'input', str(endpoint), json.dumps(dict(
+            window='main', token=tree['token'], action='key', key='tab')), env=env)
+        assert node(env, endpoint, 'main', 'workspaces/two')['focused']
+        assert pixels('main', 'focus-keyboard.png') != mouse
+        click(env, endpoint, 'main', 'workspaces/one')
+        assert pixels('main', 'focus-mouse-restored.png') == mouse
+        print('PASS native focus: panel click has identical pixels; Tab draws ring; click removes it')
+    finally:
+        terminate(process)
+        errors = process.stderr.read()
+        assert process.returncode in (0, 143, -15), (process.returncode, errors)
+        assert 'panic' not in errors and 'leaked' not in errors, errors
+
+
 def suite(root, env):
     assert BINARY.is_file(), f"missing {BINARY}; wait for /tmp/ouro-desktop-build.log then build"
+    focus_test(root, env)
     document_test(root, env)
     parent_lifetime_test(root, env)
     drag_test(root, env)

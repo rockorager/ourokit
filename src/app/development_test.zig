@@ -208,6 +208,43 @@ test "multiline mode changes replace retained sessions even for equal uncontroll
     try std.testing.expectEqualStrings("same", (try f.runtime.text_inputs.session(target)).model.text());
 }
 
+test "focus rings follow keyboard navigation without changing logical pointer focus" {
+    const f = try Fixture.create(
+        \\function build() return ouro.column {key='root', gap=8,
+        \\ ouro.button {key='flat', label='Workspace', border_width=0},
+        \\ ouro.button {key='bordered', label='Bordered', border_width=1},
+        \\ ouro.text_input {key='edit', default_text='Text'},
+        \\} end
+    );
+    defer f.destroy();
+    const flat = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("root/flat")).id).?;
+    const render = try f.runtime.instances.renderObject(flat);
+    try f.play(.{ .click = "root/flat" });
+    try std.testing.expectEqual(flat, f.runtime.focus.current().?);
+    try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.objectAt(render)).box.outline_width);
+    // Keyboard activation of the SAME pointer-focused button reveals the ring.
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
+    try std.testing.expectEqual(@as(f32, 2), (try f.runtime.tree.objectAt(render)).box.outline_width);
+    try f.play(.{ .click = "root/flat" });
+    try std.testing.expectEqual(flat, f.runtime.focus.current().?);
+    try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.objectAt(render)).box.outline_width);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    const bordered = f.runtime.focus.current().?;
+    const bordered_render = try f.runtime.instances.renderObject(bordered);
+    try std.testing.expectEqual(f.runtime.focus_color, (try f.runtime.tree.objectAt(bordered_render)).box.border_color.?);
+    try f.play(.{ .click = "root/bordered" });
+    try std.testing.expectEqual(f.runtime.buttons.styleFor(bordered).?.border.?, (try f.runtime.tree.objectAt(bordered_render)).box.border_color.?);
+    try f.play(.{ .click = "root/edit" });
+    const edit_render = try f.runtime.instances.renderObject(f.runtime.focus.current().?);
+    try std.testing.expectEqual(f.runtime.focus_color, (try f.runtime.tree.objectAt(edit_render)).box.border_color.?);
+    // A keyboard-ineligible layer panel must never show a ring on click.
+    try f.runtime.routeKeyboard(.{ .leave = .{ .window = f.runtime.window, .serial = 0 } });
+    try f.settle();
+    try f.play(.{ .click = "root/flat" });
+    try std.testing.expectEqual(flat, f.runtime.focus.current().?);
+    try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.objectAt(render)).box.outline_width);
+}
+
 test "forms checkbox requests remain controlled and disabled controls skip focus" {
     const f = try Fixture.create(
         \\requested=false
