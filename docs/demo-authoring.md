@@ -64,8 +64,8 @@ commits from the input method.
 Run `zig build test --summary all` and `zig build --summary all` first. For native
 demo checks, provide a dedicated Weston X11 display with a 1,500 × 950 or larger
 X screen. Do not use a display containing personal applications. The test needs
-`xdotool`, ImageMagick and `systemd-socket-activate`; video capture also needs
-FFmpeg. Set `DISPLAY` to the X display and `OUROKIT_TEST_WAYLAND_DISPLAY` to the
+`xdotool` and ImageMagick; video capture also needs FFmpeg. Set `DISPLAY` to
+the X display and `OUROKIT_TEST_WAYLAND_DISPLAY` to the
 absolute Weston socket path, then run:
 
 ```sh
@@ -73,8 +73,8 @@ python3 tests/demo_apps.py
 ```
 
 Optionally set `OUROKIT_DEMO_ARTIFACTS` to a capture directory. The test checks
-headless Contacts calls, native activation and editing, scrolling, distant
-MCP updates, theme retention, dialog validation, backpressured single-decision
+Contacts calls on an explicit development instance, native editing, scrolling,
+distant MCP updates, theme retention, dialog validation, backpressured single-decision
 output, denial, malformed input, and clean exits. It captures representative
 windows and a Contacts scrolling/theme-switch video for visual inspection.
 These demo checks use the software renderer; they do not verify hardware

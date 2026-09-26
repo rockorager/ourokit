@@ -1,519 +1,173 @@
 # Transactional source reload
 
-Ourokit treats application source as runtime input. A disk-backed application
-can replace its Lua source while the process, native windows, platform
-connection, renderer, and retained UI stay alive. Reload is an explicit
-operation; automatic file watching may request the same operation later but is
-not a separate reload mechanism.
-
-The defining guarantee is:
-
-> A reload either commits one complete, validated source generation or leaves
-> the currently running generation entirely intact.
-
-This is source reload, not mutation of live Lua functions. Ourokit never
-executes changed files into the active Lua state. Doing that would retain stale
-globals, module values, closures, subscriptions, and suspended coroutines in
-ways application authors could not reason about.
-
-## User experience
-
-A development application is launched from a source entry path rather than
-from source bytes detached from their origin:
+Source reload replaces a disk-backed application's Lua generation while keeping
+the process, Wayland connection, renderer, and compatible retained UI alive.
+It is a development operation, not a production application action.
 
 ```sh
-ouroctl run --dev
+ouroctl run app.lua --dev
+# Use the exact "development socket: ..." path printed by this process.
+ouroctl dev status "$development_socket"
+ouroctl dev reload "$development_socket"
 ```
 
-After saving one or more files, the author requests a reload through either:
+Only `--dev` enables reload. Declaring actions does not enable a server, and
+optional production `--mcp` does not expose runtime tools. Development copies
+never acquire or activate the application's production D-Bus name. Desktop
+activation is described separately in [the application model](application-model.md).
 
-- the built-in `Reload Source` application command, with a conventional
-  `Ctrl+Shift+R` shortcut once keyboard commands are available; or
-- the development control interface, exposed by the CLI as
-  `ouroctl dev reload <development-socket>` using the path printed at launch.
+## Validation failures preserve the last-good application
 
-Both only enqueue a reload request. They do not read files, enter Lua, or
-reconcile UI from an input callback. The request is consumed at an application
-safe point. Repeated requests coalesce to the newest source snapshot.
+The runner prepares a fresh Lua VM and builds every candidate window before
+changing live UI. Source, declaration, UI-build, and local capacity failures
+reject the candidate. The active generation, native windows, callback bindings,
+focus, and last-good scene remain usable.
 
-On success, the next frame uses the new source. On failure, the application
-keeps running its previous source and last good frame. Ourokit reports a
-structured diagnostic with generation, file, line, phase, and Lua traceback;
-the same diagnostic is available to the in-app development surface and control
-client. Reload failure is not a process-fatal error.
+The transaction covers local application ownership, not rollback of external
+systems. A native protocol, allocation, or device failure after local commit
+shuts down the host; it is not reported as successful rollback. Application code
+that performs external effects during source evaluation cannot expect those
+effects to be undone by rejection.
 
-Production bundles use the same generation machinery but never expose reload.
-Only explicit per-instance `--dev` enables development control; declared actions
-and outbound `ouro.mcp.call` do not affect that decision.
+`runtime.reload` replies only after its request commits or fails. Success
+returns the new generation. Failure returns an MCP tool error with a structured
+`ReloadFailed` error; `runtime.status` exposes the latest diagnostic. Diagnostic
+fields are phase, source, and message. Lua messages may include source locations
+and traceback text; there is no separate structured line/traceback contract.
 
-## Lifetime model
+A reload acknowledgment establishes source commit, not compositor presentation.
+Use a fresh runtime inspection and capture to verify replacement content.
+Software scene replay is not GPU readback or proof of pixels reaching a screen.
 
-Reload separates process-lifetime native services from replaceable application
-language state:
+## Source generations have separate ownership
 
 ```diagram
-┌──────────────────── process lifetime ────────────────────────────┐
-│ io_uring · scheduler · Wayland · renderers · fonts · state store │
-│                                                                  │
-│  ┌──────── retained native application ───────────────────────┐  │
-│  │ window IDs/handles · keyed instances · widget state        │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                              ▲                                   │
-│                              ┃ atomic commit                     │
-│  ┌──────── active source generation ────────┐                    │
-│  │ source snapshot · Lua VM · module cache  │                    │
-│  │ declarations · callbacks · subscriptions │                    │
-│  │ generation-owned tasks and resources     │                    │
-│  └──────────────────────────────────────────┘                    │
-└──────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│ Process: event loop, scheduler, Wayland, renderer      │
+│ Native windows and keyed retained widget state       │
+└────────────────────────┬──────────────────────────────┘
+                         │ adopts prepared UI
+              ┌──────────▼──────────┐
+              │ Active generation   │
+              │ Lua VM and modules  │
+              │ callbacks and tasks │
+              └──────────┬──────────┘
+                         │ replaced at safe point
+              ┌──────────▼──────────┐
+              │ Retiring generation │
+              │ cancel and drain    │
+              └─────────────────────┘
 ```
 
-A source generation owns everything whose meaning can depend on the exact
-source text:
-
-- one fresh isolated Lua state;
-- one immutable source snapshot and module cache;
-- the evaluated application declaration;
-- Lua closures and registry references;
-- signal subscriptions into that generation;
-- language tasks, timers, and other language-created resources.
-
-The native host survives generation replacement. Window declarations continue
-to reconcile by application window ID. Retained widget and render identity
-continue to reconcile by stable keys and typed descriptor identity. Unchanged
-IDs therefore do not recreate Wayland windows, and unchanged keys do not
-discard native widget state.
-
-The application ID is process identity. A candidate whose application ID does
-not match the active generation is rejected with `ApplicationIdChanged`; that
-change requires a restart.
-
-Inbound-server enablement is also process-lifetime configuration. Changing
-`actions` between nil/omitted and a table during source reload is rejected with
-`ApplicationActionsChanged` and requires a restart. The contents of an enabled
-table may change between generations.
-
-## Source and modules
-
-`app.runWayland` accepts immutable embedded bytes, while the executable passes
-the reloadable host a retained source provider:
-
-```zig
-pub const SourceProvider = union(enum) {
-    disk: DiskSource,
-    bundle: EmbeddedBundle,
-};
-```
-
-The `bundle` module owns source paths, snapshots, and module resolution. The
-`app` coordinator owns when a snapshot becomes active. Lua owns compilation and
-module execution. Platform and UI modules never read application files.
-
-Disk paths are resolved relative to the entry file's source root. Ourokit
-provides a constrained `require` implementation without exposing Lua's
-`package`, native module loading, environment search paths, or path traversal.
-Resolution supports `name.lua` and `name/init.lua` within the source root.
-Every module is loaded at most once per generation, while every generation has
-a fresh module cache.
-
-Imports must be resolved while preparing the entry point and its top-level
-module dependency closure. After UI initialization, first-time lazy imports from
-a later event callback are rejected. Headless services keep the module loader
-available until the deferred UI factory finishes, so that factory can load its
-UI dependencies. Loaded modules remain cached within their source generation.
-
-Each file read records canonical path, bytes, content hash, and filesystem
-identity. After candidate preparation, the disk provider revalidates every
-dependency. If a file changed during preparation, the mixed snapshot is
-discarded and the latest request is prepared again. Atomic-save renames are
-detected by filesystem identity, not only modification time.
-
-The host keeps the source root as an opened directory capability. Module names
-cannot escape it through `..`, absolute paths, or symlink traversal. Lua never
-receives a general filesystem API merely to support imports.
-
-## State that survives
-
-Reload persistence is explicit rather than accidental.
-
-### Native retained state
-
-The following survives automatically when semantic identity and type remain
-compatible:
-
-- native window identity and compositor state by window ID;
-- instance/render-object identity by stable widget keys;
-- widget-owned interaction state such as focus, scrolling, selection, and
-  other future retained component state;
-- renderer, font, glyph, and shape caches.
-
-Removing an ID performs its normal lifecycle and cancellation. Reintroducing a
-previously removed ID creates new identity; stale handles never become valid
-again. A compositor-closed window remains tombstoned until a committed source
-generation omits it, preserving the existing no-accidental-resurrection rule.
-
-Compatibility is explicit. A mounted component has both a placement key and a
-component-family token. The placement key identifies that component among its
-siblings; the family token determines whether its retained state layout is
-compatible with replacement source. Built-in constructors use their generated
-schema identity and native state version. Future source-defined components use
-a stable module-local `hot_id` and positive integer `hot_version`:
-
-```lua
-local ouro = require("ouro")
-local Counter = ouro.component {
-  hot_id = "counter",
-  hot_version = 2,
-  -- component declaration
-}
-```
-
-The resulting family identity is the canonical module name plus `hot_id` plus
-`hot_version`; source line numbers are never identity. The `hot_id` must be
-unique within its module. A retained position preserves component state only
-when both placement key and family token match. Changing `hot_version`
-intentionally remounts that component subtree, retires its old execution scope,
-and runs its initializer again. This gives state-layout changes an explicit
-escape hatch without forcing authors to rename every call-site key.
-
-### Application state
-
-Ordinary Lua globals and module locals reset. State intended to survive source
-replacement uses a stable key:
-
-```lua
-local ouro = require("ouro")
-local count = ouro.state("counter", 0)
-
-local settings = ouro.state("settings", {
-  version = 2,
-  initial = function()
-    return { theme = "dark" }
-  end,
-  migrate = function(previous, previous_version)
-    if previous_version == 1 then
-      return { theme = previous.dark and "dark" or "light" }
-    end
-    return previous
-  end,
-})
-```
-
-`ouro.state` has signal semantics for builds but stores a bounded,
-language-neutral value in the process-lifetime application state store. The
-two-argument value form is shorthand for version 1 with that value as its
-initial value. The versioned form uses `initial` only when the key does not
-exist. When the stored and requested versions differ, `migrate` receives a
-candidate-owned copy and the previous version. Migration may move either
-forward or backward so source edit/undo remains supported. A missing or failed
-migration rejects the candidate.
-
-Reload preparation reads an immutable view of the active store and stages new
-keys and migrated values; it cannot mutate active state before commit. A
-migration runs in the same effect-free `preparing` capability phase as entry
-evaluation. Its result is copied into a language-neutral value and validated
-before the candidate can commit. Multiple declarations of one key in a
-generation must request the same version.
-
-Reloadable values initially support nil, booleans, finite numbers, strings,
-and acyclic arrays/maps composed from those values. Functions, threads,
-userdata, cycles, and native handles are generation-owned and cannot be
-persisted. A migration that returns an unsupported value fails preparation
-rather than silently resetting user state. Reusing a key at the same version
-returns its stored value; authors must increment the version when source starts
-expecting a different layout. Renaming a key remains the explicit reset
-mechanism.
-
-`ouro.signal(value)` remains generation-local and resets on reload. This gives
-authors a clear choice instead of trying to infer which arbitrary Lua values
-should survive.
-
-Keys no longer referenced by source remain in the bounded store for the
-process lifetime, making edit/undo cycles stable. Development tooling can show
-and explicitly clear them; reload does not garbage-collect user state based on
-one source generation.
-
-## Preparation and commit
-
-Reload runs as a state machine owned by the application coordinator:
-
-```diagram
-                 request
-                    │
-                    ▼
-┌────────┐    ┌────────────┐    ┌─────────┐    ┏━━━━━━━━┓
-│ active │───→│ snapshot + │───→│ prepare │───▶┃ commit ┃
-└────────┘    │ compile    │    │ + build │    ┗━━━┳━━━━┛
-     ▲        └──────┬─────┘    └────┬────┘        ┃
-     │               │ error         │ error       ▼
-     └───────────────┴────────────────┘       ┌──────────┐
-          diagnostic; old app continues      │ retire old│
-                                              └──────────┘
-```
-
-Preparation performs all fallible source-dependent work without mutating the
-active generation:
-
-1. Read a stable source snapshot.
-2. Create a candidate generation at a stable address.
-3. Install only reviewed Ouro APIs and the snapshot-backed module loader.
-4. Compile and execute the entry point and top-level module closure.
-5. Stage and validate new or migrated reloadable state.
-6. Validate application ID, lifecycle callbacks, component-family tokens, and
-   the complete window declaration.
-7. Invoke every desired window build at its current configured size (or its
-   initial size for a new window).
-8. Validate typed descriptors, semantic snapshots, callback bindings, state
-   dependencies, capacities, and module/source stability.
-9. Produce a prepared application change containing no unvalidated Lua table
-   data.
-
-Candidate code executes in a `preparing` capability phase. APIs with external
-effects, task spawning, or process-lifetime resource creation reject calls in
-that phase. The application entry point and UI builds are declaration work;
-effects begin only through lifecycle or event callbacks after commit.
-
-Commit occurs between the task and reconciliation phases, when no Lua code,
-build, input dispatch, or frame submission is in progress. It is allocation
-free and cannot fail after preparation. In one commit it:
-
-1. installs staged application-state keys;
-2. reconciles the desired native window set by ID;
-3. applies prepared descriptors to retained window runtimes by stable identity;
-4. replaces callback capabilities and signal dependency sets;
-5. switches the active generation pointer;
-6. invalidates affected scenes and schedules frames;
-7. queues cancellation of the old generation's language work.
-
-The previous display list remains valid until the replacement list is built
-and accepted by a renderer. Reload never produces a blank error frame as an
-intermediate state.
-
-Preparing all windows before mutation is essential. Per-window transactional
-reconciliation alone is insufficient because a later window failure would
-otherwise leave an application containing parts of two generations.
-
-## Reload lifecycle
-
-State initialization and side effects have deliberately different lifetimes:
-
-- application entry points, state `initial`/`migrate` functions, component
-  initializers, and UI builds run during preparation and must be effect-free;
-- application and component `start` callbacks run after commit in fresh
-  generation-owned execution scopes; and
-- replacing a generation or remounting a component cancels its execution scope
-  and all tasks/resources below it.
-
-An application may declare post-commit work explicitly:
-
-```lua
-local ouro = require("ouro")
-return ouro.app {
-  id = "dev.example.app",
-  run = function(context)
-    return { windows = { ... } }
-  end,
-  start = function()
-    -- Future post-commit, generation-owned effects live here.
-  end,
-}
-```
-
-`start` will be spawned only after the generation pointer and prepared UI commit. It
-inherits the generation root execution scope and may yield. At the first task
-safe point after commit, queued cancellation of the old generation is applied
-before the scheduler grants new `start` work, preventing overlapping old and
-new services. Future source-defined components follow the same model: `init`
-creates reloadable plain state only when the family is first mounted, while
-`start` establishes effects after each compatible source-generation commit.
-Retained state is rebound to the new component declaration before its new
-`start` runs.
-
-There is no synchronous user `stop` callback in the atomic commit path.
-Generation-owned native resources receive normal scope cancellation, suspended
-Lua tasks unwind through `lua_closethread`, and resource-specific cleanup runs
-through their lifecycle hooks. This prevents arbitrary old source from
-re-entering Lua or delaying a commit.
-
-Preparation failures preserve the old generation exactly. A `start` failure is
-different: it occurs after a successful commit because effectful work cannot be
-preflighted safely. It is reported as a structured runtime diagnostic, cancels
-the failed start task according to normal task rules, and does not roll back to
-source whose retirement has already begun.
-
-## Callbacks, tasks, and retirement
-
-Native input bindings store a generation-checked callback capability, not a
-bare Lua registry integer. Dispatch resolves that capability through its source
-generation. Replacing or removing a binding releases it through the generation
-that created it, so registry references are never accidentally unreferenced in
-the wrong Lua state.
-
-Native instance scopes continue to own native widget resources and survive
-compatible reloads. Language execution uses a separate scope tree rooted at
-the source generation. It maps window/widget semantic identity to execution
-scopes so either event cancels the right work:
-
-- removing a window or widget cancels its language execution subtree; and
-- replacing a source generation cancels all of that generation's language
-  execution, including suspended handlers and timers.
-
-The old Lua state is not closed synchronously during commit. It enters a
-retiring list, queued cancellations are applied at the next task safe point,
-and suspended coroutines unwind through `lua_closethread`. Completion routing
-continues to recognize retiring generations until their kernel operations,
-tasks, resources, registry references, and scopes are drained. Only then does
-Ourokit close the old VM and destroy its source snapshot.
-
-Rapid reload requests do not wait for retirement. Requests coalesce by source
-revision, candidates older than the newest completed snapshot are discarded,
-and more than one old generation may drain concurrently within a fixed host
-capacity.
-
-## Native host implementation
-
-The production runner now owns a `SourceReload` coordinator rather than one
-fixed `Application` and `Vm`. The implemented ownership boundary includes:
-
-- `main.zig` passes a retained disk source provider instead of source bytes
-  detached from their origin;
-- the runner fetches active application, UI-build, and signal ownership once
-  per turn and services coalesced requests at its reconciliation safe point;
-- window runtime records are keyed by window identity, with host capacity
-  independent of the initial declaration count;
-- callback bindings carry generation capabilities rather than raw Lua
-  registry references;
-- every candidate window owns its staged descriptors, semantics, handlers,
-  shapes, signal dependencies, and revision-checked instance plan;
-- candidate layout and scene lowering run in isolated scratch storage before
-  any retained window changes;
-- one application commit validates every window and reserves callback capacity
-  before applying the first retained plan;
-- old generations cancel and drain asynchronously while task and completion
-  routing continues by owning VM; and
-- source, declaration, and build failures become structured diagnostics and do
-  not escape the run loop after successful startup;
-- disk startup and reload evaluate the entry in scheduler-owned retained
-  coroutines, with cache misses yielding opaquely through asynchronous
-  capability-relative whole-file reads; and
-- `require("ouro")` resolves the runtime-owned built-in module synchronously,
-  while the disk module closure freezes when UI initialization completes.
-
-The first runner integration deliberately accepts only an unchanged window-ID
-set. Added and removed windows still require transactional native-host
-preparation. The process-lifetime MCP control transport now wakes the shared
-event loop and submits the same in-process request used by other producers.
-Module dependency revalidation before commit, stale-candidate supersession,
-persistent state, component-family identity, and post-commit lifecycle hooks
-remain future slices below.
-
-These changes belong in existing ownership modules. There is still no broad
-`runtime` module: `bundle` owns source, `lua` owns language generations and
-bindings, UI owns prepared typed snapshots, and `app` orders their transaction.
-
-## Development control interface
-
-`ouroctl run --dev` exposes a random per-instance endpoint at
-`$XDG_RUNTIME_DIR/ourokit/dev/<32-hex-digits>`, logged at startup. Its parent
-directories are private (0700), and its socket is 0600. Two copies coexist even
-when production with the same ID is running. No development catalog is published
-to production discovery directories. The server authenticates the Unix peer UID,
-uses Ourokit's bounded sans-I/O MCP state machines, and submits accept,
-receive, and send operations through disjoint tags in the shared `io_uring`
-loop. `ouroctl dev` accepts only an explicit path in this session's development
-directory, never an application ID or a production socket. Ordinary `run` does
-not create a server; optional `--mcp` is production actions only.
-
-The built-in tools are `runtime.reload` (returns the committed generation),
-`runtime.status` (returns application ID, active generation, reload/UI state,
-and an optional diagnostic). Their JSON Schemas are available through `tools/list`.
-Desktop activation is the separate `org.freedesktop.Application` interface.
-Tool execution failures use `isError: true` and a structured error; malformed
-RPC requests and unknown tools use JSON-RPC errors.
-
-Custom actions are named MCP tools; they cannot replace runtime tools.
-JSON Schemas and Lua handlers are validated before
-commit and replaced together. A headless reload does not invoke the UI factory.
-Calls belong to the source generation that
-accepted them. Reload cancellation returns `ActionFailed` rather than allowing
-a retiring coroutine to resume, and a Lua error fails only that call.
-
-The CLI calls the selected instance's explicit endpoint. The server
-keeps the `runtime.reload` call pending without blocking the event loop until the newest
-coalesced request either commits or fails. Every caller waiting on that request
-receives the committed generation or the same structured `ReloadFailed` error,
-so `ouroctl dev reload` has useful shell exit status without polling. Requests that
-arrive during preparation remain queued for the next transaction and cannot be
-satisfied by the in-flight candidate. Discarding that now-stale in-flight
-candidate before commit remains a separate optimization and correctness polish.
-`runtime.status` remains available for development surfaces that observe reload without
-initiating it. The future built-in command will call the same in-process request
-API and will not depend on the control socket.
-
-For cross-turn runtime operations, the host registers development-only tool
-schemas before admitting peers. `takeDevelopmentRequest` transfers an owned
-`{name, arguments}` request and unique token to the runner at a safe point.
-`developmentPending(token)` becomes false on cancellation, disconnect, shutdown,
-or source-generation retirement. The runner must check it before each playback
-advance and release the request when finished. `completeDevelopment` replies
-only after normal dispatch, tasks, reconciliation, and the final frame have
-settled. Taking a request or dispatching an input event is not completion.
-
-Automatic watching is optional policy on top. An inotify watcher may debounce
-changes and enqueue a reload, but it receives no privileged fast path and
-cannot weaken snapshot or transactional guarantees.
-
-## Required verification
-
-The reload implementation is not complete until headless integration tests
-prove these cases:
-
-- syntax, module execution, declaration, and UI-build failures retain the old
-  generation, callbacks, state, windows, and display list;
-- a successful reload switches every window and callback in one commit;
-- changing a callback uses the new closure immediately after commit;
-- unchanged window IDs preserve native handles;
-- unchanged widget keys preserve compatible native widget state;
-- matching component family/version preserves state, while changing
-  `hot_version` remounts and reruns initialization;
-- added, removed, reordered, and title-updated windows reconcile correctly;
-- `ouro.state` values survive, migrate transactionally in either version
-  direction, and remain unchanged after failed migrations;
-- ordinary signals and module locals reset;
-- post-commit `start` runs in the new generation scope and its failure cannot
-  resurrect or partially reactivate the old generation;
-- old sleeping handlers are canceled and to-be-closed values unwind;
-- completions for retiring generations cannot resume the active generation;
-- edits or atomic renames during preparation cannot commit a mixed snapshot;
-- repeated requests coalesce and stale candidates never replace newer source;
-- callback references are released from the Lua state that owns them; and
-- source reload still obeys the existing rule that only the task phase enters
-  yieldable Lua and only reconciliation performs UI builds.
-
-Wayland tests then need only verify that a retained ID keeps its native window
-while title/content changes become visible. The transaction, failure, state,
-and task semantics should remain testable without a compositor.
-
-## Delivery order
-
-The smallest sequence that preserves the final architecture is:
-
-1. Add disk/embedded source providers, immutable snapshots, controlled
-   `require`, and structured Lua diagnostics.
-2. Introduce `SourceGeneration` and make initial startup use the same
-   prepare/commit path as every later reload.
-3. Replace declaration-indexed runner arrays with keyed, capacity-bounded
-   window runtime records.
-4. Add prepared multi-window builds and an allocation-free application commit.
-5. Add generation callback capabilities, execution scopes, and asynchronous
-   old-generation retirement.
-6. Add versioned keyed `ouro.state`, migration, component family/version
-   identity, and their staged commit views.
-7. Add post-commit application/component lifecycle scopes.
-8. Add the completion-returning built-in reload request and development control
-   endpoint.
-9. Optionally add file watching as another request producer.
-
-There must not be a separate unsafe “quick reload” path. Startup, explicit
-reload, control-interface reload, and future watcher reload all use the same
-generation transaction.
+`bundle` owns source providers and snapshots. `lua` owns language state and
+bindings. Window runtimes own prepared typed UI and retained native state.
+`app.SourceReload` and the runner order the application-wide transaction.
+
+Each generation owns its Lua VM, module cache, declarations, closures, signal
+graph, and language tasks/resources. Old source is never patched into a live
+VM. Callback capabilities identify their owning generation, so an old registry
+reference cannot be dispatched or released through a replacement VM.
+
+Retirement is asynchronous. Removed runtimes detach callbacks and signal
+dependencies before the old VM is marked detached. Old tasks receive scope
+cancellation, suspended coroutines unwind, and pending kernel work drains before
+the generation is destroyed. Retirement capacity is bounded; exhaustion rejects
+a candidate rather than discarding still-live resources.
+
+## Preserved state follows native identity
+
+- Unchanged application window IDs preserve native window handles.
+- Compatible keyed widgets preserve retained native state, including focus,
+  text editing, selection, and scrolling where the widget owns that state.
+- Renderer, font, glyph, and paragraph caches belong to the surviving host.
+- Lua locals, globals, module values, and `ouro.signal` values reset with the VM.
+  Native retention is not general application-state persistence.
+
+The application ID cannot change during reload. Such a candidate fails with
+`ApplicationIdChanged` and requires a new process. Development enablement and
+socket identity are launch configuration. Optional action declarations and their
+schemas may be added, changed, or removed across generations independently.
+
+Window declarations may be added, removed, reordered, and updated. New windows
+are built once in stable reserved runtime slots; commit adopts that validated
+build rather than executing unchecked source again. Removed windows undergo
+normal closure and scope retirement. Adding replacements needs temporary free
+slot capacity while old windows retire. Reusing an ID that is still retiring
+fails with `SourceWindowRetiring`.
+
+A compositor-closed window is suppressed while its declaration remains present.
+A committed generation must omit that ID before later source can create it
+again. Suppressed declarations are still validated in scratch runtimes, so an
+invalid hidden window cannot enter the active generation unnoticed.
+
+## Preparation precedes native changes
+
+The runner consumes reload requests at its task/reconciliation safe point:
+
+1. Read source and evaluate a candidate in a fresh generation.
+2. Validate identity and window declarations; reserve local window IDs, scopes,
+   strings, and stable runtime slots without issuing native changes.
+3. Build every desired window at its configured or initial size, including
+   additions and suppressed declarations.
+4. Validate retained instance plans, layout, scene lowering, callback capacity,
+   and aggregate instance-scope capacity across all windows.
+5. Commit prepared runtime ownership and control schemas, reconcile native
+   windows, invalidate replacement frames, and retire old source.
+
+A later window's build failure cannot leave earlier windows partially replaced.
+Local allocation and capacity checks occur before retained UI changes. The
+subsequent native commit may still fail as described above.
+
+Requests visible in one batch coalesce. Requests arriving during preparation
+remain queued for the next transaction; they are not satisfied by the earlier
+candidate's acknowledgment. There is no automatic file watcher or built-in
+reload keyboard command today.
+
+## Modules are generation-local
+
+Disk startup and reload evaluate source in scheduler-owned coroutines. Module
+cache misses yield through asynchronous capability-relative file reads. Module
+names resolve within the entry source root as `name.lua` or `name/init.lua`;
+path traversal and arbitrary native module loading are not enabled by `require`.
+`require("ouro")` resolves the runtime-owned module without a disk read.
+
+The module loader freezes after UI initialization. Already loaded modules stay
+available, but a callback cannot load previously unseen mutable source. Explicit
+headless execution leaves loading available until a deferred UI factory finishes.
+
+Files are not currently revalidated as one atomic multi-file snapshot after
+preparation. Avoid changing dependencies during a reload; atomic per-file saves
+do not themselves guarantee a consistent multi-file revision.
+
+## Development transport stays private
+
+`--dev` logs a random `$XDG_RUNTIME_DIR/ourokit/dev/<32-hex-digits>` endpoint.
+Its parent directories are 0700 and the socket is 0600. The server checks the
+Unix peer UID. No development catalog is published in production discovery
+directories, and CLI requests require the explicit endpoint, never an app ID.
+
+The transport uses bounded MCP `tools/list` and `tools/call` messages on the
+shared event loop. Runtime tools are reserved; application actions cannot
+replace them. Invalid calls use JSON-RPC errors; execution failures use MCP
+`isError` and structured error results. Pending application actions remain owned
+by their source generation and are canceled when that generation retires.
+
+The runner registers development operation schemas before admitting peers.
+`takeDevelopmentRequest` transfers an owned request and unique token at a safe
+point. `developmentPending` rejects canceled, disconnected, shutdown, and retired
+requests. Input playback advances one event at a time, running normal dispatch,
+tasks, reconciliation, and frame work between events. The runner completes a
+request only after the final event settles, not when it is merely queued.
+
+## Verification covers transactions and native integration
+
+Headless tests exercise candidate failures, aggregate capacity rejection,
+retained widget identity, removed callback detachment, signal dependency
+survival, and ownership across generation retirement. Native tests additionally
+exercise window creation/removal, visible replacement content, stale targets,
+and input on newly added windows.
+
+Versioned application-state migration, source-defined component family tokens,
+post-commit application lifecycle hooks, multi-file dependency revalidation, and
+file watching are not implemented contracts. Applications should not depend on
+proposed APIs for those features.
