@@ -3,8 +3,9 @@ set -euo pipefail
 
 # Native integration tests use an isolated compositor, not the orb's desktop.
 # Portal fixtures run against a private D-Bus session through system Python.
+# Application benchmarks also build the matched GTK and Qt software fixtures.
 missing=()
-for package in weston xvfb xdotool sway grim python3-dbus python3-gi; do
+for package in weston xvfb xdotool sway grim wayland-utils python3-dbus python3-gi libgtk-4-dev qt6-base-dev qt6-wayland; do
   if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]]; then
     missing+=("$package")
   fi
