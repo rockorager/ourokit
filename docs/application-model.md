@@ -86,6 +86,12 @@ create state in `run` or application initialization. New IDs mount native
 surfaces, omitted IDs retire them, and retained IDs preserve their widget
 runtime. Reopening a removed ID mounts fresh widgets after teardown drains.
 An empty reactive list keeps the application alive for later state changes.
+Retained windows with the same `content` function do not rerender content just
+because `windows()` reruns or a title changes. Each content function tracks its
+own signal reads; replacing that function invalidates only its window. Store
+stable content functions outside `windows()` when their identity should survive
+declaration updates. Geometry and host appearance changes still invalidate the
+affected window as needed.
 Evaluation and parsing failures retain the last valid list. `outputs = "all"` still
 expands to stable per-output IDs. Source reload retains matching IDs and their
 widget identity, retires removed IDs, and prepares added IDs before committing.
@@ -1158,13 +1164,43 @@ or `"fill"` and default to `"fill"`; `flex` is also supported. Item keys must be
 stable, unique, non-empty strings. The list key, item key, and keys within the
 returned description form each row's semantic target path.
 
-Builds evaluate `item_key` for all items and retain O(N) key and provider
-metadata. Native scrolling reuses this metadata while the list props and the
-signals read by `item_key` remain unchanged. `render_item` and native nodes are
-limited to the visible rows plus a two-row buffer on each side. Variable rows
-replace their estimate with measured native height (at least one pixel),
-preserving the scroll anchor by item key as measurements or width change. A
-focused row remains mounted even when it moves outside that range.
+`item_key` and `render_item` are lazy: builds evaluate the visible rows plus a
+two-row buffer on each side, with additional key lookups for the previous
+anchor, mounted measurements, and focused row. A fresh root render does not
+scan all items. Fixed-height offsets use arithmetic, not an item-sized table.
+Variable rows use a sparse measurement index; unseen rows use the estimate,
+while measured native heights are at least one pixel. Native scrolling retains
+offscreen measurements; data/provider or width changes discard them, keeping
+mounted heights provisionally until layout measures them again. Measurement
+updates are staged so a failed build preserves the committed index.
+
+For insertions or reordering, optionally provide `item_index(key)`, returning
+the key's current 1-based integer index, or `nil` if removed. It must agree with
+`item_key(index)`. For example, an application model can maintain
+`positions[key]` alongside its ordered records:
+
+```lua
+item_key = function(index) return records[index].id end,
+item_index = function(key) return positions[key] end,
+```
+
+The list uses this lookup to preserve a moved scroll anchor and keep a focused
+row mounted outside the viewport. Without it, a previous anchor or focused row
+is retained only if its key remains at its previous index. A removed focus row
+unmounts normally. Signals read by either key provider invalidate the list's
+key reader; row-provider signals invalidate its separate row reader.
+
+A clean retained list can reuse its complete plan when its declaration,
+enclosing renders, readers, geometry, measurements, and focus pin are unchanged.
+Explicit invalidation, changed root arguments or callback, and executed
+enclosing renders force bounded provider evaluation even if they return the
+same declaration. Fresh closures are not assumed to have unchanged results.
+
+Migration from the eager implementation: add `item_index` if data can move and
+must retain anchor/focus identity. Keys must still be globally unique, but
+duplicate and invalid keys are checked only among keys visited in a build;
+unseen invalid data no longer fails the initial build. Do not rely on providers
+running for every item or use them for whole-model validation.
 
 The viewport handles wheel scrolling and Up/Down, Home/End, and Page Up/Page
 Down. It is a generic viewport, not a listbox: it has no selection model. Data

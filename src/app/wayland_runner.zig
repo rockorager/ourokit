@@ -17,6 +17,7 @@ const core = @import("../core/root.zig");
 const design = @import("../design/root.zig");
 const io_loop = @import("../loop/root.zig");
 const lua = @import("../lua/root.zig");
+const lua_c = @import("../lua/c.zig");
 const platform = @import("../platform/root.zig");
 const renderer = @import("../renderer/root.zig");
 const shell = @import("../shell/root.zig");
@@ -69,6 +70,8 @@ const RuntimeSlot = struct {
     id: ?[]u8 = null,
     declared: bool = false,
     next_declared: bool = false,
+    content_reference: c_int = lua_c.no_reference,
+    content_changed: bool = false,
     desired: bool = false,
     configured_size: ?core.SizeU = null,
     frames_seen: usize = 0,
@@ -699,7 +702,8 @@ fn runSourceInternal(
                 };
                 try syncRuntimeSlots(init.gpa, runtime_slots, active_application.windows);
                 for (runtime_slots) |*slot| if (slot.runtime.ready and slot.desired) {
-                    _ = try slot.runtime.build_owners.markDirty(slot.runtime.root_owner);
+                    if (slot.content_changed)
+                        _ = try slot.runtime.build_owners.markDirty(slot.runtime.root_owner);
                 };
                 desired_changed = true;
             }
@@ -1542,7 +1546,10 @@ const PreparedRuntimeSlots = struct {
         self.committed = true;
         for (self.slots) |*slot| {
             const id = slot.id orelse continue;
-            const declared = applicationWindowForId(self.candidate.application.windows, id) != null;
+            const window = applicationWindowForId(self.candidate.application.windows, id);
+            const declared = window != null;
+            slot.content_reference = if (window) |value| value.content_reference else lua_c.no_reference;
+            slot.content_changed = false;
             if (!declared) {
                 slot.desired = false;
                 if (slot.runtime.registered) {
@@ -1661,6 +1668,9 @@ fn syncRuntimeSlots(
             };
         }
         const target = slot orelse return error.WindowCapacityExceeded;
+        target.content_changed = target.declared and
+            target.content_reference != declaration.content_reference;
+        target.content_reference = declaration.content_reference;
         if (!target.declared) {
             target.desired = true;
             target.frames_seen = 0;
@@ -1669,7 +1679,11 @@ fn syncRuntimeSlots(
     }
     for (slots) |*slot| {
         if (slot.popup != null) continue;
-        if (slot.declared and !slot.next_declared) slot.desired = false;
+        if (slot.declared and !slot.next_declared) {
+            slot.desired = false;
+            slot.content_reference = lua_c.no_reference;
+            slot.content_changed = false;
+        }
         slot.declared = slot.next_declared;
         slot.next_declared = false;
     }
@@ -1782,6 +1796,13 @@ test "runtime slots retain window state by ID across declaration changes" {
     try std.testing.expect(runtimeSlotForId(&slots, "tools").? == tools);
     try std.testing.expectEqual(@as(usize, 4), main.frames_seen);
     try std.testing.expectEqual(@as(u32, 320), tools.configured_size.?.width);
+    try std.testing.expect(!main.content_changed and !tools.content_changed);
+
+    var changed = reordered;
+    changed[0].content_reference = 3;
+    try syncRuntimeSlots(std.testing.allocator, &slots, &changed);
+    try std.testing.expect(!main.content_changed);
+    try std.testing.expect(tools.content_changed);
 
     try syncRuntimeSlots(std.testing.allocator, &slots, initial[1..]);
     try std.testing.expect(!main.declared and !main.desired);
@@ -1953,6 +1974,9 @@ test "structural reload validates later additions and capacity before retaining 
     const active = reload.active();
     const keep = runtimeSlotForId(&slots, "keep").?;
     const removed = runtimeSlotForId(&slots, "remove").?;
+    try std.testing.expectEqual(applicationWindowForId(active.application.windows, "keep").?.content_reference, keep.content_reference);
+    try syncRuntimeSlots(std.testing.allocator, &slots, active.application.windows);
+    try std.testing.expect(!keep.content_changed and !removed.content_changed);
     const handle = keep.runtime.window;
     const scope = try windows.scope(handle);
     const button_id = (try keep.runtime.semantics.findPath("button")).id;

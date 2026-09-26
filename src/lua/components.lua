@@ -32,6 +32,7 @@ function M.root(callback, ...)
     else
         select_reader(-1) -- Preserve the clean root's committed dependencies.
         t.root = t.old.root
+        t.root_clean = true
     end
     t.callback, t.args = callback, args
     return t.root
@@ -63,7 +64,8 @@ function M.render(definition, props, children, parent, visual_parent)
         output = record.output }
     t.updates[#t.updates + 1] = update
     record.values = values
-    if not old or changed or dirty(record.token) then
+    local retained = old and not changed and not dirty(record.token)
+    if not retained then
         select_reader(record.token)
         if not old then
             record.render = definition[1](record.proxy)
@@ -74,23 +76,24 @@ function M.render(definition, props, children, parent, visual_parent)
     -- Prepared snapshots outlive later updates to the same mounted record.
     -- Pin immutable output cells, not just the mutable retained mount table.
     t.outputs[#t.outputs + 1] = update.output
-    return update.output.value, record.token
+    return update.output.value, record.token, retained
 end
 
-function M.virtual(props, id)
+function M.virtual(props, id, scope_clean, capacity)
     local t = transaction
     assert(not t.lists[id], "duplicate virtual list key")
     local old = t.old.lists[id]
     local token, key_token
     if old then token, key_token = old.token, old.key_token
     else serial = serial + 2; token, key_token = serial - 1, serial end
-    -- Native scrolling can retain indexed metadata without reevaluating its
-    -- providers. Keep their subscriptions separate from visible row reads.
-    local reuse_keys = old and old.props == props and t.native_update and not dirty(key_token)
-    local plan = build_list(props, old, id, geometry, select_reader, key_token, token, reuse_keys)
-    plan.token, plan.key_token = token, key_token
+    -- An executed ancestor may change plain captured data even when it returns
+    -- the same declaration. Only retained scopes can preserve provider reads.
+    local reuse_keys = old and old.props == props and t.root_clean and scope_clean and not dirty(key_token)
+    local plan = build_list(props, old, id, geometry, select_reader, key_token, token,
+        reuse_keys, reuse_keys and not dirty(token), capacity)
+    if plan ~= old then plan.token, plan.key_token = token, key_token end
     t.lists[id] = plan
-    return plan
+    return plan, plan == old
 end
 
 function M.finish()

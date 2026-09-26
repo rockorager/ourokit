@@ -88,6 +88,7 @@ pub const UiBuild = struct {
     root_reference: c_int = c.no_reference,
     components: Components = .{},
     component_namespace: u64 = 0,
+    component_scope_clean: bool = true,
     virtual_lists: virtual_list.Snapshot = .{},
     semantic_storage: []SemanticDescriptor = &.{},
     semantic_count: usize = 0,
@@ -205,6 +206,7 @@ pub const UiBuild = struct {
         self.parent_count = 0;
         self.theme_count = 0;
         self.component_namespace = 0;
+        self.component_scope_clean = true;
         self.virtual_lists = .{};
         self.pending_button_count = 0;
         self.pending_text_input_count = 0;
@@ -665,7 +667,9 @@ pub const UiBuild = struct {
         _ = c.lua_getiuservalue(state, 1, 2);
         c.lua_pushinteger(state, @bitCast(self.component_namespace));
         c.lua_pushinteger(state, @bitCast(parent.id));
-        if (c.lua_pcallk(state, 5, 2, 0, 0, null) != c.ok) return c.lua_error(state);
+        if (c.lua_pcallk(state, 5, 3, 0, 0, null) != c.ok) return c.lua_error(state);
+        const retained = c.lua_toboolean(state, -1) != 0;
+        c.lua_settop(state, -2);
         var number: c_int = 0;
         const token: u64 = @intCast(c.lua_tointegerx(state, -1, &number));
         c.lua_settop(state, -2);
@@ -676,11 +680,14 @@ pub const UiBuild = struct {
             return luaError(state, "component nesting is too deep");
         const previous = self.component_namespace;
         self.component_namespace = group;
+        const previous_clean = self.component_scope_clean;
+        self.component_scope_clean = previous_clean and retained;
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, lowerDescription, 1);
         c.lua_pushvalue(state, -2);
         const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
         self.component_namespace = previous;
+        self.component_scope_clean = previous_clean;
         self.popParent();
         if (status != c.ok) return c.lua_error(state);
         return 0;
@@ -698,6 +705,10 @@ pub const UiBuild = struct {
             c.lua_settop(state, -2);
             if (kind != c.type_function) return luaError(state, "item_key and render_item must be functions");
         }
+        const index_kind = c.lua_getfield(state, props, "item_index");
+        c.lua_settop(state, -2);
+        if (index_kind != c.type_nil and index_kind != c.type_function)
+            return luaError(state, "item_index must be a function");
         const fixed = tableOptionalNullableExtent(state, props, "item_height") orelse return luaError(state, "invalid item_height");
         const estimated = tableOptionalNullableExtent(state, props, "estimated_item_height") orelse return luaError(state, "invalid estimated_item_height");
         if ((fixed.value == null) == (estimated.value == null))
@@ -714,7 +725,11 @@ pub const UiBuild = struct {
         self.components.push("virtual");
         c.lua_pushvalue(state, props);
         c.lua_pushinteger(state, @bitCast(id));
-        if (c.lua_pcallk(state, 2, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        c.lua_pushboolean(state, @intFromBool(self.component_scope_clean));
+        c.lua_pushinteger(state, @intCast(self.virtual_lists.rows.len - self.virtual_lists.row_count));
+        if (c.lua_pcallk(state, 4, 2, 0, 0, null) != c.ok) return c.lua_error(state);
+        const retained = c.lua_toboolean(state, -1) != 0;
+        c.lua_settop(state, -2);
         const plan: c_int = 3;
         const total = tableRequiredExtent(state, plan, "total") orelse return luaError(state, "virtual list extent is too large");
         if (self.virtual_lists.count == self.virtual_lists.lists.len) return luaError(state, "virtual list capacity exceeded");
@@ -744,6 +759,9 @@ pub const UiBuild = struct {
         const row_start = self.virtual_lists.row_count;
         self.virtual_lists.row_count += row_count;
         self.virtual_lists.lists[list_index].row_count = row_count;
+        const previous_clean = self.component_scope_clean;
+        self.component_scope_clean = previous_clean and retained;
+        defer self.component_scope_clean = previous_clean;
         for (0..row_count) |index| {
             _ = c.lua_rawgeti(state, rows, @intCast(index + 1));
             const row: c_int = 5;

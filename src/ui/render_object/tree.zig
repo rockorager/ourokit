@@ -989,14 +989,17 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .box => |old_box| changed: {
             const new_box = new.box;
             break :changed old_box.width != new_box.width or old_box.height != new_box.height or
+                old_box.min_width != new_box.min_width or old_box.min_height != new_box.min_height or
+                old_box.fill_width != new_box.fill_width or old_box.fill_height != new_box.fill_height or
                 old_box.border_width != new_box.border_width or
                 !std.meta.eql(old_box.padding, new_box.padding) or
                 !std.meta.eql(old_box.alignment, new_box.alignment);
         },
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
-        .stack => false,
+        .stack => |old_stack| old_stack.unbounded_height != new.stack.unbounded_height,
         .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
-        .image => |old_image| !std.meta.eql(old_image.image, new.image.image) or
+        .image => |old_image| (old_image.width == null or old_image.height == null) and
+            !std.meta.eql(old_image.image, new.image.image) or
             old_image.width != new.image.width or old_image.height != new.image.height or
             old_image.fill_width != new.image.fill_width or old_image.fill_height != new.image.fill_height,
         .canvas => |old_drawing| !std.meta.eql(old_drawing.size, new.canvas.size),
@@ -1007,7 +1010,8 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .text_input => |old_input| !sameSource(old_input.source, new.text_input.source) or
             !std.meta.eql(old_input.placeholder, new.text_input.placeholder) or
             (old_input.placeholder != null and (old_input.preedit == null) != (new.text_input.preedit == null)) or
-            old_input.alignment != new.text_input.alignment,
+            old_input.alignment != new.text_input.alignment or
+            old_input.caret_width != new.text_input.caret_width,
     };
 }
 
@@ -1050,6 +1054,89 @@ fn objectSource(object: types.Object) ?text.ParagraphSourceHandle {
 fn hasCaretBoundary(positioned: *const text.PositionedLines, byte_offset: usize) bool {
     for (positioned.carets) |caret| if (caret.byte_offset == byte_offset) return true;
     return false;
+}
+
+test "layout property classification includes geometry and excludes paint-only state" {
+    for ([_]types.Box{
+        .{ .min_width = 10 }, .{ .min_height = 5 }, .{ .fill_width = true }, .{ .fill_height = true },
+    }) |box| try std.testing.expect(layoutPropertiesChanged(.{ .box = .{} }, .{ .box = box }));
+    try std.testing.expect(layoutPropertiesChanged(
+        .{ .stack = .{} },
+        .{ .stack = .{ .unbounded_height = true } },
+    ));
+    const source: text.ParagraphSourceHandle = .{ .slot = 0, .generation = 1 };
+    const input: types.TextInput = .{
+        .source = source,
+        .color = Color.rgba(1, 2, 3, 255),
+        .selection_color = Color.rgba(4, 5, 6, 255),
+        .caret_color = Color.rgba(7, 8, 9, 255),
+        .selection_start = 0,
+        .selection_end = 0,
+        .caret_offset = 0,
+    };
+    var wider_caret = input;
+    wider_caret.caret_width = 3;
+    try std.testing.expect(layoutPropertiesChanged(.{ .text_input = input }, .{ .text_input = wider_caret }));
+
+    try std.testing.expect(!layoutPropertiesChanged(
+        .{ .box = .{} },
+        .{ .box = .{ .background = Color.rgba(10, 20, 30, 255), .clip = true } },
+    ));
+    const fixed: types.Image = .{ .width = 40, .height = 20 };
+    var replacement = fixed;
+    replacement.image = .{ .slot = 0, .generation = 1 };
+    try std.testing.expect(!layoutPropertiesChanged(.{ .image = fixed }, .{ .image = replacement }));
+    try std.testing.expect(layoutPropertiesChanged(.{ .image = .{ .width = 40 } }, .{ .image = replacement }));
+}
+
+test "box geometry updates invalidate ancestors and refresh size and hit bounds" {
+    const Case = struct { box: types.Box, size: SizeF };
+    for ([_]Case{
+        .{ .box = .{ .min_width = 73 }, .size = .{ .width = 73, .height = 11 } },
+        .{ .box = .{ .min_height = 29 }, .size = .{ .width = 13, .height = 29 } },
+        .{ .box = .{ .fill_width = true }, .size = .{ .width = 101, .height = 11 } },
+        .{ .box = .{ .fill_height = true }, .size = .{ .width = 13, .height = 83 } },
+    }) |case| {
+        var tree: Tree = undefined;
+        try tree.init(std.testing.allocator, 3);
+        defer tree.deinit();
+        const root = try tree.create(.{ .stack = .{} });
+        const box = try tree.create(.{ .box = .{} });
+        const leaf = try tree.create(.{ .box = .{ .width = 13, .height = 11 } });
+        try tree.appendChild(root, box, .none);
+        try tree.appendChild(box, leaf, .none);
+        const bounds: Constraints = .{ .max_width = 101, .max_height = 83 };
+        try std.testing.expectEqual(SizeF{ .width = 13, .height = 11 }, try tree.layout(root, bounds));
+        const point: PointF = .{ .x = case.size.width - 0.5, .y = case.size.height - 0.5 };
+        try std.testing.expectEqual(@as(?NodeHandle, null), try tree.hitTest(root, point));
+        try tree.update(box, .{ .box = case.box });
+        try std.testing.expect(try tree.layoutDirty(root));
+        try std.testing.expectEqual(case.size, try tree.layout(root, bounds));
+        try std.testing.expectEqual(case.size, try tree.nodeSize(box));
+        // Unaligned boxes pass minimum constraints to their child as well.
+        try std.testing.expectEqual(case.size, try tree.nodeSize(leaf));
+        try std.testing.expectEqual(leaf, (try tree.hitTest(root, point)).?);
+        try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(root));
+    }
+}
+
+test "stack height constraint updates relayout retained children in both directions" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    const root = try tree.create(.{ .stack = .{} });
+    const child = try tree.create(.{ .box = .{ .width = 13, .height = 140 } });
+    try tree.appendChild(root, child, .none);
+    const bounds: Constraints = .{ .max_width = 101, .max_height = 83 };
+    _ = try tree.layout(root, bounds);
+    try std.testing.expectEqual(@as(f32, 83), (try tree.nodeSize(child)).height);
+    try tree.update(root, .{ .stack = .{ .unbounded_height = true } });
+    _ = try tree.layout(root, bounds);
+    try std.testing.expectEqual(@as(f32, 140), (try tree.nodeSize(child)).height);
+    try tree.update(root, .{ .stack = .{} });
+    _ = try tree.layout(root, bounds);
+    try std.testing.expectEqual(@as(f32, 83), (try tree.nodeSize(child)).height);
+    try std.testing.expectEqual(@as(usize, 3), try tree.layoutCount(child));
 }
 
 test "flex layout is bounded, cached, and separates paint invalidation" {
@@ -1494,6 +1581,16 @@ test "text input scrolls one line and shares viewport coordinates with caret hit
         try std.testing.expect((try tree.slot(input)).text_offset_x >= 0);
         caret = try tree.textCaretRectangle(input);
         try std.testing.expect(caret.x >= 0 and caret.x + caret.width <= 900);
+        // Bounded inputs fill their width; unbounded inputs include the caret
+        // in their intrinsic width instead.
+        const intrinsic = try tree.layout(input, .{ .max_height = 100 });
+        object.text_input.caret_width = 5;
+        try tree.update(input, object);
+        try std.testing.expect(try tree.layoutDirty(input));
+        _ = try tree.layout(input, .{ .max_height = 100 });
+        try std.testing.expectApproxEqAbs(intrinsic.width + 4, (try tree.nodeSize(input)).width, 0.001);
+        try std.testing.expectEqual(intrinsic.height, (try tree.nodeSize(input)).height);
+        try std.testing.expectEqual(@as(f32, 5), (try tree.textCaretRectangle(input)).width);
         try tree.destroy(input);
     }
 }
@@ -1790,6 +1887,17 @@ test "image tree retains intrinsic resources and emits scaled clipped native com
     try tree.buildScene(root, &builder);
     try std.testing.expectEqual(@as(usize, 2), builder.count);
     try std.testing.expect(commands[0] == .push_clip_rect and commands[1] == .pop_clip);
+
+    // Loading a resource into an explicitly sized image changes paint only.
+    try tree.update(leaf, .{ .image = .{ .image = image, .width = 35.5, .height = 17.25 } });
+    try std.testing.expect(!(try tree.layoutDirty(root)));
+    try std.testing.expect(try tree.paintDirty(root));
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 100, .height = 80 }));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(leaf));
+    builder = try scene_builder.Builder.init(&commands, 2);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(image, commands[1].image.image);
+    try std.testing.expectEqual(RectI{ .x = 2, .y = 5, .width = 72, .height = 35 }, commands[1].image.bounds);
 
     try tree.update(leaf, .{ .image = .{ .image = image } });
     try images.release(image);

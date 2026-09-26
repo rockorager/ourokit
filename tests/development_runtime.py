@@ -199,6 +199,65 @@ def session(root):
         assert metrics['submitted_revision'] == metrics['scene_revision']
         assert json.loads(cli(env, 'diagnostics', path))['diagnostic'] is None
         print('PASS native live inspection/input/capture/metrics; rejected and accepted structural reload; identity/stale tokens/cancellation')
+
+        # Window declarations and each content callback have independent signal
+        # readers. Metadata-only updates must not rerender unchanged content.
+        atomic_write(app, '''local o = require('ouro')
+local title, alternate, value = o.signal('Original'), o.signal(false), o.signal(0)
+local main_builds, peer_builds = 0, 0
+local function main()
+  main_builds = main_builds + 1
+  return o.column {key='root',
+    o.text {key='count', text='Main builds '..main_builds},
+    o.button {key='rename', label='Rename peer', on_press=function() title:set('Renamed') end},
+    o.button {key='replace', label='Replace peer', on_press=function() alternate:set(true) end}}
+end
+local function peer()
+  peer_builds = peer_builds + 1
+  return o.column {key='root',
+    o.text {key='count', text='Peer builds '..peer_builds..' value '..value()},
+    o.button {key='bump', label='Bump', on_press=function() value:set(value()+1) end}}
+end
+local function replacement()
+  return o.text {key='replacement', text='Changed callback'}
+end
+return o.app {id='dev.ourokit.live-test', run=function() return {windows=function()
+  return {o.window {id='main', title='Main', width=320, height=200, content=main},
+    o.window {id='peer', title=title(), width=320, height=200,
+      content=alternate() and replacement or peer}}
+end} end}
+''')
+        assert 'generation 3' in cli(env, 'reload', path)
+        # Reload acknowledges commit, not the new surfaces' final configure.
+        # Establish a quiet baseline before measuring controlled updates; do
+        # not hide stale-token errors by retrying the subsequent input actions.
+        deadline = time.monotonic() + 8
+        previous, stable_since = None, time.monotonic()
+        while True:
+            snapshots = tuple(inspect(env, path, window) for window in ('main', 'peer'))
+            now = time.monotonic()
+            if snapshots != previous:
+                previous, stable_since = snapshots, now
+            elif now - stable_since >= .3:
+                break
+            assert now < deadline, ('new windows did not settle', snapshots)
+            time.sleep(.05)
+        main_before = node(snapshots[0], 'root/count')['label']
+        peer_before = node(snapshots[1], 'root/count')['label']
+        assert main_before.startswith('Main builds ') and peer_before.endswith(' value 0')
+        peer_renders = int(peer_before.split()[2])
+        peer_builds = json.loads(cli(env, 'metrics', path, {'window':'peer'}))['windows'][0]['metrics']['builds']['count']
+        action(env, path, 'main', action='click', target='root/rename')
+        assert node(inspect(env, path, 'main'), 'root/count')['label'] == main_before
+        assert node(inspect(env, path, 'peer'), 'root/count')['label'] == peer_before
+        assert json.loads(cli(env, 'metrics', path, {'window':'peer'}))['windows'][0]['metrics']['builds']['count'] == peer_builds
+        action(env, path, 'peer', action='click', target='root/bump')
+        assert node(inspect(env, path, 'peer'), 'root/count')['label'] == f'Peer builds {peer_renders + 1} value 1'
+        assert node(inspect(env, path, 'main'), 'root/count')['label'] == main_before
+        action(env, path, 'main', action='click', target='root/replace')
+        assert node(inspect(env, path, 'peer'), 'replacement')['label'] == 'Changed callback'
+        assert node(inspect(env, path, 'main'), 'root/count')['label'] == main_before
+        print('PASS native window declaration/content scope isolation and changed callback invalidation')
     finally:
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)

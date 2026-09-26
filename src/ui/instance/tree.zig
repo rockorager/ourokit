@@ -39,6 +39,7 @@ const Slot = struct {
     focusable: bool = false,
     traversal_order: usize = 0,
     reconcile_child: ?render_object.NodeHandle = null,
+    rebuild_children: bool = false,
 };
 
 const IndexEntry = struct {
@@ -245,10 +246,35 @@ pub const Tree = struct {
         const topology_changed = plan.topology_changed;
 
         if (topology_changed) {
-            // Detach first so retained objects can change typed parent roles
-            // and desired order without replacing their identities.
-            for (self.slots) |slot| if (slot.state == .active and slot.parent_id != null)
-                self.render_tree.detachChild(slot.render.?) catch unreachable;
+            // Identify only parents whose ordered, typed edge list changed.
+            // Detaching a whole affected list keeps append semantics simple
+            // without invalidating unrelated branches.
+            for (self.slots) |*slot| if (slot.state == .active) {
+                slot.reconcile_child = self.render_tree.firstChild(slot.render.?);
+                slot.rebuild_children = false;
+            };
+            for (descriptors) |descriptor| {
+                const parent_id = descriptor.parent orelse continue;
+                const parent = self.findActiveById(parent_id) orelse continue;
+                const child = self.findActiveById(descriptor.id);
+                const expected = parent.reconcile_child;
+                if (child == null or expected == null or !same(expected.?, child.?.render.?) or
+                    !std.meta.eql(try self.render_tree.parentData(child.?.render.?), descriptor.parent_data))
+                {
+                    parent.rebuild_children = true;
+                } else {
+                    parent.reconcile_child = self.render_tree.nextSibling(expected.?);
+                }
+            }
+            for (self.slots) |*slot| {
+                if (slot.state == .active and slot.reconcile_child != null)
+                    slot.rebuild_children = true;
+            }
+            for (self.slots) |slot| if (slot.state == .active and slot.parent_id != null) {
+                const parent = self.findActiveById(slot.parent_id.?).?;
+                if (parent.rebuild_children)
+                    self.render_tree.detachChild(slot.render.?) catch unreachable;
+            };
         }
 
         for (self.slots) |*slot| {
@@ -282,6 +308,7 @@ pub const Tree = struct {
                 .depth = if (parent_slot) |parent| parent.depth + 1 else 0,
                 .scope = instance_scope,
                 .render = render,
+                .rebuild_children = true,
             };
             _ = (IdIndex{ .entries = self.instance_entries }).put(
                 descriptor.id,
@@ -310,11 +337,12 @@ pub const Tree = struct {
             }
             if (topology_changed) if (descriptor.parent) |parent_id| {
                 const parent = self.findActiveById(parent_id).?;
-                self.render_tree.appendChild(
-                    parent.render.?,
-                    slot.render.?,
-                    descriptor.parent_data,
-                ) catch unreachable;
+                if (parent.rebuild_children)
+                    self.render_tree.appendChild(
+                        parent.render.?,
+                        slot.render.?,
+                        descriptor.parent_data,
+                    ) catch unreachable;
             };
         }
         self.revision +%= 1;
@@ -670,6 +698,54 @@ test "typed snapshots preserve keyed state and reorder render children" {
         try instances.renderObject(instances.handleForId(3).?),
         renders.firstChild(root).?,
     );
+
+    try instances.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try instances.collectRetired();
+    try scheduler.destroyScope(window_scope);
+}
+
+test "topology reconciliation relayouts only the affected sibling branch" {
+    const Constraints = @import("../layout/constraints.zig").Constraints;
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 12, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 8);
+    defer renders.deinit();
+    var instances: Tree = undefined;
+    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 8);
+    defer instances.deinit();
+
+    const initial = [_]Descriptor{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .flex = .{ .main_axis_size = .min } } },
+        .{ .id = 3, .parent = 2, .object = .{ .box = .{ .width = 10, .height = 10 } } },
+        .{ .id = 4, .parent = 1, .object = .{ .stack = .{} } },
+        .{ .id = 5, .parent = 4, .object = .{ .box = .{ .width = 20, .height = 20 } } },
+        .{ .id = 6, .parent = 4, .object = .{ .box = .{ .width = 30, .height = 30 } } },
+    };
+    try instances.reconcile(&initial);
+    const root = (try instances.rootRenderObject()).?;
+    const unchanged = try instances.renderObject(instances.handleForId(2).?);
+    _ = try renders.layout(root, Constraints.tight(.{ .width = 100, .height = 80 }));
+    const count = try renders.layoutCount(unchanged);
+
+    const reordered = [_]Descriptor{ initial[0], initial[1], initial[2], initial[3], initial[5], initial[4] };
+    try instances.reconcile(&reordered);
+    _ = try renders.layout(root, Constraints.tight(.{ .width = 100, .height = 80 }));
+    try std.testing.expectEqual(count, try renders.layoutCount(unchanged));
+
+    const removed = [_]Descriptor{ reordered[0], reordered[1], reordered[2], reordered[3], reordered[4] };
+    try instances.reconcile(&removed);
+    _ = try renders.layout(root, Constraints.tight(.{ .width = 100, .height = 80 }));
+    try std.testing.expectEqual(count, try renders.layoutCount(unchanged));
+
+    const created = [_]Descriptor{ removed[0], removed[1], removed[2], removed[3], removed[4], .{ .id = 7, .parent = 4, .object = .{ .box = .{ .width = 15, .height = 15 } } } };
+    try instances.reconcile(&created);
+    _ = try renders.layout(root, Constraints.tight(.{ .width = 100, .height = 80 }));
+    try std.testing.expectEqual(count, try renders.layoutCount(unchanged));
 
     try instances.reconcile(&.{});
     try scheduler.applyQueuedCancellations();

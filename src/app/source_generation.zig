@@ -10,6 +10,7 @@ const ui = @import("../ui/root.zig");
 const image_service = @import("../image/service.zig");
 const ImageCache = @import("../image/cache.zig").Cache;
 const native = @import("../native/root.zig");
+const lua_c = @import("../lua/c.zig");
 
 pub const Config = struct {
     /// Code and names remain borrowed through destruction of all generations.
@@ -715,12 +716,61 @@ pub const SourceGeneration = struct {
         finished = true;
         try self.signals.validateCommit(owner, work.revision);
         try self.signals.commit(owner, work.revision);
+        // Registry reference numbers are allocation details, not Lua identity.
+        // Transfer unchanged callbacks only after the candidate is committed;
+        // rejected declarations must leave the last-good refs untouched.
+        retainUnchangedContent(
+            self.vm.state,
+            self.application.windows,
+            candidate.windows,
+            self.application.output_templates,
+            candidate.output_templates,
+        );
+        retainUnchangedContent(self.vm.state, self.application.output_templates, candidate.output_templates, &.{}, &.{});
         self.application.releaseWindows(self.application.windows);
         self.application.releaseWindows(self.application.output_templates);
         self.application.windows = candidate.windows;
         self.application.output_templates = candidate.output_templates;
         try owners.complete(work);
         return true;
+    }
+
+    fn retainUnchangedContent(
+        state: *lua_c.State,
+        previous: []lua.ApplicationWindow,
+        candidate: []lua.ApplicationWindow,
+        previous_templates: []lua.ApplicationWindow,
+        candidate_templates: []lua.ApplicationWindow,
+    ) void {
+        for (candidate) |*next| {
+            const prior = for (previous) |*window| {
+                if (std.mem.eql(u8, window.declaration.id(), next.declaration.id())) break window;
+            } else continue;
+            var same = false;
+            _ = lua_c.lua_rawgeti(state, lua_c.registry_index, prior.content_reference);
+            _ = lua_c.lua_rawgeti(state, lua_c.registry_index, next.content_reference);
+            same = lua_c.lua_rawequal(state, -1, -2) != 0;
+            lua_c.lua_settop(state, -3);
+            if (!same and next.template_id != null and prior.template_id != null) {
+                const next_template = windowForId(candidate_templates, next.template_id.?);
+                const prior_template = windowForId(previous_templates, prior.template_id.?);
+                if (next_template != null and prior_template != null) {
+                    _ = lua_c.lua_rawgeti(state, lua_c.registry_index, prior_template.?.content_reference);
+                    _ = lua_c.lua_rawgeti(state, lua_c.registry_index, next_template.?.content_reference);
+                    same = lua_c.lua_rawequal(state, -1, -2) != 0;
+                    lua_c.lua_settop(state, -3);
+                }
+            }
+            if (!same) continue;
+            lua_c.luaL_unref(state, lua_c.registry_index, next.content_reference);
+            next.content_reference = prior.content_reference;
+            prior.content_reference = lua_c.no_reference;
+        }
+    }
+
+    fn windowForId(windows: []lua.ApplicationWindow, id: []const u8) ?*lua.ApplicationWindow {
+        for (windows) |*window| if (std.mem.eql(u8, window.declaration.id(), id)) return window;
+        return null;
     }
 
     fn disposeWindowOwner(self: *SourceGeneration) void {
@@ -1138,15 +1188,20 @@ test "reactive windows track signals, retain output identities, and roll back in
         \\invalid = ouro.signal(false)
         \\empty = ouro.signal(false)
         \\unused = ouro.signal(0)
+        \\title = ouro.signal('Launcher')
+        \\replacement = ouro.signal(false)
+        \\local bar_content = function() end
+        \\local launcher_content = function() end
+        \\local replacement_content = function() end
         \\return ouro.app { id = 'dev.ouro.reactive', run = function()
         \\  return { windows = function()
         \\    if empty() then return {} end
         \\    local bar = ouro.layer_surface {
         \\      id='bar', namespace='bar', outputs='all', layer='top',
-        \\      width=0, height=40, anchors={'top', 'left', 'right'}, content=function() end,
+        \\      width=0, height=40, anchors={'top', 'left', 'right'}, content=bar_content,
         \\    }
         \\    if invalid() then return {bar, bar} end
-        \\    if visible() then return {bar, ouro.window {id='launcher', title='Launcher', content=function() end}} end
+        \\    if visible() then return {bar, ouro.window {id='launcher', title=title(), content=replacement() and replacement_content or launcher_content}} end
         \\    return {bar}
         \\  end }
         \\end }
@@ -1171,6 +1226,19 @@ test "reactive windows track signals, retain output identities, and roll back in
     try std.testing.expectEqualStrings("launcher", generation.application.windows[0].declaration.id());
     try std.testing.expectEqualStrings("bar@4:DP-2", generation.application.windows[1].declaration.id());
     try std.testing.expectEqualStrings("bar@8:HDMI-A-1", generation.application.windows[2].declaration.id());
+    const launcher_content = generation.application.windows[0].content_reference;
+    const dp_content = generation.application.windows[1].content_reference;
+    _ = try generation.vm.spawnApplication("title:set('Renamed')");
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    try std.testing.expect(try generation.refreshWindows());
+    try std.testing.expectEqual(launcher_content, generation.application.windows[0].content_reference);
+    try std.testing.expectEqual(dp_content, generation.application.windows[1].content_reference);
+    try std.testing.expectEqualStrings("Renamed", generation.application.windows[0].declaration.toplevel.title);
+    _ = try generation.vm.spawnApplication("replacement:set(true)");
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    try std.testing.expect(try generation.refreshWindows());
+    try std.testing.expect(launcher_content != generation.application.windows[0].content_reference);
+    try std.testing.expectEqual(dp_content, generation.application.windows[1].content_reference);
     const retained = generation.application.windows.ptr;
     _ = try generation.vm.spawnApplication("invalid:set(true)");
     while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
