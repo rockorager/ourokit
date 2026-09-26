@@ -2886,7 +2886,7 @@ pub const Host = struct {
         if (output.name) |old| self.allocator.free(old);
         output.name = owned;
         if (self.workspaces) |*client| try client.nameOutput(output.handle.?, name);
-        std.log.info("Wayland output available: {s}", .{name});
+        std.log.debug("Wayland output available: {s}", .{name});
         try self.resumeWaitingOutputs();
     }
 
