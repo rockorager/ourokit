@@ -1536,15 +1536,30 @@ pub const UiBuild = struct {
             } },
         }) catch return luaError(state, "cannot append option descriptor");
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
+        var content_parent = option_id;
         if (parent.kind == .radio_group) {
-            const prefix: []const u8 = if (selected) "●  " else "○  ";
-            _ = c.lua_pushlstring(state, prefix.ptr, prefix.len);
-            _ = c.lua_pushlstring(state, label.ptr, label.len);
-            c.lua_concat(state, 2);
+            content_parent = semanticId("content", option_id);
+            self.append(.{
+                .id = content_parent,
+                .parent = option_id,
+                .object = .{ .flex = .{ .gap = 8, .cross_axis_alignment = .center } },
+            }) catch return luaError(state, "cannot append radio content");
+            const foreground = if (selected) style.selected.foreground else style.idle.foreground;
+            self.append(.{
+                .id = semanticId("indicator", option_id),
+                .parent = content_parent,
+                .object = .{ .box = .{
+                    .width = 12,
+                    .height = 12,
+                    .corner_radius = 6,
+                    .background = if (selected) foreground else null,
+                    .border_width = if (selected) 0 else 1,
+                    .border_color = if (selected) null else foreground,
+                } },
+            }) catch return luaError(state, "cannot append radio indicator");
         }
-        const display_label = if (parent.kind == .radio_group) string(state, -1).? else label;
         const source = sources.acquire(.{
-            .utf8 = display_label,
+            .utf8 = label,
             .language = "und",
             .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
             .candidates = self.themedFonts(selected and listbox.appearance == .sidebar) catch |err| return luaError(state, @errorName(err)),
@@ -1552,7 +1567,8 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot retain option label");
         self.append(.{
             .id = label_id,
-            .parent = option_id,
+            .parent = content_parent,
+            .parent_data = if (parent.kind == .radio_group) .{ .flex = .{ .factor = 1 } } else .none,
             .object = .{ .text = .{
                 .source = source,
                 .color = if (!listbox.enabled) theme.disabled_foreground else if (selected) style.selected.foreground else style.idle.foreground,

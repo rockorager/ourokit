@@ -159,6 +159,27 @@ test "forms radio navigation wraps and follows reordered declarations" {
     try std.testing.expect((try f.runtime.semantics.findPath("choices/d")).checked);
 }
 
+test "forms radio indicators stay centered independently of label font metrics" {
+    const f = try Fixture.create(
+        \\function build() return ouro.radio_group {key='choices', selected=17, on_select=function() end,
+        \\ ouro.radio {key='large', value=17, label='Large', height=44, font_size=28},
+        \\ ouro.radio {key='small', value=29, label='Small', height=32, font_size=14}} end
+    );
+    defer f.destroy();
+    for ([_][]const u8{ "choices/large", "choices/small" }, [_]f32{ 22, 16 }) |path, center| {
+        const semantic = try f.runtime.semantics.findPath(path);
+        const render = try f.runtime.instances.renderObject(f.runtime.instances.handleForId(semantic.id).?);
+        const content = f.runtime.tree.firstChild(render).?;
+        const indicator = f.runtime.tree.firstChild(content).?;
+        const circle = (try f.runtime.tree.objectAt(indicator)).box;
+        try std.testing.expectEqual(@as(f32, 12), circle.width.?);
+        try std.testing.expectEqual(@as(f32, 12), circle.height.?);
+        try std.testing.expectEqual(semantic.checked, circle.background != null);
+        const y = (try f.runtime.tree.nodeOffset(content)).y + (try f.runtime.tree.nodeOffset(indicator)).y;
+        try std.testing.expectApproxEqAbs(center, y + 6, 0.001);
+    }
+}
+
 test "forms slider keyboard bounds and captured drag use the declared range" {
     const f = try Fixture.create(
         \\value=ouro.signal(-1.25)

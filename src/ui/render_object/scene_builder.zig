@@ -10,8 +10,8 @@ const ImageHandle = @import("../../image/cache.zig").ImageHandle;
 const ImageFit = @import("../../image/pixels.zig").Fit;
 
 /// Allocation-free lowering from logical layout coordinates to the existing
-/// renderer-neutral device-space display list. Conservative edge rounding is
-/// explicit until subpixel coverage semantics are implemented in both peers.
+/// renderer-neutral device-space display list. Coverage bounds round outward;
+/// decorated shapes snap their origin and extent separately to avoid distortion.
 pub const Builder = struct {
     storage: []scene.Command,
     count: usize = 0,
@@ -28,12 +28,12 @@ pub const Builder = struct {
     }
 
     pub fn solidRectangle(self: *Builder, bounds: RectF, color: Color) !void {
-        const device = try self.deviceRect(bounds);
+        const device = try self.deviceRect(bounds, .outward);
         if (!device.isEmpty()) try self.append(.{ .solid_rectangle = .{ .bounds = device, .color = color } });
     }
 
     pub fn image(self: *Builder, handle: ImageHandle, bounds: RectF, fit: ImageFit) !void {
-        const device = try self.deviceRect(bounds);
+        const device = try self.deviceRect(bounds, .outward);
         if (!device.isEmpty()) try self.append(.{ .image = .{ .image = handle, .bounds = device, .fit = fit } });
     }
 
@@ -45,7 +45,7 @@ pub const Builder = struct {
         border_width: f32,
         corner_radius: f32,
     ) !void {
-        const device = try self.deviceRect(bounds);
+        const device = try self.deviceRect(bounds, .preserve_size);
         if (device.isEmpty()) return;
         const maximum = @min(device.width, device.height) / 2;
         try self.append(.{ .decorated_rectangle = .{
@@ -58,7 +58,7 @@ pub const Builder = struct {
     }
 
     pub fn pushClip(self: *Builder, bounds: RectF) !void {
-        try self.append(.{ .push_clip_rect = try self.deviceRect(bounds) });
+        try self.append(.{ .push_clip_rect = try self.deviceRect(bounds, .outward) });
     }
 
     pub fn popClip(self: *Builder) !void {
@@ -103,12 +103,12 @@ pub const Builder = struct {
         self.count += 1;
     }
 
-    fn deviceRect(self: *const Builder, bounds: RectF) !RectI {
+    fn deviceRect(self: *const Builder, bounds: RectF, rounding: enum { outward, preserve_size }) !RectI {
         if (!validRect(bounds)) return error.InvalidLogicalRectangle;
-        const left = @floor(bounds.x * self.scale);
-        const top = @floor(bounds.y * self.scale);
-        const right = @ceil((bounds.x + bounds.width) * self.scale);
-        const bottom = @ceil((bounds.y + bounds.height) * self.scale);
+        const left = if (rounding == .outward) @floor(bounds.x * self.scale) else @round(bounds.x * self.scale);
+        const top = if (rounding == .outward) @floor(bounds.y * self.scale) else @round(bounds.y * self.scale);
+        const right = if (rounding == .outward) @ceil((bounds.x + bounds.width) * self.scale) else left + @ceil(bounds.width * self.scale);
+        const bottom = if (rounding == .outward) @ceil((bounds.y + bounds.height) * self.scale) else top + @ceil(bounds.height * self.scale);
         const left64: f64 = left;
         const top64: f64 = top;
         const right64: f64 = right;
@@ -165,21 +165,51 @@ test "scene lowering scales logical rectangles conservatively" {
     try std.testing.expectEqual(@as(u32, 5), decorated.corner_radius);
 }
 
+test "decorated shapes retain dimensions at fractional origins and scales" {
+    const cases = [_]struct { scale: f32, expected: RectI }{
+        .{ .scale = 1, .expected = .{ .x = 3, .y = -1, .width = 12, .height = 12 } },
+        .{ .scale = 1.25, .expected = .{ .x = 4, .y = -2, .width = 15, .height = 15 } },
+        .{ .scale = 2, .expected = .{ .x = 6, .y = -3, .width = 24, .height = 24 } },
+    };
+    for (cases) |case| {
+        var commands: [1]scene.Command = undefined;
+        var builder = try Builder.init(&commands, case.scale);
+        try builder.decoratedRectangle(
+            .{ .x = 3, .y = -1.25, .width = 12, .height = 12 },
+            Color.rgba(20, 40, 180, 255),
+            null,
+            0,
+            6,
+        );
+        try std.testing.expectEqual(case.expected, commands[0].decorated_rectangle.bounds);
+    }
+    var commands: [1]scene.Command = undefined;
+    var builder = try Builder.init(&commands, 1);
+    try builder.decoratedRectangle(
+        .{ .x = 0.75, .y = 2.25, .width = 10, .height = 4 },
+        null,
+        Color.rgba(20, 40, 180, 255),
+        1,
+        2,
+    );
+    try std.testing.expectEqual(RectI{ .x = 1, .y = 2, .width = 10, .height = 4 }, commands[0].decorated_rectangle.bounds);
+}
+
 test "device rectangles preserve exact empty dimensions" {
     var commands: [1]scene.Command = undefined;
     const builder = try Builder.init(&commands, 1.5);
 
     try std.testing.expectEqual(
         RectI{ .x = 0, .y = 0, .width = 0, .height = 4 },
-        try builder.deviceRect(.{ .x = 0.25, .y = 0.5, .width = 0, .height = 2 }),
+        try builder.deviceRect(.{ .x = 0.25, .y = 0.5, .width = 0, .height = 2 }, .outward),
     );
     try std.testing.expectEqual(
         RectI{ .x = 1, .y = 0, .width = 2, .height = 0 },
-        try builder.deviceRect(.{ .x = 1.25, .y = 0.25, .width = 0.5, .height = 0 }),
+        try builder.deviceRect(.{ .x = 1.25, .y = 0.25, .width = 0.5, .height = 0 }, .outward),
     );
     try std.testing.expectEqual(
         RectI{ .x = -1, .y = -2, .width = 0, .height = 0 },
-        try builder.deviceRect(.{ .x = -0.25, .y = -1.25, .width = 0, .height = 0 }),
+        try builder.deviceRect(.{ .x = -0.25, .y = -1.25, .width = 0, .height = 0 }, .outward),
     );
 }
 
@@ -189,7 +219,7 @@ test "device rectangles conservatively retain positive subpixel extents" {
 
     try std.testing.expectEqual(
         RectI{ .x = 0, .y = 1, .width = 1, .height = 1 },
-        try builder.deviceRect(.{ .x = 0.25, .y = 1.25, .width = 0.01, .height = 0.01 }),
+        try builder.deviceRect(.{ .x = 0.25, .y = 1.25, .width = 0.01, .height = 0.01 }, .outward),
     );
 }
 
