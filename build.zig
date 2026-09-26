@@ -585,22 +585,56 @@ fn addWaylandExample(
         run_vulkan_step.dependOn(&run_vulkan.step);
     }
 
-    const install_benchmark = b.addInstallArtifact(example, .{
+    const button_benchmark = b.addExecutable(.{
+        .name = "ourokit-button-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/application-benchmark/application.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+        }),
+    });
+    button_benchmark.root_module.addAnonymousImport("benchmark_application", .{
+        .root_source_file = b.path("examples/wayland.lua"),
+    });
+    const install_benchmark = b.addInstallArtifact(button_benchmark, .{
         .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
         .dest_sub_path = "ourokit",
     });
     const settings_benchmark = b.addExecutable(.{
         .name = "ourokit-settings-benchmark",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/settings.zig"),
+            .root_source_file = b.path("tools/application-benchmark/application.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "ourokit", .module = ourokit }},
         }),
     });
+    settings_benchmark.root_module.addAnonymousImport("benchmark_application", .{
+        .root_source_file = b.path("tools/application-benchmark/settings.lua"),
+    });
     const install_settings_benchmark = b.addInstallArtifact(settings_benchmark, .{
         .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
         .dest_sub_path = "ourokit-settings",
+    });
+    const scroll_benchmark = b.addExecutable(.{
+        .name = "ourokit-scroll-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/application-benchmark/scroll.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+        }),
+    });
+    scroll_benchmark.root_module.addAnonymousImport("benchmark_stories", .{
+        .root_source_file = b.path("examples/virtual-list.lua"),
+    });
+    scroll_benchmark.root_module.addAnonymousImport("benchmark_font", .{
+        .root_source_file = b.path("src/text/fonts/SourceSans3-Regular.otf"),
+    });
+    const install_scroll_benchmark = b.addInstallArtifact(scroll_benchmark, .{
+        .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
+        .dest_sub_path = "ourokit-scroll",
     });
     const benchmark_step = b.step(
         "build-application-benchmark",
@@ -608,6 +642,7 @@ fn addWaylandExample(
     );
     benchmark_step.dependOn(&install_benchmark.step);
     benchmark_step.dependOn(&install_settings_benchmark.step);
+    benchmark_step.dependOn(&install_scroll_benchmark.step);
 }
 
 fn addWaylandProtocol(
