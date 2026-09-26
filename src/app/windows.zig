@@ -33,6 +33,7 @@ const Slot = struct {
     generation: u32 = 0,
     state: State = .free,
     dropped: bool = false,
+    native_pending: bool = false,
     id: ?[]u8 = null,
     title: ?[]u8 = null,
     namespace: ?[]u8 = null,
@@ -95,6 +96,134 @@ pub const WindowSet = struct {
         self.allocator.free(self.slots);
         self.* = undefined;
     }
+
+    /// Reserves local resources without issuing native requests or changing
+    /// live slots. Closing slots and compositor tombstones remain occupied:
+    /// replacing a full set needs temporary headroom until retirement drains.
+    pub fn prepare(self: *WindowSet, declarations: []const SurfaceDeclaration) !Prepared {
+        try validateDeclarations(declarations);
+        try self.validateTransitions(declarations);
+        try self.ensureCreateCapacity(declarations);
+        const additions = try self.allocator.alloc(Slot, self.slots.len);
+        @memset(additions, .{});
+        errdefer self.allocator.free(additions);
+        const titles = try self.allocator.alloc(?[]u8, self.slots.len);
+        @memset(titles, null);
+        var prepared: Prepared = .{
+            .windows = self,
+            .declarations = declarations,
+            .additions = additions,
+            .titles = titles,
+        };
+        // Prepared owns both arrays from here on.
+        errdefer prepared.releaseContents();
+        for (declarations) |declaration| {
+            if (self.findById(declaration.id())) |slot| {
+                if (slot.state == .active and declaration == .toplevel and
+                    !std.mem.eql(u8, slot.title.?, declaration.toplevel.title))
+                {
+                    const index = self.handleForId(declaration.id()).?.slot;
+                    titles[index] = try self.allocator.dupe(u8, declaration.toplevel.title);
+                }
+                continue;
+            }
+            for (self.slots, additions) |slot, *addition| {
+                if (slot.state != .free or addition.state != .free) continue;
+                addition.* = try self.prepareSlot(declaration, slot.generation);
+                break;
+            }
+        }
+        return prepared;
+    }
+
+    pub const Prepared = struct {
+        windows: *WindowSet,
+        declarations: []const SurfaceDeclaration,
+        additions: []Slot,
+        titles: []?[]u8,
+
+        pub fn deinit(self: *Prepared) void {
+            self.releaseContents();
+            self.windows.allocator.free(self.additions);
+            self.* = undefined;
+        }
+
+        fn releaseContents(self: *Prepared) void {
+            for (self.additions) |slot| if (slot.state != .free) {
+                self.windows.scheduler.destroyScope(slot.scope) catch unreachable;
+                self.windows.freeSlotStrings(slot);
+            };
+            for (self.titles) |title| if (title) |value| self.windows.allocator.free(value);
+            self.windows.allocator.free(self.titles);
+        }
+
+        pub fn handleForId(self: *Prepared, id: []const u8) ?WindowHandle {
+            if (self.windows.activeHandleForId(id)) |handle| return handle;
+            for (self.additions, 0..) |*slot, index| {
+                if (slot.state != .free and std.mem.eql(u8, slot.id.?, id)) return handleFor(slot, index);
+            }
+            return null;
+        }
+
+        pub fn scope(self: *Prepared, handle: WindowHandle) ScopeHandle {
+            const addition = self.additions[handle.slot];
+            if (addition.state != .free) return addition.scope;
+            return self.windows.scope(handle) catch unreachable;
+        }
+
+        /// The caller has committed its validated local application before
+        /// entering here. Protocol/transport failures are fatal host failures,
+        /// NOT recoverable reload rejection: native effects cannot be undone.
+        pub fn commit(self: *Prepared) !void {
+            const windows = self.windows;
+            // Publish every reserved scope first, so ownership remains known
+            // even if a later native request fails.
+            for (windows.slots, self.additions) |*slot, *addition| {
+                if (addition.state == .free) continue;
+                slot.* = addition.*;
+                addition.* = .{};
+            }
+            for (windows.slots, 0..) |*slot, index| {
+                if (slot.state != .active) continue;
+                const declaration = findDeclaration(self.declarations, slot.id.?) orelse {
+                    slot.dropped = true;
+                    try windows.host.beginClose(handleFor(slot, index));
+                    try windows.scheduler.queueScopeCancellation(slot.scope);
+                    slot.state = .closing;
+                    continue;
+                };
+                // New slots have not yet had native creation.
+                if (slot.native_pending) {
+                    try windows.host.create(handleFor(slot, index), slot.scope, declaration);
+                    slot.native_pending = false;
+                    continue;
+                }
+                switch (declaration) {
+                    .toplevel => |value| {
+                        if (self.titles[index]) |title| {
+                            try windows.host.updateTitle(handleFor(slot, index), title);
+                            windows.allocator.free(slot.title.?);
+                            slot.title = title;
+                            self.titles[index] = null;
+                        }
+                        if (slot.min_width != value.min_width or slot.min_height != value.min_height) {
+                            try windows.host.updateMinimumSize(handleFor(slot, index), value.min_width, value.min_height);
+                            slot.min_width = value.min_width;
+                            slot.min_height = value.min_height;
+                        }
+                    },
+                    .layer_surface => |value| if (!layerStateEqual(slot, value)) {
+                        try windows.host.updateLayerSurface(handleFor(slot, index), value);
+                        setLayerState(slot, value);
+                    },
+                    .popup => {},
+                }
+            }
+            for (windows.slots) |*slot| if (slot.state != .free and findDeclaration(self.declarations, slot.id.?) == null) {
+                slot.dropped = true;
+            };
+        }
+    };
 
     /// Applies one complete, already-decoded desired-state snapshot. Validation
     /// finishes before native state changes, so malformed Lua output can never
@@ -257,6 +386,24 @@ pub const WindowSet = struct {
             break;
         };
         const index = free_index orelse return error.WindowCapacityExceeded;
+        var prepared = try self.prepareSlot(declaration, self.slots[index].generation);
+        errdefer {
+            self.scheduler.destroyScope(prepared.scope) catch unreachable;
+            self.freeSlotStrings(prepared);
+        }
+        try self.host.create(handleFor(&prepared, index), prepared.scope, declaration);
+        prepared.native_pending = false;
+        self.slots[index] = prepared;
+    }
+
+    fn freeSlotStrings(self: *WindowSet, slot: Slot) void {
+        self.allocator.free(slot.id.?);
+        if (slot.title) |value| self.allocator.free(value);
+        if (slot.namespace) |value| self.allocator.free(value);
+        if (slot.output) |value| self.allocator.free(value);
+    }
+
+    fn prepareSlot(self: *WindowSet, declaration: SurfaceDeclaration, previous_generation: u32) !Slot {
         const id = try self.allocator.dupe(u8, declaration.id());
         errdefer self.allocator.free(id);
         const title = switch (declaration) {
@@ -280,14 +427,12 @@ pub const WindowSet = struct {
         const scope_handle = try self.scheduler.createScope(self.scheduler.application_scope);
         errdefer self.scheduler.destroyScope(scope_handle) catch unreachable;
 
-        const slot = &self.slots[index];
-        var generation = slot.generation +% 1;
+        var generation = previous_generation +% 1;
         if (generation == 0) generation = 1;
-        const handle: WindowHandle = .{ .slot = @intCast(index), .generation = generation };
-        try self.host.create(handle, scope_handle, declaration);
-        slot.* = .{
+        var slot: Slot = .{
             .generation = generation,
             .state = .active,
+            .native_pending = true,
             .id = id,
             .title = title,
             .namespace = namespace,
@@ -302,9 +447,10 @@ pub const WindowSet = struct {
                 slot.min_width = value.min_width;
                 slot.min_height = value.min_height;
             },
-            .layer_surface => |value| setLayerState(slot, value),
+            .layer_surface => |value| setLayerState(&slot, value),
             .popup => {},
         }
+        return slot;
     }
 
     fn collectClosed(self: *WindowSet) !void {
@@ -777,6 +923,68 @@ test "invalid declaration snapshots do not alter native windows" {
     const handle = host.actions[0].create.handle;
     try windows.reconcile(&.{});
     try scheduler.applyQueuedCancellations();
+    try windows.markClosed(handle);
+    try windows.reconcile(&.{});
+}
+
+fn preparedAllocationFailure(allocator: std.mem.Allocator) !void {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 1, 0);
+    defer scheduler.deinit();
+    var host: FakeHost = .{};
+    var windows: WindowSet = undefined;
+    try windows.init(std.testing.allocator, &scheduler, host.interface(), 4, 4);
+    defer windows.deinit();
+    try windows.reconcile(&.{
+        .{ .toplevel = .{ .id = "keep", .title = "Old" } },
+        .{ .toplevel = .{ .id = "remove", .title = "Removed" } },
+    });
+    const keep = windows.activeHandleForId("keep").?;
+    const removed = windows.activeHandleForId("remove").?;
+    const scopes = scheduler.availableScopeCapacity();
+    defer {
+        windows.allocator = std.testing.allocator;
+        windows.markClosed(keep) catch unreachable;
+        windows.markClosed(removed) catch unreachable;
+        windows.reconcile(&.{}) catch unreachable;
+    }
+    windows.allocator = allocator;
+    var prepared = windows.prepare(&.{
+        .{ .toplevel = .{ .id = "new-first", .title = "First" } },
+        .{ .toplevel = .{ .id = "keep", .title = "Changed" } },
+        .{ .layer_surface = .{ .id = "new-last", .namespace = "test", .output = "DP-1", .width = 100, .height = 40, .layer = .top } },
+    }) catch |err| {
+        try std.testing.expectEqual(@as(usize, 2), host.count);
+        try std.testing.expectEqual(keep, windows.activeHandleForId("keep").?);
+        try std.testing.expectEqual(removed, windows.activeHandleForId("remove").?);
+        try std.testing.expectEqualStrings("Old", windows.slots[keep.slot].title.?);
+        try std.testing.expect(!windows.slots[removed.slot].dropped);
+        try std.testing.expectEqual(scopes, scheduler.availableScopeCapacity());
+        return err;
+    };
+    prepared.deinit();
+    try std.testing.expectEqual(scopes, scheduler.availableScopeCapacity());
+    try std.testing.expectEqual(@as(usize, 2), host.count);
+}
+
+test "prepared window reservations roll back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, preparedAllocationFailure, .{});
+}
+
+test "prepared window capacity failure does not drop live identities" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    var host: FakeHost = .{};
+    var windows: WindowSet = undefined;
+    try windows.init(std.testing.allocator, &scheduler, host.interface(), 1, 2);
+    defer windows.deinit();
+    try windows.reconcile(&.{.{ .toplevel = .{ .id = "old", .title = "Old" } }});
+    const handle = windows.activeHandleForId("old").?;
+    try std.testing.expectError(error.WindowCapacityExceeded, windows.prepare(&.{.{ .toplevel = .{ .id = "new", .title = "New" } }}));
+    try std.testing.expectEqual(handle, windows.activeHandleForId("old").?);
+    try std.testing.expect(!windows.slots[handle.slot].dropped);
+    try std.testing.expectEqual(@as(usize, 1), host.count);
     try windows.markClosed(handle);
     try windows.reconcile(&.{});
 }

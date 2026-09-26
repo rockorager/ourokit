@@ -871,6 +871,7 @@ fn runSourceInternal(
                         &callbacks,
                         control,
                         sequence,
+                        .{ .windows = &window_set, .host = &host, .dirty = &dirty, .clipboard = &clipboard, .config = options.window },
                     );
                     active_reload_sequence = null;
                 }
@@ -1107,7 +1108,7 @@ fn runHeadless(
                 try reportReloadFailure(reload, control, value, err);
                 sequence = null;
             } else if (reload.candidateReady()) {
-                try servicePreparedReload(reload, &.{}, &.{}, callbacks, control, value);
+                try servicePreparedReload(reload, &.{}, &.{}, callbacks, control, value, null);
                 sequence = null;
             }
         }
@@ -1309,6 +1310,7 @@ fn servicePreparedReload(
     callbacks: *lua.CallbackRegistry,
     control: ?*ControlServer,
     request_sequence: u64,
+    native: ?ReloadNativeContext,
 ) !void {
     var candidate_pending = true;
     defer if (candidate_pending) reload.discard();
@@ -1326,28 +1328,15 @@ fn servicePreparedReload(
             return;
         };
     };
-    var target_count: usize = 0;
-    for (candidate.application.windows) |window| {
-        const slot = runtimeSlotForId(slots, window.declaration.id()) orelse {
-            try reportReloadFailure(
-                reload,
-                control,
-                request_sequence,
-                error.SourceWindowSetChanged,
-            );
+    var prepared_slots: ?PreparedRuntimeSlots = if (native) |context|
+        PreparedRuntimeSlots.init(reload, slots, target_storage, context) catch |err| {
+            try reportReloadFailure(reload, control, request_sequence, err);
             return;
-        };
-        target_storage[target_count] = .{
-            .id = window.declaration.id(),
-            .runtime = &slot.runtime,
-            .size = slot.configured_size orelse slot.runtime.frame_state.size orelse .{
-                .width = 0,
-                .height = 0,
-            },
-        };
-        target_count += 1;
-    }
-    const targets = target_storage[0..target_count];
+        }
+    else
+        null;
+    defer if (prepared_slots) |*prepared| prepared.deinit();
+    const targets = if (prepared_slots) |prepared| target_storage[0..prepared.target_count] else target_storage[0..0];
     reload.prepareApplication(targets) catch |err| {
         try reportReloadFailure(reload, control, request_sequence, err);
         return;
@@ -1365,8 +1354,25 @@ fn servicePreparedReload(
         return;
     };
     candidate_pending = false;
+    if (control) |server| server.commitApplication(&prepared_control.?);
+    if (prepared_slots) |*prepared| {
+        prepared.commit() catch |err| {
+            // Local ownership has committed. Never claim that a transport or
+            // native allocation failure rolled back already-issued requests.
+            const context = native.?;
+            std.log.err("source generation {d} committed, but native window commit failed; shutting down: {s}", .{ committed.generation, @errorName(err) });
+            context.host.failure = err;
+            try context.host.beginShutdown();
+            for (slots) |*slot| {
+                slot.desired = false;
+                if (slot.id) |id| if (context.windows.handleForId(id)) |handle|
+                    try context.windows.markClosed(handle);
+            }
+            if (control) |server| try server.reloadFailed(request_sequence, null, error.NativeWindowCommitFailed);
+            return;
+        };
+    }
     if (control) |server| {
-        server.commitApplication(&prepared_control.?);
         try server.reloadSucceeded(request_sequence, committed.generation);
     }
     std.log.info(
@@ -1374,6 +1380,168 @@ fn servicePreparedReload(
         .{ request_sequence, committed.generation },
     );
 }
+
+const ReloadNativeContext = struct {
+    windows: *windows_module.WindowSet,
+    host: *platform.wayland.Host,
+    dirty: *ui.instance.ReconcileQueue,
+    clipboard: *clipboard_module.Coordinator,
+    config: WindowRuntimeConfig,
+};
+
+/// Runtime addresses must never move: trees, signals and build owners borrow
+/// them. Reserve unused slots in place, then either publish or dismantle only
+/// those reservations. Existing slots are unchanged until commit.
+const PreparedRuntimeSlots = struct {
+    const Scratch = struct { runtime: WindowRuntime = .{}, scope: ?task.ScopeHandle = null };
+    reload: *SourceReload,
+    candidate: *SourceGeneration,
+    context: ReloadNativeContext,
+    slots: []RuntimeSlot,
+    reserved: []bool,
+    scratch: []Scratch,
+    declarations: []platform.window.SurfaceDeclaration,
+    windows: windows_module.WindowSet.Prepared,
+    target_count: usize = 0,
+    committed: bool = false,
+
+    fn init(
+        reload: *SourceReload,
+        slots: []RuntimeSlot,
+        targets: []source_reload_module.WindowTarget,
+        context: ReloadNativeContext,
+    ) !PreparedRuntimeSlots {
+        const allocator = reload.allocator;
+        const candidate = reload.candidate.?;
+        if (candidate.application.windows.len > slots.len) return error.WindowCapacityExceeded;
+        const declarations = try allocator.alloc(platform.window.SurfaceDeclaration, candidate.application.windows.len);
+        errdefer allocator.free(declarations);
+        var declaration_count: usize = 0;
+        for (candidate.application.windows) |window| {
+            if (runtimeSlotForId(slots, window.declaration.id())) |slot| {
+                if (slot.declared and !slot.desired) continue;
+                if (!slot.declared) return error.SourceWindowRetiring;
+            }
+            declarations[declaration_count] = window.declaration;
+            declaration_count += 1;
+        }
+        var windows = try context.windows.prepare(declarations[0..declaration_count]);
+        errdefer windows.deinit();
+        const reserved = try allocator.alloc(bool, slots.len);
+        errdefer allocator.free(reserved);
+        @memset(reserved, false);
+        const scratch = try allocator.alloc(Scratch, candidate.application.windows.len);
+        errdefer allocator.free(scratch);
+        @memset(scratch, .{});
+        var prepared: PreparedRuntimeSlots = .{
+            .reload = reload,
+            .candidate = candidate,
+            .context = context,
+            .slots = slots,
+            .reserved = reserved,
+            .scratch = scratch,
+            .declarations = declarations,
+            .windows = windows,
+        };
+        errdefer prepared.clearReservations();
+        for (candidate.application.windows, 0..) |window, index| {
+            const id = window.declaration.id();
+            const slot = runtimeSlotForId(slots, id) orelse blk: {
+                for (slots, 0..) |*slot, slot_index| if (slot.id == null) {
+                    slot.id = try allocator.dupe(u8, id);
+                    reserved[slot_index] = true;
+                    break :blk slot;
+                };
+                return error.WindowCapacityExceeded;
+            };
+            const handle = prepared.windows.handleForId(id);
+            const suppressed = slot.declared and !slot.desired or handle == null;
+            const runtime = if (suppressed) &scratch[index].runtime else &slot.runtime;
+            if (!runtime.initialized) {
+                const scope = if (suppressed) blk: {
+                    scratch[index].scope = try reload.scheduler.createScope(reload.scheduler.application_scope);
+                    break :blk scratch[index].scope.?;
+                } else prepared.windows.scope(handle.?);
+                const theme = candidate.ui_build.widget_theme.?.colors;
+                const services = candidate.services.?;
+                // commitPreparedSource detaches the runtime's old graph before
+                // adopting the candidate. Even empty new runtimes must start
+                // on the old graph, or commit would erase freshly built edges.
+                const signals = if (suppressed) &candidate.signals else &reload.active().signals;
+                try runtime.init(allocator, reload.scheduler, scope, handle orelse .invalid, theme.background, theme.primary, theme.foreground, theme.input, theme.ring, signals, services.paragraph_sources, services.paragraphs, context.config);
+                if (window.declaration != .toplevel) runtime.root_padding = 0;
+            }
+            if (prepared.target_count == targets.len) return error.WindowCapacityExceeded;
+            targets[prepared.target_count] = .{
+                .id = id,
+                .runtime = runtime,
+                .size = slot.configured_size orelse runtime.frame_state.size orelse .{
+                    .width = @max(1, window.declaration.initialWidth()),
+                    .height = @max(1, window.declaration.initialHeight()),
+                },
+                .disposition = if (suppressed) .validate_only else .retain,
+            };
+            prepared.target_count += 1;
+        }
+        for (slots) |*slot| {
+            const id = slot.id orelse continue;
+            if (applicationWindowForId(candidate.application.windows, id) != null) continue;
+            if (prepared.target_count == targets.len) return error.WindowCapacityExceeded;
+            targets[prepared.target_count] = .{ .id = id, .runtime = &slot.runtime, .size = .{ .width = 1, .height = 1 }, .disposition = .remove };
+            prepared.target_count += 1;
+        }
+        return prepared;
+    }
+
+    fn clearReservations(self: *PreparedRuntimeSlots) void {
+        for (self.scratch) |*scratch| {
+            scratch.runtime.clear(&self.candidate.ui_build) catch unreachable;
+            scratch.runtime.collectRetired() catch unreachable;
+            scratch.runtime.deinit();
+            if (scratch.scope) |scope| self.reload.scheduler.destroyScope(scope) catch unreachable;
+        }
+        if (!self.committed) for (self.slots, self.reserved) |*slot, reserved| {
+            if (!reserved) continue;
+            slot.runtime.signals = &self.candidate.signals;
+            slot.runtime.clear(&self.candidate.ui_build) catch unreachable;
+            slot.runtime.collectRetired() catch unreachable;
+            slot.runtime.deinit();
+            self.reload.allocator.free(slot.id.?);
+            slot.* = .{};
+        };
+    }
+
+    fn deinit(self: *PreparedRuntimeSlots) void {
+        self.clearReservations();
+        self.windows.deinit();
+        self.reload.allocator.free(self.scratch);
+        self.reload.allocator.free(self.reserved);
+        self.reload.allocator.free(self.declarations);
+    }
+
+    fn commit(self: *PreparedRuntimeSlots) !void {
+        self.committed = true;
+        for (self.slots) |*slot| {
+            const id = slot.id orelse continue;
+            const declared = applicationWindowForId(self.candidate.application.windows, id) != null;
+            if (!declared) {
+                slot.desired = false;
+                if (slot.runtime.registered) {
+                    self.context.dirty.unregister(slot.runtime.window) catch unreachable;
+                    slot.runtime.registered = false;
+                }
+            } else if (!slot.declared) {
+                slot.desired = true;
+                self.context.dirty.register(slot.runtime.window) catch unreachable;
+                slot.runtime.registered = true;
+                slot.runtime.setDirtyWindowQueue(self.context.dirty);
+                slot.runtime.setClipboardCoordinator(self.context.clipboard);
+            }
+            slot.declared = declared;
+        }
+        try self.windows.commit();
+    }
+};
 
 fn reportReloadFailure(
     reload: *const SourceReload,
@@ -1641,4 +1809,244 @@ test "layer popup keyboard routing isolates parent and preserves physical proven
     try std.testing.expectEqualDeep(direct, popupKeyboard(&slots, direct));
     slots[0].desired = false;
     try std.testing.expectEqualDeep(key, popupKeyboard(&slots, key));
+}
+
+test "structural reload validates later additions and capacity before retaining removing or creating windows" {
+    const TestHost = struct {
+        creates: usize = 0,
+        updates: usize = 0,
+        closes: usize = 0,
+        fn create(context: *anyopaque, _: core.Handle, _: task.ScopeHandle, _: platform.window.SurfaceDeclaration) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.creates += 1;
+        }
+        fn title(context: *anyopaque, _: core.Handle, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.updates += 1;
+        }
+        fn minimum(_: *anyopaque, _: core.Handle, _: u32, _: u32) !void {}
+        fn layer(_: *anyopaque, _: core.Handle, _: platform.window.LayerSurfaceDeclaration) !void {}
+        fn close(context: *anyopaque, _: core.Handle) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.closes += 1;
+        }
+        const vtable: platform.window.NativeHost.VTable = .{
+            .create = create,
+            .update_title = title,
+            .update_minimum_size = minimum,
+            .update_layer_surface = layer,
+            .begin_close = close,
+        };
+    };
+    const Source = struct {
+        fn write(dir: std.Io.Dir, declarations: []const u8) !void {
+            const source = try std.mem.concat(std.testing.allocator, u8, &.{
+                \\local ouro = require('ouro')
+                \\local function window(id, label, fail)
+                \\  local value = ouro.signal(label)
+                \\  return ouro.window { id=id, title=label, width=320, height=200, content=function()
+                \\    if fail then error('late new window failed') end
+                \\    return ouro.button { key='button', label=value(), on_press=function() value:set('Pressed') end }
+                \\  end }
+                \\end
+                \\return ouro.app { id='dev.ouro.structural-test', windows={
+                ,
+                declarations,
+                "}}",
+            });
+            defer std.testing.allocator.free(source);
+            try dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = source });
+        }
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try Source.write(temporary.dir, "window('keep','Old'), window('remove','Gone')");
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &temporary.sub_path, "app.lua" });
+    defer std.testing.allocator.free(path);
+    var provider = try bundle.SourceProvider.initDisk(std.testing.allocator, path);
+    defer provider.deinit();
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 16, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 128, 8, 8);
+    defer scheduler.deinit();
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(std.testing.allocator, 32);
+    defer callbacks.deinit();
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{ .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 }, .bytes = @embedFile("ourokit_test_font_static") });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const services: source_generation.UiServices = .{
+        .paragraph_sources = &sources,
+        .paragraphs = &paragraphs,
+        .font_candidates = &.{font},
+        .medium_font_candidates = &.{font},
+        .theme = design.tokens.light,
+        .callbacks = &callbacks,
+    };
+    const config: source_generation.Config = .{ .node_capacity = 16, .semantic_text_capacity = 256 };
+    const initial = try SourceGeneration.create(std.testing.allocator, &scheduler, &loop, try provider.snapshot(std.testing.io, std.testing.allocator), services, config, null);
+    var reload: SourceReload = undefined;
+    reload.init(std.testing.allocator, std.testing.io, &provider, &scheduler, &loop, services, config, initial);
+    defer reload.deinit();
+    var host: TestHost = .{};
+    var windows: windows_module.WindowSet = undefined;
+    try windows.init(std.testing.allocator, &scheduler, .{ .context = &host, .vtable = &TestHost.vtable }, 4, 8);
+    defer windows.deinit();
+    var dirty: ui.instance.ReconcileQueue = undefined;
+    try dirty.init(std.testing.allocator, 4);
+    defer dirty.deinit();
+    var clipboard: clipboard_module.Coordinator = undefined;
+    try clipboard.init(std.testing.allocator, &scheduler, 1, 1, 256);
+    defer clipboard.deinit();
+    const context: ReloadNativeContext = .{ .windows = &windows, .host = undefined, .dirty = &dirty, .clipboard = &clipboard, .config = .{ .node_capacity = 16, .command_capacity = 16 } };
+    var slots = [_]RuntimeSlot{.{}} ** 4;
+    defer {
+        for (&slots) |*slot| {
+            slot.runtime.clear(&reload.active().ui_build) catch unreachable;
+            if (slot.id) |id| if (windows.handleForId(id)) |native_handle| windows.markClosed(native_handle) catch unreachable;
+        }
+        scheduler.applyQueuedCancellations() catch unreachable;
+        for (&slots) |*slot| {
+            slot.runtime.collectRetired() catch unreachable;
+            slot.runtime.deinit();
+            if (slot.id) |id| std.testing.allocator.free(id);
+        }
+        windows.reconcile(&.{}) catch unreachable;
+    }
+    var targets: [4]source_reload_module.WindowTarget = undefined;
+    try reload.prepare();
+    {
+        var prepared = try PreparedRuntimeSlots.init(&reload, &slots, &targets, context);
+        defer prepared.deinit();
+        try reload.prepareApplication(targets[0..prepared.target_count]);
+        _ = try reload.commitApplication(targets[0..prepared.target_count], &callbacks);
+        try prepared.commit();
+    }
+    try reload.beginRetirement();
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+    const active = reload.active();
+    const keep = runtimeSlotForId(&slots, "keep").?;
+    const removed = runtimeSlotForId(&slots, "remove").?;
+    const handle = keep.runtime.window;
+    const scope = try windows.scope(handle);
+    const button_id = (try keep.runtime.semantics.findPath("button")).id;
+    const button = keep.runtime.instances.handleForId(button_id).?;
+    const old_handler = keep.runtime.pointer_bindings.get(button).?;
+    _ = try keep.runtime.focus.request(&keep.runtime.instances, button);
+    try keep.runtime.prepareFrame(1);
+    const commands = try std.testing.allocator.dupe(@import("../scene/root.zig").Command, keep.runtime.commands[0..keep.runtime.command_count]);
+    defer std.testing.allocator.free(commands);
+    const old_callbacks = callbacks.countForVm(&active.vm);
+    const available_scopes = scheduler.availableScopeCapacity();
+    try std.testing.expect(old_callbacks > 1);
+
+    // A valid addition and retained-window edit precede the failing addition.
+    try Source.write(temporary.dir, "window('new-first','New'), window('keep','Changed'), window('new-late','Bad',true)");
+    try reload.prepare();
+    {
+        var prepared = try PreparedRuntimeSlots.init(&reload, &slots, &targets, context);
+        defer prepared.deinit();
+        var failed = false;
+        reload.prepareApplication(targets[0..prepared.target_count]) catch {
+            failed = true;
+        };
+        try std.testing.expect(failed);
+    }
+    try reload.beginRetirement();
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+    try std.testing.expect(reload.active() == active);
+    try std.testing.expectEqual(@as(usize, 2), host.creates);
+    try std.testing.expectEqual(@as(usize, 0), host.updates);
+    try std.testing.expectEqual(@as(usize, 0), host.closes);
+    try std.testing.expect(runtimeSlotForId(&slots, "new-first") == null);
+    try std.testing.expectEqual(available_scopes, scheduler.availableScopeCapacity());
+    try std.testing.expectEqual(old_callbacks, callbacks.countForVm(&active.vm));
+    try std.testing.expectEqualDeep(old_handler, keep.runtime.pointer_bindings.get(button).?);
+    try std.testing.expectEqualStrings("Old", (try keep.runtime.semantics.findPath("button")).label);
+    try std.testing.expectEqualStrings("Gone", (try removed.runtime.semantics.findPath("button")).label);
+    try std.testing.expectEqualDeep(commands, keep.runtime.commands[0..keep.runtime.command_count]);
+    try std.testing.expectEqual(button, keep.runtime.focus.current().?);
+
+    // Each tree fits independently, but the application-wide sum does not.
+    try Source.write(temporary.dir, "window('new-first','New'), window('keep','Changed'), window('new-late','Later')");
+    try reload.prepare();
+    {
+        var prepared = try PreparedRuntimeSlots.init(&reload, &slots, &targets, context);
+        defer prepared.deinit();
+        try reload.prepareApplication(targets[0..prepared.target_count]);
+        const per_window = reload.candidate.?.prepared_builds[0].descriptors().len;
+        var held: [128]task.ScopeHandle = undefined;
+        var held_count: usize = 0;
+        while (scheduler.availableScopeCapacity() > per_window) : (held_count += 1)
+            held[held_count] = try scheduler.createScope(scheduler.application_scope);
+        defer for (held[0..held_count]) |held_scope| scheduler.destroyScope(held_scope) catch unreachable;
+        try std.testing.expectError(error.ScopeCapacityExceeded, reload.commitApplication(targets[0..prepared.target_count], &callbacks));
+        try std.testing.expect(reload.active() == active);
+        try std.testing.expectEqual(old_callbacks, callbacks.countForVm(&active.vm));
+        try std.testing.expectEqualDeep(commands, keep.runtime.commands[0..keep.runtime.command_count]);
+        reload.discard();
+    }
+    try reload.beginRetirement();
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+
+    try Source.write(temporary.dir, "window('new-first','New'), window('keep','Changed')");
+    try reload.prepare();
+    {
+        var prepared = try PreparedRuntimeSlots.init(&reload, &slots, &targets, context);
+        defer prepared.deinit();
+        try reload.prepareApplication(targets[0..prepared.target_count]);
+        _ = try reload.commitApplication(targets[0..prepared.target_count], &callbacks);
+        try prepared.commit();
+    }
+    try std.testing.expectEqual(handle, windows.activeHandleForId("keep").?);
+    try std.testing.expectEqual(scope, try windows.scope(handle));
+    try std.testing.expect(keep == runtimeSlotForId(&slots, "keep").?);
+    try std.testing.expectEqual(button, keep.runtime.instances.handleForId(button_id).?);
+    try std.testing.expectEqual(button, keep.runtime.focus.current().?);
+    try std.testing.expectEqualStrings("Changed", (try keep.runtime.semantics.findPath("button")).label);
+    try std.testing.expectEqualStrings("New", (try runtimeSlotForId(&slots, "new-first").?.runtime.semantics.findPath("button")).label);
+    try std.testing.expectEqual(@as(usize, 0), callbacks.countForVm(&active.vm));
+    try std.testing.expect(!removed.runtime.ready and !removed.desired);
+    try std.testing.expectEqual(@as(usize, 3), host.creates);
+    try std.testing.expectEqual(@as(usize, 1), host.closes);
+    try reload.beginRetirement();
+    try scheduler.applyQueuedCancellations();
+    for (&slots) |*slot| try slot.runtime.collectRetired();
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+
+    // A compositor-closed declaration remains suppressed across reload.
+    const added = runtimeSlotForId(&slots, "new-first").?;
+    // A new runtime must keep the candidate's dependency graph on commit.
+    // Publishing its signal must notify the native dirty queue immediately,
+    // without relying on a subsequent configure/rebuild to repair the graph.
+    const added_button = added.runtime.instances.handleForId((try added.runtime.semantics.findPath("button")).id).?;
+    try std.testing.expect(!(try dirty.hasPending(added.runtime.window)));
+    _ = try callbacks.spawn(added.runtime.pointer_bindings.get(added_button).?.id, try windows.scope(added.runtime.window), &.{});
+    while (scheduler.takeRunnable()) |runnable| try reload.resumeRunnable(runnable);
+    try std.testing.expect(try dirty.hasPending(added.runtime.window));
+    added.desired = false;
+    try windows.markClosed(added.runtime.window);
+    try added.runtime.clear(&reload.active().ui_build);
+    try scheduler.applyQueuedCancellations();
+    try added.runtime.collectRetired();
+    try reload.prepare();
+    {
+        var prepared = try PreparedRuntimeSlots.init(&reload, &slots, &targets, context);
+        defer prepared.deinit();
+        try reload.prepareApplication(targets[0..prepared.target_count]);
+        _ = try reload.commitApplication(targets[0..prepared.target_count], &callbacks);
+        try prepared.commit();
+    }
+    try std.testing.expect(!added.desired and !added.runtime.ready);
+    try std.testing.expect(windows.activeHandleForId("new-first") == null);
+    try std.testing.expectEqual(@as(usize, 3), host.creates);
+    try reload.beginRetirement();
+    _ = reload.collectRetired();
 }

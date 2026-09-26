@@ -26,6 +26,8 @@ pub const WindowTarget = struct {
     id: []const u8,
     runtime: *WindowRuntime,
     size: core.SizeU,
+    /// Closed declarations are validated in scratch runtimes, never remounted.
+    disposition: enum { retain, validate_only, remove } = .retain,
 };
 
 /// Owns the active source generation and at most one fully prepared candidate.
@@ -204,34 +206,13 @@ pub const SourceReload = struct {
         @panic("source candidate discard without retirement capacity");
     }
 
-    /// Prepares every retained window against the candidate generation. The
-    /// first implementation requires the same window ID set; structural
-    /// window changes will use reserved runtime slots in a subsequent step.
+    /// Builds all candidate windows, including new and compositor-closed IDs,
+    /// before touching any live UI. The coordinator supplies stable reserved
+    /// runtimes for additions and scratch runtimes for suppressed declarations.
     pub fn prepareApplication(self: *SourceReload, targets: []const WindowTarget) !void {
         const candidate = self.candidate orelse return error.SourceCandidateNotPrepared;
-        if (targets.len != candidate.application.windows.len or
-            candidate.application.windows.len != self.active().application.windows.len)
-        {
-            self.recordBuildError(error.SourceWindowSetChanged);
-            self.discard();
-            return error.SourceWindowSetChanged;
-        }
-        for (candidate.application.windows) |window| {
-            var retained = false;
-            for (self.active().application.windows) |active_window| {
-                if (std.mem.eql(u8, window.declaration.id(), active_window.declaration.id())) {
-                    retained = true;
-                    break;
-                }
-            }
-            if (!retained) {
-                self.recordBuildError(error.SourceWindowSetChanged);
-                self.discard();
-                return error.SourceWindowSetChanged;
-            }
-        }
-        if (candidate.prepared_builds.len != targets.len) {
-            const builds = try self.allocator.alloc(lua.PreparedBuild, targets.len);
+        if (candidate.prepared_builds.len != candidate.application.windows.len) {
+            const builds = try self.allocator.alloc(lua.PreparedBuild, candidate.application.windows.len);
             var initialized: usize = 0;
             errdefer {
                 for (builds[0..initialized]) |*prepared| prepared.deinit();
@@ -269,31 +250,58 @@ pub const SourceReload = struct {
         }
     }
 
-    /// Commits an already prepared same-window-set candidate. Every fallible
-    /// check and allocation completes before the first retained window changes.
-    pub fn commitApplication(
+    /// Complete application-wide capacity checks, not just each tree's local
+    /// check: all new instance scopes coexist until old scopes drain.
+    pub fn validateApplicationCommit(
         self: *SourceReload,
         targets: []const WindowTarget,
         callbacks: *lua.CallbackRegistry,
-    ) !Commit {
+    ) !void {
         const candidate = self.candidate orelse return error.SourceCandidateNotPrepared;
-        if (targets.len != candidate.application.windows.len)
-            return error.SourceWindowSetChanged;
+        if (candidate.prepared_builds.len != candidate.application.windows.len)
+            return error.SourceBuildNotPrepared;
         var callback_count: usize = 0;
+        var scope_count: usize = 0;
         for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
             const target = findWindowTarget(targets, window.declaration.id()) orelse
                 return error.SourceWindowSetChanged;
+            if (target.disposition == .remove) return error.SourceWindowSetChanged;
             try target.runtime.validatePreparedSourceCommit(prepared);
+            if (target.disposition == .validate_only) continue;
+            for (prepared.descriptors()) |descriptor| {
+                if (target.runtime.instances.handleForId(descriptor.id) == null) scope_count += 1;
+            }
             callback_count = std.math.add(
                 usize,
                 callback_count,
                 prepared.handler_count,
             ) catch return error.CallbackCapacityExceeded;
         }
+        if (scope_count > self.scheduler.availableScopeCapacity()) return error.ScopeCapacityExceeded;
         try callbacks.ensureAvailable(callback_count);
+        // A coordinator must account for every old live runtime before the VM
+        // can be marked detached. Empty trees validate retirement without any
+        // allocation or mutation of callbacks, widgets, or frame content.
+        for (targets) |target| if (target.disposition == .remove and target.runtime.initialized) {
+            _ = try target.runtime.instances.prepareReconcile(&.{});
+        };
+    }
 
+    /// Every fallible check completes before the first retained window changes.
+    pub fn commitApplication(
+        self: *SourceReload,
+        targets: []const WindowTarget,
+        callbacks: *lua.CallbackRegistry,
+    ) !Commit {
+        try self.validateApplicationCommit(targets, callbacks);
+        const candidate = self.candidate.?;
+        for (targets) |target| if (target.disposition == .remove) {
+            target.runtime.clear(&self.active().ui_build) catch unreachable;
+            target.runtime.signals = &candidate.signals;
+        };
         for (candidate.application.windows, candidate.prepared_builds) |window, *prepared| {
             const target = findWindowTarget(targets, window.declaration.id()).?;
+            if (target.disposition == .validate_only) continue;
             target.runtime.background = switch (window.declaration) {
                 .layer_surface => |layer| layer.background,
                 .toplevel, .popup => null,
