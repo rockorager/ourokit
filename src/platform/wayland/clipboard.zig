@@ -428,13 +428,18 @@ pub const Clipboard = struct {
         try self.destroyAllSources(objects, queue);
         try self.destroyAllOffers(objects, queue);
         const device = self.device orelse return false;
-        try wayring.client.sendRequest(
+        const object = objects.namespace.resolve(device) orelse return error.StaleHandle;
+        if (object.version >= 2) try wayring.client.sendRequest(
             protocol.wl_data_device,
             objects,
             queue,
             device,
             .{ .release = .{} },
-        );
+        ) else {
+            // Older objects have no wire destructor. Keep their ID reserved
+            // until disconnect and discard any late events through a tombstone.
+            _ = try objects.retireLocal(device);
+        }
         self.device = null;
         return true;
     }
@@ -446,13 +451,16 @@ pub const Clipboard = struct {
     ) !bool {
         _ = try self.releaseDevice(objects, queue);
         const manager = self.manager orelse return false;
-        try wayring.client.sendRequest(
+        const object = objects.namespace.resolve(manager) orelse return error.StaleHandle;
+        if (object.version >= 4) try wayring.client.sendRequest(
             protocol.wl_data_device_manager,
             objects,
             queue,
             manager,
             .{ .release = .{} },
-        );
+        ) else {
+            _ = try objects.retireLocal(manager);
+        }
         self.manager = null;
         self.manager_global_name = null;
         return true;
@@ -705,6 +713,52 @@ pub const Clipboard = struct {
 
 fn sameRequest(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+test "clipboard teardown respects device and manager destructor versions" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 1, 2, 3, 4 }) |version| {
+        var objects = try wayring.objects.ClientObjects.init(allocator, 8, 8, &protocol.wl_display.info, null);
+        defer objects.deinit(allocator);
+        var blocks = try wayring.pool.SharedBlocks.init(allocator, 1024, 1);
+        defer blocks.deinit(allocator);
+        var fds = try wayring.pool.SharedFds.init(allocator, 1);
+        defer fds.deinit(allocator);
+        var queue = wayring.tx.Queue.init(&blocks, 1024, &fds, 0);
+        defer queue.deinit();
+        var loop: OuroLoop = undefined; // No transfers or kernel operations.
+        var clipboard = try Clipboard.init(allocator, &loop, 1, 1, 1, 1, 64);
+        defer clipboard.deinit();
+        defer clipboard.abandonProtocol();
+        const manager = try objects.createLocal(&protocol.wl_data_device_manager.info, version, null);
+        const device = try objects.createLocal(&protocol.wl_data_device.info, version, null);
+        clipboard.bindManager(manager, 19);
+        clipboard.device = device;
+
+        try std.testing.expect(try clipboard.releaseManager(&objects, &queue));
+        try std.testing.expect(clipboard.manager == null and clipboard.device == null);
+        try std.testing.expect(clipboard.manager_global_name == null);
+        try std.testing.expect(objects.namespace.resolve(manager).?.destroyed);
+        try std.testing.expect(objects.namespace.resolve(device).?.destroyed);
+        const expected_bytes: usize = if (version == 1) 0 else if (version < 4) 8 else 16;
+        try std.testing.expectEqual(expected_bytes, queue.queuedBytes());
+        if (version >= 2) {
+            const bytes = (try queue.snapshot(&.{}, &.{})).first;
+            const device_release = (try wayring.wire.Message.decode(bytes)).?;
+            try std.testing.expectEqual(device.id, device_release.header.object_id);
+            try std.testing.expectEqual(@as(u16, 2), device_release.header.opcode);
+            if (version >= 4) {
+                const manager_release = (try wayring.wire.Message.decode(bytes[8..])).?;
+                try std.testing.expectEqual(manager.id, manager_release.header.object_id);
+                try std.testing.expectEqual(@as(u16, 2), manager_release.header.opcode);
+            }
+        }
+        // A proxy with no wire destructor must not recycle a live server ID.
+        const next = try objects.createLocal(&protocol.wl_data_device_manager.info, version, null);
+        try std.testing.expect(next.id != manager.id and next.id != device.id);
+        try std.testing.expect(!try clipboard.releaseManager(&objects, &queue));
+        try std.testing.expectEqual(expected_bytes, queue.queuedBytes());
+    }
 }
 
 test "clipboard transfer drains a pipe through repeated io_uring reads" {
