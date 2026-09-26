@@ -95,6 +95,7 @@ pub const TextRange = struct {
 pub const TextInput = struct {
     source: ParagraphSourceHandle,
     color: Color,
+    multiline: bool = false,
     /// Display-only hint, shaped separately from the editable paragraph. It is
     /// visible only when source is empty and no IME preedit is active.
     placeholder: ?ParagraphSourceHandle = null,

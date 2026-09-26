@@ -616,10 +616,34 @@ pub fn positionLinesWithOptions(
     else
         &.{};
     defer if (include_caret_stops) allocator.free(source_graphemes);
-    try lines.ensureTotalCapacity(allocator, visible_count);
+    // A terminal hard break has no following measured segment. Editable text
+    // still needs an empty final line for the insertion position after it.
+    const trailing_line = if (source_graphemes.len != 0) blk: {
+        const last = source_graphemes[source_graphemes.len - 1];
+        const length = try std.unicode.utf8ByteSequenceLength(utf8[last.byte_start]);
+        const cp = try std.unicode.utf8Decode(utf8[last.byte_start..][0..length]);
+        break :blk switch (uucode.get(.line_break, cp)) {
+            .bk, .cr, .lf, .nl => true,
+            else => false,
+        };
+    } else false;
+    const total_count = selected.lines.len + @intFromBool(trailing_line);
+    const display_count = @min(total_count, if (style.max_lines) |count| @as(usize, count) else total_count);
+    try lines.ensureTotalCapacity(allocator, display_count);
     var line_top: f32 = 0;
 
-    for (selected.lines[0..visible_count], 0..) |selected_line, line_index| {
+    for (0..display_count) |line_index| {
+        const selected_line: line_layout.Line = if (line_index < selected.lines.len) selected.lines[line_index] else .{
+            .byte_start = utf8.len,
+            .byte_len = 0,
+            .advance = 0,
+            .mandatory = true,
+            .reshape_start = false,
+            .reshape_end = false,
+            .base_level = selected.lines[selected.lines.len - 1].base_level,
+            .visual_run_start = selected.visual_runs.len,
+            .visual_run_count = 0,
+        };
         if (!std.math.isFinite(selected_line.advance) or selected_line.advance < 0)
             return error.InvalidMeasurements;
         var fragments: std.ArrayList(Fragment) = .empty;
@@ -740,7 +764,7 @@ pub fn positionLinesWithOptions(
         .glyphs = owned_glyphs,
         .carets = try carets.toOwnedSlice(allocator),
         .layout_width = available_width orelse natural_width,
-        .truncated = visible_count < selected.lines.len,
+        .truncated = display_count < total_count,
         .source_byte_len = utf8.len,
         .ellipsis_byte_offset = null,
     };
@@ -1296,7 +1320,7 @@ test "unsafe shaping changes demand line reflow" {
 
 test "empty lines retain font height for layout and insertion carets" {
     const Fixture = @import("positioned_lines_test.zig").Fixture;
-    for ([_][]const u8{ "", "\n", "a\n\nb" }) |utf8| {
+    for ([_][]const u8{ "", "\n", "a\n\nb", "é\n\n", "é\r\n", "é\u{2028}" }, [_]usize{ 1, 2, 3, 3, 2, 2 }) |utf8, count| {
         var fixture: Fixture = undefined;
         try fixture.init(utf8, 200);
         defer fixture.deinit();
@@ -1313,7 +1337,9 @@ test "empty lines retain font height for layout and insertion carets" {
         try std.testing.expect(height > 1);
         var positioned = try positionLines(std.testing.allocator, utf8, &fixture.shaped, &fixture.selected);
         defer positioned.deinit();
-        try std.testing.expect(positioned.lines.len > 0);
+        try std.testing.expectEqual(count, positioned.lines.len);
+        const last_caret = try positioned.caretRectangleForOffset(utf8.len, .downstream, 1);
+        try std.testing.expectApproxEqAbs(positioned.lines[count - 1].top, last_caret.y, 0.001);
         for (positioned.lines, 0..) |line, index| {
             try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(index)) * advance, line.top, 0.001);
             const caret = try positioned.caretRectangle(index, line.byte_start, .downstream, 1);

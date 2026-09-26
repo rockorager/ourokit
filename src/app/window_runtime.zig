@@ -421,8 +421,8 @@ pub const WindowRuntime = struct {
                 ).?;
                 var object = &prepared.descriptor_storage[descriptor_index].object;
                 if (object.* != .text_input) return error.TextInputRenderObjectMismatch;
-                if (input.mode == .uncontrolled or
-                    std.mem.eql(u8, retained.model.text(), candidate.text()))
+                if (retained.model.multiline == candidate.multiline and (input.mode == .uncontrolled or
+                    std.mem.eql(u8, retained.model.text(), candidate.text())))
                 {
                     const retained_content = try self.text_inputs.content(target);
                     const retained_object = try self.tree.objectAt(
@@ -1420,6 +1420,14 @@ pub const WindowRuntime = struct {
             },
             else => return false,
         };
+        if (try self.textInputAncestor(target)) |input| {
+            const render = try self.instances.renderObject(try self.text_inputs.content(input));
+            const axis: ui.render_object.types.Axis = if (axis_event.axis == .vertical) .vertical else .horizontal;
+            if (try self.tree.scrollTextInput(render, axis, axis_event.delta)) {
+                self.scroll_motions[@intFromEnum(axis_event.axis)] = .{};
+                return true;
+            }
+        }
         const scroll = try self.scrollBy(target, axis_event.axis, axis_event.delta);
         const motion = &self.scroll_motions[@intFromEnum(axis_event.axis)];
         if (axis_event.source == .finger and scroll != null) {
@@ -1498,7 +1506,8 @@ pub const WindowRuntime = struct {
             return .{ .center = .{}, .bounds = .{ .x = 0, .y = 0, .width = 0, .height = 0 }, .role = .group, .enabled = semantic.enabled, .scroll_axis = null };
         };
         const render = try self.instances.renderObject(target);
-        const scroll_axis: ?platform.PointerAxis = switch (try self.tree.objectAt(render)) {
+        const scroll_axis: ?platform.PointerAxis = if (self.text_inputs.contains(target) and
+            (try self.text_inputs.session(target)).model.multiline) .vertical else switch (try self.tree.objectAt(render)) {
             .scroll => |scroll| switch (scroll.axis) {
                 .vertical => .vertical,
                 .horizontal => .horizontal,
@@ -1661,10 +1670,14 @@ pub const WindowRuntime = struct {
         const content = try self.text_inputs.content(input);
         const origin = try self.instanceOrigin(content);
         const size = try self.tree.nodeSize(try self.instances.renderObject(content));
-        return .{ .x = std.math.clamp(position.x, origin.x, origin.x + size.width), .y = origin.y + size.height / 2 };
+        const multiline = (try self.text_inputs.session(input)).model.multiline;
+        return .{ .x = std.math.clamp(position.x, origin.x, origin.x + size.width), .y = if (multiline)
+            std.math.clamp(position.y, origin.y, origin.y + size.height)
+        else
+            origin.y + size.height / 2 };
     }
 
-    const SelectionScroll = struct { input: ui.instance.InstanceHandle, render: ui.render_object.NodeHandle, speed: f32 };
+    const SelectionScroll = struct { input: ui.instance.InstanceHandle, render: ui.render_object.NodeHandle, axis: ui.render_object.types.Axis, speed: f32 };
 
     fn selectionScroll(self: *WindowRuntime) !?SelectionScroll {
         if (!self.initialized) return null;
@@ -1672,15 +1685,16 @@ pub const WindowRuntime = struct {
         const input = self.focus.current() orelse return null;
         if (!self.instances.isActive(input) or !self.text_inputs.contains(input)) return null;
         const session = try self.text_inputs.session(input);
-        if (!session.isSelecting() or session.preedit() != null or session.drag_anchor.?.granularity == .line or
+        if (!session.isSelecting() or session.preedit() != null or (session.drag_anchor.?.granularity == .line and !session.model.multiline) or
             !(try self.text_inputs.getBehavior(input)).enabled) return null;
         const edge = try self.clampSelectionPointer(input, position);
-        const distance = position.x - edge.x;
+        const axis: ui.render_object.types.Axis = if (session.model.multiline and position.y != edge.y) .vertical else .horizontal;
+        const distance = if (axis == .vertical) position.y - edge.y else position.x - edge.x;
         if (distance == 0) return null;
         const speed = std.math.sign(distance) * std.math.clamp(@abs(distance) * 12, 40, 800);
         const render = try self.instances.renderObject(try self.text_inputs.content(input));
-        if (try self.tree.textScrollDelta(render, speed) == 0) return null;
-        return .{ .input = input, .render = render, .speed = speed };
+        if (try self.tree.textScrollDelta(render, axis, speed) == 0) return null;
+        return .{ .input = input, .render = render, .axis = axis, .speed = speed };
     }
 
     const CaretActivity = struct {
@@ -1784,7 +1798,7 @@ pub const WindowRuntime = struct {
         const previous = self.selection_tick_ns orelse now_ns;
         self.selection_tick_ns = now_ns;
         const elapsed: f32 = @floatFromInt(@min(now_ns -| previous, 50 * std.time.ns_per_ms));
-        if (!try self.tree.scrollTextInput(scroll.render, scroll.speed * elapsed / std.time.ns_per_s)) return;
+        if (!try self.tree.scrollTextInput(scroll.render, scroll.axis, scroll.speed * elapsed / std.time.ns_per_s)) return;
         const session = try self.text_inputs.session(scroll.input);
         const caret = try self.textCaretAtPointer(scroll.input, try self.clampSelectionPointer(scroll.input, self.selection_pointer.?));
         _ = try session.updateSelectionDrag(caret.byte_offset, caret.affinity);
@@ -1864,6 +1878,10 @@ pub const WindowRuntime = struct {
             try self.syncTextInputVisuals();
             if (intentEditsText(intent)) try self.notifyTextInputChanged(callback_service, target);
         }
+        // Navigation also reveals a stationary caret after manual scrolling.
+        if (intent == .move) try self.tree.revealTextInputCaret(
+            try self.instances.renderObject(try self.text_inputs.content(target)),
+        );
     }
 
     fn applyTextInputIntent(
@@ -1881,6 +1899,10 @@ pub const WindowRuntime = struct {
             .undo, .redo => blk: {
                 session.preferred_x = null;
                 break :blk if (intent == .undo) session.model.undo() else session.model.redo();
+            },
+            .insert_newline => blk: {
+                session.preferred_x = null;
+                break :blk if (session.model.multiline) try session.model.replaceSelection("\n") else false;
             },
             .delete_backward => blk: {
                 session.preferred_x = null;
@@ -1970,6 +1992,14 @@ pub const WindowRuntime = struct {
 
         const next = switch (move.destination) {
             .word_previous, .word_next => unreachable,
+            .document_start, .document_end => blk: {
+                session.preferred_x = null;
+                break :blk text.CaretStop{
+                    .byte_offset = if (move.destination == .document_start) 0 else session.model.text().len,
+                    .x = 0,
+                    .affinity = .downstream,
+                };
+            },
             .visual_left, .visual_right => blk: {
                 session.preferred_x = null;
                 break :blk try self.tree.textVisualNeighbor(
@@ -2346,6 +2376,8 @@ test "queued pointer axis scrolls retained instance only during input dispatch" 
     );
     try runtime.pointer_bindings.init(std.testing.allocator, 2);
     defer runtime.pointer_bindings.deinit();
+    try runtime.text_inputs.init(std.testing.allocator, 2);
+    defer runtime.text_inputs.deinit();
     defer {
         runtime.router.deinit();
         runtime.instances.reconcile(&.{}) catch unreachable;
@@ -3144,7 +3176,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
 
 fn intentEditsText(intent: ui.text_input.EditIntent) bool {
     return switch (intent) {
-        .undo, .redo, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
+        .undo, .redo, .insert_newline, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
         .select_all, .move => false,
     };
 }

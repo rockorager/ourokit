@@ -67,6 +67,7 @@ pub const Node = struct {
     scroll_axis: ?platform.PointerAxis,
     scroll_offset: ?f32,
     read_only: bool,
+    multiline: bool,
 };
 
 /// Fully owned, bounded copy. It survives rebuild/reload; its token does not.
@@ -124,10 +125,12 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
         var value: ?[]const u8 = null;
         var selection: ?ui.text_input.Selection = null;
         var read_only = false;
+        var multiline = false;
         if (runtime.text_inputs.contains(handle)) {
             const session = try runtime.text_inputs.session(handle);
             value = try copyText(storage, &used, session.model.text());
             selection = session.model.selection;
+            multiline = session.model.multiline;
             read_only = (try runtime.text_inputs.getBehavior(handle)).read_only;
         }
         const selected = if (runtime.listboxes.option(handle)) |option|
@@ -150,8 +153,11 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             .focused = if (runtime.focus.current()) |focused| std.meta.eql(focused, handle) else false,
             .selection = selection,
             .scroll_axis = target.scroll_axis,
-            .scroll_offset = if (target.scroll_axis != null) try runtime.instances.scrollOffset(handle) else null,
+            .scroll_offset = if (multiline)
+                try runtime.tree.textScrollOffset(try runtime.instances.renderObject(try runtime.text_inputs.content(handle)), .vertical)
+            else if (target.scroll_axis != null) try runtime.instances.scrollOffset(handle) else null,
             .read_only = read_only,
+            .multiline = multiline,
         };
     }
     return .{ .allocator = allocator, .token = Token.current(runtime), .nodes = nodes, .text = storage, .metrics = runtime.metrics };
@@ -217,11 +223,14 @@ pub const Playback = struct {
         if (action == .text) {
             if (action.text.len > 16 * 1024) return error.DevelopmentTextTooLong;
             if (!std.unicode.utf8ValidateSlice(action.text)) return error.InvalidUtf8;
-            var characters = (try std.unicode.Utf8View.init(action.text)).iterator();
-            while (characters.nextCodepoint()) |cp|
-                if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return error.DevelopmentTextContainsControl;
             const focused = runtime.focus.current() orelse return error.DevelopmentTargetNotFocused;
             if (!runtime.text_inputs.contains(focused)) return error.DevelopmentTargetNotEditable;
+            const multiline = (try runtime.text_inputs.session(focused)).model.multiline;
+            var characters = (try std.unicode.Utf8View.init(action.text)).iterator();
+            while (characters.nextCodepoint()) |cp| {
+                if (cp == '\n' and multiline) continue;
+                if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return error.DevelopmentTextContainsControl;
+            }
             const behavior = try runtime.text_inputs.getBehavior(focused);
             if (!behavior.enabled) return error.DevelopmentTargetDisabled;
             if (behavior.read_only) return error.DevelopmentTargetReadOnly;
@@ -282,7 +291,7 @@ pub const Playback = struct {
                     .serial = 0,
                     .time_ms = 0,
                     .state = if (self.step % 2 == 0) .pressed else .released,
-                    .translated = .{ .keycode = 0, .unicode = cp },
+                    .translated = if (cp == '\n') .{ .keycode = 0, .logical = .enter } else .{ .keycode = 0, .unicode = cp },
                 } });
                 if (self.step % 2 == 1) self.text_offset += len;
             },
@@ -307,7 +316,7 @@ pub const Playback = struct {
             const bytes = self.action.text;
             const len = try std.unicode.utf8ByteSequenceLength(bytes[self.text_offset]);
             const cp = try std.unicode.utf8Decode(bytes[self.text_offset..][0..len]);
-            try runtime.routeKeyboard(.{ .key = .{ .window = runtime.window, .serial = 0, .time_ms = 0, .state = .released, .translated = .{ .keycode = 0, .unicode = cp } } });
+            try runtime.routeKeyboard(.{ .key = .{ .window = runtime.window, .serial = 0, .time_ms = 0, .state = .released, .translated = if (cp == '\n') .{ .keycode = 0, .logical = .enter } else .{ .keycode = 0, .unicode = cp } } });
         }
         self.step = 4;
         if (self.action == .text) self.text_offset = self.action.text.len;

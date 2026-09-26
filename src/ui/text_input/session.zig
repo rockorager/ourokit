@@ -62,9 +62,13 @@ pub const Session = struct {
     revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Session {
+        return initWithMode(allocator, initial, false);
+    }
+
+    pub fn initWithMode(allocator: std.mem.Allocator, initial: []const u8, multiline: bool) !Session {
         return .{
             .allocator = allocator,
-            .model = try model_module.Model.init(allocator, initial),
+            .model = try model_module.Model.initWithMode(allocator, initial, multiline),
         };
     }
 
@@ -121,7 +125,7 @@ pub const Session = struct {
         const range = switch (granularity) {
             .character => model_module.Range{ .start = byte_offset, .end = byte_offset },
             .word => self.model.wordRangeAt(byte_offset, affinity),
-            .line => model_module.Range{ .start = 0, .end = self.model.text().len },
+            .line => self.model.lineRangeAt(byte_offset),
         };
         const previous = self.drag_anchor;
         errdefer self.drag_anchor = previous;
@@ -153,7 +157,13 @@ pub const Session = struct {
                 else
                     .{ .anchor = anchor.range.start, .extent = @max(anchor.range.end, range.end), .extent_affinity = .upstream };
             },
-            .line => .{ .anchor = 0, .extent = self.model.text().len, .extent_affinity = .upstream },
+            .line => blk: {
+                const range = self.model.lineRangeAt(byte_offset);
+                break :blk if (range.start < anchor.range.start)
+                    .{ .anchor = anchor.range.end, .extent = range.start, .anchor_affinity = .upstream }
+                else
+                    .{ .anchor = anchor.range.start, .extent = @max(anchor.range.end, range.end), .extent_affinity = .upstream };
+            },
         };
         const changed = try self.model.setSelection(selected);
         self.preferred_x = null;
@@ -186,7 +196,7 @@ pub const Session = struct {
             if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
             if (text.len != 0) {
                 if (update.cursor) |cursor| try validatePreeditCursor(text, cursor);
-                next_preedit = try single_line.normalize(self.allocator, text) orelse
+                next_preedit = try single_line.normalizeWithMode(self.allocator, text, self.model.multiline) orelse
                     try self.allocator.dupe(u8, text);
                 next_cursor = if (update.cursor) |cursor| .{
                     .start = single_line.offset(text, cursor.start),
@@ -358,6 +368,24 @@ test "single line IME preedit maps cursors and commits normalized surrounding te
     try std.testing.expect(session.preedit() == null);
 }
 
+test "multiline IME preedit canonicalizes breaks and remaps asymmetric UTF-8 cursors" {
+    var session = try Session.initWithMode(std.testing.allocator, "左\nright", true);
+    defer session.deinit();
+    _ = try session.model.setSelection(.collapsed("左".len));
+    const raw = "é\r\n候補\u{2028}x";
+    _ = try session.apply(.{ .preedit = .{
+        .text = raw,
+        .cursor = .{ .start = "é\r\n".len, .end = "é\r\n候補\u{2028}".len },
+    } });
+    try std.testing.expectEqualStrings("é\n候補\nx", session.preedit().?.text);
+    try std.testing.expectEqual(model_module.Range{
+        .start = "é\n".len,
+        .end = "é\n候補\n".len,
+    }, session.preedit().?.cursor.?);
+    _ = try session.apply(.{ .commit = .{ .text = raw } });
+    try std.testing.expectEqualStrings("左é\n候補\nx\nright", session.model.text());
+}
+
 test "preedit removes selection but remains outside committed text" {
     var session = try Session.init(std.testing.allocator, "hello world");
     defer session.deinit();
@@ -480,6 +508,22 @@ test "shift click retains directional anchor and triple click keeps the entire l
     try std.testing.expectEqual(@as(usize, 10), session.model.selection.extent);
     session.endSelectionDrag();
     try std.testing.expect(!session.isSelecting());
+}
+
+test "multiline triple click selects and drags by complete asymmetric logical lines" {
+    const value = "é短\nB\n👩🏽‍🚀 long";
+    var session = try Session.initWithMode(std.testing.allocator, value, true);
+    defer session.deinit();
+    const second_start = "é短\n".len;
+    const third_start = "é短\nB\n".len;
+    _ = try session.beginPointerSelection(second_start, .downstream, .line, false);
+    try std.testing.expectEqualStrings("B\n", session.model.selectedText());
+    _ = try session.updateSelectionDrag(third_start + "👩🏽‍🚀".len, .downstream);
+    try std.testing.expectEqualStrings("B\n👩🏽‍🚀 long", session.model.selectedText());
+    _ = try session.updateSelectionDrag(1, .downstream);
+    try std.testing.expectEqualStrings("é短\nB\n", session.model.selectedText());
+    try std.testing.expectEqual(second_start + "B\n".len, session.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 0), session.model.selection.extent);
 }
 
 test "composition cancellation preserves committed text and closes one undo group" {

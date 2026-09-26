@@ -856,9 +856,9 @@ or snapshot `examples/forms-storybook.lua` for light, dark, disabled, changed,
 and modal states. These controls reuse Box/Text/Flex/Stack render primitives;
 Lua composes the standard parts and Zig owns input, focus, and range policy.
 
-### Single-line text inputs
+### Text inputs
 
-`ouro.text_input` is a single-line field. Long values scroll horizontally to
+`ouro.text_input` is single-line by default. Long values scroll horizontally to
 keep the focused caret or selection extent visible, including during IME
 composition and pointer dragging. Resizing clamps the retained scroll offset.
 Enter defaults to a `"submit"` command rather than inserting a newline.
@@ -868,6 +868,22 @@ hard line breaks to spaces: CRLF becomes one space; standalone CR, LF, vertical
 tab, form feed, NEL, and Unicode line/paragraph separators each become one space.
 Values reported by `on_change` contain the normalized text. Normalizing an
 initial or externally supplied value does not itself emit `on_change`.
+
+Set `multiline = true` for a native plain-text editor (default height 160;
+set `height` for a different viewport). Hard breaks normalize to LF instead of
+spaces. Text wraps at the viewport width; an unbreakable run can scroll
+horizontally. Enter and Shift+Enter insert a newline. Up/Down move by visual
+line, Home/End move to visual line edges, and Ctrl+Home/End move to document
+edges; Shift extends selection. Tab still moves focus, rather than inserting
+a tab. Existing key-binding overrides take precedence over these defaults.
+
+The multiline viewport scrolls vertically with the wheel or a captured drag
+beyond its top/bottom edges. Caret movement and edits reveal the selection
+extent; blinking does not undo manual scrolling. IME composition, clipboard,
+read-only selection, and undo/redo share the single-line editing machinery.
+The development tree reports `multiline`, the vertical `scroll_axis`, and
+`scroll_offset`; development `text` accepts LF only in multiline fields and
+`scroll` targets the editor itself.
 
 By default, Ctrl+Z undoes an edit; Ctrl+Shift+Z or Ctrl+Y redoes it. Each field
 retains up to 100 undo steps, including the selection before and after each
@@ -883,7 +899,9 @@ empty history does nothing. They are unavailable in disabled/read-only fields
 and during active IME preedit. Controlled rebuilds that echo the current value
 preserve history; a different external `text` value resets it. Uncontrolled
 rebuilds preserve history, and unmounting discards it. Editing after undo
-discards the redo branch.
+discards the redo branch. Changing `multiline` replaces the editing session
+from the current declaration, clearing composition and history and clamping
+the retained selection, including for uncontrolled fields.
 
 Text input shortcuts are configurable. `ouro.app.text_input_bindings` supplies
 app-wide overrides; `ouro.text_input.key_bindings` overrides those for one field.
@@ -933,11 +951,12 @@ identity for bindings without changing the character inserted when unbound.
 Duplicate normalized chords, unknown keys/actions, and invalid value types
 are declaration errors.
 
-Actions are `undo`, `redo`, `select_all`, `delete_backward`, `delete_forward`,
+Actions are `undo`, `redo`, `select_all`, `insert_newline`, `delete_backward`, `delete_forward`,
 `delete_word_backward`, `delete_word_forward`, `copy`, `cut`, `paste`, `submit`,
 `cancel`, `previous`, and `next`. Movement actions use `move_` or `select_` plus
 one of `visual_left`, `visual_right`, `word_previous`, `word_next`, `line_up`,
-`line_down`, `line_start`, or `line_end`. For example, `select_line_end` extends
+`line_down`, `line_start`, `line_end`, `document_start`, or `document_end`.
+`insert_newline` only edits multiline fields. For example, `select_line_end` extends
 the selection to the line end. Without `on_command`, `previous` and `next` fall
 back to line-up/down caret movement. Unbound printable keys still enter text;
 unbound Tab/Shift+Tab still traverse focus. Key releases never invoke actions.
@@ -1422,8 +1441,9 @@ render object or scene.
 
 Double-click selects a Unicode word, whitespace, or punctuation segment;
 dragging after it extends by whole segments in either direction. Triple-click
-selects the entire single-line value. Shift-click extends from the existing
-directional anchor. While a captured pointer rests beyond the horizontal
+selects the entire single-line value, or a logical hard line (including its LF)
+in a multiline field; dragging then extends by whole logical lines. Shift-click
+extends from the existing directional anchor. While a captured pointer rests beyond the
 viewport, a demand-driven native timer scrolls and extends selection without
 requiring more motion events. It stops at the content limit or when selection
 ends. Active composition owns selection instead of accepting pointer edits.

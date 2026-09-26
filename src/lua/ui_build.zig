@@ -1275,13 +1275,15 @@ pub const UiBuild = struct {
         if (controlled.present == uncontrolled.present)
             return luaError(state, "text_input requires exactly one of text or default_text");
         const mode: TextInputValueMode = if (controlled.present) .controlled else .uncontrolled;
+        const multiline = tableOptionalBoolean(state, 1, "multiline", false) orelse
+            return luaError(state, "text_input multiline must be a boolean");
         const width = tableOptionalSize(state, 1, "width", .fill) orelse
             return luaError(state, "invalid text_input width");
         const height = tableOptionalExtent(
             state,
             1,
             "height",
-            visual.height orelse defaults.controls.height,
+            visual.height orelse if (multiline) @as(f32, 160) else defaults.controls.height,
         ) orelse return luaError(state, "invalid text_input height");
         const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
             return luaError(state, "text_input enabled must be a boolean");
@@ -1289,8 +1291,9 @@ pub const UiBuild = struct {
             return luaError(state, "text_input read_only must be a boolean");
         const autofocus = tableOptionalBoolean(state, 1, "autofocus", false) orelse
             return luaError(state, "text_input autofocus must be a boolean");
-        const bindings = @import("key_bindings.zig").field(state, 1, "key_bindings", self.text_input_bindings) catch |err|
+        var bindings = @import("key_bindings.zig").field(state, 1, "key_bindings", self.text_input_bindings) catch |err|
             return luaError(state, @errorName(err));
+        bindings.multiline = multiline;
         const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id ^ self.component_namespace);
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
         const border_width = visual.border_width orelse defaults.controls.border_width orelse design.tokens.foundation.border_width_default;
@@ -1303,9 +1306,10 @@ pub const UiBuild = struct {
             .content_id = content_id,
             .mode = mode,
             .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
-            .session = TextInputSession.init(
+            .session = TextInputSession.initWithMode(
                 sources.allocator,
                 if (controlled.present) controlled.value else uncontrolled.value,
+                multiline,
             ) catch return luaError(state, "cannot create text_input session"),
         };
         const initial = self.pending_text_inputs[self.pending_text_input_count].session.?.model.text();
@@ -1320,8 +1324,10 @@ pub const UiBuild = struct {
                 .padding = .{
                     .left = visual.padding_x orelse design.tokens.foundation.spacing_2,
                     .right = visual.padding_x orelse design.tokens.foundation.spacing_2,
+                    .top = if (multiline) design.tokens.foundation.spacing_2 else 0,
+                    .bottom = if (multiline) design.tokens.foundation.spacing_2 else 0,
                 },
-                .alignment = .{ .vertical = .center },
+                .alignment = if (multiline) null else .{ .vertical = .center },
                 .background = if (enabled) visual.background orelse theme.surface else visual.disabled orelse theme.surface,
                 .border_color = if (border_width > 0) visual.border orelse if (enabled) theme.input else theme.border else null,
                 .border_width = border_width,
@@ -1354,6 +1360,7 @@ pub const UiBuild = struct {
             .parent = target_id,
             .object = .{ .text_input = .{
                 .source = source,
+                .multiline = multiline,
                 .placeholder = placeholder_source,
                 .placeholder_color = theme.muted_foreground,
                 .color = if (enabled) visual.foreground orelse theme.foreground else visual.disabled_foreground orelse theme.disabled_foreground,

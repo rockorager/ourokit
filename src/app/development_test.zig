@@ -101,6 +101,113 @@ fn node(snapshot: dev.Snapshot, path: []const u8) !dev.Node {
     return error.TestPathMissing;
 }
 
+test "multiline development editing preserves lines and navigates visual rows" {
+    const f = try Fixture.create(
+        \\value=ouro.signal('')
+        \\function build() return ouro.text_input {key='body', multiline=true, height=84, text=value(),
+        \\ on_change=function(v) value:set(v) end} end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "body" });
+    try f.play(.{ .text = "alpha\nb\nthird\n" });
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    try std.testing.expectEqualStrings("alpha\nb\nthird\n", session.model.text());
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    try std.testing.expect((try node(snapshot, "body")).multiline);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .home, .modifiers = .{ .control = true } } });
+    try std.testing.expectEqual(@as(usize, 0), session.model.selection.extent);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_down } });
+    try std.testing.expectEqual(@as(usize, 6), session.model.selection.extent);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .end } });
+    try std.testing.expectEqual(@as(usize, 7), session.model.selection.extent);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_down, .modifiers = .{ .shift = true } } });
+    try std.testing.expectEqual(@as(usize, 7), session.model.selection.anchor);
+    try std.testing.expect(session.model.selection.extent > 8);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .end, .modifiers = .{ .control = true } } });
+    try std.testing.expectEqual(@as(usize, 14), session.model.selection.extent);
+    // Native paste uses the same normalization/history as IME commits, not dev text playback.
+    try std.testing.expect(try f.runtime.applyClipboardPaste(&f.callbacks, target, "é\r\nlast"));
+    try f.settle();
+    try std.testing.expectEqualStrings("alpha\nb\nthird\né\nlast", session.model.text());
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_z, .modifiers = .{ .control = true } } });
+    try std.testing.expectEqualStrings("alpha\nb\nthird\n", session.model.text());
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_z, .modifiers = .{ .control = true, .shift = true } } });
+    try std.testing.expectEqualStrings("alpha\nb\nthird\né\nlast", session.model.text());
+    try std.testing.expectError(error.DevelopmentTextContainsControl, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .text = "bad\ttext" }));
+    var bottom = try f.snapshot();
+    defer bottom.deinit();
+    try std.testing.expect((try node(bottom, "body")).scroll_offset.? > 0);
+    try f.play(.{ .scroll = .{ .target = "body", .delta = -10000 } });
+    var top = try f.snapshot();
+    defer top.deinit();
+    try std.testing.expectEqual(@as(f32, 0), (try node(top, "body")).scroll_offset.?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .end, .modifiers = .{ .control = true } } });
+    var revealed = try f.snapshot();
+    defer revealed.deinit();
+    try std.testing.expect((try node(revealed, "body")).scroll_offset.? > 0);
+}
+
+test "multiline read-only selection auto-scrolls vertically without editing" {
+    const f = try Fixture.create(
+        \\function build() return ouro.text_input {key='body', multiline=true, height=64, read_only=true,
+        \\ default_text='one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n'} end
+    );
+    defer f.destroy();
+    try f.play(.{ .pointer_down = "body" });
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    const render = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(target));
+    try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 1, .position = .{ .x = 50, .y = 190 } } });
+    try f.settle();
+    const initial = session.model.selection.extent;
+    for (0..100) |tick| {
+        try f.runtime.advanceAnimations(tick * 16 * std.time.ns_per_ms);
+        try f.settle();
+    }
+    try std.testing.expect(session.model.selection.extent > initial);
+    try std.testing.expectEqual(session.model.text().len, session.model.selection.extent);
+    try std.testing.expectEqual(@as(f32, 0), try f.runtime.tree.textScrollDelta(render, .vertical, 100));
+    try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 2, .position = .{ .x = 0, .y = -80 } } });
+    try f.settle();
+    for (100..200) |tick| {
+        try f.runtime.advanceAnimations(tick * 16 * std.time.ns_per_ms);
+        try f.settle();
+    }
+    try std.testing.expectEqual(@as(usize, 0), session.model.selection.extent);
+    try std.testing.expectEqual(@as(f32, 0), try f.runtime.tree.textScrollOffset(render, .vertical));
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 0, .time_ms = 3, .button = 0x110, .state = .released } });
+    try f.settle();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+    try std.testing.expect(!try f.runtime.applyClipboardPaste(&f.callbacks, target, "overwrite\n"));
+    try std.testing.expectEqualStrings("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n", session.model.text());
+}
+
+test "multiline mode changes replace retained sessions even for equal uncontrolled text" {
+    const f = try Fixture.create(
+        \\multi=ouro.signal(false)
+        \\function build() return ouro.column {key='root',
+        \\ ouro.text_input {key='body', default_text='same', multiline=multi()},
+        \\ ouro.button {key='toggle', label='Toggle', on_press=function() multi:set(not multi()) end}} end
+    );
+    defer f.destroy();
+    const semantic = try f.runtime.semantics.findPath("root/body");
+    const target = f.runtime.instances.handleForId(semantic.id).?;
+    try f.play(.{ .click = "root/body" });
+    try std.testing.expectError(error.DevelopmentTextContainsControl, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .text = "a\nb" }));
+    try f.play(.{ .click = "root/toggle" });
+    try std.testing.expect((try f.runtime.text_inputs.session(target)).model.multiline);
+    try std.testing.expectEqualStrings("same", (try f.runtime.text_inputs.session(target)).model.text());
+    try f.play(.{ .click = "root/body" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .end, .modifiers = .{ .control = true } } });
+    try f.play(.{ .text = "\nmore" });
+    try std.testing.expectEqualStrings("same\nmore", (try f.runtime.text_inputs.session(target)).model.text());
+    try f.play(.{ .click = "root/toggle" });
+    try std.testing.expect(!(try f.runtime.text_inputs.session(target)).model.multiline);
+    try std.testing.expectEqualStrings("same", (try f.runtime.text_inputs.session(target)).model.text());
+}
+
 test "forms checkbox requests remain controlled and disabled controls skip focus" {
     const f = try Fixture.create(
         \\requested=false

@@ -865,7 +865,7 @@ test "stationary edge dragging scrolls to both limits and stops on release" {
     }
     try std.testing.expect(session.model.selection.extent > initial_extent);
     try std.testing.expectEqual(session.model.text().len, session.model.selection.extent);
-    try std.testing.expectEqual(@as(f32, 0), try f.runtime.tree.textScrollDelta(render, 100));
+    try std.testing.expectEqual(@as(f32, 0), try f.runtime.tree.textScrollDelta(render, .horizontal, 100));
     try std.testing.expect((try f.runtime.animationDelay()) == null);
     try f.pointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 3, .position = .{ .x = -80, .y = 16 } } });
     for (100..200) |tick| {
@@ -873,7 +873,7 @@ test "stationary edge dragging scrolls to both limits and stops on release" {
         try f.runtime.prepareFrame(1);
     }
     try std.testing.expectEqual(@as(usize, 0), session.model.selection.extent);
-    try std.testing.expectEqual(@as(f32, 0), try f.runtime.tree.textScrollDelta(render, -100));
+    try std.testing.expectEqual(@as(f32, 0), try f.runtime.tree.textScrollDelta(render, .horizontal, -100));
     try std.testing.expect((try f.runtime.animationDelay()) == null);
     try f.pointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 4, .position = .{ .x = 200, .y = 16 } } });
     try std.testing.expect((try f.runtime.animationDelay()) != null);

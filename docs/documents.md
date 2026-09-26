@@ -1,10 +1,11 @@
 # Multi-document notes example
 
 `examples/documents` is a deliberately small desktop-completeness example. Each
-window owns a stable document id, path, title, text, dirty state, and inline
-save/discard/cancel close confirmation. Both fields are single-line because
-`text_input` is single-line. Files use strict JSON and the custom
-`application/vnd.ourokit.note+json` MIME type; malformed, oversized, or unknown
+window owns a stable document id, path, title, text, and dirty state. The title
+is single-line, while the note body demonstrates multiline `text_input` with
+native wrapping and vertical scrolling. A modal dialog provides
+save/discard/cancel close confirmation and Escape cancels it. Files use strict
+JSON and the custom `application/vnd.ourokit.note+json` MIME type; malformed, oversized, or unknown
 data opens an error window without replacing any current edits.
 
 Run it from the checkout with `zig-out/bin/ouroctl run
@@ -41,7 +42,8 @@ before the UI factory and is queued.
 Portal cancellation and failed writes retain dirty state. Each document allows
 one save at a time, including its chooser phase, and snapshots carry a revision
 so edits made while saving remain dirty. Save-and-close only closes after the
-saved snapshot still matches the document. Closing
-the final clean window exits naturally; dirty windows require an explicit
-choice. Development source reload reconstructs Lua state and therefore loses
-all unsaved application data—reload is not persistence.
+saved snapshot still matches the document. Closing the final clean window exits
+naturally; dirty windows require an explicit choice. Note bodies preserve LF
+line breaks; line breaks in titles and CR line endings in bodies remain invalid
+in the strict file schema. Development source reload reconstructs Lua state and
+therefore loses all unsaved application data—reload is not persistence.

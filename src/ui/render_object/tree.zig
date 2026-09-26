@@ -57,8 +57,9 @@ const Slot = struct {
     layout_count: usize = 0,
     paragraph_layout: ?text.ParagraphHandle = null,
     placeholder_layout: ?text.ParagraphHandle = null,
-    /// Horizontal paragraph translation within a single-line input viewport.
+    /// Paragraph translation within the editable viewport.
     text_offset_x: f32 = 0,
+    text_offset_y: f32 = 0,
     scroll_offset: f32 = 0,
     scroll_extent: f32 = 0,
 };
@@ -231,8 +232,13 @@ pub const Tree = struct {
         if (affects_layout) {
             self.markNeedsLayout(handle);
         } else {
-            if (object == .text_input and target.has_layout and !target.needs_layout)
-                try self.updateTextInputOffset(target, target.size.width);
+            if (object == .text_input and target.has_layout and !target.needs_layout and
+                (previous.text_input.caret_offset != object.text_input.caret_offset or
+                    previous.text_input.caret_affinity != object.text_input.caret_affinity or
+                    previous.text_input.selection_start != object.text_input.selection_start or
+                    previous.text_input.selection_end != object.text_input.selection_end or
+                    (!previous.text_input.reveal_caret and object.text_input.reveal_caret)))
+                try self.updateTextInputOffset(target, target.size);
             self.markNeedsPaint(handle);
         }
     }
@@ -276,24 +282,43 @@ pub const Tree = struct {
             return error.StaleParagraph;
         return paragraph_layout.positioned.hitTestPoint(.{
             .x = point.x - target.text_offset_x,
-            .y = point.y,
+            .y = point.y - target.text_offset_y,
         }) orelse
             return error.TextPositionNotFound;
     }
 
-    /// Signed remaining horizontal scroll, clamped to the requested delta.
-    pub fn textScrollDelta(self: *Tree, handle: NodeHandle, delta: f32) !f32 {
+    pub fn textScrollOffset(self: *Tree, handle: NodeHandle, axis: types.Axis) !f32 {
         const target = try self.ensureTextLayout(handle);
-        const paragraph_layout = try self.paragraphs.?.get(target.paragraph_layout.?);
-        const minimum = @min(0, target.size.width - paragraph_layout.size.width - target.object.text_input.caret_width);
-        if (minimum == 0) return 0;
-        return target.text_offset_x - std.math.clamp(target.text_offset_x - delta, minimum, 0);
+        return if (axis == .vertical) -target.text_offset_y else -target.text_offset_x;
     }
 
-    pub fn scrollTextInput(self: *Tree, handle: NodeHandle, delta: f32) !bool {
-        const actual = try self.textScrollDelta(handle, delta);
+    pub fn revealTextInputCaret(self: *Tree, handle: NodeHandle) !void {
+        const target = try self.ensureTextLayout(handle);
+        const x = target.text_offset_x;
+        const y = target.text_offset_y;
+        try self.updateTextInputOffset(target, target.size);
+        if (x != target.text_offset_x or y != target.text_offset_y) self.markNeedsPaint(handle);
+    }
+
+    /// Signed remaining scroll, clamped to the requested delta.
+    pub fn textScrollDelta(self: *Tree, handle: NodeHandle, axis: types.Axis, delta: f32) !f32 {
+        const target = try self.ensureTextLayout(handle);
+        const paragraph_layout = try self.paragraphs.?.get(target.paragraph_layout.?);
+        if (axis == .vertical and !target.object.text_input.multiline) return 0;
+        const minimum = @min(0, if (axis == .horizontal)
+            target.size.width - paragraph_layout.size.width - target.object.text_input.caret_width
+        else
+            target.size.height - paragraph_layout.size.height);
+        if (minimum == 0) return 0;
+        const offset = if (axis == .horizontal) target.text_offset_x else target.text_offset_y;
+        return offset - std.math.clamp(offset - delta, minimum, 0);
+    }
+
+    pub fn scrollTextInput(self: *Tree, handle: NodeHandle, axis: types.Axis, delta: f32) !bool {
+        const actual = try self.textScrollDelta(handle, axis, delta);
         if (actual == 0) return false;
-        (try self.slot(handle)).text_offset_x -= actual;
+        const target = try self.slot(handle);
+        if (axis == .horizontal) target.text_offset_x -= actual else target.text_offset_y -= actual;
         self.markNeedsPaint(handle);
         return true;
     }
@@ -312,6 +337,7 @@ pub const Tree = struct {
             input.caret_width,
         );
         rectangle.x += target.text_offset_x;
+        rectangle.y += target.text_offset_y;
         return rectangle;
     }
 
@@ -588,7 +614,7 @@ pub const Tree = struct {
                 const paragraph_handle = target.paragraph_layout orelse return error.LayoutRequired;
                 const paragraph_layout = self.paragraphs.?.get(paragraph_handle) catch
                     return error.StaleParagraph;
-                const text_origin: PointF = .{ .x = origin.x + target.text_offset_x, .y = origin.y };
+                const text_origin: PointF = .{ .x = origin.x + target.text_offset_x, .y = origin.y + target.text_offset_y };
                 try builder.pushClip(bounds);
                 if (value.selection_start != value.selection_end) {
                     var rectangles = try paragraph_layout.positioned.selectionRectangleIterator(.{
@@ -597,7 +623,7 @@ pub const Tree = struct {
                     });
                     while (try rectangles.next()) |rectangle| try builder.solidRectangle(.{
                         .x = text_origin.x + rectangle.x,
-                        .y = origin.y + rectangle.y,
+                        .y = text_origin.y + rectangle.y,
                         .width = rectangle.width,
                         .height = rectangle.height,
                     }, value.selection_color);
@@ -613,7 +639,7 @@ pub const Tree = struct {
                     });
                     while (try rectangles.next()) |rectangle| try builder.solidRectangle(.{
                         .x = text_origin.x + rectangle.x,
-                        .y = origin.y + rectangle.y + rectangle.height - value.preedit_width,
+                        .y = text_origin.y + rectangle.y + rectangle.height - value.preedit_width,
                         .width = rectangle.width,
                         .height = value.preedit_width,
                     }, value.preedit_color.?);
@@ -626,7 +652,7 @@ pub const Tree = struct {
                     );
                     try builder.solidRectangle(.{
                         .x = text_origin.x + rectangle.x,
-                        .y = origin.y + rectangle.y,
+                        .y = text_origin.y + rectangle.y,
                         .width = rectangle.width,
                         .height = rectangle.height,
                     }, value.caret_color);
@@ -798,8 +824,10 @@ pub const Tree = struct {
             .base_direction = source.base_direction,
             .language = source.language,
             .logical_size = source.logical_size,
-            // Shape the entire value on one line; the node is the viewport.
-            .max_width = std.math.floatMax(f32),
+            .max_width = if (input.multiline and constraints.hasBoundedWidth())
+                @max(1, constraints.max_width - input.caret_width)
+            else
+                std.math.floatMax(f32),
             .candidates = source.candidates,
             .configuration_revision = source.configuration_revision,
             .style = .{ .alignment = input.alignment },
@@ -845,14 +873,15 @@ pub const Tree = struct {
         self.releaseParagraphLayout(target);
         target.paragraph_layout = layout_handle;
         target.placeholder_layout = placeholder_layout;
-        try self.updateTextInputOffset(target, result.width);
+        try self.updateTextInputOffset(target, result);
         return result;
     }
 
-    fn updateTextInputOffset(self: *Tree, target: *Slot, width: f32) LayoutError!void {
+    fn updateTextInputOffset(self: *Tree, target: *Slot, viewport: SizeF) LayoutError!void {
         const paragraph_layout = self.paragraphs.?.get(target.paragraph_layout.?) catch
             return error.StaleParagraph;
         const input = target.object.text_input;
+        const width = viewport.width;
         const remaining = width - paragraph_layout.size.width - input.caret_width;
         const minimum = @min(0, remaining);
         if (remaining >= 0 or !target.has_layout) {
@@ -866,6 +895,8 @@ pub const Tree = struct {
         } else {
             target.text_offset_x = std.math.clamp(target.text_offset_x, minimum, 0);
         }
+        const minimum_y = if (input.multiline) @min(0, viewport.height - paragraph_layout.size.height) else 0;
+        target.text_offset_y = std.math.clamp(target.text_offset_y, minimum_y, 0);
         if (!input.reveal_caret and !input.show_caret) return;
         const caret = paragraph_layout.positioned.caretRectangleForOffset(
             input.caret_offset,
@@ -878,6 +909,11 @@ pub const Tree = struct {
             target.text_offset_x = -caret.x;
         if (remaining < 0)
             target.text_offset_x = std.math.clamp(target.text_offset_x, minimum, 0);
+        if (caret.y + target.text_offset_y + caret.height > viewport.height)
+            target.text_offset_y = viewport.height - caret.y - caret.height;
+        if (caret.y + target.text_offset_y < 0)
+            target.text_offset_y = -caret.y;
+        target.text_offset_y = std.math.clamp(target.text_offset_y, minimum_y, 0);
     }
 
     fn ensureTextLayout(self: *Tree, handle: NodeHandle) !*Slot {
@@ -1011,7 +1047,8 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
             !std.meta.eql(old_input.placeholder, new.text_input.placeholder) or
             (old_input.placeholder != null and (old_input.preedit == null) != (new.text_input.preedit == null)) or
             old_input.alignment != new.text_input.alignment or
-            old_input.caret_width != new.text_input.caret_width,
+            old_input.caret_width != new.text_input.caret_width or
+            old_input.multiline != new.text_input.multiline,
     };
 }
 
@@ -1483,6 +1520,69 @@ test "text objects cache width-specific mixed-script paragraphs across unchanged
     try tree.destroy(paragraph);
     try std.testing.expectEqual(@as(usize, 0), sources.count());
     try std.testing.expectEqual(@as(usize, 0), paragraphs.count());
+}
+
+test "multiline viewport wraps reveals trailing caret and preserves manual scroll during blink" {
+    const scene = @import("../../scene/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    tree.attachTextCaches(&sources, &paragraphs);
+    defer tree.deinit();
+    const value = "First line wraps over several visual rows\n\nLast\n";
+    const source = try sources.acquire(.{ .utf8 = value, .language = "und", .logical_size = 18, .candidates = &.{font}, .configuration_revision = 1 });
+    defer sources.release(source) catch unreachable;
+    var object: types.Object = .{ .text_input = .{
+        .source = source,
+        .multiline = true,
+        .color = Color.rgba(0, 0, 0, 255),
+        .caret_color = Color.rgba(0, 0, 0, 255),
+        .selection_color = Color.rgba(80, 120, 240, 120),
+        .caret_offset = value.len,
+        .selection_start = value.len,
+        .selection_end = value.len,
+        .reveal_caret = true,
+        .show_caret = true,
+    } };
+    const input = try tree.create(object);
+    _ = try tree.layout(input, .{ .max_width = 150, .max_height = 60 });
+    const paragraph = try paragraphs.get((try tree.slot(input)).paragraph_layout.?);
+    try std.testing.expect(paragraph.positioned.lines.len > 4);
+    const narrow_height = paragraph.size.height;
+    const caret = try tree.textCaretRectangle(input);
+    try std.testing.expect(caret.y >= 0 and caret.y + caret.height <= 60.001);
+    try std.testing.expectEqual(value.len, (try tree.hitTestText(input, .{ .x = caret.x, .y = caret.y + caret.height / 2 })).caret.byte_offset);
+    try std.testing.expect(try tree.scrollTextInput(input, .vertical, -10000));
+    try std.testing.expectEqual(@as(f32, 0), try tree.textScrollOffset(input, .vertical));
+    object.text_input.show_caret = false;
+    try tree.update(input, object);
+    object.text_input.show_caret = true;
+    try tree.update(input, object);
+    try std.testing.expectEqual(@as(f32, 0), try tree.textScrollOffset(input, .vertical));
+    // Moving selection after scrolling must reveal again; paint uses the same translation.
+    object.text_input.selection_start = value.len - 3;
+    object.text_input.show_caret = false;
+    try tree.update(input, object);
+    try std.testing.expect((try tree.textScrollOffset(input, .vertical)) > 0);
+    var commands: [40]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(input, &builder);
+    for (builder.displayList().commands) |command| if (command == .paragraph) {
+        try std.testing.expectEqual(-(try tree.textScrollOffset(input, .vertical)), command.paragraph.origin.y);
+    };
+    _ = try tree.layout(input, .{ .max_width = 600, .max_height = 200 });
+    try std.testing.expect((try paragraphs.get((try tree.slot(input)).paragraph_layout.?)).size.height < narrow_height);
+    try std.testing.expectEqual(@as(f32, 0), try tree.textScrollOffset(input, .vertical));
 }
 
 test "text input scrolls one line and shares viewport coordinates with caret hit testing and paint" {

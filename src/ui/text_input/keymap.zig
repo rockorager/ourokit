@@ -45,6 +45,7 @@ pub const Binding = struct {
 /// Defaults are fallback data, not special cases in event dispatch.
 pub const Keymap = struct {
     inherit_defaults: bool = true,
+    multiline: bool = false,
     bindings: [64]Binding = @splat(.{}),
     len: usize = 0,
 
@@ -63,10 +64,32 @@ pub const Keymap = struct {
     pub fn resolve(self: *const Keymap, key: platform.TranslatedKey) ?Action {
         for (self.bindings[0..self.len]) |entry|
             if (entry.chord.matches(key)) return entry.action;
+        if (self.inherit_defaults and self.multiline) for (multiline_defaults) |entry|
+            if (entry.chord.matches(key)) return entry.action;
         if (self.inherit_defaults) for (defaults) |entry|
             if (entry.chord.matches(key)) return entry.action;
         return null;
     }
+};
+
+const multiline_defaults = blk: {
+    @setEvalBranchQuota(100000);
+    const definitions = .{
+        .{ "Enter", "insert_newline" },
+        .{ "Shift+Enter", "insert_newline" },
+        .{ "Up", "move_line_up" },
+        .{ "Down", "move_line_down" },
+        .{ "Ctrl+Home", "move_document_start" },
+        .{ "Ctrl+End", "move_document_end" },
+        .{ "Ctrl+Shift+Home", "select_document_start" },
+        .{ "Ctrl+Shift+End", "select_document_end" },
+    };
+    var result: [definitions.len]Binding = undefined;
+    for (definitions, 0..) |definition, i| result[i] = .{
+        .chord = KeyChord.parse(definition[0]) catch unreachable,
+        .action = Action.parse(definition[1]) catch unreachable,
+    };
+    break :blk result;
 };
 
 pub const defaults = blk: {

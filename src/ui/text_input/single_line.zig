@@ -27,17 +27,33 @@ pub fn offset(bytes: []const u8, original: usize) usize {
 /// Returns owned normalized text only when a transformation is necessary.
 /// Callers validate UTF-8 before calling this function.
 pub fn normalize(allocator: std.mem.Allocator, bytes: []const u8) !?[]u8 {
+    return normalizeWithMode(allocator, bytes, false);
+}
+
+/// In multiline mode every hard break is represented by LF; in single-line
+/// mode every hard break is represented by a space.
+pub fn normalizeWithMode(allocator: std.mem.Allocator, bytes: []const u8, multiline: bool) !?[]u8 {
     for (bytes, 0..) |_, index| {
-        if (breakLength(bytes[index..]) != 0) break;
+        const length = breakLength(bytes[index..]);
+        if (length != 0 and !(multiline and length == 1 and bytes[index] == '\n')) break;
     } else return null;
     const result = try allocator.alloc(u8, offset(bytes, bytes.len));
     var read: usize = 0;
     for (result) |*byte| {
         const length = breakLength(bytes[read..]);
-        byte.* = if (length != 0) ' ' else bytes[read];
+        byte.* = if (length != 0) (if (multiline) '\n' else ' ') else bytes[read];
         read += @max(1, length);
     }
     return result;
+}
+
+test "multiline normalization canonicalizes hard breaks to LF" {
+    const original = "é\r\nB\u{2028}C\nD\u{85}E";
+    const normalized = (try normalizeWithMode(std.testing.allocator, original, true)).?;
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings("é\nB\nC\nD\nE", normalized);
+    try std.testing.expectEqual(@as(usize, "é\nB\n".len), offset(original, "é\r\nB\u{2028}".len));
+    try std.testing.expect((try normalizeWithMode(std.testing.allocator, "é\nB", true)) == null);
 }
 
 test "single line normalization preserves words and maps preedit byte offsets" {

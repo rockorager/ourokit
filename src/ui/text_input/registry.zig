@@ -84,11 +84,11 @@ pub const Registry = struct {
     ) !void {
         const candidate = if (prepared.*) |*session_value| session_value else return error.TextInputSessionMissing;
         const entry = self.find(target) orelse return;
-        if (mode == .uncontrolled or std.mem.eql(
+        if (entry.session.?.model.multiline == candidate.model.multiline and (mode == .uncontrolled or std.mem.eql(
             u8,
             entry.session.?.model.text(),
             candidate.model.text(),
-        )) return;
+        ))) return;
         _ = candidate.model.setSelectionClamped(entry.session.?.model.selection);
         candidate.revision = entry.session.?.revision +% 1;
     }
@@ -113,11 +113,11 @@ pub const Registry = struct {
             entry.behavior = behavior;
             if (!behavior.enabled) entry.session.?.endSelectionDrag();
             entry.seen = true;
-            if (mode == .controlled and !std.mem.eql(
+            if (entry.session.?.model.multiline != prepared.*.?.model.multiline or (mode == .controlled and !std.mem.eql(
                 u8,
                 entry.session.?.model.text(),
                 prepared.*.?.model.text(),
-            )) {
+            ))) {
                 entry.session.?.deinit();
                 entry.session = prepared.*.?;
                 entry.session_generation +%= 1;

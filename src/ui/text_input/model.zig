@@ -74,15 +74,20 @@ pub const Model = struct {
     history: std.ArrayList(HistoryEntry) = .empty,
     history_cursor: usize = 0,
     edit_group: ?EditKind = null,
+    multiline: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, raw: []const u8) !Model {
+        return initWithMode(allocator, raw, false);
+    }
+
+    pub fn initWithMode(allocator: std.mem.Allocator, raw: []const u8, multiline: bool) !Model {
         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
-        const normalized = try single_line.normalize(allocator, raw);
+        const normalized = try single_line.normalizeWithMode(allocator, raw, multiline);
         defer if (normalized) |bytes| allocator.free(bytes);
         const initial = normalized orelse raw;
         const boundary_capacity = std.math.add(usize, initial.len, 1) catch
             return error.OutOfMemory;
-        var self: Model = .{ .allocator = allocator };
+        var self: Model = .{ .allocator = allocator, .multiline = multiline };
         errdefer self.deinit();
         try self.bytes.appendSlice(allocator, initial);
         try self.boundaries.ensureTotalCapacity(allocator, boundary_capacity);
@@ -172,7 +177,7 @@ pub const Model = struct {
         if (!isUtf8Boundary(self.bytes.items, range.start) or
             !isUtf8Boundary(self.bytes.items, range.end))
             return error.InvalidTextOffset;
-        const normalized = try single_line.normalize(self.allocator, raw);
+        const normalized = try single_line.normalizeWithMode(self.allocator, raw, self.multiline);
         defer if (normalized) |bytes| self.allocator.free(bytes);
         const replacement = normalized orelse raw;
         const removed_len = range.end - range.start;
@@ -341,6 +346,16 @@ pub const Model = struct {
         };
     }
 
+    /// The logical hard line at an insertion offset, including its terminating
+    /// LF when present. Single-line models retain the historical whole-value range.
+    pub fn lineRangeAt(self: *const Model, offset: usize) Range {
+        if (!self.multiline) return .{ .start = 0, .end = self.bytes.items.len };
+        const at = @min(offset, self.bytes.items.len);
+        const start = if (std.mem.lastIndexOfScalar(u8, self.bytes.items[0..at], '\n')) |index| index + 1 else 0;
+        const end = if (std.mem.indexOfScalar(u8, self.bytes.items[at..], '\n')) |index| at + index + 1 else self.bytes.items.len;
+        return .{ .start = start, .end = end };
+    }
+
     fn rebuildBoundaries(self: *Model) void {
         self.boundaries.clearRetainingCapacity();
         self.boundaries.appendAssumeCapacity(0);
@@ -473,6 +488,22 @@ test "single line model normalizes initial values and replacements before placin
     _ = try model.replaceSelection("Ω\r\nB\u{2028}C");
     try std.testing.expectEqualStrings("a Ω B C z", model.text());
     try std.testing.expectEqual(Selection.collapsed("a Ω B C".len), model.selection);
+}
+
+test "multiline model preserves normalized lines through selection deletion and undo" {
+    var model = try Model.initWithMode(std.testing.allocator, "α\r\nβ\u{2029}👩🏽‍🚀\nZ", true);
+    defer model.deinit();
+    try std.testing.expect(model.multiline);
+    try std.testing.expectEqualStrings("α\nβ\n👩🏽‍🚀\nZ", model.text());
+    _ = try model.setSelection(.{ .anchor = "α\nβ\n".len, .extent = "α\n".len });
+    _ = try model.replaceSelection("Ω\rX");
+    try std.testing.expectEqualStrings("α\nΩ\nX👩🏽‍🚀\nZ", model.text());
+    _ = try model.deleteBackward();
+    try std.testing.expectEqualStrings("α\nΩ\n👩🏽‍🚀\nZ", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("α\nΩ\nX👩🏽‍🚀\nZ", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("α\nβ\n👩🏽‍🚀\nZ", model.text());
 }
 
 test "selection direction is retained and replacement is normalized" {

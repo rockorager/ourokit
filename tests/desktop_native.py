@@ -158,6 +158,9 @@ def document_test(root, env):
                               if n["path"] == "drop/body/error"), None)
                 raise AssertionError(f"{failure}; UI error={error}; portal={portal_log.read_text() if portal_log.exists() else 'no call'}") from failure
             assert node(app_env, endpoint, "document-2", "drop/body/title")["value"] == "From disk"
+            # Dev focus is semantic, not compositor activation. Raise the editor
+            # so Sway does not throttle replay behind the newly opened window.
+            sway(app_env, '[app_id="dev.ourokit.documents" title="^Untitled$"]', "focus")
             click(app_env, endpoint, "document-1", "drop/body/title")
             tree = inspect(app_env, endpoint, "document-1")["windows"][0]
             run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
@@ -165,9 +168,36 @@ def document_test(root, env):
             tree = inspect(app_env, endpoint, "document-1")["windows"][0]
             run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
                 "action":"text", "text":"Native save"}), env=app_env)
+            body = ("A small native notes editor\n\n"
+                    "This paragraph wraps within the editor. Selection, keyboard movement and scrolling use the same native text layout, even when a sentence continues onto another visual line.\n\n"
+                    + "".join(f"Note {i}\n" for i in range(1, 19)))
+            click(app_env, endpoint, "document-1", "drop/body/text")
+            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
+            # Native development replay settles a submitted frame per edit.
+            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
+                "action":"text", "text":body}), env=app_env, timeout=90)
+            field = node(app_env, endpoint, "document-1", "drop/body/text")
+            assert field["multiline"] and field["scroll_offset"] > 0, field
+            assert field["selection"]["extent"] == len(body.encode()), field
+            capture(app_env, endpoint, "document-1", "document-scrolled.png")
+            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
+            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
+                "action":"scroll", "target":"drop/body/text", "delta":-10000}), env=app_env)
+            time.sleep(.7)  # A caret blink must not undo manual scrolling.
+            assert node(app_env, endpoint, "document-1", "drop/body/text")["scroll_offset"] == 0
+            for action in [{"action":"key", "key":"home", "control":True},
+                           {"action":"key", "key":"arrow_down", "shift":True},
+                           {"action":"key", "key":"arrow_down", "shift":True},
+                           {"action":"key", "key":"arrow_down", "shift":True}]:
+                tree = inspect(app_env, endpoint, "document-1")["windows"][0]
+                run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"], **action}), env=app_env)
+            selection = node(app_env, endpoint, "document-1", "drop/body/text")["selection"]
+            assert selection["anchor"] == 0 and selection["extent"] > len("A small native notes editor\n\n")
+            capture(app_env, endpoint, "document-1", "document-multiline-selection.png")
             click(app_env, endpoint, "document-1", "drop/body/actions/save")
             wait_for(saved.exists, "portal save did not write the returned local URI")
-            assert "Native save" in saved.read_text()
+            persisted = json.loads(saved.read_text())
+            assert persisted["title"] == "Native save" and persisted["text"] == body, persisted
 
             # Re-open what was actually written through the application's open hook.
             run(str(BINARY), "activate", "dev.ourokit.documents", saved.as_uri(), env=app_env, ok=False)
@@ -181,6 +211,7 @@ def document_test(root, env):
             click(app_env, endpoint, "document-1", "drop/body/actions/open")
             wait_for(lambda: len(inspect(app_env, endpoint)["windows"]) == 3, "saved file did not reopen")
             assert node(app_env, endpoint, "document-3", "drop/body/title")["value"] == "Native save"
+            assert node(app_env, endpoint, "document-3", "drop/body/text")["value"] == body
 
             # A compositor close is a request, not destruction of a dirty window.
             click(app_env, endpoint, "document-1", "drop/body/title")
@@ -188,9 +219,14 @@ def document_test(root, env):
             run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
                 "action":"text", "text":"!"}), env=app_env)
             sway(app_env, '[app_id="dev.ourokit.documents"]', "kill")
-            wait_for(lambda: any(n["path"] == "drop/body/close-confirm" for n in inspect(app_env, endpoint, "document-1")["windows"][0]["nodes"]),
+            wait_for(lambda: any(n["path"] == "drop/close-confirm" for n in inspect(app_env, endpoint, "document-1")["windows"][0]["nodes"]),
                      "native close bypassed dirty-document interception")
             capture(app_env, endpoint, "document-1", "document-unsaved-close.png")
+            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
+            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
+                "action":"key", "key":"escape"}), env=app_env)
+            wait_for(lambda: not any(n["path"] == "drop/close-confirm" for n in inspect(app_env, endpoint, "document-1")["windows"][0]["nodes"]),
+                     "Escape did not cancel close confirmation")
             evidence = portal_log.read_text()
             assert evidence.startswith("OpenFile wayland:"), evidence
             print("PASS actual documents UI, portal parent, disk save/reopen, multiple windows and native close")

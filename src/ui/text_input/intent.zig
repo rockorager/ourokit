@@ -5,6 +5,7 @@ pub const Intent = union(enum) {
     select_all,
     undo,
     redo,
+    insert_newline,
     delete_backward,
     delete_forward,
     delete_word_backward,
@@ -26,4 +27,6 @@ pub const Destination = enum {
     line_down,
     line_start,
     line_end,
+    document_start,
+    document_end,
 };

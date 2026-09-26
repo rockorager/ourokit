@@ -11,7 +11,9 @@ return function(json)
   end
   function M.edit(d, field, value)
     assert(field == "title" or field == "text")
-    if type(value) ~= "string" or value:find("[\r\n]") then return nil, field .. " must be a single line" end
+    if type(value) ~= "string" then return nil, field .. " must be text" end
+    if field == "title" and value:find("[\r\n]") then return nil, "title must be a single line" end
+    if field == "text" and value:find("\r") then return nil, "text must use LF line endings" end
     if d[field] ~= value then d[field], d.dirty, d.revision = value, true, d.revision + 1 end
     return true
   end
@@ -22,7 +24,7 @@ return function(json)
     local ok, value = pcall(json.decode, bytes)
     if not ok or type(value) ~= "table" or value.format ~= "dev.ourokit.ournote" or value.version ~= 1
       or type(value.title) ~= "string" or type(value.text) ~= "string"
-      or value.title:find("[\r\n]") or value.text:find("[\r\n]") then
+      or value.title:find("[\r\n]") or value.text:find("\r") then
       return nil, "Not a valid Ourokit note"
     end
     for key in pairs(value) do
