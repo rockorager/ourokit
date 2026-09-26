@@ -212,7 +212,7 @@ pub fn build(b: *std.Build) void {
     const generate_step = b.step("generate-tokens", "Validate tokens and regenerate Zig data");
     generate_step.dependOn(&token_generate.step);
 
-    addWaylandExample(b, target, optimize, ourokit, enable_vulkan);
+    const host = addWaylandExample(b, target, optimize, ourokit, enable_vulkan);
     addRendererBenchmark(b, target, optimize, ourokit);
     addParagraphBenchmark(
         b,
@@ -291,12 +291,27 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_ui_tests = b.addRunArtifact(ui_tests);
-    const test_step = b.step("test", "Run all deterministic and integration tests");
+    const test_step = b.step("test", "Run Zig unit and integration tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_ui_tests.step);
     test_step.dependOn(&run_codec_tests.step);
     test_step.dependOn(addNativePlugins(b, target, optimize, ourokit));
+
+    const development = b.addSystemCommand(&.{"python3"});
+    development.addFileArg(b.path("tests/verify_development.py"));
+    development.addArtifactArg(host);
+    development.setCwd(b.path("."));
+    development.has_side_effects = true;
+    const development_step = b.step("test-development", "Verify the development loop and control isolation on a disposable headless Sway");
+    development_step.dependOn(&development.step);
+
+    const format = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", "--check", "build.zig", "src", "examples", "tools" });
+    format.setCwd(b.path("."));
+    const verify = b.step("verify", "Run Zig tests, formatting and native development/control verification");
+    verify.dependOn(test_step);
+    verify.dependOn(development_step);
+    verify.dependOn(&format.step);
 
     const ui_test_step = b.step("test-ourokit-ui", "Run platform-neutral UI integration tests");
     ui_test_step.dependOn(&run_ui_tests.step);
@@ -537,7 +552,7 @@ fn addWaylandExample(
     optimize: std.builtin.OptimizeMode,
     ourokit: *std.Build.Module,
     enable_vulkan: bool,
-) void {
+) *std.Build.Step.Compile {
     const host = b.addExecutable(.{
         .name = "ouroctl",
         .root_module = b.createModule(.{
@@ -643,6 +658,7 @@ fn addWaylandExample(
     benchmark_step.dependOn(&install_benchmark.step);
     benchmark_step.dependOn(&install_settings_benchmark.step);
     benchmark_step.dependOn(&install_scroll_benchmark.step);
+    return host;
 }
 
 fn addWaylandProtocol(

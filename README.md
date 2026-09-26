@@ -56,10 +56,30 @@ Lua and native-extension contracts are also evolving; no stable ABI is promised.
 
 ```sh
 zig build
-zig build test
-zig fmt --check build.zig src examples tools
-zig build tokens
+zig build verify
 ```
+
+`verify` is the routine pre-commit check: Zig tests (including token validation),
+Zig formatting, and five real-process development/control suites. The native
+suite starts its own headless Sway with software rendering and private D-Bus
+sessions; it does not use your desktop, session bus, or compositor configuration.
+It checks inspection, input, capture pixels, rejected and accepted reloads,
+retained identity, cancellation, desktop activation, and production isolation.
+It tests the CLI artifact from this build, not a previously installed binary,
+and runs again even when the build is cached.
+
+Run as a regular user with Python 3, Sway (including `swaymsg`),
+`dbus-run-session`, `dbus-daemon`, `gdbus`, and system fonts installed. On
+Debian/Ubuntu the additional packages are `sway dbus-daemon libglib2.0-bin`.
+Missing tools, compositor startup failures, timeouts and failed tests are errors,
+not skipped checks. The compositor and test process groups are stopped on exit.
+This verifies software-rendered native behavior, not GPU presentation latency or
+integration with a particular desktop environment.
+
+For focused iteration, `zig build test` runs the Zig suite without a compositor;
+`zig build test-development` runs only the isolated native/control suites.
+Individual Python tests still support `OUROKIT_TEST_WAYLAND_DISPLAY` for manual
+use on a disposable compositor. The `verify` command always creates its own.
 
 The default build includes both software and Vulkan renderers and installs
 `zig-out/lib/libourokit.a`. Use `-Dvulkan=false` for a software-only build that
