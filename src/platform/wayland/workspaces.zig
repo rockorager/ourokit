@@ -185,8 +185,14 @@ pub const Client = struct {
             message,
             fds,
         )) {
-            .output_enter => |event| try self.addGroupOutput(slot, objects.namespace.lookupHandle(event.output) orelse return error.UnknownOutput),
-            .output_leave => |event| self.removeGroupOutput(slot, objects.namespace.lookupHandle(event.output) orelse return error.UnknownOutput),
+            // Wayring decodes references to locally released outputs as zero.
+            // removeOutput already withdrew them; queued membership is stale.
+            .output_enter => |event| if (event.output != 0) {
+                try self.addGroupOutput(slot, objects.namespace.lookupHandle(event.output) orelse return error.UnknownOutput);
+            },
+            .output_leave => |event| if (event.output != 0) {
+                self.removeGroupOutput(slot, objects.namespace.lookupHandle(event.output) orelse return error.UnknownOutput);
+            },
             .workspace_enter => |event| {
                 const workspace = self.workspaceForObject(event.workspace) orelse return error.UnknownWorkspace;
                 workspace.group = slot.protocol_handle;
@@ -481,4 +487,120 @@ test "workspace groups resolve output names across moves and removal" {
     try store.commit();
     client.batch_pending = false;
     try std.testing.expectEqualStrings("pending", store.snapshot()[0].name);
+}
+
+test "workspace output events tolerate released outputs without hiding invalid wire references" {
+    const allocator = std.testing.allocator;
+    const Wire = struct {
+        fn dispatch(
+            comptime Interface: type,
+            client: *Client,
+            objects: *wayring.objects.ClientObjects,
+            incoming: *wayring.tx.Queue,
+            transmit: *wayring.tx.Queue,
+            fds: *wayring.ancillary.FdQueue,
+            target: Handle,
+            event: Interface.Event,
+        ) !void {
+            try Interface.encodeEvent(incoming, target.id, event);
+            const snapshot = try incoming.snapshot(&.{}, &.{});
+            const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+            defer {
+                incoming.begin(snapshot) catch unreachable;
+                incoming.complete(snapshot.byteCount()) catch unreachable;
+            }
+            if (Interface == protocol.ext_workspace_group_handle_v1) {
+                try client.groupEvent(objects, transmit, target.id, message, fds);
+            } else if (Interface == protocol.ext_workspace_manager_v1) {
+                try client.managerEvent(objects, transmit, message, fds);
+            } else {
+                _ = try Core.decodeDisplayEvent(objects, message, fds);
+            }
+        }
+    };
+    const Group = protocol.ext_workspace_group_handle_v1;
+    const Manager = protocol.ext_workspace_manager_v1;
+
+    for ([_]bool{ false, true }) |leave_before_release| {
+        var store: shell_workspaces.Store = undefined;
+        try store.init(allocator, 1, 1);
+        defer store.deinit();
+        var client: Client = undefined;
+        try client.init(allocator, &store, 1);
+        defer client.deinit();
+        var objects = try wayring.objects.ClientObjects.init(allocator, 16, 16, &protocol.wl_display.info, null);
+        defer objects.deinit(allocator);
+        var blocks = try wayring.pool.SharedBlocks.init(allocator, 4096, 2);
+        defer blocks.deinit(allocator);
+        var fd_pool = try wayring.pool.SharedFds.init(allocator, 1);
+        defer fd_pool.deinit(allocator);
+        var incoming = wayring.tx.Queue.init(&blocks, 4096, &fd_pool, 0);
+        defer incoming.deinit();
+        var transmit = wayring.tx.Queue.init(&blocks, 4096, &fd_pool, 0);
+        defer transmit.deinit();
+        var fds = wayring.ancillary.FdQueue.init(&fd_pool, 0);
+        defer fds.deinit();
+
+        const manager = try objects.createLocal(&Manager.info, 1, null);
+        const group = try objects.createLocal(&Group.info, 1, null);
+        const workspace = try objects.createLocal(&protocol.ext_workspace_handle_v1.info, 1, null);
+        const removed = try objects.createLocal(&protocol.wl_output.info, 4, null);
+        const survivor = try objects.createLocal(&protocol.wl_output.info, 4, null);
+        client.manager = manager;
+        client.groups[0].protocol_handle = group;
+        client.workspace_slots[0] = .{ .protocol_handle = workspace, .model_handle = try store.create(), .group = group };
+        try client.nameOutput(removed, "DP-1");
+        try client.nameOutput(survivor, "eDP-1");
+        for ([_]Handle{ removed, survivor }) |output|
+            try Wire.dispatch(Group, &client, &objects, &incoming, &transmit, &fds, group, .{ .output_enter = .{ .output = output.id } });
+        try Wire.dispatch(Manager, &client, &objects, &incoming, &transmit, &fds, manager, .{ .done = .{} });
+        try std.testing.expectEqual(@as(usize, 2), store.snapshot()[0].outputs.len);
+
+        if (leave_before_release) {
+            try Wire.dispatch(Group, &client, &objects, &incoming, &transmit, &fds, group, .{ .output_leave = .{ .output = removed.id } });
+            try std.testing.expectEqual(@as(usize, 1), client.groups[0].outputs.items.len);
+            // Membership is published only at the manager's done boundary.
+            try std.testing.expectEqual(@as(usize, 2), store.snapshot()[0].outputs.len);
+        }
+        // Match Host.removeOutput: remove membership, then release wl_output.
+        try client.removeOutput(removed);
+        try wayring.client.sendRequest(protocol.wl_output, &objects, &transmit, removed, .{ .release = .{} });
+        try std.testing.expect(objects.namespace.resolve(removed).?.destroyed);
+        try std.testing.expectEqual(removed, objects.namespace.lookupHandle(removed.id).?);
+        // Both queued events carry a nonzero wire ID, decoded as zero for a zombie.
+        for ([_]Group.Event{
+            .{ .output_leave = .{ .output = removed.id } },
+            .{ .output_enter = .{ .output = removed.id } },
+        }) |event| try Wire.dispatch(Group, &client, &objects, &incoming, &transmit, &fds, group, event);
+        try Wire.dispatch(Manager, &client, &objects, &incoming, &transmit, &fds, manager, .{ .done = .{} });
+        try std.testing.expect(!client.batch_pending);
+        try std.testing.expectEqual(@as(usize, 1), client.groups[0].outputs.items.len);
+        try std.testing.expectEqual(survivor, client.groups[0].outputs.items[0]);
+        try std.testing.expectEqual(@as(usize, 1), store.snapshot()[0].outputs.len);
+        try std.testing.expectEqualStrings("eDP-1", store.snapshot()[0].outputs[0]);
+
+        // Zero on the wire, a missing object, and a wrong interface stay invalid.
+        for ([_]u32{ 0, 99, workspace.id }) |invalid| {
+            const expected = if (invalid == 0) error.NullObject else if (invalid == 99) error.UnknownObject else error.WrongInterface;
+            for ([_]Group.Event{
+                .{ .output_enter = .{ .output = invalid } },
+                .{ .output_leave = .{ .output = invalid } },
+            }) |event| try std.testing.expectError(expected, Wire.dispatch(Group, &client, &objects, &incoming, &transmit, &fds, group, event));
+        }
+
+        const display = objects.namespace.lookupHandle(1).?;
+        try Wire.dispatch(protocol.wl_display, &client, &objects, &incoming, &transmit, &fds, display, .{ .delete_id = .{ .id = removed.id } });
+        try std.testing.expectError(error.UnknownObject, Wire.dispatch(Group, &client, &objects, &incoming, &transmit, &fds, group, .{ .output_leave = .{ .output = removed.id } }));
+        const reconnected = try objects.createLocal(&protocol.wl_output.info, 4, null);
+        try std.testing.expectEqual(removed.id, reconnected.id);
+        try std.testing.expect(removed.generation != reconnected.generation);
+        try client.nameOutput(reconnected, "DP-1");
+        try Wire.dispatch(Group, &client, &objects, &incoming, &transmit, &fds, group, .{ .output_enter = .{ .output = reconnected.id } });
+        try Wire.dispatch(Manager, &client, &objects, &incoming, &transmit, &fds, manager, .{ .done = .{} });
+        try std.testing.expectEqual(@as(usize, 2), client.groups[0].outputs.items.len);
+        try std.testing.expectEqual(reconnected, client.groups[0].outputs.items[1]);
+        try std.testing.expectEqual(@as(usize, 2), store.snapshot()[0].outputs.len);
+        try std.testing.expectEqualStrings("eDP-1", store.snapshot()[0].outputs[0]);
+        try std.testing.expectEqualStrings("DP-1", store.snapshot()[0].outputs[1]);
+    }
 }
