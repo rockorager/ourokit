@@ -1192,6 +1192,9 @@ pub const Host = struct {
     /// Callers that omit this keep the alpha-capable conversion path.
     pub fn prepareScene(self: *Host, handle: WindowHandle, list: scene.DisplayList) !void {
         const window = try self.windowFor(handle);
+        // A retained UI can request submission while its native layer surface
+        // is being recreated and still has the declaration's zero extent.
+        if (window.state != .open or window.recreate or !window.configured) return;
         const bounds: RectI = .{ .x = 0, .y = 0, .width = try scaledExtent(window.width, window.scale_120), .height = try scaledExtent(window.height, window.scale_120) };
         window.direct_presentation = self.usingDmabuf() and list.isOpaque(bounds) and
             self.dmabuf_direct_supported;
@@ -4182,6 +4185,157 @@ test "layer background effect wire requests cover fallback removal and recreatio
         try transmit.begin(removal);
         try transmit.complete(removal.byteCount());
     }
+}
+
+test "retained scene waits for layer configure after output reconnect" {
+    const allocator = std.testing.allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    try reactor.initOwned(allocator, .{ .entries = 8 }, (Config{ .app_id = "test" }).reactor);
+    defer reactor.deinit(allocator);
+    const socket = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket) != .SUCCESS) return error.SocketFailed;
+    const peer = try reactor.attach(@intCast(socket), .{ .received_fd_budget = 0, .transmit_byte_budget = 65536, .transmit_fd_budget = 16 });
+    defer reactor.destroyPeer(peer) catch unreachable;
+    var windows = [_]Window{.{}} ** 2;
+    var outputs = [_]Output{.{}} ** 2;
+    var host: Host = .{
+        .allocator = allocator,
+        .loop = undefined,
+        .sink = undefined,
+        .app_id = undefined,
+        .vulkan = null,
+        .adapter = undefined,
+        .connection = .{ .reactor = &reactor, .peer = peer, .objects = try wayring.objects.ClientObjects.init(allocator, 128, 128, &protocol.wl_display.info, null) },
+        .driver = undefined,
+        .registry = undefined,
+        .text_input_pending = TextInput.Pending.init(allocator),
+        .clipboard = undefined,
+        .xkb = undefined,
+        .windows = &windows,
+        .outputs = &outputs,
+    };
+    defer host.connection.objects.deinit(allocator);
+    defer host.text_input_pending.deinit();
+    defer for (&windows) |*window| host.releaseWindowLocal(window);
+    defer for (&outputs) |output| if (output.name) |name| allocator.free(name);
+    host.driver = Driver.init(&host.connection);
+    const objects = &host.connection.objects;
+    host.compositor = try objects.createLocal(&protocol.wl_compositor.info, 4, null);
+    host.shm = try objects.createLocal(&protocol.wl_shm.info, 1, null);
+    host.layer_shell = try objects.createLocal(&protocol.zwlr_layer_shell_v1.info, 4, null);
+    host.layer_shell_version = 4;
+    const Recorder = struct {
+        configurations: usize = 0,
+        fn configured(context: *anyopaque, _: WindowHandle, _: u32, _: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.configurations += 1;
+        }
+        fn event(host_: *Host, object: Handle, comptime interface: type, value: interface.Event) !void {
+            var blocks = try wayring.pool.SharedBlocks.init(std.testing.allocator, 4096, 1);
+            defer blocks.deinit(std.testing.allocator);
+            var descriptors = try wayring.pool.SharedFds.init(std.testing.allocator, 1);
+            defer descriptors.deinit(std.testing.allocator);
+            var queue = wayring.tx.Queue.init(&blocks, 4096, &descriptors, 0);
+            defer queue.deinit();
+            var fds = wayring.ancillary.FdQueue.init(&descriptors, 0);
+            defer fds.deinit();
+            try interface.encodeEvent(&queue, object.id, value);
+            const snapshot = try queue.snapshot(&.{}, &.{});
+            const message = (try wayring.wire.Message.decode(snapshot.first)).?;
+            _ = try host_.event(try host_.connection.objects.namespace.event(object.id, message.header.opcode), message, &fds);
+        }
+    };
+    var recorder: Recorder = .{};
+    var sink: platform_window.EventSink.VTable = undefined;
+    sink.configured = Recorder.configured;
+    host.sink = .{ .context = &recorder, .vtable = &sink };
+    for (&outputs, 0..) |*output, index| {
+        output.* = .{ .global_name = @intCast(10 + index), .handle = try objects.createLocal(&protocol.wl_output.info, 4, null) };
+        try host.nameOutput(output, if (index == 0) "DP-1" else "survivor");
+        try Host.nativeCreate(&host, .{ .slot = @intCast(index), .generation = 1 }, .invalid, .{ .layer_surface = .{
+            .id = if (index == 0) "panel" else "other",
+            .namespace = "test",
+            .output = output.name,
+            .width = 0,
+            .height = 40,
+            .layer = .top,
+            .anchors = .{ .top = true, .left = true, .right = true },
+        } });
+        try Recorder.event(&host, windows[index].layer_surface.?, protocol.zwlr_layer_surface_v1, .{ .configure = .{ .serial = @intCast(index + 1), .width = if (index == 0) 3072 else 1280, .height = 40 } });
+    }
+
+    // Keep the UI submission state and display list alive across native teardown.
+    const Runtime = @import("../../app/window_runtime.zig").WindowRuntime;
+    var commands = [_]scene.Command{.{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 3072, .height = 40 }, .color = .rgba(12, 34, 56, 255) } }};
+    var runtime: Runtime = .{ .initialized = true, .ready = true, .commands = &commands, .command_count = 1 };
+    runtime.damage_tracker = try scene.DamageTracker.init(allocator, 1);
+    defer runtime.damage_tracker.deinit();
+    _ = try runtime.frame_state.configure(.{ .width = 3072, .height = 40 });
+    try runtime.frame_state.layoutComplete();
+    _ = try runtime.frame_state.sceneBuilt();
+    const handle = windows[0].handle;
+    const old_surface = windows[0].surface.?;
+    const survivor = windows[1].surface.?;
+    try std.testing.expect(runtime.wantsSubmission());
+    try host.prepareScene(handle, try runtime.displayList());
+    const first = (try host.acquireFrame(handle)).?;
+    try host.present(first);
+    try runtime.frameSubmitted();
+    try Recorder.event(&host, windows[0].frame_callback.?, protocol.wl_callback, .{ .done = .{ .callback_data = 1 } });
+    try Recorder.event(&host, windows[0].buffers.slots[first.slot].handle.?, protocol.wl_buffer, .{ .release = .{} });
+
+    try host.removeOutput(10);
+    try Recorder.event(&host, windows[0].layer_surface.?, protocol.zwlr_layer_surface_v1, .{ .closed = .{} });
+    try host.maintainWindows();
+    try std.testing.expectEqual(WindowState.waiting_output, windows[0].state);
+    runtime.frame_state.submission_requested = true;
+    try host.prepareScene(handle, try runtime.displayList());
+    try std.testing.expectEqual(null, try host.acquireFrame(handle));
+    outputs[0] = .{ .global_name = 23, .handle = try objects.createLocal(&protocol.wl_output.info, 4, null) };
+    try host.nameOutput(&outputs[0], "DP-1");
+    try std.testing.expectEqual(handle, windows[0].handle);
+    try std.testing.expect(!std.meta.eql(old_surface, windows[0].surface.?));
+    try std.testing.expectEqual(@as(u32, 0), windows[0].width);
+    try std.testing.expectEqual(@as(u32, 40), windows[0].height);
+    try std.testing.expect(!windows[0].configured);
+    for (0..3) |_| {
+        try host.prepareScene(handle, try runtime.displayList());
+        try host.requestRedraw(handle);
+        try std.testing.expectEqual(null, try host.acquireFrame(handle));
+        try std.testing.expect(runtime.wantsSubmission());
+        try std.testing.expectEqual(@as(usize, 1), windows[0].frames_presented);
+    }
+    try std.testing.expectEqual(survivor, windows[1].surface.?);
+    try host.prepareScene(windows[1].handle, try runtime.displayList());
+    const other = (try host.acquireFrame(windows[1].handle)).?;
+    try std.testing.expectEqual(@as(u32, 1280), other.width);
+    try host.present(other);
+
+    try Recorder.event(&host, windows[0].layer_surface.?, protocol.zwlr_layer_surface_v1, .{ .configure = .{ .serial = 37, .width = 3072, .height = 40 } });
+    try std.testing.expectEqual(@as(usize, 3), recorder.configurations);
+    try host.prepareScene(handle, try runtime.displayList());
+    var resumed = (try host.acquireFrame(handle)).?;
+    try std.testing.expectEqual(@as(u32, 3072), resumed.width);
+    try std.testing.expectEqual(@as(u32, 40), resumed.height);
+    var list = try runtime.displayList();
+    try host.prepareFrameDamage(&resumed, list.damage);
+    list.damage = resumed.damage();
+    try @import("../../renderer/software/root.zig").render(list, .{ .pixels = resumed.target.software.pixels, .width = resumed.width, .height = resumed.height, .stride = resumed.target.software.stride, .format = .bgra8_unorm });
+    try std.testing.expectEqualSlices(u8, &.{ 56, 34, 12, 255 }, resumed.target.software.pixels[0..4]);
+    try host.present(resumed);
+    try runtime.frameSubmitted();
+    try Recorder.event(&host, windows[0].frame_callback.?, protocol.wl_callback, .{ .done = .{ .callback_data = 2 } });
+    try std.testing.expectEqual(@as(usize, 2), windows[0].frames_presented);
+    try std.testing.expect(!runtime.wantsSubmission());
+    // Readiness must not hide invalid extents on an already-configured surface.
+    windows[0].width = 0;
+    try std.testing.expectError(error.InvalidScaledExtent, host.prepareScene(handle, .{ .commands = &.{} }));
+    windows[0].recreate = true;
+    try host.prepareScene(handle, .{ .commands = &.{} });
+    windows[0].recreate = false;
+    windows[0].width = std.math.maxInt(u32);
+    windows[0].scale_120 = 240;
+    try std.testing.expectError(error.ScaledExtentOverflow, host.prepareScene(handle, .{ .commands = &.{} }));
 }
 
 test "layer state owns output identity across hotplug recreation" {
