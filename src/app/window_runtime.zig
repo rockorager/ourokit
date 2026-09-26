@@ -19,15 +19,46 @@ pub const Config = struct {
     input_capacity: usize = 128,
     command_capacity: usize = 512,
     semantic_text_capacity: usize = 16 * 1024,
+    /// Enable monotonic CPU phase timing for explicitly opted-in development.
+    measure_phases: bool = false,
     /// Duration of each caret phase. Zero keeps the caret steady.
     caret_blink_interval_ns: u64 = 500 * std.time.ns_per_ms,
 };
 
 pub const SemanticTarget = struct {
     center: core.PointF,
+    bounds: core.RectF,
     role: ui.semantics.Role,
     enabled: bool,
     scroll_axis: ?platform.PointerAxis,
+};
+
+pub const Measurement = struct {
+    count: u64 = 0,
+    timed_count: u64 = 0,
+    total_ns: u64 = 0,
+    last_ns: ?u64 = null,
+
+    fn finish(self: *Measurement, start: ?u64) void {
+        self.count +|= 1;
+        self.last_ns = null;
+        const before = start orelse return;
+        const after = @import("../loop/root.zig").monotonicNow() catch return;
+        const elapsed = after -| before;
+        self.timed_count +|= 1;
+        self.total_ns +|= elapsed;
+        self.last_ns = elapsed;
+    }
+};
+
+/// Successful CPU phases and accepted backend submissions, not presentation
+/// timestamps or input-to-display latency. Failed phase attempts are excluded.
+pub const Metrics = struct {
+    builds: Measurement = .{},
+    layouts: Measurement = .{},
+    paints: Measurement = .{},
+    input_events: u64 = 0,
+    submitted_frames: u64 = 0,
 };
 
 pub const TextInputStatus = struct {
@@ -99,6 +130,10 @@ pub const WindowRuntime = struct {
     virtual_lists: virtual_list.Snapshot = .{},
     virtual_work: bool = false,
     virtual_offsets_pending: bool = false,
+    development_generation: u64 = 1,
+    development_revision: u64 = 0,
+    measure_phases: bool = false,
+    metrics: Metrics = .{},
 
     pub fn init(
         self: *WindowRuntime,
@@ -168,7 +203,13 @@ pub const WindowRuntime = struct {
             .signals = signals,
             .paragraph_sources = paragraph_sources,
             .paragraphs = paragraphs,
+            .measure_phases = config.measure_phases,
         };
+    }
+
+    fn phaseStart(self: *const WindowRuntime) ?u64 {
+        if (!self.measure_phases) return null;
+        return @import("../loop/root.zig").monotonicNow() catch null;
     }
 
     pub fn setDirtyWindowQueue(
@@ -223,6 +264,7 @@ pub const WindowRuntime = struct {
 
     pub fn clear(self: *WindowRuntime, lua_ui: *lua.UiBuild) !void {
         if (!self.initialized) return;
+        self.development_generation +%= 1;
         lua_ui.clearHandlers(&self.pointer_bindings);
         self.buttons.clear();
         self.listboxes.clear();
@@ -267,6 +309,7 @@ pub const WindowRuntime = struct {
     ) !void {
         if (!self.initialized or size.width == 0 or size.height == 0)
             return error.WindowRuntimeNotReadyForSourcePreparation;
+        const started = self.phaseStart();
         prepared.reset();
         const work: ui.instance.BuildWork = .{
             .owner = self.root_owner,
@@ -386,6 +429,7 @@ pub const WindowRuntime = struct {
         prepared.reconcile_plan = plan;
         prepared.size = size;
         captured = false;
+        self.metrics.builds.finish(started);
     }
 
     pub fn validatePreparedSourceCommit(
@@ -408,6 +452,7 @@ pub const WindowRuntime = struct {
         signals: *lua.Signals,
     ) void {
         self.validatePreparedSourceCommit(prepared) catch unreachable;
+        self.development_generation +%= 1;
         self.semantics.stage(prepared.semanticDescriptors());
         self.instances.applyReconcile(prepared.reconcile_plan.?) catch unreachable;
 
@@ -515,6 +560,7 @@ pub const WindowRuntime = struct {
         defer lua_ui.components.instances = null;
         var builds = self.build_owners.beginCycle();
         while (try builds.take()) |work| {
+            const started = self.phaseStart();
             std.debug.assert(sameHandle(work.owner, self.root_owner));
             lua_ui.components.focused = self.focus.current();
             lua_ui.components.native_update = self.virtual_work;
@@ -612,6 +658,8 @@ pub const WindowRuntime = struct {
             self.virtual_offsets_pending = true;
             self.virtual_work = false;
             try self.build_owners.complete(work);
+            self.development_revision +%= 1;
+            self.metrics.builds.finish(started);
             // Native layout feeds the next bounded build pass; it never calls Lua.
             try self.prepareFrame(self.output_scale);
         }
@@ -633,6 +681,7 @@ pub const WindowRuntime = struct {
         const width: f32 = @floatFromInt(size.width);
         const height: f32 = @floatFromInt(size.height);
         if (self.frame_state.needsLayout() or try self.tree.layoutDirty(root)) {
+            const started = self.phaseStart();
             self.frame_state.invalidateLayout();
             _ = try self.tree.layout(
                 root,
@@ -640,9 +689,11 @@ pub const WindowRuntime = struct {
             );
             try self.instances.syncScrollOffsets();
             try self.frame_state.layoutComplete();
+            self.metrics.layouts.finish(started);
         }
         try self.updateVirtualLayout();
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
+            const started = self.phaseStart();
             self.frame_state.invalidatePaint();
             var builder = try ui.render_object.Builder.init(self.commands, self.output_scale);
             // The root paints the tint once. Reset reused buffers so a
@@ -651,6 +702,7 @@ pub const WindowRuntime = struct {
             try self.tree.buildScene(root, &builder);
             self.command_count = builder.displayList().commands.len;
             _ = try self.frame_state.sceneBuilt();
+            self.metrics.paints.finish(started);
         }
     }
 
@@ -752,6 +804,8 @@ pub const WindowRuntime = struct {
     pub fn dispatchInput(self: *WindowRuntime, callback_service: anytype) !void {
         while (self.router.takeEvent()) |event| {
             defer self.router.releaseEvent(event);
+            self.development_revision +%= 1;
+            self.metrics.input_events +|= 1;
             self.activation_input = null;
             defer self.activation_input = null;
             const serial: ?u32 = switch (event) {
@@ -1279,6 +1333,12 @@ pub const WindowRuntime = struct {
     pub fn semanticTarget(self: *WindowRuntime, path: []const u8) !SemanticTarget {
         if (!self.ready) return error.WindowRuntimeNotReady;
         const semantic = try self.semantics.findPath(path);
+        return self.semanticNodeTarget(semantic.id);
+    }
+
+    pub fn semanticNodeTarget(self: *WindowRuntime, id: u64) !SemanticTarget {
+        if (!self.ready) return error.WindowRuntimeNotReady;
+        const semantic = self.semantics.findId(id) orelse return error.SemanticInstanceMissing;
         const target = self.instances.handleForId(semantic.id) orelse
             return error.SemanticInstanceMissing;
         const render = try self.instances.renderObject(target);
@@ -1304,6 +1364,7 @@ pub const WindowRuntime = struct {
                 .x = origin.x + size.width / 2,
                 .y = origin.y + size.height / 2,
             },
+            .bounds = .{ .x = origin.x, .y = origin.y, .width = size.width, .height = size.height },
             .role = semantic.role,
             .enabled = semantic.enabled,
             .scroll_axis = scroll_axis,
@@ -1314,6 +1375,7 @@ pub const WindowRuntime = struct {
         _ = try self.displayList();
         try self.frame_state.submitted();
         self.damage_tracker.submitted();
+        self.metrics.submitted_frames +|= 1;
     }
 
     fn notifyDirtyWindow(context: *anyopaque) !void {

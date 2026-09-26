@@ -8,6 +8,7 @@ pub const turn = @import("turn.zig");
 pub const windows = @import("windows.zig");
 pub const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 pub const WindowRuntimeConfig = @import("window_runtime.zig").Config;
+pub const development = @import("development.zig");
 pub const SourceGeneration = @import("source_generation.zig").SourceGeneration;
 pub const SourceReload = @import("source_reload.zig").SourceReload;
 pub const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
@@ -33,6 +34,7 @@ test {
     _ = @import("turn.zig");
     _ = @import("windows.zig");
     _ = @import("window_runtime.zig");
+    _ = @import("development.zig");
     _ = @import("source_generation.zig");
     _ = @import("source_reload.zig");
     _ = @import("reload_requests.zig");

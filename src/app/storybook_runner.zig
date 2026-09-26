@@ -305,59 +305,23 @@ fn playAction(
     story: *const lua.StorybookStory,
     action: lua.StorybookAction,
 ) !void {
-    const target = try runtime.semanticTarget(action.target);
-    const window = runtime.window;
-    if (action.kind == .tab) {
-        try runtime.routeKeyboard(.{ .key = .{
-            .window = window,
-            .serial = 1,
-            .time_ms = 0,
-            .state = .pressed,
-            .translated = .{ .keycode = 0, .logical = .tab },
-        } });
+    const development = @import("development.zig");
+    _ = try runtime.semanticTarget(action.target);
+    const input: development.Action = switch (action.kind) {
+        .hover => .{ .hover = action.target },
+        .pointer_down => .{ .pointer_down = action.target },
+        .click => .{ .click = action.target },
+        .scroll => .{ .scroll = .{ .target = action.target, .delta = action.delta } },
+        .tab => .{ .key = .{ .keycode = 0, .logical = .tab } },
+    };
+    var playback = try development.Playback.init(runtime, development.Token.current(runtime), input);
+    while (try playback.advance(runtime) == .routed)
         try dispatchAndSettle(runtime, vm, callbacks, scheduler, lua_ui, story);
+    if (action.kind == .tab) {
         const focused = runtime.focus.current() orelse return error.StoryActionTargetNotFocused;
         if (try runtime.instances.semanticId(focused) != (try runtime.semantics.findPath(action.target)).id)
             return error.StoryActionTargetNotFocused;
-        return;
     }
-    try runtime.routePointer(.{ .motion = .{
-        .window = window,
-        .time_ms = 0,
-        .position = target.center,
-    } });
-    try dispatchAndSettle(runtime, vm, callbacks, scheduler, lua_ui, story);
-    if (action.kind == .scroll) {
-        try runtime.routePointer(.{ .axis = .{
-            .window = window,
-            .time_ms = 0,
-            .axis = target.scroll_axis orelse return error.StoryActionTargetNotScrollable,
-            .delta = action.delta,
-        } });
-        try dispatchAndSettle(runtime, vm, callbacks, scheduler, lua_ui, story);
-        return;
-    }
-    if (action.kind == .hover) return;
-    if (target.role != .button and target.role != .@"switch") return error.StoryActionTargetNotInteractive;
-
-    try runtime.routePointer(.{ .button = .{
-        .window = window,
-        .serial = 1,
-        .time_ms = 0,
-        .button = 0x110,
-        .state = .pressed,
-    } });
-    try dispatchAndSettle(runtime, vm, callbacks, scheduler, lua_ui, story);
-    if (action.kind == .pointer_down) return;
-
-    try runtime.routePointer(.{ .button = .{
-        .window = window,
-        .serial = 2,
-        .time_ms = 0,
-        .button = 0x110,
-        .state = .released,
-    } });
-    try dispatchAndSettle(runtime, vm, callbacks, scheduler, lua_ui, story);
 }
 
 fn dispatchAndSettle(

@@ -146,6 +146,10 @@ pub const ListBoxes = struct {
         return self.findList(target) != null;
     }
 
+    pub fn selectedValue(self: *const ListBoxes, target: instance.InstanceHandle) ?i64 {
+        return (self.findList(target) orelse return null).selected;
+    }
+
     pub fn option(self: *const ListBoxes, target: instance.InstanceHandle) ?Selection {
         for (self.options) |entry| if (entry.active and same(entry.target, target)) return .{
             .listbox = entry.listbox,
