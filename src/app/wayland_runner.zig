@@ -35,7 +35,7 @@ pub const Options = struct {
     /// Optional process-lifetime control edge. Any thread may call `request`;
     /// this runner consumes and commits requests only at its safe point.
     reload_requests: ?*ReloadRequests = null,
-    /// Optional host-owned appearance state. When supplied, ourosettings is
+    /// Optional host-owned appearance state. When supplied, the Settings portal is
     /// not connected. Mutate on the owning event-loop thread, then wake it.
     appearance: ?*appearance_module.Store = null,
     application_window_capacity: usize = 16,
@@ -349,14 +349,9 @@ fn runSourceInternal(
     }
     var appearance_store: appearance_module.Store = .{};
     const appearance = options.appearance orelse &appearance_store;
-    const settings_path = if (options.appearance == null and generation_config.runtime_dir != null and
-        generation_config.runtime_dir.?.len != 0)
-        try std.fmt.allocPrint(init.gpa, "{s}/ouro/settings.mcp.sock", .{generation_config.runtime_dir.?})
-    else
-        null;
-    defer if (settings_path) |path| init.gpa.free(path);
     var appearance_client: appearance_module.Client = undefined;
-    try appearance_client.init(init.gpa, &loop, appearance, settings_path);
+    // Reuse session-address resolution, but own the connection across reloads.
+    try appearance_client.init(init.gpa, &loop, appearance, if (options.appearance == null) initial_generation.dbus.session_address else null);
     defer appearance_client.deinit();
     var source_reload: SourceReload = undefined;
     source_reload.init(

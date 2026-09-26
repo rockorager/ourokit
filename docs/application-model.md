@@ -575,18 +575,26 @@ generated values instead of repeating literals: `ouro.tokens.foundation.spacing_
 `ouro.tokens.light` and `ouro.tokens.dark` provide fixed semantic palettes, not
 the currently inherited theme; their colors act as explicit overrides.
 
-The standard runner follows [ourosettings](https://github.com/rockorager/ourosettings)'
-`appearance.color_scheme` automatically. Omit `theme.color_scheme` to follow the
+The standard runner follows the [Settings portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Settings.html)
+over the session D-Bus automatically (`org.freedesktop.appearance`, `color-scheme`).
+Omit `theme.color_scheme` to follow the
 system; typography, metrics, and individual color overrides still apply. Set
 `color_scheme = "light"` or `"dark"` on the app or a nested `ouro.theme` to pin
 that palette. Explicit colors remain explicit even when they match the previous
 system default.
 
-Startup never waits for the settings daemon. The initial fallback and the
-`"default"` preference use the light palette. Changes invalidate existing windows
+Startup never waits for the portal. The initial fallback and the
+no-preference value (`0`) use the light palette; `1` prefers dark and `2` light.
+Unknown values, missing settings, and unavailable services use the fallback.
+Changes invalidate existing windows
 without remounting their components. New windows and reloaded Lua inherit the
-latest snapshot. A daemon disconnect keeps the last known preference and retries
-with bounded backoff; no Lua subscription is needed for ordinary theme following.
+latest snapshot. Portal owner loss resets to the fallback. D-Bus owner-change
+signals discover a returning service and trigger a fresh read, without polling.
+Both portal versions are supported through `ReadAll`; `SettingChanged` supplies
+live updates. The session address comes from `DBUS_SESSION_BUS_ADDRESS`, or
+`$XDG_RUNTIME_DIR/bus` when unset. An unavailable or disconnected session bus
+uses the fallback for the rest of that application run. No Lua subscription or
+toolkit-specific settings daemon is needed for ordinary theme following.
 See [system-appearance.lua](../examples/system-appearance.lua) for a following
 window with an explicitly light section.
 
@@ -595,9 +603,9 @@ Native hosts can use `app.appearance.Store`: `current` is a typed `Snapshot`,
 `.appearance_changed` with the newest snapshot. Equal updates are suppressed and
 multiple pending changes coalesce. `Snapshot.color_scheme` is `.default`,
 `.light`, or `.dark`. Pass a process-lifetime store as `app.WaylandRunOptions.appearance`
-to supply appearance instead of connecting to ourosettings. The store is not
+to supply appearance instead of connecting to the portal. The store is not
 thread-safe: update it on the owning event-loop thread and wake that loop. The
-runner consumes its events at the UI safe point. Its built-in ourosettings
+runner consumes its events at the UI safe point. Its built-in portal
 client shares the native I/O loop and survives Lua source-generation retirement.
 
 The supported defaults are:

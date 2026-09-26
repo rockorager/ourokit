@@ -15,7 +15,7 @@ local function content()
   return ouro.box { key = "padding", padding = 24,
     ouro.column { key = "content", gap = 20,
       ouro.text { key = "title", text = "System appearance", size = 28 },
-      ouro.text { key = "description", text = "This window follows ourosettings automatically." },
+      ouro.text { key = "description", text = "This window follows the Settings portal automatically." },
       Counter { key = "retained" },
       ouro.theme { key = "fixed", color_scheme = "light",
         ouro.box { key = "card", padding = 20, background = "#ffffff",

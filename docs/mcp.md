@@ -1,7 +1,8 @@
 # MCP
 
-Ourokit, ourosettings, and the Ouro compositor use MCP over local Unix sockets.
-This document defines their transport contract and Ourokit's Lua client API.
+Ourokit supports MCP over local Unix sockets for application automation and
+optional agent integrations. This document defines its transport contract and
+Lua client API. Desktop appearance uses the D-Bus Settings portal, not MCP.
 The [discovery contract](mcp-discovery.md) defines installed and runtime
 catalogs for the separate `ouro-mcp` stdio bridge. Agent authorization and
 multi-instance application routing remain separate from discovery metadata.
@@ -27,69 +28,10 @@ values are invalid. This does not add support for legacy version negotiation.
 
 Servers implement `server/discover` and the discovery methods for advertised
 capabilities. Ourokit app discovery and tool lists use `ttlMs: 60000` and
-`cacheScope: "private"`; settings discovery and resource reads retain `ttlMs: 0`.
+`cacheScope: "private"`.
 Tool-list notifications invalidate fresh cache entries immediately. TTL is a
 freshness bound checked on access, not an app-waking polling interval. Local
 clients and the first bridge do not support initialization-based MCP revisions.
-
-## Settings resources
-
-The complete settings resource is `ouro://settings`. A resource URI's path is
-an RFC 6901 JSON pointer, percent-encoded for transport. Decode URI escapes once,
-then apply JSON pointer escaping. Encode bytes other than URI unreserved
-characters and `/` as uppercase percent escapes. Reject query strings,
-fragments, malformed escapes, and invalid pointers. Do not normalize slashes or
-Unicode. Examples:
-
-- `ouro://settings/compositor`: compositor configuration.
-- `ouro://settings/appearance/color_scheme`: appearance preference.
-- `ouro://settings/`: the empty-name member at the settings root, not the root.
-- A key `a/b` is the pointer segment `a~1b`; a literal `%2F` is `%252F`.
-
-`resources/list` includes the root and supported settings section resources.
-`resources/templates/list` advertises the pointer resource family. Resource
-contents have MIME type `application/json` and a `text` field encoding:
-
-```json
-{"revision":"opaque-store-revision","exists":true,"value":{"general":{}}}
-```
-
-`revision` is the existing global optimistic-concurrency token, not a numeric
-sequence. A valid pointer that selects no value is still a readable selection
-resource: return `exists: false, value: null`. Stored JSON null instead returns
-`exists: true, value: null`. Unsupported resource families are invalid resource
-requests, not missing selections. Settings persistence and normalization remain
-authoritative; reading must not reinterpret their missing/null behavior.
-Preserve number lexemes in compositor JSON: `1`, `1.0`, and `1e0` can have
-different validity in Ouro's integer fields. Transport decoding must not change
-which settings the compositor accepts.
-
-## Settings mutations
-
-Expose `settings.set` and `settings.set_section` through `tools/list` and
-`tools/call`, with JSON Schemas and descriptions explaining full replacement:
-
-- `settings.set`: `{ expected_revision, settings }` replaces all settings.
-- `settings.set_section`: `{ expected_revision, section, value? }` replaces one
-  complete section. Omitted/null `preferred_output` clears it; other sections
-  reject omitted/null values, as before. This is not a merge operation.
-
-Success uses `structuredContent: { revision, settings }` plus serialized JSON
-in a text content block. If duplicating the complete JSON would exceed the
-record limit, text contains only `{ revision }`; `structuredContent` still
-contains the complete result. This keeps large valid writes acknowledgeable
-without lowering the settings store's existing size limit.
-
-Tool execution failures use `isError: true` and
-`structuredContent: { error: { code, message, revision? } }`. Codes are
-`Conflict`, `InvalidParameters`, and `PersistenceFailed`; `Conflict` includes
-the current revision. Output schemas cover both success and execution failure.
-Malformed RPC envelopes and unknown tools use JSON-RPC errors instead.
-
-Preserve atomic persistence, no-op suppression, validation, and fail-stop
-behavior for an ambiguous durable commit. A successful write means desired
-settings were persisted, not that compositor hardware changes have completed.
-Never automatically replay a mutation after losing its response.
 
 ## Subscription and read ordering
 
@@ -112,40 +54,6 @@ subscribe and read again, not replay. Ignore stale completions from a retired
 connection. Bounded output can coalesce invalidations or disconnect a slow
 subscriber; it must not silently drop the last invalidation on a live stream.
 
-Ouro preserves its initial settings validation gate, runtime last-good config,
-retry backoff, and application-safe-point handoff. Ourokit's native appearance
-service likewise reconnects and retains its last good color scheme. Ordinary
-windows inherit this service without requiring a Lua subscription.
-
-## Keybinding calls
-
-Keep Ouro's `call` configuration shape:
-
-```json
-["call", "unix:/run/user/1000/example.sock", "toggle_launcher", {}]
-```
-
-The address after `unix:` is a literal absolute path or `@`-prefixed Linux
-abstract socket name. Semicolons are part of the name, not transport properties.
-
-The third field becomes an MCP tool name rather than a qualified Varlink
-method. Send `tools/call` with `name` and `arguments`. A configured call needs no
-discovery round trip. Preserve nonblocking independent calls, the five-second
-timeout, the 16-call bound, and no retries. Treat JSON-RPC errors and
-`isError: true` as failures; discard successful results. Unsupported interim
-results must fail explicitly rather than look successful. Existing Varlink
-targets must migrate; unchanged configuration shape is not wire compatibility.
-
-## Cutover
-
-ourosettings exposes only MCP at `$XDG_RUNTIME_DIR/ouro/settings.mcp.sock`.
-The `--socket` option overrides that path. One systemd listener activates one
-process with one settings store. There is no Varlink endpoint, dual-protocol
-dispatch, or wire-compatibility bridge.
-
-Ourokit's appearance service, Lua clients, app control server, and `ouroctl`
-use MCP exclusively. There are no legacy API aliases or IDL declarations.
-
 ## Lua client API
 
 Use these functions from a yieldable Ouro task, not a UI build function:
@@ -164,13 +72,15 @@ automatically retried.
 
 ```lua
 local ouro = require("ouro")
-local address = "unix:" .. assert(ouro.xdg.runtime_dir) .. "/ouro/settings.mcp.sock"
-local uri = "ouro://settings/appearance/color_scheme"
+local address = "unix:" .. assert(ouro.xdg.runtime_dir) .. "/example-service.sock"
+local uri = "example://documents/current"
 local reply = ouro.mcp.request(address, "resources/read", {uri = uri})
 if reply.error then error(reply.error.message) end
-local selection = ouro.json.decode(reply.result.contents[1].text)
--- selection.exists distinguishes a missing value from stored JSON null.
+ouro.stdout.write(reply.result.contents[1].text .. "\n")
 ```
+
+The address after `unix:` is a literal absolute path or `@`-prefixed Linux
+abstract socket name. Semicolons are part of the name, not transport properties.
 
 Parameters must be JSON objects. String-keyed Lua tables encode objects,
 dense integer-keyed tables encode arrays, and `ouro.json.array()` constructs
@@ -193,9 +103,7 @@ connection, discarding buffered notifications. Callback errors also close it.
 Reads pause during callbacks; there is no unbounded callback queue. A slow
 subscriber may be disconnected by its server and must establish a new
 subscription before rereading. Notifications are invalidations, not a history
-of intermediate values. The [watch example](../examples/ourosettings-watch.lua)
-demonstrates this flow; [the one-shot example](../examples/ourosettings.lua)
-prints the current color scheme.
+of intermediate values.
 
 Every source generation owns 16 concurrent client slots by default, shared by
 requests and subscriptions. Each uses an independent Unix connection, bounded
