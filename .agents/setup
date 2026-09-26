@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Native integration tests use an isolated compositor, not the orb's desktop.
+# Portal fixtures run against a private D-Bus session through system Python.
+missing=()
+for package in weston xvfb xdotool sway grim python3-dbus python3-gi; do
+  if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]]; then
+    missing+=("$package")
+  fi
+done
+if ((${#missing[@]})); then
+  sudo apt-get update -qq
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
 # The base development image supplies Zig and the native graphics dependencies.
 # Image decoding also builds the pinned resvg bridge with Cargo.
 if ! command -v cargo >/dev/null && [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
