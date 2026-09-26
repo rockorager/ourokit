@@ -11,20 +11,33 @@ local function locate(prefix, count, offset)
     return low
 end
 
-return function(props, old, id, geometry)
+return function(props, old, id, geometry, select_reader, key_token, row_token, reuse_keys)
     local width, viewport, scroll = geometry(id)
     width, viewport, scroll = width or 0, viewport or 0, scroll or 0
     local count = props.item_count
     local estimate = props.item_height or props.estimated_item_height
     local changed = not old or old.props ~= props or old.width ~= width
-    local keys, positions, heights = {}, {}, {}
-    for i = 1, count do
-        local key = props.item_key(i)
-        assert(valid_key(key), "item_key must return a non-empty string")
-        assert(not positions[key], "duplicate virtual list item key")
-        keys[i], positions[key] = key, i
-        local previous = old and old.positions[key]
-        heights[i] = not changed and previous and old.heights[previous] or estimate
+    local keys, positions
+    if reuse_keys then keys, positions = old.keys, old.positions
+    else
+        select_reader(key_token)
+        keys, positions = {}, {}
+        for i = 1, count do
+            local key = props.item_key(i)
+            assert(valid_key(key), "item_key must return a non-empty string")
+            assert(not positions[key], "duplicate virtual list item key")
+            keys[i], positions[key] = key, i
+        end
+    end
+    -- Fixed metadata is immutable. Variable heights still stage fresh arrays:
+    -- provisional measurements must not alter the last committed plan.
+    local reuse_heights = reuse_keys and props.item_height
+    local heights = reuse_heights and old.heights or {}
+    if not reuse_heights then
+        for i = 1, count do
+            local previous = old and old.positions[keys[i]]
+            heights[i] = not changed and previous and old.heights[previous] or estimate
+        end
     end
 
     local anchor, within, pinned
@@ -44,8 +57,10 @@ return function(props, old, id, geometry)
             end
         end
     end
-    local prefix = { 0 }
-    for i = 1, count do prefix[i + 1] = prefix[i] + heights[i] end
+    local prefix = reuse_heights and old.prefix or { 0 }
+    if not reuse_heights then
+        for i = 1, count do prefix[i + 1] = prefix[i] + heights[i] end
+    end
     if anchor and positions[anchor] then
         local index = positions[anchor]
         local offset = within < heights[index] and within or heights[index] - 1
@@ -64,6 +79,7 @@ return function(props, old, id, geometry)
         last = locate(prefix, count, scroll + visible_height) + 2
         if last > count then last = count end
     end
+    select_reader(row_token)
     local rows = {}
     local function row(index)
         rows[#rows + 1] = {

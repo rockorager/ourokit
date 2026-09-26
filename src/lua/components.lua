@@ -81,11 +81,14 @@ function M.virtual(props, id)
     local t = transaction
     assert(not t.lists[id], "duplicate virtual list key")
     local old = t.old.lists[id]
-    local token
-    if old then token = old.token else serial = serial + 1; token = serial end
-    select_reader(token)
-    local plan = build_list(props, old, id, geometry)
-    plan.token = token
+    local token, key_token
+    if old then token, key_token = old.token, old.key_token
+    else serial = serial + 2; token, key_token = serial - 1, serial end
+    -- Native scrolling can retain indexed metadata without reevaluating its
+    -- providers. Keep their subscriptions separate from visible row reads.
+    local reuse_keys = old and old.props == props and t.native_update and not dirty(key_token)
+    local plan = build_list(props, old, id, geometry, select_reader, key_token, token, reuse_keys)
+    plan.token, plan.key_token = token, key_token
     t.lists[id] = plan
     return plan
 end
@@ -96,7 +99,10 @@ function M.finish()
         if t.mounts[identity] ~= record then select_reader(record.token) end
     end
     for id, record in next, t.old.lists do
-        if not t.lists[id] then select_reader(record.token) end
+        if not t.lists[id] then
+            select_reader(record.token)
+            select_reader(record.key_token)
+        end
     end
     t.next = { root = t.root, mounts = t.mounts, lists = t.lists, callback = t.callback,
         args = t.args, invalidation = t.invalidation }

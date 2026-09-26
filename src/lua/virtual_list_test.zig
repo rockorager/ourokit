@@ -166,6 +166,71 @@ test "virtual fixed rows bound construction, scroll through input, anchor keys a
     try std.testing.expectEqual(@as(usize, 0), f.runtime.virtual_lists.row_count);
 }
 
+test "virtual fixed metadata survives native scroll without dropping provider dependencies" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\keys, roots = 0, 0
+        \\shift, duplicate = ouro.signal(0), ouro.signal(false)
+        \\height = ouro.signal(12)
+        \\function build()
+        \\  roots = roots + 1
+        \\  return ouro.virtual_list {
+        \\    key = 'people', item_count = 10000, item_height = 40,
+        \\    item_key = function(i)
+        \\      keys = keys + 1
+        \\      if duplicate() and i == 10000 then i = 1 end
+        \\      return 'person-' .. (i - shift())
+        \\    end,
+        \\    render_item = function() return ouro.box { key = 'row', height = height() } end,
+        \\  }
+        \\end
+    );
+    try f.build();
+    const initial_keys = f.number("keys");
+    try f.wheel(200013);
+    try f.build();
+    const retained = try f.handle("people/person-5001/row");
+    try f.wheel(40);
+    try f.build();
+    try std.testing.expectEqual(initial_keys, f.number("keys"));
+    try std.testing.expectEqual(@as(f32, 200053), try f.offset());
+    // A dependency read only by item_key must still invalidate the metadata
+    // after clean native builds, even though the root description is reused.
+    try f.exec("shift:set(1)");
+    try f.build();
+    try std.testing.expect(f.number("keys") > initial_keys);
+    try std.testing.expectEqual(@as(f64, 1), f.number("roots"));
+    try std.testing.expectEqual(retained, try f.handle("people/person-5001/row"));
+    try std.testing.expectEqual(@as(f32, 200093), try f.offset());
+    // Validate offscreen keys too, and do not mutate the committed metadata
+    // when a replacement fails validation.
+    try f.exec("duplicate:set(true)");
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try std.testing.expectEqual(@as(f32, 200093), try f.offset());
+    try f.exec("duplicate:set(false); shift:set(2)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 200133), try f.offset());
+    try std.testing.expectEqual(retained, try f.handle("people/person-5001/row"));
+    const rebuilt_keys = f.number("keys");
+    try f.wheel(-80);
+    try f.build();
+    try std.testing.expectEqual(rebuilt_keys, f.number("keys"));
+    try f.exec("height:set(19)");
+    try f.build();
+    const object = try f.runtime.tree.objectAt(try f.runtime.instances.renderObject(retained));
+    try std.testing.expectEqual(@as(f32, 19), object.box.height.?);
+    try std.testing.expectEqual(@as(f64, 1), f.number("roots"));
+    // Removing a list retires both its metadata and visible-row readers.
+    try f.exec("function build() return ouro.box { key = 'empty' } end");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    _ = try f.handle("empty");
+    try std.testing.expectEqual(@as(usize, 0), f.runtime.virtual_lists.count);
+    try std.testing.expect(!f.runtime.instances.isActive(retained));
+    for (f.signals.edges) |edge| try std.testing.expect(!edge.active);
+}
+
 test "virtual list scroll momentum survives recycled rows and cancels on input bounds and removal" {
     const Sink = struct {
         runtime: *WindowRuntime,

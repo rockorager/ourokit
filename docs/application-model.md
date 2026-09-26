@@ -1158,12 +1158,13 @@ or `"fill"` and default to `"fill"`; `flex` is also supported. Item keys must be
 stable, unique, non-empty strings. The list key, item key, and keys within the
 returned description form each row's semantic target path.
 
-Each build evaluates `item_key` for all items and retains O(N) key and provider
-metadata, but calls `render_item` and mounts native nodes only for the visible
-rows plus a two-row buffer on each side. Variable rows replace their estimate
-with measured native height (at least one pixel), preserving the scroll anchor
-by item key as measurements or width change. A focused row remains mounted even
-when it moves outside that range.
+Builds evaluate `item_key` for all items and retain O(N) key and provider
+metadata. Native scrolling reuses this metadata while the list props and the
+signals read by `item_key` remain unchanged. `render_item` and native nodes are
+limited to the visible rows plus a two-row buffer on each side. Variable rows
+replace their estimate with measured native height (at least one pixel),
+preserving the scroll anchor by item key as measurements or width change. A
+focused row remains mounted even when it moves outside that range.
 
 The viewport handles wheel scrolling and Up/Down, Home/End, and Page Up/Page
 Down. It is a generic viewport, not a listbox: it has no selection model. Data
