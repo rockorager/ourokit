@@ -3104,13 +3104,13 @@ test "candidate source build preserves layer background alpha without changing r
         \\local ouro = require("ouro")
         \\return ouro.app {
         \\  id = "dev.ouro.prepared-test",
-        \\  windows = {
+        \\  run = function() return { windows = {
         \\    ouro.window {
         \\      id = "main",
         \\      title = "Candidate",
         \\      content = function() end,
         \\    },
-        \\  },
+        \\  } } end,
         \\}
     );
     defer provider.deinit();

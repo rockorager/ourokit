@@ -17,10 +17,21 @@ Start with the [application model](docs/application-model.md), the `ouroctl`
 host, and the examples. Applications compose widgets and state; the host owns
 the event loop, native resources, rendering, and task lifetimes.
 
-The [D-Bus API](docs/dbus.md), [shell workspace API](docs/workspaces.md), optional
-MCP application tools, and [experimental native plugins](docs/native-plugins.md)
-serve applications that need those capabilities. They are not prerequisites for
-opening a window.
+| Surface | Role |
+| --- | --- |
+| Lua `ouro.app`, `run(context)`, windows, widgets, components, signals and tasks | Ordinary application authoring |
+| `ouro.json` and `ouroctl run` | Application identity, entry point and launch; individual Lua files can also run directly |
+| `ouroctl dev …` and Storybook | Explicit per-instance development and component testing |
+| Desktop hooks and the [D-Bus API](docs/dbus.md) | Standard desktop integration and an escape hatch for application-specific services |
+| Declared actions, `--mcp` and `ouroctl mcp export` | Optional production automation; not UI lifecycle or development authority |
+| Layer surfaces and the [shell workspace API](docs/workspaces.md) | Optional shell extensions |
+| [Native plugins](docs/native-plugins.md) and `ourokit_ui` | Experimental native integration and low-level UI embedding |
+
+There is one UI startup form: `run(context)` returns a static or reactive
+`windows` declaration. Top-level `ouro.app.windows` is rejected. Actions and
+shell extensions are not prerequisites for opening a window. The
+[Contacts example](examples/contacts/README.md) uses the ordinary application
+surface and optionally exposes actions over MCP.
 
 The Zig modules exposed by `src/ourokit.zig` support embedding and internal
 testing, but their exports do not constitute separate stable SDKs. Internal

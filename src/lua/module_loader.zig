@@ -321,17 +321,19 @@ test "application bootstrap asynchronously loads fallback and nested modules" {
         scheduler.application_scope,
         "local ouro = require('ouro'); " ++
             "local first = require('model'); local second = require('model'); " ++
-            "return ouro.app { id = 'dev.ouro.bootstrap-test', windows = { " ++
+            "return ouro.app { id = 'dev.ouro.bootstrap-test', run=function() return {windows = { " ++
             "ouro.window { id = 'main', title = first == 42 and first == second " ++
-            "and 'Loaded' or 'Wrong', content = function() end } } }",
+            "and 'Loaded' or 'Wrong', content = function() end } } } end}",
         "@app.lua",
     );
-    var completed = false;
-    while (!completed) {
+    defer bootstrap.deinit();
+    var ready: ?application.Application = null;
+    while (ready == null) {
         while (scheduler.takeRunnable()) |runnable| {
-            completed = try vm.resumeRunnable(runnable) == .completed;
+            if (try vm.resumeRunnable(runnable) == .completed)
+                ready = try bootstrap.advance("default");
         }
-        if (completed) break;
+        if (ready != null) break;
         _ = try loop.submit();
         switch (loop.dispatch(try loop.wait())) {
             .file => |completion| try std.testing.expect(try loader.dispatch(completion)),
@@ -339,7 +341,7 @@ test "application bootstrap asynchronously loads fallback and nested modules" {
             else => return error.UnexpectedCompletion,
         }
     }
-    var result = try bootstrap.take();
+    var result = ready.?;
     defer result.deinit();
     try std.testing.expectEqualStrings("dev.ouro.bootstrap-test", result.id);
     try std.testing.expectEqualStrings("Loaded", result.windows[0].declaration.toplevel.title);

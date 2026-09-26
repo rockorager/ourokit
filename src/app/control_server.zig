@@ -930,7 +930,7 @@ test "runtime server holds Reload reply until the generation commits" {
         \\local function action(input, output, handler) return {description='Test action', inputSchema=input, outputSchema=output, handler=handler} end
         \\return ouro.app {
         \\  id = 'dev.ourokit.test',
-        \\  windows = { ouro.window { id = 'main', title = 'Test', content = function() end } },
+        \\  run = function() return {windows = { ouro.window { id = 'main', title = 'Test', content = function() end } }} end,
         \\  actions = {
         \\    Subtract = action(obj({left=int,right=int},{'left','right'}), obj({difference=int},{'difference'}), function(p) return {difference=p.left-p.right} end),
         \\    Echo = action({type='object'}, {type='object'}, function(p) return p end),
@@ -974,7 +974,7 @@ test "runtime server holds Reload reply until the generation commits" {
         defer std.testing.allocator.free(before);
         var candidate = try lua.Application.loadNamedWithApi(std.testing.allocator, vm.state,
             \\local o = require('ouro')
-            \\return o.app {id='dev.ourokit.test', actions={}, windows={o.window{id='candidate',title='Candidate',content=function() end}}}
+            \\return o.app {id='dev.ourokit.test', actions={}, run=function() return {windows={o.window{id='candidate',title='Candidate',content=function() end}}} end}
         , "@discarded-catalog", null, vm.apiReference());
         defer candidate.deinit();
         var prepared = try control.prepareApplication(&candidate, &vm);

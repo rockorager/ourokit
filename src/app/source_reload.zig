@@ -484,13 +484,13 @@ const initial_source =
     \\local ouro = require("ouro")
     \\return ouro.app {
     \\  id = "dev.ouro.reload-test",
-    \\  windows = {
+    \\  run = function() return { windows = {
     \\    ouro.window {
     \\      id = "main",
     \\      title = "Initial",
     \\      content = function() end,
     \\    },
-    \\  },
+    \\  } } end,
     \\}
 ;
 
@@ -498,13 +498,13 @@ const replacement_source =
     \\local ouro = require("ouro")
     \\return ouro.app {
     \\  id = "dev.ouro.reload-test",
-    \\  windows = {
+    \\  run = function() return { windows = {
     \\    ouro.window {
     \\      id = "main",
     \\      title = "Replacement",
     \\      content = function() end,
     \\    },
-    \\  },
+    \\  } } end,
     \\}
 ;
 
@@ -512,13 +512,13 @@ const changed_identity_source =
     \\local ouro = require("ouro")
     \\return ouro.app {
     \\  id = "dev.ouro.other-app",
-    \\  windows = {
+    \\  run = function() return { windows = {
     \\    ouro.window {
     \\      id = "main",
     \\      title = "Wrong identity",
     \\      content = function() end,
     \\    },
-    \\  },
+    \\  } } end,
     \\}
 ;
 
@@ -531,7 +531,7 @@ fn expectActionReload(initial_actions: []const u8, candidate_actions: []const u8
         \\  id = "dev.ouro.actions-reload-test",
     ;
     const suffix =
-        \\  windows = { ouro.window { id = "main", title = "Actions", content = function() end } },
+        \\  run = function() return {windows = { ouro.window { id = "main", title = "Actions", content = function() end } }} end,
         \\}
     ;
     const initial_text = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, initial_actions, "\n", suffix });
@@ -883,9 +883,9 @@ test "disk reload keeps active generation while candidate requires modules" {
         \\local title = require("title")
         \\return ouro.app {
         \\  id = "dev.ouro.reload-test",
-        \\  windows = {
+        \\  run = function() return { windows = {
         \\    ouro.window { id = "main", title = title, content = function() end },
-        \\  },
+        \\  } } end,
         \\}
         ,
     });
@@ -1020,10 +1020,10 @@ test "a later window build failure leaves every retained window on the active ge
         \\return ouro.app {
         \\  id = "dev.ouro.atomic-window-test",
         \\  theme = { typography = { size = 19 }, controls = { height = 43 } },
-        \\  windows = {
+        \\  run = function() return { windows = {
         \\    ouro.window { id = "first", title = "First", content = content("Active first") },
         \\    ouro.window { id = "second", title = "Second", content = content("Active second") },
-        \\  },
+        \\  } } end,
         \\}
     ;
     const failing_second_window =
@@ -1048,7 +1048,7 @@ test "a later window build failure leaves every retained window on the active ge
         \\return ouro.app {
         \\  id = "dev.ouro.atomic-window-test",
         \\  theme = { typography = { size = 25 }, controls = { height = 57 } },
-        \\  windows = {
+        \\  run = function() return { windows = {
         \\    ouro.window {
         \\      id = "first",
         \\      title = "Changed first",
@@ -1061,7 +1061,7 @@ test "a later window build failure leaves every retained window on the active ge
         \\      title = "Changed second",
         \\      content = function() return Panel { key = "panel", label = "Candidate second", fail = true } end,
         \\    },
-        \\  },
+        \\  } } end,
         \\}
     ;
 

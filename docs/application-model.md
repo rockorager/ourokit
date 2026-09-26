@@ -1,33 +1,21 @@
 # Application model
 
-`app` is a small coordinator, not an implementation home. It owns the process
-lifetime and orders sibling loop/task/Lua/platform/UI/renderer modules. The
-reusable turn coordinator fixes that order in one implementation. The retained
-UI and Wayland example now exercise reconciliation, layout/scene construction,
-and frame submission as distinct phases; the general `App` host hooks remain
-the integration seam rather than absorbing those implementations.
+Write an application in Lua and launch it with `ouroctl run`. The host owns the
+event loop, native windows, rendering, and task lifetimes. Application code owns
+state, composition, and behavior; it does not need renderer or protocol handles.
+Use `--dev` for an isolated development instance. Neither an action catalog nor
+a production MCP server is required to build or inspect its UI.
 
 ## Declarative surfaces
 
 Applications declare their desired window set rather than imperatively owning
-Wayring objects. The first working application-facing surface is:
+Wayring objects. `run(context)` is the UI entry point:
 
 ```lua
 local ouro = require("ouro")
 
 return ouro.app {
   id = "dev.ouro.example",
-  actions = {
-    Ping = {
-      description = "Return a greeting without opening the UI.",
-      inputSchema = { type = "object", additionalProperties = false },
-      outputSchema = {
-        type = "object", properties = { reply = { type = "string" } },
-        required = { "reply" }, additionalProperties = false,
-      },
-      handler = function() return { reply = "pong" } end,
-    },
-  },
   run = function(context)
     local clicked = ouro.signal(false)
     return { windows = {
@@ -66,6 +54,12 @@ return ouro.app {
   end,
 }
 ```
+
+`run` returns `{ windows = ... }`; `windows` does not belong on `ouro.app` itself.
+This keeps UI creation under the same lifecycle for direct launch, deferred
+desktop activation, and source reload. A deliberately headless application may
+omit `run`; it cannot subsequently open a UI. Actions remain optional and do not
+select when `run` executes.
 
 `run` may also return a reactive window declaration function:
 
@@ -642,12 +636,12 @@ return ouro.app {
     controls = { height = 36, radius = 0, border_width = 1 },
     widgets = { button = { padding_x = 20 } },
   },
-  windows = { ouro.window {
+  run = function() return { windows = { ouro.window {
     id = "main", title = "Example",
     content = function()
       return ouro.button { key = "save", label = "Save" }
     end,
-  } },
+  } } } end,
 }
 ```
 
@@ -794,7 +788,7 @@ return ouro.app {
     ["Ctrl+B"] = "move_word_previous",
     ["Ctrl+Shift+B"] = "select_word_previous",
   },
-  windows = {
+  run = function() return { windows = {
     ouro.window {
       id = "main", title = "Search",
       content = function()
@@ -805,7 +799,7 @@ return ouro.app {
         }
       end,
     },
-  },
+  } } end,
 }
 ```
 

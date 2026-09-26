@@ -43,7 +43,6 @@ pub const Definition = struct {
     run_reference: c_int = c.no_reference,
     desktop_reference: c_int = c.no_reference,
     windows_reference: c_int = c.no_reference,
-    legacy_windows: ?[]Window = null,
 
     pub fn parseStack(allocator: std.mem.Allocator, state: *c.State) !Definition {
         return parseDefinition(allocator, state);
@@ -62,10 +61,6 @@ pub const Definition = struct {
         if (self.action_schema) |*schema| schema.deinit();
         if (self.windows_reference != c.no_reference)
             c.luaL_unref(self.state, c.registry_index, self.windows_reference);
-        if (self.legacy_windows) |windows| {
-            for (windows) |window| deinitWindow(self.allocator, self.state, window);
-            self.allocator.free(windows);
-        }
         if (self.run_reference != c.no_reference)
             c.luaL_unref(self.state, c.registry_index, self.run_reference);
         if (self.actions_reference != c.no_reference)
@@ -95,7 +90,6 @@ pub const Definition = struct {
         self.run_reference = c.no_reference;
         self.desktop_reference = c.no_reference;
         self.windows_reference = c.no_reference;
-        self.legacy_windows = null;
         return application;
     }
 };
@@ -139,14 +133,7 @@ pub const Bootstrap = struct {
                 var definition = try Definition.parseStack(self.allocator, self.vm.state);
                 if (self.defer_run) {
                     errdefer definition.deinit();
-                    if (definition.legacy_windows) |windows| {
-                        return definition.finish(windows);
-                    }
                     return definition.finish(try self.allocator.alloc(Window, 0));
-                }
-                if (definition.legacy_windows) |windows| {
-                    definition.legacy_windows = null;
-                    return definition.finish(windows);
                 }
                 if (!definition.hasRun()) {
                     definition.deinit();
@@ -175,10 +162,6 @@ pub const Bootstrap = struct {
                 ));
             },
         }
-    }
-
-    pub fn take(self: *Bootstrap) !Application {
-        return (try self.advance("default")) orelse error.ApplicationRunPending;
     }
 
     pub fn deinit(self: *Bootstrap) void {
@@ -397,10 +380,6 @@ pub const Application = struct {
             return err;
         };
         errdefer definition.deinit();
-        if (definition.legacy_windows) |windows| {
-            definition.legacy_windows = null;
-            return definition.finish(windows);
-        }
         if (!definition.hasRun()) return error.ApplicationRunRequired;
         const windows = invokeRun(
             allocator,
@@ -438,10 +417,6 @@ pub const Application = struct {
     pub fn parseStack(allocator: std.mem.Allocator, state: *c.State) !Application {
         var definition = try parseDefinition(allocator, state);
         errdefer definition.deinit();
-        if (definition.legacy_windows) |windows| {
-            definition.legacy_windows = null;
-            return definition.finish(windows);
-        }
         if (!definition.hasRun()) return error.ApplicationRunRequired;
         return definition.finish(try invokeRun(
             allocator,
@@ -569,6 +544,9 @@ pub const Application = struct {
 
 fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     if (c.lua_type(state, -1) != c.type_table) return error.ApplicationDeclarationRequired;
+    const windows_kind = c.lua_getfield(state, -1, "windows");
+    c.lua_settop(state, -2);
+    if (windows_kind != c.type_nil) return error.ApplicationWindowsMustBeReturnedFromRun;
     const text_input_bindings = try key_bindings.field(state, -1, "text_input_bindings", .{});
     var inherited_colors = theming.ColorFields.initEmpty();
     const theme = blk: {
@@ -591,15 +569,6 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     var action_schema = try parseActionSchema(allocator, state, actions_reference);
     errdefer if (action_schema) |*schema| schema.deinit();
     const run_reference = try optionalFunction(state, -1, "run");
-    errdefer if (run_reference != c.no_reference)
-        c.luaL_unref(state, c.registry_index, run_reference);
-    const legacy_windows = try optionalWindows(allocator, state, -1);
-    errdefer if (legacy_windows) |windows| {
-        for (windows) |window| deinitWindow(allocator, state, window);
-        allocator.free(windows);
-    };
-    if (run_reference != c.no_reference and legacy_windows != null)
-        return error.ConflictingApplicationRun;
     return .{
         .allocator = allocator,
         .state = state,
@@ -611,7 +580,6 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
         .actions_reference = actions_reference,
         .run_reference = run_reference,
         .desktop_reference = desktop_reference,
-        .legacy_windows = legacy_windows,
     };
 }
 
@@ -720,24 +688,6 @@ fn optionalFunction(
         return error.ApplicationRunInvalid;
     }
     return c.luaL_ref(state, c.registry_index);
-}
-
-fn optionalWindows(
-    allocator: std.mem.Allocator,
-    state: *c.State,
-    table: c_int,
-) !?[]Window {
-    const value_type = c.lua_getfield(state, table, "windows");
-    if (value_type == c.type_nil) {
-        c.lua_settop(state, -2);
-        return null;
-    }
-    if (value_type != c.type_table) {
-        c.lua_settop(state, -2);
-        return error.InvalidWindowsDeclaration;
-    }
-    defer c.lua_settop(state, -2);
-    return @as(?[]Window, try parseWindowsTable(allocator, state));
 }
 
 fn parseRunWindows(allocator: std.mem.Allocator, state: *c.State, reference: *c_int) ![]Window {
@@ -1115,7 +1065,7 @@ test "declarative application owns windows and content callbacks" {
     var application = try Application.load(std.testing.allocator, state,
         \\return ouro.app {
         \\  id = "dev.ouro.test",
-        \\  windows = {
+        \\  run = function() return { windows = {
         \\    ouro.window {
         \\      id = "main",
         \\      title = "Test",
@@ -1125,7 +1075,7 @@ test "declarative application owns windows and content callbacks" {
         \\      min_height = 160,
         \\      content = function() end,
         \\    },
-        \\  },
+        \\  } } end,
         \\}
     );
     defer application.deinit();
@@ -1145,7 +1095,7 @@ test "layer surface constructor parses shell policy into a distinct declaration"
     var application = try Application.load(std.testing.allocator, state,
         \\return ouro.app {
         \\  id = "dev.ouro.shell",
-        \\  windows = { ouro.layer_surface {
+        \\  run = function() return { windows = { ouro.layer_surface {
         \\    id = "panel",
         \\    namespace = "ouro-shell",
         \\    output = "DP-1",
@@ -1160,7 +1110,7 @@ test "layer surface constructor parses shell policy into a distinct declaration"
         \\    background = "#111820B8",
         \\    background_effect = "blur",
         \\    content = function() end,
-        \\  } },
+        \\  } } } end,
         \\}
     );
     defer application.deinit();
@@ -1187,8 +1137,8 @@ test "layer surface background defaults and validation" {
     defer c.lua_close(state);
     c.lua_createtable(state, 0, 3);
     c.lua_setglobal(state, "ouro");
-    const prefix = "return ouro.app { id='test', windows={ouro.layer_surface {id='panel', namespace='test', layer='top', width=90, height=30, content=function() end,";
-    const suffix = "}}}";
+    const prefix = "return ouro.app { id='test', run=function() return {windows={ouro.layer_surface {id='panel', namespace='test', layer='top', width=90, height=30, content=function() end,";
+    const suffix = "}}} end}";
     var application = try Application.load(std.testing.allocator, state, prefix ++ suffix);
     defer application.deinit();
     try std.testing.expectEqual(null, application.windows[0].declaration.layer_surface.background);
@@ -1214,10 +1164,10 @@ test "window minimum dimensions cannot exceed the initial size" {
         Application.load(std.testing.allocator, state,
             \\return ouro.app {
             \\  id = "dev.ouro.test",
-            \\  windows = { ouro.window {
+            \\  run = function() return { windows = { ouro.window {
             \\    id = "main", title = "Test", width = 320, min_width = 321,
             \\    content = function() end,
-            \\  } },
+            \\  } } } end,
             \\}
         ),
     );
@@ -1264,13 +1214,13 @@ test "application actions opt in by table presence, including an empty table" {
         .{ .field = "actions = { Ping = {description='Ping', inputSchema={type='object'}, outputSchema={type='object'}, handler=function() return {} end} },", .enabled = true },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(std.testing.allocator, "return ouro.app {{ id = 'dev.ouro.test', {s} windows = {{ ouro.window {{ id = 'main', title = 'Test', content = function() end }} }} }}", .{case.field});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "return ouro.app {{ id = 'dev.ouro.test', {s} run = function() return {{windows = {{ ouro.window {{ id = 'main', title = 'Test', content = function() end }} }} }} end }}", .{case.field});
         defer std.testing.allocator.free(source);
         var application = try Application.load(std.testing.allocator, state, source);
         defer application.deinit();
         try std.testing.expectEqual(case.enabled, application.hasActions());
     }
-    try std.testing.expectError(error.InvalidActionsDeclaration, Application.load(std.testing.allocator, state, "return ouro.app { id = 'dev.ouro.test', actions = false, windows = {} }"));
+    try std.testing.expectError(error.InvalidActionsDeclaration, Application.load(std.testing.allocator, state, "return ouro.app { id = 'dev.ouro.test', actions = false, run = function() return {windows = {}} end }"));
 }
 
 test "application rejects malformed action declarations" {
@@ -1395,17 +1345,47 @@ test "deferred application window declaration is independent of actions" {
     try vm.init(std.testing.allocator, &scheduler, &loop);
     defer vm.deinit();
     for ([_]bool{ false, true }) |service| {
-        const source = try std.fmt.allocPrint(std.testing.allocator, "local ouro = require('ouro'); return ouro.app {{ id='dev.test.legacy', {s} windows = {{ouro.window {{id='main', title='Legacy', content=function() end}}}} }}", .{if (service) "actions = {}," else ""});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "local ouro = require('ouro'); return ouro.app {{ id='dev.test.deferred', {s} run = function(context) return {{windows = {{ouro.window {{id='main', title=context.instance_id, content=function() end}}}}}} end }}", .{if (service) "actions = {}," else ""});
         defer std.testing.allocator.free(source);
-        var bootstrap = try Bootstrap.start(std.testing.allocator, &vm, scheduler.application_scope, source, "@legacy");
+        var bootstrap = try Bootstrap.start(std.testing.allocator, &vm, scheduler.application_scope, source, "@deferred");
         defer bootstrap.deinit();
         bootstrap.defer_run = true;
         _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
         var application = (try bootstrap.advance("main")).?;
         defer application.deinit();
-        try std.testing.expect(!application.hasRun());
+        try std.testing.expect(application.hasRun());
         try std.testing.expectEqual(service, application.hasActions());
+        try std.testing.expectEqual(@as(usize, 0), application.windows.len);
+        const ui_task = try application.startUi(&vm, scheduler.application_scope, "activated");
+        _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+        try application.finishUi(&vm, ui_task);
         try std.testing.expectEqual(@as(usize, 1), application.windows.len);
+        try std.testing.expectEqualStrings("activated", application.windows[0].declaration.toplevel.title);
+    }
+}
+
+test "eager application windows are rejected before normal or deferred UI startup" {
+    var loop: @import("../loop/root.zig").Loop = undefined;
+    try loop.init(std.testing.allocator, 16, 8);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 4, 4);
+    defer scheduler.deinit();
+    var vm: vm_module.Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    for ([_]bool{ false, true }) |deferred| {
+        for ([_][]const u8{ "", "run=function() run_called=true; return {windows={}} end," }) |run| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "local ouro=require('ouro'); return ouro.app {{id='dev.test.eager', {s} windows={{}}}}", .{run});
+            defer std.testing.allocator.free(source);
+            var bootstrap = try Bootstrap.start(std.testing.allocator, &vm, scheduler.application_scope, source, "@eager");
+            defer bootstrap.deinit();
+            bootstrap.defer_run = deferred;
+            _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+            try std.testing.expectError(error.ApplicationWindowsMustBeReturnedFromRun, bootstrap.advance("main"));
+            try std.testing.expect(!vm.globalBoolean("run_called"));
+            try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
+        }
     }
 }
 
@@ -1415,12 +1395,12 @@ test "all-output layers materialize stable independent callbacks and retain disc
     c.lua_createtable(state, 0, 2);
     c.lua_setglobal(state, "ouro");
     var application = try Application.load(std.testing.allocator, state,
-        \\return ouro.app { id='dev.test.outputs', windows={
+        \\return ouro.app { id='dev.test.outputs', run=function() return {windows={
         \\ ouro.layer_surface {id='panel', namespace='test', outputs='all',
         \\   layer='top', height=40, anchors={'top','left','right'},
         \\   content=function(output) return output end},
         \\ ouro.window {id='settings', title='Settings', content=function() return 'settings' end},
-        \\} }
+        \\} } end }
     );
     defer application.deinit();
     try application.extractOutputTemplates();

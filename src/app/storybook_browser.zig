@@ -20,7 +20,7 @@ const browser_suffix =
     \\end
     \\return ouro.app {
     \\  id = "dev.ourokit.storybook",
-    \\  windows = {
+    \\  run = function() return { windows = {
     \\    ouro.window {
     \\      id = "storybook",
     \\      title = catalog.title or "Ourokit Storybook",
@@ -159,7 +159,7 @@ const browser_suffix =
     \\        }
     \\      end,
     \\    },
-    \\  },
+    \\  } } end,
     \\}
 ;
 

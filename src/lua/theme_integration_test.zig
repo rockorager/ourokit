@@ -635,7 +635,7 @@ test "host appearance rethemes retained components while app and nested override
         \\return ouro.app {
         \\  id = 'dev.test.appearance',
         \\  theme = {controls = {height = 45}, colors = {background = '#ffffff'}},
-        \\  windows = {ouro.window {id = 'main', title = 'Appearance', content = build}},
+        \\  run = function() return {windows = {ouro.window {id = 'main', title = 'Appearance', content = build}}} end,
         \\}
     );
     defer application.deinit();
@@ -655,7 +655,7 @@ test "host appearance rethemes retained components while app and nested override
     var pinned = try Application.load(std.testing.allocator, f.state,
         \\return ouro.app {
         \\  id = 'dev.test.pinned', theme = {color_scheme = 'light'},
-        \\  windows = {ouro.window {id = 'main', title = 'Pinned', content = build}},
+        \\  run = function() return {windows = {ouro.window {id = 'main', title = 'Pinned', content = build}}} end,
         \\}
     );
     defer pinned.deinit();
@@ -696,7 +696,7 @@ test "app and field keymaps dispatch edits and clipboard actions across retained
         \\    ['Alt+D'] = 'delete_word_forward', ['Tab'] = 'select_all',
         \\    ['Ctrl+X'] = false, ['Alt+X'] = 'cut', ['Alt+C'] = 'copy', ['Alt+V'] = 'paste',
         \\  },
-        \\  windows = {ouro.window {id = 'main', title = 'Bindings', content = build}},
+        \\  run = function() return {windows = {ouro.window {id = 'main', title = 'Bindings', content = build}}} end,
         \\}
     );
     defer app.deinit();

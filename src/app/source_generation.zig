@@ -866,13 +866,13 @@ test "source generation owns a named snapshot and application Lua state" {
         \\return ouro.app {
         \\  id = "dev.ouro.generation-test",
         \\  text_input_bindings = {['Alt+R'] = 'redo'},
-        \\  windows = {
+        \\  run = function() return { windows = {
         \\    ouro.window {
         \\      id = "main",
         \\      title = "Generation",
         \\      content = function() end,
         \\    },
-        \\  },
+        \\  } } end,
         \\}
     );
     defer provider.deinit();
@@ -917,9 +917,9 @@ test "source generation rejects Lua identity that differs from package metadata"
         \\local ouro = require("ouro")
         \\return ouro.app {
         \\  id = "dev.ouro.wrong",
-        \\  windows = {
+        \\  run = function() return { windows = {
         \\    ouro.window { id = "main", title = "Wrong", content = function() end },
-        \\  },
+        \\  } } end,
         \\}
     ,
         "dev.ouro.expected",

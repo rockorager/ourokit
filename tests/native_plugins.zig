@@ -116,9 +116,9 @@ test "native contexts remain independent while reload generations overlap" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &temporary.sub_path, "app.lua" });
     defer std.testing.allocator.free(path);
     const application =
-        \\return require('ouro').app { id = 'dev.ouro.native-test', windows = {
+        \\return require('ouro').app { id = 'dev.ouro.native-test', run=function() return {windows = {
         \\  require('ouro').window { id='main', title=tostring(require('counter').get()), content=function() end }
-        \\} }
+        \\} } end }
     ;
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = "require('counter').set(61); " ++ application });
     var provider = try ouro.bundle.SourceProvider.initDisk(std.testing.allocator, path);

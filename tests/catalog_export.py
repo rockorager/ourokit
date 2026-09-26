@@ -83,13 +83,14 @@ return o.app {{id='{APP_ID}', actions=require('declaration'),
             assert destination.read_bytes() == first.stdout
             assert not list(destination.parent.glob("*.tmp-*"))
             for source in ("invalid lua ???", original.replace("id='" + APP_ID, "id='dev.wrong.app"),
+                           original.replace("actions=require('declaration'),", "actions=require('declaration'), windows={},"),
                            f"return require('ouro').app{{id='{APP_ID}'}}", "require('ouro').exit(0)"):
                 app.write_text(source)
                 failed = export(manifest, "--output", str(destination))
                 assert failed.returncode != 0 and failed.stdout == b"", failed
                 assert destination.read_bytes() == first.stdout, "failed export replaced installed metadata"
                 assert b"panic" not in failed.stderr, failed.stderr
-            print("PASS: atomic file output preserves previous catalog on malformed/disabled/mismatched/exit declarations")
+            print("PASS: atomic file output preserves previous catalog on malformed/eager/disabled/mismatched/exit declarations")
 
             app.write_text(original)
             contacts = export(ROOT / "examples/contacts/ouro.json")

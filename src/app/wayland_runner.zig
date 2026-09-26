@@ -1868,10 +1868,10 @@ test "structural reload validates later additions and capacity before retaining 
                 \\    return ouro.button { key='button', label=value(), on_press=function() value:set('Pressed') end }
                 \\  end }
                 \\end
-                \\return ouro.app { id='dev.ouro.structural-test', windows={
+                \\return ouro.app { id='dev.ouro.structural-test', run=function() return {windows={
                 ,
                 declarations,
-                "}}",
+                "}} end}",
             });
             defer std.testing.allocator.free(source);
             try dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = source });

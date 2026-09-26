@@ -1,8 +1,10 @@
 # Contacts
 
-One Lua application with schema-validated MCP tools and an optional UI. The sample
-address book and selection are in memory; they reset after exit or source reload.
-No real address-book storage or portal integration is implied.
+A desktop application with optional schema-validated MCP tools. Its UI uses
+`ouro.app`, `run`, windows, widgets, signals, and ordinary Lua functions; it does
+not need native plugins or shell APIs. The sample address book and selection are
+in memory; they reset after exit or source reload. No real address-book storage
+or portal integration is implied.
 
 The list contains 500 synthetic contacts with three different note lengths.
 `ouro.virtual_list` measures row heights and mounts only the visible range plus

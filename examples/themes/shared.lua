@@ -101,10 +101,12 @@ local function app(style)
   return ouro.app {
     id = "dev.ourokit.theme-" .. style,
     theme = themes[style],
-    windows = { ouro.window {
-      id = "main", title = "Contacts — " .. style, width = 800, height = 480,
-      content = content(),
-    } },
+    run = function()
+      return { windows = { ouro.window {
+        id = "main", title = "Contacts — " .. style, width = 800, height = 480,
+        content = content(),
+      } } }
+    end,
   }
 end
 
