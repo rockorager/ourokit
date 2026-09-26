@@ -76,6 +76,13 @@ also omit extra focus outlines for now. Button pressed state uses the Radix
 hover color but omits its brightness/saturation filter until Ourokit has a
 justified color-filter primitive.
 
+Disabled buttons use opaque Slate step 5 backgrounds and Slate step 11 text
+instead of faint alpha colors. This keeps button labels readable (at least
+4.5:1 contrast in both default themes) while the neutral fill distinguishes
+them from enabled primary buttons. The shared `disabled` and
+`disabled_foreground` roles also style disabled switch tracks and input text;
+application and widget overrides still take precedence.
+
 Switch uses the Radix Themes size-2 surface recipe: a 35×20 logical-pixel
 track, 18×18 thumb, 1-pixel inset, and pill radius. Geometry derives from
 `spacing_5` and border-width foundations; `controls.radius` can override the
