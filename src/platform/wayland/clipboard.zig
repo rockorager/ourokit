@@ -10,12 +10,25 @@ const OperationHandle = @import("../../loop/io_uring.zig").OperationHandle;
 const linux = std.os.linux;
 const utf8_mime = "text/plain;charset=utf-8";
 const plain_mime = "text/plain";
+const uri_mime = "text/uri-list";
 const read_size = 16 * 1024;
+const drag_event_capacity = 32;
 
 const Offer = struct {
     handle: ?Handle = null,
     utf8: bool = false,
     plain: bool = false,
+    uri_list: bool = false,
+    source_copy: bool = false,
+    selected_copy: bool = false,
+};
+
+pub const DragMime = enum { text, uri_list };
+pub const DragEvent = union(enum) {
+    enter: struct { offer_id: u32, serial: u32, surface: u32, x: f32, y: f32, text: bool, uri_list: bool },
+    motion: struct { time_ms: u32, x: f32, y: f32 },
+    leave,
+    drop,
 };
 
 const TransferState = enum { free, reading, canceling, closing, completed, delivered };
@@ -29,6 +42,9 @@ const Transfer = struct {
     scratch: [read_size]u8 = undefined,
     canceled: bool = false,
     failed: bool = false,
+    drag: bool = false,
+    drag_offer_id: ?u32 = null,
+    drag_mime: DragMime = .text,
 };
 
 const Source = struct {
@@ -36,6 +52,7 @@ const Source = struct {
     id: u32 = 0,
     bytes: std.ArrayList(u8) = .empty,
     canceled: bool = false,
+    mime: DragMime = .text,
 };
 
 const WriteState = enum { free, writing, closing };
@@ -54,6 +71,8 @@ pub const Completion = struct {
     canceled: bool,
 };
 
+pub const DragCompletion = struct { request: RequestHandle, mime: DragMime, bytes: ?[]const u8 };
+
 /// Wayland clipboard protocol and pipe-transfer state. It owns no UI or Lua
 /// objects; callers identify requests with opaque generation-checked handles.
 pub const Clipboard = struct {
@@ -70,6 +89,12 @@ pub const Clipboard = struct {
     selection_offer_id: ?u32 = null,
     drag_offer_id: ?u32 = null,
     current_source_id: ?u32 = null,
+    drag_events: [drag_event_capacity]DragEvent = undefined,
+    drag_event_head: usize = 0,
+    drag_event_count: usize = 0,
+    drop_seen: bool = false,
+    dispatch_offer_id: ?u32 = null,
+    dispatch_serial: ?u32 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -180,18 +205,33 @@ pub const Clipboard = struct {
             .enter => |enter| {
                 self.drag_offer_id = enter.id;
                 if (enter.id) |id| if (self.offerForId(id)) |offer| {
-                    try wayring.client.sendRequest(
-                        protocol.wl_data_offer,
-                        objects,
-                        queue,
-                        offer.handle.?,
-                        .{ .accept = .{ .serial = enter.serial, .mime_type = null } },
-                    );
+                    self.drop_seen = false;
+                    try self.pushDragEvent(.{ .enter = .{
+                        .offer_id = id,
+                        .serial = enter.serial,
+                        .surface = enter.surface,
+                        .x = fixedToFloat(enter.x),
+                        .y = fixedToFloat(enter.y),
+                        .text = offer.utf8 or offer.plain,
+                        .uri_list = offer.uri_list,
+                    } });
                 };
             },
-            .leave => try self.clearDragOffer(objects, queue),
-            .drop => try self.clearDragOffer(objects, queue),
-            .motion => {},
+            .leave => {
+                try self.pushDragEvent(.leave);
+                // Compositors send leave after drop. The offer remains valid
+                // until the asynchronous pipe is consumed and finish is sent.
+                if (!self.drop_seen) try self.clearDragOffer(objects, queue);
+            },
+            .drop => {
+                self.drop_seen = true;
+                try self.pushDragEvent(.drop);
+            },
+            .motion => |motion| try self.pushDragEvent(.{ .motion = .{
+                .time_ms = motion.time,
+                .x = fixedToFloat(motion.x),
+                .y = fixedToFloat(motion.y),
+            } }),
         }
     }
 
@@ -214,10 +254,86 @@ pub const Clipboard = struct {
                 if (std.ascii.eqlIgnoreCase(value.mime_type, utf8_mime))
                     offer.utf8 = true
                 else if (std.ascii.eqlIgnoreCase(value.mime_type, plain_mime))
-                    offer.plain = true;
+                    offer.plain = true
+                else if (std.ascii.eqlIgnoreCase(value.mime_type, uri_mime))
+                    offer.uri_list = true;
             },
-            .source_actions, .action => {},
+            .source_actions => |actions| offer.source_copy = (actions.source_actions.value & 1) != 0,
+            .action => |action| offer.selected_copy = action.dnd_action.value == 1,
         }
+    }
+
+    pub fn takeDragEvent(self: *Clipboard) ?DragEvent {
+        if (self.drag_event_count == 0) return null;
+        const event = self.drag_events[self.drag_event_head];
+        self.drag_event_head = (self.drag_event_head + 1) % drag_event_capacity;
+        self.drag_event_count -= 1;
+        // Protocol dispatch may already have received the next drag. Resolve
+        // each queued event against its own offer, never the latest wire state.
+        if (event == .enter) {
+            self.dispatch_offer_id = event.enter.offer_id;
+            self.dispatch_serial = event.enter.serial;
+        } else if (event == .leave) {
+            self.dispatch_offer_id = null;
+            self.dispatch_serial = null;
+        }
+        return event;
+    }
+
+    fn pushDragEvent(self: *Clipboard, event: DragEvent) !void {
+        if (event == .motion and self.drag_event_count != 0) {
+            const last = &self.drag_events[(self.drag_event_head + self.drag_event_count - 1) % drag_event_capacity];
+            if (last.* == .motion) {
+                last.* = event;
+                return;
+            }
+        }
+        if (self.drag_event_count == drag_event_capacity) return error.DragEventCapacityExceeded;
+        self.drag_events[(self.drag_event_head + self.drag_event_count) % drag_event_capacity] = event;
+        self.drag_event_count += 1;
+    }
+
+    /// Negotiate only after retained hit testing found a matching target.
+    pub fn acceptDrag(self: *Clipboard, objects: *wayring.objects.ClientObjects, queue: *wayring.tx.Queue, mime: ?DragMime) !void {
+        const id = self.dispatch_offer_id orelse return;
+        const offer = self.offerForId(id) orelse return;
+        const selected: ?[]const u8 = if (mime) |kind| switch (kind) {
+            .text => if (offer.utf8) utf8_mime else if (offer.plain) plain_mime else null,
+            .uri_list => if (offer.uri_list) uri_mime else null,
+        } else null;
+        try wayring.client.sendRequest(protocol.wl_data_offer, objects, queue, offer.handle.?, .{
+            .accept = .{ .serial = self.dispatch_serial.?, .mime_type = selected },
+        });
+        if (objectVersion(objects, offer.handle.?) >= 3) try wayring.client.sendRequest(
+            protocol.wl_data_offer,
+            objects,
+            queue,
+            offer.handle.?,
+            .{ .set_actions = .{ .dnd_actions = if (selected == null) .none else .copy, .preferred_action = if (selected == null) .none else .copy } },
+        );
+    }
+
+    /// Starts the bounded asynchronous receive for the current drag offer.
+    /// URI-list bytes are only syntax-validated by the application layer; this
+    /// module never opens or stats paths named by an untrusted offer.
+    pub fn receiveDrop(self: *Clipboard, objects: *wayring.objects.ClientObjects, queue: *wayring.tx.Queue, request: RequestHandle, mime: DragMime) !bool {
+        const id = self.dispatch_offer_id orelse return false;
+        const offer = self.offerForId(id) orelse return false;
+        const selected: ?[]const u8 = switch (mime) {
+            .text => if (offer.utf8) utf8_mime else if (offer.plain) plain_mime else null,
+            .uri_list => if (offer.uri_list) uri_mime else null,
+        };
+        if (selected == null or (objectVersion(objects, offer.handle.?) >= 3 and
+            (!offer.source_copy or !offer.selected_copy))) return false;
+        const transfer = try self.beginReceive(objects, queue, offer, request, selected.?);
+        transfer.drag = true;
+        transfer.drag_offer_id = id;
+        transfer.drag_mime = mime;
+        return true;
+    }
+
+    pub fn rejectDrop(self: *Clipboard, objects: *wayring.objects.ClientObjects, queue: *wayring.tx.Queue) !void {
+        if (self.dispatch_offer_id) |id| try self.destroyOffer(objects, queue, id);
     }
 
     pub fn dataSourceEvent(
@@ -252,8 +368,52 @@ pub const Clipboard = struct {
                     self.current_source_id = null;
                 self.collectSource(source);
             },
-            .target, .dnd_drop_performed, .dnd_finished, .action => {},
+            .dnd_finished => {
+                const id = source.handle.?.id;
+                try wayring.client.sendRequest(protocol.wl_data_source, objects, queue, source.handle.?, .{ .destroy = .{} });
+                source.handle = null;
+                source.canceled = true;
+                if (self.current_source_id != null and self.current_source_id.? == id)
+                    self.current_source_id = null;
+                self.collectSource(source);
+            },
+            .target, .dnd_drop_performed, .action => {},
         }
+    }
+
+    /// `serial` must be the compositor serial from the button press which
+    /// caused this drag. Callers deliberately cannot request a synthetic one.
+    pub fn startDrag(self: *Clipboard, objects: *wayring.objects.ClientObjects, queue: *wayring.tx.Queue, serial: u32, origin_surface: u32, mime: DragMime, bytes: []const u8) !void {
+        if (serial == 0) return error.InvalidDragSerial;
+        if (bytes.len == 0 or bytes.len > self.max_text_bytes) return error.InvalidDragPayload;
+        if (mime == .text and !std.unicode.utf8ValidateSlice(bytes)) return error.InvalidDragPayload;
+        if (mime == .uri_list and !validUriList(bytes)) return error.InvalidDragPayload;
+        const manager = self.manager orelse return error.ClipboardManagerUnavailable;
+        // Copy negotiation and a definitive source-finished event require v3.
+        if (objectVersion(objects, manager) < 3) return error.DragActionsUnavailable;
+        const device = self.device orelse return error.ClipboardDeviceUnavailable;
+        const source = for (self.sources) |*candidate| {
+            if (candidate.handle == null and candidate.bytes.items.len == 0) break candidate;
+        } else return error.ClipboardSourceCapacityExceeded;
+        try source.bytes.appendSlice(self.allocator, bytes);
+        errdefer source.bytes.deinit(self.allocator);
+        source.handle = (try protocol.wl_data_device_manager.construct_create_data_source(objects, queue, manager, .{})).id;
+        source.id = source.handle.?.id;
+        source.canceled = false;
+        source.mime = mime;
+        try wayring.client.sendRequest(protocol.wl_data_source, objects, queue, source.handle.?, .{
+            .offer = .{ .mime_type = if (mime == .text) utf8_mime else uri_mime },
+        });
+        if (objectVersion(objects, source.handle.?) >= 3) try wayring.client.sendRequest(
+            protocol.wl_data_source,
+            objects,
+            queue,
+            source.handle.?,
+            .{ .set_actions = .{ .dnd_actions = .copy } },
+        );
+        try wayring.client.sendRequest(protocol.wl_data_device, objects, queue, device, .{
+            .start_drag = .{ .source = source.handle.?.id, .origin = origin_surface, .icon = null, .serial = serial },
+        });
     }
 
     pub fn setSelection(
@@ -320,8 +480,12 @@ pub const Clipboard = struct {
         else
             null;
         if (mime == null) return false;
-        const transfer = try self.reserveTransfer(request);
+        _ = try self.beginReceive(objects, queue, offer.?, request, mime.?);
+        return true;
+    }
 
+    fn beginReceive(self: *Clipboard, objects: *wayring.objects.ClientObjects, queue: *wayring.tx.Queue, offer: *Offer, request: RequestHandle, mime: []const u8) !*Transfer {
+        const transfer = try self.reserveTransfer(request);
         var pipe: [2]linux.fd_t = undefined;
         switch (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true }))) {
             .SUCCESS => {},
@@ -341,8 +505,8 @@ pub const Clipboard = struct {
             protocol.wl_data_offer,
             objects,
             queue,
-            offer.?.handle.?,
-            .{ .receive = .{ .mime_type = mime.?, .fd = pipe[1] } },
+            offer.handle.?,
+            .{ .receive = .{ .mime_type = mime, .fd = pipe[1] } },
         );
         write_owned = false; // Wayring's transmit queue owns the descriptor.
         transfer.fd = pipe[0];
@@ -353,7 +517,7 @@ pub const Clipboard = struct {
             std.math.maxInt(u64),
         );
         transfer.state = .reading;
-        return true;
+        return transfer;
     }
 
     pub fn cancel(self: *Clipboard, request: RequestHandle) !bool {
@@ -399,7 +563,7 @@ pub const Clipboard = struct {
     }
 
     pub fn takeCompletion(self: *Clipboard) ?Completion {
-        for (self.transfers) |*transfer| if (transfer.state == .completed) {
+        for (self.transfers) |*transfer| if (transfer.state == .completed and !transfer.drag) {
             transfer.state = .delivered;
             return .{
                 .request = transfer.request,
@@ -408,6 +572,25 @@ pub const Clipboard = struct {
             };
         };
         return null;
+    }
+
+    pub fn takeDragCompletion(self: *Clipboard) ?DragCompletion {
+        for (self.transfers) |*transfer| if (transfer.state == .completed and transfer.drag) {
+            transfer.state = .delivered;
+            return .{ .request = transfer.request, .mime = transfer.drag_mime, .bytes = if (!transfer.canceled and !transfer.failed) transfer.bytes.items else null };
+        };
+        return null;
+    }
+
+    pub fn finishDrop(self: *Clipboard, objects: *wayring.objects.ClientObjects, queue: *wayring.tx.Queue, request: RequestHandle, accepted: bool) !void {
+        const transfer = self.transferForRequest(request) orelse return error.StaleClipboardRequest;
+        if (!transfer.drag or transfer.state != .delivered) return error.InvalidClipboardTransfer;
+        if (transfer.drag_offer_id) |id| if (self.offerForId(id)) |offer| {
+            if (accepted and !transfer.failed and !transfer.canceled and objectVersion(objects, offer.handle.?) >= 3)
+                try wayring.client.sendRequest(protocol.wl_data_offer, objects, queue, offer.handle.?, .{ .finish = .{} });
+            try self.destroyOffer(objects, queue, id);
+        };
+        self.resetTransfer(transfer);
     }
 
     pub fn releaseCompletion(self: *Clipboard, request: RequestHandle) !void {
@@ -526,6 +709,11 @@ pub const Clipboard = struct {
         self.selection_offer_id = null;
         self.drag_offer_id = null;
         self.current_source_id = null;
+        self.drag_event_head = 0;
+        self.drag_event_count = 0;
+        self.drop_seen = false;
+        self.dispatch_offer_id = null;
+        self.dispatch_serial = null;
     }
 
     fn transferForRequest(self: *Clipboard, request: RequestHandle) ?*Transfer {
@@ -561,8 +749,9 @@ pub const Clipboard = struct {
         write.source_id = source.id;
         write.fd = fd;
         write.offset = 0;
-        if (std.ascii.eqlIgnoreCase(mime_type, utf8_mime) or
-            std.ascii.eqlIgnoreCase(mime_type, plain_mime))
+        if ((source.mime == .text and (std.ascii.eqlIgnoreCase(mime_type, utf8_mime) or
+            std.ascii.eqlIgnoreCase(mime_type, plain_mime))) or
+            (source.mime == .uri_list and std.ascii.eqlIgnoreCase(mime_type, uri_mime)))
         {
             write.operation = try self.loop.prepareWrite(
                 fd,
@@ -715,6 +904,67 @@ fn sameRequest(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
+fn objectVersion(objects: *wayring.objects.ClientObjects, handle: Handle) u32 {
+    return if (objects.namespace.resolve(handle)) |object| object.version else 0;
+}
+
+fn fixedToFloat(value: i32) f32 {
+    return @as(f32, @floatFromInt(value)) / 256.0;
+}
+
+/// RFC 2483 text/uri-list validation. It validates transport syntax only and
+/// intentionally performs no filesystem access or URI dereferencing.
+pub fn validUriList(bytes: []const u8) bool {
+    if (bytes.len == 0 or !std.unicode.utf8ValidateSlice(bytes)) return false;
+    var found = false;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.indexOfScalar(u8, line, ':') == null) return false;
+        const colon = std.mem.indexOfScalar(u8, line, ':').?;
+        if (colon == 0 or !std.ascii.isAlphabetic(line[0])) return false;
+        for (line[1..colon]) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '+' and byte != '-' and byte != '.') return false;
+        var index: usize = colon + 1;
+        while (index < line.len) : (index += 1) {
+            const byte = line[index];
+            if (byte < 0x20 or byte == 0x7f or byte == ' ') return false;
+            if (byte == '%') {
+                if (index + 2 >= line.len or !std.ascii.isHex(line[index + 1]) or !std.ascii.isHex(line[index + 2])) return false;
+                index += 2;
+            }
+        }
+        found = true;
+    }
+    return found;
+}
+
+test "URI lists are validated without resolving their resources" {
+    try std.testing.expect(validUriList("# files\r\nfile:///tmp/a%20b\r\nhttps://example.test/x\n"));
+    try std.testing.expect(!validUriList("/tmp/not-a-uri\n"));
+    try std.testing.expect(!validUriList("file:///tmp/bad%2\n"));
+    try std.testing.expect(!validUriList("file:///tmp/raw space\n"));
+    try std.testing.expect(!validUriList("# comments only\n"));
+}
+
+test "drag event queue preserves enter motion drop and leave in one dispatch batch" {
+    var clipboard: Clipboard = undefined;
+    clipboard.drag_event_head = 0;
+    clipboard.drag_event_count = 0;
+    try clipboard.pushDragEvent(.{ .enter = .{ .offer_id = 17, .serial = 1, .surface = 2, .x = 3, .y = 4, .text = true, .uri_list = false } });
+    try clipboard.pushDragEvent(.{ .motion = .{ .time_ms = 5, .x = 6, .y = 7 } });
+    for (0..100) |i| try clipboard.pushDragEvent(.{ .motion = .{ .time_ms = @intCast(i + 6), .x = @floatFromInt(i), .y = 9 } });
+    try clipboard.pushDragEvent(.drop);
+    try clipboard.pushDragEvent(.leave);
+    try std.testing.expect(clipboard.takeDragEvent().? == .enter);
+    try std.testing.expectEqual(@as(?u32, 17), clipboard.dispatch_offer_id);
+    try std.testing.expectEqual(@as(?u32, 1), clipboard.dispatch_serial);
+    try std.testing.expectEqual(@as(f32, 99), clipboard.takeDragEvent().?.motion.x);
+    try std.testing.expect(clipboard.takeDragEvent().? == .drop);
+    try std.testing.expect(clipboard.takeDragEvent().? == .leave);
+    try std.testing.expect(clipboard.takeDragEvent() == null);
+}
+
 test "clipboard teardown respects device and manager destructor versions" {
     const allocator = std.testing.allocator;
     for ([_]u32{ 1, 2, 3, 4 }) |version| {
@@ -735,6 +985,7 @@ test "clipboard teardown respects device and manager destructor versions" {
         clipboard.bindManager(manager, 19);
         clipboard.device = device;
 
+        if (version < 3) try std.testing.expectError(error.DragActionsUnavailable, clipboard.startDrag(&objects, &queue, 47, 91, .text, "copy"));
         try std.testing.expect(try clipboard.releaseManager(&objects, &queue));
         try std.testing.expect(clipboard.manager == null and clipboard.device == null);
         try std.testing.expect(clipboard.manager_global_name == null);

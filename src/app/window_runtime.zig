@@ -70,6 +70,12 @@ pub const TextInputStatus = struct {
     commit_permitted: bool,
 };
 
+pub const DropSelection = struct {
+    target: ui.instance.InstanceHandle,
+    handler: ui.input.Handler,
+    mime: @import("../platform/wayland/clipboard.zig").DragMime,
+};
+
 /// Retained UI state for one application window. This coordinates sibling UI,
 /// task, Lua, text, and scene implementations without owning platform objects
 /// or a renderer backend.
@@ -80,6 +86,7 @@ pub const WindowRuntime = struct {
     ready: bool = false,
     window: platform.WindowHandle = .invalid,
     activation_input: ?@import("../platform/activation.zig").Input = null,
+    pointer_input: ?@import("../platform/activation.zig").Input = null,
     tree: ui.render_object.Tree = undefined,
     instances: ui.instance.Tree = undefined,
     build_owners: ui.instance.BuildOwners = undefined,
@@ -237,6 +244,36 @@ pub const WindowRuntime = struct {
 
     pub fn setClipboardCoordinator(self: *WindowRuntime, clipboard: *clipboard_module.Coordinator) void {
         self.clipboard = clipboard;
+    }
+
+    /// Hit tests the retained tree and resolves the nearest matching box
+    /// binding. The returned generation-checked identity is snapshotted by the
+    /// runner when transfer begins.
+    pub fn dropTarget(self: *WindowRuntime, position: platform.LogicalPosition, text_offer: bool, uri_offer: bool) !?DropSelection {
+        if (!self.ready) return null;
+        const root = (try self.instances.rootRenderObject()) orelse return null;
+        const render = (try self.tree.hitTest(root, .{ .x = position.x, .y = position.y })) orelse return null;
+        var current: ?ui.instance.InstanceHandle = self.instances.instanceForRenderObject(render);
+        while (current) |target| {
+            if (uri_offer) if (self.pointer_bindings.getKind(target, .drop_uris)) |handler|
+                return .{ .target = target, .handler = handler, .mime = .uri_list };
+            if (text_offer) if (self.pointer_bindings.getKind(target, .drop_text)) |handler|
+                return .{ .target = target, .handler = handler, .mime = .text };
+            current = try self.instances.parentOf(target);
+        }
+        return null;
+    }
+
+    pub fn deliverDrop(self: *WindowRuntime, callbacks: *lua.CallbackRegistry, selection: DropSelection, bytes: []const u8) !bool {
+        if (!self.ready) return false;
+        if (!self.instances.isActive(selection.target)) return false;
+        const kind: ui.input.HandlerKind = if (selection.mime == .text) .drop_text else .drop_uris;
+        const current = self.pointer_bindings.getKind(selection.target, kind) orelse return false;
+        if (!std.meta.eql(current, selection.handler)) return false;
+        if (selection.mime == .text and !std.unicode.utf8ValidateSlice(bytes)) return false;
+        if (selection.mime == .uri_list and !@import("../platform/wayland/clipboard.zig").validUriList(bytes)) return false;
+        _ = try callbacks.spawn(current.id, self.callback_scope orelse try self.instances.scope(selection.target), &.{.{ .string = bytes }});
+        return true;
     }
 
     pub fn deinit(self: *WindowRuntime) void {
@@ -807,7 +844,9 @@ pub const WindowRuntime = struct {
             self.development_revision +%= 1;
             self.metrics.input_events +|= 1;
             self.activation_input = null;
+            self.pointer_input = null;
             defer self.activation_input = null;
+            defer self.pointer_input = null;
             const serial: ?u32 = switch (event) {
                 .pointer => |pointer| switch (pointer.event) {
                     .button => |button| if (button.state == .pressed) button.serial else null,
@@ -824,7 +863,10 @@ pub const WindowRuntime = struct {
                     event.keyboard.key.source_window orelse self.window
                 else
                     self.window;
-                if (value != 0) self.activation_input = .{ .window = source, .serial = value };
+                if (value != 0) {
+                    self.activation_input = .{ .window = source, .serial = value };
+                    if (event == .pointer) self.pointer_input = self.activation_input;
+                }
             }
             if (event == .text_input_focus) {
                 self.text_input_surface_focused = event.text_input_focus;
@@ -1216,7 +1258,8 @@ pub const WindowRuntime = struct {
     ) !void {
         const Service = @typeInfo(@TypeOf(callback_service)).pointer.child;
         if (Service == lua.CallbackRegistry) {
-            _ = try callback_service.spawnInput(callback, self.callback_scope orelse scope, arguments, self.activation_input);
+            const spawned = try callback_service.spawnInput(callback, self.callback_scope orelse scope, arguments, self.activation_input);
+            try callback_service.setPointerInput(callback, spawned, self.pointer_input);
         } else {
             return error.CallbackServiceUnavailable;
         }

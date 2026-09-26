@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ourokit Notes
+Comment=Small multi-document Ourokit example
+Exec=/usr/bin/ouroctl run /usr/share/ourokit/documents/ouro.json -- %U
+DBusActivatable=true
+Terminal=false
+MimeType=application/vnd.ourokit.note+json;
+Categories=Office;TextEditor;

@@ -51,8 +51,19 @@ not arrival order.
 A reply or signal is a table with `signature` and positional `args`. It also
 contains `sender`, `destination`, `path`, `interface`, and `member` when present
 in the received header. The bus does not infer types or introspect methods.
+`bus:unique_name()` returns the connection's native unique bus name after
+connect completes. This is useful when protocols derive object paths from it.
+`bus:send{...}` queues the same typed method call without waiting for a reply.
+It is non-yielding and can be used by a close guard for protocol cancellation;
+success means queued, not acknowledged by the service.
 
 ## Subscribe to signals
+
+Set `close_on_owner_change=true` when a stream must remain bound to one service
+instance. Losing or replacing a previously resolved sender closes the stream
+with `ServiceDisappeared`, waking a pending `next()` without periodic polling.
+The default follows name-owner changes. `next(timeout_ms)` optionally bounds a
+wait using the monotonic clock; omitting the timeout waits for an event or close.
 
 ```lua
 local stream, err = bus:subscribe {
@@ -78,7 +89,8 @@ All four match fields are optional exact matches. `subscribe` waits for the
 bus daemon to register the match, with a two-second deadline. Well-known
 senders are resolved to unique names and tracked across ownership changes.
 Each stream has one consumer: a second simultaneous `next` returns an error.
-`next` waits indefinitely when its queue is empty. `stream:close()` unregisters
+`next` waits indefinitely when its queue is empty. `next(timeout_ms)` instead
+returns a timeout error after the positive integer deadline. `stream:close()` unregisters
 the match and wakes its waiter; `bus:close()` closes all its streams and calls.
 
 ## Export a service

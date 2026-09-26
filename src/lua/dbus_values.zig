@@ -280,12 +280,16 @@ pub fn encode(L: *c.State, index: c_int, signature: []const u8, allocator: std.m
     return .{ .allocator = allocator, .body = body, .fds = owned_fds };
 }
 
-pub fn pushFd(L: *c.State, fd: linux.fd_t) !void {
+/// Pushes an FD userdata which takes ownership of `fd`. On failure ownership
+/// remains with the caller.
+pub fn pushOwnedFd(L: *c.State, fd: linux.fd_t) !void {
     const p = c.lua_newuserdatauv(L, @sizeOf(Fd), 0) orelse return error.OutOfMemory;
     @as(*Fd, @ptrCast(@alignCast(p))).* = .{ .value = fd };
     _ = c.luaL_newmetatable(L, fd_mt);
     _ = c.lua_setmetatable(L, -2);
 }
+
+pub const pushFd = pushOwnedFd;
 
 fn pushOne(L: *c.State, sig: []const u8, pos: *usize, d: *wire.Decoder, message: *const wire.Message, count: *usize, depth: usize) anyerror!void {
     if (depth >= max_depth or count.* >= max_values) return error.InvalidValue;

@@ -27,6 +27,7 @@ pub const ActionSchema = struct {
 pub const Window = struct {
     declaration: platform.SurfaceDeclaration,
     content_reference: c_int,
+    on_close_request: c_int = c.no_reference,
     all_outputs: bool = false,
     template_id: ?[]const u8 = null,
 };
@@ -245,6 +246,8 @@ pub const Application = struct {
                 .content_reference = c.luaL_ref(self.state, c.registry_index),
                 .template_id = template.declaration.id(),
             };
+            _ = c.lua_rawgeti(self.state, c.registry_index, template.on_close_request);
+            windows[windows.len - 1].on_close_request = c.luaL_ref(self.state, c.registry_index);
             changed = true;
         }
         return changed;
@@ -786,9 +789,15 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
         if (c.lua_getfield(state, -1, "content") != c.type_function)
             return error.WindowContentRequired;
         const content_reference = c.luaL_ref(state, c.registry_index);
+        errdefer c.luaL_unref(state, c.registry_index, content_reference);
+        const close_kind = c.lua_getfield(state, -1, "on_close_request");
+        if (close_kind != c.type_nil and close_kind != c.type_function)
+            return error.InvalidWindowCloseHandler;
+        const on_close_request = c.luaL_ref(state, c.registry_index);
         window.* = .{
             .declaration = declaration,
             .content_reference = content_reference,
+            .on_close_request = on_close_request,
             .all_outputs = all_outputs,
         };
         initialized += 1;
@@ -1033,6 +1042,7 @@ fn optionalSignedInteger(
 
 fn deinitWindow(allocator: std.mem.Allocator, state: *c.State, window: Window) void {
     c.luaL_unref(state, c.registry_index, window.content_reference);
+    c.luaL_unref(state, c.registry_index, window.on_close_request);
     switch (window.declaration) {
         .toplevel => |declaration| {
             allocator.free(declaration.title);

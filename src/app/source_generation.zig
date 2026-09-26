@@ -56,6 +56,7 @@ pub const SourceGeneration = struct {
     mcp_client: lua.McpClient,
     dbus: lua.Dbus,
     stdio: lua.Stdio,
+    files: @import("../lua/files.zig").Binding,
     applications: lua.Applications,
     image_import: lua.ImageImport,
     signals: lua.Signals,
@@ -194,6 +195,7 @@ pub const SourceGeneration = struct {
         var mcp_client_initialized = false;
         var dbus_initialized = false;
         var stdio_initialized = false;
+        var files_initialized = false;
         var applications_initialized = false;
         var image_import_initialized = false;
         var signals_initialized = false;
@@ -215,6 +217,7 @@ pub const SourceGeneration = struct {
             if (self.images) |*images| images.deinit();
             if (applications_initialized) self.applications.deinit();
             if (image_import_initialized) self.image_import.deinit();
+            if (files_initialized) self.files.deinit();
             if (stdio_initialized) self.stdio.deinit();
             if (dbus_initialized) self.dbus.deinit();
             if (mcp_client_initialized) self.mcp_client.deinit();
@@ -268,6 +271,8 @@ pub const SourceGeneration = struct {
         dbus_initialized = true;
         try self.stdio.init(allocator, &self.vm, loop, config.mcp_call_capacity);
         stdio_initialized = true;
+        try self.files.init(allocator, &self.vm, loop);
+        files_initialized = true;
         self.signals.initWithApi(
             allocator,
             self.vm.state,
@@ -631,6 +636,7 @@ pub const SourceGeneration = struct {
         if (self.images) |*images| if (try images.dispatch(completion)) return true;
         if (try self.applications.dispatch(completion)) return true;
         if (try self.image_import.dispatch(completion)) return true;
+        if (try self.files.dispatch(completion)) return true;
         if (try self.stdio.dispatch(completion)) return true;
         if (self.module_loader) |*loader| return loader.dispatch(completion);
         return false;
@@ -654,6 +660,7 @@ pub const SourceGeneration = struct {
         try self.stdio.collectCanceled();
         try self.applications.collectCanceled();
         self.image_import.collectCanceled();
+        self.files.collectCanceled();
     }
 
     pub fn workspacesRequested(self: *const SourceGeneration) bool {
@@ -888,6 +895,7 @@ pub const SourceGeneration = struct {
         if (self.images) |*images| images.deinit();
         self.applications.deinit();
         self.image_import.deinit();
+        self.files.deinit();
         self.stdio.deinit();
         self.dbus.deinit();
         self.mcp_client.deinit();

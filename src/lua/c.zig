@@ -59,6 +59,7 @@ pub extern fn lua_rawgeti(state: *State, index: c_int, integer: Integer) c_int;
 pub extern fn lua_rawseti(state: *State, index: c_int, integer: Integer) void;
 pub extern fn lua_settable(state: *State, index: c_int) void;
 pub extern fn lua_rawlen(state: *State, index: c_int) usize;
+pub extern fn lua_concat(state: *State, count: c_int) void;
 pub extern fn lua_next(state: *State, index: c_int) c_int;
 pub extern fn lua_settop(state: *State, index: c_int) void;
 pub extern fn lua_rotate(state: *State, index: c_int, count: c_int) void;

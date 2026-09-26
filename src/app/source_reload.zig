@@ -335,6 +335,7 @@ pub const SourceReload = struct {
             try retiring.generation.vm.requestCancellation();
             retiring.generation.shutdownImages();
             retiring.generation.dbus.shutdown();
+            retiring.generation.files.stop();
             retiring.cancellation_started = true;
         }
     }
@@ -449,6 +450,7 @@ pub const SourceReload = struct {
                 retiring.generation.vm.activeTaskCount() != 0) continue;
             if (!retiring.generation.imagesQuiescent()) continue;
             if (!retiring.generation.dbus.canDeinit()) continue;
+            if (!retiring.generation.files.canDeinit()) continue;
             if (self.services) |services|
                 if (services.callbacks.countForVm(&retiring.generation.vm) != 0) continue;
             retiring.generation.destroy();

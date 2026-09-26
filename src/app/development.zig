@@ -243,7 +243,10 @@ pub const Playback = struct {
         const window = runtime.window;
         if (self.action.path()) |path| {
             const geometry = try runtime.semanticTarget(path);
-            if (self.action != .hover and !geometry.enabled) return error.DevelopmentTargetDisabled;
+            // A press handler may disable itself while asynchronous work is
+            // pending. Its matching release must still drain normally.
+            if (self.action != .hover and !geometry.enabled and
+                !(self.action == .click and self.step == 2)) return error.DevelopmentTargetDisabled;
             if (self.step == 0) {
                 try checkHit(runtime, self.target.?, geometry.center);
                 // Unlike a real seat, headless playback may not have entered.

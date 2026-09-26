@@ -28,6 +28,7 @@ const Bus = struct {
     closing: bool = false,
     ready: bool = false,
     setup_serial: ?u32 = null,
+    unique_name: ?[]u8 = null,
 };
 const Subscription = struct {
     binding: *Binding = undefined,
@@ -41,6 +42,7 @@ const Subscription = struct {
     rule: []u8 = &.{},
     sender: ?[]u8 = null,
     sender_owner: ?[]u8 = null,
+    close_on_owner_change: bool = false,
     path: ?[]u8 = null,
     interface: ?[]u8 = null,
     member: ?[]u8 = null,
@@ -132,7 +134,7 @@ pub const Binding = struct {
         c.lua_pushcclosure(L, connect, 1);
         c.lua_setfield(L, -2, "connect");
         c.lua_setfield(L, -2, "dbus");
-        installMetatable(L, bus_mt, &.{ .{ "call", call }, .{ "subscribe", subscribe }, .{ "close", closeBusLua }, .{ "__close", closeBusLua }, .{ "__gc", closeBusLua } });
+        installMetatable(L, bus_mt, &.{ .{ "call", call }, .{ "send", sendLua }, .{ "unique_name", uniqueNameLua }, .{ "subscribe", subscribe }, .{ "close", closeBusLua }, .{ "__close", closeBusLua }, .{ "__gc", closeBusLua } });
         installMetatable(L, sub_mt, &.{ .{ "next", next }, .{ "close", closeSubLua }, .{ "__close", closeSubLua }, .{ "__gc", closeSubLua } });
         installMetatable(L, export_mt, &.{ .{ "close", closeSubLua }, .{ "__close", closeSubLua }, .{ "__gc", closeSubLua } });
         installMetatable(L, wait_mt, &.{.{ "__close", closeWaitLua }});
@@ -150,6 +152,12 @@ pub const Binding = struct {
         c.lua_pushcclosure(L, next, 0);
         if (c.lua_pcallk(L, 3, 1, 0, 0, null) != c.ok) return error.ServiceInitializationFailed;
         c.lua_setfield(L, -2, "export");
+        c.lua_settop(L, -2);
+        const desktop = @embedFile("desktop.lua");
+        if (c.luaL_loadbufferx(L, desktop, desktop.len, "=ouro.desktop", "t") != c.ok) return error.ServiceInitializationFailed;
+        c.lua_pushvalue(L, -2);
+        c.lua_pushcclosure(L, setMetatableLua, 0);
+        if (c.lua_pcallk(L, 2, 0, 0, 0, null) != c.ok) return error.ServiceInitializationFailed;
     }
 
     /// Retires this generation's persistent connections without canceling
@@ -214,10 +222,14 @@ pub const Binding = struct {
             if (wait.kind == .subscribe) wait.sub.?.phase = .closing;
             if (wait.kind == .own_name) wait.name.?.closing = true;
             try self.finish(wait, error.Canceled);
-            self.releaseWait(wait);
+            // Keep the connection reachable until the canceled coroutine has
+            // run its __close guards (including protocol-level cancellation).
+            if (wait.guard == null) self.releaseWait(wait);
         };
         for (self.buses) |*bus| if (bus.active) {
-            if (bus.closing) try bus.client.close();
+            // A non-yielding send may have been queued by a Lua __close guard.
+            // Flush it before retiring the transport.
+            if (bus.closing and !self.busHasWait(bus) and bus.client.outgoing.items.len == 0 and bus.client.write_operation == null) try bus.client.close();
             try bus.client.collectCanceled();
             if (bus.client.isReady() and !bus.closing and bus.setup_serial == null and !bus.ready)
                 bus.setup_serial = daemonCall(bus, "AddMatch", owner_match) catch |err| blk: {
@@ -299,6 +311,7 @@ pub const Binding = struct {
             };
             try bus.client.collectCanceled();
             if (bus.closing) {
+                if (self.busHasWait(bus) or bus.client.outgoing.items.len != 0 or bus.client.write_operation != null) continue;
                 try bus.client.close();
                 if (bus.client.canDeinit() and !self.busHasWait(bus)) {
                     var serving = false;
@@ -309,6 +322,7 @@ pub const Binding = struct {
                     for (self.subscriptions) |*sub| if (sub.active and sub.bus == bus) self.releaseSub(sub);
                     if (bus.guard) |guard| guard.* = null;
                     if (bus.resource) |resource| try self.vm.scheduler.destroyResource(resource);
+                    if (bus.unique_name) |name| self.allocator.free(name);
                     bus.client.deinit();
                     bus.* = .{ .binding = self };
                 }
@@ -325,6 +339,12 @@ pub const Binding = struct {
                 _ = try decoder.string();
                 const owner = try decoder.string();
                 for (self.subscriptions) |*sub| if (sub.active and sub.bus == bus and optionalEqual(sub.sender, name)) {
+                    if (sub.close_on_owner_change) if (sub.sender_owner) |old| {
+                        if (old.len != 0 and !std.mem.eql(u8, old, owner)) {
+                            sub.failure = error.ServiceDisappeared;
+                            sub.phase = .closing;
+                        }
+                    };
                     const copy = try self.allocator.dupe(u8, owner);
                     if (sub.sender_owner) |old| self.allocator.free(old);
                     sub.sender_owner = copy;
@@ -354,6 +374,11 @@ pub const Binding = struct {
         const serial = message.header.reply_serial orelse return;
         if (bus.setup_serial == serial) {
             if (message.header.message_type == .error_reply) return error.MatchRegistrationFailed;
+            if (bus.unique_name == null) {
+                const destination = message.header.destination orelse return error.ProtocolError;
+                if (destination.len == 0 or destination[0] != ':') return error.ProtocolError;
+                bus.unique_name = try self.allocator.dupe(u8, destination);
+            }
             bus.ready = true;
             return;
         }
@@ -583,6 +608,14 @@ pub const Binding = struct {
         try sendReturn(bus, message, "s", encoded.bytes(), &.{});
     }
 };
+
+fn setMetatableLua(L: *c.State) callconv(.c) c_int {
+    if (c.lua_gettop(L) != 2 or c.lua_type(L, 1) != c.type_table or c.lua_type(L, 2) != c.type_table) return 0;
+    c.lua_pushvalue(L, 2);
+    _ = c.lua_setmetatable(L, 1);
+    c.lua_pushvalue(L, 1);
+    return 1;
+}
 
 fn findMethod(sub: *const Subscription, member: []const u8) ?Method {
     for (sub.methods.items) |method| if (std.mem.eql(u8, method.name, member)) return method;
@@ -847,6 +880,36 @@ fn callImpl(L: *c.State) !*Wait {
     };
     return wait;
 }
+fn uniqueNameLua(L: *c.State) callconv(.c) c_int {
+    if (c.lua_gettop(L) != 1) return localError(L, error.InvalidArguments);
+    const bus = getHandle(Bus, L, 1, bus_mt) catch |err| return localError(L, err);
+    const name = bus.unique_name orelse return localError(L, error.ConnectionClosed);
+    _ = c.lua_pushlstring(L, name.ptr, name.len);
+    return 1;
+}
+/// Queue a method call without waiting for its reply. This is intentionally
+/// narrow: desktop request guards use it to send Request.Close while a task is
+/// being canceled and therefore cannot yield.
+fn sendLua(L: *c.State) callconv(.c) c_int {
+    sendImpl(L) catch |err| return localError(L, err);
+    c.lua_pushboolean(L, 1);
+    return 1;
+}
+fn sendImpl(L: *c.State) !void {
+    if (c.lua_gettop(L) != 2) return error.InvalidArguments;
+    const bus = try getHandle(Bus, L, 1, bus_mt);
+    // Cleanup guards may queue a final message after scope cancellation but
+    // before the connection's transport is drained and closed.
+    if (!bus.ready or !bus.client.isReady()) return error.ConnectionClosed;
+    _ = try bus.binding.vm.currentScope(L);
+    if (c.lua_type(L, 2) != c.type_table) return error.InvalidCall;
+    const metadata: wire.Metadata = .{ .message_type = .method_call, .destination = try stringField(L, 2, "destination"), .path = try stringField(L, 2, "path"), .interface = try stringField(L, 2, "interface"), .member = try stringField(L, 2, "member"), .signature = try stringField(L, 2, "signature") };
+    try validateMetadata(metadata);
+    _ = c.lua_getfield(L, 2, "args");
+    var encoded = try values.encode(L, -1, metadata.signature, bus.binding.allocator);
+    defer encoded.deinit();
+    _ = try bus.client.send(metadata, encoded.body, encoded.fds);
+}
 fn yieldWait(L: *c.State, wait: *Wait) c_int {
     // Allocation-owning helpers have returned and run their defers before
     // lua_yieldk longjmps out of the C entrypoint.
@@ -869,6 +932,10 @@ fn subscribeImpl(L: *c.State) !*Wait {
     } else return error.SubscriptionCapacityExceeded;
     sub.* = .{ .binding = self, .bus = bus, .active = true };
     errdefer self.releaseSub(sub);
+    _ = c.lua_getfield(L, 2, "close_on_owner_change");
+    if (c.lua_type(L, -1) != c.type_nil and c.lua_type(L, -1) != c.type_boolean) return error.InvalidMatch;
+    sub.close_on_owner_change = c.lua_toboolean(L, -1) != 0;
+    c.lua_settop(L, -2);
     inline for (.{ "sender", "path", "interface", "member" }) |field| {
         _ = c.lua_getfield(L, 2, field);
         if (c.lua_type(L, -1) != c.type_nil) {
@@ -908,6 +975,7 @@ fn next(L: *c.State) callconv(.c) c_int {
     return if (wait) |pending| yieldWait(L, pending) else 1;
 }
 fn nextImpl(L: *c.State) !?*Wait {
+    if (c.lua_gettop(L) < 1 or c.lua_gettop(L) > 2) return error.InvalidArguments;
     const guard = handlePointer(Subscription, L, 1, sub_mt) orelse handlePointer(Subscription, L, 1, export_mt) orelse return error.InvalidHandle;
     const sub = guard.* orelse return error.Closed;
     const self = sub.binding;
@@ -926,7 +994,14 @@ fn nextImpl(L: *c.State) !?*Wait {
         try self.pushIncoming(L, sub, &message);
         return null;
     }
-    const wait = try self.beginWait(L, sub.bus, sub, .next, null);
+    var timeout: ?u32 = null;
+    if (c.lua_gettop(L) == 2 and c.lua_type(L, 2) != c.type_nil) {
+        var valid: c_int = 0;
+        const value = c.lua_tointegerx(L, 2, &valid);
+        if (valid == 0 or value < 1 or value > std.math.maxInt(i32)) return error.InvalidTimeout;
+        timeout = @intCast(value);
+    }
+    const wait = try self.beginWait(L, sub.bus, sub, .next, timeout);
     return wait;
 }
 

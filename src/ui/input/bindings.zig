@@ -12,6 +12,8 @@ pub const HandlerKind = enum {
     listbox,
     interaction_change,
     cancel,
+    drop_text,
+    drop_uris,
 
     fn primary(self: HandlerKind) bool {
         return self == .pointer or self == .button or self == .@"switch" or self == .listbox;

@@ -86,6 +86,13 @@ create state in `run` or application initialization. New IDs mount native
 surfaces, omitted IDs retire them, and retained IDs preserve their widget
 runtime. Reopening a removed ID mounts fresh widgets after teardown drains.
 An empty reactive list keeps the application alive for later state changes.
+An optional `on_close_request=function() ... end` on a window intercepts a
+compositor close request. The callback runs in that window's task scope; omit
+the window from the reactive declaration to close it after confirmation.
+Without the callback, close requests retain their usual automatic behavior.
+Process exit/shutdown does not wait for close confirmation. The
+[document example](documents.md) demonstrates save/discard/cancel and explicitly
+exits after the last document closes.
 Retained windows with the same `content` function do not rerender content just
 because `windows()` reruns or a title changes. Each content function tracks its
 own signal reads; replacing that function invalidates only its window. Store

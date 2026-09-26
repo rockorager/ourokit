@@ -1613,6 +1613,10 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append box semantics");
         self.stageCallback(state, id, "on_interaction_change", .interaction_change) catch |err|
             return luaError(state, @errorName(err));
+        self.stageCallback(state, id, "on_drop_text", .drop_text) catch |err|
+            return luaError(state, @errorName(err));
+        self.stageCallback(state, id, "on_drop_uris", .drop_uris) catch |err|
+            return luaError(state, @errorName(err));
         return self.emitChildren(state, .{ .id = id, .kind = .box });
     }
 

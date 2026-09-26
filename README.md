@@ -508,6 +508,8 @@ and shared-memory/dma-buf presentation paths.
 - [Rendering](docs/rendering.md)
 - [Runtime, tasks, Lua, and io_uring](docs/runtime.md)
 - [D-Bus clients and services](docs/dbus.md)
+- [Desktop choosers, external opening, and notifications](docs/desktop-services.md)
+- [Local file I/O](docs/files.md) and [multi-document example](docs/documents.md)
 - [Application model](docs/application-model.md)
 - [Transactional source reload](docs/hot-reload.md)
 - [Native plugins](docs/native-plugins.md)

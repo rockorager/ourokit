@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=dev.ourokit.documents
+Exec=/usr/bin/ouroctl run /usr/share/ourokit/documents/ouro.json --dbus-activated

@@ -101,6 +101,19 @@ fn node(snapshot: dev.Snapshot, path: []const u8) !dev.Node {
     return error.TestPathMissing;
 }
 
+test "development click releases a button disabled by its own press handler" {
+    const f = try Fixture.create(
+        \\busy = ouro.signal(false)
+        \\function build()
+        \\  return ouro.button {key='save', label='Save', enabled=not busy(), on_press=function() busy:set(true) end}
+        \\end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "save" });
+    try std.testing.expect(!(try f.runtime.semantics.findPath("save")).enabled);
+    try std.testing.expectError(error.DevelopmentTargetDisabled, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = "save" }));
+}
+
 test "development click and hover use dispatch, reject disabled and stale targets, and own bounded snapshots" {
     const f = try Fixture.create(
         \\checked = ouro.signal(false)

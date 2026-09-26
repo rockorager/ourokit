@@ -301,6 +301,7 @@ pub fn build(b: *std.Build) void {
     const development = b.addSystemCommand(&.{"python3"});
     development.addFileArg(b.path("tests/verify_development.py"));
     development.addArtifactArg(host);
+    development.setEnvironmentVariable("OUROKIT_TEST_POINTER_XML", b.dependency("wlr_protocols", .{}).path("unstable/wlr-virtual-pointer-unstable-v1.xml").getPath(b));
     development.setCwd(b.path("."));
     development.has_side_effects = true;
     const development_step = b.step("test-development", "Verify the development loop and control isolation on a disposable headless Sway");
@@ -676,6 +677,7 @@ fn addWaylandProtocol(
     generate.addFileArg(wayland.path("protocol/wayland.xml"));
     generate.addFileArg(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
     generate.addFileArg(wayland_protocols.path("staging/xdg-activation/xdg-activation-v1.xml"));
+    generate.addFileArg(wayland_protocols.path("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml"));
     generate.addFileArg(wlr_protocols.path("unstable/wlr-layer-shell-unstable-v1.xml"));
     generate.addFileArg(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     generate.addFileArg(wayland_protocols.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));

@@ -23,6 +23,9 @@ TESTS = (
     'application_services.py',
     'catalog_export.py',
     'mcp_bridge.py',
+    'desktop_services.py',
+    'documents.py',
+    'desktop_native.py',
 )
 
 
@@ -118,7 +121,7 @@ def verify(binary):
                         stop(process)
                     if compositor.poll() is not None:
                         raise RuntimeError('Sway exited while tests were running')
-                print('PASS development verification: all 5 suites ran on a private headless compositor', flush=True)
+                print(f'PASS development verification: all {len(TESTS)} suites ran on a private headless compositor', flush=True)
             except BaseException:
                 log.seek(0)
                 print('--- disposable Sway log ---\n' + log.read(), file=sys.stderr)

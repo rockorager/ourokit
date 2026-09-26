@@ -11,6 +11,7 @@ const Adapter = @import("adapter.zig").Adapter;
 const Repeat = @import("repeat.zig");
 const Scroll = @import("scroll.zig");
 const Activation = @import("../activation.zig");
+const WindowExport = @import("../window_export.zig");
 const TextInput = @import("text_input.zig");
 const Cursor = @import("cursor.zig").Cursor;
 const WaylandClipboard = @import("clipboard.zig");
@@ -660,6 +661,17 @@ const Window = struct {
     }
 };
 
+const ExportSlot = struct {
+    host: ?*Host = null,
+    request: ?*WindowExport.Request = null,
+    owner: WindowHandle = .invalid,
+    object: Handle = .{ .id = 0, .generation = 0 },
+    timer: ?@import("../../loop/io_uring.zig").OperationHandle = null,
+    lease: ?*ExportLease = null,
+};
+
+const ExportLease = struct { allocator: std.mem.Allocator, host: ?*Host, slot: *ExportSlot, handle: []u8 };
+
 pub const Host = struct {
     const ActivationSlot = struct {
         request: ?*Activation.Request = null,
@@ -698,6 +710,8 @@ pub const Host = struct {
     wm_base: ?Handle = null,
     activation: ?Handle = null,
     activation_requests: [8]ActivationSlot = @splat(.{}),
+    exporter: ?Handle = null,
+    export_requests: [8]ExportSlot = @splat(.{}),
     layer_shell: ?Handle = null,
     layer_shell_version: u32 = 0,
     text_input_manager: ?Handle = null,
@@ -780,6 +794,8 @@ pub const Host = struct {
         self.wm_base = null;
         self.activation = null;
         self.activation_requests = @splat(.{});
+        self.exporter = null;
+        self.export_requests = @splat(.{});
         self.layer_shell = null;
         self.layer_shell_version = 0;
         self.text_input_manager = null;
@@ -903,6 +919,10 @@ pub const Host = struct {
 
     pub fn deinit(self: *Host) void {
         std.debug.assert(self.quiescent());
+        for (&self.export_requests) |*slot| if (slot.host != null) {
+            std.debug.assert(slot.request == null);
+            self.releaseWindowExport(slot) catch unreachable;
+        };
         self.connection.deinit(self.allocator) catch unreachable;
         self.clipboard.abandonProtocol();
         for (self.windows) |*window| {
@@ -1015,6 +1035,81 @@ pub const Host = struct {
 
     pub fn activationProvider(self: *Host) Activation.Provider {
         return .{ .context = self, .start = startActivation, .cancel = cancelActivation };
+    }
+
+    pub fn startWindowExport(self: *Host, request: *WindowExport.Request) !void {
+        if (self.disconnect_started or self.failure != null) return error.WindowExportUnavailable;
+        const manager = self.exporter orelse return error.WindowExportUnavailable;
+        const window = try self.windowFor(request.window);
+        if (window.state != .open or window.recreate) return error.WindowClosing;
+        if (window.popup != null) return error.PopupCannotBeExported;
+        if (window.layer_surface != null) return error.LayerSurfaceCannotBeExported;
+        const surface = window.surface orelse return error.WindowSurfaceUnavailable;
+        if (window.toplevel == null) return error.NotToplevel;
+        const slot = for (&self.export_requests) |*candidate| {
+            if (candidate.host == null) break candidate;
+        } else return error.WindowExportCapacityExceeded;
+        const timer = try self.loop.prepareTimeout(2 * std.time.ns_per_s);
+        errdefer self.loop.prepareCancel(timer) catch {};
+        const created = try protocol.zxdg_exporter_v2.construct_export_toplevel(&self.connection.objects, try self.queue(), manager, .{ .surface = surface.id });
+        slot.* = .{ .host = self, .request = request, .owner = window.handle, .object = created.id, .timer = timer };
+        _ = try self.driver.schedule();
+    }
+
+    pub fn cancelWindowExport(self: *Host, request: *WindowExport.Request) !void {
+        for (&self.export_requests) |*slot| if (slot.request == request) {
+            try self.releaseWindowExport(slot);
+            return;
+        };
+    }
+
+    fn closeWindowExport(context: *anyopaque) void {
+        const lease: *ExportLease = @ptrCast(@alignCast(context));
+        if (lease.host) |host| host.releaseWindowExport(lease.slot) catch {};
+        lease.allocator.free(lease.handle);
+        lease.allocator.destroy(lease);
+    }
+
+    fn releaseWindowExport(self: *Host, slot: *ExportSlot) !void {
+        if (!self.disconnect_started)
+            try wayring.client.sendRequest(protocol.zxdg_exported_v2, &self.connection.objects, try self.queue(), slot.object, .{ .destroy = .{} });
+        if (slot.timer) |timer| try self.loop.prepareCancel(timer);
+        if (slot.lease) |lease| lease.host = null;
+        slot.* = .{};
+        if (!self.disconnect_started) _ = try self.driver.schedule();
+    }
+
+    fn finishWindowExport(self: *Host, slot: *ExportSlot, result: anyerror![]const u8) !void {
+        const request = slot.request.?;
+        if (slot.timer) |timer| try self.loop.prepareCancel(timer);
+        slot.timer = null;
+        const window = self.windowFor(slot.owner) catch {
+            try self.releaseWindowExport(slot);
+            return request.complete(request.context, error.StaleWindow);
+        };
+        if (window.state != .open or window.recreate) {
+            try self.releaseWindowExport(slot);
+            return request.complete(request.context, error.WindowClosing);
+        }
+        const foreign = result catch |err| {
+            try self.releaseWindowExport(slot);
+            return request.complete(request.context, err);
+        };
+        if (foreign.len > 4096) {
+            try self.releaseWindowExport(slot);
+            return request.complete(request.context, error.WindowExportHandleTooLong);
+        }
+        const handle = try self.allocator.alloc(u8, "wayland:".len + foreign.len);
+        @memcpy(handle[0.."wayland:".len], "wayland:");
+        @memcpy(handle["wayland:".len..], foreign);
+        const lease = self.allocator.create(ExportLease) catch |err| {
+            self.allocator.free(handle);
+            return err;
+        };
+        lease.* = .{ .allocator = self.allocator, .host = self, .slot = slot, .handle = handle };
+        slot.lease = lease;
+        slot.request = null;
+        try request.complete(request.context, .{ .context = lease, .handle = handle, .closeFn = closeWindowExport });
     }
 
     fn startActivation(context: *anyopaque, request: *Activation.Request) !void {
@@ -1360,6 +1455,66 @@ pub const Host = struct {
         return self.clipboard.available();
     }
 
+    pub const DragEvent = union(enum) {
+        enter: struct { window: WindowHandle, serial: u32, position: platform_window.LogicalPosition, text: bool, uri_list: bool },
+        motion: struct { time_ms: u32, position: platform_window.LogicalPosition },
+        leave,
+        drop,
+    };
+
+    pub fn takeDragEvent(self: *Host) !?DragEvent {
+        const drag_event = self.clipboard.takeDragEvent() orelse return null;
+        return switch (drag_event) {
+            .enter => |enter| .{ .enter = .{
+                .window = (try self.windowForSurface(enter.surface)).handle,
+                .serial = enter.serial,
+                .position = .{ .x = enter.x, .y = enter.y },
+                .text = enter.text,
+                .uri_list = enter.uri_list,
+            } },
+            .motion => |motion| .{ .motion = .{ .time_ms = motion.time_ms, .position = .{ .x = motion.x, .y = motion.y } } },
+            .leave => .leave,
+            .drop => .drop,
+        };
+    }
+
+    /// The serial is intentionally supplied by retained input dispatch; this
+    /// adapter never substitutes the last pointer serial or fabricates one.
+    pub fn startDrag(self: *Host, window: WindowHandle, serial: u32, mime: WaylandClipboard.DragMime, bytes: []const u8) !void {
+        const origin = (try self.windowFor(window)).surface orelse return error.WindowSurfaceUnavailable;
+        try self.clipboard.startDrag(&self.connection.objects, try self.queue(), serial, origin.id, mime, bytes);
+        _ = try self.driver.schedule();
+    }
+
+    pub fn receiveDrop(self: *Host, request: ClipboardRequestHandle, mime: WaylandClipboard.DragMime) !bool {
+        const started = try self.clipboard.receiveDrop(&self.connection.objects, try self.queue(), request, mime);
+        if (started) {
+            self.submission_pending = true;
+            _ = try self.driver.schedule();
+        }
+        return started;
+    }
+
+    pub fn acceptDrag(self: *Host, mime: ?WaylandClipboard.DragMime) !void {
+        try self.clipboard.acceptDrag(&self.connection.objects, try self.queue(), mime);
+        _ = try self.driver.schedule();
+    }
+
+    pub fn rejectDrop(self: *Host) !void {
+        try self.clipboard.rejectDrop(&self.connection.objects, try self.queue());
+        _ = try self.driver.schedule();
+    }
+
+    pub fn takeDropCompletion(self: *Host) ?WaylandClipboard.DragCompletion {
+        return self.clipboard.takeDragCompletion();
+    }
+
+    pub fn finishDrop(self: *Host, request: ClipboardRequestHandle, accepted: bool) !void {
+        if (self.disconnect_started) return self.clipboard.releaseCompletion(request);
+        try self.clipboard.finishDrop(&self.connection.objects, try self.queue(), request, accepted);
+        _ = try self.driver.schedule();
+    }
+
     pub fn setClipboard(self: *Host, serial: u32, text: []const u8) !void {
         try self.clipboard.setSelection(
             &self.connection.objects,
@@ -1670,6 +1825,12 @@ pub const Host = struct {
                 try self.sink.closeRequested(child.handle);
                 try self.destroySurfaces(child);
             }
+        };
+        for (&self.export_requests) |*slot| if (slot.host != null and sameWindow(slot.owner, window.handle)) {
+            if (slot.request) |request| {
+                try self.releaseWindowExport(slot);
+                try request.complete(request.context, error.StaleWindow);
+            } else try self.releaseWindowExport(slot);
         };
         if (self.text_input_active) |active|
             if (sameWindow(active, window.handle)) try self.disableTextInput(window.handle);
@@ -2210,6 +2371,12 @@ pub const Host = struct {
                 try self.finishActivation(slot, if (event_value.done.token.len <= 4096) event_value.done.token else error.ActivationTokenTooLong);
                 break;
             };
+        } else if (interface == &protocol.zxdg_exported_v2.info) {
+            for (&self.export_requests) |*slot| if (slot.host != null and slot.object.id == message.header.object_id) {
+                const event_value = try wayring.client.decodeEvent(protocol.zxdg_exported_v2, objects, slot.object, message, fds);
+                try self.finishWindowExport(slot, event_value.handle.handle);
+                break;
+            };
         } else if (interface == &protocol.wl_keyboard.info) {
             try self.keyboardEvent(message, fds);
         } else if (interface == &protocol.wl_data_device.info) {
@@ -2615,6 +2782,8 @@ pub const Host = struct {
                 1,
                 null,
             );
+        } else if (std.mem.eql(u8, global.interface, protocol.zxdg_exporter_v2.info.name)) {
+            self.exporter = try Core.bind(objects, transmit, self.registry, global.name, &protocol.zxdg_exporter_v2.info, 1, null);
         } else if (std.mem.eql(u8, global.interface, protocol.zwlr_layer_shell_v1.info.name)) {
             const version = @min(global.version, 5);
             self.layer_shell = try Core.bind(
@@ -3073,6 +3242,15 @@ pub const Host = struct {
             if (sameWindow(pending, timer)) {
                 slot.timer = null;
                 try self.finishActivation(slot, error.ActivationTimeout);
+                return true;
+            }
+        };
+        for (&self.export_requests) |*slot| if (slot.timer) |pending| {
+            if (sameWindow(pending, timer)) {
+                slot.timer = null;
+                const request = slot.request.?;
+                try self.releaseWindowExport(slot);
+                try request.complete(request.context, error.WindowExportTimeout);
                 return true;
             }
         };
@@ -3672,6 +3850,7 @@ test "layer background teardown retires pending callbacks and destroys effect be
     defer host.connection.objects.deinit(allocator);
     host.driver = Driver.init(&host.connection);
     host.text_input_active = null;
+    host.export_requests = @splat(.{});
     host.text_input_pending = TextInput.Pending.init(allocator);
     defer host.text_input_pending.deinit();
     host.pointer_focus = null;
@@ -4195,6 +4374,7 @@ test "native popup validates input, positions independently and tears down befor
     host.background_effect_manager = null;
     host.blur_supported = false;
     host.text_input_active = null;
+    host.export_requests = @splat(.{});
     host.text_input_pending = TextInput.Pending.init(allocator);
     defer host.text_input_pending.deinit();
     host.pointer_focus = null;

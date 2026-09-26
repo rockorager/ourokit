@@ -24,6 +24,8 @@ pub const CallbackRegistry = struct {
     slots: []Slot,
     activation_provider: ?activation.Provider = null,
     popup_provider: ?@import("popup.zig").Provider = null,
+    drag_provider: ?@import("drag.zig").Provider = null,
+    window_export_provider: ?@import("../platform/window_export.zig").Provider = null,
 
     pub fn init(
         self: *CallbackRegistry,
@@ -92,9 +94,16 @@ pub const CallbackRegistry = struct {
         const vm = slot.vm.?;
         vm.activation_provider = self.activation_provider;
         vm.popup_provider = self.popup_provider;
+        vm.drag_provider = self.drag_provider;
+        vm.window_export_provider = self.window_export_provider;
         const spawned = try vm.spawnReference(scope, slot.reference, arguments);
         try vm.setActivationInput(spawned, input);
         return spawned;
+    }
+
+    pub fn setPointerInput(self: *CallbackRegistry, handle: CallbackHandle, task_handle: @import("vm.zig").TaskHandle, input: ?activation.Input) !void {
+        const slot = try self.activeSlot(handle);
+        try slot.vm.?.setPointerInput(task_handle, input);
     }
 
     pub fn availableCapacity(self: *const CallbackRegistry) usize {

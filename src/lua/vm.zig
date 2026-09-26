@@ -6,6 +6,7 @@ const task = @import("../task/scheduler.zig");
 const json = @import("mcp_client.zig");
 const activation = @import("activation.zig");
 const platform_activation = @import("../platform/activation.zig");
+const window_export = @import("window_export.zig");
 
 pub const TaskHandle = Handle;
 
@@ -49,7 +50,9 @@ const Slot = struct {
     retain_result: bool = false,
     completed_result_count: ?c_int = null,
     activation_input: ?platform_activation.Input = null,
+    pointer_input: ?platform_activation.Input = null,
     activation_job: ?*activation.Job = null,
+    window_export_job: ?*window_export.Job = null,
 };
 
 const slots_per_chunk = 32;
@@ -75,6 +78,8 @@ pub const Vm = struct {
     sleep_enabled: bool = true,
     activation_provider: ?platform_activation.Provider = null,
     popup_provider: ?@import("popup.zig").Provider = null,
+    drag_provider: ?@import("drag.zig").Provider = null,
+    window_export_provider: ?@import("../platform/window_export.zig").Provider = null,
     /// First explicit exit request. The host drains output, cancels tasks,
     /// and tears down; this VM never exits the process or resumes user Lua.
     exit_code: ?u8 = null,
@@ -111,10 +116,18 @@ pub const Vm = struct {
         c.lua_pushcclosure(state, activation.request, 1);
         c.lua_setfield(state, -2, "activation_token");
         c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, window_export.request, 1);
+        c.lua_setfield(state, -2, "_desktop_parent");
+        c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, @import("popup.zig").open, 1);
         c.lua_setfield(state, -2, "popup");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, @import("drag.zig").start, 1);
+        c.lua_setfield(state, -2, "start_drag");
         c.lua_pushcclosure(state, c.ouro_os_time, 0);
         c.lua_setfield(state, -2, "time");
+        c.lua_pushcclosure(state, monotonicMilliseconds, 0);
+        c.lua_setfield(state, -2, "_monotonic_ms");
         c.lua_pushcclosure(state, c.ouro_os_date, 0);
         c.lua_setfield(state, -2, "date");
         c.lua_pushlightuserdata(state, self);
@@ -381,6 +394,20 @@ pub const Vm = struct {
         (try self.activeSlot(handle)).activation_input = input;
     }
 
+    pub fn setPointerInput(self: *Vm, handle: TaskHandle, input: ?platform_activation.Input) !void {
+        (try self.activeSlot(handle)).pointer_input = input;
+    }
+
+    /// Consumed exactly once by start_drag. Keyboard and synthetic activation
+    /// serials are never stored in this provenance channel.
+    pub fn takePointerInput(self: *Vm, state: *c.State) !platform_activation.Input {
+        const slot = try self.activeSlot(self.running orelse return error.NoPointerInput);
+        if (slot.thread != state) return error.WrongLuaTask;
+        const input = slot.pointer_input orelse return error.NoPointerInput;
+        slot.pointer_input = null;
+        return input;
+    }
+
     pub fn takeActivationInput(self: *Vm, state: *c.State) !platform_activation.Input {
         const slot = try self.activeSlot(self.running orelse return error.NoActivationInput);
         if (slot.thread != state) return error.WrongLuaTask;
@@ -393,6 +420,12 @@ pub const Vm = struct {
         const slot = self.activeSlot(handle) catch unreachable;
         std.debug.assert(slot.activation_job == null);
         slot.activation_job = job;
+    }
+
+    pub fn retainWindowExportJob(self: *Vm, handle: TaskHandle, job: *window_export.Job) void {
+        const slot = self.activeSlot(handle) catch unreachable;
+        if (slot.window_export_job) |previous| previous.deinit();
+        slot.window_export_job = job;
     }
 
     /// Candidate `ouro.app.run(context)` invocation. The sole return value is
@@ -478,6 +511,7 @@ pub const Vm = struct {
         // Input provenance expires at the callback's first yield; child tasks
         // and later timer/DBus continuations cannot reuse a press.
         slot.activation_input = null;
+        slot.pointer_input = null;
         switch (status) {
             c.ok => {
                 try self.scheduler.complete(scheduler_handle);
@@ -695,6 +729,7 @@ pub const Vm = struct {
         c.lua_settop(slot.thread.?, 0);
         c.luaL_unref(self.state, c.registry_index, slot.thread_reference);
         if (slot.activation_job) |job| job.deinit();
+        if (slot.window_export_job) |job| job.deinit();
         if (self.scheduler_tasks[slot.scheduler_handle.slot]) |mapped| {
             if (same(mapped, handle)) self.scheduler_tasks[slot.scheduler_handle.slot] = null;
         }
@@ -780,6 +815,13 @@ pub const Vm = struct {
         const slot = try self.activeSlot(handle);
         if (!same(slot.scheduler_handle, scheduler_handle)) return error.StaleTask;
         return handle;
+    }
+
+    fn monotonicMilliseconds(state: *c.State) callconv(.c) c_int {
+        const now = @import("../loop/io_uring.zig").monotonicNow() catch
+            return luaError(state, "monotonic clock unavailable");
+        c.lua_pushinteger(state, @intCast(now / std.time.ns_per_ms));
+        return 1;
     }
 
     fn requestExit(state: *c.State) callconv(.c) c_int {

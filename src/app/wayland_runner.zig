@@ -178,6 +178,41 @@ const PopupHost = struct {
     }
 };
 
+const DragHost = struct {
+    host: *platform.wayland.Host,
+
+    fn start(context: *anyopaque, input: @import("../platform/activation.zig").Input, mime: @import("../lua/drag.zig").Mime, bytes: []const u8) !void {
+        const self: *DragHost = @ptrCast(@alignCast(context));
+        try self.host.startDrag(input.window, input.serial, switch (mime) {
+            .text => .text,
+            .uri_list => .uri_list,
+        }, bytes);
+    }
+};
+
+const WindowExportHost = struct {
+    host: *platform.wayland.Host,
+    windows: *windows_module.WindowSet,
+
+    fn start(context: *anyopaque, id: []const u8, request: *@import("../platform/window_export.zig").Request) !void {
+        const self: *WindowExportHost = @ptrCast(@alignCast(context));
+        request.window = self.windows.handleForId(id) orelse return error.StaleWindow;
+        try self.host.startWindowExport(request);
+    }
+
+    fn cancel(context: *anyopaque, request: *@import("../platform/window_export.zig").Request) !void {
+        const self: *WindowExportHost = @ptrCast(@alignCast(context));
+        try self.host.cancelWindowExport(request);
+    }
+};
+
+const PendingDrop = struct {
+    request: core.Handle,
+    window: core.Handle,
+    selection: @import("window_runtime.zig").DropSelection,
+    generation: u64,
+};
+
 /// Runs one declarative Lua application on the production Wayland stack.
 /// Applications provide source and policy; this coordinator owns all
 /// native services and preserves the explicit event-loop safe points.
@@ -518,6 +553,17 @@ fn runSourceInternal(
     try syncRuntimeSlots(init.gpa, runtime_slots, application.windows);
     var popups: PopupHost = .{ .allocator = init.gpa, .windows = &window_set, .callbacks = &callbacks, .slots = runtime_slots };
     callbacks.popup_provider = .{ .context = &popups, .open = PopupHost.open, .close = PopupHost.close };
+    var drag_host: DragHost = .{ .host = &host };
+    callbacks.drag_provider = .{ .context = &drag_host, .start = DragHost.start };
+    var window_export_host: WindowExportHost = .{ .host = &host, .windows = &window_set };
+    callbacks.window_export_provider = .{ .context = &window_export_host, .start = WindowExportHost.start, .cancel = WindowExportHost.cancel };
+    var drag_window: ?core.Handle = null;
+    var drag_position: platform.window.LogicalPosition = .{};
+    var drag_text = false;
+    var drag_uris = false;
+    var drag_selection: ?@import("window_runtime.zig").DropSelection = null;
+    var pending_drop: ?PendingDrop = null;
+    var drop_sequence: u32 = 0;
     var dirty: ui.instance.ReconcileQueue = undefined;
     try dirty.init(init.gpa, options.application_window_capacity);
     defer dirty.deinit();
@@ -546,6 +592,7 @@ fn runSourceInternal(
     while (true) {
         const shutdown_signal = try loop.receivedSignal();
         const active_generation = source_reload.active();
+        active_generation.vm.window_export_provider = callbacks.window_export_provider;
         const active_application = &active_generation.application;
         const signals = &active_generation.signals;
         const lua_ui = &active_generation.ui_build;
@@ -584,6 +631,12 @@ fn runSourceInternal(
                 .close_requested => |handle| {
                     if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
                         if (slot.desired) {
+                            if (applicationWindowForId(active_application.windows, slot.id.?)) |window| {
+                                if (window.on_close_request >= 0) {
+                                    _ = try active_generation.vm.spawnReference(try window_set.scope(handle), window.on_close_request, &.{});
+                                    continue;
+                                }
+                            }
                             slot.desired = false;
                             desired_changed = true;
                         }
@@ -651,6 +704,62 @@ fn runSourceInternal(
                     },
                 },
             }
+        }
+
+        while (try host.takeDragEvent()) |event| switch (event) {
+            .enter => |enter| {
+                drag_window = enter.window;
+                drag_position = enter.position;
+                drag_text = enter.text;
+                drag_uris = enter.uri_list;
+                drag_selection = if (slotForNativeHandle(&window_set, runtime_slots, enter.window)) |slot|
+                    try slot.runtime.dropTarget(drag_position, drag_text, drag_uris)
+                else
+                    null;
+                try host.acceptDrag(if (drag_selection) |selection| selection.mime else null);
+            },
+            .motion => |motion| {
+                drag_position = motion.position;
+                drag_selection = if (drag_window) |window|
+                    if (slotForNativeHandle(&window_set, runtime_slots, window)) |slot|
+                        try slot.runtime.dropTarget(drag_position, drag_text, drag_uris)
+                    else
+                        null
+                else
+                    null;
+                try host.acceptDrag(if (drag_selection) |selection| selection.mime else null);
+            },
+            .leave => {
+                drag_window = null;
+                drag_selection = null;
+            },
+            .drop => {
+                if (pending_drop == null and drag_window != null and drag_selection != null) {
+                    drop_sequence +%= 1;
+                    if (drop_sequence == 0) drop_sequence = 1;
+                    // Clipboard paste requests use indexed slots; reserve a
+                    // disjoint identity for the runner-owned drop transfer.
+                    const request: core.Handle = .{ .slot = std.math.maxInt(u32), .generation = drop_sequence };
+                    const selection = drag_selection.?;
+                    if (try host.receiveDrop(request, selection.mime)) pending_drop = .{
+                        .request = request,
+                        .window = drag_window.?,
+                        .selection = selection,
+                        .generation = source_reload.generation,
+                    } else try host.rejectDrop();
+                } else try host.rejectDrop();
+            },
+        };
+        while (host.takeDropCompletion()) |completion| {
+            var accepted = false;
+            if (pending_drop) |pending| if (sameHandle(pending.request, completion.request) and completion.bytes != null and
+                pending.generation == source_reload.generation and host.failure == null and shutdown_signal == null)
+            {
+                if (slotForNativeHandle(&window_set, runtime_slots, pending.window)) |slot|
+                    accepted = try slot.runtime.deliverDrop(&callbacks, pending.selection, completion.bytes.?);
+            };
+            try host.finishDrop(completion.request, accepted);
+            pending_drop = null;
         }
 
         // Task safe point: platform and CQE dispatch only changed state.
@@ -755,6 +864,12 @@ fn runSourceInternal(
             current_count += 1;
         };
         const calls_pending = if (control) |server| server.hasPendingCalls() else false;
+        if (pending_drop) |pending| {
+            const slot = slotForNativeHandle(&window_set, runtime_slots, pending.window);
+            if (slot == null or !slot.?.desired or pending.generation != source_reload.generation or
+                host.failure != null or shutdown_signal != null or active_generation.vm.exit_code != null)
+                _ = try host.cancelClipboard(pending.request);
+        }
         if (!disconnect_started and current_count == 0 and
             (active_generation.window_owners == null or active_generation.vm.exit_code != null or shutdown_signal != null or host.failure != null or options.exit_after_first_frame) and
             (active_application.windows.len != 0 or active_application.output_templates.len == 0 or active_generation.vm.exit_code != null or shutdown_signal != null or host.failure != null) and
