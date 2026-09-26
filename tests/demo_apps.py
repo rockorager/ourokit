@@ -2,7 +2,7 @@
 """Native demo checks on a disposable Weston X11 display.
 
 Requires DISPLAY, OUROKIT_TEST_WAYLAND_DISPLAY (absolute socket), xdotool,
-ImageMagick and systemd-socket-activate. Optional OUROKIT_DEMO_ARTIFACTS saves
+and ImageMagick. Optional OUROKIT_DEMO_ARTIFACTS saves
 window captures and a scrolling clip. Never run on a display with personal apps.
 Run after zig build: python3 tests/demo_apps.py
 """
@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 
-from application_services import BINARY, ROOT, call
+from application_services import BINARY, ROOT, call, development_path
 
 
 def pointer(origin, x, y):
@@ -60,22 +60,14 @@ def stop(process):
 
 
 def contacts(env, directory, artifacts):
-    address = directory / "contacts.socket"
-    process = subprocess.Popen(["systemd-socket-activate", f"--listen={address}", "--fdname=mcp",
-                                "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY",
-                                str(BINARY), "run", str(ROOT / "examples/contacts/ouro.json"), "--software"],
+    process = subprocess.Popen([str(BINARY), "run", str(ROOT / "examples/contacts/ouro.json"), "--software", "--dev"],
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     recorder = None
     try:
-        for _ in range(100):
-            if address.exists():
-                break
-            time.sleep(.02)
+        address = development_path(directory, process)
         people = call(address, "GetContacts")["structuredContent"]["contacts"]
         assert len(people) == 500 and people[0]["id"] == "ada" and people[-1]["id"] == "person-500"
-        assert call(address, "runtime.status")["structuredContent"]["uiActive"] is False
         assert call(address, "SelectContact", {"id": "alan"})["structuredContent"] == {}
-        assert call(address, "runtime.activate")["structuredContent"] == {}
         origin = window(process, 940)
         time.sleep(.4)
         capture(artifacts, "contacts-fallback", origin, (940, 650))
@@ -115,7 +107,7 @@ def contacts(env, directory, artifacts):
         pointer(origin, 500, 505)
         out, errors = process.communicate(timeout=8)
         assert process.returncode == 0 and out == b"" and b"panic" not in errors, errors
-        print("PASS: 500 headless contacts, activation, UI rename, scrolling, distant MCP edit, themes, clean Quit")
+        print("PASS: 500 contacts, dev launch, UI rename, scrolling, distant MCP edit, themes, clean Quit")
     finally:
         if recorder and recorder.poll() is None:
             recorder.terminate()

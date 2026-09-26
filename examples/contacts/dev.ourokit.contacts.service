@@ -1,6 +1,3 @@
-[Unit]
-Description=Ourokit Contacts
-
-[Service]
-Type=exec
-ExecStart=%h/.local/bin/ouroctl run %h/.local/share/ourokit/contacts/ouro.json
+[D-BUS Service]
+Name=dev.ourokit.contacts
+Exec="/usr/bin/ouroctl" run "/usr/share/ourokit/contacts/ouro.json" --dbus-activated

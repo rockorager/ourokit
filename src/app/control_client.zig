@@ -3,7 +3,7 @@ const linux = std.os.linux;
 const wayring = @import("wayring");
 const mcp = @import("../mcp/root.zig");
 const control = @import("control_server.zig");
-const socket_activation = @import("socket_activation.zig");
+const endpoint = @import("control_endpoint.zig");
 
 pub const Diagnostic = struct {
     phase: []u8,
@@ -55,32 +55,20 @@ pub const Application = struct {
     }
 };
 
-/// Resolves the application's well-known address. Connecting can activate its
-/// systemd service; discovering the owner never scans unrelated sockets.
-pub fn findApplication(
+/// Connect only to the explicitly selected running development instance.
+pub fn findDevelopment(
     io: std.Io,
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
-    application_id: []const u8,
+    socket_path: []const u8,
 ) !Application {
     _ = io;
-    const socket_path = try socket_activation.socketPath(allocator, environ, application_id);
-    defer allocator.free(socket_path);
+    try endpoint.validateDevelopmentPath(allocator, environ, socket_path);
     const path = try allocator.dupe(u8, socket_path);
     errdefer allocator.free(path);
     var status = try statusAt(allocator, path);
     errdefer status.deinit(allocator);
-    if (!std.mem.eql(u8, status.application_id, application_id)) return error.ApplicationIdMismatch;
     return .{ .path = path, .status = status };
-}
-
-pub fn activateAt(allocator: std.mem.Allocator, path: []const u8, token: ?[]const u8) !void {
-    var parameters = std.json.ObjectMap.empty;
-    defer parameters.deinit(allocator);
-    if (token) |value| try parameters.put(allocator, "activationToken", .{ .string = value });
-    var reply = try call(allocator, path, control.activate_method, .{ .object = parameters });
-    defer reply.deinit();
-    if (try failed(reply)) return error.ActivationFailed;
 }
 
 pub fn statusAt(allocator: std.mem.Allocator, path: []const u8) !Status {

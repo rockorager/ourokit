@@ -8,6 +8,7 @@ const mcp_json = @import("mcp_client.zig");
 const mcp = @import("../mcp/root.zig");
 const theming = @import("theme.zig");
 const key_bindings = @import("key_bindings.zig");
+pub const desktop = @import("desktop_application.zig");
 
 pub const ActionSchema = struct {
     arena: std.heap.ArenaAllocator,
@@ -40,6 +41,7 @@ pub const Definition = struct {
     action_schema: ?ActionSchema = null,
     actions_reference: c_int = c.no_reference,
     run_reference: c_int = c.no_reference,
+    desktop_reference: c_int = c.no_reference,
     windows_reference: c_int = c.no_reference,
     legacy_windows: ?[]Window = null,
 
@@ -56,6 +58,7 @@ pub const Definition = struct {
     }
 
     pub fn deinit(self: *Definition) void {
+        c.luaL_unref(self.state, c.registry_index, self.desktop_reference);
         if (self.action_schema) |*schema| schema.deinit();
         if (self.windows_reference != c.no_reference)
             c.luaL_unref(self.state, c.registry_index, self.windows_reference);
@@ -82,6 +85,7 @@ pub const Definition = struct {
             .action_schema = self.action_schema,
             .actions_reference = self.actions_reference,
             .run_reference = self.run_reference,
+            .desktop_reference = self.desktop_reference,
             .windows_reference = self.windows_reference,
             .windows = windows,
         };
@@ -89,6 +93,7 @@ pub const Definition = struct {
         self.action_schema = null;
         self.actions_reference = c.no_reference;
         self.run_reference = c.no_reference;
+        self.desktop_reference = c.no_reference;
         self.windows_reference = c.no_reference;
         self.legacy_windows = null;
         return application;
@@ -135,7 +140,6 @@ pub const Bootstrap = struct {
                 if (self.defer_run) {
                     errdefer definition.deinit();
                     if (definition.legacy_windows) |windows| {
-                        if (definition.hasActions()) return error.EagerWindowsInHeadlessApplication;
                         return definition.finish(windows);
                     }
                     return definition.finish(try self.allocator.alloc(Window, 0));
@@ -195,6 +199,8 @@ pub const Application = struct {
     action_schema: ?ActionSchema = null,
     actions_reference: c_int,
     run_reference: c_int,
+    desktop_reference: c_int = c.no_reference,
+    desktop_state: c_int = c.no_reference,
     windows_reference: c_int = c.no_reference,
     windows: []Window,
     output_templates: []Window = &.{},
@@ -543,6 +549,8 @@ pub const Application = struct {
     }
 
     pub fn deinit(self: *Application) void {
+        c.luaL_unref(self.state, c.registry_index, self.desktop_reference);
+        c.luaL_unref(self.state, c.registry_index, self.desktop_state);
         if (self.action_schema) |*schema| schema.deinit();
         if (self.windows_reference != c.no_reference)
             c.luaL_unref(self.state, c.registry_index, self.windows_reference);
@@ -575,6 +583,8 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     };
     const id = try requiredString(allocator, state, -1, "id");
     errdefer allocator.free(id);
+    const desktop_reference = try desktop.declaration(state, id);
+    errdefer c.luaL_unref(state, c.registry_index, desktop_reference);
     const actions_reference = try optionalActions(state, -1);
     errdefer if (actions_reference != c.no_reference)
         c.luaL_unref(state, c.registry_index, actions_reference);
@@ -600,6 +610,7 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
         .action_schema = action_schema,
         .actions_reference = actions_reference,
         .run_reference = run_reference,
+        .desktop_reference = desktop_reference,
         .legacy_windows = legacy_windows,
     };
 }
@@ -1372,7 +1383,7 @@ test "deferred application retains actions and transactionally starts UI in the 
     try std.testing.expectError(error.ApplicationUiAlreadyStarted, application.startUi(&vm, scheduler.application_scope, "duplicate"));
 }
 
-test "deferred application permits legacy standalone windows but rejects eager service windows" {
+test "deferred application window declaration is independent of actions" {
     const loop_module = @import("../loop/root.zig");
     var loop: loop_module.Loop = undefined;
     try loop.init(std.testing.allocator, 16, 8);
@@ -1390,14 +1401,11 @@ test "deferred application permits legacy standalone windows but rejects eager s
         defer bootstrap.deinit();
         bootstrap.defer_run = true;
         _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
-        if (service) {
-            try std.testing.expectError(error.EagerWindowsInHeadlessApplication, bootstrap.advance("main"));
-        } else {
-            var application = (try bootstrap.advance("main")).?;
-            defer application.deinit();
-            try std.testing.expect(!application.hasRun());
-            try std.testing.expectEqual(@as(usize, 1), application.windows.len);
-        }
+        var application = (try bootstrap.advance("main")).?;
+        defer application.deinit();
+        try std.testing.expect(!application.hasRun());
+        try std.testing.expectEqual(service, application.hasActions());
+        try std.testing.expectEqual(@as(usize, 1), application.windows.len);
     }
 }
 

@@ -2,7 +2,7 @@
 """Native layer-background checks on a disposable 800x600 Sway output.
 
 Run after zig build. Requires SWAYSOCK, OUROKIT_TEST_WAYLAND_DISPLAY (absolute
-socket), swaymsg, grim, ImageMagick, wayland-info and systemd-socket-activate.
+socket), swaymsg, grim, ImageMagick and wayland-info.
 The compositor must NOT advertise ext-background-effect-v1: this tests fallback,
 not actual blur. Changes output background/scale; never use a personal session.
 Optional OUROKIT_LAYER_ARTIFACTS saves representative compositor captures.
@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 
-from application_services import BINARY, call, record
+from application_services import BINARY, call, record, development_path
 
 
 def sway(*args):
@@ -48,6 +48,8 @@ return ouro.app {{ id='dev.ourokit.layer-background-test', actions={{
 def main():
     env = os.environ.copy()
     env["WAYLAND_DISPLAY"] = os.environ["OUROKIT_TEST_WAYLAND_DISPLAY"]
+    # Desktop focus tokens target toplevels, never layer-shell surfaces.
+    env["XDG_ACTIVATION_TOKEN"] = "layer-must-not-activate"
     for key in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES", "WAYLAND_SOCKET"):
         env.pop(key, None)
     info = subprocess.check_output(["wayland-info"], env=env, stderr=subprocess.DEVNULL)
@@ -65,18 +67,17 @@ def main():
         sway("output", "HEADLESS-1", "bg", str(wallpaper), "stretch")
         app = directory / "app.lua"
         app.write_text(source())
-        address = directory / "control.socket"
         log = directory / "app.log"
         with log.open("wb") as errors:
-            process = subprocess.Popen(["systemd-socket-activate", f"--listen={address}", "--fdname=mcp",
-                "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY", str(BINARY), "run", str(app), "--software"],
+            process = subprocess.Popen([str(BINARY), "run", str(app), "--software", "--dev"],
                 env=env, stdout=subprocess.DEVNULL, stderr=errors)
             try:
+                address = development_path(directory, process)
                 for _ in range(100):
-                    if address.exists():
+                    if call(address, "runtime.status")["structuredContent"]["uiActive"]:
                         break
                     time.sleep(.02)
-                assert not call(address, "runtime.activate").get("isError"), log.read_text()
+                assert call(address, "runtime.status")["structuredContent"]["uiActive"], log.read_text()
 
                 def check(name, tint=(17, 24, 32, 184), width=400, height=200, scale=1):
                     capture = directory / "capture.png"

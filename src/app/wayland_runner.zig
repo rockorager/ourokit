@@ -9,7 +9,7 @@ const source_reload_module = @import("source_reload.zig");
 const SourceReload = source_reload_module.SourceReload;
 const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
 const ControlServer = @import("control_server.zig").ControlServer;
-const socket_activation = @import("socket_activation.zig");
+const desktop = @import("../lua/desktop_application.zig");
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const WindowRuntimeConfig = @import("window_runtime.zig").Config;
 const core = @import("../core/root.zig");
@@ -24,6 +24,10 @@ const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
 
 pub const Options = struct {
+    development: bool = false,
+    mcp: bool = false,
+    headless: bool = false,
+    desktop: desktop.Options = .{},
     native_modules: []const @import("../native/root.zig").Module = &.{},
     exit_after_first_frame: bool = false,
     /// Receives the Lua-requested exit status after all resources are drained.
@@ -190,7 +194,7 @@ pub fn runSource(
     provider: *const bundle.SourceProvider,
     options: Options,
 ) !void {
-    if (!renderer.software.has_freetype) return error.FreeTypeDisabled;
+    if (!options.headless and !renderer.software.has_freetype) return error.FreeTypeDisabled;
     return runSourceInternal(init, provider, options) catch |err| {
         if (err != error.ApplicationInterrupted) return err;
     };
@@ -347,6 +351,18 @@ fn runSourceInternal(
         if (options.exit_code) |result| result.* = code;
         return;
     }
+    if (options.development and options.mcp) return error.ConflictingControlModes;
+    var desktop_options = options.desktop;
+    desktop_options.development = options.development;
+    desktop_options.token = init.minimal.environ.getPosix("XDG_ACTIVATION_TOKEN");
+    desktop_options.startup_id = init.minimal.environ.getPosix("DESKTOP_STARTUP_ID");
+    initial_generation.desktop_task = try desktop.start(&initial_generation.vm, initial_generation.application.desktop_reference, &initial_generation.application.desktop_state, desktop_options);
+    try finishInitialBootstrap(initial_generation, &scheduler, &loop, &diagnostic);
+    if (desktop.flag(initial_generation.vm.state, initial_generation.application.desktop_state, "forwarded")) return;
+    if (initial_generation.vm.exit_code) |code| {
+        if (options.exit_code) |result| result.* = code;
+        return;
+    }
     var appearance_store: appearance_module.Store = .{};
     const appearance = options.appearance orelse &appearance_store;
     var appearance_client: appearance_module.Client = undefined;
@@ -376,26 +392,22 @@ fn runSourceInternal(
     var runtime_reload_requests: ReloadRequests = .{};
     const reload_requests = options.reload_requests orelse &runtime_reload_requests;
     var control_storage: ControlServer = undefined;
-    const control: ?*ControlServer = if (source_reload.active().application.hasActions()) &control_storage else null;
-    const inherited = try socket_activation.listener(init.minimal.environ);
-    if (inherited != null and control == null) return error.SocketActivationRequiresActions;
+    const control: ?*ControlServer = if (options.development or options.mcp) &control_storage else null;
+    if (options.mcp and !source_reload.active().application.hasActions()) return error.ApplicationActionsDisabled;
     if (control) |server| {
-        try server.init(init.gpa, &loop, init.minimal.environ, source_reload.active().application.id, source_reload.generation, reload_requests);
-        std.log.info("application socket: {s}", .{server.socketPath()});
+        try server.init(init.gpa, &loop, init.minimal.environ, source_reload.active().application.id, source_reload.generation, reload_requests, options.development);
+        std.log.info("{s} socket: {s}", .{ if (options.development) "development" else "application", server.socketPath() });
     }
     var control_destroyed = false;
     defer if (!control_destroyed) if (control) |server|
         shutdownControl(server, &loop, null, &source_reload);
     if (control) |server| try server.setApplication(&source_reload.active().application, &source_reload.active().vm);
-    if (inherited != null) {
-        if (!(try runHeadless(&source_reload, control.?, &callbacks, reload_requests, &loop, &scheduler))) {
+    if (options.headless or options.desktop.dbus_activated) {
+        if (!(try runHeadless(&source_reload, control, &callbacks, reload_requests, &loop, &scheduler, options.headless, options.development))) {
             if (options.exit_code) |code| code.* = source_reload.active().vm.exit_code orelse 0;
             return;
         }
     }
-    errdefer |err| if (!control_destroyed) {
-        failActivation(control, &source_reload, &loop, null, err) catch {};
-    };
 
     var fonts = text.FontCache.init(init.gpa);
     defer fonts.deinit();
@@ -441,9 +453,6 @@ fn runSourceInternal(
         source_reload.deinit();
         sources_destroyed = true;
     }
-    errdefer |err| if (!control_destroyed) {
-        failActivation(control, &source_reload, &loop, null, err) catch {};
-    };
     try source_reload.active().attachUi(services);
     source_reload.services = services;
     source_reload.config.defer_run = false;
@@ -517,11 +526,9 @@ fn runSourceInternal(
         drainSources(&source_reload, &loop, null, null) catch |err|
             std.debug.panic("could not drain application: {s}", .{@errorName(err)});
     }
-    errdefer |err| failActivation(control, &source_reload, &loop, &host, err) catch {};
     var disconnect_started = false;
     var active_reload_sequence: ?u64 = null;
     var queued_reload_sequence: ?u64 = null;
-    var initial_activation_token = std.process.Environ.getPosix(init.minimal.environ, "XDG_ACTIVATION_TOKEN");
     var animation_timer: @import("animation_timer.zig").Timer = .{};
     defer animation_timer.stop(&loop) catch unreachable;
 
@@ -745,6 +752,13 @@ fn runSourceInternal(
             try host.beginShutdown();
             try appearance_client.stop();
             if (control) |server| try server.beginShutdown();
+            // Persistent D-Bus receives outlive Lua tasks. Retire them before
+            // waiting for ring quiescence, not only in the deferred drain.
+            source_reload.active().dbus.shutdown();
+            if (source_reload.candidate) |candidate| {
+                candidate.dbus.shutdown();
+                try candidate.vm.requestCancellation();
+            }
             try source_reload.active().vm.requestCancellation();
             disconnect_started = true;
         }
@@ -845,7 +859,7 @@ fn runSourceInternal(
             try dirty.complete(work);
         }
 
-        if (reload_requests.take()) |sequence| {
+        if (if (options.development) reload_requests.take() else null) |sequence| {
             if (active_reload_sequence == null) {
                 if (try beginReload(&source_reload, control, sequence))
                     active_reload_sequence = sequence;
@@ -966,28 +980,17 @@ fn runSourceInternal(
             slot.frames_seen = @max(slot.frames_seen, try host.framesPresented(handle));
         }
 
-        if (control) |server| {
-            var presented = false;
-            for (runtime_slots) |slot| presented = presented or slot.frames_seen > 0;
-            if (presented) {
-                _ = server.takeActivation();
-                if (server.activationToken() orelse initial_activation_token) |token| {
-                    for (runtime_slots) |slot| if (slot.desired and slot.runtime.initialized) {
-                        try host.activate(slot.runtime.window, token);
-                        break;
-                    };
-                }
-                initial_activation_token = null;
-                server.setActivated(true);
-                try server.activationSucceeded();
-            }
-        } else if (initial_activation_token) |token| {
-            for (runtime_slots) |slot| if (slot.desired and slot.frames_seen > 0) {
+        for (runtime_slots) |slot| if (slot.desired and slot.frames_seen > 0) {
+            const app = &source_reload.active().application;
+            if (control) |server| server.setActivated(true);
+            const window = applicationWindowForId(app.windows, slot.id.?) orelse continue;
+            if (window.declaration != .toplevel) continue;
+            if (try desktop.takeToken(init.gpa, app.state, app.desktop_state)) |token| {
+                defer init.gpa.free(token);
                 try host.activate(slot.runtime.window, token);
-                initial_activation_token = null;
-                break;
-            };
-        }
+            }
+            break;
+        };
 
         if (options.exit_after_first_frame) {
             var all_presented = true;
@@ -1062,45 +1065,35 @@ fn runSourceInternal(
     if (host.failure) |failure| return @as(anyerror!void, failure);
 }
 
-/// Deliver a failed activation before the normal teardown closes its socket.
-fn failActivation(control: ?*ControlServer, reload: *SourceReload, loop: *io_loop.Loop, host: ?*platform.wayland.Host, err: anyerror) !void {
-    const server = control orelse return;
-    if (!server.activating) return;
-    try server.activationFailed(err);
-    while (server.hasPendingOutput()) {
-        _ = try loop.submit();
-        _ = try dispatchApplication(reload, loop, server, host, null);
-        try server.serviceRequests();
-    }
-}
-
 /// Runs only application tasks and IPC. No font, renderer or Wayland state
 /// exists yet. An accepted Activate transfers control to UI initialization.
 fn runHeadless(
     reload: *SourceReload,
-    control: *ControlServer,
+    control: ?*ControlServer,
     callbacks: *lua.CallbackRegistry,
     requests: *ReloadRequests,
     loop: *io_loop.Loop,
     scheduler: *task.Scheduler,
+    stay_headless: bool,
+    development: bool,
 ) !bool {
     var sequence: ?u64 = null;
-    var idle_timer: ?io_loop.OperationHandle = null;
-    defer if (idle_timer) |timer| loop.prepareCancel(timer) catch {};
     while (true) {
         if (try loop.receivedSignal() != null) return false;
-        control.collectClosed();
-        try control.setApplication(&reload.active().application, &reload.active().vm);
-        try control.serviceRequests();
+        if (control) |server| {
+            server.collectClosed();
+            try server.setApplication(&reload.active().application, &reload.active().vm);
+            try server.serviceRequests();
+        }
         try reload.collectCanceledMcp();
         try scheduler.applyQueuedCancellations();
         while (scheduler.takeRunnable()) |handle| {
-            if (try control.resumeRunnable(handle)) continue;
+            if (control) |server| if (try server.resumeRunnable(handle)) continue;
             try reload.resumeRunnable(handle);
         }
-        try control.serviceRequests();
+        if (control) |server| try server.serviceRequests();
         if (reload.active().vm.exit_code != null and !reload.active().stdio.hasPendingOutput()) return false;
-        if (sequence == null) if (requests.take()) |value| {
+        if (development and sequence == null) if (requests.take()) |value| {
             if (try beginReload(reload, control, value)) sequence = value;
         };
         if (sequence) |value| {
@@ -1114,21 +1107,12 @@ fn runHeadless(
         }
         try reload.beginRetirement();
         _ = reload.collectRetired();
-        if (sequence == null and control.takeActivation()) {
-            if (reload.active().application.hasRun()) return true;
-            try control.activationFailed(error.ApplicationRunRequired);
-        }
-        const busy = control.hasClients() or sequence != null or reload.active().vm.activeTaskCount() != 0;
-        if (busy) {
-            if (idle_timer) |timer| try loop.prepareCancel(timer);
-            idle_timer = null;
-        } else if (idle_timer == null) {
-            idle_timer = try loop.prepareTimeout(30 * std.time.ns_per_s);
-        }
+        const app = &reload.active().application;
+        if (!stay_headless and desktop.flag(app.state, app.desktop_state, "requested")) return true;
         try reload.collectCanceledMcp();
         _ = try loop.submit();
         if (scheduler.hasPendingWork()) continue;
-        if (try dispatchApplication(reload, loop, control, null, &idle_timer)) return false;
+        _ = try dispatchApplication(reload, loop, control, null, null);
     }
 }
 
@@ -1232,7 +1216,7 @@ fn finishInitialBootstrap(
     loop: *io_loop.Loop,
     diagnostic: *?lua.Diagnostic,
 ) !void {
-    while (!generation.application_ready) {
+    while (!generation.application_ready or generation.desktop_task != null) {
         if (try loop.receivedSignal() != null) return error.ApplicationInterrupted;
         while (scheduler.takeRunnable()) |runnable|
             _ = generation.resumeRunnable(runnable, diagnostic) catch |err| {
@@ -1245,7 +1229,7 @@ fn finishInitialBootstrap(
                 );
                 return err;
             };
-        if (generation.application_ready or
+        if ((generation.application_ready and generation.desktop_task == null) or
             (generation.vm.exit_code != null and !generation.stdio.hasPendingOutput())) return;
         try generation.collectCanceledMcp();
         _ = try loop.submit();

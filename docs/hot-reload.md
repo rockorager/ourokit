@@ -22,7 +22,7 @@ A development application is launched from a source entry path rather than
 from source bytes detached from their origin:
 
 ```sh
-ouroctl run
+ouroctl run --dev
 ```
 
 After saving one or more files, the author requests a reload through either:
@@ -30,7 +30,7 @@ After saving one or more files, the author requests a reload through either:
 - the built-in `Reload Source` application command, with a conventional
   `Ctrl+Shift+R` shortcut once keyboard commands are available; or
 - the development control interface, exposed by the CLI as
-  `ouroctl reload dev.example.app`.
+  `ouroctl dev reload <development-socket>` using the path printed at launch.
 
 Both only enqueue a reload request. They do not read files, enter Lua, or
 reconcile UI from an input callback. The request is consumed at an application
@@ -42,10 +42,9 @@ structured diagnostic with generation, file, line, phase, and Lua traceback;
 the same diagnostic is available to the in-app development surface and control
 client. Reload failure is not a process-fatal error.
 
-Production bundles use the same generation machinery with an immutable source
-provider. An application owns an inbound runtime MCP server only when it
-declares an `actions` table; this opt-in is independent of source mutability and
-of outbound `ouro.mcp.call`.
+Production bundles use the same generation machinery but never expose reload.
+Only explicit per-instance `--dev` enables development control; declared actions
+and outbound `ouro.mcp.call` do not affect that decision.
 
 ## Lifetime model
 
@@ -414,19 +413,21 @@ bindings, UI owns prepared typed snapshots, and `app` orders their transaction.
 
 ## Development control interface
 
-An application with a non-nil `actions` table exposes a well-known per-user
-endpoint at `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`; omitted/nil actions means no inbound
-server. An empty table enables the runtime tools, `server/discover`, and
-`tools/list`. The server authenticates the Unix peer UID,
+`ouroctl run --dev` exposes a random per-instance endpoint at
+`$XDG_RUNTIME_DIR/ourokit/dev/<32-hex-digits>`, logged at startup. Its parent
+directories are private (0700), and its socket is 0600. Two copies coexist even
+when production with the same ID is running. No development catalog is published
+to production discovery directories. The server authenticates the Unix peer UID,
 uses Ourokit's bounded sans-I/O MCP state machines, and submits accept,
 receive, and send operations through disjoint tags in the shared `io_uring`
-loop. Systemd may own the listening socket and activate the application without
-UI. `ouroctl` addresses the application by ID rather than scanning PID sockets.
+loop. `ouroctl dev` accepts only an explicit path in this session's development
+directory, never an application ID or a production socket. Ordinary `run` does
+not create a server; optional `--mcp` is production actions only.
 
 The built-in tools are `runtime.reload` (returns the committed generation),
 `runtime.status` (returns application ID, active generation, reload/UI state,
-and an optional diagnostic), and `runtime.activate` (accepts an optional
-activation token). Their JSON Schemas are available through `tools/list`.
+and an optional diagnostic). Their JSON Schemas are available through `tools/list`.
+Desktop activation is the separate `org.freedesktop.Application` interface.
 Tool execution failures use `isError: true` and a structured error; malformed
 RPC requests and unknown tools use JSON-RPC errors.
 
@@ -437,17 +438,26 @@ Calls belong to the source generation that
 accepted them. Reload cancellation returns `ActionFailed` rather than allowing
 a retiring coroutine to resume, and a Lua error fails only that call.
 
-The CLI discovers an app by application ID and calls this endpoint. The server
+The CLI calls the selected instance's explicit endpoint. The server
 keeps the `runtime.reload` call pending without blocking the event loop until the newest
 coalesced request either commits or fails. Every caller waiting on that request
 receives the committed generation or the same structured `ReloadFailed` error,
-so `ouroctl reload` has useful shell exit status without polling. Requests that
+so `ouroctl dev reload` has useful shell exit status without polling. Requests that
 arrive during preparation remain queued for the next transaction and cannot be
 satisfied by the in-flight candidate. Discarding that now-stale in-flight
 candidate before commit remains a separate optimization and correctness polish.
 `runtime.status` remains available for development surfaces that observe reload without
 initiating it. The future built-in command will call the same in-process request
 API and will not depend on the control socket.
+
+For cross-turn runtime operations, the host registers development-only tool
+schemas before admitting peers. `takeDevelopmentRequest` transfers an owned
+`{name, arguments}` request and unique token to the runner at a safe point.
+`developmentPending(token)` becomes false on cancellation, disconnect, shutdown,
+or source-generation retirement. The runner must check it before each playback
+advance and release the request when finished. `completeDevelopment` replies
+only after normal dispatch, tasks, reconciliation, and the final frame have
+settled. Taking a request or dispatching an input event is not completion.
 
 Automatic watching is optional policy on top. An inotify watcher may debounce
 changes and enqueue a reload, but it receives no privileged fast path and

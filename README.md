@@ -118,21 +118,27 @@ The public `ourokit.mcp` module provides bounded sans-I/O MCP client and server
 state machines, literal Unix address parsing, and JSON Schema validation. See
 [the MCP transport and Lua API](docs/mcp.md).
 
-An application opts into a same-user MCP socket at
-`$XDG_RUNTIME_DIR/ourokit/apps/<application-id>` by declaring `actions`. An empty
-table enables `runtime.status`, `runtime.reload`, `runtime.activate` and tool
-discovery; custom actions declare JSON Schemas beside their Lua handlers.
-Systemd socket activation starts the application headlessly. Only activation
-initializes its UI. Omitting `actions` starts no inbound server; small subprocess
-dialogs can instead use async stdin/stdout/stderr and `ouro.exit`. See the runnable
-[Contacts service](examples/contacts/README.md) and
+Ordinary `ouroctl run` opens the application without an MCP server. Desktop
+activation uses `org.freedesktop.Application`; `single_instance = true` selects
+application-wide ownership and forwarding through the session bus. See the runnable
+[Contacts application](examples/contacts/README.md) and
 [permission dialog](examples/permission-dialog/README.md).
 
+Development is explicit per process. `--dev` prints a unique private socket
+path; two development copies never forward to each other or to production.
+Status and reload require that exact path, independent of declared actions:
+
 ```sh
-ouroctl status dev.example.app
+ouroctl run examples/contacts/ouro.json --dev
+ouroctl dev status "$development_socket"
+ouroctl dev reload "$development_socket"
 ouroctl activate dev.example.app
-ouroctl reload dev.example.app
 ```
+
+Optional `--mcp` exposes only declared actions at
+`$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`. It cannot enable development
+diagnostics or determine desktop lifecycle. `--headless` is a separate explicit
+launch option; neither declaring actions nor exporting them starts a service.
 
 Export an installed tool catalog without opening the UI or connecting to a
 running application:
@@ -141,15 +147,15 @@ running application:
 ouroctl mcp export examples/contacts/ouro.json --output dev.ourokit.contacts.json
 ```
 
-Install the result under `$XDG_DATA_HOME/ouro/mcp/apps` for a user application,
-or `$datadir/ouro/mcp/apps` for a system package. The separate `ouro-mcp` bridge
-reads these descriptors without starting every service. See the
+Install the result under `$XDG_DATA_HOME/ourokit/mcp/apps` for a user application,
+or `$datadir/ourokit/mcp/apps` for a system package. Optional MCP consumers can
+read these descriptors without starting applications. See the
 [XDG discovery and runtime-catalog contract](docs/mcp-discovery.md).
 
 See [transactional source reload](docs/hot-reload.md) for the generation and
 failure-preservation guarantees.
 
-Installed or socket-activated applications use `ouro.json` so identity is
+Installed applications use `ouro.json` so identity is
 known before mutable Lua source is evaluated:
 
 ```json

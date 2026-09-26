@@ -23,12 +23,17 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
         .help => try writeStdout(init, cli.usage),
         .version => try writeStdout(init, "ouroctl " ++ version ++ "\n"),
         .activate => |target| {
-            const path = try ourokit.app.socket_activation.socketPath(init.gpa, init.minimal.environ, target.application_id);
-            defer init.gpa.free(path);
-            try ourokit.app.control_client.activateAt(init.gpa, path, std.process.Environ.getPosix(init.minimal.environ, "XDG_ACTIVATION_TOKEN"));
+            try ourokit.app.desktop.validateId(target.path.?);
+            const source = try std.fmt.allocPrint(init.gpa, "return {{id='{s}'}}", .{target.path.?});
+            defer init.gpa.free(source);
+            try ourokit.app.runWayland(init, source, .{ .headless = true, .desktop = .{
+                .client = true,
+                .uris = target.uris,
+                .action = target.action,
+            } });
         },
-        .status => |target| try statusApplication(init, target.application_id),
-        .reload => |target| try reloadApplication(init, target.application_id),
+        .status => |target| try statusApplication(init, target.socket_path),
+        .reload => |target| try reloadApplication(init, target.socket_path),
         .mcp_export => |options| {
             var manifest: ?ourokit.bundle.Manifest = null;
             defer if (manifest) |*value| value.deinit();
@@ -66,30 +71,14 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
                 );
             } else try ourokit.bundle.SourceProvider.initDisk(init.gpa, path);
             defer provider.deinit();
-            if (try ourokit.app.socket_activation.listener(init.minimal.environ) == null and
-                std.process.Environ.getPosix(init.minimal.environ, "XDG_RUNTIME_DIR") != null)
-            {
-                if (provider.applicationId()) |id| {
-                    const socket_path = try ourokit.app.socket_activation.socketPath(init.gpa, init.minimal.environ, id);
-                    defer init.gpa.free(socket_path);
-                    const exists = blk: {
-                        std.Io.Dir.accessAbsolute(init.io, socket_path, .{}) catch |err| switch (err) {
-                            error.FileNotFound => break :blk false,
-                            else => return err,
-                        };
-                        break :blk true;
-                    };
-                    if (exists) {
-                        try ourokit.app.control_client.activateAt(init.gpa, socket_path, std.process.Environ.getPosix(init.minimal.environ, "XDG_ACTIVATION_TOKEN"));
-                        return 0;
-                    }
-                }
-            }
-            // An activation-only invocation must not execute library constructors.
             var libraries = try openNativeModules(init.gpa, manifest);
             defer libraries.deinit();
             var exit_code: u8 = 0;
             var run_options: ourokit.app.WaylandRunOptions = .{
+                .development = options.development,
+                .mcp = options.mcp,
+                .headless = options.headless,
+                .desktop = .{ .dbus_activated = options.dbus_activated, .uris = options.uris, .action = options.action },
                 .native_modules = libraries.modules,
                 .exit_after_first_frame = options.exit_after_first_frame,
                 .exit_code = &exit_code,
@@ -130,12 +119,12 @@ fn openNativeModules(allocator: std.mem.Allocator, manifest: ?ourokit.bundle.Man
     return ourokit.native.Libraries.open(allocator, paths);
 }
 
-fn statusApplication(init: std.process.Init, application_id: []const u8) !void {
-    var application = try ourokit.app.control_client.findApplication(
+fn statusApplication(init: std.process.Init, socket_path: []const u8) !void {
+    var application = try ourokit.app.control_client.findDevelopment(
         init.io,
         init.gpa,
         init.minimal.environ,
-        application_id,
+        socket_path,
     );
     defer application.deinit(init.gpa);
     var output: std.Io.Writer.Allocating = .init(init.gpa);
@@ -152,12 +141,12 @@ fn statusApplication(init: std.process.Init, application_id: []const u8) !void {
     try writeStdout(init, output.written());
 }
 
-fn reloadApplication(init: std.process.Init, application_id: []const u8) !void {
-    var application = try ourokit.app.control_client.findApplication(
+fn reloadApplication(init: std.process.Init, socket_path: []const u8) !void {
+    var application = try ourokit.app.control_client.findDevelopment(
         init.io,
         init.gpa,
         init.minimal.environ,
-        application_id,
+        socket_path,
     );
     defer application.deinit(init.gpa);
     var result = try ourokit.app.control_client.reloadAt(init.gpa, application.path);
@@ -167,7 +156,7 @@ fn reloadApplication(init: std.process.Init, application_id: []const u8) !void {
             const message = try std.fmt.allocPrint(
                 init.gpa,
                 "reloaded {s} as generation {d}\n",
-                .{ application_id, generation },
+                .{ socket_path, generation },
             );
             defer init.gpa.free(message);
             try writeStdout(init, message);

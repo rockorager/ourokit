@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Real-process stdio and inherited-listener checks; no compositor required.
+"""Real-process stdio, explicit development and optional MCP checks.
 
 Run after `zig build`: python3 tests/application_services.py
-Requires systemd-socket-activate. Uses only temporary application files/sockets.
+Uses only temporary application files/sockets. No service manager required.
 Set OUROKIT_TEST_WAYLAND_DISPLAY to an absolute compositor socket path to also
 exercise native activation, repeated activation, live actions and exit draining.
 """
@@ -18,6 +18,18 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "zig-out/bin/ouroctl"
+
+
+def development_path(directory, process, exclude=()):
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        assert process.poll() is None, f"application exited: {process.returncode}"
+        paths = [p for p in (directory / "ourokit/dev").glob("*") if p.is_socket() and p not in exclude]
+        if paths:
+            assert len(paths) == 1, paths
+            return paths[0]
+        time.sleep(.01)
+    raise AssertionError("development endpoint never appeared")
 
 
 def record(method, params=None, request_id=1):
@@ -90,19 +102,11 @@ class RpcStream:
 
 
 def check_catalog_changes(directory, path, app, source, process):
-    published = directory / "ouro/mcp/apps/dev.ourokit.servicetest.json"
-    initial = published.read_bytes()
-    descriptor = json.loads(initial)
-    assert set(descriptor) == {"schema_version", "application_id", "endpoint", "tools", "runtime"}
-    assert descriptor["schema_version"] == 1 and descriptor["application_id"] == "dev.ourokit.servicetest"
-    assert descriptor["endpoint"] == {"runtime_path": "ourokit/apps/dev.ourokit.servicetest"}
-    assert descriptor["tools"] == request(path, "tools/list")["result"]["tools"]
-    names = [tool["name"] for tool in descriptor["tools"]]
+    assert not (directory / "ourokit/mcp/apps/dev.ourokit.servicetest.json").exists()
+    names = [tool["name"] for tool in request(path, "tools/list")["result"]["tools"]]
     assert names == sorted(names)
-    assert descriptor["runtime"] == {"pid": process.pid, "start_ticks":
-                                     Path(f"/proc/{process.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]}
-    assert published.stat().st_mode & 0o777 == 0o600
-    assert published.stat().st_uid == os.getuid()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
 
     stream = RpcStream(path)
     try:
@@ -121,8 +125,7 @@ def check_catalog_changes(directory, path, app, source, process):
         stream.quiet()
 
         def reload(candidate, changed, fails=False):
-            before = published.stat()
-            before_bytes = published.read_bytes()
+            before = request(path, "tools/list")["result"]["tools"]
             app.write_text(candidate)
             stream.socket.sendall(record("tools/call", {"name": "runtime.reload"}, "reload"))
             response = stream.read()
@@ -134,13 +137,12 @@ def check_catalog_changes(directory, path, app, source, process):
             assert len(replies) == 1 and replies[0]["result"]["isError"] == fails, messages
             updates = [m for m in messages if m.get("method") == "notifications/tools/list_changed"]
             assert {m["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] for m in updates} == (set(ids) if changed else set())
-            after = published.stat()
+            after = request(path, "tools/list")["result"]["tools"]
             if changed:
-                assert after.st_ino != before.st_ino
+                assert after != before
             else:
-                assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
-                assert published.read_bytes() == before_bytes
-            assert json.loads(published.read_bytes())["tools"] == request(path, "tools/list")["result"]["tools"]
+                assert after == before
+            assert not (directory / "ourokit/mcp/apps/dev.ourokit.servicetest.json").exists()
             stream.quiet()
 
         # Handler state and recursive object/declaration ordering are not catalog changes.
@@ -205,7 +207,7 @@ def check_catalog_changes(directory, path, app, source, process):
 
 
 def check_publication_safety(directory, env):
-    for mode in ("normal", "trailing", "replacement", "crash", "outside", "symlink-dir", "symlink-file", "writable-dir", "writable-file"):
+    for mode in ("normal", "trailing", "replacement", "crash", "symlink-dir", "symlink-file", "writable-dir", "writable-file"):
         runtime = directory / mode
         runtime.mkdir(mode=0o700)
         app = runtime / "app.lua"
@@ -218,12 +220,13 @@ return o.app {id='dev.test.catalog', actions={
         app.write_text(source)
         manifest = runtime / "ouro.json"
         manifest.write_text(json.dumps({"schema_version": 1, "id": "dev.test.catalog", "entry": "app.lua"}))
-        published = runtime / "ouro/mcp/apps/dev.test.catalog.json"
+        published = runtime / "ourokit/mcp/apps/dev.test.catalog.json"
         victim = runtime / "victim"
         victim.write_text("preserve victim")
+        (runtime / "ourokit").mkdir(mode=0o700)
         if mode == "symlink-dir":
             (runtime / "elsewhere").mkdir()
-            (runtime / "ouro").symlink_to(runtime / "elsewhere", target_is_directory=True)
+            (runtime / "ourokit/mcp").symlink_to(runtime / "elsewhere", target_is_directory=True)
         elif mode in ("symlink-file", "writable-dir", "writable-file"):
             published.parent.mkdir(parents=True, mode=0o700)
             if mode == "symlink-file":
@@ -233,19 +236,13 @@ return o.app {id='dev.test.catalog', actions={
             else:
                 published.write_text("preserve unsafe file")
                 published.chmod(0o666)
-        endpoint = directory / "outside.sock" if mode == "outside" else runtime / "overridden.sock"
+        endpoint = runtime / "ourokit/apps/dev.test.catalog"
         local_env = dict(env, XDG_RUNTIME_DIR=str(runtime))
-        listener_path = str(endpoint)
         if mode == "trailing":
             local_env["XDG_RUNTIME_DIR"] += "///"
-            endpoint = runtime / "ourokit/apps/dev.test.catalog"
-            endpoint.parent.mkdir(parents=True, mode=0o700)
-            listener_path = local_env["XDG_RUNTIME_DIR"] + "/ourokit/apps/dev.test.catalog"
         log = runtime / "log"
         with log.open("wb") as errors:
-            process = subprocess.Popen(["systemd-socket-activate", f"--listen={listener_path}", "--fdname=mcp",
-                                        "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY",
-                                        str(BINARY), "run", str(manifest), "--software"],
+            process = subprocess.Popen([str(BINARY), "run", str(manifest), "--mcp", "--headless"],
                                        env=local_env, stdout=subprocess.DEVNULL, stderr=errors)
             try:
                 for _ in range(200):
@@ -257,18 +254,19 @@ return o.app {id='dev.test.catalog', actions={
                 safe = mode in ("normal", "trailing", "replacement", "crash")
                 if safe:
                     descriptor = json.loads(published.read_bytes())
-                    expected_path = "ourokit/apps/dev.test.catalog" if mode == "trailing" else "overridden.sock"
-                    assert descriptor["endpoint"] == {"runtime_path": expected_path}
+                    assert descriptor["endpoint"] == {"runtime_path": "ourokit/apps/dev.test.catalog"}
                     assert descriptor["runtime"]["pid"] == process.pid
+                    assert descriptor["tools"] == request(endpoint, "tools/list")["result"]["tools"]
+                    assert {t['name'] for t in descriptor['tools']} == {'Probe'}
+                    assert published.stat().st_mode & 0o777 == 0o600
                 if mode == "replacement":
                     replacement = runtime / "replacement.json"
                     replacement.write_text("replacement stays")
                     replacement.replace(published)
-                # Publication failures, including a safe inode replaced by its
-                # owner, cannot invalidate this successfully committed reload.
-                app.write_text(source.replace("description='Probe'", "description='Changed'"))
-                assert call(endpoint, "runtime.reload")["isError"] is False
-                assert next(t for t in request(endpoint, "tools/list")["result"]["tools"] if t["name"] == "Probe")["description"] == "Changed"
+                # Production automation never grants development or activation.
+                for method in ('runtime.reload', 'runtime.status', 'runtime.activate'):
+                    assert call(endpoint, method)['rpcError']['code'] == -32602
+                assert call(endpoint, 'Probe')['isError'] is False
                 if mode == "trailing":
                     assert json.loads(published.read_bytes())["endpoint"] == {"runtime_path": "ourokit/apps/dev.test.catalog"}
                 if mode == "crash":
@@ -293,7 +291,7 @@ return o.app {id='dev.test.catalog', actions={
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=8)
-    print("PASS: runtime publication is best effort, normalizes trailing runtime slashes, uses actual endpoints, rejects symlink/unsafe paths, preserves replacement inodes, cleans graceful shutdown and identifies crash residue")
+    print("PASS: production actions-only publication rejects unsafe paths, preserves replacement inodes, cleans shutdown and identifies crash residue; development calls denied")
 
 
 def check_signal_shutdown(directory, env):
@@ -302,7 +300,6 @@ def check_signal_shutdown(directory, env):
     app = manifest.parent / "interrupt.lua"
     manifest.write_text(json.dumps({"schema_version": 1, "id": "dev.ourokit.interrupt",
                                     "entry": "interrupt.lua"}))
-    path = directory / "ourokit/apps/dev.ourokit.interrupt"
     sources = {
         "module-bootstrap": "o.stdout.write('ready\\n'); o.stdin.read(1); o.exit(0)",
         "ui-bootstrap": """
@@ -311,7 +308,7 @@ return o.app {
   run = function() o.stdout.write('ready\\n'); o.sleep(30000) end,
 }
 """,
-        "inherited-headless": "return o.app {id='dev.ourokit.interrupt', actions={}}",
+        "development-headless": "return o.app {id='dev.ourokit.interrupt'}",
     }
     if os.environ.get("OUROKIT_TEST_WAYLAND_DISPLAY"):
         sources["native"] = """
@@ -327,18 +324,14 @@ return o.app {
 """
     for name, source in sources.items():
         app.write_text("local o = require('ouro')\n" + source)
-        inherited = name == "inherited-headless"
         for sig in (signal.SIGINT, signal.SIGTERM):
-            # Reuse the exact pathname on the next launch: leftover owned
-            # sockets must fail this test rather than being manually removed.
-            args = [str(BINARY), "run", str(app if name == "module-bootstrap" else manifest), "--software"]
+            path = None
+            args = [str(BINARY), "run", str(app if name == "module-bootstrap" else manifest), "--software", "--dev"]
             child_env = env.copy()
             if name == "native":
                 child_env["WAYLAND_DISPLAY"] = os.environ["OUROKIT_TEST_WAYLAND_DISPLAY"]
-            if inherited:
-                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                args = ["systemd-socket-activate", f"--listen={path}", "--fdname=mcp",
-                        "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY"] + args
+            if name == "development-headless":
+                args.append("--headless")
             process = subprocess.Popen(args, env=child_env, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
@@ -346,27 +339,25 @@ return o.app {
                     assert select.select([process.stdout], [], [], 8)[0], "bootstrap never became ready"
                     assert process.stdout.readline() == b"ready\n"
                 else:
+                    path = development_path(directory, process)
                     deadline = time.monotonic() + 8
                     while True:
                         assert process.poll() is None, process.stderr.read().decode()
                         assert time.monotonic() < deadline, "server never became ready"
                         if path.exists():
                             status = call(path, "runtime.status")["structuredContent"]
-                            if inherited or status["uiActive"]:
+                            if name == "development-headless" or status["uiActive"]:
                                 break
                         time.sleep(.01)
                 if name != "module-bootstrap":
+                    if path is None:
+                        path = development_path(directory, process)
                     assert path.is_socket()
-                    identity = path.stat().st_ino
                 process.send_signal(sig)
                 assert process.wait(timeout=8) == 128 + sig
                 errors = process.stderr.read().decode()
                 assert "panic" not in errors and "leaked" not in errors, errors
-                if inherited:
-                    assert path.is_socket() and path.stat().st_ino == identity
-                    # This path belongs to the test's socket activator.
-                    path.unlink()
-                else:
+                if path is not None:
                     assert not path.exists(), f"{name} left an owned socket behind"
                 print(f"PASS: {name} {sig.name} exits cleanly and preserves socket ownership")
             finally:
@@ -441,28 +432,19 @@ return o.app {
         app.write_text(source)
         manifest = directory / "ouro.json"
         manifest.write_text(json.dumps({"schema_version": 1, "id": "dev.ourokit.servicetest", "entry": "app.lua"}))
-        path = directory / "ourokit/apps/dev.ourokit.servicetest"
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         log = directory / "service.log"
         with log.open("wb") as errors:
-            process = subprocess.Popen(["systemd-socket-activate", f"--listen={path}", "--fdname=mcp",
-                                        "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY",
-                                        str(BINARY), "run", str(manifest), "--software"],
+            process = subprocess.Popen([str(BINARY), "run", str(manifest), "--dev", "--headless"],
                                        env=env, stdout=subprocess.DEVNULL, stderr=errors)
             try:
-                for _ in range(200):
-                    if path.exists():
-                        break
-                    if process.poll() is not None:
-                        raise AssertionError(log.read_text())
-                    time.sleep(.01)
+                path = development_path(directory, process)
                 status = call(path, "runtime.status")["structuredContent"]
                 assert status["uiActive"] is False
                 info = request(path, "server/discover")["result"]
                 assert info["supportedVersions"] == ["2026-07-28"] and info["capabilities"] == {"tools": {"listChanged": True}}
                 assert info["ttlMs"] == 60000 and info["cacheScope"] == "private"
                 tools = request(path, "tools/list")["result"]
-                assert {t["name"] for t in tools["tools"]} == {"runtime.status", "runtime.reload", "runtime.activate", "Get", "Set", "Delayed", "Invalid", "Fail"}
+                assert {t["name"] for t in tools["tools"]} == {"runtime.status", "runtime.reload", "Get", "Set", "Delayed", "Invalid", "Fail"}
                 assert tools["ttlMs"] == 60000 and tools["cacheScope"] == "private"
                 assert all("inputSchema" in t and "outputSchema" in t and t["description"] for t in tools["tools"])
                 assert call(path, "Set", {"value": "changed"})["structuredContent"] == {}
@@ -475,9 +457,9 @@ return o.app {
                 failure = call(path, "Fail")
                 assert failure["isError"] is True and failure["structuredContent"] == {
                     "error": {"code": "Rejected", "message": "Rejected", "parameters": {"reason": "test"}}}
-                assert call(path, "runtime.activate")["structuredContent"]["error"]["code"] == "ActivateFailed"
+                assert call(path, "runtime.activate")["rpcError"]["code"] == -32602
                 assert call(path, "runtime.status")["structuredContent"]["uiActive"] is False
-                print("PASS: inherited listener, headless calls/introspection, typed inputs/outputs/errors, no-UI activation error")
+                print("PASS: explicit dev listener, headless calls/introspection, typed inputs/outputs/errors, proprietary activation removed")
 
                 with socket.socket(socket.AF_UNIX) as cancel:
                     cancel.settimeout(8)
@@ -526,10 +508,11 @@ return o.app {
                 print("PASS: headless reload, pending-call cancellation, invalid declaration rollback")
 
                 check_catalog_changes(directory, path, app, source, process)
-                assert process.wait(timeout=40) == 0, log.read_text()
-                assert path.exists(), "application unlinked inherited socket"
-                assert not (directory / "ouro/mcp/apps/dev.ourokit.servicetest.json").exists()
-                print("PASS: 30-second headless idle exit retains inherited socket pathname")
+                process.terminate()
+                assert process.wait(timeout=8) == 143, log.read_text()
+                assert not path.exists()
+                assert not (directory / "ourokit/mcp/apps/dev.ourokit.servicetest.json").exists()
+                print("PASS: explicit headless lifetime and development endpoint cleanup")
             except Exception:
                 print(log.read_text())
                 raise
@@ -543,22 +526,14 @@ return o.app {
             ("no-compositor", "function() return {windows={o.window{id='main', title='Test', width=50, height=50, content=function() end}}} end"),
         ):
             app.write_text(source.replace("  actions = {", f"  run = {run},\n  actions = {{"))
-            failure_path = directory / name
             with log.open("wb") as errors:
-                process = subprocess.Popen(["systemd-socket-activate", f"--listen={failure_path}",
-                                            "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY",
-                                            str(BINARY), "run", str(manifest), "--software"],
+                process = subprocess.Popen([str(BINARY), "run", str(manifest), "--software"],
                                            env=env, stdout=subprocess.DEVNULL, stderr=errors)
                 try:
-                    for _ in range(200):
-                        if failure_path.exists():
-                            break
-                        time.sleep(.01)
-                    response = call(failure_path, "runtime.activate")
-                    assert response["structuredContent"]["error"]["code"] == "ActivateFailed", response
                     assert process.wait(timeout=8) == 1, log.read_text()
                     assert "panic" not in log.read_text() and "leaked" not in log.read_text(), log.read_text()
-                    print(f"PASS: {name} returns ActivateFailed before clean teardown")
+                    assert not (directory / "ourokit/apps/dev.ourokit.servicetest").exists()
+                    print(f"PASS: ordinary {name} reports failure with no MCP socket")
                 except Exception:
                     print(log.read_text())
                     raise
@@ -585,32 +560,25 @@ return o.app {
   }}} end,
 }
 """)
-            native_path = directory / "native"
             with log.open("wb") as errors:
-                process = subprocess.Popen(["systemd-socket-activate", f"--listen={native_path}",
-                                            "--setenv=XDG_RUNTIME_DIR", "--setenv=WAYLAND_DISPLAY",
-                                            str(BINARY), "run", str(manifest), "--software"],
+                process = subprocess.Popen([str(BINARY), "run", str(manifest), "--software", "--dev"],
                                            env=env, stdout=subprocess.PIPE, stderr=errors)
                 try:
+                    native_path = development_path(directory, process)
                     for _ in range(200):
-                        if native_path.exists():
+                        if call(native_path, "runtime.status")["structuredContent"]["uiActive"]:
                             break
                         time.sleep(.01)
-                    assert call(native_path, "runtime.status")["structuredContent"]["uiActive"] is False
-                    assert call(native_path, "Set", {"title": "Before activation"})["structuredContent"] == {}
-                    activation = call(native_path, "runtime.activate")
-                    assert activation["structuredContent"] == {}, activation
                     assert call(native_path, "runtime.status")["structuredContent"]["uiActive"] is True
-                    assert call(native_path, "runtime.activate")["structuredContent"] == {}
                     assert call(native_path, "Set", {"title": "While running"})["structuredContent"] == {}
                     with socket.socket(socket.AF_UNIX) as stop:
                         stop.connect(str(native_path))
                         stop.sendall(record("tools/call", {"name": "Stop"}))
                         stdout, _ = process.communicate(timeout=8)
                     assert process.returncode == 9 and stdout == b"finished\n", log.read_text()
-                    assert native_path.exists()
+                    assert not native_path.exists()
                     assert "panic" not in log.read_text() and "leaked" not in log.read_text(), log.read_text()
-                    print("PASS: native activation on shared ring, repeat activation, live action, action exit/output drain")
+                    print("PASS: native startup on shared ring, live action, action exit/output drain")
                 except Exception:
                     print(log.read_text())
                     raise

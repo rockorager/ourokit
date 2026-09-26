@@ -9,8 +9,7 @@ pub const max_bytes = 256 * 1024;
 pub const builtin_tools =
     \\[
     \\{"name":"runtime.status","description":"Read application status without activating UI.","inputSchema":{"type":"object","additionalProperties":false},"outputSchema":{"type":"object","properties":{"applicationId":{"type":"string"},"activeGeneration":{"type":"integer"},"reloading":{"type":"boolean"},"uiActive":{"type":"boolean"},"diagnostic":{"type":["object","null"]}},"required":["applicationId","activeGeneration","reloading","uiActive","diagnostic"],"additionalProperties":false}},
-    \\{"name":"runtime.reload","description":"Validate a candidate source generation and commit it atomically; resets Lua state.","inputSchema":{"type":"object","additionalProperties":false},"outputSchema":{"type":"object","properties":{"generation":{"type":"integer"}},"required":["generation"],"additionalProperties":false}},
-    \\{"name":"runtime.activate","description":"Initialize or present the application UI. Focus remains compositor policy.","inputSchema":{"type":"object","properties":{"activationToken":{"type":["string","null"]}},"additionalProperties":false},"outputSchema":{"type":"object","additionalProperties":false}}
+    \\{"name":"runtime.reload","description":"Validate a candidate source generation and commit it atomically; resets Lua state.","inputSchema":{"type":"object","additionalProperties":false},"outputSchema":{"type":"object","properties":{"generation":{"type":"integer"}},"required":["generation"],"additionalProperties":false}}
     \\]
 ;
 const failure_schema =
@@ -22,13 +21,18 @@ pub fn descriptor(allocator: std.mem.Allocator, application: *const lua.Applicat
     defer arena.deinit();
     const a = arena.allocator();
     const path = try std.fmt.allocPrint(a, "ourokit/apps/{s}", .{application.id});
-    return serialize(allocator, try descriptorValue(a, application.id, path, try toolsValue(a, application)));
+    return serialize(allocator, try descriptorValue(a, application.id, path, try toolsValue(a, application, false, null)));
 }
 
-pub fn tools(allocator: std.mem.Allocator, application: ?*const lua.Application) ![]u8 {
+pub fn tools(allocator: std.mem.Allocator, application: ?*const lua.Application, development: bool) ![]u8 {
+    return toolsWithDevelopment(allocator, application, development, null);
+}
+
+pub fn toolsWithDevelopment(allocator: std.mem.Allocator, application: ?*const lua.Application, development: bool, extra: ?mcp.Value) ![]u8 {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
-    return serialize(allocator, try toolsValue(arena.allocator(), application));
+    const a = arena.allocator();
+    return serialize(allocator, try toolsValue(a, application, development, extra));
 }
 
 /// Shared with runtime publication, whose endpoint reflects the actual socket.
@@ -45,11 +49,12 @@ pub fn descriptorValue(a: std.mem.Allocator, id: []const u8, path: []const u8, l
     });
 }
 
-fn toolsValue(a: std.mem.Allocator, application: ?*const lua.Application) !mcp.Value {
+fn toolsValue(a: std.mem.Allocator, application: ?*const lua.Application, development: bool, extra: ?mcp.Value) !mcp.Value {
     const builtins = try std.json.parseFromSlice(mcp.Value, a, builtin_tools, .{});
     const failure = try std.json.parseFromSlice(mcp.Value, a, failure_schema, .{});
     var list = std.array_list.Managed(mcp.Value).init(a);
-    try list.appendSlice(builtins.value.array.items);
+    if (development) try list.appendSlice(builtins.value.array.items);
+    if (development) if (extra) |items| try list.appendSlice(items.array.items);
     if (application) |app| if (app.action_schema) |schema| {
         var it = schema.tools.iterator();
         while (it.next()) |entry| try list.append(entry.value_ptr.*);

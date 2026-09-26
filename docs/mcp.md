@@ -4,7 +4,7 @@ Ourokit supports MCP over local Unix sockets for application automation and
 optional agent integrations. This document defines its transport contract and
 Lua client API. Desktop appearance uses the D-Bus Settings portal, not MCP.
 The [discovery contract](mcp-discovery.md) defines installed and runtime
-catalogs for the separate `ouro-mcp` stdio bridge. Agent authorization and
+catalogs for optional MCP consumers. Agent authorization and
 multi-instance application routing remain separate from discovery metadata.
 
 ## Local transport
@@ -114,9 +114,11 @@ are available regardless of whether the app enables an inbound server.
 
 ## App tools and ownership
 
-Declaring `actions = {}` enables `runtime.status`, `runtime.reload`, and
-`runtime.activate`, plus `server/discover` and `tools/list`, at
-`$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`. Custom actions declare
+`ouroctl run --mcp` explicitly exposes declared actions, `server/discover`, and
+`tools/list` at `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`.
+Declaring actions alone enables no inbound server. `--dev` creates a separate
+private per-instance endpoint with development status/reload tools, regardless
+of actions. Production catalogs never include runtime tools. Custom actions declare
 `description`, `inputSchema`, `outputSchema`, and `handler` together. See
 [the application model](application-model.md) and the runnable
 [Contacts service](../examples/contacts/README.md). Installed descriptors and
@@ -130,11 +132,12 @@ Handler-only changes and failed reloads do not invalidate the catalog. Each
 notification carries the listen request ID in subscription metadata. Canceling
 the listen yields a terminal complete result; disconnect discards its state.
 The resource-only Lua `subscribe` helper is unchanged; catalog subscriptions
-are handled by the bridge and native MCP clients.
+are handled by native MCP clients and optional consumers.
 
-Use `FileDescriptorName=mcp` for systemd socket activation. The host checks
-same-user peer credentials and retains existing listener/pathname ownership
-rules. Activation, reload, and in-flight action lifetimes remain host-owned.
+The host checks same-user peer credentials and removes only paths it owns.
+No inherited systemd MCP listener is adopted. Desktop launch and activation use
+desktop entries and `org.freedesktop.Application`, not MCP. Reload and runtime
+diagnostics are development-only; in-flight action lifetimes remain host-owned.
 
 The public `ourokit.mcp.Client` and `Server` are sans-I/O state machines:
 

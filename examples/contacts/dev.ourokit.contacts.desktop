@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Contacts
+Comment=Ourokit in-memory contact example
+Exec="/usr/bin/ouroctl" run "/usr/share/ourokit/contacts/ouro.json"
+DBusActivatable=true
+Terminal=false
+Categories=Office;ContactManagement;

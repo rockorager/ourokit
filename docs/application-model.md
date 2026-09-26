@@ -336,9 +336,10 @@ the optional MCP tools and action handlers. `run(context)` initializes
 the UI only when requested. Actions and window callbacks share the same Lua VM
 and closures; invoking a method never implicitly initializes Wayland.
 
-Omitting `actions` (or using nil) starts no server. `actions = {}` enables
-`runtime.status`, `runtime.reload`, `runtime.activate`, `server/discover`, and
-`tools/list`. Each action has a description, `inputSchema`, `outputSchema`, and
+Declaring `actions` does not start a server or select single-instance policy.
+`ouroctl run --mcp` explicitly enables an optional production actions endpoint;
+`--dev` instead creates a private development endpoint with status/reload tools,
+even when `actions` is absent. Each action has a description, `inputSchema`, `outputSchema`, and
 handler. The table key is the exact tool name; `runtime.` names are reserved.
 Use `tools/call` with `{name, arguments}`. There is no `interface` field, IDL,
 qualified-method alias, initialization handshake, or old wire protocol.
@@ -379,26 +380,56 @@ cancel actions without resuming their old Lua continuations. The server admits
 at most eight same-UID peers and owns separate bounded read/write operations.
 See the [MCP contract](mcp.md) for request metadata and result-type rules.
 
-Service applications use `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`.
-Systemd socket activation (`Accept=no`, `FileDescriptorName=mcp`) passes an
-already-listening socket through `LISTEN_FDS`. Ourokit loads only the application
-declaration and serves requests until `Activate` asks for UI. It never unlinks
-the systemd-owned socket. With no connections or tasks, the headless service
-exits after 30 seconds; systemd retains the socket for the next request.
+Direct `ouroctl run` launches the UI without any MCP server. `--headless`
+explicitly runs only application tasks and IPC until exit. Optional production
+MCP uses `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`, exposes actions only,
+and never activates the UI. Existing listeners are not replaced or adopted.
 
-Direct `ouroctl run` launches the UI. For a manifest whose well-known socket
-already exists, it forwards `Activate` to the owner instead. `ouroctl activate
-<application-id>` explicitly activates an installed socket-backed application.
-Activation can carry a Wayland activation token; focus remains compositor policy.
-Repeated activation does not rerun the UI factory or create duplicate windows.
+Desktop activation follows the [Desktop Entry Specification](https://specifications.freedesktop.org/desktop-entry-spec/latest/dbus.html).
+Declare `single_instance = true` to own the application's session-bus name.
+Subsequent ordinary launches forward to that owner. The default is false:
+each launch is a new process, without a public bus name. Development always
+creates an independent process and neither calls nor owns the production name.
+
+The optional declaration hooks are:
+
+```lua
+single_instance = true,
+activate = function(platform_data) end,
+open = function(uris, platform_data) end,
+activate_action = function(name, parameters, platform_data) end,
+```
+
+These map to `org.freedesktop.Application.Activate(a{sv})`, `Open(asa{sv})`,
+and `ActivateAction(sava{sv})`, each with an empty reply. The object path is the
+application ID with dots replaced by slashes, prefixed by `/`, and hyphens
+replaced by underscores. `parameters` contains typed `ouro.dbus.variant`
+values. Known platform fields `activation-token` and `desktop-startup-id` are
+strings; other fields remain typed variants. Hooks may yield and may return
+`nil, {name='org.example.Error', message='...'}` to reject delivery. Missing
+Open/action hooks return `org.freedesktop.DBus.Error.NotSupported`.
+
+Install a matching `<id>.desktop` with `DBusActivatable=true` and a session-bus
+`<id>.service` whose Exec runs `ouroctl run <manifest> --dbus-activated`.
+The latter acquires the name but waits for an actual method call before UI
+initialization; it requires `single_instance=true`. The desktop Exec fallback
+uses ordinary `run`. `ouroctl activate <id>`, optionally `--action <name>` or
+`-- <URI>...`, calls the standard interface and can trigger bus activation.
+Ordinary `run` accepts the same action/URI launch arguments. Pass URIs, not raw
+file paths. Command-line actions carry an empty parameter array; D-Bus callers
+may send typed parameters. `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID` are
+forwarded as platform data. A Wayland token is consumed once when a surface is
+ready; focus remains compositor policy. Repeated activation does not rerun the
+UI factory. See [Contacts packaging](../examples/contacts/README.md).
+
 Closing the last window drains accepted calls/output and exits. Explicit
 `ouro.exit(code)` drains stdio output, cancels remaining tasks and exits.
 Lua state is process-local, not persistent storage.
 
 Ctrl+C (`SIGINT`) and `SIGTERM` request shutdown through the event loop, cancel
 remaining tasks, and remove only the runtime socket owned by the application.
-`ouroctl run` exits with status 130 or 143 respectively. Inherited systemd sockets
-remain in place. `SIGKILL` and crashes cannot run cleanup; any orphaned socket
+`ouroctl run` exits with status 130 or 143 respectively.
+`SIGKILL` and crashes cannot run cleanup; any orphaned socket
 still requires explicit removal after confirming no listener owns it.
 Native hosts must enter the application runner before starting other threads
 so worker threads inherit its signal mask. The runner restores the calling
@@ -407,7 +438,8 @@ thread's previous mask after teardown and preserves ignored signal dispositions.
 Headless reload validates a fresh declaration without invoking `run`. UI reload
 prepares a fresh UI in a candidate source generation and atomically replaces the
 active generation only after its windows, schemas and handlers validate.
-Reload resets Lua state. Server enablement remains restart-only.
+Reload resets Lua state. Development enablement is fixed for each process;
+declared action sets may change on reload. Production never exposes reload.
 
 ## Standalone subprocess dialogs
 

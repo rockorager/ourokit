@@ -64,7 +64,7 @@ return o.app {{id='{APP_ID}', actions=require('declaration'),
             assert catalog["schema_version"] == 1 and catalog["application_id"] == APP_ID
             assert catalog["endpoint"] == {"runtime_path": f"ourokit/apps/{APP_ID}"}
             tools = {tool["name"]: tool for tool in catalog["tools"]}
-            assert set(tools) == {"Echo", "runtime.activate", "runtime.reload", "runtime.status"}
+            assert set(tools) == {"Echo"}
             assert tools["Echo"]["description"] == "Echo an exact message"
             assert tools["Echo"]["inputSchema"] == {
                 "type": "object", "properties": {"message": {"type": "string"}},
@@ -74,7 +74,7 @@ return o.app {{id='{APP_ID}', actions=require('declaration'),
                     "required": ["reply"], "additionalProperties": False} in tools["Echo"]["outputSchema"]["anyOf"]
             assert export(app).stdout == first.stdout
             assert not select.select(listeners, [], [], 0)[0], "export activated a socket"
-            assert not (root / "ouro/mcp").exists(), "export published a runtime catalog"
+            assert not (root / "ourokit/mcp").exists(), "export published a runtime catalog"
             print("PASS: module-based export uses live schemas, no UI/action/activation, stdout is JSON")
 
             destination = root / "installed" / f"{APP_ID}.json"
@@ -96,7 +96,7 @@ return o.app {{id='{APP_ID}', actions=require('declaration'),
             assert contacts.returncode == 0 and contacts.stderr == b"", contacts
             contact_catalog = json.loads(contacts.stdout)
             assert {t["name"] for t in contact_catalog["tools"]} == {
-                "GetContacts", "SelectContact", "RenameContact", "runtime.status", "runtime.reload", "runtime.activate",
+                "GetContacts", "SelectContact", "RenameContact",
             }
             assert contact_catalog["application_id"] == "dev.ourokit.contacts"
             assert not select.select(listeners, [], [], 0)[0]

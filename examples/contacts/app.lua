@@ -111,6 +111,7 @@ local empty_schema = { type = "object", additionalProperties = false }
 
 return ouro.app {
   id = "dev.ourokit.contacts",
+  single_instance = true,
   actions = {
     GetContacts = {
       description = "Read the in-memory address book without opening a window.",

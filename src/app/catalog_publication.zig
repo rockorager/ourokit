@@ -135,7 +135,7 @@ fn openDirectory(a: std.mem.Allocator, runtime: []const u8) !linux.fd_t {
         }
     }
     try safe(try stat(fd, ""), linux.S.IFDIR);
-    for ([_][:0]const u8{ "ouro", "mcp", "apps" }) |name| {
+    for ([_][:0]const u8{ "ourokit", "mcp", "apps" }) |name| {
         const result = linux.mkdirat(fd, name, 0o700);
         if (linux.errno(result) != .EXIST) try check(result);
         const next = try open(fd, name, .{ .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
@@ -183,7 +183,7 @@ test "catalog runtime normalizes trailing separators without accepting sibling p
         try map.put("XDG_RUNTIME_DIR", runtime);
         const environ: std.process.Environ = .{ .block = try map.createPosixBlock(a, .{}) };
         defer environ.block.deinit(a);
-        const socket = try @import("socket_activation.zig").socketPath(a, environ, "dev.test.catalog");
+        const socket = try @import("control_endpoint.zig").socketPath(a, environ, "dev.test.catalog", false);
         defer a.free(socket);
         var publication = try Publication.init(a, environ, "dev.test.catalog", socket);
         defer publication.deinit();

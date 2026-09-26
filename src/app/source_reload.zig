@@ -176,19 +176,6 @@ pub const SourceReload = struct {
             self.discard();
             return error.ApplicationIdChanged;
         }
-        if (candidate_generation.application_ready and
-            candidate_generation.application.hasActions() != self.active_generation.application.hasActions())
-        {
-            lua.recordDiagnosticError(
-                &self.diagnostic,
-                self.allocator,
-                .declaration,
-                candidate_generation.snapshot.entry_name,
-                error.ApplicationActionsChanged,
-            );
-            self.discard();
-            return error.ApplicationActionsChanged;
-        }
     }
 
     /// Rejects a candidate without dropping ownership of its pending work.
@@ -398,20 +385,6 @@ pub const SourceReload = struct {
                 self.discard();
                 self.candidate_failure = err;
             }
-            if (self.candidate != null and candidate.application_ready and
-                candidate.application.hasActions() != self.active_generation.application.hasActions())
-            {
-                const err = error.ApplicationActionsChanged;
-                lua.recordDiagnosticError(
-                    &self.diagnostic,
-                    self.allocator,
-                    .declaration,
-                    candidate.snapshot.entry_name,
-                    err,
-                );
-                self.discard();
-                self.candidate_failure = err;
-            }
             return;
         };
         if (self.active_generation.vm.ownsSchedulerTask(handle)) {
@@ -549,7 +522,7 @@ const changed_identity_source =
     \\}
 ;
 
-fn expectActionReload(initial_actions: []const u8, candidate_actions: []const u8, allowed: bool, asynchronous: bool) !void {
+fn expectActionReload(initial_actions: []const u8, candidate_actions: []const u8, asynchronous: bool) !void {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const prefix =
@@ -610,36 +583,20 @@ fn expectActionReload(initial_actions: []const u8, candidate_actions: []const u8
         try reload.prepare();
         try std.testing.expect(!reload.candidateReady());
         while (scheduler.takeRunnable()) |handle| try reload.resumeRunnable(handle);
-        if (allowed) {
-            try std.testing.expect(reload.candidateReady());
-            try std.testing.expect(reload.candidate.?.application.hasActions());
-        } else {
-            try std.testing.expectEqual(error.ApplicationActionsChanged, reload.takeCandidateFailure().?);
-            try std.testing.expect(reload.active() == initial);
-            try std.testing.expect(reload.candidate == null);
-            try std.testing.expectEqual(lua.DiagnosticPhase.declaration, reload.lastDiagnostic().?.phase);
-        }
-        return;
-    }
-    if (allowed) {
-        try reload.prepare();
-        try std.testing.expect(reload.candidateReady());
-        try std.testing.expect(reload.candidate.?.application.hasActions());
     } else {
-        try std.testing.expectError(error.ApplicationActionsChanged, reload.prepare());
-        try std.testing.expect(reload.active() == initial);
-        try std.testing.expect(reload.candidate == null);
-        try std.testing.expectEqual(lua.DiagnosticPhase.declaration, reload.lastDiagnostic().?.phase);
+        try reload.prepare();
     }
+    try std.testing.expect(reload.candidateReady());
+    try std.testing.expectEqual(candidate_actions.len != 0, reload.candidate.?.application.hasActions());
 }
 
-test "source reload validates process-lifetime application action enablement" {
+test "source reload can add and remove optional application actions" {
     for ([_]bool{ false, true }) |asynchronous| {
-        try expectActionReload("actions = {},", "", false, asynchronous);
-        try expectActionReload("", "actions = {},", false, asynchronous);
+        try expectActionReload("actions = {},", "", asynchronous);
+        try expectActionReload("", "actions = {},", asynchronous);
         try expectActionReload("actions = {},", "actions = { Ping = {description='Ping', " ++
             "inputSchema={type='object'}, outputSchema={type='object', properties={reply={type='string'}}, required={'reply'}}, " ++
-            "handler=function() return {reply='pong'} end} },", true, asynchronous);
+            "handler=function() return {reply='pong'} end} },", asynchronous);
     }
 }
 

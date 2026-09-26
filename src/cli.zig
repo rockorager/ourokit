@@ -3,7 +3,7 @@ const std = @import("std");
 pub const Command = union(enum) {
     help,
     version,
-    activate: RuntimeTarget,
+    activate: Run,
     reload: RuntimeTarget,
     status: RuntimeTarget,
     run: Run,
@@ -12,7 +12,7 @@ pub const Command = union(enum) {
 };
 
 pub const RuntimeTarget = struct {
-    application_id: []const u8,
+    socket_path: []const u8,
 };
 
 pub const Export = struct {
@@ -24,6 +24,12 @@ pub const Run = struct {
     path: ?[]const u8 = null,
     vulkan: ?bool = null,
     exit_after_first_frame: bool = false,
+    development: bool = false,
+    mcp: bool = false,
+    headless: bool = false,
+    dbus_activated: bool = false,
+    action: ?[]const u8 = null,
+    uris: []const []const u8 = &.{},
 };
 
 pub const Storybook = union(enum) {
@@ -52,10 +58,11 @@ pub const Snapshot = struct {
 
 pub const usage =
     \\Usage:
-    \\  ouroctl run [application.lua|ouro.json] [--vulkan|--software] [--exit-after-first-frame]
-    \\  ouroctl activate <application-id>
-    \\  ouroctl reload <application-id>
-    \\  ouroctl status <application-id>
+    \\  ouroctl run [application.lua|ouro.json] [--dev|--mcp] [--headless] [--dbus-activated]
+    \\              [--vulkan|--software] [--exit-after-first-frame] [--action <name>] [-- <URI>...]
+    \\  ouroctl activate <application-id> [--action <name>] [-- <URI>...]
+    \\  ouroctl dev reload <development-socket>
+    \\  ouroctl dev status <development-socket>
     \\  ouroctl mcp export <application.lua|ouro.json> [--output <file>]
     \\  ouroctl storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
     \\  ouroctl storybook list <stories.lua> [--json]
@@ -73,12 +80,18 @@ pub fn parse(args: []const []const u8) !Command {
         return if (args.len == 2) .help else error.UnexpectedArgument;
     if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version"))
         return if (args.len == 2) .version else error.UnexpectedArgument;
-    if (std.mem.eql(u8, command, "activate"))
-        return .{ .activate = try parseRuntimeTarget(args[2..]) };
-    if (std.mem.eql(u8, command, "reload"))
-        return .{ .reload = try parseRuntimeTarget(args[2..]) };
-    if (std.mem.eql(u8, command, "status"))
-        return .{ .status = try parseRuntimeTarget(args[2..]) };
+    if (std.mem.eql(u8, command, "activate")) {
+        const options = try parseRun(args[2..]);
+        if (options.path == null) return error.ExpectedApplicationId;
+        if (options.development or options.mcp or options.headless or options.dbus_activated or options.vulkan != null or options.exit_after_first_frame) return error.UnknownOption;
+        return .{ .activate = options };
+    }
+    if (std.mem.eql(u8, command, "dev")) {
+        if (args.len < 3) return error.ExpectedDevelopmentCommand;
+        if (std.mem.eql(u8, args[2], "reload")) return .{ .reload = try parseRuntimeTarget(args[3..]) };
+        if (std.mem.eql(u8, args[2], "status")) return .{ .status = try parseRuntimeTarget(args[3..]) };
+        return error.ExpectedDevelopmentCommand;
+    }
     if (std.mem.eql(u8, command, "run")) return .{ .run = try parseRun(args[2..]) };
     if (std.mem.eql(u8, command, "storybook"))
         return .{ .storybook = try parseStorybook(args[2..]) };
@@ -111,19 +124,21 @@ fn parseExport(args: []const []const u8) !Export {
 }
 
 fn parseRuntimeTarget(args: []const []const u8) !RuntimeTarget {
-    if (args.len == 0) return error.ExpectedApplicationId;
+    if (args.len == 0) return error.ExpectedDevelopmentEndpoint;
     if (args.len != 1) return error.UnexpectedArgument;
     if (args[0].len == 0 or std.mem.startsWith(u8, args[0], "--"))
-        return error.ExpectedApplicationId;
-    return .{ .application_id = args[0] };
+        return error.ExpectedDevelopmentEndpoint;
+    return .{ .socket_path = args[0] };
 }
 
 fn parseRun(args: []const []const u8) !Run {
-    var result: Run = undefined;
+    var result: Run = .{};
     var path: ?[]const u8 = null;
     var vulkan: ?bool = null;
     var exit_after_first_frame = false;
-    for (args) |argument| {
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const argument = args[index];
         if (std.mem.eql(u8, argument, "--vulkan")) {
             if (vulkan != null) return error.DuplicateOption;
             vulkan = true;
@@ -132,6 +147,22 @@ fn parseRun(args: []const []const u8) !Run {
             vulkan = false;
         } else if (std.mem.eql(u8, argument, "--exit-after-first-frame")) {
             exit_after_first_frame = true;
+        } else if (std.mem.eql(u8, argument, "--dev")) {
+            if (result.development or result.mcp) return error.DuplicateOption;
+            result.development = true;
+        } else if (std.mem.eql(u8, argument, "--mcp")) {
+            if (result.development or result.mcp) return error.DuplicateOption;
+            result.mcp = true;
+        } else if (std.mem.eql(u8, argument, "--headless")) {
+            result.headless = true;
+        } else if (std.mem.eql(u8, argument, "--dbus-activated")) {
+            result.dbus_activated = true;
+        } else if (try optionValue(args, &index, argument, "--action")) |value| {
+            if (result.action != null) return error.DuplicateOption;
+            result.action = value;
+        } else if (std.mem.eql(u8, argument, "--")) {
+            result.uris = args[index + 1 ..];
+            break;
         } else if (std.mem.startsWith(u8, argument, "--")) {
             return error.UnknownOption;
         } else if (path == null) {
@@ -140,11 +171,11 @@ fn parseRun(args: []const []const u8) !Run {
             return error.UnexpectedArgument;
         }
     }
-    result = .{
-        .path = path,
-        .vulkan = vulkan,
-        .exit_after_first_frame = exit_after_first_frame,
-    };
+    if (result.action != null and result.uris.len != 0) return error.ConflictingActivationArguments;
+    if (result.dbus_activated and (result.development or result.action != null or result.uris.len != 0)) return error.ConflictingActivationArguments;
+    result.path = path;
+    result.vulkan = vulkan;
+    result.exit_after_first_frame = exit_after_first_frame;
     return result;
 }
 
@@ -158,6 +189,7 @@ fn parseStorybook(args: []const []const u8) !Storybook {
 
 fn parseStorybookRun(args: []const []const u8) !StorybookRun {
     const run = try parseRun(args);
+    if (run.development or run.mcp or run.headless or run.dbus_activated or run.action != null or run.uris.len != 0) return error.UnknownOption;
     return .{
         .path = run.path orelse return error.ExpectedStorybookPath,
         .vulkan = run.vulkan,
@@ -253,12 +285,12 @@ test "CLI parses application and Storybook commands" {
     } }, try parse(&.{ "ouroctl", "run", "app.lua" }));
     try std.testing.expectEqualDeep(Command{ .run = .{} }, try parse(&.{ "ouroctl", "run" }));
     try std.testing.expectEqualDeep(
-        Command{ .reload = .{ .application_id = "dev.example.app" } },
-        try parse(&.{ "ouroctl", "reload", "dev.example.app" }),
+        Command{ .reload = .{ .socket_path = "/runtime/ourokit/dev/0123456789abcdef0123456789abcdef" } },
+        try parse(&.{ "ouroctl", "dev", "reload", "/runtime/ourokit/dev/0123456789abcdef0123456789abcdef" }),
     );
     try std.testing.expectEqualDeep(
-        Command{ .status = .{ .application_id = "dev.example.app" } },
-        try parse(&.{ "ouroctl", "status", "dev.example.app" }),
+        Command{ .status = .{ .socket_path = "/runtime/ourokit/dev/0123456789abcdef0123456789abcdef" } },
+        try parse(&.{ "ouroctl", "dev", "status", "/runtime/ourokit/dev/0123456789abcdef0123456789abcdef" }),
     );
     try std.testing.expectEqualDeep(Command{ .storybook = .{ .list = .{
         .path = "stories.lua",
@@ -281,7 +313,7 @@ test "CLI parses application and Storybook commands" {
 
 test "CLI rejects malformed commands and options" {
     try std.testing.expectError(error.ExpectedStorybookPath, parse(&.{ "ouroctl", "storybook", "run" }));
-    try std.testing.expectError(error.ExpectedApplicationId, parse(&.{ "ouroctl", "reload" }));
+    try std.testing.expectError(error.ExpectedDevelopmentEndpoint, parse(&.{ "ouroctl", "dev", "reload" }));
     try std.testing.expectError(error.UnknownCommand, parse(&.{ "ouroctl", "wat" }));
     try std.testing.expectError(error.UnknownOption, parse(&.{ "ouroctl", "run", "app.lua", "--wat" }));
     try std.testing.expectError(error.DuplicateOption, parse(&.{
@@ -304,4 +336,17 @@ test "CLI parses explicit MCP catalog exports and rejects ambiguous output" {
     try std.testing.expectError(error.ExpectedOptionValue, parse(&.{ "ouroctl", "mcp", "export", "app.lua", "--output" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "ouroctl", "mcp", "export", "a.lua", "b.lua" }));
     try std.testing.expectError(error.DuplicateOption, parse(&.{ "ouroctl", "mcp", "export", "a.lua", "--output=a.json", "--output=b.json" }));
+}
+
+test "CLI separates development production and standard activation" {
+    try std.testing.expectEqualDeep(Command{ .run = .{ .path = "app.lua", .development = true, .headless = true } }, try parse(&.{ "ouroctl", "run", "app.lua", "--dev", "--headless" }));
+    try std.testing.expectEqualDeep(Command{ .run = .{ .path = "app.lua", .mcp = true } }, try parse(&.{ "ouroctl", "run", "app.lua", "--mcp" }));
+    try std.testing.expectEqualDeep(Command{ .activate = .{ .path = "org.example.App", .uris = &.{ "file:///tmp/a%20b", "https://example.test/doc" } } }, try parse(&.{ "ouroctl", "activate", "org.example.App", "--", "file:///tmp/a%20b", "https://example.test/doc" }));
+    try std.testing.expectEqualDeep(Command{ .activate = .{ .path = "org.example.App", .action = "NewWindow" } }, try parse(&.{ "ouroctl", "activate", "org.example.App", "--action", "NewWindow" }));
+    try std.testing.expectError(error.DuplicateOption, parse(&.{ "ouroctl", "run", "--mcp", "--dev" }));
+    try std.testing.expectError(error.ConflictingActivationArguments, parse(&.{ "ouroctl", "run", "--dev", "--dbus-activated" }));
+    try std.testing.expectError(error.ConflictingActivationArguments, parse(&.{ "ouroctl", "activate", "org.example.App", "--action", "New", "--", "file:///tmp/a" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "ouroctl", "activate", "org.example.App", "--mcp" }));
+    try std.testing.expectError(error.UnknownCommand, parse(&.{ "ouroctl", "reload", "org.example.App" }));
+    try std.testing.expectError(error.UnknownCommand, parse(&.{ "ouroctl", "status", "org.example.App" }));
 }

@@ -25,40 +25,60 @@ arrow keys scroll rather than change the selected contact.
 
 ```sh
 zig build
-zig-out/bin/ouroctl run examples/contacts/ouro.json --software
+zig-out/bin/ouroctl run examples/contacts/ouro.json --software --dev
 ```
 
-This opens the UI and binds `$XDG_RUNTIME_DIR/ourokit/apps/dev.ourokit.contacts`.
-Repeating the manifest launch forwards `Activate` to that process.
+This opens an independent UI and prints a private development socket. Use
+`ouroctl dev status <socket>` or `ouroctl dev reload <socket>` for that instance.
+Repeated development launches create independent copies. Without `--dev`, the
+sample's `single_instance=true` forwards subsequent launches through the session
+bus, not MCP. Ordinary launch starts no MCP server.
 
-## Systemd user socket activation
+## Desktop and session-bus activation
 
 Install the example into your own account (run these commands from the repo):
 
 ```sh
 install -Dm755 zig-out/bin/ouroctl "$HOME/.local/bin/ouroctl"
-mkdir -p "$HOME/.local/share/ourokit/contacts" "$HOME/.config/systemd/user"
-cp examples/contacts/{app.lua,ouro.json} "$HOME/.local/share/ourokit/contacts/"
-cp -R examples/contacts/assets "$HOME/.local/share/ourokit/contacts/"
-cp examples/contacts/dev.ourokit.contacts.{socket,service} "$HOME/.config/systemd/user/"
-"$HOME/.local/bin/ouroctl" mcp export "$HOME/.local/share/ourokit/contacts/ouro.json" \
-  --output "${XDG_DATA_HOME:-$HOME/.local/share}/ouro/mcp/apps/dev.ourokit.contacts.json"
-systemctl --user daemon-reload
-systemctl --user import-environment WAYLAND_DISPLAY
-systemctl --user enable --now dev.ourokit.contacts.socket
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+mkdir -p "$data/ourokit/contacts" "$data/applications" "$data/dbus-1/services"
+cp examples/contacts/{app.lua,ouro.json} "$data/ourokit/contacts/"
+cp -R examples/contacts/assets "$data/ourokit/contacts/"
+sed -e "s|/usr/bin/ouroctl|$HOME/.local/bin/ouroctl|g" \
+    -e "s|/usr/share/ourokit/contacts|$data/ourokit/contacts|g" \
+    examples/contacts/dev.ourokit.contacts.desktop > "$data/applications/dev.ourokit.contacts.desktop"
+sed -e "s|/usr/bin/ouroctl|$HOME/.local/bin/ouroctl|g" \
+    -e "s|/usr/share/ourokit/contacts|$data/ourokit/contacts|g" \
+    examples/contacts/dev.ourokit.contacts.service > "$data/dbus-1/services/dev.ourokit.contacts.service"
+dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
+"$HOME/.local/bin/ouroctl" activate dev.ourokit.contacts
 ```
 
-The manager must have the current session's `WAYLAND_DISPLAY`. The service's
-`XDG_RUNTIME_DIR` is supplied by the user manager. Headless requests do not need
-a compositor; only `Activate` does. Start the socket, not the service, to let
-systemd activate the process on the first connection.
+The desktop entry and session-bus service share the application ID. The bus
+starts the process with `--dbus-activated`, which waits for the real
+`org.freedesktop.Application.Activate` call before opening UI. The desktop Exec
+fallback launches normally. The sample has no file-opening or desktop-action
+hooks; those operations return NotSupported. Tokens are forwarded to Wayland;
+the compositor decides focus. Remove the desktop/service files to uninstall
+activation. No systemd socket or proprietary activation method is used.
 
-The exported descriptor lets the standalone `ouro-mcp` stdio bridge list tools
-without activating Contacts. Regenerate it when installing an updated version.
-The running service publishes a runtime catalog and sends standard MCP
-tool-list invalidations after successful catalog-changing reloads. Export only
-evaluates the declaration; it does not call the UI factory or action handlers.
-Declaration stdout is redirected to stderr, and declaration stdin is EOF.
+## Optional application tools
+
+To expose the sample's actions, start it explicitly with `--mcp` (after closing
+an ordinary running copy). Add `--headless` only if you want a process that
+never opens UI. This binds `$XDG_RUNTIME_DIR/ourokit/apps/dev.ourokit.contacts`;
+it is separate from desktop activation. Export is optional and starts no app:
+
+```sh
+ouroctl run examples/contacts/ouro.json --mcp
+ouroctl mcp export examples/contacts/ouro.json \
+  --output "${XDG_DATA_HOME:-$HOME/.local/share}/ourokit/mcp/apps/dev.ourokit.contacts.json"
+```
+
+Regenerate the installed descriptor when updating the application. Export
+evaluates only the declaration, not UI factories or action handlers; declaration
+stdout is redirected to stderr and stdin is EOF. Optional consumers can read
+descriptors offline; no external bridge is required.
 
 Invoke tools from a standalone Ourokit Lua script (for example, `/tmp/contacts-call.lua`):
 
@@ -83,16 +103,14 @@ ouro.exit(0)
 "$HOME/.local/bin/ouroctl" activate dev.ourokit.contacts
 ```
 
-The first calls return data/change selection without creating a window.
-Activation shows the selected contact. Renaming it updates the live UI through
+The calls return data/change selection without altering desktop lifecycle.
+Renaming updates the live UI through
 the same shared signal. Missing IDs return an `isError: true` tool result with
 `structuredContent.error.code = "ContactNotFound"` and the ID in
 `structuredContent.error.parameters.id`. The native runtime validates arguments
 and successful output against each action's JSON Schemas. `GetContacts` returns
-all 500 records; `runtime.status`, `runtime.reload`, and `runtime.activate` share
-the same MCP socket. No `initialize` handshake or legacy endpoint is supported.
-
-When no UI has been activated, the process exits after 30 seconds with no
-connections or tasks. Systemd retains its listening socket. Closing the last
-window drains pending calls/output and exits; Quit explicitly requests exit.
-To remove the example's activation, stop and disable its socket and service.
+all 500 records. Runtime status/reload exist only on an explicitly enabled
+development endpoint, never in the production catalog. No `initialize`
+handshake or legacy endpoint is supported. Closing the last window drains
+pending calls/output and exits; Quit explicitly requests exit. A deliberately
+headless process runs until application exit or a termination signal.

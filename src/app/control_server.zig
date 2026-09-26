@@ -8,11 +8,10 @@ const task = @import("../task/root.zig");
 const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
 const catalog = @import("catalog.zig");
 const Publication = @import("catalog_publication.zig").Publication;
-pub const socket_activation = @import("socket_activation.zig");
+const endpoint = @import("control_endpoint.zig");
 
 pub const reload_method = "runtime.reload";
 pub const status_method = "runtime.status";
-pub const activate_method = "runtime.activate";
 
 const client_capacity = 8;
 const receive_capacity = 64 * 1024;
@@ -27,6 +26,26 @@ const Subscription = struct {
 const Waiter = struct {
     sequence: u64,
     call: mcp.CallHandle,
+};
+
+/// Owned by the runner after takeDevelopmentRequest. Keep it across turns;
+/// completion means the final event has settled, not merely been dispatched.
+pub const DevelopmentRequest = struct {
+    token: u64,
+    parameters: std.json.Parsed(mcp.Value),
+
+    pub fn deinit(self: *DevelopmentRequest) void {
+        self.parameters.deinit();
+        self.* = undefined;
+    }
+};
+
+const DevelopmentCall = struct {
+    token: u64,
+    call: mcp.CallHandle,
+    generation: u64,
+    tool: mcp.Value,
+    queued: ?DevelopmentRequest,
 };
 
 const Action = struct {
@@ -63,7 +82,7 @@ const Client = struct {
     received: usize = 0,
     consumed: usize = 0,
     action: ?Action = null,
-    activation: ?mcp.CallHandle = null,
+    development_call: ?DevelopmentCall = null,
     subscriptions: [subscription_capacity]?Subscription = @splat(null),
     closing: bool = false,
     receive_buffer: [receive_capacity]u8 = undefined,
@@ -80,12 +99,18 @@ const Client = struct {
 
     fn deinit(self: *Client) void {
         std.debug.assert(self.action == null);
+        self.clearDevelopment();
         if (self.transmit) |*transmit| transmit.deinit();
         for (&self.subscriptions) |*entry| if (entry.*) |*subscription| subscription.id.deinit();
         self.waiters.deinit();
         self.protocol.deinit();
         _ = linux.close(self.fd);
         self.* = undefined;
+    }
+
+    fn clearDevelopment(self: *Client) void {
+        if (self.development_call) |*pending| if (pending.queued) |*request| request.deinit();
+        self.development_call = null;
     }
 };
 
@@ -99,7 +124,8 @@ pub const ControlServer = struct {
     application_id: []u8,
     path: [:0]u8,
     listener: linux.fd_t,
-    owned_path: ?socket_activation.PathIdentity = null,
+    owned_path: ?endpoint.PathIdentity = null,
+    development: bool,
     listener_operation: ?io_loop.OperationHandle = null,
     listener_terminal: bool = false,
     clients: [client_capacity]?Client = [_]?Client{null} ** client_capacity,
@@ -110,12 +136,11 @@ pub const ControlServer = struct {
     application: ?*const lua.Application = null,
     vm: ?*lua.Vm = null,
     ui_active: bool = false,
-    activation_queued: bool = false,
-    activating: bool = false,
-    activation_token: ?[]u8 = null,
     tools_json: []u8,
     publication: ?Publication = null,
     publication_dirty: bool = false,
+    development_tools: ?std.json.Parsed(mcp.Value) = null,
+    next_development_token: u64 = 1,
 
     pub fn init(
         self: *ControlServer,
@@ -125,30 +150,22 @@ pub const ControlServer = struct {
         application_id: []const u8,
         generation: u64,
         requests: *ReloadRequests,
+        development: bool,
     ) !void {
-        return self.initListener(allocator, loop, environ, application_id, generation, requests, try socket_activation.listener(environ));
-    }
-
-    /// Takes descriptor ownership on success, never pathname ownership.
-    pub fn initWithListener(self: *ControlServer, allocator: std.mem.Allocator, loop: *io_loop.Loop, environ: std.process.Environ, application_id: []const u8, generation: u64, requests: *ReloadRequests, listener: linux.fd_t) !void {
-        return self.initListener(allocator, loop, environ, application_id, generation, requests, listener);
-    }
-
-    fn initListener(self: *ControlServer, allocator: std.mem.Allocator, loop: *io_loop.Loop, environ: std.process.Environ, application_id: []const u8, generation: u64, requests: *ReloadRequests, inherited: ?linux.fd_t) !void {
-        const path = if (inherited) |fd| try socket_activation.listenerPath(allocator, fd) else try socket_activation.socketPath(allocator, environ, application_id);
+        const path = try endpoint.socketPath(allocator, environ, application_id, development);
         errdefer allocator.free(path);
         const owned_id = try allocator.dupe(u8, application_id);
         errdefer allocator.free(owned_id);
-        const tools_json = try catalog.tools(allocator, null);
+        const tools_json = try catalog.tools(allocator, null, development);
         errdefer allocator.free(tools_json);
-        if (inherited == null) try socket_activation.makeParentDirectories(allocator, path);
-        const listener = inherited orelse try wayring.unix_socket.listen(path, 16);
-        errdefer if (inherited == null) {
+        try endpoint.makeParentDirectories(allocator, path);
+        const listener = try wayring.unix_socket.listen(path, 16);
+        errdefer {
             _ = linux.close(listener);
             wayring.unix_socket.unlink(path) catch {};
-        };
-        try socket_activation.configure(listener);
-        const owned_path = if (inherited == null) try socket_activation.PathIdentity.read(path) else null;
+        }
+        if (linux.errno(linux.chmod(path, 0o600)) != .SUCCESS) return error.SocketPermissionsFailed;
+        const owned_path = try endpoint.PathIdentity.read(path);
         const operation = try loop.prepareAccept(listener);
         self.* = .{
             .allocator = allocator,
@@ -160,8 +177,9 @@ pub const ControlServer = struct {
             .owned_path = owned_path,
             .listener_operation = operation,
             .generation = generation,
+            .development = development,
             .tools_json = tools_json,
-            .publication = Publication.init(allocator, environ, application_id, path) catch null,
+            .publication = if (development) null else Publication.init(allocator, environ, application_id, path) catch null,
         };
     }
 
@@ -171,9 +189,9 @@ pub const ControlServer = struct {
         for (&self.clients) |*entry| std.debug.assert(entry.* == null);
         if (self.listener >= 0) _ = linux.close(self.listener);
         if (self.owned_path) |identity| identity.unlink(self.path);
-        if (self.activation_token) |token| self.allocator.free(token);
         if (self.failure) |*failure| failure.deinit(self.allocator);
         if (self.publication) |*publication| publication.deinit();
+        if (self.development_tools) |*tools| tools.deinit();
         self.allocator.free(self.tools_json);
         self.allocator.free(self.path);
         self.allocator.free(self.application_id);
@@ -182,6 +200,66 @@ pub const ControlServer = struct {
 
     pub fn socketPath(self: *const ControlServer) []const u8 {
         return self.path;
+    }
+
+    /// Register a fixed array of runtime.* tool schemas before admitting peers.
+    /// Production cannot register these tools. The runner owns their semantics.
+    pub fn registerDevelopmentTools(self: *ControlServer, json: []const u8) !void {
+        if (!self.development) return error.DevelopmentDisabled;
+        if (self.development_tools != null or self.hasClients()) return error.DevelopmentToolsAlreadyRegistered;
+        var doc = try std.json.parseFromSlice(mcp.Value, self.allocator, json, .{ .allocate = .alloc_always });
+        errdefer doc.deinit();
+        if (doc.value != .array) return error.InvalidDevelopmentTools;
+        for (doc.value.array.items, 0..) |tool, index| {
+            const name = mcp.get(tool, "name") orelse return error.InvalidDevelopmentTools;
+            if (name != .string or !std.mem.startsWith(u8, name.string, "runtime.") or
+                std.mem.eql(u8, name.string, status_method) or std.mem.eql(u8, name.string, reload_method)) return error.InvalidDevelopmentTools;
+            for (doc.value.array.items[0..index]) |previous| if (mcp.isString(mcp.get(previous, "name"), name.string)) return error.DuplicateToolName;
+            try mcp.schema.check(mcp.get(tool, "inputSchema") orelse return error.InvalidDevelopmentTools);
+            try mcp.schema.check(mcp.get(tool, "outputSchema") orelse return error.InvalidDevelopmentTools);
+        }
+        const tools = try catalog.toolsWithDevelopment(self.allocator, self.application, true, doc.value);
+        self.allocator.free(self.tools_json);
+        self.tools_json = tools;
+        self.development_tools = doc;
+    }
+
+    /// Call at a runner safe point, never from a socket completion callback.
+    /// The returned request owns {name, arguments}; release it after playback.
+    pub fn takeDevelopmentRequest(self: *ControlServer) ?DevelopmentRequest {
+        for (&self.clients) |*entry| if (entry.*) |*client| {
+            if (client.closing) continue;
+            if (client.development_call) |*pending| if (pending.queued) |request| {
+                pending.queued = null;
+                return request;
+            };
+        };
+        return null;
+    }
+
+    /// Check before each playback advance. Disconnect, cancellation, reload,
+    /// and shutdown invalidate a token; client slot reuse cannot revive it.
+    pub fn developmentPending(self: *const ControlServer, token: u64) bool {
+        for (self.clients) |entry| if (entry) |client| if (!client.closing) {
+            if (client.development_call) |pending| if (pending.token == token and pending.generation == self.generation) return true;
+        };
+        return false;
+    }
+
+    pub fn completeDevelopment(self: *ControlServer, token: u64, result: mcp.Value, is_error: bool) !bool {
+        if (!self.developmentPending(token)) return false;
+        for (&self.clients) |*entry| if (entry.*) |*client| if (client.development_call) |pending| {
+            if (pending.token != token) continue;
+            if (!is_error and !mcp.schema.validate(mcp.get(pending.tool, "outputSchema").?, result)) return error.InvalidDevelopmentOutput;
+            sendToolResult(&client.protocol, pending.call, result, is_error) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try self.closeClient(client);
+                return false;
+            };
+            client.clearDevelopment();
+            return true;
+        };
+        return false;
     }
 
     pub fn setReloading(self: *ControlServer, reloading: bool) void {
@@ -214,9 +292,8 @@ pub const ControlServer = struct {
     /// A discarded preparation has no effect on the live server.
     pub fn prepareApplication(self: *ControlServer, application: *const lua.Application, vm: *lua.Vm) !PreparedApplication {
         if (!std.mem.eql(u8, self.application_id, application.id)) return error.ApplicationIdChanged;
-        if (!application.hasActions()) return error.ApplicationActionsDisabled;
         if (vm.state != application.state) return error.ApplicationVmMismatch;
-        const tools_json = try catalog.tools(self.allocator, application);
+        const tools_json = try catalog.toolsWithDevelopment(self.allocator, application, self.development, if (self.development_tools) |tools| tools.value else null);
         return .{ .application = application, .vm = vm, .allocator = self.allocator, .tools_json = tools_json, .changed = !std.mem.eql(u8, self.tools_json, tools_json) };
     }
 
@@ -235,19 +312,8 @@ pub const ControlServer = struct {
         }
     }
 
-    pub fn takeActivation(self: *ControlServer) bool {
-        if (!self.activation_queued) return false;
-        self.activation_queued = false;
-        return true;
-    }
-
     pub fn setActivated(self: *ControlServer, active: bool) void {
         self.ui_active = active;
-    }
-
-    /// The most recently supplied coalesced token, borrowed until completion.
-    pub fn activationToken(self: *const ControlServer) ?[]const u8 {
-        return self.activation_token;
     }
 
     pub fn hasClients(self: *const ControlServer) bool {
@@ -265,49 +331,13 @@ pub const ControlServer = struct {
 
     /// Idle accept/read operations and open clients do not count as work.
     pub fn hasPendingCalls(self: *const ControlServer) bool {
-        if (self.activating or self.activation_queued) return true;
         for (self.clients) |entry| if (entry) |client| {
-            if (client.action != null or client.activation != null or client.waiters.items.len != 0 or
+            if (client.action != null or client.waiters.items.len != 0 or
                 client.transmit != null or client.protocol.pending.items.len != 0 or
                 client.protocol.events.items.len != 0 or
                 client.protocol.transmits.items.len != 0 or client.consumed < client.received) return true;
         };
         return false;
-    }
-
-    pub fn activationSucceeded(self: *ControlServer) !void {
-        if (self.activation_token) |token| self.allocator.free(token);
-        self.activation_token = null;
-        self.ui_active = true;
-        self.activating = false;
-        self.activation_queued = false;
-        for (&self.clients) |*entry| if (entry.*) |*client| {
-            if (client.activation) |call| {
-                if (!client.closing and !self.shutting_down) sendToolResult(&client.protocol, call, .{ .object = .empty }, false) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    try self.closeClient(client);
-                };
-                client.activation = null;
-            }
-        };
-        try self.serviceRequests();
-    }
-
-    pub fn activationFailed(self: *ControlServer, err: anyerror) !void {
-        if (self.activation_token) |token| self.allocator.free(token);
-        self.activation_token = null;
-        self.activating = false;
-        self.activation_queued = false;
-        for (&self.clients) |*entry| if (entry.*) |*client| {
-            if (client.activation) |call| {
-                if (!client.closing and !self.shutting_down) sendToolError(&client.protocol, call, "ActivateFailed", @errorName(err), null) catch |send_err| {
-                    if (send_err == error.OutOfMemory) return send_err;
-                    try self.closeClient(client);
-                };
-                client.activation = null;
-            }
-        };
-        try self.serviceRequests();
     }
 
     /// Consumes scheduler grants for custom actions, isolating Lua failures to
@@ -425,11 +455,21 @@ pub const ControlServer = struct {
             if (self.publication) |*publication| publication.publish(self.application_id, self.tools_json) catch {};
         }
         for (&self.clients) |*entry| if (entry.*) |*client| {
+            if (!client.closing) if (client.development_call) |pending| if (pending.generation != self.generation) {
+                sendToolError(&client.protocol, pending.call, "DevelopmentCanceled", "Source generation retired", null) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try self.closeClient(client);
+                };
+                client.clearDevelopment();
+            };
             self.pumpClient(client) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 try self.closeClient(client);
             };
         };
+        // A parse failure can close a peer with no kernel operation left to
+        // complete. Release it before the runner sleeps waiting for unrelated IO.
+        self.collectClosed();
     }
 
     pub fn dispatch(self: *ControlServer, completion: io_loop.SocketCompletion) !bool {
@@ -515,6 +555,7 @@ pub const ControlServer = struct {
     fn closeClient(self: *ControlServer, client: *Client) !void {
         if (client.closing) return;
         client.closing = true;
+        client.clearDevelopment();
         if (client.action) |action| try action.vm.scheduler.queueScopeCancellation(action.scope);
         if (client.operation) |operation| try self.loop.prepareCancel(operation);
         if (client.read_operation) |operation| try self.loop.prepareCancel(operation);
@@ -634,6 +675,11 @@ pub const ControlServer = struct {
             if (std.mem.eql(u8, request.method, "notifications/cancelled")) {
                 const id = mcp.get(request.params orelse return, "requestId") orelse return;
                 const target = client.protocol.handleForId(id) orelse return;
+                if (client.development_call) |pending| if (pending.call.value == target.value) {
+                    try sendToolError(&client.protocol, target, "DevelopmentCanceled", "Caller canceled request", null);
+                    client.clearDevelopment();
+                    return;
+                };
                 for (&client.subscriptions) |*entry| if (entry.*) |*subscription| {
                     if (subscription.call.value != target.value) continue;
                     var arena: std.heap.ArenaAllocator = .init(self.allocator);
@@ -684,10 +730,22 @@ pub const ControlServer = struct {
         if (name_value != .string) return client.protocol.sendError(call, -32602, "Invalid tool name", null);
         const name = name_value.string;
         const arguments = mcp.get(params, "arguments") orelse mcp.Value{ .object = .empty };
+        if (self.development_tools) |tools| for (tools.value.array.items) |tool| {
+            if (!mcp.isString(mcp.get(tool, "name"), name)) continue;
+            if (!mcp.schema.validate(mcp.get(tool, "inputSchema").?, arguments)) return client.protocol.sendError(call, -32602, "Invalid tool arguments", null);
+            if (client.development_call != null) return sendToolError(&client.protocol, call, "Busy", "One development operation per connection", null);
+            const bytes = try std.json.Stringify.valueAlloc(self.allocator, params, .{});
+            defer self.allocator.free(bytes);
+            const owned = try std.json.parseFromSlice(mcp.Value, self.allocator, bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
+            const token = self.next_development_token;
+            self.next_development_token += 1;
+            client.development_call = .{ .token = token, .call = call, .generation = self.generation, .tool = tool, .queued = .{ .token = token, .parameters = owned } };
+            return;
+        };
         var builtins = try std.json.parseFromSlice(mcp.Value, self.allocator, catalog.builtin_tools, .{});
         defer builtins.deinit();
         const tool = for (builtins.value.array.items) |item| {
-            if (mcp.isString(mcp.get(item, "name"), name)) break item;
+            if (self.development and mcp.isString(mcp.get(item, "name"), name)) break item;
         } else (if (self.application) |app| app.actionTool(name) else null) orelse
             return client.protocol.sendError(call, -32602, "Unknown tool", null);
         if (!mcp.schema.validate(mcp.get(tool, "inputSchema").?, arguments))
@@ -700,21 +758,6 @@ pub const ControlServer = struct {
             client.waiters.appendAssumeCapacity(.{ .sequence = sequence, .call = call });
         } else if (std.mem.eql(u8, name, status_method)) {
             try self.sendStatus(client, call);
-        } else if (std.mem.eql(u8, name, activate_method)) {
-            if (client.activation != null) return sendToolError(&client.protocol, call, "Busy", "Activation already pending", null);
-            if (arguments.object.get("activationToken")) |value| {
-                if (value == .string) {
-                    const token = try self.allocator.dupe(u8, value.string);
-                    if (self.activation_token) |old| self.allocator.free(old);
-                    self.activation_token = token;
-                }
-            }
-            if (!self.activating) {
-                self.activating = true;
-                self.activation_queued = true;
-            }
-            // Even an active UI needs the host to present/focus its window.
-            client.activation = call;
         } else {
             if (client.action != null) return sendToolError(&client.protocol, call, "Busy", "One custom action per connection", null);
             const application = self.application.?;
@@ -848,7 +891,7 @@ fn same(first: io_loop.OperationHandle, second: io_loop.OperationHandle) bool {
 }
 
 test "runtime tool schemas use the supported JSON Schema subset" {
-    const bytes = try catalog.tools(std.testing.allocator, null);
+    const bytes = try catalog.tools(std.testing.allocator, null, true);
     defer std.testing.allocator.free(bytes);
     var tools = try std.json.parseFromSlice(mcp.Value, std.testing.allocator, bytes, .{});
     defer tools.deinit();
@@ -866,15 +909,6 @@ test "runtime server holds Reload reply until the generation commits" {
         .block = try environment_map.createPosixBlock(std.testing.allocator, .{}),
     };
     defer environment.block.deinit(std.testing.allocator);
-
-    const expected_path = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "/tmp/ouro-{d}.mcp",
-        .{linux.getpid()},
-    );
-    defer std.testing.allocator.free(expected_path);
-    const direct_listener = try wayring.unix_socket.listen(expected_path, 16);
-    defer wayring.unix_socket.unlink(expected_path) catch {};
 
     var loop: io_loop.Loop = undefined;
     try loop.init(std.testing.allocator, 16, 8);
@@ -920,14 +954,14 @@ test "runtime server holds Reload reply until the generation commits" {
     defer application.deinit();
     var requests: ReloadRequests = .{};
     var control: ControlServer = undefined;
-    try control.initWithListener(
+    try control.init(
         std.testing.allocator,
         &loop,
         environment,
         "dev.ourokit.test",
         1,
         &requests,
-        direct_listener,
+        true,
     );
     try control.setApplication(&application, &vm);
     try std.testing.expect(!control.hasClients() and !control.hasPendingCalls());
@@ -958,7 +992,10 @@ test "runtime server holds Reload reply until the generation commits" {
         try std.testing.expect(mcp.isString(mcp.get(mcp.get(descriptor.value, "endpoint").?, "runtime_path"), "ourokit/apps/dev.ourokit.test"));
         const exported_tools = try catalog.serialize(std.testing.allocator, mcp.get(descriptor.value, "tools").?);
         defer std.testing.allocator.free(exported_tools);
-        try std.testing.expectEqualStrings(before, exported_tools);
+        const production_tools = try catalog.tools(std.testing.allocator, &application, false);
+        defer std.testing.allocator.free(production_tools);
+        try std.testing.expectEqualStrings(production_tools, exported_tools);
+        try std.testing.expect(std.mem.indexOf(u8, exported_tools, "\"name\":\"runtime.") == null);
     }
 
     _ = try loop.submit();
@@ -1018,36 +1055,8 @@ test "runtime server holds Reload reply until the generation commits" {
         "\"applicationId\":\"dev.ourokit.test\"",
     ) != null);
 
-    // Activation replies wait for the host, including presentation of an
-    // already-active UI. A failed first attempt can be retried without reload.
-    for (0..3) |attempt| {
-        const activation_request = try testRequest(activate_method, if (attempt == 1) "{\"activationToken\":\"test-token\"}" else "{}");
-        defer std.testing.allocator.free(activation_request);
-        try std.testing.expectEqual(activation_request.len, linux.write(client, activation_request.ptr, activation_request.len));
-        while (!control.activation_queued) {
-            try testService(&control, &vm);
-            if (control.activation_queued) break;
-            try testDispatch(&control, &vm, &outbound);
-        }
-        try std.testing.expect(control.hasClients() and control.hasPendingCalls());
-        try std.testing.expect(control.takeActivation());
-        try std.testing.expect(!control.takeActivation());
-        try std.testing.expect(control.clients[0].?.protocol.transmits.items.len == 0);
-        if (attempt == 1) try std.testing.expectEqualStrings("test-token", control.activationToken().?);
-        if (attempt == 0) try control.activationFailed(error.UiUnavailable) else try control.activationSucceeded();
-        try std.testing.expect(control.activationToken() == null);
-        var activation_response: [2048]u8 = undefined;
-        const bytes = try testReceive(&control, &vm, &outbound, client, &activation_response);
-        if (attempt == 0) {
-            try std.testing.expect(std.mem.indexOf(u8, bytes, "ActivateFailed") != null);
-            try std.testing.expect(!control.ui_active);
-        } else {
-            try std.testing.expect(std.mem.indexOf(u8, bytes, "\"structuredContent\":{}") != null);
-            try std.testing.expect(control.ui_active);
-        }
-    }
-
     const cases = [_]struct { method: []const u8, parameters: []const u8 = "{}", expected: []const u8 }{
+        .{ .method = "runtime.activate", .expected = "Unknown tool" },
         .{ .method = "Subtract", .parameters = "{\"left\":19,\"right\":7}", .expected = "\"structuredContent\":{\"difference\":12}" },
         .{ .method = "Nothing", .expected = "\"structuredContent\":{}" },
         .{ .method = "Echo", .expected = "\"structuredContent\":{}" },
@@ -1113,10 +1122,6 @@ test "runtime server holds Reload reply until the generation commits" {
         try testDispatch(&control, &vm, &outbound);
     }
     control.deinit();
-    // The supplied listener was closed, but its pathname belongs to the caller.
-    const surviving_path = try std.testing.allocator.dupeZ(u8, expected_path);
-    defer std.testing.allocator.free(surviving_path);
-    _ = try socket_activation.PathIdentity.read(surviving_path);
 }
 
 test "runtime server stable listener never replaces an existing owner" {
@@ -1140,14 +1145,13 @@ test "runtime server stable listener never replaces an existing owner" {
     defer loop.deinit();
     var requests: ReloadRequests = .{};
     var first: ControlServer = undefined;
-    try first.init(std.testing.allocator, &loop, environ, "dev.test.owner", 1, &requests);
+    try first.init(std.testing.allocator, &loop, environ, "dev.test.owner", 1, &requests, false);
     const path = try std.testing.allocator.dupeZ(u8, first.socketPath());
     defer std.testing.allocator.free(path);
-    const identity = try socket_activation.PathIdentity.read(path);
+    const identity = try endpoint.PathIdentity.read(path);
     var second: ControlServer = undefined;
-    try std.testing.expectError(error.AddressInUse, second.init(std.testing.allocator, &loop, environ, "dev.test.owner", 1, &requests));
-    try std.testing.expectEqual(identity, try socket_activation.PathIdentity.read(path));
-    try socket_activation.validate(first.listener);
+    try std.testing.expectError(error.AddressInUse, second.init(std.testing.allocator, &loop, environ, "dev.test.owner", 1, &requests, false));
+    try std.testing.expectEqual(identity, try endpoint.PathIdentity.read(path));
     try first.beginShutdown();
     while (!first.quiescent()) {
         _ = try loop.submit();
@@ -1158,7 +1162,91 @@ test "runtime server stable listener never replaces an existing owner" {
         }
     }
     first.deinit();
-    try std.testing.expectError(error.SocketActivationSystemCallFailed, socket_activation.PathIdentity.read(path));
+    try std.testing.expectError(error.ControlEndpointSystemCallFailed, endpoint.PathIdentity.read(path));
+}
+
+test "runtime server development requests remain pending across turns and cancellation" {
+    const a = std.testing.allocator;
+    var loop: io_loop.Loop = undefined;
+    var requests: ReloadRequests = .{};
+    var control: ControlServer = .{
+        .allocator = a,
+        .loop = &loop,
+        .requests = &requests,
+        .application_id = try a.dupe(u8, "dev.test.pending"),
+        .path = try a.dupeZ(u8, "/unused"),
+        .listener = -1,
+        .development = false,
+        .generation = 1,
+        .tools_json = try catalog.tools(a, null, false),
+    };
+    defer control.deinit();
+    defer control.beginShutdown() catch unreachable;
+    const tools =
+        \\[{"name":"runtime.test","inputSchema":{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]},"outputSchema":{"type":"object","properties":{"settled":{"type":"boolean"}},"required":["settled"]}}]
+    ;
+    try std.testing.expectError(error.DevelopmentDisabled, control.registerDevelopmentTools(tools));
+    control.development = true;
+    try control.registerDevelopmentTools(tools);
+    control.clients[0] = try Client.init(a, -1);
+    const client = &control.clients[0].?;
+    const wire = try testRequest("runtime.test", "{\"value\":17}");
+    defer a.free(wire);
+    try testFeedDevelopment(&control, client, wire);
+    var first = control.takeDevelopmentRequest().?;
+    defer first.deinit();
+    try std.testing.expect(control.takeDevelopmentRequest() == null);
+    try std.testing.expect(control.developmentPending(first.token));
+    try std.testing.expect(client.protocol.takeTransmit() == null);
+    try std.testing.expect(mcp.isString(mcp.get(first.parameters.value, "name"), "runtime.test"));
+    try std.testing.expectEqualStrings("17", mcp.get(mcp.get(first.parameters.value, "arguments").?, "value").?.number_string);
+    var result = try std.json.parseFromSlice(mcp.Value, a, "{\"settled\":true}", .{});
+    defer result.deinit();
+    try std.testing.expectError(error.InvalidDevelopmentOutput, control.completeDevelopment(first.token, .null, false));
+    try std.testing.expect(try control.completeDevelopment(first.token, result.value, false));
+    try std.testing.expect(!try control.completeDevelopment(first.token, result.value, false));
+    var reply = client.protocol.takeTransmit().?;
+    try std.testing.expect(std.mem.indexOf(u8, reply.remaining(), "\"settled\":true") != null);
+    reply.deinit();
+
+    try testFeedDevelopment(&control, client, wire);
+    var canceled = control.takeDevelopmentRequest().?;
+    defer canceled.deinit();
+    try std.testing.expect(canceled.token != first.token);
+    try testFeedDevelopment(&control, client, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n");
+    try std.testing.expect(!control.developmentPending(canceled.token));
+    try std.testing.expect(!try control.completeDevelopment(canceled.token, result.value, false));
+    reply = client.protocol.takeTransmit().?;
+    try std.testing.expect(std.mem.indexOf(u8, reply.remaining(), "DevelopmentCanceled") != null);
+    reply.deinit();
+
+    try testFeedDevelopment(&control, client, wire);
+    var retired = control.takeDevelopmentRequest().?;
+    defer retired.deinit();
+    control.generation += 1;
+    try std.testing.expect(!control.developmentPending(retired.token));
+    try std.testing.expect(!try control.completeDevelopment(retired.token, result.value, false));
+    try control.closeClient(client);
+    control.collectClosed();
+    control.clients[0] = try Client.init(a, -1);
+    try testFeedDevelopment(&control, &control.clients[0].?, wire);
+    var replacement = control.takeDevelopmentRequest().?;
+    defer replacement.deinit();
+    try std.testing.expect(replacement.token != retired.token);
+    try std.testing.expect(!control.developmentPending(retired.token));
+    try control.beginShutdown();
+    try std.testing.expect(!control.developmentPending(replacement.token));
+}
+
+fn testFeedDevelopment(control: *ControlServer, client: *Client, wire: []const u8) !void {
+    try std.testing.expectEqual(wire.len, try client.protocol.feed(wire));
+    while (client.protocol.takeEvent()) |value| {
+        var event = value;
+        defer event.deinit();
+        switch (event) {
+            .call => |call| try control.handleCall(client, call.handle, &call.request),
+        }
+    }
 }
 
 fn testService(control: *ControlServer, vm: *lua.Vm) !void {

@@ -73,6 +73,7 @@ pub const SourceGeneration = struct {
     asset_root: ?std.os.linux.fd_t = null,
     bootstrap: ?lua.ApplicationBootstrap = null,
     ui_task: ?lua.TaskHandle = null,
+    desktop_task: ?lua.TaskHandle = null,
     application_ready: bool = false,
     services: ?UiServices = null,
     config: Config = .{},
@@ -182,6 +183,7 @@ pub const SourceGeneration = struct {
         self.shell_workspaces = null;
         self.bootstrap = null;
         self.ui_task = null;
+        self.desktop_task = null;
         self.application_ready = false;
         self.window_owners = null;
         self.window_owner = .invalid;
@@ -523,12 +525,17 @@ pub const SourceGeneration = struct {
             std.meta.eql(try self.vm.schedulerHandle(handle), scheduler_handle)
         else
             false;
+        const is_desktop = if (self.desktop_task) |handle|
+            std.meta.eql(try self.vm.schedulerHandle(handle), scheduler_handle)
+        else
+            false;
         const result = self.vm.resumeRunnable(scheduler_handle) catch |err| {
             if (is_bootstrap) {
                 self.bootstrap.?.deinit();
                 self.bootstrap = null;
             }
             if (is_ui) self.ui_task = null;
+            if (is_desktop) self.desktop_task = null;
             return err;
         };
         if (result == .canceled and is_bootstrap) {
@@ -536,6 +543,14 @@ pub const SourceGeneration = struct {
             self.bootstrap = null;
         }
         if (result == .canceled and is_ui) self.ui_task = null;
+        if (result == .canceled and is_desktop) self.desktop_task = null;
+        if (result == .completed and is_desktop) {
+            const c = @import("../lua/c.zig");
+            const top = c.lua_gettop(self.vm.state);
+            defer c.lua_settop(self.vm.state, top);
+            try self.vm.takeRetainedValue(self.desktop_task.?);
+            self.desktop_task = null;
+        }
         if (result == .completed and is_bootstrap)
             try self.finishBootstrap(diagnostic);
         if (result == .completed and is_ui) {
