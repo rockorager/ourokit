@@ -6,6 +6,7 @@ pub const Command = union(enum) {
     activate: Run,
     reload: RuntimeTarget,
     status: RuntimeTarget,
+    development: Development,
     run: Run,
     storybook: Storybook,
     mcp_export: Export,
@@ -13,6 +14,13 @@ pub const Command = union(enum) {
 
 pub const RuntimeTarget = struct {
     socket_path: []const u8,
+};
+
+pub const Development = struct {
+    operation: enum { inspect, input, capture, diagnostics, metrics },
+    socket_path: []const u8,
+    arguments: []const u8 = "{}",
+    output_path: ?[]const u8 = null,
 };
 
 pub const Export = struct {
@@ -63,6 +71,8 @@ pub const usage =
     \\  ouroctl activate <application-id> [--action <name>] [-- <URI>...]
     \\  ouroctl dev reload <development-socket>
     \\  ouroctl dev status <development-socket>
+    \\  ouroctl dev inspect|input|capture|diagnostics|metrics <development-socket> [JSON]
+    \\              [--output <PNG-path>]  (capture only)
     \\  ouroctl mcp export <application.lua|ouro.json> [--output <file>]
     \\  ouroctl storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
     \\  ouroctl storybook list <stories.lua> [--json]
@@ -90,6 +100,8 @@ pub fn parse(args: []const []const u8) !Command {
         if (args.len < 3) return error.ExpectedDevelopmentCommand;
         if (std.mem.eql(u8, args[2], "reload")) return .{ .reload = try parseRuntimeTarget(args[3..]) };
         if (std.mem.eql(u8, args[2], "status")) return .{ .status = try parseRuntimeTarget(args[3..]) };
+        if (std.meta.stringToEnum(@FieldType(Development, "operation"), args[2])) |operation|
+            return .{ .development = try parseDevelopment(operation, args[3..]) };
         return error.ExpectedDevelopmentCommand;
     }
     if (std.mem.eql(u8, command, "run")) return .{ .run = try parseRun(args[2..]) };
@@ -129,6 +141,30 @@ fn parseRuntimeTarget(args: []const []const u8) !RuntimeTarget {
     if (args[0].len == 0 or std.mem.startsWith(u8, args[0], "--"))
         return error.ExpectedDevelopmentEndpoint;
     return .{ .socket_path = args[0] };
+}
+
+fn parseDevelopment(operation: @FieldType(Development, "operation"), args: []const []const u8) !Development {
+    if (args.len == 0) return error.ExpectedDevelopmentEndpoint;
+    const target = try parseRuntimeTarget(args[0..1]);
+    var result: Development = .{ .operation = operation, .socket_path = target.socket_path };
+    var arguments_set = false;
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        if (try optionValue(args, &index, args[index], "--output")) |path| {
+            if (operation != .capture) return error.UnknownOption;
+            if (result.output_path != null) return error.DuplicateOption;
+            if (path.len == 0 or std.mem.startsWith(u8, path, "--")) return error.ExpectedOptionValue;
+            result.output_path = path;
+        } else if (std.mem.startsWith(u8, args[index], "--")) {
+            return error.UnknownOption;
+        } else if (arguments_set) {
+            return error.UnexpectedArgument;
+        } else {
+            result.arguments = args[index];
+            arguments_set = true;
+        }
+    }
+    return result;
 }
 
 fn parseRun(args: []const []const u8) !Run {
@@ -309,6 +345,16 @@ test "CLI parses application and Storybook commands" {
         "ouroctl",  "storybook", "snapshot", "stories.lua", "--story=button/default",
         "--output", "artifacts", "--json",
     }));
+}
+
+test "CLI development operations retain JSON and limit output to capture" {
+    try std.testing.expectEqualDeep(Command{ .development = .{ .operation = .inspect, .socket_path = "/private/dev/socket" } }, try parse(&.{ "ouroctl", "dev", "inspect", "/private/dev/socket" }));
+    const arguments = "{\"window\":\"secondary\",\"token\":\"1:9:3:4:5\"}";
+    try std.testing.expectEqualDeep(Command{ .development = .{ .operation = .capture, .socket_path = "/private/dev/socket", .arguments = arguments, .output_path = "frame.png" } }, try parse(&.{ "ouroctl", "dev", "capture", "/private/dev/socket", "--output=frame.png", arguments }));
+    try std.testing.expectError(error.ExpectedDevelopmentEndpoint, parse(&.{ "ouroctl", "dev", "input" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "ouroctl", "dev", "metrics", "/private/dev/socket", "{}", "{}" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "ouroctl", "dev", "inspect", "/private/dev/socket", "--output=wrong.png" }));
+    try std.testing.expectError(error.DuplicateOption, parse(&.{ "ouroctl", "dev", "capture", "/private/dev/socket", "--output=a.png", "--output=b.png" }));
 }
 
 test "CLI rejects malformed commands and options" {

@@ -93,9 +93,11 @@ surfaces, omitted IDs retire them, and retained IDs preserve their widget
 runtime. Reopening a removed ID mounts fresh widgets after teardown drains.
 An empty reactive list keeps the application alive for later state changes.
 Evaluation and parsing failures retain the last valid list. `outputs = "all"` still
-expands to stable per-output IDs. Source reload currently requires the same
-window ID set, so dismiss transient windows before reloading a source whose
-initial state does not declare them.
+expands to stable per-output IDs. Source reload retains matching IDs and their
+widget identity, retires removed IDs, and prepares added IDs before committing.
+Preparing additions needs temporary window-slot headroom while removed windows
+remain live; exceeding it rejects the candidate without replacing the last-good
+UI. See [source reload](hot-reload.md) for validation and commit boundaries.
 
 Widget constructors take one props table and return an opaque description;
 calling a constructor does not emit UI. A window, layer surface, or story's
@@ -338,7 +340,7 @@ and closures; invoking a method never implicitly initializes Wayland.
 
 Declaring `actions` does not start a server or select single-instance policy.
 `ouroctl run --mcp` explicitly enables an optional production actions endpoint;
-`--dev` instead creates a private development endpoint with status/reload tools,
+`--dev` instead creates a private development endpoint with live runtime tools,
 even when `actions` is absent. Each action has a description, `inputSchema`, `outputSchema`, and
 handler. The table key is the exact tool name; `runtime.` names are reserved.
 Use `tools/call` with `{name, arguments}`. There is no `interface` field, IDL,
@@ -440,6 +442,61 @@ prepares a fresh UI in a candidate source generation and atomically replaces the
 active generation only after its windows, schemas and handlers validate.
 Reload resets Lua state. Development enablement is fixed for each process;
 declared action sets may change on reload. Production never exposes reload.
+
+### Live development operations
+
+`ouroctl run app.lua --dev` logs `development socket: <path>`. Pass that exact
+instance path to each command; development never discovers a production app ID.
+The private, same-UID endpoint also accepts MCP `tools/call` with the corresponding
+`runtime.inspect`, `runtime.input`, `runtime.capture`, `runtime.diagnostics`, and
+`runtime.metrics` names. These tools are absent from `--mcp` production endpoints.
+
+```sh
+ouroctl dev inspect "$socket"
+ouroctl dev inspect "$socket" '{"window":"main"}'
+ouroctl dev input "$socket" '{"window":"main","token":"TOKEN","action":"click","target":"root/save"}'
+ouroctl dev capture "$socket" '{"window":"main","token":"FRESH_TOKEN"}' --output frame.png
+ouroctl dev metrics "$socket" '{"window":"main"}'
+ouroctl dev diagnostics "$socket"
+ouroctl dev reload "$socket"
+```
+
+Inspection without `window` lists live windows, handles, sizes and opaque tokens.
+With `window`, it returns `windows: [{window, token, nodes}]`: semantic paths,
+roles, labels, values, logical bounds, enabled/checked/selected/focused state,
+text selection and scroll offsets. Semantic IDs are strings. Paths can be null
+for unkeyed or ambiguous nodes; bounds may extend beyond clips. Snapshots fail
+explicitly above 1,024 nodes or 64 KiB of text instead of silently truncating.
+
+Input and capture require a fresh token from inspection. Reinspect after
+`StaleDevelopmentTarget`; tokens cover window identity, source generation and
+runtime/scene revisions, not just the path. Input accepts `click` or `hover`
+with `target`, `scroll` with `target` and signed `delta`, `key` with a logical
+`key` name and optional `shift`/`control`/`alt`/`logo`, or `text` with UTF-8 `text`.
+Keys include `tab`, `enter`, `space`, `escape`, `backspace`, `delete`, `home`,
+`end`, `page_up`, `page_down`, `arrow_left/right/up/down`, and lowercase letters.
+Text types printable characters into the focused editable field through normal
+translated key events (up to 16 KiB); active IME composition and control
+characters are rejected. Use key actions for navigation or Enter. Disabled,
+read-only, stale, occluded, or noninteractive targets fail explicitly.
+
+Input runs normal routing, dispatch, runnable tasks, reconciliation and backend
+submission before returning a fresh token and
+`settled: "runnable_tasks_and_backend_submission"`. It does not await sleeping
+tasks, animation completion or compositor presentation. Cancellation/disconnect
+releases an in-flight press through routing but cannot undo callbacks already
+run. Inspection and diagnostics do not evaluate Lua or expose arbitrary mutation.
+
+Capture returns `{window, token, kind, path, width, height, bytes}`. Its kind is
+`software_scene_replay`, never presented GPU readback. The endpoint retains four
+private mode-0600 PNG files, deleting older captures and cleaning them up on
+normal exit. `--output` atomically copies a capture to a durable caller-selected
+path. Capture is bounded to 16 million pixels. Metrics report actual successful
+CPU build/layout/paint counts and timings, routed events, accepted backend
+submissions and resource counts; none measures input-to-presentation latency.
+Diagnostics return active `source`, `generation`, and the latest structured
+reload `diagnostic` (`phase`, `source`, `message`) or null. CLI operations print
+JSON and exit nonzero on errors; reload/status retain their text output.
 
 ## Standalone subprocess dialogs
 

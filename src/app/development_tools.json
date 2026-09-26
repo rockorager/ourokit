@@ -1,0 +1,32 @@
+[
+  {
+    "name": "runtime.inspect",
+    "description": "Inspect live windows, or a window's bounded semantic tree. Use its opaque token with runtime.input or runtime.capture; inspect again after StaleDevelopmentTarget. Bounds use logical window coordinates and may extend beyond clips.",
+    "inputSchema": {"type":"object","properties":{"window":{"type":"string"}},"additionalProperties":false},
+    "outputSchema": {"type":"object"}
+  },
+  {
+    "name": "runtime.input",
+    "description": "Route one click, hover, scroll, key, or text action through the live window. Requires a fresh inspection token. Pointer actions require a semantic target path. Text types printable UTF-8 into the focused field; control characters and active IME composition are rejected. Key names are tab, enter, space, escape, backspace, delete, home, end, page_up, page_down, arrow_left, arrow_right, arrow_up, arrow_down, and lowercase letters. Returns after runnable callbacks, reconciliation and backend frame submission, not display presentation or asynchronous task completion. Errors or cancellation do not undo callbacks already run.",
+    "inputSchema": {"type":"object","properties":{"window":{"type":"string"},"token":{"type":"string"},"action":{"enum":["click","hover","scroll","key","text"]},"target":{"type":"string"},"delta":{"type":"number"},"key":{"type":"string"},"text":{"type":"string"},"shift":{"type":"boolean"},"control":{"type":"boolean"},"alt":{"type":"boolean"},"logo":{"type":"boolean"}},"required":["window","token","action"],"additionalProperties":false},
+    "outputSchema": {"type":"object"}
+  },
+  {
+    "name": "runtime.capture",
+    "description": "Replay a live window's current scene to a private PNG. This is software_scene_replay, not GPU readback. Requires a fresh inspection token. Returns a local path retained until four later captures or instance exit; copy it to keep it.",
+    "inputSchema": {"type":"object","properties":{"window":{"type":"string"},"token":{"type":"string"}},"required":["window","token"],"additionalProperties":false},
+    "outputSchema": {"type":"object"}
+  },
+  {
+    "name": "runtime.diagnostics",
+    "description": "Read the active source name, source generation and latest structured reload diagnostic. Does not evaluate Lua or change application state.",
+    "inputSchema": {"type":"object","properties":{},"additionalProperties":false},
+    "outputSchema": {"type":"object"}
+  },
+  {
+    "name": "runtime.metrics",
+    "description": "Read actual successful CPU build/layout/paint counts and timings, input-event and backend-submission counts, and retained resource counts. These are not GPU timings or input-to-presentation latency. Omit window to list all live windows.",
+    "inputSchema": {"type":"object","properties":{"window":{"type":"string"}},"additionalProperties":false},
+    "outputSchema": {"type":"object"}
+  }
+]

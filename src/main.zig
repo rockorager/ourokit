@@ -34,6 +34,7 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
         },
         .status => |target| try statusApplication(init, target.socket_path),
         .reload => |target| try reloadApplication(init, target.socket_path),
+        .development => |options| return developmentOperation(init, options),
         .mcp_export => |options| {
             var manifest: ?ourokit.bundle.Manifest = null;
             defer if (manifest) |*value| value.deinit();
@@ -139,6 +140,40 @@ fn statusApplication(init: std.process.Init, socket_path: []const u8) !void {
         .{ diagnostic.phase, diagnostic.source, diagnostic.message },
     );
     try writeStdout(init, output.written());
+}
+
+fn developmentOperation(init: std.process.Init, options: cli.Development) !u8 {
+    const mcp = ourokit.mcp;
+    var args = try std.json.parseFromSlice(mcp.Value, init.gpa, options.arguments, .{ .parse_numbers = false });
+    defer args.deinit();
+    if (args.value != .object) return error.ExpectedDevelopmentArgumentsObject;
+    const method = try std.fmt.allocPrint(init.gpa, "runtime.{s}", .{@tagName(options.operation)});
+    defer init.gpa.free(method);
+    var reply = try ourokit.app.control_client.developmentAt(init.gpa, init.minimal.environ, options.socket_path, method, args.value);
+    defer reply.deinit();
+    const failed = try ourokit.app.control_client.failed(reply);
+    const result = if (reply.rpc_error) |err| err else mcp.get(reply.result.?, "structuredContent") orelse return error.InvalidToolReply;
+    if (!failed) if (options.output_path) |output| {
+        const path_value = mcp.get(result, "path") orelse return error.InvalidCaptureReply;
+        if (path_value != .string) return error.InvalidCaptureReply;
+        const prefix = try std.fmt.allocPrint(init.gpa, "{s}-", .{options.socket_path});
+        defer init.gpa.free(prefix);
+        const path = path_value.string;
+        if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, ".png")) return error.InvalidCaptureReply;
+        for (path[prefix.len .. path.len - 4]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidCaptureReply;
+        const file = try std.Io.Dir.openFileAbsolute(init.io, path, .{});
+        defer file.close(init.io);
+        var buffer: [8192]u8 = undefined;
+        var reader = file.reader(init.io, &buffer);
+        const bytes = try reader.interface.allocRemaining(init.gpa, .limited(70 * 1024 * 1024));
+        defer init.gpa.free(bytes);
+        try writeAtomic(init, output, bytes);
+    };
+    const json = try std.json.Stringify.valueAlloc(init.gpa, result, .{ .whitespace = .indent_2 });
+    defer init.gpa.free(json);
+    try writeStdout(init, json);
+    try writeStdout(init, "\n");
+    return if (failed) 1 else 0;
 }
 
 fn reloadApplication(init: std.process.Init, socket_path: []const u8) !void {

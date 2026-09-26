@@ -117,12 +117,24 @@ pub fn reloadAt(allocator: std.mem.Allocator, path: []const u8) !ReloadResult {
     return .{ .committed = try unsignedField(object, "generation") };
 }
 
-fn failed(reply: mcp.Reply) !bool {
+pub fn failed(reply: mcp.Reply) !bool {
     if (reply.rpc_error != null) return true;
     const result = reply.result orelse return error.InvalidToolReply;
     const flag = mcp.get(result, "isError") orelse return false;
     if (flag != .bool) return error.InvalidToolReply;
     return flag.bool;
+}
+
+/// Calls a development tool only on the explicitly selected private endpoint.
+pub fn developmentAt(
+    allocator: std.mem.Allocator,
+    environ: std.process.Environ,
+    path: []const u8,
+    method: []const u8,
+    parameters: mcp.Value,
+) !mcp.Reply {
+    try endpoint.validateDevelopmentPath(allocator, environ, path);
+    return call(allocator, path, method, parameters);
 }
 
 fn call(

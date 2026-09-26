@@ -203,6 +203,11 @@ test "development keyboard and text preserve asymmetric UTF-8 selection through 
     try std.testing.expectEqualStrings("aéZ", edit.value.?);
     try std.testing.expectEqual(@as(usize, 4), edit.selection.?.anchor);
     try std.testing.expectEqual(@as(usize, 3), edit.selection.?.extent);
+    // A native window can retain semantic focus without seat/IME ownership.
+    try f.runtime.routeKeyboard(.{ .leave = .{ .window = f.runtime.window, .serial = 0 } });
+    try f.settle();
+    try std.testing.expect((try f.runtime.textInputStatus()) == null);
+    try std.testing.expectError(error.DevelopmentTextContainsControl, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .text = "a\nb" }));
     try f.play(.{ .text = "Ω!" });
     try f.play(.{ .key = .{ .keycode = 0, .logical = .backspace } });
     var after = try f.snapshot();
@@ -212,6 +217,16 @@ test "development keyboard and text preserve asymmetric UTF-8 selection through 
     try std.testing.expectEqual(@as(usize, 5), changed.selection.?.extent);
     try std.testing.expectEqualStrings("keep", (try node(after, "root/locked")).value.?);
     try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.init(&f.runtime, selected.token, .{ .text = "stale" }));
+    var canceled = try dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .text = "λnot typed" });
+    try std.testing.expectEqual(.routed, try canceled.advance(&f.runtime));
+    try f.settle();
+    try canceled.cancel(&f.runtime);
+    try f.settle();
+    try canceled.cancel(&f.runtime);
+    try std.testing.expectEqual(.complete, try canceled.advance(&f.runtime));
+    var partial = try f.snapshot();
+    defer partial.deinit();
+    try std.testing.expectEqualStrings("aéΩλ", (try node(partial, "root/edit")).value.?);
     try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
     try std.testing.expectError(error.DevelopmentTargetReadOnly, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .text = "bad" }));
 }

@@ -189,7 +189,8 @@ pub const Playback = struct {
     token: Token,
     action: Action,
     target: ?ui.instance.InstanceHandle,
-    step: u8 = 0,
+    step: usize = 0,
+    text_offset: usize = 0,
 
     pub fn init(runtime: *WindowRuntime, token: Token, action: Action) !Playback {
         try token.validate(runtime);
@@ -212,11 +213,15 @@ pub const Playback = struct {
         if (action == .text) {
             if (action.text.len > 16 * 1024) return error.DevelopmentTextTooLong;
             if (!std.unicode.utf8ValidateSlice(action.text)) return error.InvalidUtf8;
+            var characters = (try std.unicode.Utf8View.init(action.text)).iterator();
+            while (characters.nextCodepoint()) |cp|
+                if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return error.DevelopmentTextContainsControl;
             const focused = runtime.focus.current() orelse return error.DevelopmentTargetNotFocused;
             if (!runtime.text_inputs.contains(focused)) return error.DevelopmentTargetNotEditable;
             const behavior = try runtime.text_inputs.getBehavior(focused);
             if (!behavior.enabled) return error.DevelopmentTargetDisabled;
             if (behavior.read_only) return error.DevelopmentTargetReadOnly;
+            if ((try runtime.text_inputs.session(focused)).preedit() != null) return error.DevelopmentCompositionActive;
             target = focused;
         }
         return .{ .token = token, .action = action, .target = target };
@@ -227,8 +232,9 @@ pub const Playback = struct {
             return error.StaleDevelopmentTarget;
         try requireSettled(runtime);
         if (self.step == 0) try self.token.validate(runtime);
-        const steps: u8 = switch (self.action) {
-            .hover, .text => 1,
+        const steps: usize = switch (self.action) {
+            .hover => 1,
+            .text => if (self.text_offset == self.action.text.len) 0 else std.math.maxInt(usize),
             .scroll, .pointer_down, .key => 2,
             .click => 3,
         };
@@ -254,16 +260,22 @@ pub const Playback = struct {
             .key => |key| try runtime.routeKeyboard(.{ .key = .{ .window = window, .serial = 0, .time_ms = 0, .state = if (self.step == 0) .pressed else .released, .translated = key } }),
             .text => |bytes| {
                 if (!std.meta.eql(runtime.focus.current(), self.target)) return error.DevelopmentTargetNotFocused;
-                const status = (try runtime.textInputStatus()) orelse return error.DevelopmentTargetNotEditable;
-                try runtime.routeTextInput(.{ .batch = .{
+                const behavior = try runtime.text_inputs.getBehavior(self.target.?);
+                if (!behavior.enabled) return error.DevelopmentTargetDisabled;
+                if (behavior.read_only) return error.DevelopmentTargetReadOnly;
+                if ((try runtime.text_inputs.session(self.target.?)).preedit() != null) return error.DevelopmentCompositionActive;
+                // Native semantic focus need not own a compositor IME session.
+                // Type through translated keys rather than inventing one.
+                const len = try std.unicode.utf8ByteSequenceLength(bytes[self.text_offset]);
+                const cp = try std.unicode.utf8Decode(bytes[self.text_offset..][0..len]);
+                try runtime.routeKeyboard(.{ .key = .{
                     .window = window,
-                    .generation = status.generation,
                     .serial = 0,
-                    .serial_matches_state = true,
-                    .delete_surrounding = null,
-                    .commit = .{ .text = bytes },
-                    .preedit = null,
+                    .time_ms = 0,
+                    .state = if (self.step % 2 == 0) .pressed else .released,
+                    .translated = .{ .keycode = 0, .unicode = cp },
                 } });
+                if (self.step % 2 == 1) self.text_offset += len;
             },
             else => unreachable,
         }
@@ -282,8 +294,14 @@ pub const Playback = struct {
             try runtime.routePointer(.{ .button = .{ .window = runtime.window, .serial = 0, .time_ms = 0, .button = 0x110, .state = .released } });
         } else if (self.action == .key and self.step == 1) {
             try runtime.routeKeyboard(.{ .key = .{ .window = runtime.window, .serial = 0, .time_ms = 0, .state = .released, .translated = self.action.key } });
+        } else if (self.action == .text and self.step % 2 == 1) {
+            const bytes = self.action.text;
+            const len = try std.unicode.utf8ByteSequenceLength(bytes[self.text_offset]);
+            const cp = try std.unicode.utf8Decode(bytes[self.text_offset..][0..len]);
+            try runtime.routeKeyboard(.{ .key = .{ .window = runtime.window, .serial = 0, .time_ms = 0, .state = .released, .translated = .{ .keycode = 0, .unicode = cp } } });
         }
-        self.step = 3;
+        self.step = 4;
+        if (self.action == .text) self.text_offset = self.action.text.len;
     }
 };
 

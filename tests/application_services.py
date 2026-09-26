@@ -264,7 +264,9 @@ return o.app {id='dev.test.catalog', actions={
                     replacement.write_text("replacement stays")
                     replacement.replace(published)
                 # Production automation never grants development or activation.
-                for method in ('runtime.reload', 'runtime.status', 'runtime.activate'):
+                for method in ('runtime.reload', 'runtime.status', 'runtime.activate',
+                               'runtime.inspect', 'runtime.input', 'runtime.capture',
+                               'runtime.metrics', 'runtime.diagnostics'):
                     assert call(endpoint, method)['rpcError']['code'] == -32602
                 assert call(endpoint, 'Probe')['isError'] is False
                 if mode == "trailing":
@@ -444,7 +446,14 @@ return o.app {
                 assert info["supportedVersions"] == ["2026-07-28"] and info["capabilities"] == {"tools": {"listChanged": True}}
                 assert info["ttlMs"] == 60000 and info["cacheScope"] == "private"
                 tools = request(path, "tools/list")["result"]
-                assert {t["name"] for t in tools["tools"]} == {"runtime.status", "runtime.reload", "Get", "Set", "Delayed", "Invalid", "Fail"}
+                assert {t["name"] for t in tools["tools"]} == {
+                    "runtime.status", "runtime.reload", "runtime.inspect", "runtime.input",
+                    "runtime.capture", "runtime.metrics", "runtime.diagnostics",
+                    "Get", "Set", "Delayed", "Invalid", "Fail"}
+                assert call(path, "runtime.inspect")["structuredContent"] == {"windows": []}
+                assert call(path, "runtime.metrics")["structuredContent"] == {"windows": []}
+                assert call(path, "runtime.diagnostics")["structuredContent"]["generation"] == 1
+                assert call(path, "runtime.inspect", {"window": "missing"})["structuredContent"]["error"]["code"] == "DevelopmentWindowNotFound"
                 assert tools["ttlMs"] == 60000 and tools["cacheScope"] == "private"
                 assert all("inputSchema" in t and "outputSchema" in t and t["description"] for t in tools["tools"])
                 assert call(path, "Set", {"value": "changed"})["structuredContent"] == {}

@@ -9,6 +9,7 @@ const source_reload_module = @import("source_reload.zig");
 const SourceReload = source_reload_module.SourceReload;
 const ReloadRequests = @import("reload_requests.zig").ReloadRequests;
 const ControlServer = @import("control_server.zig").ControlServer;
+const development_control = @import("development_control.zig");
 const desktop = @import("../lua/desktop_application.zig");
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const WindowRuntimeConfig = @import("window_runtime.zig").Config;
@@ -398,12 +399,17 @@ fn runSourceInternal(
         try server.init(init.gpa, &loop, init.minimal.environ, source_reload.active().application.id, source_reload.generation, reload_requests, options.development);
         std.log.info("{s} socket: {s}", .{ if (options.development) "development" else "application", server.socketPath() });
     }
+    var development_service: development_control.Service = .{ .allocator = init.gpa, .io = init.io };
+    defer development_service.deinit();
+    var runtime_config = options.window;
+    if (options.development) runtime_config.measure_phases = true;
     var control_destroyed = false;
     defer if (!control_destroyed) if (control) |server|
         shutdownControl(server, &loop, null, &source_reload);
+    if (options.development) try control.?.registerDevelopmentTools(development_control.tools);
     if (control) |server| try server.setApplication(&source_reload.active().application, &source_reload.active().vm);
     if (options.headless or options.desktop.dbus_activated) {
-        if (!(try runHeadless(&source_reload, control, &callbacks, reload_requests, &loop, &scheduler, options.headless, options.development))) {
+        if (!(try runHeadless(&source_reload, control, &callbacks, reload_requests, &loop, &scheduler, options.headless, options.development, &development_service))) {
             if (options.exit_code) |code| code.* = source_reload.active().vm.exit_code orelse 0;
             return;
         }
@@ -504,6 +510,8 @@ fn runSourceInternal(
         }
         init.gpa.free(runtime_slots);
     }
+    const development_windows = try init.gpa.alloc(development_control.Window, if (options.development) options.application_window_capacity else 0);
+    defer init.gpa.free(development_windows);
     try syncRuntimeSlots(init.gpa, runtime_slots, application.windows);
     var popups: PopupHost = .{ .allocator = init.gpa, .windows = &window_set, .callbacks = &callbacks, .slots = runtime_slots };
     callbacks.popup_provider = .{ .context = &popups, .open = PopupHost.open, .close = PopupHost.close };
@@ -810,7 +818,7 @@ fn runSourceInternal(
                     signals,
                     &paragraph_sources,
                     &paragraphs,
-                    options.window,
+                    runtime_config,
                 );
                 // Grabs are user-initiated. Some layer-shell compositors keep
                 // physical focus on the parent; popupKeyboard routes its keys.
@@ -852,8 +860,18 @@ fn runSourceInternal(
                 lua_ui,
                 window.content_reference,
             ) catch |err| {
-                try dirty.retry(work);
-                return @as(anyerror!void, err);
+                if (slot.runtime.ready) {
+                    try dirty.retry(work);
+                    return @as(anyerror!void, err);
+                }
+                // Failed initial content still owns a root build scope. Exit
+                // via the ordinary close/drain phases rather than deinitializing
+                // a mounted runtime while unwinding this stack.
+                std.log.err("initial window build failed ({s}): {s}", .{ active_generation.snapshot.entry_name, @errorName(err) });
+                try dirty.complete(work);
+                active_generation.vm.exit_code = 1;
+                desired_changed = true;
+                break;
             };
             slot.configured_size = null;
             try dirty.complete(work);
@@ -871,7 +889,7 @@ fn runSourceInternal(
             if (source_reload.takeCandidateFailure()) |err| {
                 try reportReloadFailure(&source_reload, control, sequence, err);
                 active_reload_sequence = null;
-            } else if (source_reload.candidateReady()) {
+            } else if (source_reload.candidateReady() and !development_service.playing()) {
                 var popup_retiring = false;
                 for (runtime_slots) |*slot| if (slot.popup != null) {
                     slot.desired = false;
@@ -885,7 +903,7 @@ fn runSourceInternal(
                         &callbacks,
                         control,
                         sequence,
-                        .{ .windows = &window_set, .host = &host, .dirty = &dirty, .clipboard = &clipboard, .config = options.window },
+                        .{ .windows = &window_set, .host = &host, .dirty = &dirty, .clipboard = &clipboard, .config = runtime_config },
                     );
                     active_reload_sequence = null;
                 }
@@ -980,6 +998,17 @@ fn runSourceInternal(
             slot.frames_seen = @max(slot.frames_seen, try host.framesPresented(handle));
         }
 
+        var development_work = false;
+        if (options.development and !scheduler.hasPendingWork()) if (control) |server| {
+            var count: usize = 0;
+            for (runtime_slots) |*slot| if (slot.desired and slot.runtime.ready) {
+                development_windows[count] = .{ .id = slot.id.?, .runtime = &slot.runtime };
+                count += 1;
+            };
+            development_work = try development_service.poll(server, &source_reload, development_windows[0..count]);
+            try server.serviceRequests();
+        };
+
         for (runtime_slots) |slot| if (slot.desired and slot.frames_seen > 0) {
             const app = &source_reload.active().application;
             if (control) |server| server.setActivated(true);
@@ -1017,7 +1046,7 @@ fn runSourceInternal(
         // MCP and Lua timers can enqueue I/O while Wayland is idle.
         try source_reload.collectCanceledMcp();
         _ = try loop.submit();
-        if (scheduler.hasPendingWork()) continue;
+        if (scheduler.hasPendingWork() or development_work) continue;
         const control_quiescent = if (control) |server| server.quiescent() else true;
         if (host.quiescent() and window_set.retainedCount() == 0 and control_quiescent and
             !loop.hasPendingTimerKernelWork() and !loop.hasPendingOperations()) break;
@@ -1076,6 +1105,7 @@ fn runHeadless(
     scheduler: *task.Scheduler,
     stay_headless: bool,
     development: bool,
+    development_service: *development_control.Service,
 ) !bool {
     var sequence: ?u64 = null;
     while (true) {
@@ -1109,9 +1139,14 @@ fn runHeadless(
         _ = reload.collectRetired();
         const app = &reload.active().application;
         if (!stay_headless and desktop.flag(app.state, app.desktop_state, "requested")) return true;
+        const development_work = if (development and control != null)
+            try development_service.poll(control.?, reload, &.{})
+        else
+            false;
+        if (control) |server| try server.serviceRequests();
         try reload.collectCanceledMcp();
         _ = try loop.submit();
-        if (scheduler.hasPendingWork()) continue;
+        if (scheduler.hasPendingWork() or development_work) continue;
         _ = try dispatchApplication(reload, loop, control, null, null);
     }
 }

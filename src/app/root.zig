@@ -35,6 +35,7 @@ test {
     _ = @import("windows.zig");
     _ = @import("window_runtime.zig");
     _ = @import("development.zig");
+    _ = @import("development_control.zig");
     _ = @import("source_generation.zig");
     _ = @import("source_reload.zig");
     _ = @import("reload_requests.zig");
