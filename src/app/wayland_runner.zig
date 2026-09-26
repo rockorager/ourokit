@@ -578,10 +578,15 @@ fn runSourceInternal(
     );
     defer init.gpa.free(reload_targets);
     defer {
-        if (control) |server| shutdownControl(server, &loop, &host, &source_reload);
-        control_destroyed = true;
-        drainSources(&source_reload, &loop, null, null) catch |err|
+        drainSources(&source_reload, &loop, control, .{
+            .host = &host,
+            .popups = &popups,
+            .clipboard = &clipboard,
+            .drop_request = if (pending_drop) |pending| pending.request else null,
+        }) catch |err|
             std.debug.panic("could not drain application: {s}", .{@errorName(err)});
+        if (control) |server| server.deinit();
+        control_destroyed = true;
     }
     var disconnect_started = false;
     var active_reload_sequence: ?u64 = null;
@@ -1335,7 +1340,27 @@ fn dispatchApplicationCompletion(reload: *SourceReload, loop: *io_loop.Loop, con
     return idle_expired;
 }
 
-fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlServer, host: ?*platform.wayland.Host) !void {
+const NativeDrain = struct {
+    host: *platform.wayland.Host,
+    popups: *PopupHost,
+    clipboard: *clipboard_module.Coordinator,
+    drop_request: ?core.Handle = null,
+};
+
+fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlServer, native: ?NativeDrain) !void {
+    // Error unwinding must perform the same ownership retirement as ordinary
+    // application exit. Keep every shared-ring owner alive until it is drained.
+    const host = if (native) |value| value.host else null;
+    if (native) |value| {
+        try value.host.beginShutdown();
+        if (value.drop_request) |request| _ = try value.host.cancelClipboard(request);
+        for (value.popups.slots) |*slot| {
+            slot.desired = false;
+            try slot.runtime.clear(&reload.active().ui_build);
+        }
+        for (value.popups.slots) |*slot| value.popups.release(slot);
+    }
+    if (control) |server| try server.beginShutdown();
     if (reload.appearance) |client| try client.stop();
     reload.active().shutdownImages();
     if (reload.candidate) |candidate| candidate.shutdownImages();
@@ -1351,8 +1376,37 @@ fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlSe
             try reload.resumeRunnable(handle);
         }
         try reload.collectCanceledMcp();
+        if (native) |value| {
+            // Configure/input events can already be queued when rendering
+            // fails. Release their owned data without re-entering the UI.
+            while (value.popups.windows.takeEvent()) |event| value.popups.windows.releaseEvent(event);
+            while (value.clipboard.takeAction()) |action| {
+                defer value.clipboard.releaseAction(action);
+                if (action == .cancel_paste) {
+                    if (!(try value.host.cancelClipboard(action.cancel_paste)))
+                        try value.clipboard.acknowledgeCancellation(action.cancel_paste);
+                }
+            }
+            while (value.host.takeClipboardCompletion()) |completion| {
+                try value.clipboard.completePaste(completion.request, null);
+                try value.host.releaseClipboardCompletion(completion.request);
+            }
+            while (value.host.takeDropCompletion()) |completion| try value.host.finishDrop(completion.request, false);
+            while (value.clipboard.takeCompletion()) |completion| try value.clipboard.releaseCompletion(completion.request);
+            try value.clipboard.collectCanceled();
+            for (value.popups.slots) |*slot| try slot.runtime.collectRetired();
+            try value.popups.windows.reconcile(&.{});
+            try value.host.flush();
+        }
+        if (control) |server| server.collectClosed();
         _ = try loop.submit();
-        if (!loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork()) break;
+        const host_quiescent = if (host) |value| value.quiescent() else true;
+        const windows_quiescent = if (native) |value| value.popups.windows.retainedCount() == 0 else true;
+        const control_quiescent = if (control) |server| server.quiescent() else true;
+        if (host_quiescent and windows_quiescent and control_quiescent and
+            !loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork()) break;
+        if (reload.scheduler.hasPendingWork() or
+            (host_quiescent and control_quiescent and !loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork())) continue;
         _ = try dispatchApplication(reload, loop, control, host, null);
     }
 }
@@ -1884,6 +1938,171 @@ fn keyboardWindow(event: platform.window.KeyboardEvent) platform.window.WindowHa
 
 fn sameHandle(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+test "render failure drains native and application owners before returning original error" {
+    const allocator = std.testing.allocator;
+    const protocol = @import("wayland_protocol");
+    const Host = platform.wayland.Host;
+    const linux = std.os.linux;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data =
+        \\local o = require('ouro')
+        \\return o.app { id='dev.ouro.drain-test', run=function() return {windows={
+        \\  o.window {id='main', title='Drain', width=300, height=40, content=function() return o.column{key='root'} end}
+        \\}} end }
+    });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &temporary.sub_path, "app.lua" });
+    defer allocator.free(path);
+    var provider = try bundle.SourceProvider.initDisk(allocator, path);
+    defer provider.deinit();
+    var loop: io_loop.Loop = undefined;
+    try loop.init(allocator, 32, 16);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(allocator, 128, 16, 32);
+    defer scheduler.deinit();
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(allocator, 16);
+    defer callbacks.deinit();
+    var clipboard: clipboard_module.Coordinator = undefined;
+    try clipboard.init(allocator, &scheduler, 4, 8, 256);
+    defer clipboard.deinit();
+    var fonts = text.FontCache.init(allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{ .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 }, .bytes = @embedFile("ourokit_test_font_static") });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(allocator, &fonts);
+    defer paragraphs.deinit();
+    const theme = design.tokens.light;
+    const services: source_generation.UiServices = .{
+        .paragraph_sources = &sources,
+        .paragraphs = &paragraphs,
+        .font_candidates = &.{font},
+        .medium_font_candidates = &.{font},
+        .theme = theme,
+        .callbacks = &callbacks,
+    };
+    const config: source_generation.Config = .{ .node_capacity = 8, .semantic_text_capacity = 128 };
+    const initial = try SourceGeneration.create(allocator, &scheduler, &loop, try provider.snapshot(std.testing.io, allocator), services, config, null);
+    var reload: SourceReload = undefined;
+    reload.init(allocator, std.testing.io, &provider, &scheduler, &loop, services, config, initial);
+    defer reload.deinit();
+
+    var windows: windows_module.WindowSet = undefined;
+    var host: Host = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .sink = windows.eventSink(),
+        .app_id = try allocator.dupe(u8, "dev.ouro.drain-test"),
+        .vulkan = null,
+        .adapter = undefined,
+        .connection = undefined,
+        .driver = undefined,
+        .registry = undefined,
+        .text_input_pending = @FieldType(Host, "text_input_pending").init(allocator),
+        .clipboard = try @FieldType(Host, "clipboard").init(allocator, &loop, 4, 4, 4, 4, 256),
+        .xkb = try @FieldType(Host, "xkb").init(),
+        .windows = try allocator.alloc(std.meta.Child(@FieldType(Host, "windows")), 1),
+        .outputs = try allocator.alloc(std.meta.Child(@FieldType(Host, "outputs")), 1),
+    };
+    @memset(host.windows, .{});
+    @memset(host.outputs, .{});
+    try host.adapter.init(allocator, &loop, (platform.wayland.HostConfig{ .app_id = "test" }).reactor);
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets)) != .SUCCESS) return error.SocketFailed;
+    defer _ = linux.close(sockets[1]);
+    host.connection = try @FieldType(Host, "connection").attach(allocator, &host.adapter.reactor, sockets[0], .{
+        .received_fd_budget = 4,
+        .transmit_byte_budget = 4096,
+        .transmit_fd_budget = 4,
+    }, .{ .max_objects = 64, .max_client_ids = 64 });
+    host.driver = @FieldType(Host, "driver").init(&host.connection);
+    defer host.deinit();
+    const objects = &host.connection.objects;
+    host.registry = try objects.createLocal(&protocol.wl_registry.info, 1, null);
+    host.compositor = try objects.createLocal(&protocol.wl_compositor.info, 4, null);
+    host.wm_base = try objects.createLocal(&protocol.xdg_wm_base.info, 5, null);
+    try windows.init(allocator, &scheduler, host.nativeHost(), 1, 8);
+    defer windows.deinit();
+    try windows.reconcile(&.{initial.application.windows[0].declaration});
+    const handle = windows.activeHandleForId("main").?;
+    var slots = [_]RuntimeSlot{.{ .id = try allocator.dupe(u8, "main"), .desired = true }};
+    defer allocator.free(slots[0].id.?);
+    const runtime = &slots[0].runtime;
+    try runtime.init(allocator, &scheduler, try windows.scope(handle), handle, theme.background, theme.primary, theme.foreground, theme.input, theme.ring, &initial.signals, &sources, &paragraphs, .{ .node_capacity = 8, .command_capacity = 16 });
+    defer runtime.deinit();
+    try runtime.reconcile(.{ .width = 300, .height = 40 }, &initial.ui_build, initial.application.windows[0].content_reference);
+    try std.testing.expect(runtime.ready);
+    var popups: PopupHost = .{ .allocator = allocator, .windows = &windows, .callbacks = &callbacks, .slots = &slots };
+
+    var environment_map: std.process.Environ.Map = .init(allocator);
+    defer environment_map.deinit();
+    const directory = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(directory);
+    try environment_map.put("XDG_RUNTIME_DIR", directory);
+    const environ: std.process.Environ = .{ .block = try environment_map.createPosixBlock(allocator, .{}) };
+    defer environ.block.deinit(allocator);
+    var requests: ReloadRequests = .{};
+    var control: ControlServer = undefined;
+    try control.init(allocator, &loop, environ, "dev.ouro.drain-test", 1, &requests, true);
+    defer control.deinit();
+    _ = try initial.vm.spawnApplication("require('ouro').sleep(60000); error('canceled task resumed')");
+    while (scheduler.takeRunnable()) |runnable| try reload.resumeRunnable(runnable);
+    // Clipboard pipes share the application CQE namespace but belong to the
+    // native host. Keep a paste and runner-owned drop blocked on input too.
+    const paste = try clipboard.requestPaste(try windows.scope(handle), .{ .window = handle, .text_input = .invalid });
+    const paste_action = clipboard.takeAction().?;
+    try std.testing.expectEqual(paste, paste_action.request_paste.request);
+    clipboard.releaseAction(paste_action);
+    const drop: core.Handle = .{ .slot = std.math.maxInt(u32), .generation = 1 };
+    var writers: [2]linux.fd_t = undefined;
+    for ([_]core.Handle{ paste, drop }, 0..) |request, index| {
+        var pipe: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+        writers[index] = pipe[1];
+        const transfer = &host.clipboard.transfers[index];
+        transfer.* = .{ .request = request, .fd = pipe[0], .drag = index == 1 };
+        transfer.operation = try loop.prepareRead(pipe[0], &transfer.scratch, std.math.maxInt(u64));
+        transfer.state = .reading;
+    }
+    defer for (writers) |fd| {
+        _ = linux.close(fd);
+    };
+    var configure: [12]u8 = undefined;
+    std.mem.writeInt(u32, configure[0..4], host.windows[0].xdg_surface.?.id, .little);
+    std.mem.writeInt(u32, configure[4..8], 12 << 16, .little);
+    std.mem.writeInt(u32, configure[8..12], 73, .little);
+    try std.testing.expectEqual(configure.len, linux.write(sockets[1], &configure, configure.len));
+    try host.flush();
+    const actor = try host.connection.actor();
+    try std.testing.expect(actor.receive_active);
+    try std.testing.expect(actor.transmit.sendActive());
+    try std.testing.expect(loop.hasPendingOperations()); // Control accept.
+    try std.testing.expect(loop.hasPendingTimerKernelWork()); // Application sleep.
+    // Match the unconsumed configure found during the original unwind.
+    try windows.enqueueConfigured(handle, 300, 40);
+    try windows.enqueueTextInput(.{ .batch = .{ .window = handle, .serial = 72, .serial_matches_state = true, .delete_surrounding = null, .commit = .{ .text = "queued input" }, .preedit = null } });
+    host.windows[0].configured = true;
+    host.windows[0].width = 0; // Inject a real extent-validation failure.
+    const Failure = struct {
+        fn run(reload_: *SourceReload, loop_: *io_loop.Loop, control_: *ControlServer, native: NativeDrain, handle_: core.Handle) !void {
+            defer drainSources(reload_, loop_, control_, native) catch unreachable;
+            try native.host.prepareScene(handle_, .{ .commands = &.{} });
+        }
+    };
+    try std.testing.expectError(error.InvalidScaledExtent, Failure.run(&reload, &loop, &control, .{ .host = &host, .popups = &popups, .clipboard = &clipboard, .drop_request = drop }, handle));
+    try std.testing.expect(host.quiescent());
+    try std.testing.expect(control.quiescent());
+    try std.testing.expectEqual(@as(usize, 0), windows.retainedCount());
+    try std.testing.expectEqual(null, windows.takeEvent());
+    try std.testing.expect(!loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork());
+    try std.testing.expect(!runtime.ready);
+    try std.testing.expect(!scheduler.hasPendingWork());
+    try std.testing.expectEqual(@as(usize, 0), initial.vm.activeTaskCount());
 }
 
 test "runtime slots retain window state by ID across declaration changes" {
