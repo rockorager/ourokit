@@ -134,21 +134,47 @@ not zero latency. The driver returns nonzero and retains failure metadata. If
 measurement completes but teardown fails, it retains the full trace with
 `measurement_complete_cleanup_failed`, and still exits nonzero.
 
-## Reload integration boundary
+## Reload measurement requires the development CLI
 
-Reload measurement is intentionally pending the development CLI/control
-contract. Do not time an unrelated app-control call or call its response
-"edit-to-visible". The small integration should launch a private development
-instance of a temporary copy of a fixture, discover its explicitly logged dev
-endpoint, and alternate two valid source revisions with a visible marker.
-Timestamp completion of an atomic file replacement, request reload, and record
-the acknowledgment separately. Verify the new source/scene revision and marker
-through inspect/capture, then correlate that revision to compositor presentation
-only if the final API exposes that relationship. Otherwise report
-**edit-to-verified-software-capture** (including CLI, polling and capture costs),
-not edit-to-visible. A software capture or committed scene revision alone is
-not evidence of compositor presentation. Include a rejected edit that preserves
-the last-good revision; never count rejection as a successful reload sample.
+The `reload.py` driver uses `run --dev`, `dev reload`, `dev inspect`,
+`dev capture --output`, and `dev diagnostics`. Build the CLI in the mode being
+measured and record that mode in the environment description; debug and release
+results are not interchangeable.
+
+```sh
+python3 tools/application-benchmark/reload.py \
+  --binary zig-out/bin/ouroctl --iterations 5 --warmups 1 \
+  --environment-description 'ReleaseFast; COMPOSITOR VERSION/BACKEND/OUTPUT' \
+  --output reload-results.json
+```
+
+It launches a private development instance with a temporary source/runtime
+directory, resolves the compositor socket before isolating `XDG_RUNTIME_DIR`,
+and discovers only the explicitly logged development endpoint. It never attaches
+to production application control or edits the original fixture. ImageMagick is
+required to decode PNGs; no compositor screenshot is taken in this timed path.
+
+Each atomic edit changes a unique semantic label and alternates a solid red/blue
+patch. Timing starts immediately after `os.replace` returns. A successful reload
+acknowledgment is recorded separately, then inspect must expose the expected
+label and a token different from the previous revision. Capture must echo that
+token and identify `software_scene_replay`. The copied PNG's dimensions/byte
+count must agree with metadata, and decoded pixels must contain the new patch
+without the old color. Read-only inspection/capture retries are bounded and
+retained in the sample; reload itself is issued exactly once per edit.
+
+The result is **edit-to-verified-software-capture**, including CLI startup,
+polling, copying, PNG decoding and pixel-verification costs. Source writing and
+file synchronization precede the starting timestamp. This is not a renderer-only
+measurement, edit-to-visible, or compositor presentation latency. A final invalid
+edit must fail reload while preserving the last-good semantic marker and exact
+decoded RGB content; rejection is not a successful latency sample.
+
+Raw timestamps, acknowledgment text, tokens, hashes, failures, and per-run
+distributions are retained in JSON. Copied PNGs are retained in a sibling
+`<output-stem>-captures` directory because the server's private capture paths
+expire. Warmup results are separate from measured samples. Any measurement or
+cleanup failure exits nonzero while preserving completed results.
 
 Measurement checks (no display required):
 
