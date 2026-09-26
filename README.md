@@ -1,53 +1,32 @@
 # Ourokit
 
-Ourokit is a Linux application platform: an Ouro-owned design system, typed UI
-and render-object architecture, renderer-neutral scenes, software and future
-Vulkan backends, Wayland integration through Wayring, an embedded Lua 5.5
-application environment, and one raw `io_uring` event loop owned by Ourokit.
+Ourokit is a Linux desktop application toolkit with declarative Lua UI, native
+Wayland windows, software and Vulkan rendering, and tools for fast development.
+Optional shell extensions support panels, launchers, and workspace controls.
+See the [product vision](vision.md) for the intended outcomes and scope.
 
-This repository is at first-milestone scope. It currently proves canonical
-design-token generation, clear/rectangle scene rendering, generation-safe raw
-`io_uring` timers and cancellation, a zero-standard-library Lua coroutine, and
-safe-point resumption after timer completion. It does not yet provide a widget
-catalog. A headless declarative-window reconciler
-now proves stable native identity, per-window resource scopes, transactional
-snapshot validation, and callback-free platform event queuing. A reusable
-multi-window Wayring host connects that model to independently configured,
-rendered, resized, and closed xdg-toplevels and `wlr-layer-shell` surfaces.
-The first headless UI kernel adds logical box constraints, typed Box/Flex/Stack
-render objects, cached allocation-free layout, ordered scene construction, and
-hit testing. A separate keyed instance layer now reconciles normalized typed
-snapshots into scoped render objects, and a bounded pointer router targets
-instances without callbacks. Mounted build owners provide scoped UI build
-lifecycle and direct dirty scheduling. A provisional constructor-specific Lua
-bridge lowers returned opaque UI descriptions into typed normalized descriptors
-during reconciliation. `ouro.component` separates one-time initialization from
-signal-driven rebuilds and retains keyed component state. Clean components reuse
-their descriptions; native reconciliation still consumes a window snapshot.
-The first ergonomic constructor composes `ouro.button` from Box and Text while
-the eventual generated constructor ABI remains intentionally unfrozen. A
-minimal Lua signal primitive tracks per-build-owner dependencies
-transactionally, rejects writes during builds, and wakes only subscribed dirty
-work without entering Lua. The isolated VM now supports independently waiting,
-scope-owned coroutine tasks in growable stable-address slabs, with direct
-scheduler and `io_uring` completion routing. A reusable native host loads a
-declarative Lua application, owns all native services, invokes button handlers
-as scoped task-phase coroutines, and presents signal-driven descriptors through
-the same mounted render path. The shared text layer uses pinned HarfBuzz for
-real OpenType run shaping, pinned SheenBidi for Unicode 17 paragraph bidi, and
-pinned uucode plus official Unicode 17 Script_Extensions data for grapheme-safe
-script and combined paragraph itemization. A uucode custom field and focused
-UAX #14 scanner provide fully conformant Unicode 17 line opportunities; greedy
-line selection is a separate linear-time strategy so future Knuth-Plass policy
-does not contaminate segmentation. HarfBuzz cluster advances feed that selector,
-unsafe selected boundaries remain explicit, and SheenBidi performs line-local
-UAX #9 L1-L2 ordering only after wrapping. A final headless stage intersects
-visual and fallback-font spans into backend-neutral positioned glyphs, reusing
-safe paragraph shaping and requesting reflow when unsafe reshaping changes a
-line width. The design system requests generic `sans-serif`, and native Linux
-builds use Fontconfig's
-configured primary and fallback faces. Pinned font fixtures keep shaping tests
-deterministic without putting shaping or measurement in a renderer.
+The toolkit is under development. It includes retained components and signals,
+text editing and shaping, images, themes, scrolling and virtual lists, scoped
+asynchronous tasks, source reload, and a native Storybook with headless snapshots.
+It is not yet a complete desktop toolkit: OS accessibility, drag-and-drop, and
+high-level desktop services such as file dialogs remain unfinished.
+
+## Application surface
+
+Start with the [application model](docs/application-model.md), the `ouroctl`
+host, and the examples. Applications compose widgets and state; the host owns
+the event loop, native resources, rendering, and task lifetimes.
+
+The [D-Bus API](docs/dbus.md), [shell workspace API](docs/workspaces.md), optional
+MCP application tools, and [experimental native plugins](docs/native-plugins.md)
+serve applications that need those capabilities. They are not prerequisites for
+opening a window.
+
+The Zig modules exposed by `src/ourokit.zig` support embedding and internal
+testing, but their exports do not constitute separate stable SDKs. Internal
+render objects, resource handles, and protocol machinery are implementation
+boundaries, not concepts ordinary application authors need to manage. Public
+Lua and native-extension contracts are also evolving; no stable ABI is promised.
 
 ## Requirements
 

@@ -2,19 +2,18 @@
 
 ## Platform scope
 
-Ourokit is the complete native application platform, not a Lua framework with
-supporting graphics. Lua is one application-language boundary. The platform
-also owns design data, typed UI policy and retention, text shaping, scenes,
-rendering backends, Linux eventing, Wayland presentation, resource lifecycle,
-and eventual application bundles/native extensions.
+Ourokit is a Linux desktop application toolkit. The [product vision](vision.md)
+defines its goals; the modules below are implementation boundaries rather than
+independent stable SDKs. Lua provides application composition and state while
+the native host owns text, rendering, eventing, Wayland presentation, and
+resource lifetimes. Shell protocols and application automation are optional
+capabilities, not prerequisites for an ordinary application.
 
-The intended source structure grows only when modules gain real code:
+The source structure separates those responsibilities:
 
 ```text
 design/
-  tokens/                  canonical Ouro token data
-  components/              future component schemas
-  icons/                   future Ouro icon sources
+  tokens/                  canonical design token data
   provenance/
 tools/design/
 src/
@@ -22,27 +21,32 @@ src/
   main.zig                 generic declarative Lua application host
   core/                    dependency-light values and handles
   mcp/                     sans-I/O MCP client/server and JSON Schema validation
+  dbus/                    D-Bus wire protocol, clients, and services
   loop/                    raw io_uring ownership and operations
   fs/                      language-neutral asynchronous file operations
   task/                    language-neutral tasks, scopes, resources
   design/                  generated token API
   text/                    paragraph analysis, shaping, metrics, Unicode boundaries
+  image/                   decoding, caches, and asynchronous loading
+  xdg/                     desktop-entry and icon discovery
+  shell/                   optional shell protocol state
   ui/
-    widget/                future Lua-facing declarations
+    widget/                retained widget behavior
     instance/              identity, lifecycle, reconciliation, state
     render_object/         small closed typed render-object set
     layout/
     input/
     focus/
     semantics/
-    command/               authoritative command registry
+    text_input/
   scene/                   immutable renderer-neutral display lists
   renderer/
     software/
     vulkan/                Vulkan backend and software-only capability stub
   platform/wayland/        sole Wayring containment boundary
   lua/                     isolated VM and coroutine adapter
-  bundle/                  source providers/snapshots; future Lua module loader
+  bundle/                  manifests and source providers/snapshots
+  native/                  experimental C-ABI extensions
   app/                     small lifecycle/phase and per-window coordinator
 examples/                  added only when environment-testable
 tests/                     cross-module tests as needed
@@ -522,14 +526,16 @@ destructive/reversible metadata. Widgets may contribute contextual entries.
 
 ## Rendering backends
 
-The current software backend consumes the same display list contract intended
-for Vulkan and writes premultiplied gamma-2.2 RGBA/BGRA bytes into
+The software and Vulkan backends consume the same display list contract.
+Software writes premultiplied piecewise-sRGB RGBA/BGRA bytes into
 caller-provided dimensions and stride. Scene colors remain straight-alpha sRGB;
 the backend decodes and premultiplies them into linear RGBA16 UNORM working
 storage for source/source-over composition, then converts damaged pixels back
-to encoded presentation bytes once per render call. Vulkan graphics uses a
-persistent per-target RGBA16F attachment with a final encoded-BGRA8 subpass;
-high-precision storage is internal and requires no special compositor format.
+to encoded presentation bytes once per render call. Vulkan graphics can render
+proven opaque scenes directly into an exported sRGB attachment. Transparent or
+unproven scenes use an RGBA16F working attachment and a final encoded-BGRA8
+subpass. See [rendering.md](docs/rendering.md) for precision, format negotiation,
+and presentation contracts.
 Tests cover clipping, damage, alpha, format, row padding, clear, rectangles, and
 reusable conformance fixtures.
 
@@ -566,44 +572,41 @@ dependency. Future lowering must preserve linear-light semantics. Pixman types
 never enter scene, UI, or platform APIs, and default headless builds do not
 fetch or link it.
 
-The Vulkan peer will own instance/device/queue selection, command buffers,
+The Vulkan backend owns instance/device/queue selection, command buffers,
 exportable images and memory, synchronization, and pipeline/cache state.
-Renderer-neutral resource IDs and caching will live below scene; widgets and
-render objects never hold Vulkan handles.
+Widgets and render objects never hold Vulkan handles.
 
 Ourokit cannot use the conventional `VK_KHR_wayland_surface` path without
 libwayland: Vulkan requires ABI `wl_display*` and `wl_surface*` objects, while
 Wayring intentionally provides its own connection and generation-checked
 protocol handles. Those representations are not interchangeable. Wayring
-remains the only Wayland implementation, so the planned Vulkan presenter is an
-Ouro-owned dma-buf path rather than a standard Wayland swapchain.
+remains the only Wayland implementation, so the Vulkan presenter uses dma-bufs
+rather than a standard Wayland swapchain.
 
-The intended prototype will negotiate DRM formats/modifiers from linux-dmabuf
-feedback, render into Vulkan external-memory images, export their plane FDs,
-and create `wl_buffer` objects through protocols generated for Wayring. Vulkan
-owns image/memory/queue lifetime; the Wayland presenter owns protocol objects
-and surface commits; a shared frame lease prevents either side from recycling
-resources before compositor release and GPU completion. Explicit-sync protocol
-selection, fallback behavior, multi-plane formats, modifier policy, and device
-matching remain prototype questions. No Vulkan placeholder pretends this path
-has already been validated.
+The presenter negotiates DRM devices and modifiers from linux-dmabuf feedback,
+exports Vulkan image plane FDs, and creates `wl_buffer` objects through Wayring.
+Slot reuse waits for GPU completion and compositor release; resize retires busy
+storage rather than replacing it in place. Explicit synchronization uses
+linux-drm-syncobj when available. When the compositor and device lack a common
+renderable format/modifier, the host falls back to shared-memory presentation.
 
 Headless development remains first-class: deterministic software buffers,
 scene logging, Button interaction tests, and retained semantic snapshots exist
 now. Semantic groups, text, and Buttons validate parent ordering, identity,
 required labels, capacity, and disabled state; double buffering keeps the prior
-snapshot visible until a complete build commits. A larger design-system gallery
-remains planned without requiring Wayland or Vulkan.
+snapshot visible until a complete build commits. Storybook renders named widget
+states and replays input through the retained runtime without a compositor.
 
 ## Lua isolation
 
-Lua 5.5.1 is fetched by exact URL/content hash. Ourokit compiles Lua core and
-`lauxlib.c`, but none of the standard-library implementation files or `linit.c`.
-It never calls `luaL_openlibs`. The only initial global is the Ouro-owned table
-containing `sleep`; the proof test verifies `print`, `package`, and `coroutine`
-are absent.
+Lua 5.5.1 is fetched by exact URL/content hash. Ourokit compiles Lua core,
+`lauxlib.c`, and an explicit allowlist of computation libraries; it never calls
+`luaL_openlibs`. Application APIs are available through `require("ouro")`, not
+an ambient global. File/module I/O and task scheduling remain host-owned.
+The allowlist is not an untrusted-code security boundary or a resource quota.
+See [runtime.md](docs/runtime.md) for the exact available functions.
 
-The UI bridge installs description constructors into that same table. These
+The UI bridge installs description constructors into that module. These
 functions may run outside a build and cannot touch native UI. Build callbacks
 and subsequent description lowering execute under protected, non-yielding
 calls. Typed descriptor storage is bounded and borrowed until the next build;
@@ -634,29 +637,18 @@ Each Lua task maps directly to its language-neutral scheduler slot and pending
 phase explicitly resumes that coroutine. A Zig frame is not retained across
 the yield. Coroutines are explicitly anchored in the Lua registry and pass
 through `lua_closethread` on completion, error, or cancellation before their
-anchor is released. A future bundle loader will be pure Ouro functionality,
-not Lua package `require`.
+anchor is released. The source-generation module loader resolves application
+modules within the source root. Explicit native modules use the experimental
+[plugin ABI](docs/native-plugins.md), not Lua's package loader.
 
-## First-milestone non-goals and open questions
+## Scope and implementation status
 
-Non-goals: complete widgets, complete paragraph layout/font discovery, command
-palette, accessibility protocols, advanced Vulkan dma-buf negotiation, bundle
-manifests/packing,
-installation/package management, native `.so` extensions, broad Lua standard
-libraries, network/filesystem APIs, permissions/sandboxing, and full Spectrum
-coverage.
+The [product vision](vision.md) sets direction, not an inventory of completed
+features. The subsystem documents describe their implemented contracts and
+limitations. In particular, retained semantics do not yet provide an OS
+accessibility bridge, and low-level D-Bus access does not imply high-level
+desktop dialogs or notification helpers.
 
-Open questions intentionally left unfrozen:
-
-- exact normalized Lua descriptor and generated-constructor ABI above the
-  established language-neutral window declaration contract;
-- close-policy ergonomics when an application retains a compositor-closed
-  declaration, including the eventual default for the last window;
-- frame resource leases for future image and glyph references;
-- renderer-neutral image/glyph resource identity and cache eviction;
-- language inheritance, optimal-wrap item representation, Fontconfig refresh
-  orchestration, and exact default versus tailored grapheme behavior;
-- transform, subpixel rasterization, layer, and color-managed surface semantics;
-- Vulkan device-loss recovery and richer damage-region coalescing;
-- scope close semantics for multiple asynchronous resource kinds;
-- versioned application bundle and native-extension ABI.
+Renderer internals, generated constructors, native extensions, and bundle formats
+remain evolving implementation contracts. New abstractions and optimizations
+need concrete application requirements and measured evidence.
