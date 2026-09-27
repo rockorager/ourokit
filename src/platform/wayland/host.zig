@@ -3100,8 +3100,13 @@ pub const Host = struct {
         switch (keyboard_event) {
             .keymap => |keymap| {
                 if (keymap.format.value != protocol.wl_keyboard.keymap_format.xkb_v1.value) {
+                    // Seats send no_keymap when the active device (for example
+                    // a virtual keyboard) has none. That is a valid state, not
+                    // a fatal error: drop the old keymap until an XKB one arrives.
                     _ = linux.close(keymap.fd);
-                    return error.UnsupportedKeymapFormat;
+                    try self.keyboard_repeat.stop(self.loop);
+                    self.xkb.clearKeymap();
+                    return;
                 }
                 try self.xkb.installKeymap(keymap.fd, keymap.size);
             },

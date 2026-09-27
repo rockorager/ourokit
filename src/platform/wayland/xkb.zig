@@ -49,6 +49,15 @@ pub const Keyboard = struct {
         self.state = state;
     }
 
+    /// Forgets the keymap. Until the next one arrives, keys translate to raw
+    /// keycodes without keysyms, text, modifiers or repeat.
+    pub fn clearKeymap(self: *Keyboard) void {
+        if (self.state) |state| c.xkb_state_unref(state);
+        if (self.keymap) |keymap| c.xkb_keymap_unref(keymap);
+        self.state = null;
+        self.keymap = null;
+    }
+
     pub fn updateModifiers(
         self: *Keyboard,
         depressed: u32,
@@ -144,6 +153,25 @@ test "bindable letters digits and function keys retain logical identity" {
     try std.testing.expectEqual(platform.LogicalKey.digit_7, logicalKey(c.XKB_KEY_7));
     try std.testing.expectEqual(platform.LogicalKey.f12, logicalKey(c.XKB_KEY_F12));
     try std.testing.expectEqual(platform.LogicalKey.unidentified, logicalKey(c.XKB_KEY_F13));
+}
+
+test "clearing the keymap leaves raw untranslated keys" {
+    var keyboard = try Keyboard.init();
+    defer keyboard.deinit();
+    const names: c.xkb_rule_names = .{ .rules = "evdev", .model = "pc105", .layout = "us", .variant = "", .options = "" };
+    keyboard.keymap = c.xkb_keymap_new_from_names(keyboard.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse return error.XkbKeymapCreationFailed;
+    keyboard.state = c.xkb_state_new(keyboard.keymap.?) orelse return error.XkbStateCreationFailed;
+    const shift: u32 = @as(u32, 1) << @intCast(c.xkb_keymap_mod_get_index(keyboard.keymap.?, c.XKB_MOD_NAME_SHIFT));
+    keyboard.updateModifiers(shift, 0, 0, 0);
+    try std.testing.expectEqual(platform.LogicalKey.arrow_down, keyboard.translate(108).logical);
+    keyboard.clearKeymap();
+    keyboard.updateModifiers(shift, 0, 0, 0);
+    const raw = keyboard.translate(108);
+    try std.testing.expectEqual(@as(u32, 108), raw.keycode);
+    try std.testing.expectEqual(platform.LogicalKey.unidentified, raw.logical);
+    try std.testing.expectEqual(platform.Modifiers{}, keyboard.modifiers());
+    try std.testing.expect(!keyboard.repeats(108));
+    keyboard.clearKeymap(); // Idempotent.
 }
 
 test "native bindings retain Ctrl letters and shifted digits without changing typed Unicode" {
