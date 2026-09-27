@@ -526,6 +526,7 @@ const LayerState = struct {
     margins: platform_window.Margins,
     keyboard_interactivity: platform_window.KeyboardInteractivity,
     background_effect: ?platform_window.BackgroundEffect,
+    input_region: ?RectI,
 
     fn init(allocator: std.mem.Allocator, declaration: platform_window.LayerSurfaceDeclaration) !LayerState {
         const namespace = try allocator.dupe(u8, declaration.namespace);
@@ -543,6 +544,7 @@ const LayerState = struct {
             .margins = declaration.margins,
             .keyboard_interactivity = declaration.keyboard_interactivity,
             .background_effect = declaration.background_effect,
+            .input_region = declaration.input_region,
         };
     }
 
@@ -560,6 +562,7 @@ const LayerState = struct {
             .margins = self.margins,
             .keyboard_interactivity = self.keyboard_interactivity,
             .background_effect = self.background_effect,
+            .input_region = self.input_region,
         };
     }
 
@@ -573,6 +576,7 @@ const LayerState = struct {
         self.margins = declaration.margins;
         self.keyboard_interactivity = declaration.keyboard_interactivity;
         self.background_effect = declaration.background_effect;
+        self.input_region = declaration.input_region;
     }
 
     fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
@@ -2166,6 +2170,7 @@ pub const Host = struct {
             declaration.height,
             fractional_scale_denominator,
         );
+        try setInputRegion(objects, transmit, self.compositor.?, surface, declaration.input_region);
         try setBackgroundEffect(objects, transmit, self.compositor.?, self.background_effect_manager, self.blur_supported, surface, &window.background_effect, declaration.background_effect);
         try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
         window.state = .open;
@@ -2259,6 +2264,8 @@ pub const Host = struct {
                 window.layer != declaration.layer,
                 self.layer_shell_version,
             );
+            if (!std.meta.eql(window.layer_state.?.input_region, declaration.input_region))
+                try setInputRegion(objects, transmit, self.compositor.?, window.surface.?, declaration.input_region);
             try setBackgroundEffect(objects, transmit, self.compositor.?, self.background_effect_manager, self.blur_supported, window.surface.?, &window.background_effect, declaration.background_effect);
             try wayring.client.sendRequest(
                 protocol.wl_surface,
@@ -3491,6 +3498,35 @@ fn edgeValue(edge: platform_window.Edge) protocol.zwlr_layer_surface_v1.anchor {
     };
 }
 
+/// Wayland copies the region at set_input_region; it can be destroyed before
+/// the caller commits. A null region restores full-surface input, unlike an
+/// allocated empty region. Coordinates stay logical even with fractional scale.
+fn setInputRegion(
+    objects: *wayring.objects.ClientObjects,
+    transmit: *wayring.tx.Queue,
+    compositor: Handle,
+    surface: Handle,
+    requested: ?RectI,
+) !void {
+    if (requested) |rect| {
+        const region = (try protocol.wl_compositor.construct_create_region(objects, transmit, compositor, .{})).id;
+        if (!rect.isEmpty()) try wayring.client.sendRequest(protocol.wl_region, objects, transmit, region, .{ .add = .{
+            .x = rect.x,
+            .y = rect.y,
+            .width = @intCast(rect.width),
+            .height = @intCast(rect.height),
+        } });
+        try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{
+            .set_input_region = .{ .region = region.id },
+        });
+        try wayring.client.sendRequest(protocol.wl_region, objects, transmit, region, .{ .destroy = .{} });
+    } else {
+        try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{
+            .set_input_region = .{ .region = null },
+        });
+    }
+}
+
 /// A positive surface-local region covering every representable surface size.
 /// The protocol clips it to the surface, including after resize/scale changes.
 /// NULL means no blur, not an infinite region. Region state is copied and
@@ -4111,6 +4147,72 @@ test "destroyed surfaces close without dma-buf release events" {
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
 }
 
+test "layer input region wire requests distinguish rectangles empty and full surface" {
+    const allocator = std.testing.allocator;
+    var objects = try wayring.objects.ClientObjects.init(allocator, 32, 32, &protocol.wl_display.info, null);
+    defer objects.deinit(allocator);
+    var blocks = try wayring.pool.SharedBlocks.init(allocator, 4096, 1);
+    defer blocks.deinit(allocator);
+    var fds = try wayring.pool.SharedFds.init(allocator, 1);
+    defer fds.deinit(allocator);
+    var transmit = wayring.tx.Queue.init(&blocks, 4096, &fds, 0);
+    defer transmit.deinit();
+    const compositor = try objects.createLocal(&protocol.wl_compositor.info, 4, null);
+    const surface = try objects.createLocal(&protocol.wl_surface.info, 4, null);
+    // Non-square, offset coordinates must reach Wayland unchanged. Empty
+    // regions must omit add, but still set a non-null wl_region.
+    for ([_]RectI{
+        .{ .x = -3, .y = 7, .width = 410, .height = 62 },
+        .{ .x = 0, .y = 0, .width = 420, .height = 0 },
+        .{ .x = 0, .y = 0, .width = 0, .height = 160 },
+    }) |rect| {
+        try setInputRegion(&objects, &transmit, compositor, surface, rect);
+        const snapshot = try transmit.snapshot(&.{}, &.{});
+        var bytes = snapshot.first;
+        const create = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(compositor.id, create.header.object_id);
+        try std.testing.expectEqual(@as(u16, 1), create.header.opcode);
+        var args = create.arguments();
+        const region_id = try args.uint();
+        try args.finish();
+        bytes = bytes[create.header.size..];
+        if (!rect.isEmpty()) {
+            const add = (try wayring.wire.Message.decode(bytes)).?;
+            try std.testing.expectEqual(region_id, add.header.object_id);
+            try std.testing.expectEqual(@as(u16, 1), add.header.opcode);
+            args = add.arguments();
+            try std.testing.expectEqual(@as(i32, -3), try args.int());
+            try std.testing.expectEqual(@as(i32, 7), try args.int());
+            try std.testing.expectEqual(@as(i32, 410), try args.int());
+            try std.testing.expectEqual(@as(i32, 62), try args.int());
+            try args.finish();
+            bytes = bytes[add.header.size..];
+        }
+        const set = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(surface.id, set.header.object_id);
+        try std.testing.expectEqual(@as(u16, 5), set.header.opcode);
+        args = set.arguments();
+        try std.testing.expectEqual(region_id, try args.uint());
+        try args.finish();
+        bytes = bytes[set.header.size..];
+        const destroy = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expectEqual(region_id, destroy.header.object_id);
+        try std.testing.expectEqual(@as(u16, 0), destroy.header.opcode);
+        try std.testing.expectEqual(destroy.header.size, bytes.len);
+        try transmit.begin(snapshot);
+        try transmit.complete(snapshot.byteCount());
+    }
+    try setInputRegion(&objects, &transmit, compositor, surface, null);
+    const snapshot = try transmit.snapshot(&.{}, &.{});
+    const set = (try wayring.wire.Message.decode(snapshot.first)).?;
+    try std.testing.expectEqual(surface.id, set.header.object_id);
+    try std.testing.expectEqual(@as(u16, 5), set.header.opcode);
+    var args = set.arguments();
+    try std.testing.expectEqual(@as(u32, 0), try args.uint());
+    try args.finish();
+    try std.testing.expectEqual(set.header.size, snapshot.byteCount());
+}
+
 test "layer background effect wire requests cover fallback removal and recreation" {
     const allocator = std.testing.allocator;
     var objects = try wayring.objects.ClientObjects.init(allocator, 32, 32, &protocol.wl_display.info, null);
@@ -4347,19 +4449,26 @@ test "layer state owns output identity across hotplug recreation" {
         .height = 32,
         .layer = .top,
         .anchors = .{ .top = true, .left = true, .right = true },
+        .input_region = .{ .x = 2, .y = 5, .width = 80, .height = 24 },
     });
     defer state.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("ouro-shell", state.namespace);
     try std.testing.expectEqualStrings("DP-1", state.output.?);
+    try std.testing.expectEqualDeep(@as(?RectI, .{ .x = 2, .y = 5, .width = 80, .height = 24 }), state.asDeclaration().input_region);
 
     var updated = state.asDeclaration();
     updated.height = 40;
     updated.exclusive_zone = 40;
     updated.background_effect = .blur;
+    updated.input_region.?.height = 31;
     state.update(updated);
     try std.testing.expectEqual(@as(u32, 40), state.height);
     try std.testing.expectEqual(@as(i32, 40), state.exclusive_zone);
     try std.testing.expectEqual(platform_window.BackgroundEffect.blur, state.asDeclaration().background_effect.?);
+    try std.testing.expectEqual(@as(u32, 31), state.asDeclaration().input_region.?.height);
+    updated.input_region = null;
+    state.update(updated);
+    try std.testing.expectEqual(null, state.asDeclaration().input_region);
 }
 
 test "damage history expands a stale slot and falls back when age is unknown" {

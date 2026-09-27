@@ -51,6 +51,7 @@ const Slot = struct {
     keyboard_interactivity: platform_window.KeyboardInteractivity = .none,
     background: ?@import("../core/color.zig").Color = null,
     background_effect: ?platform_window.BackgroundEffect = null,
+    input_region: ?@import("../core/geometry.zig").RectI = null,
     scope: ScopeHandle = .invalid,
 };
 
@@ -685,6 +686,7 @@ fn layerStateEqual(slot: *const Slot, declaration: LayerSurfaceDeclaration) bool
         std.meta.eql(slot.margins, declaration.margins) and
         std.meta.eql(slot.background, declaration.background) and
         slot.background_effect == declaration.background_effect and
+        std.meta.eql(slot.input_region, declaration.input_region) and
         slot.keyboard_interactivity == declaration.keyboard_interactivity;
 }
 
@@ -699,6 +701,7 @@ fn setLayerState(slot: *Slot, declaration: LayerSurfaceDeclaration) void {
     slot.keyboard_interactivity = declaration.keyboard_interactivity;
     slot.background = declaration.background;
     slot.background_effect = declaration.background_effect;
+    slot.input_region = declaration.input_region;
 }
 
 fn handleFor(slot: *const Slot, index: usize) WindowHandle {
@@ -887,6 +890,22 @@ test "layer surface declarations retain identity and update role-specific state"
     updated.layer_surface.background_effect = null;
     try windows.reconcile(&.{updated});
     try std.testing.expectEqual(handle, host.actions[4].update_layer_surface);
+
+    updated.layer_surface.input_region = .{ .x = 3, .y = 7, .width = 110, .height = 23 };
+    try windows.reconcile(&.{updated});
+    try std.testing.expectEqual(handle, host.actions[5].update_layer_surface);
+    try windows.reconcile(&.{updated});
+    try std.testing.expectEqual(@as(usize, 6), host.count);
+    updated.layer_surface.input_region.?.height = 0;
+    try windows.reconcile(&.{updated});
+    try std.testing.expectEqual(handle, host.actions[6].update_layer_surface);
+    var invalid_region = updated;
+    invalid_region.layer_surface.input_region.?.width = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidLayerSurfaceInputRegion, windows.reconcile(&.{invalid_region}));
+    try std.testing.expectEqual(@as(usize, 7), host.count);
+    updated.layer_surface.input_region = null;
+    try windows.reconcile(&.{updated});
+    try std.testing.expectEqual(handle, host.actions[7].update_layer_surface);
 
     try windows.reconcile(&.{});
     try scheduler.applyQueuedCancellations();

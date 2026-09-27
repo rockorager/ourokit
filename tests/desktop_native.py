@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 
-from application_services import development_path
+from application_services import call, development_path
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("OUROKIT_TEST_BINARY", ROOT / "zig-out/bin/ouroctl"))
@@ -437,6 +437,7 @@ return o.app{id='dev.ourokit.drag-target',run=function() return {windows={o.wind
         wait_for(lambda: node(app_env, target_ep, "target", "drop/status")["label"] == "two file URIs", "file URI drop did not arrive intact")
         print("PASS synthetic drag rejected; real private-seat two-client text and file-URI drags")
         forms_test(root, app_env)
+        layer_input_test(root, app_env)
     finally:
         terminate(pointer)
         for process in processes:
@@ -444,6 +445,113 @@ return o.app{id='dev.ourokit.drag-target',run=function() return {windows={o.wind
             errors=process.stderr.read()
             assert process.returncode in (0, 143, -15), (process.returncode, errors)
             assert "panic" not in errors and "leaked" not in errors, errors
+
+
+def layer_input_test(root, env):
+    """Compositor hit testing, not development-injected widget clicks."""
+    runtime = root / 'layer-input-runtime'
+    runtime.mkdir(mode=0o700)
+    env = dict(env, XDG_RUNTIME_DIR=str(runtime))
+    source = root / 'layer-input.lua'
+    text = '''local o=require('ouro')
+local mode=o.signal('default')
+local under, card = 0, 0
+return o.app {id='dev.ourokit.layer-input', actions={
+  Stats={description='Click counts',inputSchema={type='object'},outputSchema={type='object'},
+    handler=function() return {under=under,card=card} end},
+  SetRegion={description='Change input policy',
+    inputSchema={type='object',properties={mode={type='string'}},required={'mode'}},
+    outputSchema={type='object'},handler=function(v) mode:set(v.mode) return {} end},
+},run=function() return {windows=function()
+  local m=mode()
+  local windows={o.window{id='under',title='Under notification',width=620,height=420,
+    content=function() return o.button{key='under',label='Underlying window',width=600,height=360,
+      on_press=function() under=under+1 end} end}}
+  if m~='closed' then
+    local region=nil
+    if m=='card' then region={x=20,y=10,width=400,height=62} end
+    if m=='empty' then region={} end
+    windows[#windows+1]=o.layer_surface{id='notification',namespace='input-test',output='HEADLESS-1',
+      layer='overlay',width=420,height=160,anchors={'top','left'},margins={top=100,left=100},
+      background='#00000000',input_region=region,
+      content=function() return o.button{key='card',label='Notification card',width=420,height=72,
+        on_press=function() card=card+1 end} end}
+  end
+  return windows
+end} end}
+'''
+    source.write_text(text)
+    process = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--software'],
+                               env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        endpoint = development_path(runtime, process)
+        wait_for(lambda: len(inspect(env, endpoint).get('windows', [])) == 2, 'layer input windows unavailable')
+        sway(env, '[app_id="dev.ourokit.layer-input"]', 'move', 'position', '0', '0')
+
+        def stats():
+            return call(endpoint, 'Stats')['structuredContent']
+
+        def check(x, y, target):
+            before = stats()
+            # Leave and re-enter so this checks hit testing, not an active grab.
+            sway(env, 'seat', 'seat0', 'cursor', 'set', '700', '350')
+            sway(env, 'seat', 'seat0', 'cursor', 'set', str(x), str(y))
+            sway(env, 'seat', 'seat0', 'cursor', 'press', 'button1')
+            sway(env, 'seat', 'seat0', 'cursor', 'release', 'button1')
+            expected = dict(before)
+            if target:
+                expected[target] += 1
+                try:
+                    wait_for(lambda: stats() == expected, f'click at {x},{y} did not reach {target}')
+                except AssertionError as error:
+                    raise AssertionError((x, y, target, expected, stats())) from error
+            # Also detect unexpected delivery to either window for swallowed clicks.
+            time.sleep(.12)
+            assert stats() == expected, (x, y, target, expected, stats())
+
+        def policy(mode):
+            assert not call(endpoint, 'SetRegion', {'mode': mode}).get('isError')
+            wait_for(lambda: len(inspect(env, endpoint).get('windows', [])) == (1 if mode == 'closed' else 2),
+                     'layer input policy did not reconcile')
+            time.sleep(.12)  # Let the compositor process the surface commit.
+
+        check(140, 140, 'card')
+        check(140, 200, None)  # Default still swallows transparent padding.
+        policy('card')
+        for scale in ('1', '1.5'):
+            sway(env, 'output', 'HEADLESS-1', 'scale', scale)
+            time.sleep(.2)
+            check(140, 140, 'card')
+            check(140, 200, 'under')
+            check(110, 140, 'under')  # Nonzero x origin, over visible card.
+            check(140, 105, 'under')  # Nonzero y origin.
+            check(140, 171, 'card')
+            check(140, 173, 'under')  # Just outside the bottom edge at both scales.
+        source.write_text(text.replace('input_region=region', 'input_region=false'))
+        assert call(endpoint, 'runtime.reload').get('isError'), 'invalid region reload accepted'
+        check(140, 200, 'under')
+        source.write_text(text)
+        policy('empty')
+        check(140, 140, 'under')  # Empty != nil, even over opaque content.
+        policy('default')
+        check(140, 200, None)  # nil resets the compositor's input region.
+        policy('closed')
+        policy('card')
+        check(140, 140, 'card')
+        check(140, 200, 'under')
+        sway(env, 'output', 'HEADLESS-1', 'disable')
+        time.sleep(.2)
+        sway(env, 'output', 'HEADLESS-1', 'enable')
+        time.sleep(.3)
+        check(140, 140, 'card')
+        check(140, 200, 'under')
+        print('PASS layer input: default, rectangle, empty, reset, invalid reload, reopen, output reconnect, 1x/1.5x and edges')
+    finally:
+        terminate(process)
+        sway(env, 'output', 'HEADLESS-1', 'scale', '1')
+        errors = process.stderr.read()
+        assert process.returncode in (0, 143, -15), (process.returncode, errors)
+        assert 'panic' not in errors and 'leaked' not in errors, errors
 
 
 def forms_test(root, env):

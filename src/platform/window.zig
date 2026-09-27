@@ -1,5 +1,6 @@
 const Handle = @import("../core/handle.zig").Handle;
 const PointF = @import("../core/geometry.zig").PointF;
+const RectI = @import("../core/geometry.zig").RectI;
 const ScopeHandle = @import("../task/scheduler.zig").ScopeHandle;
 const Color = @import("../core/color.zig").Color;
 
@@ -325,11 +326,21 @@ pub const LayerSurfaceDeclaration = struct {
     keyboard_interactivity: KeyboardInteractivity = .none,
     background: ?Color = null,
     background_effect: ?BackgroundEffect = null,
+    /// Integer surface-local logical coordinates, independent of buffer scale.
+    /// Null accepts input over the entire surface; an empty rectangle accepts none.
+    input_region: ?RectI = null,
 
     pub fn validate(self: LayerSurfaceDeclaration) !void {
         if (self.id.len == 0) return error.EmptyWindowId;
         if (self.namespace.len == 0) return error.EmptyLayerSurfaceNamespace;
         if (self.output) |output| if (output.len == 0) return error.EmptyOutputName;
+        if (self.input_region) |region| {
+            const maximum = @import("std").math.maxInt(i32);
+            if (region.width > maximum or region.height > maximum or
+                @as(i64, region.x) + region.width > maximum or
+                @as(i64, region.y) + region.height > maximum)
+                return error.InvalidLayerSurfaceInputRegion;
+        }
         if (self.width == 0 and !(self.anchors.left and self.anchors.right))
             return error.InvalidLayerSurfaceSize;
         if (self.height == 0 and !(self.anchors.top and self.anchors.bottom))

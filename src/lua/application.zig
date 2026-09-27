@@ -766,6 +766,7 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
                     .margins = try optionalMargins(state, -1),
                     .background = try optionalBackground(state, -1),
                     .background_effect = try optionalNullableEnum(platform.BackgroundEffect, state, -1, "background_effect"),
+                    .input_region = try optionalInputRegion(state, -1),
                     .keyboard_interactivity = try optionalEnum(
                         platform.KeyboardInteractivity,
                         state,
@@ -917,6 +918,19 @@ fn optionalBackground(state: *c.State, table: c_int) !?@import("../core/color.zi
     defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return null;
     return try theming.color(state, -1);
+}
+
+fn optionalInputRegion(state: *c.State, table: c_int) !?@import("../core/geometry.zig").RectI {
+    const value_type = c.lua_getfield(state, table, "input_region");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return null;
+    if (value_type != c.type_table) return error.InvalidLayerSurfaceInputRegion;
+    return .{
+        .x = try optionalSignedInteger(state, -1, "x", 0, std.math.minInt(i32)),
+        .y = try optionalSignedInteger(state, -1, "y", 0, std.math.minInt(i32)),
+        .width = try optionalNonNegativeDimension(state, -1, "width", 0),
+        .height = try optionalNonNegativeDimension(state, -1, "height", 0),
+    };
 }
 
 fn optionalAnchors(state: *c.State, table: c_int) !platform.Anchors {
@@ -1159,6 +1173,40 @@ test "layer surface background defaults and validation" {
         .{ "background=false", error.InvalidThemeType },
         .{ "background_effect='frost'", error.InvalidEnumValue },
         .{ "background_effect=true", error.InvalidEnumValue },
+    }) |case| {
+        try std.testing.expectError(case[1], Application.load(std.testing.allocator, state, prefix ++ case[0] ++ suffix));
+    }
+}
+
+test "layer surface input region defaults rectangles empty regions and validation" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 3);
+    c.lua_setglobal(state, "ouro");
+    const prefix = "return ouro.app { id='test', run=function() return {windows={ouro.layer_surface {id='panel', namespace='test', layer='top', width=420, height=160, content=function() end,";
+    const suffix = "}}} end}";
+    const Rect = @import("../core/geometry.zig").RectI;
+    inline for (.{
+        .{ "", @as(?Rect, null) },
+        .{ "input_region=nil", @as(?Rect, null) },
+        .{ "input_region={x=-3,y=7,width=410,height=62}", @as(?Rect, .{ .x = -3, .y = 7, .width = 410, .height = 62 }) },
+        .{ "input_region={}", @as(?Rect, .{ .x = 0, .y = 0, .width = 0, .height = 0 }) },
+        .{ "input_region={width=420,height=0}", @as(?Rect, .{ .x = 0, .y = 0, .width = 420, .height = 0 }) },
+    }) |case| {
+        var application = try Application.load(std.testing.allocator, state, prefix ++ case[0] ++ suffix);
+        defer application.deinit();
+        try std.testing.expectEqualDeep(case[1], application.windows[0].declaration.layer_surface.input_region);
+    }
+    inline for (.{
+        .{ "input_region=false", error.InvalidLayerSurfaceInputRegion },
+        .{ "input_region='content'", error.InvalidLayerSurfaceInputRegion },
+        .{ "input_region={x=1.5}", error.InvalidLayerSurfaceInteger },
+        .{ "input_region={y=-2147483649}", error.InvalidLayerSurfaceInteger },
+        .{ "input_region={width=-1}", error.InvalidWindowDimension },
+        .{ "input_region={height=2.5}", error.InvalidWindowDimension },
+        .{ "input_region={width=2147483648}", error.InvalidWindowDimension },
+        .{ "input_region={x=2147483647,width=1}", error.InvalidLayerSurfaceInputRegion },
+        .{ "input_region={y=2147483647,height=1}", error.InvalidLayerSurfaceInputRegion },
     }) |case| {
         try std.testing.expectError(case[1], Application.load(std.testing.allocator, state, prefix ++ case[0] ++ suffix));
     }

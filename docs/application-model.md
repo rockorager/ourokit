@@ -285,10 +285,44 @@ resizes and output scaling. Closing/reopening or reconnecting an output creates
 a fresh effect object, and capability changes are handled without changing the
 tint.
 
+`input_region = { x = 0, y = 0, width = 420, height = 72 }` restricts pointer
+and touch input to one rectangle in **surface-local logical coordinates**,
+independent of output scale or renderer. The compositor delivers input outside
+it to surfaces underneath, including through transparent padding. Omit it (or
+set it to `nil`) to accept input over the entire surface, the existing default.
+Set `input_region = {}` to make the entire surface click-through. Each omitted
+rectangle field defaults to zero; either zero dimension makes the region empty.
+Fields must be integers, dimensions must be non-negative, and coordinates,
+dimensions, and right/bottom edges must fit signed 32-bit values. Negative
+origins are allowed; the compositor clips the rectangle to the surface.
+
+For example, a 420×160 notification surface with a known 72-unit card height
+can leave the area below the card click-through:
+
+```lua
+ouro.layer_surface {
+  id = "notification", namespace = "shell-notification", layer = "overlay",
+  width = 420, height = 160,
+  background = "#00000000",
+  input_region = { width = 420, height = 72 },
+  content = function()
+    return ouro.button { key = "card", label = "New message", width = 420, height = 72 }
+  end,
+}
+```
+
+This is an explicit input policy, not alpha-based hit testing: transparent pixels
+inside the rectangle still accept input, and visible pixels outside it do not.
+It does not change painting, layout, or keyboard interactivity. For auto-sized
+content, the application must supply and update the input bounds; Ourokit does
+not infer them from the widget tree. Reactive window declarations and source
+reload can change or remove the region without recreating the surface, and it
+is reapplied after output reconnection.
+
 Namespace, output, and surface role are immutable for a retained ID, while
 size, layer, anchors, exclusive zone and edge, margins, keyboard interactivity,
-background, and background effect update transactionally, including on source
-reload. Invalid color/effect values reject the new declaration.
+background, background effect, and input region update transactionally, including
+on source reload. Invalid color/effect/region values reject the new declaration.
 
 ## User-initiated anchored popups
 
