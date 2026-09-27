@@ -16,6 +16,9 @@ const instance = @import("../ui/instance/tree.zig");
 const PointerBindings = @import("../ui/input/bindings.zig").PointerBindings;
 const Buttons = @import("../ui/widget/buttons.zig").Buttons;
 const ButtonStyle = @import("../ui/widget/buttons.zig").Style;
+const ButtonRecipe = @import("../ui/widget/buttons.zig").Recipe;
+const ButtonVariant = @import("../ui/widget/buttons.zig").Variant;
+const ButtonTone = @import("../ui/widget/buttons.zig").Tone;
 const TextInputs = @import("../ui/text_input/registry.zig").Registry;
 const TextInputValueMode = @import("../ui/text_input/registry.zig").ValueMode;
 const TextInputSession = @import("../ui/text_input/session.zig").Session;
@@ -647,6 +650,7 @@ pub const UiBuild = struct {
             .tab_bar => emitTabBar,
             .tab => emitTab,
             .split_view => emitSplitView,
+            .separator => emitSeparator,
             .box => emitBox,
             .stack => emitStack,
             .row => emitRow,
@@ -898,7 +902,6 @@ pub const UiBuild = struct {
 
     fn emitImageKind(state: *c.State, icon: bool) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const images = self.images orelse return luaError(state, "image service unavailable");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const parent = self.currentParent() orelse return luaError(state, "image requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "image key is required");
@@ -937,7 +940,9 @@ pub const UiBuild = struct {
             .size = (rasterDimension(@max(logical_width.?, logical_height.?), 1) catch return luaError(state, "icon too large")).?,
             .scale = (rasterDimension(1, self.image_scale) catch return luaError(state, "icon scale too large")).?,
         } } else if (path.present) .{ .path = path.value } else .{ .bytes = bytes.value };
-        const handle = images.request(
+        // A host without an image service behaves like a failed asset: the
+        // leaf keeps its declared dimensions and paints nothing.
+        const handle = if (self.images) |images| images.request(
             source,
             .{
                 .width = rasterDimension(logical_width, self.image_scale) catch return luaError(state, "image raster too large"),
@@ -946,8 +951,8 @@ pub const UiBuild = struct {
                 .scale = self.image_scale,
             },
             .{ .owners = active.owners, .handle = active.handle },
-        ) catch |err| return luaError(state, @errorName(err));
-        if (handle) |value| images.cache.retain(value) catch |err| return luaError(state, @errorName(err));
+        ) catch |err| return luaError(state, @errorName(err)) else null;
+        if (handle) |value| self.images.?.cache.retain(value) catch |err| return luaError(state, @errorName(err));
         const id = semanticId(key, 0x696d616765 ^ parent.id ^ self.component_namespace);
         self.append(.{
             .id = id,
@@ -962,7 +967,7 @@ pub const UiBuild = struct {
             } },
             .parent_data = parent_data,
         }) catch {
-            if (handle) |value| images.cache.release(value) catch unreachable;
+            if (handle) |value| self.images.?.cache.release(value) catch unreachable;
             return luaError(state, "cannot append image descriptor");
         };
         self.images_staged = true;
@@ -980,9 +985,20 @@ pub const UiBuild = struct {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.button, true) catch |err| return luaError(state, @errorName(err));
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.button expects one declaration table");
+        const variant = tableOptionalEnum(ButtonVariant, state, 1, "variant", .solid) orelse
+            return luaError(state, "button variant must be 'solid', 'soft', 'surface', or 'ghost'");
+        const tone = tableOptionalEnum(ButtonTone, state, 1, "tone", .accent) orelse
+            return luaError(state, "button tone must be 'accent', 'neutral', or 'destructive'");
+        // Theme-wide button colors style the default solid accent button.
+        // Geometry applies to every variant; per-button colors always win.
+        var inherited = defaults.widgets.button;
+        if (variant != .solid or tone != .accent) inline for (std.meta.fields(theming.Overrides)) |field| {
+            if (field.type == ?@import("../core/color.zig").Color) @field(inherited, field.name) = null;
+        };
+        const visual = widgetOverrides(state, inherited, true) catch |err| return luaError(state, @errorName(err));
+        const recipe = ButtonRecipe.init(theme, variant, tone);
         const key = tableString(state, 1, "key") orelse return luaError(state, "button key is required");
         const label = tableString(state, 1, "label") orelse return luaError(state, "button label is required");
         const child_count = c.lua_rawlen(state, c.upvalueIndex(2));
@@ -1004,15 +1020,21 @@ pub const UiBuild = struct {
             return luaError(state, parentDataErrorMessage(err));
         const button_id = semanticId(key, 0x627574746f6e ^ parent.id ^ self.component_namespace);
         const label_id = semanticId(key, 0x6c6162656c ^ button_id);
-        const border_width = visual.border_width orelse defaults.controls.border_width orelse 0;
+        const border_width = visual.border_width orelse defaults.controls.border_width orelse
+            if (recipe.bordered) design.tokens.foundation.border_width_default else 0;
         const style: ButtonStyle = .{
-            .idle = visual.background orelse theme.primary,
-            .hovered = visual.hover orelse theme.primary_hover,
-            .pressed = visual.pressed orelse visual.hover orelse theme.primary_hover,
-            .disabled = visual.disabled orelse theme.disabled,
-            .border = visual.border orelse theme.border,
-            .focus = visual.focus orelse theme.ring,
+            .idle = visual.background orelse recipe.style.idle,
+            .hovered = visual.hover orelse recipe.style.hovered,
+            .pressed = visual.pressed orelse visual.hover orelse recipe.style.pressed,
+            .disabled = visual.disabled orelse recipe.style.disabled,
+            .border = visual.border orelse if (enabled) recipe.style.border else theme.border,
+            .focus = visual.focus orelse recipe.style.focus,
         };
+        const foreground = if (enabled)
+            visual.foreground orelse recipe.foreground
+        else
+            visual.disabled_foreground orelse recipe.disabled_foreground;
+        const font_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2;
         self.append(.{
             .id = button_id,
             .parent = parent.id,
@@ -1038,7 +1060,7 @@ pub const UiBuild = struct {
             const source = sources.acquire(.{
                 .utf8 = label,
                 .language = "und",
-                .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
+                .logical_size = font_size,
                 .candidates = self.themedFonts(true) catch |err| return luaError(state, @errorName(err)),
                 .configuration_revision = self.text_configuration_revision,
             }) catch return luaError(state, "cannot retain button label");
@@ -1047,10 +1069,7 @@ pub const UiBuild = struct {
                 .parent = button_id,
                 .object = .{ .text = .{
                     .source = source,
-                    .color = if (enabled)
-                        visual.foreground orelse theme.primary_foreground
-                    else
-                        visual.disabled_foreground orelse theme.disabled_foreground,
+                    .color = foreground,
                     .alignment = .center,
                     .max_lines = 1,
                     .overflow = .ellipsis,
@@ -1078,7 +1097,17 @@ pub const UiBuild = struct {
             .enabled = enabled,
         }) catch return luaError(state, "cannot append button semantics");
 
-        if (child_count != 0) _ = self.emitChildren(state, .{ .id = button_id, .kind = .box });
+        if (child_count != 0) {
+            // Custom content inherits the variant's label color and size, so
+            // text and tinted icons match the automatic label in every state.
+            var content_theme = defaults;
+            content_theme.colors.foreground = foreground;
+            content_theme.widgets.text.foreground = null;
+            content_theme.typography.size = font_size;
+            self.pushTheme(content_theme) catch return luaError(state, "widget nesting is too deep");
+            defer self.popTheme();
+            _ = self.emitChildren(state, .{ .id = button_id, .kind = .box });
+        }
         self.stageCallback(state, button_id, "on_interaction_change", .interaction_change) catch |err|
             return luaError(state, @errorName(err));
         self.stageCallback(state, button_id, "on_cancel", .cancel) catch |err|
@@ -1436,7 +1465,7 @@ pub const UiBuild = struct {
             return luaError(state, "selection group enabled must be boolean");
         const appearance = tableOptionalListBoxAppearance(state, 1) orelse
             return luaError(state, "listbox appearance must be 'default' or 'sidebar'");
-        const gap = tableOptionalExtent(state, 1, "gap", design.tokens.foundation.spacing_1) orelse
+        const gap = tableOptionalExtent(state, 1, "gap", if (tabs) 0 else design.tokens.foundation.spacing_1) orelse
             return luaError(state, "invalid listbox gap");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
@@ -1523,16 +1552,25 @@ pub const UiBuild = struct {
             if (option.listbox_id == parent.id and option.value == value)
                 return luaError(state, "selection values must be unique");
         }
-        const idle_foreground = if (listbox.appearance == .sidebar)
+        // Tabs follow Radix Themes' tab list: transparent triggers with gray
+        // step 11 text, gray step 3 hover, and gray step 12 active text above
+        // an accent indicator instead of a filled selection.
+        const idle_foreground = if (tab)
+            theme.muted_foreground
+        else if (listbox.appearance == .sidebar)
             theme.sidebar_foreground
         else
             theme.foreground;
-        const hovered = if (listbox.appearance == .sidebar) theme.sidebar_accent else theme.accent;
-        const selected_background = if (listbox.appearance == .sidebar)
+        const hovered = if (tab) theme.secondary else if (listbox.appearance == .sidebar) theme.sidebar_accent else theme.accent;
+        const selected_background: ?@import("../core/color.zig").Color = if (tab)
+            null
+        else if (listbox.appearance == .sidebar)
             theme.sidebar_accent_selected
         else
             theme.accent_selected;
-        const accent_foreground = if (listbox.appearance == .sidebar)
+        const accent_foreground = if (tab)
+            theme.foreground
+        else if (listbox.appearance == .sidebar)
             theme.sidebar_accent_foreground
         else
             theme.accent_foreground;
@@ -1549,11 +1587,10 @@ pub const UiBuild = struct {
         self.append(.{
             .id = option_id,
             .parent = parent.id,
-            .parent_data = if (tab) .{ .flex = .{ .factor = 1 } } else .none,
             .object = .{ .box = .{
-                .height = visual.height orelse defaults.controls.height,
-                .padding = .{ .left = visual.padding_x orelse design.tokens.foundation.spacing_2, .right = visual.padding_x orelse design.tokens.foundation.spacing_2 },
-                .alignment = .{ .horizontal = .minimum, .vertical = .center },
+                .height = visual.height orelse if (tab) design.tokens.foundation.spacing_7 else defaults.controls.height,
+                .padding = if (tab) .{} else .{ .left = visual.padding_x orelse design.tokens.foundation.spacing_2, .right = visual.padding_x orelse design.tokens.foundation.spacing_2 },
+                .alignment = if (tab) null else .{ .horizontal = .minimum, .vertical = .center },
                 .background = if (selected) style.selected.background else style.idle.background,
                 .border_color = if (border_width > 0) visual.border orelse theme.border else null,
                 .border_width = border_width,
@@ -1562,7 +1599,32 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append option descriptor");
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         var content_parent = option_id;
-        if (parent.kind == .radio_group or tab) {
+        const frame_id = semanticId("frame", option_id);
+        if (tab) {
+            // Tabs keep their intrinsic width. The frame stretches the
+            // indicator to that width below the padded label row.
+            const inset_id = semanticId("inset", option_id);
+            self.append(.{
+                .id = frame_id,
+                .parent = option_id,
+                .object = .{ .flex = .{ .axis = .vertical, .cross_axis_alignment = .stretch } },
+            }) catch return luaError(state, "cannot append tab frame");
+            self.append(.{
+                .id = inset_id,
+                .parent = frame_id,
+                .parent_data = .{ .flex = .{ .factor = 1 } },
+                .object = .{ .box = .{
+                    .padding = .{ .left = visual.padding_x orelse design.tokens.foundation.spacing_3, .right = visual.padding_x orelse design.tokens.foundation.spacing_3 },
+                    .alignment = .{ .horizontal = .minimum, .vertical = .center },
+                } },
+            }) catch return luaError(state, "cannot append tab inset");
+            content_parent = semanticId("content", option_id);
+            self.append(.{
+                .id = content_parent,
+                .parent = inset_id,
+                .object = .{ .flex = .{ .main_axis_size = .min, .gap = design.tokens.foundation.spacing_1, .cross_axis_alignment = .center } },
+            }) catch return luaError(state, "cannot append option content");
+        } else if (parent.kind == .radio_group) {
             content_parent = semanticId("content", option_id);
             self.append(.{
                 .id = content_parent,
@@ -1589,13 +1651,13 @@ pub const UiBuild = struct {
             .utf8 = label,
             .language = "und",
             .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
-            .candidates = self.themedFonts(selected and listbox.appearance == .sidebar) catch |err| return luaError(state, @errorName(err)),
+            .candidates = self.themedFonts(selected and (tab or listbox.appearance == .sidebar)) catch |err| return luaError(state, @errorName(err)),
             .configuration_revision = self.text_configuration_revision,
         }) catch return luaError(state, "cannot retain option label");
         self.append(.{
             .id = label_id,
             .parent = content_parent,
-            .parent_data = if (parent.kind == .radio_group or tab) .{ .flex = .{ .factor = 1 } } else .none,
+            .parent_data = if (parent.kind == .radio_group) .{ .flex = .{ .factor = 1 } } else .none,
             .object = .{ .text = .{
                 .source = source,
                 .color = if (!listbox.enabled) theme.disabled_foreground else if (selected) style.selected.foreground else style.idle.foreground,
@@ -1627,7 +1689,17 @@ pub const UiBuild = struct {
             .checked = parent.kind == .radio_group and selected,
             .enabled = listbox.enabled,
         }) catch return luaError(state, "cannot append option semantics");
-        if (tab) return self.emitChildren(state, .{ .id = content_parent, .kind = .flex, .semantic_id = option_id });
+        if (tab) {
+            _ = self.emitChildren(state, .{ .id = content_parent, .kind = .flex, .semantic_id = option_id });
+            self.append(.{
+                .id = semanticId("indicator", option_id),
+                .parent = frame_id,
+                .object = .{ .box = .{
+                    .height = design.tokens.foundation.border_width_strong,
+                    .background = if (selected and listbox.enabled) theme.primary else null,
+                } },
+            }) catch return luaError(state, "cannot append tab indicator");
+        }
         return 0;
     }
 
@@ -1681,6 +1753,33 @@ pub const UiBuild = struct {
         self.pending_button_count += 1;
         self.appendSemantic(.{ .id = divider, .parent = id, .role = .separator, .key = "divider" }) catch return luaError(state, "cannot append split divider semantics");
         self.stageCallback(state, divider, "on_change", .split_change) catch |err| return luaError(state, @errorName(err));
+        return 0;
+    }
+
+    /// Radix Themes full-size separator: a 1px `border` rule that fills the
+    /// bounded axis of its parent.
+    fn emitSeparator(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.separator expects one declaration table");
+        const parent = self.currentParent() orelse return luaError(state, "separator requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "separator key is required");
+        const axis = tableOptionalAxis(state, 1, "orientation", .horizontal) orelse
+            return luaError(state, "separator orientation must be 'horizontal' or 'vertical'");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
+        const id = semanticId(key, 0x7365706172 ^ parent.id ^ self.component_namespace);
+        const thickness = design.tokens.foundation.border_width_default;
+        self.append(.{ .id = id, .parent = parent.id, .parent_data = parent_data, .object = .{ .box = .{
+            .fill_width = axis == .horizontal,
+            .fill_height = axis == .vertical,
+            .width = if (axis == .vertical) thickness else null,
+            .height = if (axis == .horizontal) thickness else null,
+            .background = theme.border,
+        } } }) catch return luaError(state, "cannot append separator");
+        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .separator, .key = key }) catch
+            return luaError(state, "cannot append separator semantics");
         return 0;
     }
 
@@ -2224,6 +2323,19 @@ fn tableOptionalParagraphOverflow(
     if (std.mem.eql(u8, value, "clip")) return .clip;
     if (std.mem.eql(u8, value, "ellipsis")) return .ellipsis;
     return null;
+}
+
+fn tableOptionalEnum(
+    comptime T: type,
+    state: *c.State,
+    table: c_int,
+    field: [*:0]const u8,
+    default: T,
+) ?T {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    return std.meta.stringToEnum(T, string(state, -1) orelse return null);
 }
 
 fn tableOptionalAxis(

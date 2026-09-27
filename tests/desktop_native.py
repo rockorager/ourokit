@@ -152,7 +152,7 @@ def document_test(root, env):
             wait_for(lambda: inspect(app_env, endpoint).get("windows"), "document window did not appear")
             window = "main"
             panel = lambda value, leaf: f"documents/tabs/control/panels/{value}/drop/layers/body/{leaf}"
-            header = lambda value, leaf="": f"documents/tabs/control/bar/{value}" + (f"/{leaf}" if leaf else "")
+            header = lambda value, leaf="": f"documents/tabs/control/strip/bar/{value}" + (f"/{leaf}" if leaf else "")
 
             def input_action(**action):
                 tree = inspect(app_env, endpoint, window)["windows"][0]
@@ -486,21 +486,21 @@ def forms_test(root, env):
         popup = open_select()
         capture(env, endpoint, popup, 'forms-select-open.png')
         key(popup, 'arrow_down')
-        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: UTF-16 ▾'
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: UTF-16'
         key(popup, 'enter', retiring=True)
         wait_for(lambda: len(inspect(env, endpoint)['windows']) == 1, 'select did not close')
-        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: ASCII ▾'
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: ASCII'
         assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['focused']
         popup = open_select()
         key(popup, 'home')
         key(popup, 'escape', retiring=True)
         wait_for(lambda: len(inspect(env, endpoint)['windows']) == 1, 'select cancellation did not close')
-        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: ASCII ▾'
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: ASCII'
         popup = open_select()
         # Pointer selection commits and closes, unlike arrow navigation.
         input_action(popup, retiring=True, action='click', target='scroll/choices/1')
         wait_for(lambda: len(inspect(env, endpoint)['windows']) == 1, 'pointer selection did not close')
-        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: UTF-8 ▾'
+        assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: UTF-8'
 
         click(env, endpoint, 'main', 'root/form/reset')
         assert node(env, endpoint, 'main', 'root/confirm/body/actions/cancel')['focused']

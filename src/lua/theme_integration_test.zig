@@ -504,6 +504,70 @@ test "Lua tokens work in theme and widget props and preserve button defaults" {
     try std.testing.expectEqual(box.background, (try f.object("scope/root/default")).box.background);
 }
 
+test "button variants use semantic recipes and tint custom content" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\function build()
+        \\  return ouro.theme { key = 'scope', widgets = { button = { background = '#010203ff', padding_x = 5 } },
+        \\    ouro.column { key = 'root',
+        \\      ouro.button { key = 'solid', label = 'Solid' },
+        \\      ouro.button { key = 'soft', label = 'Soft', variant = 'soft', tone = 'neutral' },
+        \\      ouro.button { key = 'surface', label = 'Surface', variant = 'surface' },
+        \\      ouro.button { key = 'off', label = 'Off', variant = 'surface', enabled = false },
+        \\      ouro.button { key = 'ghost', label = 'Ghost', variant = 'ghost', tone = 'destructive', background = '#040506ff' },
+        \\      ouro.button { key = 'icon', label = 'Close', variant = 'ghost', tone = 'neutral',
+        \\        ouro.text { key = 'glyph', text = 'x' } },
+        \\      ouro.separator { key = 'rule' },
+        \\    },
+        \\  }
+        \\end
+    );
+    try f.build();
+    const light = @import("../design/root.zig").tokens.light;
+    // Theme button colors style only the default solid accent button;
+    // geometry applies to every variant and per-button colors still win.
+    try std.testing.expectEqual(core.Color.rgba(1, 2, 3, 255), (try f.object("scope/root/solid")).box.background.?);
+    const soft = (try f.object("scope/root/soft")).box;
+    try std.testing.expectEqual(light.secondary, soft.background.?);
+    try std.testing.expectEqual(@as(f32, 5), soft.padding.left);
+    try std.testing.expectEqual(@as(f32, 0), soft.border_width);
+    const surface = (try f.object("scope/root/surface")).box;
+    try std.testing.expectEqual(light.surface, surface.background.?);
+    try std.testing.expectEqual(@as(f32, 1), surface.border_width);
+    try std.testing.expectEqual(light.accent_border, surface.border_color.?);
+    const off = (try f.object("scope/root/off")).box;
+    try std.testing.expectEqual(light.muted, off.background.?);
+    try std.testing.expectEqual(light.border, off.border_color.?);
+    try std.testing.expectEqual(core.Color.rgba(4, 5, 6, 255), (try f.object("scope/root/ghost")).box.background.?);
+    const surface_id = (try f.runtime.semantics.findPath("scope/root/surface")).id;
+    for (f.ui.storage[0..f.ui.count]) |descriptor| {
+        if (descriptor.parent == surface_id and descriptor.object == .text)
+            try std.testing.expectEqual(light.accent_text, descriptor.object.text.color);
+    }
+    // Custom content inherits the variant foreground and label size.
+    const glyph = (try f.object("scope/root/icon/glyph")).text;
+    try std.testing.expectEqual(light.muted_foreground, glyph.color);
+    try std.testing.expectEqual(@as(f32, 14), (try f.sources.get(glyph.source)).logical_size);
+    const rule = (try f.object("scope/root/rule")).box;
+    try std.testing.expectEqual(light.border, rule.background.?);
+    try std.testing.expectEqual(@as(f32, 1), rule.height.?);
+    try std.testing.expectEqual(.separator, (try f.runtime.semantics.findPath("scope/root/rule")).role);
+
+    for ([_][]const u8{
+        "ouro.button {key='bad', label='Bad', variant='outline'}",
+        "ouro.button {key='bad', label='Bad', tone='gray'}",
+        "ouro.button {key='bad', label='Bad', variant=1}",
+        "ouro.separator {key='bad', orientation='diagonal'}",
+    }) |declaration| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(source);
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+    }
+}
+
 test "theme inheritance and explicit precedence retheme clean components without remounting" {
     const f = try Fixture.create();
     defer f.destroy();

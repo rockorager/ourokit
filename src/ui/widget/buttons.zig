@@ -2,6 +2,7 @@ const std = @import("std");
 const Color = @import("../../core/color.zig").Color;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
+const tokens = @import("../../design/root.zig").tokens;
 
 pub const Style = struct {
     idle: Color,
@@ -10,6 +11,59 @@ pub const Style = struct {
     disabled: Color,
     border: ?Color = null,
     focus: ?Color = null,
+};
+
+/// Radix Themes button variants that retained state can express by recoloring
+/// the Button Box background. Outline and classic are intentionally omitted.
+pub const Variant = enum { solid, soft, surface, ghost };
+
+/// Semantic color family. Neutral soft and surface use high-contrast gray text.
+pub const Tone = enum { accent, neutral, destructive };
+
+pub const Recipe = struct {
+    style: Style,
+    foreground: Color,
+    disabled_foreground: Color,
+    /// Surface draws a border even when the shared controls border width is 0.
+    bordered: bool,
+
+    /// Radix Themes base-button recipe mapped onto semantic roles. Hover and
+    /// pressed change only the background: surface uses soft steps where Radix
+    /// strengthens its inset border, and solid pressed omits Radix's filter.
+    pub fn init(theme: tokens.Theme, variant: Variant, tone: Tone) Recipe {
+        const transparent = Color.rgba(0, 0, 0, 0);
+        const soft: [3]Color, const text: Color, const border: Color = switch (tone) {
+            .accent => .{ .{ theme.accent, theme.accent_hover, theme.accent_selected }, theme.accent_text, theme.accent_border },
+            .neutral => .{ .{ theme.secondary, theme.secondary_hover, theme.secondary_selected }, theme.secondary_foreground, theme.input },
+            .destructive => .{ .{ theme.destructive_subtle, theme.destructive_subtle_hover, theme.destructive_subtle_selected }, theme.destructive_text, theme.destructive_border },
+        };
+        const solid: [2]Color, const solid_text: Color = switch (tone) {
+            .accent => .{ .{ theme.primary, theme.primary_hover }, theme.primary_foreground },
+            .neutral => .{ .{ theme.foreground, theme.muted_foreground }, theme.background },
+            .destructive => .{ .{ theme.destructive, theme.destructive_hover }, theme.destructive_foreground },
+        };
+        const colors: [4]Color = switch (variant) {
+            .solid => .{ solid[0], solid[1], solid[1], theme.disabled },
+            .soft => .{ soft[0], soft[1], soft[2], theme.disabled },
+            .surface => .{ theme.surface, soft[0], soft[1], theme.muted },
+            .ghost => .{ transparent, soft[0], soft[1], transparent },
+        };
+        return .{
+            .style = .{
+                .idle = colors[0],
+                .hovered = colors[1],
+                .pressed = colors[2],
+                .disabled = colors[3],
+                .border = if (variant == .surface) border else theme.border,
+                .focus = theme.ring,
+            },
+            // Neutral ghost keeps Radix's gray step 11 text for low-emphasis
+            // chrome such as close buttons; soft and surface use step 12.
+            .foreground = if (variant == .solid) solid_text else if (variant == .ghost and tone == .neutral) theme.muted_foreground else text,
+            .disabled_foreground = theme.disabled_foreground,
+            .bordered = variant == .surface,
+        };
+    }
 };
 
 pub const VisualUpdate = struct {
@@ -196,6 +250,31 @@ fn color(entry: Entry) Color {
 
 fn same(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+test "Button recipes map variants and tones onto semantic roles" {
+    const light = tokens.light;
+    const solid = Recipe.init(light, .solid, .accent);
+    try std.testing.expectEqual(light.primary, solid.style.idle);
+    try std.testing.expectEqual(light.primary_hover, solid.style.pressed);
+    try std.testing.expectEqual(light.primary_foreground, solid.foreground);
+    try std.testing.expect(!solid.bordered);
+    const soft = Recipe.init(light, .soft, .destructive);
+    try std.testing.expectEqual(light.destructive_subtle, soft.style.idle);
+    try std.testing.expectEqual(light.destructive_subtle_hover, soft.style.hovered);
+    try std.testing.expectEqual(light.destructive_subtle_selected, soft.style.pressed);
+    try std.testing.expectEqual(light.destructive_text, soft.foreground);
+    const surface = Recipe.init(tokens.dark, .surface, .neutral);
+    try std.testing.expectEqual(tokens.dark.surface, surface.style.idle);
+    try std.testing.expectEqual(tokens.dark.input, surface.style.border.?);
+    try std.testing.expectEqual(tokens.dark.secondary_foreground, surface.foreground);
+    try std.testing.expect(surface.bordered);
+    const ghost = Recipe.init(light, .ghost, .neutral);
+    try std.testing.expectEqual(@as(u8, 0), ghost.style.idle.a);
+    try std.testing.expectEqual(@as(u8, 0), ghost.style.disabled.a);
+    try std.testing.expectEqual(light.secondary, ghost.style.hovered);
+    try std.testing.expectEqual(light.muted_foreground, ghost.foreground);
+    try std.testing.expectEqual(light.accent_text, Recipe.init(light, .ghost, .accent).foreground);
 }
 
 test "Button state preserves identity and resolves interaction colors" {

@@ -23,7 +23,7 @@ local function content(options)
       o.column {key='body',gap=16,
         o.text {key='title',text='Reset preferences?',size=22},
         o.text {key='detail',text='Your current editor preferences will be replaced.'},
-        o.row {key='actions',gap=10,o.button {key='cancel',label='Cancel'},o.button {key='reset',label='Reset'}},
+        o.row {key='actions',gap=10,o.button {key='cancel',label='Cancel',variant='soft',tone='neutral'},o.button {key='reset',label='Reset'}},
       }} end
     return o.stack {key='root',children=children}
   end

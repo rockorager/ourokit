@@ -19,6 +19,12 @@ Controlled state and button-backed switch semantics were checked against
 also MIT licensed. Ourokit retains its native activation-on-press convention;
 visual departures are documented in `docs/design-system.md`.
 
+Button variants and tones were checked on 2026-09-27 against the same revision's
+[base-button.css](https://github.com/radix-ui/themes/blob/1faff10ac26ae17f09944d418c6949b93fc6b566/packages/radix-ui-themes/src/components/_internal/base-button.css),
+and the tab list against
+[base-tab-list.css](https://github.com/radix-ui/themes/blob/1faff10ac26ae17f09944d418c6949b93fc6b566/packages/radix-ui-themes/src/components/_internal/base-tab-list.css).
+Departures are documented in `docs/design-system.md`.
+
 The raw palette is imported from `@radix-ui/colors` 3.0.0. The pinned npm
 tarball has SHA-512
 `1543ac181907ad827009212d5910887d06d91bbab57ba0e0c4220e7b54944330deffbad75de038eecf320a7e9fb93350023d59ab8a13162f588e9df0cc495cc6`

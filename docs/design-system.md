@@ -78,12 +78,59 @@ focus does not show this ring. Button pressed state uses the Radix
 hover color but omits its brightness/saturation filter until Ourokit has a
 justified color-filter primitive.
 
+Buttons support Radix Themes' solid, soft, surface, and ghost variants in
+accent, neutral, and destructive tones. Outline and classic are omitted to
+keep the vocabulary small; surface covers the bordered case. The recipes use
+these semantic roles:
+
+| Tone | Solid (idle, hover) | Soft/ghost steps (3, 4, 5) | Text | Surface border |
+| --- | --- | --- | --- | --- |
+| Accent | `primary`, `primary_hover` | `accent`, `accent_hover`, `accent_selected` | `accent_text` | `accent_border` |
+| Neutral | `foreground`, `muted_foreground` | `secondary`, `secondary_hover`, `secondary_selected` | `secondary_foreground` | `input` |
+| Destructive | `destructive`, `destructive_hover` | `destructive_subtle`, `destructive_subtle_hover`, `destructive_subtle_selected` | `destructive_text` | `destructive_border` |
+
+Soft uses steps 3/4/5 for idle, hover, and pressed. Ghost is transparent and
+uses steps 3/4 for hover and pressed. Surface sits on the `surface` role with a
+1-pixel step 7 border, and uses steps 3/4 for hover and pressed. Retained
+button state recolors only the background, so surface hover departs from
+Radix: Radix strengthens the border from step 7 to 8 instead. Surface uses the
+`surface` background for every tone rather than per-accent surface colors.
+Neutral solid is Radix's high-contrast gray: step 12 fill, step 11 hover, and
+background-colored text. Neutral soft and surface text also use high-contrast
+step 12 so secondary actions such as Cancel stay readable. Neutral ghost keeps
+Radix's step 11 text for low-emphasis chrome such as tab close buttons. The
+accent and destructive soft steps are opaque for accent (the existing roles)
+and alpha for destructive (new roles), matching their Radix scales on the
+default background.
+
+Theme-wide `widgets.button` colors apply only to solid accent, the original
+default. This keeps an app's primary-button styling from recoloring neutral
+chrome. Custom button content inherits the variant foreground and label size,
+so icons and text follow enabled, disabled, and tone changes.
+
+Tabs follow Radix Themes' base tab list at size 2: 40-pixel intrinsic
+triggers, gray step 11 idle text, step 12 hover and active text, medium
+active weight, and a 2-pixel accent indicator (`primary`, Radix
+`accent-indicator`) at the trigger's bottom edge. The list's gray step 5 inset
+shadow becomes a `separator` using `border` (step 6) under a horizontal scroll
+strip. Hover fills the whole trigger with `secondary` rather than Radix's
+inset inner pill, because retained option state recolors the trigger box.
+
+The Select trigger is a neutral surface button with a left-aligned value and a
+trailing 16-pixel chevron icon, matching Radix's surface select trigger.
+Spinbox steppers are square neutral soft buttons. Tab close buttons are
+24-pixel neutral ghost buttons with a 14-pixel cross icon. The built-in icons
+are path-only SVGs tinted by the button foreground.
+
 Disabled buttons use opaque Slate step 5 backgrounds and Slate step 11 text
 instead of faint alpha colors. This keeps button labels readable (at least
 4.5:1 contrast in both default themes) while the neutral fill distinguishes
 them from enabled primary buttons. The shared `disabled` and
 `disabled_foreground` roles also style disabled switch tracks and input text;
-application and widget overrides still take precedence.
+application and widget overrides still take precedence. Soft buttons share the
+solid disabled fill. Disabled ghost buttons stay transparent, and disabled
+surface buttons use `muted` with a `border` edge, like Radix's step 2 fill and
+step 6 border.
 
 Switch uses the Radix Themes size-2 surface recipe: a 35×20 logical-pixel
 track, 18×18 thumb, 1-pixel inset, and pill radius. Geometry derives from

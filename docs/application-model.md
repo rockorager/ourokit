@@ -758,6 +758,34 @@ no children or button-style dimension/visual props. See the
 `switch/*` stories in `examples/storybook.lua` for both palettes, on/off,
 disabled, keyboard focus, and controlled pointer activation.
 
+### Button variants and tones
+
+```lua
+ouro.row { key = "actions", gap = 8,
+  ouro.button { key = "cancel", label = "Cancel", variant = "soft", tone = "neutral" },
+  ouro.button { key = "delete", label = "Delete", tone = "destructive" },
+}
+```
+
+`variant` is `"solid"` (default), `"soft"`, `"surface"`, or `"ghost"`, and
+`tone` is `"accent"` (default), `"neutral"`, or `"destructive"`. They follow
+the Radix Themes button recipes: solid fills with step 9, soft with step 3,
+surface adds a step 7 border over the `surface` role, and ghost stays
+transparent until hovered. Use one solid accent button for the primary action
+and soft or ghost neutral buttons around it. See
+[design-system.md](design-system.md#widget-design-guidance) for the exact roles
+and intentional departures. Unknown values are build errors.
+
+Theme `widgets.button` colors style only the default solid accent button;
+its geometry fields apply to every variant. Per-button color props override
+any variant. Custom button content inherits the variant's label color and size
+through the theme scope, so `ouro.text` and tinted `ouro.icon` children match
+the automatic label in enabled and disabled states.
+
+`ouro.separator { key = "rule", orientation = "horizontal" }` draws a 1-pixel
+`border` rule that fills the bounded axis of its parent. `orientation` may
+also be `"vertical"`.
+
 ### Checkboxes, radio groups, and selects
 
 `ouro.checkbox` has the same controlled `checked`, `label`, `enabled`,
@@ -789,8 +817,12 @@ supported.
 
 `ouro.select` is a shipped Lua composition of a native button, anchored popup,
 scroll viewport, and listbox. `options` must be nonempty, with unique integer
-values and string labels, and `selected` must name an option. Its optional
-`label` prefixes the selected text. Up/Down/Home/End preview inside the popup;
+values and string labels, and `selected` must name an option. The trigger uses
+the neutral surface button recipe: the selected text starts at the left and a
+chevron icon sits at the right. Its optional `label` stays semantic: the
+trigger's accessible label is `"<label>: <selected text>"`, but only the
+selected text is visible. Without `width` or `flex`, the trigger and popup are
+240 pixels wide. Up/Down/Home/End preview inside the popup;
 Enter, Space, or a pointer selection commits through `on_select(value)` and
 closes it. Escape, outside click, and native dismissal cancel the preview.
 Focus returns to the trigger. `enabled=false` disables the trigger and closes
@@ -827,7 +859,12 @@ retained panel boxes. It requires `key`, semantic `label`, controlled integer
 `selected`, `on_select(value)`, and a nonempty `tabs` array. Each tab has a
 unique integer `value`, string `label`, `content`, and optional `closable=true`;
 closable tabs require `on_close(value)`. The control also accepts optional
-`flex`.
+`flex`. Its header follows the Radix Themes tab list: intrinsically sized
+40-pixel tabs with gray step 11 labels, a gray step 3 hover, and a
+medium-weight step 12 label over a 2-pixel `primary` indicator for the
+selection. A separator rule runs under the bar, and a horizontal scroll strip
+(semantic key `strip`) holds tabs that overflow. Close buttons are neutral ghost
+icon buttons.
 
 ```lua
 ouro.tabs {
@@ -1198,6 +1235,8 @@ are not converted; output is premultiplied encoded sRGB, without HDR/wide gamut.
 File reading, decoding, and SVG rasterization run on a worker, never in layout or
 paint. A successful build queues work; completions invalidate only subscribed
 windows. Pending and failed assets paint nothing but keep declared dimensions.
+A host without an image service treats every image as failed rather than
+rejecting the build.
 Use an enclosing box for a placeholder surface. Missing dimensions use the loaded
 intrinsic size; one declared dimension preserves aspect ratio, subject to parent
 constraints. Failed sources remain failed until eviction or source reload.
@@ -1384,8 +1423,8 @@ Applications provide stable local keys but no numeric IDs or parent links.
 Their visual defaults come from generated Radix-derived semantic tokens and
 documented component recipes, with optional inherited Lua theme overrides. Buttons are
 intrinsically sized with Radix Themes size-2 geometry: 32-pixel height,
-12-pixel horizontal padding, 4-pixel radius, medium label face, primary color
-pair, and one-line ellipsis. A button can set `height = "auto"` to size to its
+12-pixel horizontal padding, 4-pixel radius, medium label face, the solid accent
+recipe unless `variant`/`tone` choose another, and one-line ellipsis. A button can set `height = "auto"` to size to its
 content instead of the themed control height. This also works with custom
 content and nested buttons: the nearest button handles the click, so a card
 can own its background action while a nested dismiss button remains separate.

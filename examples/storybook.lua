@@ -33,6 +33,46 @@ local function button_story(label, enabled)
   }
 end
 
+local variant_names = { "solid", "soft", "surface", "ghost" }
+local function button_variants_story(enabled)
+  return function()
+    local f = ouro.tokens.foundation
+    local rows = {}
+    for _, tone in ipairs { "accent", "neutral", "destructive" } do
+      local buttons = {}
+      for _, variant in ipairs(variant_names) do
+        buttons[#buttons + 1] = ouro.button {
+          key = variant, label = (variant:gsub("^%l", string.upper)),
+          variant = variant, tone = tone, enabled = enabled,
+        }
+      end
+      rows[#rows + 1] = ouro.row { key = tone, gap = f.spacing_3, children = buttons }
+    end
+    return ouro.column { key = "content", gap = f.spacing_4, children = rows }
+  end
+end
+
+local function tabs_story()
+  local function panel(text) return ouro.box { key = "panel", padding = 12, ouro.text { key = "body", text = text } } end
+  return ouro.column {
+    key = "content", gap = ouro.tokens.foundation.spacing_4, cross_alignment = "stretch",
+    ouro.tabs {
+      key = "tabs", label = "Documents", selected = 1, flex = 1,
+      on_select = function() end, on_close = function() end,
+      tabs = {
+        { value = 1, label = "Notes", closable = true, content = panel("Notes body") },
+        { value = 2, label = "* Todo", closable = true, content = panel("Todo body") },
+        { value = 3, label = "Readme", content = panel("Readme body") },
+      },
+    },
+    ouro.select {
+      key = "encoding", label = "Encoding", selected = 2, width = 240,
+      options = { { value = 1, label = "UTF-8" }, { value = 2, label = "UTF-16" } },
+    },
+    ouro.spinbox { key = "size", label = "Text size", value = 12, min = 8, max = 32, step = 1 },
+  }
+end
+
 local function scroll_story()
   local children = {
     ouro.text { key = "heading", text = "Application settings", size = 18 },
@@ -555,6 +595,49 @@ return ouro.storybook {
       content = function()
         return listbox_story()
       end,
+    },
+    ouro.story {
+      id = "button/variants-light", group = "Button", name = "Variants and tones (light)",
+      viewport = { width = 420, height = 180 }, snapshot_scale = 2,
+      color_scheme = "light", content = button_variants_story(true),
+    },
+    ouro.story {
+      id = "button/variants-dark", group = "Button", name = "Variants and tones (dark)",
+      viewport = { width = 420, height = 180 }, snapshot_scale = 2,
+      color_scheme = "dark", content = button_variants_story(true),
+    },
+    ouro.story {
+      id = "button/variants-disabled", group = "Button", name = "Disabled variants",
+      viewport = { width = 420, height = 180 }, snapshot_scale = 2,
+      color_scheme = "light", content = button_variants_story(false),
+    },
+    ouro.story {
+      id = "button/variants-hovered", group = "Button", name = "Hovered neutral soft",
+      viewport = { width = 420, height = 180 }, snapshot_scale = 2,
+      color_scheme = "light", content = button_variants_story(true),
+      actions = { { type = "hover", target = "content/neutral/soft" } },
+    },
+    ouro.story {
+      id = "tabs/light", group = "Tabs", name = "Tabs, select, and spinbox (light)",
+      viewport = { width = 420, height = 260 }, snapshot_scale = 2,
+      color_scheme = "light", content = tabs_story,
+    },
+    ouro.story {
+      id = "tabs/dark", group = "Tabs", name = "Tabs, select, and spinbox (dark)",
+      viewport = { width = 420, height = 260 }, snapshot_scale = 2,
+      color_scheme = "dark", content = tabs_story,
+    },
+    ouro.story {
+      id = "tabs/hovered", group = "Tabs", name = "Hovered inactive tab",
+      viewport = { width = 420, height = 260 }, snapshot_scale = 2,
+      color_scheme = "light", content = tabs_story,
+      actions = { { type = "hover", target = "content/tabs/control/strip/bar/3" } },
+    },
+    ouro.story {
+      id = "tabs/focus", group = "Tabs", name = "Keyboard focus",
+      viewport = { width = 420, height = 260 }, snapshot_scale = 2,
+      color_scheme = "light", content = tabs_story,
+      actions = { { type = "tab", target = "content/tabs/control/strip/bar" } },
     },
     ouro.story {
       id = "button/default",

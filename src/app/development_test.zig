@@ -164,17 +164,17 @@ test "tabs retain hidden editor state and reject hidden input without selecting 
     const offset = try f.runtime.tree.textScrollOffset(render, .vertical);
     try std.testing.expect(offset > 0);
     // A close request for a background tab does not implicitly select it.
-    try f.play(.{ .click = "tabs/control/bar/29/close" });
+    try f.play(.{ .click = "tabs/control/strip/bar/29/close" });
     _ = c.lua_getglobal(f.vm.state, "closed");
     var is_number: c_int = 0;
     try std.testing.expectEqual(@as(c.Integer, 29), c.lua_tointegerx(f.vm.state, -1, &is_number));
     c.lua_settop(f.vm.state, -2);
-    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/bar/17")).selected);
+    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/strip/bar/17")).selected);
     // Selecting a narrow closable tab must hit its label, not its close button.
-    try f.play(.{ .click = "tabs/control/bar/29" });
-    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/bar/29")).selected);
+    try f.play(.{ .click = "tabs/control/strip/bar/29" });
+    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/strip/bar/29")).selected);
     // Focus the tab list, then switch using its native horizontal policy.
-    try f.play(.{ .click = "tabs/control/bar/17" });
+    try f.play(.{ .click = "tabs/control/strip/bar/17" });
     try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
     try std.testing.expect(!f.runtime.instances.isFocusable(target));
     try std.testing.expectError(error.DevelopmentTargetHidden, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = "tabs/control/panels/17/edit" }));
@@ -182,14 +182,14 @@ test "tabs retain hidden editor state and reject hidden input without selecting 
     defer snapshot.deinit();
     try std.testing.expect(!(try node(snapshot, "tabs/control/panels/17/edit")).visible);
     try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
-    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/bar/17")).selected);
+    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/strip/bar/17")).selected);
     try std.testing.expectEqual(target, f.runtime.instances.handleForId((try f.runtime.semantics.findPath("tabs/control/panels/17/edit")).id).?);
     try std.testing.expectEqual(selection, session.model.selection);
     try std.testing.expectEqual(offset, try f.runtime.tree.textScrollOffset(render, .vertical));
     try f.play(.{ .click = "tabs/control/panels/17/edit" });
     try f.play(.{ .key = .{ .keycode = 0, .logical = .end, .modifiers = .{ .control = true } } });
     try f.play(.{ .text = "!" });
-    try f.play(.{ .click = "tabs/control/bar/17" });
+    try f.play(.{ .click = "tabs/control/strip/bar/17" });
     try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
     try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_left } });
     try f.play(.{ .click = "tabs/control/panels/17/edit" });
@@ -209,7 +209,7 @@ test "development click releases capture when a tab close removes its own target
         \\end
     );
     defer f.destroy();
-    try f.play(.{ .click = "tabs/control/bar/17/close" });
+    try f.play(.{ .click = "tabs/control/strip/bar/17/close" });
     try std.testing.expect(f.runtime.router.captured == null);
     try std.testing.expect(f.runtime.buttons.armed == null);
     const check = "assert(closes==1 and replacements==0)";

@@ -36,7 +36,7 @@ return function(options)
         o.text {key='title', text='Reset preferences?', size=22},
         o.text {key='detail', text='Your current editor preferences will be replaced.'},
         o.row {key='actions', gap=10,
-          o.button {key='cancel', label='Cancel', on_press=close},
+          o.button {key='cancel', label='Cancel', variant='soft', tone='neutral', on_press=close},
           o.button {key='reset', label='Reset', on_press=function()
             checked:set(true); mode:set(29); size:set(12); selected:set(2); close()
           end},
