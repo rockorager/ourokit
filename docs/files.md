@@ -6,6 +6,8 @@
 local bytes, err = ouro.files.read(path_or_file_uri, { max_bytes = 1024 * 1024 })
 local ok, err = ouro.files.write(path_or_file_uri, bytes)
 local fd, err = ouro.files.open(path_or_file_uri)
+local fd, err = ouro.files.open(path_or_file_uri, { writable = true })
+local ok, err = ouro.files.mkdir(absolute_directory)
 ```
 
 Errors are returned as `nil, { name = "Code", message = "Code" }`. Operations are bounded to eight
@@ -16,7 +18,15 @@ Paths must be absolute. `file:/path`, `file:///path`, and
 `file://localhost/path` are accepted. Other authorities, query strings,
 fragments, malformed escapes, encoded `/`, and NUL are rejected. Percent
 escapes decode directly to filename bytes; they are not Unicode-normalized.
-Network retrieval and general directory/filesystem access are not provided.
+Network retrieval, directory enumeration, and arbitrary filesystem mutations
+are not provided.
+
+`mkdir` recursively creates directories with mode `0700` (subject to umask),
+accepts existing directories without changing their permissions, and rejects
+symlink components and `.`/`..` traversal. It uses directory-relative syscalls
+and runs on the file worker. Failure/cancellation may leave directories already
+created; it never removes them. Lookup through [XDG paths](xdg.md) alone does not
+create directories.
 
 Writes create a same-directory mode `0600` temporary file, write and `fsync`
 it, then atomically rename it over the destination. Existing permissions are
@@ -43,4 +53,7 @@ kernel work; it does not promise immediate syscall interruption.
 `open` accepts regular files and directories and returns an owned D-Bus FD
 userdata (closed by `:close()`, `<close>`, or garbage collection). It uses
 nonblocking open and rejects other file kinds, so FIFOs and devices cannot
-stall the UI thread.
+stall the UI thread. Opens are read-only by default. `{writable=true}` requests
+read/write access to an existing file without creating or truncating it, for
+services such as the Trash portal. Linux does not support read/write opens of
+directories; use the default for directory descriptors.

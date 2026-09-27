@@ -24,6 +24,23 @@ activation callback, offering either the note text or its saved file URI.
 Keyboard or synthetic button activation intentionally cannot supply the pointer
 serial required to begin a compositor drag.
 
+## Preferences and session restoration
+
+On clean window close, Notes saves the split position under
+`$XDG_CONFIG_HOME/dev.ourokit.documents/preferences.json` and up to 32 saved-file
+paths plus the selected file under `$XDG_STATE_HOME/dev.ourokit.documents/session.json`.
+The [standard XDG defaults](xdg.md) apply. Directories are created only on save;
+JSON writes are atomic, not a cross-file transaction. Failed persistence is
+reported to stderr without preventing a confirmed close.
+
+An ordinary launch reopens those files from disk and restores the split.
+Explicit launch/open URIs take precedence over the saved session. Missing,
+unreadable, or invalid restored notes are skipped; malformed preferences/state
+use defaults. Closing individual tabs removes them from the next session, and
+closing the last tab saves an empty session. Discarded edits and unsaved notes
+are never written into session state. This is clean-close restoration, not
+crash recovery or autosave.
+
 ## User-local packaging
 
 Review and adapt `/usr/bin/ouroctl` and `/usr/share/ourokit` in the supplied
@@ -33,15 +50,18 @@ desktop/service files, then install (no root required):
 install -Dm644 examples/documents/dev.ourokit.documents.desktop ~/.local/share/applications/dev.ourokit.documents.desktop
 install -Dm644 examples/documents/dev.ourokit.documents.service ~/.local/share/dbus-1/services/dev.ourokit.documents.service
 install -Dm644 examples/documents/dev.ourokit.documents.xml ~/.local/share/mime/packages/dev.ourokit.documents.xml
-install -Dm644 -t ~/.local/share/ourokit/documents examples/documents/{app.lua,model.lua,ouro.json}
+install -Dm644 -t ~/.local/share/ourokit/documents examples/documents/{app.lua,model.lua,storage.lua,ouro.json}
 update-mime-database ~/.local/share/mime
 update-desktop-database ~/.local/share/applications
 ```
 
-Uninstall those six copied files, remove the now-empty documents directory,
+Uninstall those seven copied files, remove the now-empty documents directory,
 then rerun both update commands. The service's `--dbus-activated` path and the
 desktop entry's `-- %U` path both reach `declaration.open`; activation may occur
 before the UI factory and is queued.
+The [desktop installation tool](desktop-installation.md) can generate the
+desktop/service/MIME integration from explicit metadata instead of editing the
+supplied files. It does not copy the application source bundle for you.
 
 Tab panels remain mounted while hidden, preserving native editor text,
 selection, scrolling, and undo state when switching notes. Hidden panels do not

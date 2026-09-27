@@ -1465,6 +1465,9 @@ fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Schedu
         while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
         try generation.collectCanceledMcp();
         _ = try loop.submit();
+        // Completing canceled external waits schedules their Lua close guards.
+        // Run those before waiting on a peer that may never send another byte.
+        if (scheduler.hasPendingWork()) continue;
         if (!loop.hasPendingOperations() and !loop.hasPendingTimerKernelWork()) return;
         switch (loop.dispatch(try loop.wait())) {
             .file => |completion| if (!(try generation.dispatchFile(completion))) return error.UnownedIoCompletion,

@@ -362,6 +362,7 @@ pub const SourceGeneration = struct {
             return err;
         };
         self.vm.setRuntimeDirectory(config.runtime_dir);
+        try @import("../lua/xdg.zig").install(&self.vm, config.environ);
         self.applications.init(&self.vm, loop, config.applications);
         applications_initialized = true;
         self.image_import.init(&self.vm, loop);

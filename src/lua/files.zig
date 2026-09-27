@@ -12,12 +12,13 @@ pub const default_max_bytes = 16 * 1024 * 1024;
 pub const absolute_max_bytes = 64 * 1024 * 1024;
 const capacity = 8;
 
-const Kind = enum { read, write, open };
+const Kind = enum { read, write, open, mkdir };
 const Phase = enum(u8) { working, canceled, committing, committed };
 const Job = struct {
     owner: *Binding,
     kind: Kind,
     path: []u8,
+    writable: bool = false,
     bytes: []u8 = &.{},
     limit: usize = default_max_bytes,
     result: anyerror![]u8 = error.NotStarted,
@@ -34,6 +35,7 @@ const Job = struct {
             .read => readFile(self.path, self.limit),
             .write => writeFile(self),
             .open => openFile(self),
+            .mkdir => makeDirectory(self),
         };
         while (linux.errno(linux.write(self.pipe[1], &.{1}, 1)) == .INTR) {}
         _ = linux.close(self.pipe[1]);
@@ -66,6 +68,10 @@ pub const Binding = struct {
         c.lua_pushinteger(L, @intFromEnum(Kind.open));
         c.lua_pushcclosure(L, call, 2);
         c.lua_setfield(L, -2, "open");
+        c.lua_pushlightuserdata(L, self);
+        c.lua_pushinteger(L, @intFromEnum(Kind.mkdir));
+        c.lua_pushcclosure(L, call, 2);
+        c.lua_setfield(L, -2, "mkdir");
         c.lua_setfield(L, -2, "files");
     }
 
@@ -122,10 +128,11 @@ pub const Binding = struct {
         const kind: Kind = @enumFromInt(c.lua_tointegerx(L, c.upvalueIndex(2), &valid));
         if (self.stopping) return pushFailure(L, "GenerationStopping");
         const argc = c.lua_gettop(L);
-        if ((kind == .read and (argc < 1 or argc > 2)) or (kind == .write and argc != 2) or (kind == .open and argc != 1)) return pushFailure(L, "InvalidArguments");
+        if (((kind == .read or kind == .open) and (argc < 1 or argc > 2)) or (kind == .write and argc != 2) or (kind == .mkdir and argc != 1)) return pushFailure(L, "InvalidArguments");
         const input = luaBytes(L, 1) orelse return pushFailure(L, "ExpectedPath");
         const path = decodeLocalPath(self.allocator, input) catch |err| return pushFailure(L, @errorName(err));
         var limit: usize = default_max_bytes;
+        var writable = false;
         var payload: []u8 = &.{};
         if (kind == .read and argc == 2) {
             if (c.lua_type(L, 2) != c.type_table) {
@@ -143,6 +150,20 @@ pub const Binding = struct {
                 }
                 limit = @intCast(n);
             }
+            c.lua_settop(L, -2);
+        } else if (kind == .open and argc == 2) {
+            if (c.lua_type(L, 2) != c.type_table) {
+                self.allocator.free(path);
+                return pushFailure(L, "InvalidOptions");
+            }
+            _ = c.lua_getfield(L, 2, "writable");
+            const option_type = c.lua_type(L, -1);
+            if (option_type != c.type_nil and option_type != c.type_boolean) {
+                c.lua_settop(L, -2);
+                self.allocator.free(path);
+                return pushFailure(L, "InvalidOptions");
+            }
+            writable = c.lua_toboolean(L, -1) != 0;
             c.lua_settop(L, -2);
         } else if (kind == .write) {
             const source = luaBytes(L, 2) orelse {
@@ -176,7 +197,7 @@ pub const Binding = struct {
             if (payload.len != 0) self.allocator.free(payload);
             return pushFailure(L, "OutOfMemory");
         };
-        job.* = .{ .owner = self, .kind = kind, .path = path, .bytes = payload, .limit = limit, .pipe = pipe };
+        job.* = .{ .owner = self, .kind = kind, .path = path, .writable = writable, .bytes = payload, .limit = limit, .pipe = pipe };
         job.task_handle = self.vm.beginExternalWait(L, .operation, job, &lifecycle) catch {
             self.allocator.destroy(job);
             _ = linux.close(pipe[0]);
@@ -214,7 +235,7 @@ fn continuation(L: *c.State, _: c_int, context: c.KContext) callconv(.c) c_int {
     if (job.result) |bytes| {
         switch (job.kind) {
             .read => _ = c.lua_pushlstring(L, bytes.ptr, bytes.len),
-            .write => c.lua_pushboolean(L, 1),
+            .write, .mkdir => c.lua_pushboolean(L, 1),
             .open => {
                 dbus_values.pushOwnedFd(L, job.result_fd) catch {
                     job.owner.release(slot);
@@ -274,7 +295,7 @@ fn readFile(path: []const u8, limit: usize) ![]u8 {
 fn openFile(job: *Job) ![]u8 {
     const path = try std.heap.page_allocator.dupeZ(u8, job.path);
     defer std.heap.page_allocator.free(path);
-    const raw = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
+    const raw = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = if (job.writable) .RDWR else .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
     try check(raw);
     const fd: linux.fd_t = @intCast(raw);
     errdefer _ = linux.close(fd);
@@ -283,6 +304,30 @@ fn openFile(job: *Job) ![]u8 {
     const kind = stat.mode & linux.S.IFMT;
     if (kind != linux.S.IFREG and kind != linux.S.IFDIR) return error.NotRegularFileOrDirectory;
     job.result_fd = fd;
+    return &.{};
+}
+
+fn makeDirectory(job: *Job) ![]u8 {
+    var components = std.mem.tokenizeScalar(u8, job.path, '/');
+    while (components.next()) |part| {
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidPath;
+    }
+    const opened = linux.openat(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECTORY = true }, 0);
+    try check(opened);
+    var fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    components.reset();
+    while (components.next()) |part| {
+        if (job.phase.load(.acquire) == .canceled) return error.Canceled;
+        const name = try std.heap.page_allocator.dupeZ(u8, part);
+        defer std.heap.page_allocator.free(name);
+        const made = linux.mkdirat(fd, name, 0o700);
+        if (linux.errno(made) != .EXIST) try check(made);
+        const child = linux.openat(fd, name, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECTORY = true, .NOFOLLOW = true }, 0);
+        try check(child);
+        _ = linux.close(fd);
+        fd = @intCast(child);
+    }
     return &.{};
 }
 

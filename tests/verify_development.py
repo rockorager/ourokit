@@ -24,6 +24,9 @@ TESTS = (
     'catalog_export.py',
     'mcp_bridge.py',
     'desktop_services.py',
+    'secrets.py',
+    'xdg.py',
+    'desktop_install.py',
     'documents.py',
     'desktop_native.py',
 )
@@ -58,11 +61,11 @@ def environment(root, binary):
         'PYTHONOPTIMIZE',
     ):
         env.pop(key, None)
-    for kind in ('config', 'data', 'cache'):
+    for kind in ('config', 'data', 'cache', 'state'):
         directory = root / kind
         directory.mkdir()
         env[f'XDG_{kind.upper()}_HOME'] = str(directory)
-        if kind != 'cache':
+        if kind in ('config', 'data'):
             env[f'XDG_{kind.upper()}_DIRS'] = str(directory)
     env.update(
         XDG_RUNTIME_DIR=str(root),

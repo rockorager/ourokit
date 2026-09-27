@@ -150,6 +150,27 @@ function desktop.open_file(fd,options)
   return portal_request('org.freedesktop.portal.OpenURI','OpenFile','sha{sv}',{'',fd,open_options(options)},options,function() return true end)
 end
 
+function desktop.show_in_folder(fd,options)
+  if type(fd)~='userdata' then return failure('InvalidFile','file must be a D-Bus file-descriptor value') end
+  local e; options,e=table_options(options); if not options then return nil,e end
+  local valid; valid,e=common_options(options); if not valid then return nil,e end
+  local activation; activation,e=typed_option(options,'activation_token','string'); if e then return nil,e end
+  local opts={}; option(opts,'activation_token','s',activation)
+  return portal_request('org.freedesktop.portal.OpenURI','OpenDirectory','sha{sv}',{'',fd,opts},options,function() return true end)
+end
+function desktop.trash(fd)
+  if type(fd)~='userdata' then return failure('InvalidFile','file must be a D-Bus file-descriptor value') end
+  local bus,e=d.connect('session'); if not bus then return nil,e end
+  local guard <close> = bus
+  local r; r,e=bus:call{destination=portal_name,path=portal_path,interface='org.freedesktop.portal.Trash',member='TrashFile',signature='h',args={fd},timeout_ms=5000}
+  if not r then return nil,e end
+  if r.signature~='u' or type(r.args)~='table' or #r.args~=1 or type(r.args[1])~='number' then
+    return failure('MalformedPortalReply','trash portal returned a malformed reply')
+  end
+  if r.args[1]~=1 then return failure('TrashFailed','the portal did not trash the file') end
+  return true
+end
+
 local notify_name,notify_path='org.freedesktop.Notifications','/org/freedesktop/Notifications'
 local notifications={}; notifications.__index=notifications
 local function notification_args(spec,replaces)

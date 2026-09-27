@@ -513,6 +513,7 @@ and shared-memory/dma-buf presentation paths.
 - [Runtime, tasks, Lua, and io_uring](docs/runtime.md)
 - [D-Bus clients and services](docs/dbus.md)
 - [Desktop choosers, external opening, and notifications](docs/desktop-services.md)
+- [XDG directories](docs/xdg.md), [secret storage](docs/secrets.md), and [desktop installation](docs/desktop-installation.md)
 - [Local file I/O](docs/files.md) and [multi-document example](docs/documents.md)
 - [Application model](docs/application-model.md)
 - [Transactional source reload](docs/hot-reload.md)

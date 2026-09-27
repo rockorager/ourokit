@@ -36,6 +36,18 @@ local opener <close> = assert(service:export{path='/org/freedesktop/portal/deskt
     assert(type(r.args[2])=='userdata'); r.args[2]:close()
     return respond(r,r.args[3],{})
   end},
+  OpenDirectory={input='sha{sv}',output='o',handler=function(r)
+    assert(type(r.args[2])=='userdata'); r.args[2]:close()
+    assert(value(r.args[3],'activation_token')=='folder-token')
+    assert(value(r.args[3],'ask')==nil and value(r.args[3],'writable')==nil)
+    return respond(r,r.args[3],{})
+  end},
+},signals={}})
+local trash_result=1
+local trash <close> = assert(service:export{path='/org/freedesktop/portal/desktop',interface='org.freedesktop.portal.Trash',methods={
+  TrashFile={input='h',output='u',handler=function(r)
+    assert(type(r.args[1])=='userdata'); r.args[1]:close(); return {trash_result}
+  end},
 },signals={}})
 local portal_name <close> = assert(service:own_name('org.freedesktop.portal.Desktop'))
 
@@ -64,6 +76,14 @@ ok,e=ouro.desktop.open_uri('FILE:relative'); assert(ok==nil and e.name=='FileURI
 assert(ouro.desktop.open_uri('https://example.test',{ask=true,writable=true,activation_token='token'}))
 local fd <close> = assert(ouro.files.open(ouro.xdg.runtime_dir..'/document'))
 assert(ouro.desktop.open_file(fd))
+assert(ouro.desktop.show_in_folder(fd,{activation_token='folder-token'}))
+local writable_fd <close> = assert(ouro.files.open(ouro.xdg.runtime_dir..'/document',{writable=true}))
+assert(ouro.desktop.trash(writable_fd))
+trash_result=0; ok,e=ouro.desktop.trash(writable_fd); assert(ok==nil and e.name=='TrashFailed')
+trash_result=2; ok,e=ouro.desktop.trash(writable_fd); assert(ok==nil and e.name=='TrashFailed')
+assert(ouro.files.read(ouro.xdg.runtime_dir..'/document')=='external-open fixture','no permanent-delete fallback')
+ok,e=ouro.desktop.trash('not an fd'); assert(ok==nil and e.name=='InvalidFile')
+ok,e=ouro.desktop.show_in_folder(fd,{activation_token=1}); assert(ok==nil and e.name=='InvalidOptions')
 ok,e=ouro.desktop.choose_file('bad'); assert(ok==nil and e.name=='InvalidOptions')
 ok,e=ouro.desktop.choose_file{multiple='yes'}; assert(ok==nil and e.name=='InvalidOptions')
 ok,e=ouro.desktop.open_uri('https://example.test',{ask='yes'}); assert(ok==nil and e.name=='InvalidOptions')

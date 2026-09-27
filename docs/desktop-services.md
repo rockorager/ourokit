@@ -34,6 +34,31 @@ The initial method reply has a five-second deadline; the human-facing dialog
 does not time out. Losing the portal service fails the wait. No file chooser UI
 is implemented or installed by Ourokit.
 
+## File-manager integration
+
+```lua
+local fd <close> = assert(ouro.files.open('/absolute/path/note.ournote'))
+assert(ouro.desktop.show_in_folder(fd, {parent='main'}))
+-- Only after the app's own user confirmation:
+local writable <close> = assert(ouro.files.open('/absolute/path/note.ournote', {writable=true}))
+assert(ouro.desktop.trash(writable))
+```
+
+`show_in_folder` uses the OpenURI portal's `OpenDirectory` method (version 3+):
+it opens the containing directory, possibly selecting the item. The portal
+handles FileManager1 integration and fallback. Options are `parent` and
+`activation_token`; the existing request cancellation and parenting rules apply.
+
+`trash` uses `org.freedesktop.portal.Trash.TrashFile` and reports success only
+for result `1`. Other results return `TrashFailed`; malformed replies return
+`MalformedPortalReply`. The portal requires read/write access to the file.
+Ourokit never falls back to permanent deletion and never implements its own
+trash layout. Neither API consumes the caller's descriptor. Unsupported or
+missing services return errors. Cancellation cannot undo a trash operation
+already accepted by the portal; these calls are not retried automatically.
+
+## Notifications
+
 Notifications use `org.freedesktop.Notifications`, rather than the portal,
 because that is the standard notification API and provides replacement IDs,
 close, actions, and close reasons used by this API. Ourokit is only a

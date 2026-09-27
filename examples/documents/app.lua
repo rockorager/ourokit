@@ -1,8 +1,10 @@
 local ouro = require("ouro")
 local model = require("model")(ouro.json)
+local storage = require("storage")
 local changed = ouro.signal(0)
 local pending_uris = {}
 local closing_all = false
+local closing_documents, closing_selected
 local split_position = 0.25
 local filters = {{ name = "Ourokit notes", patterns = {"*.ournote"}, mime_types = {"application/vnd.ourokit.note+json"} }}
 
@@ -36,11 +38,15 @@ local function activate(uris)
 end
 
 local advance_window_close
+local function persist(documents, selected)
+  local ok,err=storage.save(split_position,documents,selected)
+  if not ok then ouro.stderr.write('Could not save Notes session: '..err.name..'\n') end
+end
 local function remove(d)
-  model.remove(d)
-  if #model.documents == 0 then ouro.exit(0)
-  elseif closing_all then advance_window_close()
-  else refresh() end
+  if closing_all and #model.documents==1 then persist(closing_documents,closing_selected); ouro.exit(0)
+  elseif closing_all then model.remove(d); advance_window_close()
+  elseif #model.documents == 1 then persist({},nil); ouro.exit(0)
+  else model.remove(d); refresh() end
 end
 local function save(d, save_as)
   local operation, busy = model.begin_save(d)
@@ -69,11 +75,15 @@ advance_window_close = function()
   for _, d in ipairs(model.documents) do
     if d.dirty or d.saving then close(d); return end
   end
-  while #model.documents > 0 do model.remove(model.documents[1]) end
+  persist(closing_documents or model.documents,closing_selected or model.selected())
   ouro.exit(0)
 end
 local function close_window()
+  if closing_all then return end
   closing_all = true
+  closing_documents={}
+  for i,d in ipairs(model.documents) do closing_documents[i]=d end
+  closing_selected=model.selected()
   advance_window_close()
 end
 
@@ -107,7 +117,7 @@ local function content(d)
   }
   local dialog
   if d.closing then
-    local function cancel() d.closing=false; closing_all=false; refresh() end
+    local function cancel() d.closing=false; closing_all=false; closing_documents=nil; closing_selected=nil; refresh() end
     dialog = ouro.dialog {key="close-confirm", label="Unsaved changes", width=430, on_cancel=cancel,
       ouro.column {key="body", gap=16,
         ouro.text {key="prompt",text="Save changes to “"..d.title.."” before closing?"},
@@ -157,6 +167,13 @@ local declaration = ouro.app {
   id="dev.ourokit.documents", single_instance=true,
   open=function(uris) if #model.documents==0 then for _,u in ipairs(uris or {}) do pending_uris[#pending_uris+1]=u end else activate(uris) end end,
   run=function()
+    local restored,selected
+    split_position,restored,selected=storage.load()
+    if #pending_uris==0 then
+      -- Reopen saved files only. Never resurrect discarded edits or overwrite files.
+      for _,uri in ipairs(restored) do open_one(uri) end
+      for _,d in ipairs(model.documents) do if d.path==selected then model.select(d.id) end end
+    end
     if #pending_uris>0 then local p=pending_uris; pending_uris={}; activate(p) end
     if #model.documents==0 then model.new() end
     return {windows=function()

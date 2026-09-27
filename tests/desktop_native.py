@@ -137,7 +137,8 @@ def document_test(root, env):
     portal_process = subprocess.Popen([str(BINARY), "run", str(portal), "--headless"], env=env,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     wait_portal(portal_process, env)
-    app_env = dict(env, WAYLAND_DISPLAY=env["OUROKIT_TEST_WAYLAND_DISPLAY"])
+    app_env = dict(env, WAYLAND_DISPLAY=env["OUROKIT_TEST_WAYLAND_DISPLAY"],
+                   XDG_CONFIG_HOME=str(root / 'notes-config'), XDG_STATE_HOME=str(root / 'notes-state'))
     errors = root / "documents.stderr"
     with errors.open("w+") as error_file:
         app = subprocess.Popen([str(BINARY), "run", str(ROOT / "examples/documents/app.lua"), "--dev", "--software"],
@@ -294,7 +295,31 @@ def document_test(root, env):
             assert node(app_env, endpoint, window, panel(3, "text"))["value"] == body + "second dirty note"
             evidence = portal_log.read_text()
             assert evidence.startswith("OpenFile wayland:"), evidence
-            print("PASS tabbed documents UI, retained editors, split geometry, portal save/reopen and native close")
+            # Finish a confirmed window close, then inspect a fresh process.
+            # Only saved paths return; the discarded dirty text must not.
+            sway(app_env, '[app_id="dev.ourokit.documents"]', "kill")
+            wait_for(lambda: any(n["path"] == next_dialog for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
+                     'final close did not prompt')
+            click(app_env, endpoint, window, next_dialog + '/body/actions/discard')
+            assert app.wait(timeout=10) == 0
+            session = json.loads((root / 'notes-state/dev.ourokit.documents/session.json').read_text())
+            assert session['uris'] == [initial.as_uri(), saved.as_uri()] and session['selected'] == saved.as_uri(), session
+            preference = json.loads((root / 'notes-config/dev.ourokit.documents/preferences.json').read_text())
+            assert preference['split_position'] != 0.25, preference
+            app = subprocess.Popen([str(BINARY), "run", str(ROOT / "examples/documents/app.lua"), "--dev", "--software"],
+                                   env=app_env, stdout=subprocess.DEVNULL, stderr=error_file)
+            endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app)
+            wait_for(lambda: endpoint.exists(), 'restored Notes endpoint did not appear')
+            wait_for(lambda: inspect(app_env, endpoint).get('windows'), 'restored window did not appear')
+            wait_for(lambda: node(app_env, endpoint, window, panel(2, 'text'))['value'] == body,
+                     'saved note was not restored from disk')
+            restored = inspect(app_env, endpoint, window)['windows'][0]['nodes']
+            assert len([n for n in restored if n['role']=='tab']) == 2
+            assert node(app_env, endpoint, window, panel(1, 'text'))['value'] == 'opened'
+            assert node(app_env, endpoint, window, panel(2, 'text'))['visible']
+            assert abs(node(app_env, endpoint, window, 'documents/sidebar')['bounds']['width'] - adjusted_sidebar['width']) < 2
+            capture(app_env, endpoint, window, 'notes-restored.png')
+            print("PASS tabbed documents UI, retained editors, split geometry, portal save/reopen, native close and session restoration")
         finally:
             terminate(app)
             terminate(portal_process)

@@ -53,6 +53,21 @@ local active=m.begin_save(g); assert(not m.finish_save(g,canceled,'file:///stale
 m.edit(g,'text','raced')
 assert(m.finish_save(g,active,'file:///g.ournote',true) and g.dirty and g.path=='file:///g.ournote')
 local final=m.begin_save(g); assert(m.finish_save(g,final,g.path,true) and not g.dirty)
+local storage=require('storage')
+local position,paths,selected=storage.load()
+assert(position==0.25 and #paths==0 and selected==nil)
+assert(storage.save(0.37,{{path='file:///first.ournote'},{title='unsaved'},{path='file:///second.ournote'}},{path='file:///first.ournote'}))
+position,paths,selected=storage.load()
+assert(position==0.37 and #paths==2 and paths[1]=='file:///first.ournote' and paths[2]=='file:///second.ournote' and selected==paths[1])
+local dirs=o.xdg.paths('dev.ourokit.documents')
+assert(o.files.write(dirs.config..'/preferences.json','{"version":1,"split_position":12}'))
+assert(o.files.write(dirs.state..'/session.json','{"version":1,"uris":["https://not-a-local-note",false,"file:///valid"],"selected":4}'))
+position,paths,selected=storage.load()
+assert(position==0.25 and #paths==1 and paths[1]=='file:///valid' and selected==nil)
+assert(o.files.write(dirs.state..'/session.json','{broken'))
+position,paths=storage.load(); assert(position==0.25 and #paths==0)
+assert(storage.save(0.4,{},nil))
+assert(o.files.read(dirs.state..'/session.json'):find('"uris":[]',1,true))
 o.stdout.write('PASS documents model\n')
 o.exit(0)
 '''
@@ -62,7 +77,9 @@ with tempfile.TemporaryDirectory() as temporary:
     app = Path(temporary) / "test.lua"
     app.write_text(source)
     (Path(temporary) / "model.lua").write_bytes((ROOT / "examples/documents/model.lua").read_bytes())
-    process = subprocess.run(["dbus-run-session", "--", str(BINARY), "run", str(app), "--headless"], capture_output=True, text=True, timeout=10)
+    (Path(temporary) / "storage.lua").write_bytes((ROOT / "examples/documents/storage.lua").read_bytes())
+    env=dict(os.environ, XDG_CONFIG_HOME=temporary+'/config', XDG_STATE_HOME=temporary+'/state')
+    process = subprocess.run(["dbus-run-session", "--", str(BINARY), "run", str(app), "--headless"], env=env, capture_output=True, text=True, timeout=10)
     stdout, stderr = process.stdout, process.stderr
     assert process.returncode == 0, stderr
 assert "LuaRuntimeError" not in stderr, stderr

@@ -158,6 +158,11 @@ pub const Binding = struct {
         c.lua_pushvalue(L, -2);
         c.lua_pushcclosure(L, setMetatableLua, 0);
         if (c.lua_pcallk(L, 2, 0, 0, 0, null) != c.ok) return error.ServiceInitializationFailed;
+        const secrets = @embedFile("secrets.lua");
+        if (c.luaL_loadbufferx(L, secrets, secrets.len, "=ouro.secrets", "t") != c.ok) return error.ServiceInitializationFailed;
+        vm.pushApi(L);
+        c.lua_pushcclosure(L, setMetatableLua, 0);
+        if (c.lua_pcallk(L, 2, 0, 0, 0, null) != c.ok) return error.ServiceInitializationFailed;
     }
 
     /// Retires this generation's persistent connections without canceling
