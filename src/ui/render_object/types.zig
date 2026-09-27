@@ -36,6 +36,8 @@ pub const Box = struct {
     outline_color: ?Color = null,
     outline_width: f32 = 0,
     outline_gap: f32 = 0,
+    /// Paint the outline inside the box, inset by outline_gap, without layout.
+    outline_inset: bool = false,
     clip: bool = false,
 };
 

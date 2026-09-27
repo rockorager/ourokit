@@ -139,7 +139,7 @@ local function main_content()
   local selected = model.selected()
   return ouro.split_view {key="documents", axis="horizontal", position=split_position, min_first=160, min_second=560,
     on_change=function(fraction) split_position=fraction; refresh() end,
-    ouro.box {key="sidebar", padding=10,
+    ouro.box {key="sidebar", padding=10, surface="sidebar",
       ouro.column {key="body", gap=8, cross_alignment="stretch",
         ouro.text {key="heading", text="Documents"},
         ouro.listbox {key="list", selected=selected.tab_value, on_select=function(value) model.select(value); refresh() end, children=options},

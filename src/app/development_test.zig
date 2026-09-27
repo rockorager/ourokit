@@ -112,6 +112,10 @@ test "split controls preserve grab offset and clamp both axes at actual layout l
         defer f.destroy();
         const horizontal = comptime std.mem.eql(u8, axis, "horizontal");
         const before = try f.runtime.semanticTarget("split/divider");
+        const divider = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("split/divider")).id).?;
+        const divider_render = try f.runtime.instances.renderObject(divider);
+        try std.testing.expectEqual(@as(f32, 8), if (horizontal) before.bounds.width else before.bounds.height);
+        try std.testing.expectEqual(@as(u8, 0), (try f.runtime.tree.objectAt(divider_render)).box.background.?.a);
         try f.play(.{ .hover = "split/divider" });
         try std.testing.expectEqual(if (horizontal) .col_resize else .row_resize, try f.runtime.pointerCursor());
         try f.play(.{ .pointer_down = "split/divider" });
@@ -365,6 +369,8 @@ test "focus rings follow keyboard navigation without changing logical pointer fo
     // Keyboard activation of the SAME pointer-focused button reveals the ring.
     try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
     try std.testing.expectEqual(@as(f32, 2), (try f.runtime.tree.objectAt(render)).box.outline_width);
+    try std.testing.expect((try f.runtime.tree.objectAt(render)).box.outline_inset);
+    try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.objectAt(render)).box.outline_gap);
     try f.play(.{ .click = "root/flat" });
     try std.testing.expectEqual(flat, f.runtime.focus.current().?);
     try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.objectAt(render)).box.outline_width);
@@ -383,6 +389,29 @@ test "focus rings follow keyboard navigation without changing logical pointer fo
     try f.play(.{ .click = "root/flat" });
     try std.testing.expectEqual(flat, f.runtime.focus.current().?);
     try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.objectAt(render)).box.outline_width);
+}
+
+test "borderless text inputs keep autofocus and editing without adding field chrome" {
+    const f = try Fixture.create(
+        \\function build() return ouro.box {key='shell',border_width=1,
+        \\ ouro.text_input {key='edit',default_text='',autofocus=true,
+        \\   border_width=0,padding_x=0,background='#00000000'}} end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    const render = try f.runtime.instances.renderObject(target);
+    try std.testing.expect(f.runtime.text_inputs.contains(target));
+    try std.testing.expect((try f.runtime.tree.objectAt(render)).box.outline_color == null);
+    const bounds = (try f.runtime.semanticTarget("shell/edit")).bounds;
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try f.play(.{ .text = "query" });
+    const box = (try f.runtime.tree.objectAt(render)).box;
+    try std.testing.expect(box.outline_color == null and box.border_color == null);
+    try std.testing.expectEqual(@as(f32, 0), box.outline_width);
+    try std.testing.expectEqual(@as(f32, 0), box.border_width);
+    try std.testing.expectEqual(bounds, (try f.runtime.semanticTarget("shell/edit")).bounds);
+    try std.testing.expectEqualStrings("query", (try f.runtime.text_inputs.session(target)).model.text());
+    try std.testing.expect((try f.runtime.textInputStatus()) != null);
 }
 
 test "forms checkbox requests remain controlled and disabled controls skip focus" {

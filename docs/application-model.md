@@ -1429,10 +1429,13 @@ shaping, and width-dependent wrapping.
 Instances also retain focusability and deterministic descriptor traversal
 order. A window-local focus manager holds only a generation-checked instance
 handle. Tab and Shift-Tab move through enabled controls with wrapping during the
-input safe point, pointer presses request focus through the same policy, and
-Controls currently add no visual focus outline. Text input focus changes its
-existing one-pixel border to the generated focus color without affecting layout,
-and remains visible through its caret. Enter and Space activate on key press and
+input safe point. Pointer presses request logical focus without showing a ring;
+keyboard navigation and activation reveal it. Borderless buttons and selection
+items draw their ring inside their bounds without changing layout. Text input
+focus changes its existing border to the generated focus color without affecting
+layout. Inputs with `border_width = 0` remain borderless on focus, allowing an
+application-owned outer field to provide the chrome; the caret remains visible.
+Enter and Space activate on key press and
 enqueue the existing Button callback task;
 Wayland dispatch never calls Lua directly.
 

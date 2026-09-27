@@ -71,8 +71,10 @@ departures here or in the relevant widget documentation.
 
 The current Button and TextInput use Radix Themes' default size-2 geometry and
 medium radius. TextInput focus intentionally changes its existing border to the
-`ring` color instead of adding Radix Themes' inset outline; Button and ListBox
-also omit extra focus outlines for now. Button pressed state uses the Radix
+`ring` color instead of adding Radix Themes' inset outline. Borderless buttons
+and selection items use a 2-pixel keyboard focus ring on their inner edge, so it
+does not bleed into surrounding padding or get clipped at pane edges. Pointer
+focus does not show this ring. Button pressed state uses the Radix
 hover color but omits its brightness/saturation filter until Ourokit has a
 justified color-filter primitive.
 

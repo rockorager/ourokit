@@ -598,21 +598,6 @@ pub const Tree = struct {
         };
         const clips = switch (target.object) {
             .box => |value| paint: {
-                if (value.outline_color) |outline_color| {
-                    const expansion = value.outline_gap + value.outline_width;
-                    try builder.decoratedRectangle(
-                        .{
-                            .x = bounds.x - expansion,
-                            .y = bounds.y - expansion,
-                            .width = bounds.width + expansion * 2,
-                            .height = bounds.height + expansion * 2,
-                        },
-                        null,
-                        outline_color,
-                        value.outline_width,
-                        value.corner_radius + expansion,
-                    );
-                }
                 if (value.border_color != null or
                     (value.background != null and value.corner_radius != 0))
                 {
@@ -624,6 +609,24 @@ pub const Tree = struct {
                         value.corner_radius,
                     );
                 } else if (value.background) |color| try builder.solidRectangle(bounds, color);
+                if (value.outline_color) |outline_color| {
+                    const expansion = if (value.outline_inset)
+                        -@min(value.outline_gap, @min(bounds.width, bounds.height) / 2)
+                    else
+                        value.outline_gap + value.outline_width;
+                    try builder.decoratedRectangle(
+                        .{
+                            .x = bounds.x - expansion,
+                            .y = bounds.y - expansion,
+                            .width = bounds.width + expansion * 2,
+                            .height = bounds.height + expansion * 2,
+                        },
+                        null,
+                        outline_color,
+                        value.outline_width,
+                        @max(0, value.corner_radius + expansion),
+                    );
+                }
                 break :paint value.clip;
             },
             .flex => false,
@@ -2039,24 +2042,41 @@ test "render-object topology rejects cycles and stale generations" {
     try std.testing.expect(child.generation != replacement.generation);
 }
 
-test "box outline is paint-only state" {
+test "box outlines stay paint-only and inset rings paint above the background" {
     var tree: Tree = undefined;
     try tree.init(std.testing.allocator, 1);
     defer tree.deinit();
     const box = try tree.create(.{ .box = .{ .width = 40, .height = 20 } });
     _ = try tree.layout(box, Constraints.tight(.{ .width = 40, .height = 20 }));
-    var commands: [1]@import("../../scene/root.zig").Command = undefined;
-    var builder = try scene_builder.Builder.init(&commands, 1);
-    try tree.buildScene(box, &builder);
-    try tree.update(box, .{ .box = .{
-        .width = 40,
-        .height = 20,
-        .outline_color = Color.rgba(20, 80, 220, 255),
-        .outline_width = 2,
-        .outline_gap = 2,
-    } });
-    try std.testing.expect(!(try tree.layoutDirty(box)));
-    try std.testing.expect(try tree.paintDirty(box));
+    for ([_]bool{ false, true }) |inset| {
+        try tree.update(box, .{ .box = .{
+            .width = 40,
+            .height = 20,
+            .background = Color.rgba(255, 255, 255, 255),
+            .corner_radius = 4,
+            .outline_color = Color.rgba(20, 80, 220, 255),
+            .outline_width = 2,
+            .outline_gap = 2,
+            .outline_inset = inset,
+        } });
+        try std.testing.expect(!(try tree.layoutDirty(box)));
+        try std.testing.expect(try tree.paintDirty(box));
+        var commands: [2]@import("../../scene/root.zig").Command = undefined;
+        var builder = try scene_builder.Builder.init(&commands, 1);
+        try tree.buildScene(box, &builder);
+        try std.testing.expectEqual(@as(usize, 2), builder.count);
+        try std.testing.expectEqual(Color.rgba(255, 255, 255, 255), commands[0].decorated_rectangle.background.?);
+        const outline = commands[1].decorated_rectangle;
+        try std.testing.expect(outline.background == null);
+        try std.testing.expectEqual(@import("../../core/geometry.zig").RectI{
+            .x = if (inset) 2 else -4,
+            .y = if (inset) 2 else -4,
+            .width = if (inset) 36 else 48,
+            .height = if (inset) 16 else 28,
+        }, outline.bounds);
+        try std.testing.expectEqual(@as(u32, if (inset) 2 else 8), outline.corner_radius);
+        try std.testing.expectEqual(@as(u32, 2), outline.border_width);
+    }
 }
 
 test "scroll lays out unbounded content and clips paint and hit testing" {

@@ -1666,9 +1666,9 @@ pub const UiBuild = struct {
         }
         self.popParent();
         const style: ButtonStyle = .{
-            .idle = theme.border,
-            .hovered = theme.primary_hover,
-            .pressed = theme.primary,
+            .idle = .rgba(0, 0, 0, 0),
+            .hovered = theme.accent,
+            .pressed = theme.accent_selected,
             .disabled = theme.disabled,
             .border = theme.border,
             .focus = theme.ring,

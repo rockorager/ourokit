@@ -2328,11 +2328,15 @@ pub const WindowRuntime = struct {
         const render = try self.instances.renderObject(target);
         var object = try self.tree.objectAt(render);
         if (object != .box) return error.ControlRenderObjectMismatch;
+        // A borderless input may live inside application-owned field chrome.
+        // Focus recolors an input's existing border; it must not invent one.
+        if (self.text_inputs.contains(target) and object.box.border_width == 0) return;
         if (object.box.border_width == 0 or self.listboxes.option(target) != null) {
             const outline: ?core.Color = if (focused) color else null;
             if (std.meta.eql(object.box.outline_color, outline)) return;
             object.box.outline_width = if (focused) 2 else 0;
-            object.box.outline_gap = if (focused) 2 else 0;
+            object.box.outline_gap = 0;
+            object.box.outline_inset = true;
             object.box.outline_color = outline;
         } else {
             if (std.meta.eql(object.box.border_color, color)) return;

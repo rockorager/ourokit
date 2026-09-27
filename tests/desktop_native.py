@@ -173,6 +173,10 @@ def document_test(root, env):
             adjusted_sidebar = node(app_env, endpoint, window, "documents/sidebar")["bounds"]
             adjusted_tabs = node(app_env, endpoint, window, "documents/tabs")["bounds"]
             assert adjusted_sidebar["width"] > sidebar["width"] and adjusted_tabs["width"] < tabs["width"]
+            capture(app_env, endpoint, window, "document-divider-focus.png")
+            click(app_env, endpoint, window, header(1))
+            input_action(action="key", key="home")
+            capture(app_env, endpoint, window, "document-tab-focus.png")
 
             click(app_env, endpoint, window, panel(1, "title"))
             input_action(action="key", key="a", control=True)
@@ -496,10 +500,20 @@ local function content() return ouro.row {key='workspaces', gap=12,
  ouro.button {key='two', label='2', width=48, border_width=0, background='#304055', hover='#304055'},
  ouro.button {key='three', label='3', width=48, border_width=0, background='#304055', hover='#304055'},
 } end
+local function search() return ouro.box {key='shell', width='fill', height=48,
+ alignment='center', background='#ffffff', border='#e0e1e6', border_width=1, radius=4,
+ ouro.row {key='row', gap=8, cross_alignment='center',
+  ouro.box {key='start', width=4},
+  ouro.xdg.icon {key='icon',name='system-search-symbolic',theme='Adwaita',width=20,height=20,alt=''},
+  ouro.text_input {key='search',default_text='',placeholder='Search apps and commands…',
+   autofocus=true,flex=1,padding_x=0,border_width=0,background='#00000000',focus='#ff00ff'},
+  ouro.box {key='end',width=4},
+ }} end
 return ouro.app {id='dev.ourokit.focus-test', run=function() return {windows={
  ouro.window {id='main', title='Keyboard focus', width=260, height=80, content=content},
  ouro.layer_surface {id='panel', namespace='focus-test', layer='top',
    width=260, height=80, keyboard_interactivity='none', content=content},
+ ouro.window {id='search',title='Composite search field',width=520,height=90,content=search},
 }} end}
 ''')
     env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'])
@@ -507,7 +521,7 @@ return ouro.app {id='dev.ourokit.focus-test', run=function() return {windows={
                                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
         endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), process)
-        wait_for(lambda: len(inspect(env, endpoint).get('windows', [])) == 2, 'focus windows unavailable')
+        wait_for(lambda: len(inspect(env, endpoint).get('windows', [])) == 3, 'focus windows unavailable')
         # Capture even without an artifact request: decoded pixels are assertions,
         # not merely optional screenshots. Flat hover colors isolate the ring.
         directory = Path(os.environ.get('OUROKIT_TEST_CAPTURE', root / 'focus-captures')).resolve()
@@ -529,11 +543,28 @@ return ouro.app {id='dev.ourokit.focus-test', run=function() return {windows={
         tree = inspect(env, endpoint, 'main')['windows'][0]
         run(str(BINARY), 'dev', 'input', str(endpoint), json.dumps(dict(
             window='main', token=tree['token'], action='key', key='tab')), env=env)
-        assert node(env, endpoint, 'main', 'workspaces/two')['focused']
-        assert pixels('main', 'focus-keyboard.png') != mouse
+        focused = node(env, endpoint, 'main', 'workspaces/two')
+        assert focused['focused']
+        keyboard = pixels('main', 'focus-keyboard.png')
+        width = int(subprocess.check_output(['magick', 'identify', '-format', '%w', str(directory / 'focus-keyboard.png')]))
+        changed = [(i // 4 % width, i // 4 // width) for i in range(0, len(mouse), 4)
+                   if mouse[i:i+4] != keyboard[i:i+4]]
+        bounds = focused['bounds']
+        x, y, w, h = (int(bounds[k]) for k in ('x', 'y', 'width', 'height'))
+        assert changed and all(x <= px < x+w and y <= py < y+h for px, py in changed), changed
+        # All four edges must remain visible, not merely be clipped away.
+        for px, py in ((x+w//2, y), (x+w//2, y+h-1), (x, y+h//2), (x+w-1, y+h//2)):
+            i = (py * width + px) * 4
+            assert keyboard[i:i+4] != mouse[i:i+4], (px, py)
         click(env, endpoint, 'main', 'workspaces/one')
         assert pixels('main', 'focus-mouse-restored.png') == mouse
-        print('PASS native focus: panel click has identical pixels; Tab draws ring; click removes it')
+        print('PASS native focus: mouse unchanged; keyboard ring stays inside bounds with all four edges; click removes it')
+        assert node(env, endpoint, 'search', 'shell/row/search')['focused']
+        search = pixels('search', 'borderless-search-focused.png')
+        # A deliberately distinctive focus color must never paint on this
+        # borderless editor inside the application-owned search-field border.
+        assert not any(search[i:i+4] == bytes((255, 0, 255, 255)) for i in range(0, len(search), 4))
+        print('PASS native borderless search retains autofocus without drawing an inner ring')
     finally:
         terminate(process)
         errors = process.stderr.read()
