@@ -37,6 +37,8 @@ pub const Cursor = struct {
             .shape = switch (shape) {
                 .default => .default,
                 .text => .text,
+                .col_resize => .col_resize,
+                .row_resize => .row_resize,
             },
         } });
         self.applied = shape;

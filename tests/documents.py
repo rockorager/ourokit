@@ -12,7 +12,7 @@ source = r'''
 local o=require('ouro')
 local m=require('model')(o.json)
 local d=m.new('A','first\nsecond','file:///old.ournote')
-assert(d.id=='document-1' and not d.dirty)
+assert(d.id=='document-1' and d.tab_value==1 and not d.dirty and m.selected()==d)
 m.edit(d,'text','new\nbody'); assert(d.dirty and d.revision==1)
 local first=m.begin_save(d)
 assert(d.saving and m.begin_save(d)==nil)
@@ -33,7 +33,26 @@ assert(not m.edit(d,'title','two\nlines') and d.title=='later')
 local uris=m.parse_uri_list('# comment\r\nfile:///one\r\n\r\nfile:///two\n')
 assert(#uris==2 and uris[1]=='file:///one' and uris[2]=='file:///two')
 local canceled=m.begin_save(d); assert(m.cancel_save(d,canceled) and not d.saving and not m.cancel_save(d,canceled))
-local e=m.new(); assert(e.id=='document-2'); assert(m.remove(d) and m.documents[1]==e)
+local e=m.new('E'); local f=m.new('F'); local g=m.new('G')
+assert(e.id=='document-2' and e.tab_value==2 and m.selected()==g)
+assert(m.select(e.tab_value)==e and m.selected_id==e.id)
+assert(m.remove(e) and m.selected()==f) -- selected first chooses its next neighbor
+assert(m.remove(f) and m.selected()==g) -- selected middle chooses its next neighbor
+local h=m.new('H'); assert(m.select(h.id)==h)
+assert(m.remove(h) and m.selected()==g) -- selected last chooses its previous neighbor
+local background=m.new('background'); m.select(g.id)
+assert(m.remove(background) and m.selected()==g) -- background close preserves selection
+assert(m.remove(d) and m.selected()==g)
+assert(m.select(99999)==nil and m.selected()==g)
+
+-- Canceling a chooser leaves the snapshot dirty and a stale completion cannot
+-- clear a later active save. A raced edit remains dirty after its snapshot lands.
+m.edit(g,'text','dirty')
+local canceled=m.begin_save(g); assert(m.cancel_save(g,canceled) and g.dirty)
+local active=m.begin_save(g); assert(not m.finish_save(g,canceled,'file:///stale',true) and g.saving)
+m.edit(g,'text','raced')
+assert(m.finish_save(g,active,'file:///g.ournote',true) and g.dirty and g.path=='file:///g.ournote')
+local final=m.begin_save(g); assert(m.finish_save(g,final,g.path,true) and not g.dirty)
 o.stdout.write('PASS documents model\n')
 o.exit(0)
 '''
@@ -48,4 +67,4 @@ with tempfile.TemporaryDirectory() as temporary:
     assert process.returncode == 0, stderr
 assert "LuaRuntimeError" not in stderr, stderr
 assert "PASS documents model" in stdout, stdout
-print("PASS documents deterministic state, strict decode, failed and raced saves")
+print("PASS documents deterministic selection/close state, strict decode, canceled and raced saves")

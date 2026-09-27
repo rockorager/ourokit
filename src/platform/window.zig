@@ -7,7 +7,7 @@ pub const WindowHandle = Handle;
 
 pub const LogicalPosition = PointF;
 
-pub const PointerCursor = enum { default, text };
+pub const PointerCursor = enum { default, text, col_resize, row_resize };
 
 pub const PointerButtonState = enum {
     released,

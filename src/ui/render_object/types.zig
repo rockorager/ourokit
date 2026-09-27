@@ -16,6 +16,9 @@ pub const Alignment = struct {
 };
 
 pub const Box = struct {
+    /// Retains layout and state while suppressing painting and hit testing for
+    /// this box and its complete subtree.
+    hidden: bool = false,
     width: ?f32 = null,
     height: ?f32 = null,
     fill_width: bool = false,
@@ -48,6 +51,14 @@ pub const Flex = struct {
     main_axis_size: MainAxisSize = .max,
     cross_axis_alignment: CrossAxisAlignment = .start,
     gap: f32 = 0,
+};
+
+pub const Split = struct {
+    axis: Axis = .horizontal,
+    position: f32 = 0.5,
+    min_first: f32 = 0,
+    min_second: f32 = 0,
+    divider: f32 = 8,
 };
 
 pub const Stack = struct {
@@ -122,6 +133,7 @@ pub const TextInput = struct {
 pub const Object = union(enum) {
     box: Box,
     flex: Flex,
+    split: Split,
     stack: Stack,
     scroll: Scroll,
     image: Image,

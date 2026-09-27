@@ -59,7 +59,7 @@ const PendingTextInput = struct {
     session: ?TextInputSession,
 };
 
-const ParentKind = enum { box, flex, stack, overlay, scroll, listbox, radio_group };
+const ParentKind = enum { box, flex, stack, overlay, scroll, listbox, radio_group, tab_bar, split };
 const BuildParent = struct { id: u64, kind: ParentKind, semantic_id: ?u64 = null };
 
 pub const Argument = union(enum) {
@@ -644,6 +644,9 @@ pub const UiBuild = struct {
             .text_input => emitTextInput,
             .listbox => emitListBox,
             .option => emitOption,
+            .tab_bar => emitTabBar,
+            .tab => emitTab,
+            .split_view => emitSplitView,
             .box => emitBox,
             .stack => emitStack,
             .row => emitRow,
@@ -1409,14 +1412,18 @@ pub const UiBuild = struct {
     }
 
     fn emitListBox(state: *c.State) callconv(.c) c_int {
-        return emitSelectionGroup(state, false);
+        return emitSelectionGroup(state, false, false);
     }
 
     fn emitRadioGroup(state: *c.State) callconv(.c) c_int {
-        return emitSelectionGroup(state, true);
+        return emitSelectionGroup(state, true, false);
     }
 
-    fn emitSelectionGroup(state: *c.State, radio: bool) c_int {
+    fn emitTabBar(state: *c.State) callconv(.c) c_int {
+        return emitSelectionGroup(state, false, true);
+    }
+
+    fn emitSelectionGroup(state: *c.State, radio: bool, tabs: bool) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
@@ -1437,15 +1444,16 @@ pub const UiBuild = struct {
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .object = .{ .flex = .{ .axis = .vertical, .gap = gap, .cross_axis_alignment = .stretch } },
+            .object = .{ .flex = .{ .axis = if (tabs) .horizontal else .vertical, .gap = gap, .cross_axis_alignment = .stretch } },
             .focusable = enabled,
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append listbox descriptor");
         self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
-            .role = if (radio) .radio_group else .listbox,
+            .role = if (radio) .radio_group else if (tabs) .tab_list else .listbox,
             .key = key,
+            .label = tableString(state, 1, "label") orelse "",
             .enabled = enabled,
         }) catch return luaError(state, "cannot append listbox semantics");
         if (self.pending_listbox_count == self.pending_listboxes.len)
@@ -1477,10 +1485,18 @@ pub const UiBuild = struct {
         c.lua_settop(state, -2);
         self.stageCallback(state, id, "on_activate", .selection_activate) catch |err| return luaError(state, @errorName(err));
         self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
-        return self.emitChildren(state, .{ .id = id, .kind = if (radio) .radio_group else .listbox });
+        return self.emitChildren(state, .{ .id = id, .kind = if (radio) .radio_group else if (tabs) .tab_bar else .listbox });
     }
 
     fn emitOption(state: *c.State) callconv(.c) c_int {
+        return emitSelectionOption(state, false);
+    }
+
+    fn emitTab(state: *c.State) callconv(.c) c_int {
+        return emitSelectionOption(state, true);
+    }
+
+    fn emitSelectionOption(state: *c.State, tab: bool) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
@@ -1488,7 +1504,8 @@ pub const UiBuild = struct {
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.option expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "option requires a listbox parent");
-        if (parent.kind != .listbox and parent.kind != .radio_group) return luaError(state, "option requires a direct selection group parent");
+        if (parent.kind != .listbox and parent.kind != .radio_group and parent.kind != .tab_bar) return luaError(state, "option requires a direct selection group parent");
+        if (tab != (parent.kind == .tab_bar)) return luaError(state, "tab requires a tab_bar parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "option key is required");
         const label = tableString(state, 1, "label") orelse return luaError(state, "option label is required");
         const value = tableRequiredInteger(state, 1, "value") orelse
@@ -1532,6 +1549,7 @@ pub const UiBuild = struct {
         self.append(.{
             .id = option_id,
             .parent = parent.id,
+            .parent_data = if (tab) .{ .flex = .{ .factor = 1 } } else .none,
             .object = .{ .box = .{
                 .height = visual.height orelse defaults.controls.height,
                 .padding = .{ .left = visual.padding_x orelse design.tokens.foundation.spacing_2, .right = visual.padding_x orelse design.tokens.foundation.spacing_2 },
@@ -1544,13 +1562,15 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append option descriptor");
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         var content_parent = option_id;
-        if (parent.kind == .radio_group) {
+        if (parent.kind == .radio_group or tab) {
             content_parent = semanticId("content", option_id);
             self.append(.{
                 .id = content_parent,
                 .parent = option_id,
                 .object = .{ .flex = .{ .gap = 8, .cross_axis_alignment = .center } },
-            }) catch return luaError(state, "cannot append radio content");
+            }) catch return luaError(state, "cannot append option content");
+        }
+        if (parent.kind == .radio_group) {
             const foreground = if (selected) style.selected.foreground else style.idle.foreground;
             self.append(.{
                 .id = semanticId("indicator", option_id),
@@ -1575,7 +1595,7 @@ pub const UiBuild = struct {
         self.append(.{
             .id = label_id,
             .parent = content_parent,
-            .parent_data = if (parent.kind == .radio_group) .{ .flex = .{ .factor = 1 } } else .none,
+            .parent_data = if (parent.kind == .radio_group or tab) .{ .flex = .{ .factor = 1 } } else .none,
             .object = .{ .text = .{
                 .source = source,
                 .color = if (!listbox.enabled) theme.disabled_foreground else if (selected) style.selected.foreground else style.idle.foreground,
@@ -1600,13 +1620,67 @@ pub const UiBuild = struct {
         self.appendSemantic(.{
             .id = option_id,
             .parent = semanticParent(parent),
-            .role = if (parent.kind == .radio_group) .radio else .option,
+            .role = if (parent.kind == .radio_group) .radio else if (tab) .tab else .option,
             .key = key,
             .label = label,
             .selected = selected,
             .checked = parent.kind == .radio_group and selected,
             .enabled = listbox.enabled,
         }) catch return luaError(state, "cannot append option semantics");
+        if (tab) return self.emitChildren(state, .{ .id = content_parent, .kind = .flex, .semantic_id = option_id });
+        return 0;
+    }
+
+    fn emitSplitView(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "ouro.split_view expects one declaration table");
+        if (c.lua_rawlen(state, c.upvalueIndex(2)) != 2)
+            return luaError(state, "split_view requires exactly two children");
+        const parent = self.currentParent() orelse return luaError(state, "split_view requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "split_view key is required");
+        const axis = tableOptionalAxis(state, 1, "axis", .horizontal) orelse return luaError(state, "invalid split axis");
+        const position = tableOptionalFraction(state, 1, "position", 0.5) orelse return luaError(state, "split position must be between zero and one");
+        const min_first = tableOptionalExtent(state, 1, "min_first", 0) orelse return luaError(state, "invalid split min_first");
+        const min_second = tableOptionalExtent(state, 1, "min_second", 0) orelse return luaError(state, "invalid split min_second");
+        const parent_data = declarativeParentData(self, state, 1) catch |err| return luaError(state, parentDataErrorMessage(err));
+        const id = semanticId(key, 0x73706c6974 ^ parent.id ^ self.component_namespace);
+        const divider = semanticId("divider", id);
+        self.append(.{ .id = id, .parent = parent.id, .parent_data = parent_data, .object = .{ .split = .{
+            .axis = axis,
+            .position = position,
+            .min_first = min_first,
+            .min_second = min_second,
+        } } }) catch return luaError(state, "cannot append split descriptor");
+        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .group, .key = key }) catch return luaError(state, "cannot append split semantics");
+        self.pushParent(.{ .id = id, .kind = .split, .semantic_id = id }) catch return luaError(state, "split nesting is too deep");
+        for (1..3) |index| {
+            c.lua_pushlightuserdata(state, self);
+            c.lua_pushcclosure(state, lowerDescription, 1);
+            _ = c.lua_rawgeti(state, c.upvalueIndex(2), @intCast(index));
+            if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) {
+                self.popParent();
+                return c.lua_error(state);
+            }
+        }
+        self.popParent();
+        const style: ButtonStyle = .{
+            .idle = theme.border,
+            .hovered = theme.primary_hover,
+            .pressed = theme.primary,
+            .disabled = theme.disabled,
+            .border = theme.border,
+            .focus = theme.ring,
+        };
+        self.append(.{ .id = divider, .parent = id, .focusable = true, .object = .{ .box = .{
+            .background = style.idle,
+        } } }) catch return luaError(state, "cannot append split divider");
+        if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "button capacity exceeded");
+        self.pending_buttons[self.pending_button_count] = .{ .id = divider, .enabled = true, .style = style };
+        self.pending_button_count += 1;
+        self.appendSemantic(.{ .id = divider, .parent = id, .role = .separator, .key = "divider" }) catch return luaError(state, "cannot append split divider semantics");
+        self.stageCallback(state, divider, "on_change", .split_change) catch |err| return luaError(state, @errorName(err));
         return 0;
     }
 
@@ -1747,6 +1821,8 @@ pub const UiBuild = struct {
             .parent = parent.id,
             .object = .{ .box = .{
                 .width = width.extent(),
+                .hidden = tableOptionalBoolean(state, 1, "hidden", false) orelse
+                    return luaError(state, "box hidden must be boolean"),
                 .height = height.extent(),
                 .fill_width = width.isFill(),
                 .fill_height = height.isFill(),
@@ -2165,6 +2241,17 @@ fn tableOptionalAxis(
     return null;
 }
 
+fn tableOptionalFraction(state: *c.State, table: c_int, field: [*:0]const u8, default: f32) ?f32 {
+    const value_type = c.lua_getfield(state, table, field);
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return default;
+    if (value_type != c.type_number) return null;
+    var is_number: c_int = 0;
+    const value = c.lua_tonumberx(state, -1, &is_number);
+    if (is_number == 0 or !std.math.isFinite(value) or value < 0 or value > 1) return null;
+    return @floatCast(value);
+}
+
 fn tableOptionalCrossAxisAlignment(
     state: *c.State,
     table: c_int,
@@ -2208,7 +2295,7 @@ fn declarativeParentData(
     const flex = try tableOptionalFlexFactor(state, table);
     return switch (parent.kind) {
         .flex => if (flex) |factor| .{ .flex = .{ .factor = factor } } else .none,
-        .box, .overlay, .scroll, .listbox, .radio_group => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
+        .box, .overlay, .scroll, .listbox, .radio_group, .tab_bar, .split => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
         .stack => stack: {
             if (flex != null) return error.FlexRequiresRowOrColumnParent;
             const x = tableOptionalExtent(state, table, "x", 0) orelse return error.InvalidPosition;

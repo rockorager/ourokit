@@ -30,6 +30,7 @@ pub const SemanticTarget = struct {
     bounds: core.RectF,
     role: ui.semantics.Role,
     enabled: bool,
+    visible: bool,
     scroll_axis: ?platform.PointerAxis,
 };
 
@@ -100,6 +101,7 @@ pub const WindowRuntime = struct {
     clicks: ui.input.Clicks = .{},
     selection_pointer: ?core.PointF = null,
     range_drag: ?ui.instance.InstanceHandle = null,
+    split_drag: ?struct { target: ui.instance.InstanceHandle, grab_offset: f32 } = null,
     selection_tick_ns: ?u64 = null,
     scroll_motions: [2]scroll_motion.Motion = @splat(.{}),
     // Headless windows act focused; native hosts start false until keyboard enter.
@@ -257,6 +259,7 @@ pub const WindowRuntime = struct {
         const root = (try self.instances.rootRenderObject()) orelse return null;
         const render = (try self.tree.hitTest(root, .{ .x = position.x, .y = position.y })) orelse return null;
         var current: ?ui.instance.InstanceHandle = self.instances.instanceForRenderObject(render);
+        if (current) |target| if (!self.instances.isVisible(target)) return null;
         if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, current)) return null;
         while (current) |target| {
             if (uri_offer) if (self.pointer_bindings.getKind(target, .drop_uris)) |handler|
@@ -270,7 +273,7 @@ pub const WindowRuntime = struct {
 
     pub fn deliverDrop(self: *WindowRuntime, callbacks: *lua.CallbackRegistry, selection: DropSelection, bytes: []const u8) !bool {
         if (!self.ready) return false;
-        if (!self.instances.isActive(selection.target)) return false;
+        if (!self.instances.isVisible(selection.target)) return false;
         if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, selection.target)) return false;
         const kind: ui.input.HandlerKind = if (selection.mime == .text) .drop_text else .drop_uris;
         const current = self.pointer_bindings.getKind(selection.target, kind) orelse return false;
@@ -313,6 +316,7 @@ pub const WindowRuntime = struct {
         self.text_inputs.clear();
         self.focus = .{};
         self.range_drag = null;
+        self.split_drag = null;
         self.text_input_owner = null;
         self.text_input_generation +%= 1;
         self.clicks.reset();
@@ -811,6 +815,7 @@ pub const WindowRuntime = struct {
 
     pub fn pointerCursor(self: *WindowRuntime) !platform.PointerCursor {
         if (!self.ready or !self.router.pointer_inside) return .default;
+        if (self.split_drag) |drag| if (try self.splitCursor(drag.target)) |cursor| return cursor;
         if (self.router.captured) |captured| if (self.instances.isActive(captured)) {
             if (try self.textInputAncestor(captured)) |input|
                 if ((try self.text_inputs.session(input)).isSelecting()) return .text;
@@ -819,8 +824,17 @@ pub const WindowRuntime = struct {
         const root = (try self.instances.rootRenderObject()) orelse return .default;
         const render = (try self.tree.hitTest(root, self.router.pointer_position)) orelse return .default;
         const target = self.instances.instanceForRenderObject(render) orelse return .default;
+        if (try self.splitCursor(target)) |cursor| return cursor;
         const input = (try self.textInputAncestor(target)) orelse return .default;
         return if ((try self.text_inputs.getBehavior(input)).enabled) .text else .default;
+    }
+
+    fn splitCursor(self: *WindowRuntime, target: ui.instance.InstanceHandle) !?platform.PointerCursor {
+        if (!self.instances.isVisible(target) or self.pointer_bindings.getKind(target, .split_change) == null) return null;
+        const parent = (try self.instances.parentOf(target)) orelse return null;
+        const object = try self.tree.objectAt(try self.instances.renderObject(parent));
+        if (object != .split) return null;
+        return if (object.split.axis == .horizontal) .col_resize else .row_resize;
     }
 
     pub fn routeKeyboard(self: *WindowRuntime, event: platform.KeyboardEvent) !void {
@@ -924,7 +938,7 @@ pub const WindowRuntime = struct {
                 .keyboard => unreachable,
                 .text_input, .text_input_focus => unreachable,
             };
-            if (!self.instances.isActive(target)) continue;
+            if (!self.instances.isActive(target) or !self.instances.isVisible(target)) continue;
             if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, target)) continue;
             try self.updateTextInputPointer(target, event);
             const activated_button = try self.updateButtonState(event);
@@ -953,6 +967,37 @@ pub const WindowRuntime = struct {
                 handler = self.pointer_bindings.get(bound_target);
             }
             const binding = handler orelse continue;
+            if (binding.kind == .split_change) {
+                if (event != .pointer) continue;
+                const pointer = event.pointer;
+                const parent = (try self.instances.parentOf(bound_target)) orelse continue;
+                const parent_render = try self.instances.renderObject(parent);
+                const object = try self.tree.objectAt(parent_render);
+                if (object != .split) continue;
+                const axis = object.split.axis;
+                if (pointer.event == .button and pointer.event.button.button == 0x110) {
+                    if (pointer.event.button.state == .pressed) {
+                        const divider_origin = try self.instanceOrigin(bound_target);
+                        self.split_drag = .{
+                            .target = bound_target,
+                            .grab_offset = axisCoordinate(axis, pointer.position) - axisCoordinate(axis, divider_origin),
+                        };
+                    } else self.split_drag = null;
+                }
+                const drag = self.split_drag orelse continue;
+                if (!sameHandle(drag.target, bound_target) or
+                    (pointer.event != .motion and pointer.event != .button)) continue;
+                const origin = try self.instanceOrigin(parent);
+                const size = try self.tree.nodeSize(parent_render);
+                const extent = if (axis == .horizontal) size.width else size.height;
+                const resolution = @import("../ui/render_object/split.zig").resolve(object.split, extent);
+                const requested = axisCoordinate(axis, pointer.position) - axisCoordinate(axis, origin) - drag.grab_offset;
+                const first = std.math.clamp(requested, resolution.min, resolution.max);
+                const fraction = if (resolution.available == 0) @as(f32, 0) else first / resolution.available;
+                if (fraction != object.split.position)
+                    try self.spawnCallback(callback_service, binding.id, try self.instances.scope(bound_target), &.{.{ .number = fraction }});
+                continue;
+            }
             if (binding.kind == .range_change) {
                 if (event != .pointer) continue;
                 const pointer = event.pointer;
@@ -983,7 +1028,7 @@ pub const WindowRuntime = struct {
                 const semantic = self.semantics.findId(try self.instances.semanticId(selection.listbox)) orelse continue;
                 if (!semantic.enabled) continue;
                 const previous = self.focus.current();
-                if (semantic.role != .radio_group) self.listboxes.select(selection);
+                if (semantic.role != .radio_group and semantic.role != .tab_list) self.listboxes.select(selection);
                 try self.refreshListBoxVisuals();
                 _ = try self.focus.request(&self.instances, selection.listbox);
                 try self.applyFocusVisual(previous, self.focus.current());
@@ -1026,7 +1071,11 @@ pub const WindowRuntime = struct {
         var boundary: ?ui.instance.InstanceHandle = null;
         for (0..self.semantics.count()) |index| {
             const node = try self.semantics.node(index);
-            if (node.role == .dialog) boundary = self.instances.handleForId(node.id);
+            if (node.role == .dialog) {
+                if (self.instances.handleForId(node.id)) |candidate| {
+                    if (self.instances.isVisible(candidate)) boundary = candidate;
+                }
+            }
         }
         const previous = self.focus.current();
         const changed = try self.focus.setBoundary(&self.instances, boundary);
@@ -1036,10 +1085,15 @@ pub const WindowRuntime = struct {
                 self.semantics.findId(try self.instances.semanticId(target))
             else
                 null;
-            if (semantic == null or !semantic.?.enabled) self.range_drag = null;
+            if (semantic == null or !semantic.?.enabled or !self.instances.isVisible(target)) self.range_drag = null;
+        }
+        if (self.split_drag) |drag| {
+            if (!self.instances.isActive(drag.target) or !self.instances.isVisible(drag.target))
+                self.split_drag = null;
         }
         if (changed) {
             self.range_drag = null;
+            self.split_drag = null;
             try self.applyButtonUpdate(self.buttons.release());
         }
         try self.applyFocusVisual(previous, self.focus.current());
@@ -1092,6 +1146,7 @@ pub const WindowRuntime = struct {
             .leave => {
                 self.keyboard_focused = false;
                 self.range_drag = null;
+                self.split_drag = null;
                 self.resetCaretBlink();
                 try self.applyButtonUpdate(self.buttons.release());
                 self.clicks.reset();
@@ -1189,6 +1244,31 @@ pub const WindowRuntime = struct {
             return;
         }
         if (key.state != .released) if (self.focus.current()) |focused| {
+            if (self.pointer_bindings.getKind(focused, .split_change)) |binding| {
+                const parent = (try self.instances.parentOf(focused)) orelse return;
+                const render = try self.instances.renderObject(parent);
+                const object = try self.tree.objectAt(render);
+                if (object != .split) return;
+                const size = try self.tree.nodeSize(render);
+                const extent = if (object.split.axis == .horizontal) size.width else size.height;
+                const resolution = @import("../ui/render_object/split.zig").resolve(object.split, extent);
+                const delta: ?f32 = switch (key.translated.logical) {
+                    .arrow_left => if (object.split.axis == .horizontal) -10 else null,
+                    .arrow_right => if (object.split.axis == .horizontal) 10 else null,
+                    .arrow_up => if (object.split.axis == .vertical) -10 else null,
+                    .arrow_down => if (object.split.axis == .vertical) 10 else null,
+                    .home => resolution.min - resolution.first,
+                    .end => resolution.max - resolution.first,
+                    else => null,
+                };
+                if (delta) |amount| {
+                    const first = std.math.clamp(resolution.first + amount, resolution.min, resolution.max);
+                    const fraction = if (resolution.available == 0) @as(f32, 0) else first / resolution.available;
+                    if (fraction != object.split.position)
+                        try self.spawnCallback(callback_service, binding.id, try self.instances.scope(focused), &.{.{ .number = fraction }});
+                    return;
+                }
+            }
             if (self.pointer_bindings.getKind(focused, .range_change)) |binding| {
                 const semantic = self.semantics.findId(try self.instances.semanticId(focused)).?;
                 if (!semantic.enabled) return;
@@ -1241,8 +1321,9 @@ pub const WindowRuntime = struct {
             const focused = self.focus.current() orelse return;
             if (!self.listboxes.contains(focused)) return;
             const semantic = self.semantics.findId(try self.instances.semanticId(focused)).?;
-            const radio = semantic.role == .radio_group;
-            if (!radio and (key.translated.logical == .arrow_left or key.translated.logical == .arrow_right)) return;
+            const controlled = semantic.role == .radio_group or semantic.role == .tab_list;
+            if (!controlled and (key.translated.logical == .arrow_left or key.translated.logical == .arrow_right)) return;
+            if (semantic.role == .tab_list and (key.translated.logical == .arrow_up or key.translated.logical == .arrow_down)) return;
             const old = self.listboxes.selectedValue(focused).?;
             var selection = switch (key.translated.logical) {
                 .home => self.listboxes.edge(focused, false),
@@ -1251,7 +1332,7 @@ pub const WindowRuntime = struct {
                 .arrow_down, .arrow_right => self.listboxes.move(focused, 1),
                 else => unreachable,
             } orelse return;
-            if (radio) {
+            if (controlled) {
                 if (selection.value == old and key.translated.logical != .home and key.translated.logical != .end)
                     selection = self.listboxes.edge(focused, key.translated.logical == .arrow_up or key.translated.logical == .arrow_left).?;
                 var restore = selection;
@@ -1527,7 +1608,7 @@ pub const WindowRuntime = struct {
                     return geometry;
                 }
             }
-            return .{ .center = .{}, .bounds = .{ .x = 0, .y = 0, .width = 0, .height = 0 }, .role = .group, .enabled = semantic.enabled, .scroll_axis = null };
+            return .{ .center = .{}, .bounds = .{ .x = 0, .y = 0, .width = 0, .height = 0 }, .role = .group, .enabled = semantic.enabled, .visible = false, .scroll_axis = null };
         };
         const render = try self.instances.renderObject(target);
         const scroll_axis: ?platform.PointerAxis = if (self.text_inputs.contains(target) and
@@ -1548,14 +1629,21 @@ pub const WindowRuntime = struct {
             );
             current = try self.instances.parentOf(instance_handle);
         }
+        var center: core.PointF = .{ .x = origin.x + size.width / 2, .y = origin.y + size.height / 2 };
+        if (semantic.role == .tab) {
+            // A tab's geometric center can fall on its nested close button.
+            // Replay selection at the label, leaving the full bounds inspectable.
+            const label = self.listboxes.currentVisual(target).content;
+            const label_origin = try self.instanceOrigin(label);
+            const label_size = try self.tree.nodeSize(try self.instances.renderObject(label));
+            center = .{ .x = label_origin.x + label_size.width / 2, .y = label_origin.y + label_size.height / 2 };
+        }
         return .{
-            .center = .{
-                .x = origin.x + size.width / 2,
-                .y = origin.y + size.height / 2,
-            },
+            .center = center,
             .bounds = .{ .x = origin.x, .y = origin.y, .width = size.width, .height = size.height },
             .role = semantic.role,
             .enabled = semantic.enabled,
+            .visible = self.instances.isVisible(target),
             .scroll_axis = scroll_axis,
         };
     }
@@ -1737,7 +1825,7 @@ pub const WindowRuntime = struct {
     // Rebuilds and animation frames must not restart an unchanged caret phase.
     fn refreshCaretActivity(self: *WindowRuntime) !bool {
         var activity: ?CaretActivity = null;
-        if (self.focus.current()) |target| if (self.instances.isActive(target) and self.text_inputs.contains(target)) {
+        if (self.focus.current()) |target| if (self.instances.isActive(target) and self.instances.isVisible(target) and self.text_inputs.contains(target)) {
             const session = try self.text_inputs.session(target);
             activity = .{
                 .target = target,
@@ -1756,7 +1844,7 @@ pub const WindowRuntime = struct {
     fn caretShouldBlink(self: *WindowRuntime) !bool {
         if (!self.initialized or !self.keyboard_focused or self.caret_blink_interval_ns == 0) return false;
         const target = self.focus.current() orelse return false;
-        if (!self.instances.isActive(target) or !self.text_inputs.contains(target)) return false;
+        if (!self.instances.isActive(target) or !self.instances.isVisible(target) or !self.text_inputs.contains(target)) return false;
         const behavior = try self.text_inputs.getBehavior(target);
         const session = try self.text_inputs.session(target);
         return behavior.enabled and !behavior.read_only and session.preedit() == null and
@@ -2257,7 +2345,7 @@ pub const WindowRuntime = struct {
     fn refreshTextInputOwner(self: *WindowRuntime) !bool {
         var owner: @TypeOf(self.text_input_owner) = null;
         if (self.keyboard_focused and self.text_input_surface_focused) {
-            if (self.focus.current()) |target| if (self.instances.isActive(target) and self.text_inputs.contains(target)) {
+            if (self.focus.current()) |target| if (self.instances.isActive(target) and self.instances.isVisible(target) and self.text_inputs.contains(target)) {
                 const behavior = try self.text_inputs.getBehavior(target);
                 if (behavior.enabled and !behavior.read_only) owner = .{
                     .target = target,
@@ -3248,6 +3336,10 @@ fn encodedColor(color: core.Color) i64 {
         (@as(i64, color.g) << 16) |
         (@as(i64, color.b) << 8) |
         color.a;
+}
+
+fn axisCoordinate(axis: ui.render_object.types.Axis, point: core.PointF) f32 {
+    return if (axis == .horizontal) point.x else point.y;
 }
 
 fn sameHandle(a: anytype, b: @TypeOf(a)) bool {

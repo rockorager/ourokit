@@ -1,13 +1,22 @@
 -- State and validation kept separate so it can be tested without a compositor.
 return function(json)
-  local M = { documents = {}, next_id = 1 }
+  local M = { documents = {}, next_id = 1, selected_id = nil }
 
   function M.new(title, text, path)
-    local d = { id = "document-" .. M.next_id, title = title or "Untitled", text = text or "", path = path,
+    local d = { id = "document-" .. M.next_id, tab_value = M.next_id, title = title or "Untitled", text = text or "", path = path,
       dirty = false, revision = 0, save_serial = 0, saving = false, closing = false, error = nil }
     M.next_id = M.next_id + 1
     M.documents[#M.documents + 1] = d
+    M.selected_id = d.id
     return d
+  end
+  function M.select(value)
+    for _, d in ipairs(M.documents) do
+      if d.id == value or d.tab_value == value then M.selected_id = d.id; return d end
+    end
+  end
+  function M.selected()
+    return M.select(M.selected_id)
   end
   function M.edit(d, field, value)
     assert(field == "title" or field == "text")
@@ -62,7 +71,17 @@ return function(json)
     return uris
   end
   function M.remove(d)
-    for i, candidate in ipairs(M.documents) do if candidate == d then table.remove(M.documents, i); return true end end
+    for i, candidate in ipairs(M.documents) do
+      if candidate == d then
+        local was_selected = M.selected_id == d.id
+        table.remove(M.documents, i)
+        if was_selected then
+          local replacement = M.documents[math.min(i, #M.documents)]
+          M.selected_id = replacement and replacement.id or nil
+        end
+        return true
+      end
+    end
   end
   return M
 end

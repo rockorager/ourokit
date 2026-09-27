@@ -10,10 +10,10 @@ text editing and shaping, images, themes, scrolling and virtual lists, scoped
 asynchronous tasks, source reload, and a native Storybook with headless snapshots.
 Desktop services include portal file choosers, URI opening, notifications, and
 text/file drag-and-drop. Form controls include checkboxes, radio groups, selects,
-sliders, spinboxes, and in-window modal dialogs; see the
+sliders, spinboxes, split views, tabs, and in-window modal dialogs; native text
+inputs support multiline editing. See the
 [form controls example](examples/forms.lua). It is not yet a complete desktop
-toolkit: OS accessibility, multiline editing, and richer data widgets remain
-unfinished.
+toolkit: OS accessibility and richer data widgets remain unfinished.
 
 ## Application surface
 

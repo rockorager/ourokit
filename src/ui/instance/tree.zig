@@ -423,9 +423,16 @@ pub const Tree = struct {
         return true;
     }
 
+    /// Visibility includes every retained Box ancestor. Hidden instances stay
+    /// active (and retain widget state), but cannot participate in input.
+    pub fn isVisible(self: *Tree, handle: InstanceHandle) bool {
+        const slot = self.activeSlot(handle) catch return false;
+        return self.render_tree.isVisible(slot.render.?) catch false;
+    }
+
     pub fn isFocusable(self: *Tree, handle: InstanceHandle) bool {
         const slot = self.activeSlot(handle) catch return false;
-        return slot.focusable;
+        return slot.focusable and (self.render_tree.isVisible(slot.render.?) catch false);
     }
 
     pub fn nextFocusable(
@@ -442,7 +449,8 @@ pub const Tree = struct {
         var selected: ?usize = null;
         var wrapped: ?usize = null;
         for (self.slots, 0..) |slot, index| {
-            if (slot.state != .active or !slot.focusable) continue;
+            if (slot.state != .active or !slot.focusable or
+                !(self.render_tree.isVisible(slot.render.?) catch false)) continue;
             if (wrapped == null or orderBefore(slot.traversal_order, self.slots[wrapped.?].traversal_order, reverse))
                 wrapped = index;
             const eligible = if (current == null)

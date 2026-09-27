@@ -101,6 +101,146 @@ fn node(snapshot: dev.Snapshot, path: []const u8) !dev.Node {
     return error.TestPathMissing;
 }
 
+test "split controls preserve grab offset and clamp both axes at actual layout limits" {
+    inline for (.{ "horizontal", "vertical" }) |axis| {
+        const f = try Fixture.create("axis='" ++ axis ++ "'\n" ++
+            \\position=ouro.signal(0.25)
+            \\function build() return ouro.split_view {key='split', axis=axis, position=position(),
+            \\ min_first=40, min_second=70, on_change=function(v) position:set(v) end,
+            \\ ouro.box {key='first'}, ouro.box {key='second'}} end
+        );
+        defer f.destroy();
+        const horizontal = comptime std.mem.eql(u8, axis, "horizontal");
+        const before = try f.runtime.semanticTarget("split/divider");
+        try f.play(.{ .hover = "split/divider" });
+        try std.testing.expectEqual(if (horizontal) .col_resize else .row_resize, try f.runtime.pointerCursor());
+        try f.play(.{ .pointer_down = "split/divider" });
+        var position = before.center;
+        if (horizontal) position.x += 23 else position.y += 23;
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 1, .position = position } });
+        try f.settle();
+        const moved = try f.runtime.semanticTarget("split/divider");
+        try std.testing.expectApproxEqAbs(@as(f32, 23), if (horizontal) moved.center.x - before.center.x else moved.center.y - before.center.y, 0.001);
+        try std.testing.expectEqual(if (horizontal) .col_resize else .row_resize, try f.runtime.pointerCursor());
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 2, .position = .{ .x = -500, .y = -500 } } });
+        try f.settle();
+        const first = (try f.runtime.semanticTarget("split/first")).bounds;
+        try std.testing.expectApproxEqAbs(@as(f32, 40), if (horizontal) first.width else first.height, 0.001);
+        try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 0, .time_ms = 3, .button = 0x110, .state = .released } });
+        try f.settle();
+        try std.testing.expect(f.runtime.split_drag == null);
+        try f.play(.{ .key = .{ .keycode = 0, .logical = .end } });
+        const second = (try f.runtime.semanticTarget("split/second")).bounds;
+        try std.testing.expectApproxEqAbs(@as(f32, 70), if (horizontal) second.width else second.height, 0.001);
+        try f.play(.{ .key = .{ .keycode = 0, .logical = .home } });
+        try f.play(.{ .key = .{ .keycode = 0, .logical = if (horizontal) .arrow_right else .arrow_down } });
+        const stepped = (try f.runtime.semanticTarget("split/first")).bounds;
+        try std.testing.expectApproxEqAbs(@as(f32, 50), if (horizontal) stepped.width else stepped.height, 0.001);
+    }
+}
+
+test "tabs retain hidden editor state and reject hidden input without selecting on close" {
+    const f = try Fixture.create(
+        \\selected=ouro.signal(17); closed=0
+        \\function build() return ouro.tabs {key='tabs', label='Editors', selected=selected(),
+        \\ on_select=function(v) selected:set(v) end, on_close=function(v) closed=v end,
+        \\ tabs={{value=17,label='First',content=ouro.text_input {key='edit',default_text='',multiline=true,height=70}},
+        \\ {value=29,label='Second',closable=true,content=ouro.text_input {key='edit',default_text='other'}}}} end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "tabs/control/panels/17/edit" });
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    const text_value = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve";
+    try f.play(.{ .text = text_value });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_left, .modifiers = .{ .shift = true } } });
+    const selection = session.model.selection;
+    const content = try f.runtime.text_inputs.content(target);
+    const render = try f.runtime.instances.renderObject(content);
+    const offset = try f.runtime.tree.textScrollOffset(render, .vertical);
+    try std.testing.expect(offset > 0);
+    // A close request for a background tab does not implicitly select it.
+    try f.play(.{ .click = "tabs/control/bar/29/close" });
+    _ = c.lua_getglobal(f.vm.state, "closed");
+    var is_number: c_int = 0;
+    try std.testing.expectEqual(@as(c.Integer, 29), c.lua_tointegerx(f.vm.state, -1, &is_number));
+    c.lua_settop(f.vm.state, -2);
+    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/bar/17")).selected);
+    // Selecting a narrow closable tab must hit its label, not its close button.
+    try f.play(.{ .click = "tabs/control/bar/29" });
+    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/bar/29")).selected);
+    // Focus the tab list, then switch using its native horizontal policy.
+    try f.play(.{ .click = "tabs/control/bar/17" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
+    try std.testing.expect(!f.runtime.instances.isFocusable(target));
+    try std.testing.expectError(error.DevelopmentTargetHidden, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = "tabs/control/panels/17/edit" }));
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    try std.testing.expect(!(try node(snapshot, "tabs/control/panels/17/edit")).visible);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
+    try std.testing.expect((try f.runtime.semantics.findPath("tabs/control/bar/17")).selected);
+    try std.testing.expectEqual(target, f.runtime.instances.handleForId((try f.runtime.semantics.findPath("tabs/control/panels/17/edit")).id).?);
+    try std.testing.expectEqual(selection, session.model.selection);
+    try std.testing.expectEqual(offset, try f.runtime.tree.textScrollOffset(render, .vertical));
+    try f.play(.{ .click = "tabs/control/panels/17/edit" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .end, .modifiers = .{ .control = true } } });
+    try f.play(.{ .text = "!" });
+    try f.play(.{ .click = "tabs/control/bar/17" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_right } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_left } });
+    try f.play(.{ .click = "tabs/control/panels/17/edit" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_z, .modifiers = .{ .control = true } } });
+    try std.testing.expectEqualStrings(text_value, session.model.text());
+}
+
+test "development click releases capture when a tab close removes its own target" {
+    const f = try Fixture.create(
+        \\closed=ouro.signal(false); closes=0; replacements=0
+        \\function build()
+        \\ if closed() then return ouro.button {key='replacement',label='Replacement',
+        \\   on_press=function() replacements=replacements+1 end} end
+        \\ return ouro.tabs {key='tabs',label='Tabs',selected=17,on_select=function() end,
+        \\   on_close=function() closes=closes+1; closed:set(true) end,
+        \\   tabs={{value=17,label='First',closable=true,content=ouro.box {key='body'}}}}
+        \\end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "tabs/control/bar/17/close" });
+    try std.testing.expect(f.runtime.router.captured == null);
+    try std.testing.expect(f.runtime.buttons.armed == null);
+    const check = "assert(closes==1 and replacements==0)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.play(.{ .click = "replacement" });
+    const check_replacement = "assert(replacements==1)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check_replacement.ptr, check_replacement.len, "@check", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+}
+
+test "hiding a focused retained editor releases IME ownership and composition" {
+    const f = try Fixture.create(
+        \\hidden=ouro.signal(false)
+        \\function build() return ouro.box {key='panel', hidden=hidden(),
+        \\ ouro.text_input {key='edit',default_text='keep'}} end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "panel/edit" });
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    try std.testing.expect((try f.runtime.textInputStatus()) != null);
+    _ = try session.apply(.{ .preedit = .{ .text = "compose", .cursor = null } });
+    const hide = "hidden:set(true)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, hide.ptr, hide.len, "@hide", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try std.testing.expect(f.runtime.focus.current() == null);
+    try std.testing.expect((try f.runtime.textInputStatus()) == null);
+    try std.testing.expect(session.preedit() == null);
+    try std.testing.expect(f.runtime.instances.isActive(target));
+    try std.testing.expectEqualStrings("keep", session.model.text());
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+}
+
 test "multiline development editing preserves lines and navigates visual rows" {
     const f = try Fixture.create(
         \\value=ouro.signal('')

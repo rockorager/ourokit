@@ -10,6 +10,7 @@ const flex_impl = @import("flex.zig");
 const image_impl = @import("image.zig");
 const ImageCache = @import("../../image/cache.zig").Cache;
 const scroll_impl = @import("scroll.zig");
+const split_impl = @import("split.zig");
 const stack_impl = @import("stack.zig");
 const scene_builder = @import("scene_builder.zig");
 const text = @import("../../text/root.zig");
@@ -26,6 +27,8 @@ pub const LayoutError = error{
     UnconstrainedLayoutSize,
     FlexInUnboundedAxis,
     ScrollInUnboundedAxis,
+    UnboundedSplitConstraints,
+    SplitRequiresThreeChildren,
     InvalidParentData,
     TextHasChildren,
     TextInputHasChildren,
@@ -189,6 +192,8 @@ pub const Tree = struct {
         try validateParentData(parent_slot.object, data);
         if ((parent_slot.object == .box or parent_slot.object == .scroll) and
             parent_slot.first_child != null) return error.BoxAlreadyHasChild;
+        if (parent_slot.object == .split and self.childCount(parent) >= 3)
+            return error.SplitRequiresThreeChildren;
         if (parent_slot.object == .text) return error.TextHasChildren;
         if (parent_slot.object == .text_input) return error.TextInputHasChildren;
 
@@ -219,6 +224,8 @@ pub const Tree = struct {
         if (std.meta.eql(target.object, object)) return;
         if ((object == .box or object == .scroll) and target.first_child != null and
             !same(target.first_child.?, target.last_child.?)) return error.BoxAlreadyHasChild;
+        if (object == .split and self.childCount(handle) > 3)
+            return error.SplitRequiresThreeChildren;
         var child = target.first_child;
         while (child) |child_handle| : (child = (try self.slot(child_handle)).next_sibling)
             try validateParentData(object, (try self.slot(child_handle)).parent_data);
@@ -239,7 +246,17 @@ pub const Tree = struct {
                     previous.text_input.selection_end != object.text_input.selection_end or
                     (!previous.text_input.reveal_caret and object.text_input.reveal_caret)))
                 try self.updateTextInputOffset(target, target.size);
-            self.markNeedsPaint(handle);
+            if (object == .box and previous == .box and
+                previous.box.hidden != object.box.hidden and object.box.hidden)
+            {
+                self.clearPaintSubtree(handle);
+                if (target.parent) |parent|
+                    self.markNeedsPaint(parent)
+                else
+                    target.needs_paint = true;
+            } else {
+                self.markNeedsPaint(handle);
+            }
         }
     }
 
@@ -437,6 +454,17 @@ pub const Tree = struct {
         return (try self.slot(handle)).needs_paint;
     }
 
+    /// Whether a node is paint/hit-test visible through all retained Box ancestors.
+    pub fn isVisible(self: *Tree, handle: NodeHandle) !bool {
+        var current: ?NodeHandle = handle;
+        while (current) |value| {
+            const target = try self.slot(value);
+            if (target.object == .box and target.object.box.hidden) return false;
+            current = target.parent;
+        }
+        return true;
+    }
+
     pub fn firstChild(self: *Tree, handle: NodeHandle) ?NodeHandle {
         return (self.slot(handle) catch unreachable).first_child;
     }
@@ -530,6 +558,7 @@ pub const Tree = struct {
         const result = switch (object) {
             .box => |value| try box_impl.layout(value, self, handle, constraints),
             .flex => |value| try flex_impl.layout(value, self, handle, constraints),
+            .split => |value| try split_impl.layout(value, self, handle, constraints),
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
             .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
             .image => |value| try self.layoutImage(value, constraints),
@@ -557,6 +586,10 @@ pub const Tree = struct {
         origin: PointF,
     ) !void {
         const target = try self.slot(handle);
+        if (target.object == .box and target.object.box.hidden) {
+            self.clearPaintSubtree(handle);
+            return;
+        }
         const bounds: RectF = .{
             .x = origin.x,
             .y = origin.y,
@@ -594,6 +627,7 @@ pub const Tree = struct {
                 break :paint value.clip;
             },
             .flex => false,
+            .split => false,
             .stack => |value| value.clip,
             .scroll => true,
             .image => |value| paint: {
@@ -675,6 +709,7 @@ pub const Tree = struct {
 
     fn hitTestNode(self: *Tree, handle: NodeHandle, point: PointF) !?NodeHandle {
         const target = try self.slot(handle);
+        if (target.object == .box and target.object.box.hidden) return null;
         if (!(RectF{ .x = 0, .y = 0, .width = target.size.width, .height = target.size.height }).contains(point))
             return null;
         var child = target.last_child;
@@ -723,8 +758,23 @@ pub const Tree = struct {
         var current: ?NodeHandle = handle;
         while (current) |value| {
             const target = self.slot(value) catch unreachable;
+            if (target.object == .box and target.object.box.hidden) {
+                target.needs_paint = false;
+                return;
+            }
             target.needs_paint = true;
             current = target.parent;
+        }
+    }
+
+    fn clearPaintSubtree(self: *Tree, handle: NodeHandle) void {
+        const target = self.slot(handle) catch unreachable;
+        target.needs_paint = false;
+        var child = target.first_child;
+        while (child) |value| {
+            const next = (self.slot(value) catch unreachable).next_sibling;
+            self.clearPaintSubtree(value);
+            child = next;
         }
     }
 
@@ -977,6 +1027,7 @@ fn validateObject(object: types.Object) !void {
     switch (object) {
         .box => |value| try box_impl.validate(value),
         .flex => |value| try flex_impl.validate(value),
+        .split => |value| try split_impl.validate(value),
         .stack => {},
         .scroll => {},
         .image => |value| try image_impl.validate(value),
@@ -1005,6 +1056,7 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
     switch (parent) {
         .box => if (data != .none) return error.InvalidParentData,
         .flex => if (data != .none and data != .flex) return error.InvalidParentData,
+        .split => if (data != .none) return error.InvalidParentData,
         .stack => switch (data) {
             .none => {},
             .stack => |value| if (!validPoint(.{ .x = value.x, .y = value.y }))
@@ -1032,6 +1084,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
                 !std.meta.eql(old_box.alignment, new_box.alignment);
         },
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
+        .split => |old_split| !std.meta.eql(old_split, new.split),
         .stack => |old_stack| old_stack.unbounded_height != new.stack.unbounded_height,
         .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
         .image => |old_image| (old_image.width == null or old_image.height == null) and
@@ -1124,6 +1177,87 @@ test "layout property classification includes geometry and excludes paint-only s
     replacement.image = .{ .slot = 0, .generation = 1 };
     try std.testing.expect(!layoutPropertiesChanged(.{ .image = fixed }, .{ .image = replacement }));
     try std.testing.expect(layoutPropertiesChanged(.{ .image = .{ .width = 40 } }, .{ .image = replacement }));
+}
+
+test "split lays out three tight children on both axes and resizes" {
+    for ([_]types.Axis{ .horizontal, .vertical }) |axis| {
+        var tree: Tree = undefined;
+        try tree.init(std.testing.allocator, 4);
+        defer tree.deinit();
+        const root = try tree.create(.{ .split = .{
+            .axis = axis,
+            .position = 0.2,
+            .min_first = 30,
+            .min_second = 10,
+            .divider = 8,
+        } });
+        const first = try tree.create(.{ .box = .{} });
+        const second = try tree.create(.{ .box = .{} });
+        const divider = try tree.create(.{ .box = .{} });
+        try tree.appendChild(root, first, .none);
+        try tree.appendChild(root, second, .none);
+        try tree.appendChild(root, divider, .none);
+
+        _ = try tree.layout(root, Constraints.tight(.{ .width = 108, .height = 68 }));
+        const first_size = try tree.nodeSize(first);
+        const second_offset = try tree.nodeOffset(second);
+        const divider_offset = try tree.nodeOffset(divider);
+        if (axis == .horizontal) {
+            try std.testing.expectEqual(@as(f32, 30), first_size.width);
+            try std.testing.expectEqual(@as(f32, 38), second_offset.x);
+            try std.testing.expectEqual(@as(f32, 30), divider_offset.x);
+        } else {
+            try std.testing.expectEqual(@as(f32, 30), first_size.height);
+            try std.testing.expectEqual(@as(f32, 38), second_offset.y);
+            try std.testing.expectEqual(@as(f32, 30), divider_offset.y);
+        }
+
+        _ = try tree.layout(root, Constraints.tight(.{ .width = 40, .height = 40 }));
+        const shrunk = try tree.nodeSize(first);
+        try std.testing.expectEqual(@as(f32, 24), if (axis == .horizontal) shrunk.width else shrunk.height);
+    }
+}
+
+test "split validates properties, child count, and bounded constraints" {
+    try std.testing.expectError(error.InvalidSplitPosition, Tree.validate(.{ .split = .{ .position = 1.1 } }));
+    try std.testing.expectError(error.InvalidSplitMinimum, Tree.validate(.{ .split = .{ .min_second = -1 } }));
+    try std.testing.expectError(error.InvalidSplitDivider, Tree.validate(.{ .split = .{ .divider = std.math.nan(f32) } }));
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    const root = try tree.create(.{ .split = .{} });
+    try std.testing.expectError(error.SplitRequiresThreeChildren, tree.layout(root, Constraints.tight(.{ .width = 20, .height = 20 })));
+    try std.testing.expectError(error.UnboundedSplitConstraints, tree.layout(root, .{ .max_height = 20 }));
+}
+
+test "hidden box retains geometry but disappears from hit testing and reappears" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    const root = try tree.create(.{ .box = .{ .width = 40, .height = 30 } });
+    const child = try tree.create(.{ .box = .{ .width = 10, .height = 10 } });
+    try tree.appendChild(root, child, .none);
+    _ = try tree.layout(root, .{});
+    const retained_size = try tree.nodeSize(child);
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 5, .y = 5 })).?);
+    try tree.update(root, .{ .box = .{ .hidden = true, .width = 40, .height = 30 } });
+    try std.testing.expect(!(try tree.isVisible(child)));
+    try std.testing.expectEqual(@as(?NodeHandle, null), try tree.hitTest(root, .{ .x = 5, .y = 5 }));
+    try std.testing.expectEqual(retained_size, try tree.nodeSize(child));
+    var commands: [2]@import("../../scene/root.zig").Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(@as(usize, 0), builder.count);
+    try tree.update(child, .{ .box = .{ .width = 10, .height = 10, .background = Color.rgba(255, 0, 0, 255) } });
+    try std.testing.expect(!(try tree.paintDirty(root)));
+    try tree.update(root, .{ .box = .{ .width = 40, .height = 30 } });
+    try std.testing.expect(try tree.isVisible(child));
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 5, .y = 5 })).?);
+    try std.testing.expect(try tree.paintDirty(root));
+    builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(@as(usize, 1), builder.count);
+    try std.testing.expect(!(try tree.paintDirty(root)));
 }
 
 test "box geometry updates invalidate ancestors and refresh size and hit bounds" {

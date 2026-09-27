@@ -77,3 +77,34 @@ ouro.select = ouro.component(function(props)
       width=props.width, enabled=props.enabled, on_press=open, flex=props.flex}
   end
 end)
+
+ouro.tabs = ouro.component(function(props)
+  return function()
+    assert(type(props.key)=='string' and type(props.label)=='string', 'tabs requires key and label')
+    assert(type(props.tabs)=='table' and #props.tabs>0, 'tabs requires nonempty tabs')
+    assert(math.type(props.selected)=='integer', 'tabs selected must be an integer')
+    local seen, selected={}, false
+    local headers, panels={}, {}
+    for _, item in ipairs(props.tabs) do
+      assert(math.type(item.value)=='integer' and type(item.label)=='string' and not seen[item.value], 'invalid tab')
+      assert(item.content ~= nil, 'tab content is required')
+      seen[item.value]=true
+      if item.value==props.selected then selected=true end
+      local key=tostring(item.value)
+      local children={}
+      if item.closable then
+        assert(type(props.on_close)=='function', 'closable tabs require on_close')
+        children[1]=ouro.button {key='close', label='Close', width=68, height=28,
+          on_press=function() props.on_close(item.value) end}
+      end
+      headers[#headers+1]=ouro.tab {key=key, value=item.value, label=item.label, children=children}
+      panels[#panels+1]=ouro.box {key=key, width='fill', height='fill', hidden=item.value~=props.selected, item.content}
+    end
+    assert(selected, 'tabs selected value must exist')
+    assert(type(props.on_select)=='function', 'tabs on_select must be a function')
+    return ouro.column {key='control', flex=props.flex, cross_alignment='stretch',
+      ouro.tab_bar {key='bar', label=props.label, selected=props.selected, on_select=props.on_select, children=headers},
+      ouro.stack {key='panels', flex=1, children=panels},
+    }
+  end
+end)

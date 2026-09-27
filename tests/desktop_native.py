@@ -149,52 +149,84 @@ def document_test(root, env):
                 error_file.flush()
                 raise AssertionError(f"{failure}: {errors.read_text()}") from failure
             wait_for(lambda: inspect(app_env, endpoint).get("windows"), "document window did not appear")
-            capture(app_env, endpoint, "document-1", "document-normal.png")
-            click(app_env, endpoint, "document-1", "drop/body/actions/open")
-            try:
-                wait_for(lambda: len(inspect(app_env, endpoint)["windows"]) == 2, "portal-opened document did not appear")
-            except AssertionError as failure:
-                error = next((n.get("label") for n in inspect(app_env, endpoint, "document-1")["windows"][0]["nodes"]
-                              if n["path"] == "drop/body/error"), None)
-                raise AssertionError(f"{failure}; UI error={error}; portal={portal_log.read_text() if portal_log.exists() else 'no call'}") from failure
-            assert node(app_env, endpoint, "document-2", "drop/body/title")["value"] == "From disk"
-            # Dev focus is semantic, not compositor activation. Raise the editor
-            # so Sway does not throttle replay behind the newly opened window.
-            sway(app_env, '[app_id="dev.ourokit.documents" title="^Untitled$"]', "focus")
-            click(app_env, endpoint, "document-1", "drop/body/title")
-            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
-            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
-                "action":"key", "key":"a", "control":True}), env=app_env)
-            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
-            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
-                "action":"text", "text":"Native save"}), env=app_env)
-            body = ("A small native notes editor\n\n"
-                    "This paragraph wraps within the editor. Selection, keyboard movement and scrolling use the same native text layout, even when a sentence continues onto another visual line.\n\n"
-                    + "".join(f"Note {i}\n" for i in range(1, 19)))
-            click(app_env, endpoint, "document-1", "drop/body/text")
-            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
-            # Native development replay settles a submitted frame per edit.
-            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
-                "action":"text", "text":body}), env=app_env, timeout=90)
-            field = node(app_env, endpoint, "document-1", "drop/body/text")
+            window = "main"
+            panel = lambda value, leaf: f"documents/tabs/control/panels/{value}/drop/layers/body/{leaf}"
+            header = lambda value, leaf="": f"documents/tabs/control/bar/{value}" + (f"/{leaf}" if leaf else "")
+
+            def input_action(**action):
+                tree = inspect(app_env, endpoint, window)["windows"][0]
+                return run(str(BINARY), "dev", "input", str(endpoint),
+                           json.dumps({"window":window, "token":tree["token"], **action}), env=app_env,
+                           timeout=60 if action["action"] == "text" else 10)
+
+            capture(app_env, endpoint, window, "document-normal.png")
+            # The split's public children and divider must all have real geometry.
+            sidebar = node(app_env, endpoint, window, "documents/sidebar")["bounds"]
+            tabs = node(app_env, endpoint, window, "documents/tabs")["bounds"]
+            divider_path = "documents/divider"
+            divider = node(app_env, endpoint, window, divider_path)["bounds"]
+            assert 150 <= sidebar["width"] < tabs["width"] and divider["width"] > 0, (sidebar, divider, tabs)
+            click(app_env, endpoint, window, divider_path)
+            input_action(action="key", key="arrow_right")
+            adjusted = node(app_env, endpoint, window, divider_path)["bounds"]
+            assert adjusted["x"] > divider["x"], (divider, adjusted)
+            adjusted_sidebar = node(app_env, endpoint, window, "documents/sidebar")["bounds"]
+            adjusted_tabs = node(app_env, endpoint, window, "documents/tabs")["bounds"]
+            assert adjusted_sidebar["width"] > sidebar["width"] and adjusted_tabs["width"] < tabs["width"]
+
+            click(app_env, endpoint, window, panel(1, "title"))
+            input_action(action="key", key="a", control=True)
+            input_action(action="text", text="Native save")
+            body = "First line\nSecond line\n" + "x\n" * 30
+            click(app_env, endpoint, window, panel(1, "text"))
+            input_action(action="text", text=body)
+            field = node(app_env, endpoint, window, panel(1, "text"))
             assert field["multiline"] and field["scroll_offset"] > 0, field
             assert field["selection"]["extent"] == len(body.encode()), field
-            capture(app_env, endpoint, "document-1", "document-scrolled.png")
-            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
-            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
-                "action":"scroll", "target":"drop/body/text", "delta":-10000}), env=app_env)
+            capture(app_env, endpoint, window, "document-scrolled.png")
+
+            click(app_env, endpoint, window, panel(1, "actions/open"))
+            try:
+                wait_for(lambda: any(n["path"] == panel(2, "title") and n["value"] == "From disk"
+                                     for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
+                         "portal-opened document tab did not appear")
+            except AssertionError as failure:
+                error = next((n.get("label") for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]
+                              if n["path"] == panel(1, "error")), None)
+                raise AssertionError(f"{failure}; UI error={error}; portal={portal_log.read_text() if portal_log.exists() else 'no call'}") from failure
+            hidden = node(app_env, endpoint, window, panel(1, "text"))
+            assert hidden["id"] == field["id"] and not hidden["visible"], hidden
+            tree = inspect(app_env, endpoint, window)["windows"][0]
+            rejected = subprocess.run([str(BINARY), "dev", "input", str(endpoint), json.dumps({
+                "window":window, "token":tree["token"], "action":"click", "target":panel(1, "text")})],
+                env=app_env, capture_output=True, text=True)
+            assert rejected.returncode != 0 and json.loads(rejected.stdout)["error"]["code"] == "DevelopmentTargetHidden", rejected
+            click(app_env, endpoint, window, header(1))
+            restored = node(app_env, endpoint, window, panel(1, "text"))
+            assert restored["id"] == field["id"] and restored["selection"] == field["selection"]
+            assert restored["scroll_offset"] == field["scroll_offset"]
+            # The retained field also keeps its edit history across tab switches.
+            click(app_env, endpoint, window, panel(1, "text"))
+            input_action(action="key", key="end", control=True)
+            input_action(action="text", text="x")
+            click(app_env, endpoint, window, header(2))
+            click(app_env, endpoint, window, header(1))
+            click(app_env, endpoint, window, panel(1, "text"))
+            input_action(action="key", key="z", control=True)
+            assert node(app_env, endpoint, window, panel(1, "text"))["value"] == body
+
+            input_action(action="scroll", target=panel(1, "text"), delta=-10000)
             time.sleep(.7)  # A caret blink must not undo manual scrolling.
-            assert node(app_env, endpoint, "document-1", "drop/body/text")["scroll_offset"] == 0
+            assert node(app_env, endpoint, window, panel(1, "text"))["scroll_offset"] == 0
             for action in [{"action":"key", "key":"home", "control":True},
                            {"action":"key", "key":"arrow_down", "shift":True},
                            {"action":"key", "key":"arrow_down", "shift":True},
                            {"action":"key", "key":"arrow_down", "shift":True}]:
-                tree = inspect(app_env, endpoint, "document-1")["windows"][0]
-                run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"], **action}), env=app_env)
-            selection = node(app_env, endpoint, "document-1", "drop/body/text")["selection"]
-            assert selection["anchor"] == 0 and selection["extent"] > len("A small native notes editor\n\n")
-            capture(app_env, endpoint, "document-1", "document-multiline-selection.png")
-            click(app_env, endpoint, "document-1", "drop/body/actions/save")
+                input_action(**action)
+            selection = node(app_env, endpoint, window, panel(1, "text"))["selection"]
+            assert selection["anchor"] == 0 and selection["extent"] > len("First line\nSecond line\n")
+            capture(app_env, endpoint, window, "document-multiline-selection.png")
+            click(app_env, endpoint, window, panel(1, "actions/save"))
             wait_for(saved.exists, "portal save did not write the returned local URI")
             persisted = json.loads(saved.read_text())
             assert persisted["title"] == "Native save" and persisted["text"] == body, persisted
@@ -208,28 +240,57 @@ def document_test(root, env):
             portal_process = subprocess.Popen([str(BINARY), "run", str(portal), "--headless"], env=env,
                                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             wait_portal(portal_process, env)
-            click(app_env, endpoint, "document-1", "drop/body/actions/open")
-            wait_for(lambda: len(inspect(app_env, endpoint)["windows"]) == 3, "saved file did not reopen")
-            assert node(app_env, endpoint, "document-3", "drop/body/title")["value"] == "Native save"
-            assert node(app_env, endpoint, "document-3", "drop/body/text")["value"] == body
+            click(app_env, endpoint, window, panel(1, "actions/open"))
+            wait_for(lambda: any(n["path"] == panel(3, "title") and n["value"] == "Native save"
+                                 for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
+                     "saved file did not reopen in a tab")
+            assert node(app_env, endpoint, window, panel(3, "text"))["value"] == body
 
-            # A compositor close is a request, not destruction of a dirty window.
-            click(app_env, endpoint, "document-1", "drop/body/title")
-            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
-            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
-                "action":"text", "text":"!"}), env=app_env)
+            # Closing a background tab selects and targets that exact dirty note.
+            click(app_env, endpoint, window, header(1))
+            click(app_env, endpoint, window, panel(1, "title"))
+            input_action(action="text", text="!")
+            click(app_env, endpoint, window, header(3))
+            click(app_env, endpoint, window, panel(3, "text"))
+            input_action(action="key", key="end", control=True)
+            input_action(action="text", text="second dirty note")
+            editor_bounds = node(app_env, endpoint, window, panel(1, "text"))["bounds"]
+            click(app_env, endpoint, window, header(1, "close"))
+            dialog = "documents/tabs/control/panels/1/drop/layers/close-confirm"
+            wait_for(lambda: any(n["path"] == dialog and n["visible"]
+                                 for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
+                     "background tab close targeted the wrong note")
+            assert node(app_env, endpoint, window, panel(1, "text"))["bounds"] == editor_bounds
+            assert not any(n["path"] == "documents/tabs/control/panels/3/drop/layers/close-confirm" for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"])
+            input_action(action="key", key="escape")
+            wait_for(lambda: not any(n["path"] == dialog for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
+                     "Escape did not cancel background close confirmation")
+
+            # A compositor close is a request, not destruction of dirty tabs.
             sway(app_env, '[app_id="dev.ourokit.documents"]', "kill")
-            wait_for(lambda: any(n["path"] == "drop/close-confirm" for n in inspect(app_env, endpoint, "document-1")["windows"][0]["nodes"]),
+            wait_for(lambda: any(n["path"] == dialog for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
                      "native close bypassed dirty-document interception")
-            capture(app_env, endpoint, "document-1", "document-unsaved-close.png")
-            tree = inspect(app_env, endpoint, "document-1")["windows"][0]
-            run(str(BINARY), "dev", "input", str(endpoint), json.dumps({"window":"document-1", "token":tree["token"],
-                "action":"key", "key":"escape"}), env=app_env)
-            wait_for(lambda: not any(n["path"] == "drop/close-confirm" for n in inspect(app_env, endpoint, "document-1")["windows"][0]["nodes"]),
+            capture(app_env, endpoint, window, "document-unsaved-close.png")
+            input_action(action="key", key="escape")
+            wait_for(lambda: not any(n["path"] == dialog for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
                      "Escape did not cancel close confirmation")
+            # Discarding the first dirty tab advances the native close walk to
+            # the next dirty note; cancel there keeps it and the clean tab open.
+            sway(app_env, '[app_id="dev.ourokit.documents"]', "kill")
+            wait_for(lambda: any(n["path"] == dialog for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
+                     "second close request did not prompt")
+            click(app_env, endpoint, window, dialog + "/body/actions/discard")
+            next_dialog = "documents/tabs/control/panels/3/drop/layers/close-confirm"
+            wait_for(lambda: any(n["path"] == next_dialog and n["visible"] for n in inspect(app_env, endpoint, window)["windows"][0]["nodes"]),
+                     "window close did not advance to the next dirty note")
+            input_action(action="key", key="escape")
+            remaining = inspect(app_env, endpoint, window)["windows"][0]["nodes"]
+            assert {n["path"] for n in remaining if n["role"] == "tab"} == {header(2), header(3)}
+            assert not any(n["role"] == "dialog" for n in remaining)
+            assert node(app_env, endpoint, window, panel(3, "text"))["value"] == body + "second dirty note"
             evidence = portal_log.read_text()
             assert evidence.startswith("OpenFile wayland:"), evidence
-            print("PASS actual documents UI, portal parent, disk save/reopen, multiple windows and native close")
+            print("PASS tabbed documents UI, retained editors, split geometry, portal save/reopen and native close")
         finally:
             terminate(app)
             terminate(portal_process)

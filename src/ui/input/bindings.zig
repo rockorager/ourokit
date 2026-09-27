@@ -12,13 +12,14 @@ pub const HandlerKind = enum {
     listbox,
     selection_activate,
     range_change,
+    split_change,
     interaction_change,
     cancel,
     drop_text,
     drop_uris,
 
     fn primary(self: HandlerKind) bool {
-        return self == .pointer or self == .button or self == .@"switch" or self == .listbox or self == .range_change;
+        return self == .pointer or self == .button or self == .@"switch" or self == .listbox or self == .range_change or self == .split_change;
     }
 };
 

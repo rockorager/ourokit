@@ -16,6 +16,9 @@ pub const Kind = enum {
     text_input,
     listbox,
     option,
+    tab_bar,
+    tab,
+    split_view,
     box,
     stack,
     row,
@@ -27,7 +30,7 @@ pub const Kind = enum {
 
     fn acceptsChildren(self: Kind) bool {
         return switch (self) {
-            .button, .listbox, .radio_group, .dialog, .box, .stack, .row, .column, .scroll, .theme, .component => true,
+            .button, .listbox, .radio_group, .tab_bar, .tab, .split_view, .dialog, .box, .stack, .row, .column, .scroll, .theme, .component => true,
             else => false,
         };
     }

@@ -798,6 +798,52 @@ an open popup. Optional `on_error(error)` handles popup-creation failure.
 This is a non-editable select, not a searchable combobox, and opening requires
 the same genuine input authority as `ouro.popup`.
 
+### Split views and tabs
+
+`ouro.split_view` takes exactly two positional child descriptions. It is
+controlled: `position` is a fraction from 0 through 1, and dragging or keyboard
+input requests a new fraction through `on_change(fraction)`; the application
+must provide it on rebuild. `axis` is `"horizontal"` or `"vertical"`.
+`min_first` and `min_second` are optional pixel minima, proportionally reduced
+when the view is too small to satisfy both. Optional `flex` has its usual
+row/column meaning.
+
+```lua
+ouro.split_view {
+  key = "workspace", axis = "horizontal", position = split(),
+  min_first = 160, min_second = 400,
+  on_change = function(fraction) split:set(fraction) end,
+  sidebar, editor,
+}
+```
+
+The native separator has semantic key `divider`. Axis arrows request a 10-pixel
+move; Home and End request the effective first- and second-pane minima. Pointer
+dragging preserves the initial grab offset instead of snapping the divider to
+the pointer.
+
+`ouro.tabs` is a Lua composition over native `tab_bar`/`tab` widgets and hidden,
+retained panel boxes. It requires `key`, semantic `label`, controlled integer
+`selected`, `on_select(value)`, and a nonempty `tabs` array. Each tab has a
+unique integer `value`, string `label`, `content`, and optional `closable=true`;
+closable tabs require `on_close(value)`. The control also accepts optional
+`flex`.
+
+```lua
+ouro.tabs {
+  key = "documents", label = "Open documents", selected = selected(),
+  on_select = select_document, on_close = close_document,
+  tabs = {{value=1, label="Notes", closable=true, content=notes_editor}},
+}
+```
+
+Stable keys keep every panel mounted and preserve native text, selection,
+scroll, and undo state across switches. Inactive panels retain layout but are
+excluded from painting, focus, pointer/keyboard input, and IME ownership.
+Switching away cancels an active IME composition rather than retaining it.
+See the [single-window documents example](documents.md) for a sidebar split
+from tabbed editors.
+
 ### Sliders and numeric inputs
 
 ```lua

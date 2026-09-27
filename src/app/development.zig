@@ -58,6 +58,7 @@ pub const Node = struct {
     value: ?[]const u8,
     bounds: core.RectF,
     enabled: bool,
+    visible: bool,
     selected: bool,
     selected_value: ?i64,
     checked: bool,
@@ -146,6 +147,7 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             .value = value,
             .bounds = target.bounds,
             .enabled = target.enabled,
+            .visible = target.visible,
             .selected = selected,
             .selected_value = runtime.listboxes.selectedValue(handle),
             .checked = semantic.checked,
@@ -207,10 +209,12 @@ pub const Playback = struct {
         if (action.path()) |path| {
             const semantic = try runtime.semantics.findPath(path);
             const geometry = try runtime.semanticTarget(path);
+            if (!geometry.visible) return error.DevelopmentTargetHidden;
             if (!geometry.enabled and action != .hover) return error.DevelopmentTargetDisabled;
             if ((action == .click or action == .pointer_down) and
                 semantic.role != .button and semantic.role != .@"switch" and
                 semantic.role != .checkbox and semantic.role != .radio and semantic.role != .radio_group and semantic.role != .slider and
+                semantic.role != .tab and semantic.role != .tab_list and semantic.role != .separator and
                 semantic.role != .text_field and semantic.role != .option and semantic.role != .listbox)
                 return error.DevelopmentTargetNotInteractive;
             if (action == .scroll) {
@@ -224,6 +228,7 @@ pub const Playback = struct {
             if (action.text.len > 16 * 1024) return error.DevelopmentTextTooLong;
             if (!std.unicode.utf8ValidateSlice(action.text)) return error.InvalidUtf8;
             const focused = runtime.focus.current() orelse return error.DevelopmentTargetNotFocused;
+            if (!runtime.instances.isVisible(focused)) return error.DevelopmentTargetNotFocused;
             if (!runtime.text_inputs.contains(focused)) return error.DevelopmentTargetNotEditable;
             const multiline = (try runtime.text_inputs.session(focused)).model.multiline;
             var characters = (try std.unicode.Utf8View.init(action.text)).iterator();
@@ -252,14 +257,19 @@ pub const Playback = struct {
             .click => 3,
         };
         if (self.step >= steps) return .complete;
+        if (self.action == .click and self.step == 2) {
+            // Press callbacks may remove their own widget (closing a tab or
+            // dismissing a dialog). Release the capture without looking up
+            // the old path or activating anything newly occupying its place.
+            try runtime.routePointer(.{ .button = .{ .window = runtime.window, .serial = 0, .time_ms = 0, .button = 0x110, .state = .released } });
+            self.step += 1;
+            return .routed;
+        }
         if (self.target) |target| if (!runtime.instances.isActive(target)) return error.StaleDevelopmentTarget;
         const window = runtime.window;
         if (self.action.path()) |path| {
             const geometry = try runtime.semanticTarget(path);
-            // A press handler may disable itself while asynchronous work is
-            // pending. Its matching release must still drain normally.
-            if (self.action != .hover and !geometry.enabled and
-                !(self.action == .click and self.step == 2)) return error.DevelopmentTargetDisabled;
+            if (self.action != .hover and !geometry.enabled) return error.DevelopmentTargetDisabled;
             if (self.step == 0) {
                 try checkHit(runtime, self.target.?, geometry.center);
                 // Unlike a real seat, headless playback may not have entered.
@@ -269,10 +279,8 @@ pub const Playback = struct {
                 try checkHit(runtime, self.target.?, runtime.router.pointer_position);
                 try runtime.routePointer(.{ .axis = .{ .window = window, .time_ms = 0, .axis = axis, .delta = self.action.scroll.delta } });
             } else {
-                // A press can open an overlay over its own target. Release
-                // belongs to the captured press, not the newly hit surface.
-                if (self.step == 1) try checkHit(runtime, self.target.?, runtime.router.pointer_position);
-                try runtime.routePointer(.{ .button = .{ .window = window, .serial = 0, .time_ms = 0, .button = 0x110, .state = if (self.step == 1) .pressed else .released } });
+                try checkHit(runtime, self.target.?, runtime.router.pointer_position);
+                try runtime.routePointer(.{ .button = .{ .window = window, .serial = 0, .time_ms = 0, .button = 0x110, .state = .pressed } });
             }
         } else switch (self.action) {
             .key => |key| try runtime.routeKeyboard(.{ .key = .{ .window = window, .serial = 0, .time_ms = 0, .state = if (self.step == 0) .pressed else .released, .translated = key } }),
