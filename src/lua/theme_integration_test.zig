@@ -456,6 +456,34 @@ test "Lua placeholder and accessible label remain independent of retained input 
     try std.testing.expectEqualStrings("", (try f.sources.get(input.source)).utf8);
 }
 
+test "Lua color with_alpha derives token colors for theme and widget props" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\local ouro = require('ouro')
+        \\local original = ouro.tokens.dark.background
+        \\local tint = ouro.color.with_alpha(original, 0.3)
+        \\assert(ouro.tokens.dark.background == original)
+        \\function build()
+        \\  return ouro.theme { key = 'scope', colors = { primary = tint },
+        \\    ouro.column { key = 'root',
+        \\      ouro.box { key = 'tint', background = tint, height = 20 },
+        \\      ouro.button { key = 'button', label = 'Tint' },
+        \\    },
+        \\  }
+        \\end
+    );
+    try f.build();
+    const expected = core.Color.rgba(17, 17, 19, 77);
+    try std.testing.expectEqual(expected, (try f.object("scope/root/tint")).box.background.?);
+    try std.testing.expectEqual(expected, (try f.object("scope/root/button")).box.background.?);
+    f.ui.widget_theme.?.colors = @import("../design/root.zig").tokens.dark;
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(expected, (try f.object("scope/root/tint")).box.background.?);
+    try std.testing.expectEqual(expected, (try f.object("scope/root/button")).box.background.?);
+}
+
 test "Lua tokens work in theme and widget props and preserve button defaults" {
     const f = try Fixture.create();
     defer f.destroy();

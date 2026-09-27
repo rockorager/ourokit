@@ -596,6 +596,8 @@ Boxes may opt into generated theme surfaces with `surface = "background" |
 including a fully transparent color; omitting both leaves the Box transparent.
 `background` and `border` accept `#RRGGBB` or `#RRGGBBAA` (including color
 values from `ouro.tokens`), using the same validation as buttons and inputs.
+Use [`ouro.color.with_alpha(color, alpha)`](design-system.md#deriving-a-color-with-alpha)
+to derive a color with a replacement alpha from 0 to 1 without slicing tokens.
 `border_width` and `radius` are finite, non-negative logical pixels, defaulting
 to zero. A positive border width uses `border` or the inherited theme's `border`
 color; zero hides it even if `border` is supplied. Border width participates in

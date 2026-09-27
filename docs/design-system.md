@@ -59,6 +59,30 @@ widget properties: for example, line-height tokens are available as numbers,
 but do not introduce a `line_height` text prop. Existing widget defaults remain
 unchanged, including 14px button labels and 16px text.
 
+### Deriving a color with alpha
+
+Use `ouro.color.with_alpha(color, alpha)` instead of slicing or appending to a
+token string:
+
+```lua
+local tint = ouro.color.with_alpha(ouro.tokens.dark.background, 0.3)
+return ouro.box { key = 'tint', background = tint, width = 'fill', height = 'fill' }
+```
+
+The helper accepts the same `#RRGGBB` or `#RRGGBBAA` colors as theme and widget
+properties (hex digits are case-insensitive). It returns a lowercase
+`#rrggbbaa` string, preserving straight-alpha sRGB channels and **replacing**
+any existing alpha, not multiplying it. `alpha` must be a finite Lua number
+from 0 (transparent) to 1 (opaque). It is rounded to the nearest 8-bit value,
+with half steps rounded up: `0.3` becomes `4d`, and `0.5` becomes `80`.
+Invalid colors, alpha values, or argument counts raise a Lua error; values are
+not clamped and numeric strings are not coerced.
+
+The result is a new color value accepted anywhere a color string is accepted.
+The source token is unchanged, and the derived value remains fixed rather than
+following later theme changes. This changes a color's alpha, not the opacity
+of a widget subtree.
+
 ## Widget design guidance
 
 Before adding a widget state, visual role, or design token, consult the current

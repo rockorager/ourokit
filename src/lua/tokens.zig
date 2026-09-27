@@ -25,11 +25,7 @@ fn push(state: *c.State, value: anytype) void {
             c.lua_setfield(state, -2, decl.name);
         }
     } else if (T == Color) {
-        var buffer: [9]u8 = undefined;
-        const hex = std.fmt.bufPrint(&buffer, "#{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-            value.r, value.g, value.b, value.a,
-        }) catch unreachable;
-        _ = c.lua_pushlstring(state, hex.ptr, hex.len);
+        @import("color.zig").push(state, value);
     } else if (T == []const u8) {
         _ = c.lua_pushlstring(state, value.ptr, value.len);
     } else switch (@typeInfo(T)) {
