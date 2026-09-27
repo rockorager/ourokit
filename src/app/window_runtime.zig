@@ -740,6 +740,7 @@ pub const WindowRuntime = struct {
             self.metrics.layouts.finish(started);
         }
         try self.updateVirtualLayout();
+        if (try self.instances.revealScrollTargets()) self.frame_state.invalidatePaint();
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
             const started = self.phaseStart();
             self.frame_state.invalidatePaint();

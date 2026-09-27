@@ -722,6 +722,24 @@ pub const UiBuild = struct {
         c.lua_settop(state, -2);
         if (index_kind != c.type_nil and index_kind != c.type_function)
             return luaError(state, "item_index must be a function");
+        const reveal_kind = c.lua_getfield(state, props, "ensure_visible");
+        c.lua_settop(state, -2);
+        switch (reveal_kind) {
+            c.type_nil => {},
+            c.type_number => {
+                const index = tableRequiredInteger(state, props, "ensure_visible") orelse
+                    return luaError(state, "ensure_visible must be a positive integer or item key");
+                if (index < 1)
+                    return luaError(state, "ensure_visible must be a positive integer or item key");
+            },
+            c.type_string => {
+                if (tableString(state, props, "ensure_visible").?.len == 0)
+                    return luaError(state, "ensure_visible item key must not be empty");
+                if (index_kind != c.type_function)
+                    return luaError(state, "ensure_visible item key requires item_index");
+            },
+            else => return luaError(state, "ensure_visible must be a positive integer or item key"),
+        }
         const fixed = tableOptionalNullableExtent(state, props, "item_height") orelse return luaError(state, "invalid item_height");
         const estimated = tableOptionalNullableExtent(state, props, "estimated_item_height") orelse return luaError(state, "invalid estimated_item_height");
         if ((fixed.value == null) == (estimated.value == null))
@@ -2023,9 +2041,21 @@ pub const UiBuild = struct {
         const key = tableString(state, 1, "key") orelse return luaError(state, "scroll key is required");
         const axis = tableOptionalAxis(state, 1, "axis", .vertical) orelse
             return luaError(state, "invalid scroll axis");
+        const reveal_kind = c.lua_getfield(state, 1, "ensure_visible");
+        c.lua_settop(state, -2);
+        if (reveal_kind != c.type_nil and reveal_kind != c.type_string)
+            return luaError(state, "scroll ensure_visible must be a descendant key path");
+        const reveal = tableString(state, 1, "ensure_visible");
+        if (reveal) |path| {
+            var segments = std.mem.splitScalar(u8, path, '/');
+            while (segments.next()) |segment| if (segment.len == 0)
+                return luaError(state, "invalid ensure_visible key path");
+        }
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x7363726f6c6c ^ parent.id ^ self.component_namespace);
+        const descriptor_index = self.count;
+        const semantic_start = self.semantic_count;
         self.append(.{
             .id = id,
             .parent = parent.id,
@@ -2038,7 +2068,37 @@ pub const UiBuild = struct {
             .role = .group,
             .key = key,
         }) catch return luaError(state, "cannot append scroll semantics");
-        return self.emitChildren(state, .{ .id = id, .kind = .scroll });
+        const status = self.emitChildren(state, .{ .id = id, .kind = .scroll });
+        if (reveal) |path| {
+            var target: ?u64 = id;
+            var segments = std.mem.splitScalar(u8, path, '/');
+            while (segments.next()) |segment| {
+                var found: ?u64 = null;
+                for (self.semantic_storage[semantic_start..self.semantic_count]) |candidate| {
+                    if (candidate.parent != target or !std.mem.eql(u8, candidate.key, segment)) continue;
+                    if (found != null) return luaError(state, "ambiguous ensure_visible key path");
+                    found = candidate.id;
+                }
+                target = found;
+                if (target == null) break;
+            }
+            // Components are semantic namespaces. As with semantic input
+            // targets, their returned root supplies the actual geometry.
+            resolve: while (target) |candidate| {
+                for (self.storage[descriptor_index + 1 .. self.count]) |descriptor| {
+                    if (descriptor.id != candidate) continue;
+                    self.storage[descriptor_index].ensure_visible = candidate;
+                    break :resolve;
+                }
+                target = null;
+                for (self.semantic_storage[semantic_start..self.semantic_count]) |child| {
+                    if (child.parent != candidate) continue;
+                    target = child.id;
+                    break;
+                }
+            }
+        }
+        return status;
     }
 
     fn discardHandlers(self: *UiBuild) void {

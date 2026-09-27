@@ -22,9 +22,13 @@ pub const Descriptor = struct {
     object: render_types.Object,
     parent_data: render_types.ParentData = .none,
     focusable: bool = false,
+    /// Descendant instance to reveal after layout; null leaves scrolling alone.
+    ensure_visible: ?u64 = null,
 };
 
 const State = enum { free, active, retiring };
+
+const RevealGeometry = struct { id: u64, start: f32, extent: f32, viewport: f32 };
 
 const Slot = struct {
     generation: u32 = 0,
@@ -36,6 +40,8 @@ const Slot = struct {
     render: ?render_object.NodeHandle = null,
     state_revision: u64 = 0,
     scroll_offset: f32 = 0,
+    ensure_visible: ?u64 = null,
+    revealed: ?RevealGeometry = null,
     focusable: bool = false,
     traversal_order: usize = 0,
     reconcile_child: ?render_object.NodeHandle = null,
@@ -323,6 +329,8 @@ pub const Tree = struct {
         for (descriptors, 0..) |descriptor, traversal_order| {
             const slot = self.findActiveById(descriptor.id).?;
             slot.focusable = descriptor.focusable;
+            slot.ensure_visible = descriptor.ensure_visible;
+            if (descriptor.ensure_visible == null) slot.revealed = null;
             slot.traversal_order = traversal_order;
             const previous = try self.render_tree.objectAt(slot.render.?);
             try self.render_tree.update(slot.render.?, descriptor.object);
@@ -488,6 +496,52 @@ pub const Tree = struct {
 
     pub fn scrollOffset(self: *Tree, handle: InstanceHandle) !f32 {
         return (try self.activeSlot(handle)).scroll_offset;
+    }
+
+    /// Reveal changed targets or changed geometry, without undoing manual
+    /// scrolling when the same declaration is rebuilt unchanged.
+    pub fn revealScrollTargets(self: *Tree) !bool {
+        var changed = false;
+        for (self.slots) |*slot| {
+            if (slot.state != .active) continue;
+            const id = slot.ensure_visible orelse continue;
+            const object = try self.render_tree.objectAt(slot.render.?);
+            if (object != .scroll) continue;
+            const target = self.handleForId(id) orelse continue;
+            const axis = object.scroll.axis;
+            const size = try self.render_tree.nodeSize(try self.renderObject(target));
+            const viewport = try self.render_tree.nodeSize(slot.render.?);
+            var start: f32 = 0;
+            var current: ?InstanceHandle = target;
+            while (current) |candidate| {
+                if (try self.semanticId(candidate) == slot.id) break;
+                current = try self.parentOf(candidate);
+                // The direct child's offset is exactly the viewport's scroll
+                // translation. Exclude it rather than canceling large floats.
+                if (current) |parent| if (try self.semanticId(parent) != slot.id) {
+                    const position = try self.render_tree.nodeOffset(try self.renderObject(candidate));
+                    start += if (axis == .vertical) position.y else position.x;
+                };
+            }
+            if (current == null) continue;
+            const geometry: RevealGeometry = .{
+                .id = id,
+                .start = start,
+                .extent = if (axis == .vertical) size.height else size.width,
+                .viewport = if (axis == .vertical) viewport.height else viewport.width,
+            };
+            if (slot.revealed) |old| if (std.meta.eql(old, geometry)) continue;
+            slot.revealed = geometry;
+            const end = start + @min(geometry.extent, geometry.viewport);
+            const offset = if (start < slot.scroll_offset or geometry.extent > geometry.viewport)
+                start
+            else if (end > slot.scroll_offset + geometry.viewport)
+                end - geometry.viewport
+            else
+                slot.scroll_offset;
+            if (try self.scrollBy(self.handleForId(slot.id).?, offset - slot.scroll_offset)) changed = true;
+        }
+        return changed;
     }
 
     pub fn nearestScroll(

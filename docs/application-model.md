@@ -1354,6 +1354,66 @@ runners configure these paths automatically.
 See `examples/xdg-icons.lua` for light/dark, color, symbolic, and missing states.
 It requires an installed Adwaita theme; icons are not bundled with the example.
 
+### Bringing a selection into view
+
+Set `ensure_visible` on a viewport to reveal an application-selected child
+without computing offsets or changing keyboard focus:
+
+```lua
+ouro.scroll {
+  key = "results",
+  ensure_visible = "rows/" .. selected_key(),
+  ouro.column { key = "rows", gap = 8, children = result_rows },
+}
+```
+
+For `ouro.scroll`, the target is a slash-separated descendant widget-key path
+relative to the scroll (not a window-wide path). Include intermediate container
+and component keys, as with other semantic paths. Layout supplies the child's
+actual position and size, including padding and gaps. Both vertical and
+horizontal scroll axes are supported. Only this viewport scrolls; this is not
+a request to reveal through every nested scroll ancestor. A missing target is
+a no-op; empty paths/segments, ambiguous paths, and non-string values are errors.
+
+For `ouro.virtual_list`, use a positive **1-based index** or an **item key**.
+A key requires `item_index(key)` so revealing an unmounted row never scans the
+entire data set. A positive index beyond `item_count`, or a key for which
+`item_index` returns `nil`, is a no-op (including an empty list). Zero, negative
+or fractional indices, empty keys, and other value types are errors.
+
+Both forms move only far enough to fit the target in the viewport and clamp to
+the content bounds. A target larger than the viewport aligns its leading edge.
+The request is re-evaluated when the target or its geometry changes, including
+viewport resizing; unchanged declarations do not undo manual wheel or keyboard
+scrolling. Set `nil` to clear the request. It does not select or focus the row,
+and it does not animate. Variable-height virtual rows use estimates to mount
+the target, then correct the reveal using measured layout.
+
+A launcher can keep its search field focused, update `selected` from its
+Up/Down handler, and render all results through one virtual list:
+
+```lua
+local selected = ouro.signal(1)
+-- Inside content; results is the application's complete ordered result set.
+return ouro.column {
+  key = "launcher", gap = 12,
+  ouro.text_input { key = "search", default_text = "", placeholder = "Search", autofocus = true },
+  ouro.virtual_list {
+    key = "results", flex = 1,
+    item_count = #results,
+    item_key = function(i) return results[i].id end,
+    estimated_item_height = 40,
+    ensure_visible = selected(),
+    render_item = function(i)
+      return ouro.text { key = "label", text = results[i].label }
+    end,
+  },
+}
+```
+
+The flex layout determines the list's remaining height. No `first`/`capacity`
+window or sum of search-field, heading, tab, and gap heights is needed.
+
 ### Virtual lists
 
 Large, generic vertical viewports use `ouro.virtual_list`:
@@ -1378,8 +1438,9 @@ returned description form each row's semantic target path.
 
 `item_key` and `render_item` are lazy: builds evaluate the visible rows plus a
 two-row buffer on each side, with additional key lookups for the previous
-anchor, mounted measurements, and focused row. A fresh root render does not
-scan all items. Fixed-height offsets use arithmetic, not an item-sized table.
+anchor, mounted measurements, focused row, and `ensure_visible` target. A fresh
+root render does not scan all items. Fixed-height offsets use arithmetic, not
+an item-sized table.
 Variable rows use a sparse measurement index; unseen rows use the estimate,
 while measured native heights are at least one pixel. Native scrolling retains
 offscreen measurements; data/provider or width changes discard them, keeping

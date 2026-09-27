@@ -945,3 +945,227 @@ test "virtual rows retire component readers and remount with fresh local state" 
     try std.testing.expectEqual(@as(f32, 7), object.box.height.?);
     try std.testing.expectEqual(@as(f64, 1), f.number("roots"));
 }
+
+test "ensure_visible virtual indices reveal lazily without stealing focus or controlling manual scroll" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\selected, count = ouro.signal(700001), ouro.signal(1000000)
+        \\broken = ouro.signal(false)
+        \\keys, rows = 0, 0
+        \\function build()
+        \\  return ouro.virtual_list {
+        \\    key='people', item_count=count(), item_height=40, ensure_visible=selected(),
+        \\    item_key=function(i) keys=keys+1; return 'person-'..i end,
+        \\    render_item=function(i) rows=rows+1; if broken() then return false end; return ouro.box {key='row', height=17} end,
+        \\  }
+        \\end
+    );
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 700001 * 40 - 200), try f.offset());
+    _ = try f.handle("people/person-700001/row");
+    try std.testing.expect(f.number("keys") < 48);
+    try std.testing.expect(f.number("rows") < 48);
+    const focus = f.runtime.focus.current();
+    try f.exec("selected:set(700002)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 700002 * 40 - 200), try f.offset());
+    try std.testing.expectEqual(focus, f.runtime.focus.current());
+    try f.exec("selected:set(700001)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 700002 * 40 - 200), try f.offset());
+    try f.exec("selected:set(699990)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 699989 * 40), try f.offset());
+    try f.wheel(-124);
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 699989 * 40 - 124), try f.offset());
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 699989 * 40 - 124), try f.offset());
+    f.size.height = 124;
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 699990 * 40 - 100), try f.offset());
+    try f.exec("selected:set(false)");
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try std.testing.expectEqual(@as(f32, 699990 * 40 - 100), try f.offset());
+    try f.exec("selected:set(800000); broken:set(true)");
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try std.testing.expectEqual(@as(f32, 699990 * 40 - 100), try f.offset());
+    try f.exec("selected:set(1000001); broken:set(false)"); // A removed/out-of-range target is a no-op.
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 699990 * 40 - 100), try f.offset());
+    try f.exec("count:set(0)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 0), try f.offset());
+    try std.testing.expectEqual(@as(usize, 0), f.runtime.virtual_lists.row_count);
+}
+
+test "ensure_visible launcher selection respects remaining flex height and keeps search focused" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\selected, gap = ouro.signal(1), ouro.signal(11)
+        \\function build()
+        \\  return ouro.column {key='content', gap=gap(),
+        \\    ouro.text_input {key='search', height=37, default_text='', autofocus=true},
+        \\    ouro.virtual_list {
+        \\      key='people', flex=1, item_count=1000, item_height=40, ensure_visible=selected(),
+        \\      item_key=function(i) return 'person-'..i end,
+        \\      render_item=function() return ouro.box {key='row', height=17} end,
+        \\    },
+        \\  }
+        \\end
+    );
+    try f.build();
+    const search = try f.handle("content/search");
+    try std.testing.expectEqual(search, f.runtime.focus.current().?);
+    try f.exec("selected:set(50)");
+    try f.build();
+    const list = try f.handle("content/people");
+    try std.testing.expectEqual(@as(f32, 50 * 40 - (200 - 37 - 11)), try f.runtime.instances.scrollOffset(list));
+    try std.testing.expectEqual(search, f.runtime.focus.current().?);
+    try f.exec("gap:set(29)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 50 * 40 - (200 - 37 - 29)), try f.runtime.instances.scrollOffset(list));
+    try std.testing.expectEqual(search, f.runtime.focus.current().?);
+    const viewport = (try f.runtime.semanticTarget("content/people")).bounds;
+    const row = (try f.runtime.semanticTarget("content/people/person-50")).bounds;
+    try std.testing.expect(row.y >= viewport.y);
+    try std.testing.expectEqual(viewport.y + viewport.height, row.y + row.height);
+}
+
+test "ensure_visible virtual keys follow item_index through reordering and removal" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\position, missing = ouro.signal(901), ouro.signal(false)
+        \\local positions = {}
+        \\for i=1,1000 do positions['person-'..i] = i end
+        \\function build()
+        \\  return ouro.virtual_list {
+        \\    key='people', item_count=1000, item_height=40, ensure_visible='chosen',
+        \\    item_key=function(i) return i == position() and not missing() and 'chosen' or 'person-'..i end,
+        \\    item_index=function(key)
+        \\      if key == 'chosen' then if not missing() then return position() end
+        \\      else local i=positions[key]; if i ~= position() or missing() then return i end end
+        \\    end,
+        \\    render_item=function() return ouro.box {key='row', height=17} end,
+        \\  }
+        \\end
+    );
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 901 * 40 - 200), try f.offset());
+    const chosen = try f.handle("people/chosen/row");
+    try f.exec("position:set(23)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 22 * 40), try f.offset());
+    try std.testing.expectEqual(chosen, try f.handle("people/chosen/row"));
+    try f.exec("missing:set(true)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 22 * 40), try f.offset());
+    try f.exec("missing:set(false); position:set(999)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 999 * 40 - 200), try f.offset());
+}
+
+test "ensure_visible virtual variable rows correct estimates and settle oversized targets" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\height = ouro.signal(91)
+        \\function build()
+        \\  return ouro.virtual_list {
+        \\    key='people', item_count=1000, estimated_item_height=40, ensure_visible=37,
+        \\    item_key=function(i) return 'person-'..i end,
+        \\    render_item=function(i) return ouro.box {key='row', height=i == 37 and height() or 40} end,
+        \\  }
+        \\end
+    );
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 36 * 40 + 91 - 200), try f.offset());
+    const viewport = (try f.runtime.semanticTarget("people")).bounds;
+    var row = (try f.runtime.semanticTarget("people/person-37")).bounds;
+    try std.testing.expectEqual(viewport.y + viewport.height, row.y + row.height);
+    try f.exec("height:set(317)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 36 * 40), try f.offset());
+    row = (try f.runtime.semanticTarget("people/person-37")).bounds;
+    try std.testing.expectEqual(viewport.y, row.y);
+    try std.testing.expectEqual(@as(f32, 317), row.height);
+    const builds = f.runtime.metrics.builds.count;
+    try f.build();
+    try std.testing.expectEqual(builds, f.runtime.metrics.builds.count);
+    try std.testing.expectEqual(@as(f32, 36 * 40), try f.offset());
+}
+
+test "ensure_visible scroll paths use actual nested layout on both axes" {
+    inline for (.{ false, true }) |horizontal| {
+        const f = try Fixture.create();
+        defer f.destroy();
+        try f.exec(if (horizontal) "horizontal=true" else "horizontal=false");
+        try f.exec(
+            \\selected, gap, large = ouro.signal('rows/last'), ouro.signal(13), ouro.signal(false)
+            \\local Last = ouro.component(function(props)
+            \\  return function() return ouro.box {key='body',
+            \\    width=horizontal and props.extent or 20, height=horizontal and 20 or props.extent} end
+            \\end)
+            \\function build()
+            \\  local extent = large() and 407 or 51
+            \\  local children = {
+            \\    ouro.box {key='first', width=horizontal and 277 or 20, height=horizontal and 20 or 277},
+            \\    Last {key='last', extent=extent},
+            \\  }
+            \\  local props = {key='rows', gap=gap(), children=children}
+            \\  return ouro.scroll {key='people', axis=horizontal and 'horizontal' or 'vertical',
+            \\    ensure_visible=selected(), horizontal and ouro.row(props) or ouro.column(props)}
+            \\end
+        );
+        const viewport: f32 = if (horizontal) 300 else 200;
+        try f.build();
+        try std.testing.expectEqual(277 + 13 + 51 - viewport, try f.offset());
+        const scroll = try f.handle("people");
+        try std.testing.expect(try f.runtime.instances.scrollBy(scroll, -19));
+        try f.runtime.prepareFrame(1);
+        try f.build();
+        try std.testing.expectEqual(277 + 13 + 51 - viewport - 19, try f.offset());
+        try f.exec("gap:set(29)");
+        try f.build();
+        try std.testing.expectEqual(277 + 29 + 51 - viewport, try f.offset());
+        try f.exec("large:set(true)");
+        try f.build();
+        try std.testing.expectEqual(@as(f32, 277 + 29), try f.offset());
+        try f.runtime.prepareFrame(1);
+        try std.testing.expectEqual(@as(f32, 277 + 29), try f.offset());
+        try f.exec("selected:set('rows/missing')");
+        try f.build();
+        try std.testing.expectEqual(@as(f32, 277 + 29), try f.offset());
+        try f.exec("selected:set('rows/first')");
+        try f.build();
+        try std.testing.expectEqual(@as(f32, 0), try f.offset());
+        try f.exec("selected:set(nil)");
+        try f.build();
+        try std.testing.expect(try f.runtime.instances.scrollBy(scroll, 77));
+        try f.runtime.prepareFrame(1);
+        try std.testing.expectEqual(@as(f32, 77), try f.offset());
+    }
+}
+
+test "ensure_visible rejects invalid declarations without replacing the committed UI" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(fixed_source);
+    try f.build();
+    const row = try f.handle("people/person-1/row");
+    inline for (.{ "0", "-1", "1.5", "true", "{}", "''", "'person-1'" }) |invalid| {
+        try f.exec("function build() return ouro.virtual_list {key='people', item_count=10, item_height=40, ensure_visible=" ++ invalid ++ ", item_key=function(i) return 'person-'..i end, render_item=function() return ouro.box {key='row'} end} end");
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(row, try f.handle("people/person-1/row"));
+    }
+    inline for (.{ "1", "false", "{}", "''", "'rows//last'", "'/last'", "'rows/'" }) |invalid| {
+        try f.exec("function build() return ouro.scroll {key='people', ensure_visible=" ++ invalid ++ ", ouro.box {key='row'}} end");
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(row, try f.handle("people/person-1/row"));
+    }
+}

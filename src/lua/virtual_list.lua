@@ -125,6 +125,27 @@ return function(props, old, id, geometry, select_reader, key_token, row_token, r
         local height = offset(measurements, count, estimate, anchor + 1) - top
         scroll = top + (within < height and within or height - 1)
     end
+    local reveal = props.ensure_visible
+    local reveal_index, reveal_key, reveal_top, reveal_height
+    if reveal then
+        if valid_key(reveal) then reveal_index = resolve(reveal, 1)
+        elseif reveal <= count then reveal_index = reveal end
+        if reveal_index then
+            reveal_key = key_at(reveal_index)
+            reveal_top = offset(measurements, count, estimate, reveal_index)
+            reveal_height = offset(measurements, count, estimate, reveal_index + 1) - reveal_top
+            -- Geometry feedback corrects estimated positions after mounting.
+            -- Unchanged requests do not pull back ordinary wheel/key scrolling.
+            if viewport > 0 and (not old or old.props.ensure_visible ~= reveal
+                or old.reveal_key ~= reveal_key or old.reveal_top ~= reveal_top
+                or old.reveal_height ~= reveal_height or old.viewport ~= viewport) then
+                if reveal_top < scroll or reveal_height > viewport then scroll = reveal_top
+                elseif reveal_top + reveal_height > scroll + viewport then
+                    scroll = reveal_top + reveal_height - viewport
+                end
+            end
+        end
+    end
     local total = count * estimate + (measurements and measurements.sum or 0)
     local limit = total > viewport and total - viewport or 0
     if scroll > limit then scroll = limit end
@@ -156,5 +177,6 @@ return function(props, old, id, geometry, select_reader, key_token, row_token, r
     if pinned and pinned > last then row(pinned) end
     return { props = props, keys = keys, positions = positions, measurements = measurements,
         estimate = estimate, count = count, width = width, viewport = viewport,
-        offset = scroll, total = total, rows = rows, pinned = pinned }
+        offset = scroll, total = total, rows = rows, pinned = pinned,
+        reveal_key = reveal_key, reveal_top = reveal_top, reveal_height = reveal_height }
 end
