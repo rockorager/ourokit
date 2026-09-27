@@ -778,7 +778,7 @@ pub const UiBuild = struct {
             .row_count = 0,
         };
         self.append(.{ .id = outer, .parent = parent.id, .parent_data = parent_data, .object = .{ .box = .{ .width = width.extent(), .fill_width = width.isFill(), .height = height.extent(), .fill_height = height.isFill() } } }) catch return luaError(state, "cannot append virtual list");
-        self.append(.{ .id = id, .parent = outer, .focusable = true, .object = .{ .scroll = .{} } }) catch return luaError(state, "cannot append virtual viewport");
+        self.append(.{ .id = id, .parent = outer, .focusable = true, .focus_request = tableFocusRequest(state, props) catch |err| return luaError(state, @errorName(err)), .object = .{ .scroll = .{} } }) catch return luaError(state, "cannot append virtual viewport");
         self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .group, .key = key }) catch return luaError(state, "cannot append virtual semantics");
         self.append(.{ .id = extent, .parent = id, .object = .{ .box = .{ .height = total, .fill_width = true } } }) catch return luaError(state, "cannot append virtual extent");
         self.append(.{ .id = stack, .parent = extent, .object = .{ .stack = .{ .unbounded_height = true } } }) catch return luaError(state, "cannot append virtual rows");
@@ -1070,6 +1070,7 @@ pub const UiBuild = struct {
                 .corner_radius = visual.radius orelse defaults.controls.radius orelse design.tokens.foundation.radius_2,
             } },
             .focusable = enabled,
+            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append button descriptor");
 
@@ -1175,6 +1176,7 @@ pub const UiBuild = struct {
             .id = id,
             .parent = parent.id,
             .focusable = enabled,
+            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
             .parent_data = declarativeParentData(self, state, 1) catch |err| return luaError(state, @errorName(err)),
             .object = .{ .box = .{ .width = width, .height = 28, .padding = .all(4), .border_width = 2, .border_color = transparent, .corner_radius = 4, .alignment = .center } },
         }) catch return luaError(state, "cannot append slider");
@@ -1246,6 +1248,7 @@ pub const UiBuild = struct {
             .parent = parent.id,
             .object = .{ .box = recipe.root },
             .focusable = enabled,
+            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append switch descriptor");
         self.append(.{
@@ -1384,6 +1387,7 @@ pub const UiBuild = struct {
                 .corner_radius = visual.radius orelse defaults.controls.radius orelse design.tokens.foundation.radius_2,
             } },
             .focusable = enabled,
+            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
             .parent_data = declarativeParentData(self, state, 1) catch |err|
                 return luaError(state, parentDataErrorMessage(err)),
         }) catch return luaError(state, "cannot append text_input descriptor");
@@ -1493,6 +1497,7 @@ pub const UiBuild = struct {
             .parent = parent.id,
             .object = .{ .flex = .{ .axis = if (tabs) .horizontal else .vertical, .gap = gap, .cross_axis_alignment = .stretch } },
             .focusable = enabled,
+            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append listbox descriptor");
         self.appendSemantic(.{
@@ -1763,7 +1768,7 @@ pub const UiBuild = struct {
             .border = theme.border,
             .focus = theme.ring,
         };
-        self.append(.{ .id = divider, .parent = id, .focusable = true, .object = .{ .box = .{
+        self.append(.{ .id = divider, .parent = id, .focusable = true, .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)), .object = .{ .box = .{
             .background = style.idle,
         } } }) catch return luaError(state, "cannot append split divider");
         if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "button capacity exceeded");
@@ -2439,6 +2444,17 @@ fn tableOptionalCrossAxisAlignment(
     if (std.mem.eql(u8, value, "end")) return .end;
     if (std.mem.eql(u8, value, "stretch")) return .stretch;
     return null;
+}
+
+fn tableFocusRequest(state: *c.State, table: c_int) !u64 {
+    const kind = c.lua_getfield(state, table, "focus_request");
+    defer c.lua_settop(state, -2);
+    if (kind == c.type_nil) return 0;
+    if (kind != c.type_number) return error.FocusRequestMustBeNonNegativeInteger;
+    var is_integer: c_int = 0;
+    const value = c.lua_tointegerx(state, -1, &is_integer);
+    if (is_integer == 0 or value < 0) return error.FocusRequestMustBeNonNegativeInteger;
+    return @intCast(value);
 }
 
 /// A zero default represents an omitted optional positive integer. Explicit

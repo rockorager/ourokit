@@ -410,6 +410,203 @@ test "Lua decoration, stack and input hints reject invalid declarations atomical
     }
 }
 
+test "Lua focus requests consume ineligible targets without delayed focus stealing" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\request=0; enabled=true; hidden=false; show=true
+        \\function build() return ouro.column {key='root',
+        \\ ouro.text_input {key='other', default_text='other', autofocus=true},
+        \\ ouro.box {key='panel', hidden=hidden,
+        \\   show and ouro.text_input {key='query', text='query', read_only=true,
+        \\     enabled=enabled, focus_request=request} or nil},
+        \\} end
+    );
+    try f.build();
+    const other = try f.handle("root/other");
+    const query = try f.handle("root/panel/query");
+    try std.testing.expectEqual(other, f.runtime.focus.current().?);
+    for ([_][]const u8{
+        "enabled=false; request=1", "enabled=true",
+        "hidden=true; request=2",   "hidden=false",
+    }) |source| {
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try f.build();
+        try std.testing.expectEqual(other, f.runtime.focus.current().?);
+    }
+    try f.exec("request=3");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(query, f.runtime.focus.current().?);
+    try f.tab();
+    try std.testing.expectEqual(other, f.runtime.focus.current().?);
+    // Zero and nil do not clear focus; a later positive value is a new request.
+    for ([_][]const u8{ "request=0", "request=nil" }) |source| {
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try f.build();
+        try std.testing.expectEqual(other, f.runtime.focus.current().?);
+    }
+    try f.exec("request=3");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(query, f.runtime.focus.current().?);
+    try f.exec("show=false");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expect(f.runtime.focus.current() == null);
+    try f.exec("show=true");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    const remounted = try f.handle("root/panel/query");
+    try std.testing.expect(!std.meta.eql(query, remounted));
+    try std.testing.expectEqual(remounted, f.runtime.focus.current().?);
+}
+
+test "Lua focus requests respect newly mounted dialog boundaries" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\opened=false; request=0
+        \\function build()
+        \\ local children={}
+        \\ if opened then children[1]=ouro.dialog {key='dialog', label='Dialog',
+        \\   ouro.column {key='actions',
+        \\     ouro.button {key='first', label='First'},
+        \\     ouro.text_input {key='last', default_text='', focus_request=1}}} end
+        \\ children[#children+1]=ouro.text_input {key='outside', default_text='', autofocus=true, focus_request=request}
+        \\ return ouro.stack {key='root', children=children}
+        \\end
+    );
+    try f.build();
+    const outside = try f.handle("root/outside");
+    try f.exec("opened=true; request=1");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    const last = try f.handle("root/dialog/actions/last");
+    try std.testing.expectEqual(last, f.runtime.focus.current().?);
+    try f.exec("request=2");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(last, f.runtime.focus.current().?);
+    try f.exec("opened=false");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(outside, f.runtime.focus.current().?);
+}
+
+test "Lua focus requests validate transactionally and follow current declaration order" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\request=0; invalid=nil; reverse=false
+        \\function build()
+        \\ local a=ouro.button {key='a', label='A', focus_request=request}
+        \\ local b=ouro.text_input {key='b', default_text='', focus_request=request}
+        \\ return ouro.column {key='root',
+        \\   children={reverse and b or a, reverse and a or b,
+        \\     ouro.button {key='bad', label='Bad', focus_request=invalid}}}
+        \\end
+    );
+    try f.build();
+    try std.testing.expect(f.runtime.focus.current() == null);
+    const a = try f.handle("root/a");
+    const b = try f.handle("root/b");
+    // Requests encountered before a later invalid declaration must not commit.
+    for ([_][]const u8{ "true", "'2'", "-1", "1.5", "{}", "math.huge" }) |value| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "request=7; invalid={s}", .{value});
+        defer std.testing.allocator.free(source);
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expect(f.runtime.focus.current() == null);
+        try std.testing.expect(f.runtime.instances.takeFocusRequest() == null);
+    }
+    try f.exec("invalid=nil");
+    try f.build();
+    try std.testing.expectEqual(b, f.runtime.focus.current().?);
+    try f.exec("reverse=true; request=4");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(a, f.runtime.focus.current().?);
+    try std.testing.expectEqual(b, try f.handle("root/b"));
+}
+
+test "Lua focus requests reach native controls and standard compositions" {
+    const cases = [_]struct { declaration: []const u8, path: []const u8 }{
+        .{ .declaration = "ouro.switch {key='target', label='Switch', checked=false, focus_request=request()}", .path = "root/target" },
+        .{ .declaration = "ouro.checkbox {key='target', label='Check', checked=false, focus_request=request()}", .path = "root/target" },
+        .{ .declaration = "ouro.slider {key='target', label='Slider', value=3, min=0, max=10, step=1, focus_request=request()}", .path = "root/target" },
+        .{ .declaration = "ouro.listbox {key='target', selected=1, on_select=function() end, focus_request=request(), ouro.option {key='one', value=1, label='One'}}", .path = "root/target" },
+        .{ .declaration = "ouro.radio_group {key='target', selected=1, on_select=function() end, focus_request=request(), ouro.radio {key='one', value=1, label='One'}}", .path = "root/target" },
+        .{ .declaration = "ouro.tab_bar {key='target', selected=1, on_select=function() end, focus_request=request(), ouro.tab {key='one', value=1, label='One'}}", .path = "root/target" },
+        .{ .declaration = "ouro.split_view {key='target', flex=1, position=0.5, focus_request=request(), ouro.box {key='a'}, ouro.box {key='b'}}", .path = "root/target/divider" },
+        .{ .declaration = "ouro.virtual_list {key='target', height=80, item_count=1, item_height=20, focus_request=request(), item_key=function(i) return tostring(i) end, render_item=function() return ouro.box {key='item'} end}", .path = "root/target" },
+        .{ .declaration = "ouro.spinbox {key='target', label='Spin', value=3, min=0, max=10, step=1, focus_request=request()}", .path = "root/target/control/value" },
+        .{ .declaration = "ouro.select {key='target', selected=1, options={{value=1, label='One'}}, focus_request=request()}", .path = "root/target/trigger" },
+        .{ .declaration = "ouro.tabs {key='target', flex=1, label='Tabs', selected=1, on_select=function() end, tabs={{value=1, label='One', content=ouro.box {key='panel'}}}, focus_request=request()}", .path = "root/target/control/strip/bar" },
+    };
+    for (cases) |case| {
+        const f = try Fixture.create();
+        defer f.destroy();
+        const source = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "request=ouro.signal(0); function build() return ouro.column {{key='root', {s}, ouro.text_input {{key='other', default_text='', autofocus=true}}}} end",
+            .{case.declaration},
+        );
+        defer std.testing.allocator.free(source);
+        try f.exec(source);
+        f.build() catch |err| {
+            std.debug.print("focus request declaration failed: {s}\n", .{case.declaration});
+            return err;
+        };
+        const target = try f.handle(case.path);
+        const other = try f.handle("root/other");
+        try std.testing.expectEqual(other, f.runtime.focus.current().?);
+        try f.exec("request:set(9)");
+        try f.build();
+        try std.testing.expectEqual(target, f.runtime.focus.current().?);
+        _ = try f.runtime.focus.request(&f.runtime.instances, other);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try f.build();
+        try std.testing.expectEqual(other, f.runtime.focus.current().?);
+        try f.exec("request:set(10)");
+        try f.build();
+        try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    }
+}
+
+test "Lua focus requests apply only on prepared source commit" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\request=0
+        \\function build() return ouro.column {key='root',
+        \\ ouro.text_input {key='other', default_text='', autofocus=true},
+        \\ ouro.text_input {key='query', default_text='retained', focus_request=request},
+        \\} end
+    );
+    try f.build();
+    const other = try f.handle("root/other");
+    const query = try f.handle("root/query");
+    var prepared: @import("prepared_build.zig").PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, f.state, &f.sources, 128, 1024);
+    defer prepared.deinit();
+    _ = c.lua_getglobal(f.state, "build");
+    const reference = c.luaL_ref(f.state, c.registry_index);
+    defer c.luaL_unref(f.state, c.registry_index, reference);
+    for ([_][]const u8{ "request=1", "request=1", "request=2" }, 0..) |source, index| {
+        _ = try f.runtime.focus.request(&f.runtime.instances, other);
+        try f.exec(source);
+        try f.runtime.prepareSourceBuild(.{ .width = 600, .height = 500 }, &f.ui, &prepared, reference, 2);
+        try std.testing.expectEqual(other, f.runtime.focus.current().?);
+        f.runtime.commitPreparedSource(&prepared, &f.callbacks, &f.vm, &f.signals);
+        try std.testing.expectEqual(if (index == 1) other else query, f.runtime.focus.current().?);
+        try std.testing.expectEqual(query, try f.handle("root/query"));
+    }
+}
+
 test "Lua placeholder and accessible label remain independent of retained input values" {
     const f = try Fixture.create();
     defer f.destroy();

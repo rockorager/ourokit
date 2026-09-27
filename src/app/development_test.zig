@@ -414,6 +414,51 @@ test "borderless text inputs keep autofocus and editing without adding field chr
     try std.testing.expect((try f.runtime.textInputStatus()) != null);
 }
 
+test "Lua focus requests return from pointer callbacks without remounting the editor" {
+    const f = try Fixture.create(
+        \\request=ouro.signal(0)
+        \\function build() return ouro.column {key='root', gap=8,
+        \\ ouro.text_input {key='query', default_text='seed', autofocus=true, focus_request=request()},
+        \\ ouro.button {key='scope', label='Scope', on_press=function() request:set(request()+1) end},
+        \\ ouro.button {key='other', label='Other'},
+        \\} end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    const scope = try f.runtime.instances.scope(target);
+    const generation = try f.runtime.text_inputs.sessionGeneration(target);
+    try f.play(.{ .text = "tail" });
+    _ = try session.model.setSelection(.{ .anchor = 6, .extent = 2 });
+    const selection = session.model.selection;
+    for (0..2) |_| {
+        try f.play(.{ .click = "root/other" });
+        try std.testing.expect(!std.meta.eql(target, f.runtime.focus.current().?));
+        try f.play(.{ .click = "root/scope" });
+        try std.testing.expectEqual(target, f.runtime.focus.current().?);
+        try std.testing.expectEqual(scope, try f.runtime.instances.scope(target));
+        try std.testing.expectEqual(generation, try f.runtime.text_inputs.sessionGeneration(target));
+        try std.testing.expectEqual(session, try f.runtime.text_inputs.session(target));
+        try std.testing.expectEqualStrings("seedtail", session.model.text());
+        try std.testing.expectEqual(selection, session.model.selection);
+        try std.testing.expect((try f.runtime.textInputStatus()) != null);
+        var snapshot = try f.snapshot();
+        defer snapshot.deinit();
+        try std.testing.expect((try node(snapshot, "root/query")).focused);
+        // Neither autofocus nor an unchanged request may steal focus on rebuild.
+        try f.play(.{ .click = "root/other" });
+        const other = f.runtime.focus.current().?;
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try f.settle();
+        try std.testing.expectEqual(other, f.runtime.focus.current().?);
+    }
+    try f.play(.{ .click = "root/scope" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_z, .modifiers = .{ .control = true } } });
+    try std.testing.expectEqualStrings("seed", session.model.text());
+    try f.play(.{ .text = "!" });
+    try std.testing.expectEqualStrings("seed!", session.model.text());
+}
+
 test "forms checkbox requests remain controlled and disabled controls skip focus" {
     const f = try Fixture.create(
         \\requested=false

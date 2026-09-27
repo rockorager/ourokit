@@ -1113,6 +1113,50 @@ in the owning task scope for bound command actions. Defaults are unmodified
 Commands are withheld during IME preedit. `on_command` and `on_change` may be
 used together.
 
+To request keyboard focus again without remounting, set `focus_request` to a
+changed positive integer. Keep the widget's `key` stable and increment a signal
+from an event callback:
+
+```lua
+local focus_request = ouro.signal(0)
+local function refocus()
+  focus_request:set(focus_request() + 1)
+end
+
+local function content()
+  return ouro.column { key = "launcher",
+    ouro.text_input {
+      key = "search", default_text = "", autofocus = true,
+      focus_request = focus_request(),
+    },
+    ouro.button { key = "scope", label = "Applications", on_press = refocus },
+  }
+end
+```
+
+The request runs after a successful build commits, including on initial mount.
+An unchanged token does not reclaim focus on later rebuilds. Omitted, `nil`, or
+zero means no request (not blur); returning from zero to a positive token requests
+again. Tokens must be non-negative Lua integers; booleans, strings, fractional
+numbers, and negative numbers are errors. Failed builds do not consume requests.
+Use a signal read by the content/component that declares the target; writing an
+ordinary Lua variable alone does not schedule a rebuild.
+
+`focus_request` works on `text_input`, `button`, `switch`, `checkbox`, `slider`,
+`listbox`, `radio_group`, `tab_bar`, `virtual_list` (viewport), and `split_view`
+(divider). The standard compositions forward it: `spinbox` to its input,
+`select` to its trigger, and `tabs` to its tab bar. Custom components must forward
+the prop to their intended focusable child.
+
+Requests obey visibility, enabled state, and the current modal focus boundary;
+read-only inputs remain focusable. Rejected requests are consumed, not deferred:
+change the token again after making the target eligible. If several widgets
+request focus in one build, the last eligible request in declaration order wins.
+Explicit requests run after autofocus and dialog focus setup. They only change
+focus within that window; they do not activate an OS window or grant keyboard
+access to a layer surface. Text, selection, and undo history stay retained with
+the widget; normal focus-loss/IME cancellation rules still apply.
+
 Widget defaults override shared controls/typography values. Explicit widget
 fields override those defaults; a text node's existing `size` prop takes precedence
 over `font_size`. Font sizes and theme heights must be positive; other metrics

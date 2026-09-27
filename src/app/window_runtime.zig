@@ -576,6 +576,7 @@ pub const WindowRuntime = struct {
         self.signals = signals;
         self.semantics.commitStaged();
         self.syncDialogFocus() catch unreachable;
+        self.applyFocusRequests() catch unreachable;
         while (self.router.takeEvent() != null) {}
         _ = self.frame_state.configure(prepared.size.?) catch unreachable;
         self.frame_state.invalidatePaint();
@@ -698,6 +699,7 @@ pub const WindowRuntime = struct {
                 _ = try self.focus.request(&self.instances, target);
                 try self.applyFocusVisual(previous, self.focus.current());
             }
+            try self.applyFocusRequests();
             for (0..self.buttons.slotCount()) |index|
                 if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
             try self.refreshListBoxVisuals();
@@ -1066,6 +1068,14 @@ pub const WindowRuntime = struct {
             current = try self.instances.parentOf(target);
         }
         return false;
+    }
+
+    fn applyFocusRequests(self: *WindowRuntime) !void {
+        const previous = self.focus.current();
+        while (self.instances.takeFocusRequest()) |target|
+            _ = try self.focus.request(&self.instances, target);
+        if (!std.meta.eql(previous, self.focus.current()))
+            try self.applyFocusVisual(previous, self.focus.current());
     }
 
     fn syncDialogFocus(self: *WindowRuntime) !void {

@@ -24,6 +24,8 @@ pub const Descriptor = struct {
     focusable: bool = false,
     /// Descendant instance to reveal after layout; null leaves scrolling alone.
     ensure_visible: ?u64 = null,
+    /// A changed nonzero token requests focus after the build commits.
+    focus_request: u64 = 0,
 };
 
 const State = enum { free, active, retiring };
@@ -43,6 +45,8 @@ const Slot = struct {
     ensure_visible: ?u64 = null,
     revealed: ?RevealGeometry = null,
     focusable: bool = false,
+    focus_request: u64 = 0,
+    focus_request_pending: bool = false,
     traversal_order: usize = 0,
     reconcile_child: ?render_object.NodeHandle = null,
     rebuild_children: bool = false,
@@ -331,6 +335,8 @@ pub const Tree = struct {
             slot.focusable = descriptor.focusable;
             slot.ensure_visible = descriptor.ensure_visible;
             if (descriptor.ensure_visible == null) slot.revealed = null;
+            slot.focus_request_pending = descriptor.focus_request != 0 and descriptor.focus_request != slot.focus_request;
+            slot.focus_request = descriptor.focus_request;
             slot.traversal_order = traversal_order;
             const previous = try self.render_tree.objectAt(slot.render.?);
             try self.render_tree.update(slot.render.?, descriptor.object);
@@ -441,6 +447,20 @@ pub const Tree = struct {
     pub fn isFocusable(self: *Tree, handle: InstanceHandle) bool {
         const slot = self.activeSlot(handle) catch return false;
         return slot.focusable and (self.render_tree.isVisible(slot.render.?) catch false);
+    }
+
+    /// Consume requests in declaration order, including ineligible targets:
+    /// rejected requests must not become delayed focus steals on later builds.
+    pub fn takeFocusRequest(self: *Tree) ?InstanceHandle {
+        var selected: ?usize = null;
+        for (self.slots, 0..) |slot, index| {
+            if (slot.state != .active or !slot.focus_request_pending) continue;
+            if (selected == null or slot.traversal_order < self.slots[selected.?].traversal_order)
+                selected = index;
+        }
+        const index = selected orelse return null;
+        self.slots[index].focus_request_pending = false;
+        return handleFor(self.slots[index], index);
     }
 
     pub fn nextFocusable(

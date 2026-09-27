@@ -25,7 +25,7 @@ ouro.spinbox = ouro.component(function(props)
     local enabled = props.enabled ~= false
     return ouro.row { key='control', gap=4, flex=props.flex,
       ouro.text_input { key='value', label=props.label, text=text, width=props.width or 100,
-        enabled=enabled, key_bindings={Up='previous', Down='next'},
+        enabled=enabled, focus_request=props.focus_request, key_bindings={Up='previous', Down='next'},
         on_change=function(value) draft:set({base=props.value, text=value}) end,
         on_command=function(command)
           if command == 'submit' then request(tonumber(text) or props.value)
@@ -88,6 +88,7 @@ ouro.select = ouro.component(function(props)
     return ouro.button {key='trigger', variant='surface', tone='neutral',
       label=(props.label and props.label .. ': ' or '') .. label,
       width=props.width or (props.flex == nil and 240 or nil), enabled=props.enabled, on_press=open, flex=props.flex,
+      focus_request=props.focus_request,
       ouro.row {key='content', gap=space.spacing_2, cross_alignment='center',
         ouro.text {key='value', text=label, flex=1, max_lines=1, overflow='ellipsis'},
         ouro.icon {key='chevron', bytes=chevron_down, width=16, height=16},
@@ -123,7 +124,7 @@ ouro.tabs = ouro.component(function(props)
     assert(type(props.on_select)=='function', 'tabs on_select must be a function')
     return ouro.column {key='control', flex=props.flex, gap=0, cross_alignment='stretch',
       ouro.scroll {key='strip', axis='horizontal',
-        ouro.tab_bar {key='bar', label=props.label, selected=props.selected, on_select=props.on_select, children=headers}},
+        ouro.tab_bar {key='bar', label=props.label, selected=props.selected, on_select=props.on_select, children=headers, focus_request=props.focus_request}},
       ouro.separator {key='rule'},
       ouro.stack {key='panels', flex=1, children=panels},
     }
