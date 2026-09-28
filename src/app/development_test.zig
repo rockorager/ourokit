@@ -641,10 +641,11 @@ test "multiline mode changes replace retained sessions even for equal uncontroll
 }
 
 test "focus rings follow keyboard navigation without changing logical pointer focus" {
+    const Color = @import("../core/color.zig").Color;
     const f = try Fixture.create(
         \\function build() return ouro.column {key='root', gap=8,
         \\ ouro.button {key='flat', label='Workspace', border_width=0},
-        \\ ouro.button {key='bordered', label='Bordered', border_width=1},
+        \\ ouro.button {key='bordered', label='Bordered', border_width=1, border='#123456'},
         \\ ouro.text_input {key='edit', default_text='Text'},
         \\} end
     );
@@ -667,7 +668,7 @@ test "focus rings follow keyboard navigation without changing logical pointer fo
     const bordered_render = try f.runtime.instances.renderObject(bordered);
     try std.testing.expectEqual(f.runtime.focus_color, (try f.runtime.tree.objectAt(bordered_render)).box.border_color.?);
     try f.play(.{ .click = "root/bordered" });
-    try std.testing.expectEqual(f.runtime.buttons.styleFor(bordered).?.border.?, (try f.runtime.tree.objectAt(bordered_render)).box.border_color.?);
+    try std.testing.expectEqual(Color.rgba(0x12, 0x34, 0x56, 255), (try f.runtime.tree.objectAt(bordered_render)).box.border_color.?);
     try f.play(.{ .click = "root/edit" });
     const edit_render = try f.runtime.instances.renderObject(f.runtime.focus.current().?);
     try std.testing.expectEqual(f.runtime.focus_color, (try f.runtime.tree.objectAt(edit_render)).box.border_color.?);

@@ -3,27 +3,9 @@ const Color = @import("../../core/color.zig").Color;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const Style = struct {
-    idle: Color,
-    hovered: Color,
-    pressed: Color,
-    disabled: Color,
-    border: ?Color = null,
-    focus: ?Color = null,
-    /// The activation owner has explicit descriptor paint bindings instead of
-    /// legacy native control chrome.
-    declarative: bool = false,
-};
-
-pub const VisualUpdate = struct {
-    target: instance.InstanceHandle,
-    color: Color,
-};
-
 const Entry = struct {
     owner: BuildOwnerHandle = .invalid,
     target: instance.InstanceHandle = .invalid,
-    style: Style = undefined,
     enabled: bool = false,
     hovered: bool = false,
     pressed: bool = false,
@@ -70,12 +52,10 @@ pub const Buttons = struct {
         self: *Buttons,
         owner: BuildOwnerHandle,
         target: instance.InstanceHandle,
-        style: Style,
         is_enabled: bool,
     ) void {
         for (self.entries) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
-            entry.style = style;
             entry.enabled = is_enabled;
             entry.seen = true;
             if (!is_enabled) {
@@ -88,7 +68,6 @@ pub const Buttons = struct {
             entry.* = .{
                 .owner = owner,
                 .target = target,
-                .style = style,
                 .enabled = is_enabled,
                 .active = true,
                 .seen = true,
@@ -96,11 +75,6 @@ pub const Buttons = struct {
             return;
         };
         unreachable;
-    }
-
-    pub fn styleFor(self: *const Buttons, target: instance.InstanceHandle) ?Style {
-        for (self.entries) |entry| if (entry.active and same(entry.target, target)) return entry.style;
-        return null;
     }
 
     pub fn finishOwner(self: *Buttons, owner: BuildOwnerHandle) void {
@@ -134,44 +108,31 @@ pub const Buttons = struct {
         return self.find(target).?.enabled;
     }
 
-    pub fn setHovered(self: *Buttons, target: instance.InstanceHandle, value: bool) ?Color {
+    pub fn setHovered(self: *Buttons, target: instance.InstanceHandle, value: bool) ?instance.InstanceHandle {
         const entry = self.find(target).?;
         if (entry.hovered == value) return null;
         entry.hovered = value;
-        return color(entry.*);
+        return target;
     }
 
-    pub fn setPressed(self: *Buttons, target: instance.InstanceHandle, value: bool) ?Color {
+    fn setPressed(self: *Buttons, target: instance.InstanceHandle, value: bool) ?instance.InstanceHandle {
         const entry = self.find(target).?;
         const next = value and entry.enabled;
         if (entry.pressed == next) return null;
         entry.pressed = next;
-        return color(entry.*);
+        return target;
     }
 
-    pub fn press(self: *Buttons, target: instance.InstanceHandle) ?VisualUpdate {
+    pub fn press(self: *Buttons, target: instance.InstanceHandle) ?instance.InstanceHandle {
         if (!self.isEnabled(target)) return null;
         self.armed = target;
-        const next = self.setPressed(target, true) orelse return null;
-        return .{ .target = target, .color = next };
+        return self.setPressed(target, true);
     }
 
-    pub fn release(self: *Buttons) ?VisualUpdate {
+    pub fn release(self: *Buttons) ?instance.InstanceHandle {
         const armed = self.armed orelse return null;
         self.armed = null;
-        const next = self.setPressed(armed, false);
-        return if (next) |value| .{ .target = armed, .color = value } else null;
-    }
-
-    pub fn releaseKeyboard(self: *Buttons) ?VisualUpdate {
-        const armed = self.armed orelse return null;
-        self.armed = null;
-        const next = self.setPressed(armed, false);
-        return if (next) |value| .{ .target = armed, .color = value } else null;
-    }
-
-    pub fn currentColor(self: *const Buttons, target: instance.InstanceHandle) Color {
-        return color(self.find(target).?.*);
+        return self.setPressed(armed, false);
     }
 
     pub fn paintColor(self: *const Buttons, target: instance.InstanceHandle, paint: instance.InteractionPaint) ?Color {
@@ -182,10 +143,9 @@ pub const Buttons = struct {
         return paint.idle;
     }
 
-    pub fn visualAt(self: *const Buttons, index: usize) ?VisualUpdate {
+    pub fn targetAt(self: *const Buttons, index: usize) ?instance.InstanceHandle {
         if (index >= self.entries.len or !self.entries[index].active) return null;
-        const entry = self.entries[index];
-        return .{ .target = entry.target, .color = color(entry) };
+        return self.entries[index].target;
     }
 
     pub fn slotCount(self: *const Buttons) usize {
@@ -198,45 +158,79 @@ pub const Buttons = struct {
     }
 };
 
-fn color(entry: Entry) Color {
-    if (!entry.enabled) return entry.style.disabled;
-    if (entry.pressed) return entry.style.pressed;
-    if (entry.hovered) return entry.style.hovered;
-    return entry.style.idle;
-}
-
 fn same(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
-test "Button state preserves identity and resolves interaction colors" {
+test "activation updates report changed targets and preserve state across rebuilds" {
     var buttons: Buttons = undefined;
     try buttons.init(std.testing.allocator, 1);
     defer buttons.deinit();
+    defer buttons.clear();
     const owner: BuildOwnerHandle = .{ .slot = 1, .generation = 2 };
     const target: instance.InstanceHandle = .{ .slot = 3, .generation = 4 };
-    const style: Style = .{
-        .idle = Color.rgba(1, 0, 0, 255),
-        .hovered = Color.rgba(2, 0, 0, 255),
-        .pressed = Color.rgba(3, 0, 0, 255),
-        .disabled = Color.rgba(4, 0, 0, 255),
+    buttons.beginOwner(owner);
+    buttons.set(owner, target, true);
+    buttons.finishOwner(owner);
+    try std.testing.expectEqual(target, buttons.targetAt(0).?);
+    try std.testing.expectEqual(null, buttons.targetAt(1));
+    try std.testing.expectEqual(null, buttons.setHovered(target, false));
+    try std.testing.expectEqual(target, buttons.setHovered(target, true).?);
+    try std.testing.expectEqual(null, buttons.setHovered(target, true));
+    // Even an owner without paint must report activation changes.
+    try std.testing.expectEqual(target, buttons.press(target).?);
+    try std.testing.expectEqual(null, buttons.press(target));
+    buttons.beginOwner(owner);
+    buttons.set(owner, target, true);
+    buttons.finishOwner(owner);
+    try std.testing.expectEqual(null, buttons.press(target));
+    try std.testing.expectEqual(target, buttons.release().?);
+    try std.testing.expectEqual(null, buttons.release());
+    try std.testing.expectEqual(target, buttons.press(target).?);
+    buttons.beginOwner(owner);
+    buttons.finishOwner(owner);
+    try std.testing.expectEqual(null, buttons.release());
+    try std.testing.expectEqual(null, buttons.targetAt(0));
+    try std.testing.expect(!buttons.contains(target));
+}
+
+test "activation resolves each descriptor paint independently and disabling cancels presses" {
+    var buttons: Buttons = undefined;
+    try buttons.init(std.testing.allocator, 1);
+    defer buttons.deinit();
+    defer buttons.clear();
+    const owner: BuildOwnerHandle = .{ .slot = 1, .generation = 2 };
+    const target: instance.InstanceHandle = .{ .slot = 3, .generation = 4 };
+    const background: instance.InteractionPaint = .{
+        .source = 17,
+        .idle = Color.rgba(13, 0, 0, 255),
+        .hover = Color.rgba(29, 0, 0, 255),
+        .pressed = Color.rgba(47, 0, 0, 255),
+        .disabled = Color.rgba(61, 0, 0, 255),
     };
-    buttons.beginOwner(owner);
-    buttons.set(owner, target, style, true);
-    buttons.finishOwner(owner);
-    try std.testing.expectEqual(@as(u8, 1), buttons.currentColor(target).r);
-    try std.testing.expectEqual(@as(u8, 2), buttons.setHovered(target, true).?.r);
-    try std.testing.expectEqual(@as(u8, 3), buttons.press(target).?.color.r);
-    buttons.beginOwner(owner);
-    buttons.set(owner, target, style, true);
-    buttons.finishOwner(owner);
-    try std.testing.expectEqual(@as(u8, 3), buttons.currentColor(target).r);
-    const release = buttons.release();
-    try std.testing.expectEqual(@as(u8, 2), release.?.color.r);
+    const foreground: instance.InteractionPaint = .{
+        .source = 17,
+        .idle = Color.rgba(83, 0, 0, 255),
+        .hover = Color.rgba(101, 0, 0, 255),
+    };
+    buttons.set(owner, target, true);
+    try std.testing.expectEqual(@as(u8, 13), buttons.paintColor(target, background).?.r);
+    try std.testing.expectEqual(@as(u8, 83), buttons.paintColor(target, foreground).?.r);
+    _ = buttons.setHovered(target, true);
+    try std.testing.expectEqual(@as(u8, 29), buttons.paintColor(target, background).?.r);
+    try std.testing.expectEqual(@as(u8, 101), buttons.paintColor(target, foreground).?.r);
     _ = buttons.press(target);
-    _ = buttons.release();
-    _ = buttons.press(target);
-    const keyboard_release = buttons.releaseKeyboard();
-    try std.testing.expectEqual(@as(u8, 2), keyboard_release.?.color.r);
-    buttons.clear();
+    try std.testing.expectEqual(@as(u8, 47), buttons.paintColor(target, background).?.r);
+    try std.testing.expectEqual(@as(u8, 101), buttons.paintColor(target, foreground).?.r);
+    // A rebuild disabling the armed owner clears the press, not its hover.
+    buttons.set(owner, target, false);
+    try std.testing.expectEqual(null, buttons.release());
+    try std.testing.expectEqual(null, buttons.press(target));
+    try std.testing.expectEqual(@as(u8, 61), buttons.paintColor(target, background).?.r);
+    try std.testing.expectEqual(@as(u8, 83), buttons.paintColor(target, foreground).?.r);
+    buttons.set(owner, target, true);
+    try std.testing.expectEqual(@as(u8, 29), buttons.paintColor(target, background).?.r);
+    try std.testing.expectEqual(target, buttons.setHovered(target, false).?);
+    try std.testing.expectEqual(@as(u8, 13), buttons.paintColor(target, background).?.r);
+    try std.testing.expectEqual(@as(u8, 83), buttons.paintColor(target, foreground).?.r);
 }

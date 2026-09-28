@@ -526,7 +526,6 @@ pub const WindowRuntime = struct {
         for (prepared.prepared_buttons[0..prepared.button_count]) |button| self.buttons.set(
             self.root_owner,
             self.instances.handleForId(button.id).?,
-            button.style,
             button.enabled,
         );
         self.buttons.finishOwner(self.root_owner);
@@ -545,7 +544,7 @@ pub const WindowRuntime = struct {
         ) catch unreachable;
         self.listboxes.finishOwner(self.root_owner);
         for (0..self.buttons.slotCount()) |index|
-            if (self.buttons.visualAt(index)) |visual| self.applyButtonUpdate(visual) catch unreachable;
+            if (self.buttons.targetAt(index)) |target| self.applyButtonUpdate(target) catch unreachable;
         self.refreshListBoxVisuals() catch unreachable;
 
         self.text_inputs.removeInactive(&self.instances);
@@ -699,7 +698,7 @@ pub const WindowRuntime = struct {
             }
             try self.applyFocusRequests();
             for (0..self.buttons.slotCount()) |index|
-                if (self.buttons.visualAt(index)) |visual| try self.applyButtonUpdate(visual);
+                if (self.buttons.targetAt(index)) |target| try self.applyButtonUpdate(target);
             try self.refreshListBoxVisuals();
             try self.applyFocusVisual(null, self.focus.current());
             self.virtual_lists = lua_ui.virtual_lists;
@@ -1410,7 +1409,7 @@ pub const WindowRuntime = struct {
                 try self.applyButtonUpdate(self.buttons.press(focused));
                 try self.spawnButtonCallback(callback_service, focused);
             },
-            .released => try self.applyButtonUpdate(self.buttons.releaseKeyboard()),
+            .released => try self.applyButtonUpdate(self.buttons.release()),
             .repeated => {},
         } else if (key.translated.logical == .enter and key.state == .pressed) {
             const focused = self.focus.current() orelse return;
@@ -1736,9 +1735,9 @@ pub const WindowRuntime = struct {
     fn updateButtonState(self: *WindowRuntime, event: ui.input.Event) !?ui.instance.InstanceHandle {
         switch (event) {
             .hover_enter => |hover| if (try self.buttonAncestor(hover.target)) |button|
-                try self.applyButtonColor(button, self.buttons.setHovered(button, true)),
+                try self.applyButtonUpdate(self.buttons.setHovered(button, true)),
             .hover_leave => |hover| if (try self.buttonAncestor(hover.target)) |button|
-                try self.applyButtonColor(button, self.buttons.setHovered(button, false)),
+                try self.applyButtonUpdate(self.buttons.setHovered(button, false)),
             .pointer => |pointer| switch (pointer.event) {
                 .button => |button_event| {
                     if (button_event.button != 0x110) return null;
@@ -2257,25 +2256,6 @@ pub const WindowRuntime = struct {
         }
     }
 
-    fn applyButtonColor(
-        self: *WindowRuntime,
-        button: ui.instance.InstanceHandle,
-        next: ?core.Color,
-    ) !void {
-        const color = next orelse return;
-        if (self.buttons.styleFor(button).?.declarative) {
-            return self.applyInteractionPaint(button, self.keyboard_focus_visible and
-                if (self.focus.current()) |focused| sameHandle(focused, button) else false);
-        }
-        const render = try self.instances.renderObject(button);
-        var object = try self.tree.objectAt(render);
-        if (object != .box) return error.ButtonRenderObjectMismatch;
-        if (std.meta.eql(object.box.background, color)) return;
-        object.box.background = color;
-        try self.tree.update(render, object);
-        self.frame_state.invalidatePaint();
-    }
-
     fn applyInteractionPaint(self: *WindowRuntime, target: ui.instance.InstanceHandle, focused: bool) !void {
         const id = try self.instances.semanticId(target);
         const selection = self.listboxes.option(target) != null;
@@ -2304,9 +2284,10 @@ pub const WindowRuntime = struct {
         }
     }
 
-    fn applyButtonUpdate(self: *WindowRuntime, update: ?ui.widget.ButtonVisualUpdate) !void {
-        const value = update orelse return;
-        try self.applyButtonColor(value.target, value.color);
+    fn applyButtonUpdate(self: *WindowRuntime, update: ?ui.instance.InstanceHandle) !void {
+        const target = update orelse return;
+        try self.applyInteractionPaint(target, self.keyboard_focus_visible and
+            if (self.focus.current()) |focused| sameHandle(focused, target) else false);
     }
 
     fn refreshListBoxVisuals(self: *WindowRuntime) !void {
@@ -2391,7 +2372,7 @@ pub const WindowRuntime = struct {
 
     fn setFocusBorder(self: *WindowRuntime, target: ui.instance.InstanceHandle, requested: bool) !void {
         const focused = requested and (self.keyboard_focus_visible or self.text_inputs.contains(target));
-        if (self.buttons.styleFor(target)) |style| if (style.declarative)
+        if (self.buttons.contains(target))
             return self.applyInteractionPaint(target, focused);
         if (self.listboxes.contains(target)) {
             for (0..self.listboxes.optionSlots()) |index| {
@@ -2406,10 +2387,7 @@ pub const WindowRuntime = struct {
         const color = if (self.text_inputs.contains(target)) blk: {
             const behavior = try self.text_inputs.getBehavior(target);
             break :blk if (focused) behavior.focus_color orelse self.focus_color else behavior.border_color orelse self.border_color;
-        } else if (self.buttons.styleFor(target)) |style|
-            (if (focused) style.focus else style.border) orelse return
-        else
-            return;
+        } else return;
         try self.setControlBorder(target, color, focused);
     }
 

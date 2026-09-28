@@ -4,7 +4,6 @@ const core = @import("../core/root.zig");
 const instance = @import("../ui/instance/tree.zig");
 const input = @import("../ui/input/bindings.zig");
 const semantics = @import("../ui/semantics/snapshot.zig");
-const buttons = @import("../ui/widget/buttons.zig");
 const text_input = @import("../ui/text_input/root.zig");
 const text = @import("../text/root.zig");
 
@@ -23,7 +22,6 @@ pub const Handler = struct {
 pub const Button = struct {
     id: u64,
     enabled: bool,
-    style: buttons.Style,
 };
 
 pub const TextInput = struct {

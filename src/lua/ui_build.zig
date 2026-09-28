@@ -15,7 +15,6 @@ const build_owner = @import("../ui/instance/build_owner.zig");
 const instance = @import("../ui/instance/tree.zig");
 const PointerBindings = @import("../ui/input/bindings.zig").PointerBindings;
 const Buttons = @import("../ui/widget/buttons.zig").Buttons;
-const ButtonStyle = @import("../ui/widget/buttons.zig").Style;
 const TextInputs = @import("../ui/text_input/registry.zig").Registry;
 const TextInputValueMode = @import("../ui/text_input/registry.zig").ValueMode;
 const TextInputSession = @import("../ui/text_input/session.zig").Session;
@@ -38,7 +37,6 @@ const PendingHandler = struct {
 const PendingButton = struct {
     id: u64,
     enabled: bool,
-    style: ButtonStyle,
 };
 const ListBoxAppearance = enum { default, sidebar };
 const PendingListBox = struct { id: u64, selected: i64, appearance: ListBoxAppearance, enabled: bool = true };
@@ -366,7 +364,6 @@ pub const UiBuild = struct {
         for (self.pending_buttons[0..self.pending_button_count]) |pending| buttons.set(
             owner,
             tree.handleForId(pending.id).?,
-            pending.style,
             pending.enabled,
         );
         buttons.finishOwner(owner);
@@ -480,7 +477,6 @@ pub const UiBuild = struct {
         ) |source, *destination| destination.* = .{
             .id = source.id,
             .enabled = source.enabled,
-            .style = source.style,
         };
         prepared.button_count = self.pending_button_count;
         for (
@@ -1303,17 +1299,9 @@ pub const UiBuild = struct {
         self.popParent();
         // The resize slot owns input and semantics, but no visual recipe.
         // Its child inherits native interaction state for declarative paint.
-        const clear = @import("../core/color.zig").Color.rgba(0, 0, 0, 0);
-        const style: ButtonStyle = .{
-            .idle = clear,
-            .hovered = clear,
-            .pressed = clear,
-            .disabled = clear,
-            .declarative = true,
-        };
         self.append(.{ .id = divider, .parent = id, .focusable = true, .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)), .object = .{ .box = .{} } }) catch return luaError(state, "cannot append split divider");
         if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "button capacity exceeded");
-        self.pending_buttons[self.pending_button_count] = .{ .id = divider, .enabled = true, .style = style };
+        self.pending_buttons[self.pending_button_count] = .{ .id = divider, .enabled = true };
         self.pending_button_count += 1;
         self.appendSemantic(.{ .id = divider, .parent = id, .role = .separator, .key = "divider" }) catch return luaError(state, "cannot append split divider semantics");
         self.stageCallback(state, divider, "on_change", .split_change) catch |err| return luaError(state, @errorName(err));
@@ -1537,17 +1525,7 @@ pub const UiBuild = struct {
             c.lua_settop(state, -3);
             if (press_type != c.type_nil and change_type != c.type_nil)
                 return luaError(state, "activation accepts on_press or on_change, not both");
-            const clear = @import("../core/color.zig").Color.rgba(0, 0, 0, 0);
-            const idle = visual.background orelse surface.value orelse clear;
-            self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled, .style = .{
-                .idle = idle,
-                .hovered = if (paint) |p| p.hover orelse idle else idle,
-                .pressed = if (paint) |p| p.pressed orelse p.hover orelse idle else idle,
-                .disabled = if (paint) |p| p.disabled orelse idle else idle,
-                .border = visual.border orelse theme.border,
-                .focus = if (paint) |p| p.focus else null,
-                .declarative = true,
-            } };
+            self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled };
             self.pending_button_count += 1;
             if (activate) self.stageCallback(state, id, "on_press", .button) catch |err| return luaError(state, @errorName(err));
             self.stageCallback(state, id, "on_change", if (range != null) .range_change else .@"switch") catch |err| return luaError(state, @errorName(err));
@@ -2764,7 +2742,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
     try std.testing.expectEqual(.button, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_button_count);
-    try std.testing.expectEqual(design.tokens.dark.disabled, ui.pending_buttons[0].style.disabled);
+    try std.testing.expectEqual(design.tokens.dark.disabled, descriptors[7].interaction_paint.?.disabled.?);
     try std.testing.expectEqual(@as(usize, 6), ui.semanticDescriptors().len);
     try std.testing.expectEqualStrings("Controls", ui.semanticDescriptors()[3].label);
     try std.testing.expectEqualStrings("Benchmark", ui.semanticDescriptors()[5].label);
