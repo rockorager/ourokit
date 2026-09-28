@@ -640,7 +640,6 @@ pub const UiBuild = struct {
             .canvas => emitCanvas,
             .icon => emitIcon,
             .text_editor => emitTextEditor,
-            .secure_entry => emitSecureEntry,
             .split => emitSplit,
             .box => emitBox,
             .stack => emitStack,
@@ -1035,69 +1034,6 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn emitSecureEntry(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
-        const visual = theming.widgetOverrides(state, .{}, true) catch |err| return luaError(state, @errorName(err));
-        const parent = self.currentParent() orelse return luaError(state, "secure_entry requires a widget parent");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "secure_entry key is required");
-        const input = @import("auth.zig").inputFromTable(state, 1) catch |err| return luaError(state, @errorName(err));
-        inline for (.{ "text", "value", "default_text", "on_change", "key_bindings", "placeholder" }) |name| {
-            const kind = c.lua_getfield(state, 1, name);
-            c.lua_settop(state, -2);
-            if (kind != c.type_nil) return luaError(state, "secure_entry never accepts text or text handlers");
-        }
-        const width = tableOptionalSize(state, 1, "width", .fill) orelse return luaError(state, "invalid secure_entry width");
-        const height = tableOptionalSize(state, 1, "height", .auto) orelse return luaError(state, "invalid secure_entry height");
-        const padding = tableOptionalExtent(state, 1, "padding", 0) orelse return luaError(state, "invalid secure_entry padding");
-        const padding_y = tableOptionalExtent(state, 1, "padding_y", padding) orelse return luaError(state, "invalid secure_entry padding_y");
-        const alignment = tableOptionalBoxAlignment(state, 1) orelse return luaError(state, "invalid secure_entry alignment");
-        const padding_x = visual.padding_x orelse padding;
-        const autofocus = tableOptionalBoolean(state, 1, "autofocus", true) orelse return luaError(state, "invalid auth_input autofocus");
-        const target = semanticId(key, 0x61757468696e ^ parent.id ^ self.component_namespace);
-        const content = semanticId(key, 0x6d61736b ^ target);
-        self.append(.{
-            .id = target,
-            .parent = parent.id,
-            .object = .{ .box = .{
-                .width = width.extent(),
-                .fill_width = width.isFill(),
-                .height = height.extent(),
-                .fill_height = height.isFill(),
-                .padding = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y },
-                .alignment = alignment.value,
-                .background = visual.background,
-                .border_color = visual.border,
-                .border_width = visual.border_width orelse 0,
-                .corner_radius = visual.radius orelse 0,
-            } },
-            .focusable = true,
-            .focus_request = if (autofocus) input.prompt else 0,
-            .auth_input = input,
-            .parent_data = declarativeParentData(self, state, 1) catch |err| return luaError(state, parentDataErrorMessage(err)),
-        }) catch return luaError(state, "cannot append auth_input");
-        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
-        const source = sources.acquire(.{ .utf8 = @import("../ui/widget/auth_input.zig").mask, .language = "und", .logical_size = visual.font_size orelse self.currentStyle().?.typography.size orelse design.tokens.foundation.typography_2, .candidates = self.themedFonts(false) catch |err| return luaError(state, @errorName(err)), .configuration_revision = self.text_configuration_revision }) catch return luaError(state, "cannot retain authentication mask");
-        self.append(.{ .id = content, .parent = target, .object = .{ .text = .{ .source = source, .color = visual.foreground orelse theme.foreground } } }) catch {
-            sources.release(source) catch unreachable;
-            return luaError(state, "cannot append authentication mask");
-        };
-        self.sources_staged = true;
-        self.appendSemantic(.{ .id = target, .parent = semanticParent(parent), .role = .text_field, .key = key, .label = "Secure authentication", .enabled = true }) catch return luaError(state, "cannot append auth_input semantics");
-        inline for (.{ "on_submit", "on_cancel", "on_error" }, .{ .auth_submit, .auth_cancel, .auth_error }) |name, kind| {
-            const callback_type = c.lua_getfield(state, 1, name);
-            if (callback_type != c.type_nil) {
-                if (callback_type != c.type_function) return luaError(state, "auth_input callback must be a function");
-                if (self.pending_handler_count == self.pending_handlers.len) return luaError(state, "input handler capacity exceeded");
-                c.lua_pushvalue(state, -1);
-                self.pending_handlers[self.pending_handler_count] = .{ .id = target, .reference = c.luaL_ref(state, c.registry_index), .kind = kind };
-                self.pending_handler_count += 1;
-            }
-            c.lua_settop(state, -2);
-        }
-        return 0;
-    }
-
     fn emitTextEditor(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1115,11 +1051,26 @@ pub const UiBuild = struct {
             return luaError(state, "text_input placeholder must be a string");
         const label = tableOptionalString(state, 1, "label") orelse
             return luaError(state, "text_input label must be a string");
-        if (controlled.present == uncontrolled.present)
+        // A conversation binds the field to an authentication prompt: its
+        // text goes natively to PAM on submit and never reaches Lua.
+        const conversation_type = c.lua_getfield(state, 1, "conversation");
+        c.lua_settop(state, -2);
+        const secret: ?@import("../ui/text_input/secret.zig").Secret = if (conversation_type == c.type_nil) null else @import("auth.zig").secretFromTable(state, 1) catch |err| return luaError(state, @errorName(err));
+        const mask = tableOptionalBoolean(state, 1, "mask", secret != null) orelse
+            return luaError(state, "text_input mask must be a boolean");
+        if (secret != null) {
+            if (!mask) return luaError(state, "text_input with a conversation must be masked");
+            if (controlled.present or uncontrolled.present)
+                return luaError(state, "text_input with a conversation never accepts text or default_text");
+            const change_type = c.lua_getfield(state, 1, "on_change");
+            c.lua_settop(state, -2);
+            if (change_type != c.type_nil) return luaError(state, "text_input with a conversation never accepts on_change");
+        } else if (controlled.present == uncontrolled.present)
             return luaError(state, "text_input requires exactly one of text or default_text");
         const mode: TextInputValueMode = if (controlled.present) .controlled else .uncontrolled;
         const multiline = tableOptionalBoolean(state, 1, "multiline", false) orelse
             return luaError(state, "text_input multiline must be a boolean");
+        if (mask and multiline) return luaError(state, "text_input mask requires a single-line field");
         const width = tableOptionalSize(state, 1, "width", .fill) orelse
             return luaError(state, "invalid text_input width");
         const height = tableOptionalSize(state, 1, "height", .auto) orelse
@@ -1161,15 +1112,29 @@ pub const UiBuild = struct {
             .target_id = target_id,
             .content_id = content_id,
             .mode = mode,
-            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border, .focus_color = visual.focus orelse theme.ring },
-            .session = TextInputSession.initWithMode(
-                sources.allocator,
-                if (controlled.present) controlled.value else uncontrolled.value,
-                multiline,
-            ) catch return luaError(state, "cannot create text_input session"),
+            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border, .focus_color = visual.focus orelse theme.ring, .secret = secret },
+            .session = if (mask)
+                TextInputSession.initSecret(sources.allocator) catch return luaError(state, "cannot create masked text_input session")
+            else
+                TextInputSession.initWithMode(
+                    sources.allocator,
+                    if (controlled.present) controlled.value else uncontrolled.value,
+                    multiline,
+                ) catch return luaError(state, "cannot create text_input session"),
         };
-        const initial = self.pending_text_inputs[self.pending_text_input_count].session.?.model.text();
+        const pending_session = &self.pending_text_inputs[self.pending_text_input_count].session.?;
         self.pending_text_input_count += 1;
+        if (mask and secret == null) {
+            const value = if (controlled.present) controlled.value else uncontrolled.value;
+            _ = pending_session.model.replaceSelection(value) catch return luaError(state, "invalid masked text_input text");
+        }
+        // Masked fields draw one dot per grapheme; the value stays in the session.
+        var mask_buffer: [@import("../ui/text_input/model.zig").secret_capacity * 3]u8 = undefined;
+        const initial = if (mask) blk: {
+            const count = pending_session.model.graphemeCount();
+            for (0..count) |i| @memcpy(mask_buffer[i * 3 ..][0..3], "•");
+            break :blk mask_buffer[0 .. count * 3];
+        } else pending_session.model.text();
         self.append(.{
             .id = target_id,
             .parent = parent.id,
@@ -1235,7 +1200,7 @@ pub const UiBuild = struct {
             .parent = semanticParent(parent),
             .role = .text_field,
             .key = key,
-            .label = if (label.present) label.value else initial,
+            .label = if (label.present) label.value else if (mask) (if (placeholder.present) placeholder.value else "Password") else initial,
             .enabled = enabled,
         }) catch return luaError(state, "cannot append text_input semantics");
 

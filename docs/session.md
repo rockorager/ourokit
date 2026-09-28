@@ -182,47 +182,46 @@ while true do
 end
 ```
 
-Render each prompt with native credential entry, never `text_input`:
+Render each prompt with a masked `text_input` bound to the conversation:
 
 ```lua
 local p = prompt() -- read the credential-free signal in the content builder
-ouro.auth_input {
+ouro.text_input {
   key="password", conversation=p.conversation, prompt_id=p.prompt_id,
-  autofocus=true, -- default; width and height are optional
-  on_submit=function() end,
-  on_cancel=function() prompt:set(nil) end,
-  on_error=function(code) show_entry_error(code) end,
+  placeholder="Password", autofocus=true,
+  on_command=function(command)
+    -- "submit": sent to PAM; "stale": the prompt had already ended;
+    -- "cancel": Escape cleared the field.
+  end,
 }
 ```
 
-`ouro.auth_input` is the standard Lua field recipe over `ouro.secure_entry`.
-The native primitive accepts the same conversation, prompt, autofocus, and
-nonsecret callbacks. It has no default background, border, radius, padding,
-or fixed height; width defaults to `fill`. Customize its `height`, `padding`,
-`padding_x`, `padding_y`, `alignment`, `background`, `border`, `border_width`,
-`radius`, `foreground`, and `font_size`, or compose surrounding content with
-ordinary layout primitives. General theme typography and foreground apply to
-the unstyled mask; the stock recipe keeps its standard font size and metrics.
-Keeping the same parent, key, conversation, and prompt preserves the native
-credential buffer when switching between the recipe and primitive.
+A `conversation` makes the field masked and binds it to that prompt. It is
+the ordinary text field, with the same caret, selection, scrolling, key
+bindings, theme overrides and placeholder, drawing one dot per grapheme. Its
+text never reaches Lua: it accepts no `text`, `default_text` or `on_change`,
+and Enter sends the bytes natively to PAM, wipes the field and then calls
+`on_command("submit")`. Escape wipes the field and calls
+`on_command("cancel")`; cancel the conversation there if appropriate. A
+submit for an ended prompt reports `"stale"`.
 
-Neither API accepts children or a replacement mask. Styling changes only the
-presentation of the native constant mask; it never exposes credential text,
-length, selection, or ordinary text-editor behavior to Lua.
+The bytes live in one locked, `MADV_DONTDUMP` page per field, capped at 512,
+and are edited in place: removed bytes are wiped and no undo history, input
+method, clipboard copy or paste, or temporary heap copy is used. Word movement
+treats the value as one word. Ctrl+U clears. Each output's field keeps its own
+buffer; a new prompt, a mask change or unmounting wipes it, including removal
+caused by output unplug. Inspection exposes the label and a null
+value/selection; capture and synthetic input reject the entire affected window
+with `SecureInputProtected`, including playback already in progress.
 
-`auth_input` always renders the same eight-dot mask, even while empty and for
-echo-on prompts. It has no getters, length, `on_change`, `value`, `text`,
-`default_text`, placeholder, or key bindings. Native editing is UTF-8 and
-limited to 512 bytes. Enter submits; Escape clears and cancels; Ctrl+A selects
-all; Ctrl+U clears; Backspace/Delete and cursor/home/end edit natively. There is
-no clipboard, IME, undo, history, development capture, or synthetic-input path.
-The app may retain only credential-free signals and prompt-table metadata.
-Each output has its own focus/UI tree, but controls bound to the same
-conversation and prompt share one native buffer. Removing/rebinding a control
-clears that buffer, including removal caused by output unplug. Inspection
-exposes a fixed label and null value/selection, never credentials or length;
-capture and synthetic input reject the entire affected window with
-`SecureInputProtected`, including playback already in progress.
+Style it like any `text_input` (`height`, `padding_x`, `radius`,
+`background`, `border`, `border_width`, `foreground`, `font_size`); keeping
+the same parent, key, conversation and prompt preserves the entered text
+across chrome changes.
+
+`mask = true` without a conversation gives an ordinary password field: the
+same masking and storage, but its value reaches Lua through `on_change` and
+`text` like any field, and paste is allowed.
 
 `start(service, username)` returns owned conversation userdata or `nil, error`.
 Choose a distribution-installed PAM service appropriate to screen unlock and
@@ -239,9 +238,9 @@ or elevate the process. Account denial/expired credentials fail authentication.
 - `{type="result", success=boolean, reason=string}` (terminal). Reasons are
   `success`, `denied`, `unavailable`, `canceled`, `timeout`, and `worker_failed`.
 
-There is no `respond` API; Lua never receives credential bytes. Non-secret
-buttons may call `auth:submit(id)` or `auth:clear_input(id)`, returning `true`
-or `nil, error`. Stale/duplicate IDs are rejected. Submitted does not mean
+There is no Lua `respond` or `submit` API; Lua never receives credential
+bytes. Only a masked `text_input` bound to the conversation responds, and
+stale/duplicate prompt IDs are rejected. Submitted does not mean
 authenticated: only a later `success=true` result permits unlock, and no error
 ever unlocks. Explicit cancel makes the next read `nil, "ConversationClosed"`.
 Close, `<close>`, GC, task cancellation, and retirement suppress success. Only
@@ -264,13 +263,14 @@ group receives TERM for 200 ms and KILL with a 500 ms bounded wait. A bounded
 32-slot PID-only reaper handles kernel-uninterruptible workers, avoiding
 indefinite pthread cancellation and shutdown waits.
 
-Startup locks and `MADV_DONTDUMP`s entry mappings and permanently disables
-shell dumps and unprivileged ptrace; workers disable dumps too. Native staging
-is bounded and wiped after transfer, cancellation, and destruction. Trusted PAM
+Starting a conversation permanently disables shell dumps and unprivileged
+ptrace; workers disable dumps too. Masked fields hold responses in locked,
+dump-excluded pages. Native staging is bounded and wiped after transfer,
+cancellation, and destruction. Trusted PAM
 owns returned response allocations. PAM modules, privileged system processes,
 and privileged inspectors are trusted; this does not claim safety against
-arbitrary malicious PAM. Never substitute ordinary `text_input`, Lua strings,
-logs, task results, clipboard, or persistence for `auth_input`.
+arbitrary malicious PAM. Never route credentials through Lua strings, logs,
+task results, clipboard, or persistence; bind the masked `text_input` instead.
 
 ## Application-scoped tasks
 

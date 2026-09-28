@@ -57,25 +57,29 @@ return o.app {id='dev.ourokit.secure-entry', theme={color_scheme='dark'}, run=fu
         o.text{key='prompt', text=p and p.text or 'Awaiting secure lock'},
       }
       if p then
-        local properties = {key='credential', conversation=auth, prompt_id=p.id, width=240,
-          on_submit=function(...) assert(select('#', ...) == 0); submissions=submissions+1 end,
-          on_cancel=function(...) assert(select('#', ...) == 0); cancellations=cancellations+1 end,
-          on_error=function(code) error(code) end}
+        local properties = {key='credential', conversation=auth, prompt_id=p.id, width=240, autofocus=true,
+          on_command=function(command, ...)
+            assert(select('#', ...) == 0)
+            if command == 'submit' then submissions=submissions+1
+            elseif command == 'cancel' then cancellations=cancellations+1; auth:cancel()
+            else error(command) end
+          end}
         if REJECT_FIELD then properties[REJECT_FIELD] = false end
         if custom_chrome() then
           properties.height=46; properties.font_size=20; properties.foreground='#fedcba'
           if output == 'TEST-1' then
-            properties.padding_x=13; properties.padding_y=7; properties.radius=9
-            properties.background='#123456'; properties.border='#789abc'; properties.border_width=3
+            properties.padding_x=13; properties.radius=9
+            -- A focused text_input draws its border in the focus color.
+            properties.background='#123456'; properties.border='#789abc'; properties.focus='#789abc'; properties.border_width=3
           end
         end
-        children[#children+1] = (custom_chrome() and o.secure_entry or o.auth_input)(properties)
+        children[#children+1] = o.text_input(properties)
         if CUSTOM_MODE then
           children[#children+1] = o.button{key='restyle',label='Custom chrome',
             on_press=function() custom_chrome:set(true) end}
         end
       end
-      children[#children+1] = o.text{key='note', text='Disposable PAM fixture; always masked, including echo-on'}
+      children[#children+1] = o.text{key='note', text='Disposable PAM fixture; masked text_input, including echo-on'}
       return o.column{key='root', children=children}
     end}}
   end}
@@ -128,7 +132,7 @@ def wait_prompt(env, endpoint, text):
         if result.returncode == 0:
             windows = json.loads(result.stdout)['windows']
             windows = [json.loads(dev(env, endpoint, 'inspect', {'window': w['window']}).stdout)['windows'][0] for w in windows]
-            if len(windows) == 2 and all(text in json.dumps(w) and 'Secure authentication' in json.dumps(w) for w in windows):
+            if len(windows) == 2 and all(text in json.dumps(w) and '"Password"' in json.dumps(w) for w in windows):
                 return windows
         time.sleep(.02)
     raise AssertionError(('secure prompt did not render', result.stdout, result.stderr))
@@ -179,7 +183,7 @@ def verify(cancel=False, custom=False, reject=None):
                 stdout, stderr = process.communicate(timeout=5)
                 assert process.returncode != 0 and 'LuaBuildFailed' in stderr, (stdout, stderr)
                 assert peer.unlocks == 0 and peer.failure is None
-                print(f'PASS {"secure_entry" if custom else "auth_input"}: rejects {reject}=false')
+                print(f'PASS masked text_input: rejects {reject}=false')
                 return
             endpoint = next((root / 'ourokit/dev').glob('*'))
             windows = wait_prompt(env, endpoint, 'Identity')
@@ -202,11 +206,11 @@ def verify(cancel=False, custom=False, reject=None):
                 assert peer.unlocks == 0
                 print(stdout.strip())
                 return
-            # Shared native prompt across output-local trees; no Lua signal holds text.
-            peer.type(7, 'ali')
+            # Each output's field owns its buffer; no Lua signal holds text.
+            peer.type(7, 'ignored')
             if custom:
                 restyle(peer, env, endpoint, windows)
-            peer.type(8, 'ce')
+            peer.type(8, 'alice')
             peer.keys(8, [46, 45, 47], control=True) # copy/cut/paste are ignored
             peer.keys(8, [28])
             windows = wait_prompt(env, endpoint, 'Challenge')
@@ -215,13 +219,14 @@ def verify(cancel=False, custom=False, reject=None):
             peer.type(7, 'test-only-responsx')
             peer.keys(7, [14])
             peer.type(7, 'e')
+            peer.type(8, 'x')  # the second output's own field also draws a dot
             time.sleep(.05)
             for w in windows:
                 inspected = dev(env, endpoint, 'inspect', {'window': w['window']})
                 assert 'test-only' not in inspected.stdout and 'alice' not in inspected.stdout
                 node = next(n for n in json.loads(inspected.stdout)['windows'][0]['nodes'] if n['path'] == 'root/credential')
-                assert node['label'] == 'Secure authentication' and node.get('value') is None and node.get('selection') is None, node
-            assert before == peer.captures, 'secret editing changed the constant-mask pixels'
+                assert node['label'] == 'Password' and node.get('value') is None and node.get('selection') is None, node
+            assert before != peer.captures, 'the mask did not show the entered characters'
             capture = os.environ.get('OUROKIT_TEST_CAPTURE')
             if capture:
                 from PIL import Image
@@ -243,7 +248,7 @@ def verify(cancel=False, custom=False, reject=None):
             assert process.returncode == 0 and 'PASS secure lock entry' in stdout, (stdout, stderr)
             assert peer.unlocks == 1, peer.unlocks
             print(stdout.strip())
-            print('PASS secure inspection: fixed metadata/mask, protected capture and synthetic input, clipboard shortcuts ignored')
+            print('PASS secure inspection: fixed metadata, per-character mask, protected capture and synthetic input, clipboard shortcuts ignored')
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -258,6 +263,8 @@ if __name__ == '__main__':
     verify(cancel=True)
     verify(custom=True)
     verify(cancel=True, custom=True)
-    for field in ('text', 'value', 'default_text', 'on_change', 'key_bindings', 'placeholder'):
+    # A PAM-bound field never takes a Lua value; key bindings and a
+    # placeholder are ordinary text_input features and stay allowed.
+    for field in ('text', 'default_text', 'on_change'):
         verify(reject=field)
         verify(custom=True, reject=field)

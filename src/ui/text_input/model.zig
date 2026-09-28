@@ -45,6 +45,8 @@ pub const Range = struct {
 pub const EditKind = enum { isolated, typing, delete_backward, delete_forward, composition };
 
 const history_limit = 100;
+/// A secret field holds at most one PAM response.
+pub const secret_capacity = 512;
 const HistoryEntry = struct {
     before: []u8,
     after: []u8,
@@ -75,6 +77,10 @@ pub const Model = struct {
     history_cursor: usize = 0,
     edit_group: ?EditKind = null,
     multiline: bool = false,
+    /// Masked secret mode: the bytes live in one locked, dump-excluded page,
+    /// are edited in place, wiped when removed and never copied into undo
+    /// history or temporary heap buffers.
+    secret_page: ?[]align(std.heap.page_size_min) u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, raw: []const u8) !Model {
         return initWithMode(allocator, raw, false);
@@ -97,13 +103,47 @@ pub const Model = struct {
         return self;
     }
 
+    /// An empty single-line secret. Fails rather than falling back to
+    /// pageable memory when the page cannot be locked.
+    pub fn initSecret(allocator: std.mem.Allocator) !Model {
+        const linux = std.os.linux;
+        const page = try std.posix.mmap(null, std.heap.page_size_min, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        errdefer std.posix.munmap(page);
+        if (linux.errno(linux.mlock(page.ptr, page.len)) != .SUCCESS) return error.SecretMemoryUnavailable;
+        std.posix.madvise(page.ptr, page.len, linux.MADV.DONTDUMP) catch return error.SecretMemoryUnavailable;
+        var self: Model = .{ .allocator = allocator, .secret_page = page };
+        self.bytes = .initBuffer(page[0..secret_capacity]);
+        errdefer self.boundaries.deinit(allocator);
+        try self.boundaries.ensureTotalCapacityPrecise(allocator, secret_capacity + 1);
+        try self.word_boundaries.ensureTotalCapacityPrecise(allocator, 2);
+        self.rebuildBoundaries();
+        return self;
+    }
+
+    pub fn isSecret(self: *const Model) bool {
+        return self.secret_page != null;
+    }
+
     pub fn deinit(self: *Model) void {
         for (self.history.items) |entry| entry.deinit(self.allocator);
         self.history.deinit(self.allocator);
         self.word_boundaries.deinit(self.allocator);
         self.boundaries.deinit(self.allocator);
-        self.bytes.deinit(self.allocator);
+        if (self.secret_page) |page| {
+            std.crypto.secureZero(u8, page);
+            std.posix.munmap(page);
+        } else self.bytes.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Wipes a secret's bytes, for example after submitting them.
+    pub fn clearSecret(self: *Model) void {
+        const page = self.secret_page orelse return;
+        std.crypto.secureZero(u8, page[0..self.bytes.items.len]);
+        self.bytes.items.len = 0;
+        self.rebuildBoundaries();
+        self.selection = .collapsed(0);
+        self.bumpRevision();
     }
 
     pub fn text(self: *const Model) []const u8 {
@@ -171,6 +211,7 @@ pub const Model = struct {
     /// Consecutive edits of one kind share a history entry until an explicit
     /// boundary or selection movement. IME sessions delimit composition groups.
     pub fn replaceRangeGrouped(self: *Model, range: Range, raw: []const u8, kind: EditKind) !bool {
+        if (self.secret_page != null) return self.replaceSecretRange(range, raw);
         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
         if (range.start > range.end or range.end > self.bytes.items.len)
             return error.InvalidTextRange;
@@ -238,6 +279,37 @@ pub const Model = struct {
             self.history_cursor = self.history.items.len;
         }
         self.edit_group = if (kind == .isolated) null else kind;
+        return true;
+    }
+
+    /// In-place secret edit: no temporary copies, no history, and removed
+    /// bytes are wiped. Text that would need line normalization is rejected.
+    fn replaceSecretRange(self: *Model, range: Range, raw: []const u8) !bool {
+        const page = self.secret_page.?;
+        if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
+        for (raw) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidSecretText;
+        if (range.start > range.end or range.end > self.bytes.items.len)
+            return error.InvalidTextRange;
+        if (!isUtf8Boundary(self.bytes.items, range.start) or
+            !isUtf8Boundary(self.bytes.items, range.end))
+            return error.InvalidTextOffset;
+        const old_len = self.bytes.items.len;
+        const removed_len = range.end - range.start;
+        if (removed_len == 0 and raw.len == 0) return false;
+        const new_len = old_len - removed_len + raw.len;
+        if (new_len > secret_capacity) return error.SecretTooLong;
+        const tail = old_len - range.end;
+        if (raw.len > removed_len) {
+            std.mem.copyBackwards(u8, page[range.start + raw.len ..][0..tail], page[range.end..][0..tail]);
+        } else {
+            std.mem.copyForwards(u8, page[range.start + raw.len ..][0..tail], page[range.end..][0..tail]);
+            std.crypto.secureZero(u8, page[new_len..old_len]);
+        }
+        @memcpy(page[range.start..][0..raw.len], raw);
+        self.bytes.items.len = new_len;
+        self.rebuildBoundaries();
+        self.selection = .collapsed(self.boundaryAtOrAfter(range.start + raw.len));
+        self.bumpRevision();
         return true;
     }
 
@@ -363,7 +435,28 @@ pub const Model = struct {
         while (iterator.nextGrapheme()) |grapheme|
             self.boundaries.appendAssumeCapacity(grapheme.end);
         self.word_boundaries.clearRetainingCapacity();
+        if (self.secret_page != null) {
+            // A secret is one word, so word movement reveals no structure.
+            self.word_boundaries.appendAssumeCapacity(0);
+            if (self.bytes.items.len != 0) self.word_boundaries.appendAssumeCapacity(self.bytes.items.len);
+            return;
+        }
         word_break.appendAssumeCapacity(self.bytes.items, &self.word_boundaries);
+    }
+
+    /// Number of extended graphemes, which a masked field draws as dots.
+    pub fn graphemeCount(self: *const Model) usize {
+        return self.boundaries.items.len - 1;
+    }
+
+    /// Grapheme index of a boundary offset, and back. Masked presentation
+    /// and pointer hit testing translate through these.
+    pub fn graphemeIndex(self: *const Model, offset: usize) usize {
+        return lowerBound(self.boundaries.items, offset);
+    }
+
+    pub fn graphemeOffset(self: *const Model, index: usize) usize {
+        return self.boundaries.items[@min(index, self.boundaries.items.len - 1)];
     }
 
     fn isBoundary(self: *const Model, offset: usize) bool {
@@ -716,4 +809,28 @@ test "text input history survives every edit allocation failure and restores wit
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.run, .{false});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.run, .{true});
+}
+
+test "secret model edits in place, caps length, rejects controls and wipes removed bytes" {
+    var model = try Model.initSecret(std.testing.allocator);
+    defer model.deinit();
+    const page = model.secret_page.?;
+    try std.testing.expect(try model.replaceSelection("hunter2"));
+    try std.testing.expectEqualStrings("hunter2", model.text());
+    try std.testing.expect(!model.undo());
+    try std.testing.expectError(error.InvalidSecretText, model.replaceSelection("a\nb"));
+    // Deleting wipes the vacated tail inside the locked page.
+    _ = try model.setSelection(.{ .anchor = 3, .extent = 7 });
+    try std.testing.expect(try model.replaceSelection(""));
+    try std.testing.expectEqualStrings("hun", model.text());
+    try std.testing.expect(std.mem.allEqual(u8, page[3..7], 0));
+    // Word movement treats the whole secret as one word.
+    try std.testing.expect(model.moveWordPrevious(false));
+    try std.testing.expectEqual(@as(usize, 0), model.selection.extent);
+    var long: [secret_capacity + 1]u8 = undefined;
+    @memset(&long, 'x');
+    try std.testing.expectError(error.SecretTooLong, model.replaceSelection(&long));
+    model.clearSecret();
+    try std.testing.expectEqualStrings("", model.text());
+    try std.testing.expect(std.mem.allEqual(u8, page[0..8], 0));
 }

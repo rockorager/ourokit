@@ -54,9 +54,6 @@ struct ouro_auth {
     int pipefd[2], control[2], canceled, done, launched, reason;
     pid_t child;
     uint64_t next_id, pending_id;
-    unsigned char *entry;
-    size_t entry_len, cursor;
-    int selected;
     char *service, *user;
     struct ouro_auth_event queue[8];
     unsigned head, count;
@@ -85,11 +82,6 @@ static void notify(struct ouro_auth *a) {
     unsigned char b = 1;
     (void)write(a->pipefd[1], &b, 1);
 }
-static void clear_locked(struct ouro_auth *a) {
-    wipe(a->entry, 513);
-    a->entry_len = a->cursor = 0;
-    a->selected = 0;
-}
 static void publish(struct ouro_auth *a, int kind, uint64_t id, int echo, int success,
                     const char *text) {
     pthread_mutex_lock(&a->lock);
@@ -112,7 +104,6 @@ static void publish(struct ouro_auth *a, int kind, uint64_t id, int echo, int su
     if (kind == OURO_AUTH_RESULT) {
         a->done = 1;
         a->pending_id = 0;
-        clear_locked(a);
     }
     pthread_mutex_unlock(&a->lock);
     notify(a);
@@ -309,8 +300,7 @@ static void *supervisor(void *arg) {
             goto failed;
         if (m.type == MSG_PROMPT) {
             pthread_mutex_lock(&a->lock);
-            clear_locked(a);
-            uint64_t id = ++a->next_id;
+                uint64_t id = ++a->next_id;
             a->pending_id = id;
             pthread_mutex_unlock(&a->lock);
             publish(a, OURO_AUTH_PROMPT, id, (int)m.value, 0, m.data);
@@ -351,12 +341,10 @@ ouro_auth *ouro_auth_start(const char *service, const char *user) {
     a->pipefd[0] = a->pipefd[1] = a->control[0] = a->control[1] = -1;
     a->service = strdup(service);
     a->user = strdup(user);
-    a->entry = mmap(NULL, 513, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (!a->service || !a->user || a->entry == MAP_FAILED || mlock(a->entry, 513) ||
-        madvise(a->entry, 513, MADV_DONTDUMP))
+    if (!a->service || !a->user)
         goto fail;
     // Starting authentication permanently disables process dumps/ptrace by
-    // unprivileged peers; the mapping is also excluded and locked against swap.
+    // unprivileged peers. Responses are edited in the caller's locked buffer.
     if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) || pthread_mutex_init(&a->lock, NULL))
         goto fail;
     if (pipe2(a->pipefd, O_CLOEXEC | O_NONBLOCK) || fcntl(a->pipefd[0], F_SETFL, 0) < 0 ||
@@ -372,11 +360,6 @@ fail:
             close(a->pipefd[i]);
         if (a->control[i] >= 0)
             close(a->control[i]);
-    }
-    if (a->entry != MAP_FAILED && a->entry) {
-        wipe(a->entry, 513);
-        munlock(a->entry, 513);
-        munmap(a->entry, 513);
     }
     free(a->service);
     if (a->user) {
@@ -408,123 +391,16 @@ int ouro_auth_pop(ouro_auth *a, struct ouro_auth_event *e) {
     pthread_mutex_unlock(&a->lock);
     return 1;
 }
-static size_t previous(const unsigned char *s, size_t p) {
-    if (!p)
-        return 0;
-    do
-        p--;
-    while (p && (s[p] & 0xc0) == 0x80);
-    return p;
-}
-static size_t following(const unsigned char *s, size_t n, size_t p) {
-    if (p >= n)
-        return n;
-    p++;
-    while (p < n && (s[p] & 0xc0) == 0x80)
-        p++;
-    return p;
-}
-int ouro_auth_edit(ouro_auth *a, uint64_t id, int command, uint32_t unicode) {
-    unsigned char bytes[4];
-    size_t bn = 0;
-    if (command == OURO_AUTH_INSERT) {
-        if (!unicode)
-            return 0;
-        if (unicode <= 0x7f)
-            bytes[bn++] = (unsigned char)unicode;
-        else if (unicode <= 0x7ff) {
-            bytes[bn++] = 0xc0 | unicode >> 6;
-            bytes[bn++] = 0x80 | (unicode & 63);
-        } else if (unicode >= 0xd800 && unicode <= 0xdfff)
-            return 0;
-        else if (unicode <= 0xffff) {
-            bytes[bn++] = 0xe0 | unicode >> 12;
-            bytes[bn++] = 0x80 | (unicode >> 6 & 63);
-            bytes[bn++] = 0x80 | (unicode & 63);
-        } else if (unicode <= 0x10ffff) {
-            bytes[bn++] = 0xf0 | unicode >> 18;
-            bytes[bn++] = 0x80 | (unicode >> 12 & 63);
-            bytes[bn++] = 0x80 | (unicode >> 6 & 63);
-            bytes[bn++] = 0x80 | (unicode & 63);
-        } else
-            return 0;
-    }
-    pthread_mutex_lock(&a->lock);
-    int valid = id && !a->done && !a->canceled && a->pending_id == id;
-    if (!valid) {
-        wipe(bytes, sizeof bytes);
-        pthread_mutex_unlock(&a->lock);
-        return 0;
-    }
-    if (a->selected && (command == OURO_AUTH_INSERT || command == OURO_AUTH_BACKSPACE ||
-                        command == OURO_AUTH_DELETE))
-        clear_locked(a);
-    if (command == OURO_AUTH_INSERT) {
-        if (a->entry_len + bn > 512) {
-            wipe(bytes, sizeof bytes);
-            pthread_mutex_unlock(&a->lock);
-            return -1;
-        }
-        memmove(a->entry + a->cursor + bn, a->entry + a->cursor, a->entry_len - a->cursor);
-        memcpy(a->entry + a->cursor, bytes, bn);
-        a->cursor += bn;
-        a->entry_len += bn;
-    } else if (command == OURO_AUTH_BACKSPACE) {
-        size_t p = previous(a->entry, a->cursor);
-        memmove(a->entry + p, a->entry + a->cursor, a->entry_len - a->cursor);
-        a->entry_len -= a->cursor - p;
-        a->cursor = p;
-    } else if (command == OURO_AUTH_DELETE) {
-        size_t p = following(a->entry, a->entry_len, a->cursor);
-        memmove(a->entry + a->cursor, a->entry + p, a->entry_len - p);
-        a->entry_len -= p - a->cursor;
-    } else if (command == OURO_AUTH_LEFT)
-        a->cursor = previous(a->entry, a->cursor);
-    else if (command == OURO_AUTH_RIGHT)
-        a->cursor = following(a->entry, a->entry_len, a->cursor);
-    else if (command == OURO_AUTH_HOME)
-        a->cursor = 0;
-    else if (command == OURO_AUTH_END)
-        a->cursor = a->entry_len;
-    else if (command == OURO_AUTH_CLEAR)
-        clear_locked(a);
-    else if (command == OURO_AUTH_SELECT_ALL)
-        a->selected = 1;
-    else {
-        wipe(bytes, sizeof bytes);
-        pthread_mutex_unlock(&a->lock);
-        return 0;
-    }
-    if (command != OURO_AUTH_SELECT_ALL)
-        a->selected = 0;
-    wipe(a->entry + a->entry_len, 513 - a->entry_len);
-    wipe(bytes, sizeof bytes);
-    pthread_mutex_unlock(&a->lock);
-    return 1;
-}
-int ouro_auth_has_input(ouro_auth *a, uint64_t id) {
-    pthread_mutex_lock(&a->lock);
-    int r = id && a->pending_id == id && a->entry_len != 0;
-    pthread_mutex_unlock(&a->lock);
-    return r;
-}
-int ouro_auth_clear_input(ouro_auth *a, uint64_t id) {
-    pthread_mutex_lock(&a->lock);
-    int r = id && a->pending_id == id && !a->done && !a->canceled;
-    if (r)
-        clear_locked(a);
-    pthread_mutex_unlock(&a->lock);
-    return r;
-}
-int ouro_auth_submit(ouro_auth *a, uint64_t id) {
+int ouro_auth_respond(ouro_auth *a, uint64_t id, const unsigned char *bytes, size_t length) {
     struct message m = {.type = MSG_REPLY};
+    if (length > 512 || (length && !bytes))
+        return 0;
     pthread_mutex_lock(&a->lock);
     int ok = id && a->pending_id == id && !a->done && !a->canceled;
     if (ok) {
-        m.length = (uint32_t)a->entry_len;
-        memcpy(m.data, a->entry, a->entry_len);
+        m.length = (uint32_t)length;
+        memcpy(m.data, bytes, length);
         a->pending_id = 0;
-        clear_locked(a);
     }
     pthread_mutex_unlock(&a->lock);
     if (ok && !write_all(a->control[0], &m, sizeof m)) {
@@ -539,7 +415,6 @@ void ouro_auth_cancel(ouro_auth *a) {
     int changed = !a->canceled;
     a->canceled = 1;
     a->pending_id = 0;
-    clear_locked(a);
     pthread_mutex_unlock(&a->lock);
     if (changed)
         notify(a);
@@ -566,9 +441,6 @@ void ouro_auth_join_destroy(ouro_auth *a) {
         close(a->control[1]);
     close(a->pipefd[0]);
     close(a->pipefd[1]);
-    clear_locked(a);
-    munlock(a->entry, 513);
-    munmap(a->entry, 513);
     wipe(a->user, strlen(a->user));
     free(a->user);
     free(a->service);

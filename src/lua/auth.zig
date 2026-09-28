@@ -5,7 +5,7 @@ const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
 const c = @import("c.zig");
 const vm_module = @import("vm.zig");
-const entry = @import("../ui/widget/auth_input.zig");
+const Secret = @import("../ui/text_input/secret.zig").Secret;
 
 const native = struct {
     const Auth = opaque {};
@@ -14,9 +14,7 @@ const native = struct {
     extern fn ouro_auth_launch(auth: *Auth) void;
     extern fn ouro_auth_fd(auth: *Auth) c_int;
     extern fn ouro_auth_pop(auth: *Auth, event: *Event) c_int;
-    extern fn ouro_auth_edit(auth: *Auth, id: u64, command: c_int, unicode: u32) c_int;
-    extern fn ouro_auth_submit(auth: *Auth, id: u64) c_int;
-    extern fn ouro_auth_clear_input(auth: *Auth, id: u64) c_int;
+    extern fn ouro_auth_respond(auth: *Auth, id: u64, bytes: [*]const u8, length: usize) c_int;
     extern fn ouro_auth_reason(auth: *Auth) c_int;
     extern fn ouro_auth_cancel(auth: *Auth) void;
     extern fn ouro_auth_done(auth: *Auth) c_int;
@@ -63,10 +61,6 @@ pub const Binding = struct {
         c.lua_setfield(L, -2, "__index");
         c.lua_pushcclosure(L, next, 0);
         c.lua_setfield(L, -2, "next");
-        c.lua_pushcclosure(L, submit, 0);
-        c.lua_setfield(L, -2, "submit");
-        c.lua_pushcclosure(L, clearInput, 0);
-        c.lua_setfield(L, -2, "clear_input");
         c.lua_pushcclosure(L, cancel, 0);
         c.lua_setfield(L, -2, "cancel");
         c.lua_pushcclosure(L, cancel, 0);
@@ -204,26 +198,6 @@ fn continuation(L: *c.State, _: c_int, context: c.KContext) callconv(.c) c_int {
     // A previous event was consumed synchronously before its wake byte.
     return next(L);
 }
-fn submit(L: *c.State) callconv(.c) c_int {
-    const job = get(L) orelse return failure(L, "ConversationClosed");
-    if (job.closed) return failure(L, "ConversationClosed");
-    var ok: c_int = 0;
-    const id = c.lua_tointegerx(L, 2, &ok);
-    if (ok == 0 or id <= 0 or c.lua_gettop(L) != 2) return failure(L, "InvalidPromptId");
-    if (native.ouro_auth_submit(job.auth, @intCast(id)) == 0) return failure(L, "StalePrompt");
-    c.lua_pushboolean(L, 1);
-    return 1;
-}
-fn clearInput(L: *c.State) callconv(.c) c_int {
-    const job = get(L) orelse return failure(L, "ConversationClosed");
-    if (job.closed) return failure(L, "ConversationClosed");
-    var ok: c_int = 0;
-    const id = c.lua_tointegerx(L, 2, &ok);
-    if (ok == 0 or id <= 0 or c.lua_gettop(L) != 2) return failure(L, "InvalidPromptId");
-    if (native.ouro_auth_clear_input(job.auth, @intCast(id)) == 0) return failure(L, "StalePrompt");
-    c.lua_pushboolean(L, 1);
-    return 1;
-}
 fn cancel(L: *c.State) callconv(.c) c_int {
     if (userdata(L)) |ud| if (ud.job) |job| {
         job.closed = true;
@@ -311,7 +285,8 @@ fn same(a: io.OperationHandle, b: io.OperationHandle) bool {
     return a.slot == b.slot and a.generation == b.generation;
 }
 
-pub fn inputFromTable(L: *c.State, table: c_int) !entry.Input {
+/// Reads `conversation` and `prompt_id` from a masked text_input declaration.
+pub fn secretFromTable(L: *c.State, table: c_int) !Secret {
     const top = c.lua_gettop(L);
     defer c.lua_settop(L, top);
     _ = c.lua_getfield(L, table, "conversation");
@@ -322,25 +297,14 @@ pub fn inputFromTable(L: *c.State, table: c_int) !entry.Input {
     var valid: c_int = 0;
     const id = c.lua_tointegerx(L, -1, &valid);
     if (valid == 0 or id <= 0) return error.InvalidPromptId;
-    return .{ .context = job.owner, .job = job.id, .prompt = @intCast(id), .dispatch = entryAction };
+    return .{ .context = job.owner, .job = job.id, .prompt = @intCast(id), .respond_fn = respondSecret };
 }
 
-fn entryAction(context: *anyopaque, id: u64, prompt: u64, command: entry.Command, unicode: u32) entry.Result {
+fn respondSecret(context: *anyopaque, id: u64, prompt: u64, bytes: []const u8) bool {
     const self: *Binding = @ptrCast(@alignCast(context));
     for (self.jobs) |maybe| if (maybe) |job| {
         if (job.id != id or job.closed) continue;
-        const result = switch (command) {
-            .submit => native.ouro_auth_submit(job.auth, prompt),
-            .clear => native.ouro_auth_clear_input(job.auth, prompt),
-            .cancel => blk: {
-                if (native.ouro_auth_clear_input(job.auth, prompt) == 0) break :blk @as(c_int, 0);
-                job.closed = true;
-                native.ouro_auth_cancel(job.auth);
-                break :blk @as(c_int, 1);
-            },
-            else => native.ouro_auth_edit(job.auth, prompt, @intFromEnum(command), unicode),
-        };
-        return if (result == 1) .ok else if (result == -1) .full else .stale;
+        return native.ouro_auth_respond(job.auth, prompt, bytes.ptr, bytes.len) == 1;
     };
-    return .stale;
+    return false;
 }

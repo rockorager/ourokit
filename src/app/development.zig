@@ -129,8 +129,11 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
         var multiline = false;
         if (runtime.text_inputs.contains(handle)) {
             const session = try runtime.text_inputs.session(handle);
-            value = try copyText(storage, &used, session.model.text());
-            selection = session.model.selection;
+            // Masked fields expose neither their value nor its structure.
+            if (!session.model.isSecret()) {
+                value = try copyText(storage, &used, session.model.text());
+                selection = session.model.selection;
+            }
             multiline = session.model.multiline;
             read_only = (try runtime.text_inputs.getBehavior(handle)).read_only;
         }
@@ -205,7 +208,7 @@ pub const Playback = struct {
 
     pub fn init(runtime: *WindowRuntime, token: Token, action: Action) !Playback {
         try token.validate(runtime);
-        if (runtime.instances.hasAuthInput()) return error.SecureInputProtected;
+        if (runtime.text_inputs.hasSecret()) return error.SecureInputProtected;
         var target: ?ui.instance.InstanceHandle = null;
         if (action.path()) |path| {
             const semantic = try runtime.semantics.findPath(path);
@@ -249,7 +252,7 @@ pub const Playback = struct {
     pub fn advance(self: *Playback, runtime: *WindowRuntime) !enum { routed, complete } {
         if (!std.meta.eql(self.token.window, runtime.window) or self.token.generation != runtime.development_generation)
             return error.StaleDevelopmentTarget;
-        if (runtime.instances.hasAuthInput()) return error.SecureInputProtected;
+        if (runtime.text_inputs.hasSecret()) return error.SecureInputProtected;
         try requireSettled(runtime);
         if (self.step == 0) try self.token.validate(runtime);
         const steps: usize = switch (self.action) {
@@ -363,7 +366,7 @@ pub const Capture = struct {
 /// A fresh target always needs full replay, even after native submission.
 pub fn capture(allocator: std.mem.Allocator, runtime: *WindowRuntime, expected: Token) !Capture {
     try expected.validate(runtime);
-    if (runtime.instances.hasAuthInput()) return error.SecureInputProtected;
+    if (runtime.text_inputs.hasSecret()) return error.SecureInputProtected;
     if (!renderer.software.has_freetype) return error.FreeTypeDisabled;
     const size = runtime.frame_state.size.?;
     const w = @ceil(@as(f64, @floatFromInt(size.width)) * runtime.output_scale);

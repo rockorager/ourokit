@@ -14,17 +14,6 @@ enum ouro_auth_reason {
     OURO_AUTH_TIMEOUT,
     OURO_AUTH_WORKER_FAILED
 };
-enum ouro_auth_command {
-    OURO_AUTH_INSERT = 0,
-    OURO_AUTH_BACKSPACE,
-    OURO_AUTH_DELETE,
-    OURO_AUTH_LEFT,
-    OURO_AUTH_RIGHT,
-    OURO_AUTH_HOME,
-    OURO_AUTH_END,
-    OURO_AUTH_CLEAR,
-    OURO_AUTH_SELECT_ALL
-};
 struct ouro_auth_event {
     int kind;
     uint64_t prompt_id;
@@ -40,11 +29,10 @@ void ouro_auth_launch(ouro_auth *auth);
 int ouro_auth_fd(ouro_auth *auth);
 /* 1 = event, 0 = none. */
 int ouro_auth_pop(ouro_auth *auth, struct ouro_auth_event *event);
-/* Credentials enter only through native key editing; never through Lua strings. */
-int ouro_auth_edit(ouro_auth *auth, uint64_t prompt_id, int command, uint32_t unicode);
-int ouro_auth_has_input(ouro_auth *auth, uint64_t prompt_id);
-int ouro_auth_submit(ouro_auth *auth, uint64_t prompt_id);
-int ouro_auth_clear_input(ouro_auth *auth, uint64_t prompt_id);
+/* Sends one prompt response to the worker. Credentials arrive from a native
+ * masked text field, never from Lua strings; the caller wipes its copy. At
+ * most 512 bytes. 1 = sent, 0 = stale prompt or failure. */
+int ouro_auth_respond(ouro_auth *auth, uint64_t prompt_id, const unsigned char *bytes, size_t length);
 void ouro_auth_cancel(ouro_auth *auth);
 int ouro_auth_done(ouro_auth *auth);
 int ouro_auth_reason(ouro_auth *auth);

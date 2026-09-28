@@ -22,19 +22,15 @@ fails('InvalidService', o.auth.start('../invalid', 'fixture-user'))
 fails('InvalidUsername', o.auth.start('fixture', ''))
 local function attempt(service)
   local a <close> = assert(o.auth.start(service, 'fixture-user'))
+  -- Responses come only from a masked text_input; Lua has no response API.
+  assert(a.submit == nil and a.respond == nil and a.clear_input == nil)
   local e = assert(a:next()); assert(e.type == 'info')
   e = assert(a:next()); assert(e.type == 'prompt' and e.echo and e.text == 'Identity')
-  fails('InvalidPromptId', a:submit(0))
-  fails('StalePrompt', a:submit(e.id + 1))
-  assert(a:clear_input(e.id)) -- Lua can only perform nonsecret operations.
-  assert(a:submit(e.id))
-  fails('StalePrompt', a:submit(e.id))
-  e = assert(a:next()); assert(e.type == 'prompt' and not e.echo)
-  assert(a:submit(e.id))
-  e = assert(a:next()); assert(e.type == 'result' and not e.success and e.reason == 'denied')
+  a:cancel()
   fails('ConversationClosed', a:next())
 end
-for i = 1, 4 do attempt('fixture') end
+-- Canceled workers are reaped asynchronously; slot reuse is covered natively.
+attempt('fixture')
 local crashed <close> = assert(o.auth.start('crash', 'fixture-user'))
 local crash = assert(crashed:next())
 assert(crash.type == 'result' and not crash.success and crash.reason == 'worker_failed')
@@ -48,7 +44,7 @@ a:cancel()
 fails('ConversationClosed', a:next())
 -- Leave one abandoned conversation for process-shutdown draining.
 assert(o.auth.start('blocked', 'fixture-user'))
-o.stdout.write('PASS Lua auth: nonsecret errors, denial, crash, cancellation and shutdown\n')
+o.stdout.write('PASS Lua auth: no response API, prompts, crash, cancellation and shutdown\n')
 o.exit(0)
 return o.app {id='dev.ourokit.auth-fixture'}
 '''

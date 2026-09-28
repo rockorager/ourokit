@@ -427,8 +427,15 @@ pub const WindowRuntime = struct {
                 ).?;
                 var object = &prepared.descriptor_storage[descriptor_index].object;
                 if (object.* != .text_input) return error.TextInputRenderObjectMismatch;
-                if (retained.model.multiline == candidate.multiline and (input.mode == .uncontrolled or
-                    std.mem.eql(u8, retained.model.text(), candidate.text())))
+                const retained_secret = (try self.text_inputs.getBehavior(target)).secret;
+                const same_secret = if (retained_secret) |value|
+                    input.behavior.secret != null and value.eql(input.behavior.secret.?)
+                else
+                    input.behavior.secret == null;
+                if (retained.model.multiline == candidate.multiline and
+                    retained.model.isSecret() == candidate.isSecret() and same_secret and
+                    (input.mode == .uncontrolled or
+                        std.mem.eql(u8, retained.model.text(), candidate.text())))
                 {
                     const retained_content = try self.text_inputs.content(target);
                     const retained_object = try self.tree.objectAt(
@@ -1201,49 +1208,28 @@ pub const WindowRuntime = struct {
             }
             try self.syncTextInputVisuals();
         }
-        if (self.focus.current()) |focused| if (self.instances.authInput(focused)) |input| {
-            if (key.state == .released) return;
-            const translated = key.translated;
-            // Tab navigates native focus. All other keys are contained here:
-            // no ordinary editor, IME, clipboard, shortcut or Lua text path.
-            if (translated.logical != .tab) {
-                const secure = @import("../ui/widget/auth_input.zig");
-                const command: secure.Command = if (translated.modifiers.control) switch (translated.logical) {
-                    .key_a => .select_all,
-                    .key_u => .clear,
-                    else => return,
-                } else if (translated.modifiers.alt or translated.modifiers.logo) return else switch (translated.logical) {
-                    .enter => .submit,
-                    .escape => .cancel,
-                    .backspace => .backspace,
-                    .delete => .delete,
-                    .arrow_left => .left,
-                    .arrow_right => .right,
-                    .home => .home,
-                    .end => .end,
-                    else => if (translated.unicode >= 0x20 and translated.unicode <= 0x10ffff and
-                        !(translated.unicode >= 0x7f and translated.unicode <= 0x9f)) .insert else return,
-                };
-                if (key.state == .repeated and (command == .submit or command == .cancel)) return;
-                const result = input.act(command, translated.unicode);
-                const kind: ?ui.input.HandlerKind = if (result != .ok) .auth_error else switch (command) {
-                    .submit => .auth_submit,
-                    .cancel => .auth_cancel,
-                    else => null,
-                };
-                if (kind) |handler_kind| if (self.pointer_bindings.getKind(focused, handler_kind)) |binding| {
-                    const args: []const lua.TaskArgument = if (result == .ok) &.{} else &.{.{ .string = if (result == .full) "InputTooLong" else "StalePrompt" }};
-                    try self.spawnCallback(callback_service, binding.id, try self.instances.scope(focused), args);
-                };
-                return;
-            }
-        };
         if (self.focus.current()) |focused| if (self.text_inputs.contains(focused) and
             key.state != .released)
         {
             const session = try self.text_inputs.session(focused);
             const behavior = try self.text_inputs.getBehavior(focused);
-            if (behavior.key_bindings.resolve(key.translated)) |action| {
+            const masked = session.model.isSecret();
+            // Ctrl+U clears a masked field, as terminals and screen lockers do.
+            if (masked and key.translated.logical == .key_u and key.translated.modifiers.control and
+                !key.translated.modifiers.shift and !key.translated.modifiers.alt and !key.translated.modifiers.logo)
+            {
+                if (key.state == .pressed and behavior.enabled and !behavior.read_only) {
+                    session.endSelectionDrag();
+                    _ = session.model.selectAll();
+                    if (try session.model.replaceSelection("")) {
+                        try self.syncTextInputVisuals();
+                        try self.notifyTextInputChanged(callback_service, focused);
+                    }
+                }
+                return;
+            }
+            if (behavior.key_bindings.resolve(key.translated)) |resolved| {
+                const action = if (masked) maskedKeyAction(resolved, behavior) else resolved;
                 // Composition and explicit field commands own Escape first.
                 // Otherwise a plain field lets its enclosing dialog cancel.
                 const bubble_cancel = action == .command and action.command == .cancel and
@@ -1267,7 +1253,12 @@ pub const WindowRuntime = struct {
                 var bytes: [4]u8 = undefined;
                 const len = std.unicode.utf8Encode(@intCast(translated.unicode), &bytes) catch return;
                 session.endSelectionDrag();
-                if (try session.typeText(bytes[0..len])) {
+                const typed = session.typeText(bytes[0..len]) catch |err| switch (err) {
+                    // A full masked field ignores further keys.
+                    error.SecretTooLong => false,
+                    else => return err,
+                };
+                if (typed) {
                     try self.syncTextInputVisuals();
                     try self.notifyTextInputChanged(callback_service, focused);
                 }
@@ -1554,6 +1545,8 @@ pub const WindowRuntime = struct {
         callback_service: anytype,
         target: ui.instance.InstanceHandle,
     ) !void {
+        // Authentication text never reaches Lua.
+        if ((try self.text_inputs.getBehavior(target)).secret != null) return;
         const binding = self.pointer_bindings.getKind(target, .text_input_change) orelse return;
         const value = (try self.text_inputs.session(target)).model.text();
         try self.spawnCallback(
@@ -1996,10 +1989,27 @@ pub const WindowRuntime = struct {
         const content = try self.text_inputs.content(input);
         const render = try self.instances.renderObject(content);
         const origin = try self.instanceOrigin(content);
-        return (try self.tree.hitTestText(render, .{
+        var caret = (try self.tree.hitTestText(render, .{
             .x = position.x - origin.x,
             .y = position.y - origin.y,
         })).caret;
+        // Masked layout holds dots; translate the hit back to the value.
+        const model = &(try self.text_inputs.session(input)).model;
+        if (model.isSecret()) caret.byte_offset = ui.text_input.maskedToModel(model, caret.byte_offset);
+        return caret;
+    }
+
+    /// Masked fields never copy their text out or keep undo history, and a
+    /// field bound to an authentication prompt does not read the clipboard.
+    fn maskedKeyAction(action: ui.text_input.KeyAction, behavior: ui.text_input.Behavior) ui.text_input.KeyAction {
+        return switch (action) {
+            .clipboard => |command| if (command == .paste and behavior.secret == null) action else .none,
+            .edit => |intent| switch (intent) {
+                .undo, .redo => .none,
+                else => action,
+            },
+            else => action,
+        };
     }
 
     fn applyTextInputAction(
@@ -2017,10 +2027,26 @@ pub const WindowRuntime = struct {
             .edit => |value| value,
             .command => |command| blk: {
                 session.model.breakUndoGroup();
+                // Submit sends the text natively; Lua hears only the outcome.
+                const name: []const u8 = if (behavior.secret) |secret| switch (command) {
+                    .submit => sent: {
+                        const accepted = secret.respond(session.model.text());
+                        session.model.clearSecret();
+                        try self.syncTextInputVisuals();
+                        break :sent if (accepted) "submit" else "stale";
+                    },
+                    .cancel => canceled: {
+                        session.model.clearSecret();
+                        try self.syncTextInputVisuals();
+                        break :canceled "cancel";
+                    },
+                    else => @tagName(command),
+                } else @tagName(command);
                 if (self.pointer_bindings.getKind(target, .text_input_command)) |binding| {
-                    try self.spawnCallback(callback_service, binding.id, try self.instances.scope(target), &.{.{ .string = @tagName(command) }});
+                    try self.spawnCallback(callback_service, binding.id, try self.instances.scope(target), &.{.{ .string = name }});
                     return;
                 }
+                if (behavior.secret != null) return;
                 // List-style navigation commands retain caret navigation as
                 // their fallback when the application has no command handler.
                 break :blk switch (command) {
@@ -2128,10 +2154,16 @@ pub const WindowRuntime = struct {
     ) !bool {
         if (!self.instances.isActive(target) or !self.text_inputs.contains(target)) return false;
         const behavior = try self.text_inputs.getBehavior(target);
-        if (!behavior.enabled or behavior.read_only) return false;
+        if (!behavior.enabled or behavior.read_only or behavior.secret != null) return false;
         const session = try self.text_inputs.session(target);
         session.endSelectionDrag();
-        const changed = try session.apply(.{ .commit = .{ .text = bytes } });
+        const masked = session.model.isSecret();
+        // Password managers often copy a trailing line break.
+        const pasted = if (masked) std.mem.trimEnd(u8, bytes, "\r\n") else bytes;
+        const changed = session.apply(.{ .commit = .{ .text = pasted } }) catch |err| switch (err) {
+            error.SecretTooLong, error.InvalidSecretText => false,
+            else => return err,
+        };
         if (changed) {
             try self.syncTextInputVisuals();
             try self.notifyTextInputChanged(callback_service, target);
@@ -2146,6 +2178,28 @@ pub const WindowRuntime = struct {
         move: ui.text_input.MoveIntent,
     ) !bool {
         const current = session.model.selection;
+        if (session.model.isSecret()) {
+            // Masked text is one left-to-right line of dots; move logically.
+            session.preferred_x = null;
+            return switch (move.destination) {
+                .visual_left => if (!move.extend and !current.isCollapsed())
+                    session.model.setSelection(.collapsed(current.range().start))
+                else
+                    session.model.movePrevious(move.extend),
+                .visual_right => if (!move.extend and !current.isCollapsed())
+                    session.model.setSelection(.collapsed(current.range().end))
+                else
+                    session.model.moveNext(move.extend),
+                .word_previous, .word_next => unreachable,
+                else => session.model.setSelection(if (move.destination == .line_start or
+                    move.destination == .document_start or move.destination == .line_up)
+                    (if (move.extend) .{ .anchor = current.anchor, .extent = 0 } else .collapsed(0))
+                else if (move.extend)
+                    .{ .anchor = current.anchor, .extent = session.model.text().len }
+                else
+                    .collapsed(session.model.text().len)),
+            };
+        }
         const content = try self.text_inputs.content(target);
         const render = try self.instances.renderObject(content);
         const horizontal: ?text.VisualCaretDirection = switch (move.destination) {
@@ -2423,7 +2477,9 @@ pub const WindowRuntime = struct {
         if (self.keyboard_focused and self.text_input_surface_focused) {
             if (self.focus.current()) |target| if (self.instances.isActive(target) and self.instances.isVisible(target) and self.text_inputs.contains(target)) {
                 const behavior = try self.text_inputs.getBehavior(target);
-                if (behavior.enabled and !behavior.read_only) owner = .{
+                // Masked text is never shared with an input method.
+                const masked = (try self.text_inputs.session(target)).model.isSecret();
+                if (behavior.enabled and !behavior.read_only and !masked) owner = .{
                     .target = target,
                     .session = try self.text_inputs.sessionGeneration(target),
                 };

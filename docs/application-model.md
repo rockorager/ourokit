@@ -1317,6 +1317,14 @@ unbound Tab/Shift+Tab still traverse focus. Key releases never invoke actions.
 Editing/navigation may repeat; clipboard, submit, and cancel actions fire only
 on the initial press. Remapping does not bypass enabled/read-only or IME guards.
 
+Set `mask = true` for a password field. It is the same single-line editor,
+drawing one dot per grapheme; the value is kept in a locked page, copy, cut
+and undo are disabled, input methods are never engaged, word movement treats
+the value as one word, and Ctrl+U clears. `on_change` and `text` still carry
+the value. Binding a PAM `conversation` and `prompt_id` instead sends the text
+natively on Enter and never exposes it to Lua; see
+[session.md](session.md#asynchronous-authentication).
+
 `ouro.text_input` accepts optional string props `placeholder` and `label`:
 
 ```lua

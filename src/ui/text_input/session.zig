@@ -72,6 +72,11 @@ pub const Session = struct {
         };
     }
 
+    /// An empty masked field whose bytes live in locked secret storage.
+    pub fn initSecret(allocator: std.mem.Allocator) !Session {
+        return .{ .allocator = allocator, .model = try model_module.Model.initSecret(allocator) };
+    }
+
     pub fn deinit(self: *Session) void {
         if (self.preedit_bytes) |bytes| self.allocator.free(bytes);
         self.model.deinit();

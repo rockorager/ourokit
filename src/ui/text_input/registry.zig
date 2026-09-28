@@ -12,7 +12,15 @@ pub const Behavior = struct {
     key_bindings: @import("keymap.zig").Keymap = .{},
     border_color: ?@import("../../core/color.zig").Color = null,
     focus_color: ?@import("../../core/color.zig").Color = null,
+    /// Masked field bound to an authentication prompt: submit sends the text
+    /// to this destination instead of Lua.
+    secret: ?@import("secret.zig").Secret = null,
 };
+
+fn sameSecret(a: ?@import("secret.zig").Secret, b: ?@import("secret.zig").Secret) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(b.?);
+}
 
 const Entry = struct {
     owner: build_owner.BuildOwnerHandle = .invalid,
@@ -110,10 +118,13 @@ pub const Registry = struct {
             entry.content = content_handle;
             if (entry.behavior.enabled != behavior.enabled or entry.behavior.read_only != behavior.read_only)
                 entry.session.?.model.breakUndoGroup();
-            entry.behavior = behavior;
             if (!behavior.enabled) entry.session.?.endSelectionDrag();
             entry.seen = true;
-            if (entry.session.?.model.multiline != prepared.*.?.model.multiline or (mode == .controlled and !std.mem.eql(
+            // A new prompt or a mask change starts from a fresh, wiped buffer.
+            const replace_secret = entry.session.?.model.isSecret() != prepared.*.?.model.isSecret() or
+                !sameSecret(entry.behavior.secret, behavior.secret);
+            entry.behavior = behavior;
+            if (replace_secret or entry.session.?.model.multiline != prepared.*.?.model.multiline or (mode == .controlled and !std.mem.eql(
                 u8,
                 entry.session.?.model.text(),
                 prepared.*.?.model.text(),
@@ -166,6 +177,12 @@ pub const Registry = struct {
 
     pub fn content(self: *const Registry, target: instance.InstanceHandle) !instance.InstanceHandle {
         return (self.find(target) orelse return error.TextInputNotFound).content;
+    }
+
+    /// Whether any mounted field sends its text to an authentication prompt.
+    pub fn hasSecret(self: *const Registry) bool {
+        for (self.entries) |entry| if (entry.active and entry.behavior.secret != null) return true;
+        return false;
     }
 
     pub fn getBehavior(self: *const Registry, target: instance.InstanceHandle) !Behavior {

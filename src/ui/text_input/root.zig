@@ -11,9 +11,11 @@ pub const EditBatch = @import("session.zig").EditBatch;
 pub const Preedit = @import("session.zig").Preedit;
 pub const Presentation = @import("presentation.zig").Presentation;
 pub const buildPresentation = @import("presentation.zig").build;
+pub const maskedToModel = @import("presentation.zig").maskedToModel;
 pub const Registry = @import("registry.zig").Registry;
 pub const ValueMode = @import("registry.zig").ValueMode;
 pub const Behavior = @import("registry.zig").Behavior;
+pub const Secret = @import("secret.zig").Secret;
 
 test {
     _ = @import("intent.zig");
@@ -21,4 +23,5 @@ test {
     _ = @import("session.zig");
     _ = @import("presentation.zig");
     _ = @import("registry.zig");
+    _ = @import("secret.zig");
 }

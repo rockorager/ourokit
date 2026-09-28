@@ -4,7 +4,6 @@ const Scheduler = @import("../../task/scheduler.zig").Scheduler;
 const ScopeHandle = @import("../../task/scheduler.zig").ScopeHandle;
 const render_object = @import("../render_object/root.zig");
 const render_types = @import("../render_object/types.zig");
-const AuthInput = @import("../widget/auth_input.zig").Input;
 
 pub const InstanceHandle = Handle;
 
@@ -40,7 +39,6 @@ pub const Descriptor = struct {
     ensure_visible: ?u64 = null,
     /// A changed nonzero token requests focus after the build commits.
     focus_request: u64 = 0,
-    auth_input: ?AuthInput = null,
     interaction_paint: ?InteractionPaint = null,
     /// Horizontal distance from each outer edge to the range's endpoint.
     range_inset: f32 = 0,
@@ -65,7 +63,6 @@ const Slot = struct {
     focusable: bool = false,
     focus_request: u64 = 0,
     focus_request_pending: bool = false,
-    auth_input: ?AuthInput = null,
     interaction_paint: ?InteractionPaint = null,
     range_inset: f32 = 0,
     traversal_order: usize = 0,
@@ -310,8 +307,6 @@ pub const Tree = struct {
 
         for (self.slots) |*slot| {
             if (slot.state != .active or self.descriptorForId(descriptors, slot.id) != null) continue;
-            if (slot.auth_input) |input| input.clear();
-            slot.auth_input = null;
             self.scheduler.queueScopeCancellation(slot.scope) catch unreachable;
             self.render_tree.destroy(slot.render.?) catch unreachable;
             slot.render = null;
@@ -355,11 +350,6 @@ pub const Tree = struct {
 
         for (descriptors, 0..) |descriptor, traversal_order| {
             const slot = self.findActiveById(descriptor.id).?;
-            if (!std.meta.eql(slot.auth_input, descriptor.auth_input)) {
-                if (slot.auth_input) |input| input.clear();
-                slot.auth_input = descriptor.auth_input;
-                slot.focus_request = 0;
-            }
             slot.focusable = descriptor.focusable;
             slot.interaction_paint = descriptor.interaction_paint;
             slot.range_inset = descriptor.range_inset;
@@ -438,17 +428,8 @@ pub const Tree = struct {
         return .{ .render = slot.render.?, .paint = slot.interaction_paint orelse return null };
     }
 
-    pub fn authInput(self: *Tree, handle: InstanceHandle) ?AuthInput {
-        return (self.activeSlot(handle) catch return null).auth_input;
-    }
-
     pub fn rangeInset(self: *Tree, handle: InstanceHandle) !f32 {
         return (try self.activeSlot(handle)).range_inset;
-    }
-
-    pub fn hasAuthInput(self: *const Tree) bool {
-        for (self.slots) |slot| if (slot.state == .active and slot.auth_input != null) return true;
-        return false;
     }
 
     pub fn instanceForRenderObject(

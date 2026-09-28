@@ -38,9 +38,8 @@ static uint64_t prompt(ouro_auth *a, int echo) {
     return e.prompt_id;
 }
 
-static void insert(ouro_auth *a, uint64_t id, const uint32_t *s, size_t n) {
-    for (size_t i = 0; i < n; i++)
-        assert(ouro_auth_edit(a, id, OURO_AUTH_INSERT, s[i]) == 1);
+static int respond(ouro_auth *a, uint64_t id, const char *text) {
+    return ouro_auth_respond(a, id, (const unsigned char *)text, strlen(text));
 }
 
 static void finish(ouro_auth *a, int success, int reason) {
@@ -55,9 +54,7 @@ static void finish(ouro_auth *a, int success, int reason) {
 static ouro_auth *start(const char *service) {
     ouro_auth *a = ouro_auth_start(service, "fixture-user");
     assert(a);
-    assert(ouro_auth_edit(a, 0, OURO_AUTH_INSERT, 'x') == 0);
-    assert(ouro_auth_clear_input(a, 0) == 0);
-    assert(ouro_auth_submit(a, 0) == 0);
+    assert(respond(a, 0, "x") == 0);
     ouro_auth_launch(a);
     return a;
 }
@@ -65,67 +62,35 @@ static ouro_auth *start(const char *service) {
 static void ordinary(const char *service, int correct, int success) {
     ouro_auth *a = start(service);
     uint64_t first = prompt(a, 1);
-    assert(ouro_auth_edit(a, 0, OURO_AUTH_INSERT, 'x') == 0);
-    assert(ouro_auth_edit(a, first + 1, OURO_AUTH_INSERT, 'x') == 0);
-    assert(ouro_auth_edit(a, first, OURO_AUTH_INSERT, 0) == 0);
-    assert(ouro_auth_edit(a, first, OURO_AUTH_INSERT, 0xd800) == 0);
-    assert(ouro_auth_edit(a, first, OURO_AUTH_INSERT, 0x110000) == 0);
-    const uint32_t alice[] = {'a', 'l', 'i', 'c', 'e'};
-    assert(ouro_auth_edit(a, first, OURO_AUTH_INSERT, 'x') == 1);
-    assert(ouro_auth_clear_input(a, first) == 1);
-    assert(!ouro_auth_has_input(a, first));
-    insert(a, first, alice, sizeof alice / sizeof *alice);
-    assert(ouro_auth_submit(a, first) == 1);
-    assert(ouro_auth_submit(a, first) == 0);
+    assert(respond(a, 0, "alice") == 0);
+    assert(respond(a, first + 1, "alice") == 0);
+    assert(ouro_auth_respond(a, first, NULL, 5) == 0);
+    assert(respond(a, first, "alice") == 1);
+    assert(respond(a, first, "alice") == 0);
     uint64_t second = prompt(a, 0);
-    assert(ouro_auth_clear_input(a, first) == 0);
-    const uint32_t good[] = {'t', 'e', 's', 't', '-', 'o', 'n', 'l', 'y',
-                             '-', 'r', 'e', 's', 'p', 'o', 'n', 's', 'e'};
-    const uint32_t bad[] = {'w', 'r', 'o', 'n', 'g'};
-    insert(a, second, correct ? good : bad, correct ? sizeof good / 4 : sizeof bad / 4);
-    assert(ouro_auth_submit(a, second) == 1);
+    assert(respond(a, first, "alice") == 0);
+    assert(respond(a, second, correct ? "test-only-response" : "wrong") == 1);
     finish(a, success, success ? OURO_AUTH_SUCCESS : OURO_AUTH_DENIED);
 }
 
-static void edited(void) {
+static void utf8(void) {
     ouro_auth *a = start("edited");
     uint64_t id = prompt(a, 1);
-    const uint32_t initial[] = {0xe9, 0x1f642, 'Q'};
-    insert(a, id, initial, 3);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_HOME, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_INSERT, 'X') == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_DELETE, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_BACKSPACE, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_HOME, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_INSERT, 'A') == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_END, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_BACKSPACE, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_INSERT, 'Z') == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_HOME, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_RIGHT, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_INSERT, 0xe9) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_END, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_LEFT, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_DELETE, 0) == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_INSERT, 'Z') == 1);
-    assert(ouro_auth_submit(a, id) == 1);
+    assert(respond(a, id, "A\xc3\xa9\xf0\x9f\x99\x82Z") == 1);
     id = prompt(a, 0);
-    const uint32_t wrong[] = {'n', 'o'}, pass[] = {'p', 0xe4, 's', 's', 0x1f512};
-    insert(a, id, wrong, 2);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_SELECT_ALL, 0) == 1);
-    assert(ouro_auth_has_input(a, id)); // selection must not prematurely erase
-    insert(a, id, pass, 5);
-    assert(ouro_auth_submit(a, id) == 1);
+    assert(respond(a, id, "p\xc3\xa4ss\xf0\x9f\x94\x92") == 1);
     finish(a, 1, OURO_AUTH_SUCCESS);
 }
 
 static void limit(void) {
     ouro_auth *a = start("limit");
     uint64_t id = prompt(a, 1);
-    for (int i = 0; i < 512; i++)
-        assert(ouro_auth_edit(a, id, OURO_AUTH_INSERT, 'x') == 1);
-    assert(ouro_auth_edit(a, id, OURO_AUTH_INSERT, 'x') == -1);
-    assert(ouro_auth_submit(a, id) == 1);
+    char text[514];
+    memset(text, 'x', sizeof text - 1);
+    text[513] = 0;
+    assert(respond(a, id, text) == 0); // 513 bytes exceed the PAM response limit
+    text[512] = 0;
+    assert(respond(a, id, text) == 1);
     finish(a, 1, OURO_AUTH_SUCCESS);
 }
 
@@ -150,13 +115,13 @@ int main(int argc, char **argv) {
     ordinary("fixture", 0, 0);
     ordinary("deny-account", 1, 0);
     ordinary("end-failed", 1, 0);
-    edited();
+    utf8();
     limit();
     ouro_auth *crash = start("crash");
     finish(crash, 0, OURO_AUTH_WORKER_FAILED);
     cancel_blocked();
     for (int i = 0; i < 4; i++)
         ordinary("fixture", 1, 1);
-    puts("PASS native auth editing, PAM outcomes, crashes, cancellation and child reaping");
+    puts("PASS native auth responses, PAM outcomes, crashes, cancellation and child reaping");
     return 0;
 }

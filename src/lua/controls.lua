@@ -175,6 +175,7 @@ ouro.text_input = ouro.stateless(function(p, children, theme)
   local alignment
   if not p.multiline then alignment = 'left' end
   return ouro.text_editor {key=p.key, text=p.text, default_text=p.default_text,
+    mask=p.mask, conversation=p.conversation, prompt_id=p.prompt_id,
     label=p.label, placeholder=p.placeholder, multiline=p.multiline,
     enabled=active, read_only=p.read_only, autofocus=p.autofocus,
     key_bindings=p.key_bindings, on_change=p.on_change, on_command=p.on_command,
@@ -188,22 +189,6 @@ ouro.text_input = ouro.stateless(function(p, children, theme)
     font_size=appearance('font_size', theme.typography.size or f.typography_2),
     foreground=appearance(active and 'foreground' or 'disabled_foreground', active and c.foreground or c.disabled_foreground),
     caret_color=appearance('foreground', c.foreground), placeholder_color=c.muted_foreground, selection_color=c.selection}
-end)
-
-ouro.auth_input = ouro.stateless(function(p, children, theme)
-  check(#children == 0, 'auth_input does not accept children')
-  check(p.height == nil or kind(p.height) == 'number', 'invalid auth_input height')
-  local height = p.height
-  if height == nil then height = theme.controls.height end
-  return ouro.secure_entry {key=p.key, conversation=p.conversation, prompt_id=p.prompt_id,
-    autofocus=p.autofocus, on_submit=p.on_submit, on_cancel=p.on_cancel, on_error=p.on_error,
-    width=p.width, height=height, flex=p.flex, x=p.x, y=p.y,
-    padding_x=8, alignment='left', radius=4, border_width=1,
-    background=theme.colors.surface, border=theme.colors.input,
-    foreground=theme.colors.foreground, font_size=f.typography_2,
-    -- Forward forbidden fields so the native security boundary rejects them.
-    text=p.text, value=p.value, default_text=p.default_text, on_change=p.on_change,
-    key_bindings=p.key_bindings, placeholder=p.placeholder}
 end)
 
 local function selection_group(p, children, policy)
