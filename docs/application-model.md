@@ -744,12 +744,12 @@ logical coordinates, not Wayring objects or raw Wayland fixed-point values.
 
 Normalized widget descriptors cross into instance construction; instances own
 identity, lifecycle, state, focus, command contribution, and reconciliation. A
-small closed render-object set (Box, Flex, Stack, Text, Image, Scroll,
+small closed render-object set (Box, Flex, Grid, Stack, Text, Image, Scroll,
 TextInput, and Canvas only when their distinct behavior is demonstrated) owns
 layout, paint, clip, and hit testing. Scenes are immutable backend-neutral
 output.
 
-The implemented headless render-tree kernel starts with Box, Flex, Stack, and a
+The implemented headless render-tree kernel includes Box, Flex, Grid, Stack, and a
 constraint-aware Text backed by immutable paragraph source and layout handles.
 It uses one-way minimum/maximum box constraints and logical `f32` geometry.
 Parents position children after each child chooses a finite constrained size.
@@ -761,9 +761,111 @@ testing without Wayland or Lua.
 
 Declarative rows and columns expose that edge metadata as a contextual
 `flex = <positive integer>` child property. It is rejected anywhere except on
-a direct row or column child. `cross_alignment = "start" | "center" | "end" |
+a direct nonwrapping row or column child. `cross_alignment = "start" | "center" | "end" |
 "stretch"` controls the container's cross axis; flex children use tight fitting
 and divide the remaining bounded main-axis space according to their factors.
+
+#### Wrapping rows and columns
+
+`ouro.row` and `ouro.column` accept `wrap=true` (default false) and `run_gap`
+(default: `gap`). Both gaps must be finite, non-negative logical pixels.
+Wrapping is greedy in child order: each child receives loose bounds for the
+**whole run**, and starts a new run only when its size plus the gap would exceed
+the main-axis maximum. An exact fit stays in the current run; an oversized child
+is constrained to the whole run without creating an empty run. Rows advance
+downward; columns advance rightward. An unbounded main axis produces one run.
+
+`cross_alignment` operates within each run, using its tallest/widest child.
+`stretch` stretches to that run's cross extent, not the entire container.
+`main_axis_size="min"` (Lua default) uses the longest run; `"max"` fills the
+bounded main axis. Incoming minimum constraints still apply. Runs can overflow
+the bounded cross axis. Fill children use the whole bounded axis; they do not
+share the remaining line space. **Direct wrapped children cannot use `flex`**;
+put a nonwrapping row/column inside a sized child for weighted subdivisions.
+
+```lua
+ouro.row {
+  key = "tags", wrap = true, gap = 8, run_gap = 12, cross_alignment = "center",
+  ouro.box { key = "short", width = 74, height = 28 },
+  ouro.box { key = "long", width = 136, height = 42 },
+  ouro.box { key = "last", width = 93, height = 32 },
+}
+```
+
+#### Explicit grids
+
+`ouro.grid` takes required dense `columns` and `rows` arrays, each containing
+1–32 tracks. A track is a finite non-negative pixel number, `"auto"`, or
+`{fr=<finite positive weight>}`. `column_gap` and `row_gap` default to zero.
+Direct children require one-based `column` and `row`. `column_span` and
+`row_span` default to one and must be positive integers wholly inside the
+declared tracks. No implicit tracks, automatic placement, named areas, minmax,
+or CSS sizing algorithm are provided. Grids accept `semantic=false` like other
+decorative containers, and contextual `flex` when placed in a nonwrapping row
+or column. Their children cannot use `flex`.
+
+```lua
+ouro.grid {
+  key = "panel", columns = {112, {fr=1}, {fr=2}}, rows = {"auto", 64, 92},
+  column_gap = 10, row_gap = 14,
+  ouro.text { key = "heading", column = 2, row = 1, column_span = 2,
+              text = "An auto-height heading spanning unequal columns" },
+  ouro.box { key = "rail", column = 1, row = 2, row_span = 2,
+             width = "fill", height = "fill", background = "#DCEBFA" },
+  ouro.box { key = "footer", column = 2, row = 3, column_span = 2,
+             width = "fill", height = "fill", background = "#DDEFD8" },
+}
+```
+
+Sizing is deliberately one-way: resolve columns, measure child heights at their
+resolved spanning width, then resolve rows. Fixed tracks never grow or shrink.
+Auto tracks grow from intrinsic child contributions. Spans include their inner
+gaps; any intrinsic deficit is divided equally among the span's auto tracks,
+shortest spans first, with declaration order breaking ties. Bounded fractional
+tracks have **zero intrinsic minimum** and divide the non-negative space left
+after fixed tracks, auto tracks, and gaps according to their weights. On an
+unbounded axis, fractional tracks behave as auto tracks instead (weights do not
+apply). Auto measurement requires children to support intrinsic sizing along
+the measured axis; weighted Flex children need a bounded axis, as elsewhere.
+
+Children receive loose cell bounds and sit at the cell origin. Omitted sizes
+stay intrinsic; use a fill Box for stretching and its `alignment` for placement
+inside the cell. A span changes placement constraints, not child identity.
+Overlapping cells are allowed: children paint in declaration order and hit
+testing visits them in reverse order. Reordering keyed children or changing
+their placement retains their instances.
+
+Grid placement on a stock control or custom stateless/stateful component flows
+through to its returned root without adding a layout wrapper. Explicit placement
+on that root overrides inherited fields. Placement stops at the first native
+container; its descendants use their own parent's layout contract.
+
+**Overflow is not implicit clipping.** The grid's own size obeys its incoming
+constraints, but fixed/auto tracks and their children may extend beyond it;
+they do not silently shrink to fit. Grid and wrapping Flex do not clip paint.
+Use an `ouro.scroll` viewport to clip it; native callers can also use
+`Box.clip=true` (not currently exposed by Lua's Box constructor).
+Existing hit testing always gates traversal at every ancestor's layout bounds,
+even without paint clipping: visible overflow outside those bounds is not
+clickable. Clip does not enlarge hit regions.
+
+Native callers use `types.Flex.wrap/run_gap`, `types.Grid`,
+`GridTracks.init(&.{ .{.fixed=112}, .auto, .{.fr=2} })`, and zero-based
+`ParentData.grid` placement with spans defaulting to one. Track arrays are
+value-owned by the render object; no caller-owned slice must remain alive.
+Native Flex defaults remain unchanged (`main_axis_size=.max`, gaps zero).
+Layout uses fixed-size track scratch storage and caches unchanged constraints.
+
+`examples/layout-storybook.lua` covers wide/narrow rows, column runs, asymmetric
+grid spans with wrapping text, and visible versus clipped overflow:
+
+```sh
+zig-out/bin/ouroctl storybook snapshot examples/layout-storybook.lua \
+  --output .amp/in/artifacts/layout
+```
+
+#### Boxes and stacks
+
 Boxes may opt into generated theme surfaces with `surface = "background" |
 "card" | "popover" | "sidebar"`. Explicit `background` overrides `surface`,
 including a fully transparent color; omitting both leaves the Box transparent.
@@ -807,8 +909,12 @@ ouro.stack {
 }
 ```
 
-Stack adds no offset, gradient, or decoration properties. Its own `flex` property
-works only when its parent is a row or column; stack children cannot use `flex`.
+The native Stack supports `ParentData.stack {x,y}` offsets. The internal Lua
+`.stack` parent context also reads non-negative `x`/`y` child properties (both
+default zero). Public `ouro.stack`, however, currently lowers children through
+the `.overlay` context and leaves them at the origin; those offset properties
+are not applied there. Stack's own `flex` property works only when its parent
+is a nonwrapping row or column; stack children cannot use `flex`.
 
 ### Inherited visual defaults
 
@@ -1935,11 +2041,105 @@ wakeups. Native keyboard focus loss also hides the caret. Horizontal caret revea
 is independent of blink visibility. `WindowRuntimeConfig.caret_blink_interval_ns`
 sets each phase duration (500 ms by default); zero disables blinking.
 
-Commands live in an authoritative registry independent of the retained render
-tree. Entries need stable semantic IDs plus revisioned invocation handles,
-scope, title/category/aliases, enabled state and reason, state, argument schema,
-shortcut, and destructive/reversible metadata. Contextual widget commands may
-register there, but external enumeration never walks render objects.
+## Contextual commands and custom input
+
+`ouro.box` is also an input scope. `focusable = true` opts a custom control into
+Tab traversal and primary-click focus; `enabled = false` excludes it from focus.
+Wrap stock controls in a box to observe or intercept their input. Recipes do not
+implicitly forward these properties. Local `commands` are private Lua callbacks;
+only `ouro.app.actions` explicitly exposes schema-backed external actions. No
+shortcut name resolves into the external action catalog.
+
+```lua
+ouro.box {
+  key = "workspace", focusable = true,
+  commands = {
+    save = function() save_document() end,
+    comment = function() comment_selection() end,
+  },
+  shortcuts = { ["Ctrl+S"] = "save", ["Ctrl+K Ctrl+C"] = "comment" },
+  on_key = {
+    keys = { "Left", "Right" }, states = { "pressed", "repeated" },
+    propagate = false,
+    handler = function(event) move_custom_selection(event.key) end,
+  },
+  on_pointer_capture = {
+    kinds = { "press" }, button = 272,
+    propagate = true,
+    handler = function(event) record_click(event.x, event.y) end,
+  },
+  -- Child descriptions...
+}
+```
+
+`on_key_capture`, `on_key`, `on_pointer_capture`, and `on_pointer` each accept
+one table with a `handler` function and an explicit boolean `propagate`.
+**Propagation is declarative, not a callback-return veto.** Native routing
+checks filters and the committed `propagate` value without running Lua. A
+matching `propagate = false` registration consumes the event; its return value,
+error, or yield cannot change that decision. Callback side effects happen later.
+Change a signal and rebuild to change future filters or propagation policy.
+
+Keyboard filters are `keys` (1–16 exact logical chords using the editor chord
+syntax above) and `states` (`pressed`, `released`, `repeated`). Pointer filters
+are `kinds` (`press`, `release`, `motion`, `enter`, `leave`, `axis`) and optional
+Linux input-event `button` code. Filters combine with AND; values within an
+array combine with OR. Omitted filters match all; an explicit array must be
+nonempty and dense. `button` only matches press/release events, never motion.
+Unknown filter fields and invalid values reject the build instead of becoming
+catch-all handlers. `enter`/`leave` describe hit-target transitions, including
+transitions between descendants. Pointer capture after a press retains the
+original target through motion and release even when the press was consumed.
+
+Each callback receives a fresh, owned event table:
+
+- Keys: `{kind="key", key="Left", state="pressed", phase="bubble",
+  modifiers={control=false, shift=false, alt=false, super=false}}`. Key names
+  use `A`–`Z`, `F1`–`F12`, `Enter`, etc.; unidentified keys use `""`.
+- Pointers: `{kind="press", x=12, y=24, button=272, phase="capture"}`.
+  Positions are window-logical coordinates, not target-local. `button` is zero
+  when inapplicable. Axis events also include `axis` (`horizontal` or `vertical`)
+  and signed logical-pixel `delta`.
+
+There is no text, Unicode value, raw keycode, input serial, or IME payload in
+these tables. Use the editor's text callbacks for text. Focused masked/secret
+editors and active IME preedit bypass **all** generic key hooks and shortcuts,
+including releases and Tab; stock protected editing/navigation still runs.
+Repeats and releases of a private press remain withheld if focus or composition
+changes before the key is released.
+
+Dispatch order is capture from the outermost scope to the target, shortcut
+resolution from the focused target outward, bubble from target outward, then
+stock editing/selection/activation. A consumed event skips later phases and
+defaults. A nonmatching filter does nothing. Modal focus boundaries fence every
+phase: outside ancestors cannot capture or resolve commands. Without focus,
+the window's single-child wrapper chain is eligible up to its first branch;
+put window-wide shortcuts on the outer content box, not an unfocused sibling.
+Native release cleanup always runs even if consumed, so existing buttons and
+selection/range/split drags cannot remain pressed.
+
+Shortcut values must name functions in the **same box's** `commands` table.
+The nearest eligible scope with a match wins. Exact modifiers matter, and only
+initial presses advance sequences or invoke commands. Space-separated sequences
+contain at most four strokes. Distinct sequences may share prefixes, but exact
+duplicates and a complete shortcut that is also another's prefix in the same
+box reject the build. Partial sequences consume their strokes without invoking
+a command. Each stroke must be dispatched less than one monotonic second after
+the previous stroke; expiry is checked before the next input dispatch. Escape
+cancels a pending sequence. A mismatch discards the prefix and retries that key
+as fresh input; consumed prefix strokes are not replayed. Focus/modal changes,
+keyboard leave, pointer press, IME input, or committed binding replacement
+(including reload) reset pending sequences. Repeats do not extend expiry.
+
+Handlers and commands run as ordinary instance-scoped scheduler tasks. They
+may yield; later handlers/defaults never wait for them. Initial executions are
+queued in routing order; continuations follow ordinary scheduler readiness.
+Cancellation and reload use existing callback ownership. Real press provenance
+is available only to the callback's first execution; it expires on yield and
+is not inherited by spawned tasks. Synthetic development/playback input grants
+no real-input capability, and a multi-stroke command uses only the final press.
+Local commands are neither discoverable nor invocable through external tools
+unless the application separately declares an action.
 
 Headless retained layout, software glyph rendering, deterministic scene
 logging, Button interaction state tests, and semantic snapshots are available

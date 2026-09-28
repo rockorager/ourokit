@@ -28,11 +28,7 @@ const image_pixels = @import("../image/pixels.zig");
 // Radix Themes keeps widget geometry in component recipes while reusable color
 // roles and scales remain generated design data.
 
-const PendingHandler = struct {
-    id: u64,
-    reference: c_int,
-    kind: @import("../ui/input/bindings.zig").HandlerKind,
-};
+const PendingHandler = @import("prepared_build.zig").Handler;
 
 const PendingButton = struct {
     id: u64,
@@ -66,8 +62,16 @@ const PendingTextInput = struct {
     session: ?TextInputSession,
 };
 
-const ParentKind = enum { box, flex, stack, overlay, scroll, listbox, radio_group, tab_bar, split };
-const BuildParent = struct { id: u64, kind: ParentKind, semantic_id: ?u64 = null };
+const ParentKind = enum { box, flex, grid, stack, overlay, scroll, listbox, radio_group, tab_bar, split };
+const BuildParent = struct {
+    id: u64,
+    kind: ParentKind,
+    semantic_id: ?u64 = null,
+    wrap: bool = false,
+    grid_columns: u8 = 0,
+    grid_rows: u8 = 0,
+    grid_cell: ?@FieldType(render_types.ParentData, "grid") = null,
+};
 
 pub const Argument = union(enum) {
     number: f64,
@@ -356,7 +360,7 @@ pub const UiBuild = struct {
             const old = bindings.set(
                 owner,
                 tree.handleForId(pending.id).?,
-                .{ .id = handle, .kind = pending.kind },
+                .{ .id = handle, .kind = pending.kind, .propagate = pending.propagate, .filter = pending.filter, .sequence = pending.sequence },
             ) catch unreachable;
             if (old) |handler| callbacks.?.release(handler.id) catch unreachable;
         }
@@ -465,11 +469,7 @@ pub const UiBuild = struct {
         for (
             self.pending_handlers[0..self.pending_handler_count],
             prepared.handlers[0..self.pending_handler_count],
-        ) |source, *destination| destination.* = .{
-            .id = source.id,
-            .reference = source.reference,
-            .kind = source.kind,
-        };
+        ) |source, *destination| destination.* = source;
         prepared.handler_count = self.pending_handler_count;
         for (
             self.pending_buttons[0..self.pending_button_count],
@@ -643,6 +643,7 @@ pub const UiBuild = struct {
             .split => emitSplit,
             .box => emitBox,
             .stack => emitStack,
+            .grid => emitGrid,
             .row => emitRow,
             .column => emitColumn,
             .scroll => emitScroll,
@@ -664,6 +665,9 @@ pub const UiBuild = struct {
         self.composition_depth += 1;
         defer self.composition_depth -= 1;
         const theme = self.currentStyle() orelse return luaError(state, "composition requires a theme");
+        _ = c.lua_getiuservalue(state, 1, 1);
+        const parent = self.compositionParent(state, -1) catch |err| return luaError(state, parentDataErrorMessage(err));
+        c.lua_settop(state, 1);
         self.components.push("compose");
         _ = c.lua_getiuservalue(state, 1, 3);
         _ = c.lua_getiuservalue(state, 1, 1);
@@ -688,11 +692,33 @@ pub const UiBuild = struct {
             c.lua_setfield(state, -2, "selection");
         }
         if (c.lua_pcallk(state, 5, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        if (parent.kind == .grid) self.pushParent(parent) catch return luaError(state, "composition nesting too deep");
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, lowerDescription, 1);
         c.lua_pushvalue(state, -2);
-        if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) return c.lua_error(state);
+        const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
+        if (parent.kind == .grid) self.popParent();
+        if (status != c.ok) return c.lua_error(state);
         return 0;
+    }
+
+    // A composition contributes no layout node. Carry its grid edge through
+    // its returned root, without mutating descriptions or individual recipes.
+    // Root properties can override inherited placement; descendants cannot
+    // inherit it once a real container has pushed its own parent context.
+    fn compositionParent(self: *UiBuild, state: *c.State, props: c_int) !BuildParent {
+        var parent = self.currentParent() orelse return error.WidgetParentMissing;
+        if (parent.kind == .grid) {
+            for ([_][:0]const u8{ "column", "row", "column_span", "row_span" }) |field| {
+                const kind = c.lua_getfield(state, props, field);
+                c.lua_settop(state, -2);
+                if (kind != c.type_nil) {
+                    parent.grid_cell = (try declarativeParentData(self, state, props)).grid;
+                    break;
+                }
+            }
+        }
+        return parent;
     }
 
     fn currentSelection(self: *const UiBuild) ?PendingListBox {
@@ -704,8 +730,8 @@ pub const UiBuild = struct {
     }
 
     fn lowerComponent(self: *UiBuild, state: *c.State) c_int {
-        const parent = self.currentParent() orelse return luaError(state, "component requires a widget parent");
         _ = c.lua_getiuservalue(state, 1, 1);
+        const parent = self.compositionParent(state, -1) catch |err| return luaError(state, parentDataErrorMessage(err));
         const key = tableString(state, -1, "key") orelse return luaError(state, "component key is required");
         if (key.len == 0) return luaError(state, "component key is required");
         c.lua_settop(state, 1);
@@ -724,7 +750,9 @@ pub const UiBuild = struct {
         const group = semanticId("component", token ^ @as(u64, @intFromPtr(state)));
         self.appendSemantic(.{ .id = group, .parent = semanticParent(parent), .role = .group, .key = key }) catch
             return luaError(state, "cannot append component semantics");
-        self.pushParent(.{ .id = parent.id, .kind = parent.kind, .semantic_id = group }) catch
+        var component_parent = parent;
+        component_parent.semantic_id = group;
+        self.pushParent(component_parent) catch
             return luaError(state, "component nesting is too deep");
         const previous = self.component_namespace;
         self.component_namespace = group;
@@ -1355,6 +1383,42 @@ pub const UiBuild = struct {
         return emitFlexContainer(state, .vertical);
     }
 
+    fn emitGrid(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        const parent = self.currentParent() orelse return luaError(state, "grid requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "grid key is required");
+        const value: render_types.Grid = .{
+            .columns = tableGridTracks(state, 1, "columns") orelse return luaError(state, "invalid grid columns"),
+            .rows = tableGridTracks(state, 1, "rows") orelse return luaError(state, "invalid grid rows"),
+            .column_gap = tableOptionalExtent(state, 1, "column_gap", 0) orelse return luaError(state, "invalid grid column_gap"),
+            .row_gap = tableOptionalExtent(state, 1, "row_gap", 0) orelse return luaError(state, "invalid grid row_gap"),
+        };
+        const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
+        const id = semanticId(key, 0x67726964 ^ parent.id ^ self.component_namespace);
+        self.append(.{
+            .id = id,
+            .parent = parent.id,
+            .object = .{ .grid = value },
+            .parent_data = parent_data,
+        }) catch return luaError(state, "cannot append grid descriptor");
+        if (semantic) self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .group,
+            .key = key,
+        }) catch return luaError(state, "cannot append grid semantics");
+        return self.emitChildren(state, .{
+            .id = id,
+            .kind = .grid,
+            .grid_columns = value.columns.len,
+            .grid_rows = value.rows.len,
+            .semantic_id = if (semantic) id else semanticParent(parent),
+        });
+    }
+
     fn emitStack(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
@@ -1496,10 +1560,12 @@ pub const UiBuild = struct {
             self.stageCallback(state, id, "on_change", if (range != null) .range_change else .@"switch") catch |err| return luaError(state, @errorName(err));
         }
         if (activate or range != null or role == .dialog) self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
+        const focusable = tableOptionalBoolean(state, 1, "focusable", false) orelse
+            return luaError(state, "focusable must be boolean");
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .focusable = (activate or range != null) and enabled,
+            .focusable = (activate or range != null or focusable) and enabled,
             .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
             .interaction_paint = paint,
             .range_inset = range_inset,
@@ -1538,6 +1604,7 @@ pub const UiBuild = struct {
             return luaError(state, @errorName(err));
         self.stageCallback(state, id, "on_drop_uris", .drop_uris) catch |err|
             return luaError(state, @errorName(err));
+        self.stageInput(state, id) catch |err| return luaError(state, @errorName(err));
         const previous_owner = self.interaction_owner;
         self.interaction_owner = owner;
         defer self.interaction_owner = previous_owner;
@@ -1557,6 +1624,79 @@ pub const UiBuild = struct {
         c.lua_settop(state, -2);
         defer if (has_content_theme) self.popTheme();
         return self.emitChildren(state, .{ .id = id, .kind = .box, .semantic_id = if (semantic) id else semanticParent(parent) });
+    }
+
+    fn stageInput(self: *UiBuild, state: *c.State, id: u64) !void {
+        const top = c.lua_gettop(state);
+        defer c.lua_settop(state, top);
+        inline for (.{ "on_key_capture", "on_key", "on_pointer_capture", "on_pointer" }, .{ .key_capture, .key_bubble, .pointer_capture, .pointer_bubble }) |name, kind| {
+            const value_type = c.lua_getfield(state, 1, name);
+            if (value_type != c.type_nil) {
+                if (value_type != c.type_table) return error.InvalidInputHandler;
+                const index = c.lua_gettop(state);
+                const keyboard = kind == .key_capture or kind == .key_bubble;
+                // A misspelled filter must not silently become a catch-all.
+                c.lua_pushnil(state);
+                while (c.lua_next(state, index) != 0) {
+                    const field = string(state, -2) orelse return error.InvalidInputHandler;
+                    if (!std.mem.eql(u8, field, "handler") and !std.mem.eql(u8, field, "propagate") and
+                        !(keyboard and (std.mem.eql(u8, field, "keys") or std.mem.eql(u8, field, "states"))) and
+                        !(!keyboard and (std.mem.eql(u8, field, "kinds") or std.mem.eql(u8, field, "button"))))
+                        return error.InvalidInputFilter;
+                    c.lua_settop(state, -2);
+                }
+                if (c.lua_getfield(state, index, "propagate") != c.type_boolean) return error.InputPropagationRequired;
+                const propagate = c.lua_toboolean(state, -1) != 0;
+                c.lua_settop(state, -2);
+                const filter = try @import("key_bindings.zig").listenerFilter(state, index, keyboard);
+                if (c.lua_getfield(state, index, "handler") != c.type_function) return error.CallbackMustBeFunction;
+                if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+                self.pending_handlers[self.pending_handler_count] = .{
+                    .id = id,
+                    .reference = c.luaL_ref(state, c.registry_index),
+                    .kind = kind,
+                    .propagate = propagate,
+                    .filter = filter,
+                };
+                self.pending_handler_count += 1;
+            }
+            c.lua_settop(state, top);
+        }
+        const commands_type = c.lua_getfield(state, 1, "commands");
+        const commands = c.lua_gettop(state);
+        if (commands_type != c.type_nil) {
+            if (commands_type != c.type_table) return error.InvalidCommands;
+            c.lua_pushnil(state);
+            while (c.lua_next(state, commands) != 0) {
+                const name = string(state, -2) orelse return error.InvalidCommands;
+                if (name.len == 0 or c.lua_type(state, -1) != c.type_function) return error.InvalidCommands;
+                c.lua_settop(state, -2);
+            }
+        }
+        const shortcuts_type = c.lua_getfield(state, 1, "shortcuts");
+        if (shortcuts_type == c.type_nil) return;
+        if (shortcuts_type != c.type_table or commands_type != c.type_table) return error.InvalidShortcuts;
+        const shortcuts = c.lua_gettop(state);
+        const first = self.pending_handler_count;
+        c.lua_pushnil(state);
+        while (c.lua_next(state, shortcuts) != 0) {
+            const raw = string(state, -2) orelse return error.InvalidShortcuts;
+            _ = string(state, -1) orelse return error.InvalidShortcuts;
+            const sequence = try @import("../ui/input/key_chord.zig").Sequence.parse(raw);
+            for (self.pending_handlers[first..self.pending_handler_count]) |previous|
+                if (sequence.overlaps(previous.sequence)) return error.AmbiguousShortcut;
+            c.lua_pushvalue(state, -1);
+            if (c.lua_rawget(state, commands) != c.type_function) return error.UnknownCommand;
+            if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+            self.pending_handlers[self.pending_handler_count] = .{
+                .id = id,
+                .reference = c.luaL_ref(state, c.registry_index),
+                .kind = .shortcut,
+                .sequence = sequence,
+            };
+            self.pending_handler_count += 1;
+            c.lua_settop(state, -2);
+        }
     }
 
     fn stageCallback(self: *UiBuild, state: *c.State, id: u64, name: [*:0]const u8, kind: @import("../ui/input/bindings.zig").HandlerKind) !void {
@@ -1742,6 +1882,8 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
     const key = tableString(state, 1, "key") orelse return luaError(state, "container key is required");
     const gap = tableOptionalExtent(state, 1, "gap", design.tokens.foundation.spacing_2) orelse
         return luaError(state, "invalid container gap");
+    const wrap = tableOptionalBoolean(state, 1, "wrap", false) orelse return luaError(state, "wrap must be boolean");
+    const run_gap = tableOptionalExtent(state, 1, "run_gap", gap) orelse return luaError(state, "invalid container run_gap");
     const cross_alignment = tableOptionalCrossAxisAlignment(
         state,
         1,
@@ -1774,6 +1916,8 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
             .main_axis_size = main_axis_size,
             .cross_axis_alignment = cross_alignment,
             .gap = gap,
+            .wrap = wrap,
+            .run_gap = run_gap,
         } },
         .parent_data = parent_data,
     }) catch return luaError(state, "cannot append container descriptor");
@@ -1806,7 +1950,7 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         .listbox => .listbox,
         .radio_group => .radio_group,
         .tab_list => .tab_bar,
-    } else .flex, .semantic_id = if (semantic) id else semanticParent(parent) });
+    } else .flex, .wrap = wrap, .semantic_id = if (semantic) id else semanticParent(parent) });
 }
 
 fn readInteractionPaint(state: *c.State, owner: ?InteractionOwner, idle: ?@import("../core/color.zig").Color, border: ?@import("../core/color.zig").Color, box: bool) !?instance.InteractionPaint {
@@ -2104,6 +2248,39 @@ fn tableOptionalPositiveInteger(
     return @intCast(value);
 }
 
+fn tableGridTracks(state: *c.State, table: c_int, field: [*:0]const u8) ?render_types.GridTracks {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    if (c.lua_getfield(state, table, field) != c.type_table) return null;
+    const index = top + 1;
+    const count = c.lua_rawlen(state, index);
+    if (count == 0 or count > render_types.GridTracks.capacity) return null;
+    // rawlen alone cannot distinguish a dense array from a sparse table.
+    c.lua_pushnil(state);
+    while (c.lua_next(state, index) != 0) {
+        var is_integer: c_int = 0;
+        const key = c.lua_tointegerx(state, -2, &is_integer);
+        if (c.lua_type(state, -2) != c.type_number or is_integer == 0 or key < 1 or key > count) return null;
+        c.lua_settop(state, -2);
+    }
+    var result: render_types.GridTracks = .{ .len = @intCast(count) };
+    for (0..count) |track| {
+        const kind = c.lua_rawgeti(state, index, @intCast(track + 1));
+        result.values[track] = switch (kind) {
+            c.type_number => .{ .fixed = requiredExtent(state, -1) orelse return null },
+            c.type_string => if (std.mem.eql(u8, string(state, -1) orelse return null, "auto")) .auto else return null,
+            c.type_table => fraction: {
+                const weight = tableRequiredExtent(state, -1, "fr") orelse return null;
+                if (weight == 0) return null;
+                break :fraction .{ .fr = weight };
+            },
+            else => return null,
+        };
+        c.lua_settop(state, -2);
+    }
+    return result;
+}
+
 fn declarativeParentData(
     self: *const UiBuild,
     state: *c.State,
@@ -2111,8 +2288,25 @@ fn declarativeParentData(
 ) !render_types.ParentData {
     const parent = self.currentParent() orelse return error.WidgetParentMissing;
     const flex = try tableOptionalFlexFactor(state, table);
+    if (parent.wrap and flex != null) return error.FlexInWrap;
     return switch (parent.kind) {
         .flex, .listbox, .radio_group, .tab_bar => if (flex) |factor| .{ .flex = .{ .factor = factor } } else .none,
+        .grid => grid: {
+            if (flex != null) return error.FlexRequiresRowOrColumnParent;
+            const column = tableOptionalPositiveInteger(state, table, "column", if (parent.grid_cell) |cell| @as(u32, cell.column) + 1 else 0) orelse return error.InvalidGridPlacement;
+            const row = tableOptionalPositiveInteger(state, table, "row", if (parent.grid_cell) |cell| @as(u32, cell.row) + 1 else 0) orelse return error.InvalidGridPlacement;
+            const column_span = tableOptionalPositiveInteger(state, table, "column_span", if (parent.grid_cell) |cell| cell.column_span else 1) orelse return error.InvalidGridPlacement;
+            const row_span = tableOptionalPositiveInteger(state, table, "row_span", if (parent.grid_cell) |cell| cell.row_span else 1) orelse return error.InvalidGridPlacement;
+            if (column == 0 or row == 0 or
+                @as(u64, column) + column_span - 1 > parent.grid_columns or
+                @as(u64, row) + row_span - 1 > parent.grid_rows) return error.InvalidGridPlacement;
+            break :grid .{ .grid = .{
+                .column = @intCast(column - 1),
+                .row = @intCast(row - 1),
+                .column_span = @intCast(column_span),
+                .row_span = @intCast(row_span),
+            } };
+        },
         .box, .overlay, .scroll, .split => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
         .stack => stack: {
             if (flex != null) return error.FlexRequiresRowOrColumnParent;
@@ -2146,6 +2340,8 @@ fn tableRequiredInteger(state: *c.State, table: c_int, field: [*:0]const u8) ?i6
 fn parentDataErrorMessage(err: anyerror) [*:0]const u8 {
     return switch (err) {
         error.InvalidFlexFactor => "flex must be a positive integer",
+        error.FlexInWrap => "flex is not supported in wrapping rows or columns",
+        error.InvalidGridPlacement => "grid children require row and column with spans inside declared tracks",
         error.FlexRequiresRowOrColumnParent => "flex requires a direct row or column parent",
         error.InvalidPosition => "invalid widget position",
         error.WidgetParentMissing => "widget parent is missing",
@@ -2184,6 +2380,43 @@ fn finiteFloat(state: *c.State, index: c_int) ?f32 {
 fn luaError(state: *c.State, message: [*:0]const u8) c_int {
     _ = c.lua_pushstring(state, message);
     return c.lua_error(state);
+}
+
+test "contextual input validates filters commands and shortcut ambiguity transactionally" {
+    const state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(state);
+    var ui: UiBuild = .{ .state = state, .storage = &.{} };
+    defer ui.rollbackHandlers();
+    const cases = [_]struct { source: []const u8, failure: ?anyerror }{
+        .{ .source = "{on_key={handler=function() end}}", .failure = error.InputPropagationRequired },
+        .{ .source = "{on_key={propagate=false,handler=function() end,key={'A'}}}", .failure = error.InvalidInputFilter },
+        .{ .source = "{on_key={propagate=false,handler=function() end,keys={}}}", .failure = error.InvalidInputFilter },
+        .{ .source = "{on_key={propagate=false,handler=function() end,keys={[2]='A'}}}", .failure = error.InvalidInputFilter },
+        .{ .source = "{on_key={propagate=false,handler=function() end,states={'press'}}}", .failure = error.InvalidInputFilter },
+        .{ .source = "{on_pointer={propagate=false,handler=function() end,kinds={'key'}}}", .failure = error.InvalidInputFilter },
+        .{ .source = "{on_pointer={propagate=false,handler=function() end,button=-1}}", .failure = error.InvalidInputFilter },
+        .{ .source = "{commands={unused=1}}", .failure = error.InvalidCommands },
+        .{ .source = "{commands={},shortcuts={['Ctrl+S']='typo'}}", .failure = error.UnknownCommand },
+        .{ .source = "{commands={go=function() end},shortcuts={['Ctrl+S']='go',['ctrl+s']='go'}}", .failure = error.AmbiguousShortcut },
+        .{ .source = "{commands={go=function() end},shortcuts={['Ctrl+K']='go',['Ctrl+K C']='go'}}", .failure = error.AmbiguousShortcut },
+        .{ .source = "{commands={go=function() end},shortcuts={['Ctrl+K C']='go',['Ctrl+K U']='go'}}", .failure = null },
+        .{ .source = "{on_key={propagate=false,handler=function() end,keys={'Ctrl+Left'},states={'pressed'}},on_pointer={propagate=true,handler=function() end,kinds={'press'},button=272}}", .failure = null },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "return {s}", .{case.source});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source.ptr, source.len, "@input-validation", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 1, 0, 0, null));
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, ui.stageInput(state, 42));
+        } else {
+            try ui.stageInput(state, 42);
+            try std.testing.expectEqual(@as(usize, 2), ui.pending_handler_count);
+        }
+        try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));
+        ui.rollbackHandlers();
+        c.lua_settop(state, 0);
+    }
 }
 
 test "Lua UI exposes only declarative constructors without standard libraries" {
@@ -2476,6 +2709,162 @@ test "declarative flex rejects invalid factors and non-flex parents" {
     c.lua_pushinteger(state, 0);
     c.lua_setfield(state, -2, "flex");
     try std.testing.expectError(error.InvalidFlexFactor, declarativeParentData(&ui, state, -1));
+}
+
+test "declarative grid and wrap validate declarations and retain keyed children through placement changes" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+    const RenderTree = @import("../ui/render_object/root.zig").Tree;
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 4);
+    c.lua_setglobal(state, "ouro");
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 32, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: build_owner.BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var renders: RenderTree = undefined;
+    try renders.init(std.testing.allocator, 16);
+    defer renders.deinit();
+    var instances: instance.Tree = undefined;
+    try instances.init(std.testing.allocator, &scheduler, &renders, scope, 16);
+    defer instances.deinit();
+    var storage: [8]instance.Descriptor = undefined;
+    var semantics: [6]SemanticDescriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    try ui.attachSemantics(&semantics);
+    ui.enableDeclarativeWidgets(design.tokens.light);
+    try execute(state,
+        \\columns = {31, {fr=2}, "auto"}
+        \\row = 1
+        \\span = 2
+        \\wrap = false
+        \\weight = nil
+        \\run_gap = 9
+        \\local Leaf = ouro.stateless(function(p)
+        \\  return ouro.box {key=p.key, width=21, height=13}
+        \\end)
+        \\local Card = ouro.stateful(function(p)
+        \\  return function() return Leaf {key="leaf"} end
+        \\end)
+        \\wrap_mounts = 0
+        \\wrap_renders = 0
+        \\local FlexChild = ouro.stateful(function(p)
+        \\  wrap_mounts = wrap_mounts + 1
+        \\  return function()
+        \\    wrap_renders = wrap_renders + 1
+        \\    return ouro.box {key="leaf", width=71, height=11, flex=p.weight}
+        \\  end
+        \\end)
+        \\function build(reorder)
+        \\  local a = ouro.box {key="a", column=2, row=row, column_span=span, width="fill", height=17}
+        \\  local b = ouro.box {key="b", column=1, row=2, width=21, height=13}
+        \\  return ouro.grid {key="grid", columns=columns, rows={23, 37}, column_gap=5,
+        \\    children = reorder and {b,a} or {a,b}}
+        \\end
+        \\function custom(reorder)
+        \\  local a = Card {key="a", column=2, row=row, column_span=span}
+        \\  local b = Leaf {key="b", column=1, row=2}
+        \\  return ouro.grid {key="grid", columns=columns, rows={23,37}, column_gap=5,
+        \\    children = reorder and {b,a} or {a,b}}
+        \\end
+        \\function stock(reorder)
+        \\  local a = ouro.button {key="a", label="A", column=2, row=row, column_span=span,
+        \\    ouro.box {key="content", width=9, height=7, semantic=false}}
+        \\  local b = ouro.box {key="b", column=1, row=2, width=21, height=13}
+        \\  return ouro.grid {key="grid", columns=columns, rows={23,37}, column_gap=5,
+        \\    children = reorder and {b,a} or {a,b}}
+        \\end
+        \\function wrapping(reorder)
+        \\  local a = ouro.box {key="a", width=71, height=11, flex=weight}
+        \\  local b = ouro.box {key="b", width=53, height=29}
+        \\  return ouro.row {key="wrap", wrap=wrap, run_gap=run_gap, gap=3,
+        \\    children = reorder and {b,a} or {a,b}}
+        \\end
+        \\function stateful_wrapping(reorder)
+        \\  local a = FlexChild {key="a", weight=weight, tick=reorder}
+        \\  local b = ouro.box {key="b", width=53, height=29}
+        \\  return ouro.row {key="wrap", wrap=wrap, run_gap=run_gap, gap=3,
+        \\    children = reorder and {b,a} or {a,b}}
+        \\end
+    );
+    for ([_][:0]const u8{ "build", "custom", "stock", "wrapping", "stateful_wrapping" }) |function| {
+        try execute(state, "row=1; span=2; wrap=false");
+        var saved: ?instance.InstanceHandle = null;
+        for (0..2) |pass| {
+            if (pass == 1) try execute(state, "row=2; span=1; wrap=true");
+            _ = try owners.markDirty(owner);
+            var cycle = owners.beginCycle();
+            const work = (try cycle.take()).?;
+            const descriptors = try ui.build(&owners, work, function, &.{.{ .boolean = pass == 1 }});
+            try instances.reconcile(descriptors);
+            const a = instances.handleForId(descriptors[if (pass == 0) 3 else 4].id).?;
+            if (saved) |handle| try std.testing.expectEqual(handle, a) else saved = a;
+            if (descriptors[2].object == .grid) {
+                try std.testing.expectEqual(@as(f32, 2), descriptors[2].object.grid.columns.values[1].fr);
+                const cell = descriptors[if (pass == 0) 3 else 4].parent_data.grid;
+                try std.testing.expectEqual(@as(u8, @intCast(pass)), cell.row);
+                try std.testing.expectEqual(@as(u8, if (pass == 0) 2 else 1), cell.column_span);
+            } else {
+                try std.testing.expectEqual(pass == 1, descriptors[2].object.flex.wrap);
+                try std.testing.expectEqual(@as(f32, 9), descriptors[2].object.flex.run_gap);
+            }
+            _ = try renders.layout((try instances.rootRenderObject()).?, .{ .max_width = 120, .max_height = 100 });
+            try ui.commitDependencies(&owners, work);
+            ui.rollbackHandlers();
+            try owners.complete(work);
+            try scheduler.applyQueuedCancellations();
+            try instances.collectRetired();
+        }
+    }
+    var is_integer: c_int = 0;
+    _ = c.lua_getglobal(state, "wrap_mounts");
+    try std.testing.expectEqual(@as(i64, 1), c.lua_tointegerx(state, -1, &is_integer));
+    c.lua_settop(state, -2);
+    _ = c.lua_getglobal(state, "wrap_renders");
+    try std.testing.expectEqual(@as(i64, 2), c.lua_tointegerx(state, -1, &is_integer));
+    c.lua_settop(state, -2);
+    try execute(state, "weight=1; wrap=true");
+    _ = try owners.markDirty(owner);
+    var rebuilding = owners.beginCycle();
+    const invalid_rebuild = (try rebuilding.take()).?;
+    try std.testing.expectError(error.LuaBuildFailed, ui.build(&owners, invalid_rebuild, "stateful_wrapping", &.{}));
+    try owners.complete(invalid_rebuild);
+    try execute(state, "weight=nil");
+    // Malformed arrays, invalid track numbers, missing/out-of-range cells,
+    // and wrap weights fail during Lua lowering, before native reconciliation.
+    for ([_][]const u8{
+        "columns={}",    "columns={[1]=20,[3]=40}",             "columns={a=20,30}",
+        "columns={-1}",  "columns={{fr=0}}",                    "columns={1/0}",
+        "columns={0/0}", "columns={31,{fr=2},'auto'}; row=nil", "row=0",
+        "row=3",         "row=1.5",                             "row=1; span=4",
+        "span=0",        "span=4294967295",
+    }) |invalid| {
+        try execute(state, invalid);
+        _ = try owners.markDirty(owner);
+        var cycle = owners.beginCycle();
+        const work = (try cycle.take()).?;
+        try std.testing.expectError(error.LuaBuildFailed, ui.build(&owners, work, "build", &.{}));
+        try owners.complete(work);
+    }
+    for ([_][]const u8{ "weight=1", "weight=nil; run_gap=-1", "run_gap=9; wrap='yes'" }) |invalid| {
+        try execute(state, invalid);
+        _ = try owners.markDirty(owner);
+        var cycle = owners.beginCycle();
+        const work = (try cycle.take()).?;
+        try std.testing.expectError(error.LuaBuildFailed, ui.build(&owners, work, "wrapping", &.{}));
+        try owners.complete(work);
+    }
+    try instances.reconcile(&.{});
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
+    try instances.collectRetired();
+    try owners.collectRetired();
+    try scheduler.destroyScope(scope);
 }
 
 test "declarative Lua text flows through layout scene and software glyph cache" {

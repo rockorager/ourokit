@@ -6,9 +6,11 @@ const types = @import("types.zig");
 
 pub fn validate(value: types.Flex) !void {
     if (!std.math.isFinite(value.gap) or value.gap < 0) return error.InvalidGap;
+    if (!std.math.isFinite(value.run_gap) or value.run_gap < 0) return error.InvalidGap;
 }
 
 pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Constraints) !SizeF {
+    if (value.wrap) return layoutWrap(value, context, node, incoming);
     var constraints = incoming;
     while (true) {
         const child_count = context.childCount(node);
@@ -92,8 +94,76 @@ fn flexData(data: types.ParentData) !FlexData {
     return switch (data) {
         .none => .{ .factor = 0, .fit = .tight },
         .flex => |value| .{ .factor = value.factor, .fit = value.fit },
-        .stack => error.InvalidParentData,
+        else => error.InvalidParentData,
     };
+}
+
+fn layoutWrap(value: types.Flex, context: anytype, node: anytype, constraints: Constraints) !SizeF {
+    // A child is measured against the whole run, never the leftover space.
+    // This gives exact-fit boundaries and keeps greedy packing predictable.
+    const child_constraints = constraints.loosen();
+    var child = context.firstChild(node);
+    while (child) |handle| : (child = context.nextSibling(handle)) {
+        if ((try flexData(try context.parentData(handle))).factor != 0)
+            return error.FlexInWrap;
+        _ = try context.layoutChild(handle, child_constraints);
+    }
+
+    var run_start = context.firstChild(node);
+    var cross_cursor: f32 = 0;
+    var main_extent: f32 = 0;
+    while (run_start) |first| {
+        var run_end = context.nextSibling(first);
+        var run_main = mainExtent(value.axis, try context.size(first));
+        var run_cross = crossExtent(value.axis, try context.size(first));
+        while (run_end) |handle| {
+            const size = try context.size(handle);
+            const next_main = run_main + value.gap + mainExtent(value.axis, size);
+            if (next_main > mainMaximum(value.axis, constraints)) break;
+            run_main = next_main;
+            run_cross = @max(run_cross, crossExtent(value.axis, size));
+            run_end = context.nextSibling(handle);
+        }
+
+        var cursor: f32 = 0;
+        child = run_start;
+        while (child) |handle| : (child = context.nextSibling(handle)) {
+            if (std.meta.eql(child, run_end)) break;
+            var size = try context.size(handle);
+            if (value.cross_axis_alignment == .stretch) {
+                var stretched = child_constraints;
+                switch (value.axis) {
+                    .horizontal => {
+                        stretched.min_height = run_cross;
+                        stretched.max_height = run_cross;
+                        stretched.min_width = size.width;
+                        stretched.max_width = size.width;
+                    },
+                    .vertical => {
+                        stretched.min_width = run_cross;
+                        stretched.max_width = run_cross;
+                        stretched.min_height = size.height;
+                        stretched.max_height = size.height;
+                    },
+                }
+                size = try context.layoutChild(handle, stretched);
+            }
+            const offset = switch (value.cross_axis_alignment) {
+                .start, .stretch => 0,
+                .center => (run_cross - crossExtent(value.axis, size)) / 2,
+                .end => run_cross - crossExtent(value.axis, size),
+            };
+            try context.setChildOffset(handle, pointFromExtents(value.axis, cursor, cross_cursor + offset));
+            cursor += mainExtent(value.axis, size) + value.gap;
+        }
+        main_extent = @max(main_extent, run_main);
+        cross_cursor += run_cross;
+        if (run_end != null) cross_cursor += value.run_gap;
+        run_start = run_end;
+    }
+    if (value.main_axis_size == .max and mainBounded(value.axis, constraints))
+        main_extent = mainMaximum(value.axis, constraints);
+    return constraints.constrain(fromExtents(value.axis, main_extent, cross_cursor));
 }
 
 fn nonFlexConstraints(value: types.Flex, constraints: Constraints) Constraints {

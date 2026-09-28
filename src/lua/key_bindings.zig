@@ -46,6 +46,72 @@ fn string(state: *c.State, index: c_int) ![]const u8 {
     return bytes[0..len];
 }
 
+/// Native listener filters share the editor's logical chord parser, but never
+/// resolve editor actions or externally exposed application actions.
+pub fn listenerFilter(state: *c.State, index: c_int, keyboard: bool) !@import("../ui/input/listener.zig").Filter {
+    const listener = @import("../ui/input/listener.zig");
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    var result: listener.Filter = .{};
+    if (keyboard) {
+        const kind = c.lua_getfield(state, index, "keys");
+        if (kind != c.type_nil) {
+            const count = try denseArray(state, c.lua_gettop(state));
+            if (count == 0 or count > result.keys.len) return error.InvalidInputFilter;
+            for (0..count) |i| {
+                _ = c.lua_rawgeti(state, -1, @intCast(i + 1));
+                result.keys[i] = try keymap.KeyChord.parse(try string(state, -1));
+                c.lua_settop(state, -2);
+            }
+            result.key_count = @intCast(count);
+        }
+        c.lua_settop(state, -2);
+        try enumFilter(listener.State, state, index, "states", &result.states);
+    } else {
+        try enumFilter(listener.Kind, state, index, "kinds", &result.kinds);
+        if (c.lua_getfield(state, index, "button") != c.type_nil) {
+            var valid: c_int = 0;
+            const button = c.lua_tointegerx(state, -1, &valid);
+            if (c.lua_type(state, -1) != c.type_number or valid == 0 or button < 0 or button > std.math.maxInt(u32))
+                return error.InvalidInputFilter;
+            result.button = @intCast(button);
+        }
+    }
+    return result;
+}
+
+fn enumFilter(comptime E: type, state: *c.State, index: c_int, name: [*:0]const u8, result: *std.EnumSet(E)) !void {
+    const kind = c.lua_getfield(state, index, name);
+    defer c.lua_settop(state, -2);
+    if (kind == c.type_nil) return;
+    const count = try denseArray(state, c.lua_gettop(state));
+    if (count == 0) return error.InvalidInputFilter;
+    result.* = std.EnumSet(E).initEmpty();
+    for (0..count) |i| {
+        _ = c.lua_rawgeti(state, -1, @intCast(i + 1));
+        const value = std.meta.stringToEnum(E, try string(state, -1)) orelse return error.InvalidInputFilter;
+        if (comptime E == @import("../ui/input/listener.zig").Kind) {
+            if (value == .key) return error.InvalidInputFilter;
+        }
+        result.insert(value);
+        c.lua_settop(state, -2);
+    }
+}
+
+fn denseArray(state: *c.State, index: c_int) !usize {
+    if (c.lua_type(state, index) != c.type_table) return error.InvalidInputFilter;
+    const count = c.lua_rawlen(state, index);
+    c.lua_pushnil(state);
+    while (c.lua_next(state, index) != 0) {
+        var valid: c_int = 0;
+        const i = c.lua_tointegerx(state, -2, &valid);
+        if (c.lua_type(state, -2) != c.type_number or valid == 0 or i < 1 or i > count)
+            return error.InvalidInputFilter;
+        c.lua_settop(state, -2);
+    }
+    return count;
+}
+
 test "Lua binding maps inherit replace reject ambiguous chords and restore the stack" {
     const state = c.luaL_newstate() orelse return error.OutOfMemory;
     defer c.lua_close(state);

@@ -9,8 +9,16 @@ pub const Manager = struct {
     focused: ?instance.InstanceHandle = null,
     boundary: ?instance.InstanceHandle = null,
     restore_target: ?instance.InstanceHandle = null,
+    revision: u64 = 0,
 
     pub fn reconcile(self: *Manager, tree: *instance.Tree) void {
+        const focused_before = self.focused;
+        const boundary_before = self.boundary;
+        defer if (!sameOptionalOptional(focused_before, self.focused) or
+            !sameOptionalOptional(boundary_before, self.boundary))
+        {
+            self.revision +%= 1;
+        };
         if (self.boundary) |boundary| {
             if (!tree.isActive(boundary)) {
                 self.boundary = null;
@@ -32,6 +40,7 @@ pub const Manager = struct {
     }
 
     pub fn clear(self: *Manager) void {
+        if (self.focused != null) self.revision +%= 1;
         self.focused = null;
     }
 
@@ -39,16 +48,18 @@ pub const Manager = struct {
         if (!tree.isFocusable(target) or !self.isPermitted(tree, target)) return false;
         if (sameOptional(self.focused, target)) return false;
         self.focused = target;
+        self.revision +%= 1;
         return true;
     }
 
     pub fn advance(self: *Manager, tree: *instance.Tree, direction: Direction) !bool {
         const next = try self.nextPermitted(tree, self.focused, direction) orelse {
-            self.focused = null;
+            self.clear();
             return false;
         };
         if (sameOptional(self.focused, next)) return false;
         self.focused = next;
+        self.revision +%= 1;
         return true;
     }
 
@@ -68,6 +79,7 @@ pub const Manager = struct {
         if (self.boundary == null and new_boundary != null)
             self.restore_target = self.focused;
         self.boundary = new_boundary;
+        self.revision +%= 1;
 
         if (new_boundary == null) {
             self.focused = if (self.restore_target) |target|

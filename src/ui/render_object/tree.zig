@@ -7,6 +7,7 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const Constraints = @import("../layout/constraints.zig").Constraints;
 const box_impl = @import("box.zig");
 const flex_impl = @import("flex.zig");
+const grid_impl = @import("grid.zig");
 const image_impl = @import("image.zig");
 const ImageCache = @import("../../image/cache.zig").Cache;
 const scroll_impl = @import("scroll.zig");
@@ -26,6 +27,7 @@ pub const LayoutError = error{
     InvalidLayoutSize,
     UnconstrainedLayoutSize,
     FlexInUnboundedAxis,
+    FlexInWrap,
     ScrollInUnboundedAxis,
     UnboundedSplitConstraints,
     SplitRequiresThreeChildren,
@@ -558,6 +560,7 @@ pub const Tree = struct {
         const result = switch (object) {
             .box => |value| try box_impl.layout(value, self, handle, constraints),
             .flex => |value| try flex_impl.layout(value, self, handle, constraints),
+            .grid => |value| try grid_impl.layout(value, self, handle, constraints),
             .split => |value| try split_impl.layout(value, self, handle, constraints),
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
             .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
@@ -630,6 +633,7 @@ pub const Tree = struct {
                 break :paint value.clip;
             },
             .flex => false,
+            .grid => false,
             .split => false,
             .stack => |value| value.clip,
             .scroll => true,
@@ -1030,6 +1034,7 @@ fn validateObject(object: types.Object) !void {
     switch (object) {
         .box => |value| try box_impl.validate(value),
         .flex => |value| try flex_impl.validate(value),
+        .grid => |value| try grid_impl.validate(value),
         .split => |value| try split_impl.validate(value),
         .stack => {},
         .scroll => {},
@@ -1058,13 +1063,17 @@ fn validateObject(object: types.Object) !void {
 fn validateParentData(parent: types.Object, data: types.ParentData) !void {
     switch (parent) {
         .box => if (data != .none) return error.InvalidParentData,
-        .flex => if (data != .none and data != .flex) return error.InvalidParentData,
+        .flex => |value| {
+            if (data != .none and data != .flex) return error.InvalidParentData;
+            if (value.wrap and data == .flex and data.flex.factor != 0) return error.FlexInWrap;
+        },
+        .grid => |value| try grid_impl.validatePlacement(value, data),
         .split => if (data != .none) return error.InvalidParentData,
         .stack => switch (data) {
             .none => {},
             .stack => |value| if (!validPoint(.{ .x = value.x, .y = value.y }))
                 return error.InvalidParentData,
-            .flex => return error.InvalidParentData,
+            else => return error.InvalidParentData,
         },
         .scroll => if (data != .none) return error.InvalidParentData,
         .image => return error.ImageHasChildren,
@@ -1087,6 +1096,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
                 !std.meta.eql(old_box.alignment, new_box.alignment);
         },
         .flex => |old_flex| !std.meta.eql(old_flex, new.flex),
+        .grid => |old_grid| !std.meta.eql(old_grid, new.grid),
         .split => |old_split| !std.meta.eql(old_split, new.split),
         .stack => |old_stack| old_stack.unbounded_height != new.stack.unbounded_height,
         .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,

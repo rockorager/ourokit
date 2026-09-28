@@ -20,6 +20,11 @@ pub const HandlerKind = enum {
     cancel,
     drop_text,
     drop_uris,
+    key_capture,
+    key_bubble,
+    pointer_capture,
+    pointer_bubble,
+    shortcut,
 
     fn primary(self: HandlerKind) bool {
         return self == .pointer or self == .button or self == .@"switch" or self == .listbox or self == .range_change or self == .split_change;
@@ -29,6 +34,9 @@ pub const HandlerKind = enum {
 pub const Handler = struct {
     id: Handle,
     kind: HandlerKind = .pointer,
+    propagate: bool = true,
+    filter: @import("listener.zig").Filter = .{},
+    sequence: @import("key_chord.zig").Sequence = .{},
 };
 
 const Entry = struct {
@@ -48,6 +56,7 @@ pub const PointerBindings = struct {
     allocator: std.mem.Allocator,
     entries: []Entry,
     interactions: []InteractionState,
+    revision: u64 = 0,
 
     pub fn init(self: *PointerBindings, allocator: std.mem.Allocator, capacity: usize) !void {
         const entries = try allocator.alloc(Entry, capacity);
@@ -103,8 +112,10 @@ pub const PointerBindings = struct {
         target: instance.InstanceHandle,
         handler: Handler,
     ) !?Handler {
+        self.revision +%= 1;
         for (self.entries) |*entry| if (same(entry.target, target) and entry.handler != null and
-            sameBindingKind(entry.handler.?.kind, handler.kind))
+            sameBindingKind(entry.handler.?.kind, handler.kind) and
+            (handler.kind != .shortcut or std.meta.eql(entry.handler.?.sequence, handler.sequence)))
         {
             const old = entry.handler;
             entry.owner = owner;
@@ -150,6 +161,7 @@ pub const PointerBindings = struct {
 
     pub fn takeOwner(self: *PointerBindings, owner: BuildOwnerHandle) ?Handler {
         for (self.entries) |*entry| if (entry.handler != null and same(entry.owner, owner)) {
+            self.revision +%= 1;
             const old = entry.handler;
             entry.* = .{};
             return old;
@@ -159,6 +171,7 @@ pub const PointerBindings = struct {
 
     pub fn remove(self: *PointerBindings, target: instance.InstanceHandle) ?Handler {
         for (self.entries) |*entry| if (same(entry.target, target)) {
+            self.revision +%= 1;
             const old = entry.handler;
             entry.* = .{};
             return old;
@@ -168,6 +181,7 @@ pub const PointerBindings = struct {
 
     pub fn takeInactive(self: *PointerBindings, tree: *instance.Tree) ?Handler {
         for (self.entries) |*entry| if (entry.handler != null and !tree.isActive(entry.target)) {
+            self.revision +%= 1;
             const old = entry.handler;
             entry.* = .{};
             return old;
@@ -177,6 +191,7 @@ pub const PointerBindings = struct {
 
     pub fn takeAny(self: *PointerBindings) ?Handler {
         for (self.entries) |*entry| if (entry.handler != null) {
+            self.revision +%= 1;
             const old = entry.handler;
             entry.* = .{};
             return old;

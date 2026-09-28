@@ -13,6 +13,7 @@ pub const Event = union(enum) {
     },
     hover_leave: struct {
         target: instance.InstanceHandle,
+        position: PointF,
         serial: ?u32,
     },
     pointer: struct {
@@ -89,6 +90,7 @@ pub const Router = struct {
                 if (self.hovered) |hovered|
                     self.enqueueAssumeCapacity(.{ .hover_leave = .{
                         .target = hovered,
+                        .position = self.pointer_position,
                         .serial = leave.serial,
                     } });
                 self.hovered = null;
@@ -234,6 +236,7 @@ pub const Router = struct {
         if (optionalHandleEqual(self.hovered, target)) return;
         if (self.hovered) |hovered| self.enqueueAssumeCapacity(.{ .hover_leave = .{
             .target = hovered,
+            .position = position,
             .serial = serial,
         } });
         if (target) |next| self.enqueueAssumeCapacity(.{ .hover_enter = .{
@@ -342,7 +345,9 @@ test "pointer routing hit tests front to back and queues hover transitions" {
         .position = .{ .x = 5, .y = 5 },
     } });
     const back = instances.handleForId(2).?;
-    try std.testing.expectEqual(front, router.takeEvent().?.hover_leave.target);
+    const leave = router.takeEvent().?.hover_leave;
+    try std.testing.expectEqual(front, leave.target);
+    try std.testing.expectEqual(PointF{ .x = 5, .y = 5 }, leave.position);
     try std.testing.expectEqual(back, router.takeEvent().?.hover_enter.target);
     const motion = router.takeEvent().?.pointer;
     try std.testing.expectEqual(back, motion.target);

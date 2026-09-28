@@ -1,0 +1,257 @@
+const std = @import("std");
+const Tree = @import("tree.zig").Tree;
+const types = @import("types.zig");
+const Constraints = @import("../layout/constraints.zig").Constraints;
+const SizeF = @import("../../core/geometry.zig").SizeF;
+const PointF = @import("../../core/geometry.zig").PointF;
+const Color = @import("../../core/color.zig").Color;
+
+test "wrap exact boundary, overflow by one, unbounded main, and line-local alignment" {
+    for ([_]types.Axis{ .horizontal, .vertical }) |axis| {
+        var tree: Tree = undefined;
+        try tree.init(std.testing.allocator, 4);
+        defer tree.deinit();
+        const horizontal = axis == .horizontal;
+        const root = try tree.create(.{ .flex = .{
+            .axis = axis,
+            .wrap = true,
+            .main_axis_size = .min,
+            .gap = 5,
+            .run_gap = 7,
+            .cross_axis_alignment = .end,
+        } });
+        const a = try tree.create(.{ .box = .{ .width = if (horizontal) 31 else 11, .height = if (horizontal) 11 else 31 } });
+        const b = try tree.create(.{ .box = .{ .width = if (horizontal) 64 else 23, .height = if (horizontal) 23 else 64 } });
+        const d = try tree.create(.{ .box = .{ .width = if (horizontal) 27 else 9, .height = if (horizontal) 9 else 27 } });
+        for ([_]@import("tree.zig").NodeHandle{ a, b, d }) |child| try tree.appendChild(root, child, .none);
+        const bounds: Constraints = if (horizontal) .{ .max_width = 100 } else .{ .max_height = 100 };
+        try std.testing.expectEqual(SizeF{ .width = if (horizontal) 100 else 39, .height = if (horizontal) 39 else 100 }, try tree.layout(root, bounds));
+        try std.testing.expectEqual(PointF{ .x = if (horizontal) 0 else 12, .y = if (horizontal) 12 else 0 }, try tree.nodeOffset(a));
+        try std.testing.expectEqual(PointF{ .x = if (horizontal) 36 else 0, .y = if (horizontal) 0 else 36 }, try tree.nodeOffset(b));
+        try std.testing.expectEqual(PointF{ .x = if (horizontal) 0 else 30, .y = if (horizontal) 30 else 0 }, try tree.nodeOffset(d));
+        _ = try tree.layout(root, if (horizontal) .{ .max_width = 99 } else .{ .max_height = 99 });
+        // A moves onto its own run; B and D now fit together (64 + 5 + 27).
+        try std.testing.expectEqual(PointF{ .x = if (horizontal) 0 else 18, .y = if (horizontal) 18 else 0 }, try tree.nodeOffset(b));
+        try std.testing.expectEqual(PointF{ .x = if (horizontal) 69 else 32, .y = if (horizontal) 32 else 69 }, try tree.nodeOffset(d));
+        try std.testing.expectEqual(SizeF{ .width = if (horizontal) 132 else 23, .height = if (horizontal) 23 else 132 }, try tree.layout(root, .{}));
+        try std.testing.expectEqual(PointF{ .x = if (horizontal) 105 else 14, .y = if (horizontal) 14 else 105 }, try tree.nodeOffset(d));
+    }
+}
+
+test "wrap stretch and fill retain finite sizing, empty runs and reject flex" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    defer tree.deinit();
+    const root = try tree.create(.{ .flex = .{ .wrap = true, .gap = 3, .run_gap = 8, .cross_axis_alignment = .stretch } });
+    try std.testing.expectEqual(SizeF{ .width = 100, .height = 0 }, try tree.layout(root, .{ .max_width = 100 }));
+    const a = try tree.create(.{ .box = .{ .width = 31, .height = 11 } });
+    const b = try tree.create(.{ .box = .{ .width = 40, .height = 23 } });
+    const fill = try tree.create(.{ .box = .{ .fill_width = true, .height = 13 } });
+    try std.testing.expectError(error.FlexInWrap, tree.appendChild(root, a, .{ .flex = .{ .factor = 1 } }));
+    try tree.appendChild(root, a, .none);
+    try tree.appendChild(root, b, .none);
+    try tree.appendChild(root, fill, .none);
+    try std.testing.expectEqual(SizeF{ .width = 100, .height = 44 }, try tree.layout(root, .{ .max_width = 100 }));
+    try std.testing.expectEqual(SizeF{ .width = 31, .height = 23 }, try tree.nodeSize(a));
+    try std.testing.expectEqual(SizeF{ .width = 100, .height = 13 }, try tree.nodeSize(fill));
+    try std.testing.expectEqual(PointF{ .x = 0, .y = 31 }, try tree.nodeOffset(fill));
+    _ = try tree.layout(root, .{ .max_width = 100 });
+    try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(root));
+    // An oversized first item is constrained to its whole run, without an empty run.
+    _ = try tree.layout(root, .{ .max_width = 20 });
+    try std.testing.expectEqual(PointF{}, try tree.nodeOffset(a));
+    try std.testing.expectEqual(SizeF{ .width = 20, .height = 11 }, try tree.nodeSize(a));
+}
+
+test "grid fixed auto fractional tracks use asymmetric gaps and intrinsic versus fill children" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 5);
+    defer tree.deinit();
+    const grid: types.Grid = .{
+        .columns = try .init(&.{ .{ .fixed = 41 }, .auto, .{ .fr = 1 }, .{ .fr = 3 } }),
+        .rows = try .init(&.{ .auto, .{ .fixed = 19 } }),
+        .column_gap = 5,
+        .row_gap = 7,
+    };
+    const root = try tree.create(.{ .grid = grid });
+    const intrinsic = try tree.create(.{ .box = .{ .width = 29, .height = 17 } });
+    const one = try tree.create(.{ .box = .{ .fill_width = true, .height = 11 } });
+    const three = try tree.create(.{ .box = .{ .fill_width = true, .fill_height = true } });
+    const span = try tree.create(.{ .box = .{ .fill_width = true, .fill_height = true } });
+    try tree.appendChild(root, intrinsic, .{ .grid = .{ .column = 1, .row = 0 } });
+    try tree.appendChild(root, one, .{ .grid = .{ .column = 2, .row = 0 } });
+    try tree.appendChild(root, three, .{ .grid = .{ .column = 3, .row = 0 } });
+    try tree.appendChild(root, span, .{ .grid = .{ .column = 0, .row = 1, .column_span = 2 } });
+    // 245 - 41 - 29 - 15 = 160, divided 1:3 => 40 and 120.
+    try std.testing.expectEqual(SizeF{ .width = 245, .height = 43 }, try tree.layout(root, .{ .max_width = 245 }));
+    try std.testing.expectEqual(SizeF{ .width = 40, .height = 11 }, try tree.nodeSize(one));
+    try std.testing.expectEqual(SizeF{ .width = 120, .height = 17 }, try tree.nodeSize(three));
+    try std.testing.expectEqual(PointF{ .x = 125, .y = 0 }, try tree.nodeOffset(three));
+    try std.testing.expectEqual(SizeF{ .width = 75, .height = 19 }, try tree.nodeSize(span));
+    try std.testing.expectEqual(PointF{ .x = 0, .y = 24 }, try tree.nodeOffset(span));
+    _ = try tree.layout(root, .{ .max_width = 245 });
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(root));
+    var updated = grid;
+    updated.column_gap = 9;
+    try tree.update(root, .{ .grid = updated });
+    try std.testing.expect(try tree.layoutDirty(root));
+    _ = try tree.layout(root, .{ .max_width = 245 });
+    try std.testing.expectEqual(SizeF{ .width = 37, .height = 11 }, try tree.nodeSize(one));
+}
+
+test "grid spans grow intrinsic tracks shortest-first, including unbounded fractions" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    defer tree.deinit();
+    const root = try tree.create(.{ .grid = .{
+        .columns = try .init(&.{ .auto, .{ .fr = 3 }, .{ .fixed = 17 } }),
+        .rows = try .init(&.{ .auto, .auto }),
+        .column_gap = 4,
+        .row_gap = 6,
+    } });
+    const span = try tree.create(.{ .box = .{ .width = 101, .height = 60 } });
+    const a = try tree.create(.{ .box = .{ .width = 21, .height = 13 } });
+    const b = try tree.create(.{ .box = .{ .width = 36, .height = 19 } });
+    // Span declared first deliberately: one-track contributions still go first.
+    try tree.appendChild(root, span, .{ .grid = .{ .column = 0, .row = 0, .column_span = 2, .row_span = 2 } });
+    try tree.appendChild(root, a, .{ .grid = .{ .column = 0, .row = 0 } });
+    try tree.appendChild(root, b, .{ .grid = .{ .column = 1, .row = 1 } });
+    // Width deficit 101-(21+4+36)=40 => 41,56. Height deficit 60-(13+6+19)=22 => 24,30.
+    try std.testing.expectEqual(SizeF{ .width = 122, .height = 60 }, try tree.layout(root, .{}));
+    try std.testing.expectEqual(PointF{ .x = 45, .y = 30 }, try tree.nodeOffset(b));
+    try std.testing.expectEqual(SizeF{ .width = 101, .height = 60 }, try tree.nodeSize(span));
+    // In a bounded axis the fractional track has no intrinsic minimum.
+    _ = try tree.layout(root, .{ .max_width = 80 });
+    try std.testing.expectEqual(PointF{ .x = 101, .y = 30 }, try tree.nodeOffset(b));
+    try std.testing.expectEqual(@as(f32, 0), (try tree.nodeSize(b)).width);
+}
+
+test "grid bounded fractional cells support nested flex without intrinsic probing" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 3);
+    defer tree.deinit();
+    const root = try tree.create(.{ .grid = .{ .columns = try .init(&.{.{ .fr = 1 }}), .rows = try .init(&.{.{ .fr = 1 }}) } });
+    const flex = try tree.create(.{ .flex = .{ .cross_axis_alignment = .stretch } });
+    const leaf = try tree.create(.{ .box = .{} });
+    try tree.appendChild(root, flex, .{ .grid = .{ .column = 0, .row = 0 } });
+    try tree.appendChild(flex, leaf, .{ .flex = .{ .factor = 1 } });
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 173, .height = 59 }));
+    try std.testing.expectEqual(SizeF{ .width = 173, .height = 59 }, try tree.nodeSize(leaf));
+}
+
+test "grid overflow and overlap retain paint order, hit coordinates and ancestor clipping" {
+    const scene = @import("../../scene/root.zig");
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    defer tree.deinit();
+    const root = try tree.create(.{ .box = .{} });
+    const grid = try tree.create(.{ .grid = .{ .columns = try .init(&.{ .{ .fixed = 70 }, .{ .fixed = 40 } }), .rows = try .init(&.{.{ .fixed = 30 }}), .column_gap = 9 } });
+    const back = try tree.create(.{ .box = .{ .fill_width = true, .fill_height = true, .background = Color.rgba(10, 20, 30, 255) } });
+    const front = try tree.create(.{ .box = .{ .width = 17, .height = 13, .background = Color.rgba(40, 50, 60, 255) } });
+    try tree.appendChild(root, grid, .none);
+    try tree.appendChild(grid, back, .{ .grid = .{ .column = 1, .row = 0 } });
+    try tree.appendChild(grid, front, .{ .grid = .{ .column = 1, .row = 0 } });
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 90, .height = 20 }));
+    try std.testing.expectEqual(SizeF{ .width = 90, .height = 20 }, try tree.nodeSize(grid));
+    try std.testing.expectEqual(SizeF{ .width = 40, .height = 30 }, try tree.nodeSize(back));
+    // Existing hit testing gates every ancestor's bounds, even without paint clipping.
+    try std.testing.expect((try tree.hitTest(root, .{ .x = 93, .y = 7 })) == null);
+    try std.testing.expect((try tree.hitTest(root, .{ .x = 111, .y = 24 })) == null);
+    try std.testing.expectEqual(front, (try tree.hitTest(root, .{ .x = 83, .y = 7 })).?);
+    try std.testing.expectEqual(back, (try tree.hitTest(root, .{ .x = 83, .y = 17 })).?);
+    var commands: [4]scene.Command = undefined;
+    var builder = try @import("scene_builder.zig").Builder.init(&commands, 1);
+    try tree.buildScene(root, &builder);
+    const list = builder.displayList();
+    try std.testing.expectEqual(@as(usize, 2), list.commands.len);
+    try std.testing.expectEqual(@as(i32, 79), list.commands[0].solid_rectangle.bounds.x);
+    try std.testing.expectEqual(@as(u32, 40), list.commands[0].solid_rectangle.bounds.width);
+    try std.testing.expectEqual(@as(u32, 17), list.commands[1].solid_rectangle.bounds.width);
+    try tree.update(root, .{ .box = .{ .clip = true } });
+    try std.testing.expect((try tree.hitTest(root, .{ .x = 93, .y = 7 })) == null);
+    try std.testing.expectEqual(front, (try tree.hitTest(root, .{ .x = 83, .y = 7 })).?);
+    builder = try @import("scene_builder.zig").Builder.init(&commands, 1);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(@as(usize, 4), builder.displayList().commands.len);
+    try std.testing.expectEqual(@as(u32, 90), commands[0].push_clip_rect.width);
+}
+
+test "grid auto rows measure text at resolved width before positioning the next row" {
+    const text = @import("../../text/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{ .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 }, .bytes = @embedFile("ourokit_test_font") });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const source = try sources.acquire(.{ .utf8 = "Alpha beta gamma delta epsilon zeta", .language = "und", .logical_size = 18, .candidates = &.{font}, .configuration_revision = 1 });
+    defer sources.release(source) catch unreachable;
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    tree.attachTextCaches(&sources, &paragraphs);
+    defer tree.deinit();
+    const object: types.Object = .{ .text = .{ .source = source, .color = Color.rgba(0, 0, 0, 255) } };
+    const reference = try tree.create(object);
+    const root = try tree.create(.{ .grid = .{
+        .columns = try .init(&.{ .{ .fixed = 37 }, .{ .fr = 1 } }),
+        .rows = try .init(&.{ .auto, .{ .fixed = 19 } }),
+        .column_gap = 3,
+        .row_gap = 7,
+    } });
+    const label = try tree.create(object);
+    const next = try tree.create(.{ .box = .{ .fill_width = true, .height = 19 } });
+    try tree.appendChild(root, label, .{ .grid = .{ .column = 1, .row = 0 } });
+    try tree.appendChild(root, next, .{ .grid = .{ .column = 0, .row = 1, .column_span = 2 } });
+    var narrow_height: f32 = 0;
+    for ([_]f32{ 153, 353 }) |width| {
+        // Independent Text layout at known width, outside any grid.
+        const expected = try tree.layout(reference, .{ .max_width = width - 40 });
+        const result = try tree.layout(root, .{ .max_width = width });
+        try std.testing.expectEqual(expected.height + 26, result.height);
+        try std.testing.expectEqual(PointF{ .x = 0, .y = expected.height + 7 }, try tree.nodeOffset(next));
+        try std.testing.expectEqual(expected, try tree.nodeSize(label));
+        if (width == 153) narrow_height = result.height else try std.testing.expect(result.height < narrow_height);
+    }
+}
+
+test "grid fractional rows share bounded height and become intrinsic when unbounded" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 3);
+    defer tree.deinit();
+    const root = try tree.create(.{ .grid = .{
+        .columns = try .init(&.{.auto}),
+        .rows = try .init(&.{ .{ .fixed = 17 }, .{ .fr = 2 }, .{ .fr = 3 } }),
+        .row_gap = 6,
+    } });
+    const a = try tree.create(.{ .box = .{ .width = 23, .height = 11, .fill_height = false } });
+    const b = try tree.create(.{ .box = .{ .width = 31, .min_height = 7, .fill_height = true } });
+    try tree.appendChild(root, a, .{ .grid = .{ .column = 0, .row = 1 } });
+    try tree.appendChild(root, b, .{ .grid = .{ .column = 0, .row = 2 } });
+    // 129 - 17 - 12 = 100 => fractional heights 40 and 60.
+    try std.testing.expectEqual(SizeF{ .width = 31, .height = 129 }, try tree.layout(root, .{ .max_height = 129 }));
+    try std.testing.expectEqual(PointF{ .x = 0, .y = 69 }, try tree.nodeOffset(b));
+    try std.testing.expectEqual(SizeF{ .width = 31, .height = 60 }, try tree.nodeSize(b));
+    try std.testing.expectEqual(SizeF{ .width = 31, .height = 47 }, try tree.layout(root, .{}));
+    try std.testing.expectEqual(PointF{ .x = 0, .y = 40 }, try tree.nodeOffset(b));
+    try std.testing.expectEqual(SizeF{ .width = 31, .height = 7 }, try tree.nodeSize(b));
+}
+
+test "grid validates track numbers and placements before layout" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    var grid: types.Grid = .{ .columns = try .init(&.{.auto}), .rows = try .init(&.{.auto}) };
+    for ([_]types.GridTrack{ .{ .fixed = -1 }, .{ .fixed = std.math.inf(f32) }, .{ .fr = 0 }, .{ .fr = std.math.nan(f32) } }) |invalid| {
+        grid.columns.values[0] = invalid;
+        try std.testing.expectError(error.InvalidGridTracks, tree.create(.{ .grid = grid }));
+    }
+    grid.columns.values[0] = .auto;
+    const root = try tree.create(.{ .grid = grid });
+    const child = try tree.create(.{ .box = .{} });
+    try std.testing.expectError(error.InvalidParentData, tree.appendChild(root, child, .none));
+    try std.testing.expectError(error.InvalidParentData, tree.appendChild(root, child, .{ .grid = .{ .column = 0, .row = 0, .column_span = 0 } }));
+    try std.testing.expectError(error.InvalidParentData, tree.appendChild(root, child, .{ .grid = .{ .column = 0, .row = 0, .row_span = 2 } }));
+    try std.testing.expectError(error.InvalidParentData, tree.appendChild(root, child, .{ .grid = .{ .column = 255, .row = 0, .column_span = 255 } }));
+}

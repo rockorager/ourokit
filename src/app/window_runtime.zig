@@ -12,6 +12,8 @@ const task = @import("../task/root.zig");
 const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
 const virtual_list = @import("../ui/widget/virtual_list.zig");
+const listener = @import("../ui/input/listener.zig");
+const KeySequence = @import("../ui/input/key_chord.zig").Sequence;
 
 pub const Config = struct {
     node_capacity: usize = 256,
@@ -99,6 +101,15 @@ pub const WindowRuntime = struct {
     text_inputs: ui.text_input.Registry = undefined,
     focus: ui.focus.Manager = .{},
     clicks: ui.input.Clicks = .{},
+    pending_shortcut: ?struct {
+        target: ui.instance.InstanceHandle,
+        focus_revision: u64,
+        revision: u64,
+        prefix: KeySequence,
+        deadline_ns: u64,
+    } = null,
+    input_now_ns: u64 = 0,
+    private_keys_down: std.EnumSet(platform.LogicalKey) = std.EnumSet(platform.LogicalKey).initEmpty(),
     selection_pointer: ?core.PointF = null,
     range_drag: ?ui.instance.InstanceHandle = null,
     split_drag: ?struct { target: ui.instance.InstanceHandle, grab_offset: f32 } = null,
@@ -523,7 +534,7 @@ pub const WindowRuntime = struct {
             const old = self.pointer_bindings.set(
                 self.root_owner,
                 target,
-                .{ .id = callback, .kind = handler.kind },
+                .{ .id = callback, .kind = handler.kind, .propagate = handler.propagate, .filter = handler.filter, .sequence = handler.sequence },
             ) catch unreachable;
             std.debug.assert(old == null);
         }
@@ -816,8 +827,10 @@ pub const WindowRuntime = struct {
     pub fn routePointer(self: *WindowRuntime, event: platform.PointerEvent) !void {
         try self.router.route(event);
         // A press outside the hit tree is not queued, but must still stop a fling.
-        if (event == .button and event.button.state == .pressed)
+        if (event == .button and event.button.state == .pressed) {
+            self.pending_shortcut = null;
             self.scroll_motions = @splat(.{});
+        }
     }
 
     pub fn pointerCursor(self: *WindowRuntime) !platform.PointerCursor {
@@ -875,6 +888,13 @@ pub const WindowRuntime = struct {
     /// Dispatches through either the process-wide callback registry used by
     /// reloadable applications or a directly owned VM used by storybooks.
     pub fn dispatchInput(self: *WindowRuntime, callback_service: anytype) !void {
+        return self.dispatchInputAt(callback_service, try @import("../loop/root.zig").monotonicNow());
+    }
+
+    /// A monotonic clock seam for deterministic input timeout tests.
+    pub fn dispatchInputAt(self: *WindowRuntime, callback_service: anytype, now_ns: u64) !void {
+        self.input_now_ns = now_ns;
+        self.validatePendingShortcut();
         while (self.router.takeEvent()) |event| {
             defer self.router.releaseEvent(event);
             self.development_revision +%= 1;
@@ -905,11 +925,13 @@ pub const WindowRuntime = struct {
                 }
             }
             if (event == .text_input_focus) {
+                self.pending_shortcut = null;
                 self.text_input_surface_focused = event.text_input_focus;
                 try self.syncTextInputVisuals();
                 continue;
             }
             if (event == .text_input) {
+                self.pending_shortcut = null;
                 _ = try self.refreshTextInputOwner();
                 const focused = (self.text_input_owner orelse continue).target;
                 if (event.text_input.generation != self.text_input_generation) continue;
@@ -929,6 +951,7 @@ pub const WindowRuntime = struct {
             }
             if (event == .pointer) switch (event.pointer.event) {
                 .button => |button| if (button.state == .pressed) {
+                    self.pending_shortcut = null;
                     self.scroll_motions = @splat(.{});
                     if (self.keyboard_focus_visible) {
                         self.keyboard_focus_visible = false;
@@ -955,6 +978,23 @@ pub const WindowRuntime = struct {
             };
             if (!self.instances.isActive(target) or !self.instances.isVisible(target)) continue;
             if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, target)) continue;
+            if (pointerListenerEvent(event)) |input| {
+                // Release bookkeeping is not a vetoable default action: a
+                // filtered release must never leave an existing native drag stuck.
+                if (input.kind == .release and input.button == 0x110) {
+                    try self.applyButtonUpdate(self.buttons.release());
+                    self.range_drag = null;
+                    self.split_drag = null;
+                    if (try self.textInputAncestor(target)) |field|
+                        (try self.text_inputs.session(field)).endSelectionDrag();
+                    self.selection_pointer = null;
+                }
+                if (input.kind == .leave) {
+                    _ = try self.updateButtonState(event);
+                    try self.updateListBoxHover(event);
+                }
+                if (try self.dispatchListeners(target, input, callback_service)) continue;
+            }
             try self.updateTextInputPointer(target, event);
             const activated_button = try self.updateButtonState(event);
             if (event == .pointer and event.pointer.event == .button and
@@ -968,7 +1008,12 @@ pub const WindowRuntime = struct {
                         try self.applyFocusVisual(previous, self.focus.current());
                         break;
                     }
-                    if (self.instances.isFocusable(handle)) break;
+                    if (self.instances.isFocusable(handle)) {
+                        const previous = self.focus.current();
+                        _ = try self.focus.request(&self.instances, handle);
+                        try self.applyFocusVisual(previous, self.focus.current());
+                        break;
+                    }
                     ancestor = try self.instances.parentOf(handle);
                 }
             }
@@ -1117,6 +1162,7 @@ pub const WindowRuntime = struct {
                 self.split_drag = null;
         }
         if (changed) {
+            self.pending_shortcut = null;
             self.range_drag = null;
             self.split_drag = null;
             try self.applyButtonUpdate(self.buttons.release());
@@ -1160,6 +1206,116 @@ pub const WindowRuntime = struct {
         }
     }
 
+    fn keyboardTarget(self: *WindowRuntime) !?ui.instance.InstanceHandle {
+        if (self.focus.current()) |target| {
+            if (!self.instances.isActive(target) or !self.instances.isVisible(target)) return null;
+            if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, target)) return null;
+            return target;
+        }
+        if (self.focus.boundary) |boundary| return boundary;
+        var root = (try self.instances.rootRenderObject()) orelse return null;
+        // Skip single-child structural wrappers, including the window's
+        // padding/stack, without arbitrarily selecting an unfocused branch.
+        while (self.tree.firstChild(root)) |child| {
+            if (self.tree.nextSibling(child) != null) break;
+            const target = self.instances.instanceForRenderObject(child) orelse break;
+            if (!self.instances.isVisible(target)) break;
+            root = child;
+        }
+        return self.instances.instanceForRenderObject(root);
+    }
+
+    fn inputParent(self: *WindowRuntime, target: ui.instance.InstanceHandle) !?ui.instance.InstanceHandle {
+        if (self.focus.boundary) |boundary| if (sameHandle(target, boundary)) return null;
+        return self.instances.parentOf(target);
+    }
+
+    fn captureInput(self: *WindowRuntime, target: ui.instance.InstanceHandle, event: listener.Event, callbacks: anytype) anyerror!bool {
+        if (try self.inputParent(target)) |parent|
+            if (try self.captureInput(parent, event, callbacks)) return true;
+        return self.invokeListener(target, event, if (event.kind == .key) .key_capture else .pointer_capture, callbacks);
+    }
+
+    fn invokeListener(self: *WindowRuntime, target: ui.instance.InstanceHandle, event: listener.Event, kind: ui.input.HandlerKind, callbacks: anytype) !bool {
+        const handler = self.pointer_bindings.getKind(target, kind) orelse return false;
+        if (!handler.filter.matches(event)) return false;
+        try self.spawnCallback(callbacks, handler.id, try self.instances.scope(target), &.{.{ .input = event }});
+        return !handler.propagate;
+    }
+
+    /// Routing decisions are entirely native. Lua runs later, in scheduler
+    /// order, and cannot retroactively veto a default by returning or yielding.
+    fn dispatchListeners(self: *WindowRuntime, target: ui.instance.InstanceHandle, event: listener.Event, callbacks: anytype) !bool {
+        var input = event;
+        input.phase = .capture;
+        if (try self.captureInput(target, input, callbacks)) {
+            if (event.kind == .key and event.state == .pressed) self.pending_shortcut = null;
+            return true;
+        }
+        if (event.kind == .key and try self.dispatchShortcut(target, event, callbacks)) return true;
+        input.phase = .bubble;
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |candidate| {
+            if (try self.invokeListener(candidate, input, if (event.kind == .key) .key_bubble else .pointer_bubble, callbacks)) return true;
+            current = try self.inputParent(candidate);
+        }
+        return false;
+    }
+
+    fn validatePendingShortcut(self: *WindowRuntime) void {
+        const pending = self.pending_shortcut orelse return;
+        if (pending.deadline_ns <= self.input_now_ns or pending.revision != self.pointer_bindings.revision or
+            pending.focus_revision != self.focus.revision or
+            !self.instances.isActive(pending.target) or !self.instances.isVisible(pending.target))
+            self.pending_shortcut = null;
+    }
+
+    fn dispatchShortcut(self: *WindowRuntime, target: ui.instance.InstanceHandle, event: listener.Event, callbacks: anytype) !bool {
+        self.validatePendingShortcut();
+        if (event.state != .pressed) return event.state == .repeated and self.pending_shortcut != null;
+        var prefix: KeySequence = .{};
+        var current: ?ui.instance.InstanceHandle = target;
+        if (self.pending_shortcut) |pending| {
+            self.pending_shortcut = null;
+            if (event.key.logical == .escape) return true;
+            prefix = pending.prefix;
+            prefix.strokes[prefix.len] = .{ .key = event.key.logical, .modifiers = event.key.modifiers };
+            prefix.len += 1;
+            if (try self.matchShortcut(pending.target, prefix, callbacks)) return true;
+            // Prefixes are consumed, never replayed. A mismatch gets one new
+            // lookup from the current focus before ordinary input fallback.
+        }
+        prefix = .{};
+        prefix.strokes[0] = .{ .key = event.key.logical, .modifiers = event.key.modifiers };
+        prefix.len = 1;
+        while (current) |candidate| {
+            if (try self.matchShortcut(candidate, prefix, callbacks)) return true;
+            current = try self.inputParent(candidate);
+        }
+        return false;
+    }
+
+    fn matchShortcut(self: *WindowRuntime, target: ui.instance.InstanceHandle, prefix: KeySequence, callbacks: anytype) !bool {
+        for (self.pointer_bindings.entries) |entry| {
+            const handler = entry.handler orelse continue;
+            if (handler.kind != .shortcut or !sameHandle(entry.target, target) or
+                handler.sequence.len < prefix.len or !prefix.overlaps(handler.sequence)) continue;
+            if (handler.sequence.len == prefix.len) {
+                try self.spawnCallback(callbacks, handler.id, try self.instances.scope(target), &.{});
+            } else {
+                self.pending_shortcut = .{
+                    .target = target,
+                    .focus_revision = self.focus.revision,
+                    .revision = self.pointer_bindings.revision,
+                    .prefix = prefix,
+                    .deadline_ns = self.input_now_ns +| std.time.ns_per_s,
+                };
+            }
+            return true;
+        }
+        return false;
+    }
+
     fn dispatchKeyboard(self: *WindowRuntime, event: platform.KeyboardEvent, callback_service: anytype) !void {
         const key = switch (event) {
             .enter => {
@@ -1169,6 +1325,7 @@ pub const WindowRuntime = struct {
                 return;
             },
             .leave => {
+                self.pending_shortcut = null;
                 self.keyboard_focused = false;
                 self.range_drag = null;
                 self.split_drag = null;
@@ -1185,6 +1342,42 @@ pub const WindowRuntime = struct {
             },
             .key => |value| value,
         };
+        // Secret editors and composition own the entire raw key stream,
+        // including releases and Tab. Generic Lua never sees those keys.
+        const private_keys = if (self.focus.current()) |focused| blk: {
+            if (!self.text_inputs.contains(focused)) break :blk false;
+            const session = try self.text_inputs.session(focused);
+            break :blk session.model.isSecret() or session.preedit() != null;
+        } else false;
+        const was_private = self.private_keys_down.contains(key.translated.logical);
+        if (key.state == .pressed) {
+            self.private_keys_down.setPresent(key.translated.logical, private_keys);
+        } else if (key.state == .released) {
+            self.private_keys_down.remove(key.translated.logical);
+        }
+        // Focus or IME state can change between a private press and its
+        // release. Do not disclose the tail of that stream to a new target.
+        if (!private_keys and was_private and key.state != .pressed) {
+            if (key.state == .released and key.translated.logical == .space)
+                try self.applyButtonUpdate(self.buttons.release());
+            return;
+        }
+        if (private_keys) {
+            self.pending_shortcut = null;
+        } else if (try self.keyboardTarget()) |target| {
+            if (key.state == .released and key.translated.logical == .space)
+                try self.applyButtonUpdate(self.buttons.release());
+            const input: listener.Event = .{
+                .kind = .key,
+                .key = .{ .keycode = 0, .logical = key.translated.logical, .modifiers = key.translated.modifiers },
+                .state = switch (key.state) {
+                    .pressed => .pressed,
+                    .released => .released,
+                    .repeated => .repeated,
+                },
+            };
+            if (try self.dispatchListeners(target, input, callback_service)) return;
+        }
         if (key.state != .released) {
             self.clicks.reset();
             self.resetCaretBlink();
@@ -1275,6 +1468,7 @@ pub const WindowRuntime = struct {
                     try self.spawnCallback(callback_service, handler.id, try self.instances.scope(target), &.{});
                     return;
                 }
+                if (self.focus.boundary) |boundary| if (sameHandle(target, boundary)) break;
                 current = try self.instances.parentOf(target);
             }
         }
@@ -2411,6 +2605,7 @@ pub const WindowRuntime = struct {
     ) !void {
         if (!self.initialized) return;
         if (!std.meta.eql(previous, current)) {
+            self.pending_shortcut = null;
             if (previous) |target| if (self.text_inputs.contains(target)) {
                 const session = try self.text_inputs.session(target);
                 session.model.breakUndoGroup();
@@ -2540,6 +2735,232 @@ pub const WindowRuntime = struct {
         }
     }
 };
+
+test "contextual input scopes timeouts privacy and task lifetime" {
+    const Fixture = struct {
+        scheduler: task.Scheduler = undefined,
+        loop: @import("../loop/io_uring.zig").Loop = undefined,
+        vm: lua.Vm = undefined,
+        callbacks: lua.CallbackRegistry = undefined,
+        runtime: WindowRuntime = .{},
+        scope: task.ScopeHandle = undefined,
+        const owner: ui.instance.BuildOwnerHandle = .{ .slot = 0, .generation = 1 };
+        const window: platform.WindowHandle = .{ .slot = 1, .generation = 1 };
+
+        fn init(self: *@This()) !void {
+            try self.scheduler.init(std.testing.allocator, 16, 16, 4);
+            self.scope = try self.scheduler.createScope(self.scheduler.application_scope);
+            try self.loop.init(std.testing.allocator, 8, 4);
+            try self.vm.init(std.testing.allocator, &self.scheduler, &self.loop);
+            try self.callbacks.init(std.testing.allocator, 16);
+            const r = &self.runtime;
+            try r.tree.init(std.testing.allocator, 5);
+            try r.instances.init(std.testing.allocator, &self.scheduler, &r.tree, self.scope, 5);
+            try r.router.init(std.testing.allocator, &r.tree, &r.instances, window, 16);
+            try r.pointer_bindings.init(std.testing.allocator, 16);
+            try r.buttons.init(std.testing.allocator, 5);
+            try r.text_inputs.init(std.testing.allocator, 2);
+            try r.semantics.init(std.testing.allocator, 5, 128);
+            try r.instances.reconcile(&.{
+                .{ .id = 1, .parent = null, .object = .{ .box = .{} } },
+                .{ .id = 2, .parent = 1, .object = .{ .stack = .{} } },
+                .{ .id = 3, .parent = 2, .object = .{ .stack = .{} } },
+                .{ .id = 4, .parent = 3, .object = .{ .box = .{ .width = 100, .height = 80 } }, .focusable = true },
+                .{ .id = 5, .parent = 3, .object = .{ .box = .{ .width = 100, .height = 80 } }, .focusable = true },
+            });
+            _ = try r.tree.layout((try r.instances.rootRenderObject()).?, ui.layout.Constraints.tight(.{ .width = 100, .height = 80 }));
+        }
+
+        fn deinit(self: *@This()) void {
+            const r = &self.runtime;
+            while (r.pointer_bindings.takeAny()) |handler| self.callbacks.release(handler.id) catch unreachable;
+            self.callbacks.deinit();
+            self.vm.deinit();
+            r.text_inputs.clear();
+            r.text_inputs.deinit();
+            r.buttons.clear();
+            r.buttons.deinit();
+            r.semantics.deinit();
+            r.pointer_bindings.deinit();
+            r.router.deinit();
+            r.instances.reconcile(&.{}) catch unreachable;
+            self.scheduler.applyQueuedCancellations() catch unreachable;
+            r.instances.collectRetired() catch unreachable;
+            r.instances.deinit();
+            r.tree.deinit();
+            self.scheduler.destroyScope(self.scope) catch unreachable;
+            self.scheduler.deinit();
+            self.loop.deinit();
+        }
+
+        fn bind(self: *@This(), id: u64, source: []const u8, value: ui.input.Handler) !void {
+            try std.testing.expectEqual(lua_c.ok, lua_c.luaL_loadbufferx(self.vm.state, source.ptr, source.len, "@input-test", "t"));
+            try std.testing.expectEqual(lua_c.ok, lua_c.lua_pcallk(self.vm.state, 0, 1, 0, 0, null));
+            var handler = value;
+            handler.id = try self.callbacks.adoptReference(&self.vm, lua_c.luaL_ref(self.vm.state, lua_c.registry_index));
+            if (try self.runtime.pointer_bindings.set(owner, self.runtime.instances.handleForId(id).?, handler)) |old|
+                try self.callbacks.release(old.id);
+        }
+
+        fn key(self: *@This(), name: []const u8, state: platform.KeyState, now: u64) !void {
+            const chord = try ui.input.KeyChord.parse(name);
+            try self.runtime.routeKeyboard(.{ .key = .{
+                .window = window,
+                .serial = 0,
+                .time_ms = 0,
+                .state = state,
+                .translated = .{ .keycode = 0, .logical = chord.key, .modifiers = chord.modifiers },
+            } });
+            try self.runtime.dispatchInputAt(&self.callbacks, now);
+        }
+
+        fn drain(self: *@This()) !void {
+            while (self.scheduler.takeRunnable()) |handle| _ = try self.vm.resumeRunnable(handle);
+        }
+
+        fn count(self: *@This()) i64 {
+            _ = lua_c.lua_getglobal(self.vm.state, "count");
+            defer lua_c.lua_settop(self.vm.state, -2);
+            var valid: c_int = 0;
+            return lua_c.lua_tointegerx(self.vm.state, -1, &valid);
+        }
+    };
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const r = &f.runtime;
+    const leaf = r.instances.handleForId(4).?;
+    const other = r.instances.handleForId(5).?;
+    const command = "return function() count=(count or 0)+7 end";
+    try f.bind(3, command, .{ .id = .invalid, .kind = .shortcut, .sequence = try KeySequence.parse("Ctrl+K Ctrl+C") });
+    try f.bind(3, command, .{ .id = .invalid, .kind = .shortcut, .sequence = try KeySequence.parse("Ctrl+S") });
+    // No focused control: skip native window wrappers, but not sibling scopes.
+    try f.key("Ctrl+S", .pressed, 0);
+    try std.testing.expectEqual(@as(i64, 0), f.count());
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 7), f.count());
+    _ = try r.focus.request(&r.instances, leaf);
+    try f.key("Ctrl+K", .pressed, 10);
+    try f.key("Ctrl+K", .repeated, 20);
+    try f.key("Ctrl+K", .released, 30);
+    try f.key("Ctrl+C", .pressed, std.time.ns_per_s + 9);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count());
+    try f.key("Ctrl+K", .pressed, 2 * std.time.ns_per_s);
+    try f.key("Ctrl+C", .pressed, 3 * std.time.ns_per_s);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count()); // Exact expiry, not one ns later.
+    try f.key("Ctrl+K", .pressed, 4 * std.time.ns_per_s);
+    _ = try r.focus.request(&r.instances, other);
+    try f.key("Ctrl+C", .pressed, 4 * std.time.ns_per_s + 1);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count());
+    try f.key("Ctrl+K", .pressed, 5 * std.time.ns_per_s);
+    _ = try r.focus.setBoundary(&r.instances, other);
+    try f.key("Ctrl+C", .pressed, 5 * std.time.ns_per_s + 1);
+    try f.key("Ctrl+S", .pressed, 5 * std.time.ns_per_s + 2);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count()); // No command outside modal.
+    _ = try r.focus.setBoundary(&r.instances, null);
+    try f.key("Ctrl+K", .pressed, 6 * std.time.ns_per_s);
+    try f.bind(3, command, .{ .id = .invalid, .kind = .shortcut, .sequence = try KeySequence.parse("Ctrl+S") });
+    try f.key("Ctrl+C", .pressed, 6 * std.time.ns_per_s + 1);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count()); // Binding/reload replacement.
+    // Even a focus/modal round trip between input events invalidates a prefix.
+    try f.key("Ctrl+K", .pressed, 6 * std.time.ns_per_s + 2);
+    _ = try r.focus.request(&r.instances, leaf);
+    _ = try r.focus.request(&r.instances, other);
+    try f.key("Ctrl+C", .pressed, 6 * std.time.ns_per_s + 3);
+    try f.key("Ctrl+K", .pressed, 6 * std.time.ns_per_s + 4);
+    _ = try r.focus.setBoundary(&r.instances, other);
+    _ = try r.focus.setBoundary(&r.instances, null);
+    try f.key("Ctrl+C", .pressed, 6 * std.time.ns_per_s + 5);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count());
+
+    // Consuming only a press leaves motion/release delivery captured at its
+    // original target, but does not arm the native button under that target.
+    try f.bind(3, "return function(e) assert(e.kind=='press' and e.x==10 and e.y==11 and e.button==272); pointer_trace='press;' end", .{
+        .id = .invalid,
+        .kind = .pointer_capture,
+        .propagate = false,
+        .filter = .{ .kinds = std.EnumSet(listener.Kind).initOne(.press), .button = 272 },
+    });
+    try f.bind(5, "return function(e) assert(e.x==150 and e.y==19); pointer_trace=pointer_trace..e.kind..';' end", .{
+        .id = .invalid,
+        .kind = .pointer_bubble,
+        .filter = .{ .kinds = std.EnumSet(listener.Kind).initMany(&.{ .motion, .release }) },
+    });
+    r.buttons.set(Fixture.owner, other, true);
+    try r.routePointer(.{ .enter = .{ .window = Fixture.window, .serial = 0, .position = .{ .x = 10, .y = 11 } } });
+    try r.routePointer(.{ .button = .{ .window = Fixture.window, .serial = 0, .time_ms = 0, .button = 272, .state = .pressed } });
+    try r.dispatchInputAt(&f.callbacks, 6 * std.time.ns_per_s + 6);
+    try std.testing.expect(r.buttons.armed == null);
+    try std.testing.expectEqual(other, r.router.captured.?);
+    try f.drain();
+    try r.routePointer(.{ .motion = .{ .window = Fixture.window, .time_ms = 1, .position = .{ .x = 150, .y = 19 } } });
+    try r.routePointer(.{ .button = .{ .window = Fixture.window, .serial = 0, .time_ms = 2, .button = 272, .state = .released } });
+    try r.dispatchInputAt(&f.callbacks, 6 * std.time.ns_per_s + 7);
+    try f.drain();
+    try std.testing.expect(r.router.captured == null);
+    _ = lua_c.lua_getglobal(f.vm.state, "pointer_trace");
+    var trace_len: usize = 0;
+    const trace = lua_c.lua_tolstring(f.vm.state, -1, &trace_len).?;
+    try std.testing.expectEqualStrings("press;motion;release;", trace[0..trace_len]);
+    lua_c.lua_settop(f.vm.state, -2);
+    // Consuming a release still clears a button armed by a preceding default.
+    _ = r.buttons.press(other);
+    try f.bind(5, "return function() end", .{ .id = .invalid, .kind = .key_bubble, .propagate = false });
+    _ = try r.focus.request(&r.instances, other);
+    try f.key("Space", .released, 6 * std.time.ns_per_s + 8);
+    try std.testing.expect(r.buttons.armed == null);
+    try f.drain();
+    r.buttons.clear();
+
+    const observe = "return function(e) assert(e.unicode==nil and e.serial==nil and e.text==nil); count=(count or 0)+1 end";
+    try f.bind(3, observe, .{ .id = .invalid, .kind = .key_capture });
+    _ = try r.focus.setBoundary(&r.instances, other);
+    try f.key("F1", .pressed, 7 * std.time.ns_per_s);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count()); // No capture outside modal.
+    _ = try r.focus.setBoundary(&r.instances, null);
+    _ = try r.focus.request(&r.instances, leaf);
+    var session: ?ui.text_input.Session = try ui.text_input.Session.initSecret(std.testing.allocator);
+    try r.text_inputs.mountPrepared(Fixture.owner, leaf, leaf, .uncontrolled, .{}, &session);
+    try f.key("Ctrl+S", .pressed, 8 * std.time.ns_per_s);
+    try f.key("Ctrl+S", .released, 8 * std.time.ns_per_s + 1);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count());
+    try f.key("Ctrl+S", .pressed, 8 * std.time.ns_per_s + 2);
+    _ = try r.focus.request(&r.instances, other);
+    try f.key("Ctrl+S", .repeated, 8 * std.time.ns_per_s + 3);
+    try f.key("Ctrl+S", .released, 8 * std.time.ns_per_s + 4);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count()); // Private release after focus changed.
+    _ = try r.focus.request(&r.instances, leaf);
+    r.text_inputs.clear();
+    try r.text_inputs.mount(Fixture.owner, leaf, leaf, "safe");
+    _ = try (try r.text_inputs.session(leaf)).apply(.{ .preedit = .{ .text = "private", .cursor = .{ .start = 0, .end = 7 } } });
+    try f.key("Ctrl+S", .pressed, 9 * std.time.ns_per_s);
+    try f.key("Ctrl+S", .released, 9 * std.time.ns_per_s + 1);
+    try f.drain();
+    try std.testing.expectEqual(@as(i64, 14), f.count());
+    r.text_inputs.clear();
+    // An error is a task failure, not a request to run the stock Tab default.
+    try f.bind(4, "return function() error('handler failed') end", .{ .id = .invalid, .kind = .key_bubble, .propagate = false });
+    try f.key("Tab", .pressed, 10 * std.time.ns_per_s);
+    try std.testing.expectEqual(leaf, r.focus.current().?);
+    _ = try f.vm.resumeRunnable(f.scheduler.takeRunnable().?); // outer observer
+    try std.testing.expectError(error.LuaRuntimeError, f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
+    try std.testing.expectEqual(leaf, r.focus.current().?);
+    // Queued callbacks retain scope cancellation, even before their first run.
+    try f.key("F1", .pressed, 11 * std.time.ns_per_s);
+    try f.scheduler.queueScopeCancellation(try r.instances.scope(leaf));
+    try f.scheduler.applyQueuedCancellations();
+    _ = try f.vm.resumeRunnable(f.scheduler.takeRunnable().?);
+    try std.testing.expectEqual(lua.ResumeResult.canceled, try f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
+}
 
 test "resize lays out a clean render tree before rebuilding its scene" {
     var scheduler: task.Scheduler = undefined;
@@ -3417,6 +3838,25 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try callbacks.release(callback);
 
     try fonts.release(font);
+}
+
+fn pointerListenerEvent(event: ui.input.Event) ?listener.Event {
+    return switch (event) {
+        .hover_enter => |hover| .{ .kind = .enter, .x = hover.position.x, .y = hover.position.y },
+        .hover_leave => |hover| .{ .kind = .leave, .x = hover.position.x, .y = hover.position.y },
+        .pointer => |pointer| switch (pointer.event) {
+            .motion => .{ .kind = .motion, .x = pointer.position.x, .y = pointer.position.y },
+            .button => |button| .{
+                .kind = if (button.state == .pressed) .press else .release,
+                .x = pointer.position.x,
+                .y = pointer.position.y,
+                .button = button.button,
+            },
+            .axis => |axis| .{ .kind = .axis, .x = pointer.position.x, .y = pointer.position.y, .delta = axis.delta, .axis = axis.axis },
+            else => null,
+        },
+        else => null,
+    };
 }
 
 fn intentEditsText(intent: ui.text_input.EditIntent) bool {

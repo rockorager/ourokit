@@ -22,6 +22,7 @@ pub const Argument = union(enum) {
     boolean: bool,
     string: []const u8,
     registry: c_int,
+    input: @import("../ui/input/listener.zig").Event,
 };
 
 const YieldRequest = enum {
@@ -309,6 +310,7 @@ pub const Vm = struct {
             .boolean => |value| c.lua_pushboolean(thread, @intFromBool(value)),
             .string => |value| _ = c.lua_pushlstring(thread, value.ptr, value.len),
             .registry => |reference| _ = c.lua_rawgeti(thread, c.registry_index, reference),
+            .input => |event| pushInputEvent(thread, event),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -354,6 +356,7 @@ pub const Vm = struct {
             .boolean => |value| c.lua_pushboolean(thread, @intFromBool(value)),
             .string => |value| _ = c.lua_pushlstring(thread, value.ptr, value.len),
             .registry => |value| _ = c.lua_rawgeti(thread, c.registry_index, value),
+            .input => |event| pushInputEvent(thread, event),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -1002,6 +1005,40 @@ const timer_lifecycle: task.ResourceLifecycle = .{
     .request_cancel = TimerResource.requestCancel,
     .destroy = TimerResource.destroy,
 };
+
+fn pushInputEvent(state: *c.State, event: @import("../ui/input/listener.zig").Event) void {
+    c.lua_createtable(state, 0, 8);
+    _ = c.lua_pushstring(state, @tagName(event.kind));
+    c.lua_setfield(state, -2, "kind");
+    _ = c.lua_pushstring(state, @tagName(event.phase));
+    c.lua_setfield(state, -2, "phase");
+    if (event.kind == .key) {
+        const key = @import("../ui/input/key_chord.zig").keyName(event.key.logical);
+        _ = c.lua_pushlstring(state, key.ptr, key.len);
+        c.lua_setfield(state, -2, "key");
+        _ = c.lua_pushstring(state, @tagName(event.state));
+        c.lua_setfield(state, -2, "state");
+        c.lua_createtable(state, 0, 4);
+        inline for (.{ "control", "shift", "alt", "logo" }, .{ "control", "shift", "alt", "super" }) |field, name| {
+            c.lua_pushboolean(state, @intFromBool(@field(event.key.modifiers, field)));
+            c.lua_setfield(state, -2, name);
+        }
+        c.lua_setfield(state, -2, "modifiers");
+    } else {
+        c.lua_pushnumber(state, event.x);
+        c.lua_setfield(state, -2, "x");
+        c.lua_pushnumber(state, event.y);
+        c.lua_setfield(state, -2, "y");
+        c.lua_pushinteger(state, event.button);
+        c.lua_setfield(state, -2, "button");
+        if (event.kind == .axis) {
+            c.lua_pushnumber(state, event.delta);
+            c.lua_setfield(state, -2, "delta");
+            _ = c.lua_pushstring(state, @tagName(event.axis));
+            c.lua_setfield(state, -2, "axis");
+        }
+    }
+}
 
 fn same(a: Handle, b: Handle) bool {
     return a.slot == b.slot and a.generation == b.generation;

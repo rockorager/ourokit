@@ -215,17 +215,20 @@ pub const Playback = struct {
             const geometry = try runtime.semanticTarget(path);
             if (!geometry.visible) return error.DevelopmentTargetHidden;
             if (!geometry.enabled and action != .hover) return error.DevelopmentTargetDisabled;
+            target = runtime.instances.handleForId(semantic.id) orelse return error.SemanticInstanceMissing;
             if ((action == .click or action == .pointer_down) and
                 semantic.role != .button and semantic.role != .@"switch" and
                 semantic.role != .checkbox and semantic.role != .radio and semantic.role != .radio_group and semantic.role != .slider and
                 semantic.role != .tab and semantic.role != .tab_list and semantic.role != .separator and
-                semantic.role != .text_field and semantic.role != .option and semantic.role != .listbox)
+                semantic.role != .text_field and semantic.role != .option and semantic.role != .listbox and
+                !runtime.instances.isFocusable(target.?) and
+                runtime.pointer_bindings.getKind(target.?, .pointer_capture) == null and
+                runtime.pointer_bindings.getKind(target.?, .pointer_bubble) == null)
                 return error.DevelopmentTargetNotInteractive;
             if (action == .scroll) {
                 if (geometry.scroll_axis == null) return error.DevelopmentTargetNotScrollable;
                 if (!std.math.isFinite(action.scroll.delta)) return error.InvalidScrollDelta;
             }
-            target = runtime.instances.handleForId(semantic.id) orelse return error.SemanticInstanceMissing;
             try checkHit(runtime, target.?, geometry.center);
         }
         if (action == .text) {

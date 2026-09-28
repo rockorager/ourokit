@@ -53,6 +53,36 @@ pub const Flex = struct {
     main_axis_size: MainAxisSize = .max,
     cross_axis_alignment: CrossAxisAlignment = .start,
     gap: f32 = 0,
+    /// Greedy runs within the bounded main axis. Flex factors are not supported.
+    wrap: bool = false,
+    run_gap: f32 = 0,
+};
+
+pub const GridTrack = union(enum) { fixed: f32, auto, fr: f32 };
+
+/// Value-owned track declarations, safe to retain across declarative rebuilds.
+pub const GridTracks = struct {
+    pub const capacity = 32;
+    values: [capacity]GridTrack = @splat(.auto),
+    len: u8 = 0,
+
+    pub fn init(tracks: []const GridTrack) !GridTracks {
+        if (tracks.len == 0 or tracks.len > capacity) return error.InvalidGridTracks;
+        var result: GridTracks = .{ .len = @intCast(tracks.len) };
+        @memcpy(result.values[0..tracks.len], tracks);
+        return result;
+    }
+
+    pub fn slice(self: *const GridTracks) []const GridTrack {
+        return self.values[0..self.len];
+    }
+};
+
+pub const Grid = struct {
+    columns: GridTracks,
+    rows: GridTracks,
+    column_gap: f32 = 0,
+    row_gap: f32 = 0,
 };
 
 pub const Split = struct {
@@ -135,6 +165,7 @@ pub const TextInput = struct {
 pub const Object = union(enum) {
     box: Box,
     flex: Flex,
+    grid: Grid,
     split: Split,
     stack: Stack,
     scroll: Scroll,
@@ -153,6 +184,13 @@ pub const ParentData = union(enum) {
     flex: struct {
         factor: u16 = 0,
         fit: FlexFit = .tight,
+    },
+    /// Zero-based explicit placement. Overlap is allowed, in child paint order.
+    grid: struct {
+        column: u8,
+        row: u8,
+        column_span: u8 = 1,
+        row_span: u8 = 1,
     },
     stack: struct {
         x: f32 = 0,

@@ -1,6 +1,30 @@
 const std = @import("std");
 const platform = @import("../../platform/window.zig");
 
+/// A bounded sequence of logical chords. Whitespace separates strokes.
+pub const Sequence = struct {
+    strokes: [4]KeyChord = @splat(.{}),
+    len: u8 = 0,
+
+    pub fn parse(raw: []const u8) !Sequence {
+        var result: Sequence = .{};
+        var parts = std.mem.tokenizeAny(u8, raw, " \t\r\n");
+        while (parts.next()) |part| {
+            if (result.len == result.strokes.len) return error.KeySequenceTooLong;
+            result.strokes[result.len] = try KeyChord.parse(part);
+            result.len += 1;
+        }
+        if (result.len == 0) return error.InvalidKeyChord;
+        return result;
+    }
+
+    pub fn overlaps(a: Sequence, b: Sequence) bool {
+        for (0..@min(a.len, b.len)) |i|
+            if (!std.meta.eql(a.strokes[i], b.strokes[i])) return false;
+        return true;
+    }
+};
+
 /// Exact logical key/modifier match, independent of physical keyboard layout.
 pub const KeyChord = struct {
     key: platform.LogicalKey = .unidentified,
@@ -32,19 +56,45 @@ pub const KeyChord = struct {
 
 fn parseKey(name: []const u8) !platform.LogicalKey {
     inline for (std.meta.fields(platform.LogicalKey)) |field| {
-        const spelling = comptime if (std.mem.startsWith(u8, field.name, "key_")) field.name[4..] else if (std.mem.startsWith(u8, field.name, "digit_")) field.name[6..] else switch (@as(platform.LogicalKey, @enumFromInt(field.value))) {
-            .unidentified => "",
-            .arrow_left => "Left",
-            .arrow_right => "Right",
-            .arrow_up => "Up",
-            .arrow_down => "Down",
-            .page_up => "PageUp",
-            .page_down => "PageDown",
-            else => field.name,
-        };
+        const spelling = comptime keyName(@enumFromInt(field.value));
         if (spelling.len != 0 and std.ascii.eqlIgnoreCase(name, spelling)) return @enumFromInt(field.value);
     }
     return error.InvalidKeyChord;
+}
+
+pub fn keyName(key: platform.LogicalKey) []const u8 {
+    @setEvalBranchQuota(10000);
+    return switch (key) {
+        .unidentified => "",
+        .tab => "Tab",
+        .enter => "Enter",
+        .space => "Space",
+        .escape => "Escape",
+        .home => "Home",
+        .end => "End",
+        .backspace => "Backspace",
+        .delete => "Delete",
+        .arrow_left => "Left",
+        .arrow_right => "Right",
+        .arrow_up => "Up",
+        .arrow_down => "Down",
+        .page_up => "PageUp",
+        .page_down => "PageDown",
+        else => blk: {
+            inline for (std.meta.fields(platform.LogicalKey)) |field| {
+                if (key == @as(platform.LogicalKey, @enumFromInt(field.value))) {
+                    const upper = comptime upper: {
+                        const raw = if (std.mem.startsWith(u8, field.name, "key_")) field.name[4..] else if (std.mem.startsWith(u8, field.name, "digit_")) field.name[6..] else field.name;
+                        var buffer: [raw.len]u8 = undefined;
+                        _ = std.ascii.upperString(&buffer, raw);
+                        break :upper buffer;
+                    };
+                    break :blk &upper;
+                }
+            }
+            unreachable;
+        },
+    };
 }
 
 test "key chords normalize names and modifier order but match modifiers exactly" {
@@ -58,4 +108,18 @@ test "key chords normalize names and modifier order but match modifiers exactly"
     try std.testing.expectEqual(platform.LogicalKey.digit_9, (try KeyChord.parse("9")).key);
     for ([_][]const u8{ "", "Ctrl+", "Ctrl+Ctrl+A", "Ctrl++A", "Meta+A", "Unknown", "F13" }) |invalid|
         try std.testing.expectError(error.InvalidKeyChord, KeyChord.parse(invalid));
+}
+
+test "contextual input sequences distinguish shared prefixes from ambiguous completion" {
+    const short = try Sequence.parse("Ctrl+K");
+    const first = try Sequence.parse(" ctrl+k\tCtrl+C ");
+    const second = try Sequence.parse("Ctrl+K Ctrl+U");
+    try std.testing.expect(short.overlaps(first));
+    try std.testing.expect(first.overlaps(short));
+    try std.testing.expect(!first.overlaps(second));
+    try std.testing.expect(first.overlaps(try Sequence.parse("CTRL+K ctrl+c")));
+    try std.testing.expectEqual(@as(u8, 4), (try Sequence.parse("A B C D")).len);
+    try std.testing.expectError(error.KeySequenceTooLong, Sequence.parse("A B C D E"));
+    try std.testing.expectError(error.InvalidKeyChord, Sequence.parse(" \t "));
+    try std.testing.expectError(error.InvalidKeyChord, Sequence.parse("Ctrl+K Ctrl+"));
 }

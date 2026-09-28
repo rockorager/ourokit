@@ -22,6 +22,6 @@ fn stackData(data: types.ParentData) !@import("../../core/geometry.zig").PointF 
     return switch (data) {
         .none => .{},
         .stack => |value| .{ .x = value.x, .y = value.y },
-        .flex => error.InvalidParentData,
+        else => error.InvalidParentData,
     };
 }
