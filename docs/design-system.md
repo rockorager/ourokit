@@ -103,9 +103,10 @@ hover color but omits its brightness/saturation filter until Ourokit has a
 justified color-filter primitive.
 
 Button, checkbox, switch, separator, option, radio, tab, selection-group,
-dialog, slider, and split-view composition lives in `src/lua/controls.lua`, using
+dialog, slider, split-view, and text-input composition lives in `src/lua/controls.lua`, using
 the public theme-aware `ouro.stateless`, box activation, ranges and modal
-semantics, row/column selection policy, and native split layout and resizing.
+semantics, row/column selection policy, native split layout and resizing,
+and unstyled native text-editor viewports.
 These controls have no native stock visual recipes or description kinds.
 Native retained interaction state drives
 declared background and text-color paint bindings on

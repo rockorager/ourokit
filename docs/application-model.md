@@ -1184,6 +1184,34 @@ Lua composes the standard parts and Zig owns input, focus, and range policy.
 
 ### Text inputs
 
+`ouro.text_input` is a theme-aware Lua recipe over the native `ouro.text_editor`
+primitive. Use the recipe for standard fields and the primitive for custom
+chrome. Both share the same value, callback, focus, key-binding, and editing
+contracts below. Keeping the same key and parent preserves native identity
+when switching between them.
+
+`ouro.text_editor` has no default background, border, radius, padding, or fixed
+height. Width defaults to `fill`; height is intrinsic unless set to a number or
+`'fill'`. It inherits general theme typography and text colors, but not
+`theme.controls` or `theme.widgets.text_input`. It accepts explicit `background`,
+`foreground`, `font_size`, `border`, `border_width`, `focus`, `radius`, `padding`,
+`padding_x`, `padding_y`, and `alignment`, plus `placeholder_color`,
+`selection_color`, and `caret_color`. Disabled state prevents editing and focus;
+custom compositions choose their own disabled paint. Focus recolors an existing
+border and never adds a border to a borderless editor. The editor is a leaf;
+compose labels, icons, and buttons around it with ordinary boxes, rows, and
+columns. Authentication input is a separate secure capability, not this editor.
+
+```lua
+ouro.row {key='search', gap=12, cross_alignment='center',
+  ouro.text {key='label', text='Find'},
+  ouro.text_editor {key='query', text=query(), on_change=function(v) query:set(v) end,
+    flex=1, height=36, padding_x=9, alignment='left',
+    border_width=1, border='#8899aa', focus='#3468d4', radius=6},
+  ouro.button {key='clear', label='Clear', on_press=function() query:set('') end},
+}
+```
+
 `ouro.text_input` is single-line by default. Long values scroll horizontally to
 keep the focused caret or selection extent visible, including during IME
 composition and pointer dragging. Resizing clamps the retained scroll offset.

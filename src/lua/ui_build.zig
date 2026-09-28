@@ -643,7 +643,7 @@ pub const UiBuild = struct {
             .image => emitImage,
             .canvas => emitCanvas,
             .icon => emitIcon,
-            .text_input => emitTextInput,
+            .text_editor => emitTextEditor,
             .auth_input => emitAuthInput,
             .split => emitSplit,
             .box => emitBox,
@@ -1086,13 +1086,13 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn emitTextInput(state: *c.State) callconv(.c) c_int {
+    fn emitTextEditor(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = theming.widgetOverrides(state, defaults.widgets.text_input, false) catch |err| return luaError(state, @errorName(err));
+        const visual = theming.widgetOverrides(state, .{}, true) catch |err| return luaError(state, @errorName(err));
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
-            return luaError(state, "ouro.text_input expects one declaration table");
+            return luaError(state, "ouro.text_editor expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "text_input requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "text_input key is required");
         const controlled = tableOptionalString(state, 1, "text") orelse
@@ -1110,12 +1110,25 @@ pub const UiBuild = struct {
             return luaError(state, "text_input multiline must be a boolean");
         const width = tableOptionalSize(state, 1, "width", .fill) orelse
             return luaError(state, "invalid text_input width");
-        const height = tableOptionalExtent(
-            state,
-            1,
-            "height",
-            visual.height orelse if (multiline) @as(f32, 160) else defaults.controls.height,
-        ) orelse return luaError(state, "invalid text_input height");
+        const height = tableOptionalSize(state, 1, "height", .auto) orelse
+            return luaError(state, "invalid text_editor height");
+        const padding = tableOptionalExtent(state, 1, "padding", 0) orelse
+            return luaError(state, "invalid text_editor padding");
+        const padding_x = visual.padding_x orelse padding;
+        const padding_y = tableOptionalExtent(state, 1, "padding_y", padding) orelse
+            return luaError(state, "invalid text_editor padding_y");
+        const alignment = tableOptionalBoxAlignment(state, 1) orelse
+            return luaError(state, "invalid text_editor alignment");
+        var colors = .{
+            .placeholder_color = theme.muted_foreground,
+            .selection_color = theme.selection,
+            .caret_color = visual.foreground orelse theme.foreground,
+        };
+        inline for (.{ "placeholder_color", "selection_color", "caret_color" }) |field| {
+            if (c.lua_getfield(state, 1, field) != c.type_nil)
+                @field(colors, field) = theming.color(state, -1) catch |err| return luaError(state, @errorName(err));
+            c.lua_settop(state, -2);
+        }
         const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
             return luaError(state, "text_input enabled must be a boolean");
         const read_only = tableOptionalBoolean(state, 1, "read_only", false) orelse
@@ -1127,7 +1140,7 @@ pub const UiBuild = struct {
         bindings.multiline = multiline;
         const target_id = semanticId(key, 0x74657874696e7075 ^ parent.id ^ self.component_namespace);
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
-        const border_width = visual.border_width orelse defaults.controls.border_width orelse design.tokens.foundation.border_width_default;
+        const border_width = visual.border_width orelse 0;
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         if (self.pending_text_input_count == self.pending_text_inputs.len)
             return luaError(state, "text_input capacity exceeded");
@@ -1136,7 +1149,7 @@ pub const UiBuild = struct {
             .target_id = target_id,
             .content_id = content_id,
             .mode = mode,
-            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border orelse if (enabled) theme.input else theme.border, .focus_color = visual.focus orelse theme.ring },
+            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border, .focus_color = visual.focus orelse theme.ring },
             .session = TextInputSession.initWithMode(
                 sources.allocator,
                 if (controlled.present) controlled.value else uncontrolled.value,
@@ -1151,18 +1164,14 @@ pub const UiBuild = struct {
             .object = .{ .box = .{
                 .width = width.extent(),
                 .fill_width = width.isFill(),
-                .height = height,
-                .padding = .{
-                    .left = visual.padding_x orelse design.tokens.foundation.spacing_2,
-                    .right = visual.padding_x orelse design.tokens.foundation.spacing_2,
-                    .top = if (multiline) design.tokens.foundation.spacing_2 else 0,
-                    .bottom = if (multiline) design.tokens.foundation.spacing_2 else 0,
-                },
-                .alignment = if (multiline) null else .{ .vertical = .center },
-                .background = if (enabled) visual.background orelse theme.surface else visual.disabled orelse theme.surface,
-                .border_color = if (border_width > 0) visual.border orelse if (enabled) theme.input else theme.border else null,
+                .height = height.extent(),
+                .fill_height = height.isFill(),
+                .padding = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y },
+                .alignment = alignment.value,
+                .background = visual.background,
+                .border_color = if (border_width > 0) visual.border else null,
                 .border_width = border_width,
-                .corner_radius = visual.radius orelse defaults.controls.radius orelse design.tokens.foundation.radius_2,
+                .corner_radius = visual.radius orelse 0,
             } },
             .focusable = enabled,
             .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
@@ -1194,10 +1203,10 @@ pub const UiBuild = struct {
                 .source = source,
                 .multiline = multiline,
                 .placeholder = placeholder_source,
-                .placeholder_color = theme.muted_foreground,
-                .color = if (enabled) visual.foreground orelse theme.foreground else visual.disabled_foreground orelse theme.disabled_foreground,
-                .selection_color = theme.selection,
-                .caret_color = visual.foreground orelse theme.foreground,
+                .placeholder_color = colors.placeholder_color,
+                .color = visual.foreground orelse theme.foreground,
+                .selection_color = colors.selection_color,
+                .caret_color = colors.caret_color,
                 .selection_start = initial.len,
                 .selection_end = initial.len,
                 .caret_offset = initial.len,
@@ -2850,7 +2859,7 @@ test "Lua constructors are pure and reject callback children" {
         "ouro.column { {} }",
         "ouro.column { false }",
         "ouro.text { key = 'leaf', text = 'Hello', ouro.box { key = 'child' } }",
-        "ouro.text_input { key = 'leaf', text = 'Hello', children = {} }",
+        "ouro.text_editor { key = 'leaf', text = 'Hello', children = {} }",
     }) |source| try std.testing.expectError(error.LuaChunkFailed, execute(state, source));
 }
 

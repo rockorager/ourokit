@@ -161,6 +161,35 @@ ouro.split_view = ouro.stateless(function(p, children, theme)
       states={hover=theme.colors.accent, pressed=theme.colors.accent_selected, focus=theme.colors.ring}}}
 end)
 
+ouro.text_input = ouro.stateless(function(p, children, theme)
+  check(#children == 0, 'text_input does not accept children')
+  validate_appearance(p)
+  local active, c, d = enabled(p), theme.colors, theme.widgets.text_input
+  local function appearance(name, fallback)
+    if p[name] ~= nil then return p[name] end
+    if d[name] ~= nil then return d[name] end
+    return fallback
+  end
+  local height = appearance('height', p.multiline and 160 or theme.controls.height)
+  check(kind(height) == 'number' and height > 0, 'invalid text_input height')
+  local alignment
+  if not p.multiline then alignment = 'left' end
+  return ouro.text_editor {key=p.key, text=p.text, default_text=p.default_text,
+    label=p.label, placeholder=p.placeholder, multiline=p.multiline,
+    enabled=active, read_only=p.read_only, autofocus=p.autofocus,
+    key_bindings=p.key_bindings, on_change=p.on_change, on_command=p.on_command,
+    focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
+    width=p.width, height=height, alignment=alignment,
+    padding_x=appearance('padding_x', f.spacing_2), padding_y=p.multiline and f.spacing_2 or 0,
+    radius=appearance('radius', theme.controls.radius or f.radius_2),
+    border_width=appearance('border_width', theme.controls.border_width or f.border_width_default),
+    background=appearance(active and 'background' or 'disabled', c.surface),
+    border=appearance('border', active and c.input or c.border), focus=appearance('focus', c.ring),
+    font_size=appearance('font_size', theme.typography.size or f.typography_2),
+    foreground=appearance(active and 'foreground' or 'disabled_foreground', active and c.foreground or c.disabled_foreground),
+    caret_color=appearance('foreground', c.foreground), placeholder_color=c.muted_foreground, selection_color=c.selection}
+end)
+
 local function selection_group(p, children, policy)
   local gap = p.gap
   if gap == nil then gap = policy == 'tab_list' and 0 or f.spacing_1 end

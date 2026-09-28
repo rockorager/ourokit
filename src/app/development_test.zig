@@ -1259,6 +1259,107 @@ test "development reports retained list selection and cancels a pressed pointer 
     try std.testing.expectEqual(.complete, try playback.advance(&f.runtime));
 }
 
+test "unstyled text editor ignores stock chrome and accepts explicit viewport paint" {
+    const f = try Fixture.create(
+        \\function build() return ouro.theme {key='theme', controls={height=61,radius=13,border_width=4},
+        \\ widgets={text_input={height=73,padding_x=19,background='#ff0000',foreground='#00ff00'}},
+        \\ ouro.column {key='root',gap=7,
+        \\   ouro.text_editor {key='bare',default_text='Bare'},
+        \\   ouro.text_editor {key='custom',text='',placeholder='Hint',height=53,padding_x=11,padding_y=7,
+        \\     background='#123456',foreground='#234567',border='#345678',border_width=3,focus='#456789',radius=9,
+        \\     placeholder_color='#56789a',selection_color='#6789ab',caret_color='#789abc'},
+        \\   ouro.text_input {key='stock',text='Stock'}}} end
+    );
+    defer f.destroy();
+    const bare = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("theme/root/bare")).id).?;
+    const bare_render = try f.runtime.instances.renderObject(bare);
+    const box = (try f.runtime.tree.objectAt(bare_render)).box;
+    try std.testing.expect(box.background == null and box.border_color == null and box.height == null);
+    try std.testing.expectEqual(@as(f32, 0), box.border_width);
+    try std.testing.expectEqual(@as(f32, 0), box.corner_radius);
+    try std.testing.expectEqual(@as(f32, 0), box.padding.left);
+    try std.testing.expectEqual(@as(f32, 0), box.padding.top);
+    try std.testing.expect((try f.runtime.semanticTarget("theme/root/bare")).bounds.height > 0);
+    const bare_content = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(bare));
+    try std.testing.expectEqual(@import("../design/root.zig").tokens.light.foreground, (try f.runtime.tree.objectAt(bare_content)).text_input.color);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try std.testing.expectEqual(bare, f.runtime.focus.current().?);
+    try std.testing.expectEqual(box, (try f.runtime.tree.objectAt(bare_render)).box);
+    const Color = @import("../core/color.zig").Color;
+    const custom = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("theme/root/custom")).id).?;
+    const custom_render = try f.runtime.instances.renderObject(custom);
+    const custom_box = (try f.runtime.tree.objectAt(custom_render)).box;
+    try std.testing.expectEqual(@as(?f32, 53), custom_box.height);
+    try std.testing.expectEqual(@as(f32, 11), custom_box.padding.left);
+    try std.testing.expectEqual(@as(f32, 7), custom_box.padding.top);
+    try std.testing.expectEqual(Color.rgba(0x12, 0x34, 0x56, 255), custom_box.background.?);
+    try std.testing.expectEqual(Color.rgba(0x34, 0x56, 0x78, 255), custom_box.border_color.?);
+    const content = (try f.runtime.tree.objectAt(try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(custom)))).text_input;
+    try std.testing.expectEqual(Color.rgba(0x56, 0x78, 0x9a, 255), content.placeholder_color);
+    try std.testing.expectEqual(Color.rgba(0x67, 0x89, 0xab, 255), content.selection_color);
+    try std.testing.expectEqual(Color.rgba(0x78, 0x9a, 0xbc, 255), content.caret_color);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try std.testing.expectEqual(Color.rgba(0x45, 0x67, 0x89, 255), (try f.runtime.tree.objectAt(custom_render)).box.border_color.?);
+    const stock = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("theme/root/stock")).id).?;
+    const stock_box = (try f.runtime.tree.objectAt(try f.runtime.instances.renderObject(stock))).box;
+    try std.testing.expectEqual(@as(?f32, 73), stock_box.height);
+    try std.testing.expectEqual(@as(f32, 19), stock_box.padding.left);
+    try std.testing.expectEqual(@as(f32, 13), stock_box.corner_radius);
+    try std.testing.expectEqual(@as(f32, 4), stock_box.border_width);
+}
+
+test "text editor and stock recipe retain the same native session across chrome changes" {
+    const f = try Fixture.create(
+        \\custom=ouro.signal(false); invalid=ouro.signal(false); changes={}
+        \\function build()
+        \\ local input=custom() and ouro.text_editor or ouro.text_input
+        \\ return input {key='edit',default_text=custom() and 'must not reset' or 'aéZ',
+        \\   height=43,padding_x=custom() and 13 or 7,foreground='#123456',
+        \\   on_change=function(v) changes[#changes+1]=v end,
+        \\   on_command=invalid() and 'not a callback' or function() end}
+        \\end
+    );
+    defer f.destroy();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    const target = f.runtime.focus.current().?;
+    const generation = try f.runtime.text_inputs.sessionGeneration(target);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .end } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_left, .modifiers = .{ .shift = true } } });
+    try f.play(.{ .text = "Ω" });
+    const session = try f.runtime.text_inputs.session(target);
+    try std.testing.expectEqualStrings("aéΩ", session.model.text());
+    _ = try session.apply(.{ .preedit = .{ .text = "候補", .cursor = null } });
+    const selection = session.model.selection;
+    const switch_source = "custom:set(true)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, switch_source.ptr, switch_source.len, "@editor-chrome", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    try std.testing.expectEqual(generation, try f.runtime.text_inputs.sessionGeneration(target));
+    try std.testing.expectEqualStrings("aéΩ", session.model.text());
+    try std.testing.expectEqual(selection, session.model.selection);
+    try std.testing.expectEqualStrings("候補", session.preedit().?.text);
+    // Fail after staging a new session and on_change callback; preserve the live owner.
+    const invalidate = "invalid:set(true)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, invalidate.ptr, invalidate.len, "@invalid-editor", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try std.testing.expectError(error.LuaBuildFailed, f.settle());
+    try std.testing.expectEqual(@as(usize, 0), f.builder.pending_text_input_count);
+    try std.testing.expectEqual(@as(usize, 0), f.builder.pending_handler_count);
+    try std.testing.expectEqual(generation, try f.runtime.text_inputs.sessionGeneration(target));
+    try std.testing.expectEqualStrings("候補", session.preedit().?.text);
+    const restore = "invalid:set(false)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, restore.ptr, restore.len, "@restore-editor", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    _ = try session.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_z, .modifiers = .{ .control = true } } });
+    try std.testing.expectEqualStrings("aéZ", session.model.text());
+    const check = "assert(#changes==2 and changes[1]=='aéΩ' and changes[2]=='aéZ')";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-editor", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+}
+
 test "development keyboard and text preserve asymmetric UTF-8 selection through real editing" {
     const f = try Fixture.create(
         \\function build()

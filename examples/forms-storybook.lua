@@ -156,6 +156,37 @@ local function split_view(axis, custom)
   end
 end
 
+local EditorLayout = o.stateless(function(p, children, theme)
+  local c, active = theme.colors, not p.disabled
+  local fg = active and c.foreground or c.disabled_foreground
+  return o.column {key=p.key,gap=14,
+    o.text {key='title',text='Native editing, Lua chrome',size=24},
+    o.text {key='bare-label',text='Unstyled editor · intrinsic height'},
+    o.text_editor {key='bare',default_text='No field background, border, or padding',enabled=active,foreground=fg},
+    o.box {key='search-frame',surface='sidebar',padding=12,radius=12,
+      o.row {key='search',gap=12,cross_alignment='center',
+        o.text {key='label',text='Find'},
+        o.text_editor {key='query',text=p.query,placeholder='Search this workspace',flex=1,height=36,
+          padding_x=9,alignment='left',radius=6,background=c.surface,foreground=fg,
+          border_width=1,border=c.input,focus=c.ring,enabled=active,on_change=p.on_change},
+        o.button {key='clear',label='Clear',variant='ghost',tone='neutral',enabled=active,
+          on_press=function() p.on_change('') end}}},
+    o.text {key='notes-label',text='Multiline · custom viewport and selection colors'},
+    o.text_editor {key='notes',default_text='First line: aéZ\nSecond line: editable notes',multiline=true,
+      height=110,padding_x=16,padding_y=11,background=c.secondary,foreground=fg,
+      border_width=2,border=c.input,focus=c.ring,radius=10,enabled=active,
+      selection_color=c.accent_selected,caret_color=c.primary},
+    o.text {key='stock-label',text='Stock Lua recipe'},
+    o.text_input {key='stock',default_text='',placeholder='Standard input',enabled=active}}
+end)
+
+local function editor_layout(disabled)
+  local query = o.signal('aéZ workspace')
+  return function()
+    return EditorLayout {key='editors',query=query(),disabled=disabled,on_change=function(v) query:set(v) end}
+  end
+end
+
 return o.storybook {id='forms', title='Form controls', stories={
   o.story {id='forms/light', name='Light', viewport={width=540,height=640}, content=content()},
   o.story {id='forms/dark', name='Dark', color_scheme='dark', viewport={width=540,height=640}, content=content()},
@@ -205,4 +236,11 @@ return o.storybook {id='forms', title='Form controls', stories={
     actions={{type='pointer_down',target='panes/divider'}}},
   o.story {id='split-custom/focus', name='Custom divider (keyboard focus)', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal',true),
     actions={{type='tab',target='panes/divider'}}},
+  o.story {id='editor-layout/light', name='Custom editor chrome', viewport={width=540,height=470}, snapshot_scale=2, content=editor_layout(false)},
+  o.story {id='editor-layout/dark', name='Custom editor chrome (dark)', color_scheme='dark', viewport={width=540,height=470}, snapshot_scale=2, content=editor_layout(false)},
+  o.story {id='editor-layout/disabled', name='Custom editor chrome (disabled)', viewport={width=540,height=470}, snapshot_scale=2, content=editor_layout(true)},
+  o.story {id='editor-layout/focus', name='Custom editor chrome (focused)', viewport={width=540,height=470}, snapshot_scale=2, content=editor_layout(false),
+    actions={{type='tab',target='editors/bare'}, {type='tab',target='editors/search-frame/search/query'}}},
+  o.story {id='editor-layout/cleared', name='Custom editor chrome (cleared)', viewport={width=540,height=470}, snapshot_scale=2, content=editor_layout(false),
+    actions={{type='click',target='editors/search-frame/search/clear'}}},
 }}
