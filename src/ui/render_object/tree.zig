@@ -741,8 +741,12 @@ pub const Tree = struct {
                 break :paint true;
             },
         };
-        if (clips and target.object != .text and target.object != .text_input)
-            try builder.pushClip(bounds);
+        if (clips and target.object != .text and target.object != .text_input) {
+            if (target.object == .box)
+                try builder.pushRoundedClip(bounds, target.object.box.corner_radius)
+            else
+                try builder.pushClip(bounds);
+        }
         var child = target.first_child;
         while (child) |child_handle| {
             const child_slot = try self.slot(child_handle);
@@ -758,6 +762,9 @@ pub const Tree = struct {
         const target = try self.slot(handle);
         if (target.object == .box and target.object.box.hidden) return null;
         if (!(RectF{ .x = 0, .y = 0, .width = target.size.width, .height = target.size.height }).contains(point))
+            return null;
+        if (target.object == .box and target.object.box.clip and
+            !(RectF{ .x = 0, .y = 0, .width = target.size.width, .height = target.size.height }).containsRounded(point, target.object.box.corner_radius))
             return null;
         var child = if (target.object == .anchored) target.first_child else target.last_child;
         while (child) |child_handle| {
@@ -2209,6 +2216,47 @@ test "box outlines stay paint-only and inset rings paint above the background" {
     }
 }
 
+test "rounded box clips children and hits without relayout and uses scaled decoration geometry" {
+    const scene = @import("../../scene/root.zig");
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    defer tree.deinit();
+    const root = try tree.create(.{ .stack = .{} });
+    const back = try tree.create(.{ .box = .{ .width = 40, .height = 30 } });
+    var box: types.Box = .{ .width = 40, .height = 30, .clip = true, .corner_radius = 10 };
+    const front = try tree.create(.{ .box = box });
+    const child = try tree.create(.{ .box = .{ .background = Color.rgba(255, 0, 0, 255) } });
+    try tree.appendChild(root, back, .{ .stack = .{} });
+    try tree.appendChild(root, front, .{ .stack = .{} });
+    try tree.appendChild(front, child, .none);
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 40, .height = 30 }));
+    try std.testing.expectEqual(back, (try tree.hitTest(root, .{ .x = 1, .y = 1 })).?);
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 10, .y = 1 })).?);
+    try std.testing.expectEqual(back, (try tree.hitTest(root, .{ .x = 39, .y = 29 })).?);
+    var storage: [4]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&storage, 1.5);
+    try tree.buildScene(root, &builder);
+    try builder.displayList().validate();
+    try std.testing.expectEqual(scene.RoundedClip{
+        .bounds = .{ .x = 0, .y = 0, .width = 60, .height = 45 },
+        .corner_radius = 15,
+    }, storage[0].push_clip_rounded);
+    box.corner_radius = 0;
+    try tree.update(front, .{ .box = box });
+    try std.testing.expect(!try tree.layoutDirty(root));
+    try std.testing.expect(try tree.paintDirty(root));
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 1, .y = 1 })).?);
+    builder = try scene_builder.Builder.init(&storage, 1.5);
+    try tree.buildScene(root, &builder);
+    try std.testing.expect(storage[0] == .push_clip_rect);
+    box.corner_radius = 10;
+    box.clip = false;
+    try tree.update(front, .{ .box = box });
+    try std.testing.expect(!try tree.layoutDirty(root));
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 1, .y = 1 })).?);
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(front));
+}
+
 test "box shadows are paint-only obey ancestor clips and never expand hit targets" {
     const scene = @import("../../scene/root.zig");
     const software = @import("../../renderer/software/root.zig");
@@ -2242,7 +2290,7 @@ test "box shadows are paint-only obey ancestor clips and never expand hit target
         try std.testing.expectEqual(RectI{ .x = 10, .y = 10, .width = 30, .height = 20 }, commands[index].shadow.shape.box);
         try std.testing.expect(commands[index + 1] == .decorated_rectangle);
         // Own clip begins after the shadow and decoration; ancestor clip begins before them.
-        try std.testing.expect(commands[index + 2] == .push_clip_rect);
+        try std.testing.expect(commands[index + 2] == .push_clip_rounded);
         try software.render(builder.displayList(), .{ .pixels = &pixels, .width = 90, .height = 60, .stride = 90 * 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
         try std.testing.expectEqualSlices(u8, &.{ 20, 60, 140, 255 }, pixels[(15 * 90 + 55) * 4 ..][0..4]);
         try std.testing.expectEqualSlices(u8, if (ancestor_clip) &.{ 255, 255, 255, 255 } else &.{ 20, 60, 140, 255 }, pixels[(15 * 90 + 65) * 4 ..][0..4]);

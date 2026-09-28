@@ -3,7 +3,7 @@
 ## Scene and color contract
 
 The display list contains clear, rectangle, shadow, text, image, and immutable path
-commands plus a balanced rectangular clip stack. A borrowed `DisplayList`
+commands plus a balanced rectangular/rounded clip stack. A borrowed `DisplayList`
 supports immediate consumption. An owning `Frame` copies command and damage
 storage and retains path geometry through completion. Text and image resources
 keep their existing cache-lifetime contracts.
@@ -40,6 +40,22 @@ Rectangular damage regions must not overlap, preventing source-over commands
 from being applied twice. Rectangles use integer device-pixel bounds; paths and
 glyphs carry antialiased coverage. Arbitrary transforms, path clipping, and layer
 isolation remain unsupported.
+
+Rounded child clips carry integer device bounds and a clamped corner radius.
+Software and Vulkan evaluate the same strict f32 signed-distance expression at
+pixel centers and quantize coverage to nearest A8. Nested rounded clips multiply
+outer-to-inner with nearest-integer division by 255; rectangular ancestors retain
+the scissor fast path. Every primitive's existing premultiplied source is scaled
+once by the combined clip coverage. Source replacement scales its erase coverage
+as well, preserving destination pixels outside the rounded edge. This is per-draw
+clipping, not isolated subtree composition.
+
+The shared clip-depth limit is 64, and clear commands remain invalid inside any
+clip. Rounded clips never establish full rectangular opacity; occlusion shortcuts
+are disabled beneath them. Damage snapshots retain rounded push/pop boundaries,
+so changing a radius or clip scope repaints unchanged child geometry. Box shadows
+and decorations precede the Box's own child clip but still obey ancestors.
+Logical hit testing uses the rounded contour, not the antialiased pixel fringe.
 
 Both backends avoid issuing a draw when the next non-empty draw completely
 replaces its clipped pixels. Opaque source-over rectangles, all source-mode

@@ -885,6 +885,29 @@ new widget-default section. An invalid `surface` remains an error even when
 remain intrinsic. Optional `min_width` and `min_height` participate in the same
 one-way constraints and yield when a parent supplies a tighter maximum.
 
+Set `clip = true` to clip children to the Box's rounded border-box shape:
+
+```lua
+ouro.box {
+  width = 180, height = 120, radius = 16, clip = true,
+  ouro.image {src = "photo.png", width = 180, height = 120, fit = "cover"},
+}
+```
+
+Omitted, nil, or false `clip` leaves child painting unchanged; other values are
+errors. Radius zero clips to a rectangle. The radius is clamped to half the
+smaller extent. Nested clips intersect, including ancestor Scroll viewports.
+The Box's own background, border, outline, and shadow paint before its child
+clip; ancestor clips still apply to them. Changing `clip` or `radius` repaints
+without changing layout or retained identity. Pointer hits outside the rounded
+contour skip the Box and its descendants, allowing an underlying sibling to be
+hit. This does not add alpha-based hit testing for images or arbitrary paths.
+
+Edges have per-draw antialiasing: this is not an isolated group or a group-opacity
+effect. Multiple overlapping children blend separately at the clipped edge.
+See `examples/clip-storybook.lua` and `examples/clip-composition.lua` for nested
+clips, shadows, content, and corner hit testing.
+
 Boxes accept one optional outset `shadow`:
 
 ```lua
@@ -917,7 +940,8 @@ the same origin. It also accepts `children = { ... }`, following the same dense
 array and key conventions as rows and columns. Children paint in declaration
 order; hit testing starts with the last child. Put decorative backgrounds first
 and foreground controls last so the background cannot intercept their hits.
-This is rectangular hit testing, not alpha-based click-through.
+Hit testing uses layout bounds and explicit rounded Box clips, not alpha-based
+click-through.
 
 Stack uses the existing native layout: children receive loose parent bounds,
 and its size is their maximum extent constrained by the parent. Fill children

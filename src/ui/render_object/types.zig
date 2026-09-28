@@ -42,6 +42,8 @@ pub const Box = struct {
     outline_gap: f32 = 0,
     /// Paint the outline inside the box, inset by outline_gap, without layout.
     outline_inset: bool = false,
+    /// Clip children and hit testing to the rounded border box. Own decoration
+    /// and outset shadow precede this clip; ancestor clips still apply to them.
     clip: bool = false,
 };
 

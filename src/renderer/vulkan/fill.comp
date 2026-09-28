@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "gradient.glsl"
+#include "clip.glsl"
 
 layout(local_size_x = 64) in;
 
@@ -26,6 +27,7 @@ layout(push_constant) uniform Push {
     uint flags;
     uint source_over;
     uint gradient_index;
+    layout(offset = 96) uint clip_index;
 };
 
 uint channel16(uvec2 pixel, uint channel) {
@@ -81,6 +83,8 @@ void main() {
     uint x = uint(left) + index % width;
     uint y = uint(top) + index / width;
     vec2 point = vec2(x, y) + vec2(0.5);
+    uint clip = clipCoverage(clip_index, point);
+    if (clip == 0u) return;
     vec4 shape = vec4(shape_left, shape_top, shape_right, shape_bottom);
     uint outer_coverage = uint(roundedRectangleCoverage(point, shape, float(corner_radius)) * 255.0 + 0.5);
     if (outer_coverage == 0u) return;
@@ -100,6 +104,8 @@ void main() {
     if (coverage == 0u) return;
     uvec2 background_value = gradient_index != 0u ? pack16(gradientSample(gradient_index, point)) : background;
     uvec2 source = addPixels(scalePixel(border, border_coverage), scalePixel(background_value, background_coverage));
+    source = scalePixel(source, clip);
+    coverage = (coverage * clip + 127u) / 255u;
     uint offset = y * target_width + x;
     if (source_over != 0u) {
         pixels[offset] = channel16(source, 3u) != 65535u ? sourceOver(source, pixels[offset]) : source;

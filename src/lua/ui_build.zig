@@ -1681,6 +1681,8 @@ pub const UiBuild = struct {
                 .border_width = border_width,
                 .corner_radius = visual.radius orelse 0,
                 .shadow = shadow,
+                .clip = tableOptionalBoolean(state, 1, "clip", false) orelse
+                    return luaError(state, "box clip must be boolean"),
             } },
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append box descriptor");
@@ -3185,6 +3187,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
         \\    min_height = 160,
         \\    padding = 8,
         \\    alignment = "center",
+        \\    clip = true,
         \\    shadow = {x=-3,y=5,blur=8,spread=-1,color='#11223380'},
         \\    ouro.theme {
         \\      key = "dark",
@@ -3215,6 +3218,8 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expectEqual(@as(?f32, 200), descriptors[2].object.box.height);
     try std.testing.expectEqual(@as(f32, 280), descriptors[2].object.box.min_width);
     try std.testing.expectEqual(@as(f32, 160), descriptors[2].object.box.min_height);
+    try std.testing.expect(descriptors[2].object.box.clip);
+    try std.testing.expect(!descriptors[3].object.box.clip);
     try std.testing.expectEqual(@as(f32, -3), descriptors[2].object.box.shadow.?.offset.x);
     try std.testing.expectEqual(@as(f32, 8), descriptors[2].object.box.shadow.?.blur);
     try std.testing.expectEqual(@as(u8, 128), descriptors[2].object.box.shadow.?.color.a);

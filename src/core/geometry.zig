@@ -29,6 +29,18 @@ pub const RectF = struct {
         return point.x >= self.x and point.y >= self.y and
             point.x < self.x + self.width and point.y < self.y + self.height;
     }
+
+    /// Logical contour containment, not the antialiased device-pixel fringe.
+    pub fn containsRounded(self: RectF, point: PointF, radius: f32) bool {
+        if (!self.contains(point)) return false;
+        const r: f64 = @min(@as(f64, radius), @as(f64, @min(self.width, self.height)) * 0.5);
+        if (r == 0) return true;
+        const x = @as(f64, point.x) - self.x;
+        const y = @as(f64, point.y) - self.y;
+        const dx = @max(@max(r - x, x - (self.width - r)), 0);
+        const dy = @max(@max(r - y, y - (self.height - r)), 0);
+        return dx * dx + dy * dy <= r * r;
+    }
 };
 
 pub const Insets = struct {
@@ -107,4 +119,16 @@ test "logical rectangles use half-open hit-test bounds" {
     try std.testing.expect(rect.contains(.{ .x = 2, .y = 3 }));
     try std.testing.expect(rect.contains(.{ .x = 5.999, .y = 7.999 }));
     try std.testing.expect(!rect.contains(.{ .x = 6, .y = 4 }));
+}
+
+test "rounded logical hit contours clamp oversized radii and retain half-open edges" {
+    const rect: RectF = .{ .x = -3, .y = 7, .width = 30, .height = 20 };
+    try std.testing.expect(!rect.containsRounded(.{ .x = -2, .y = 8 }, 10));
+    try std.testing.expect(rect.containsRounded(.{ .x = -2, .y = 8 }, 0));
+    // Radius10, center(7,17): the3-4-5 scaled boundary at(1,9).
+    try std.testing.expect(rect.containsRounded(.{ .x = 1, .y = 9 }, 100));
+    try std.testing.expect(!rect.containsRounded(.{ .x = 0.99, .y = 9 }, 100));
+    try std.testing.expect(rect.containsRounded(.{ .x = 7, .y = 7 }, 100));
+    try std.testing.expect(!rect.containsRounded(.{ .x = 27, .y = 17 }, 100));
+    try std.testing.expect(!rect.containsRounded(.{ .x = 7, .y = 27 }, 100));
 }

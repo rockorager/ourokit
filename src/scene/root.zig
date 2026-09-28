@@ -49,6 +49,40 @@ pub const BlendMode = enum {
 
 pub const max_clip_depth = 64;
 
+/// Device-space, per-draw antialiased child clip; not an isolated layer.
+pub const RoundedClip = struct {
+    bounds: RectI,
+    corner_radius: u32,
+
+    /// Shared CPU/GPU contract: strict separate binary32 operations, nearest
+    /// A8 coverage. Nested masks multiply outer-to-inner with (a*b+127)/255.
+    pub fn coverage(self: RoundedClip, x: usize, y: usize) u8 {
+        @setFloatMode(.strict);
+        if (self.bounds.isEmpty()) return 0;
+        const left: f32 = @floatFromInt(self.bounds.x);
+        const top: f32 = @floatFromInt(self.bounds.y);
+        const width: f32 = @floatFromInt(self.bounds.width);
+        const height: f32 = @floatFromInt(self.bounds.height);
+        const px: f32 = @as(f32, @floatFromInt(x)) + 0.5;
+        const py: f32 = @as(f32, @floatFromInt(y)) + 0.5;
+        const radius: f32 = @floatFromInt(@min(self.corner_radius, @min(self.bounds.width, self.bounds.height) / 2));
+        if (radius == 0) return if (px >= left and px < left + width and py >= top and py < top + height) 255 else 0;
+        const half_width = width * 0.5;
+        const half_height = height * 0.5;
+        const dx = @abs(px - (left + half_width)) - (half_width - radius);
+        const dy = @abs(py - (top + half_height)) - (half_height - radius);
+        const ox = @max(dx, 0);
+        const oy = @max(dy, 0);
+        const square_x = ox * ox;
+        const square_y = oy * oy;
+        const outside = @sqrt(square_x + square_y);
+        const distance = outside + @min(@max(dx, dy), 0) - radius;
+        const alpha = std.math.clamp(0.5 - distance, 0, 1);
+        const scaled = alpha * 255;
+        return @intFromFloat(@floor(scaled + 0.5));
+    }
+};
+
 pub const GlyphRun = struct {
     shape: ShapeHandle,
     origin: PointF,
@@ -85,6 +119,7 @@ pub const DecoratedRectangle = struct {
 pub const Command = union(enum) {
     clear: Color,
     push_clip_rect: RectI,
+    push_clip_rounded: RoundedClip,
     pop_clip,
     solid_rectangle: struct {
         bounds: RectI,
@@ -129,6 +164,7 @@ pub const DisplayList = struct {
         var result = false;
         var clips: [max_clip_depth + 1]RectI = undefined;
         clips[0] = bounds;
+        var rounded = [_]bool{false} ** (max_clip_depth + 1);
         var depth: usize = 0;
         for (self.commands) |command| switch (command) {
             .clear => |color| {
@@ -138,6 +174,13 @@ pub const DisplayList = struct {
             .push_clip_rect => |clip| {
                 if (depth == max_clip_depth) return false;
                 clips[depth + 1] = RectI.intersect(clips[depth], clip);
+                rounded[depth + 1] = rounded[depth];
+                depth += 1;
+            },
+            .push_clip_rounded => |clip| {
+                if (depth == max_clip_depth) return false;
+                clips[depth + 1] = RectI.intersect(clips[depth], clip.bounds);
+                rounded[depth + 1] = true;
                 depth += 1;
             },
             .pop_clip => {
@@ -146,13 +189,13 @@ pub const DisplayList = struct {
             },
             .solid_rectangle => |rect| {
                 if (rect.blend == .source and rect.color.a != 255) result = false;
-                if (rect.color.a == 255 and std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
+                if (!rounded[depth] and rect.color.a == 255 and std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
             },
             .decorated_rectangle => |rect| {
                 if (rect.blend == .source) result = false;
                 // Rounded corners and translucent borders do not cover every
                 // pixel. Do not infer opacity from just the background alpha.
-                if (rect.corner_radius == 0 and rect.backgroundIsOpaque() and
+                if (!rounded[depth] and rect.corner_radius == 0 and rect.backgroundIsOpaque() and
                     (rect.border_color == null or rect.border_color.?.a == 255) and
                     std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
             },
@@ -165,7 +208,10 @@ pub const DisplayList = struct {
         var depth: usize = 0;
         for (self.commands) |command| switch (command) {
             .clear => if (depth != 0) return error.ClearInsideClip,
-            .push_clip_rect => depth += 1,
+            .push_clip_rect, .push_clip_rounded => {
+                if (depth == max_clip_depth) return error.ClipStackOverflow;
+                depth += 1;
+            },
             .pop_clip => {
                 if (depth == 0) return error.UnbalancedClipStack;
                 depth -= 1;
@@ -233,6 +279,7 @@ pub fn occludedByNextDraw(
     var depth = active_clips.len - 1;
     for (remaining) |command| switch (command) {
         .clear => return contains(clips[0], bounds),
+        .push_clip_rounded => return false,
         .push_clip_rect => |clip| {
             if (depth == max_clip_depth) return false;
             depth += 1;
@@ -724,4 +771,43 @@ test "gradient frames copy values and damage opacity and occlusion follow paint 
     try std.testing.expectEqual(gradient, frame.command_storage[0].decorated_rectangle.background_gradient.?);
     commands[0].decorated_rectangle.background_gradient.?.count = 1;
     try std.testing.expectError(error.InvalidGradient, list.validate());
+}
+
+test "rounded clip coverage clamps radius and cannot establish rectangular opacity" {
+    const bounds: RectI = .{ .x = 2, .y = 3, .width = 13, .height = 11 };
+    const clip: RoundedClip = .{ .bounds = bounds, .corner_radius = 500 };
+    // Radius clamps to5, not5.5. Independent circle distances at pixel centers:
+    // sqrt(2.5^2+4.5^2) =>90/255, sqrt(3.5^2+3.5^2) =>140/255.
+    try std.testing.expectEqual(@as(u8, 0), clip.coverage(2, 3));
+    try std.testing.expectEqual(@as(u8, 90), clip.coverage(4, 3));
+    try std.testing.expectEqual(@as(u8, 140), clip.coverage(3, 4));
+    try std.testing.expectEqual(@as(u8, 255), clip.coverage(8, 7));
+    try std.testing.expectEqual(@as(u8, 0), clip.coverage(15, 7));
+    try std.testing.expectEqual(@as(u8, 255), (RoundedClip{ .bounds = bounds, .corner_radius = 0 }).coverage(2, 3));
+    try std.testing.expectEqual(@as(u8, 0), (RoundedClip{ .bounds = .{ .x = 0, .y = 0, .width = 0, .height = 9 }, .corner_radius = 4 }).coverage(0, 0));
+    var commands = [_]Command{
+        .{ .clear = Color.rgba(0, 0, 0, 0) },
+        .{ .push_clip_rounded = clip },
+        .{ .push_clip_rect = bounds },
+        .{ .solid_rectangle = .{ .bounds = bounds, .color = Color.rgba(255, 255, 255, 255) } },
+        .pop_clip,
+        .pop_clip,
+    };
+    const list: DisplayList = .{ .commands = &commands };
+    try list.validate();
+    try std.testing.expect(!list.isOpaque(bounds));
+    try std.testing.expect(!occludedByNextDraw(commands[1..], &.{bounds}, bounds));
+    commands[0].clear.a = 255;
+    try std.testing.expect(list.isOpaque(bounds));
+    commands[3].solid_rectangle.blend = .source;
+    commands[3].solid_rectangle.color.a = 0;
+    try std.testing.expect(!list.isOpaque(bounds));
+    var frame = try Frame.init(std.testing.allocator, &commands, .full);
+    defer frame.deinit();
+    commands[1].push_clip_rounded.corner_radius = 0;
+    try std.testing.expectEqual(@as(u32, 500), frame.command_storage[1].push_clip_rounded.corner_radius);
+    try std.testing.expectError(error.ClearInsideClip, (DisplayList{ .commands = &.{ commands[1], commands[0], .pop_clip } }).validate());
+    try std.testing.expectError(error.UnbalancedClipStack, (DisplayList{ .commands = &.{commands[1]} }).validate());
+    const too_deep = [_]Command{commands[1]} ** (max_clip_depth + 1);
+    try std.testing.expectError(error.ClipStackOverflow, (DisplayList{ .commands = &too_deep }).validate());
 }

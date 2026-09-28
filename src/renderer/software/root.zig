@@ -55,6 +55,7 @@ const RasterTarget = struct {
     pixels: []LinearRgba16,
     width: u32,
     height: u32,
+    rounded_clips: []const scene.RoundedClip = &.{},
 };
 
 const max_clip_depth = scene.max_clip_depth;
@@ -164,7 +165,7 @@ fn renderOutputRegion(
 
 fn renderRegion(
     commands: []const scene.Command,
-    target: RasterTarget,
+    unclipped: RasterTarget,
     damage: RectI,
     glyphs: ?*GlyphCache,
     shapes: ?*const text.ShapeCache,
@@ -173,8 +174,11 @@ fn renderRegion(
     masks: *paths.MaskCache,
     shadow_masks: *shadows.MaskCache,
 ) !void {
+    var target = unclipped;
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
+    var rounded: [max_clip_depth]scene.RoundedClip = undefined;
+    var counts = [_]usize{0} ** (max_clip_depth + 1);
     var depth: usize = 0;
     for (commands, 0..) |command, index| switch (command) {
         .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
@@ -183,11 +187,23 @@ fn renderRegion(
             if (depth == max_clip_depth) return error.ClipStackOverflow;
             depth += 1;
             clips[depth] = RectI.intersect(clips[depth - 1], clip);
+            counts[depth] = counts[depth - 1];
         },
-        .pop_clip => depth -= 1,
+        .push_clip_rounded => |clip| {
+            if (depth == max_clip_depth) return error.ClipStackOverflow;
+            rounded[counts[depth]] = clip;
+            depth += 1;
+            clips[depth] = RectI.intersect(clips[depth - 1], clip.bounds);
+            counts[depth] = counts[depth - 1] + 1;
+            target.rounded_clips = rounded[0..counts[depth]];
+        },
+        .pop_clip => {
+            depth -= 1;
+            target.rounded_clips = rounded[0..counts[depth]];
+        },
         .solid_rectangle => |rectangle| {
             const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
-            if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
+            if (target.rounded_clips.len != 0 or !scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
                 fill(target, bounds, rectangle.color, rectangle.blend);
         },
         .decorated_rectangle => |rectangle| {
@@ -216,12 +232,11 @@ fn renderRegion(
             const top: usize = @intCast(bounds.y);
             for (top..top + bounds.height) |y| for (left..left + bounds.width) |x| {
                 const source = placement.sample(bitmap, x, y) orelse continue;
-                const offset = y * target.width + x;
-                target.pixels[offset] = source.over(target.pixels[offset]);
+                blendCoveredPixel(target, x, y, source, 255, .source_over);
             };
         },
         .glyph_run => |run| {
-            if (scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;
+            if (target.rounded_clips.len == 0 and scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;
             if (!has_freetype) return error.FreeTypeDisabled;
             try drawGlyphRun(
                 run,
@@ -232,7 +247,7 @@ fn renderRegion(
             );
         },
         .paragraph => |paragraph| {
-            if (scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;
+            if (target.rounded_clips.len == 0 and scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;
             if (!has_freetype) return error.FreeTypeDisabled;
             try drawParagraph(
                 paragraph,
@@ -340,9 +355,7 @@ fn drawMask(
             else
                 source_color.scaled(@as(u16, bitmap.pixels[index]) * 257);
             if (source.a == 0) continue;
-            const destination_offset = (@as(usize, @intCast(bounds.y)) + row) * target.width +
-                @as(usize, @intCast(bounds.x)) + column;
-            target.pixels[destination_offset] = source.over(target.pixels[destination_offset]);
+            blendCoveredPixel(target, @as(usize, @intCast(bounds.x)) + column, @as(usize, @intCast(bounds.y)) + row, source, 255, .source_over);
         }
     }
 }
@@ -350,7 +363,7 @@ fn drawMask(
 fn fill(target: RasterTarget, bounds: RectI, color: Color, blend: scene.BlendMode) void {
     if (bounds.isEmpty()) return;
     const source = LinearRgba16.fromColor(color);
-    if (blend == .source or source.a == 65535) {
+    if (target.rounded_clips.len == 0 and (blend == .source or source.a == 65535)) {
         fillSource(target, bounds, source);
         return;
     }
@@ -360,8 +373,7 @@ fn fill(target: RasterTarget, bounds: RectI, color: Color, blend: scene.BlendMod
     const bottom: u32 = @intCast(@as(i64, bounds.y) + bounds.height);
     for (top..bottom) |y| {
         for (left..right) |x| {
-            const offset = y * target.width + x;
-            target.pixels[offset] = source.over(target.pixels[offset]);
+            blendCoveredPixel(target, x, y, source, 255, blend);
         }
     }
 }
@@ -376,8 +388,7 @@ fn drawCoverage(target: RasterTarget, bounds: RectI, mask_bounds: RectI, pixels:
         const coverage = pixels[(source_y + row) * mask_bounds.width + source_x + column];
         const sampled = if (gradient) |g| g.sample(.{ .x = @as(f32, @floatFromInt(left + column)) + 0.5, .y = @as(f32, @floatFromInt(top + row)) + 0.5 }) else source_color;
         const source = sampled.scaled(@as(u16, coverage) * 257);
-        const offset = (top + row) * target.width + left + column;
-        target.pixels[offset] = source.over(target.pixels[offset]);
+        blendCoveredPixel(target, left + column, top + row, source, 255, .source_over);
     };
 }
 
@@ -458,10 +469,15 @@ fn blendCoveredPixel(
     target: RasterTarget,
     x: usize,
     y: usize,
-    source: LinearRgba16,
-    coverage: u8,
+    unclipped_source: LinearRgba16,
+    unclipped_coverage: u8,
     blend: scene.BlendMode,
 ) void {
+    var clip_coverage: u8 = 255;
+    for (target.rounded_clips) |clip| clip_coverage = multiply(clip_coverage, clip.coverage(x, y));
+    if (clip_coverage == 0) return;
+    const source = unclipped_source.scaled(@as(u16, clip_coverage) * 257);
+    const coverage = multiply(unclipped_coverage, clip_coverage);
     const offset = y * target.width + x;
     if (coverage == 255 and (blend == .source or source.a == 65535)) {
         target.pixels[offset] = source;
@@ -837,6 +853,44 @@ test "gradient rectangles sample device centers in linear light without transpar
     };
     try render(.{ .commands = &commands, .damage = .{ .regions = &damage } }, target);
     try std.testing.expectEqualSlices(u8, &expected, &pixels);
+}
+
+test "rounded clip combines nested A8 coverage and masks transparent source replacement" {
+    const white = Color.rgba(255, 255, 255, 255);
+    var commands = [_]scene.Command{
+        .{ .clear = white },
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 2, .y = 3, .width = 13, .height = 11 }, .corner_radius = 5 } },
+        .{ .push_clip_rect = .{ .x = 0, .y = 0, .width = 16, .height = 16 } },
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 3, .y = 2, .width = 13, .height = 11 }, .corner_radius = 5 } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 16, .height = 16 }, .color = Color.rgba(0, 0, 0, 0), .blend = .source } },
+        .pop_clip,
+        .pop_clip,
+        .pop_clip,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(0, 0, 255, 255) } },
+    };
+    var pixels: [16 * 16 * 4]u8 = undefined;
+    const target: Target = .{ .pixels = &pixels, .width = 16, .height = 16, .stride = 64, .format = .rgba8_unorm, .allocator = std.testing.allocator };
+    try render(.{ .commands = &commands }, target);
+    // Independent circular-edge coverages90 and140 combine to49, not min90.
+    // A transparent source replaces only49/255; the white remainder has a206.
+    try std.testing.expectEqualSlices(u8, &.{ 206, 206, 206, 206 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[(3 * 16 + 3) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, pixels[(7 * 16 + 8) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, pixels[0..4]);
+    const expected = pixels;
+    @memset(&pixels, 77);
+    try render(.{ .commands = &commands, .damage = .{ .regions = &.{
+        .{ .x = 0, .y = 0, .width = 5, .height = 16 },
+        .{ .x = 5, .y = 0, .width = 11, .height = 16 },
+    } } }, target);
+    try std.testing.expectEqualSlices(u8, &expected, &pixels);
+    commands[4].solid_rectangle.blend = .source_over;
+    try render(.{ .commands = &commands }, target);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
+    commands[4].solid_rectangle.color = Color.rgba(255, 0, 0, 255);
+    try render(.{ .commands = &commands }, target);
+    // Linear red49/255 over white encodes approximately(255,232,232).
+    try std.testing.expectEqualSlices(u8, &.{ 255, 232, 232, 255 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
 }
 
 test "glyph masks are linear coverage in both polarities and transparent output" {

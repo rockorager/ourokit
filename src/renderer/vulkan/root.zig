@@ -694,14 +694,35 @@ fn commandGradient(command: scene.Command) ?paint.LinearGradient {
     };
 }
 
-/// Immutable per-submission stop tables, never rasterized gradient images.
-/// Index zero in push constants means solid; index one selects the first record.
-const GradientUploads = struct {
+/// std430 record; parent is the one-based index of the next rounded ancestor.
+const ClipRecord = extern struct {
+    origin: [2]i32,
+    size: [2]u32,
+    radius: u32,
+    parent: u32,
+    padding: [2]u32 = @splat(0),
+};
+
+// This word is independent of each pipeline's draw push constants, so clip
+// state survives all draws until traversal changes it at a push/pop boundary.
+const clip_push_offset = 96;
+const draw_push_size = clip_push_offset + @sizeOf(u32);
+comptime {
+    std.debug.assert(max_clip_depth == 64); // clip.glsl ancestor array.
+    std.debug.assert(@sizeOf(Push) <= clip_push_offset);
+    std.debug.assert(@sizeOf(GlyphPush) <= clip_push_offset);
+    std.debug.assert(@sizeOf(PresentationPush) <= clip_push_offset);
+    std.debug.assert(@sizeOf(PresentationGlyphPush) <= clip_push_offset);
+}
+
+/// Immutable per-submission analytic tables. Index zero means no gradient/clip;
+/// nonzero indexes are one-based. Each table owns its storage until the fence.
+const TableUpload = struct {
     pixels: ?Target = null,
     pool: c.VkDescriptorPool = null,
     descriptor: c.VkDescriptorSet = null,
 
-    fn init(renderer: *Renderer, commands: []const scene.Command) !GradientUploads {
+    fn gradients(renderer: *Renderer, commands: []const scene.Command) !TableUpload {
         const byte_limit = @min(4 * 1024 * 1024, renderer.max_image_pixels * 4);
         var count: usize = 0;
         for (commands) |command| if (commandGradient(command) != null) {
@@ -720,9 +741,51 @@ const GradientUploads = struct {
             records[index] = GradientRecord.init(try gradient.prepare());
             index += 1;
         };
+        return upload(renderer, std.mem.sliceAsBytes(records));
+    }
+
+    fn clips(renderer: *Renderer, commands: []const scene.Command) !TableUpload {
+        const byte_limit = @min(4 * 1024 * 1024, renderer.max_image_pixels * 4);
+        var count: usize = 0;
+        for (commands) |command| if (command == .push_clip_rounded) {
+            if (count == byte_limit / @sizeOf(ClipRecord)) return error.ClipUploadBudgetExceeded;
+            count += 1;
+        };
+        if (@max(count, 1) * @sizeOf(ClipRecord) > byte_limit) return error.ClipUploadBudgetExceeded;
+        const records = try renderer.allocator.alloc(ClipRecord, @max(count, 1));
+        defer renderer.allocator.free(records);
+        @memset(records, std.mem.zeroes(ClipRecord));
+        var parents: [max_clip_depth + 1]u32 = undefined;
+        parents[0] = 0;
+        var depth: usize = 0;
+        var index: u32 = 0;
+        for (commands) |command| switch (command) {
+            .push_clip_rect => {
+                parents[depth + 1] = parents[depth];
+                depth += 1;
+            },
+            .push_clip_rounded => |clip| {
+                records[index] = .{
+                    .origin = .{ clip.bounds.x, clip.bounds.y },
+                    .size = .{ clip.bounds.width, clip.bounds.height },
+                    .radius = clip.corner_radius,
+                    .parent = parents[depth],
+                };
+                index += 1;
+                depth += 1;
+                parents[depth] = index;
+            },
+            .pop_clip => depth -= 1,
+            else => {},
+        };
+        return upload(renderer, std.mem.sliceAsBytes(records));
+    }
+
+    fn upload(renderer: *Renderer, bytes: []const u8) !TableUpload {
+        const byte_size = bytes.len;
         var pixels = try Target.initBuffer(renderer, @intCast(byte_size / 4), 1, .encoded_rgba, renderer.max_image_pixels);
         errdefer pixels.deinit(renderer);
-        @memcpy(@as([*]u8, @ptrCast(pixels.mapping))[0..byte_size], std.mem.sliceAsBytes(records));
+        @memcpy(@as([*]u8, @ptrCast(pixels.mapping))[0..byte_size], bytes);
         var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 };
         var pool_info: c.VkDescriptorPoolCreateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -754,7 +817,7 @@ const GradientUploads = struct {
         return .{ .pixels = pixels, .pool = pool, .descriptor = descriptor };
     }
 
-    fn deinit(self: *GradientUploads, renderer: *Renderer) void {
+    fn deinit(self: *TableUpload, renderer: *Renderer) void {
         c.vkDestroyDescriptorPool(renderer.device, self.pool, null);
         if (self.pixels) |*pixels| pixels.deinit(renderer);
         self.* = .{};
@@ -895,7 +958,8 @@ pub const DmabufTarget = struct {
     release_point: u64 = 0,
     image_uploads: ImageUploads = .{},
     coverage_uploads: CoverageUploads = .{},
-    gradient_uploads: GradientUploads = .{},
+    gradient_uploads: TableUpload = .{},
+    clip_uploads: TableUpload = .{},
     /// Optional borrowed two-query timestamp pool for the presentation probe.
     /// The caller owns it and must wait for this target before reading/freeing.
     timestamp_pool: c.VkQueryPool = null,
@@ -1120,6 +1184,7 @@ pub const DmabufTarget = struct {
         self.image_uploads.deinit(renderer);
         self.coverage_uploads.deinit(renderer);
         self.gradient_uploads.deinit(renderer);
+        self.clip_uploads.deinit(renderer);
         c.vkDestroySemaphore(renderer.device, self.timeline, null);
         c.vkDestroyFence(renderer.device, self.fence, null);
         c.vkDestroyCommandPool(renderer.device, self.command_pool, null);
@@ -1139,6 +1204,7 @@ pub const DmabufTarget = struct {
                 self.image_uploads.deinit(renderer);
                 self.coverage_uploads.deinit(renderer);
                 self.gradient_uploads.deinit(renderer);
+                self.clip_uploads.deinit(renderer);
                 break :blk true;
             },
             c.VK_NOT_READY => false,
@@ -1153,6 +1219,7 @@ pub const DmabufTarget = struct {
         self.image_uploads.deinit(renderer);
         self.coverage_uploads.deinit(renderer);
         self.gradient_uploads.deinit(renderer);
+        self.clip_uploads.deinit(renderer);
     }
 
     pub fn exportSyncobjFd(self: *DmabufTarget, renderer: *Renderer) !std.posix.fd_t {
@@ -1371,11 +1438,11 @@ fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSe
     var push_range: c.VkPushConstantRange = .{
         .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
-        .size = @max(@sizeOf(PresentationPush), @sizeOf(PresentationGlyphPush)),
+        .size = draw_push_size,
     };
-    // Identical layouts/ranges keep set 1 bound across solid, glyph and image
+    // Identical layouts/ranges keep tables bound across solid, glyph and image
     // pipelines, while their existing set-0 atlas descriptors can change.
-    var set_layouts = [_]c.VkDescriptorSetLayout{ atlas_layout, gradient_layout };
+    var set_layouts = [_]c.VkDescriptorSetLayout{ atlas_layout, gradient_layout, gradient_layout };
     var layout_info: c.VkPipelineLayoutCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .pNext = null,
@@ -1767,11 +1834,11 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     var gradient_descriptor_layout: c.VkDescriptorSetLayout = undefined;
     try vk(c.vkCreateDescriptorSetLayout(device, &gradient_layout_info, null, &gradient_descriptor_layout), error.CreateDescriptorLayoutFailed);
     errdefer c.vkDestroyDescriptorSetLayout(device, gradient_descriptor_layout, null);
-    var compute_set_layouts = [_]c.VkDescriptorSetLayout{ descriptor_layout, gradient_descriptor_layout };
+    var compute_set_layouts = [_]c.VkDescriptorSetLayout{ descriptor_layout, gradient_descriptor_layout, gradient_descriptor_layout };
     var push_range: c.VkPushConstantRange = .{
         .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
-        .size = @max(@sizeOf(Push), @sizeOf(GlyphPush)),
+        .size = draw_push_size,
     };
     var pipeline_layout_info: c.VkPipelineLayoutCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -2079,8 +2146,10 @@ pub fn renderResources(
     defer image_uploads.deinit(self);
     var coverage_uploads = try CoverageUploads.init(self, list.commands, target);
     defer coverage_uploads.deinit(self);
-    var gradient_uploads = try GradientUploads.init(self, list.commands);
+    var gradient_uploads = try TableUpload.gradients(self, list.commands);
     defer gradient_uploads.deinit(self);
+    var clip_uploads = try TableUpload.clips(self, list.commands);
+    defer clip_uploads.deinit(self);
     try vk(c.vkResetDescriptorPool(self.device, self.descriptor_pool, 0), error.ResetDescriptorPoolFailed);
     var descriptor_allocate_info: c.VkDescriptorSetAllocateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2158,10 +2227,10 @@ pub fn renderResources(
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, descriptor_set),
+        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, descriptor_set),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, descriptor_set);
+            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, descriptor_set);
         },
     }
     var host_barrier: c.VkMemoryBarrier = .{
@@ -2274,8 +2343,10 @@ pub fn renderGraphicsResources(
     errdefer image_uploads.deinit(self);
     var coverage_uploads = try CoverageUploads.init(self, list.commands, null);
     errdefer coverage_uploads.deinit(self);
-    var gradient_uploads = try GradientUploads.init(self, list.commands);
+    var gradient_uploads = try TableUpload.gradients(self, list.commands);
     errdefer gradient_uploads.deinit(self);
+    var clip_uploads = try TableUpload.clips(self, list.commands);
+    errdefer clip_uploads.deinit(self);
     try vk(c.vkResetCommandBuffer(target.command_buffer, 0), error.ResetCommandBufferFailed);
     var begin_info: c.VkCommandBufferBeginInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2360,10 +2431,10 @@ pub fn renderGraphicsResources(
     // guarantees that replaying the entire scene defines every pixel.
     const damage: scene.Damage = if (target.direct and target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED) .full else list.damage;
     switch (damage) {
-        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads),
+        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads);
+            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads);
         },
     }
     if (!target.direct) self.convertPresentation(target);
@@ -2419,6 +2490,7 @@ pub fn renderGraphicsResources(
     target.image_uploads = image_uploads;
     target.coverage_uploads = coverage_uploads;
     target.gradient_uploads = gradient_uploads;
+    target.clip_uploads = clip_uploads;
     target.layout = c.VK_IMAGE_LAYOUT_GENERAL;
     target.gpu_pending = true;
     if (target.explicit_sync) {
@@ -2450,11 +2522,16 @@ fn renderPresentationRegion(
     paragraphs: ?*const text.ParagraphCache,
     images: *const ImageUploads,
     coverage: *const CoverageUploads,
-    gradients: *const GradientUploads,
+    gradients: *const TableUpload,
+    rounded: *const TableUpload,
 ) void {
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_pipeline_layout, 1, 1, &gradients.descriptor, 0, null);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_pipeline_layout, 2, 1, &rounded.descriptor, 0, null);
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
+    var rounded_indexes: [max_clip_depth + 1]u32 = undefined;
+    rounded_indexes[0] = 0;
+    var rounded_index: u32 = 0;
     var depth: usize = 0;
     var image_index: usize = 0;
     var coverage_index: usize = 0;
@@ -2463,17 +2540,34 @@ fn renderPresentationRegion(
         const has_gradient = commandGradient(command) != null;
         if (has_gradient) gradient_index += 1;
         const current_gradient = if (has_gradient) gradient_index else 0;
+        const current_clip = rounded_indexes[depth];
+        c.vkCmdPushConstants(target.command_buffer, self.presentation_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, clip_push_offset, @sizeOf(u32), &current_clip);
         switch (command) {
             .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
                 self.presentationFill(target, damage, color, .source),
             .push_clip_rect => |clip| {
                 depth += 1;
                 clips[depth] = RectI.intersect(clips[depth - 1], clip);
+                rounded_indexes[depth] = rounded_indexes[depth - 1];
+            },
+            .push_clip_rounded => |clip| {
+                depth += 1;
+                clips[depth] = RectI.intersect(clips[depth - 1], clip.bounds);
+                rounded_index += 1;
+                rounded_indexes[depth] = rounded_index;
             },
             .pop_clip => depth -= 1,
             .solid_rectangle => |rectangle| {
                 const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
-                if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
+                // Attachment clears bypass fragment coverage. Rounded-clipped
+                // solids use the ordinary decorated source/erase-add path.
+                if (current_clip != 0) {
+                    self.presentationDecoratedRectangle(target, bounds, .{
+                        .bounds = rectangle.bounds,
+                        .background = rectangle.color,
+                        .blend = rectangle.blend,
+                    }, 0);
+                } else if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
                     self.presentationFill(target, bounds, rectangle.color, rectangle.blend);
             },
             .decorated_rectangle => |rectangle| self.presentationDecoratedRectangle(
@@ -2636,7 +2730,7 @@ fn validateClipDepth(
 ) !void {
     var depth: usize = 0;
     for (commands) |command| switch (command) {
-        .push_clip_rect => {
+        .push_clip_rect, .push_clip_rounded => {
             if (depth == max_clip_depth) return error.ClipStackOverflow;
             depth += 1;
         },
@@ -2657,12 +2751,17 @@ fn renderRegion(
     paragraphs: ?*const text.ParagraphCache,
     images: *const ImageUploads,
     coverage: *const CoverageUploads,
-    gradients: *const GradientUploads,
+    gradients: *const TableUpload,
+    rounded: *const TableUpload,
     descriptor: c.VkDescriptorSet,
 ) void {
     c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 1, 1, &gradients.descriptor, 0, null);
+    c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 2, 1, &rounded.descriptor, 0, null);
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
+    var rounded_indexes: [max_clip_depth + 1]u32 = undefined;
+    rounded_indexes[0] = 0;
+    var rounded_index: u32 = 0;
     var depth: usize = 0;
     var image_index: usize = 0;
     var coverage_index: usize = 0;
@@ -2671,17 +2770,26 @@ fn renderRegion(
         const has_gradient = commandGradient(command) != null;
         if (has_gradient) gradient_index += 1;
         const current_gradient = if (has_gradient) gradient_index else 0;
+        const current_clip = rounded_indexes[depth];
+        c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, clip_push_offset, @sizeOf(u32), &current_clip);
         switch (command) {
             .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
                 self.fill(target, damage, color, .source),
             .push_clip_rect => |clip| {
                 depth += 1;
                 clips[depth] = RectI.intersect(clips[depth - 1], clip);
+                rounded_indexes[depth] = rounded_indexes[depth - 1];
+            },
+            .push_clip_rounded => |clip| {
+                depth += 1;
+                clips[depth] = RectI.intersect(clips[depth - 1], clip.bounds);
+                rounded_index += 1;
+                rounded_indexes[depth] = rounded_index;
             },
             .pop_clip => depth -= 1,
             .solid_rectangle => |rectangle| {
                 const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
-                if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
+                if (current_clip != 0 or !scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
                     self.fill(target, bounds, rectangle.color, rectangle.blend);
             },
             .decorated_rectangle => |rectangle| self.decoratedRectangle(
@@ -3325,7 +3433,7 @@ test "Vulkan lowering bounds its clip stack" {
         commands[index] = .{ .push_clip_rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 } };
         commands[commands.len - index - 1] = .pop_clip;
     }
-    try (scene.DisplayList{ .commands = &commands }).validate();
+    try std.testing.expectError(error.ClipStackOverflow, (scene.DisplayList{ .commands = &commands }).validate());
     try std.testing.expectError(error.ClipStackOverflow, validateClipDepth(&commands, false, false));
 }
 
@@ -3535,6 +3643,22 @@ test "Vulkan glyph atlas matches exact software text rendering" {
         for (0..36) |y| for (0..160) |x|
             try output.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
     }
+    var clipped: [mixed.len + 2]scene.Command = undefined;
+    clipped[0] = mixed[0];
+    clipped[1] = .{ .push_clip_rounded = .{ .bounds = .{ .x = 8, .y = 3, .width = 134, .height = 30 }, .corner_radius = 14 } };
+    @memcpy(clipped[2 .. clipped.len - 1], mixed[1..]);
+    clipped[clipped.len - 1] = .pop_clip;
+    const clipped_list: scene.DisplayList = .{ .commands = &clipped };
+    try software.renderText(clipped_list, .{ .pixels = &expected, .width = 160, .height = 36, .stride = 640, .format = .rgba8_unorm }, &software_glyphs, &shapes);
+    try renderer.renderText(clipped_list, &target, &glyphs, &shapes);
+    try target.readPixels(&actual, 640, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    for ([_]*GraphicsReadback{ &graphics, &direct_graphics }) |output| {
+        try renderer.renderGraphicsResources(clipped_list, &output.target, &glyphs, &shapes, null, null, false);
+        try output.target.wait(&renderer);
+        for (0..36) |y| for (0..160) |x|
+            try output.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
+    }
 }
 
 test "Vulkan positioned paragraphs match exact software text rendering" {
@@ -3627,6 +3751,26 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
     for (0..72) |y| for (0..160) |x| {
         try direct.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
     };
+    var clipped = [_]scene.Command{
+        commands[0],
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 5, .y = 1, .width = 120, .height = 60 }, .corner_radius = 25 } },
+        commands[1],
+        commands[2],
+        .pop_clip,
+        .pop_clip,
+    };
+    const clipped_list: scene.DisplayList = .{ .commands = &clipped };
+    for ([_]*GraphicsReadback{ &graphics, &direct }, 0..) |output, index| {
+        clipped[0].clear = Color.rgba(20, 30, 40, if (index == 0) 0 else 255);
+        try software.renderParagraphs(clipped_list, .{ .pixels = &expected, .width = 160, .height = 72, .stride = 640, .format = .rgba8_unorm }, &software_glyphs, &paragraphs);
+        try renderer.renderParagraphs(clipped_list, &target, &glyphs, &paragraphs);
+        try target.readPixels(&actual, 640, .rgba8_unorm);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        try renderer.renderGraphicsResources(clipped_list, &output.target, &glyphs, null, &paragraphs, null, false);
+        try output.target.wait(&renderer);
+        for (0..72) |y| for (0..160) |x|
+            try output.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
+    }
 }
 
 test "Vulkan clipping, damage, and BGRA readback preserve untouched pixels" {
@@ -3821,9 +3965,11 @@ test "graphics image sampling matches software and upload copies outlive source 
         .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = 32, .height = 12 } },
     };
     c.vkCmdBeginRenderPass(renderer.command_buffer, &pass, c.VK_SUBPASS_CONTENTS_INLINE);
-    var gradients = try GradientUploads.init(&renderer, &commands);
+    var gradients = try TableUpload.gradients(&renderer, &commands);
     defer gradients.deinit(&renderer);
-    renderer.renderPresentationRegion(&commands, &target, .{ .x = 0, .y = 0, .width = 32, .height = 12 }, null, null, null, &uploads, &.{}, &gradients);
+    var rounded = try TableUpload.clips(&renderer, &commands);
+    defer rounded.deinit(&renderer);
+    renderer.renderPresentationRegion(&commands, &target, .{ .x = 0, .y = 0, .width = 32, .height = 12 }, null, null, null, &uploads, &.{}, &gradients, &rounded);
     renderer.convertPresentation(&target);
     c.vkCmdEndRenderPass(renderer.command_buffer);
     barrier.srcAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -4696,7 +4842,7 @@ test "Vulkan gradient tables copy prepared stops and enforce budgets before targ
         .{ .decorated_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 4, .height = 2 }, .background_gradient = gradient } },
         .{ .decorated_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 4, .height = 2 }, .background_gradient = gradient } },
     };
-    var uploads = try GradientUploads.init(&renderer, &commands);
+    var uploads = try TableUpload.gradients(&renderer, &commands);
     defer uploads.deinit(&renderer);
     const records = @as([*]const GradientRecord, @ptrCast(@alignCast(uploads.pixels.?.mapping)))[0..2];
     try std.testing.expectEqual(@as(u64, 320), uploads.pixels.?.byte_size);
@@ -4713,7 +4859,7 @@ test "Vulkan gradient tables copy prepared stops and enforce budgets before targ
             const original = r.allocator;
             r.allocator = allocator;
             defer r.allocator = original;
-            var copies = try GradientUploads.init(r, batch);
+            var copies = try TableUpload.gradients(r, batch);
             defer copies.deinit(r);
         }
     }.check, .{ &renderer, @as([]const scene.Command, &commands) });
@@ -4740,7 +4886,7 @@ test "Vulkan gradient tables copy prepared stops and enforce budgets before targ
         if (output.linear) |attachment| try std.testing.expect(!attachment.initialized);
     }
     renderer.max_image_pixels = 80;
-    var exact = try GradientUploads.init(&renderer, &commands);
+    var exact = try TableUpload.gradients(&renderer, &commands);
     exact.deinit(&renderer);
     renderer.max_image_pixels = original_limit;
     commands[2].decorated_rectangle.background_gradient.?.count = 9;
@@ -4931,6 +5077,276 @@ test "Vulkan gradients interleave paths images solids and survive damage and asy
     try std.testing.expect(try direct.target.ready(&renderer));
     for ([_]*DmabufTarget{ &direct.target, &linear.target, &shared.target }) |output|
         try std.testing.expect(output.gradient_uploads.pixels == null and output.gradient_uploads.descriptor == null);
+    for (0..40) |y| for (0..64) |x| {
+        try shared.expectPixel(x, y, transparent[(y * 64 + x) * 4 ..][0..4].*);
+        try std.testing.expectEqual(expected[(y * 64 + x) * 4 ..][0..4].*, direct.pixel(x, y));
+    };
+}
+
+test "Vulkan rounded clip tables preserve parents budgets and failure cleanup" {
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(ClipRecord));
+    try std.testing.expectEqual(@as(usize, 20), @offsetOf(ClipRecord, "parent"));
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const bounds: RectI = .{ .x = -3, .y = 2, .width = 23, .height = 21 };
+    const rounded: scene.Command = .{ .push_clip_rounded = .{ .bounds = bounds, .corner_radius = 8 } };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(10, 30, 70, 255) },
+        rounded,
+        .{ .push_clip_rect = bounds },
+        rounded,
+        .pop_clip,
+        .pop_clip,
+        rounded,
+        .pop_clip,
+        .pop_clip,
+        rounded,
+        rounded,
+        .pop_clip,
+        rounded,
+        .pop_clip,
+        .pop_clip,
+    };
+    try (scene.DisplayList{ .commands = &commands }).validate();
+    var table = try TableUpload.clips(&renderer, &commands);
+    defer table.deinit(&renderer);
+    const records = @as([*]const ClipRecord, @ptrCast(@alignCast(table.pixels.?.mapping)))[0..6];
+    for (records, [_]u32{ 0, 1, 1, 0, 4, 4 }) |record, parent| {
+        try std.testing.expectEqual(parent, record.parent);
+        try std.testing.expectEqual([2]i32{ -3, 2 }, record.origin);
+        try std.testing.expectEqual([2]u32{ 23, 21 }, record.size);
+    }
+    commands[1].push_clip_rounded.bounds.x = 100;
+    try std.testing.expectEqual(@as(i32, -3), records[0].origin[0]);
+    commands[1] = rounded;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator, r: *Renderer, batch: []const scene.Command) !void {
+            const original = r.allocator;
+            r.allocator = allocator;
+            defer r.allocator = original;
+            var copy = try TableUpload.clips(r, batch);
+            defer copy.deinit(r);
+        }
+    }.check, .{ &renderer, @as([]const scene.Command, &commands) });
+    var target = try Target.init(&renderer, 8, 8);
+    defer target.deinit(&renderer);
+    try renderer.render(.{ .commands = commands[0..1] }, &target);
+    var before: [8 * 8 * 4]u8 = undefined;
+    try target.readPixels(&before, 32, .rgba8_unorm);
+    var direct = try GraphicsReadback.initMode(&renderer, 8, 8, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 8, 8);
+    defer linear.deinit(&renderer);
+    const original_limit = renderer.max_image_pixels;
+    renderer.max_image_pixels = 47; // Gradient dummy fits; six clip records do not.
+    try std.testing.expectError(error.ClipUploadBudgetExceeded, renderer.render(.{ .commands = &commands }, &target));
+    var after: [before.len]u8 = undefined;
+    try target.readPixels(&after, 32, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &before, &after);
+    for ([_]*DmabufTarget{ &direct.target, &linear.target }) |output| {
+        try std.testing.expectError(error.ClipUploadBudgetExceeded, renderer.renderGraphicsResources(.{ .commands = &commands }, output, null, null, null, null, false));
+        try std.testing.expect(output.clip_uploads.pixels == null and !output.gpu_pending);
+        try std.testing.expectEqual(@as(c.VkImageLayout, c.VK_IMAGE_LAYOUT_UNDEFINED), output.layout);
+        if (output.linear) |attachment| try std.testing.expect(!attachment.initialized);
+    }
+    renderer.max_image_pixels = 48;
+    var exact = try TableUpload.clips(&renderer, &commands);
+    exact.deinit(&renderer);
+    renderer.max_image_pixels = original_limit;
+}
+
+test "Vulkan rounded clips use exact outer to inner A8 and covered source erasure" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const clips = [_]scene.RoundedClip{
+        .{ .bounds = .{ .x = -3, .y = 3, .width = 23, .height = 21 }, .corner_radius = 8 },
+        .{ .bounds = .{ .x = -3, .y = 3, .width = 23, .height = 21 }, .corner_radius = 9 },
+        .{ .bounds = .{ .x = 1, .y = 2, .width = 23, .height = 21 }, .corner_radius = 7 },
+    };
+    // Independent SDF/A8 golden: reversing these ancestors gives54, not55.
+    for (clips, [_]u8{ 217, 163, 100 }) |clip, alpha| try std.testing.expectEqual(alpha, clip.coverage(3, 3));
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(0, 0, 0, 255) },
+        .{ .push_clip_rounded = clips[0] },
+        .{ .push_clip_rect = .{ .x = 0, .y = 0, .width = 32, .height = 28 } },
+        .{ .push_clip_rounded = clips[1] },
+        .{ .push_clip_rounded = clips[2] },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 32, .height = 28 }, .color = Color.rgba(255, 255, 255, 255) } },
+        .pop_clip,
+        .pop_clip,
+        .pop_clip,
+        .pop_clip,
+    };
+    var target = try Target.init(&renderer, 32, 28);
+    defer target.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 32, 28);
+    defer linear.deinit(&renderer);
+    var direct = try GraphicsReadback.initMode(&renderer, 32, 28, null, true);
+    defer direct.deinit(&renderer);
+    for (0..2) |mode| {
+        if (mode == 1) commands[5].solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 32, .height = 28 }, .color = Color.rgba(0, 0, 0, 0), .blend = .source };
+        const list: scene.DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{
+            .{ .x = 0, .y = 0, .width = 11, .height = 28 },
+            .{ .x = 11, .y = 0, .width = 21, .height = 28 },
+        } } };
+        try renderer.render(list, &target);
+        const output = if (mode == 0) &direct else &linear;
+        try renderer.renderGraphicsResources(list, &output.target, null, null, null, null, false);
+        try output.target.wait(&renderer);
+        const pixels = @as([*]const LinearRgba16, @ptrCast(@alignCast(target.mapping)))[0 .. 32 * 28];
+        for (pixels, 0..) |pixel, i| {
+            const x = i % 32;
+            const y = i / 32;
+            var alpha: u32 = 255;
+            for (clips) |clip| alpha = (alpha * clip.coverage(x, y) + 127) / 255;
+            const channel: u16 = @intCast(alpha * 257);
+            const expected: LinearRgba16 = if (mode == 0) .{ .r = channel, .g = channel, .b = channel, .a = 65535 } else .{ .r = 0, .g = 0, .b = 0, .a = 65535 - channel };
+            try std.testing.expectEqual(expected, pixel);
+            const encoded = expected.toSrgba8();
+            try output.expectPixel(x, y, .{ encoded.r, encoded.g, encoded.b, encoded.a });
+        }
+        try std.testing.expectEqual(@as(u16, if (mode == 0) 14135 else 51400), if (mode == 0) pixels[3 * 32 + 3].r else pixels[3 * 32 + 3].a);
+    }
+    // The shader stack must handle the public maximum depth, not just one or
+    // two clips; odd dimensions also exercise integer radius clamping.
+    var deep: [max_clip_depth * 2 + 2]scene.Command = undefined;
+    deep[0] = commands[0];
+    for (deep[1 .. max_clip_depth + 1]) |*command| command.* = .{ .push_clip_rounded = .{ .bounds = .{ .x = 1, .y = 1, .width = 7, .height = 5 }, .corner_radius = 999 } };
+    deep[max_clip_depth + 1] = commands[5];
+    @memset(deep[max_clip_depth + 2 ..], .pop_clip);
+    var expected: [32 * 28 * 4]u8 = undefined;
+    try @import("../software/root.zig").render(.{ .commands = &deep }, .{ .pixels = &expected, .width = 32, .height = 28, .stride = 128, .format = .rgba8_unorm });
+    try renderer.render(.{ .commands = &deep }, &target);
+    var actual: [expected.len]u8 = undefined;
+    try target.readPixels(&actual, 128, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+test "Vulkan rounded clips cover mixed draws damage and queued table lifetimes" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const geometry = try path.Path.create(std.testing.allocator, &.{
+        .{ .move = .{ .x = -5, .y = -2 } }, .{ .line = .{ .x = 67, .y = 11 } }, .{ .line = .{ .x = 13, .y = 41 } }, .close,
+    }, .{ .fill = .nonzero });
+    defer geometry.release();
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try @import("../image_test.zig").insertFixture(&images);
+    const gradient = try paint.LinearGradient.init(.{ .x = 4, .y = 3 }, .{ .x = 58, .y = 35 }, &.{
+        .{ .offset = 0, .color = Color.rgba(240, 80, 30, 210) },
+        .{ .offset = 1, .color = Color.rgba(40, 120, 250, 110) },
+    });
+    const path_command: scene.Command = .{ .path = .{ .path = geometry, .identity = geometry.identity, .origin = .{ .x = -0.25, .y = 0.5 }, .scale = 1, .bounds = try path.deviceBounds(geometry, .{ .x = -0.25, .y = 0.5 }, 1), .color = Color.rgba(255, 255, 255, 255), .gradient = gradient } };
+    const image_command: scene.Command = .{ .image = .{ .image = image, .bounds = .{ .x = 2, .y = 2, .width = 51, .height = 31 }, .fit = .fill } };
+    const shadow_shape: shadow.Shape = .{ .box = .{ .x = 14, .y = 7, .width = 31, .height = 22 }, .corner_radius = 3, .offset = .{ .x = -3.25, .y = 2.5 }, .blur = 6 };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(25, 40, 65, 255) },
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 3, .y = 2, .width = 58, .height = 35 }, .corner_radius = 12 } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 64, .height = 40 }, .color = Color.rgba(50, 160, 220, 190) } },
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 7, .y = 5, .width = 46, .height = 26 }, .corner_radius = 10 } },
+        .{ .push_clip_rect = .{ .x = 0, .y = 3, .width = 57, .height = 33 } },
+        image_command,
+        path_command,
+        .{ .shadow = .{ .shape = shadow_shape, .bounds = try shadow.deviceBounds(shadow_shape), .color = Color.rgba(90, 230, 40, 150) } },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 5, .y = 7, .width = 49, .height = 25 }, .background_gradient = gradient, .corner_radius = 4, .border_width = 2, .border_color = Color.rgba(230, 180, 40, 210) } },
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 9, .y = 9, .width = 0, .height = 8 }, .corner_radius = 4 } },
+        path_command,
+        image_command,
+        .pop_clip,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 32, .y = 15, .width = 25, .height = 24 }, .color = Color.rgba(230, 70, 100, 145) } },
+        .pop_clip,
+        .pop_clip,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 4, .y = 3, .width = 6, .height = 29 }, .color = Color.rgba(170, 70, 230, 160) } },
+        .pop_clip,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 1, .y = 1, .width = 3, .height = 3 }, .color = Color.rgba(250, 190, 30, 255) } },
+    };
+    const list: scene.DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{
+        .{ .x = 0, .y = 0, .width = 19, .height = 40 },
+        .{ .x = 19, .y = 0, .width = 45, .height = 40 },
+    } } };
+    const software = @import("../software/root.zig");
+    var expected: [64 * 40 * 4]u8 = undefined;
+    const reference: software.Target = .{ .pixels = &expected, .width = 64, .height = 40, .stride = 256, .format = .rgba8_unorm };
+    try software.renderResources(list, reference, null, null, null, &images);
+    var target = try Target.init(&renderer, 64, 40);
+    defer target.deinit(&renderer);
+    try renderer.renderResources(list, &target, null, null, null, &images);
+    var actual: [expected.len]u8 = undefined;
+    try target.readPixels(&actual, 256, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    var direct = try GraphicsReadback.initMode(&renderer, 64, 40, null, true);
+    defer direct.deinit(&renderer);
+    // Direct hardware quantizes after each primitive: test each added draw over
+    // the previously observed destination, without widening one-byte tolerance.
+    try software.render(.{ .commands = commands[0..1] }, reference);
+    var active: [max_clip_depth]scene.Command = undefined;
+    var depth: usize = 0;
+    for (commands[1..], 1..) |command, index| switch (command) {
+        .push_clip_rect, .push_clip_rounded => {
+            active[depth] = command;
+            depth += 1;
+        },
+        .pop_clip => depth -= 1,
+        else => {
+            var batch: [max_clip_depth * 2 + 1]scene.Command = undefined;
+            @memcpy(batch[0..depth], active[0..depth]);
+            batch[depth] = command;
+            @memset(batch[depth + 1 .. depth * 2 + 1], .pop_clip);
+            try software.renderResources(.{ .commands = batch[0 .. depth * 2 + 1] }, reference, null, null, null, &images);
+            var prefix: [commands.len + max_clip_depth]scene.Command = undefined;
+            @memcpy(prefix[0 .. index + 1], commands[0 .. index + 1]);
+            @memset(prefix[index + 1 .. index + 1 + depth], .pop_clip);
+            try renderer.renderGraphicsResources(.{ .commands = prefix[0 .. index + 1 + depth] }, &direct.target, null, null, null, &images, false);
+            try direct.target.wait(&renderer);
+            for (0..40) |y| for (0..64) |x| {
+                const pixel = expected[(y * 64 + x) * 4 ..][0..4];
+                try direct.expectPixel(x, y, pixel.*);
+                pixel.* = direct.pixel(x, y);
+            };
+        },
+    };
+    try renderer.renderGraphicsResources(list, &direct.target, null, null, null, &images, false);
+    var transparent: [expected.len]u8 = undefined;
+    const transparent_reference: software.Target = .{ .pixels = &transparent, .width = 64, .height = 40, .stride = 256, .format = .rgba8_unorm };
+    commands[0].clear.a = 0;
+    commands[8].decorated_rectangle.blend = .source;
+    commands[13].solid_rectangle.color = Color.rgba(0, 0, 0, 0);
+    commands[13].solid_rectangle.blend = .source;
+    try software.renderResources(list, transparent_reference, null, null, null, &images);
+    try renderer.renderResources(list, &target, null, null, null, &images);
+    try target.readPixels(&actual, 256, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &transparent, &actual);
+    var linear = try GraphicsReadback.init(&renderer, 64, 40);
+    defer linear.deinit(&renderer);
+    var shared = try GraphicsReadback.initWithLinear(&renderer, 64, 40, linear.target.linear);
+    defer shared.deinit(&renderer);
+    try renderer.renderGraphicsResources(list, &linear.target, null, null, null, &images, false);
+    // Change only the inner analytic clip and reconstruct its affected extent
+    // in another queued slot sharing the linear attachment.
+    commands[3].push_clip_rounded.corner_radius = 4;
+    try software.renderResources(.{ .commands = &commands }, transparent_reference, null, null, null, &images);
+    try renderer.renderGraphicsResources(.{ .commands = &commands, .damage = .{ .regions = &.{commands[3].push_clip_rounded.bounds} } }, &shared.target, null, null, null, &images, false);
+    for ([_]*DmabufTarget{ &direct.target, &linear.target, &shared.target }) |output| {
+        try std.testing.expect(output.gpu_pending);
+        try std.testing.expectEqual(@as(usize, 3 * 32), output.clip_uploads.pixels.?.byte_size);
+    }
+    @memset(&commands, .{ .clear = Color.rgba(0, 0, 0, 0) });
+    try images.release(image);
+    try linear.target.wait(&renderer);
+    try shared.target.wait(&renderer);
+    try vk(c.vkWaitForFences(renderer.device, 1, &direct.target.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
+    try std.testing.expect(try direct.target.ready(&renderer));
+    for ([_]*DmabufTarget{ &direct.target, &linear.target, &shared.target }) |output|
+        try std.testing.expect(output.clip_uploads.pixels == null and output.clip_uploads.descriptor == null);
     for (0..40) |y| for (0..64) |x| {
         try shared.expectPixel(x, y, transparent[(y * 64 + x) * 4 ..][0..4].*);
         try std.testing.expectEqual(expected[(y * 64 + x) * 4 ..][0..4].*, direct.pixel(x, y));

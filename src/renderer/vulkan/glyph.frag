@@ -19,16 +19,21 @@ layout(push_constant) uniform Push {
     float image_width;
     float image_height;
     uint gradient_index;
+    layout(offset = 96) uint clip_index;
 };
 
 #include "image.glsl"
 #include "gradient.glsl"
+#include "clip.glsl"
 
 layout(location = 0) out vec4 target_color;
 
 void main() {
+    uint clip = clipCoverage(clip_index, gl_FragCoord.xy);
+    if (clip == 0u) discard;
+    float clip_alpha = float(clip) / 255.0;
     if (image_mode == 1u) {
-        target_color = vec4(imageSampleLinear(gl_FragCoord.xy)) / 65535.0;
+        target_color = vec4(imageSampleLinear(gl_FragCoord.xy)) / 65535.0 * clip_alpha;
         return;
     }
     uvec2 local = uvec2(ivec2(gl_FragCoord.xy) - bounds.xy);
@@ -36,11 +41,11 @@ void main() {
         uint offset = ((atlas_origin.y + local.y) * atlas_width + atlas_origin.x + local.x * 8u) / 4u;
         uvec2 pixel = uvec2(masks[offset], masks[offset + 1u]);
         uvec4 channels = uvec4(pixel.x & 65535u, pixel.x >> 16u, pixel.y & 65535u, pixel.y >> 16u);
-        target_color = vec4(channels) / 65535.0 * color.a;
+        target_color = vec4(channels) / 65535.0 * color.a * clip_alpha;
         return;
     }
     uint index = (atlas_origin.y + local.y) * atlas_width + atlas_origin.x + local.x;
     uint coverage = (masks[index / 4u] >> ((index % 4u) * 8u)) & 255u;
     vec4 tint = gradient_index != 0u ? vec4(gradientSample(gradient_index, gl_FragCoord.xy)) / 65535.0 : color;
-    target_color = tint * (float(coverage) / 255.0);
+    target_color = tint * (float(coverage) / 255.0) * clip_alpha;
 }

@@ -50,23 +50,36 @@ pub const Tracker = struct {
         self.candidate_viewport = viewport;
         var clips: [scene.max_clip_depth + 1]RectI = undefined;
         clips[0] = viewport;
+        var rounded = [_]bool{false} ** (scene.max_clip_depth + 1);
         var depth: usize = 0;
         for (commands) |command| {
+            var clip_change: ?RectI = null;
             switch (command) {
                 .push_clip_rect => |clip| {
                     if (depth == scene.max_clip_depth) return error.ClipStackOverflow;
                     depth += 1;
                     clips[depth] = RectI.intersect(clips[depth - 1], clip);
+                    rounded[depth] = false;
                     continue;
+                },
+                .push_clip_rounded => |clip| {
+                    if (depth == scene.max_clip_depth) return error.ClipStackOverflow;
+                    depth += 1;
+                    clips[depth] = RectI.intersect(clips[depth - 1], clip.bounds);
+                    rounded[depth] = true;
+                    clip_change = clips[depth];
                 },
                 .pop_clip => {
                     if (depth == 0) return error.UnbalancedClipStack;
+                    if (rounded[depth]) clip_change = clips[depth];
                     depth -= 1;
-                    continue;
+                    if (clip_change == null) continue;
                 },
                 else => {},
             }
-            const bounds = switch (command) {
+            // Keep rounded scope boundaries, not just their bounding rectangle:
+            // changing radius or moving a pop must invalidate unchanged children.
+            const bounds = clip_change orelse switch (command) {
                 .solid_rectangle => |value| RectI.intersect(value.bounds, clips[depth]),
                 .decorated_rectangle => |value| RectI.intersect(value.bounds, clips[depth]),
                 .image => |value| RectI.intersect(value.bounds, clips[depth]),
@@ -187,4 +200,29 @@ test "scene damage sees changed text clips and immutable resource generations" {
     tracker.submitted();
     commands[4].image.image.generation += 1;
     try std.testing.expectEqual(commands[4].image.bounds, (try tracker.compare(&commands, viewport)).regions[0]);
+}
+
+test "rounded clip radius and scope changes damage otherwise unchanged draws" {
+    const Color = @import("../core/color.zig").Color;
+    const viewport: RectI = .{ .x = 0, .y = 0, .width = 60, .height = 40 };
+    const bounds: RectI = .{ .x = 5, .y = 7, .width = 23, .height = 17 };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(255, 255, 255, 255) },
+        .{ .push_clip_rounded = .{ .bounds = bounds, .corner_radius = 3 } },
+        .{ .solid_rectangle = .{ .bounds = bounds, .color = Color.rgba(255, 0, 0, 255) } },
+        .pop_clip,
+    };
+    var tracker = try Tracker.init(std.testing.allocator, commands.len);
+    defer tracker.deinit();
+    _ = try tracker.compare(&commands, viewport);
+    tracker.submitted();
+    commands[1].push_clip_rounded.corner_radius = 8;
+    try std.testing.expectEqualSlices(RectI, &.{bounds}, (try tracker.compare(&commands, viewport)).regions);
+    // Unsubmitted candidates never replace committed clip state.
+    commands[1].push_clip_rounded.corner_radius = 3;
+    try std.testing.expectEqual(@as(usize, 0), (try tracker.compare(&commands, viewport)).regions.len);
+    const moved_pop = [_]scene.Command{ commands[0], commands[1], .pop_clip, commands[2] };
+    try std.testing.expectEqualSlices(RectI, &.{bounds}, (try tracker.compare(&moved_pop, viewport)).regions);
+    const removed = [_]scene.Command{ commands[0], commands[2] };
+    try std.testing.expectEqualSlices(RectI, &.{bounds}, (try tracker.compare(&removed, viewport)).regions);
 }

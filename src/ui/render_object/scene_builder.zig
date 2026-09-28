@@ -105,6 +105,15 @@ pub const Builder = struct {
         try self.append(.{ .push_clip_rect = try self.deviceRect(bounds, .outward) });
     }
 
+    pub fn pushRoundedClip(self: *Builder, bounds: RectF, radius: f32) !void {
+        if (radius == 0) return self.pushClip(bounds);
+        const device = try self.deviceRect(bounds, .preserve_size);
+        try self.append(.{ .push_clip_rounded = .{
+            .bounds = device,
+            .corner_radius = @min(try self.deviceExtent(radius), @min(device.width, device.height) / 2),
+        } });
+    }
+
     pub fn popClip(self: *Builder) !void {
         try self.append(.pop_clip);
     }

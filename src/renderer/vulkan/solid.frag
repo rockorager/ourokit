@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "gradient.glsl"
+#include "clip.glsl"
 
 layout(location = 0) out vec4 target_color;
 
@@ -16,6 +17,7 @@ layout(push_constant) uniform Push {
     uint has_border;
     uint coverage_only;
     uint gradient_index;
+    layout(offset = 96) uint clip_index;
 };
 
 float roundedRectangleCoverage(vec2 point, vec4 rectangle, float radius_value) {
@@ -31,6 +33,8 @@ float roundedRectangleCoverage(vec2 point, vec4 rectangle, float radius_value) {
 
 void main() {
     vec2 point = gl_FragCoord.xy;
+    uint clip = clipCoverage(clip_index, point);
+    if (clip == 0u) discard;
     vec4 outer = vec4(bounds);
     float outer_coverage = roundedRectangleCoverage(point, outer, corner_radius);
     if (outer_coverage == 0.0) discard;
@@ -44,4 +48,5 @@ void main() {
     vec4 background_value = gradient_index != 0u ? vec4(gradientSample(gradient_index, point)) / 65535.0 : background;
     target_color = border * border_coverage + background_value * background_coverage;
     if (coverage_only != 0u) target_color = vec4(0.0, 0.0, 0.0, border_coverage + background_coverage);
+    target_color *= float(clip) / 255.0;
 }

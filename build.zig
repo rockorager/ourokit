@@ -493,6 +493,7 @@ fn compileShader(b: *std.Build, source: []const u8, output: []const u8) std.Buil
         std.mem.eql(u8, source, "src/renderer/vulkan/glyph.frag"))
     {
         compile.addFileInput(b.path("src/renderer/vulkan/gradient.glsl"));
+        compile.addFileInput(b.path("src/renderer/vulkan/clip.glsl"));
     }
     compile.addArg("-o");
     return compile.addOutputFileArg(output);

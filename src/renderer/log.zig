@@ -24,6 +24,12 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
             "push_clip_rect x={d} y={d} width={d} height={d}\n",
             .{ clip.x, clip.y, clip.width, clip.height },
         ),
+        .push_clip_rounded => |clip| try append(
+            output,
+            &used,
+            "push_clip_rounded x={d} y={d} width={d} height={d} radius={d}\n",
+            .{ clip.bounds.x, clip.bounds.y, clip.bounds.width, clip.bounds.height, clip.corner_radius },
+        ),
         .pop_clip => try append(output, &used, "pop_clip\n", .{}),
         .image => |image| try append(
             output,
