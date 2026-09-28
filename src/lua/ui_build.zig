@@ -3,6 +3,7 @@ const c = @import("c.zig");
 const Description = @import("description.zig").Description;
 const Components = @import("components.zig").Components;
 const virtual_list = @import("../ui/widget/virtual_list.zig");
+const animation = @import("../ui/animation.zig");
 const theming = @import("theme.zig");
 const ThemeFonts = @import("theme_fonts.zig").ThemeFonts;
 const CallbackRegistry = @import("callbacks.zig").CallbackRegistry;
@@ -103,6 +104,9 @@ pub const UiBuild = struct {
     interaction_owner: ?InteractionOwner = null,
     composition_depth: usize = 0,
     virtual_lists: virtual_list.Snapshot = .{},
+    animations: ?*const animation.Registry = null,
+    pending_animations: [256]animation.Descriptor = undefined,
+    pending_animation_count: usize = 0,
     semantic_storage: []SemanticDescriptor = &.{},
     semantic_count: usize = 0,
     active_owner: ?ActiveBuildOwner = null,
@@ -224,6 +228,7 @@ pub const UiBuild = struct {
         self.interaction_owner = null;
         self.composition_depth = 0;
         self.virtual_lists = .{};
+        self.pending_animation_count = 0;
         self.pending_button_count = 0;
         self.pending_text_input_count = 0;
         self.pending_listbox_count = 0;
@@ -451,6 +456,8 @@ pub const UiBuild = struct {
         @memcpy(prepared.descriptor_storage[0..descriptors.len], descriptors);
         prepared.descriptor_count = descriptors.len;
         prepared.virtual_lists = self.virtual_lists;
+        @memcpy(prepared.animations[0..self.pending_animation_count], self.animationDescriptors());
+        prepared.animation_count = self.pending_animation_count;
         var text_offset: usize = 0;
         for (
             self.semantic_storage[0..self.semantic_count],
@@ -629,6 +636,10 @@ pub const UiBuild = struct {
         return self.semantic_storage[0..self.semantic_count];
     }
 
+    pub fn animationDescriptors(self: *const UiBuild) []const animation.Descriptor {
+        return self.pending_animations[0..self.pending_animation_count];
+    }
+
     fn lowerDescription(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         if (c.lua_type(state, 1) == c.type_nil) return 0;
@@ -651,6 +662,7 @@ pub const UiBuild = struct {
             .theme => emitTheme,
             .stateful => return self.lowerComponent(state),
             .stateless => return self.lowerComposition(state),
+            .animation => return self.lowerAnimation(state),
             .virtual_list => return self.lowerVirtualList(state),
         };
         c.lua_pushlightuserdata(state, self);
@@ -658,6 +670,50 @@ pub const UiBuild = struct {
         c.lua_pushcclosure(state, emit, 2);
         _ = c.lua_getiuservalue(state, 1, 1);
         if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) return c.lua_error(state);
+        return 0;
+    }
+
+    fn lowerAnimation(self: *UiBuild, state: *c.State) c_int {
+        if (self.composition_depth == 32) return luaError(state, "composition nesting too deep");
+        self.composition_depth += 1;
+        defer self.composition_depth -= 1;
+        _ = c.lua_getiuservalue(state, 1, 1);
+        var parent = self.compositionParent(state, 2) catch |err| return luaError(state, parentDataErrorMessage(err));
+        const key = tableString(state, 2, "key") orelse return luaError(state, "animation key is required");
+        if (key.len == 0) return luaError(state, "animation key is required");
+        const duration = tableRequiredInteger(state, 2, "duration") orelse return luaError(state, "animation duration must be non-negative integer milliseconds");
+        if (duration < 0) return luaError(state, "animation duration must be non-negative integer milliseconds");
+        const descriptor: animation.Descriptor = .{
+            .id = semanticId(key, 0x616e696d617465 ^ parent.id ^ self.component_namespace),
+            .config = .{
+                .duration_ns = std.math.mul(u64, @intCast(duration), std.time.ns_per_ms) catch return luaError(state, "animation duration too large"),
+                .easing = tableOptionalEnum(animation.Easing, state, 2, "easing", .linear) orelse return luaError(state, "invalid animation easing"),
+                .loop = tableOptionalBoolean(state, 2, "loop", false) orelse return luaError(state, "animation loop must be boolean"),
+            },
+        };
+        descriptor.config.validate() catch return luaError(state, "looping animation requires positive duration");
+        if (self.pending_animation_count == self.pending_animations.len) return luaError(state, "animation capacity exceeded");
+        for (self.animationDescriptors()) |existing| if (existing.id == descriptor.id) return luaError(state, "duplicate animation key");
+        self.pending_animations[self.pending_animation_count] = descriptor;
+        self.pending_animation_count += 1;
+        self.appendSemantic(.{ .id = descriptor.id, .parent = semanticParent(parent), .role = .group, .key = key }) catch
+            return luaError(state, "cannot append animation semantics");
+        const progress = if (self.animations) |registry| registry.sample(descriptor) else if (duration == 0) @as(f64, 1) else 0;
+        self.components.push("compose");
+        if (c.lua_getfield(state, 2, "render") != c.type_function) return luaError(state, "animation render must be a function");
+        c.lua_pushnumber(state, progress);
+        if (c.lua_pcallk(state, 2, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        parent.semantic_id = descriptor.id;
+        self.pushParent(parent) catch return luaError(state, "animation nesting too deep");
+        const previous = self.component_namespace;
+        self.component_namespace = descriptor.id;
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, lowerDescription, 1);
+        c.lua_pushvalue(state, -2);
+        const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
+        self.component_namespace = previous;
+        self.popParent();
+        if (status != c.ok) return c.lua_error(state);
         return 0;
     }
 

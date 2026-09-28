@@ -969,6 +969,59 @@ Use `ouro.popup` when a compositor-managed popup surface is required. Neither
 API is implicitly substituted for the other. Native callers use
 `Object.anchored = types.Anchored{...}` with `.none` on both child edges.
 
+#### Duration animations
+
+`ouro.animation` rebuilds a description from native elapsed-time progress:
+
+```lua
+ouro.animation {
+  key = "grow", duration = 300, easing = "ease_out",
+  render = function(progress)
+    return ouro.box {
+      key = "bar", width = 43 + 200 * progress, height = 20,
+      background = "#37656f",
+    }
+  end,
+}
+```
+
+`duration` is required, in non-negative integer milliseconds. `easing` is
+`"linear"` (default), `"ease_in"` (quadratic), `"ease_out"` (inverse quadratic),
+or `"ease_in_out"` (smoothstep). `loop=true` repeats; it requires a positive
+duration. A one-shot starts at zero and reaches exactly one at its deadline;
+zero duration renders one immediately and requests no further frames. Loops
+wrap to zero at each duration boundary. Missed frames do not extend duration.
+
+The key is local to its logical parent and component instance. Rebuilds and
+keyed reordering retain the timeline when its duration, easing and loop options
+are unchanged. Changing those options or the key restarts from the initial
+progress, without retargeting from the current value. Removing the declaration
+stops it; remounting starts fresh. Accepted source reloads start fresh too;
+rejected reloads do not alter the committed timelines. Each window owns its
+own timelines, which are disposed when that window closes.
+
+`render(progress)` follows the same non-yielding, side-effect-free rules as
+component rendering. It may read signals and return a description or nil. It
+does not run as an asynchronous task. The wrapper adds a semantic group but no
+layout node; its returned root receives the ordinary parent constraints and
+can inherit grid placement declared on the animation wrapper. Put other layout
+properties on the returned root. Returning nil does not stop a still-mounted
+animation; omit the animation declaration to stop it.
+
+Zig samples time and easing and requests the shared native animation timer.
+Only active timelines request wakeups, at most 16 ms apart or sooner at a
+one-shot deadline. Animation frames reuse clean root/stateful descriptions and
+rerun lowering, including the animation render callback; this is not a native
+property binding or an independent Lua timer loop. Headless snapshots remain
+at their initial progress unless the host explicitly advances the runtime
+clock. Native hosts use the existing `advanceAnimations`/`animationDelay` pair.
+The language-neutral core is `ui.animation.Registry`.
+
+This primitive does not include springs, pause/seek, completion callbacks,
+automatic reduced-motion preference detection, or exit animations after a
+declaration is removed. Applications can choose zero-duration one-shots or
+omit looping animations when their own motion policy calls for it.
+
 ### Inherited visual defaults
 
 Set `theme` on `ouro.app` to style every window without repeating widget props:

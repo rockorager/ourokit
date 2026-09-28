@@ -11,6 +11,7 @@ pub const Kind = enum {
     box,
     stack,
     anchored,
+    animation,
     grid,
     row,
     column,

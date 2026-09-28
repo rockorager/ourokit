@@ -124,6 +124,9 @@ pub const WindowRuntime = struct {
     caret_deadline_ns: ?u64 = null,
     caret_activity: ?CaretActivity = null,
     animation_now_ns: u64 = 0,
+    animations: ui.animation.Registry = undefined,
+    animation_deadline_ns: ?u64 = null,
+    animation_frame_pending: bool = false,
     semantics: ui.semantics.Snapshot = undefined,
     surface_color: core.Color = undefined,
     background: ?core.Color = null,
@@ -151,7 +154,7 @@ pub const WindowRuntime = struct {
     text_input_owner: ?struct { target: ui.instance.InstanceHandle, session: u64 } = null,
     text_input_generation: u64 = 0,
     virtual_lists: virtual_list.Snapshot = .{},
-    virtual_work: bool = false,
+    native_work: bool = false,
     virtual_offsets_pending: bool = false,
     development_generation: u64 = 1,
     development_revision: u64 = 0,
@@ -193,6 +196,8 @@ pub const WindowRuntime = struct {
         errdefer self.listboxes.deinit();
         try self.text_inputs.init(allocator, config.node_capacity);
         errdefer self.text_inputs.deinit();
+        self.animations = try ui.animation.Registry.init(allocator, config.node_capacity);
+        errdefer self.animations.deinit();
         try self.semantics.init(allocator, config.node_capacity, config.semantic_text_capacity);
         errdefer self.semantics.deinit();
         const commands = try allocator.alloc(scene.Command, config.command_capacity);
@@ -215,6 +220,7 @@ pub const WindowRuntime = struct {
             .text_inputs = self.text_inputs,
             .focus = .{},
             .caret_blink_interval_ns = config.caret_blink_interval_ns,
+            .animations = self.animations,
             .semantics = self.semantics,
             .surface_color = surface,
             .accent_color = accent,
@@ -301,6 +307,7 @@ pub const WindowRuntime = struct {
         self.allocator.free(self.commands);
         self.damage_tracker.deinit();
         self.semantics.deinit();
+        self.animations.deinit();
         self.text_inputs.deinit();
         self.listboxes.deinit();
         self.buttons.deinit();
@@ -325,6 +332,9 @@ pub const WindowRuntime = struct {
         self.buttons.clear();
         self.listboxes.clear();
         self.text_inputs.clear();
+        self.animations.clear();
+        self.animation_deadline_ns = null;
+        self.animation_frame_pending = false;
         self.focus = .{};
         self.range_drag = null;
         self.split_drag = null;
@@ -351,7 +361,7 @@ pub const WindowRuntime = struct {
         self.frame_state = .{};
         self.damage_tracker.invalidate();
         self.virtual_lists = .{};
-        self.virtual_work = false;
+        self.native_work = false;
         self.virtual_offsets_pending = false;
     }
 
@@ -385,6 +395,9 @@ pub const WindowRuntime = struct {
         lua_ui.components.instances = &self.instances;
         lua_ui.components.focused = self.focus.current();
         lua_ui.components.native_update = false;
+        // Candidate generations start fresh, without sampling or mutating
+        // the live generation's timelines during preparation.
+        lua_ui.animations = null;
         lua_ui.image_scale = self.output_scale;
         lua_ui.root_padding = self.root_padding;
         if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
@@ -488,6 +501,7 @@ pub const WindowRuntime = struct {
             }
         }
         const plan = try self.instances.prepareReconcile(prepared.descriptors());
+        try self.animations.validate(prepared.animations[0..prepared.animation_count]);
         try self.validatePreparedFrame(prepared.descriptors(), size, lua_ui.root_background != null);
         try lua_ui.commitDependencies(&self.build_owners, work);
         dependencies_pending = false;
@@ -520,6 +534,10 @@ pub const WindowRuntime = struct {
         self.development_generation +%= 1;
         self.semantics.stage(prepared.semanticDescriptors());
         self.instances.applyReconcile(prepared.reconcile_plan.?) catch unreachable;
+        self.animations.clear();
+        self.animations.reconcile(prepared.animations[0..prepared.animation_count]) catch unreachable;
+        self.animation_deadline_ns = null;
+        self.animation_frame_pending = false;
 
         while (self.pointer_bindings.takeInactive(&self.instances)) |old|
             callbacks.release(old.id) catch unreachable;
@@ -599,7 +617,8 @@ pub const WindowRuntime = struct {
         self.ready = true;
         self.virtual_lists = prepared.virtual_lists;
         self.virtual_offsets_pending = true;
-        if (self.virtual_lists.count != 0) self.queueVirtualBuild() catch unreachable;
+        self.native_work = false;
+        if (self.virtual_lists.count != 0) self.queueNativeBuild() catch unreachable;
         prepared.reset();
     }
 
@@ -617,6 +636,8 @@ pub const WindowRuntime = struct {
         const width: f32 = @floatFromInt(size.width);
         const height: f32 = @floatFromInt(size.height);
         lua_ui.components.instances = &self.instances;
+        lua_ui.animations = &self.animations;
+        defer lua_ui.animations = null;
         lua_ui.image_scale = self.output_scale;
         lua_ui.root_padding = self.root_padding;
         lua_ui.root_background = self.background;
@@ -627,7 +648,7 @@ pub const WindowRuntime = struct {
             const started = self.phaseStart();
             std.debug.assert(sameHandle(work.owner, self.root_owner));
             lua_ui.components.focused = self.focus.current();
-            lua_ui.components.native_update = self.virtual_work;
+            lua_ui.components.native_update = self.native_work;
             const arguments = [_]lua.UiBuildArgument{
                 .{ .number = width },
                 .{ .number = height },
@@ -680,6 +701,12 @@ pub const WindowRuntime = struct {
                 try self.build_owners.retry(work);
                 return err;
             };
+            self.animations.validate(lua_ui.animationDescriptors()) catch |err| {
+                lua_ui.rollbackHandlers();
+                try lua_ui.rollbackDependencies(&self.build_owners, work);
+                try self.build_owners.retry(work);
+                return err;
+            };
             self.semantics.stage(lua_ui.semanticDescriptors());
             self.instances.applyReconcile(plan) catch unreachable;
             self.buttons.removeInactive(&self.instances);
@@ -720,8 +747,16 @@ pub const WindowRuntime = struct {
             try self.refreshListBoxVisuals();
             try self.applyFocusVisual(null, self.focus.current());
             self.virtual_lists = lua_ui.virtual_lists;
+            self.animations.reconcile(lua_ui.animationDescriptors()) catch unreachable;
+            // This build consumed current samples, including an external
+            // invalidation between animation frames. Never postpone a wakeup.
+            self.animation_frame_pending = false;
+            if (self.animations.delay()) |delay| {
+                const deadline = self.animation_now_ns +| delay;
+                self.animation_deadline_ns = @min(self.animation_deadline_ns orelse deadline, deadline);
+            } else self.animation_deadline_ns = null;
             self.virtual_offsets_pending = true;
-            self.virtual_work = false;
+            self.native_work = false;
             try self.build_owners.complete(work);
             self.development_revision +%= 1;
             self.metrics.builds.finish(started);
@@ -772,9 +807,9 @@ pub const WindowRuntime = struct {
         }
     }
 
-    fn queueVirtualBuild(self: *WindowRuntime) !void {
-        if (self.virtual_work) return;
-        self.virtual_work = true;
+    fn queueNativeBuild(self: *WindowRuntime) !void {
+        if (self.native_work) return;
+        self.native_work = true;
         _ = try self.build_owners.markReaderDirty(self.root_owner);
     }
 
@@ -796,7 +831,7 @@ pub const WindowRuntime = struct {
             };
         }
         self.virtual_offsets_pending = false;
-        if (changed) try self.queueVirtualBuild();
+        if (changed) try self.queueNativeBuild();
     }
 
     pub fn textInputStatus(self: *WindowRuntime) !?TextInputStatus {
@@ -1571,7 +1606,7 @@ pub const WindowRuntime = struct {
                     if (delta) |amount| {
                         if (try self.instances.scrollBy(scroll, amount)) {
                             self.frame_state.invalidatePaint();
-                            try self.queueVirtualBuild();
+                            try self.queueNativeBuild();
                         }
                         return;
                     }
@@ -1714,7 +1749,7 @@ pub const WindowRuntime = struct {
         if (delta != 0 and try self.instances.scrollBy(scroll, delta)) {
             self.frame_state.invalidatePaint();
             if (self.virtual_lists.find(try self.instances.semanticId(scroll)) != null)
-                try self.queueVirtualBuild();
+                try self.queueNativeBuild();
         }
     }
 
@@ -1825,7 +1860,7 @@ pub const WindowRuntime = struct {
             const scroll = (try self.instances.nearestScroll(start, axis)) orelse return null;
             if (try self.instances.scrollBy(scroll, delta)) {
                 if (self.virtual_lists.find(try self.instances.semanticId(scroll)) != null)
-                    try self.queueVirtualBuild();
+                    try self.queueNativeBuild();
                 return scroll;
             }
             current = try self.instances.scrollParent(scroll);
@@ -2137,6 +2172,10 @@ pub const WindowRuntime = struct {
     /// The native host owns one timer for the earliest requested animation.
     pub fn animationDelay(self: *WindowRuntime) !?u64 {
         var delay: ?u64 = if (try self.selectionScroll() != null) 16 * std.time.ns_per_ms else null;
+        if (self.animation_frame_pending or self.animations.delay() != null) {
+            const next = if (self.animation_deadline_ns) |deadline| deadline -| self.animation_now_ns else 0;
+            delay = @min(delay orelse next, next);
+        }
         for (self.scroll_motions) |motion| if (motion.active) {
             delay = @min(delay orelse scroll_motion.interval_ns, scroll_motion.interval_ns);
         };
@@ -2150,6 +2189,15 @@ pub const WindowRuntime = struct {
     pub fn advanceAnimations(self: *WindowRuntime, now_ns: u64) !void {
         if (!self.initialized) return;
         self.animation_now_ns = now_ns;
+        // Input and development socket wakeups also enter this method. Sample
+        // their time, but publish at frame cadence instead of making every
+        // inspect request invalidate its own token before the next request.
+        const changed = self.animations.advance(now_ns);
+        self.animation_frame_pending = self.animation_frame_pending or changed;
+        if (self.animation_deadline_ns == null or now_ns >= self.animation_deadline_ns.?) {
+            if (self.animation_frame_pending) try self.queueNativeBuild();
+            self.animation_deadline_ns = if (self.animations.delay()) |delay| now_ns +| delay else null;
+        }
         for (&self.scroll_motions, 0..) |*motion, index| {
             if (!motion.active) continue;
             if (!self.instances.isActive(motion.target.?)) {

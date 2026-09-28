@@ -84,9 +84,9 @@ end
 
 -- Stateless expansion output must outlive lowering too: semantic strings and
 -- prepared descriptions borrow its storage until the candidate is released.
-function M.compose(render, props, children, theme, context)
+function M.compose(render, ...)
     select_reader(-2)
-    local value = render(props, children, theme, context)
+    local value = render(...)
     local outputs = transaction.outputs
     outputs[#outputs + 1] = value
     return value

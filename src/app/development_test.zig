@@ -1060,6 +1060,146 @@ test "anchored declarations reject invalid options and child counts" {
     }) |source| try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
 }
 
+test "animation frames retain components and identity and stop at the exact endpoint" {
+    const f = try Fixture.create(
+        \\roots=0; initializes=0; renders=0; frames=0; unrelated=ouro.signal(0)
+        \\local Motion=ouro.stateful(function()
+        \\ initializes=initializes+1
+        \\ return function()
+        \\  renders=renders+1
+        \\  return ouro.animation {key='motion',duration=100,easing='ease_in',render=function(p)
+        \\   frames=frames+1
+        \\   return ouro.box {key='bar',width=43+200*p,height=17,background='#234567'}
+        \\  end}
+        \\ end
+        \\end)
+        \\function build() roots=roots+1; return ouro.column {key='root',
+        \\ ouro.text {key='other',text='Other '..unrelated()},Motion {key='component'}} end
+    );
+    defer f.destroy();
+    const path = "root/component/motion/bar";
+    const id = (try f.runtime.semantics.findPath(path)).id;
+    const handle = f.runtime.instances.handleForId(id).?;
+    try std.testing.expectEqual(@as(f32, 43), (try f.runtime.semanticTarget(path)).bounds.width);
+    try f.runtime.advanceAnimations(1000 * std.time.ns_per_ms);
+    try f.settle();
+    try f.runtime.advanceAnimations(1025 * std.time.ns_per_ms);
+    try f.settle();
+    // At one quarter, quadratic ease-in is 1/16, not linear 1/4.
+    try std.testing.expectEqual(@as(f32, 55.5), (try f.runtime.semanticTarget(path)).bounds.width);
+    const check = "assert(roots==1 and initializes==1 and renders==1 and frames==2); unrelated:set(7)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@animation-check", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 55.5), (try f.runtime.semanticTarget(path)).bounds.width);
+    try std.testing.expectEqual(handle, f.runtime.instances.handleForId(id).?);
+    try f.runtime.advanceAnimations(1099 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(@as(?u64, std.time.ns_per_ms), try f.runtime.animationDelay());
+    try f.runtime.advanceAnimations(1100 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 243), (try f.runtime.semanticTarget(path)).bounds.width);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    const builds = f.runtime.metrics.builds.count;
+    try f.runtime.advanceAnimations(9000 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(builds, f.runtime.metrics.builds.count);
+}
+
+test "animation sampling between frames preserves development tokens and pending endpoint work" {
+    const f = try Fixture.create(
+        \\extra=ouro.signal(0)
+        \\function build() local e=extra(); return ouro.animation {key='motion',duration=100,
+        \\ render=function(p) return ouro.box {key='bar',width=43+200*p+e,height=17} end} end
+    );
+    defer f.destroy();
+    try f.runtime.advanceAnimations(0);
+    const initial_token = dev.Token.current(&f.runtime);
+    const initial_builds = f.runtime.metrics.builds.count;
+    try f.runtime.advanceAnimations(5 * std.time.ns_per_ms);
+    try f.settle();
+    try initial_token.validate(&f.runtime);
+    try std.testing.expectEqual(initial_builds, f.runtime.metrics.builds.count);
+    try std.testing.expectEqual(@as(f32, 43), (try f.runtime.semanticTarget("motion/bar")).bounds.width);
+    try std.testing.expectEqual(@as(?u64, 11 * std.time.ns_per_ms), try f.runtime.animationDelay());
+
+    // An unrelated build consumes the current sample without postponing the
+    // already requested frame or restarting its timeline.
+    const update = "extra:set(1)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, update.ptr, update.len, "@animation-external", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 54), (try f.runtime.semanticTarget("motion/bar")).bounds.width);
+    const token = dev.Token.current(&f.runtime);
+    try f.runtime.advanceAnimations(6 * std.time.ns_per_ms);
+    try f.settle();
+    try token.validate(&f.runtime);
+    try f.runtime.advanceAnimations(16 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectError(error.StaleDevelopmentTarget, token.validate(&f.runtime));
+    try std.testing.expectEqual(@as(f32, 76), (try f.runtime.semanticTarget("motion/bar")).bounds.width);
+    try f.runtime.advanceAnimations(99 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(@as(?u64, std.time.ns_per_ms), try f.runtime.animationDelay());
+    try f.runtime.advanceAnimations(100 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 244), (try f.runtime.semanticTarget("motion/bar")).bounds.width);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+}
+
+test "animation can render nil and restart after removal without retaining timer demand" {
+    const f = try Fixture.create(
+        \\shown=ouro.signal(true); measured=-1
+        \\function build()
+        \\ if not shown() then return nil end
+        \\ return ouro.animation {key='empty',duration=80,loop=true,
+        \\  render=function(p) measured=p;return nil end}
+        \\end
+    );
+    defer f.destroy();
+    try f.runtime.advanceAnimations(0);
+    try f.runtime.advanceAnimations(30 * std.time.ns_per_ms);
+    try f.settle();
+    const hide = "assert(measured==0.375); shown:set(false)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, hide.ptr, hide.len, "@hide-animation", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    try f.runtime.advanceAnimations(97 * std.time.ns_per_ms);
+    const show = "shown:set(true)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, show.ptr, show.len, "@show-animation", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    const restarted = "assert(measured==0)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, restarted.ptr, restarted.len, "@restarted-animation", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try std.testing.expect((try f.runtime.animationDelay()) != null);
+}
+
+test "animation validates declarations and zero duration settles immediately" {
+    for ([_][]const u8{
+        "function build() return ouro.animation {key='a',render=function() end} end",
+        "function build() return ouro.animation {duration=10,render=function() end} end",
+        "function build() return ouro.animation {key='a',duration=-1,render=function() end} end",
+        "function build() return ouro.animation {key='a',duration=1.5,render=function() end} end",
+        "function build() return ouro.animation {key='a',duration='10',render=function() end} end",
+        "function build() return ouro.animation {key='a',duration=math.huge,render=function() end} end",
+        "function build() return ouro.animation {key='a',duration=0,loop=true,render=function() end} end",
+        "function build() return ouro.animation {key='a',duration=10,loop=1,render=function() end} end",
+        "function build() return ouro.animation {key='a',duration=10,easing='typo',render=function() end} end",
+        "function build() return ouro.animation {key='a',duration=10,render=1} end",
+        "function build() local a=ouro.animation {key='same',duration=10,render=function() end}; return ouro.row {key='row',a,a} end",
+        "function build() return ouro.animation {key='a',duration=10,render=function() return 7 end} end",
+    }) |source| try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
+    const f = try Fixture.create(
+        \\function build() return ouro.animation {key='instant',duration=0,
+        \\ render=function(p) assert(p==1);return ouro.box {key='bar',width=73,height=19} end} end
+    );
+    defer f.destroy();
+    try std.testing.expectEqual(@as(f32, 73), (try f.runtime.semanticTarget("instant/bar")).bounds.width);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+}
+
 test "forms dialog contains focus and restores opener after escape" {
     const f = try Fixture.create(
         \\opened=ouro.signal(false)

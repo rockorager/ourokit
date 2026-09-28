@@ -1,3 +1,4 @@
+pub const animation = @import("animation.zig");
 pub const layout = @import("layout/root.zig");
 pub const focus = @import("focus/root.zig");
 pub const instance = @import("instance/root.zig");
@@ -8,6 +9,7 @@ pub const text_input = @import("text_input/root.zig");
 pub const widget = @import("widget/root.zig");
 
 test {
+    _ = @import("animation.zig");
     _ = @import("layout/root.zig");
     _ = @import("focus/root.zig");
     _ = @import("instance/root.zig");

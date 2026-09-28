@@ -23,6 +23,7 @@ TESTS = (
     'selection_composition.py',
     'input_composition.py',
     'overlay_composition.py',
+    'animation_composition.py',
     'desktop_activation.py',
     'application_services.py',
     'catalog_export.py',
