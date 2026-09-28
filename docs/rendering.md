@@ -38,8 +38,8 @@ transfer; PNG files contain straight sRGB rather than Wayland premultiplied RGB.
 
 Rectangular damage regions must not overlap, preventing source-over commands
 from being applied twice. Rectangles use integer device-pixel bounds; paths and
-glyphs carry antialiased coverage. Arbitrary transforms, path clipping, and layer
-isolation remain unsupported.
+glyphs carry antialiased coverage. Arbitrary transforms and path clipping remain
+unsupported.
 
 Rounded child clips carry integer device bounds and a clamped corner radius.
 Software and Vulkan evaluate the same strict f32 signed-distance expression at
@@ -56,6 +56,31 @@ are disabled beneath them. Damage snapshots retain rounded push/pop boundaries,
 so changing a radius or clip scope repaints unchanged child geometry. Box shadows
 and decorations precede the Box's own child clip but still obey ancestors.
 Logical hit testing uses the rounded contour, not the antialiased pixel fringe.
+
+`push_opacity`/`pop_opacity` isolate a balanced subsequence onto transparent
+premultiplied linear RGBA16. Pop scales the completed source by the supplied
+UNORM16 opacity and composites source-over once. Source replacement within a
+group can erase that group's pixels, never the parent. Ancestor rounded masks
+are deferred to the composite; only rounded clips opened inside a group affect
+its individual draws. Rectangular clips still bound the work. Clip scopes may
+not cross a group boundary; clear is invalid inside either scope. Explicit
+native groups isolate even at opacity 65535; the Box API omits scopes at one.
+
+The shared opacity plan computes cropped device bounds from clipped draws,
+including nested groups and outset shadows. Text without a tighter clip uses
+the enclosing viewport conservatively. It limits each submission to 1024 groups,
+16 nested groups, and 64 MiB of RGBA16 layer pixels (apart from the root target).
+Zero-opacity groups and their descendants require no layer pixels but retain
+command validation and resource checks. Layer preflight/allocation failure leaves the
+destination unchanged. Layers are temporary, not persistent render caches.
+Vulkan builds the layers with integer compute shaders and composites their
+buffers through the existing compute/graphics pipelines; asynchronous submissions
+own these buffers through their fence. No CPU raster fallback is used.
+
+Opacity preserves a parent's established opacity but conservatively cannot
+establish it. Occlusion lookahead stops at group boundaries. Damage snapshots
+retain group boundaries; changing group opacity or scope invalidates the
+enclosing clip, while changing an internal draw retains normal bounded damage.
 
 Both backends avoid issuing a draw when the next non-empty draw completely
 replaces its clipped pixels. Opaque source-over rectangles, all source-mode

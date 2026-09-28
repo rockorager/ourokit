@@ -114,7 +114,7 @@ test "anchored inline size loose popup measure cache resize and dimension update
     try std.testing.expectEqual(PointF{ .x = -68.5, .y = -57.5 }, try tree.nodeOffset(popup));
 }
 
-test "anchored deferred paint and hits escape clips preserve nested and later sibling order" {
+test "anchored deferred paint and hits escape clips and opacity preserve nested and later sibling order" {
     var tree: Tree = undefined;
     try tree.init(std.testing.allocator, 11);
     defer tree.deinit();
@@ -170,6 +170,18 @@ test "anchored deferred paint and hits escape clips preserve nested and later si
     try std.testing.expectEqualSlices(u8, &.{ 40, 70, 210, 255 }, pixels[(40 * 101 + 25) * 4 ..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 30, 170, 70, 255 }, pixels[(40 * 101 + 19) * 4 ..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 210, 30, 40, 255 }, pixels[(40 * 101 + 65) * 4 ..][0..4]);
+    // Floating content is a separate paint plane, just as it escapes clips.
+    // Fade its own Box explicitly; a nested popup remains independently painted.
+    try tree.update(hidden, .{ .box = .{ .width = 20, .height = 12, .clip = true, .opacity = 0 } });
+    try tree.update(parent_popup, .{ .box = .{ .width = 53, .height = 29, .background = Color.rgba(0, 0, 0, 255), .clip = true, .opacity = 0.5 } });
+    builder = try Builder.init(&commands, 1);
+    try tree.buildScene(root, &builder);
+    try builder.displayList().validate();
+    @memset(&pixels, 255);
+    try software.render(builder.displayList(), target);
+    try std.testing.expectEqualSlices(u8, &.{ 188, 188, 188, 255 }, pixels[(40 * 101 + 65) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 30, 170, 70, 255 }, pixels[(40 * 101 + 19) * 4 ..][0..4]);
+    try std.testing.expectEqual(nested_popup, (try tree.hitTest(root, .{ .x = 19, .y = 40 })).?);
     try tree.update(hidden, .{ .box = .{ .width = 20, .height = 12, .clip = true, .hidden = true } });
     try std.testing.expect(!(try tree.layoutDirty(root)));
     try std.testing.expectEqual(root, (try tree.hitTest(root, .{ .x = 19, .y = 40 })).?);

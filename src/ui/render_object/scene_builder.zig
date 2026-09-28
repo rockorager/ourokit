@@ -105,6 +105,16 @@ pub const Builder = struct {
         try self.append(.{ .push_clip_rect = try self.deviceRect(bounds, .outward) });
     }
 
+    pub fn pushOpacity(self: *Builder, opacity: f32) !void {
+        if (!std.math.isFinite(opacity) or opacity < 0 or opacity > 1) return error.InvalidOpacity;
+        // Quantize the supplied binary32 value without a second f32 rounding.
+        try self.append(.{ .push_opacity = @intFromFloat(@floor(@as(f64, opacity) * 65535 + 0.5)) });
+    }
+
+    pub fn popOpacity(self: *Builder) !void {
+        try self.append(.pop_opacity);
+    }
+
     pub fn pushRoundedClip(self: *Builder, bounds: RectF, radius: f32) !void {
         if (radius == 0) return self.pushClip(bounds);
         const device = try self.deviceRect(bounds, .preserve_size);

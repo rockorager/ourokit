@@ -343,6 +343,8 @@ pub const Target = struct {
     height: u32,
     byte_size: usize,
     format: StorageFormat,
+    origin: [2]i32 = .{ 0, 0 },
+    command_buffer: c.VkCommandBuffer = null,
 
     pub fn init(renderer: *Renderer, width: u32, height: u32) !Target {
         return initFormat(renderer, width, height, .rgba);
@@ -482,7 +484,7 @@ const ImageUploads = struct {
         return self;
     }
 
-    fn upload(renderer: *Renderer, bitmap: *const @import("../../image/pixels.zig").Bitmap, target: ?*const Target) !Resource {
+    fn upload(renderer: *Renderer, bitmap: *const @import("../../image/pixels.zig").Bitmap, _: ?*const Target) !Resource {
         // Source images are storage-limited, not dispatch-limited: a
         // large image can be drawn into a much smaller destination.
         var pixels = try Target.initBuffer(renderer, bitmap.width, bitmap.height, .encoded_rgba, renderer.max_image_pixels);
@@ -498,7 +500,7 @@ const ImageUploads = struct {
         var pool: c.VkDescriptorPool = undefined;
         try vk(c.vkCreateDescriptorPool(renderer.device, &pool_info, null, &pool), error.CreateDescriptorPoolFailed);
         errdefer c.vkDestroyDescriptorPool(renderer.device, pool, null);
-        var layout = if (target != null) renderer.descriptor_layout else renderer.atlas_descriptor_layout;
+        var layout = renderer.atlas_descriptor_layout;
         var allocate: c.VkDescriptorSetAllocateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool = pool,
@@ -507,12 +509,10 @@ const ImageUploads = struct {
         };
         var descriptor: c.VkDescriptorSet = undefined;
         try vk(c.vkAllocateDescriptorSets(renderer.device, &allocate, &descriptor), error.AllocateDescriptorSetFailed);
-        const first = target orelse &pixels;
         var buffers = [_]c.VkDescriptorBufferInfo{
-            .{ .buffer = first.buffer, .offset = 0, .range = first.byte_size },
             .{ .buffer = pixels.buffer, .offset = 0, .range = pixels.byte_size },
         };
-        var writes: [2]c.VkWriteDescriptorSet = undefined;
+        var writes: [1]c.VkWriteDescriptorSet = undefined;
         for (&writes, 0..) |*write, binding| write.* = .{
             .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = descriptor,
@@ -521,7 +521,7 @@ const ImageUploads = struct {
             .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .pBufferInfo = &buffers[binding],
         };
-        c.vkUpdateDescriptorSets(renderer.device, if (target != null) 2 else 1, &writes, 0, null);
+        c.vkUpdateDescriptorSets(renderer.device, 1, &writes, 0, null);
         return .{
             .pixels = pixels,
             .pool = pool,
@@ -601,7 +601,7 @@ const CoverageUploads = struct {
         return self;
     }
 
-    fn upload(renderer: *Renderer, mask: []const u8, padded_size: usize, target: ?*const Target) !Resource {
+    fn upload(renderer: *Renderer, mask: []const u8, padded_size: usize, _: ?*const Target) !Resource {
         // Target's encoded format allocates four bytes per element; these are
         // raw A8 words, not encoded image texels. Drawing uses mask bounds for
         // the byte stride instead of this buffer's word count.
@@ -620,7 +620,7 @@ const CoverageUploads = struct {
         var pool: c.VkDescriptorPool = undefined;
         try vk(c.vkCreateDescriptorPool(renderer.device, &pool_info, null, &pool), error.CreateDescriptorPoolFailed);
         errdefer c.vkDestroyDescriptorPool(renderer.device, pool, null);
-        var layout = if (target != null) renderer.descriptor_layout else renderer.atlas_descriptor_layout;
+        var layout = renderer.atlas_descriptor_layout;
         var allocate: c.VkDescriptorSetAllocateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool = pool,
@@ -629,12 +629,10 @@ const CoverageUploads = struct {
         };
         var descriptor: c.VkDescriptorSet = undefined;
         try vk(c.vkAllocateDescriptorSets(renderer.device, &allocate, &descriptor), error.AllocateDescriptorSetFailed);
-        const first = target orelse &pixels;
         var buffers = [_]c.VkDescriptorBufferInfo{
-            .{ .buffer = first.buffer, .offset = 0, .range = first.byte_size },
             .{ .buffer = pixels.buffer, .offset = 0, .range = pixels.byte_size },
         };
-        var writes: [2]c.VkWriteDescriptorSet = undefined;
+        var writes: [1]c.VkWriteDescriptorSet = undefined;
         for (&writes, 0..) |*write, binding| write.* = .{
             .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = descriptor,
@@ -643,7 +641,7 @@ const CoverageUploads = struct {
             .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .pBufferInfo = &buffers[binding],
         };
-        c.vkUpdateDescriptorSets(renderer.device, if (target != null) 2 else 1, &writes, 0, null);
+        c.vkUpdateDescriptorSets(renderer.device, 1, &writes, 0, null);
         return .{ .pixels = pixels, .pool = pool, .descriptor = descriptor };
     }
 
@@ -655,6 +653,155 @@ const CoverageUploads = struct {
         self.resources.deinit(renderer.allocator);
         self.entries.deinit(renderer.allocator);
         self.* = .{};
+    }
+};
+
+const DrawIndexes = struct {
+    image: usize = 0,
+    coverage: usize = 0,
+    gradient: u32 = 0,
+    rounded: u32 = 0,
+    group: usize = 0,
+
+    fn advance(self: *DrawIndexes, command: scene.Command) void {
+        if (commandGradient(command) != null) self.gradient += 1;
+        switch (command) {
+            .image => self.image += 1,
+            .path, .shadow => self.coverage += 1,
+            .push_clip_rounded => self.rounded += 1,
+            .push_opacity => self.group += 1,
+            else => {},
+        }
+    }
+};
+
+const DrawRange = struct {
+    begin: usize = 0,
+    end: usize,
+    indexes: DrawIndexes = .{},
+};
+
+/// Cropped integer GPU surfaces, computed bottom-up once per submission. No
+/// scene pointers or borrowed CPU pixels survive recording. Both descriptors
+/// address the same storage, once as a compute destination and once as a source.
+const OpacityLayers = struct {
+    entries: []Entry = &.{},
+    pool: c.VkDescriptorPool = null,
+    byte_size: usize = 0,
+
+    const Entry = struct {
+        group: scene.opacity.Group,
+        body: DrawRange,
+        after: DrawIndexes = .{},
+        pixels: ?Target = null,
+        destination: c.VkDescriptorSet = null,
+        source: c.VkDescriptorSet = null,
+    };
+
+    fn init(renderer: *Renderer, commands: []const scene.Command, viewport: RectI) !OpacityLayers {
+        var plan = try scene.opacity.Plan.init(renderer.allocator, commands, viewport);
+        defer plan.deinit();
+        var self: OpacityLayers = .{ .byte_size = plan.byte_size };
+        self.entries = try renderer.allocator.alloc(Entry, plan.groups.len);
+        for (self.entries, plan.groups) |*entry, group| entry.* = .{
+            .group = group,
+            .body = .{ .begin = group.begin + 1, .end = group.end },
+        };
+        errdefer self.deinit(renderer);
+        var indexes: DrawIndexes = .{};
+        var stack: [scene.max_opacity_depth]usize = undefined;
+        var depth: usize = 0;
+        for (commands) |command| {
+            const group_index = indexes.group;
+            indexes.advance(command);
+            switch (command) {
+                .push_opacity => {
+                    self.entries[group_index].body.indexes = indexes;
+                    stack[depth] = group_index;
+                    depth += 1;
+                },
+                .pop_opacity => {
+                    depth -= 1;
+                    self.entries[stack[depth]].after = indexes;
+                },
+                else => {},
+            }
+        }
+        var count: u32 = 0;
+        for (plan.groups) |group| if (!group.bounds.isEmpty()) {
+            // Check every extent before allocating any Vulkan object.
+            if (@as(u64, group.bounds.width) * group.bounds.height > renderer.max_pixels) return error.InvalidExtent;
+            count += 1;
+        };
+        if (count == 0) return self;
+        var size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = count * 2 };
+        var info: c.VkDescriptorPoolCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = count * 2,
+            .poolSizeCount = 1,
+            .pPoolSizes = &size,
+        };
+        try vk(c.vkCreateDescriptorPool(renderer.device, &info, null, &self.pool), error.CreateDescriptorPoolFailed);
+        for (self.entries) |*entry| {
+            const bounds = entry.group.bounds;
+            if (bounds.isEmpty()) continue;
+            entry.pixels = try Target.init(renderer, bounds.width, bounds.height);
+            const pixels = &entry.pixels.?;
+            pixels.origin = .{ bounds.x, bounds.y };
+            @memset(@as([*]u8, @ptrCast(pixels.mapping))[0..pixels.byte_size], 0);
+            var layouts = [_]c.VkDescriptorSetLayout{ renderer.descriptor_layout, renderer.atlas_descriptor_layout };
+            var allocate: c.VkDescriptorSetAllocateInfo = .{
+                .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = self.pool,
+                .descriptorSetCount = 2,
+                .pSetLayouts = &layouts,
+            };
+            var descriptors: [2]c.VkDescriptorSet = undefined;
+            try vk(c.vkAllocateDescriptorSets(renderer.device, &allocate, &descriptors), error.AllocateDescriptorSetFailed);
+            entry.destination = descriptors[0];
+            entry.source = descriptors[1];
+            var buffer: c.VkDescriptorBufferInfo = .{ .buffer = pixels.buffer, .offset = 0, .range = pixels.byte_size };
+            var writes: [2]c.VkWriteDescriptorSet = undefined;
+            for (&writes, descriptors) |*write, descriptor| write.* = .{
+                .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = descriptor,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &buffer,
+            };
+            c.vkUpdateDescriptorSets(renderer.device, 2, &writes, 0, null);
+        }
+        return self;
+    }
+
+    fn deinit(self: *OpacityLayers, renderer: *Renderer) void {
+        if (self.pool != null) c.vkDestroyDescriptorPool(renderer.device, self.pool, null);
+        for (self.entries) |*entry| if (entry.pixels) |*pixels| pixels.deinit(renderer);
+        renderer.allocator.free(self.entries);
+        self.* = .{};
+    }
+
+    fn record(self: *OpacityLayers, renderer: *Renderer, command_buffer: c.VkCommandBuffer, commands: []const scene.Command, glyphs: ?*GlyphCache, shapes: ?*const text.ShapeCache, paragraphs: ?*const text.ParagraphCache, images: *const ImageUploads, coverage: *const CoverageUploads, gradients: *const TableUpload, rounded: *const TableUpload) void {
+        if (self.byte_size == 0) return;
+        var barrier: c.VkMemoryBarrier = .{
+            .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = c.VK_ACCESS_HOST_WRITE_BIT,
+            .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        c.vkCmdPipelineBarrier(command_buffer, c.VK_PIPELINE_STAGE_HOST_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+        var remaining = self.entries.len;
+        while (remaining != 0) {
+            remaining -= 1;
+            const entry = &self.entries[remaining];
+            if (entry.pixels) |*pixels| {
+                pixels.command_buffer = command_buffer;
+                renderer.renderRegion(commands, pixels, entry.group.bounds, glyphs, shapes, paragraphs, images, coverage, gradients, rounded, entry.destination, self, entry.body);
+            }
+        }
+        barrier.srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT;
+        c.vkCmdPipelineBarrier(command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
     }
 };
 
@@ -706,7 +853,8 @@ const ClipRecord = extern struct {
 // This word is independent of each pipeline's draw push constants, so clip
 // state survives all draws until traversal changes it at a push/pop boundary.
 const clip_push_offset = 96;
-const draw_push_size = clip_push_offset + @sizeOf(u32);
+const origin_push_offset = 104;
+const draw_push_size = origin_push_offset + @sizeOf([2]i32);
 comptime {
     std.debug.assert(max_clip_depth == 64); // clip.glsl ancestor array.
     std.debug.assert(@sizeOf(Push) <= clip_push_offset);
@@ -759,7 +907,18 @@ const TableUpload = struct {
         parents[0] = 0;
         var depth: usize = 0;
         var index: u32 = 0;
+        var opacity_parents: [scene.max_opacity_depth]u32 = undefined;
+        var opacity_depth: usize = 0;
         for (commands) |command| switch (command) {
+            .push_opacity => {
+                opacity_parents[opacity_depth] = parents[depth];
+                opacity_depth += 1;
+                parents[depth] = 0;
+            },
+            .pop_opacity => {
+                opacity_depth -= 1;
+                parents[depth] = opacity_parents[opacity_depth];
+            },
             .push_clip_rect => {
                 parents[depth + 1] = parents[depth];
                 depth += 1;
@@ -960,6 +1119,7 @@ pub const DmabufTarget = struct {
     coverage_uploads: CoverageUploads = .{},
     gradient_uploads: TableUpload = .{},
     clip_uploads: TableUpload = .{},
+    opacity_layers: OpacityLayers = .{},
     /// Optional borrowed two-query timestamp pool for the presentation probe.
     /// The caller owns it and must wait for this target before reading/freeing.
     timestamp_pool: c.VkQueryPool = null,
@@ -1185,6 +1345,7 @@ pub const DmabufTarget = struct {
         self.coverage_uploads.deinit(renderer);
         self.gradient_uploads.deinit(renderer);
         self.clip_uploads.deinit(renderer);
+        self.opacity_layers.deinit(renderer);
         c.vkDestroySemaphore(renderer.device, self.timeline, null);
         c.vkDestroyFence(renderer.device, self.fence, null);
         c.vkDestroyCommandPool(renderer.device, self.command_pool, null);
@@ -1205,6 +1366,7 @@ pub const DmabufTarget = struct {
                 self.coverage_uploads.deinit(renderer);
                 self.gradient_uploads.deinit(renderer);
                 self.clip_uploads.deinit(renderer);
+                self.opacity_layers.deinit(renderer);
                 break :blk true;
             },
             c.VK_NOT_READY => false,
@@ -1220,6 +1382,7 @@ pub const DmabufTarget = struct {
         self.coverage_uploads.deinit(renderer);
         self.gradient_uploads.deinit(renderer);
         self.clip_uploads.deinit(renderer);
+        self.opacity_layers.deinit(renderer);
     }
 
     pub fn exportSyncobjFd(self: *DmabufTarget, renderer: *Renderer) !std.posix.fd_t {
@@ -1801,13 +1964,6 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
             .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
             .pImmutableSamplers = null,
         },
-        .{
-            .binding = 1,
-            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
-            .pImmutableSamplers = null,
-        },
     };
     var descriptor_layout_info: c.VkDescriptorSetLayoutCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -1834,7 +1990,7 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     var gradient_descriptor_layout: c.VkDescriptorSetLayout = undefined;
     try vk(c.vkCreateDescriptorSetLayout(device, &gradient_layout_info, null, &gradient_descriptor_layout), error.CreateDescriptorLayoutFailed);
     errdefer c.vkDestroyDescriptorSetLayout(device, gradient_descriptor_layout, null);
-    var compute_set_layouts = [_]c.VkDescriptorSetLayout{ descriptor_layout, gradient_descriptor_layout, gradient_descriptor_layout };
+    var compute_set_layouts = [_]c.VkDescriptorSetLayout{ descriptor_layout, gradient_descriptor_layout, gradient_descriptor_layout, gradient_descriptor_layout };
     var push_range: c.VkPushConstantRange = .{
         .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
@@ -1897,7 +2053,7 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
         .binding = 0,
         .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
-        .stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+        .stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT | c.VK_SHADER_STAGE_COMPUTE_BIT,
         .pImmutableSamplers = null,
     };
     var atlas_layout_info: c.VkDescriptorSetLayoutCreateInfo = .{
@@ -2141,6 +2297,9 @@ pub fn renderResources(
 ) !void {
     try list.validate();
     try validateClipDepth(list.commands, glyphs != null and shapes != null, glyphs != null and paragraphs != null);
+    const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
+    var opacity_layers = try OpacityLayers.init(self, list.commands, bounds);
+    defer opacity_layers.deinit(self);
     if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
     var image_uploads = try ImageUploads.init(self, list.commands, images, target);
     defer image_uploads.deinit(self);
@@ -2162,7 +2321,6 @@ pub fn renderResources(
     try vk(c.vkAllocateDescriptorSets(self.device, &descriptor_allocate_info, &descriptor_set), error.AllocateDescriptorSetFailed);
     var buffer_infos = [_]c.VkDescriptorBufferInfo{
         .{ .buffer = target.buffer, .offset = 0, .range = target.byte_size },
-        .{ .buffer = if (has_freetype and glyphs != null) glyphs.?.buffer else target.buffer, .offset = 0, .range = if (glyphs != null) atlas_bytes else target.byte_size },
     };
     var descriptor_writes = [_]c.VkWriteDescriptorSet{
         .{
@@ -2177,20 +2335,8 @@ pub fn renderResources(
             .pBufferInfo = &buffer_infos[0],
             .pTexelBufferView = null,
         },
-        .{
-            .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext = null,
-            .dstSet = descriptor_set,
-            .dstBinding = 1,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pImageInfo = null,
-            .pBufferInfo = &buffer_infos[1],
-            .pTexelBufferView = null,
-        },
     };
-    c.vkUpdateDescriptorSets(self.device, if (glyphs != null) 2 else 1, &descriptor_writes, 0, null);
+    c.vkUpdateDescriptorSets(self.device, 1, &descriptor_writes, 0, null);
 
     try vk(c.vkResetCommandPool(self.device, self.command_pool, 0), error.ResetCommandPoolFailed);
     var begin_info: c.VkCommandBufferBeginInfo = .{
@@ -2225,12 +2371,14 @@ pub fn renderResources(
         null,
     );
 
-    const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
+    opacity_layers.record(self, self.command_buffer, list.commands, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads);
+    target.command_buffer = self.command_buffer;
+    const range: DrawRange = .{ .end = list.commands.len };
     switch (list.damage) {
-        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, descriptor_set),
+        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, descriptor_set, &opacity_layers, range),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, descriptor_set);
+            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, descriptor_set, &opacity_layers, range);
         },
     }
     var host_barrier: c.VkMemoryBarrier = .{
@@ -2339,6 +2487,9 @@ pub fn renderGraphicsResources(
     try validateClipDepth(list.commands, glyphs != null and shapes != null, glyphs != null and paragraphs != null);
     if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
     if (!try target.ready(self)) return error.TargetBusy;
+    const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
+    var opacity_layers = try OpacityLayers.init(self, list.commands, bounds);
+    errdefer opacity_layers.deinit(self);
     var image_uploads = try ImageUploads.init(self, list.commands, images, null);
     errdefer image_uploads.deinit(self);
     var coverage_uploads = try CoverageUploads.init(self, list.commands, null);
@@ -2360,9 +2511,10 @@ pub fn renderGraphicsResources(
         c.vkCmdWriteTimestamp(target.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, target.timestamp_pool, 0);
     }
     const atlas_uploaded = if (has_freetype and glyphs != null)
-        glyphs.?.recordUpload(target.command_buffer, c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+        glyphs.?.recordUpload(target.command_buffer, c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     else
         false;
+    opacity_layers.record(self, target.command_buffer, list.commands, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads);
     if (target.linear) |linear| {
         if (!linear.initialized) linear.initialize(target.command_buffer);
     }
@@ -2426,15 +2578,14 @@ pub fn renderGraphicsResources(
     };
     c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
 
-    const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     // A new direct slot has no contents to preserve. The opacity proof also
     // guarantees that replaying the entire scene defines every pixel.
     const damage: scene.Damage = if (target.direct and target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED) .full else list.damage;
     switch (damage) {
-        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads),
+        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, &opacity_layers),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads);
+            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, &opacity_layers);
         },
     }
     if (!target.direct) self.convertPresentation(target);
@@ -2491,6 +2642,7 @@ pub fn renderGraphicsResources(
     target.coverage_uploads = coverage_uploads;
     target.gradient_uploads = gradient_uploads;
     target.clip_uploads = clip_uploads;
+    target.opacity_layers = opacity_layers;
     target.layout = c.VK_IMAGE_LAYOUT_GENERAL;
     target.gpu_pending = true;
     if (target.explicit_sync) {
@@ -2524,6 +2676,7 @@ fn renderPresentationRegion(
     coverage: *const CoverageUploads,
     gradients: *const TableUpload,
     rounded: *const TableUpload,
+    layers: *const OpacityLayers,
 ) void {
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_pipeline_layout, 1, 1, &gradients.descriptor, 0, null);
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_pipeline_layout, 2, 1, &rounded.descriptor, 0, null);
@@ -2531,18 +2684,25 @@ fn renderPresentationRegion(
     clips[0] = damage;
     var rounded_indexes: [max_clip_depth + 1]u32 = undefined;
     rounded_indexes[0] = 0;
-    var rounded_index: u32 = 0;
     var depth: usize = 0;
-    var image_index: usize = 0;
-    var coverage_index: usize = 0;
-    var gradient_index: u32 = 0;
-    for (commands, 0..) |command, index| {
+    var indexes: DrawIndexes = .{};
+    var index: usize = 0;
+    while (index < commands.len) : (index += 1) {
+        const command = commands[index];
+        const before = indexes;
+        indexes.advance(command);
         const has_gradient = commandGradient(command) != null;
-        if (has_gradient) gradient_index += 1;
-        const current_gradient = if (has_gradient) gradient_index else 0;
+        const current_gradient = if (has_gradient) indexes.gradient else 0;
         const current_clip = rounded_indexes[depth];
         c.vkCmdPushConstants(target.command_buffer, self.presentation_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, clip_push_offset, @sizeOf(u32), &current_clip);
         switch (command) {
+            .push_opacity => {
+                const entry = &layers.entries[before.group];
+                self.drawPresentationLayer(target, clips[depth], entry);
+                indexes = entry.after;
+                index = entry.group.end;
+            },
+            .pop_opacity => unreachable,
             .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
                 self.presentationFill(target, damage, color, .source),
             .push_clip_rect => |clip| {
@@ -2553,8 +2713,7 @@ fn renderPresentationRegion(
             .push_clip_rounded => |clip| {
                 depth += 1;
                 clips[depth] = RectI.intersect(clips[depth - 1], clip.bounds);
-                rounded_index += 1;
-                rounded_indexes[depth] = rounded_index;
+                rounded_indexes[depth] = indexes.rounded;
             },
             .pop_clip => depth -= 1,
             .solid_rectangle => |rectangle| {
@@ -2577,15 +2736,13 @@ fn renderPresentationRegion(
                 current_gradient,
             ),
             .image => |value| {
-                const entry = &images.entries.items[image_index];
+                const entry = &images.entries.items[before.image];
                 self.drawPresentationImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
-                image_index += 1;
             },
             inline .path, .shadow => |value| {
-                const entry = coverage.entries.items[coverage_index];
+                const entry = coverage.entries.items[before.coverage];
                 if (entry.resource_index) |resource_index|
                     self.drawPresentationCoverage(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &coverage.resources.items[resource_index], current_gradient);
-                coverage_index += 1;
             },
             .glyph_run => |run| self.drawPresentationGlyphRun(
                 run,
@@ -2754,25 +2911,36 @@ fn renderRegion(
     gradients: *const TableUpload,
     rounded: *const TableUpload,
     descriptor: c.VkDescriptorSet,
+    layers: *const OpacityLayers,
+    range: DrawRange,
 ) void {
-    c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 1, 1, &gradients.descriptor, 0, null);
-    c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 2, 1, &rounded.descriptor, 0, null);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 1, 1, &gradients.descriptor, 0, null);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 2, 1, &rounded.descriptor, 0, null);
+    c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, origin_push_offset, @sizeOf([2]i32), &target.origin);
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var rounded_indexes: [max_clip_depth + 1]u32 = undefined;
     rounded_indexes[0] = 0;
-    var rounded_index: u32 = 0;
     var depth: usize = 0;
-    var image_index: usize = 0;
-    var coverage_index: usize = 0;
-    var gradient_index: u32 = 0;
-    for (commands, 0..) |command, index| {
+    var indexes = range.indexes;
+    var index = range.begin;
+    while (index < range.end) : (index += 1) {
+        const command = commands[index];
+        const before = indexes;
+        indexes.advance(command);
         const has_gradient = commandGradient(command) != null;
-        if (has_gradient) gradient_index += 1;
-        const current_gradient = if (has_gradient) gradient_index else 0;
+        const current_gradient = if (has_gradient) indexes.gradient else 0;
         const current_clip = rounded_indexes[depth];
-        c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, clip_push_offset, @sizeOf(u32), &current_clip);
+        c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, clip_push_offset, @sizeOf(u32), &current_clip);
         switch (command) {
+            .push_opacity => {
+                const entry = &layers.entries[before.group];
+                self.drawLayer(target, clips[depth], entry);
+                indexes = entry.after;
+                index = entry.group.end;
+            },
+            .pop_opacity => unreachable,
             .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
                 self.fill(target, damage, color, .source),
             .push_clip_rect => |clip| {
@@ -2783,8 +2951,7 @@ fn renderRegion(
             .push_clip_rounded => |clip| {
                 depth += 1;
                 clips[depth] = RectI.intersect(clips[depth - 1], clip.bounds);
-                rounded_index += 1;
-                rounded_indexes[depth] = rounded_index;
+                rounded_indexes[depth] = indexes.rounded;
             },
             .pop_clip => depth -= 1,
             .solid_rectangle => |rectangle| {
@@ -2799,17 +2966,13 @@ fn renderRegion(
                 current_gradient,
             ),
             .image => |value| {
-                const entry = &images.entries.items[image_index];
+                const entry = &images.entries.items[before.image];
                 self.drawImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
-                image_index += 1;
-                c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
             },
             inline .path, .shadow => |value| {
-                const entry = coverage.entries.items[coverage_index];
+                const entry = coverage.entries.items[before.coverage];
                 if (entry.resource_index) |resource_index|
                     self.drawCoverage(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &coverage.resources.items[resource_index], current_gradient);
-                coverage_index += 1;
-                c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
             },
             .glyph_run => |run| self.drawGlyphRun(
                 run,
@@ -2829,11 +2992,70 @@ fn renderRegion(
     }
 }
 
+fn drawLayer(self: *Renderer, target: *const Target, clip: RectI, entry: *const OpacityLayers.Entry) void {
+    const bounds = RectI.intersect(clip, entry.group.bounds);
+    if (bounds.isEmpty()) return;
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 3, 1, &entry.source, 0, null);
+    const push: GlyphPush = .{
+        .target_width = target.width,
+        .atlas_width_value = entry.group.bounds.width * 8,
+        .source = .{ 0, @as(u32, entry.group.opacity) << 16 },
+        .left = bounds.x,
+        .top = bounds.y,
+        .right = @intCast(@as(i64, bounds.x) + bounds.width),
+        .bottom = @intCast(@as(i64, bounds.y) + bounds.height),
+        .atlas_x = @as(u32, @intCast(bounds.x - entry.group.bounds.x)) * 8,
+        .atlas_y = @intCast(bounds.y - entry.group.bounds.y),
+        .image_mode = 3,
+    };
+    c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
+    const count = @as(u64, bounds.width) * bounds.height;
+    c.vkCmdDispatch(target.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+    var barrier: c.VkMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+}
+
+fn drawPresentationLayer(self: *Renderer, target: *const DmabufTarget, clip: RectI, entry: *const OpacityLayers.Entry) void {
+    const bounds = RectI.intersect(clip, entry.group.bounds);
+    if (bounds.isEmpty()) return;
+    var scissor: c.VkRect2D = .{
+        .offset = .{ .x = bounds.x, .y = bounds.y },
+        .extent = .{ .width = bounds.width, .height = bounds.height },
+    };
+    var viewport: c.VkViewport = .{
+        .x = @floatFromInt(bounds.x),
+        .y = @floatFromInt(bounds.y),
+        .width = @floatFromInt(bounds.width),
+        .height = @floatFromInt(bounds.height),
+        .minDepth = 0,
+        .maxDepth = 1,
+    };
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, if (target.direct) self.direct_presentation.glyph_pipeline else self.presentation_glyph_pipeline);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_glyph_pipeline_layout, 0, 1, &entry.source, 0, null);
+    c.vkCmdSetViewport(target.command_buffer, 0, 1, &viewport);
+    c.vkCmdSetScissor(target.command_buffer, 0, 1, &scissor);
+    const push: PresentationGlyphPush = .{
+        .color = .{ 0, 0, 0, @as(f32, @floatFromInt(entry.group.opacity)) / 65535 },
+        .target_size = .{ @floatFromInt(target.width), @floatFromInt(target.height) },
+        .bounds = .{ bounds.x, bounds.y, @intCast(@as(i64, bounds.x) + bounds.width), @intCast(@as(i64, bounds.y) + bounds.height) },
+        .atlas_origin = .{ @as(u32, @intCast(bounds.x - entry.group.bounds.x)) * 8, @intCast(bounds.y - entry.group.bounds.y) },
+        .atlas_width_value = entry.group.bounds.width * 8,
+        .image_mode = 3,
+    };
+    c.vkCmdPushConstants(target.command_buffer, self.presentation_glyph_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(PresentationGlyphPush), &push);
+    c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
+}
+
 fn drawCoverage(self: *Renderer, target: *const Target, clip: RectI, color: Color, mask_bounds: RectI, resource: *const CoverageUploads.Resource, gradient_index: u32) void {
     const bounds = RectI.intersect(clip, mask_bounds);
     if (bounds.isEmpty()) return;
-    c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
-    c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &resource.descriptor, 0, null);
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 3, 1, &resource.descriptor, 0, null);
     const push: GlyphPush = .{
         .target_width = target.width,
         .atlas_width_value = mask_bounds.width,
@@ -2846,15 +3068,15 @@ fn drawCoverage(self: *Renderer, target: *const Target, clip: RectI, color: Colo
         .atlas_y = @intCast(@as(i64, bounds.y) - mask_bounds.y),
         .gradient_index = gradient_index,
     };
-    c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
+    c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
     const count = @as(u64, bounds.width) * bounds.height;
-    c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+    c.vkCmdDispatch(target.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
     var barrier: c.VkMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
     };
-    c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+    c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 }
 
 fn drawPresentationCoverage(self: *Renderer, target: *const DmabufTarget, clip: RectI, color: Color, mask_bounds: RectI, resource: *const CoverageUploads.Resource, gradient_index: u32) void {
@@ -2890,8 +3112,8 @@ fn drawPresentationCoverage(self: *Renderer, target: *const DmabufTarget, clip: 
 
 fn drawImage(self: *Renderer, target: *const Target, bounds: RectI, placement: ImagePlacement, image: *const ImageUploads.Resource) void {
     if (bounds.isEmpty()) return;
-    c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
-    c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &image.descriptor, 0, null);
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 3, 1, &image.descriptor, 0, null);
     const push: GlyphPush = .{
         .target_width = target.width,
         .atlas_width_value = image.pixels.width,
@@ -2909,15 +3131,15 @@ fn drawImage(self: *Renderer, target: *const Target, bounds: RectI, placement: I
         .image_width = placement.width,
         .image_height = placement.height,
     };
-    c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
+    c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
     const count = @as(u64, bounds.width) * bounds.height;
-    c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+    c.vkCmdDispatch(target.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
     var barrier: c.VkMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
     };
-    c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+    c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 }
 
 fn drawPresentationImage(self: *Renderer, target: *const DmabufTarget, bounds: RectI, placement: ImagePlacement, image: *const ImageUploads.Resource) void {
@@ -2957,7 +3179,7 @@ fn drawPresentationImage(self: *Renderer, target: *const DmabufTarget, bounds: R
 
 fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, blend: scene.BlendMode) void {
     if (bounds.isEmpty()) return;
-    c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
     const source = LinearRgba16.fromColor(color);
     const push: Push = .{
         .target_width = target.width,
@@ -2976,9 +3198,9 @@ fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, ble
         .flags = 1,
         .source_over = @intFromBool(blend == .source_over and source.a != 65535),
     };
-    c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
+    c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
     const count = @as(u64, bounds.width) * bounds.height;
-    c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+    c.vkCmdDispatch(target.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
     var barrier: c.VkMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = null,
@@ -2986,7 +3208,7 @@ fn fill(self: *Renderer, target: *const Target, bounds: RectI, color: Color, ble
         .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
     };
     c.vkCmdPipelineBarrier(
-        self.command_buffer,
+        target.command_buffer,
         c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0,
@@ -3007,7 +3229,7 @@ fn decoratedRectangle(
     gradient_index: u32,
 ) void {
     if (clipped_bounds.isEmpty()) return;
-    c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+    c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
     const background = if (rectangle.background) |color| LinearRgba16.fromColor(color) else LinearRgba16.fromColor(Color.rgba(0, 0, 0, 0));
     const border = if (rectangle.border_color) |color| LinearRgba16.fromColor(color) else LinearRgba16.fromColor(Color.rgba(0, 0, 0, 0));
     const push: Push = .{
@@ -3029,9 +3251,9 @@ fn decoratedRectangle(
         .source_over = @intFromBool(rectangle.blend == .source_over),
         .gradient_index = gradient_index,
     };
-    c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
+    c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
     const count = @as(u64, clipped_bounds.width) * clipped_bounds.height;
-    c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+    c.vkCmdDispatch(target.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
     var barrier: c.VkMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = null,
@@ -3039,7 +3261,7 @@ fn decoratedRectangle(
         .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
     };
     c.vkCmdPipelineBarrier(
-        self.command_buffer,
+        target.command_buffer,
         c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0,
@@ -3127,6 +3349,7 @@ fn drawGlyphRun(
     shapes: *const text.ShapeCache,
 ) void {
     if (!has_freetype) unreachable;
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 3, 1, &cache.descriptor_set, 0, null);
     const shaped = shapes.get(command.shape) catch unreachable;
     const source = packedLinear(LinearRgba16.fromColor(command.color));
     var pen = command.origin;
@@ -3141,7 +3364,7 @@ fn drawGlyphRun(
         };
         const bounds = RectI.intersect(clip, glyph_bounds);
         if (!bounds.isEmpty()) {
-            c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
+            c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
             const push: GlyphPush = .{
                 .target_width = target.width,
                 .atlas_width_value = atlas_width,
@@ -3154,16 +3377,16 @@ fn drawGlyphRun(
                 .atlas_y = atlas.y + @as(u32, @intCast(bounds.y - glyph_bounds.y)),
                 .image_mode = if (atlas.color) 2 else 0,
             };
-            c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
+            c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
             const count = @as(u64, bounds.width) * bounds.height;
-            c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+            c.vkCmdDispatch(target.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
             var barrier: c.VkMemoryBarrier = .{
                 .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = null,
                 .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
             };
-            c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+            c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
         }
         pen.x += glyph.advance.x * command.scale;
         pen.y -= glyph.advance.y * command.scale;
@@ -3467,6 +3690,7 @@ fn drawParagraph(
     paragraphs: *const text.ParagraphCache,
 ) void {
     if (!has_freetype) unreachable;
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 3, 1, &cache.descriptor_set, 0, null);
     const layout = paragraphs.get(command.layout) catch unreachable;
     const source = packedLinear(LinearRgba16.fromColor(command.color));
     for (layout.positioned.lines) |line| {
@@ -3482,7 +3706,7 @@ fn drawParagraph(
             };
             const bounds = RectI.intersect(clip, glyph_bounds);
             if (!bounds.isEmpty()) {
-                c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
+                c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
                 const push: GlyphPush = .{
                     .target_width = target.width,
                     .atlas_width_value = atlas_width,
@@ -3495,16 +3719,16 @@ fn drawParagraph(
                     .atlas_y = atlas.y + @as(u32, @intCast(bounds.y - glyph_bounds.y)),
                     .image_mode = if (atlas.color) 2 else 0,
                 };
-                c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
+                c.vkCmdPushConstants(target.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
                 const count = @as(u64, bounds.width) * bounds.height;
-                c.vkCmdDispatch(self.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
+                c.vkCmdDispatch(target.command_buffer, @intCast((count + local_size - 1) / local_size), 1, 1);
                 var barrier: c.VkMemoryBarrier = .{
                     .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     .pNext = null,
                     .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
                     .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT,
                 };
-                c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+                c.vkCmdPipelineBarrier(target.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
             }
         };
     }
@@ -3969,7 +4193,7 @@ test "graphics image sampling matches software and upload copies outlive source 
     defer gradients.deinit(&renderer);
     var rounded = try TableUpload.clips(&renderer, &commands);
     defer rounded.deinit(&renderer);
-    renderer.renderPresentationRegion(&commands, &target, .{ .x = 0, .y = 0, .width = 32, .height = 12 }, null, null, null, &uploads, &.{}, &gradients, &rounded);
+    renderer.renderPresentationRegion(&commands, &target, .{ .x = 0, .y = 0, .width = 32, .height = 12 }, null, null, null, &uploads, &.{}, &gradients, &rounded, &.{});
     renderer.convertPresentation(&target);
     c.vkCmdEndRenderPass(renderer.command_buffer);
     barrier.srcAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -5081,6 +5305,380 @@ test "Vulkan gradients interleave paths images solids and survive damage and asy
         try shared.expectPixel(x, y, transparent[(y * 64 + x) * 4 ..][0..4].*);
         try std.testing.expectEqual(expected[(y * 64 + x) * 4 ..][0..4].*, direct.pixel(x, y));
     };
+}
+
+test "Vulkan opacity isolates overlaps erasure and nested cropped layers" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const black: scene.Command = .{ .solid_rectangle = .{ .bounds = .{ .x = 3, .y = 2, .width = 8, .height = 6 }, .color = Color.rgba(0, 0, 0, 255) } };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(255, 255, 255, 255) },
+        .{ .push_opacity = 32768 },
+        black,
+        black,
+        .{ .push_opacity = 32768 },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 9, .y = 4, .width = 5, .height = 6 }, .color = Color.rgba(0, 0, 0, 255) } },
+        .pop_opacity,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 5, .y = 4, .width = 2, .height = 2 }, .color = Color.rgba(0, 0, 0, 0), .blend = .source } },
+        .pop_opacity,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(255, 0, 0, 255) } },
+    };
+    const software = @import("../software/root.zig");
+    var expected: [16 * 12 * 4]u8 = undefined;
+    var actual: [expected.len]u8 = undefined;
+    const reference: software.Target = .{ .pixels = &expected, .width = 16, .height = 12, .stride = 64, .format = .rgba8_unorm, .allocator = std.testing.allocator };
+    var target = try Target.init(&renderer, 16, 12);
+    defer target.deinit(&renderer);
+    var direct = try GraphicsReadback.initMode(&renderer, 16, 12, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 16, 12);
+    defer linear.deinit(&renderer);
+    for ([_]u16{ 32768, 65535, 0 }) |opacity| {
+        commands[1].push_opacity = opacity;
+        const list: scene.DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{
+            .{ .x = 0, .y = 0, .width = 7, .height = 12 },
+            .{ .x = 7, .y = 0, .width = 9, .height = 12 },
+        } } };
+        try software.render(list, reference);
+        try renderer.render(list, &target);
+        try target.readPixels(&actual, 64, .rgba8_unorm);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        if (opacity == 32768) {
+            // Independent goldens distinguish isolation from child alpha and
+            // parent erasure, including a nested pixel outside the first box.
+            try std.testing.expectEqual([4]u8{ 188, 188, 188, 255 }, actual[(3 * 16 + 4) * 4 ..][0..4].*);
+            try std.testing.expectEqual([4]u8{ 225, 225, 225, 255 }, actual[(9 * 16 + 13) * 4 ..][0..4].*);
+        }
+        try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, actual[(4 * 16 + 5) * 4 ..][0..4].*);
+        for ([_]*GraphicsReadback{ &direct, &linear }) |output| {
+            try renderer.renderGraphicsResources(list, &output.target, null, null, null, null, false);
+            try std.testing.expectEqual(@as(usize, 2), output.target.opacity_layers.entries.len);
+            try std.testing.expectEqual(@as(usize, if (opacity == 0) 0 else (11 * 8 + 5 * 6) * 8), output.target.opacity_layers.byte_size);
+            try output.target.wait(&renderer);
+            try std.testing.expectEqual(@as(usize, 0), output.target.opacity_layers.entries.len);
+            for (0..12) |y| for (0..16) |x| try output.expectPixel(x, y, expected[(y * 16 + x) * 4 ..][0..4].*);
+        }
+    }
+}
+
+test "Vulkan opacity applies ancestor clips once and inner clips per draw" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const white: scene.Command = .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 16, .height = 16 }, .color = Color.rgba(255, 255, 255, 255) } };
+    const outer: scene.Command = .{ .push_clip_rounded = .{ .bounds = .{ .x = 2, .y = 3, .width = 13, .height = 11 }, .corner_radius = 5 } };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(0, 0, 0, 0) }, outer, .{ .push_opacity = 65535 }, white, white, .pop_opacity, .pop_clip,
+    };
+    var target = try Target.init(&renderer, 16, 16);
+    defer target.deinit(&renderer);
+    var output = try GraphicsReadback.init(&renderer, 16, 16);
+    defer output.deinit(&renderer);
+    const software = @import("../software/root.zig");
+    var expected: [16 * 16 * 4]u8 = undefined;
+    var actual: [expected.len]u8 = undefined;
+    for ([_]u8{ 90, 45, 74 }) |golden| {
+        if (golden == 45) commands[2].push_opacity = 32768;
+        if (golden == 74) commands = .{ commands[0], commands[2], outer, white, white, .pop_clip, .pop_opacity };
+        const list: scene.DisplayList = .{ .commands = &commands };
+        try software.render(list, .{ .pixels = &expected, .width = 16, .height = 16, .stride = 64, .format = .rgba8_unorm, .allocator = std.testing.allocator });
+        try renderer.render(list, &target);
+        try target.readPixels(&actual, 64, .rgba8_unorm);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        try std.testing.expectEqual([4]u8{ golden, golden, golden, golden }, actual[(3 * 16 + 4) * 4 ..][0..4].*);
+        try renderer.renderGraphicsResources(list, &output.target, null, null, null, null, false);
+        try output.target.wait(&renderer);
+        for (0..16) |y| for (0..16) |x| try output.expectPixel(x, y, expected[(y * 16 + x) * 4 ..][0..4].*);
+    }
+}
+
+test "Vulkan opacity mixed resources preserve indexes and queued layer lifetimes" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const geometry = try path.Path.create(std.testing.allocator, &.{
+        .{ .move = .{ .x = -5, .y = -2 } }, .{ .line = .{ .x = 67, .y = 11 } }, .{ .line = .{ .x = 13, .y = 41 } }, .close,
+    }, .{ .fill = .nonzero });
+    defer geometry.release();
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try @import("../image_test.zig").insertFixture(&images);
+    const gradient = try paint.LinearGradient.init(.{ .x = 4, .y = 3 }, .{ .x = 58, .y = 35 }, &.{
+        .{ .offset = 0, .color = Color.rgba(240, 80, 30, 210) },
+        .{ .offset = 1, .color = Color.rgba(40, 120, 250, 110) },
+    });
+    const path_command: scene.Command = .{ .path = .{ .path = geometry, .identity = geometry.identity, .origin = .{ .x = -0.25, .y = 0.5 }, .scale = 1, .bounds = try path.deviceBounds(geometry, .{ .x = -0.25, .y = 0.5 }, 1), .color = Color.rgba(255, 255, 255, 255), .gradient = gradient } };
+    const image_command: scene.Command = .{ .image = .{ .image = image, .bounds = .{ .x = 2, .y = 2, .width = 51, .height = 31 }, .fit = .fill } };
+    const shadow_shape: shadow.Shape = .{ .box = .{ .x = 14, .y = 7, .width = 31, .height = 22 }, .corner_radius = 3, .offset = .{ .x = -3.25, .y = 2.5 }, .blur = 6 };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(25, 40, 65, 255) },
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 3, .y = 2, .width = 58, .height = 35 }, .corner_radius = 12 } },
+        .{ .push_opacity = 43001 },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 1, .y = 1, .width = 62, .height = 38 }, .color = Color.rgba(50, 160, 220, 190) } },
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 7, .y = 5, .width = 46, .height = 26 }, .corner_radius = 10 } },
+        .{ .push_opacity = 51003 },
+        image_command,
+        path_command,
+        .{ .push_opacity = 0 },
+        path_command,
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 9, .y = 9, .width = 0, .height = 8 }, .corner_radius = 4 } },
+        image_command,
+        .pop_clip,
+        .pop_opacity,
+        .{ .shadow = .{ .shape = shadow_shape, .bounds = try shadow.deviceBounds(shadow_shape), .color = Color.rgba(90, 230, 40, 150) } },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 5, .y = 7, .width = 49, .height = 25 }, .background_gradient = gradient, .corner_radius = 4, .border_width = 2, .border_color = Color.rgba(230, 180, 40, 210), .blend = .source } },
+        .pop_opacity,
+        image_command,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 32, .y = 15, .width = 25, .height = 24 }, .color = Color.rgba(0, 0, 0, 0), .blend = .source } },
+        .pop_clip,
+        path_command,
+        .pop_opacity,
+        .pop_clip,
+        .{ .push_clip_rect = .{ .x = 61, .y = 0, .width = 3, .height = 40 } },
+        path_command,
+        image_command,
+        .pop_clip,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 1, .y = 1, .width = 3, .height = 3 }, .color = Color.rgba(250, 190, 30, 255) } },
+    };
+    const software = @import("../software/root.zig");
+    var expected: [64 * 40 * 4]u8 = undefined;
+    var actual: [expected.len]u8 = undefined;
+    const reference: software.Target = .{ .pixels = &expected, .width = 64, .height = 40, .stride = 256, .format = .rgba8_unorm, .allocator = std.testing.allocator };
+    const list: scene.DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{
+        .{ .x = 0, .y = 0, .width = 19, .height = 40 },
+        .{ .x = 19, .y = 0, .width = 45, .height = 40 },
+    } } };
+    try software.renderResources(list, reference, null, null, null, &images);
+    var target = try Target.init(&renderer, 64, 40);
+    defer target.deinit(&renderer);
+    try renderer.renderResources(list, &target, null, null, null, &images);
+    try target.readPixels(&actual, 256, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    var direct = try GraphicsReadback.initMode(&renderer, 64, 40, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 64, 40);
+    defer linear.deinit(&renderer);
+    var shared = try GraphicsReadback.initWithLinear(&renderer, 64, 40, linear.target.linear);
+    defer shared.deinit(&renderer);
+    try renderer.renderGraphicsResources(list, &direct.target, null, null, null, &images, false);
+    try renderer.renderGraphicsResources(list, &linear.target, null, null, null, &images, false);
+    // Full cropped groups are recomputed; only these damaged columns update
+    // the existing shared attachment. No CPU wait between the two slots.
+    commands[5].push_opacity = 21987;
+    const damage = [_]RectI{
+        .{ .x = 7, .y = 5, .width = 18, .height = 26 },
+        .{ .x = 25, .y = 5, .width = 28, .height = 26 },
+    };
+    var updated = expected;
+    try software.renderResources(.{ .commands = &commands, .damage = .{ .regions = &damage } }, .{ .pixels = &updated, .width = 64, .height = 40, .stride = 256, .format = .rgba8_unorm, .allocator = std.testing.allocator }, null, null, null, &images);
+    try renderer.renderGraphicsResources(.{ .commands = &commands, .damage = .{ .regions = &damage } }, &shared.target, null, null, null, &images, false);
+    for ([_]*DmabufTarget{ &direct.target, &linear.target, &shared.target }) |output| {
+        try std.testing.expect(output.gpu_pending);
+        try std.testing.expectEqual(@as(usize, 3), output.opacity_layers.entries.len);
+        try std.testing.expect(output.opacity_layers.entries[2].pixels == null);
+        const records = @as([*]const ClipRecord, @ptrCast(@alignCast(output.clip_uploads.pixels.?.mapping)))[0..3];
+        // Outer, inner, and hidden inner all start independent clip chains.
+        for (records) |record| try std.testing.expectEqual(@as(u32, 0), record.parent);
+    }
+    @memset(&commands, .{ .clear = Color.rgba(0, 0, 0, 0) });
+    try images.release(image);
+    renderer.path_masks.deinit();
+    renderer.path_masks = path.MaskCache.init(renderer.allocator);
+    renderer.shadow_masks.deinit();
+    renderer.shadow_masks = shadow.MaskCache.init(renderer.allocator);
+    try linear.target.wait(&renderer);
+    try shared.target.wait(&renderer);
+    try vk(c.vkWaitForFences(renderer.device, 1, &direct.target.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
+    try std.testing.expect(try direct.target.ready(&renderer));
+    for ([_]*DmabufTarget{ &direct.target, &linear.target, &shared.target }) |output|
+        try std.testing.expect(output.opacity_layers.entries.len == 0 and output.opacity_layers.pool == null);
+    for (0..40) |y| for (0..64) |x| {
+        try direct.expectPixel(x, y, expected[(y * 64 + x) * 4 ..][0..4].*);
+        try linear.expectPixel(x, y, expected[(y * 64 + x) * 4 ..][0..4].*);
+        try shared.expectPixel(x, y, updated[(y * 64 + x) * 4 ..][0..4].*);
+    };
+}
+
+test "Vulkan opacity retains outset shadow pixels when union moves left and up" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const box: RectI = .{ .x = 20, .y = 30, .width = 80, .height = 60 };
+    const shape: shadow.Shape = .{ .box = box, .offset = .{ .x = 20, .y = 12 } };
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(232, 238, 244, 255) },
+        .{ .push_opacity = 32768 },
+        .{ .shadow = .{ .shape = shape, .bounds = try shadow.deviceBounds(shape), .color = Color.rgba(32, 48, 64, 255) } },
+        .{ .decorated_rectangle = .{ .bounds = box, .background = Color.rgba(240, 190, 40, 255), .border_color = Color.rgba(20, 30, 40, 255), .border_width = 3 } },
+        .pop_opacity,
+    };
+    const list: scene.DisplayList = .{ .commands = &commands };
+    var target = try Target.init(&renderer, 140, 120);
+    defer target.deinit(&renderer);
+    try renderer.render(list, &target);
+    var pixels: [140 * 120 * 4]u8 = undefined;
+    try target.readPixels(&pixels, 560, .rgba8_unorm);
+    try std.testing.expectEqual([4]u8{ 172, 177, 184, 255 }, pixels[(60 * 140 + 110) * 4 ..][0..4].*);
+    var direct = try GraphicsReadback.initMode(&renderer, 140, 120, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 140, 120);
+    defer linear.deinit(&renderer);
+    for ([_]*GraphicsReadback{ &direct, &linear }) |output| {
+        try renderer.renderGraphicsResources(list, &output.target, null, null, null, null, false);
+        try output.target.wait(&renderer);
+        for (0..120) |y| for (0..140) |x| try output.expectPixel(x, y, pixels[(y * 140 + x) * 4 ..][0..4].*);
+    }
+}
+
+test "Vulkan opacity preflight bounds budgets resources and allocation failures preserve targets" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const box: RectI = .{ .x = 2, .y = 1, .width = 5, .height = 6 };
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(31, 51, 79, 255) },
+        .{ .push_opacity = 37129 },
+        .{ .solid_rectangle = .{ .bounds = box, .color = Color.rgba(255, 170, 20, 255) } },
+        .{ .push_opacity = 51007 },
+        .{ .solid_rectangle = .{ .bounds = box, .color = Color.rgba(40, 150, 240, 210) } },
+        .pop_opacity,
+        .pop_opacity,
+    };
+    var target = try Target.init(&renderer, 8, 8);
+    defer target.deinit(&renderer);
+    var direct = try GraphicsReadback.initMode(&renderer, 8, 8, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 8, 8);
+    defer linear.deinit(&renderer);
+    const checks = struct {
+        fn check(allocator: std.mem.Allocator, r: *Renderer, batch: []const scene.Command, output: *Target, graphics: ?*DmabufTarget) !void {
+            const old = r.allocator;
+            r.allocator = allocator;
+            defer r.allocator = old;
+            if (graphics) |g| {
+                r.renderGraphicsResources(.{ .commands = batch }, g, null, null, null, null, false) catch |err| {
+                    try std.testing.expect(!g.gpu_pending and g.opacity_layers.entries.len == 0);
+                    try std.testing.expectEqual(@as(c.VkImageLayout, c.VK_IMAGE_LAYOUT_UNDEFINED), g.layout);
+                    if (g.linear) |attachment| try std.testing.expect(!attachment.initialized);
+                    return err;
+                };
+                try g.wait(r);
+                // The check harness reuses the target across injected failures.
+                g.layout = c.VK_IMAGE_LAYOUT_UNDEFINED;
+                if (g.linear) |attachment| attachment.initialized = false;
+            } else {
+                const bytes = @as([*]u8, @ptrCast(output.mapping))[0..output.byte_size];
+                @memset(bytes, 73);
+                r.render(.{ .commands = batch }, output) catch |err| {
+                    for (bytes) |value| try std.testing.expectEqual(@as(u8, 73), value);
+                    return err;
+                };
+            }
+        }
+    };
+    for ([_]?*DmabufTarget{ null, &direct.target, &linear.target }) |output|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, checks.check, .{ &renderer, @as([]const scene.Command, &commands), &target, output });
+    const huge: scene.Command = .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 2048, .height = 2048 }, .color = Color.rgba(255, 255, 255, 255) } };
+    // Three individually legal32MiB layers exceed the aggregate64MiB cap.
+    try std.testing.expectError(error.OpacityBudgetExceeded, OpacityLayers.init(&renderer, &.{ .{ .push_opacity = 1 }, .{ .push_opacity = 1 }, .{ .push_opacity = 1 }, huge, .pop_opacity, .pop_opacity, .pop_opacity }, huge.solid_rectangle.bounds));
+    const original_limit = renderer.max_pixels;
+    renderer.max_pixels = 29;
+    try std.testing.expectError(error.InvalidExtent, OpacityLayers.init(&renderer, &commands, .{ .x = 0, .y = 0, .width = 8, .height = 8 }));
+    renderer.max_pixels = 30;
+    var exact = try OpacityLayers.init(&renderer, &commands, .{ .x = 0, .y = 0, .width = 8, .height = 8 });
+    try std.testing.expectEqual(@as(usize, 480), exact.byte_size);
+    exact.deinit(&renderer);
+    renderer.max_pixels = original_limit;
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try @import("../image_test.zig").insertFixture(&images);
+    try images.release(image);
+    const hidden = [_]scene.Command{ commands[0], .{ .push_opacity = 0 }, .{ .image = .{ .image = image, .bounds = box } }, .pop_opacity };
+    try std.testing.expectError(error.StaleImageHandle, renderer.renderResources(.{ .commands = &hidden }, &target, null, null, null, &images));
+    for ([_]*DmabufTarget{ &direct.target, &linear.target }) |output| {
+        try std.testing.expectError(error.StaleImageHandle, renderer.renderGraphicsResources(.{ .commands = &hidden }, output, null, null, null, &images, false));
+        try std.testing.expect(!output.gpu_pending and output.opacity_layers.entries.len == 0);
+    }
+}
+
+test "Vulkan opacity restores text atlas after images and group composites" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    const software = @import("../software/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
+    defer fonts.release(font) catch unreachable;
+    const emoji = try fonts.acquire(.{ .key = .{ .file = "/fixtures/EmojiTest.ttf", .index = 0 }, .bytes = @embedFile("../../text/fonts/EmojiTest.ttf") });
+    defer fonts.release(emoji) catch unreachable;
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    const shape = try shapes.acquire(.{
+        .spec = .{ .paragraph = "🚀 GPU", .direction = .left_to_right, .script = .latin, .language = "en", .logical_size = 16.25 },
+        .candidates = &.{ font, emoji },
+        .configuration_revision = 1,
+    });
+    defer shapes.release(shape) catch unreachable;
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const layout = try paragraphs.acquire(.{ .utf8 = "group 👋", .language = "en", .logical_size = 14.25, .max_width = 85, .candidates = &.{ font, emoji }, .configuration_revision = 1 });
+    defer paragraphs.release(layout) catch unreachable;
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var glyphs = try GlyphCache.init(std.testing.allocator, &fonts, &renderer);
+    defer glyphs.deinit();
+    var software_glyphs = try software.GlyphCache.init(std.testing.allocator, &fonts);
+    defer software_glyphs.deinit();
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try @import("../image_test.zig").insertFixture(&images);
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(25, 40, 65, 255) },
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 4, .y = 3, .width = 112, .height = 56 }, .corner_radius = 9 } },
+        .{ .push_opacity = 47013 },
+        .{ .image = .{ .image = image, .bounds = .{ .x = 5, .y = 6, .width = 40, .height = 35 }, .fit = .fill } },
+        .{ .glyph_run = .{ .shape = shape, .origin = .{ .x = 5.25, .y = 24.5 }, .scale = 1, .color = Color.rgba(250, 230, 180, 220) } },
+        .{ .push_opacity = 51007 },
+        .{ .paragraph = .{ .layout = layout, .origin = .{ .x = 23.5, .y = 28.25 }, .scale = 1, .color = Color.rgba(200, 230, 250, 240) } },
+        .pop_opacity,
+        .{ .glyph_run = .{ .shape = shape, .origin = .{ .x = 39.75, .y = 55.25 }, .scale = 1, .color = Color.rgba(140, 240, 200, 200) } },
+        .pop_opacity,
+        .pop_clip,
+    };
+    const list: scene.DisplayList = .{ .commands = &commands };
+    var expected: [120 * 64 * 4]u8 = undefined;
+    var actual: [expected.len]u8 = undefined;
+    try software.renderResources(list, .{ .pixels = &expected, .width = 120, .height = 64, .stride = 480, .format = .rgba8_unorm, .allocator = std.testing.allocator }, &software_glyphs, &shapes, &paragraphs, &images);
+    var target = try Target.init(&renderer, 120, 64);
+    defer target.deinit(&renderer);
+    try renderer.renderResources(list, &target, &glyphs, &shapes, &paragraphs, &images);
+    try target.readPixels(&actual, 480, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    var direct = try GraphicsReadback.initMode(&renderer, 120, 64, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 120, 64);
+    defer linear.deinit(&renderer);
+    // Force the next submission to perform an atlas transfer into compute and
+    // fragment consumers, rather than only reusing the headless upload.
+    try glyphs.reset();
+    for ([_]*GraphicsReadback{ &direct, &linear }) |output| {
+        try renderer.renderGraphicsResources(list, &output.target, &glyphs, &shapes, &paragraphs, &images, false);
+        try output.target.wait(&renderer);
+        for (0..64) |y| for (0..120) |x| try output.expectPixel(x, y, expected[(y * 120 + x) * 4 ..][0..4].*);
+    }
 }
 
 test "Vulkan rounded clip tables preserve parents budgets and failure cleanup" {

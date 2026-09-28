@@ -5,6 +5,8 @@ const Constraints = @import("../layout/constraints.zig").Constraints;
 const types = @import("types.zig");
 
 pub fn validate(value: types.Box) !void {
+    if (!std.math.isFinite(value.opacity) or value.opacity < 0 or value.opacity > 1)
+        return error.InvalidOpacity;
     if (value.width) |width| if (!validExtent(width)) return error.InvalidExtent;
     if (value.height) |height| if (!validExtent(height)) return error.InvalidExtent;
     if (!validExtent(value.min_width) or !validExtent(value.min_height) or

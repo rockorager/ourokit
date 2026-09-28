@@ -28,6 +28,7 @@ layout(push_constant) uniform Push {
     uint source_over;
     uint gradient_index;
     layout(offset = 96) uint clip_index;
+    layout(offset = 104) ivec2 target_origin;
 };
 
 uint channel16(uvec2 pixel, uint channel) {
@@ -106,7 +107,7 @@ void main() {
     uvec2 source = addPixels(scalePixel(border, border_coverage), scalePixel(background_value, background_coverage));
     source = scalePixel(source, clip);
     coverage = (coverage * clip + 127u) / 255u;
-    uint offset = y * target_width + x;
+    uint offset = (y - uint(target_origin.y)) * target_width + x - uint(target_origin.x);
     if (source_over != 0u) {
         pixels[offset] = channel16(source, 3u) != 65535u ? sourceOver(source, pixels[offset]) : source;
     } else if (coverage == 255u) {

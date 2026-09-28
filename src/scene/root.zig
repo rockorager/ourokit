@@ -13,6 +13,7 @@ const shadows = @import("../shadow/root.zig");
 const paint = @import("../paint/root.zig");
 
 pub const DamageTracker = @import("damage.zig").Tracker;
+pub const opacity = @import("opacity.zig");
 
 pub const Shadow = struct {
     shape: shadows.Shape,
@@ -48,6 +49,7 @@ pub const BlendMode = enum {
 };
 
 pub const max_clip_depth = 64;
+pub const max_opacity_depth = 16;
 
 /// Device-space, per-draw antialiased child clip; not an isolated layer.
 pub const RoundedClip = struct {
@@ -118,6 +120,10 @@ pub const DecoratedRectangle = struct {
 /// plugin callbacks. Clips affect subsequent drawing until `pop_clip`.
 pub const Command = union(enum) {
     clear: Color,
+    /// Isolate into transparent linear RGBA16, then scale once and source-over.
+    /// Ancestor rounded clips apply at pop, not separately to the children.
+    push_opacity: u16,
+    pop_opacity,
     push_clip_rect: RectI,
     push_clip_rounded: RoundedClip,
     pop_clip,
@@ -166,54 +172,87 @@ pub const DisplayList = struct {
         clips[0] = bounds;
         var rounded = [_]bool{false} ** (max_clip_depth + 1);
         var depth: usize = 0;
-        for (self.commands) |command| switch (command) {
-            .clear => |color| {
-                if (depth != 0) return false;
-                result = color.a == 255;
-            },
-            .push_clip_rect => |clip| {
-                if (depth == max_clip_depth) return false;
-                clips[depth + 1] = RectI.intersect(clips[depth], clip);
-                rounded[depth + 1] = rounded[depth];
-                depth += 1;
-            },
-            .push_clip_rounded => |clip| {
-                if (depth == max_clip_depth) return false;
-                clips[depth + 1] = RectI.intersect(clips[depth], clip.bounds);
-                rounded[depth + 1] = true;
-                depth += 1;
-            },
-            .pop_clip => {
-                if (depth == 0) return false;
-                depth -= 1;
-            },
-            .solid_rectangle => |rect| {
-                if (rect.blend == .source and rect.color.a != 255) result = false;
-                if (!rounded[depth] and rect.color.a == 255 and std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
-            },
-            .decorated_rectangle => |rect| {
-                if (rect.blend == .source) result = false;
-                // Rounded corners and translucent borders do not cover every
-                // pixel. Do not infer opacity from just the background alpha.
-                if (!rounded[depth] and rect.corner_radius == 0 and rect.backgroundIsOpaque() and
-                    (rect.border_color == null or rect.border_color.?.a == 255) and
-                    std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
-            },
-            .glyph_run, .paragraph, .image, .path, .shadow => {},
-        };
-        return result and depth == 0;
+        var group_depth: usize = 0;
+        for (self.commands) |command| {
+            switch (command) {
+                .push_opacity => {
+                    group_depth += 1;
+                    continue;
+                },
+                .pop_opacity => {
+                    if (group_depth == 0) return false;
+                    group_depth -= 1;
+                    continue;
+                },
+                else => if (group_depth != 0) continue,
+            }
+            switch (command) {
+                .clear => |color| {
+                    if (depth != 0) return false;
+                    result = color.a == 255;
+                },
+                .push_clip_rect => |clip| {
+                    if (depth == max_clip_depth) return false;
+                    clips[depth + 1] = RectI.intersect(clips[depth], clip);
+                    rounded[depth + 1] = rounded[depth];
+                    depth += 1;
+                },
+                .push_clip_rounded => |clip| {
+                    if (depth == max_clip_depth) return false;
+                    clips[depth + 1] = RectI.intersect(clips[depth], clip.bounds);
+                    rounded[depth + 1] = true;
+                    depth += 1;
+                },
+                .pop_clip => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                },
+                .solid_rectangle => |rect| {
+                    if (rect.blend == .source and rect.color.a != 255) result = false;
+                    if (!rounded[depth] and rect.color.a == 255 and std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
+                },
+                .decorated_rectangle => |rect| {
+                    if (rect.blend == .source) result = false;
+                    // Rounded corners and translucent borders do not cover every
+                    // pixel. Do not infer opacity from just the background alpha.
+                    if (!rounded[depth] and rect.corner_radius == 0 and rect.backgroundIsOpaque() and
+                        (rect.border_color == null or rect.border_color.?.a == 255) and
+                        std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
+                },
+                .glyph_run, .paragraph, .image, .path, .shadow => {},
+                .push_opacity, .pop_opacity => unreachable,
+            }
+        }
+        // Isolated groups source-over the parent, so cannot remove its opacity.
+        return result and depth == 0 and group_depth == 0;
     }
 
     pub fn validate(self: DisplayList) !void {
         var depth: usize = 0;
+        var group_depth: usize = 0;
+        var clip_floors: [max_opacity_depth]usize = undefined;
         for (self.commands) |command| switch (command) {
-            .clear => if (depth != 0) return error.ClearInsideClip,
+            .clear => {
+                if (depth != 0) return error.ClearInsideClip;
+                if (group_depth != 0) return error.ClearInsideOpacity;
+            },
+            .push_opacity => {
+                if (group_depth == max_opacity_depth) return error.OpacityStackOverflow;
+                clip_floors[group_depth] = depth;
+                group_depth += 1;
+            },
+            .pop_opacity => {
+                if (group_depth == 0) return error.UnbalancedOpacityStack;
+                if (depth != clip_floors[group_depth - 1]) return error.UnbalancedClipStack;
+                group_depth -= 1;
+            },
             .push_clip_rect, .push_clip_rounded => {
                 if (depth == max_clip_depth) return error.ClipStackOverflow;
                 depth += 1;
             },
             .pop_clip => {
                 if (depth == 0) return error.UnbalancedClipStack;
+                if (group_depth != 0 and depth == clip_floors[group_depth - 1]) return error.UnbalancedClipStack;
                 depth -= 1;
             },
             .solid_rectangle => {},
@@ -251,6 +290,7 @@ pub const DisplayList = struct {
             },
         };
         if (depth != 0) return error.UnbalancedClipStack;
+        if (group_depth != 0) return error.UnbalancedOpacityStack;
         switch (self.damage) {
             .full => {},
             .regions => |regions| for (regions, 0..) |region, index| {
@@ -279,7 +319,7 @@ pub fn occludedByNextDraw(
     var depth = active_clips.len - 1;
     for (remaining) |command| switch (command) {
         .clear => return contains(clips[0], bounds),
-        .push_clip_rounded => return false,
+        .push_clip_rounded, .push_opacity, .pop_opacity => return false,
         .push_clip_rect => |clip| {
             if (depth == max_clip_depth) return false;
             depth += 1;
@@ -810,4 +850,38 @@ test "rounded clip coverage clamps radius and cannot establish rectangular opaci
     try std.testing.expectError(error.UnbalancedClipStack, (DisplayList{ .commands = &.{commands[1]} }).validate());
     const too_deep = [_]Command{commands[1]} ** (max_clip_depth + 1);
     try std.testing.expectError(error.ClipStackOverflow, (DisplayList{ .commands = &too_deep }).validate());
+}
+
+test "opacity isolates source erasure and enforces independent balanced scopes" {
+    const bounds: RectI = .{ .x = 0, .y = 0, .width = 20, .height = 10 };
+    var commands = [_]Command{
+        .{ .clear = Color.rgba(255, 255, 255, 255) },
+        .{ .push_opacity = 12345 },
+        .{ .solid_rectangle = .{ .bounds = bounds, .color = Color.rgba(0, 0, 0, 0), .blend = .source } },
+        .pop_opacity,
+    };
+    const list: DisplayList = .{ .commands = &commands };
+    try list.validate();
+    try std.testing.expect(list.isOpaque(bounds));
+    try std.testing.expect(!occludedByNextDraw(commands[1..], &.{bounds}, bounds));
+    try std.testing.expect(!occludedByNextDraw(commands[3..], &.{bounds}, bounds));
+    var frame = try Frame.init(std.testing.allocator, &commands, .full);
+    defer frame.deinit();
+    commands[1].push_opacity = 0;
+    try std.testing.expectEqual(@as(u16, 12345), frame.command_storage[1].push_opacity);
+    commands[0].clear.a = 0;
+    commands[2].solid_rectangle.color.a = 255;
+    try std.testing.expect(!list.isOpaque(bounds));
+    const clip: Command = .{ .push_clip_rect = bounds };
+    try std.testing.expectError(error.UnbalancedOpacityStack, (DisplayList{ .commands = &.{.pop_opacity} }).validate());
+    try std.testing.expectError(error.UnbalancedOpacityStack, (DisplayList{ .commands = &.{commands[1]} }).validate());
+    try std.testing.expectError(error.ClearInsideOpacity, (DisplayList{ .commands = &.{ commands[1], commands[0], .pop_opacity } }).validate());
+    try std.testing.expectError(error.UnbalancedClipStack, (DisplayList{ .commands = &.{ clip, commands[1], .pop_clip, clip, .pop_opacity, .pop_clip } }).validate());
+    try std.testing.expectError(error.UnbalancedClipStack, (DisplayList{ .commands = &.{ commands[1], clip, .pop_opacity, .pop_clip } }).validate());
+    var deep: [max_opacity_depth * 2]Command = undefined;
+    @memset(deep[0..max_opacity_depth], commands[1]);
+    @memset(deep[max_opacity_depth..], .pop_opacity);
+    try (DisplayList{ .commands = &deep }).validate();
+    const overflow = [_]Command{commands[1]} ** (max_opacity_depth + 1);
+    try std.testing.expectError(error.OpacityStackOverflow, (DisplayList{ .commands = &overflow }).validate());
 }

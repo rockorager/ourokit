@@ -1550,6 +1550,8 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box min_width");
         const min_height = tableOptionalExtent(state, 1, "min_height", 0) orelse
             return luaError(state, "invalid box min_height");
+        const opacity = tableOptionalFraction(state, 1, "opacity", 1) orelse
+            return luaError(state, "box opacity must be a finite number from zero to one");
         if (width.extent()) |value| if (value < min_width)
             return luaError(state, "box width must be at least min_width");
         if (height.extent()) |value| if (value < min_height)
@@ -1681,6 +1683,7 @@ pub const UiBuild = struct {
                 .border_width = border_width,
                 .corner_radius = visual.radius orelse 0,
                 .shadow = shadow,
+                .opacity = opacity,
                 .clip = tableOptionalBoolean(state, 1, "clip", false) orelse
                     return luaError(state, "box clip must be boolean"),
             } },
@@ -3188,6 +3191,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
         \\    padding = 8,
         \\    alignment = "center",
         \\    clip = true,
+        \\    opacity = 0.375,
         \\    shadow = {x=-3,y=5,blur=8,spread=-1,color='#11223380'},
         \\    ouro.theme {
         \\      key = "dark",
@@ -3220,6 +3224,8 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expectEqual(@as(f32, 160), descriptors[2].object.box.min_height);
     try std.testing.expect(descriptors[2].object.box.clip);
     try std.testing.expect(!descriptors[3].object.box.clip);
+    try std.testing.expectEqual(@as(f32, 0.375), descriptors[2].object.box.opacity);
+    try std.testing.expectEqual(@as(f32, 1), descriptors[3].object.box.opacity);
     try std.testing.expectEqual(@as(f32, -3), descriptors[2].object.box.shadow.?.offset.x);
     try std.testing.expectEqual(@as(f32, 8), descriptors[2].object.box.shadow.?.blur);
     try std.testing.expectEqual(@as(u8, 128), descriptors[2].object.box.shadow.?.color.a);

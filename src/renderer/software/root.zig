@@ -55,7 +55,13 @@ const RasterTarget = struct {
     pixels: []LinearRgba16,
     width: u32,
     height: u32,
+    origin_x: usize = 0,
+    origin_y: usize = 0,
     rounded_clips: []const scene.RoundedClip = &.{},
+
+    fn pixelIndex(self: RasterTarget, x: usize, y: usize) usize {
+        return (y - self.origin_y) * self.width + x - self.origin_x;
+    }
 };
 
 const max_clip_depth = scene.max_clip_depth;
@@ -105,6 +111,10 @@ pub fn renderResources(
 ) !void {
     try target.validate();
     try list.validate();
+    var opacity = try scene.opacity.Plan.init(target.allocator, list.commands, targetBounds(target));
+    defer opacity.deinit();
+    const layer_pixels = try target.allocator.alloc(LinearRgba16, opacity.byte_size / @sizeOf(LinearRgba16));
+    defer target.allocator.free(layer_pixels);
     var temporary_masks = paths.MaskCache.init(target.allocator);
     defer temporary_masks.deinit();
     const masks = target.path_masks orelse &temporary_masks;
@@ -124,11 +134,11 @@ pub fn renderResources(
     defer target.allocator.free(pixels);
     const working: RasterTarget = .{ .pixels = pixels, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => try renderOutputRegion(list.commands, target, working, targetBounds(target), glyphs, shapes, paragraphs, images, masks, shadow_masks),
+        .full => try renderOutputRegion(list.commands, target, working, targetBounds(target), glyphs, shapes, paragraphs, images, masks, shadow_masks, opacity.groups, layer_pixels),
         .regions => |regions| {
             for (regions) |region| {
                 const clipped = RectI.intersect(region, targetBounds(target));
-                if (!clipped.isEmpty()) try renderOutputRegion(list.commands, target, working, clipped, glyphs, shapes, paragraphs, images, masks, shadow_masks);
+                if (!clipped.isEmpty()) try renderOutputRegion(list.commands, target, working, clipped, glyphs, shapes, paragraphs, images, masks, shadow_masks, opacity.groups, layer_pixels);
             }
         },
     }
@@ -145,6 +155,8 @@ fn renderOutputRegion(
     images: ?*const ImageCache,
     masks: *paths.MaskCache,
     shadow_masks: *shadows.MaskCache,
+    groups: []const scene.opacity.Group,
+    layer_pixels: []LinearRgba16,
 ) !void {
     const left: usize = @intCast(damage.x);
     const top: usize = @intCast(damage.y);
@@ -156,7 +168,7 @@ fn renderOutputRegion(
             working.pixels[y * working.width + x] = LinearRgba16.fromSrgba8(readPixel(output.format, output.pixels[offset..][0..4]));
         };
     }
-    try renderRegion(commands, working, damage, glyphs, shapes, paragraphs, images, masks, shadow_masks);
+    try renderRegion(commands, working, damage, glyphs, shapes, paragraphs, images, masks, shadow_masks, groups, layer_pixels);
     for (top..top + damage.height) |y| for (left..left + damage.width) |x| {
         const offset = y * output.stride + x * 4;
         writePixel(output.format, output.pixels[offset..][0..4], working.pixels[y * working.width + x].toSrgba8());
@@ -173,6 +185,8 @@ fn renderRegion(
     images: ?*const ImageCache,
     masks: *paths.MaskCache,
     shadow_masks: *shadows.MaskCache,
+    groups: []const scene.opacity.Group,
+    layer_pixels: []LinearRgba16,
 ) !void {
     var target = unclipped;
     var clips: [max_clip_depth + 1]RectI = undefined;
@@ -180,7 +194,51 @@ fn renderRegion(
     var rounded: [max_clip_depth]scene.RoundedClip = undefined;
     var counts = [_]usize{0} ** (max_clip_depth + 1);
     var depth: usize = 0;
+    var rounded_start: usize = 0;
+    var group_stack: [scene.max_opacity_depth]struct {
+        target: RasterTarget,
+        clip: RectI,
+        rounded_start: usize,
+        index: usize,
+    } = undefined;
+    var group_depth: usize = 0;
+    var group_index: usize = 0;
+    var layer_offset: usize = 0;
     for (commands, 0..) |command, index| switch (command) {
+        .push_opacity => {
+            const group = groups[group_index];
+            group_stack[group_depth] = .{ .target = target, .clip = clips[depth], .rounded_start = rounded_start, .index = group_index };
+            group_depth += 1;
+            group_index += 1;
+            const area = @as(usize, group.bounds.width) * group.bounds.height;
+            target = .{
+                .pixels = layer_pixels[layer_offset..][0..area],
+                .width = group.bounds.width,
+                .height = group.bounds.height,
+                .origin_x = @intCast(group.bounds.x),
+                .origin_y = @intCast(group.bounds.y),
+            };
+            @memset(target.pixels, .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+            layer_offset += area;
+            clips[depth] = RectI.intersect(clips[depth], group.bounds);
+            rounded_start = counts[depth];
+        },
+        .pop_opacity => {
+            group_depth -= 1;
+            const saved = group_stack[group_depth];
+            const layer = target;
+            target = saved.target;
+            clips[depth] = saved.clip;
+            rounded_start = saved.rounded_start;
+            const group = groups[saved.index];
+            const bounds = RectI.intersect(clips[depth], group.bounds);
+            const left: usize = @intCast(bounds.x);
+            const top: usize = @intCast(bounds.y);
+            for (top..top + bounds.height) |y| for (left..left + bounds.width) |x| {
+                const source = layer.pixels[layer.pixelIndex(x, y)].scaled(group.opacity);
+                blendCoveredPixel(target, x, y, source, 255, .source_over);
+            };
+        },
         .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
             fill(target, damage, color, .source),
         .push_clip_rect => |clip| {
@@ -195,11 +253,11 @@ fn renderRegion(
             depth += 1;
             clips[depth] = RectI.intersect(clips[depth - 1], clip.bounds);
             counts[depth] = counts[depth - 1] + 1;
-            target.rounded_clips = rounded[0..counts[depth]];
+            target.rounded_clips = rounded[rounded_start..counts[depth]];
         },
         .pop_clip => {
             depth -= 1;
-            target.rounded_clips = rounded[0..counts[depth]];
+            target.rounded_clips = rounded[rounded_start..counts[depth]];
         },
         .solid_rectangle => |rectangle| {
             const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
@@ -478,7 +536,7 @@ fn blendCoveredPixel(
     if (clip_coverage == 0) return;
     const source = unclipped_source.scaled(@as(u16, clip_coverage) * 257);
     const coverage = multiply(unclipped_coverage, clip_coverage);
-    const offset = y * target.width + x;
+    const offset = target.pixelIndex(x, y);
     if (coverage == 255 and (blend == .source or source.a == 65535)) {
         target.pixels[offset] = source;
         return;
@@ -497,7 +555,8 @@ fn fillSource(target: RasterTarget, bounds: RectI, source: LinearRgba16) void {
     const right: usize = @intCast(@as(i64, bounds.x) + bounds.width);
     const bottom: usize = @intCast(@as(i64, bounds.y) + bounds.height);
     for (top..bottom) |y| {
-        @memset(target.pixels[y * target.width + left .. y * target.width + right], source);
+        const start = target.pixelIndex(left, y);
+        @memset(target.pixels[start .. start + right - left], source);
     }
 }
 
@@ -853,6 +912,122 @@ test "gradient rectangles sample device centers in linear light without transpar
     };
     try render(.{ .commands = &commands, .damage = .{ .regions = &damage } }, target);
     try std.testing.expectEqualSlices(u8, &expected, &pixels);
+}
+
+test "opacity isolates overlaps nested groups erasure and split damage" {
+    const bounds: RectI = .{ .x = 3, .y = 2, .width = 8, .height = 6 };
+    const black: scene.Command = .{ .solid_rectangle = .{ .bounds = bounds, .color = Color.rgba(0, 0, 0, 255) } };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(255, 255, 255, 255) },
+        .{ .push_opacity = 32768 },
+        black,
+        black,
+        .{ .push_opacity = 32768 },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 9, .y = 4, .width = 5, .height = 6 }, .color = Color.rgba(0, 0, 0, 255) } },
+        .pop_opacity,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 5, .y = 4, .width = 2, .height = 2 }, .color = Color.rgba(0, 0, 0, 0), .blend = .source } },
+        .pop_opacity,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(255, 0, 0, 255) } },
+    };
+    var pixels: [16 * 12 * 4]u8 = undefined;
+    const target: Target = .{ .pixels = &pixels, .width = 16, .height = 12, .stride = 64, .format = .rgba8_unorm, .allocator = std.testing.allocator };
+    try render(.{ .commands = &commands }, target);
+    // Two opaque black draws remain opaque within the layer. Half-opacity
+    // linear black over white is188, not the137 of per-child opacity.
+    try std.testing.expectEqualSlices(u8, &.{ 188, 188, 188, 255 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 188, 188, 188, 255 }, pixels[(5 * 16 + 10) * 4 ..][0..4]);
+    // Nested half opacity over transparent becomes one-quarter black over white.
+    try std.testing.expectEqualSlices(u8, &.{ 225, 225, 225, 255 }, pixels[(9 * 16 + 13) * 4 ..][0..4]);
+    // Erasure exposes the untouched parent, not transparent output.
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[(4 * 16 + 5) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, pixels[0..4]);
+    const expected = pixels;
+    @memset(&pixels, 19);
+    try render(.{ .commands = &commands, .damage = .{ .regions = &.{
+        .{ .x = 0, .y = 0, .width = 7, .height = 12 },
+        .{ .x = 7, .y = 0, .width = 9, .height = 12 },
+    } } }, target);
+    try std.testing.expectEqualSlices(u8, &expected, &pixels);
+    commands[1].push_opacity = 0;
+    try render(.{ .commands = &commands }, target);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
+    commands[1].push_opacity = 65535;
+    try render(.{ .commands = &commands }, target);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator, batch: []const scene.Command) !void {
+            var output = [_]u8{73} ** (16 * 12 * 4);
+            const before = output;
+            render(.{ .commands = batch }, .{ .pixels = &output, .width = 16, .height = 12, .stride = 64, .format = .rgba8_unorm, .allocator = allocator }) catch |err| {
+                try std.testing.expectEqualSlices(u8, &before, &output);
+                return err;
+            };
+        }
+    }.check, .{@as([]const scene.Command, &commands)});
+}
+
+test "opacity preflight rejects excess pixels and invisible missing resources without writes" {
+    const bounds: RectI = .{ .x = 0, .y = 0, .width = 1024, .height = 1024 };
+    const pixels = try std.testing.allocator.alloc(u8, 1024 * 1024 * 4);
+    defer std.testing.allocator.free(pixels);
+    @memset(pixels, 73);
+    const target: Target = .{ .pixels = pixels, .width = 1024, .height = 1024, .stride = 4096, .format = .rgba8_unorm, .allocator = std.testing.allocator };
+    var commands: [20]scene.Command = undefined;
+    commands[0] = .{ .clear = Color.rgba(255, 255, 255, 255) };
+    @memset(commands[1..10], .{ .push_opacity = 32768 });
+    commands[10] = .{ .solid_rectangle = .{ .bounds = bounds, .color = Color.rgba(0, 0, 0, 255) } };
+    @memset(commands[11..], .pop_opacity);
+    try std.testing.expectError(error.OpacityBudgetExceeded, render(.{ .commands = &commands }, target));
+    try std.testing.expect(std.mem.allEqual(u8, pixels, 73));
+    const invisible = [_]scene.Command{
+        commands[0],                                                                   .{ .push_opacity = 0 },
+        .{ .image = .{ .bounds = bounds, .image = .{ .slot = 0, .generation = 1 } } }, .pop_opacity,
+    };
+    try std.testing.expectError(error.ImageResourcesRequired, render(.{ .commands = &invisible }, target));
+    try std.testing.expect(std.mem.allEqual(u8, pixels, 73));
+}
+
+test "opacity includes hard outset shadows beyond decorated bounds" {
+    const shape: shadows.Shape = .{ .box = .{ .x = 20, .y = 30, .width = 80, .height = 60 }, .offset = .{ .x = 20, .y = 12 } };
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(232, 238, 244, 255) },
+        .{ .push_opacity = 32768 },
+        .{ .shadow = .{ .shape = shape, .bounds = try shadows.deviceBounds(shape), .color = Color.rgba(32, 48, 64, 255) } },
+        .{ .decorated_rectangle = .{ .bounds = shape.box, .background = Color.rgba(232, 182, 90, 255), .border_color = Color.rgba(36, 112, 128, 255), .border_width = 3 } },
+        .pop_opacity,
+    };
+    var pixels: [148 * 120 * 4]u8 = undefined;
+    var plan = try scene.opacity.Plan.init(std.testing.allocator, &commands, .{ .x = 0, .y = 0, .width = 148, .height = 120 });
+    defer plan.deinit();
+    try std.testing.expectEqual(RectI{ .x = 20, .y = 30, .width = 101, .height = 73 }, plan.groups[0].bounds);
+    try render(.{ .commands = &commands }, .{ .pixels = &pixels, .width = 148, .height = 120, .stride = 148 * 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
+    try std.testing.expectEqualSlices(u8, &.{ 172, 177, 184, 255 }, pixels[(60 * 148 + 110) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 172, 177, 184, 255 }, pixels[(100 * 148 + 60) * 4 ..][0..4]);
+}
+
+test "opacity applies ancestor rounded coverage once and keeps internal clips per draw" {
+    const white: scene.Command = .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 16, .height = 16 }, .color = Color.rgba(255, 255, 255, 255) } };
+    const outer: scene.Command = .{ .push_clip_rounded = .{ .bounds = .{ .x = 2, .y = 3, .width = 13, .height = 11 }, .corner_radius = 5 } };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(0, 0, 0, 0) }, outer,
+        .{ .push_opacity = 65535 },           white,
+        white,                                .pop_opacity,
+        .pop_clip,
+    };
+    var pixels: [16 * 16 * 4]u8 = undefined;
+    const target: Target = .{ .pixels = &pixels, .width = 16, .height = 16, .stride = 64, .format = .rgba8_unorm, .allocator = std.testing.allocator };
+    try render(.{ .commands = &commands }, target);
+    // Edge coverage90 applies once to opaque completed layer, not each white draw.
+    try std.testing.expectEqualSlices(u8, &.{ 90, 90, 90, 90 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
+    commands[2].push_opacity = 32768;
+    try render(.{ .commands = &commands }, target);
+    try std.testing.expectEqualSlices(u8, &.{ 45, 45, 45, 45 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
+    const internal = [_]scene.Command{
+        commands[0], commands[2], outer, white, white, .pop_clip, .pop_opacity,
+    };
+    try render(.{ .commands = &internal }, target);
+    // Each child gets90/255, yielding about148/255 in the layer, then half.
+    try std.testing.expectEqualSlices(u8, &.{ 74, 74, 74, 74 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
 }
 
 test "rounded clip combines nested A8 coverage and masks transparent source replacement" {

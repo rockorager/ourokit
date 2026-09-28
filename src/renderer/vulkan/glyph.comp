@@ -7,7 +7,7 @@ layout(set = 0, binding = 0, std430) buffer Target {
     uvec2 pixels[];
 };
 
-layout(set = 0, binding = 1, std430) readonly buffer Atlas {
+layout(set = 3, binding = 0, std430) readonly buffer Atlas {
     uint masks[];
 };
 
@@ -29,6 +29,7 @@ layout(push_constant) uniform Push {
     float image_height;
     uint gradient_index;
     layout(offset = 96) uint clip_index;
+    layout(offset = 104) ivec2 target_origin;
 };
 
 #include "image.glsl"
@@ -63,13 +64,13 @@ void main() {
     vec2 point = vec2(left + int(x), top + int(y)) + vec2(0.5);
     uint clip = clipCoverage(clip_index, point);
     if (clip == 0u) return;
-    uint target_index = uint(top + int(y)) * target_width + uint(left + int(x));
+    uint target_index = uint(top + int(y) - target_origin.y) * target_width + uint(left + int(x) - target_origin.x);
     if (image_mode == 1u) {
         uvec2 sampled = pack16(clipScale(imageSampleLinear(point), clip));
         pixels[target_index] = sourceOver(sampled, pixels[target_index]);
         return;
     }
-    if (image_mode == 2u) {
+    if (image_mode == 2u || image_mode == 3u) {
         uint offset = ((atlas_y + y) * atlas_width + atlas_x + x * 8u) / 4u;
         uvec2 sampled = uvec2(masks[offset], masks[offset + 1u]);
         uvec4 channels;

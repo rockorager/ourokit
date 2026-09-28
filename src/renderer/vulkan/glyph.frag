@@ -37,10 +37,16 @@ void main() {
         return;
     }
     uvec2 local = uvec2(ivec2(gl_FragCoord.xy) - bounds.xy);
-    if (image_mode == 2u) {
+    if (image_mode == 2u || image_mode == 3u) {
         uint offset = ((atlas_origin.y + local.y) * atlas_width + atlas_origin.x + local.x * 8u) / 4u;
         uvec2 pixel = uvec2(masks[offset], masks[offset + 1u]);
         uvec4 channels = uvec4(pixel.x & 65535u, pixel.x >> 16u, pixel.y & 65535u, pixel.y >> 16u);
+        if (image_mode == 3u) {
+            uint opacity = uint(color.a * 65535.0 + 0.5);
+            channels = (channels * opacity + 32767u) / 65535u;
+            target_color = vec4(clipScale(channels, clip)) / 65535.0;
+            return;
+        }
         target_color = vec4(channels) / 65535.0 * color.a * clip_alpha;
         return;
     }

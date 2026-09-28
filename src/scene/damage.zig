@@ -55,6 +55,9 @@ pub const Tracker = struct {
         for (commands) |command| {
             var clip_change: ?RectI = null;
             switch (command) {
+                // Group boundaries conservatively damage their enclosing clip:
+                // children and outset shadows may exceed the Box's layout bounds.
+                .push_opacity, .pop_opacity => clip_change = clips[depth],
                 .push_clip_rect => |clip| {
                     if (depth == scene.max_clip_depth) return error.ClipStackOverflow;
                     depth += 1;
@@ -225,4 +228,28 @@ test "rounded clip radius and scope changes damage otherwise unchanged draws" {
     try std.testing.expectEqualSlices(RectI, &.{bounds}, (try tracker.compare(&moved_pop, viewport)).regions);
     const removed = [_]scene.Command{ commands[0], commands[2] };
     try std.testing.expectEqualSlices(RectI, &.{bounds}, (try tracker.compare(&removed, viewport)).regions);
+}
+
+test "opacity changes and moved group boundaries invalidate the enclosing clip" {
+    const Color = @import("../core/color.zig").Color;
+    const viewport: RectI = .{ .x = 0, .y = 0, .width = 60, .height = 40 };
+    const clip: RectI = .{ .x = 4, .y = 3, .width = 25, .height = 20 };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(255, 255, 255, 255) },
+        .{ .push_clip_rect = clip },
+        .{ .push_opacity = 32768 },
+        .{ .solid_rectangle = .{ .bounds = viewport, .color = Color.rgba(255, 0, 0, 255) } },
+        .pop_opacity,
+        .pop_clip,
+    };
+    var tracker = try Tracker.init(std.testing.allocator, commands.len);
+    defer tracker.deinit();
+    _ = try tracker.compare(&commands, viewport);
+    tracker.submitted();
+    commands[2].push_opacity = 12345;
+    try std.testing.expectEqualSlices(RectI, &.{clip}, (try tracker.compare(&commands, viewport)).regions);
+    commands[2].push_opacity = 32768;
+    try std.testing.expectEqual(@as(usize, 0), (try tracker.compare(&commands, viewport)).regions.len);
+    std.mem.swap(scene.Command, &commands[3], &commands[4]);
+    try std.testing.expectEqualSlices(RectI, &.{clip}, (try tracker.compare(&commands, viewport)).regions);
 }

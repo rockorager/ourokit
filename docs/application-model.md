@@ -908,6 +908,39 @@ effect. Multiple overlapping children blend separately at the clipped edge.
 See `examples/clip-storybook.lua` and `examples/clip-composition.lua` for nested
 clips, shadows, content, and corner hit testing.
 
+Set `opacity = 0.5` on a Box to fade its complete subtree as one group:
+
+```lua
+ouro.box {
+  opacity = 0.5, padding = 16, radius = 12, surface = "card",
+  ouro.text {text = "The card and its content fade together"},
+}
+```
+
+Opacity must be a finite number from zero to one; omitted or nil means one.
+The Box's own background, border, outline, shadow, and children render into a
+transparent linear-light surface, which is then scaled and composited once.
+Overlapping opaque children do not become extra dark in their overlap. Nested
+groups composite independently. Ancestor rounded clips apply once to the
+finished group; clips declared inside it still apply separately to each draw.
+
+Opacity is paint-only: changing it preserves layout, identity, state, focus,
+semantics, and pointer behavior. Zero opacity is invisible but still interactive;
+disable its controls or omit the subtree when interaction should stop.
+Exactly one uses the ordinary rendering path without a layer. Values are
+quantized to 16-bit coverage. The existing `ouro.animation` render callback can
+drive opacity just like other numeric Box properties.
+
+Anchored floating content is painted separately in the window's overlay plane.
+It escapes inline ancestor opacity, just as it escapes their clips. Set opacity
+on the floating Box itself to fade a popup; nested popups remain independent.
+
+Temporary layers are cropped to painted bounds, including overflowing children
+and shadows, and limited to 64 MiB of pixels per submission, 1024 groups, and
+16 nested groups. Exceeding a limit returns a rendering error rather than
+silently dropping the effect. See `examples/opacity-storybook.lua` and
+`examples/opacity-composition.lua` for overlap, nested clips, input, and fades.
+
 Boxes accept one optional outset `shadow`:
 
 ```lua
@@ -978,7 +1011,8 @@ measured against the window viewport, positioned after normal layout, and drawn
 after ordinary content. Its paint and hit testing escape ancestor Scroll clips
 and layout bounds, while event routing and retained identity keep their logical
 ancestry. Later overlays draw above earlier ones; nested overlays draw above
-their containing overlay. Hidden ancestors suppress their overlays.
+their containing overlay. Hidden ancestors suppress their overlays. Inline
+ancestor opacity does not fade floating content; set it on the floating Box.
 
 Options are `side="top" | "bottom" | "left" | "right"` (default `"bottom"`),
 `alignment="start" | "center" | "end"` (default `"start"`, along the side's

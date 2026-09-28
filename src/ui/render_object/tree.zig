@@ -635,6 +635,8 @@ pub const Tree = struct {
             .width = target.size.width,
             .height = target.size.height,
         };
+        const isolated = target.object == .box and target.object.box.opacity != 1;
+        if (isolated) try builder.pushOpacity(target.object.box.opacity);
         const clips = switch (target.object) {
             .box => |value| paint: {
                 if (value.shadow) |shadow| try builder.boxShadow(bounds, value.corner_radius, shadow);
@@ -755,6 +757,7 @@ pub const Tree = struct {
             child = if (target.object == .anchored) null else next;
         }
         if (clips) try builder.popClip();
+        if (isolated) try builder.popOpacity();
         target.needs_paint = false;
     }
 
@@ -2213,6 +2216,49 @@ test "box outlines stay paint-only and inset rings paint above the background" {
         }, outline.bounds);
         try std.testing.expectEqual(@as(u32, if (inset) 2 else 8), outline.corner_radius);
         try std.testing.expectEqual(@as(u32, 2), outline.border_width);
+    }
+}
+
+test "box opacity wraps own paint and children without layout or hit changes" {
+    const scene = @import("../../scene/root.zig");
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    var box: types.Box = .{ .opacity = 0.5, .clip = true, .corner_radius = 6, .background = Color.rgba(255, 255, 255, 255), .shadow = .{ .offset = .{ .x = 4, .y = 3 }, .color = Color.rgba(0, 0, 0, 255) } };
+    const root = try tree.create(.{ .box = box });
+    const child = try tree.create(.{ .box = .{ .background = Color.rgba(0, 0, 255, 255) } });
+    try tree.appendChild(root, child, .none);
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 40, .height = 30 }));
+    var storage: [12]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&storage, 1.5);
+    try tree.buildScene(root, &builder);
+    try builder.displayList().validate();
+    try std.testing.expectEqual(@as(u16, 32768), storage[0].push_opacity);
+    try std.testing.expect(storage[1] == .shadow);
+    try std.testing.expect(storage[2] == .decorated_rectangle);
+    try std.testing.expect(storage[3] == .push_clip_rounded);
+    try std.testing.expect(storage[builder.count - 2] == .pop_clip);
+    try std.testing.expect(storage[builder.count - 1] == .pop_opacity);
+    const count = builder.count;
+    box.opacity = 0;
+    try tree.update(root, .{ .box = box });
+    try std.testing.expect(!try tree.layoutDirty(root));
+    try std.testing.expect(try tree.paintDirty(root));
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 20, .y = 15 })).?);
+    builder = try scene_builder.Builder.init(&storage, 1.5);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(@as(u16, 0), storage[0].push_opacity);
+    try std.testing.expectEqual(count, builder.count);
+    box.opacity = 1;
+    try tree.update(root, .{ .box = box });
+    builder = try scene_builder.Builder.init(&storage, 1.5);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(count - 2, builder.count);
+    try std.testing.expect(storage[0] == .shadow);
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(root));
+    for ([_]f32{ -0.01, 1.01, std.math.nan(f32), std.math.inf(f32) }) |invalid| {
+        box.opacity = invalid;
+        try std.testing.expectError(error.InvalidOpacity, tree.update(root, .{ .box = box }));
     }
 }
 

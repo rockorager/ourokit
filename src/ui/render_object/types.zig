@@ -19,6 +19,8 @@ pub const Box = struct {
     /// Retains layout and state while suppressing painting and hit testing for
     /// this box and its complete subtree.
     hidden: bool = false,
+    /// Isolated opacity of own paint and children. Does not affect hit testing.
+    opacity: f32 = 1,
     width: ?f32 = null,
     height: ?f32 = null,
     fill_width: bool = false,

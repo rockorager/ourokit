@@ -18,6 +18,8 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
         .clear => |color| try append(output, &used, "clear rgba({d},{d},{d},{d})\n", .{
             color.r, color.g, color.b, color.a,
         }),
+        .push_opacity => |alpha| try append(output, &used, "push_opacity alpha={d}\n", .{alpha}),
+        .pop_opacity => try append(output, &used, "pop_opacity\n", .{}),
         .push_clip_rect => |clip| try append(
             output,
             &used,
