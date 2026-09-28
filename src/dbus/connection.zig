@@ -38,6 +38,8 @@ pub const Client = struct {
     read_cancel: bool = false,
     write_cancel: bool = false,
     timer: ?io.OperationHandle = null,
+    /// Handshake phase when `timer` was armed; see `armStartupTimer`.
+    timer_phase: Phase = .closed,
     next_serial: u64 = 1,
     hello_serial: u32 = 0,
     unix_fds: bool = false,
@@ -64,7 +66,9 @@ pub const Client = struct {
     pub fn init(self: *Client, allocator: std.mem.Allocator, loop: *io.Loop, addresses: []const u8) !void {
         self.* = .{ .allocator = allocator, .loop = loop, .addresses = try allocator.dupe(u8, addresses), .phase = .connecting };
         errdefer self.deinitImmediate();
-        self.timer = try loop.prepareTimeout(startup_timeout_ns);
+        // The startup deadline is armed by the host's first collectCanceled,
+        // not here: hosts may do seconds of synchronous work before the loop
+        // first submits the connect, and that must not count against the bus.
         try self.tryNextAddress();
     }
 
@@ -196,7 +200,10 @@ pub const Client = struct {
         const timer = self.timer orelse return false;
         if (!same(timer, operation)) return false;
         self.timer = null;
-        if (!self.isReady()) self.fail(error.Timeout);
+        // A handshake step completed since the deadline was armed, so the bus
+        // is answering and a stalled host made the timer late. The next
+        // collectCanceled arms a fresh deadline for the current step.
+        if (!self.isReady() and self.phase == self.timer_phase) self.fail(error.Timeout);
         return true;
     }
 
@@ -210,11 +217,13 @@ pub const Client = struct {
         try self.collectCanceled();
     }
 
-    /// Also pumps queued writes and retries SQ backpressure. Call at each
-    /// host safe point before submission, not just after cancel completions.
+    /// Also pumps queued writes, retries SQ backpressure and arms the startup
+    /// deadline. Call at each host safe point before submission, not just
+    /// after cancel completions.
     pub fn collectCanceled(self: *Client) !void {
         if (self.phase == .closed) return;
         if (self.phase != .closing) {
+            self.armStartupTimer() catch |err| return self.fail(err);
             self.pump() catch |err| {
                 if (err != error.SubmissionQueueFull) self.fail(err);
             };
@@ -254,6 +263,17 @@ pub const Client = struct {
         std.debug.assert(self.canDeinit());
         self.deinitImmediate();
         self.* = undefined;
+    }
+
+    /// The deadline bounds how long one handshake step may go unanswered, and
+    /// starts only when the host pumps the connection, so time the host spends
+    /// elsewhere before submitting is not blamed on the bus. dispatchTimer
+    /// fails only when no step completed since arming. The handshake has a
+    /// fixed number of phases, so a trickling bus still fails in bounded time.
+    fn armStartupTimer(self: *Client) !void {
+        if (self.phase == .ready or self.timer != null) return;
+        self.timer = try self.loop.prepareTimeout(startup_timeout_ns);
+        self.timer_phase = self.phase;
     }
 
     fn tryNextAddress(self: *Client) !void {
@@ -644,7 +664,116 @@ test "D-Bus startup timeout cancels a silent abstract bus without leaking operat
     try std.testing.expectEqual(error.Timeout, client.failure.?);
 }
 
+test "D-Bus startup deadline ignores host stalls before and during a responsive handshake" {
+    const a = std.testing.allocator;
+    var loop: io.Loop = undefined;
+    try loop.init(a, 16, 8);
+    defer loop.deinit();
+    const address_text = try std.fmt.allocPrint(a, "unix:abstract=ouro-dbus-stall-{d}", .{linux.getpid()});
+    defer a.free(address_text);
+    const address = try parseAddress(address_text);
+    const opened = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+    var bus: TestBus = .{ .listener = @intCast(opened) };
+    defer _ = linux.close(bus.listener);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(bus.listener, @ptrCast(&address.address), address.length)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(bus.listener, 1)));
+    var client: Client = undefined;
+    try client.init(a, &loop, address_text);
+    defer client.deinit();
+    const thread = try std.Thread.spawn(.{}, TestBus.run, .{&bus});
+    defer thread.join();
+    var unused: Client = .{ .allocator = a, .loop = &loop };
+    defer testDrain(&loop, &client, &unused) catch unreachable;
+    const stall: linux.timespec = .{ .sec = 1, .nsec = 200 * std.time.ns_per_ms };
+    // Synchronous host startup work after init, before the first submit.
+    _ = linux.nanosleep(&stall, null);
+    // Another stall while the bus has already answered the AUTH line.
+    while (client.phase != .auth_recv and client.failure == null) try testStep(&loop, &client, &unused);
+    _ = linux.nanosleep(&stall, null);
+    while (!client.isReady() and client.failure == null) try testStep(&loop, &client, &unused);
+    try std.testing.expectEqual(@as(?anyerror, null), client.failure);
+    try std.testing.expect(client.timer == null);
+}
+
+/// A responsive bus on its own thread: answers the SASL handshake and Hello
+/// immediately, then waits for the client to hang up.
+const TestBus = struct {
+    listener: linux.fd_t,
+    buffer: [4096]u8 = undefined,
+    length: usize = 0,
+    line_buffer: [256]u8 = undefined,
+
+    /// Any protocol error closes the socket, which the client observes.
+    fn run(self: *TestBus) void {
+        self.serve() catch {};
+    }
+
+    fn serve(self: *TestBus) !void {
+        const accepted = linux.accept(self.listener, null, null);
+        if (linux.errno(accepted) != .SUCCESS) return error.AcceptFailed;
+        const fd: linux.fd_t = @intCast(accepted);
+        defer _ = linux.close(fd);
+        if (!std.mem.startsWith(u8, try self.line(fd), "\x00AUTH EXTERNAL ")) return error.UnexpectedAuth;
+        try writeAll(fd, "OK 0123456789abcdef0123456789abcdef\r\n");
+        if (!std.mem.eql(u8, try self.line(fd), "NEGOTIATE_UNIX_FD")) return error.UnexpectedNegotiate;
+        try writeAll(fd, "AGREE_UNIX_FD\r\n");
+        if (!std.mem.eql(u8, try self.line(fd), "BEGIN")) return error.UnexpectedBegin;
+        while ((try wire.messageLength(self.buffer[0..self.length])) == null) try self.fill(fd);
+        const length = (try wire.messageLength(self.buffer[0..self.length])).?;
+        const hello = try wire.parseMessage(std.testing.allocator, self.buffer[0..length], &.{});
+        if (!std.mem.eql(u8, hello.header.member orelse "", "Hello")) return error.UnexpectedHello;
+        var body = wire.Encoder.init(std.testing.allocator);
+        defer body.deinit();
+        try body.string(":1.1");
+        const reply = try wire.encodeMessage(std.testing.allocator, .{ .message_type = .method_return, .reply_serial = hello.header.serial, .sender = "org.freedesktop.DBus", .destination = ":1.1", .signature = "s" }, 1, body.bytes(), 0);
+        defer std.testing.allocator.free(reply);
+        try writeAll(fd, reply);
+        // Hold the connection open until the client closes it.
+        while (true) {
+            const result = linux.read(fd, &self.buffer, self.buffer.len);
+            if (linux.errno(result) == .INTR) continue;
+            if (linux.errno(result) != .SUCCESS or result == 0) return;
+        }
+    }
+
+    /// Returns the next CRLF-terminated line and keeps any bytes after it.
+    fn line(self: *TestBus, fd: linux.fd_t) ![]const u8 {
+        while (true) {
+            if (std.mem.indexOf(u8, self.buffer[0..self.length], "\r\n")) |end| {
+                if (end > self.line_buffer.len) return error.LineTooLong;
+                @memcpy(self.line_buffer[0..end], self.buffer[0..end]);
+                std.mem.copyForwards(u8, self.buffer[0 .. self.length - end - 2], self.buffer[end + 2 .. self.length]);
+                self.length -= end + 2;
+                return self.line_buffer[0..end];
+            }
+            try self.fill(fd);
+        }
+    }
+
+    fn fill(self: *TestBus, fd: linux.fd_t) !void {
+        if (self.length == self.buffer.len) return error.BufferFull;
+        const result = linux.read(fd, self.buffer[self.length..].ptr, self.buffer.len - self.length);
+        if (linux.errno(result) == .INTR) return;
+        if (linux.errno(result) != .SUCCESS or result == 0) return error.ConnectionClosed;
+        self.length += result;
+    }
+
+    fn writeAll(fd: linux.fd_t, bytes: []const u8) !void {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const result = linux.write(fd, bytes[written..].ptr, bytes.len - written);
+            if (linux.errno(result) == .INTR) continue;
+            if (linux.errno(result) != .SUCCESS or result == 0) return error.WriteFailed;
+            written += result;
+        }
+    }
+};
+
 fn testStep(loop: *io.Loop, first: *Client, second: *Client) !void {
+    // Hosts pump every connection at a safe point before each submission.
+    try first.collectCanceled();
+    try second.collectCanceled();
     _ = try loop.submit();
     switch (loop.dispatch(try loop.wait())) {
         .socket => |completion| if (!(try first.dispatch(completion)) and !(try second.dispatch(completion))) return error.UnownedCompletion,
