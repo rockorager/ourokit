@@ -1,5 +1,5 @@
 #!/bin/sh
-# Called only by build steps linking the full ourokit module. A packager can
+# Used by the full toolkit and opt-in ourokit_ui path rasterization. A packager can
 # build/install this same bridge and use -Dresvg-system=true instead of Cargo.
 set -eu
 manifest=$1

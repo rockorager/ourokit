@@ -125,3 +125,28 @@ test "native surface reports node and scene capacity failures" {
     _ = try too_few_commands.layout(.{ .width = 240, .height = 32 });
     try std.testing.expectError(error.SceneCapacityExceeded, too_few_commands.buildDisplayList(1));
 }
+
+test "native path rasterization is opt in and disabled rendering leaves pixels intact" {
+    const path = try ui.path.Path.create(std.testing.allocator, &.{
+        .{ .move = .{ .x = 1, .y = 1 } },
+        .{ .line = .{ .x = 4, .y = 1 } },
+        .{ .line = .{ .x = 4, .y = 3 } },
+        .{ .line = .{ .x = 1, .y = 3 } },
+        .close,
+    }, .{ .fill = .nonzero });
+    defer path.release();
+    const commands = [_]ui.scene.Command{
+        .{ .clear = ui.core.Color.rgba(7, 11, 19, 255) },
+        .{ .path = .{ .path = path, .identity = path.identity, .origin = .{}, .scale = 1, .bounds = try ui.path.deviceBounds(path, .{}, 1), .color = ui.core.Color.rgba(211, 23, 71, 255) } },
+    };
+    var pixels: [6 * 5 * 4]u8 = @splat(91);
+    const target: ui.software.Target = .{ .pixels = &pixels, .width = 6, .height = 5, .stride = 6 * 4, .format = .rgba8_unorm, .allocator = std.testing.allocator };
+    if (ui.path.has_rasterizer) {
+        try ui.software.render(.{ .commands = &commands }, target);
+        try std.testing.expectEqualSlices(u8, &.{ 211, 23, 71, 255 }, pixels[(2 * 6 + 2) * 4 ..][0..4]);
+        try std.testing.expectEqualSlices(u8, &.{ 7, 11, 19, 255 }, pixels[0..4]);
+    } else {
+        try std.testing.expectError(error.PathRasterizerDisabled, ui.software.render(.{ .commands = &commands }, target));
+        try std.testing.expectEqualSlices(u8, &(@as([pixels.len]u8, @splat(91))), &pixels);
+    }
+}

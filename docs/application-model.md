@@ -1760,7 +1760,7 @@ local picture = ouro.drawing {
 ouro.canvas { key = "preview", drawing = picture, alt = "Overlapping color samples" }
 ```
 
-The required `rectangles` field is a dense array of at most 4096 records; an
+The `rectangles` field is a dense array of at most 4096 records; an
 empty array is valid. Each record requires `x`, `y`, `width`, `height`, and
 `color`; `corner_radius` defaults to zero. Colors use `#RRGGBB` or `#RRGGBBAA`
 straight-alpha sRGB. Records paint in array order using linear-light
@@ -1786,11 +1786,48 @@ and retained render objects hold independent leases, so failed builds/reloads
 cannot invalidate the committed picture. Scenes contain copied paint commands.
 Normal scene-capacity and device-coordinate limits still apply when painting.
 
-This initial constructor supports solid and rounded rectangles only, matching
-the existing [native drawing contract](native-plugins.md#custom-painted-widgets).
-Paths, strokes, gradients, shadows, and arbitrary transforms are not implemented.
+For ordered rectangles and vector paths, pass `commands` **instead of**
+`rectangles`. Exactly one array is required, with at most 4096 paint commands:
+
+```lua
+local picture = ouro.drawing {
+  width = 160, height = 100,
+  commands = {
+    { kind = "rectangle", x = 0, y = 0, width = 160, height = 100,
+      color = "#182430" },
+    { kind = "fill", color = "#39bda480", fill_rule = "even_odd",
+      path = {{"move", 12, 12}, {"line", 120, 20}, {"line", 40, 80}, {"close"}} },
+    { kind = "stroke", color = "#e85d75", width = 3, cap = "round", join = "round",
+      path = {{"move", 16, 70}, {"quadratic", 60, 0, 90, 60},
+              {"cubic", 110, 90, 130, 10, 148, 55}} },
+  },
+}
+```
+
+`fill_rule` is `"nonzero"` (default) or `"even_odd"`. Strokes require a positive
+finite `width`; `cap` is `"butt"` (default), `"round"`, or `"square"`; `join` is
+`"miter"` (default), `"round"`, or `"bevel"`. `miter_limit` defaults to 4 and must
+be finite and at least 1. Rectangle commands use the same fields as above.
+
+Each path is a dense array of at most 4096 segment records, with at most 65536
+records across one drawing. Records have exactly the positional fields shown:
+`{"move", x, y}`, `{"line", x, y}`, `{"quadratic", cx, cy, x, y}`,
+`{"cubic", c1x, c1y, c2x, c2y, x, y}`, or `{"close"}`. A contour starts with
+`move`; after `close`, another `move` is required. Fills implicitly close open
+contours. Empty and move-only paths paint nothing. Geometry and style are copied,
+including nested segment arrays. Colors blend once through antialiased A8
+coverage in linear light; intersections within a stroke do not add extra alpha.
+
+Each rasterized path is limited to 8192 pixels per axis and 16 Mi pixels,
+including conservative stroke/antialiasing padding. The coverage cache is bounded
+to 32 MiB; extreme geometry may be accepted at construction but rejected when
+painted at a particular display scale. Arcs, dashes, gradients, shadows, arbitrary
+transforms, and path clips are not implemented. The experimental native plugin
+ABI still exposes rectangles only; its ABI is unchanged.
+
 See `examples/drawing-composition.lua` for shared, replaced, and constrained
-drawings.
+rectangles, and `examples/path-storybook.lua` and `examples/path-composition.lua`
+for path styles and retained path drawings.
 
 ### Images and icons load asynchronously
 

@@ -141,6 +141,13 @@ Images remain caller-decoded at this boundary: insert an `ImageBitmap` into an
 `ImageCache`, call `Surface.attachImageCache`, and render with
 `software.renderResources`. Neither Cargo nor the image decoders are required.
 
+Immutable `path` geometry and bounds are always available. Rendering nonempty
+paths requires opting into `-Dui-paths=true` (dependency option `.@"ui-paths" = true`),
+which builds the tiny-skia/resvg bridge with Cargo or links a supplied ABI-2 bridge
+with `-Dresvg-system=true`. Without it, rendering a nonempty path returns
+`error.PathRasterizerDisabled` before changing the target. The full `ourokit`
+module always enables path rasterization.
+
 Text remains explicit: a caller that uses Text render objects must create and
 attach its own paragraph source/layout caches, and text-capable software
 rendering requires caller-owned glyph/font caches. Fontconfig discovery is

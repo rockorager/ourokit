@@ -8,8 +8,20 @@ const ShapeHandle = @import("../text/shape_cache.zig").ShapeHandle;
 const ShapeCache = @import("../text/shape_cache.zig").ShapeCache;
 const ImageHandle = @import("../image/cache.zig").ImageHandle;
 const ImageCache = @import("../image/cache.zig").Cache;
+const paths = @import("../path/root.zig");
 
 pub const DamageTracker = @import("damage.zig").Tracker;
+
+/// The display list borrows immutable native geometry; Frame retains it.
+/// Identity is copied so damage history never needs to dereference old paths.
+pub const Path = struct {
+    path: *const paths.Path,
+    identity: u64,
+    origin: PointF,
+    scale: f32,
+    bounds: RectI,
+    color: Color,
+};
 
 pub const Image = struct {
     image: ImageHandle,
@@ -50,8 +62,8 @@ pub const DecoratedRectangle = struct {
     blend: BlendMode = .source_over,
 };
 
-/// Renderer-neutral, value-only painting vocabulary. Clip commands are
-/// balanced and affect subsequent drawing until `pop_clip`.
+/// Renderer-neutral painting values and immutable native resources. No Lua or
+/// plugin callbacks. Clips affect subsequent drawing until `pop_clip`.
 pub const Command = union(enum) {
     clear: Color,
     push_clip_rect: RectI,
@@ -69,6 +81,7 @@ pub const Command = union(enum) {
     /// complete; renderers only rasterize the referenced glyph sequence.
     paragraph: Paragraph,
     image: Image,
+    path: Path,
 };
 
 pub const Damage = union(enum) {
@@ -124,7 +137,7 @@ pub const DisplayList = struct {
                     (rect.border_color == null or rect.border_color.?.a == 255) and
                     std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
             },
-            .glyph_run, .paragraph, .image => {},
+            .glyph_run, .paragraph, .image, .path => {},
         };
         return result and depth == 0;
     }
@@ -140,6 +153,11 @@ pub const DisplayList = struct {
             },
             .solid_rectangle => {},
             .image => |value| if (value.image.generation == 0) return error.InvalidImage,
+            .path => |value| {
+                if (value.identity == 0 or value.identity != value.path.identity or
+                    !std.meta.eql(value.bounds, try paths.deviceBounds(value.path, value.origin, value.scale)))
+                    return error.InvalidPath;
+            },
             .decorated_rectangle => |rectangle| {
                 if (rectangle.background == null and rectangle.border_color == null)
                     return error.EmptyDecoratedRectangle;
@@ -215,6 +233,7 @@ pub fn occludedByNextDraw(
         .glyph_run => if (!clips[depth].isEmpty()) return false,
         .paragraph => if (!clips[depth].isEmpty()) return false,
         .image => |value| if (!RectI.intersect(value.bounds, clips[depth]).isEmpty()) return false,
+        .path => |value| if (!RectI.intersect(value.bounds, clips[depth]).isEmpty()) return false,
     };
     return false;
 }
@@ -346,6 +365,11 @@ pub const Frame = struct {
             },
             else => {},
         };
+        // No fallible operations remain after acquiring these native leases.
+        for (owned_commands) |command| switch (command) {
+            .path => |value| @constCast(value.path).retain(),
+            else => {},
+        };
         return .{
             .allocator = allocator,
             .command_storage = owned_commands,
@@ -361,6 +385,10 @@ pub const Frame = struct {
     }
 
     pub fn deinit(self: *Frame) void {
+        for (self.command_storage) |command| switch (command) {
+            .path => |value| @constCast(value.path).release(),
+            else => {},
+        };
         if (self.shape_cache) |cache| for (self.shape_leases) |handle|
             cache.release(handle) catch unreachable;
         if (self.paragraph_cache) |cache| for (self.paragraph_leases) |handle|
@@ -575,4 +603,63 @@ test "opacity proof recognizes retained root coverage but not gaps clips or roun
     commands[2].decorated_rectangle.border_width = 1;
     commands[2].decorated_rectangle.border_color = Color.rgba(1, 2, 3, 254);
     try std.testing.expect(!list.isOpaque(extent));
+}
+
+test "path frames own geometry and damage never resolves released paths" {
+    const allocator = std.testing.allocator;
+    const geometry = [_]paths.Command{
+        .{ .move = .{ .x = 3, .y = 2 } },
+        .{ .line = .{ .x = 17, .y = 5 } },
+        .{ .line = .{ .x = 7, .y = 13 } },
+        .close,
+    };
+    const path = try paths.Path.create(allocator, &geometry, .{ .fill = .nonzero });
+    var initial_owned = true;
+    defer if (initial_owned) path.release();
+    const origin: PointF = .{ .x = -1.25, .y = 2.5 };
+    var commands = [_]Command{.{ .path = .{
+        .path = path,
+        .identity = path.identity,
+        .origin = origin,
+        .scale = 1.5,
+        .bounds = try paths.deviceBounds(path, origin, 1.5),
+        .color = Color.rgba(13, 170, 31, 128),
+    } }};
+    try std.testing.checkAllAllocationFailures(allocator, testPathFrameAllocation, .{&commands});
+    var frame = try Frame.init(allocator, &commands, .full);
+    var frame_owned = true;
+    defer if (frame_owned) frame.deinit();
+    path.release();
+    initial_owned = false;
+    var cache = paths.MaskCache.init(allocator);
+    defer cache.deinit();
+    const value = frame.command_storage[0].path;
+    const mask = try cache.get(value.path, value.origin, value.scale);
+    try std.testing.expect(std.mem.indexOfScalar(u8, mask.pixels, 255) != null);
+    try frame.displayList().validate();
+    try std.testing.expect(!frame.displayList().isOpaque(value.bounds));
+    var tracker = try DamageTracker.init(allocator, 1);
+    defer tracker.deinit();
+    const viewport: RectI = .{ .x = 0, .y = 0, .width = 64, .height = 48 };
+    _ = try tracker.compare(frame.command_storage, viewport);
+    tracker.submitted();
+    try std.testing.expectEqual(@as(usize, 0), (try tracker.compare(frame.command_storage, viewport)).regions.len);
+    frame.deinit(); // History still contains the freed address but never reads it.
+    frame_owned = false;
+    const replacement = try paths.Path.create(allocator, &geometry, .{ .fill = .nonzero });
+    defer replacement.release();
+    try std.testing.expect(replacement.identity != value.identity);
+    commands[0].path.path = replacement;
+    commands[0].path.identity = replacement.identity;
+    const damage = try tracker.compare(&commands, viewport);
+    try std.testing.expectEqual(@as(usize, 1), damage.regions.len);
+    try std.testing.expectEqual(RectI.intersect(value.bounds, viewport), damage.regions[0]);
+    commands[0].path.bounds.width += 1;
+    try std.testing.expectError(error.InvalidPath, (DisplayList{ .commands = &commands }).validate());
+}
+
+fn testPathFrameAllocation(allocator: std.mem.Allocator, commands: []const Command) !void {
+    var frame = try Frame.init(allocator, commands, .full);
+    defer frame.deinit();
+    try frame.displayList().validate();
 }

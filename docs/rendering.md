@@ -2,10 +2,11 @@
 
 ## Scene and color contract
 
-The display list contains value commands for clear, solid rectangles, and a
-balanced rectangular clip stack. A borrowed `DisplayList` supports immediate
-consumption. An owning `Frame` copies command and damage storage so worker
-threads and asynchronous backends can safely retain it through completion.
+The display list contains clear, rectangle, text, image, and immutable path
+commands plus a balanced rectangular clip stack. A borrowed `DisplayList`
+supports immediate consumption. An owning `Frame` copies command and damage
+storage and retains path geometry through completion. Text and image resources
+keep their existing cache-lifetime contracts.
 
 Scene and design `Color` values, including Lua hex literals and Radix tokens,
 are straight-alpha, 8-bit sRGB. Renderers decode RGB with the piecewise sRGB
@@ -35,11 +36,10 @@ images and UI colors compose without encoded-space blending. Storybook
 and renderer-review PNG exports unassociate presentation pixels without another
 transfer; PNG files contain straight sRGB rather than Wayland premultiplied RGB.
 
-Integer device-pixel geometry gives clear first rasterization rules. Rectangular
-damage regions must not overlap, preventing source-over commands from being
-applied twice. Transforms, subpixel edge coverage, path clipping, and layer
-isolation remain deliberately uncommitted until equivalent software and Vulkan
-prototypes validate their semantics.
+Rectangular damage regions must not overlap, preventing source-over commands
+from being applied twice. Rectangles use integer device-pixel bounds; paths and
+glyphs carry antialiased coverage. Arbitrary transforms, path clipping, and layer
+isolation remain unsupported.
 
 Both backends avoid issuing a draw when the next non-empty draw completely
 replaces its clipped pixels. Opaque source-over rectangles, all source-mode
@@ -51,7 +51,39 @@ The scene has no Lua, Wayland, `wl_shm`, stride, pixel format, or Vulkan state.
 UI layout uses logical floating-point geometry above this contract. The
 headless scene builder applies output scale and conservatively rounds logical
 edges outward into device-space display-list rectangles. Pixel formats and row
-layout remain backend-only. Subpixel coverage is still deliberately unfrozen.
+layout remain backend-only.
+
+## Immutable vector paths
+
+`path.Path` copies move/line/quadratic/cubic/close geometry and fill/stroke style.
+It has an atomic native reference count and a non-reused identity. Drawings and
+owning scene frames retain independent leases; borrowed display lists require
+the caller to keep geometry alive. Damage history compares copied identities
+and bounds without dereferencing released geometry. Path commands preserve
+opacity but never establish rectangular coverage for opacity or occlusion proofs.
+
+The pinned tiny-skia implementation behind the private resvg bridge rasterizes
+each fill or whole stroked outline into A8. Both renderers consume the same mask,
+multiply linear-premultiplied color by coverage, and composite source-over.
+The headless software and Vulkan compute backends require exact pixel parity;
+graphics presentation retains its existing rounding tolerance. The native plugin
+rectangle ABI is unchanged. Packagers using `-Dresvg-system=true` must supply
+private bridge ABI 2, including `ourokit_path_mask` as well as the SVG functions.
+
+Mask keys include geometry identity, exact display-scale bits, and the origin's
+nearest 1/64-pixel phase. Integer translation and color do not change coverage.
+Bounds use a conservative control-point hull, stroke expansion, and one pixel of
+antialiasing padding. Each dimension is at most 8192 pixels and each mask at most
+16 Mi pixels. The LRU CPU cache is limited to 32 MiB including entry metadata;
+these bounds exclude temporary rasterizer storage. Zig allocation failures are
+recoverable; internal Rust allocations retain the existing resvg process-OOM
+abort policy.
+
+The Wayland software runner keeps a persistent mask cache; standalone software
+targets may supply `path_masks` or use a temporary per-render cache. Vulkan keeps
+a persistent CPU cache and deduplicates uploads by mask key per submission.
+Uploads are bounded to 32 MiB and device storage-buffer limits, and remain owned
+by the target until its fence completes. There is no GPU path atlas or new shader.
 
 ## Software backend
 

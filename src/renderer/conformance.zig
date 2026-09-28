@@ -81,3 +81,66 @@ test "software backend satisfies exact integer conformance fixtures" {
         };
     }
 }
+
+test "path coverage preserves holes paint order clips and backend parity" {
+    const paths = @import("../path/root.zig");
+    const allocator = std.testing.allocator;
+    const fill = try paths.Path.create(allocator, &.{
+        .{ .move = .{ .x = 2, .y = 2 } },
+        .{ .line = .{ .x = 22, .y = 2 } },
+        .{ .line = .{ .x = 22, .y = 18 } },
+        .{ .line = .{ .x = 2, .y = 18 } },
+        .close,
+        .{ .move = .{ .x = 7, .y = 6 } },
+        .{ .line = .{ .x = 15, .y = 6 } },
+        .{ .line = .{ .x = 15, .y = 12 } },
+        .{ .line = .{ .x = 7, .y = 12 } },
+        .close,
+    }, .{ .fill = .even_odd });
+    defer fill.release();
+    const stroke = try paths.Path.create(allocator, &.{
+        .{ .move = .{ .x = 3, .y = 25 } },
+        .{ .quadratic = .{ .control = .{ .x = 9, .y = 14 }, .to = .{ .x = 16, .y = 24 } } },
+        .{ .cubic = .{ .control1 = .{ .x = 23, .y = 33 }, .control2 = .{ .x = 31, .y = 14 }, .to = .{ .x = 37, .y = 26 } } },
+    }, .{ .stroke = .{ .width = 2.5, .cap = .round, .join = .bevel } });
+    defer stroke.release();
+    const origin = @import("../core/geometry.zig").PointF{ .x = 0.25, .y = 0.5 };
+    const commands = [_]scene.Command{
+        .{ .clear = Color.rgba(7, 11, 19, 255) },
+        .{ .path = .{ .path = fill, .identity = fill.identity, .origin = .{}, .scale = 1, .bounds = try paths.deviceBounds(fill, .{}, 1), .color = Color.rgba(220, 50, 80, 128) } },
+        .{ .path = .{ .path = stroke, .identity = stroke.identity, .origin = origin, .scale = 1.25, .bounds = try paths.deviceBounds(stroke, origin, 1.25), .color = Color.rgba(30, 210, 95, 173) } },
+        .{ .push_clip_rect = .{ .x = 28, .y = 0, .width = 5, .height = 20 } },
+        .{ .path = .{ .path = fill, .identity = fill.identity, .origin = .{ .x = 24 }, .scale = 1, .bounds = try paths.deviceBounds(fill, .{ .x = 24 }, 1), .color = Color.rgba(13, 25, 231, 255) } },
+        .pop_clip,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 3, .y = 3, .width = 2, .height = 2 }, .color = Color.rgba(251, 197, 29, 255) } },
+    };
+    var expected: [48 * 40 * 4]u8 = undefined;
+    try software.render(.{ .commands = &commands }, .{ .pixels = &expected, .width = 48, .height = 40, .stride = 48 * 4, .format = .rgba8_unorm, .allocator = allocator });
+    // Independently calculated sRGB linear-light source-over at full coverage.
+    try std.testing.expectEqualSlices(u8, &.{ 162, 36, 59, 255 }, expected[(4 * 48 + 19) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 11, 19, 255 }, expected[(8 * 48 + 9) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 251, 197, 29, 255 }, expected[(3 * 48 + 3) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 13, 25, 231, 255 }, expected[(4 * 48 + 29) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 11, 19, 255 }, expected[(4 * 48 + 34) * 4 ..][0..4]);
+    if (@import("ourokit_build_options").vulkan) {
+        const vulkan = @import("vulkan/root.zig");
+        var renderer = vulkan.init(allocator) catch |err| switch (err) {
+            error.VulkanUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer renderer.deinit();
+        var target = try vulkan.Target.init(&renderer, 48, 40);
+        defer target.deinit(&renderer);
+        try renderer.render(.{ .commands = &commands }, &target);
+        var actual: @TypeOf(expected) = undefined;
+        try target.readPixels(&actual, 48 * 4, .rgba8_unorm);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        // Each damage traversal must restart the path-upload command index.
+        try renderer.render(.{ .commands = &commands, .damage = .{ .regions = &.{
+            .{ .x = 1, .y = 1, .width = 22, .height = 17 },
+            .{ .x = 26, .y = 0, .width = 11, .height = 20 },
+        } } }, &target);
+        try target.readPixels(&actual, 48 * 4, .rgba8_unorm);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+    }
+}

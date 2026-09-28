@@ -2,21 +2,51 @@ const std = @import("std");
 const geometry = @import("../../core/geometry.zig");
 const Color = @import("../../core/color.zig").Color;
 const Builder = @import("scene_builder.zig").Builder;
+const Path = @import("../../path/root.zig").Path;
 
 pub const Rectangle = struct {
     bounds: geometry.RectF,
     color: Color,
     corner_radius: f32 = 0,
+
+    fn validate(self: Rectangle) !void {
+        const bounds = self.bounds;
+        if (!std.math.isFinite(bounds.x) or !std.math.isFinite(bounds.y) or
+            !std.math.isFinite(bounds.width) or !std.math.isFinite(bounds.height) or
+            !std.math.isFinite(bounds.x + bounds.width) or !std.math.isFinite(bounds.y + bounds.height) or
+            bounds.width < 0 or bounds.height < 0 or
+            !std.math.isFinite(self.corner_radius) or self.corner_radius < 0)
+            return error.InvalidDrawingRectangle;
+    }
+
+    fn paint(self: Rectangle, builder: *Builder, origin: geometry.RectF) !void {
+        const positioned: geometry.RectF = .{
+            .x = origin.x + self.bounds.x,
+            .y = origin.y + self.bounds.y,
+            .width = self.bounds.width,
+            .height = self.bounds.height,
+        };
+        if (self.corner_radius == 0)
+            try builder.solidRectangle(positioned, self.color)
+        else
+            try builder.decoratedRectangle(positioned, self.color, null, 0, self.corner_radius);
+    }
+};
+
+pub const Command = union(enum) {
+    rectangle: Rectangle,
+    path: struct { path: *Path, color: Color },
 };
 
 /// Host-owned, immutable logical-coordinate paint snapshot. Leases belong to
 /// Lua, prepared builds, and render trees on the event thread. Frames receive
-/// value-only scene commands, never this object or a plugin callback.
+/// paint values and independently leased paths, never this object or callbacks.
 pub const Drawing = struct {
     allocator: std.mem.Allocator,
     references: usize = 1,
     size: geometry.SizeF,
     rectangles: []const Rectangle,
+    commands: []const Command = &.{},
 
     pub const max_rectangles = 4096;
 
@@ -24,19 +54,30 @@ pub const Drawing = struct {
         if (!std.math.isFinite(size.width) or !std.math.isFinite(size.height) or
             size.width < 0 or size.height < 0) return error.InvalidDrawingSize;
         if (rectangles.len > max_rectangles) return error.DrawingCapacityExceeded;
-        for (rectangles) |rectangle| {
-            const bounds = rectangle.bounds;
-            if (!std.math.isFinite(bounds.x) or !std.math.isFinite(bounds.y) or
-                !std.math.isFinite(bounds.width) or !std.math.isFinite(bounds.height) or
-                !std.math.isFinite(bounds.x + bounds.width) or !std.math.isFinite(bounds.y + bounds.height) or
-                bounds.width < 0 or bounds.height < 0 or
-                !std.math.isFinite(rectangle.corner_radius) or rectangle.corner_radius < 0)
-                return error.InvalidDrawingRectangle;
-        }
+        for (rectangles) |rectangle| try rectangle.validate();
         const copy = try allocator.dupe(Rectangle, rectangles);
         errdefer allocator.free(copy);
         const self = try allocator.create(Drawing);
         self.* = .{ .allocator = allocator, .size = size, .rectangles = copy };
+        return self;
+    }
+
+    /// Copy ordered paint commands and acquire independent geometry leases.
+    /// The rectangle-only constructor remains the native plugin ABI path.
+    pub fn createCommands(allocator: std.mem.Allocator, size: geometry.SizeF, commands: []const Command) !*Drawing {
+        if (commands.len > max_rectangles) return error.DrawingCapacityExceeded;
+        for (commands) |command| switch (command) {
+            .rectangle => |rectangle| try rectangle.validate(),
+            .path => {},
+        };
+        const self = try create(allocator, size, &.{});
+        errdefer self.release();
+        const copy = try allocator.dupe(Command, commands);
+        for (copy) |command| switch (command) {
+            .path => |value| value.path.retain(),
+            else => {},
+        };
+        self.commands = copy;
         return self;
     }
 
@@ -48,6 +89,11 @@ pub const Drawing = struct {
         self.references -= 1;
         if (self.references != 0) return;
         const allocator = self.allocator;
+        for (self.commands) |command| switch (command) {
+            .path => |value| value.path.release(),
+            else => {},
+        };
+        allocator.free(self.commands);
         allocator.free(self.rectangles);
         allocator.destroy(self);
     }
@@ -58,19 +104,11 @@ pub const Drawing = struct {
         const start = builder.count;
         errdefer builder.count = start;
         try builder.pushClip(bounds);
-        for (self.rectangles) |rectangle| {
-            const local = rectangle.bounds;
-            const positioned: geometry.RectF = .{
-                .x = bounds.x + local.x,
-                .y = bounds.y + local.y,
-                .width = local.width,
-                .height = local.height,
-            };
-            if (rectangle.corner_radius == 0)
-                try builder.solidRectangle(positioned, rectangle.color)
-            else
-                try builder.decoratedRectangle(positioned, rectangle.color, null, 0, rectangle.corner_radius);
-        }
+        for (self.rectangles) |rectangle| try rectangle.paint(builder, bounds);
+        for (self.commands) |command| switch (command) {
+            .rectangle => |rectangle| try rectangle.paint(builder, bounds),
+            .path => |value| try builder.path(value.path, .{ .x = bounds.x, .y = bounds.y }, value.color),
+        };
         try builder.popClip();
     }
 };

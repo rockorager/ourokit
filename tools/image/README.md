@@ -1,7 +1,8 @@
 # Image codecs
 
 `zig build test-image-codecs` tests the isolated codec and native bridges.
-`ourokit_ui` never imports their build module and does not need Cargo.
+`ourokit_ui` does not import image codecs. It needs the Rust bridge only when
+the embedder opts into path rasterization with `-Dui-paths=true`.
 
 The default full build requires Cargo and Rust **1.85 or newer**, tested with
 **1.94.0**. For example, install a minimal 1.94.0 Rust toolchain through rustup
@@ -14,8 +15,9 @@ offline packagers should prefetch or vendor the locked Cargo dependency graph.
 Bundled builds support native Linux GNU and macOS on x86_64/aarch64. Other
 targets and cross-compilation fail explicitly rather than linking host code.
 Packagers may build `src/image/resvg/Cargo.toml` for their target and use
-`-Dresvg-system=true` to link **libourokit_resvg**, the custom bridge ABI 1 from
-this repository, not resvg's unrelated C API library. Supply library search
+`-Dresvg-system=true` to link **libourokit_resvg**, the custom bridge ABI 2 from
+this repository (SVG functions plus `ourokit_path_mask`), not resvg's unrelated
+C API library. Supply library search
 paths with Zig's `--search-prefix` or a `ourokit_resvg.pc` pkg-config file.
 No Cargo process is run in system mode. The supplied bridge must retain the
 resource restrictions in lib.rs. The bundled static bridge uses Rust's standard

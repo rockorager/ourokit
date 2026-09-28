@@ -104,10 +104,12 @@ pub fn build(b: *std.Build) void {
     });
     addHarfBuzz(ourokit_ui, harfbuzz);
     addSheenBidi(ourokit_ui, sheenbidi);
+    const enable_ui_paths = b.option(bool, "ui-paths", "Enable path rasterization in ourokit_ui (requires Cargo or -Dresvg-system)") orelse false;
     const ourokit_ui_options = b.addOptions();
     ourokit_ui_options.addOption(bool, "fontconfig", false);
     ourokit_ui_options.addOption(bool, "freetype", enable_freetype);
     ourokit_ui_options.addOption(bool, "vulkan", false);
+    ourokit_ui_options.addOption(bool, "paths", enable_ui_paths);
     ourokit_ui.addOptions("ourokit_build_options", ourokit_ui_options);
     ourokit_ui.addAnonymousImport("unicode_line_break_tests", .{
         .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
@@ -150,6 +152,7 @@ pub fn build(b: *std.Build) void {
     ourokit_options.addOption(bool, "freetype", enable_freetype);
     ourokit_options.addOption(bool, "vulkan", enable_vulkan);
     ourokit_options.addOption(bool, "xkbcommon", enable_xkbcommon);
+    ourokit_options.addOption(bool, "paths", true);
     ourokit.addOptions("ourokit_build_options", ourokit_options);
     ourokit.addAnonymousImport("unicode_line_break_tests", .{
         .root_source_file = unicode_ucd.path("auxiliary/LineBreakTest.txt"),
@@ -166,8 +169,10 @@ pub fn build(b: *std.Build) void {
         ourokit.link_libc = true;
     }
     if (enable_xkbcommon) ourokit.linkSystemLibrary("xkbcommon", .{});
-    // Keep codec/native Rust linkage off ourokit_ui and its renderer/cache path.
-    const image_codecs = addImageCodecs(b, target, optimize);
+    // Embedders remain codec/Cargo-free unless they opt into path rasterization.
+    const resvg_bridge = addResvgBridge(b, target, optimize);
+    if (enable_ui_paths) ourokit_ui.addImport("ourokit_resvg", resvg_bridge);
+    const image_codecs = addImageCodecs(b, target, optimize, resvg_bridge);
     ourokit.addImport("ourokit_image_codecs", image_codecs);
 
     // An isolated root keeps codec tests independent of the platform renderer.
@@ -746,10 +751,9 @@ fn addHarfBuzz(module: *std.Build.Module, harfbuzz: *std.Build.Dependency) void 
     module.link_libcpp = true;
 }
 
-fn addImageCodecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    // Rust's prebuilt std needs unwind symbols even with panic=abort. Reuse
-    // Zig's bundled C++/unwind runtime (already used by Ourokit's HarfBuzz).
+fn addImageCodecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, bridge: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
+    module.addImport("ourokit_resvg", bridge);
     const wuffs = b.dependency("wuffs", .{});
     const webp = b.dependency("libwebp", .{});
     module.addIncludePath(wuffs.path("release/c"));
@@ -774,7 +778,20 @@ fn addImageCodecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         },
         .flags = &.{ "-std=c99", "-DHAVE_CONFIG_H", "-DWEBP_USE_THREAD", "-DWEBP_DISABLE_STAT", "-DWEBP_REDUCE_SIZE" },
     });
-    const system_resvg = b.option(bool, "resvg-system", "Link a packager-provided ourokit_resvg bridge (ABI 1) instead of building with Cargo") orelse false;
+    return module;
+}
+
+fn addResvgBridge(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    // Rust's prebuilt std needs unwind symbols even with panic=abort. Reuse
+    // Zig's bundled C++/unwind runtime (already used by Ourokit's HarfBuzz).
+    const module = b.createModule(.{
+        .root_source_file = b.addWriteFiles().add("resvg_bridge.zig", ""),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    const system_resvg = b.option(bool, "resvg-system", "Link a packager-provided ourokit_resvg bridge (ABI 2) instead of building with Cargo") orelse false;
     if (system_resvg) {
         module.linkSystemLibrary("ourokit_resvg", .{});
     } else {

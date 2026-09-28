@@ -598,15 +598,17 @@ default. Eviction and LCD/subpixel policy await benchmark evidence.
 
 UI layout never sees pixel formats or stride. Scene construction lowers logical
 rectangles using an explicit output scale into renderer-neutral device-space
-commands. Conservative floor/ceil edge snapping is the current contract;
-subpixel coverage remains open until software and Vulkan implementations can
-share tested semantics.
+commands. Rectangles use conservative floor/ceil edge snapping. Immutable paths
+use shared tiny-skia A8 coverage keyed by geometry identity, scale, and 1/64-pixel
+origin phase. Software and Vulkan apply the same linear-light color/coverage
+contract; integer translation and tint reuse the raster.
 
 Frame-owned immutable command and damage storage can outlive the scene-building
-stack for worker or asynchronous backend use. Borrowed display-list views are
-only synchronous conveniences. Rectangular clip and non-overlapping damage
-semantics are established; transforms, subpixel coverage, paths, layers, and
-advanced color spaces remain open until both real backends validate them.
+stack for worker or asynchronous backend use. Frames retain referenced native
+paths independently; damage history compares copied identities without resolving
+old geometry. Borrowed display-list views require live resources. Rectangular
+clip and non-overlapping damage semantics are established; arbitrary transforms,
+path clips, layers, and advanced color spaces remain open.
 
 Ourokit owns software lowering. Direct paths remain for clear and opaque
 rectangles. Pinned Pixman is an optional legacy encoded-8-bit benchmark

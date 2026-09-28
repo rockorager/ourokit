@@ -2,8 +2,11 @@ const std = @import("std");
 const c = @import("c.zig");
 const Drawing = @import("../ui/render_object/drawing.zig").Drawing;
 const Rectangle = @import("../ui/render_object/drawing.zig").Rectangle;
+const Paint = @import("../ui/render_object/drawing.zig").Command;
+const paths = @import("../path/root.zig");
 
 const metatable = "ouro.drawing.v1";
+const path_metatable = "ouro.drawing.path-staging.v1";
 
 /// Install on the API table. The closure copies the allocator, not a VM or
 /// build-context pointer; drawings can be constructed outside UI evaluation.
@@ -54,6 +57,18 @@ fn construct(state: *c.State) callconv(.c) c_int {
         return fail(state, "ouro.drawing width must be a finite nonnegative number");
     const height = numberField(state, 1, "height", null, true) catch
         return fail(state, "ouro.drawing height must be a finite nonnegative number");
+    if (rawField(state, 1, "commands") != c.type_nil) {
+        if (c.lua_type(state, 2) != c.type_table or rawField(state, 1, "rectangles") != c.type_nil)
+            return fail(state, "ouro.drawing requires exactly one commands or rectangles array");
+        c.lua_settop(state, 2);
+        return constructCommands(state, allocator.*, width, height) catch |err| {
+            _ = c.lua_pushstring(state, "ouro.drawing: ");
+            _ = c.lua_pushstring(state, @errorName(err));
+            c.lua_concat(state, 2);
+            return c.lua_error(state);
+        };
+    }
+    c.lua_settop(state, 1);
     if (rawField(state, 1, "rectangles") != c.type_table)
         return fail(state, "ouro.drawing rectangles must be a dense array");
     const count = c.lua_rawlen(state, 2);
@@ -90,6 +105,129 @@ fn construct(state: *c.State) callconv(.c) c_int {
     return 1;
 }
 
+fn constructCommands(state: *c.State, allocator: std.mem.Allocator, width: f32, height: f32) !c_int {
+    const count = try denseCount(state, 2, Drawing.max_rectangles);
+    const slot = newSlot(state); // 3: final result, initially null.
+    const memory: [*]Paint = @ptrCast(@alignCast(c.lua_newuserdatauv(state, count * @sizeOf(Paint), 0).?));
+    const commands = memory[0..count]; // 4: Lua-owned command scratch.
+    c.lua_createtable(state, @intCast(count), 0); // 5: temporary path leases.
+    var segments: usize = 0;
+    for (commands, 1..) |*command, index| {
+        if (c.lua_rawgeti(state, 2, @intCast(index)) != c.type_table) return error.InvalidDrawingCommand;
+        const kind = try enumField(enum { rectangle, fill, stroke }, state, 6, "kind", null);
+        if (kind == .rectangle) {
+            command.* = .{ .rectangle = try readRectangle(state, 6) };
+        } else {
+            _ = rawField(state, 6, "color");
+            const color = try @import("theme.zig").color(state, -1);
+            c.lua_settop(state, 6);
+            const style: paths.Style = if (kind == .fill)
+                .{ .fill = try enumField(paths.FillRule, state, 6, "fill_rule", .nonzero) }
+            else
+                .{ .stroke = .{
+                    .width = try numberField(state, 6, "width", null, true),
+                    .cap = try enumField(@FieldType(paths.Stroke, "cap"), state, 6, "cap", .butt),
+                    .join = try enumField(@FieldType(paths.Stroke, "join"), state, 6, "join", .miter),
+                    .miter_limit = try numberField(state, 6, "miter_limit", 4, true),
+                } };
+            const path = try readPath(state, allocator, style, &segments);
+            command.* = .{ .path = .{ .path = path, .color = color } };
+            // readPath leaves its owning userdata on top. Anchor it before
+            // any subsequent parse/allocation can run Lua's collector.
+            c.lua_rawseti(state, 5, @intCast(index));
+        }
+        c.lua_settop(state, 5);
+    }
+    slot.* = try Drawing.createCommands(allocator, .{ .width = width, .height = height }, commands);
+    c.lua_settop(state, 3);
+    return 1;
+}
+
+fn readPath(state: *c.State, allocator: std.mem.Allocator, style: paths.Style, total: *usize) !*paths.Path {
+    if (rawField(state, 6, "path") != c.type_table) return error.InvalidDrawingPath;
+    const count = try denseCount(state, 7, 4096);
+    if (count > 65536 - total.*) return error.DrawingPathCapacityExceeded;
+    total.* += count;
+    // The staged userdata owns native geometry even if a later Lua call
+    // longjmps. No native allocation is left solely in a Zig local variable.
+    const slot: *?*paths.Path = @ptrCast(@alignCast(c.lua_newuserdatauv(state, @sizeOf(?*paths.Path), 0).?));
+    slot.* = null;
+    _ = c.luaL_newmetatable(state, path_metatable);
+    c.lua_pushcclosure(state, releasePath, 0);
+    c.lua_setfield(state, -2, "__gc");
+    _ = c.lua_setmetatable(state, -2); // 8: staged path owner.
+    const memory: [*]paths.Command = @ptrCast(@alignCast(c.lua_newuserdatauv(state, count * @sizeOf(paths.Command), 0).?));
+    for (memory[0..count], 1..) |*command, index| {
+        if (c.lua_rawgeti(state, 7, @intCast(index)) != c.type_table) return error.InvalidPathSegment;
+        const fields = try denseCount(state, 10, 7);
+        _ = c.lua_rawgeti(state, 10, 1);
+        const kind = try readEnum(enum { move, line, quadratic, cubic, close }, state, -1);
+        c.lua_settop(state, 10);
+        const arity: usize = switch (kind) {
+            .move, .line => 2,
+            .quadratic => 4,
+            .cubic => 6,
+            .close => 0,
+        };
+        if (fields != arity + 1) return error.InvalidPathSegment;
+        var numbers: [6]f32 = undefined;
+        for (numbers[0..arity], 2..) |*number, field| {
+            _ = c.lua_rawgeti(state, 10, @intCast(field));
+            number.* = try readNumber(state, -1, false);
+            c.lua_settop(state, 10);
+        }
+        command.* = switch (kind) {
+            .move => .{ .move = .{ .x = numbers[0], .y = numbers[1] } },
+            .line => .{ .line = .{ .x = numbers[0], .y = numbers[1] } },
+            .quadratic => .{ .quadratic = .{ .control = .{ .x = numbers[0], .y = numbers[1] }, .to = .{ .x = numbers[2], .y = numbers[3] } } },
+            .cubic => .{ .cubic = .{ .control1 = .{ .x = numbers[0], .y = numbers[1] }, .control2 = .{ .x = numbers[2], .y = numbers[3] }, .to = .{ .x = numbers[4], .y = numbers[5] } } },
+            .close => .close,
+        };
+        c.lua_settop(state, 9);
+    }
+    const value = try paths.Path.create(allocator, memory[0..count], style);
+    slot.* = value;
+    c.lua_settop(state, 8);
+    c.lua_rotate(state, 7, 1);
+    c.lua_settop(state, 7);
+    return value;
+}
+
+fn releasePath(state: *c.State) callconv(.c) c_int {
+    const slot: *?*paths.Path = @ptrCast(@alignCast(c.luaL_testudata(state, 1, path_metatable) orelse return 0));
+    if (slot.*) |path| path.release();
+    slot.* = null;
+    return 0;
+}
+
+fn denseCount(state: *c.State, index: c_int, limit: usize) !usize {
+    const count = c.lua_rawlen(state, index);
+    if (count > limit) return error.DrawingCapacityExceeded;
+    c.lua_pushnil(state);
+    while (c.lua_next(state, index) != 0) {
+        var is_integer: c_int = 0;
+        const key = c.lua_tointegerx(state, -2, &is_integer);
+        if (c.lua_type(state, -2) != c.type_number or is_integer == 0 or key < 1 or key > count)
+            return error.InvalidDrawingArray;
+        c.lua_settop(state, -2);
+    }
+    return count;
+}
+
+fn enumField(comptime T: type, state: *c.State, index: c_int, name: [*:0]const u8, default: ?T) !T {
+    const kind = rawField(state, index, name);
+    defer c.lua_settop(state, -2);
+    if (kind == c.type_nil) if (default) |value| return value;
+    return readEnum(T, state, -1);
+}
+
+fn readEnum(comptime T: type, state: *c.State, index: c_int) !T {
+    if (c.lua_type(state, index) != c.type_string) return error.InvalidDrawingOption;
+    var length: usize = 0;
+    const text = c.lua_tolstring(state, index, &length).?;
+    return std.meta.stringToEnum(T, text[0..length]) orelse error.InvalidDrawingOption;
+}
+
 fn readRectangle(state: *c.State, index: c_int) !Rectangle {
     const x = try numberField(state, index, "x", null, false);
     const y = try numberField(state, index, "y", null, false);
@@ -106,9 +244,13 @@ fn numberField(state: *c.State, index: c_int, name: [*:0]const u8, default: ?f32
     const kind = rawField(state, index, name);
     defer c.lua_settop(state, -2);
     if (kind == c.type_nil) if (default) |value| return value;
-    if (kind != c.type_number) return error.InvalidDrawingNumber;
+    return readNumber(state, -1, nonnegative);
+}
+
+fn readNumber(state: *c.State, index: c_int, nonnegative: bool) !f32 {
+    if (c.lua_type(state, index) != c.type_number) return error.InvalidDrawingNumber;
     var is_number: c_int = 0;
-    const number = c.lua_tonumberx(state, -1, &is_number);
+    const number = c.lua_tonumberx(state, index, &is_number);
     if (!std.math.isFinite(number) or @abs(number) > std.math.floatMax(f32) or (nonnegative and number < 0))
         return error.InvalidDrawingNumber;
     const value: f32 = @floatCast(number);
@@ -228,6 +370,100 @@ test "Lua drawing validates numbers colors dense lists and capacity boundaries" 
 
 test "Lua drawing unwinds every native allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocation, .{});
+}
+
+test "Lua path drawings preserve paint order and copy geometry and stroke style" {
+    const state = try testState(std.testing.allocator);
+    defer c.lua_close(state);
+    try testCall(state,
+        \\local points = {{'move',2,3},{'quadratic',7,13,17,5},{'cubic',21,2,29,19,31,7}}
+        \\local stroke = {kind='stroke',path=points,width=3.5,color='#15263780',cap='round',join='bevel',miter_limit=2}
+        \\local commands = {
+        \\  {kind='fill',path={{'move',1,1},{'line',11,1},{'line',7,13},{'close'}},color='#ee0022',fill_rule='even_odd'},
+        \\  {kind='rectangle',x=9,y=5,width=7,height=3,color='#ab12cd'}, stroke,
+        \\}
+        \\local result = ouro.drawing {width=43,height=29,commands=commands}
+        \\points[1][2], points[2], stroke.width, stroke.cap, commands[1] = 999, {'close'}, 12, 'square', nil
+        \\return result
+    );
+    _ = c.lua_gc(state, 2); // Drop temporary construction leases, keep result.
+    const drawing = get(state, -1).?;
+    try std.testing.expectEqual(@as(usize, 0), drawing.rectangles.len);
+    try std.testing.expectEqual(@as(usize, 3), drawing.commands.len);
+    const fill = drawing.commands[0].path;
+    try std.testing.expectEqual(paths.FillRule.even_odd, fill.path.style.fill);
+    try std.testing.expectEqual(@as(f32, 9), drawing.commands[1].rectangle.bounds.x);
+    const stroke = drawing.commands[2].path;
+    try std.testing.expectEqual(paths.Stroke{ .width = 3.5, .cap = .round, .join = .bevel, .miter_limit = 2 }, stroke.path.style.stroke);
+    try std.testing.expectEqual(@as(f32, 2), stroke.path.commands[0].move.x);
+    try std.testing.expectEqual(@as(f32, 13), stroke.path.commands[1].quadratic.control.y);
+    try std.testing.expectEqual(@as(f32, 29), stroke.path.commands[2].cubic.control2.x);
+    try std.testing.expectEqual(@as(u8, 128), stroke.color.a);
+}
+
+test "Lua path drawings reject malformed records and unwind partial construction" {
+    const state = try testState(std.testing.allocator);
+    defer c.lua_close(state);
+    try testCall(state,
+        \\local good = {kind='fill',color='#abcdef',path={{'move',0,0},{'line',9,2},{'line',3,7},{'close'}}}
+        \\local function invalid(value)
+        \\  assert(not pcall(ouro.drawing, value))
+        \\end
+        \\invalid {width=1,height=1,commands={},rectangles={}}
+        \\invalid {width=1,height=1,commands=false}
+        \\invalid {width=1,height=1,commands={[2]=good}}
+        \\for _, bad in ipairs {false, {}, {kind='triangle'},
+        \\    {kind='fill',color='#ffffff',path={{'line',1,2}}},
+        \\    {kind='fill',color='#ffffff',path={{'move',1,2,3}}},
+        \\    {kind='fill',color='#ffffff',path={{'move',1}}},
+        \\    {kind='fill',color='#ffffff',path={{'move','1',2}}},
+        \\    {kind='fill',color='#ffffff',path={{'move',0/0,2}}},
+        \\    {kind='fill',color='#ffffff',path={{'move',0,0},{'close'},{'line',1,1}}},
+        \\    {kind='fill',color='#ffffff',path={{'move',0,0},{'quadratic',1,2,3}}},
+        \\    {kind='fill',color='#ffffff',path={{'move',0,0},{'cubic',1,2,3,4,5}}},
+        \\    {kind='fill',color='#ffffff',path={['1']={'move',0,0}}},
+        \\    {kind='fill',color='#ffffff',path={},fill_rule='winding'},
+        \\    {kind='stroke',color='#ffffff',path=good.path,width=0},
+        \\    {kind='stroke',color='#ffffff',path=good.path,width=1,cap='flat'},
+        \\    {kind='stroke',color='#ffffff',path=good.path,width=1,join='sharp'},
+        \\    {kind='stroke',color='#ffffff',path=good.path,width=1,miter_limit=0.5}} do
+        \\  invalid {width=19,height=13,commands={good,bad}}
+        \\end
+        \\local commands = {}; for i=1,4097 do commands[i]=good end
+        \\invalid {width=19,height=13,commands=commands}
+        \\local path = {}; for i=1,4097 do path[i]={'move',0,0} end
+        \\invalid {width=19,height=13,commands={{kind='fill',path=path,color='#ffffff'}}}
+        \\path[4097] = nil
+        \\commands = {}; for i=1,16 do commands[i]={kind='fill',path=path,color='#ffffff'} end
+        \\assert(ouro.drawing {width=19,height=13,commands=commands})
+        \\commands[17] = {kind='fill',path={{'move',1,1}},color='#ffffff'}
+        \\invalid {width=19,height=13,commands=commands}
+        \\return ouro.drawing {width=0,height=0,commands={}}
+    );
+    _ = c.lua_gc(state, 2);
+    try std.testing.expectEqual(@as(usize, 0), get(state, -1).?.commands.len);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testPathAllocation, .{});
+}
+
+fn testPathAllocation(allocator: std.mem.Allocator) !void {
+    const state = try testState(allocator);
+    defer c.lua_close(state);
+    const source =
+        \\local path={{'move',1,2},{'line',13,5},{'line',7,11},{'close'}}
+        \\return ouro.drawing {width=17,height=13,commands={
+        \\  {kind='fill',path=path,color='#abcdef'},
+        \\  {kind='stroke',path=path,width=2,color='#123456'},
+        \\}}
+    ;
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source.ptr, source.len, "drawing-test", "t"));
+    if (c.lua_pcallk(state, 0, 1, 0, 0, null) != c.ok) {
+        var length: usize = 0;
+        const message = c.lua_tolstring(state, -1, &length).?;
+        try std.testing.expectEqualStrings("ouro.drawing: OutOfMemory", message[0..length]);
+        return error.OutOfMemory;
+    }
+    _ = c.lua_gc(state, 2);
+    try std.testing.expectEqual(@as(usize, 2), get(state, -1).?.commands.len);
 }
 
 fn testAllocation(allocator: std.mem.Allocator) !void {

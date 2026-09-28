@@ -31,6 +31,12 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
             "image handle={d}:{d} x={d} y={d} width={d} height={d} fit={s}\n",
             .{ image.image.slot, image.image.generation, image.bounds.x, image.bounds.y, image.bounds.width, image.bounds.height, @tagName(image.fit) },
         ),
+        .path => |path| try append(
+            output,
+            &used,
+            "path identity={d} origin=({d},{d}) scale={d} x={d} y={d} width={d} height={d} rgba({d},{d},{d},{d})\n",
+            .{ path.identity, path.origin.x, path.origin.y, path.scale, path.bounds.x, path.bounds.y, path.bounds.width, path.bounds.height, path.color.r, path.color.g, path.color.b, path.color.a },
+        ),
         .solid_rectangle => |rectangle| try append(
             output,
             &used,

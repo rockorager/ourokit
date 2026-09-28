@@ -3,8 +3,8 @@ const scene = @import("root.zig");
 const RectI = @import("../core/geometry.zig").RectI;
 
 /// Compares complete scenes with the last successfully submitted scene, not
-/// the last build. Snapshots contain values only: resource handles are immutable
-/// and generation checked, and old bounds never require resolving old leases.
+/// the last build. Snapshots compare values only: handles are generation checked
+/// and paths carry unique identities. Old bounds never resolve old resources.
 pub const Tracker = struct {
     const Draw = struct {
         command: scene.Command,
@@ -70,6 +70,7 @@ pub const Tracker = struct {
                 .solid_rectangle => |value| RectI.intersect(value.bounds, clips[depth]),
                 .decorated_rectangle => |value| RectI.intersect(value.bounds, clips[depth]),
                 .image => |value| RectI.intersect(value.bounds, clips[depth]),
+                .path => |value| RectI.intersect(value.bounds, clips[depth]),
                 .clear, .glyph_run, .paragraph => clips[depth],
                 else => unreachable,
             };

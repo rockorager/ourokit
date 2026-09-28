@@ -37,6 +37,19 @@ pub const Builder = struct {
         if (!device.isEmpty()) try self.append(.{ .image = .{ .image = handle, .bounds = device, .fit = fit } });
     }
 
+    pub fn path(self: *Builder, value: *const @import("../../path/root.zig").Path, origin: PointF, color: Color) !void {
+        const device: PointF = .{ .x = origin.x * self.scale, .y = origin.y * self.scale };
+        const bounds = try @import("../../path/root.zig").deviceBounds(value, device, self.scale);
+        if (!bounds.isEmpty()) try self.append(.{ .path = .{
+            .path = value,
+            .identity = value.identity,
+            .origin = device,
+            .scale = self.scale,
+            .bounds = bounds,
+            .color = color,
+        } });
+    }
+
     pub fn decoratedRectangle(
         self: *Builder,
         bounds: RectF,
