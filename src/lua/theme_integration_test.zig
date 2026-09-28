@@ -155,7 +155,7 @@ const Fixture = struct {
 test "stock Lua controls preserve asymmetric root stack offsets" {
     const f = try Fixture.create();
     defer f.destroy();
-    for ([_][]const u8{ "button", "checkbox", "switch" }) |name| {
+    for ([_][]const u8{ "button", "checkbox", "switch", "separator" }) |name| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.{s} {{key='control', label='Offset', checked=true, x=17, y=31}} end", .{name});
         defer std.testing.allocator.free(source);
         try f.exec(source);
@@ -910,6 +910,63 @@ test "button variants use semantic recipes and tint custom content" {
         try f.exec(source);
         _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
         try std.testing.expectError(error.LuaBuildFailed, f.build());
+    }
+}
+
+test "separators preserve axis geometry semantics and inherited themes through retained parents" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\changed = ouro.signal(false)
+        \\local Rules = ouro.stateful(function()
+        \\  return function()
+        \\    return ouro.row {key='rules', gap=17,
+        \\      ouro.box {key='horizontal', width=173, height=91, alignment='left',
+        \\        ouro.separator {key='rule'}},
+        \\      ouro.theme {key='nested', colors={border='#ab6543'},
+        \\        ouro.box {key='vertical', width=211, height=67, alignment='left',
+        \\          ouro.separator {key='rule', orientation='vertical'}}},
+        \\      ouro.box {key='explicit', width=59, height=83, alignment='left',
+        \\        ouro.separator {key='rule', orientation='horizontal'}},
+        \\    }
+        \\  end
+        \\end)
+        \\function build()
+        \\  return ouro.theme {key='scope', colors={border=changed() and '#654321' or '#123456'},
+        \\    Rules {key='retained'}}
+        \\end
+    );
+    try f.build();
+    const horizontal = try f.handle("scope/retained/rules/horizontal/rule");
+    for ([_]struct { path: []const u8, size: core.SizeF, color: core.Color }{
+        .{ .path = "scope/retained/rules/horizontal/rule", .size = .{ .width = 173, .height = 1 }, .color = .rgba(18, 52, 86, 255) },
+        .{ .path = "scope/retained/rules/nested/vertical/rule", .size = .{ .width = 1, .height = 67 }, .color = .rgba(171, 101, 67, 255) },
+        .{ .path = "scope/retained/rules/explicit/rule", .size = .{ .width = 59, .height = 1 }, .color = .rgba(18, 52, 86, 255) },
+    }) |case| {
+        const handle = try f.handle(case.path);
+        try std.testing.expectEqual(case.size, try f.runtime.tree.nodeSize(try f.runtime.instances.renderObject(handle)));
+        try std.testing.expectEqual(case.color, (try f.object(case.path)).box.background.?);
+        try std.testing.expectEqual(.separator, (try f.runtime.semantics.findPath(case.path)).role);
+        try std.testing.expect(!f.runtime.instances.isFocusable(handle));
+    }
+    try f.exec("changed:set(true)");
+    try f.build();
+    try std.testing.expectEqual(horizontal, try f.handle("scope/retained/rules/horizontal/rule"));
+    try std.testing.expectEqual(core.Color.rgba(101, 67, 33, 255), (try f.object("scope/retained/rules/horizontal/rule")).box.background.?);
+    try std.testing.expectEqual(core.Color.rgba(171, 101, 67, 255), (try f.object("scope/retained/rules/nested/vertical/rule")).box.background.?);
+
+    for ([_][]const u8{
+        "ouro.separator {key='bad', orientation=false}",
+        "ouro.separator {key='bad', orientation=17}",
+        "ouro.separator {key='bad', ouro.box {key='child'}}",
+        "ouro.separator {key='bad', flex=0}",
+    }) |declaration| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(source);
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(horizontal, try f.handle("scope/retained/rules/horizontal/rule"));
     }
 }
 

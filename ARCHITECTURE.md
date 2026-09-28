@@ -248,7 +248,7 @@ Lua-composed Box plus Text and a typed activation binding. A bounded lowering co
 identity and parent links from stable local keys and resolves inherited themes
 and parent data. No Button render object or Lua theme mirror is introduced.
 
-Stock button, checkbox, and switch recipes live only in `lua/controls.lua`.
+Stock button, checkbox, switch, and separator recipes live only in `lua/controls.lua`.
 `ouro.stateless` expands stateless descriptions with a fresh effective native
 theme value during lowering, without mounting a component or adding a
 VM-specific identity namespace. Its output is pinned in the build transaction,

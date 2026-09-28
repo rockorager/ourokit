@@ -649,7 +649,6 @@ pub const UiBuild = struct {
             .tab_bar => emitTabBar,
             .tab => emitTab,
             .split_view => emitSplitView,
-            .separator => emitSeparator,
             .box => emitBox,
             .stack => emitStack,
             .row => emitRow,
@@ -1592,33 +1591,6 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    /// Radix Themes full-size separator: a 1px `border` rule that fills the
-    /// bounded axis of its parent.
-    fn emitSeparator(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
-        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
-            return luaError(state, "ouro.separator expects one declaration table");
-        const parent = self.currentParent() orelse return luaError(state, "separator requires a widget parent");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "separator key is required");
-        const axis = tableOptionalAxis(state, 1, "orientation", .horizontal) orelse
-            return luaError(state, "separator orientation must be 'horizontal' or 'vertical'");
-        const parent_data = declarativeParentData(self, state, 1) catch |err|
-            return luaError(state, parentDataErrorMessage(err));
-        const id = semanticId(key, 0x7365706172 ^ parent.id ^ self.component_namespace);
-        const thickness = design.tokens.foundation.border_width_default;
-        self.append(.{ .id = id, .parent = parent.id, .parent_data = parent_data, .object = .{ .box = .{
-            .fill_width = axis == .horizontal,
-            .fill_height = axis == .vertical,
-            .width = if (axis == .vertical) thickness else null,
-            .height = if (axis == .horizontal) thickness else null,
-            .background = theme.border,
-        } } }) catch return luaError(state, "cannot append separator");
-        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .separator, .key = key }) catch
-            return luaError(state, "cannot append separator semantics");
-        return 0;
-    }
-
     fn emitDeclarativeText(self: *UiBuild, state: *c.State) c_int {
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
@@ -1761,8 +1733,8 @@ pub const UiBuild = struct {
         const activate = tableOptionalBoolean(state, 1, "activate", false) orelse return luaError(state, "activate must be boolean");
         const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse return luaError(state, "enabled must be boolean");
         const role = tableOptionalEnum(@import("../ui/semantics/snapshot.zig").Role, state, 1, "role", .group) orelse return luaError(state, "invalid semantic role");
-        if (role != .group and role != .button and role != .checkbox and role != .@"switch")
-            return luaError(state, "box role must be group, button, checkbox, or switch");
+        if (role != .group and role != .button and role != .checkbox and role != .@"switch" and role != .separator)
+            return luaError(state, "box role must be group, button, checkbox, switch, or separator");
         const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
         if (activate and !semantic) return luaError(state, "activation requires semantics");
         const checked = tableOptionalBoolean(state, 1, "checked", false) orelse return luaError(state, "checked must be boolean");

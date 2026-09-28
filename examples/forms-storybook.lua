@@ -28,6 +28,24 @@ local function content(options)
     return o.stack {key='root',children=children}
   end
 end
+
+local function separators()
+  return o.column {key='separators', gap=16,
+    o.text {key='title', text='Separators', size=24},
+    o.text {key='horizontal-label', text='Horizontal: fills the available width'},
+    o.separator {key='horizontal'},
+    o.box {key='vertical-region', width=400, height=80,
+      o.row {key='columns', gap=20, cross_alignment='center',
+        o.text {key='left', text='Left column'},
+        o.separator {key='vertical', orientation='vertical'},
+        o.text {key='right', text='Right column'},
+      }},
+    o.text {key='theme-label', text='Nested theme: blue border'},
+    o.theme {key='nested', colors={border='#137ba9'},
+      o.separator {key='themed', orientation='horizontal'}},
+  }
+end
+
 return o.storybook {id='forms', title='Form controls', stories={
   o.story {id='forms/light', name='Light', viewport={width=540,height=640}, content=content()},
   o.story {id='forms/dark', name='Dark', color_scheme='dark', viewport={width=540,height=640}, content=content()},
@@ -39,4 +57,6 @@ return o.storybook {id='forms', title='Form controls', stories={
   o.story {id='forms/narrow', name='Constrained slider', viewport={width=220,height=100}, content=function()
     return o.slider {key='level',label='Level',width=300,value=7.5,min=0,max=10,step=0.5}
   end},
+  o.story {id='separator/light', name='Separators', viewport={width=480,height=300}, snapshot_scale=2, content=separators},
+  o.story {id='separator/dark', name='Separators (dark)', color_scheme='dark', viewport={width=480,height=300}, snapshot_scale=2, content=separators},
 }}

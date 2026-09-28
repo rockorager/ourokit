@@ -100,3 +100,16 @@ local function toggle(p, children, theme, checkbox)
 end
 ouro.switch = ouro.stateless(function(p, children, theme) return toggle(p, children, theme, false) end)
 ouro.checkbox = ouro.stateless(function(p, children, theme) return toggle(p, children, theme, true) end)
+
+ouro.separator = ouro.stateless(function(p, children, theme)
+  check(#children == 0, 'separator does not accept children')
+  local orientation = p.orientation
+  if orientation == nil then orientation = 'horizontal' end
+  check(orientation == 'horizontal' or orientation == 'vertical', "separator orientation must be 'horizontal' or 'vertical'")
+  local horizontal = orientation == 'horizontal'
+  return ouro.box {key=p.key, role='separator', flex=p.flex, x=p.x, y=p.y,
+    width=horizontal and 'fill' or f.border_width_default,
+    height=horizontal and f.border_width_default or 'fill',
+    background=theme.colors.border,
+  }
+end)

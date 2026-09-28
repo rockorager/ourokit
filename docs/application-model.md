@@ -267,7 +267,7 @@ Space/Enter activation, repeat suppression, focus traversal, and cancellation.
 `focus_request`, `on_cancel`, and `on_interaction_change` use the existing control
 contracts. Supply either `on_press()` or `on_change(not checked)`, not both;
 `checked` remains application-controlled. Box roles are `group` (default),
-`button`, `checkbox`, and `switch`; declaring a role alone does not enable input.
+`button`, `checkbox`, `switch`, and `separator`; declaring a role alone does not enable input.
 `label`, `checked`, and `enabled` are copied to the semantic snapshot.
 
 Any box under an activation owner can declare `states`, independently of the
@@ -905,7 +905,9 @@ the automatic label in enabled and disabled states.
 
 `ouro.separator { key = "rule", orientation = "horizontal" }` draws a 1-pixel
 `border` rule that fills the bounded axis of its parent. `orientation` may
-also be `"vertical"`.
+also be `"vertical"`. It is a stateless Lua recipe over a box with the
+`separator` semantic role, not a native widget kind. It accepts no children
+and does not take focus.
 
 ### Checkboxes, radio groups, and selects
 

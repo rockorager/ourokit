@@ -17,7 +17,6 @@ pub const Kind = enum {
     tab_bar,
     tab,
     split_view,
-    separator,
     box,
     stack,
     row,
