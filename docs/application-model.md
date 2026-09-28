@@ -1741,6 +1741,57 @@ and selection. `appearance = "sidebar"` instead uses gray steps 3 and 5 plus a
 medium selected label for navigation catalogs without introducing a separate
 widget.
 
+### Drawings are immutable native snapshots
+
+`ouro.drawing` creates a reusable drawing without a native plugin or a paint
+callback. Pass it to `ouro.canvas` to place it among ordinary widgets:
+
+```lua
+local picture = ouro.drawing {
+  width = 180, height = 80,
+  rectangles = {
+    { x = 0, y = 0, width = 180, height = 80, color = "#182430" },
+    { x = 12, y = 16, width = 97, height = 48,
+      color = "#39bda4", corner_radius = 8 },
+    { x = 73, y = 8, width = 65, height = 40, color = "#e85d7580" },
+  },
+}
+
+ouro.canvas { key = "preview", drawing = picture, alt = "Overlapping color samples" }
+```
+
+The required `rectangles` field is a dense array of at most 4096 records; an
+empty array is valid. Each record requires `x`, `y`, `width`, `height`, and
+`color`; `corner_radius` defaults to zero. Colors use `#RRGGBB` or `#RRGGBBAA`
+straight-alpha sRGB. Records paint in array order using linear-light
+source-over blending. Coordinates are finite logical-pixel numbers representable
+in native `f32`; dimensions and radii must be nonnegative. Negative `x`/`y`
+are allowed. Numeric strings, nonfinite values, holes, and overflowing bounds
+are errors. Zero dimensions are valid. Fields are read directly from the tables,
+not from metatable callbacks.
+
+Construction copies all geometry and colors. Mutating the original tables does
+not change the drawing. Store a drawing in Lua to reuse it across renders,
+canvases, or windows; construct a replacement when reactive state changes.
+Construction is also valid during a render: signal reads used to compute the
+geometry subscribe that component as usual. Painting never invokes Lua or reads
+signals. The userdata is immutable and has no drawing methods.
+
+The drawing's width and height supply the canvas's preferred size. Parent
+constraints can change its allocated box, but the recording is **cropped, not
+stretched**. Display scaling still applies. Painting clips to the canvas bounds
+and ancestor clips. The canvas is an image-role leaf with optional `alt` text;
+wrap it in a focusable/input-handling box for interaction. Lua, prepared builds,
+and retained render objects hold independent leases, so failed builds/reloads
+cannot invalidate the committed picture. Scenes contain copied paint commands.
+Normal scene-capacity and device-coordinate limits still apply when painting.
+
+This initial constructor supports solid and rounded rectangles only, matching
+the existing [native drawing contract](native-plugins.md#custom-painted-widgets).
+Paths, strokes, gradients, shadows, and arbitrary transforms are not implemented.
+See `examples/drawing-composition.lua` for shared, replaced, and constrained
+drawings.
+
 ### Images and icons load asynchronously
 
 ```lua
