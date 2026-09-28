@@ -10,6 +10,7 @@ const ImageCache = @import("../../image/cache.zig").Cache;
 const ImagePlacement = @import("../image_sampling.zig").Placement;
 const GlyphPosition = @import("../glyph_position.zig").Position;
 const paths = @import("../../path/root.zig");
+const shadows = @import("../../shadow/root.zig");
 
 pub const has_freetype = build_options.freetype;
 pub const GlyphCache = if (has_freetype)
@@ -39,6 +40,7 @@ pub const Target = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     /// Optional persistent coverage cache; one-shot callers get a temporary one.
     path_masks: ?*paths.MaskCache = null,
+    shadow_masks: ?*shadows.MaskCache = null,
 
     pub fn validate(self: Target) !void {
         const row_bytes = std.math.mul(usize, self.width, 4) catch return error.InvalidTarget;
@@ -104,10 +106,14 @@ pub fn renderResources(
     var temporary_masks = paths.MaskCache.init(target.allocator);
     defer temporary_masks.deinit();
     const masks = target.path_masks orelse &temporary_masks;
+    var temporary_shadows = shadows.MaskCache.init(target.allocator);
+    defer temporary_shadows.deinit();
+    const shadow_masks = target.shadow_masks orelse &temporary_shadows;
     // Resolve before touching the target, even for clipped or undamaged images.
     for (list.commands) |command| switch (command) {
         .image => |value| _ = try (images orelse return error.ImageResourcesRequired).get(value.image),
         .path => |value| _ = try masks.get(value.path, value.origin, value.scale),
+        .shadow => |value| _ = try shadow_masks.get(value.shape),
         else => {},
     };
     if (list.commands.len == 0 or target.width == 0 or target.height == 0) return;
@@ -116,11 +122,11 @@ pub fn renderResources(
     defer target.allocator.free(pixels);
     const working: RasterTarget = .{ .pixels = pixels, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => try renderOutputRegion(list.commands, target, working, targetBounds(target), glyphs, shapes, paragraphs, images, masks),
+        .full => try renderOutputRegion(list.commands, target, working, targetBounds(target), glyphs, shapes, paragraphs, images, masks, shadow_masks),
         .regions => |regions| {
             for (regions) |region| {
                 const clipped = RectI.intersect(region, targetBounds(target));
-                if (!clipped.isEmpty()) try renderOutputRegion(list.commands, target, working, clipped, glyphs, shapes, paragraphs, images, masks);
+                if (!clipped.isEmpty()) try renderOutputRegion(list.commands, target, working, clipped, glyphs, shapes, paragraphs, images, masks, shadow_masks);
             }
         },
     }
@@ -136,6 +142,7 @@ fn renderOutputRegion(
     paragraphs: ?*const text.ParagraphCache,
     images: ?*const ImageCache,
     masks: *paths.MaskCache,
+    shadow_masks: *shadows.MaskCache,
 ) !void {
     const left: usize = @intCast(damage.x);
     const top: usize = @intCast(damage.y);
@@ -147,7 +154,7 @@ fn renderOutputRegion(
             working.pixels[y * working.width + x] = LinearRgba16.fromSrgba8(readPixel(output.format, output.pixels[offset..][0..4]));
         };
     }
-    try renderRegion(commands, working, damage, glyphs, shapes, paragraphs, images, masks);
+    try renderRegion(commands, working, damage, glyphs, shapes, paragraphs, images, masks, shadow_masks);
     for (top..top + damage.height) |y| for (left..left + damage.width) |x| {
         const offset = y * output.stride + x * 4;
         writePixel(output.format, output.pixels[offset..][0..4], working.pixels[y * working.width + x].toSrgba8());
@@ -163,6 +170,7 @@ fn renderRegion(
     paragraphs: ?*const text.ParagraphCache,
     images: ?*const ImageCache,
     masks: *paths.MaskCache,
+    shadow_masks: *shadows.MaskCache,
 ) !void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
@@ -189,17 +197,13 @@ fn renderRegion(
             const bounds = RectI.intersect(value.bounds, clips[depth]);
             if (bounds.isEmpty()) continue;
             const mask = try masks.get(value.path, value.origin, value.scale);
-            const source_color = LinearRgba16.fromColor(value.color);
-            const left: usize = @intCast(bounds.x);
-            const top: usize = @intCast(bounds.y);
-            const source_x: usize = @intCast(bounds.x - mask.bounds.x);
-            const source_y: usize = @intCast(bounds.y - mask.bounds.y);
-            for (0..bounds.height) |row| for (0..bounds.width) |column| {
-                const coverage = mask.pixels[(source_y + row) * mask.bounds.width + source_x + column];
-                const source = source_color.scaled(@as(u16, coverage) * 257);
-                const offset = (top + row) * target.width + left + column;
-                target.pixels[offset] = source.over(target.pixels[offset]);
-            };
+            drawCoverage(target, bounds, mask.bounds, mask.pixels, value.color);
+        },
+        .shadow => |value| {
+            const bounds = RectI.intersect(value.bounds, clips[depth]);
+            if (bounds.isEmpty()) continue;
+            const mask = try shadow_masks.get(value.shape);
+            drawCoverage(target, bounds, mask.bounds, mask.pixels, value.color);
         },
         .image => |value| {
             const bitmap = try images.?.get(value.image);
@@ -358,6 +362,20 @@ fn fill(target: RasterTarget, bounds: RectI, color: Color, blend: scene.BlendMod
             target.pixels[offset] = source.over(target.pixels[offset]);
         }
     }
+}
+
+fn drawCoverage(target: RasterTarget, bounds: RectI, mask_bounds: RectI, pixels: []const u8, color: Color) void {
+    const source_color = LinearRgba16.fromColor(color);
+    const left: usize = @intCast(bounds.x);
+    const top: usize = @intCast(bounds.y);
+    const source_x: usize = @intCast(@as(i64, bounds.x) - mask_bounds.x);
+    const source_y: usize = @intCast(@as(i64, bounds.y) - mask_bounds.y);
+    for (0..bounds.height) |row| for (0..bounds.width) |column| {
+        const coverage = pixels[(source_y + row) * mask_bounds.width + source_x + column];
+        const source = source_color.scaled(@as(u16, coverage) * 257);
+        const offset = (top + row) * target.width + left + column;
+        target.pixels[offset] = source.over(target.pixels[offset]);
+    };
 }
 
 fn drawDecoratedRectangle(

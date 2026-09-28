@@ -71,6 +71,7 @@ pub const Tracker = struct {
                 .decorated_rectangle => |value| RectI.intersect(value.bounds, clips[depth]),
                 .image => |value| RectI.intersect(value.bounds, clips[depth]),
                 .path => |value| RectI.intersect(value.bounds, clips[depth]),
+                .shadow => |value| RectI.intersect(value.bounds, clips[depth]),
                 .clear, .glyph_run, .paragraph => clips[depth],
                 else => unreachable,
             };

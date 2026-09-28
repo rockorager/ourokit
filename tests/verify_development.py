@@ -26,6 +26,7 @@ TESTS = (
     'animation_composition.py',
     'drawing_composition.py',
     'path_composition.py',
+    'shadow_composition.py',
     'desktop_activation.py',
     'application_services.py',
     'catalog_export.py',

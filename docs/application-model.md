@@ -884,6 +884,33 @@ new widget-default section. An invalid `surface` remains an error even when
 remain intrinsic. Optional `min_width` and `min_height` participate in the same
 one-way constraints and yield when a parent supplies a tighter maximum.
 
+Boxes accept one optional outset `shadow`:
+
+```lua
+ouro.box {
+  width = 180, height = 90, radius = 12, surface = "card",
+  shadow = { x = 0, y = 4, blur = 12, spread = 0, color = "#00000040" },
+  ouro.text { text = "Elevated card" },
+}
+```
+
+`color` is required and uses the same hex/token format as `background`.
+`x`, `y`, `blur`, and `spread` default to zero in logical pixels. All must be
+finite numbers; `blur` must be nonnegative, while offsets and spread may be
+negative. Omitted or nil `shadow` removes it; false and malformed tables are
+errors. Positive spread expands the rounded border box and negative spread
+contracts it. Blur uses a Gaussian with standard deviation `blur / 2`.
+
+The shadow paints before the box background, border, and outline. The original
+rounded box interior is excluded even when the box background is transparent.
+Shadows do not change layout, semantic bounds, hit targets, or scroll extents.
+They extend past the box's own content clip but obey ancestor clips such as
+`ouro.scroll`. There are no inset shadows, lists of shadows, or drawing-command
+shadows. Device-space blur is limited to 128 pixels after output scaling; masks
+are limited to 8192 pixels per axis and 16 Mi pixels. These limits are checked
+when the scene is built. See `examples/shadow-storybook.lua` for spread,
+transparent knockout, clipping, and anchored-popup compositions.
+
 `ouro.stack { key = "layers", ... }` overlays an ordered array of children at
 the same origin. It also accepts `children = { ... }`, following the same dense
 array and key conventions as rows and columns. Children paint in declaration
@@ -1821,8 +1848,9 @@ coverage in linear light; intersections within a stroke do not add extra alpha.
 Each rasterized path is limited to 8192 pixels per axis and 16 Mi pixels,
 including conservative stroke/antialiasing padding. The coverage cache is bounded
 to 32 MiB; extreme geometry may be accepted at construction but rejected when
-painted at a particular display scale. Arcs, dashes, gradients, shadows, arbitrary
-transforms, and path clips are not implemented. The experimental native plugin
+painted at a particular display scale. Arcs, dashes, gradients, drawing shadows,
+arbitrary transforms, and path clips are not implemented. Outset box shadows are
+available separately through the `shadow` field on `ouro.box`. The experimental native plugin
 ABI still exposes rectangles only; its ABI is unchanged.
 
 See `examples/drawing-composition.lua` for shared, replaced, and constrained

@@ -50,6 +50,21 @@ pub const Builder = struct {
         } });
     }
 
+    pub fn boxShadow(self: *Builder, bounds: RectF, radius: f32, style: @import("../../shadow/root.zig").Style) !void {
+        try style.validate();
+        const device = try self.deviceRect(bounds, .preserve_size);
+        if (device.isEmpty() or style.color.a == 0) return;
+        const shape: @import("../../shadow/root.zig").Shape = .{
+            .box = device,
+            .corner_radius = @min(try self.deviceExtent(radius), @min(device.width, device.height) / 2),
+            .offset = .{ .x = style.offset.x * self.scale, .y = style.offset.y * self.scale },
+            .blur = style.blur * self.scale,
+            .spread = style.spread * self.scale,
+        };
+        const painted = try @import("../../shadow/root.zig").deviceBounds(shape);
+        if (!painted.isEmpty()) try self.append(.{ .shadow = .{ .shape = shape, .bounds = painted, .color = style.color } });
+    }
+
     pub fn decoratedRectangle(
         self: *Builder,
         bounds: RectF,
@@ -206,6 +221,27 @@ test "decorated shapes retain dimensions at fractional origins and scales" {
         2,
     );
     try std.testing.expectEqual(RectI{ .x = 1, .y = 2, .width = 10, .height = 4 }, commands[0].decorated_rectangle.bounds);
+}
+
+test "shadow lowering scales style and matches snapped rounded decoration" {
+    var commands: [2]scene.Command = undefined;
+    var builder = try Builder.init(&commands, 1.5);
+    const bounds: RectF = .{ .x = -1.25, .y = 3.5, .width = 17, .height = 9 };
+    try builder.boxShadow(bounds, 2.5, .{ .offset = .{ .x = -2.25, .y = 4.5 }, .blur = 6, .spread = -1, .color = Color.rgba(20, 30, 40, 128) });
+    try builder.decoratedRectangle(bounds, Color.rgba(10, 20, 30, 255), null, 0, 2.5);
+    const shape = commands[0].shadow.shape;
+    try std.testing.expectEqual(RectI{ .x = -2, .y = 5, .width = 26, .height = 14 }, shape.box);
+    try std.testing.expectEqual(shape.box, commands[1].decorated_rectangle.bounds);
+    try std.testing.expectEqual(@as(u32, 4), shape.corner_radius);
+    try std.testing.expectEqual(shape.corner_radius, commands[1].decorated_rectangle.corner_radius);
+    try std.testing.expectEqual(PointF{ .x = -3.375, .y = 6.75 }, shape.offset);
+    try std.testing.expectEqual(@as(f32, 9), shape.blur);
+    try std.testing.expectEqual(@as(f32, -1.5), shape.spread);
+    try builder.displayList().validate();
+    builder.count = 0;
+    try builder.boxShadow(bounds, 0, .{ .color = Color.rgba(0, 0, 0, 0) });
+    try std.testing.expectEqual(@as(usize, 0), builder.count);
+    try std.testing.expectError(error.BlurTooLarge, builder.boxShadow(bounds, 0, .{ .blur = 86, .color = Color.rgba(0, 0, 0, 255) }));
 }
 
 test "device rectangles preserve exact empty dimensions" {

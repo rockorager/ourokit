@@ -148,6 +148,11 @@ with `-Dresvg-system=true`. Without it, rendering a nonempty path returns
 `error.PathRasterizerDisabled` before changing the target. The full `ourokit`
 module always enables path rasterization.
 
+Outset Box shadows (`shadow.Style`) are pure Zig and available without opt-in
+or Cargo. They do not change layout or hit bounds. See the
+[shadow rendering contract](docs/rendering.md#outset-box-shadows) for clipping,
+blur, cache, and device limits.
+
 Text remains explicit: a caller that uses Text render objects must create and
 attach its own paragraph source/layout caches, and text-capable software
 rendering requires caller-owned glyph/font caches. Fontconfig discovery is

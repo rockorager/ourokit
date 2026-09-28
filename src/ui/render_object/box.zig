@@ -19,6 +19,7 @@ pub fn validate(value: types.Box) !void {
         return error.InvalidBorder;
     if ((value.outline_width == 0) != (value.outline_color == null))
         return error.InvalidOutline;
+    if (value.shadow) |shadow| try shadow.validate();
     if (!validExtent(value.padding.left) or !validExtent(value.padding.top) or
         !validExtent(value.padding.right) or !validExtent(value.padding.bottom))
         return error.InvalidInsets;

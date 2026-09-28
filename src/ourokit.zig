@@ -5,6 +5,7 @@ pub const design = @import("design/root.zig");
 pub const text = @import("text/root.zig");
 pub const image = @import("image/root.zig");
 pub const path = @import("path/root.zig");
+pub const shadow = @import("shadow/root.zig");
 pub const xdg = @import("xdg/root.zig");
 pub const mcp = @import("mcp/root.zig");
 pub const dbus = @import("dbus/root.zig");
@@ -27,6 +28,7 @@ test {
     _ = text;
     _ = image;
     _ = path;
+    _ = shadow;
     _ = xdg;
     _ = mcp;
     _ = dbus;

@@ -33,6 +33,8 @@ pub const Box = struct {
     border_color: ?Color = null,
     border_width: f32 = 0,
     corner_radius: f32 = 0,
+    /// Outset paint only; does not change layout, clipping, or hit bounds.
+    shadow: ?@import("../../shadow/root.zig").Style = null,
     outline_color: ?Color = null,
     outline_width: f32 = 0,
     outline_gap: f32 = 0,

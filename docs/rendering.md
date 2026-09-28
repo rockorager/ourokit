@@ -2,7 +2,7 @@
 
 ## Scene and color contract
 
-The display list contains clear, rectangle, text, image, and immutable path
+The display list contains clear, rectangle, shadow, text, image, and immutable path
 commands plus a balanced rectangular clip stack. A borrowed `DisplayList`
 supports immediate consumption. An owning `Frame` copies command and damage
 storage and retains path geometry through completion. Text and image resources
@@ -82,8 +82,43 @@ abort policy.
 The Wayland software runner keeps a persistent mask cache; standalone software
 targets may supply `path_masks` or use a temporary per-render cache. Vulkan keeps
 a persistent CPU cache and deduplicates uploads by mask key per submission.
-Uploads are bounded to 32 MiB and device storage-buffer limits, and remain owned
+Combined path/shadow uploads are bounded to 32 MiB and device storage-buffer limits, and remain owned
 by the target until its fence completes. There is no GPU path atlas or new shader.
+
+## Outset box shadows
+
+`shadow.Style` is an optional Box value: signed offset/spread, nonnegative blur,
+and color. Scene lowering scales these logical lengths and uses the same snapped
+border-box bounds and clamped radius as the decoration. The value-only scene
+command records the device-space shape, complete painted bounds, and color;
+it needs no resource lease. Damage includes both old and new shadow extents.
+Shadows preserve opacity but never establish opaque coverage or occlusion.
+
+The pure-Zig rasterizer expands/contracts the rounded box by spread, applies the
+offset, convolves its A8 coverage with a separable Gaussian (sigma = blur / 2,
+support = ceil(3 sigma)), then knocks out the original rounded box coverage.
+Positive spread uses the CSS corner-radius adjustment, preserving square corners.
+This knockout is independent of the background color or alpha. Paint order is
+shadow, background/border/outline, then clipped content. Ancestor clips apply to
+the shadow; the box's own content clip does not. Layout and hit bounds stay fixed.
+
+Relative offsets quantize to the nearest 1/64 pixel. Cache keys include dimensions,
+clamped original radius, the **full** quantized offset, and blur/spread bits.
+Integer box translation and color share masks; integer relative offsets cannot,
+because they change the relationship to the knockout. Bounds include one AA pixel
+plus Gaussian support. Device blur is capped at 128; masks at 8192 pixels per axis
+and 16 Mi pixels. Each persistent CPU cache retains at most 32 MiB including
+metadata and 256 entries. Convolution scratch uses at most 64 MiB plus a fixed
+kernel; a miss builds its new mask before evicting old entries so allocation
+failure preserves the cache. Zig allocation errors are recoverable.
+
+Software targets may supply `shadow_masks`, otherwise they use a temporary cache.
+The Wayland runner and Vulkan renderer keep persistent caches. Vulkan uses the
+same A8 upload/compositing lifecycle as paths, with distinct tagged keys and a
+shared submission budget; copied coverage lives until the target fence completes.
+Compute/software pixels match exactly; direct/linear graphics retain the existing
+presentation tolerance. Shadows require no Rust rasterizer or new shaders and
+are available in the default platform-neutral `ourokit_ui` module.
 
 ## Software backend
 

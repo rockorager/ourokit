@@ -3,6 +3,77 @@ const Color = @import("../core/color.zig").Color;
 const scene = @import("../scene/root.zig");
 const software = @import("software/root.zig");
 
+test "shadow coverage knockout clipping and changed extents replay exactly" {
+    const shadows = @import("../shadow/root.zig");
+    const allocator = std.testing.allocator;
+    const viewport = @import("../core/geometry.zig").RectI{ .x = 0, .y = 0, .width = 64, .height = 48 };
+    var tracker = try scene.DamageTracker.init(allocator, 4);
+    defer tracker.deinit();
+    var shape: shadows.Shape = .{ .box = .{ .x = 10, .y = 8, .width = 20, .height = 16 }, .offset = .{ .x = 12, .y = 4 } };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(7, 11, 19, 255) },
+        .{ .push_clip_rect = .{ .x = 0, .y = 0, .width = 40, .height = 48 } },
+        .{ .shadow = .{ .shape = shape, .bounds = try shadows.deviceBounds(shape), .color = Color.rgba(220, 50, 80, 128) } },
+        .pop_clip,
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 34, .y = 14, .width = 2, .height = 3 }, .color = Color.rgba(251, 197, 29, 255) } },
+    };
+    var full: [64 * 48 * 4]u8 = undefined;
+    var partial: @TypeOf(full) = undefined;
+    const target: software.Target = .{ .pixels = &full, .width = 64, .height = 48, .stride = 64 * 4, .format = .rgba8_unorm, .allocator = allocator };
+    var partial_target = target;
+    partial_target.pixels = &partial;
+    for (0..4) |revision| {
+        if (revision == 1) {
+            // Change every extent-producing property, including negative placement.
+            shape = .{ .box = .{ .x = 5, .y = 13, .width = 20, .height = 16 }, .corner_radius = 5, .offset = .{ .x = -7.25, .y = 3.5 }, .blur = 6, .spread = 2 };
+            commands[2].shadow.shape = shape;
+            commands[2].shadow.bounds = try shadows.deviceBounds(shape);
+        } else if (revision == 2) {
+            // Color must invalidate paint despite identical coverage and bounds.
+            commands[2].shadow.color = Color.rgba(20, 190, 120, 211);
+        }
+        const removed = [_]scene.Command{ commands[0], commands[4] };
+        const current: []const scene.Command = if (revision == 3) &removed else &commands;
+        const damage = try tracker.compare(current, viewport);
+        try software.render(.{ .commands = current }, target);
+        try software.render(.{ .commands = current, .damage = damage }, partial_target);
+        try std.testing.expectEqualSlices(u8, &full, &partial);
+        if (revision == 0) {
+            // Full-coverage source-over calculated independently in linear sRGB.
+            try std.testing.expectEqualSlices(u8, &.{ 162, 36, 59, 255 }, full[(18 * 64 + 32) * 4 ..][0..4]);
+            // The original box is transparent yet still knocks out its interior.
+            try std.testing.expectEqualSlices(u8, &.{ 7, 11, 19, 255 }, full[(18 * 64 + 26) * 4 ..][0..4]);
+            try std.testing.expectEqualSlices(u8, &.{ 7, 11, 19, 255 }, full[(18 * 64 + 41) * 4 ..][0..4]);
+            try std.testing.expectEqualSlices(u8, &.{ 251, 197, 29, 255 }, full[(15 * 64 + 35) * 4 ..][0..4]);
+        }
+        if (revision == 1) {
+            // Knockout remains clear after blur; outside the box the tail fades.
+            try std.testing.expectEqualSlices(u8, &.{ 7, 11, 19, 255 }, full[(20 * 64 + 12) * 4 ..][0..4]);
+            try std.testing.expect(full[(20 * 64 + 3) * 4] > full[(10 * 64 + 3) * 4]);
+            try std.testing.expect(full[(10 * 64 + 3) * 4] > 7);
+        }
+        if (@import("ourokit_build_options").vulkan) {
+            const vulkan = @import("vulkan/root.zig");
+            var renderer = vulkan.init(allocator) catch |err| switch (err) {
+                error.VulkanUnavailable => return error.SkipZigTest,
+                else => return err,
+            };
+            defer renderer.deinit();
+            var gpu = try vulkan.Target.init(&renderer, 64, 48);
+            defer gpu.deinit(&renderer);
+            try renderer.render(.{ .commands = current }, &gpu);
+            var actual: @TypeOf(full) = undefined;
+            try gpu.readPixels(&actual, 64 * 4, .rgba8_unorm);
+            try std.testing.expectEqualSlices(u8, &full, &actual);
+        }
+        tracker.submitted();
+        try std.testing.expectEqual(@as(usize, 0), (try tracker.compare(current, viewport)).regions.len);
+    }
+    const invalid = [_]scene.Command{.{ .shadow = .{ .shape = shape, .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .color = Color.rgba(0, 0, 0, 255) } }};
+    try std.testing.expectError(error.InvalidShadow, (scene.DisplayList{ .commands = &invalid }).validate());
+    try std.testing.expect(!(scene.DisplayList{ .commands = commands[1..4] }).isOpaque(viewport));
+}
+
 /// Backend conformance fixture. Future backends render the same commands and
 /// compare their readback against `expected_rgba` under the documented
 /// rasterization tolerance. Current integer rectangles require exact bytes.

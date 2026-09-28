@@ -637,6 +637,7 @@ pub const Tree = struct {
         };
         const clips = switch (target.object) {
             .box => |value| paint: {
+                if (value.shadow) |shadow| try builder.boxShadow(bounds, value.corner_radius, shadow);
                 if (value.border_color != null or
                     (value.background != null and value.corner_radius != 0))
                 {
@@ -2204,6 +2205,55 @@ test "box outlines stay paint-only and inset rings paint above the background" {
         try std.testing.expectEqual(@as(u32, if (inset) 2 else 8), outline.corner_radius);
         try std.testing.expectEqual(@as(u32, 2), outline.border_width);
     }
+}
+
+test "box shadows are paint-only obey ancestor clips and never expand hit targets" {
+    const scene = @import("../../scene/root.zig");
+    const software = @import("../../renderer/software/root.zig");
+    const RectI = @import("../../core/geometry.zig").RectI;
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    var parent_box: types.Box = .{ .width = 60, .height = 50, .padding = .all(10), .alignment = .{} };
+    var child_box: types.Box = .{ .width = 30, .height = 20, .corner_radius = 4, .clip = true, .background = Color.rgba(255, 255, 255, 255) };
+    const root = try tree.create(.{ .box = parent_box });
+    const child = try tree.create(.{ .box = child_box });
+    try tree.appendChild(root, child, .none);
+    _ = try tree.layout(root, .{ .max_width = 90, .max_height = 60 });
+    child_box.shadow = .{ .offset = .{ .x = 36, .y = -3 }, .spread = 2, .color = Color.rgba(20, 60, 140, 255) };
+    try tree.update(child, .{ .box = child_box });
+    try std.testing.expect(!(try tree.layoutDirty(root)));
+    try std.testing.expect(try tree.paintDirty(root));
+    try std.testing.expectEqual(SizeF{ .width = 30, .height = 20 }, try tree.nodeSize(child));
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 20, .y = 15 })).?);
+    try std.testing.expectEqual(root, (try tree.hitTest(root, .{ .x = 55, .y = 15 })).?);
+    try std.testing.expect((try tree.hitTest(root, .{ .x = 65, .y = 15 })) == null);
+    var commands: [8]scene.Command = undefined;
+    var pixels: [90 * 60 * 4]u8 = undefined;
+    for ([_]bool{ false, true }) |ancestor_clip| {
+        parent_box.clip = ancestor_clip;
+        try tree.update(root, .{ .box = parent_box });
+        var builder = try scene_builder.Builder.init(&commands, 1);
+        try builder.clear(Color.rgba(255, 255, 255, 255));
+        try tree.buildScene(root, &builder);
+        const index: usize = if (ancestor_clip) 2 else 1;
+        try std.testing.expectEqual(RectI{ .x = 10, .y = 10, .width = 30, .height = 20 }, commands[index].shadow.shape.box);
+        try std.testing.expect(commands[index + 1] == .decorated_rectangle);
+        // Own clip begins after the shadow and decoration; ancestor clip begins before them.
+        try std.testing.expect(commands[index + 2] == .push_clip_rect);
+        try software.render(builder.displayList(), .{ .pixels = &pixels, .width = 90, .height = 60, .stride = 90 * 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
+        try std.testing.expectEqualSlices(u8, &.{ 20, 60, 140, 255 }, pixels[(15 * 90 + 55) * 4 ..][0..4]);
+        try std.testing.expectEqualSlices(u8, if (ancestor_clip) &.{ 255, 255, 255, 255 } else &.{ 20, 60, 140, 255 }, pixels[(15 * 90 + 65) * 4 ..][0..4]);
+    }
+    child_box.shadow = null;
+    try tree.update(child, .{ .box = child_box });
+    try std.testing.expect(!(try tree.layoutDirty(root)));
+    try std.testing.expect(try tree.paintDirty(root));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(child));
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try builder.clear(Color.rgba(255, 255, 255, 255));
+    try tree.buildScene(root, &builder);
+    for (builder.displayList().commands) |command| try std.testing.expect(command != .shadow);
 }
 
 test "scroll lays out unbounded content and clips paint and hit testing" {

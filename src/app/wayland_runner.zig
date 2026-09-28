@@ -472,6 +472,8 @@ fn runSourceInternal(
     defer glyphs.deinit();
     var path_masks = @import("../path/root.zig").MaskCache.init(init.gpa);
     defer path_masks.deinit();
+    var shadow_masks = @import("../shadow/root.zig").MaskCache.init(init.gpa);
+    defer shadow_masks.deinit();
     var vulkan_renderer: renderer.vulkan = undefined;
     if (options.vulkan) vulkan_renderer = try renderer.vulkan.init(init.gpa);
     defer if (options.vulkan) vulkan_renderer.deinit();
@@ -1115,6 +1117,7 @@ fn runSourceInternal(
                         .stride = target.stride,
                         .format = .bgra8_unorm,
                         .path_masks = &path_masks,
+                        .shadow_masks = &shadow_masks,
                     }, &glyphs, null, &paragraphs, &images),
                     .vulkan => |target| vulkan_renderer.renderDmabufResources(
                         list,

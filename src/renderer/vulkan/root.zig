@@ -15,6 +15,7 @@ const RectI = @import("../../core/geometry.zig").RectI;
 const scene = @import("../../scene/root.zig");
 const text = @import("../../text/root.zig");
 const path = @import("../../path/root.zig");
+const shadow = @import("../../shadow/root.zig");
 const build_options = @import("ourokit_build_options");
 const ImageCache = @import("../../image/cache.zig").Cache;
 const ImagePlacement = @import("../image_sampling.zig").Placement;
@@ -85,6 +86,7 @@ fence: c.VkFence,
 max_pixels: u64,
 max_image_pixels: u64,
 path_masks: path.MaskCache,
+shadow_masks: shadow.MaskCache,
 
 const atlas_width = 2048;
 const atlas_height = 2048;
@@ -538,11 +540,12 @@ const ImageUploads = struct {
 
 /// Submission-owned A8 copies. Cache pixels are borrowed only until the next
 /// get, so copy each unique mask before asking the CPU cache for another one.
-const PathUploads = struct {
+const CoverageUploads = struct {
     entries: std.ArrayList(Entry) = .empty,
     resources: std.ArrayList(Resource) = .empty,
     byte_size: u64 = 0,
 
+    const Key = union(enum) { path: path.Key, shadow: shadow.Key };
     const Entry = struct {
         resource_index: ?usize,
         bounds: RectI,
@@ -553,39 +556,46 @@ const PathUploads = struct {
         descriptor: c.VkDescriptorSet,
     };
 
-    fn init(renderer: *Renderer, commands: []const scene.Command, target: ?*const Target) !PathUploads {
-        var self: PathUploads = .{};
+    fn init(renderer: *Renderer, commands: []const scene.Command, target: ?*const Target) !CoverageUploads {
+        var self: CoverageUploads = .{};
         errdefer self.deinit(renderer);
-        var indices: std.AutoHashMapUnmanaged(path.Key, usize) = .empty;
+        var indices: std.AutoHashMapUnmanaged(Key, usize) = .empty;
         defer indices.deinit(renderer.allocator);
         const byte_limit = @min(32 * 1024 * 1024, renderer.max_image_pixels * 4);
-        for (commands) |command| switch (command) {
-            .path => |value| {
-                const mask = try renderer.path_masks.get(value.path, value.origin, value.scale);
-                var resource_index: ?usize = null;
-                if (!mask.bounds.isEmpty()) {
-                    const index = try indices.getOrPut(renderer.allocator, mask.key);
-                    if (!index.found_existing) {
-                        // uint shader loads include up to three bytes after the
-                        // final texel, including when the row width is odd.
-                        const padded_size = std.mem.alignForward(usize, mask.pixels.len, 4);
-                        if (padded_size > byte_limit - self.byte_size) return error.PathUploadBudgetExceeded;
-                        var resource = try upload(renderer, mask.pixels, padded_size, target);
-                        errdefer {
-                            c.vkDestroyDescriptorPool(renderer.device, resource.pool, null);
-                            resource.pixels.deinit(renderer);
-                        }
-                        try self.resources.append(renderer.allocator, resource);
-                        index.value_ptr.* = self.resources.items.len - 1;
-                        self.byte_size += padded_size;
+        for (commands) |command| {
+            const mask: struct { key: Key, bounds: RectI, pixels: []const u8 } = switch (command) {
+                .path => |value| blk: {
+                    const mask = try renderer.path_masks.get(value.path, value.origin, value.scale);
+                    break :blk .{ .key = .{ .path = mask.key }, .bounds = mask.bounds, .pixels = mask.pixels };
+                },
+                .shadow => |value| blk: {
+                    const mask = try renderer.shadow_masks.get(value.shape);
+                    break :blk .{ .key = .{ .shadow = mask.key }, .bounds = mask.bounds, .pixels = mask.pixels };
+                },
+                else => continue,
+            };
+            var resource_index: ?usize = null;
+            if (!mask.bounds.isEmpty()) {
+                const index = try indices.getOrPut(renderer.allocator, mask.key);
+                if (!index.found_existing) {
+                    // uint shader loads include up to three bytes after the
+                    // final texel, including when the row width is odd.
+                    const padded_size = std.mem.alignForward(usize, mask.pixels.len, 4);
+                    if (padded_size > byte_limit - self.byte_size) return error.CoverageUploadBudgetExceeded;
+                    var resource = try upload(renderer, mask.pixels, padded_size, target);
+                    errdefer {
+                        c.vkDestroyDescriptorPool(renderer.device, resource.pool, null);
+                        resource.pixels.deinit(renderer);
                     }
-                    resource_index = index.value_ptr.*;
+                    try self.resources.append(renderer.allocator, resource);
+                    index.value_ptr.* = self.resources.items.len - 1;
+                    self.byte_size += padded_size;
                 }
-                // Even empty masks occupy an entry in scene command order.
-                try self.entries.append(renderer.allocator, .{ .resource_index = resource_index, .bounds = mask.bounds });
-            },
-            else => {},
-        };
+                resource_index = index.value_ptr.*;
+            }
+            // Even empty masks occupy an entry in scene command order.
+            try self.entries.append(renderer.allocator, .{ .resource_index = resource_index, .bounds = mask.bounds });
+        }
         return self;
     }
 
@@ -635,7 +645,7 @@ const PathUploads = struct {
         return .{ .pixels = pixels, .pool = pool, .descriptor = descriptor };
     }
 
-    fn deinit(self: *PathUploads, renderer: *Renderer) void {
+    fn deinit(self: *CoverageUploads, renderer: *Renderer) void {
         for (self.resources.items) |*resource| {
             c.vkDestroyDescriptorPool(renderer.device, resource.pool, null);
             resource.pixels.deinit(renderer);
@@ -784,7 +794,7 @@ pub const DmabufTarget = struct {
     acquire_point: u64 = 0,
     release_point: u64 = 0,
     image_uploads: ImageUploads = .{},
-    path_uploads: PathUploads = .{},
+    coverage_uploads: CoverageUploads = .{},
     /// Optional borrowed two-query timestamp pool for the presentation probe.
     /// The caller owns it and must wait for this target before reading/freeing.
     timestamp_pool: c.VkQueryPool = null,
@@ -1007,7 +1017,7 @@ pub const DmabufTarget = struct {
         if (self.gpu_pending)
             _ = c.vkWaitForFences(renderer.device, 1, &self.fence, c.VK_TRUE, std.math.maxInt(u64));
         self.image_uploads.deinit(renderer);
-        self.path_uploads.deinit(renderer);
+        self.coverage_uploads.deinit(renderer);
         c.vkDestroySemaphore(renderer.device, self.timeline, null);
         c.vkDestroyFence(renderer.device, self.fence, null);
         c.vkDestroyCommandPool(renderer.device, self.command_pool, null);
@@ -1025,7 +1035,7 @@ pub const DmabufTarget = struct {
             c.VK_SUCCESS => blk: {
                 self.gpu_pending = false;
                 self.image_uploads.deinit(renderer);
-                self.path_uploads.deinit(renderer);
+                self.coverage_uploads.deinit(renderer);
                 break :blk true;
             },
             c.VK_NOT_READY => false,
@@ -1038,7 +1048,7 @@ pub const DmabufTarget = struct {
         try vk(c.vkWaitForFences(renderer.device, 1, &self.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
         self.gpu_pending = false;
         self.image_uploads.deinit(renderer);
-        self.path_uploads.deinit(renderer);
+        self.coverage_uploads.deinit(renderer);
     }
 
     pub fn exportSyncobjFd(self: *DmabufTarget, renderer: *Renderer) !std.posix.fd_t {
@@ -1818,12 +1828,14 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
         ),
         .max_image_pixels = @as(u64, properties.limits.maxStorageBufferRange) / 4,
         .path_masks = path.MaskCache.init(allocator),
+        .shadow_masks = shadow.MaskCache.init(allocator),
     };
 }
 
 pub fn deinit(self: *Renderer) void {
     _ = c.vkDeviceWaitIdle(self.device);
     self.path_masks.deinit();
+    self.shadow_masks.deinit();
     self.direct_presentation.deinit(self.device);
     c.vkDestroyFence(self.device, self.fence, null);
     c.vkDestroyCommandPool(self.device, self.command_pool, null);
@@ -1946,8 +1958,8 @@ pub fn renderResources(
     if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
     var image_uploads = try ImageUploads.init(self, list.commands, images, target);
     defer image_uploads.deinit(self);
-    var path_uploads = try PathUploads.init(self, list.commands, target);
-    defer path_uploads.deinit(self);
+    var coverage_uploads = try CoverageUploads.init(self, list.commands, target);
+    defer coverage_uploads.deinit(self);
     try vk(c.vkResetDescriptorPool(self.device, self.descriptor_pool, 0), error.ResetDescriptorPoolFailed);
     var descriptor_allocate_info: c.VkDescriptorSetAllocateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2025,10 +2037,10 @@ pub fn renderResources(
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &path_uploads, descriptor_set),
+        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, descriptor_set),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &path_uploads, descriptor_set);
+            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, descriptor_set);
         },
     }
     var host_barrier: c.VkMemoryBarrier = .{
@@ -2139,8 +2151,8 @@ pub fn renderGraphicsResources(
     if (!try target.ready(self)) return error.TargetBusy;
     var image_uploads = try ImageUploads.init(self, list.commands, images, null);
     errdefer image_uploads.deinit(self);
-    var path_uploads = try PathUploads.init(self, list.commands, null);
-    errdefer path_uploads.deinit(self);
+    var coverage_uploads = try CoverageUploads.init(self, list.commands, null);
+    errdefer coverage_uploads.deinit(self);
     try vk(c.vkResetCommandBuffer(target.command_buffer, 0), error.ResetCommandBufferFailed);
     var begin_info: c.VkCommandBufferBeginInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2225,10 +2237,10 @@ pub fn renderGraphicsResources(
     // guarantees that replaying the entire scene defines every pixel.
     const damage: scene.Damage = if (target.direct and target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED) .full else list.damage;
     switch (damage) {
-        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &path_uploads),
+        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &path_uploads);
+            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads);
         },
     }
     if (!target.direct) self.convertPresentation(target);
@@ -2282,7 +2294,7 @@ pub fn renderGraphicsResources(
     if (target.linear) |linear| linear.initialized = true;
     if (has_freetype and atlas_uploaded) glyphs.?.uploaded();
     target.image_uploads = image_uploads;
-    target.path_uploads = path_uploads;
+    target.coverage_uploads = coverage_uploads;
     target.layout = c.VK_IMAGE_LAYOUT_GENERAL;
     target.gpu_pending = true;
     if (target.explicit_sync) {
@@ -2313,13 +2325,13 @@ fn renderPresentationRegion(
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
     images: *const ImageUploads,
-    paths: *const PathUploads,
+    coverage: *const CoverageUploads,
 ) void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
     var image_index: usize = 0;
-    var path_index: usize = 0;
+    var coverage_index: usize = 0;
     for (commands, 0..) |command, index| switch (command) {
         .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
             self.presentationFill(target, damage, color, .source),
@@ -2343,11 +2355,11 @@ fn renderPresentationRegion(
             self.drawPresentationImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
             image_index += 1;
         },
-        .path => |value| {
-            const entry = paths.entries.items[path_index];
+        inline .path, .shadow => |value| {
+            const entry = coverage.entries.items[coverage_index];
             if (entry.resource_index) |resource_index|
-                self.drawPresentationPath(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &paths.resources.items[resource_index]);
-            path_index += 1;
+                self.drawPresentationCoverage(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &coverage.resources.items[resource_index]);
+            coverage_index += 1;
         },
         .glyph_run => |run| self.drawPresentationGlyphRun(
             run,
@@ -2509,14 +2521,14 @@ fn renderRegion(
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
     images: *const ImageUploads,
-    paths: *const PathUploads,
+    coverage: *const CoverageUploads,
     descriptor: c.VkDescriptorSet,
 ) void {
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
     var image_index: usize = 0;
-    var path_index: usize = 0;
+    var coverage_index: usize = 0;
     for (commands, 0..) |command, index| switch (command) {
         .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
             self.fill(target, damage, color, .source),
@@ -2541,11 +2553,11 @@ fn renderRegion(
             image_index += 1;
             c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
         },
-        .path => |value| {
-            const entry = paths.entries.items[path_index];
+        inline .path, .shadow => |value| {
+            const entry = coverage.entries.items[coverage_index];
             if (entry.resource_index) |resource_index|
-                self.drawPath(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &paths.resources.items[resource_index]);
-            path_index += 1;
+                self.drawCoverage(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &coverage.resources.items[resource_index]);
+            coverage_index += 1;
             c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
         },
         .glyph_run => |run| self.drawGlyphRun(
@@ -2565,7 +2577,7 @@ fn renderRegion(
     };
 }
 
-fn drawPath(self: *Renderer, target: *const Target, clip: RectI, color: Color, mask_bounds: RectI, resource: *const PathUploads.Resource) void {
+fn drawCoverage(self: *Renderer, target: *const Target, clip: RectI, color: Color, mask_bounds: RectI, resource: *const CoverageUploads.Resource) void {
     const bounds = RectI.intersect(clip, mask_bounds);
     if (bounds.isEmpty()) return;
     c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
@@ -2592,7 +2604,7 @@ fn drawPath(self: *Renderer, target: *const Target, clip: RectI, color: Color, m
     c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 }
 
-fn drawPresentationPath(self: *Renderer, target: *const DmabufTarget, clip: RectI, color: Color, mask_bounds: RectI, resource: *const PathUploads.Resource) void {
+fn drawPresentationCoverage(self: *Renderer, target: *const DmabufTarget, clip: RectI, color: Color, mask_bounds: RectI, resource: *const CoverageUploads.Resource) void {
     const bounds = RectI.intersect(clip, mask_bounds);
     if (bounds.isEmpty()) return;
     var scissor: c.VkRect2D = .{
@@ -4152,7 +4164,7 @@ test "Vulkan path uploads pad A8 words and copy borrowed bytes" {
     defer target.deinit(&renderer);
     for ([_]?*const Target{ &target, null }) |destination| {
         var mask = [_]u8{ 9, 127, 255, 42, 0, 89, 213, 11, 73, 96, 254, 1, 33, 160, 220 };
-        var resource = try PathUploads.upload(&renderer, &mask, 16, destination);
+        var resource = try CoverageUploads.upload(&renderer, &mask, 16, destination);
         defer {
             c.vkDestroyDescriptorPool(renderer.device, resource.pool, null);
             resource.pixels.deinit(&renderer);
@@ -4202,7 +4214,7 @@ test "Vulkan path uploads deduplicate translations and clean up allocation failu
     defer target.deinit(&renderer);
     const original_limit = renderer.max_image_pixels;
     for ([_]?*const Target{ &target, null }) |destination| {
-        var uploads = try PathUploads.init(&renderer, &commands, destination);
+        var uploads = try CoverageUploads.init(&renderer, &commands, destination);
         try std.testing.expectEqual(@as(usize, 3), uploads.resources.items.len);
         try std.testing.expectEqual(commands.len, uploads.entries.items.len);
         try std.testing.expectEqual(uploads.entries.items[0].resource_index, uploads.entries.items[63].resource_index);
@@ -4211,9 +4223,9 @@ test "Vulkan path uploads deduplicate translations and clean up allocation failu
         uploads.deinit(&renderer);
         try std.testing.expectEqual(@as(usize, 0), uploads.resources.items.len);
         renderer.max_image_pixels = budget / 4 - 1;
-        try std.testing.expectError(error.PathUploadBudgetExceeded, PathUploads.init(&renderer, &commands, destination));
+        try std.testing.expectError(error.CoverageUploadBudgetExceeded, CoverageUploads.init(&renderer, &commands, destination));
         renderer.max_image_pixels += 1;
-        uploads = try PathUploads.init(&renderer, &commands, destination);
+        uploads = try CoverageUploads.init(&renderer, &commands, destination);
         try std.testing.expectEqual(budget, uploads.byte_size);
         uploads.deinit(&renderer);
         renderer.max_image_pixels = original_limit;
@@ -4222,7 +4234,7 @@ test "Vulkan path uploads deduplicate translations and clean up allocation failu
                 const original = r.allocator;
                 r.allocator = allocator;
                 defer r.allocator = original;
-                var copies = try PathUploads.init(r, batch, output);
+                var copies = try CoverageUploads.init(r, batch, output);
                 defer copies.deinit(r);
             }
         }.check, .{ &renderer, @as([]const scene.Command, &commands), destination });
@@ -4275,11 +4287,11 @@ test "Vulkan paths preserve targets on preflight failure and outlive native mask
     defer direct.deinit(&renderer);
     const original_limit = renderer.max_image_pixels;
     renderer.max_image_pixels = 1;
-    try std.testing.expectError(error.PathUploadBudgetExceeded, renderer.render(list, &target));
+    try std.testing.expectError(error.CoverageUploadBudgetExceeded, renderer.render(list, &target));
     try target.readPixels(&actual, 14 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);
     for ([_]*DmabufTarget{ &linear.target, &direct.target }) |output| {
-        try std.testing.expectError(error.PathUploadBudgetExceeded, renderer.renderGraphicsResources(list, output, null, null, null, null, false));
+        try std.testing.expectError(error.CoverageUploadBudgetExceeded, renderer.renderGraphicsResources(list, output, null, null, null, null, false));
         try std.testing.expect(!output.gpu_pending);
         try std.testing.expectEqual(@as(c.VkImageLayout, c.VK_IMAGE_LAYOUT_UNDEFINED), output.layout);
         if (output.linear) |attachment| try std.testing.expect(!attachment.initialized);
@@ -4296,9 +4308,9 @@ test "Vulkan paths preserve targets on preflight failure and outlive native mask
     try renderer.renderGraphicsResources(list, &linear.target, null, null, null, null, false);
     for ([_]*DmabufTarget{ &linear.target, &direct.target }) |output| {
         try std.testing.expect(output.gpu_pending);
-        try std.testing.expectEqual(@as(usize, 3), output.path_uploads.entries.items.len);
-        try std.testing.expectEqual(@as(usize, 1), output.path_uploads.resources.items.len);
-        try std.testing.expectEqual(@as(?usize, null), output.path_uploads.entries.items[1].resource_index);
+        try std.testing.expectEqual(@as(usize, 3), output.coverage_uploads.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 1), output.coverage_uploads.resources.items.len);
+        try std.testing.expectEqual(@as(?usize, null), output.coverage_uploads.entries.items[1].resource_index);
     }
     // Neither geometry nor borrowed CPU pixels survive to fence completion.
     geometry.release();
@@ -4309,11 +4321,178 @@ test "Vulkan paths preserve targets on preflight failure and outlive native mask
     try linear.target.wait(&renderer);
     try vk(c.vkWaitForFences(renderer.device, 1, &direct.target.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
     try std.testing.expect(try direct.target.ready(&renderer));
-    try std.testing.expectEqual(@as(usize, 0), linear.target.path_uploads.resources.items.len);
-    try std.testing.expectEqual(@as(usize, 0), direct.target.path_uploads.resources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), linear.target.coverage_uploads.resources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), direct.target.coverage_uploads.resources.items.len);
     for (0..10) |y| for (0..14) |x| {
         const pixel = expected[(y * 14 + x) * 4 ..][0..4].*;
         try linear.expectPixel(x, y, transparent[(y * 14 + x) * 4 ..][0..4].*);
         try direct.expectPixel(x, y, pixel);
+    };
+}
+
+test "Vulkan shadow and path uploads deduplicate within one shared budget" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const geometry = try path.Path.create(std.testing.allocator, &.{
+        .{ .move = .{ .x = 0, .y = 0 } },
+        .{ .line = .{ .x = 6, .y = 1 } },
+        .{ .line = .{ .x = 2, .y = 4 } },
+        .close,
+    }, .{ .fill = .nonzero });
+    defer geometry.release();
+    const shape: shadow.Shape = .{ .box = .{ .x = 7, .y = 4, .width = 9, .height = 5 }, .corner_radius = 2, .offset = .{ .x = -1.25, .y = 2.5 }, .blur = 2, .spread = 0.5 };
+    var translated = shape;
+    translated.box.x -= 11;
+    translated.box.y += 3;
+    const empty: shadow.Shape = .{ .box = .{ .x = 0, .y = 0, .width = 0, .height = 5 }, .blur = 2 };
+    const path_bounds = try path.deviceBounds(geometry, .{}, 1);
+    const shadow_bounds = try shadow.deviceBounds(shape);
+    const commands = [_]scene.Command{
+        .{ .path = .{ .path = geometry, .identity = geometry.identity, .origin = .{}, .scale = 1, .bounds = path_bounds, .color = Color.rgba(120, 40, 70, 180) } },
+        .{ .shadow = .{ .shape = shape, .bounds = shadow_bounds, .color = Color.rgba(0, 0, 0, 150) } },
+        .{ .path = .{ .path = geometry, .identity = geometry.identity, .origin = .{ .x = 12 }, .scale = 1, .bounds = try path.deviceBounds(geometry, .{ .x = 12 }, 1), .color = Color.rgba(20, 190, 130, 140) } },
+        .{ .shadow = .{ .shape = translated, .bounds = try shadow.deviceBounds(translated), .color = Color.rgba(240, 130, 10, 100) } },
+        .{ .shadow = .{ .shape = empty, .bounds = try shadow.deviceBounds(empty), .color = Color.rgba(255, 255, 255, 255) } },
+    };
+    // Derive the budget from raster extents, not the upload accounting under test.
+    const path_bytes = (@as(u64, path_bounds.width) * path_bounds.height + 3) / 4 * 4;
+    const shadow_bytes = (@as(u64, shadow_bounds.width) * shadow_bounds.height + 3) / 4 * 4;
+    const budget = path_bytes + shadow_bytes;
+    var target = try Target.init(&renderer, 1, 1);
+    defer target.deinit(&renderer);
+    const original_limit = renderer.max_image_pixels;
+    for ([_]?*const Target{ &target, null }) |destination| {
+        renderer.max_image_pixels = budget / 4 - 1;
+        // Each mask fits alone; splitting budgets by kind would wrongly pass.
+        try std.testing.expect(@max(path_bytes, shadow_bytes) <= renderer.max_image_pixels * 4);
+        try std.testing.expectError(error.CoverageUploadBudgetExceeded, CoverageUploads.init(&renderer, &commands, destination));
+        renderer.max_image_pixels += 1;
+        var uploads = try CoverageUploads.init(&renderer, &commands, destination);
+        try std.testing.expectEqual(budget, uploads.byte_size);
+        try std.testing.expectEqual(@as(usize, 2), uploads.resources.items.len);
+        try std.testing.expectEqual(commands.len, uploads.entries.items.len);
+        for (uploads.entries.items, [_]?usize{ 0, 1, 0, 1, null }) |entry, expected|
+            try std.testing.expectEqual(expected, entry.resource_index);
+        try std.testing.expectEqual(@as(i32, 12), uploads.entries.items[2].bounds.x - uploads.entries.items[0].bounds.x);
+        try std.testing.expectEqual(@as(i32, -11), uploads.entries.items[3].bounds.x - uploads.entries.items[1].bounds.x);
+        try std.testing.expectEqual(@as(i32, 3), uploads.entries.items[3].bounds.y - uploads.entries.items[1].bounds.y);
+        uploads.deinit(&renderer);
+        renderer.max_image_pixels = original_limit;
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+            fn check(allocator: std.mem.Allocator, r: *Renderer, batch: []const scene.Command, output: ?*const Target) !void {
+                const original = r.allocator;
+                r.allocator = allocator;
+                defer r.allocator = original;
+                var copies = try CoverageUploads.init(r, batch, output);
+                defer copies.deinit(r);
+            }
+        }.check, .{ &renderer, @as([]const scene.Command, &commands), destination });
+    }
+}
+
+test "Vulkan shadows interleave with paths and outlive CPU caches on both graphics targets" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const geometry = try path.Path.create(std.testing.allocator, &.{
+        .{ .move = .{ .x = 0, .y = 0 } },
+        .{ .line = .{ .x = 29, .y = 10 } },
+        .{ .line = .{ .x = 3, .y = 23 } },
+        .close,
+    }, .{ .fill = .nonzero });
+    var native_live = true;
+    defer if (native_live) geometry.release();
+    const blurred: shadow.Shape = .{ .box = .{ .x = 5, .y = 6, .width = 14, .height = 10 }, .corner_radius = 3, .offset = .{ .x = -2.25, .y = 2.5 }, .blur = 4, .spread = 1.25 };
+    const sharp: shadow.Shape = .{ .box = .{ .x = 31, .y = 7, .width = 8, .height = 6 }, .offset = .{ .x = -3, .y = 2 } };
+    const empty: shadow.Shape = .{ .box = .{ .x = 0, .y = 0, .width = 0, .height = 3 }, .blur = 4 };
+    const origin: @import("../../core/geometry.zig").PointF = .{ .x = 0.5, .y = 1.25 };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(36, 50, 90, 255) },
+        .{ .push_clip_rect = .{ .x = 2, .y = 1, .width = 42, .height = 28 } },
+        .{ .shadow = .{ .shape = blurred, .bounds = try shadow.deviceBounds(blurred), .color = Color.rgba(240, 80, 50, 150) } },
+        .{ .path = .{ .path = geometry, .identity = geometry.identity, .origin = origin, .scale = 1, .bounds = try path.deviceBounds(geometry, origin, 1), .color = Color.rgba(40, 210, 90, 170) } },
+        .{ .shadow = .{ .shape = empty, .bounds = try shadow.deviceBounds(empty), .color = Color.rgba(255, 255, 255, 255) } },
+        .{ .shadow = .{ .shape = blurred, .bounds = try shadow.deviceBounds(blurred), .color = Color.rgba(50, 100, 240, 110) } },
+        .{ .shadow = .{ .shape = sharp, .bounds = try shadow.deviceBounds(sharp), .color = Color.rgba(230, 150, 40, 160) } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 32, .y = 8, .width = 5, .height = 3 }, .color = Color.rgba(170, 80, 200, 160) } },
+        .pop_clip,
+    };
+    const list: scene.DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{
+        .{ .x = 0, .y = 0, .width = 13, .height = 32 },
+        .{ .x = 13, .y = 0, .width = 35, .height = 32 },
+    } } };
+    var expected: [48 * 32 * 4]u8 = undefined;
+    const software = @import("../software/root.zig");
+    try software.render(list, .{ .pixels = &expected, .width = 48, .height = 32, .stride = 48 * 4, .format = .rgba8_unorm });
+    var reversed: [expected.len]u8 = undefined;
+    std.mem.swap(scene.Command, &commands[2], &commands[3]);
+    try software.render(list, .{ .pixels = &reversed, .width = 48, .height = 32, .stride = 48 * 4, .format = .rgba8_unorm });
+    try std.testing.expect(!std.mem.eql(u8, &expected, &reversed));
+    std.mem.swap(scene.Command, &commands[2], &commands[3]);
+    var target = try Target.init(&renderer, 48, 32);
+    defer target.deinit(&renderer);
+    try renderer.render(list, &target);
+    var actual: [expected.len]u8 = undefined;
+    try target.readPixels(&actual, 48 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    var direct = try GraphicsReadback.initMode(&renderer, 48, 32, null, true);
+    defer direct.deinit(&renderer);
+    // Direct sRGB8 quantizes after every draw, and hardware conversion can
+    // accumulate more than one byte of drift across draws. Check each added
+    // draw against software over the previous observed destination instead of
+    // widening the one-byte tolerance, then check damage replay exactly.
+    var encoded_steps: [expected.len]u8 = undefined;
+    const encoded_target: software.Target = .{ .pixels = &encoded_steps, .width = 48, .height = 32, .stride = 48 * 4, .format = .rgba8_unorm };
+    try software.render(.{ .commands = commands[0..1] }, encoded_target);
+    for (commands[2 .. commands.len - 1], 2..) |command, index| {
+        const batch = [_]scene.Command{ commands[1], command, .pop_clip };
+        try software.render(.{ .commands = &batch }, encoded_target);
+        var prefix: [commands.len]scene.Command = undefined;
+        @memcpy(prefix[0 .. index + 1], commands[0 .. index + 1]);
+        prefix[index + 1] = .pop_clip;
+        try renderer.renderGraphicsResources(.{ .commands = prefix[0 .. index + 2] }, &direct.target, null, null, null, null, false);
+        try direct.target.wait(&renderer);
+        for (0..32) |y| for (0..48) |x| {
+            const pixel = encoded_steps[(y * 48 + x) * 4 ..][0..4];
+            try direct.expectPixel(x, y, pixel.*);
+            pixel.* = direct.pixel(x, y);
+        };
+    }
+    try renderer.renderGraphicsResources(list, &direct.target, null, null, null, null, false);
+    commands[0].clear.a = 0;
+    var transparent: [expected.len]u8 = undefined;
+    try software.render(list, .{ .pixels = &transparent, .width = 48, .height = 32, .stride = 48 * 4, .format = .rgba8_unorm });
+    try renderer.render(list, &target);
+    try target.readPixels(&actual, 48 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &transparent, &actual);
+    var linear = try GraphicsReadback.init(&renderer, 48, 32);
+    defer linear.deinit(&renderer);
+    try renderer.renderGraphicsResources(list, &linear.target, null, null, null, null, false);
+    for ([_]*DmabufTarget{ &linear.target, &direct.target }) |output| {
+        try std.testing.expect(output.gpu_pending);
+        try std.testing.expectEqual(@as(usize, 5), output.coverage_uploads.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 3), output.coverage_uploads.resources.items.len);
+        for (output.coverage_uploads.entries.items, [_]?usize{ 0, 1, null, 0, 2 }) |entry, expected_index|
+            try std.testing.expectEqual(expected_index, entry.resource_index);
+    }
+    geometry.release();
+    native_live = false;
+    renderer.path_masks.deinit();
+    renderer.path_masks = path.MaskCache.init(std.testing.allocator);
+    renderer.shadow_masks.deinit();
+    renderer.shadow_masks = shadow.MaskCache.init(std.testing.allocator);
+    try linear.target.wait(&renderer);
+    try vk(c.vkWaitForFences(renderer.device, 1, &direct.target.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
+    try std.testing.expect(try direct.target.ready(&renderer));
+    try std.testing.expectEqual(@as(usize, 0), linear.target.coverage_uploads.resources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), direct.target.coverage_uploads.resources.items.len);
+    for (0..32) |y| for (0..48) |x| {
+        try linear.expectPixel(x, y, transparent[(y * 48 + x) * 4 ..][0..4].*);
+        try std.testing.expectEqual(encoded_steps[(y * 48 + x) * 4 ..][0..4].*, direct.pixel(x, y));
     };
 }

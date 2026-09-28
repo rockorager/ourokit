@@ -9,8 +9,16 @@ const ShapeCache = @import("../text/shape_cache.zig").ShapeCache;
 const ImageHandle = @import("../image/cache.zig").ImageHandle;
 const ImageCache = @import("../image/cache.zig").Cache;
 const paths = @import("../path/root.zig");
+const shadows = @import("../shadow/root.zig");
 
 pub const DamageTracker = @import("damage.zig").Tracker;
+
+pub const Shadow = struct {
+    shape: shadows.Shape,
+    /// Complete shadow extent including blur support, not the box's hit bounds.
+    bounds: RectI,
+    color: Color,
+};
 
 /// The display list borrows immutable native geometry; Frame retains it.
 /// Identity is copied so damage history never needs to dereference old paths.
@@ -82,6 +90,7 @@ pub const Command = union(enum) {
     paragraph: Paragraph,
     image: Image,
     path: Path,
+    shadow: Shadow,
 };
 
 pub const Damage = union(enum) {
@@ -137,7 +146,7 @@ pub const DisplayList = struct {
                     (rect.border_color == null or rect.border_color.?.a == 255) and
                     std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
             },
-            .glyph_run, .paragraph, .image, .path => {},
+            .glyph_run, .paragraph, .image, .path, .shadow => {},
         };
         return result and depth == 0;
     }
@@ -157,6 +166,10 @@ pub const DisplayList = struct {
                 if (value.identity == 0 or value.identity != value.path.identity or
                     !std.meta.eql(value.bounds, try paths.deviceBounds(value.path, value.origin, value.scale)))
                     return error.InvalidPath;
+            },
+            .shadow => |value| {
+                if (!std.meta.eql(value.bounds, try shadows.deviceBounds(value.shape)))
+                    return error.InvalidShadow;
             },
             .decorated_rectangle => |rectangle| {
                 if (rectangle.background == null and rectangle.border_color == null)
@@ -234,6 +247,7 @@ pub fn occludedByNextDraw(
         .paragraph => if (!clips[depth].isEmpty()) return false,
         .image => |value| if (!RectI.intersect(value.bounds, clips[depth]).isEmpty()) return false,
         .path => |value| if (!RectI.intersect(value.bounds, clips[depth]).isEmpty()) return false,
+        .shadow => |value| if (!RectI.intersect(value.bounds, clips[depth]).isEmpty()) return false,
     };
     return false;
 }

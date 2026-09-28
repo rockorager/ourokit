@@ -37,6 +37,12 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
             "path identity={d} origin=({d},{d}) scale={d} x={d} y={d} width={d} height={d} rgba({d},{d},{d},{d})\n",
             .{ path.identity, path.origin.x, path.origin.y, path.scale, path.bounds.x, path.bounds.y, path.bounds.width, path.bounds.height, path.color.r, path.color.g, path.color.b, path.color.a },
         ),
+        .shadow => |shadow| try append(
+            output,
+            &used,
+            "shadow box={any} radius={d} offset=({d},{d}) blur={d} spread={d} rgba({d},{d},{d},{d})\n",
+            .{ shadow.shape.box, shadow.shape.corner_radius, shadow.shape.offset.x, shadow.shape.offset.y, shadow.shape.blur, shadow.shape.spread, shadow.color.r, shadow.color.g, shadow.color.b, shadow.color.a },
+        ),
         .solid_rectangle => |rectangle| try append(
             output,
             &used,

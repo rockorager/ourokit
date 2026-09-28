@@ -1564,6 +1564,8 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box alignment");
         const surface = tableOptionalSurface(state, 1, theme) orelse
             return luaError(state, "box surface must be 'background', 'card', 'popover', or 'sidebar'");
+        const shadow = tableOptionalShadow(state, 1) catch
+            return luaError(state, "box shadow requires a color and finite x/y/spread and nonnegative blur");
         var visual: theming.Overrides = .{};
         inline for (.{ "background", "foreground", "border", "border_width", "radius" }) |field| {
             if (c.lua_getfield(state, 1, field) != c.type_nil) {
@@ -1672,6 +1674,7 @@ pub const UiBuild = struct {
                 .border_color = if (border_width > 0) visual.border orelse theme.border else null,
                 .border_width = border_width,
                 .corner_radius = visual.radius orelse 0,
+                .shadow = shadow,
             } },
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append box descriptor");
@@ -2212,6 +2215,29 @@ fn tableOptionalParagraphAlignment(
 
 const OptionalSurface = struct { value: ?@TypeOf(design.tokens.light.background) };
 
+fn tableOptionalShadow(state: *c.State, table: c_int) !?@import("../shadow/root.zig").Style {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    const kind = c.lua_getfield(state, table, "shadow");
+    if (kind == c.type_nil) return null;
+    if (kind != c.type_table) return error.InvalidShadow;
+    const index = c.lua_gettop(state);
+    _ = c.lua_getfield(state, index, "color");
+    var result: @import("../shadow/root.zig").Style = .{ .color = try theming.color(state, -1) };
+    c.lua_settop(state, index);
+    inline for (.{ "x", "y", "blur", "spread" }) |field| {
+        const field_kind = c.lua_getfield(state, index, field);
+        if (field_kind != c.type_nil) {
+            if (field_kind != c.type_number) return error.InvalidShadow;
+            const value = finiteFloat(state, -1) orelse return error.InvalidShadow;
+            if (comptime std.mem.eql(u8, field, "x")) result.offset.x = value else if (comptime std.mem.eql(u8, field, "y")) result.offset.y = value else @field(result, field) = value;
+        }
+        c.lua_settop(state, index);
+    }
+    try result.validate();
+    return result;
+}
+
 fn tableOptionalSurface(
     state: *c.State,
     table: c_int,
@@ -2507,6 +2533,36 @@ test "contextual input validates filters commands and shortcut ambiguity transac
         ui.rollbackHandlers();
         c.lua_settop(state, 0);
     }
+}
+
+test "Lua box shadows validate signed numbers defaults and rejected declarations" {
+    const state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(state);
+    for ([_][]const u8{
+        "false",                        "1",                          "{}",                      "{color=false}",            "{color='red'}",
+        "{color='#000000',blur=-1}",    "{color='#000000',blur=0/0}", "{color='#000000',x=1/0}", "{color='#000000',y=1e39}", "{color='#000000',spread='2'}",
+        "{color='#000000',blur=false}",
+    }) |invalid| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "return {{shadow={s}}}", .{invalid});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source.ptr, source.len, "@shadow-validation", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 1, 0, 0, null));
+        const result = tableOptionalShadow(state, 1);
+        if (result) |_| return error.InvalidShadowAccepted else |_| {}
+        try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));
+        c.lua_settop(state, 0);
+    }
+    const valid = "return {shadow={color='#12345680',x=-3.25,y=7.5,spread=-2}}, {shadow={color='#abcdef'}}, {}";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, valid.ptr, valid.len, "@shadow-validation", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 3, 0, 0, null));
+    const value = (try tableOptionalShadow(state, 1)).?;
+    try std.testing.expectEqual(@as(f32, -3.25), value.offset.x);
+    try std.testing.expectEqual(@as(f32, 7.5), value.offset.y);
+    try std.testing.expectEqual(@as(f32, -2), value.spread);
+    try std.testing.expectEqual(@as(u8, 128), value.color.a);
+    const defaults = (try tableOptionalShadow(state, 2)).?;
+    try std.testing.expectEqual(@as(f32, 0), defaults.blur + defaults.spread + defaults.offset.x + defaults.offset.y);
+    try std.testing.expect((try tableOptionalShadow(state, 3)) == null);
 }
 
 test "Lua UI exposes only declarative constructors without standard libraries" {
@@ -3123,6 +3179,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
         \\    min_height = 160,
         \\    padding = 8,
         \\    alignment = "center",
+        \\    shadow = {x=-3,y=5,blur=8,spread=-1,color='#11223380'},
         \\    ouro.theme {
         \\      key = "dark",
         \\      color_scheme = "dark",
@@ -3152,6 +3209,9 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try std.testing.expectEqual(@as(?f32, 200), descriptors[2].object.box.height);
     try std.testing.expectEqual(@as(f32, 280), descriptors[2].object.box.min_width);
     try std.testing.expectEqual(@as(f32, 160), descriptors[2].object.box.min_height);
+    try std.testing.expectEqual(@as(f32, -3), descriptors[2].object.box.shadow.?.offset.x);
+    try std.testing.expectEqual(@as(f32, 8), descriptors[2].object.box.shadow.?.blur);
+    try std.testing.expectEqual(@as(u8, 128), descriptors[2].object.box.shadow.?.color.a);
     try std.testing.expectEqual(
         render_types.Alignment.center,
         descriptors[2].object.box.alignment.?,
