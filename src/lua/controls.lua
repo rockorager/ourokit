@@ -1,4 +1,4 @@
-local ouro, check, kind, validate_appearance = ...
+local ouro, check, kind, validate_appearance, normalize = ...
 local f = ouro.tokens.foundation
 local transparent = '#00000000'
 
@@ -125,6 +125,30 @@ ouro.dialog = ouro.stateless(function(p, children, theme)
     ouro.box {key='panel', semantic=false, width=width, padding=16,
       background=theme.colors.card, border=theme.colors.border, border_width=1,
       radius=8, children=children}}
+end)
+
+ouro.slider = ouro.stateless(function(p, children, theme)
+  check(#children == 0, 'slider does not accept children')
+  check(kind(p.key) == 'string' and kind(p.label) == 'string', 'slider key and label required')
+  local value = normalize(p) -- Validate and convert to native floating-point range values.
+  local active, width = enabled(p), p.width
+  if width == nil then width = 200 end
+  check(kind(width) == 'number' and width >= 32, 'slider width must be at least 32')
+  local before = math.floor((value-p.min)/(p.max*1.0-p.min)*65535 + 0.5)
+  return ouro.box {key=p.key, label=p.label, enabled=active,
+    range={value=p.value, min=p.min, max=p.max, step=p.step, inset=14},
+    on_change=p.on_change, focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
+    width=width, height=28, padding=4, border_width=2, border=transparent,
+    radius=4, alignment='center', states={focus=theme.colors.ring},
+    ouro.stack {key='layers', semantic=false,
+      ouro.box {key='track-frame', semantic=false, width='fill', height=16, alignment='center',
+        ouro.box {key='track', semantic=false, width='fill', height=4,
+          background=theme.colors.switch_track, radius=2}},
+      ouro.row {key='rail', semantic=false, main_axis_size='max', gap=0,
+        ouro.box {key='before', semantic=false, width=0, flex=before > 0 and before or nil},
+        ouro.box {key='thumb', semantic=false, width=16, height=16, radius=8,
+          background=active and theme.colors.primary or theme.colors.disabled},
+        ouro.box {key='after', semantic=false, width=0, flex=before < 65535 and 65535-before or nil}}}}
 end)
 
 local function selection_group(p, children, policy)

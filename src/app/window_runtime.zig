@@ -1015,7 +1015,8 @@ pub const WindowRuntime = struct {
                 const origin = try self.instanceOrigin(bound_target);
                 const size = try self.tree.nodeSize(try self.instances.renderObject(bound_target));
                 const range = semantic.range.?;
-                const value = range.atFraction((pointer.position.x - origin.x - 14) / @max(1, size.width - 28));
+                const inset = try self.instances.rangeInset(bound_target);
+                const value = range.atFraction((pointer.position.x - origin.x - inset) / @max(1, size.width - 2 * inset));
                 if (value != range.value) try self.spawnCallback(callback_service, binding.id, try self.instances.scope(bound_target), &.{.{ .number = value }});
                 continue;
             }
@@ -1094,7 +1095,7 @@ pub const WindowRuntime = struct {
                 self.semantics.findId(try self.instances.semanticId(target))
             else
                 null;
-            if (semantic == null or !semantic.?.enabled or !self.instances.isVisible(target)) self.range_drag = null;
+            if (semantic == null or semantic.?.range == null or !semantic.?.enabled or !self.instances.isVisible(target)) self.range_drag = null;
         }
         if (self.split_drag) |drag| {
             if (!self.instances.isActive(drag.target) or !self.instances.isVisible(drag.target))

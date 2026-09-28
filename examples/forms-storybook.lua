@@ -97,6 +97,40 @@ local function custom_dialog()
   end
 end
 
+local Level = o.stateless(function(p, children, theme)
+  local c = theme.colors
+  local before = math.floor((p.value+2.25)/5.25*65535+0.5)
+  return o.box {key=p.key, label='Custom level', enabled=not p.disabled,
+    range={value=p.value,min=-2.25,max=3,step=0.5,inset=22}, on_change=p.on_change,
+    width=400,height=44,padding=8,border_width=2,border=c.border,radius=6,
+    background=c.secondary,states={focus=c.ring},alignment='center',
+    o.stack {key='layers',semantic=false,
+      o.box {key='track-frame',semantic=false,width='fill',height=24,alignment='center',
+        o.box {key='track',semantic=false,width='fill',height=8,background=c.switch_track}},
+      o.row {key='rail',semantic=false,main_axis_size='max',gap=0,
+        o.box {key='before',semantic=false,width=0,flex=before>0 and before or nil},
+        o.box {key='thumb',semantic=false,width=24,height=24,radius=4,
+          background=c.primary,states={disabled=c.disabled}},
+        o.box {key='after',semantic=false,width=0,flex=before<65535 and 65535-before or nil}}}}
+end)
+
+local function custom_range(disabled)
+  local value = o.signal(-1.25)
+  local function change(v) value:set(v) end
+  return function()
+    return o.column {key='ranges',gap=16,
+      o.text {key='title',text='Custom range geometry',size=24},
+      Level {key='wide',value=value(),disabled=disabled,on_change=change},
+      o.text {key='narrow-label',text='Same recipe constrained to 180 pixels'},
+      o.box {key='narrow',width=180,Level {key='control',value=value(),disabled=disabled,on_change=change}},
+      o.text {key='value',text='Value: '..value()},
+      o.text {key='stock-label',text='Stock slider endpoints'},
+      o.row {key='endpoints',gap=16,
+        o.slider {key='min',label='Minimum',width=180,value=-2.25,min=-2.25,max=3,step=0.5,enabled=not disabled},
+        o.slider {key='max',label='Maximum',width=180,value=3,min=-2.25,max=3,step=0.5,enabled=not disabled}}}
+  end
+end
+
 return o.storybook {id='forms', title='Form controls', stories={
   o.story {id='forms/light', name='Light', viewport={width=540,height=640}, content=content()},
   o.story {id='forms/dark', name='Dark', color_scheme='dark', viewport={width=540,height=640}, content=content()},
@@ -121,4 +155,11 @@ return o.storybook {id='forms', title='Form controls', stories={
     actions={{type='click',target='root/page/open'}}},
   o.story {id='dialog-layout/closed', name='Custom modal side sheet (closed)', viewport={width=560,height=340}, snapshot_scale=2, content=custom_dialog(),
     actions={{type='click',target='root/page/open'}, {type='click',target='root/sheet/body/close'}}},
+  o.story {id='range-layout/light', name='Custom ranges', viewport={width=460,height=360}, snapshot_scale=2, content=custom_range(false)},
+  o.story {id='range-layout/dark', name='Custom ranges (dark)', color_scheme='dark', viewport={width=460,height=360}, snapshot_scale=2, content=custom_range(false)},
+  o.story {id='range-layout/disabled', name='Custom ranges (disabled)', viewport={width=460,height=360}, snapshot_scale=2, content=custom_range(true)},
+  o.story {id='range-layout/focus', name='Custom ranges (keyboard focus)', viewport={width=460,height=360}, snapshot_scale=2, content=custom_range(false),
+    actions={{type='tab',target='ranges/wide'}}},
+  o.story {id='range-layout/changed', name='Custom ranges (changed)', viewport={width=460,height=360}, snapshot_scale=2, content=custom_range(false),
+    actions={{type='click',target='ranges/narrow/control'}}},
 }}

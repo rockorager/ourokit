@@ -249,7 +249,7 @@ identity and parent links from stable local keys and resolves inherited themes
 and parent data. No Button render object or Lua theme mirror is introduced.
 
 Stock button, checkbox, switch, separator, option, radio, tab, selection-group,
-and dialog recipes live only in `lua/controls.lua`.
+dialog, and slider recipes live only in `lua/controls.lua`.
 `ouro.stateless` expands stateless descriptions with a fresh effective native
 theme value during lowering, without mounting a component or adding a
 VM-specific identity namespace. Its output is pinned in the build transaction,
@@ -272,6 +272,10 @@ Boxes with the dialog semantic role establish a native modal boundary: input
 gating, contained focus traversal, Escape routing, and opener restoration.
 The stock dialog recipe supplies the dim backdrop and centered panel in Lua;
 custom dialog boxes use the same policy with arbitrary presentation.
+Boxes with a range binding reuse native numeric validation, snapping,
+keyboard input, and captured dragging. The instance retains the declared
+endpoint inset; pointer mapping uses actual layout width, not stock thumb
+geometry. Lua owns the slider track and thumb, positioned by flex spacers.
 
 Layout uses one-way Flutter-style box constraints in logical `f32` units. A
 parent passes minimum/maximum width and height, each child returns one finite

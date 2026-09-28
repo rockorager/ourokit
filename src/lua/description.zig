@@ -6,7 +6,6 @@ pub const Kind = enum {
     image,
     canvas,
     icon,
-    slider,
     text_input,
     auth_input,
     split_view,

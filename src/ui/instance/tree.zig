@@ -42,6 +42,8 @@ pub const Descriptor = struct {
     focus_request: u64 = 0,
     auth_input: ?AuthInput = null,
     interaction_paint: ?InteractionPaint = null,
+    /// Horizontal distance from each outer edge to the range's endpoint.
+    range_inset: f32 = 0,
 };
 
 const State = enum { free, active, retiring };
@@ -65,6 +67,7 @@ const Slot = struct {
     focus_request_pending: bool = false,
     auth_input: ?AuthInput = null,
     interaction_paint: ?InteractionPaint = null,
+    range_inset: f32 = 0,
     traversal_order: usize = 0,
     reconcile_child: ?render_object.NodeHandle = null,
     rebuild_children: bool = false,
@@ -359,6 +362,7 @@ pub const Tree = struct {
             }
             slot.focusable = descriptor.focusable;
             slot.interaction_paint = descriptor.interaction_paint;
+            slot.range_inset = descriptor.range_inset;
             slot.ensure_visible = descriptor.ensure_visible;
             if (descriptor.ensure_visible == null) slot.revealed = null;
             slot.focus_request_pending = descriptor.focus_request != 0 and descriptor.focus_request != slot.focus_request;
@@ -436,6 +440,10 @@ pub const Tree = struct {
 
     pub fn authInput(self: *Tree, handle: InstanceHandle) ?AuthInput {
         return (self.activeSlot(handle) catch return null).auth_input;
+    }
+
+    pub fn rangeInset(self: *Tree, handle: InstanceHandle) !f32 {
+        return (try self.activeSlot(handle)).range_inset;
     }
 
     pub fn hasAuthInput(self: *const Tree) bool {
@@ -679,6 +687,8 @@ pub const Tree = struct {
         var roots: usize = 0;
         for (descriptors, 0..) |descriptor, index| {
             if (descriptor.id == 0) return error.InvalidInstanceId;
+            if (!std.math.isFinite(descriptor.range_inset) or descriptor.range_inset < 0)
+                return error.InvalidRangeInset;
             try render_object.Tree.validate(descriptor.object);
             if (!(try descriptor_index.put(descriptor.id, index)))
                 return error.DuplicateInstanceId;

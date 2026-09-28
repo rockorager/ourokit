@@ -720,8 +720,9 @@ test "forms slider keyboard bounds and captured drag use the declared range" {
 
 test "forms slider thumb follows constrained width not requested width" {
     const f = try Fixture.create(
+        \\value=ouro.signal(7.5)
         \\function build() return ouro.box {key='narrow', width=160,
-        \\ ouro.slider {key='level', label='Level', width=300, value=7.5, min=0, max=10, step=0.5}} end
+        \\ ouro.slider {key='level', label='Level', width=300, value=value(), min=0, max=10, step=0.5}} end
     );
     defer f.destroy();
     const semantic = try f.runtime.semantics.findPath("narrow/level");
@@ -733,6 +734,31 @@ test "forms slider thumb follows constrained width not requested width" {
     try std.testing.expectEqual(@as(f32, 160), (try f.runtime.tree.nodeSize(render)).width);
     try std.testing.expectApproxEqAbs(@as(f32, 99), (try f.runtime.tree.nodeOffset(thumb)).x, 0.01);
     try std.testing.expectEqual(@as(f32, 16), (try f.runtime.tree.nodeSize(thumb)).width);
+    for ([_][]const u8{ "value:set(0)", "value:set(10)" }, [_]f32{ 0, 132 }) |source, expected| {
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@slider-edge", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        try f.settle();
+        try std.testing.expectEqual(expected, (try f.runtime.tree.nodeOffset(thumb)).x);
+    }
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    for (snapshot.nodes) |item| if (item.path) |path| {
+        try std.testing.expect(std.mem.indexOf(u8, path, "layers") == null);
+    };
+}
+
+test "forms slider converts wide Lua integer bounds before computing thumb position" {
+    const f = try Fixture.create(
+        \\function build() return ouro.slider {key='level',label='Wide',width=160,
+        \\ value=0,min=math.mininteger,max=math.maxinteger,step=1} end
+    );
+    defer f.destroy();
+    const render = try f.runtime.instances.renderObject(f.runtime.instances.handleForId((try f.runtime.semantics.findPath("level")).id).?);
+    const layers = f.runtime.tree.firstChild(render).?;
+    const rail = f.runtime.tree.nextSibling(f.runtime.tree.firstChild(layers).?).?;
+    const thumb = f.runtime.tree.nextSibling(f.runtime.tree.firstChild(rail).?).?;
+    // 160px minus 12px chrome and a 16px thumb leaves 132px travel.
+    try std.testing.expectApproxEqAbs(@as(f32, 66), (try f.runtime.tree.nodeOffset(thumb)).x, 0.01);
 }
 
 test "forms disabling slider on change cancels the active drag" {
@@ -746,6 +772,108 @@ test "forms disabling slider on change cancels the active drag" {
     try f.play(.{ .pointer_down = "level" });
     try std.testing.expect(!(try f.runtime.semantics.findPath("level")).enabled);
     try std.testing.expect(f.runtime.range_drag == null);
+}
+
+test "custom range boxes use declared geometry and keep ignored requests controlled" {
+    const f = try Fixture.create(
+        \\inset=ouro.signal(30); ranged=ouro.signal(true); requests={}; builds=0
+        \\function build() builds=builds+1; return ouro.box {key='level', label='Custom', width=200,height=40,
+        \\ range=ranged() and {value=-0.25,min=-2.25,max=3,step=0.5,inset=inset()} or nil,
+        \\ on_change=function(v) requests[#requests+1]=v end,
+        \\ ouro.stack {key='chrome',semantic=false,
+        \\   ouro.text {key='caption',text='Custom range'}}} end
+    );
+    defer f.destroy();
+    const semantic = try f.runtime.semantics.findPath("level");
+    try std.testing.expectEqual(.slider, semantic.role);
+    const handle = f.runtime.instances.handleForId(semantic.id).?;
+    _ = try f.runtime.semantics.findPath("level/caption");
+    const bounds = (try f.runtime.semanticTarget("level")).bounds;
+    try f.play(.{ .pointer_down = "level" });
+    try std.testing.expectEqual(handle, f.runtime.focus.current().?);
+    // 44 is 10% along the custom 30..170 rail. A stock 14px inset
+    // would request -1.25 here instead of -1.75.
+    for ([_]f32{ 44, 170, -50 }) |x| {
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 1, .position = .{ .x = bounds.x + x, .y = bounds.y + 20 } } });
+        try f.settle();
+    }
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 0, .time_ms = 2, .button = 0x110, .state = .released } });
+    try f.settle();
+    const Logical = @import("../platform/window.zig").LogicalKey;
+    for ([_]Logical{ .arrow_up, .arrow_down, .page_up, .page_down, .home, .end, .enter, .space }) |key|
+        try f.play(.{ .key = .{ .keycode = 0, .logical = key } });
+    try std.testing.expectEqual(@as(f64, -0.25), (try f.runtime.semantics.findPath("level")).range.?.value);
+    const check =
+        \\local expected={0.25,-1.75,3,-2.25,0.25,-0.75,3,-2.25,-2.25,3}
+        \\assert(#requests==#expected and builds==1)
+        \\for i,v in ipairs(expected) do assert(requests[i]==v) end
+        \\inset:set(0)
+    ;
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-range", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 0), try f.runtime.instances.rangeInset(handle));
+    try f.play(.{ .pointer_down = "level" });
+    try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 3, .position = .{ .x = bounds.x + 44, .y = bounds.y + 20 } } });
+    try f.settle();
+    const remove = "assert(#requests==12 and requests[12]==-1.25); ranged:set(false)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, remove.ptr, remove.len, "@remove-range", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try std.testing.expectEqual(handle, f.runtime.instances.handleForId(semantic.id).?);
+    try std.testing.expect(f.runtime.range_drag == null);
+    try std.testing.expect(!f.runtime.buttons.contains(handle));
+    try std.testing.expectEqual(.group, (try f.runtime.semantics.findPath("level")).role);
+}
+
+test "invalid range candidates preserve committed geometry and handlers" {
+    const f = try Fixture.create(
+        \\requests={}
+        \\function build() return ouro.box {key='level',label='Custom',width=200,height=40,
+        \\ range={value=-0.25,min=-2.25,max=3,step=0.5,inset=30},
+        \\ on_change=function(v) requests[#requests+1]=v end} end
+        \\good=build
+    );
+    defer f.destroy();
+    try f.play(.{ .pointer_down = "level" });
+    const handle = f.runtime.range_drag.?;
+    const bounds = (try f.runtime.semanticTarget("level")).bounds;
+    const valid_range = "range={value=0,min=-1,max=1,step=0.5}";
+    for ([_][]const u8{
+        "range=false",
+        "range={value=0,min=1,max=1,step=1}",
+        "range={value=2,min=-1,max=1,step=1}",
+        "range={value=0,min=-1,max=1,step=0}",
+        "range={value=0,min=-1,max=1,step=1,inset=-1}",
+        "range={value=0,min=-1,max=1,step=1,inset=math.huge}",
+        valid_range ++ ",semantic=false",
+        valid_range ++ ",activate=true",
+        valid_range ++ ",role='button'",
+        valid_range ++ ",option=1",
+        valid_range ++ ",checked=false",
+        valid_range ++ ",on_press=function() end",
+        valid_range ++ ",label=nil",
+        valid_range ++ ",on_change=false",
+    }) |invalid| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.box {{key='level',label='Bad',{s}}} end", .{invalid});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@invalid-range", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.settle());
+        try std.testing.expectEqual(handle, f.runtime.range_drag.?);
+        try std.testing.expectEqual(handle, f.runtime.focus.current().?);
+        try std.testing.expectEqual(@as(f32, 30), try f.runtime.instances.rangeInset(handle));
+        try std.testing.expectEqual(@as(usize, 0), f.builder.pending_handler_count);
+    }
+    const restore = "build=good";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, restore.ptr, restore.len, "@restore-range", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 1, .position = .{ .x = bounds.x + 44, .y = bounds.y + 20 } } });
+    try f.settle();
+    const check = "assert(#requests==2 and requests[1]==0.25 and requests[2]==-1.75)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-range", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
 }
 
 test "forms dialog contains focus and restores opener after escape" {

@@ -643,7 +643,6 @@ pub const UiBuild = struct {
             .image => emitImage,
             .canvas => emitCanvas,
             .icon => emitIcon,
-            .slider => emitSlider,
             .text_input => emitTextInput,
             .auth_input => emitAuthInput,
             .split_view => emitSplitView,
@@ -1040,47 +1039,6 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn emitSlider(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
-        const parent = self.currentParent() orelse return luaError(state, "slider requires a parent");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "slider key required");
-        const label = tableString(state, 1, "label") orelse return luaError(state, "slider label required");
-        const range = @import("forms.zig").readRange(state, 1) catch |err| return luaError(state, @errorName(err));
-        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse return luaError(state, "invalid slider enabled");
-        const width = tableOptionalExtent(state, 1, "width", 200) orelse return luaError(state, "invalid slider width");
-        if (width < 32) return luaError(state, "slider width must be at least 32");
-        const id = semanticId(key, 0x736c69646572 ^ parent.id ^ self.component_namespace);
-        const track = semanticId("track", id);
-        const thumb = semanticId("thumb", id);
-        const layers = semanticId("layers", id);
-        const rail = semanticId("rail", id);
-        const before: u16 = @intFromFloat(@round(range.fraction() * 65535));
-        const transparent = @import("../core/color.zig").Color.rgba(0, 0, 0, 0);
-        self.append(.{
-            .id = id,
-            .parent = parent.id,
-            .focusable = enabled,
-            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
-            .parent_data = declarativeParentData(self, state, 1) catch |err| return luaError(state, @errorName(err)),
-            .object = .{ .box = .{ .width = width, .height = 28, .padding = .all(4), .border_width = 2, .border_color = transparent, .corner_radius = 4, .alignment = .center } },
-        }) catch return luaError(state, "cannot append slider");
-        self.append(.{ .id = layers, .parent = id, .object = .{ .stack = .{} } }) catch return luaError(state, "cannot append slider layers");
-        self.append(.{ .id = track, .parent = layers, .parent_data = .{ .stack = .{ .y = 6 } }, .object = .{ .box = .{ .fill_width = true, .height = 4, .background = theme.switch_track, .corner_radius = 2 } } }) catch return luaError(state, "cannot append slider track");
-        // Flex spacers position the thumb against actual layout constraints,
-        // including a parent narrower or wider than the requested width.
-        self.append(.{ .id = rail, .parent = layers, .object = .{ .flex = .{} } }) catch return luaError(state, "cannot append slider rail");
-        self.append(.{ .id = semanticId("before", id), .parent = rail, .parent_data = .{ .flex = .{ .factor = before } }, .object = .{ .box = .{ .width = 0 } } }) catch return luaError(state, "cannot append slider spacer");
-        self.append(.{ .id = thumb, .parent = rail, .object = .{ .box = .{ .width = 16, .height = 16, .corner_radius = 8, .background = if (enabled) theme.primary else theme.disabled } } }) catch return luaError(state, "cannot append slider thumb");
-        self.append(.{ .id = semanticId("after", id), .parent = rail, .parent_data = .{ .flex = .{ .factor = 65535 - before } }, .object = .{ .box = .{ .width = 0 } } }) catch return luaError(state, "cannot append slider spacer");
-        if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "control capacity exceeded");
-        self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled, .style = .{ .idle = transparent, .hovered = transparent, .pressed = transparent, .disabled = transparent, .border = transparent, .focus = theme.ring } };
-        self.pending_button_count += 1;
-        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .slider, .key = key, .label = label, .enabled = enabled, .range = range }) catch return luaError(state, "cannot append slider semantics");
-        self.stageCallback(state, id, "on_change", .range_change) catch |err| return luaError(state, @errorName(err));
-        return 0;
-    }
-
     fn emitAuthInput(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1414,6 +1372,7 @@ pub const UiBuild = struct {
             return luaError(state, "ouro.stack expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "stack requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "stack key is required");
+        const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x737461636b ^ parent.id ^ self.component_namespace);
@@ -1423,7 +1382,7 @@ pub const UiBuild = struct {
             .object = .{ .stack = .{} },
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append stack descriptor");
-        self.appendSemantic(.{
+        if (semantic) self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
             .role = .group,
@@ -1431,7 +1390,7 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append stack semantics");
         // Public stacks overlay children at the origin; the internal root's
         // legacy positioned edge metadata is not part of this constructor.
-        return self.emitChildren(state, .{ .id = id, .kind = .overlay });
+        return self.emitChildren(state, .{ .id = id, .kind = .overlay, .semantic_id = if (semantic) id else semanticParent(parent) });
     }
 
     fn emitBox(state: *c.State) callconv(.c) c_int {
@@ -1489,10 +1448,27 @@ pub const UiBuild = struct {
             _ = tableString(state, 1, "label") orelse return luaError(state, "dialog label required");
         }
         var checked = tableOptionalBoolean(state, 1, "checked", false) orelse return luaError(state, "checked must be boolean");
+        var range: ?@import("../ui/widget/range.zig").Range = null;
+        var range_inset: f32 = 0;
+        const range_type = c.lua_getfield(state, 1, "range");
+        if (range_type != c.type_nil) {
+            if (range_type != c.type_table) return luaError(state, "range must be a table");
+            range = @import("forms.zig").readRange(state, -1) catch |err| return luaError(state, @errorName(err));
+            range_inset = tableOptionalExtent(state, -1, "inset", 0) orelse return luaError(state, "invalid range inset");
+            if (!semantic) return luaError(state, "range requires semantics");
+            inline for (.{ "activate", "role", "checked", "option", "on_press" }) |field| {
+                const field_type = c.lua_getfield(state, 1, field);
+                c.lua_settop(state, -2);
+                if (field_type != c.type_nil) return luaError(state, "range owns activation and role; option, checked, and on_press are unsupported");
+            }
+            _ = tableString(state, 1, "label") orelse return luaError(state, "range label required");
+            role = .slider;
+        }
+        c.lua_settop(state, -2);
         const option_type = c.lua_getfield(state, 1, "option");
         c.lua_settop(state, -2);
         var selected = false;
-        var owner = if (activate) InteractionOwner{ .id = id, .enabled = enabled } else self.interaction_owner;
+        var owner = if (activate or range != null) InteractionOwner{ .id = id, .enabled = enabled } else self.interaction_owner;
         if (option_type != c.type_nil) {
             if (!semantic) return luaError(state, "selection requires semantics");
             inline for (.{ "activate", "role", "checked", "enabled" }) |field| {
@@ -1517,7 +1493,7 @@ pub const UiBuild = struct {
         }
         const paint = readInteractionPaint(state, owner, visual.background orelse surface.value, visual.border orelse theme.border, true) catch |err|
             return luaError(state, @errorName(err));
-        if (activate) {
+        if (activate or range != null) {
             if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "activation capacity exceeded");
             const press_type = c.lua_getfield(state, 1, "on_press");
             const change_type = c.lua_getfield(state, 1, "on_change");
@@ -1536,16 +1512,17 @@ pub const UiBuild = struct {
                 .declarative = true,
             } };
             self.pending_button_count += 1;
-            self.stageCallback(state, id, "on_press", .button) catch |err| return luaError(state, @errorName(err));
-            self.stageCallback(state, id, "on_change", .@"switch") catch |err| return luaError(state, @errorName(err));
+            if (activate) self.stageCallback(state, id, "on_press", .button) catch |err| return luaError(state, @errorName(err));
+            self.stageCallback(state, id, "on_change", if (range != null) .range_change else .@"switch") catch |err| return luaError(state, @errorName(err));
         }
-        if (activate or role == .dialog) self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
+        if (activate or range != null or role == .dialog) self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .focusable = activate and enabled,
+            .focusable = (activate or range != null) and enabled,
             .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
             .interaction_paint = paint,
+            .range_inset = range_inset,
             .object = .{ .box = .{
                 .width = width.extent(),
                 .hidden = tableOptionalBoolean(state, 1, "hidden", false) orelse
@@ -1573,6 +1550,7 @@ pub const UiBuild = struct {
             .enabled = enabled,
             .checked = checked,
             .selected = selected,
+            .range = range,
         }) catch return luaError(state, "cannot append box semantics");
         self.stageCallback(state, id, "on_interaction_change", .interaction_change) catch |err|
             return luaError(state, @errorName(err));

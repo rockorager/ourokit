@@ -35,7 +35,8 @@ pub fn install(state: *c.State) !void {
     c.lua_pushcclosure(state, check, 0);
     c.lua_pushcclosure(state, valueType, 0);
     c.lua_pushcclosure(state, validateAppearance, 0);
-    if (c.lua_pcallk(state, 4, 0, 0, 0, null) != c.ok)
+    c.lua_pushcclosure(state, normalize, 0);
+    if (c.lua_pcallk(state, 5, 0, 0, 0, null) != c.ok)
         return error.FormsInitializationFailed;
     const source = @embedFile("forms.lua");
     if (c.luaL_loadbufferx(state, source, source.len, "=ouro.forms", "t") != c.ok)

@@ -243,7 +243,7 @@ inherited themes cannot become stale. Hover, pressed, and keyboard-focus paint
 updates do not lower descriptions or run composition functions.
 
 Buttons, checkboxes, switches, separators, options, radios, tabs, selection
-groups, and dialogs are stock Lua compositions over box, text, and layout
+groups, dialogs, and sliders are stock Lua compositions over box, text, and layout
 primitives. Applications have the same primitive boundary:
 
 ```lua
@@ -274,10 +274,10 @@ under [in-window modal dialogs](#in-window-modal-dialogs).
 `label`, `checked`, and `enabled` are copied to the semantic snapshot.
 
 Any box or text under an interaction owner can declare `states`, independently
-of the owner's visual structure. It binds to the nearest activation or selection
-ancestor, or itself when `activate=true` or `option` is set. Colors change a
-box's background or text's foreground. For activation, precedence is disabled,
-pressed, hover, then the ordinary color.
+of the owner's visual structure. It binds to the nearest activation, range, or
+selection ancestor, or itself when `activate=true`, `range`, or `option` is set.
+Colors change a box's background or text's foreground. For activation and
+ranges, precedence is disabled, pressed, hover, then the ordinary color.
 Missing pressed falls back to hover; other missing states use the ordinary
 color. Box-only `focus` recolors an existing border for keyboard-visible focus,
 or draws a 2-pixel inset outline when borderless. These properties change paint
@@ -316,13 +316,13 @@ including the stock groups. Values must be unique integers. The native group sup
 selected/checked state, enabled state, focus, and keyboard policy; the item
 must not override `activate`, `role`, `checked`, or `enabled`, or disable its
 semantics. Nested activation controls remain independent, as with tab close
-buttons. Decorative rows and columns may use `semantic=false` to keep child
-semantic paths directly under the item.
+buttons. Decorative rows, columns, and stacks may use `semantic=false` to keep
+child semantic paths directly under the item.
 
 Selection paint supports `selected` and `hover`, with selected taking precedence;
 missing colors fall back to the ordinary color. `pressed` and `disabled` paint
-belong to activation owners only. The group draws an inset focus outline around
-its selected item; descendants may also declare `focus` paint.
+belong to activation and range owners only. The group draws an inset focus
+outline around its selected item; descendants may also declare `focus` paint.
 
 Stateless render functions receive an optional fourth argument, `context`.
 When directly under a selection group, `context.selection` contains `role`
@@ -1085,6 +1085,33 @@ step, PageDown/PageUp ten, and Home/End to the bounds. Disabling or removing it
 cancels dragging. `width` defaults to 200 and must be at least 32 logical pixels;
 layout may constrain it. Development inspection exposes `range` with all four
 numeric fields.
+
+`ouro.slider` is a Lua recipe over boxes, a stack, and flex spacers. To build a
+different horizontal value control, opt a box into native range input:
+
+```lua
+ouro.box {
+  key='level', label='Level', width=240, height=40,
+  range={value=level(), min=-2, max=7, step=0.5, inset=20},
+  on_change=function(value) level:set(value) end,
+  -- Supply your own track, thumb, or other content here.
+}
+```
+
+`range` supplies the slider semantic role, focus stop, pointer dragging,
+keyboard commands, and the same validation and controlled-value contract as
+the stock slider. It requires a `label` and semantics; do not also supply
+`activate`, `role`, `option`, `checked`, or `on_press`. `enabled`,
+`focus_request`, `on_cancel`, and native `states` paint work as on other controls.
+Omitting `on_change` leaves a focusable control that makes no value requests.
+
+`range.inset` is the finite non-negative distance from each outer horizontal
+edge to its value endpoint, defaulting to zero. Pointer mapping uses the
+actual laid-out width minus both insets, with a minimum travel of one pixel
+when constrained smaller. The stock recipe declares 14 pixels to account for
+its padding, border, and half-thumb width; custom recipes choose their own
+geometry. Removing the range binding or hiding/disabling the box cancels a
+drag. No track or thumb is inserted by Zig.
 
 The spinbox is a shipped Lua composition of a native single-line field and
 decrement/increment buttons, sharing the native range validation and snapping.
