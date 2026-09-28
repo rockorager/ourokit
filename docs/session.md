@@ -195,6 +195,21 @@ ouro.auth_input {
 }
 ```
 
+`ouro.auth_input` is the standard Lua field recipe over `ouro.secure_entry`.
+The native primitive accepts the same conversation, prompt, autofocus, and
+nonsecret callbacks. It has no default background, border, radius, padding,
+or fixed height; width defaults to `fill`. Customize its `height`, `padding`,
+`padding_x`, `padding_y`, `alignment`, `background`, `border`, `border_width`,
+`radius`, `foreground`, and `font_size`, or compose surrounding content with
+ordinary layout primitives. General theme typography and foreground apply to
+the unstyled mask; the stock recipe keeps its standard font size and metrics.
+Keeping the same parent, key, conversation, and prompt preserves the native
+credential buffer when switching between the recipe and primitive.
+
+Neither API accepts children or a replacement mask. Styling changes only the
+presentation of the native constant mask; it never exposes credential text,
+length, selection, or ordinary text-editor behavior to Lua.
+
 `auth_input` always renders the same eight-dot mask, even while empty and for
 echo-on prompts. It has no getters, length, `on_change`, `value`, `text`,
 `default_text`, placeholder, or key bindings. Native editing is UTF-8 and

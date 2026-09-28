@@ -17,6 +17,7 @@ SOURCE = r'''
 local o = require('ouro')
 return o.app {id='dev.ourokit.secure-entry', theme={color_scheme='dark'}, run=function()
   local visible, prompt = o.signal(false), o.signal(nil)
+  local custom_chrome = o.signal(REJECT_FIELD ~= nil and CUSTOM_MODE)
   local auth, submissions, cancellations = nil, 0, 0
   o.spawn(function()
     local lock = o.session.lock()
@@ -56,10 +57,23 @@ return o.app {id='dev.ourokit.secure-entry', theme={color_scheme='dark'}, run=fu
         o.text{key='prompt', text=p and p.text or 'Awaiting secure lock'},
       }
       if p then
-        children[#children+1] = o.auth_input{key='credential', conversation=auth, prompt_id=p.id, width=240,
+        local properties = {key='credential', conversation=auth, prompt_id=p.id, width=240,
           on_submit=function(...) assert(select('#', ...) == 0); submissions=submissions+1 end,
           on_cancel=function(...) assert(select('#', ...) == 0); cancellations=cancellations+1 end,
           on_error=function(code) error(code) end}
+        if REJECT_FIELD then properties[REJECT_FIELD] = false end
+        if custom_chrome() then
+          properties.height=46; properties.font_size=20; properties.foreground='#fedcba'
+          if output == 'TEST-1' then
+            properties.padding_x=13; properties.padding_y=7; properties.radius=9
+            properties.background='#123456'; properties.border='#789abc'; properties.border_width=3
+          end
+        end
+        children[#children+1] = (custom_chrome() and o.secure_entry or o.auth_input)(properties)
+        if CUSTOM_MODE then
+          children[#children+1] = o.button{key='restyle',label='Custom chrome',
+            on_press=function() custom_chrome:set(true) end}
+        end
       end
       children[#children+1] = o.text{key='note', text='Disposable PAM fixture; always masked, including echo-on'}
       return o.column{key='root', children=children}
@@ -120,7 +134,30 @@ def wait_prompt(env, endpoint, text):
     raise AssertionError(('secure prompt did not render', result.stdout, result.stderr))
 
 
-def verify(cancel=False):
+def restyle(peer, env, endpoint, before):
+    # Real peer keyboard input activates a nonsecret button; no dev-input bypass.
+    peer.keys(7, [15, 28])
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        after = wait_prompt(env, endpoint, 'Identity')
+        entries = [next(n for n in w['nodes'] if n['path'] == 'root/credential') for w in after]
+        if all(n['bounds']['height'] == 46 for n in entries):
+            break
+        time.sleep(.02)
+    else:
+        raise AssertionError('custom chrome did not render')
+    ids = {w['window']: next(n['id'] for n in w['nodes'] if n['path'] == 'root/credential') for w in before}
+    for w, entry in zip(after, entries):
+        assert entry['id'] == ids[w['window']] and entry['bounds']['width'] == 240, entry
+        params = {'window': w['window'], 'token': w['token']}
+        capture = dev(env, endpoint, 'capture', params)
+        injection = dev(env, endpoint, 'input', dict(params, action='text', text='injected'))
+        assert 'SecureInputProtected' in capture.stdout + capture.stderr
+        assert 'SecureInputProtected' in injection.stdout + injection.stderr
+    peer.keys(7, [15])  # Restore focus from the chrome button to credential entry.
+
+
+def verify(cancel=False, custom=False, reject=None):
     with tempfile.TemporaryDirectory(prefix='ourokit-secure-entry-') as temp:
         root = Path(temp)
         subprocess.run([os.environ.get('OUROKIT_TEST_ZIG', 'zig'), 'cc', '-shared', '-fPIC',
@@ -129,13 +166,21 @@ def verify(cancel=False):
         thread = threading.Thread(target=peer.run, daemon=True)
         thread.start()
         app = root / 'app.lua'
-        app.write_text(SOURCE.replace('CANCEL_MODE', 'true' if cancel else 'false'))
+        app.write_text(SOURCE.replace('CANCEL_MODE', 'true' if cancel else 'false')
+                       .replace('CUSTOM_MODE', 'true' if custom else 'false')
+                       .replace('REJECT_FIELD', json.dumps(reject) if reject else 'nil'))
         env = dict(os.environ, XDG_RUNTIME_DIR=str(root), WAYLAND_DISPLAY=peer.path, LD_LIBRARY_PATH=str(root))
         env.pop('WAYLAND_SOCKET', None)
         process = subprocess.Popen([str(BINARY), 'run', str(app), '--software', '--dev'], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             assert peer.locked.wait(5), ('lock did not render', peer.failure)
+            if reject:
+                stdout, stderr = process.communicate(timeout=5)
+                assert process.returncode != 0 and 'LuaBuildFailed' in stderr, (stdout, stderr)
+                assert peer.unlocks == 0 and peer.failure is None
+                print(f'PASS {"secure_entry" if custom else "auth_input"}: rejects {reject}=false')
+                return
             endpoint = next((root / 'ourokit/dev').glob('*'))
             windows = wait_prompt(env, endpoint, 'Identity')
             for w in windows:
@@ -144,8 +189,13 @@ def verify(cancel=False):
                 assert 'SecureInputProtected' in capture.stdout + capture.stderr
                 injection = dev(env, endpoint, 'input', dict(params, action='text', text='injected'))
                 assert 'SecureInputProtected' in injection.stdout + injection.stderr, (injection.stdout, injection.stderr)
+                entry = next(n for n in w['nodes'] if n['path'] == 'root/credential')
+                assert entry['focused'] and entry['bounds']['width'] == 240, entry
+                assert entry['bounds']['height'] == 32, entry
             if cancel:
                 peer.type(7, 'discarded')
+                if custom:
+                    restyle(peer, env, endpoint, windows)
                 peer.keys(7, [1])
                 stdout, stderr = process.communicate(timeout=5)
                 assert process.returncode == 0 and 'PASS secure Escape' in stdout, (stdout, stderr)
@@ -154,6 +204,8 @@ def verify(cancel=False):
                 return
             # Shared native prompt across output-local trees; no Lua signal holds text.
             peer.type(7, 'ali')
+            if custom:
+                restyle(peer, env, endpoint, windows)
             peer.type(8, 'ce')
             peer.keys(8, [46, 45, 47], control=True) # copy/cut/paste are ignored
             peer.keys(8, [28])
@@ -173,9 +225,19 @@ def verify(cancel=False):
             capture = os.environ.get('OUROKIT_TEST_CAPTURE')
             if capture:
                 from PIL import Image
-                directory = Path(capture); directory.mkdir(parents=True, exist_ok=True)
+                directory = Path(capture) / ('custom' if custom else 'stock')
+                directory.mkdir(parents=True, exist_ok=True)
                 for name, (w, h, stride, pixels) in peer.captures.items():
                     Image.frombytes('RGBA', (w, h), pixels, 'raw', 'BGRA', stride).save(directory / f'secure-{name}.png')
+            if custom:
+                # Explicit chrome only on the first output; the second is an unstyled mask.
+                background = bytes((0x56, 0x34, 0x12, 0xff))
+                border = bytes((0xbc, 0x9a, 0x78, 0xff))
+                foreground = bytes((0xba, 0xdc, 0xfe, 0xff))
+                first, second = peer.captures['TEST-1'][3], peer.captures['TEST-2'][3]
+                assert first.count(background) > 100 and first.count(border) > 100
+                assert background not in second and border not in second
+                assert foreground in first and foreground in second
             peer.keys(7, [28])
             stdout, stderr = process.communicate(timeout=5)
             assert process.returncode == 0 and 'PASS secure lock entry' in stdout, (stdout, stderr)
@@ -186,7 +248,7 @@ def verify(cancel=False):
             if process.poll() is None:
                 process.terminate()
             stdout, stderr = process.communicate(timeout=5)
-            if process.returncode != 0: print(stdout, stderr)
+            if process.returncode != 0 and not reject: print(stdout, stderr)
             thread.join(timeout=3)
         assert peer.failure is None, peer.failure
 
@@ -194,3 +256,8 @@ def verify(cancel=False):
 if __name__ == '__main__':
     verify()
     verify(cancel=True)
+    verify(custom=True)
+    verify(cancel=True, custom=True)
+    for field in ('text', 'value', 'default_text', 'on_change', 'key_bindings', 'placeholder'):
+        verify(reject=field)
+        verify(custom=True, reject=field)

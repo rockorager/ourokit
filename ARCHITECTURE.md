@@ -249,7 +249,8 @@ identity and parent links from stable local keys and resolves inherited themes
 and parent data. No Button render object or Lua theme mirror is introduced.
 
 Stock button, checkbox, switch, separator, option, radio, tab, selection-group,
-dialog, slider, split-view, and text-input recipes live only in `lua/controls.lua`.
+dialog, slider, split-view, text-input, and authentication-input recipes live
+only in `lua/controls.lua`.
 `ouro.stateless` expands stateless descriptions with a fresh effective native
 theme value during lowering, without mounting a component or adding a
 VM-specific identity namespace. Its output is pinned in the build transaction,
@@ -284,7 +285,9 @@ The native text-editor primitive pairs a focus/semantic target with an editable
 viewport and retained session. It has no stock field chrome; Lua resolves the
 text-input recipe's dimensions, padding, colors, and border. Changing chrome
 does not replace editing identity, undo history, or IME composition. Authentication
-input remains a separate opaque capability, never a normal text editor.
+input uses a separate native secure-entry capability, never a normal text editor.
+Lua chooses its field chrome; the native boundary retains the constant mask,
+credential-free semantics, protected capture/input, and direct credential dispatch.
 
 Layout uses one-way Flutter-style box constraints in logical `f32` units. A
 parent passes minimum/maximum width and height, each child returns one finite
