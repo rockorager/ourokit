@@ -248,8 +248,8 @@ Lua-composed Box plus Text and a typed activation binding. A bounded lowering co
 identity and parent links from stable local keys and resolves inherited themes
 and parent data. No Button render object or Lua theme mirror is introduced.
 
-Stock button, checkbox, switch, separator, option, radio, tab, and selection-group
-recipes live only in `lua/controls.lua`.
+Stock button, checkbox, switch, separator, option, radio, tab, selection-group,
+and dialog recipes live only in `lua/controls.lua`.
 `ouro.stateless` expands stateless descriptions with a fresh effective native
 theme value during lowering, without mounting a component or adding a
 VM-specific identity namespace. Its output is pinned in the build transaction,
@@ -268,6 +268,10 @@ Rows and columns opt into native selection policy; stock selection-group
 recipes choose axis, spacing, alignment, and main-axis sizing in Lua. Stateless
 item recipes receive their declared group context. The native selection registry
 owns order, values, and hover, not group layout or a hardcoded label child.
+Boxes with the dialog semantic role establish a native modal boundary: input
+gating, contained focus traversal, Escape routing, and opener restoration.
+The stock dialog recipe supplies the dim backdrop and centered panel in Lua;
+custom dialog boxes use the same policy with arbitrary presentation.
 
 Layout uses one-way Flutter-style box constraints in logical `f32` units. A
 parent passes minimum/maximum width and height, each child returns one finite

@@ -242,9 +242,9 @@ it again, including when enclosing components retain their descriptions, so
 inherited themes cannot become stale. Hover, pressed, and keyboard-focus paint
 updates do not lower descriptions or run composition functions.
 
-Buttons, checkboxes, switches, separators, options, radios, and tabs are stock
-Lua compositions over box, text, and layout primitives. Applications have the
-same primitive boundary:
+Buttons, checkboxes, switches, separators, options, radios, tabs, selection
+groups, and dialogs are stock Lua compositions over box, text, and layout
+primitives. Applications have the same primitive boundary:
 
 ```lua
 local Action = ouro.stateless(function(props, children, theme)
@@ -268,7 +268,9 @@ Space/Enter activation, repeat suppression, focus traversal, and cancellation.
 `focus_request`, `on_cancel`, and `on_interaction_change` use the existing control
 contracts. Supply either `on_press()` or `on_change(not checked)`, not both;
 `checked` remains application-controlled. Box roles are `group` (default),
-`button`, `checkbox`, `switch`, and `separator`; declaring a role alone does not enable input.
+`button`, `checkbox`, `switch`, `separator`, and `dialog`. Only `dialog` adds
+input policy by role alone: it establishes a native modal boundary, as described
+under [in-window modal dialogs](#in-window-modal-dialogs).
 `label`, `checked`, and `enabled` are copied to the semantic snapshot.
 
 Any box or text under an interaction owner can declare `states`, independently
@@ -1102,12 +1104,23 @@ a column with visible title, body, and action buttons. `on_cancel()` receives
 Escape; it must update state to dismiss the dialog. Clicking the backdrop does
 not dismiss it automatically.
 
-The native runtime dims and blocks the underlying page, moves focus into the
-dialog, contains Tab/Shift+Tab traversal, and restores the opener on unmount
-if it still exists and is enabled. A text field's explicit command handler or
-active IME composition takes precedence over dialog Escape. Only one dialog
-per window is supported; nested dialogs are rejected. This is an application
-modal surface, not an OS file chooser or a separate native window.
+The Lua recipe draws the dim backdrop and centered themed panel. The native
+runtime blocks input outside the dialog, moves focus inside, contains
+Tab/Shift+Tab traversal, and restores the opener on unmount or hiding if it
+still exists and is enabled. A child's explicit cancel handler or a text
+field's active IME composition takes precedence over dialog Escape.
+
+For custom presentation, use `ouro.box {role='dialog', key=..., label=...}`
+with any layout, paint, and content. This opts into the same native modal
+policy without adding a backdrop or panel. Supply `on_cancel()` to handle
+Escape, including when there are no focusable children. A dialog box requires
+semantics, `enabled=true`, and no activation; `semantic=false`,
+`enabled=false`, and `activate=true` are rejected. Dismiss it by unmounting it
+or setting `hidden=true`, not by disabling it.
+
+Only one dialog descriptor per window is supported, including hidden
+descriptors; nested dialogs are rejected. This is an application modal
+surface, not an OS file chooser or a separate native window.
 
 Run `ouroctl run examples/forms.lua` for the interactive settings smoke app,
 or snapshot `examples/forms-storybook.lua` for light, dark, disabled, changed,

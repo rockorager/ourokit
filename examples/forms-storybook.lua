@@ -76,6 +76,27 @@ local function selection_layout(disabled)
   end
 end
 
+local function custom_dialog()
+  local opened = o.signal(false)
+  local function close() opened:set(false) end
+  return function()
+    return o.stack {key='root',
+      o.column {key='page', gap=16,
+        o.text {key='title', text='Workspace', size=24},
+        o.button {key='open', label='Open details', on_press=function() opened:set(true) end},
+        o.text {key='status', text=opened() and 'Details open' or 'Details closed'}},
+      o.box {key='sheet', role='dialog', label='Workspace details', hidden=not opened(),
+        width='fill', height='fill', alignment='right', background='#00000040', on_cancel=close,
+        o.box {key='panel', semantic=false, width=300, height='fill', padding=20, surface='card',
+          o.column {key='body', gap=20,
+            o.box {key='stripe', height=4, width='fill', background='#137ba9', semantic=false},
+            o.text {key='title', text='Workspace details', size=22},
+            o.text {key='detail', text='Custom layout, native modality.'},
+            o.text {key='hint', text='Tab stays here. Escape closes.'},
+            o.button {key='close', label='Close details', on_press=close}}}}}
+  end
+end
+
 return o.storybook {id='forms', title='Form controls', stories={
   o.story {id='forms/light', name='Light', viewport={width=540,height=640}, content=content()},
   o.story {id='forms/dark', name='Dark', color_scheme='dark', viewport={width=540,height=640}, content=content()},
@@ -94,4 +115,10 @@ return o.storybook {id='forms', title='Form controls', stories={
   o.story {id='selection-layout/disabled', name='Custom selection layout (disabled)', viewport={width=560,height=340}, snapshot_scale=2, content=selection_layout(true)},
   o.story {id='selection-layout/changed', name='Custom selection layout (changed)', viewport={width=560,height=340}, snapshot_scale=2, content=selection_layout(false),
     actions={{type='click',target='layout/intrinsic/first'}}},
+  o.story {id='dialog-layout/light', name='Custom modal side sheet', viewport={width=560,height=340}, snapshot_scale=2, content=custom_dialog(),
+    actions={{type='click',target='root/page/open'}}},
+  o.story {id='dialog-layout/dark', name='Custom modal side sheet (dark)', color_scheme='dark', viewport={width=560,height=340}, snapshot_scale=2, content=custom_dialog(),
+    actions={{type='click',target='root/page/open'}}},
+  o.story {id='dialog-layout/closed', name='Custom modal side sheet (closed)', viewport={width=560,height=340}, snapshot_scale=2, content=custom_dialog(),
+    actions={{type='click',target='root/page/open'}, {type='click',target='root/sheet/body/close'}}},
 }}

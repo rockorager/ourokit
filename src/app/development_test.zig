@@ -774,6 +774,102 @@ test "forms dialog contains focus and restores opener after escape" {
     try std.testing.expectEqual(f.runtime.instances.handleForId((try f.runtime.semantics.findPath("root/open")).id).?, f.runtime.focus.current().?);
 }
 
+test "custom dialog boxes gate outside input and restore focus when hidden" {
+    const f = try Fixture.create(
+        \\opened=ouro.signal(false); empty=ouro.signal(false); opens=0; cancels=0; inner=0
+        \\function build() return ouro.row {key='root',gap=20,
+        \\ ouro.button {key='open',label='Open',width=80,on_press=function() opens=opens+1;opened:set(true) end},
+        \\ ouro.box {key='dialog',role='dialog',label='Custom',hidden=not opened(),
+        \\   width=180,height=140,padding=9,background='#123456',
+        \\   on_cancel=function() cancels=cancels+1;opened:set(false) end,
+        \\   not empty() and ouro.column {key='actions',semantic=false,
+        \\     ouro.button {key='first',label='First'},
+        \\     ouro.button {key='last',label='Last',on_cancel=function() inner=inner+1 end}} or nil}}
+        \\end
+    );
+    defer f.destroy();
+    try std.testing.expect(f.runtime.focus.boundary == null);
+    try f.play(.{ .click = "root/open" });
+    const dialog = f.runtime.focus.boundary.?;
+    const first = f.runtime.focus.current().?;
+    const bounds = (try f.runtime.semanticTarget("root/dialog")).bounds;
+    try std.testing.expectEqual(@as(f32, 180), bounds.width);
+    try std.testing.expectEqual(@as(f32, 140), bounds.height);
+    try std.testing.expect(!f.runtime.buttons.contains(dialog));
+    // The custom surface does not cover the opener. Hit testing can reach it,
+    // but the native modal boundary must suppress its callback and focus.
+    try f.play(.{ .click = "root/open" });
+    try std.testing.expectEqual(first, f.runtime.focus.current().?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab, .modifiers = .{ .shift = true } } });
+    try std.testing.expectEqual(f.runtime.instances.handleForId((try f.runtime.semantics.findPath("root/dialog/last")).id).?, f.runtime.focus.current().?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .escape } });
+    try std.testing.expectEqual(dialog, f.runtime.focus.boundary.?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try std.testing.expectEqual(first, f.runtime.focus.current().?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .escape } });
+    try std.testing.expect(f.runtime.focus.boundary == null);
+    const opener = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("root/open")).id).?;
+    try std.testing.expectEqual(opener, f.runtime.focus.current().?);
+    const prepare = "assert(opens==1 and cancels==1 and inner==1); empty:set(true)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, prepare.ptr, prepare.len, "@empty-dialog", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try f.play(.{ .click = "root/open" });
+    try std.testing.expectEqual(dialog, f.runtime.focus.boundary.?);
+    try std.testing.expect(f.runtime.focus.current() == null);
+    // With no focusable child, Escape must fall back to the dialog boundary.
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .escape } });
+    try std.testing.expect(f.runtime.focus.boundary == null);
+    try std.testing.expectEqual(opener, f.runtime.focus.current().?);
+    const check = "assert(opens==2 and cancels==2 and inner==1)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-dialog", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+}
+
+test "invalid dialog candidates preserve the committed modal boundary" {
+    const f = try Fixture.create(
+        \\cancels=0
+        \\function build() return ouro.dialog {key='dialog',label='Original',
+        \\ on_cancel=function() cancels=cancels+1 end,ouro.button {key='action',label='Keep'}} end
+        \\good=build
+    );
+    defer f.destroy();
+    const boundary = f.runtime.focus.boundary.?;
+    const focused = f.runtime.focus.current().?;
+    for ([_][]const u8{
+        "ouro.box {key='bad',role='dialog',label='Bad',semantic=false}",
+        "ouro.box {key='bad',role='dialog',label='Bad',activate=true}",
+        "ouro.box {key='bad',role='dialog',label='Bad',enabled=false}",
+        "ouro.box {key='bad',role='dialog'}",
+        "ouro.box {key='bad',role='dialog',label='Bad',on_cancel=false}",
+        "ouro.dialog {key='bad',label='Bad',width=false}",
+        "ouro.dialog {key='bad',label='Bad',width='fill'}",
+        "ouro.dialog {key='bad',label='Bad',width=-1}",
+        "ouro.dialog {key='bad',label='Bad',ouro.box {key='a'},ouro.box {key='b'}}",
+        "ouro.stack {key='two',ouro.box {key='a',role='dialog',label='A'},ouro.dialog {key='b',label='B'}}",
+    }, 0..) |invalid, index| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{invalid});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@invalid-dialog", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(if (index == 9) error.MultipleDialogsUnsupported else error.LuaBuildFailed, f.settle());
+        try std.testing.expectEqual(boundary, f.runtime.focus.boundary.?);
+        try std.testing.expectEqual(focused, f.runtime.focus.current().?);
+        try std.testing.expectEqual(@as(usize, 0), f.builder.pending_handler_count);
+    }
+    const restore = "build=good";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, restore.ptr, restore.len, "@restore-dialog", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    // Dispatch against the committed handler before rebuilding the restored
+    // source; development playback requires a settled successful build.
+    try f.runtime.routeKeyboard(.{ .key = .{ .window = f.runtime.window, .serial = 0, .time_ms = 0, .state = .pressed, .translated = .{ .keycode = 0, .logical = .escape } } });
+    try f.settle();
+    const check = "assert(cancels==1)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-dialog", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+}
+
 test "forms dialog escape bubbles from plain fields but not active composition" {
     const f = try Fixture.create(
         \\opened=ouro.signal(true)

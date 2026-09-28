@@ -644,7 +644,6 @@ pub const UiBuild = struct {
             .canvas => emitCanvas,
             .icon => emitIcon,
             .slider => emitSlider,
-            .dialog => emitDialog,
             .text_input => emitTextInput,
             .auth_input => emitAuthInput,
             .split_view => emitSplitView,
@@ -1082,22 +1081,6 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn emitDialog(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
-        const parent = self.currentParent() orelse return luaError(state, "dialog requires a parent");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "dialog key required");
-        const label = tableString(state, 1, "label") orelse return luaError(state, "dialog label required");
-        const width = tableOptionalExtent(state, 1, "width", 360) orelse return luaError(state, "invalid dialog width");
-        const id = semanticId(key, 0x6469616c6f67 ^ parent.id ^ self.component_namespace);
-        const panel = semanticId("panel", id);
-        self.append(.{ .id = id, .parent = parent.id, .object = .{ .box = .{ .fill_width = true, .fill_height = true, .alignment = .center, .background = @import("../core/color.zig").Color.rgba(0, 0, 0, 110) } } }) catch return luaError(state, "cannot append dialog backdrop");
-        self.append(.{ .id = panel, .parent = id, .object = .{ .box = .{ .width = width, .padding = .all(16), .background = theme.card, .border_color = theme.border, .border_width = 1, .corner_radius = 8 } } }) catch return luaError(state, "cannot append dialog panel");
-        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .dialog, .key = key, .label = label }) catch return luaError(state, "cannot append dialog semantics");
-        self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
-        return self.emitChildren(state, .{ .id = panel, .kind = .box, .semantic_id = id });
-    }
-
     fn emitAuthInput(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1497,10 +1480,14 @@ pub const UiBuild = struct {
         const activate = tableOptionalBoolean(state, 1, "activate", false) orelse return luaError(state, "activate must be boolean");
         var enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse return luaError(state, "enabled must be boolean");
         var role = tableOptionalEnum(@import("../ui/semantics/snapshot.zig").Role, state, 1, "role", .group) orelse return luaError(state, "invalid semantic role");
-        if (role != .group and role != .button and role != .checkbox and role != .@"switch" and role != .separator)
-            return luaError(state, "box role must be group, button, checkbox, switch, or separator");
+        if (role != .group and role != .button and role != .checkbox and role != .@"switch" and role != .separator and role != .dialog)
+            return luaError(state, "box role must be group, button, checkbox, switch, separator, or dialog");
         const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
         if (activate and !semantic) return luaError(state, "activation requires semantics");
+        if (role == .dialog) {
+            if (!semantic or activate or !enabled) return luaError(state, "dialog requires semantics, enabled=true, and no activation");
+            _ = tableString(state, 1, "label") orelse return luaError(state, "dialog label required");
+        }
         var checked = tableOptionalBoolean(state, 1, "checked", false) orelse return luaError(state, "checked must be boolean");
         const option_type = c.lua_getfield(state, 1, "option");
         c.lua_settop(state, -2);
@@ -1551,8 +1538,8 @@ pub const UiBuild = struct {
             self.pending_button_count += 1;
             self.stageCallback(state, id, "on_press", .button) catch |err| return luaError(state, @errorName(err));
             self.stageCallback(state, id, "on_change", .@"switch") catch |err| return luaError(state, @errorName(err));
-            self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
         }
+        if (activate or role == .dialog) self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
         self.append(.{
             .id = id,
             .parent = parent.id,

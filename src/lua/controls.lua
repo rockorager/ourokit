@@ -114,6 +114,19 @@ ouro.separator = ouro.stateless(function(p, children, theme)
   }
 end)
 
+ouro.dialog = ouro.stateless(function(p, children, theme)
+  check(kind(p.key) == 'string' and kind(p.label) == 'string', 'dialog key and label required')
+  check(#children <= 1, 'dialog accepts one content child')
+  check(p.width == nil or kind(p.width) == 'number', 'invalid dialog width')
+  local width = p.width
+  if width == nil then width = 360 end
+  return ouro.box {key=p.key, role='dialog', label=p.label, on_cancel=p.on_cancel,
+    width='fill', height='fill', alignment='center', background='#0000006e',
+    ouro.box {key='panel', semantic=false, width=width, padding=16,
+      background=theme.colors.card, border=theme.colors.border, border_width=1,
+      radius=8, children=children}}
+end)
+
 local function selection_group(p, children, policy)
   local gap = p.gap
   if gap == nil then gap = policy == 'tab_list' and 0 or f.spacing_1 end
