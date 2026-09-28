@@ -45,12 +45,28 @@ pub const Store = struct {
 /// Host-owned Settings portal subscription. All I/O is asynchronous; the host
 /// pumps collectCanceled before submission and routes socket/timer/cancel CQEs.
 /// Portal restarts are discovered through bus owner changes, never polling.
+/// A failed bus connection (startup timeout, disconnect, broker restart) is
+/// drained, released and reopened after an exponential backoff; the Store
+/// holds the default snapshot until the new connection reads the portal.
 pub const Client = struct {
     allocator: std.mem.Allocator = undefined,
+    loop: *io.Loop = undefined,
     store: *Store = undefined,
+    address: []u8 = &.{},
     bus: dbus.Client = undefined,
     enabled: bool = false,
+    /// `bus` is initialized and must be drained and released.
+    connected: bool = false,
+    /// Pending reconnect timer; only set while `connected` is false.
+    retry: ?io.OperationHandle = null,
+    /// Delay before the next reconnect: 1 s doubling to 30 s, reset once a
+    /// connection subscribes. Fields rather than constants so tests can
+    /// shorten them.
+    retry_delay_ns: u64 = std.time.ns_per_s,
+    retry_min_ns: u64 = std.time.ns_per_s,
+    retry_max_ns: u64 = 30 * std.time.ns_per_s,
     stopping: bool = false,
+    // Per-connection subscription state, reset by `reconnect`.
     started: bool = false,
     watching: bool = false,
     owner: ?[]u8 = null,
@@ -62,56 +78,105 @@ pub const Client = struct {
 
     /// A null address disables the built-in service (for host-supplied Stores).
     pub fn init(self: *Client, allocator: std.mem.Allocator, loop: *io.Loop, store: *Store, address: ?[]const u8) !void {
-        self.* = .{ .allocator = allocator, .store = store };
+        self.* = .{ .allocator = allocator, .loop = loop, .store = store };
         const value = address orelse return;
         if (value.len == 0) return;
-        try self.bus.init(allocator, loop, value);
+        self.address = try allocator.dupe(u8, value);
+        errdefer allocator.free(self.address);
+        try self.bus.init(allocator, loop, self.address);
+        self.connected = true;
         self.enabled = true;
     }
 
     pub fn dispatch(self: *Client, completion: io.SocketCompletion) !bool {
-        if (!self.enabled or !try self.bus.dispatch(completion)) return false;
+        if (!self.connected or !try self.bus.dispatch(completion)) return false;
         try self.collectCanceled();
         return true;
     }
 
     pub fn dispatchTimer(self: *Client, operation: io.OperationHandle) !bool {
-        if (!self.enabled or !try self.bus.dispatchTimer(operation)) return false;
+        if (self.retry) |retry| if (std.meta.eql(retry, operation)) {
+            self.retry = null;
+            try self.reconnect();
+            try self.collectCanceled();
+            return true;
+        };
+        if (!self.connected or !try self.bus.dispatchTimer(operation)) return false;
         try self.collectCanceled();
         return true;
     }
 
     pub fn collectCanceled(self: *Client) !void {
-        if (!self.enabled) return;
+        if (!self.connected) return;
         try self.bus.collectCanceled();
         if (self.stopping) return;
-        if (self.bus.failure != null) {
-            self.store.update(.{});
-            return;
+        if (self.bus.failure == null and self.bus.isReady()) {
+            if (!self.started) {
+                self.owner_match_serial = try self.daemonCall("AddMatch", owner_match);
+                self.started = true;
+            }
+            while (try self.bus.takeMessage()) |incoming| {
+                var message = incoming;
+                defer message.deinit();
+                // A transport failure while replying ends this connection;
+                // it is retried below rather than failing the host.
+                self.accept(&message) catch |err| if (self.bus.failure == null) return err else break;
+            }
+            try self.bus.collectCanceled();
         }
-        if (!self.bus.isReady()) return;
-        if (!self.started) {
-            self.owner_match_serial = try self.daemonCall("AddMatch", owner_match);
-            self.started = true;
-        }
-        while (try self.bus.takeMessage()) |incoming| {
-            var message = incoming;
-            defer message.deinit();
-            try self.accept(&message);
-        }
-        try self.bus.collectCanceled();
+        if (self.bus.failure == null) return;
+        self.store.update(.{});
+        // Release the connection only after its io_uring work has drained.
+        if (!self.bus.canDeinit()) return;
+        self.bus.deinit();
+        self.connected = false;
+        try self.scheduleRetry();
     }
 
+    /// Also cancels a pending reconnect. Drain the loop before deinit.
     pub fn stop(self: *Client) !void {
         self.stopping = true;
-        if (self.enabled) try self.bus.close();
+        if (self.retry) |retry| {
+            self.loop.prepareCancel(retry) catch |err| if (err != error.StaleOperation) return err;
+            self.retry = null;
+        }
+        if (self.connected) try self.bus.close();
+    }
+
+    pub fn canDeinit(self: *const Client) bool {
+        return self.retry == null and (!self.connected or self.bus.canDeinit());
     }
 
     /// Valid after all native operations have drained.
     pub fn deinit(self: *Client) void {
-        if (self.enabled) self.bus.deinit();
+        std.debug.assert(self.canDeinit());
+        if (self.connected) self.bus.deinit();
+        if (self.enabled) self.allocator.free(self.address);
         if (self.owner) |owner| self.allocator.free(owner);
         self.* = undefined;
+    }
+
+    /// Opens a new bus connection with fresh subscription state. The portal
+    /// is then read once, exactly as at startup.
+    fn reconnect(self: *Client) !void {
+        if (self.owner) |owner| self.allocator.free(owner);
+        self.owner = null;
+        self.started = false;
+        self.watching = false;
+        self.owner_match_serial = null;
+        self.setting_match_serial = null;
+        self.activation_serial = null;
+        self.owner_serial = null;
+        self.read_serial = null;
+        // The address worked at startup, so init can only fail on transient
+        // resource exhaustion; count that as another failed attempt.
+        self.bus.init(self.allocator, self.loop, self.address) catch return self.scheduleRetry();
+        self.connected = true;
+    }
+
+    fn scheduleRetry(self: *Client) !void {
+        self.retry = try self.loop.prepareTimeout(self.retry_delay_ns);
+        self.retry_delay_ns = @min(self.retry_delay_ns *| 2, self.retry_max_ns);
     }
 
     fn daemonCall(self: *Client, member: []const u8, argument: []const u8) !u32 {
@@ -171,6 +236,7 @@ pub const Client = struct {
                 self.setting_match_serial = null;
                 if (!ok) return self.disable();
                 self.watching = true;
+                self.retry_delay_ns = self.retry_min_ns;
                 // Activate installed portals, but never wait for one at startup.
                 self.activation_serial = try self.daemonCall("StartServiceByName", portal);
             } else if (self.activation_serial == serial) {
@@ -377,17 +443,166 @@ test "appearance portal disabled and missing buses fall back without publishing 
         try client.init(std.testing.allocator, &loop, &store, "unix:abstract=ouro-appearance-missing-bus");
         defer client.deinit();
         if (!stop_before_connect) {
-            while (client.bus.failure == null) try testStep(&loop, &client, null);
+            while (client.retry == null) try testStep(&loop, &client, null);
             try std.testing.expectEqual(ColorScheme.default, store.takeEvent().?.appearance_changed.color_scheme);
         }
         try client.stop();
         try client.stop();
         while (loop.hasPendingOperations() or loop.hasPendingTimerKernelWork()) try testStep(&loop, &client, null);
-        try std.testing.expect(client.bus.canDeinit());
+        try std.testing.expect(client.canDeinit());
         try std.testing.expect(store.takeEvent() == null);
         try std.testing.expectEqual(if (stop_before_connect) ColorScheme.dark else ColorScheme.default, store.current.color_scheme);
     }
 }
+
+test "appearance portal retries failed buses with capped backoff and stops while a retry is pending" {
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 16, 8);
+    defer loop.deinit();
+    var store: Store = .{ .current = .{ .color_scheme = .dark } };
+    var client: Client = undefined;
+    try client.init(std.testing.allocator, &loop, &store, "unix:abstract=ouro-appearance-missing-bus");
+    defer client.deinit();
+    client.retry_min_ns = std.time.ns_per_ms;
+    client.retry_delay_ns = std.time.ns_per_ms;
+    client.retry_max_ns = 4 * std.time.ns_per_ms;
+    // Each attempt is refused; the delay armed after it doubles up to the cap.
+    for ([_]u64{ 2, 4, 4, 4 }) |next_ms| {
+        while (client.connected) try testStep(&loop, &client, null);
+        try std.testing.expect(client.retry != null);
+        try std.testing.expectEqual(next_ms * std.time.ns_per_ms, client.retry_delay_ns);
+        try std.testing.expectEqual(ColorScheme.default, store.current.color_scheme);
+        while (!client.connected) try testStep(&loop, &client, null);
+    }
+    // The failed attempts published one fallback snapshot in total.
+    try std.testing.expectEqual(ColorScheme.default, store.takeEvent().?.appearance_changed.color_scheme);
+    try std.testing.expect(store.takeEvent() == null);
+    while (client.connected) try testStep(&loop, &client, null);
+    try client.stop();
+    try std.testing.expect(client.retry == null and client.canDeinit());
+    while (loop.hasPendingOperations() or loop.hasPendingTimerKernelWork()) try testStep(&loop, &client, null);
+    try std.testing.expect(!client.connected and store.takeEvent() == null);
+}
+
+// Run under a disposable dbus-run-session with OURO_APPEARANCE_INTEGRATION=1.
+test "appearance portal live bus reconnects after a startup timeout and a disconnect" {
+    if (std.testing.environ.getPosix("OURO_APPEARANCE_INTEGRATION") == null) return error.SkipZigTest;
+    const address = std.testing.environ.getPosix("DBUS_SESSION_BUS_ADDRESS") orelse return error.MissingTestBus;
+    // The first connection goes to a silent socket at `link`, which is then
+    // replaced by a symlink to the real bus before the retry.
+    const prefix = "unix:path=";
+    if (!std.mem.startsWith(u8, address, prefix)) return error.SkipZigTest;
+    const bus_path_end = std.mem.indexOfAny(u8, address, ",;") orelse address.len;
+    const bus_path = try std.testing.allocator.dupeZ(u8, address[prefix.len..bus_path_end]);
+    defer std.testing.allocator.free(bus_path);
+    var link_buffer: [64]u8 = undefined;
+    const link = try std.fmt.bufPrintZ(&link_buffer, "/tmp/ouro-appearance-{d}.sock", .{std.os.linux.getpid()});
+    _ = std.os.linux.unlink(link);
+    defer _ = std.os.linux.unlink(link);
+    var socket_address: std.os.linux.sockaddr.un = .{ .family = std.os.linux.AF.UNIX, .path = @splat(0) };
+    @memcpy(socket_address.path[0..link.len], link);
+    const opened = std.os.linux.socket(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(opened));
+    var listener: ?std.os.linux.fd_t = @intCast(opened);
+    defer if (listener) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.bind(listener.?, @ptrCast(&socket_address), @sizeOf(std.os.linux.sockaddr.un))));
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.listen(listener.?, 1)));
+    const client_address = try std.fmt.allocPrint(std.testing.allocator, "unix:path={s}", .{link});
+    defer std.testing.allocator.free(client_address);
+
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 32, 16);
+    defer loop.deinit();
+    var store: Store = .{};
+    var client: Client = undefined;
+    try client.init(std.testing.allocator, &loop, &store, client_address);
+    defer client.deinit();
+    client.retry_min_ns = 10 * std.time.ns_per_ms;
+    client.retry_delay_ns = 10 * std.time.ns_per_ms;
+    var service: dbus.Client = undefined;
+    try service.init(std.testing.allocator, &loop, address);
+    defer service.deinit();
+    // A stuck reconnect fails the test through an unowned timer, not a hang.
+    var watchdog: ?io.OperationHandle = try loop.prepareTimeout(20 * std.time.ns_per_s);
+    defer {
+        // Already gone if it fired and failed the test.
+        if (watchdog) |timer| loop.prepareCancel(timer) catch {};
+        client.stop() catch unreachable;
+        service.close() catch unreachable;
+        while (loop.hasPendingOperations() or loop.hasPendingTimerKernelWork()) testStep(&loop, &client, &service) catch unreachable;
+    }
+    var fake: TestPortal = .{ .service = &service, .preference = 1 };
+    try fake.start(&loop, &client);
+
+    // The silent socket accepts but never authenticates: startup timeout.
+    while (client.connected) try fake.step(&loop, &client);
+    try std.testing.expect(client.retry != null);
+    try std.testing.expectEqual(ColorScheme.default, store.current.color_scheme);
+    try std.testing.expectEqual(@as(usize, 0), fake.reads);
+    _ = std.os.linux.close(listener.?);
+    listener = null;
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.unlink(link)));
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.symlink(bus_path, link)));
+    while (store.current.color_scheme != .dark) try fake.step(&loop, &client);
+    try std.testing.expectEqual(ColorScheme.dark, store.takeEvent().?.appearance_changed.color_scheme);
+    try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    try std.testing.expectEqual(client.retry_min_ns, client.retry_delay_ns);
+
+    // The bus drops the connection, as when the broker restarts.
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.shutdown(client.bus.fd, std.os.linux.SHUT.RDWR)));
+    while (client.connected) try fake.step(&loop, &client);
+    try std.testing.expectEqual(ColorScheme.default, store.takeEvent().?.appearance_changed.color_scheme);
+    fake.preference = 2;
+    while (store.current.color_scheme != .light) try fake.step(&loop, &client);
+    try std.testing.expectEqual(ColorScheme.light, store.takeEvent().?.appearance_changed.color_scheme);
+    try std.testing.expectEqual(@as(usize, 2), fake.reads);
+    loop.prepareCancel(watchdog.?) catch unreachable;
+    watchdog = null;
+}
+
+/// A fake Settings portal on its own bus connection that answers ReadAll.
+const TestPortal = struct {
+    service: *dbus.Client,
+    preference: u32,
+    reads: usize = 0,
+
+    fn start(self: *TestPortal, loop: *io.Loop, client: *Client) !void {
+        while (!self.service.isReady()) try testStep(loop, client, self.service);
+        var request = wire.Encoder.init(std.testing.allocator);
+        defer request.deinit();
+        try request.string(portal);
+        try request.uint32(4); // Do not queue for a name owned by another service.
+        const serial = try self.service.send(.{ .message_type = .method_call, .destination = daemon, .path = daemon_path, .interface = daemon, .member = "RequestName", .signature = "su" }, request.bytes(), &.{});
+        while (true) {
+            try testStep(loop, client, self.service);
+            while (try self.service.takeMessage()) |incoming| {
+                var message = incoming;
+                defer message.deinit();
+                if (message.header.reply_serial != serial) continue;
+                try std.testing.expectEqual(wire.MessageType.method_return, message.messageType());
+                var body = message.bodyDecoder();
+                try std.testing.expectEqual(@as(u32, 1), try body.uint32());
+                return;
+            }
+        }
+    }
+
+    fn step(self: *TestPortal, loop: *io.Loop, client: *Client) !void {
+        try testStep(loop, client, self.service);
+        while (try self.service.takeMessage()) |incoming| {
+            var message = incoming;
+            defer message.deinit();
+            if (message.messageType() != .method_call) continue;
+            try std.testing.expectEqualStrings("ReadAll", message.header.member.?);
+            var response = try testSettings(self.preference);
+            defer response.deinit();
+            _ = try self.service.send(.{ .message_type = .method_return, .destination = message.header.sender, .reply_serial = message.header.serial, .signature = "a{sa{sv}}" }, response.bytes(), &.{});
+            self.reads += 1;
+        }
+    }
+};
 
 // Run under a disposable dbus-run-session with OURO_APPEARANCE_INTEGRATION=1.
 test "appearance portal live bus recovers service restart without polling and drains shutdown" {
