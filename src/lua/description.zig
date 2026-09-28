@@ -8,7 +8,7 @@ pub const Kind = enum {
     icon,
     text_input,
     auth_input,
-    split_view,
+    split,
     box,
     stack,
     row,
@@ -21,7 +21,7 @@ pub const Kind = enum {
 
     fn acceptsChildren(self: Kind) bool {
         return switch (self) {
-            .split_view, .box, .stack, .row, .column, .scroll, .theme, .stateful, .stateless => true,
+            .split, .box, .stack, .row, .column, .scroll, .theme, .stateful, .stateless => true,
             else => false,
         };
     }

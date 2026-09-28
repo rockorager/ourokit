@@ -274,7 +274,9 @@ test "split controls preserve grab offset and clamp both axes at actual layout l
         const divider = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("split/divider")).id).?;
         const divider_render = try f.runtime.instances.renderObject(divider);
         try std.testing.expectEqual(@as(f32, 8), if (horizontal) before.bounds.width else before.bounds.height);
-        try std.testing.expectEqual(@as(u8, 0), (try f.runtime.tree.objectAt(divider_render)).box.background.?.a);
+        try std.testing.expect((try f.runtime.tree.objectAt(divider_render)).box.background == null);
+        const chrome = f.runtime.tree.firstChild(divider_render).?;
+        try std.testing.expectEqual(@as(u8, 0), (try f.runtime.tree.objectAt(chrome)).box.background.?.a);
         try f.play(.{ .hover = "split/divider" });
         try std.testing.expectEqual(if (horizontal) .col_resize else .row_resize, try f.runtime.pointerCursor());
         try f.play(.{ .pointer_down = "split/divider" });
@@ -300,6 +302,133 @@ test "split controls preserve grab offset and clamp both axes at actual layout l
         const stepped = (try f.runtime.semanticTarget("split/first")).bounds;
         try std.testing.expectApproxEqAbs(@as(f32, 50), if (horizontal) stepped.width else stepped.height, 0.001);
     }
+}
+
+test "custom split content inherits resize state without rebuilding ignored requests" {
+    inline for (.{ "horizontal", "vertical" }) |axis| {
+        const f = try Fixture.create("axis='" ++ axis ++ "'\n" ++
+            \\position=ouro.signal(0.25); connected=ouro.signal(true); accepting=false; requests={}; builds=0
+            \\function build() builds=builds+1; return ouro.split {key='split',axis=axis,position=position(),
+            \\ divider_size=24,min_first=30,min_second=50,
+            \\ on_change=connected() and function(v) requests[#requests+1]=v;if accepting then position:set(v) end end or nil,
+            \\ ouro.box {key='first'},ouro.box {key='second'},
+            \\ ouro.box {key='chrome',semantic=false,alignment='center',background='#123456',
+            \\   states={hover='#234567',pressed='#345678',focus='#456789'},
+            \\   ouro.box {key='grip',width=12,height=12,background='#abcdef',
+            \\     states={hover='#56789a',pressed='#6789ab',focus='#789abc'}}}} end
+        );
+        defer f.destroy();
+        const horizontal = comptime std.mem.eql(u8, axis, "horizontal");
+        const available: f64 = if (horizontal) 276 else 176;
+        const before = try f.runtime.semanticTarget("split/divider/grip");
+        const divider = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("split/divider")).id).?;
+        const bounds = (try f.runtime.semanticTarget("split/divider")).bounds;
+        try std.testing.expectEqual(@as(f32, 24), if (horizontal) bounds.width else bounds.height);
+        const grip = try f.runtime.instances.renderObject(f.runtime.instances.handleForId((try f.runtime.semantics.findPath("split/divider/grip")).id).?);
+        const Color = @import("../core/color.zig").Color;
+        try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+        try std.testing.expectEqual(divider, f.runtime.focus.current().?);
+        try std.testing.expectEqual(Color.rgba(0x78, 0x9a, 0xbc, 255), (try f.runtime.tree.objectAt(grip)).box.outline_color.?);
+        try f.play(.{ .hover = "split/divider/grip" });
+        try std.testing.expectEqual(if (horizontal) .col_resize else .row_resize, try f.runtime.pointerCursor());
+        try std.testing.expectEqual(Color.rgba(0x56, 0x78, 0x9a, 255), (try f.runtime.tree.objectAt(grip)).box.background.?);
+        try f.play(.{ .pointer_down = "split/divider" });
+        try std.testing.expectEqual(grip, try f.runtime.instances.renderObject(f.runtime.router.captured.?));
+        try std.testing.expectEqual(Color.rgba(0x67, 0x89, 0xab, 255), (try f.runtime.tree.objectAt(grip)).box.background.?);
+        for ([_]f32{ 17, 31 }) |delta| {
+            var point = before.center;
+            if (horizontal) point.x += delta else point.y += delta;
+            try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 1, .position = point } });
+            try f.settle();
+            try std.testing.expectEqual(before.center, (try f.runtime.semanticTarget("split/divider/grip")).center);
+        }
+        try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 0, .time_ms = 2, .button = 0x110, .state = .released } });
+        try f.settle();
+        try f.play(.{ .key = .{ .keycode = 0, .logical = if (horizontal) .arrow_down else .arrow_right } });
+        try f.play(.{ .key = .{ .keycode = 0, .logical = if (horizontal) .arrow_right else .arrow_down } });
+        try f.play(.{ .key = .{ .keycode = 0, .logical = .home } });
+        try f.play(.{ .key = .{ .keycode = 0, .logical = .end } });
+        const check = try std.fmt.allocPrint(std.testing.allocator, "local expected={{{d},{d},{d},{d},{d}}}; assert(#requests==5 and builds==1); for i,v in ipairs(expected) do assert(math.abs(requests[i]-v)<0.000001) end; accepting=true", .{ 0.25 + 17 / available, 0.25 + 31 / available, 0.25 + 10 / available, 30 / available, (available - 50) / available });
+        defer std.testing.allocator.free(check);
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-split", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        try f.play(.{ .pointer_down = "split/divider" });
+        var point = before.center;
+        if (horizontal) point.x += 17 else point.y += 17;
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 3, .position = point } });
+        try f.settle();
+        const moved = try f.runtime.semanticTarget("split/divider/grip");
+        try std.testing.expectApproxEqAbs(@as(f32, 17), if (horizontal) moved.center.x - before.center.x else moved.center.y - before.center.y, 0.001);
+        try std.testing.expectEqual(divider, f.runtime.split_drag.?.target);
+        const disconnect = "assert(#requests==6 and builds==2); connected:set(false)";
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, disconnect.ptr, disconnect.len, "@disconnect-split", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        try f.settle();
+        try std.testing.expect(f.runtime.split_drag == null);
+        try std.testing.expectEqual(divider, f.runtime.instances.handleForId((try f.runtime.semantics.findPath("split/divider")).id).?);
+        try std.testing.expectEqual(.default, try f.runtime.pointerCursor());
+    }
+}
+
+test "split divider content keeps nested activation independent" {
+    const f = try Fixture.create(
+        \\changes=0; presses=0
+        \\function build() return ouro.split {key='split',divider_size=40,
+        \\ on_change=function() changes=changes+1 end,
+        \\ ouro.box {key='first'},ouro.box {key='second'},
+        \\ ouro.box {key='chrome',semantic=false,alignment='center',
+        \\   ouro.button {key='action',label='X',width=24,on_press=function() presses=presses+1 end}}} end
+    );
+    defer f.destroy();
+    try f.play(.{ .hover = "split/divider/action" });
+    try std.testing.expectEqual(.default, try f.runtime.pointerCursor());
+    try f.play(.{ .click = "split/divider/action" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
+    try std.testing.expect(f.runtime.split_drag == null);
+    const check = "assert(changes==0 and presses==3)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-split-child", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+}
+
+test "invalid split content rolls back its resize binding and geometry" {
+    const f = try Fixture.create(
+        \\changes=0
+        \\function build() return ouro.split_view {key='split',position=0.25,
+        \\ on_change=function() changes=changes+1 end,
+        \\ ouro.box {key='first'},ouro.box {key='second'}} end
+        \\good=build
+    );
+    defer f.destroy();
+    try f.play(.{ .pointer_down = "split/divider" });
+    const divider = f.runtime.split_drag.?.target;
+    const before = try f.runtime.semanticTarget("split/divider");
+    for ([_][]const u8{
+        "ouro.split {key='bad',ouro.box {key='one'},ouro.box {key='two'}}",
+        "ouro.split_view {key='bad',ouro.box {key='one'},ouro.box {key='two'},ouro.box {key='three'}}",
+        "ouro.split {key='bad',divider_size=-1,ouro.box {key='one'},ouro.box {key='two'},ouro.box {key='three'}}",
+        "ouro.split {key='bad',divider_size=math.huge,ouro.box {key='one'},ouro.box {key='two'},ouro.box {key='three'}}",
+        // This fails inside the third child, after the resize callback is staged.
+        "ouro.split {key='bad',on_change=function() changes=999 end,ouro.box {key='one'},ouro.box {key='two'},ouro.box {key='three',background='invalid'}}",
+    }) |invalid| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{invalid});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@invalid-split", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.settle());
+        try std.testing.expectEqual(divider, f.runtime.split_drag.?.target);
+        try std.testing.expectEqual(@as(usize, 0), f.builder.pending_handler_count);
+    }
+    const restore = "build=good";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, restore.ptr, restore.len, "@restore-split", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 1, .position = .{ .x = before.center.x + 19, .y = before.center.y } } });
+    try f.settle();
+    try std.testing.expectEqual(before.bounds, (try f.runtime.semanticTarget("split/divider")).bounds);
+    const check = "assert(changes==1)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-split-rollback", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
 }
 
 test "tabs retain hidden editor state and reject hidden input without selecting on close" {

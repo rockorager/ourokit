@@ -131,6 +131,31 @@ local function custom_range(disabled)
   end
 end
 
+local SplitGrip = o.stateless(function(p, children, theme)
+  local c = theme.colors
+  local horizontal = p.axis == 'horizontal'
+  return o.box {key=p.key,semantic=false,width='fill',height='fill',alignment='center',
+    background=c.secondary,states={hover=c.accent,pressed=c.accent_selected,focus=c.ring},
+    o.box {key='grip',semantic=false,width=horizontal and 4 or 44,height=horizontal and 44 or 4,
+      radius=2,background=c.muted_foreground,states={hover=c.primary,pressed=c.primary}}}
+end)
+
+local function split_view(axis, custom)
+  local position = o.signal(0.25)
+  return function()
+    local panes = {key='panes',axis=axis,position=position(),min_first=40,min_second=70,
+      on_change=function(v) position:set(v) end,
+      o.box {key='first',surface='sidebar',padding=12,o.text {key='title',text='First pane'}},
+      o.box {key='second',surface='card',padding=12,o.text {key='title',text='Second pane'}}}
+    if custom then
+      panes.divider_size=24
+      panes[3]=SplitGrip {key='chrome',axis=axis}
+      return o.split(panes)
+    end
+    return o.split_view(panes)
+  end
+end
+
 return o.storybook {id='forms', title='Form controls', stories={
   o.story {id='forms/light', name='Light', viewport={width=540,height=640}, content=content()},
   o.story {id='forms/dark', name='Dark', color_scheme='dark', viewport={width=540,height=640}, content=content()},
@@ -162,4 +187,22 @@ return o.storybook {id='forms', title='Form controls', stories={
     actions={{type='tab',target='ranges/wide'}}},
   o.story {id='range-layout/changed', name='Custom ranges (changed)', viewport={width=460,height=360}, snapshot_scale=2, content=custom_range(false),
     actions={{type='click',target='ranges/narrow/control'}}},
+  o.story {id='split/horizontal', name='Horizontal split', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal')},
+  o.story {id='split/vertical', name='Vertical split', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('vertical')},
+  o.story {id='split/dark', name='Split (dark)', color_scheme='dark', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal')},
+  o.story {id='split/hover', name='Split (hover)', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal'),
+    actions={{type='hover',target='panes/divider'}}},
+  o.story {id='split/pressed', name='Split (pressed)', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal'),
+    actions={{type='pointer_down',target='panes/divider'}}},
+  o.story {id='split/focus', name='Split (keyboard focus)', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal'),
+    actions={{type='tab',target='panes/divider'}}},
+  o.story {id='split-custom/horizontal', name='Custom horizontal divider', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal',true)},
+  o.story {id='split-custom/vertical', name='Custom vertical divider', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('vertical',true)},
+  o.story {id='split-custom/dark', name='Custom divider (dark)', color_scheme='dark', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal',true)},
+  o.story {id='split-custom/hover', name='Custom divider (hover)', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal',true),
+    actions={{type='hover',target='panes/divider'}}},
+  o.story {id='split-custom/pressed', name='Custom divider (pressed)', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal',true),
+    actions={{type='pointer_down',target='panes/divider'}}},
+  o.story {id='split-custom/focus', name='Custom divider (keyboard focus)', viewport={width=440,height=260}, snapshot_scale=2, content=split_view('horizontal',true),
+    actions={{type='tab',target='panes/divider'}}},
 }}

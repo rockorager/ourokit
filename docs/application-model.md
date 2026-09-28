@@ -243,8 +243,8 @@ inherited themes cannot become stale. Hover, pressed, and keyboard-focus paint
 updates do not lower descriptions or run composition functions.
 
 Buttons, checkboxes, switches, separators, options, radios, tabs, selection
-groups, dialogs, and sliders are stock Lua compositions over box, text, and layout
-primitives. Applications have the same primitive boundary:
+groups, dialogs, sliders, and split views are stock Lua compositions over box,
+text, and layout primitives. Applications have the same primitive boundary:
 
 ```lua
 local Action = ouro.stateless(function(props, children, theme)
@@ -1030,6 +1030,34 @@ The native separator has semantic key `divider`. Axis arrows request a 10-pixel
 move; Home and End request the effective first- and second-pane minima. Pointer
 dragging preserves the initial grab offset instead of snapping the divider to
 the pointer.
+
+`ouro.split_view` is a Lua recipe with an 8-pixel divider, transparent at rest,
+and theme-aware hover, pressed, and keyboard-focus paint. For custom divider
+content, use the native `ouro.split` primitive with three ordered children:
+first pane, second pane, and divider content. It accepts the same layout and
+callback properties, plus finite non-negative `divider_size` (default 8),
+measured along the split axis.
+
+```lua
+ouro.split {
+  key='workspace', axis='horizontal', position=split(), divider_size=24,
+  on_change=function(fraction) split:set(fraction) end,
+  sidebar, editor,
+  ouro.box {key='grip', semantic=false, alignment='center',
+    background='#dddddd', states={hover='#c8d9fa', focus='#3468d4'},
+    ouro.box {key='mark', semantic=false, width=4, height=40,
+      radius=2, background='#666666'}},
+}
+```
+
+The primitive owns an unpainted resize slot at `workspace/divider`. Its content
+receives tight divider bounds and inherits native interaction state, so nested
+boxes and text can declare `states` without Lua input handlers or rebuilds on
+hover/focus. `focus_request` targets the resize slot. The slot keeps its identity
+when its content changes; descendant semantic paths appear beneath `divider`
+with decorative `semantic=false` containers omitted from those paths. Nested activation controls
+remain independent. Omitting `on_change` keeps the focus stop but makes no
+resize requests; removing the callback during a drag cancels that drag.
 
 `ouro.tabs` is a Lua composition over native `tab_bar`/`tab` widgets and hidden,
 retained panel boxes. It requires `key`, semantic `label`, controlled integer

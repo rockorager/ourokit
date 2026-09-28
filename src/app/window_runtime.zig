@@ -831,8 +831,16 @@ pub const WindowRuntime = struct {
     }
 
     fn splitCursor(self: *WindowRuntime, target: ui.instance.InstanceHandle) !?platform.PointerCursor {
-        if (!self.instances.isVisible(target) or self.pointer_bindings.getKind(target, .split_change) == null) return null;
-        const parent = (try self.instances.parentOf(target)) orelse return null;
+        if (!self.instances.isVisible(target)) return null;
+        var current = target;
+        while (true) {
+            if (self.pointer_bindings.get(current)) |binding| {
+                if (binding.kind != .split_change) return null;
+                break;
+            }
+            current = (try self.instances.parentOf(current)) orelse return null;
+        }
+        const parent = (try self.instances.parentOf(current)) orelse return null;
         const object = try self.tree.objectAt(try self.instances.renderObject(parent));
         if (object != .split) return null;
         return if (object.split.axis == .horizontal) .col_resize else .row_resize;
@@ -1098,7 +1106,8 @@ pub const WindowRuntime = struct {
             if (semantic == null or semantic.?.range == null or !semantic.?.enabled or !self.instances.isVisible(target)) self.range_drag = null;
         }
         if (self.split_drag) |drag| {
-            if (!self.instances.isActive(drag.target) or !self.instances.isVisible(drag.target))
+            if (!self.instances.isActive(drag.target) or !self.instances.isVisible(drag.target) or
+                self.pointer_bindings.getKind(drag.target, .split_change) == null)
                 self.split_drag = null;
         }
         if (changed) {

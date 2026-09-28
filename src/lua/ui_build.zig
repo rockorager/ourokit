@@ -645,7 +645,7 @@ pub const UiBuild = struct {
             .icon => emitIcon,
             .text_input => emitTextInput,
             .auth_input => emitAuthInput,
-            .split_view => emitSplitView,
+            .split => emitSplit,
             .box => emitBox,
             .stack => emitStack,
             .row => emitRow,
@@ -1240,19 +1240,20 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn emitSplitView(state: *c.State) callconv(.c) c_int {
+    fn emitSplit(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
-            return luaError(state, "ouro.split_view expects one declaration table");
-        if (c.lua_rawlen(state, c.upvalueIndex(2)) != 2)
-            return luaError(state, "split_view requires exactly two children");
-        const parent = self.currentParent() orelse return luaError(state, "split_view requires a widget parent");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "split_view key is required");
+            return luaError(state, "ouro.split expects one declaration table");
+        if (c.lua_rawlen(state, c.upvalueIndex(2)) != 3)
+            return luaError(state, "split requires two panes and divider content");
+        const parent = self.currentParent() orelse return luaError(state, "split requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "split key is required");
         const axis = tableOptionalAxis(state, 1, "axis", .horizontal) orelse return luaError(state, "invalid split axis");
         const position = tableOptionalFraction(state, 1, "position", 0.5) orelse return luaError(state, "split position must be between zero and one");
         const min_first = tableOptionalExtent(state, 1, "min_first", 0) orelse return luaError(state, "invalid split min_first");
         const min_second = tableOptionalExtent(state, 1, "min_second", 0) orelse return luaError(state, "invalid split min_second");
+        const divider_size = tableOptionalExtent(state, 1, "divider_size", 8) orelse return luaError(state, "invalid split divider_size");
         const parent_data = declarativeParentData(self, state, 1) catch |err| return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x73706c6974 ^ parent.id ^ self.component_namespace);
         const divider = semanticId("divider", id);
@@ -1261,6 +1262,7 @@ pub const UiBuild = struct {
             .position = position,
             .min_first = min_first,
             .min_second = min_second,
+            .divider = divider_size,
         } } }) catch return luaError(state, "cannot append split descriptor");
         self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .group, .key = key }) catch return luaError(state, "cannot append split semantics");
         self.pushParent(.{ .id = id, .kind = .split, .semantic_id = id }) catch return luaError(state, "split nesting is too deep");
@@ -1274,22 +1276,32 @@ pub const UiBuild = struct {
             }
         }
         self.popParent();
+        // The resize slot owns input and semantics, but no visual recipe.
+        // Its child inherits native interaction state for declarative paint.
+        const clear = @import("../core/color.zig").Color.rgba(0, 0, 0, 0);
         const style: ButtonStyle = .{
-            .idle = .rgba(0, 0, 0, 0),
-            .hovered = theme.accent,
-            .pressed = theme.accent_selected,
-            .disabled = theme.disabled,
-            .border = theme.border,
-            .focus = theme.ring,
+            .idle = clear,
+            .hovered = clear,
+            .pressed = clear,
+            .disabled = clear,
+            .declarative = true,
         };
-        self.append(.{ .id = divider, .parent = id, .focusable = true, .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)), .object = .{ .box = .{
-            .background = style.idle,
-        } } }) catch return luaError(state, "cannot append split divider");
+        self.append(.{ .id = divider, .parent = id, .focusable = true, .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)), .object = .{ .box = .{} } }) catch return luaError(state, "cannot append split divider");
         if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "button capacity exceeded");
         self.pending_buttons[self.pending_button_count] = .{ .id = divider, .enabled = true, .style = style };
         self.pending_button_count += 1;
         self.appendSemantic(.{ .id = divider, .parent = id, .role = .separator, .key = "divider" }) catch return luaError(state, "cannot append split divider semantics");
         self.stageCallback(state, divider, "on_change", .split_change) catch |err| return luaError(state, @errorName(err));
+        const previous_owner = self.interaction_owner;
+        self.interaction_owner = .{ .id = divider };
+        defer self.interaction_owner = previous_owner;
+        self.pushParent(.{ .id = divider, .kind = .box }) catch return luaError(state, "split nesting is too deep");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, lowerDescription, 1);
+        _ = c.lua_rawgeti(state, c.upvalueIndex(2), 3);
+        const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
+        self.popParent();
+        if (status != c.ok) return c.lua_error(state);
         return 0;
     }
 

@@ -151,6 +151,16 @@ ouro.slider = ouro.stateless(function(p, children, theme)
         ouro.box {key='after', semantic=false, width=0, flex=before < 65535 and 65535-before or nil}}}}
 end)
 
+ouro.split_view = ouro.stateless(function(p, children, theme)
+  check(#children == 2, 'split_view requires exactly two children')
+  return ouro.split {key=p.key, axis=p.axis, position=p.position,
+    min_first=p.min_first, min_second=p.min_second, divider_size=8,
+    on_change=p.on_change, focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
+    children[1], children[2],
+    ouro.box {key='chrome', semantic=false, width='fill', height='fill', background=transparent,
+      states={hover=theme.colors.accent, pressed=theme.colors.accent_selected, focus=theme.colors.ring}}}
+end)
+
 local function selection_group(p, children, policy)
   local gap = p.gap
   if gap == nil then gap = policy == 'tab_list' and 0 or f.spacing_1 end
