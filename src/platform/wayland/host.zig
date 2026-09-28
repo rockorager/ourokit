@@ -17,6 +17,8 @@ const Cursor = @import("cursor.zig").Cursor;
 const WaylandClipboard = @import("clipboard.zig");
 const WaylandWorkspaces = @import("workspaces.zig");
 const ShellWorkspaces = @import("../../shell/workspaces.zig");
+const Session = @import("session.zig");
+const SessionStore = @import("../../shell/session.zig").Store;
 const Xkb = if (build_options.xkbcommon) @import("xkb.zig") else @import("xkb_disabled.zig");
 const Vulkan = if (build_options.vulkan)
     @import("../../renderer/vulkan/root.zig")
@@ -48,6 +50,7 @@ pub const Config = struct {
     window_capacity: usize = 8,
     output_capacity: usize = 16,
     workspaces: ?*ShellWorkspaces.Store = null,
+    session: ?*SessionStore = null,
     workspace_capacity: usize = 32,
     /// Other owners may already have I/O on the shared ring during startup.
     /// This callback routes completions only; it must not enter application Lua.
@@ -516,6 +519,7 @@ const Output = struct {
 
 const LayerState = struct {
     namespace: []u8,
+    session_lock: bool = false,
     output: ?[]u8,
     width: u32,
     height: u32,
@@ -534,6 +538,7 @@ const LayerState = struct {
         const output = if (declaration.output) |name| try allocator.dupe(u8, name) else null;
         return .{
             .namespace = namespace,
+            .session_lock = declaration.session_lock,
             .output = output,
             .width = declaration.width,
             .height = declaration.height,
@@ -552,6 +557,7 @@ const LayerState = struct {
         return .{
             .id = "host-owned-layer-surface",
             .namespace = self.namespace,
+            .session_lock = self.session_lock,
             .output = self.output,
             .width = self.width,
             .height = self.height,
@@ -597,6 +603,8 @@ const Window = struct {
     popup_parent: ?WindowHandle = null,
     popup_keyboard_promoted: bool = false,
     layer_surface: ?Handle = null,
+    lock_surface: ?Handle = null,
+    lock_owner: ?Handle = null,
     background_effect: ?Handle = null,
     layer_state: ?LayerState = null,
     output_global_name: ?u32 = null,
@@ -630,6 +638,7 @@ const Window = struct {
             (self.toplevel != null and self.toplevel.?.id == object_id) or
             (self.popup != null and self.popup.?.id == object_id) or
             (self.layer_surface != null and self.layer_surface.?.id == object_id) or
+            (self.lock_surface != null and self.lock_surface.?.id == object_id) or
             (self.viewport != null and self.viewport.?.id == object_id) or
             (self.fractional_scale != null and self.fractional_scale.?.id == object_id) or
             (self.frame_callback != null and self.frame_callback.?.id == object_id) or
@@ -725,6 +734,7 @@ pub const Host = struct {
     text_input_pending: TextInput.Pending,
     clipboard: WaylandClipboard.Clipboard,
     workspaces: ?WaylandWorkspaces.Client = null,
+    session: Session.Client = .{},
     seat: ?Handle = null,
     seat_global_name: ?u32 = null,
     pointer: ?Handle = null,
@@ -810,6 +820,7 @@ pub const Host = struct {
         errdefer self.text_input_pending.deinit();
         self.clipboard = try WaylandClipboard.Clipboard.init(allocator, loop, 8, 4, 16, 16, 1024 * 1024);
         errdefer self.clipboard.deinit();
+        self.session = .{ .store = config.session };
         self.workspaces = null;
         if (config.workspaces) |store| {
             self.workspaces = @as(WaylandWorkspaces.Client, undefined);
@@ -965,6 +976,21 @@ pub const Host = struct {
         else
             try self.maintainWindows();
         try self.flushHandler(self);
+    }
+
+    pub fn pumpSession(self: *Host) !void {
+        if (self.transport_lost or self.disconnect_started) return;
+        try self.session.pump(&self.connection.objects, try self.queue(), self.seat, self.outputs);
+        for (self.windows) |*window| {
+            if (window.state == .open and window.lock_surface != null and !std.meta.eql(window.lock_owner, self.session.lock)) {
+                window.state = .closing;
+                window.recreate = true;
+                window.pending_redraw = false;
+            }
+        }
+        try self.maintainWindows();
+        try self.resumeWaitingOutputs();
+        _ = try self.driver.schedule();
     }
 
     pub fn beginDisconnect(self: *Host) !void {
@@ -1795,6 +1821,7 @@ pub const Host = struct {
     }
 
     fn abandonWindows(self: *Host) !void {
+        self.session.disconnect();
         self.releaseDmabufFormatTable();
         self.text_input_active = null;
         self.text_input_pending.resetObject();
@@ -1888,6 +1915,8 @@ pub const Host = struct {
             try wayring.client.sendRequest(protocol.xdg_surface, objects, transmit, handle, .{ .destroy = .{} });
         if (window.layer_surface) |handle|
             try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, handle, .{ .destroy = .{} });
+        if (window.lock_surface) |handle|
+            try wayring.client.sendRequest(protocol.ext_session_lock_surface_v1, objects, transmit, handle, .{ .destroy = .{} });
         if (window.sync_surface) |handle|
             try wayring.client.sendRequest(
                 protocol.wp_linux_drm_syncobj_surface_v1,
@@ -1902,6 +1931,8 @@ pub const Host = struct {
         window.popup = null;
         window.xdg_surface = null;
         window.layer_surface = null;
+        window.lock_surface = null;
+        window.lock_owner = null;
         window.background_effect = null;
         window.output_global_name = null;
         window.fractional_scale = null;
@@ -1939,6 +1970,7 @@ pub const Host = struct {
                 if (input.serial != popup.input.serial or !sameWindow(input.window, popup.input.window))
                     return error.StalePopupInput;
                 const parent = try self.windowFor(popup.input.window);
+                if (parent.lock_surface != null) return error.LockSurfacePopupUnsupported;
                 if (parent.state != .open or !parent.configured or parent.frames_presented == 0)
                     return error.PopupParentNotMapped;
                 if (parent.popup != null) return error.NestedPopupUnsupported;
@@ -1951,7 +1983,10 @@ pub const Host = struct {
                     return error.LayerShellVersionTooOld;
             },
             .layer_surface => |value| {
-                if (self.layer_shell == null) return error.LayerShellUnavailable;
+                if (value.session_lock) {
+                    if (self.session.manager == null and self.session.lock == null) return error.SessionLockUnavailable;
+                    if (value.output == null) return error.LockOutputRequired;
+                } else if (self.layer_shell == null) return error.LayerShellUnavailable;
                 if (value.keyboard_interactivity == .on_demand and self.layer_shell_version < 4)
                     return error.LayerShellVersionTooOld;
                 if (value.exclusive_edge != null and self.layer_shell_version < 5)
@@ -2103,6 +2138,7 @@ pub const Host = struct {
     fn activateLayerSurface(self: *Host, window: *Window) !void {
         std.debug.assert(window.state == .waiting_output);
         const layer_state = &(window.layer_state orelse return error.LayerStateMissing);
+        if (layer_state.session_lock and self.session.lock == null) return;
         const output = if (layer_state.output) |name|
             self.outputNamed(name) orelse return
         else
@@ -2116,7 +2152,11 @@ pub const Host = struct {
             self.compositor.?,
             .{},
         )).id;
-        const layer_surface = (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
+        const lock_surface = if (declaration.session_lock)
+            (try protocol.ext_session_lock_v1.construct_get_lock_surface(objects, transmit, self.session.lock.?, .{ .surface = surface.id, .output = output.?.handle.?.id })).id
+        else
+            null;
+        const layer_surface = if (!declaration.session_lock) (try protocol.zwlr_layer_shell_v1.construct_get_layer_surface(
             objects,
             transmit,
             self.layer_shell.?,
@@ -2126,11 +2166,11 @@ pub const Host = struct {
                 .layer = layerValue(declaration.layer),
                 .namespace = declaration.namespace,
             },
-        )).id;
-        try setLayerSurfaceState(
+        )).id else null;
+        if (layer_surface) |role| try setLayerSurfaceState(
             objects,
             transmit,
-            layer_surface,
+            role,
             declaration,
             false,
             self.layer_shell_version,
@@ -2172,10 +2212,14 @@ pub const Host = struct {
         );
         try setInputRegion(objects, transmit, self.compositor.?, surface, declaration.input_region);
         try setBackgroundEffect(objects, transmit, self.compositor.?, self.background_effect_manager, self.blur_supported, surface, &window.background_effect, declaration.background_effect);
-        try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
+        // Session lock configure is sent on role creation; a null-buffer
+        // initial commit is forbidden by the lock protocol.
+        if (!declaration.session_lock) try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
         window.state = .open;
         window.surface = surface;
         window.layer_surface = layer_surface;
+        window.lock_surface = lock_surface;
+        window.lock_owner = if (lock_surface != null) self.session.lock else null;
         window.output_global_name = if (output) |value| value.global_name else null;
         window.recreate = false;
         window.layer = declaration.layer;
@@ -2238,6 +2282,8 @@ pub const Host = struct {
         const self: *Host = @ptrCast(@alignCast(context));
         const window = try self.windowFor(handle);
         if (window.layer_state == null) return error.NotLayerSurface;
+        if (window.layer_state.?.session_lock != declaration.session_lock) return error.WindowRoleChanged;
+        if (declaration.session_lock) return;
         if (window.state != .open and window.state != .waiting_output and
             !(window.state == .closing and window.recreate)) return error.WindowClosing;
         if (declaration.keyboard_interactivity == .on_demand and self.layer_shell_version < 4)
@@ -2312,6 +2358,7 @@ pub const Host = struct {
     ) !wayring.dispatch.Control {
         const objects = &self.connection.objects;
         const interface = target.object.interface;
+        if (try self.session.event(objects, try self.queue(), message, fds)) return .continue_dispatch;
         if (interface == &protocol.wl_display.info) {
             _ = try Core.decodeDisplayEvent(objects, message, fds);
         } else if (interface == &protocol.wl_registry.info) {
@@ -2320,8 +2367,11 @@ pub const Host = struct {
                 .global_remove => |removed| {
                     try self.removeOutput(removed.name);
                     if (self.workspaces) |*client| client.removeGlobal(removed.name);
-                    if (self.seat_global_name != null and self.seat_global_name.? == removed.name)
+                    try self.session.removeGlobal(objects, try self.queue(), removed.name);
+                    if (self.seat_global_name != null and self.seat_global_name.? == removed.name) {
+                        self.session.seatRemoved();
                         try self.releaseInput();
+                    }
                     if (self.clipboard.managerRemoved(removed.name))
                         try self.releaseClipboardManager();
                     if (self.text_input_manager_global_name != null and
@@ -2462,6 +2512,23 @@ pub const Host = struct {
                         window.height,
                         window.scale_120,
                     );
+                    window.configured = true;
+                    window.pending_redraw = true;
+                    try self.sink.configured(window.handle, window.width, window.height);
+                },
+            }
+        } else if (interface == &protocol.ext_session_lock_surface_v1.info) {
+            const window = try self.windowForObject(message.header.object_id);
+            switch (try wayring.client.decodeEvent(protocol.ext_session_lock_surface_v1, objects, window.lock_surface.?, message, fds)) {
+                .configure => |configure| {
+                    if (configure.width == 0 or configure.height == 0) return error.InvalidLockSurfaceConfigure;
+                    try wayring.client.sendRequest(protocol.ext_session_lock_surface_v1, objects, try self.queue(), window.lock_surface.?, .{ .ack_configure = .{ .serial = configure.serial } });
+                    window.width = configure.width;
+                    window.height = configure.height;
+                    window.pending_width = configure.width;
+                    window.pending_height = configure.height;
+                    window.damage_history = .{};
+                    if (window.viewport) |viewport| try setViewport(objects, try self.queue(), viewport, window.width, window.height, window.scale_120);
                     window.configured = true;
                     window.pending_redraw = true;
                     try self.sink.configured(window.handle, window.width, window.height);
@@ -2691,6 +2758,7 @@ pub const Host = struct {
     fn bindGlobal(self: *Host, global: protocol.wl_registry.Event_global) !void {
         const objects = &self.connection.objects;
         const transmit = try self.queue();
+        if (try self.session.bind(objects, transmit, self.registry, global)) return;
         if (std.mem.eql(u8, global.interface, protocol.wl_compositor.info.name)) {
             self.compositor = try Core.bind(
                 objects,
@@ -2903,6 +2971,7 @@ pub const Host = struct {
             for (self.windows) |*window| {
                 if (window.state != .open or window.output_global_name != global_name) continue;
                 window.recreate = true;
+                if (window.lock_surface != null) window.state = .closing;
                 window.pending_redraw = false;
             }
             if (self.workspaces) |*client| try client.removeOutput(output.handle.?);

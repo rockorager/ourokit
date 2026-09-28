@@ -726,9 +726,27 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
         const all_outputs = outputs_type == c.type_string and
             std.mem.eql(u8, c.lua_tolstring(state, -1, &outputs_length).?[0..outputs_length], "all");
         c.lua_settop(state, -2);
-        if (outputs_type != c.type_nil and (!all_outputs or role != .layer_surface))
+        if (outputs_type != c.type_nil and (!all_outputs or role == .toplevel))
             return error.InvalidOutputSelector;
         const declaration: platform.SurfaceDeclaration = switch (role) {
+            .session_lock => blk: {
+                const output = try optionalString(allocator, state, -1, "output");
+                errdefer if (output) |value| allocator.free(value);
+                if (all_outputs == (output != null)) return error.InvalidOutputSelector;
+                const namespace = try allocator.dupe(u8, "session-lock");
+                errdefer allocator.free(namespace);
+                break :blk .{ .layer_surface = .{
+                    .id = window_id,
+                    .namespace = namespace,
+                    .session_lock = true,
+                    .output = output,
+                    .width = 0,
+                    .height = 0,
+                    .layer = .overlay,
+                    .anchors = .{ .top = true, .bottom = true, .left = true, .right = true },
+                    .background = try optionalBackground(state, -1),
+                } };
+            },
             .toplevel => blk: {
                 const title = try requiredString(allocator, state, -1, "title");
                 errdefer allocator.free(title);
@@ -821,6 +839,8 @@ fn installConstructors(state: *c.State, api_reference: ?c_int) !void {
     c.lua_setfield(state, -2, "window");
     c.lua_pushcclosure(state, layerSurfaceTable, 0);
     c.lua_setfield(state, -2, "layer_surface");
+    c.lua_pushcclosure(state, lockSurfaceTable, 0);
+    c.lua_setfield(state, -2, "lock_surface");
     c.lua_pushcclosure(state, actionError, 0);
     c.lua_setfield(state, -2, "action_error");
 }
@@ -856,7 +876,16 @@ fn layerSurfaceTable(state: *c.State) callconv(.c) c_int {
     return 1;
 }
 
-const SurfaceRole = enum { toplevel, layer_surface };
+fn lockSurfaceTable(state: *c.State) callconv(.c) c_int {
+    if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+        return luaError(state, "constructor expects one declaration table");
+    _ = c.lua_pushstring(state, "session_lock");
+    c.lua_setfield(state, 1, "__ouro_surface_role");
+    c.lua_pushvalue(state, 1);
+    return 1;
+}
+
+const SurfaceRole = enum { toplevel, layer_surface, session_lock };
 
 fn surfaceRole(state: *c.State, table: c_int) !SurfaceRole {
     const value_type = c.lua_getfield(state, table, "__ouro_surface_role");

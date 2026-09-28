@@ -76,6 +76,7 @@ pub const Vm = struct {
     operation_tasks: []?TaskHandle,
     running: ?TaskHandle = null,
     sleep_enabled: bool = true,
+    app_spawn_allowed: bool = true,
     activation_provider: ?platform_activation.Provider = null,
     popup_provider: ?@import("popup.zig").Provider = null,
     drag_provider: ?@import("drag.zig").Provider = null,
@@ -112,6 +113,9 @@ pub const Vm = struct {
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, spawnChild, 1);
         c.lua_setfield(state, -2, "spawn");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, spawnApp, 1);
+        c.lua_setfield(state, -2, "spawn_app");
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, activation.request, 1);
         c.lua_setfield(state, -2, "activation_token");
@@ -712,6 +716,7 @@ pub const Vm = struct {
     /// Cancels only tasks and resources created by this VM. Their retained
     /// native scopes remain usable by a replacement source generation.
     pub fn requestCancellation(self: *Vm) !void {
+        self.app_spawn_allowed = false;
         for (self.chunks) |chunk| for (chunk) |*slot| if (slot.active) {
             if (slot.timer_resource_handle) |resource|
                 try self.scheduler.requestResourceCancellation(resource);
@@ -911,6 +916,21 @@ pub const Vm = struct {
         ) catch return luaError(state, "ouro.sleep duration is too large");
         slot.yield_request = .sleep;
         return c.lua_yieldk(state, 0, 0, sleepContinuation);
+    }
+
+    fn spawnApp(state: *c.State) callconv(.c) c_int {
+        const self: *Vm = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
+        if (!self.app_spawn_allowed) return luaError(state, "ApplicationSpawnUnavailable");
+        if (self.running == null or c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_function)
+            return luaError(state, "spawn_app expects one function in a running task");
+        c.lua_pushvalue(state, 1);
+        const reference = c.luaL_ref(state, c.registry_index);
+        _ = self.spawnReference(self.scheduler.application_scope, reference, &.{}) catch {
+            c.luaL_unref(state, c.registry_index, reference);
+            return luaError(state, "could not spawn application task");
+        };
+        c.luaL_unref(state, c.registry_index, reference);
+        return 0;
     }
 
     fn spawnChild(state: *c.State) callconv(.c) c_int {
@@ -1219,6 +1239,49 @@ test "Ouro clock and spawned coroutine APIs are scoped and asynchronous" {
     try scheduler.requestTaskCancellation(canceled_scheduler);
     try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
     try std.testing.expect(!vm.hasGlobal("canceled_continuation"));
+}
+
+test "spawn_app survives widget scope cancellation but not generation retirement" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 8, 4);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 8);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    _ = try vm.spawnApplication(
+        \\local o = require('ouro')
+        \\function handler()
+        \\  o.spawn_app(function() promoted = true end)
+        \\  o.spawn(function() local_ran = true end)
+        \\end
+    );
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    const widget = try scheduler.createScope(scheduler.application_scope);
+    _ = try vm.spawnGlobal(widget, "handler", &.{});
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    try scheduler.queueScopeCancellation(widget);
+    try scheduler.applyQueuedCancellations();
+    while (scheduler.takeRunnable()) |runnable| _ = try vm.resumeRunnable(runnable);
+    try std.testing.expect(vm.globalBoolean("promoted"));
+    try std.testing.expect(!vm.globalBoolean("local_ran"));
+    try scheduler.destroyScope(widget);
+
+    vm.app_spawn_allowed = false; // candidate evaluation, including ordinary spawned children
+    _ = try vm.spawnApplication("require('ouro').spawn(function() assert(not pcall(require('ouro').spawn_app, function() error('candidate ran') end)); candidate_rejected = true end)");
+    while (scheduler.takeRunnable()) |runnable| _ = try vm.resumeRunnable(runnable);
+    try std.testing.expect(vm.globalBoolean("candidate_rejected"));
+    vm.app_spawn_allowed = true;
+    _ = try vm.spawnApplication("promoted = false; handler()");
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    try vm.requestCancellation();
+    while (scheduler.takeRunnable()) |runnable| _ = try vm.resumeRunnable(runnable);
+    try std.testing.expect(!vm.globalBoolean("promoted"));
+    try std.testing.expect(!vm.globalBoolean("local_ran"));
+    try std.testing.expect(!vm.app_spawn_allowed);
+    try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
 }
 
 test "safe Lua protected calls yield through Ouro and cannot catch cancellation" {

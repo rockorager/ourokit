@@ -307,11 +307,29 @@ pub fn build(b: *std.Build) void {
     const development_step = b.step("test-development", "Verify the development loop and control isolation on a disposable headless Sway");
     development_step.dependOn(&development.step);
 
+    const session_tests = b.step("test-session", "Exercise native session protocols and asynchronous PAM with disposable peers");
+    inline for (.{ "session_native.py", "auth_native.py", "secure_entry.py" }) |file| {
+        const check = b.addSystemCommand(&.{"python3"});
+        check.addFileArg(b.path("tests/" ++ file));
+        check.addArtifactArg(host);
+        check.setEnvironmentVariable("OUROKIT_TEST_ZIG", b.graph.zig_exe);
+        check.setEnvironmentVariable("OUROKIT_TEST_PROTOCOL_XMLS", b.fmt("{s}:{s}:{s}:{s}", .{
+            b.dependency("wayland", .{}).path("protocol/wayland.xml").getPath(b),
+            b.dependency("wayland_protocols", .{}).path("staging/ext-idle-notify/ext-idle-notify-v1.xml").getPath(b),
+            b.dependency("wayland_protocols", .{}).path("staging/ext-session-lock/ext-session-lock-v1.xml").getPath(b),
+            b.dependency("wlr_protocols", .{}).path("unstable/wlr-output-power-management-unstable-v1.xml").getPath(b),
+        }));
+        check.setCwd(b.path("."));
+        check.has_side_effects = true;
+        session_tests.dependOn(&check.step);
+    }
+
     const format = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", "--check", "build.zig", "src", "examples", "tools" });
     format.setCwd(b.path("."));
     const verify = b.step("verify", "Run Zig tests, formatting and native development/control verification");
     verify.dependOn(test_step);
     verify.dependOn(development_step);
+    verify.dependOn(session_tests);
     verify.dependOn(&format.step);
 
     const ui_test_step = b.step("test-ourokit-ui", "Run platform-neutral UI integration tests");
@@ -688,6 +706,9 @@ fn addWaylandProtocol(
     generate.addFileArg(wayland_protocols.path("staging/cursor-shape/cursor-shape-v1.xml"));
     generate.addFileArg(wayland_protocols.path("staging/ext-workspace/ext-workspace-v1.xml"));
     generate.addFileArg(wayland_protocols.path("staging/ext-background-effect/ext-background-effect-v1.xml"));
+    generate.addFileArg(wayland_protocols.path("staging/ext-idle-notify/ext-idle-notify-v1.xml"));
+    generate.addFileArg(wayland_protocols.path("staging/ext-session-lock/ext-session-lock-v1.xml"));
+    generate.addFileArg(wlr_protocols.path("unstable/wlr-output-power-management-unstable-v1.xml"));
     const generated = generate.addOutputFileArg("ourokit-wayland-protocol.zig");
     return b.createModule(.{
         .root_source_file = generated,
@@ -706,6 +727,10 @@ fn addLua(module: *std.Build.Module, lua: *std.Build.Dependency) void {
     module.addCSourceFile(.{
         .file = module.owner.path("src/lua/safe_libraries.c"),
         .flags = &.{ "-std=c99", "-DLUA_USE_LINUX" },
+    });
+    module.addCSourceFile(.{
+        .file = module.owner.path("src/lua/auth.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     module.addIncludePath(lua.path("src"));
     module.link_libc = true;

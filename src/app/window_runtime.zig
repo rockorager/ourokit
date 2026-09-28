@@ -1194,6 +1194,43 @@ pub const WindowRuntime = struct {
             }
             try self.syncTextInputVisuals();
         }
+        if (self.focus.current()) |focused| if (self.instances.authInput(focused)) |input| {
+            if (key.state == .released) return;
+            const translated = key.translated;
+            // Tab navigates native focus. All other keys are contained here:
+            // no ordinary editor, IME, clipboard, shortcut or Lua text path.
+            if (translated.logical != .tab) {
+                const secure = @import("../ui/widget/auth_input.zig");
+                const command: secure.Command = if (translated.modifiers.control) switch (translated.logical) {
+                    .key_a => .select_all,
+                    .key_u => .clear,
+                    else => return,
+                } else if (translated.modifiers.alt or translated.modifiers.logo) return else switch (translated.logical) {
+                    .enter => .submit,
+                    .escape => .cancel,
+                    .backspace => .backspace,
+                    .delete => .delete,
+                    .arrow_left => .left,
+                    .arrow_right => .right,
+                    .home => .home,
+                    .end => .end,
+                    else => if (translated.unicode >= 0x20 and translated.unicode <= 0x10ffff and
+                        !(translated.unicode >= 0x7f and translated.unicode <= 0x9f)) .insert else return,
+                };
+                if (key.state == .repeated and (command == .submit or command == .cancel)) return;
+                const result = input.act(command, translated.unicode);
+                const kind: ?ui.input.HandlerKind = if (result != .ok) .auth_error else switch (command) {
+                    .submit => .auth_submit,
+                    .cancel => .auth_cancel,
+                    else => null,
+                };
+                if (kind) |handler_kind| if (self.pointer_bindings.getKind(focused, handler_kind)) |binding| {
+                    const args: []const lua.TaskArgument = if (result == .ok) &.{} else &.{.{ .string = if (result == .full) "InputTooLong" else "StalePrompt" }};
+                    try self.spawnCallback(callback_service, binding.id, try self.instances.scope(focused), args);
+                };
+                return;
+            }
+        };
         if (self.focus.current()) |focused| if (self.text_inputs.contains(focused) and
             key.state != .released)
         {

@@ -27,7 +27,7 @@ pub const Event = union(enum) {
 };
 
 const State = enum { free, active, closing, closed };
-const Role = enum { toplevel, layer_surface, popup };
+const Role = enum { toplevel, layer_surface, session_lock, popup };
 
 const Slot = struct {
     generation: u32 = 0,
@@ -646,6 +646,11 @@ fn validateDeclarations(declarations: []const SurfaceDeclaration) !void {
             },
             .layer_surface => |layer_surface| {
                 try layer_surface.validate();
+                if (layer_surface.session_lock) for (declarations[0..index]) |earlier| {
+                    if (earlier == .layer_surface and earlier.layer_surface.session_lock and
+                        optionalStringEqual(earlier.layer_surface.output, layer_surface.output))
+                        return error.DuplicateLockOutput;
+                };
             },
             .popup => |popup| try popup.validate(),
         }
@@ -666,7 +671,7 @@ fn findDeclaration(
 fn declarationRole(declaration: SurfaceDeclaration) Role {
     return switch (declaration) {
         .toplevel => .toplevel,
-        .layer_surface => .layer_surface,
+        .layer_surface => |value| if (value.session_lock) .session_lock else .layer_surface,
         .popup => .popup,
     };
 }

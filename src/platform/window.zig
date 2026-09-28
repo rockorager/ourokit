@@ -315,6 +315,9 @@ pub const BackgroundEffect = enum { blur };
 pub const LayerSurfaceDeclaration = struct {
     id: []const u8,
     namespace: []const u8,
+    /// Uses ext-session-lock, NEVER layer-shell. Shares only output expansion
+    /// and render/input plumbing with desktop surfaces. Immutable per identity.
+    session_lock: bool = false,
     output: ?[]const u8 = null,
     width: u32,
     height: u32,

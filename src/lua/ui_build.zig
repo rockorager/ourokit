@@ -645,6 +645,7 @@ pub const UiBuild = struct {
             .slider => emitSlider,
             .dialog => emitDialog,
             .text_input => emitTextInput,
+            .auth_input => emitAuthInput,
             .listbox => emitListBox,
             .option => emitOption,
             .tab_bar => emitTabBar,
@@ -1305,6 +1306,53 @@ pub const UiBuild = struct {
             .kind = .@"switch",
         };
         self.pending_handler_count += 1;
+        return 0;
+    }
+
+    fn emitAuthInput(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
+        const parent = self.currentParent() orelse return luaError(state, "auth_input requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "auth_input key is required");
+        const input = @import("auth.zig").inputFromTable(state, 1) catch |err| return luaError(state, @errorName(err));
+        inline for (.{ "text", "value", "default_text", "on_change", "key_bindings", "placeholder" }) |name| {
+            const kind = c.lua_getfield(state, 1, name);
+            c.lua_settop(state, -2);
+            if (kind != c.type_nil) return luaError(state, "auth_input never accepts text or text handlers");
+        }
+        const width = tableOptionalSize(state, 1, "width", .fill) orelse return luaError(state, "invalid auth_input width");
+        const height = tableOptionalExtent(state, 1, "height", self.currentStyle().?.controls.height) orelse return luaError(state, "invalid auth_input height");
+        const autofocus = tableOptionalBoolean(state, 1, "autofocus", true) orelse return luaError(state, "invalid auth_input autofocus");
+        const target = semanticId(key, 0x61757468696e ^ parent.id ^ self.component_namespace);
+        const content = semanticId(key, 0x6d61736b ^ target);
+        self.append(.{
+            .id = target,
+            .parent = parent.id,
+            .object = .{ .box = .{ .width = width.extent(), .fill_width = width.isFill(), .height = height, .padding = .{ .left = 8, .right = 8 }, .alignment = .{ .vertical = .center }, .background = theme.surface, .border_color = theme.input, .border_width = 1, .corner_radius = 4 } },
+            .focusable = true,
+            .focus_request = if (autofocus) input.prompt else 0,
+            .auth_input = input,
+            .parent_data = declarativeParentData(self, state, 1) catch |err| return luaError(state, parentDataErrorMessage(err)),
+        }) catch return luaError(state, "cannot append auth_input");
+        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
+        const source = sources.acquire(.{ .utf8 = @import("../ui/widget/auth_input.zig").mask, .language = "und", .logical_size = design.tokens.foundation.typography_2, .candidates = self.themedFonts(false) catch |err| return luaError(state, @errorName(err)), .configuration_revision = self.text_configuration_revision }) catch return luaError(state, "cannot retain authentication mask");
+        self.append(.{ .id = content, .parent = target, .object = .{ .text = .{ .source = source, .color = theme.foreground } } }) catch {
+            sources.release(source) catch unreachable;
+            return luaError(state, "cannot append authentication mask");
+        };
+        self.sources_staged = true;
+        self.appendSemantic(.{ .id = target, .parent = semanticParent(parent), .role = .text_field, .key = key, .label = "Secure authentication", .enabled = true }) catch return luaError(state, "cannot append auth_input semantics");
+        inline for (.{ "on_submit", "on_cancel", "on_error" }, .{ .auth_submit, .auth_cancel, .auth_error }) |name, kind| {
+            const callback_type = c.lua_getfield(state, 1, name);
+            if (callback_type != c.type_nil) {
+                if (callback_type != c.type_function) return luaError(state, "auth_input callback must be a function");
+                if (self.pending_handler_count == self.pending_handlers.len) return luaError(state, "input handler capacity exceeded");
+                c.lua_pushvalue(state, -1);
+                self.pending_handlers[self.pending_handler_count] = .{ .id = target, .reference = c.luaL_ref(state, c.registry_index), .kind = kind };
+                self.pending_handler_count += 1;
+            }
+            c.lua_settop(state, -2);
+        }
         return 0;
     }
 

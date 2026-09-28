@@ -332,6 +332,7 @@ fn runSourceInternal(
     defer callbacks.deinit();
 
     var workspaces: shell.workspaces.Store = undefined;
+    var session: @import("../shell/session.zig").Store = .{};
     try workspaces.init(
         init.gpa,
         options.workspace_capacity,
@@ -485,6 +486,7 @@ fn runSourceInternal(
         .callbacks = &callbacks,
         .theme_fonts = &theme_fonts,
         .workspaces = &workspaces,
+        .session = &session,
         .images = &images,
         .icon_roots = icon_paths.paths,
     };
@@ -519,6 +521,7 @@ fn runSourceInternal(
             .window_capacity = options.application_window_capacity,
             .output_capacity = options.output_capacity,
             .workspaces = &workspaces,
+            .session = &session,
             .workspace_capacity = options.workspace_capacity,
             .startup_completions = .{ .context = &startup_io, .dispatch = StartupIo.dispatch },
             .vulkan = if (options.vulkan) &vulkan_renderer else null,
@@ -768,6 +771,7 @@ fn runSourceInternal(
         }
 
         // Task safe point: platform and CQE dispatch only changed state.
+        try host.pumpSession();
         try host.enableWorkspacesIf(active_generation.workspacesRequested());
         try active_generation.syncWorkspaces();
         if (control) |server| {
@@ -887,8 +891,12 @@ fn runSourceInternal(
             // Persistent D-Bus receives outlive Lua tasks. Retire them before
             // waiting for ring quiescence, not only in the deferred drain.
             source_reload.active().dbus.shutdown();
+            source_reload.active().auth.stop();
+            if (source_reload.active().session) |*binding| binding.stop();
             if (source_reload.candidate) |candidate| {
                 candidate.dbus.shutdown();
+                candidate.auth.stop();
+                if (candidate.session) |*binding| binding.stop();
                 try candidate.vm.requestCancellation();
             }
             try source_reload.active().vm.requestCancellation();
@@ -1166,6 +1174,7 @@ fn runSourceInternal(
             desired_changed = true;
         };
         const serial_before_flush = window_set.changeSerial();
+        try host.pumpSession();
         try host.flush();
         // MCP and Lua timers can enqueue I/O while Wayland is idle.
         try source_reload.collectCanceledMcp();
@@ -1366,6 +1375,12 @@ fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlSe
     if (reload.candidate) |candidate| candidate.shutdownImages();
     reload.active().dbus.shutdown();
     if (reload.candidate) |candidate| candidate.dbus.shutdown();
+    reload.active().auth.stop();
+    if (reload.active().session) |*binding| binding.stop();
+    if (reload.candidate) |candidate| {
+        candidate.auth.stop();
+        if (candidate.session) |*binding| binding.stop();
+    }
     try reload.active().vm.requestCancellation();
     if (reload.candidate) |candidate| try candidate.vm.requestCancellation();
     try reload.beginRetirement();
@@ -1459,6 +1474,8 @@ fn finishInitialBootstrap(
 fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Scheduler, loop: *io_loop.Loop) !void {
     generation.shutdownImages();
     generation.dbus.shutdown();
+    generation.auth.stop();
+    if (generation.session) |*binding| binding.stop();
     try generation.vm.requestCancellation();
     while (true) {
         try scheduler.applyQueuedCancellations();
@@ -1490,6 +1507,12 @@ fn beginReload(
     control: ?*ControlServer,
     request_sequence: u64,
 ) !bool {
+    if (reload.services) |services| if (services.session) |session| {
+        if (session.blocksReload()) {
+            try reportReloadFailure(reload, control, request_sequence, error.SessionLockActive);
+            return false;
+        }
+    };
     reload.prepare() catch |err| {
         try reportReloadFailure(reload, control, request_sequence, err);
         return false;
@@ -1511,6 +1534,12 @@ fn servicePreparedReload(
     defer if (candidate_pending) reload.discard();
 
     const candidate = reload.candidate.?;
+    if (reload.services) |services| if (services.session) |session| {
+        if (session.blocksReload()) {
+            try reportReloadFailure(reload, control, request_sequence, error.SessionLockActive);
+            return;
+        }
+    };
     // Include disconnected outputs retained by the active generation, keeping
     // reload's window identities aligned with the host's hotplug lifetimes.
     candidate.application.extractOutputTemplates() catch |err| {

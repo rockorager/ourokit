@@ -14,6 +14,7 @@ pub const Kind = enum {
     slider,
     dialog,
     text_input,
+    auth_input,
     listbox,
     option,
     tab_bar,

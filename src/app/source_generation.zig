@@ -30,6 +30,7 @@ pub const Config = struct {
     /// Immutable process configuration; absent in deterministic/export hosts.
     applications: ?*const @import("../xdg/applications.zig").Config = null,
     defer_run: bool = false,
+    session_candidate: bool = false,
 };
 
 pub const UiServices = struct {
@@ -42,6 +43,7 @@ pub const UiServices = struct {
     callbacks: *lua.CallbackRegistry,
     theme_fonts: ?*@import("../lua/theme_fonts.zig").ThemeFonts = null,
     workspaces: ?*shell.workspaces.Store = null,
+    session: ?*@import("../shell/session.zig").Store = null,
     images: ?*ImageCache = null,
     icon_roots: []const []const u8 = &.{},
 };
@@ -57,6 +59,8 @@ pub const SourceGeneration = struct {
     dbus: lua.Dbus,
     stdio: lua.Stdio,
     files: @import("../lua/files.zig").Binding,
+    auth: @import("../lua/auth.zig").Binding,
+    session: ?@import("../lua/session.zig").Binding = null,
     applications: lua.Applications,
     image_import: lua.ImageImport,
     signals: lua.Signals,
@@ -183,6 +187,7 @@ pub const SourceGeneration = struct {
         self.images = null;
         self.asset_root = module_root;
         self.shell_workspaces = null;
+        self.session = null;
         self.bootstrap = null;
         self.ui_task = null;
         self.desktop_task = null;
@@ -196,6 +201,7 @@ pub const SourceGeneration = struct {
         var dbus_initialized = false;
         var stdio_initialized = false;
         var files_initialized = false;
+        var auth_initialized = false;
         var applications_initialized = false;
         var image_import_initialized = false;
         var signals_initialized = false;
@@ -217,11 +223,13 @@ pub const SourceGeneration = struct {
             if (self.images) |*images| images.deinit();
             if (applications_initialized) self.applications.deinit();
             if (image_import_initialized) self.image_import.deinit();
+            if (auth_initialized) self.auth.deinit();
             if (files_initialized) self.files.deinit();
             if (stdio_initialized) self.stdio.deinit();
             if (dbus_initialized) self.dbus.deinit();
             if (mcp_client_initialized) self.mcp_client.deinit();
             if (vm_initialized) self.vm.deinit();
+            if (self.session) |*binding| binding.deinit();
             if (self.native_modules) |*modules| modules.deinit();
             if (shell_workspaces_initialized) self.shell_workspaces.?.deinit();
             if (signals_initialized) self.signals.deinit();
@@ -251,6 +259,7 @@ pub const SourceGeneration = struct {
             return err;
         };
         vm_initialized = true;
+        self.vm.app_spawn_allowed = !config.session_candidate;
         self.mcp_client.init(
             allocator,
             &self.vm,
@@ -273,6 +282,14 @@ pub const SourceGeneration = struct {
         stdio_initialized = true;
         try self.files.init(allocator, &self.vm, loop);
         files_initialized = true;
+        try self.auth.init(allocator, &self.vm, loop);
+        auth_initialized = true;
+        self.auth.stopping = config.session_candidate;
+        if (services) |value| if (value.session) |store| {
+            self.session = @as(@import("../lua/session.zig").Binding, undefined);
+            try self.session.?.init(&self.vm, store);
+            self.session.?.candidate = config.session_candidate;
+        };
         self.signals.initWithApi(
             allocator,
             self.vm.state,
@@ -601,6 +618,10 @@ pub const SourceGeneration = struct {
         self.ui_build.text_input_bindings = self.application.text_input_bindings;
         self.ui_build.theme_fonts = services.theme_fonts;
         try self.attachImages(services.images, services.icon_roots);
+        if (services.session) |store| {
+            self.session = @as(@import("../lua/session.zig").Binding, undefined);
+            try self.session.?.init(&self.vm, store);
+        }
         if (services.workspaces) |store| {
             self.shell_workspaces = @as(lua.ShellWorkspaces, undefined);
             try self.shell_workspaces.?.init(self.vm.state, &self.signals, store, self.vm.apiReference());
@@ -638,6 +659,7 @@ pub const SourceGeneration = struct {
         if (try self.applications.dispatch(completion)) return true;
         if (try self.image_import.dispatch(completion)) return true;
         if (try self.files.dispatch(completion)) return true;
+        if (try self.auth.dispatch(completion)) return true;
         if (try self.stdio.dispatch(completion)) return true;
         if (self.module_loader) |*loader| return loader.dispatch(completion);
         return false;
@@ -662,6 +684,8 @@ pub const SourceGeneration = struct {
         try self.applications.collectCanceled();
         self.image_import.collectCanceled();
         self.files.collectCanceled();
+        try self.auth.collectCanceled();
+        if (self.session) |*binding| try binding.sync();
     }
 
     pub fn workspacesRequested(self: *const SourceGeneration) bool {
@@ -897,10 +921,12 @@ pub const SourceGeneration = struct {
         self.applications.deinit();
         self.image_import.deinit();
         self.files.deinit();
+        self.auth.deinit();
         self.stdio.deinit();
         self.dbus.deinit();
         self.mcp_client.deinit();
         self.vm.deinit();
+        if (self.session) |*binding| binding.deinit();
         if (self.native_modules) |*modules| modules.deinit();
         if (self.shell_workspaces) |*binding| binding.deinit();
         self.signals.deinit();

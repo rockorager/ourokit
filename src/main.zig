@@ -6,6 +6,9 @@ const version = "0.1.0";
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--ourokit-auth-worker")) {
+        std.process.exit(@intCast(ouro_auth_worker_main()));
+    }
     const command = cli.parse(args) catch |err| {
         try writeError(init, @errorName(err));
         try writeStdout(init, cli.usage);
@@ -17,6 +20,8 @@ pub fn main(init: std.process.Init) !void {
     };
     if (exit_code != 0) std.process.exit(exit_code);
 }
+
+extern fn ouro_auth_worker_main() c_int;
 
 fn execute(init: std.process.Init, command: cli.Command) !u8 {
     switch (command) {

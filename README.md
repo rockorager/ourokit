@@ -29,6 +29,7 @@ the event loop, native resources, rendering, and task lifetimes.
 | Desktop hooks and the [D-Bus API](docs/dbus.md) | Standard desktop integration and an escape hatch for application-specific services |
 | Declared actions, `--mcp` and `ouroctl mcp export` | Optional production automation; not UI lifecycle or development authority |
 | Layer surfaces and the [shell workspace API](docs/workspaces.md) | Optional shell extensions |
+| [Session services and authentication](docs/session.md) | Native idle, display power, secure lock surfaces and asynchronous PAM |
 | [Native plugins](docs/native-plugins.md) and `ourokit_ui` | Experimental native integration and low-level UI embedding |
 
 There is one UI startup form: `run(context)` returns a static or reactive
@@ -64,7 +65,8 @@ zig build verify
 ```
 
 `verify` is the routine pre-commit check: Zig tests (including token validation),
-Zig formatting, and eight real-process development/control suites. The native
+Zig formatting, real-process development/control suites, and disposable native
+session/PAM fixtures. The native development
 suite starts its own headless Sway with software rendering and private D-Bus
 sessions; it does not use your desktop, session bus, or compositor configuration.
 It checks inspection, input, capture pixels, rejected and accepted reloads,
@@ -82,6 +84,8 @@ integration with a particular desktop environment.
 
 For focused iteration, `zig build test` runs the Zig suite without a compositor;
 `zig build test-development` runs only the isolated native/control suites.
+`zig build test-session` runs strict session-protocol rendering and asynchronous
+mock-PAM tests without touching a real compositor, PAM policy or credentials.
 Individual Python tests still support `OUROKIT_TEST_WAYLAND_DISPLAY` for manual
 use on a disposable compositor. The `verify` command always creates its own.
 
@@ -512,6 +516,7 @@ and shared-memory/dma-buf presentation paths.
 - [Rendering](docs/rendering.md)
 - [Runtime, tasks, Lua, and io_uring](docs/runtime.md)
 - [D-Bus clients and services](docs/dbus.md)
+- [Native idle, output power, session locks and authentication](docs/session.md)
 - [Desktop choosers, external opening, and notifications](docs/desktop-services.md)
 - [XDG directories](docs/xdg.md), [secret storage](docs/secrets.md), and [desktop installation](docs/desktop-installation.md)
 - [Local file I/O](docs/files.md) and [multi-document example](docs/documents.md)

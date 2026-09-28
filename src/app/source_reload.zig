@@ -124,6 +124,9 @@ pub const SourceReload = struct {
     /// Builds a complete candidate declaration from a fresh source snapshot.
     /// The active generation remains authoritative until `commit` is called.
     pub fn prepare(self: *SourceReload) !void {
+        if (self.services) |services| if (services.session) |session| {
+            if (session.blocksReload()) return error.SessionLockActive;
+        };
         if (self.candidate != null) return error.SourceCandidateAlreadyPrepared;
         if (self.retiringCount() == retiring_capacity)
             return error.SourceRetirementCapacityExceeded;
@@ -139,6 +142,8 @@ pub const SourceReload = struct {
             );
             return err;
         };
+        var candidate_config = self.config;
+        candidate_config.session_candidate = true;
         const candidate = if (self.module_root) |root|
             SourceGeneration.createBootstrap(
                 self.allocator,
@@ -147,7 +152,7 @@ pub const SourceReload = struct {
                 snapshot,
                 root,
                 self.services,
-                self.config,
+                candidate_config,
                 &self.diagnostic,
             )
         else
@@ -157,7 +162,7 @@ pub const SourceReload = struct {
                 self.loop,
                 snapshot,
                 self.services,
-                self.config,
+                candidate_config,
                 &self.diagnostic,
             );
         const prepared = candidate catch |err| return err;
@@ -318,6 +323,9 @@ pub const SourceReload = struct {
             @panic("source generation commit without retirement capacity");
         const candidate = self.candidate orelse @panic("source generation commit without candidate");
         const retired = self.active_generation;
+        if (candidate.session) |*binding| binding.activate();
+        candidate.auth.stopping = false;
+        candidate.vm.app_spawn_allowed = true;
         self.active_generation = candidate;
         self.candidate = null;
         retirement_slot.* = .{ .generation = retired };
@@ -336,6 +344,8 @@ pub const SourceReload = struct {
             retiring.generation.shutdownImages();
             retiring.generation.dbus.shutdown();
             retiring.generation.files.stop();
+            retiring.generation.auth.stop();
+            if (retiring.generation.session) |*binding| binding.stop();
             retiring.cancellation_started = true;
         }
     }
@@ -451,6 +461,7 @@ pub const SourceReload = struct {
             if (!retiring.generation.imagesQuiescent()) continue;
             if (!retiring.generation.dbus.canDeinit()) continue;
             if (!retiring.generation.files.canDeinit()) continue;
+            if (!retiring.generation.auth.canDeinit()) continue;
             if (self.services) |services|
                 if (services.callbacks.countForVm(&retiring.generation.vm) != 0) continue;
             retiring.generation.destroy();
