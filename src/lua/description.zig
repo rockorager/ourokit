@@ -7,15 +7,12 @@ pub const Kind = enum {
     canvas,
     icon,
     radio_group,
-    radio,
     slider,
     dialog,
     text_input,
     auth_input,
     listbox,
-    option,
     tab_bar,
-    tab,
     split_view,
     box,
     stack,
@@ -29,7 +26,7 @@ pub const Kind = enum {
 
     fn acceptsChildren(self: Kind) bool {
         return switch (self) {
-            .listbox, .radio_group, .tab_bar, .tab, .split_view, .dialog, .box, .stack, .row, .column, .scroll, .theme, .stateful, .stateless => true,
+            .listbox, .radio_group, .tab_bar, .split_view, .dialog, .box, .stack, .row, .column, .scroll, .theme, .stateful, .stateless => true,
             else => false,
         };
     }

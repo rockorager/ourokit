@@ -541,9 +541,7 @@ pub const WindowRuntime = struct {
             self.root_owner,
             self.instances.handleForId(option.listbox_id).?,
             self.instances.handleForId(option.id).?,
-            self.instances.handleForId(option.content_id).?,
             option.value,
-            option.style,
         ) catch unreachable;
         self.listboxes.finishOwner(self.root_owner);
         for (0..self.buttons.slotCount()) |index|
@@ -1678,13 +1676,10 @@ pub const WindowRuntime = struct {
             current = try self.instances.parentOf(instance_handle);
         }
         var center: core.PointF = .{ .x = origin.x + size.width / 2, .y = origin.y + size.height / 2 };
-        if (semantic.role == .tab) {
-            // A tab's geometric center can fall on its nested close button.
-            // Replay selection at the label, leaving the full bounds inspectable.
-            const label = self.listboxes.currentVisual(target).content;
-            const label_origin = try self.instanceOrigin(label);
-            const label_size = try self.tree.nodeSize(try self.instances.renderObject(label));
-            center = .{ .x = label_origin.x + label_size.width / 2, .y = label_origin.y + label_size.height / 2 };
+        if (self.listboxes.option(target) != null) {
+            // Custom selection content can contain independent controls. Find
+            // a point routed to the item, not its close button or text input.
+            center = try self.selectionPoint(target, render, origin) orelse center;
         }
         return .{
             .center = center,
@@ -1694,6 +1689,25 @@ pub const WindowRuntime = struct {
             .visible = self.instances.isVisible(target),
             .scroll_axis = scroll_axis,
         };
+    }
+
+    fn selectionPoint(self: *WindowRuntime, target: ui.instance.InstanceHandle, render: ui.render_object.NodeHandle, origin: core.PointF) anyerror!?core.PointF {
+        const size = try self.tree.nodeSize(render);
+        const center: core.PointF = .{ .x = origin.x + size.width / 2, .y = origin.y + size.height / 2 };
+        const root = (try self.instances.rootRenderObject()).?;
+        if (try self.tree.hitTest(root, center)) |hit| {
+            var current = self.instances.instanceForRenderObject(hit);
+            while (current) |candidate| {
+                if (sameHandle(candidate, target)) return center;
+                if (self.pointer_bindings.get(candidate) != null or self.text_inputs.contains(candidate)) break;
+                current = try self.instances.parentOf(candidate);
+            }
+        }
+        var child = self.tree.firstChild(render);
+        while (child) |node| : (child = self.tree.nextSibling(node)) {
+            if (try self.selectionPoint(target, node, core.PointF.add(origin, try self.tree.nodeOffset(node)))) |point| return point;
+        }
+        return null;
     }
 
     pub fn frameSubmitted(self: *WindowRuntime) !void {
@@ -2254,14 +2268,18 @@ pub const WindowRuntime = struct {
 
     fn applyInteractionPaint(self: *WindowRuntime, target: ui.instance.InstanceHandle, focused: bool) !void {
         const id = try self.instances.semanticId(target);
+        const selection = self.listboxes.option(target) != null;
         for (0..self.instances.slots.len) |index| {
             const binding = self.instances.paintAt(index) orelse continue;
             if (binding.paint.source != id) continue;
             var object = try self.tree.objectAt(binding.render);
             const previous = object;
-            // These bindings are emitted by the Box primitive, not inferred
-            // from a stock control's role, root, or child positions.
-            object.box.background = self.buttons.paintColor(target, binding.paint);
+            const color = if (selection) self.listboxes.paintColor(target, binding.paint) else self.buttons.paintColor(target, binding.paint);
+            switch (object) {
+                .box => |*box| box.background = color,
+                .text => |*text_object| text_object.color = color.?,
+                else => unreachable,
+            }
             if (binding.paint.focus) |focus_color| {
                 if (object.box.border_width == 0) {
                     object.box.outline_color = if (focused) focus_color else null;
@@ -2284,35 +2302,22 @@ pub const WindowRuntime = struct {
     fn refreshListBoxVisuals(self: *WindowRuntime) !void {
         for (0..self.listboxes.optionSlots()) |index| {
             const option = self.listboxes.optionAt(index) orelse continue;
-            try self.applyListBoxVisual(self.listboxes.currentVisual(option));
+            try self.applyListBoxVisualUpdate(option);
         }
         self.frame_state.invalidatePaint();
     }
 
     fn applyListBoxVisualUpdate(
         self: *WindowRuntime,
-        update: ?ui.widget.ListBoxVisualUpdate,
+        update: ?ui.instance.InstanceHandle,
     ) !void {
-        const next = update orelse return;
-        try self.applyListBoxVisual(next);
-        self.frame_state.invalidatePaint();
-    }
-
-    fn applyListBoxVisual(self: *WindowRuntime, update: ui.widget.ListBoxVisualUpdate) !void {
-        const option_render = try self.instances.renderObject(update.option);
-        var option = try self.tree.objectAt(option_render);
-        if (option != .box) return error.ListBoxOptionRenderObjectMismatch;
-        option.box.background = update.visual.background;
-        option.box.outline_color = null;
-        option.box.outline_width = 0;
-        option.box.outline_gap = 0;
-        try self.tree.update(option_render, option);
-
-        const content_render = try self.instances.renderObject(update.content);
-        var content = try self.tree.objectAt(content_render);
-        if (content != .text) return error.ListBoxOptionContentRenderObjectMismatch;
-        content.text.color = update.visual.foreground;
-        try self.tree.update(content_render, content);
+        const option = update orelse return;
+        const selection = self.listboxes.option(option).?;
+        const focused = self.keyboard_focus_visible and
+            (if (self.focus.current()) |focus| sameHandle(focus, selection.listbox) else false) and
+            selection.value == self.listboxes.selectedValue(selection.listbox);
+        try self.applyInteractionPaint(option, focused);
+        try self.setControlBorder(option, self.focus_color, focused);
     }
 
     /// Exercises candidate layout and scene lowering against isolated native
@@ -2383,6 +2388,7 @@ pub const WindowRuntime = struct {
                 const option = self.listboxes.optionAt(index) orelse continue;
                 const selection = self.listboxes.option(option).?;
                 if (!sameHandle(selection.listbox, target)) continue;
+                try self.applyInteractionPaint(option, focused and selection.value == self.listboxes.selectedValue(target));
                 try self.setControlBorder(option, self.focus_color, focused and selection.value == self.listboxes.selectedValue(target));
             }
             return;

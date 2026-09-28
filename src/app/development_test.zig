@@ -101,6 +101,103 @@ fn node(snapshot: dev.Snapshot, path: []const u8) !dev.Node {
     return error.TestPathMissing;
 }
 
+test "custom selection items repaint nested content without rebuilding and isolate child activation" {
+    const f = try Fixture.create(
+        \\builds=0; requests=0; closes=0
+        \\local Item=ouro.stateless(function(p, children, theme, context)
+        \\ assert(context.selection.role=='listbox' and context.selection.selected==41)
+        \\ return ouro.box {key=p.key, option=p.value, label='Semantic '..p.key, height=50,
+        \\   border_width=3, border='#234567', background='#102030', states={hover='#405060',selected='#708090'},
+        \\   ouro.row {key='row', semantic=false, gap=0,
+        \\     ouro.box {key='swatch', width=30, height=40, background='#112233', states={hover='#445566',selected='#778899',focus='#abcdef'}},
+        \\     ouro.text {key='title', text='Visible', foreground='#213243', states={hover='#546576',selected='#8798a9'}},
+        \\     ouro.box {key='close', role='button', label='Close', activate=true, width=190, height=40,
+        \\       on_press=function() closes=closes+1 end,
+        \\       ouro.text {key='glyph', text='X', foreground='#321043',states={hover='#654376'}}}}}
+        \\end)
+        \\function build() builds=builds+1; return ouro.listbox {key='items',selected=41,
+        \\ on_select=function(v) requests=requests+v end,
+        \\ Item {key='first',value=41}, Item {key='second',value=-7}} end
+    );
+    defer f.destroy();
+    const Color = @import("../core/color.zig").Color;
+    const check = struct {
+        fn object(fixture: *Fixture, path: []const u8) !ui.render_object.types.Object {
+            const id = (try fixture.runtime.semantics.findPath(path)).id;
+            return fixture.runtime.tree.objectAt(try fixture.runtime.instances.renderObject(fixture.runtime.instances.handleForId(id).?));
+        }
+        fn colors(fixture: *Fixture, box: Color, swatch: Color, title: Color) !void {
+            try std.testing.expectEqual(box, (try object(fixture, "items/second")).box.background.?);
+            try std.testing.expectEqual(swatch, (try object(fixture, "items/second/swatch")).box.background.?);
+            try std.testing.expectEqual(title, (try object(fixture, "items/second/title")).text.color);
+        }
+        fn selected(fixture: *Fixture) !void {
+            var snapshot = try fixture.snapshot();
+            defer snapshot.deinit();
+            try std.testing.expect((try node(snapshot, "items/second")).selected);
+            try std.testing.expect(!(try node(snapshot, "items/first")).selected);
+        }
+    };
+    try check.colors(f, .rgba(0x10, 0x20, 0x30, 255), .rgba(0x11, 0x22, 0x33, 255), .rgba(0x21, 0x32, 0x43, 255));
+    try f.play(.{ .hover = "items/second" });
+    try check.colors(f, .rgba(0x40, 0x50, 0x60, 255), .rgba(0x44, 0x55, 0x66, 255), .rgba(0x54, 0x65, 0x76, 255));
+    // Its geometric center is covered by the wide close button. Semantic
+    // playback must find another point without relying on a stock label ID.
+    try f.play(.{ .click = "items/second" });
+    try check.colors(f, .rgba(0x70, 0x80, 0x90, 255), .rgba(0x77, 0x88, 0x99, 255), .rgba(0x87, 0x98, 0xa9, 255));
+    try check.selected(f);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_up } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_down } });
+    try std.testing.expectEqual(@as(f32, 2), (try check.object(f, "items/second")).box.outline_width);
+    try std.testing.expectEqual(Color.rgba(0xab, 0xcd, 0xef, 255), (try check.object(f, "items/second/swatch")).box.outline_color.?);
+    try f.play(.{ .click = "items/second/close" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+    try check.selected(f);
+    try std.testing.expectEqual(@as(f32, 0), (try check.object(f, "items/second/swatch")).box.outline_width);
+    try std.testing.expectEqual(Color.rgba(0x65, 0x43, 0x76, 255), (try check.object(f, "items/second/close/glyph")).text.color);
+    const assertions = "assert(builds==1 and requests==27 and closes==2)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, assertions.ptr, assertions.len, "@check", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+}
+
+test "selection primitive rejects conflicting policies and rolls back staged items and text" {
+    const f = try Fixture.create("function build() return ouro.box {key='original'} end");
+    defer f.destroy();
+    const original = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("original")).id).?;
+    const cases = [_][]const u8{
+        "ouro.box {key='bad',option=17,label='Bad'}",
+        "ouro.box {key='bad',option=1.5,label='Bad'}",
+        "ouro.box {key='bad',option=23,label='Bad',activate=false}",
+        "ouro.box {key='bad',option=23,label='Bad',enabled=true}",
+        "ouro.box {key='bad',option=23,label='Bad',checked=false}",
+        "ouro.box {key='bad',option=23,label='Bad',role='group'}",
+        "ouro.box {key='bad',option=23,label='Bad',semantic=false}",
+        "ouro.box {key='bad',option=23}",
+        "ouro.box {key='bad',option=23,label='Bad',states={pressed='#123456'}}",
+        "ouro.box {key='bad',option=23,label='Bad',states={disabled='#123456'}}",
+        "ouro.box {key='wrap',ouro.box {key='bad',option=23,label='Bad'}}",
+        "ouro.text {key='bad',text='No owner',states={hover='#123456'}}",
+        "ouro.box {key='bad',activate=true,states={selected='#123456'}}",
+        "ouro.box {key='bad',option=23,label='Bad',ouro.text {key='label',text='Bad',states={focus='#123456'}}}",
+        "ouro.option {key='bad',label='Missing value'}",
+        "ouro.option {key='bad',value=23,label='Bad',hover=false}",
+        "ouro.option {key='bad',value=23,label='Bad',height=0}",
+        "ouro.option {key='bad',value=23,label='Bad',height='auto'}",
+    };
+    for (cases) |invalid| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.listbox {{key='list',selected=17,on_select=function() end," ++
+            "ouro.box {{key='valid',option=17,label='Valid',ouro.text {{key='label',text='Staged',states={{selected='#123456'}}}}}}, {s}}} end", .{invalid});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@invalid-selection", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.settle());
+        try std.testing.expectEqual(original, f.runtime.instances.handleForId((try f.runtime.semantics.findPath("original")).id).?);
+        try std.testing.expectEqual(@as(usize, 0), f.builder.pending_option_count);
+        try std.testing.expectEqual(@as(usize, 0), f.sources.count());
+    }
+}
+
 test "split controls preserve grab offset and clamp both axes at actual layout limits" {
     inline for (.{ "horizontal", "vertical" }) |axis| {
         const f = try Fixture.create("axis='" ++ axis ++ "'\n" ++

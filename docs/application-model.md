@@ -242,8 +242,9 @@ it again, including when enclosing components retain their descriptions, so
 inherited themes cannot become stale. Hover, pressed, and keyboard-focus paint
 updates do not lower descriptions or run composition functions.
 
-Buttons, checkboxes, and switches are stock Lua compositions over `ouro.box`
-and `ouro.text`. Applications have the same primitive boundary:
+Buttons, checkboxes, switches, separators, options, radios, and tabs are stock
+Lua compositions over box, text, and layout primitives. Applications have the
+same primitive boundary:
 
 ```lua
 local Action = ouro.stateless(function(props, children, theme)
@@ -270,14 +271,38 @@ contracts. Supply either `on_press()` or `on_change(not checked)`, not both;
 `button`, `checkbox`, `switch`, and `separator`; declaring a role alone does not enable input.
 `label`, `checked`, and `enabled` are copied to the semantic snapshot.
 
-Any box under an activation owner can declare `states`, independently of the
-owner's visual structure. It binds to the nearest activation ancestor, or itself
-when `activate=true`. `hover`, `pressed`, and `disabled` are background colors;
-precedence is disabled, pressed, hover, then the box's ordinary background.
+Any box or text under an interaction owner can declare `states`, independently
+of the owner's visual structure. It binds to the nearest activation or selection
+ancestor, or itself when `activate=true` or `option` is set. Colors change a
+box's background or text's foreground. For activation, precedence is disabled,
+pressed, hover, then the ordinary color.
 Missing pressed falls back to hover; other missing states use the ordinary
-background. `focus` recolors an existing border for keyboard-visible focus,
+color. Box-only `focus` recolors an existing border for keyboard-visible focus,
 or draws a 2-pixel inset outline when borderless. These properties change paint
 only. Omit `states` for chrome that never changes with interaction.
+
+**Selection items.** `ouro.box {key='entry', option=17, label='Entry', ...}`
+registers custom content as a direct child of `listbox`, `radio_group`, or
+`tab_bar`. Values must be unique integers. The native group supplies role,
+selected/checked state, enabled state, focus, and keyboard policy; the item
+must not override `activate`, `role`, `checked`, or `enabled`, or disable its
+semantics. Nested activation controls remain independent, as with tab close
+buttons. Decorative rows and columns may use `semantic=false` to keep child
+semantic paths directly under the item.
+
+Selection paint supports `selected` and `hover`, with selected taking precedence;
+missing colors fall back to the ordinary color. `pressed` and `disabled` paint
+belong to activation owners only. The group draws an inset focus outline around
+its selected item; descendants may also declare `focus` paint.
+
+Stateless render functions receive an optional fourth argument, `context`.
+When directly under a selection group, `context.selection` contains `role`
+(`listbox`, `radio_group`, or `tab_list`), `selected`, `enabled`, and `appearance`.
+These are the group's declared values at lowering, not a subscription to native
+hover or selection changes. Use `states` for native repaint without rebuilding.
+Listboxes can retain a new selection without a Lua rebuild; radio groups and
+tab bars remain controlled and only change selection when the application
+updates their declared value.
 
 `content_theme` applies native theme inheritance to a box's descendants without
 adding a layout node. A box's explicit `foreground` then sets the descendant

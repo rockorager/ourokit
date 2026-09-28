@@ -20,7 +20,6 @@ const TextInputs = @import("../ui/text_input/registry.zig").Registry;
 const TextInputValueMode = @import("../ui/text_input/registry.zig").ValueMode;
 const TextInputSession = @import("../ui/text_input/session.zig").Session;
 const ListBoxes = @import("../ui/widget/listboxes.zig").ListBoxes;
-const ListBoxStyle = @import("../ui/widget/listboxes.zig").Style;
 const render_types = @import("../ui/render_object/types.zig");
 const SemanticDescriptor = @import("../ui/semantics/snapshot.zig").Descriptor;
 const text = @import("../text/root.zig");
@@ -45,10 +44,20 @@ const ListBoxAppearance = enum { default, sidebar };
 const PendingListBox = struct { id: u64, selected: i64, appearance: ListBoxAppearance, enabled: bool = true };
 const PendingOption = struct {
     id: u64,
-    content_id: u64,
     listbox_id: u64,
     value: i64,
-    style: ListBoxStyle,
+};
+
+const InteractionOwner = struct {
+    id: u64,
+    selection: bool = false,
+    selected: bool = false,
+    enabled: bool = true,
+
+    fn initialColor(self: InteractionOwner, paint: instance.InteractionPaint) ?@import("../core/color.zig").Color {
+        if (self.selection) return if (self.selected) paint.selected orelse paint.idle else paint.idle;
+        return if (self.enabled) paint.idle else paint.disabled orelse paint.idle;
+    }
 };
 
 const PendingTextInput = struct {
@@ -89,7 +98,7 @@ pub const UiBuild = struct {
     components: Components = .{},
     component_namespace: u64 = 0,
     component_scope_clean: bool = true,
-    interaction_owner: ?u64 = null,
+    interaction_owner: ?InteractionOwner = null,
     composition_depth: usize = 0,
     virtual_lists: virtual_list.Snapshot = .{},
     semantic_storage: []SemanticDescriptor = &.{},
@@ -386,9 +395,7 @@ pub const UiBuild = struct {
             owner,
             tree.handleForId(pending.listbox_id).?,
             tree.handleForId(pending.id).?,
-            tree.handleForId(pending.content_id).?,
             pending.value,
-            pending.style,
         );
         listboxes.finishOwner(owner);
         self.pending_handler_count = 0;
@@ -500,10 +507,8 @@ pub const UiBuild = struct {
         for (self.pending_options[0..self.pending_option_count], prepared.prepared_options[0..self.pending_option_count]) |source, *destination|
             destination.* = .{
                 .id = source.id,
-                .content_id = source.content_id,
                 .listbox_id = source.listbox_id,
                 .value = source.value,
-                .style = source.style,
             };
         prepared.option_count = self.pending_option_count;
         prepared.owns_shapes = self.sources_staged;
@@ -639,15 +644,12 @@ pub const UiBuild = struct {
             .canvas => emitCanvas,
             .icon => emitIcon,
             .radio_group => emitRadioGroup,
-            .radio => emitOption,
             .slider => emitSlider,
             .dialog => emitDialog,
             .text_input => emitTextInput,
             .auth_input => emitAuthInput,
             .listbox => emitListBox,
-            .option => emitOption,
             .tab_bar => emitTabBar,
-            .tab => emitTab,
             .split_view => emitSplitView,
             .box => emitBox,
             .stack => emitStack,
@@ -677,12 +679,38 @@ pub const UiBuild = struct {
         _ = c.lua_getiuservalue(state, 1, 1);
         _ = c.lua_getiuservalue(state, 1, 2);
         @import("tokens.zig").push(state, theme);
-        if (c.lua_pcallk(state, 4, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        c.lua_createtable(state, 0, 1);
+        if (self.currentSelection()) |group| {
+            c.lua_createtable(state, 0, 4);
+            _ = c.lua_pushstring(state, switch (self.currentParent().?.kind) {
+                .listbox => "listbox",
+                .radio_group => "radio_group",
+                .tab_bar => "tab_list",
+                else => unreachable,
+            });
+            c.lua_setfield(state, -2, "role");
+            c.lua_pushinteger(state, group.selected);
+            c.lua_setfield(state, -2, "selected");
+            c.lua_pushboolean(state, @intFromBool(group.enabled));
+            c.lua_setfield(state, -2, "enabled");
+            _ = c.lua_pushstring(state, @tagName(group.appearance));
+            c.lua_setfield(state, -2, "appearance");
+            c.lua_setfield(state, -2, "selection");
+        }
+        if (c.lua_pcallk(state, 5, 1, 0, 0, null) != c.ok) return c.lua_error(state);
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, lowerDescription, 1);
         c.lua_pushvalue(state, -2);
         if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) return c.lua_error(state);
         return 0;
+    }
+
+    fn currentSelection(self: *const UiBuild) ?PendingListBox {
+        const parent = self.currentParent() orelse return null;
+        if (parent.kind != .listbox and parent.kind != .radio_group and parent.kind != .tab_bar) return null;
+        for (self.pending_listboxes[0..self.pending_listbox_count]) |group|
+            if (group.id == parent.id) return group;
+        return null;
     }
 
     fn lowerComponent(self: *UiBuild, state: *c.State) c_int {
@@ -1352,192 +1380,6 @@ pub const UiBuild = struct {
         return self.emitChildren(state, .{ .id = id, .kind = if (radio) .radio_group else if (tabs) .tab_bar else .listbox });
     }
 
-    fn emitOption(state: *c.State) callconv(.c) c_int {
-        return emitSelectionOption(state, false);
-    }
-
-    fn emitTab(state: *c.State) callconv(.c) c_int {
-        return emitSelectionOption(state, true);
-    }
-
-    fn emitSelectionOption(state: *c.State, tab: bool) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
-        const defaults = self.currentStyle().?;
-        const visual = theming.widgetOverrides(state, defaults.widgets.option, false) catch |err| return luaError(state, @errorName(err));
-        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
-            return luaError(state, "ouro.option expects one declaration table");
-        const parent = self.currentParent() orelse return luaError(state, "option requires a listbox parent");
-        if (parent.kind != .listbox and parent.kind != .radio_group and parent.kind != .tab_bar) return luaError(state, "option requires a direct selection group parent");
-        if (tab != (parent.kind == .tab_bar)) return luaError(state, "tab requires a tab_bar parent");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "option key is required");
-        const label = tableString(state, 1, "label") orelse return luaError(state, "option label is required");
-        const value = tableRequiredInteger(state, 1, "value") orelse
-            return luaError(state, "option value must be an integer");
-        const option_id = semanticId(key, 0x6f7074696f6e ^ parent.id ^ self.component_namespace);
-        const label_id = semanticId(key, 0x6c6162656c ^ option_id);
-        const border_width = visual.border_width orelse defaults.controls.border_width orelse 0;
-        const listbox = blk: {
-            for (self.pending_listboxes[0..self.pending_listbox_count]) |candidate|
-                if (candidate.id == parent.id) break :blk candidate;
-            return luaError(state, "option listbox state is missing");
-        };
-        const selected = listbox.selected == value;
-        for (self.pending_options[0..self.pending_option_count]) |option| {
-            if (option.listbox_id == parent.id and option.value == value)
-                return luaError(state, "selection values must be unique");
-        }
-        // Tabs follow Radix Themes' tab list: transparent triggers with gray
-        // step 11 text, gray step 3 hover, and gray step 12 active text above
-        // an accent indicator instead of a filled selection.
-        const idle_foreground = if (tab)
-            theme.muted_foreground
-        else if (listbox.appearance == .sidebar)
-            theme.sidebar_foreground
-        else
-            theme.foreground;
-        const hovered = if (tab) theme.secondary else if (listbox.appearance == .sidebar) theme.sidebar_accent else theme.accent;
-        const selected_background: ?@import("../core/color.zig").Color = if (tab)
-            null
-        else if (listbox.appearance == .sidebar)
-            theme.sidebar_accent_selected
-        else
-            theme.accent_selected;
-        const accent_foreground = if (tab)
-            theme.foreground
-        else if (listbox.appearance == .sidebar)
-            theme.sidebar_accent_foreground
-        else
-            theme.accent_foreground;
-        var style: ListBoxStyle = .{
-            .idle = .{ .background = visual.background, .foreground = visual.foreground orelse idle_foreground },
-            .hovered = .{ .background = visual.hover orelse hovered, .foreground = visual.foreground orelse accent_foreground },
-            .selected = .{ .background = visual.pressed orelse selected_background, .foreground = visual.foreground orelse accent_foreground },
-        };
-        if (!listbox.enabled) {
-            style.idle.foreground = theme.disabled_foreground;
-            style.hovered.foreground = theme.disabled_foreground;
-            style.selected.foreground = theme.disabled_foreground;
-        }
-        self.append(.{
-            .id = option_id,
-            .parent = parent.id,
-            .object = .{ .box = .{
-                .height = visual.height orelse if (tab) design.tokens.foundation.spacing_7 else defaults.controls.height,
-                .padding = if (tab) .{} else .{ .left = visual.padding_x orelse design.tokens.foundation.spacing_2, .right = visual.padding_x orelse design.tokens.foundation.spacing_2 },
-                .alignment = if (tab) null else .{ .horizontal = .minimum, .vertical = .center },
-                .background = if (selected) style.selected.background else style.idle.background,
-                .border_color = if (border_width > 0) visual.border orelse theme.border else null,
-                .border_width = border_width,
-                .corner_radius = visual.radius orelse defaults.controls.radius orelse design.tokens.foundation.radius_1,
-            } },
-        }) catch return luaError(state, "cannot append option descriptor");
-        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
-        var content_parent = option_id;
-        const frame_id = semanticId("frame", option_id);
-        if (tab) {
-            // Tabs keep their intrinsic width. The frame stretches the
-            // indicator to that width below the padded label row.
-            const inset_id = semanticId("inset", option_id);
-            self.append(.{
-                .id = frame_id,
-                .parent = option_id,
-                .object = .{ .flex = .{ .axis = .vertical, .cross_axis_alignment = .stretch } },
-            }) catch return luaError(state, "cannot append tab frame");
-            self.append(.{
-                .id = inset_id,
-                .parent = frame_id,
-                .parent_data = .{ .flex = .{ .factor = 1 } },
-                .object = .{ .box = .{
-                    .padding = .{ .left = visual.padding_x orelse design.tokens.foundation.spacing_3, .right = visual.padding_x orelse design.tokens.foundation.spacing_3 },
-                    .alignment = .{ .horizontal = .minimum, .vertical = .center },
-                } },
-            }) catch return luaError(state, "cannot append tab inset");
-            content_parent = semanticId("content", option_id);
-            self.append(.{
-                .id = content_parent,
-                .parent = inset_id,
-                .object = .{ .flex = .{ .main_axis_size = .min, .gap = design.tokens.foundation.spacing_1, .cross_axis_alignment = .center } },
-            }) catch return luaError(state, "cannot append option content");
-        } else if (parent.kind == .radio_group) {
-            content_parent = semanticId("content", option_id);
-            self.append(.{
-                .id = content_parent,
-                .parent = option_id,
-                .object = .{ .flex = .{ .gap = 8, .cross_axis_alignment = .center } },
-            }) catch return luaError(state, "cannot append option content");
-        }
-        if (parent.kind == .radio_group) {
-            const foreground = if (selected) style.selected.foreground else style.idle.foreground;
-            self.append(.{
-                .id = semanticId("indicator", option_id),
-                .parent = content_parent,
-                .object = .{ .box = .{
-                    .width = 12,
-                    .height = 12,
-                    .corner_radius = 6,
-                    .background = if (selected) foreground else null,
-                    .border_width = if (selected) 0 else 1,
-                    .border_color = if (selected) null else foreground,
-                } },
-            }) catch return luaError(state, "cannot append radio indicator");
-        }
-        const source = sources.acquire(.{
-            .utf8 = label,
-            .language = "und",
-            .logical_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2,
-            .candidates = self.themedFonts(selected and (tab or listbox.appearance == .sidebar)) catch |err| return luaError(state, @errorName(err)),
-            .configuration_revision = self.text_configuration_revision,
-        }) catch return luaError(state, "cannot retain option label");
-        self.append(.{
-            .id = label_id,
-            .parent = content_parent,
-            .parent_data = if (parent.kind == .radio_group) .{ .flex = .{ .factor = 1 } } else .none,
-            .object = .{ .text = .{
-                .source = source,
-                .color = if (!listbox.enabled) theme.disabled_foreground else if (selected) style.selected.foreground else style.idle.foreground,
-                .max_lines = 1,
-                .overflow = .ellipsis,
-            } },
-        }) catch {
-            sources.release(source) catch unreachable;
-            return luaError(state, "cannot append option label descriptor");
-        };
-        self.sources_staged = true;
-        if (self.pending_option_count == self.pending_options.len)
-            return luaError(state, "listbox option capacity exceeded");
-        self.pending_options[self.pending_option_count] = .{
-            .id = option_id,
-            .content_id = label_id,
-            .listbox_id = parent.id,
-            .value = value,
-            .style = style,
-        };
-        self.pending_option_count += 1;
-        self.appendSemantic(.{
-            .id = option_id,
-            .parent = semanticParent(parent),
-            .role = if (parent.kind == .radio_group) .radio else if (tab) .tab else .option,
-            .key = key,
-            .label = label,
-            .selected = selected,
-            .checked = parent.kind == .radio_group and selected,
-            .enabled = listbox.enabled,
-        }) catch return luaError(state, "cannot append option semantics");
-        if (tab) {
-            _ = self.emitChildren(state, .{ .id = content_parent, .kind = .flex, .semantic_id = option_id });
-            self.append(.{
-                .id = semanticId("indicator", option_id),
-                .parent = frame_id,
-                .object = .{ .box = .{
-                    .height = design.tokens.foundation.border_width_strong,
-                    .background = if (selected and listbox.enabled) theme.primary else null,
-                } },
-            }) catch return luaError(state, "cannot append tab indicator");
-        }
-        return 0;
-    }
-
     fn emitSplitView(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1617,6 +1459,8 @@ pub const UiBuild = struct {
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         const weight = tableOptionalEnum(enum { normal, medium }, state, 1, "weight", .normal) orelse
             return luaError(state, "text weight must be normal or medium");
+        const paint = readInteractionPaint(state, self.interaction_owner, visual.foreground orelse theme.foreground, null, false) catch |err|
+            return luaError(state, @errorName(err));
         const source = sources.acquire(.{
             .utf8 = value,
             .language = "und",
@@ -1628,9 +1472,10 @@ pub const UiBuild = struct {
         self.append(.{
             .id = id,
             .parent = parent.id,
+            .interaction_paint = paint,
             .object = .{ .text = .{
                 .source = source,
-                .color = visual.foreground orelse theme.foreground,
+                .color = if (paint) |p| self.interaction_owner.?.initialColor(p).? else visual.foreground orelse theme.foreground,
                 .alignment = alignment,
                 .max_lines = if (max_lines_value == 0) null else max_lines_value,
                 .overflow = overflow,
@@ -1731,25 +1576,41 @@ pub const UiBuild = struct {
             return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x626f78 ^ parent.id ^ self.component_namespace);
         const activate = tableOptionalBoolean(state, 1, "activate", false) orelse return luaError(state, "activate must be boolean");
-        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse return luaError(state, "enabled must be boolean");
-        const role = tableOptionalEnum(@import("../ui/semantics/snapshot.zig").Role, state, 1, "role", .group) orelse return luaError(state, "invalid semantic role");
+        var enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse return luaError(state, "enabled must be boolean");
+        var role = tableOptionalEnum(@import("../ui/semantics/snapshot.zig").Role, state, 1, "role", .group) orelse return luaError(state, "invalid semantic role");
         if (role != .group and role != .button and role != .checkbox and role != .@"switch" and role != .separator)
             return luaError(state, "box role must be group, button, checkbox, switch, or separator");
         const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
         if (activate and !semantic) return luaError(state, "activation requires semantics");
-        const checked = tableOptionalBoolean(state, 1, "checked", false) orelse return luaError(state, "checked must be boolean");
-        var paint: ?instance.InteractionPaint = null;
-        const states_type = c.lua_getfield(state, 1, "states");
-        if (states_type != c.type_nil) {
-            if (states_type != c.type_table) return luaError(state, "states must be a table");
-            paint = .{ .source = if (activate) id else self.interaction_owner orelse return luaError(state, "states require an activation ancestor"), .idle = visual.background orelse surface.value, .border = visual.border orelse theme.border };
-            inline for (.{ "hover", "pressed", "disabled", "focus" }) |field| {
-                if (c.lua_getfield(state, -1, field) != c.type_nil)
-                    @field(paint.?, field) = theming.color(state, -1) catch |err| return luaError(state, @errorName(err));
-                c.lua_settop(state, -2);
-            }
-        }
+        var checked = tableOptionalBoolean(state, 1, "checked", false) orelse return luaError(state, "checked must be boolean");
+        const option_type = c.lua_getfield(state, 1, "option");
         c.lua_settop(state, -2);
+        var selected = false;
+        var owner = if (activate) InteractionOwner{ .id = id, .enabled = enabled } else self.interaction_owner;
+        if (option_type != c.type_nil) {
+            if (!semantic) return luaError(state, "selection requires semantics");
+            inline for (.{ "activate", "role", "checked", "enabled" }) |field| {
+                const field_type = c.lua_getfield(state, 1, field);
+                c.lua_settop(state, -2);
+                if (field_type != c.type_nil) return luaError(state, "selection owns activate, role, checked, and enabled");
+            }
+            const group = self.currentSelection() orelse return luaError(state, "option requires a direct selection group parent");
+            const value = tableRequiredInteger(state, 1, "option") orelse return luaError(state, "option value must be an integer");
+            _ = tableString(state, 1, "label") orelse return luaError(state, "option label is required");
+            for (self.pending_options[0..self.pending_option_count]) |option| {
+                if (option.listbox_id == parent.id and option.value == value) return luaError(state, "selection values must be unique");
+            }
+            if (self.pending_option_count == self.pending_options.len) return luaError(state, "listbox option capacity exceeded");
+            self.pending_options[self.pending_option_count] = .{ .id = id, .listbox_id = parent.id, .value = value };
+            self.pending_option_count += 1;
+            selected = group.selected == value;
+            enabled = group.enabled;
+            checked = parent.kind == .radio_group and selected;
+            role = if (parent.kind == .radio_group) .radio else if (parent.kind == .tab_bar) .tab else .option;
+            owner = .{ .id = id, .selection = true, .selected = selected, .enabled = enabled };
+        }
+        const paint = readInteractionPaint(state, owner, visual.background orelse surface.value, visual.border orelse theme.border, true) catch |err|
+            return luaError(state, @errorName(err));
         if (activate) {
             if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "activation capacity exceeded");
             const press_type = c.lua_getfield(state, 1, "on_press");
@@ -1790,7 +1651,7 @@ pub const UiBuild = struct {
                 .min_height = min_height,
                 .padding = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y },
                 .alignment = alignment.value,
-                .background = if (!enabled and paint != null) paint.?.disabled orelse paint.?.idle else visual.background orelse surface.value,
+                .background = if (paint) |p| owner.?.initialColor(p) else visual.background orelse surface.value,
                 .border_color = if (border_width > 0) visual.border orelse theme.border else null,
                 .border_width = border_width,
                 .corner_radius = visual.radius orelse 0,
@@ -1805,6 +1666,7 @@ pub const UiBuild = struct {
             .label = tableString(state, 1, "label") orelse "",
             .enabled = enabled,
             .checked = checked,
+            .selected = selected,
         }) catch return luaError(state, "cannot append box semantics");
         self.stageCallback(state, id, "on_interaction_change", .interaction_change) catch |err|
             return luaError(state, @errorName(err));
@@ -1813,7 +1675,7 @@ pub const UiBuild = struct {
         self.stageCallback(state, id, "on_drop_uris", .drop_uris) catch |err|
             return luaError(state, @errorName(err));
         const previous_owner = self.interaction_owner;
-        if (activate) self.interaction_owner = id;
+        self.interaction_owner = owner;
         defer self.interaction_owner = previous_owner;
         const content_theme_type = c.lua_getfield(state, 1, "content_theme");
         const has_content_theme = content_theme_type != c.type_nil or visual.foreground != null;
@@ -2039,13 +1901,40 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         } },
         .parent_data = parent_data,
     }) catch return luaError(state, "cannot append container descriptor");
-    self.appendSemantic(.{
+    const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
+    if (semantic) self.appendSemantic(.{
         .id = id,
         .parent = semanticParent(parent),
         .role = .group,
         .key = key,
     }) catch return luaError(state, "cannot append container semantics");
-    return self.emitChildren(state, .{ .id = id, .kind = .flex });
+    return self.emitChildren(state, .{ .id = id, .kind = .flex, .semantic_id = if (semantic) id else semanticParent(parent) });
+}
+
+fn readInteractionPaint(state: *c.State, owner: ?InteractionOwner, idle: ?@import("../core/color.zig").Color, border: ?@import("../core/color.zig").Color, box: bool) !?instance.InteractionPaint {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    const kind = c.lua_getfield(state, 1, "states");
+    if (kind == c.type_nil) return null;
+    if (kind != c.type_table) return error.StatesMustBeTable;
+    const source = owner orelse return error.StatesRequireInteractionAncestor;
+    var paint: instance.InteractionPaint = .{ .source = source.id, .idle = idle, .border = border };
+    inline for (.{ "hover", "pressed", "disabled", "selected", "focus" }) |field| {
+        if (c.lua_getfield(state, -1, field) != c.type_nil) {
+            if (comptime std.mem.eql(u8, field, "selected")) {
+                if (!source.selection) return error.SelectedRequiresSelection;
+            }
+            if (comptime std.mem.eql(u8, field, "pressed") or std.mem.eql(u8, field, "disabled")) {
+                if (source.selection) return error.ActivationStateRequiresActivation;
+            }
+            if (comptime std.mem.eql(u8, field, "focus")) {
+                if (!box) return error.FocusRequiresBox;
+            }
+            @field(paint, field) = try theming.color(state, -1);
+        }
+        c.lua_settop(state, -2);
+    }
+    return paint;
 }
 
 fn bridge(state: *c.State) ?*UiBuild {
@@ -2593,10 +2482,11 @@ test "declarative sidebar listbox uses paired active visuals" {
         descriptors[6].object.text.color,
     );
     try std.testing.expectEqual(@as(usize, 2), ui.pending_option_count);
-    try std.testing.expectEqual(descriptors[4].id, ui.pending_options[0].content_id);
+    try std.testing.expectEqual(descriptors[3].id, ui.pending_options[0].id);
+    try std.testing.expectEqual(descriptors[3].id, descriptors[4].interaction_paint.?.source);
     try std.testing.expectEqual(
         design.tokens.light.sidebar_accent_foreground,
-        ui.pending_options[0].style.hovered.foreground,
+        descriptors[4].interaction_paint.?.hover.?,
     );
     const idle_source = try sources.get(descriptors[4].object.text.source);
     const selected_source = try sources.get(descriptors[6].object.text.source);
@@ -2607,7 +2497,8 @@ test "declarative sidebar listbox uses paired active visuals" {
     try prepared.init(std.testing.allocator, state, &sources, 7, 64);
     defer prepared.deinit();
     try ui.capturePrepared(&prepared, descriptors);
-    try std.testing.expectEqual(descriptors[6].id, prepared.prepared_options[1].content_id);
+    try std.testing.expectEqual(descriptors[5].id, prepared.prepared_options[1].id);
+    try std.testing.expectEqual(descriptors[5].id, prepared.descriptors()[6].interaction_paint.?.source);
     prepared.reset();
     try owners.complete(work);
     try fonts.release(font);

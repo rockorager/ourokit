@@ -8,12 +8,13 @@ const AuthInput = @import("../widget/auth_input.zig").Input;
 
 pub const InstanceHandle = Handle;
 
-/// Paint-only box properties driven by a retained activation owner. The source
+/// Paint-only box/text colors driven by a retained interaction owner. The source
 /// is a semantic ID, never a Lua reference or a position in a widget recipe.
 pub const InteractionPaint = struct {
     source: u64,
     idle: ?@import("../../core/color.zig").Color = null,
     hover: ?@import("../../core/color.zig").Color = null,
+    selected: ?@import("../../core/color.zig").Color = null,
     pressed: ?@import("../../core/color.zig").Color = null,
     disabled: ?@import("../../core/color.zig").Color = null,
     border: ?@import("../../core/color.zig").Color = null,
@@ -694,7 +695,8 @@ pub const Tree = struct {
                 if (descriptor.parent_data != .none) return error.RootHasParentData;
             }
             if (descriptor.interaction_paint) |paint| {
-                if (descriptor.object != .box) return error.InvalidInteractionPaint;
+                if (descriptor.object != .box and descriptor.object != .text) return error.InvalidInteractionPaint;
+                if (descriptor.object == .text and (paint.idle == null or paint.focus != null)) return error.InvalidInteractionPaint;
                 var source: ?u64 = descriptor.id;
                 while (source != null and source.? != paint.source) {
                     const source_index = descriptor_index.get(source.?) orelse return error.InvalidInteractionPaint;

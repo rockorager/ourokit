@@ -6,7 +6,6 @@ const input = @import("../ui/input/bindings.zig");
 const semantics = @import("../ui/semantics/snapshot.zig");
 const buttons = @import("../ui/widget/buttons.zig");
 const text_input = @import("../ui/text_input/root.zig");
-const listboxes = @import("../ui/widget/listboxes.zig");
 const text = @import("../text/root.zig");
 
 pub const Handler = struct {
@@ -37,10 +36,8 @@ pub const TextInput = struct {
 pub const ListBox = struct { id: u64, selected: i64 };
 pub const Option = struct {
     id: u64,
-    content_id: u64,
     listbox_id: u64,
     value: i64,
-    style: listboxes.Style,
 };
 
 /// One candidate-owned, normalized window build. Registry references and

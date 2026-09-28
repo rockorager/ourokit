@@ -248,7 +248,8 @@ Lua-composed Box plus Text and a typed activation binding. A bounded lowering co
 identity and parent links from stable local keys and resolves inherited themes
 and parent data. No Button render object or Lua theme mirror is introduced.
 
-Stock button, checkbox, switch, and separator recipes live only in `lua/controls.lua`.
+Stock button, checkbox, switch, separator, option, radio, and tab recipes live
+only in `lua/controls.lua`.
 `ouro.stateless` expands stateless descriptions with a fresh effective native
 theme value during lowering, without mounting a component or adding a
 VM-specific identity namespace. Its output is pinned in the build transaction,
@@ -256,13 +257,16 @@ including prepared candidates; failures discard callbacks and dependencies
 through the same ownership paths as other descriptions. Retained components
 may cache these declarations, but theme-aware expansion always runs at lowering.
 
-Boxes opt into shared native activation and semantics independently of their
-content. Explicit paint bindings connect boxes to their nearest activation
+Boxes opt into shared native activation or selection membership and semantics
+independently of their content. Explicit paint bindings connect boxes and text to their nearest interaction
 owner by stable ID, so nested visual chrome need not follow a stock structure.
-Hover, press, disabled, and keyboard-visible focus resolve from retained native
+Hover, press, disabled, selected, and keyboard-visible focus resolve from retained native
 state; they update paint without Lua or layout. The window coordinator applies
 these bindings, while native editing/IME, selection, and range policies remain
 specialized. This is not an arbitrary renderer callback or an everything-node.
+Selection groups still lower natively; stateless item recipes receive their
+declared group context. The native selection registry owns order, values, and
+hover, not item geometry or a hardcoded label child.
 
 Layout uses one-way Flutter-style box constraints in logical `f32` units. A
 parent passes minimum/maximum width and height, each child returns one finite

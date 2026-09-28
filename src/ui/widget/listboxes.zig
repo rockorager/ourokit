@@ -3,16 +3,6 @@ const Color = @import("../../core/color.zig").Color;
 const instance = @import("../instance/tree.zig");
 const BuildOwnerHandle = @import("../instance/build_owner.zig").BuildOwnerHandle;
 
-pub const Visual = struct {
-    background: ?Color,
-    foreground: Color,
-};
-pub const Style = struct { idle: Visual, hovered: Visual, selected: Visual };
-pub const VisualUpdate = struct {
-    option: instance.InstanceHandle,
-    content: instance.InstanceHandle,
-    visual: Visual,
-};
 pub const Selection = struct {
     listbox: instance.InstanceHandle,
     option: instance.InstanceHandle,
@@ -32,10 +22,8 @@ const Option = struct {
     owner: BuildOwnerHandle = .invalid,
     listbox: instance.InstanceHandle = .invalid,
     target: instance.InstanceHandle = .invalid,
-    content: instance.InstanceHandle = .invalid,
     value: i64 = 0,
     order: usize = 0,
-    style: Style = undefined,
     hovered: bool = false,
     active: bool = false,
     seen: bool = false,
@@ -98,9 +86,7 @@ pub const ListBoxes = struct {
         owner: BuildOwnerHandle,
         listbox: instance.InstanceHandle,
         target: instance.InstanceHandle,
-        content: instance.InstanceHandle,
         value: i64,
-        style: Style,
     ) !void {
         const list = self.findListMutable(listbox) orelse return error.ListBoxMissing;
         const order = list.next_order;
@@ -108,10 +94,8 @@ pub const ListBoxes = struct {
         for (self.options) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.listbox = listbox;
-            entry.content = content;
             entry.value = value;
             entry.order = order;
-            entry.style = style;
             entry.seen = true;
             return;
         };
@@ -120,10 +104,8 @@ pub const ListBoxes = struct {
                 .owner = owner,
                 .listbox = listbox,
                 .target = target,
-                .content = content,
                 .value = value,
                 .order = order,
-                .style = style,
                 .active = true,
                 .seen = true,
             };
@@ -203,18 +185,20 @@ pub const ListBoxes = struct {
         list.selected = selection.value;
     }
 
-    pub fn setHovered(self: *ListBoxes, target: instance.InstanceHandle, hovered: bool) ?VisualUpdate {
+    pub fn setHovered(self: *ListBoxes, target: instance.InstanceHandle, hovered: bool) ?instance.InstanceHandle {
         for (self.options) |*entry| if (entry.active and same(entry.target, target)) {
             if (entry.hovered == hovered) return null;
             entry.hovered = hovered;
-            return update(entry.*, self.optionVisual(entry.*));
+            return target;
         };
         return null;
     }
 
-    pub fn currentVisual(self: *const ListBoxes, target: instance.InstanceHandle) VisualUpdate {
+    pub fn paintColor(self: *const ListBoxes, target: instance.InstanceHandle, paint: instance.InteractionPaint) ?Color {
         for (self.options) |entry| if (entry.active and same(entry.target, target)) {
-            return update(entry, self.optionVisual(entry));
+            if (entry.value == self.findList(entry.listbox).?.selected) return paint.selected orelse paint.idle;
+            if (entry.hovered) return paint.hover orelse paint.idle;
+            return paint.idle;
         };
         unreachable;
     }
@@ -235,18 +219,7 @@ pub const ListBoxes = struct {
         for (self.lists) |*entry| if (entry.active and same(entry.target, target)) return entry;
         return null;
     }
-
-    fn optionVisual(self: *const ListBoxes, option_value: Option) Visual {
-        const list = self.findList(option_value.listbox).?;
-        if (option_value.value == list.selected) return option_value.style.selected;
-        if (option_value.hovered) return option_value.style.hovered;
-        return option_value.style.idle;
-    }
 };
-
-fn update(option: Option, visual: Visual) VisualUpdate {
-    return .{ .option = option.target, .content = option.content, .visual = visual };
-}
 
 fn previousOption(options: []const Option, listbox: instance.InstanceHandle, start: usize) ?usize {
     var best: ?usize = null;
@@ -274,24 +247,24 @@ test "listbox moves through options without wrapping" {
     const list: instance.InstanceHandle = .{ .slot = 2, .generation = 1 };
     boxes.beginOwner(owner);
     try boxes.setList(owner, list, 1);
-    const style: Style = .{
-        .idle = .{ .background = null, .foreground = Color.rgba(1, 0, 0, 255) },
-        .hovered = .{ .background = Color.rgba(2, 0, 0, 255), .foreground = Color.rgba(4, 0, 0, 255) },
-        .selected = .{ .background = Color.rgba(3, 0, 0, 255), .foreground = Color.rgba(5, 0, 0, 255) },
+    const paint: instance.InteractionPaint = .{
+        .source = 1,
+        .idle = Color.rgba(1, 0, 0, 255),
+        .hover = Color.rgba(2, 0, 0, 255),
+        .selected = Color.rgba(3, 0, 0, 255),
     };
     const first: instance.InstanceHandle = .{ .slot = 3, .generation = 1 };
     const second: instance.InstanceHandle = .{ .slot = 4, .generation = 1 };
-    const first_content: instance.InstanceHandle = .{ .slot = 5, .generation = 1 };
-    const second_content: instance.InstanceHandle = .{ .slot = 6, .generation = 1 };
-    try boxes.setOption(owner, list, first, first_content, 1, style);
-    try boxes.setOption(owner, list, second, second_content, 2, style);
+    try boxes.setOption(owner, list, first, 1);
+    try boxes.setOption(owner, list, second, 2);
     boxes.finishOwner(owner);
-    try std.testing.expectEqual(@as(u8, 3), boxes.currentVisual(first).visual.background.?.r);
-    try std.testing.expectEqual(@as(u8, 2), boxes.setHovered(second, true).?.visual.background.?.r);
-    try std.testing.expectEqual(@as(u8, 4), boxes.currentVisual(second).visual.foreground.r);
+    try std.testing.expectEqual(@as(u8, 3), boxes.paintColor(first, paint).?.r);
+    try std.testing.expectEqual(@as(u8, 1), boxes.paintColor(second, paint).?.r);
+    try std.testing.expectEqual(second, boxes.setHovered(second, true).?);
+    try std.testing.expectEqual(@as(u8, 2), boxes.paintColor(second, paint).?.r);
     try std.testing.expectEqual(@as(i64, 2), boxes.move(list, 1).?.value);
-    try std.testing.expectEqual(@as(u8, 3), boxes.currentVisual(second).visual.background.?.r);
-    try std.testing.expectEqual(@as(u8, 5), boxes.currentVisual(second).visual.foreground.r);
+    try std.testing.expectEqual(@as(u8, 3), boxes.paintColor(second, paint).?.r);
     try std.testing.expectEqual(@as(i64, 1), boxes.move(list, -1).?.value);
+    try std.testing.expectEqual(@as(u8, 2), boxes.paintColor(second, paint).?.r);
     boxes.clear();
 }

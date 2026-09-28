@@ -113,3 +113,56 @@ ouro.separator = ouro.stateless(function(p, children, theme)
     background=theme.colors.border,
   }
 end)
+
+local function selection_item(p, children, theme, context, tab)
+  validate_appearance(p)
+  local group = context.selection
+  check(group ~= nil, 'option requires a direct selection group parent')
+  check(tab == (group.role == 'tab_list'), 'tab requires a tab_bar parent')
+  check(kind(p.key) == 'string' and kind(p.label) == 'string', 'option key and label required')
+  check(p.value ~= nil, 'option value must be an integer')
+  check(p.height == nil or (kind(p.height) == 'number' and p.height > 0), 'invalid option height')
+  check(tab or #children == 0, 'option does not accept children')
+  local c, d = theme.colors, theme.widgets.option
+  local function metric(name, fallback)
+    if p[name] ~= nil then return p[name] end
+    if d[name] ~= nil then return d[name] end
+    return fallback
+  end
+  local selected, sidebar = group.selected == p.value, group.appearance == 'sidebar'
+  local radio = group.role == 'radio_group'
+  local idle = metric('foreground', tab and c.muted_foreground or (sidebar and c.sidebar_foreground or c.foreground))
+  local active = metric('foreground', tab and c.foreground or (sidebar and c.sidebar_accent_foreground or c.accent_foreground))
+  if not group.enabled then idle, active = c.disabled_foreground, c.disabled_foreground end
+  local label = ouro.text {key='label', text=p.label, semantic=false,
+    flex=radio and 1 or nil, size=metric('font_size', theme.typography.size or f.typography_2),
+    weight=selected and (tab or sidebar) and 'medium' or 'normal', max_lines=1, overflow='ellipsis',
+    foreground=idle, states={hover=active, selected=active}}
+  local content = label
+  if tab then
+    local row = {key='content', semantic=false, gap=f.spacing_1, cross_alignment='center', label}
+    for i=1,#children do row[#row+1] = children[i] end
+    content = ouro.column {key='frame', semantic=false, gap=0, cross_alignment='stretch',
+      ouro.box {key='inset', semantic=false, flex=1, padding_x=metric('padding_x', f.spacing_3),
+        alignment='left', ouro.row(row)},
+      ouro.box {key='indicator', semantic=false, height=f.border_width_strong,
+        background=selected and group.enabled and c.primary or nil}}
+  elseif radio then
+    local fg = selected and active or idle
+    content = ouro.row {key='content', semantic=false, gap=8, cross_alignment='center',
+      ouro.box {key='indicator', semantic=false, width=12, height=12, radius=6,
+        background=selected and fg or nil, border_width=selected and 0 or 1, border=fg}, label}
+  end
+  return ouro.box {key=p.key, option=p.value, label=p.label,
+    height=metric('height', tab and f.spacing_7 or theme.controls.height),
+    padding_x=tab and 0 or metric('padding_x', f.spacing_2), alignment=not tab and 'left' or nil,
+    background=metric('background'), border=metric('border', c.border),
+    border_width=metric('border_width', theme.controls.border_width or 0),
+    radius=metric('radius', theme.controls.radius or f.radius_1),
+    states={hover=metric('hover', tab and c.secondary or (sidebar and c.sidebar_accent or c.accent)),
+      selected=metric('pressed', tab and transparent or (sidebar and c.sidebar_accent_selected or c.accent_selected))},
+    content}
+end
+ouro.option = ouro.stateless(function(p, children, theme, context) return selection_item(p, children, theme, context, false) end)
+ouro.radio = ouro.stateless(function(p, children, theme, context) return selection_item(p, children, theme, context, false) end)
+ouro.tab = ouro.stateless(function(p, children, theme, context) return selection_item(p, children, theme, context, true) end)
