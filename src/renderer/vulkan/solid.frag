@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "gradient.glsl"
 
 layout(location = 0) out vec4 target_color;
 
@@ -12,6 +15,7 @@ layout(push_constant) uniform Push {
     uint has_background;
     uint has_border;
     uint coverage_only;
+    uint gradient_index;
 };
 
 float roundedRectangleCoverage(vec2 point, vec4 rectangle, float radius_value) {
@@ -37,6 +41,7 @@ void main() {
         : 1.0;
     float border_coverage = has_border != 0u ? outer_coverage * (1.0 - inner_coverage) : 0.0;
     float background_coverage = has_background != 0u ? outer_coverage * inner_coverage : 0.0;
-    target_color = border * border_coverage + background * background_coverage;
+    vec4 background_value = gradient_index != 0u ? vec4(gradientSample(gradient_index, point)) / 65535.0 : background;
+    target_color = border * border_coverage + background_value * background_coverage;
     if (coverage_only != 0u) target_color = vec4(0.0, 0.0, 0.0, border_coverage + background_coverage);
 }

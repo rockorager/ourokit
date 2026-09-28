@@ -8,6 +8,7 @@ pub const core = @import("core/root.zig");
 pub const text = @import("text/root.zig");
 pub const path = @import("path/root.zig");
 pub const shadow = @import("shadow/root.zig");
+pub const paint = @import("paint/root.zig");
 pub const ImageCache = @import("image/cache.zig").Cache;
 pub const ImageBitmap = @import("image/pixels.zig").Bitmap;
 pub const scene = @import("scene/root.zig");
@@ -23,6 +24,7 @@ test {
     _ = text;
     _ = path;
     _ = shadow;
+    _ = paint;
     _ = scene;
     _ = layout;
     _ = render_object;

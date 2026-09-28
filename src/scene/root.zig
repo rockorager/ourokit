@@ -10,6 +10,7 @@ const ImageHandle = @import("../image/cache.zig").ImageHandle;
 const ImageCache = @import("../image/cache.zig").Cache;
 const paths = @import("../path/root.zig");
 const shadows = @import("../shadow/root.zig");
+const paint = @import("../paint/root.zig");
 
 pub const DamageTracker = @import("damage.zig").Tracker;
 
@@ -29,6 +30,8 @@ pub const Path = struct {
     scale: f32,
     bounds: RectI,
     color: Color,
+    /// Overrides color when present; endpoints are absolute device pixels.
+    gradient: ?paint.LinearGradient = null,
 };
 
 pub const Image = struct {
@@ -64,10 +67,17 @@ pub const Paragraph = struct {
 pub const DecoratedRectangle = struct {
     bounds: RectI,
     background: ?Color = null,
+    /// Overrides background when present; endpoints are absolute device pixels.
+    background_gradient: ?paint.LinearGradient = null,
     border_color: ?Color = null,
     border_width: u32 = 0,
     corner_radius: u32 = 0,
     blend: BlendMode = .source_over,
+
+    pub fn backgroundIsOpaque(self: DecoratedRectangle) bool {
+        if (self.background_gradient) |gradient| return gradient.isOpaque();
+        return if (self.background) |color| color.a == 255 else false;
+    }
 };
 
 /// Renderer-neutral painting values and immutable native resources. No Lua or
@@ -142,7 +152,7 @@ pub const DisplayList = struct {
                 if (rect.blend == .source) result = false;
                 // Rounded corners and translucent borders do not cover every
                 // pixel. Do not infer opacity from just the background alpha.
-                if (rect.corner_radius == 0 and rect.background != null and rect.background.?.a == 255 and
+                if (rect.corner_radius == 0 and rect.backgroundIsOpaque() and
                     (rect.border_color == null or rect.border_color.?.a == 255) and
                     std.meta.eql(RectI.intersect(rect.bounds, clips[depth]), bounds)) result = true;
             },
@@ -166,13 +176,15 @@ pub const DisplayList = struct {
                 if (value.identity == 0 or value.identity != value.path.identity or
                     !std.meta.eql(value.bounds, try paths.deviceBounds(value.path, value.origin, value.scale)))
                     return error.InvalidPath;
+                if (value.gradient) |gradient| try gradient.validate();
             },
             .shadow => |value| {
                 if (!std.meta.eql(value.bounds, try shadows.deviceBounds(value.shape)))
                     return error.InvalidShadow;
             },
             .decorated_rectangle => |rectangle| {
-                if (rectangle.background == null and rectangle.border_color == null)
+                if (rectangle.background_gradient) |gradient| try gradient.validate();
+                if (rectangle.background == null and rectangle.background_gradient == null and rectangle.border_color == null)
                     return error.EmptyDecoratedRectangle;
                 if ((rectangle.border_width == 0) != (rectangle.border_color == null))
                     return error.InvalidDecoratedRectangleBorder;
@@ -237,9 +249,9 @@ pub fn occludedByNextDraw(
             if (rectangle.corner_radius != 0) return false;
             const covered = RectI.intersect(rectangle.bounds, clips[depth]);
             if (covered.isEmpty()) continue;
-            const background = rectangle.background orelse return false;
+            if (rectangle.background == null and rectangle.background_gradient == null) return false;
             const fully_opaque = rectangle.blend == .source or
-                (background.a == 255 and
+                (rectangle.backgroundIsOpaque() and
                     (rectangle.border_color == null or rectangle.border_color.?.a == 255));
             return fully_opaque and contains(covered, bounds);
         },
@@ -676,4 +688,40 @@ fn testPathFrameAllocation(allocator: std.mem.Allocator, commands: []const Comma
     var frame = try Frame.init(allocator, commands, .full);
     defer frame.deinit();
     try frame.displayList().validate();
+}
+
+test "gradient frames copy values and damage opacity and occlusion follow paint changes" {
+    const viewport: RectI = .{ .x = 3, .y = 5, .width = 17, .height = 11 };
+    const gradient = try paint.LinearGradient.init(.{}, .{ .x = 20 }, &.{
+        .{ .offset = 0, .color = Color.rgba(0, 0, 0, 255) },
+        .{ .offset = 1, .color = Color.rgba(255, 255, 255, 255) },
+    });
+    var commands = [_]Command{.{ .decorated_rectangle = .{
+        .bounds = viewport,
+        .background = Color.rgba(255, 0, 0, 255),
+        .background_gradient = gradient,
+    } }};
+    const list: DisplayList = .{ .commands = &commands };
+    try list.validate();
+    try std.testing.expect(list.isOpaque(viewport));
+    try std.testing.expect(occludedByNextDraw(&commands, &.{viewport}, viewport));
+    var frame = try Frame.init(std.testing.allocator, &commands, .full);
+    defer frame.deinit();
+    var tracker = try DamageTracker.init(std.testing.allocator, 1);
+    defer tracker.deinit();
+    _ = try tracker.compare(&commands, viewport);
+    tracker.submitted();
+    commands[0].decorated_rectangle.background_gradient.?.end.x = 23;
+    try std.testing.expectEqual(viewport, (try tracker.compare(&commands, viewport)).regions[0]);
+    commands[0].decorated_rectangle.background_gradient = gradient;
+    try std.testing.expectEqual(@as(usize, 0), (try tracker.compare(&commands, viewport)).regions.len);
+    commands[0].decorated_rectangle.background_gradient.?.stops[1].color.a = 0;
+    try std.testing.expectEqual(viewport, (try tracker.compare(&commands, viewport)).regions[0]);
+    // The optional gradient overrides even an opaque legacy background.
+    try std.testing.expect(!list.isOpaque(viewport));
+    try std.testing.expect(!occludedByNextDraw(&commands, &.{viewport}, viewport));
+    try std.testing.expect(frame.displayList().isOpaque(viewport));
+    try std.testing.expectEqual(gradient, frame.command_storage[0].decorated_rectangle.background_gradient.?);
+    commands[0].decorated_rectangle.background_gradient.?.count = 1;
+    try std.testing.expectError(error.InvalidGradient, list.validate());
 }

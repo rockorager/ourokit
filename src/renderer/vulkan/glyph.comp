@@ -27,9 +27,11 @@ layout(push_constant) uniform Push {
     float image_top;
     float image_width;
     float image_height;
+    uint gradient_index;
 };
 
 #include "image.glsl"
+#include "gradient.glsl"
 
 uint channel16(uvec2 pixel, uint channel) {
     return channel < 2u ? ((pixel.x >> (channel * 16u)) & 65535u) : ((pixel.y >> ((channel - 2u) * 16u)) & 65535u);
@@ -75,9 +77,12 @@ void main() {
     uint atlas_index = (atlas_y + y) * atlas_width + atlas_x + x;
     uint coverage = (masks[atlas_index / 4u] >> ((atlas_index % 4u) * 8u)) & 255u;
     if (coverage == 0u) return;
+    uvec2 tint = gradient_index != 0u
+        ? pack16(gradientSample(gradient_index, vec2(left + int(x), top + int(y)) + vec2(0.5)))
+        : source;
     uvec4 covered_channels;
     for (uint i = 0u; i < 4u; ++i) {
-        covered_channels[i] = (channel16(source, i) * (coverage * 257u) + 32767u) / 65535u;
+        covered_channels[i] = (channel16(tint, i) * (coverage * 257u) + 32767u) / 65535u;
     }
     uvec2 covered = pack16(covered_channels);
     pixels[target_index] = sourceOver(covered, pixels[target_index]);

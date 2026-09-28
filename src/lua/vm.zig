@@ -130,6 +130,7 @@ pub const Vm = struct {
         c.lua_pushcclosure(state, @import("drag.zig").start, 1);
         c.lua_setfield(state, -2, "start_drag");
         @import("drawing.zig").install(state, allocator);
+        @import("paint.zig").install(state);
         c.lua_pushcclosure(state, c.ouro_os_time, 0);
         c.lua_setfield(state, -2, "time");
         c.lua_pushcclosure(state, monotonicMilliseconds, 0);

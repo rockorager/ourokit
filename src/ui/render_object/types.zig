@@ -30,6 +30,8 @@ pub const Box = struct {
     /// within the resolved padded content box. Null preserves tight propagation.
     alignment: ?Alignment = null,
     background: ?Color = null,
+    /// Overrides background; endpoints are local logical border-box coordinates.
+    background_gradient: ?@import("../../paint/root.zig").LinearGradient = null,
     border_color: ?Color = null,
     border_width: f32 = 0,
     corner_radius: f32 = 0,

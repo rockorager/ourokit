@@ -85,6 +85,29 @@ a persistent CPU cache and deduplicates uploads by mask key per submission.
 Combined path/shadow uploads are bounded to 32 MiB and device storage-buffer limits, and remain owned
 by the target until its fence completes. There is no GPU path atlas or new shader.
 
+## Linear-gradient fills
+
+`paint.LinearGradient` owns 2–8 stops and explicit endpoints by value. Scene
+decorations and paths optionally carry a gradient that overrides their solid
+background/color. Box endpoints start at the logical border-box origin; retained
+drawings share recording coordinates across primitives. Lowering translates and
+scales endpoints into absolute device pixels without stretching cropped canvases.
+Scene frames copy the value; damage comparisons include endpoints and stops.
+Only all-opaque stops can establish opaque rectangular coverage, subject to the
+same corner, border, and clip constraints as solid backgrounds.
+
+Both renderers prepare stops as premultiplied linear-light RGBA16 and nearest
+UNORM16 offsets. Sampling uses device pixel centers and separate strict f32
+subtract/multiply/add operations, then nearest UNORM16 projection and exact u32
+interpolation. Duplicate quantized stops use the last value at the boundary;
+outside the stop range, colors extend constantly. Coverage multiplies the
+sampled premultiplied color once before the existing source-over blend.
+
+Vulkan copies prepared values into a per-submission storage buffer, bounded to
+4 MiB and the device storage-buffer range, separately from the A8 upload budget.
+The buffer stays alive until the target fence completes. This changes neither
+the native plugin rectangle ABI nor the solid text, border, or shadow APIs.
+
 ## Outset box shadows
 
 `shadow.Style` is an optional Box value: signed offset/spread, nonnegative blur,

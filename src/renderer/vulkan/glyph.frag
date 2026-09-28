@@ -18,9 +18,11 @@ layout(push_constant) uniform Push {
     float image_top;
     float image_width;
     float image_height;
+    uint gradient_index;
 };
 
 #include "image.glsl"
+#include "gradient.glsl"
 
 layout(location = 0) out vec4 target_color;
 
@@ -39,5 +41,6 @@ void main() {
     }
     uint index = (atlas_origin.y + local.y) * atlas_width + atlas_origin.x + local.x;
     uint coverage = (masks[index / 4u] >> ((index % 4u) * 8u)) & 255u;
-    target_color = color * (float(coverage) / 255.0);
+    vec4 tint = gradient_index != 0u ? vec4(gradientSample(gradient_index, gl_FragCoord.xy)) / 65535.0 : color;
+    target_color = tint * (float(coverage) / 255.0);
 }

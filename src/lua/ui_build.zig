@@ -1567,7 +1567,12 @@ pub const UiBuild = struct {
         const shadow = tableOptionalShadow(state, 1) catch
             return luaError(state, "box shadow requires a color and finite x/y/spread and nonnegative blur");
         var visual: theming.Overrides = .{};
-        inline for (.{ "background", "foreground", "border", "border_width", "radius" }) |field| {
+        const background_kind = c.lua_getfield(state, 1, "background");
+        const background_gradient = @import("paint.zig").get(state, -1);
+        if (background_kind != c.type_nil and background_gradient == null)
+            visual.background = theming.color(state, -1) catch |err| return luaError(state, @errorName(err));
+        c.lua_settop(state, -2);
+        inline for (.{ "foreground", "border", "border_width", "radius" }) |field| {
             if (c.lua_getfield(state, 1, field) != c.type_nil) {
                 @field(visual, field) = if (@TypeOf(@field(visual, field)) == ?f32)
                     theming.extent(state, -1, false) catch |err| return luaError(state, @errorName(err))
@@ -1671,6 +1676,7 @@ pub const UiBuild = struct {
                 .padding = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y },
                 .alignment = alignment.value,
                 .background = if (paint) |p| owner.?.initialColor(p) else visual.background orelse surface.value,
+                .background_gradient = background_gradient,
                 .border_color = if (border_width > 0) visual.border orelse theme.border else null,
                 .border_width = border_width,
                 .corner_radius = visual.radius orelse 0,

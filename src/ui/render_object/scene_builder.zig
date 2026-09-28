@@ -50,6 +50,22 @@ pub const Builder = struct {
         } });
     }
 
+    pub fn gradientPath(self: *Builder, value: *const @import("../../path/root.zig").Path, origin: PointF, gradient: @import("../../paint/root.zig").LinearGradient) !void {
+        const device = try gradient.transformed(.{ .x = origin.x * self.scale, .y = origin.y * self.scale }, self.scale);
+        const start = self.count;
+        try self.path(value, origin, Color.rgba(0, 0, 0, 0));
+        if (self.count != start) self.storage[start].path.gradient = device;
+    }
+
+    /// The paint origin is independent of rectangle bounds so retained drawings
+    /// can share one gradient across multiple primitives without stretching it.
+    pub fn gradientRectangle(self: *Builder, bounds: RectF, gradient: @import("../../paint/root.zig").LinearGradient, origin: PointF, border_color: ?Color, border_width: f32, radius: f32) !void {
+        const device = try gradient.transformed(.{ .x = origin.x * self.scale, .y = origin.y * self.scale }, self.scale);
+        const start = self.count;
+        try self.decoratedRectangle(bounds, null, border_color, border_width, radius);
+        if (self.count != start) self.storage[start].decorated_rectangle.background_gradient = device;
+    }
+
     pub fn boxShadow(self: *Builder, bounds: RectF, radius: f32, style: @import("../../shadow/root.zig").Style) !void {
         try style.validate();
         const device = try self.deviceRect(bounds, .preserve_size);

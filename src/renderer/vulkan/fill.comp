@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "gradient.glsl"
 
 layout(local_size_x = 64) in;
 
@@ -22,6 +25,7 @@ layout(push_constant) uniform Push {
     uint border_width;
     uint flags;
     uint source_over;
+    uint gradient_index;
 };
 
 uint channel16(uvec2 pixel, uint channel) {
@@ -94,7 +98,8 @@ void main() {
         : 0u;
     uint coverage = min(border_coverage + background_coverage, 255u);
     if (coverage == 0u) return;
-    uvec2 source = addPixels(scalePixel(border, border_coverage), scalePixel(background, background_coverage));
+    uvec2 background_value = gradient_index != 0u ? pack16(gradientSample(gradient_index, point)) : background;
+    uvec2 source = addPixels(scalePixel(border, border_coverage), scalePixel(background_value, background_coverage));
     uint offset = y * target_width + x;
     if (source_over != 0u) {
         pixels[offset] = channel16(source, 3u) != 65535u ? sourceOver(source, pixels[offset]) : source;

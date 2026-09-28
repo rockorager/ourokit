@@ -119,7 +119,8 @@ fn constructCommands(state: *c.State, allocator: std.mem.Allocator, width: f32, 
             command.* = .{ .rectangle = try readRectangle(state, 6) };
         } else {
             _ = rawField(state, 6, "color");
-            const color = try @import("theme.zig").color(state, -1);
+            const gradient = @import("paint.zig").get(state, -1);
+            const color = if (gradient != null) @import("../core/color.zig").Color.rgba(0, 0, 0, 0) else try @import("theme.zig").color(state, -1);
             c.lua_settop(state, 6);
             const style: paths.Style = if (kind == .fill)
                 .{ .fill = try enumField(paths.FillRule, state, 6, "fill_rule", .nonzero) }
@@ -131,7 +132,7 @@ fn constructCommands(state: *c.State, allocator: std.mem.Allocator, width: f32, 
                     .miter_limit = try numberField(state, 6, "miter_limit", 4, true),
                 } };
             const path = try readPath(state, allocator, style, &segments);
-            command.* = .{ .path = .{ .path = path, .color = color } };
+            command.* = .{ .path = .{ .path = path, .color = color, .gradient = gradient } };
             // readPath leaves its owning userdata on top. Anchor it before
             // any subsequent parse/allocation can run Lua's collector.
             c.lua_rawseti(state, 5, @intCast(index));
@@ -236,8 +237,9 @@ fn readRectangle(state: *c.State, index: c_int) !Rectangle {
     const radius = try numberField(state, index, "corner_radius", 0, true);
     _ = rawField(state, index, "color");
     defer c.lua_settop(state, -2);
-    const color = try @import("theme.zig").color(state, -1);
-    return .{ .bounds = .{ .x = x, .y = y, .width = width, .height = height }, .color = color, .corner_radius = radius };
+    const gradient = @import("paint.zig").get(state, -1);
+    const color = if (gradient != null) @import("../core/color.zig").Color.rgba(0, 0, 0, 0) else try @import("theme.zig").color(state, -1);
+    return .{ .bounds = .{ .x = x, .y = y, .width = width, .height = height }, .color = color, .gradient = gradient, .corner_radius = radius };
 }
 
 fn numberField(state: *c.State, index: c_int, name: [*:0]const u8, default: ?f32, nonnegative: bool) !f32 {
@@ -480,6 +482,40 @@ fn testAllocation(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), get(state, -1).?.rectangles.len);
 }
 
+test "Lua gradient drawing retains value paints after Lua closes and crops recording coordinates" {
+    var drawing: *Drawing = undefined;
+    {
+        const state = try testState(std.testing.allocator);
+        defer c.lua_close(state);
+        try testCall(state,
+            \\local g = ouro.linear_gradient {from={x=1,y=2},to={x=17,y=6},
+            \\  stops={{offset=0,color='#ff0000'},{offset=1,color='#0000ff00'}}}
+            \\return ouro.drawing {width=23,height=19,commands={
+            \\  {kind='rectangle',x=7,y=3,width=13,height=9,color=g},
+            \\  {kind='fill',path={{'move',2,1},{'line',12,3},{'line',4,9},{'close'}},color=g},
+            \\  {kind='stroke',path={{'move',1,3},{'line',11,8}},width=2,color=g}}}
+        );
+        drawing = get(state, -1).?;
+        drawing.retain();
+    }
+    defer drawing.release();
+    const scene = @import("../scene/root.zig");
+    const PointF = @import("../core/geometry.zig").PointF;
+    var commands: [5]scene.Command = undefined;
+    var builder = try @import("../ui/render_object/scene_builder.zig").Builder.init(&commands, 1.5);
+    try drawing.paint(&builder, .{ .x = 10, .y = 20, .width = 8, .height = 7 });
+    try builder.displayList().validate();
+    try std.testing.expectEqual(@as(u32, 12), commands[0].push_clip_rect.width);
+    for ([_]@import("../paint/root.zig").LinearGradient{
+        commands[1].decorated_rectangle.background_gradient.?, commands[2].path.gradient.?, commands[3].path.gradient.?,
+    }) |gradient| {
+        // All primitives share recording coordinates, despite their offsets.
+        try std.testing.expectEqual(PointF{ .x = 16.5, .y = 33 }, gradient.start);
+        try std.testing.expectEqual(PointF{ .x = 40.5, .y = 39 }, gradient.end);
+        try std.testing.expectEqual(@as(u8, 0), gradient.stops[1].color.a);
+    }
+}
+
 fn testState(allocator: std.mem.Allocator) !*c.State {
     const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
     errdefer c.lua_close(state);
@@ -487,6 +523,7 @@ fn testState(allocator: std.mem.Allocator) !*c.State {
     try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 0, 0, 0, null));
     c.lua_createtable(state, 0, 1);
     install(state, allocator);
+    @import("paint.zig").install(state);
     c.lua_setglobal(state, "ouro");
     return state;
 }

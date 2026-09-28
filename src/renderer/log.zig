@@ -108,6 +108,14 @@ pub fn render(list: scene.DisplayList, output: []u8) ![]const u8 {
             },
         ),
     };
+    for (list.commands, 0..) |command, index| {
+        const gradient = switch (command) {
+            .path => |value| value.gradient,
+            .decorated_rectangle => |value| value.background_gradient,
+            else => null,
+        };
+        if (gradient) |value| try append(output, &used, "linear_gradient command={d} start={any} end={any} stops={any}\n", .{ index, value.start, value.end, value.stops[0..value.count] });
+    }
     return output[0..used];
 }
 

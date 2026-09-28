@@ -872,6 +872,7 @@ Boxes may opt into generated theme surfaces with `surface = "background" |
 including a fully transparent color; omitting both leaves the Box transparent.
 `background` and `border` accept `#RRGGBB` or `#RRGGBBAA` (including color
 values from `ouro.tokens`), using the same validation as buttons and inputs.
+`background` also accepts an immutable [`ouro.linear_gradient`](#linear-gradient-paints).
 Use [`ouro.color.with_alpha(color, alpha)`](design-system.md#deriving-a-color-with-alpha)
 to derive a color with a replacement alpha from 0 to 1 without slicing tokens.
 `border_width` and `radius` are finite, non-negative logical pixels, defaulting
@@ -1790,7 +1791,7 @@ ouro.canvas { key = "preview", drawing = picture, alt = "Overlapping color sampl
 The `rectangles` field is a dense array of at most 4096 records; an
 empty array is valid. Each record requires `x`, `y`, `width`, `height`, and
 `color`; `corner_radius` defaults to zero. Colors use `#RRGGBB` or `#RRGGBBAA`
-straight-alpha sRGB. Records paint in array order using linear-light
+straight-alpha sRGB, or an immutable `ouro.linear_gradient`. Records paint in array order using linear-light
 source-over blending. Coordinates are finite logical-pixel numbers representable
 in native `f32`; dimensions and radii must be nonnegative. Negative `x`/`y`
 are allowed. Numeric strings, nonfinite values, holes, and overflowing bounds
@@ -1848,7 +1849,7 @@ coverage in linear light; intersections within a stroke do not add extra alpha.
 Each rasterized path is limited to 8192 pixels per axis and 16 Mi pixels,
 including conservative stroke/antialiasing padding. The coverage cache is bounded
 to 32 MiB; extreme geometry may be accepted at construction but rejected when
-painted at a particular display scale. Arcs, dashes, gradients, drawing shadows,
+painted at a particular display scale. Arcs, dashes, drawing shadows,
 arbitrary transforms, and path clips are not implemented. Outset box shadows are
 available separately through the `shadow` field on `ouro.box`. The experimental native plugin
 ABI still exposes rectangles only; its ABI is unchanged.
@@ -1856,6 +1857,37 @@ ABI still exposes rectangles only; its ABI is unchanged.
 See `examples/drawing-composition.lua` for shared, replaced, and constrained
 rectangles, and `examples/path-storybook.lua` and `examples/path-composition.lua`
 for path styles and retained path drawings.
+
+### Linear-gradient paints
+
+```lua
+local ramp = ouro.linear_gradient {
+  from = {x = 0, y = 0}, to = {x = 180, y = 90},
+  stops = {{offset = 0, color = '#ef5350'},
+           {offset = 1, color = '#1976d200'}},
+}
+ouro.box {width = 180, height = 90, radius = 12, background = ramp}
+```
+
+Gradients work as Box `background` and drawing rectangle/fill/stroke `color`.
+Endpoints are explicit logical pixels relative to the Box border-box origin or
+the **recording origin**, not each drawing primitive. Display scaling transforms
+the endpoints; a constrained canvas crops without stretching the ramp. Text,
+borders, and shadows still require solid colors.
+
+The constructor copies the endpoint and stop tables into immutable userdata.
+It requires distinct finite endpoints and a dense array of 2–8 stops, with finite
+nondecreasing offsets in `[0,1]` and hex colors. Numeric strings are not accepted.
+Colors extend constantly beyond the first and last stops. Duplicate stops create
+hard edges: the last stop wins exactly at the quantized boundary. Stops and
+projection use nearest UNORM16 quantization. Colors interpolate in premultiplied
+linear light, so black-to-white has an sRGB midpoint near 188, and transparent
+colored stops do not create colored halos. Extreme endpoints or transforms that
+cannot support finite device-pixel projection are rejected. Radial and repeating
+gradients are not supported.
+
+See `examples/gradient-storybook.lua` and `examples/gradient-composition.lua` for
+rounded surfaces, hard stops, transparent ramps, and retained drawing sharing.
 
 ### Images and icons load asynchronously
 

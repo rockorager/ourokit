@@ -638,7 +638,9 @@ pub const Tree = struct {
         const clips = switch (target.object) {
             .box => |value| paint: {
                 if (value.shadow) |shadow| try builder.boxShadow(bounds, value.corner_radius, shadow);
-                if (value.border_color != null or
+                if (value.background_gradient) |gradient| {
+                    try builder.gradientRectangle(bounds, gradient, .{ .x = bounds.x, .y = bounds.y }, value.border_color, value.border_width, value.corner_radius);
+                } else if (value.border_color != null or
                     (value.background != null and value.corner_radius != 0))
                 {
                     try builder.decoratedRectangle(

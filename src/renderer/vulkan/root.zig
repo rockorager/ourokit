@@ -16,6 +16,7 @@ const scene = @import("../../scene/root.zig");
 const text = @import("../../text/root.zig");
 const path = @import("../../path/root.zig");
 const shadow = @import("../../shadow/root.zig");
+const paint = @import("../../paint/root.zig");
 const build_options = @import("ourokit_build_options");
 const ImageCache = @import("../../image/cache.zig").Cache;
 const ImagePlacement = @import("../image_sampling.zig").Placement;
@@ -68,6 +69,7 @@ pipeline_layout: c.VkPipelineLayout,
 pipeline: c.VkPipeline,
 glyph_pipeline: c.VkPipeline,
 atlas_descriptor_layout: c.VkDescriptorSetLayout,
+gradient_descriptor_layout: c.VkDescriptorSetLayout,
 presentation_render_pass: c.VkRenderPass,
 presentation_pipeline_layout: c.VkPipelineLayout,
 presentation_pipeline: c.VkPipeline,
@@ -661,6 +663,104 @@ pub const DmabufPlane = struct {
     stride: u32,
 };
 
+/// std430 record shared by all compute and graphics gradient samplers.
+const GradientRecord = extern struct {
+    start: [2]f32,
+    direction: [2]f32,
+    count: u32,
+    padding: [3]u32 = @splat(0),
+    stops: [8][4]u32,
+
+    fn init(value: paint.Prepared) GradientRecord {
+        var result: GradientRecord = .{
+            .start = .{ value.start.x, value.start.y },
+            .direction = .{ value.direction.x, value.direction.y },
+            .count = value.count,
+            .stops = undefined,
+        };
+        for (value.stops, &result.stops) |stop, *output| {
+            const color = packedLinear(stop.color);
+            output.* = .{ stop.offset, color[0], color[1], 0 };
+        }
+        return result;
+    }
+};
+
+fn commandGradient(command: scene.Command) ?paint.LinearGradient {
+    return switch (command) {
+        .decorated_rectangle => |value| value.background_gradient,
+        .path => |value| value.gradient,
+        else => null,
+    };
+}
+
+/// Immutable per-submission stop tables, never rasterized gradient images.
+/// Index zero in push constants means solid; index one selects the first record.
+const GradientUploads = struct {
+    pixels: ?Target = null,
+    pool: c.VkDescriptorPool = null,
+    descriptor: c.VkDescriptorSet = null,
+
+    fn init(renderer: *Renderer, commands: []const scene.Command) !GradientUploads {
+        const byte_limit = @min(4 * 1024 * 1024, renderer.max_image_pixels * 4);
+        var count: usize = 0;
+        for (commands) |command| if (commandGradient(command) != null) {
+            if (count == byte_limit / @sizeOf(GradientRecord)) return error.GradientUploadBudgetExceeded;
+            count += 1;
+        };
+        // Even solid-only submissions bind a valid table: a dynamically skipped
+        // SSBO remains a statically used descriptor in the shared shaders.
+        const byte_size = @max(count, 1) * @sizeOf(GradientRecord);
+        if (byte_size > byte_limit) return error.GradientUploadBudgetExceeded;
+        const records = try renderer.allocator.alloc(GradientRecord, @max(count, 1));
+        defer renderer.allocator.free(records);
+        @memset(records, std.mem.zeroes(GradientRecord));
+        var index: usize = 0;
+        for (commands) |command| if (commandGradient(command)) |gradient| {
+            records[index] = GradientRecord.init(try gradient.prepare());
+            index += 1;
+        };
+        var pixels = try Target.initBuffer(renderer, @intCast(byte_size / 4), 1, .encoded_rgba, renderer.max_image_pixels);
+        errdefer pixels.deinit(renderer);
+        @memcpy(@as([*]u8, @ptrCast(pixels.mapping))[0..byte_size], std.mem.sliceAsBytes(records));
+        var pool_size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 };
+        var pool_info: c.VkDescriptorPoolCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        var pool: c.VkDescriptorPool = undefined;
+        try vk(c.vkCreateDescriptorPool(renderer.device, &pool_info, null, &pool), error.CreateDescriptorPoolFailed);
+        errdefer c.vkDestroyDescriptorPool(renderer.device, pool, null);
+        var allocate: c.VkDescriptorSetAllocateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &renderer.gradient_descriptor_layout,
+        };
+        var descriptor: c.VkDescriptorSet = undefined;
+        try vk(c.vkAllocateDescriptorSets(renderer.device, &allocate, &descriptor), error.AllocateDescriptorSetFailed);
+        var buffer: c.VkDescriptorBufferInfo = .{ .buffer = pixels.buffer, .offset = 0, .range = byte_size };
+        var write: c.VkWriteDescriptorSet = .{
+            .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buffer,
+        };
+        c.vkUpdateDescriptorSets(renderer.device, 1, &write, 0, null);
+        return .{ .pixels = pixels, .pool = pool, .descriptor = descriptor };
+    }
+
+    fn deinit(self: *GradientUploads, renderer: *Renderer) void {
+        c.vkDestroyDescriptorPool(renderer.device, self.pool, null);
+        if (self.pixels) |*pixels| pixels.deinit(renderer);
+        self.* = .{};
+    }
+};
+
 /// Private persistent linear storage. Only the BGRA8 image is shared with the
 /// compositor. Presentation slots retain this allocation at a stable address,
 /// including when the host moves a pool into retirement during resize.
@@ -795,6 +895,7 @@ pub const DmabufTarget = struct {
     release_point: u64 = 0,
     image_uploads: ImageUploads = .{},
     coverage_uploads: CoverageUploads = .{},
+    gradient_uploads: GradientUploads = .{},
     /// Optional borrowed two-query timestamp pool for the presentation probe.
     /// The caller owns it and must wait for this target before reading/freeing.
     timestamp_pool: c.VkQueryPool = null,
@@ -1018,6 +1119,7 @@ pub const DmabufTarget = struct {
             _ = c.vkWaitForFences(renderer.device, 1, &self.fence, c.VK_TRUE, std.math.maxInt(u64));
         self.image_uploads.deinit(renderer);
         self.coverage_uploads.deinit(renderer);
+        self.gradient_uploads.deinit(renderer);
         c.vkDestroySemaphore(renderer.device, self.timeline, null);
         c.vkDestroyFence(renderer.device, self.fence, null);
         c.vkDestroyCommandPool(renderer.device, self.command_pool, null);
@@ -1036,6 +1138,7 @@ pub const DmabufTarget = struct {
                 self.gpu_pending = false;
                 self.image_uploads.deinit(renderer);
                 self.coverage_uploads.deinit(renderer);
+                self.gradient_uploads.deinit(renderer);
                 break :blk true;
             },
             c.VK_NOT_READY => false,
@@ -1049,6 +1152,7 @@ pub const DmabufTarget = struct {
         self.gpu_pending = false;
         self.image_uploads.deinit(renderer);
         self.coverage_uploads.deinit(renderer);
+        self.gradient_uploads.deinit(renderer);
     }
 
     pub fn exportSyncobjFd(self: *DmabufTarget, renderer: *Renderer) !std.posix.fd_t {
@@ -1095,6 +1199,7 @@ const PresentationPush = extern struct {
     has_background: u32,
     has_border: u32,
     coverage_only: u32 = 0,
+    gradient_index: u32 = 0,
 };
 
 const Push = extern struct {
@@ -1114,6 +1219,7 @@ const Push = extern struct {
     border_width: u32,
     flags: u32,
     source_over: u32,
+    gradient_index: u32 = 0,
 };
 
 const GlyphPush = extern struct {
@@ -1132,6 +1238,7 @@ const GlyphPush = extern struct {
     image_top: f32 = 0,
     image_width: f32 = 0,
     image_height: f32 = 0,
+    gradient_index: u32 = 0,
 };
 
 const PresentationGlyphPush = extern struct {
@@ -1147,6 +1254,7 @@ const PresentationGlyphPush = extern struct {
     image_top: f32 = 0,
     image_width: f32 = 0,
     image_height: f32 = 0,
+    gradient_index: u32 = 0,
 };
 
 const PresentationObjects = struct {
@@ -1175,7 +1283,7 @@ const PresentationObjects = struct {
     }
 };
 
-fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSetLayout, direct: bool) !PresentationObjects {
+fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSetLayout, gradient_layout: c.VkDescriptorSetLayout, direct: bool) !PresentationObjects {
     const attachment: c.VkAttachmentDescription = .{
         .flags = 0,
         .format = if (direct) c.VK_FORMAT_B8G8R8A8_SRGB else c.VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -1263,14 +1371,17 @@ fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSe
     var push_range: c.VkPushConstantRange = .{
         .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
-        .size = @sizeOf(PresentationPush),
+        .size = @max(@sizeOf(PresentationPush), @sizeOf(PresentationGlyphPush)),
     };
+    // Identical layouts/ranges keep set 1 bound across solid, glyph and image
+    // pipelines, while their existing set-0 atlas descriptors can change.
+    var set_layouts = [_]c.VkDescriptorSetLayout{ atlas_layout, gradient_layout };
     var layout_info: c.VkPipelineLayoutCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .setLayoutCount = 0,
-        .pSetLayouts = null,
+        .setLayoutCount = set_layouts.len,
+        .pSetLayouts = &set_layouts,
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_range,
     };
@@ -1426,17 +1537,8 @@ fn createPresentationPipeline(device: c.VkDevice, atlas_layout: c.VkDescriptorSe
     blend_attachment.dstColorBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     blend_attachment.dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
 
-    var glyph_push_range: c.VkPushConstantRange = .{
-        .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset = 0,
-        .size = @sizeOf(PresentationGlyphPush),
-    };
-    var glyph_layout_info = layout_info;
-    glyph_layout_info.setLayoutCount = 1;
-    glyph_layout_info.pSetLayouts = &atlas_layout;
-    glyph_layout_info.pPushConstantRanges = &glyph_push_range;
     var glyph_layout: c.VkPipelineLayout = undefined;
-    try vk(c.vkCreatePipelineLayout(device, &glyph_layout_info, null, &glyph_layout), error.CreatePipelineLayoutFailed);
+    try vk(c.vkCreatePipelineLayout(device, &layout_info, null, &glyph_layout), error.CreatePipelineLayoutFailed);
     errdefer c.vkDestroyPipelineLayout(device, glyph_layout, null);
     const glyph_fragment_bytes align(@alignOf(u32)) = @embedFile("ourokit_vulkan_glyph_fragment").*;
     const glyph_fragment = try createShader(device, &glyph_fragment_bytes);
@@ -1651,6 +1753,21 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     try vk(c.vkCreateDescriptorSetLayout(device, &descriptor_layout_info, null, &descriptor_layout), error.CreateDescriptorLayoutFailed);
     errdefer c.vkDestroyDescriptorSetLayout(device, descriptor_layout, null);
 
+    var gradient_binding: c.VkDescriptorSetLayoutBinding = .{
+        .binding = 0,
+        .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+    var gradient_layout_info: c.VkDescriptorSetLayoutCreateInfo = .{
+        .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &gradient_binding,
+    };
+    var gradient_descriptor_layout: c.VkDescriptorSetLayout = undefined;
+    try vk(c.vkCreateDescriptorSetLayout(device, &gradient_layout_info, null, &gradient_descriptor_layout), error.CreateDescriptorLayoutFailed);
+    errdefer c.vkDestroyDescriptorSetLayout(device, gradient_descriptor_layout, null);
+    var compute_set_layouts = [_]c.VkDescriptorSetLayout{ descriptor_layout, gradient_descriptor_layout };
     var push_range: c.VkPushConstantRange = .{
         .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
@@ -1660,8 +1777,8 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
         .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .pNext = null,
         .flags = 0,
-        .setLayoutCount = 1,
-        .pSetLayouts = &descriptor_layout,
+        .setLayoutCount = compute_set_layouts.len,
+        .pSetLayouts = &compute_set_layouts,
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_range,
     };
@@ -1728,7 +1845,7 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     errdefer c.vkDestroyDescriptorSetLayout(device, atlas_descriptor_layout, null);
 
     const presentation = if (linear_supported)
-        try createPresentationPipeline(device, atlas_descriptor_layout, false)
+        try createPresentationPipeline(device, atlas_descriptor_layout, gradient_descriptor_layout, false)
     else
         std.mem.zeroes(PresentationObjects);
     errdefer presentation.deinit(device);
@@ -1736,7 +1853,7 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
     c.vkGetPhysicalDeviceFormatProperties(selection.physical_device, c.VK_FORMAT_B8G8R8A8_SRGB, &srgb_properties);
     const srgb_required = c.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | c.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
     const direct_presentation = if (linear_supported and srgb_properties.optimalTilingFeatures & srgb_required == srgb_required)
-        try createPresentationPipeline(device, atlas_descriptor_layout, true)
+        try createPresentationPipeline(device, atlas_descriptor_layout, gradient_descriptor_layout, true)
     else
         std.mem.zeroes(PresentationObjects);
     errdefer direct_presentation.deinit(device);
@@ -1807,6 +1924,7 @@ pub fn init(allocator: std.mem.Allocator) !Renderer {
         .pipeline = pipeline,
         .glyph_pipeline = glyph_pipeline,
         .atlas_descriptor_layout = atlas_descriptor_layout,
+        .gradient_descriptor_layout = gradient_descriptor_layout,
         .presentation_render_pass = presentation.render_pass,
         .presentation_pipeline_layout = presentation.layout,
         .presentation_pipeline = presentation.pipeline,
@@ -1855,6 +1973,7 @@ pub fn deinit(self: *Renderer) void {
     c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
     c.vkDestroyDescriptorSetLayout(self.device, self.descriptor_layout, null);
     c.vkDestroyDescriptorSetLayout(self.device, self.atlas_descriptor_layout, null);
+    c.vkDestroyDescriptorSetLayout(self.device, self.gradient_descriptor_layout, null);
     c.vkDestroyDevice(self.device, null);
     c.vkDestroyInstance(self.instance, null);
     self.* = undefined;
@@ -1960,6 +2079,8 @@ pub fn renderResources(
     defer image_uploads.deinit(self);
     var coverage_uploads = try CoverageUploads.init(self, list.commands, target);
     defer coverage_uploads.deinit(self);
+    var gradient_uploads = try GradientUploads.init(self, list.commands);
+    defer gradient_uploads.deinit(self);
     try vk(c.vkResetDescriptorPool(self.device, self.descriptor_pool, 0), error.ResetDescriptorPoolFailed);
     var descriptor_allocate_info: c.VkDescriptorSetAllocateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2037,10 +2158,10 @@ pub fn renderResources(
 
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     switch (list.damage) {
-        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, descriptor_set),
+        .full => self.renderRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, descriptor_set),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, descriptor_set);
+            if (!clipped.isEmpty()) self.renderRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, descriptor_set);
         },
     }
     var host_barrier: c.VkMemoryBarrier = .{
@@ -2153,6 +2274,8 @@ pub fn renderGraphicsResources(
     errdefer image_uploads.deinit(self);
     var coverage_uploads = try CoverageUploads.init(self, list.commands, null);
     errdefer coverage_uploads.deinit(self);
+    var gradient_uploads = try GradientUploads.init(self, list.commands);
+    errdefer gradient_uploads.deinit(self);
     try vk(c.vkResetCommandBuffer(target.command_buffer, 0), error.ResetCommandBufferFailed);
     var begin_info: c.VkCommandBufferBeginInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2237,10 +2360,10 @@ pub fn renderGraphicsResources(
     // guarantees that replaying the entire scene defines every pixel.
     const damage: scene.Damage = if (target.direct and target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED) .full else list.damage;
     switch (damage) {
-        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads),
+        .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads),
         .regions => |regions| for (regions) |region| {
             const clipped = RectI.intersect(region, bounds);
-            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads);
+            if (!clipped.isEmpty()) self.renderPresentationRegion(list.commands, target, clipped, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads);
         },
     }
     if (!target.direct) self.convertPresentation(target);
@@ -2295,6 +2418,7 @@ pub fn renderGraphicsResources(
     if (has_freetype and atlas_uploaded) glyphs.?.uploaded();
     target.image_uploads = image_uploads;
     target.coverage_uploads = coverage_uploads;
+    target.gradient_uploads = gradient_uploads;
     target.layout = c.VK_IMAGE_LAYOUT_GENERAL;
     target.gpu_pending = true;
     if (target.explicit_sync) {
@@ -2326,56 +2450,65 @@ fn renderPresentationRegion(
     paragraphs: ?*const text.ParagraphCache,
     images: *const ImageUploads,
     coverage: *const CoverageUploads,
+    gradients: *const GradientUploads,
 ) void {
+    c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.presentation_pipeline_layout, 1, 1, &gradients.descriptor, 0, null);
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
     var image_index: usize = 0;
     var coverage_index: usize = 0;
-    for (commands, 0..) |command, index| switch (command) {
-        .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
-            self.presentationFill(target, damage, color, .source),
-        .push_clip_rect => |clip| {
-            depth += 1;
-            clips[depth] = RectI.intersect(clips[depth - 1], clip);
-        },
-        .pop_clip => depth -= 1,
-        .solid_rectangle => |rectangle| {
-            const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
-            if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
-                self.presentationFill(target, bounds, rectangle.color, rectangle.blend);
-        },
-        .decorated_rectangle => |rectangle| self.presentationDecoratedRectangle(
-            target,
-            RectI.intersect(rectangle.bounds, clips[depth]),
-            rectangle,
-        ),
-        .image => |value| {
-            const entry = &images.entries.items[image_index];
-            self.drawPresentationImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
-            image_index += 1;
-        },
-        inline .path, .shadow => |value| {
-            const entry = coverage.entries.items[coverage_index];
-            if (entry.resource_index) |resource_index|
-                self.drawPresentationCoverage(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &coverage.resources.items[resource_index]);
-            coverage_index += 1;
-        },
-        .glyph_run => |run| self.drawPresentationGlyphRun(
-            run,
-            target,
-            clips[depth],
-            glyphs orelse unreachable,
-            shapes orelse unreachable,
-        ),
-        .paragraph => |paragraph| self.drawPresentationParagraph(
-            paragraph,
-            target,
-            clips[depth],
-            glyphs orelse unreachable,
-            paragraphs orelse unreachable,
-        ),
-    };
+    var gradient_index: u32 = 0;
+    for (commands, 0..) |command, index| {
+        const has_gradient = commandGradient(command) != null;
+        if (has_gradient) gradient_index += 1;
+        const current_gradient = if (has_gradient) gradient_index else 0;
+        switch (command) {
+            .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
+                self.presentationFill(target, damage, color, .source),
+            .push_clip_rect => |clip| {
+                depth += 1;
+                clips[depth] = RectI.intersect(clips[depth - 1], clip);
+            },
+            .pop_clip => depth -= 1,
+            .solid_rectangle => |rectangle| {
+                const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
+                if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
+                    self.presentationFill(target, bounds, rectangle.color, rectangle.blend);
+            },
+            .decorated_rectangle => |rectangle| self.presentationDecoratedRectangle(
+                target,
+                RectI.intersect(rectangle.bounds, clips[depth]),
+                rectangle,
+                current_gradient,
+            ),
+            .image => |value| {
+                const entry = &images.entries.items[image_index];
+                self.drawPresentationImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
+                image_index += 1;
+            },
+            inline .path, .shadow => |value| {
+                const entry = coverage.entries.items[coverage_index];
+                if (entry.resource_index) |resource_index|
+                    self.drawPresentationCoverage(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &coverage.resources.items[resource_index], current_gradient);
+                coverage_index += 1;
+            },
+            .glyph_run => |run| self.drawPresentationGlyphRun(
+                run,
+                target,
+                clips[depth],
+                glyphs orelse unreachable,
+                shapes orelse unreachable,
+            ),
+            .paragraph => |paragraph| self.drawPresentationParagraph(
+                paragraph,
+                target,
+                clips[depth],
+                glyphs orelse unreachable,
+                paragraphs orelse unreachable,
+            ),
+        }
+    }
 }
 
 fn presentationFill(
@@ -2444,6 +2577,7 @@ fn presentationDecoratedRectangle(
     target: *const DmabufTarget,
     clipped_bounds: RectI,
     rectangle: scene.DecoratedRectangle,
+    gradient_index: u32,
 ) void {
     if (clipped_bounds.isEmpty()) return;
     c.vkCmdBindPipeline(target.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, if (target.direct) self.direct_presentation.pipeline else self.presentation_pipeline);
@@ -2472,8 +2606,9 @@ fn presentationDecoratedRectangle(
         .corner_radius = @floatFromInt(rectangle.corner_radius),
         .border_width = @floatFromInt(rectangle.border_width),
         .bounds = .{ rectangle.bounds.x, rectangle.bounds.y, @intCast(right), @intCast(bottom) },
-        .has_background = @intFromBool(rectangle.background != null),
+        .has_background = @intFromBool(rectangle.background != null or gradient_index != 0),
         .has_border = @intFromBool(rectangle.border_color != null),
+        .gradient_index = gradient_index,
     };
     if (rectangle.blend == .source) {
         push.coverage_only = 1;
@@ -2522,62 +2657,71 @@ fn renderRegion(
     paragraphs: ?*const text.ParagraphCache,
     images: *const ImageUploads,
     coverage: *const CoverageUploads,
+    gradients: *const GradientUploads,
     descriptor: c.VkDescriptorSet,
 ) void {
+    c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 1, 1, &gradients.descriptor, 0, null);
     var clips: [max_clip_depth + 1]RectI = undefined;
     clips[0] = damage;
     var depth: usize = 0;
     var image_index: usize = 0;
     var coverage_index: usize = 0;
-    for (commands, 0..) |command, index| switch (command) {
-        .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
-            self.fill(target, damage, color, .source),
-        .push_clip_rect => |clip| {
-            depth += 1;
-            clips[depth] = RectI.intersect(clips[depth - 1], clip);
-        },
-        .pop_clip => depth -= 1,
-        .solid_rectangle => |rectangle| {
-            const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
-            if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
-                self.fill(target, bounds, rectangle.color, rectangle.blend);
-        },
-        .decorated_rectangle => |rectangle| self.decoratedRectangle(
-            target,
-            RectI.intersect(rectangle.bounds, clips[depth]),
-            rectangle,
-        ),
-        .image => |value| {
-            const entry = &images.entries.items[image_index];
-            self.drawImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
-            image_index += 1;
-            c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
-        },
-        inline .path, .shadow => |value| {
-            const entry = coverage.entries.items[coverage_index];
-            if (entry.resource_index) |resource_index|
-                self.drawCoverage(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &coverage.resources.items[resource_index]);
-            coverage_index += 1;
-            c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
-        },
-        .glyph_run => |run| self.drawGlyphRun(
-            run,
-            target,
-            clips[depth],
-            glyphs orelse unreachable,
-            shapes orelse unreachable,
-        ),
-        .paragraph => |paragraph| self.drawParagraph(
-            paragraph,
-            target,
-            clips[depth],
-            glyphs orelse unreachable,
-            paragraphs orelse unreachable,
-        ),
-    };
+    var gradient_index: u32 = 0;
+    for (commands, 0..) |command, index| {
+        const has_gradient = commandGradient(command) != null;
+        if (has_gradient) gradient_index += 1;
+        const current_gradient = if (has_gradient) gradient_index else 0;
+        switch (command) {
+            .clear => |color| if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], damage))
+                self.fill(target, damage, color, .source),
+            .push_clip_rect => |clip| {
+                depth += 1;
+                clips[depth] = RectI.intersect(clips[depth - 1], clip);
+            },
+            .pop_clip => depth -= 1,
+            .solid_rectangle => |rectangle| {
+                const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
+                if (!scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], bounds))
+                    self.fill(target, bounds, rectangle.color, rectangle.blend);
+            },
+            .decorated_rectangle => |rectangle| self.decoratedRectangle(
+                target,
+                RectI.intersect(rectangle.bounds, clips[depth]),
+                rectangle,
+                current_gradient,
+            ),
+            .image => |value| {
+                const entry = &images.entries.items[image_index];
+                self.drawImage(target, RectI.intersect(value.bounds, clips[depth]), entry.placement, &images.resources.items[entry.resource_index]);
+                image_index += 1;
+                c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
+            },
+            inline .path, .shadow => |value| {
+                const entry = coverage.entries.items[coverage_index];
+                if (entry.resource_index) |resource_index|
+                    self.drawCoverage(target, RectI.intersect(value.bounds, clips[depth]), value.color, entry.bounds, &coverage.resources.items[resource_index], current_gradient);
+                coverage_index += 1;
+                c.vkCmdBindDescriptorSets(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, &descriptor, 0, null);
+            },
+            .glyph_run => |run| self.drawGlyphRun(
+                run,
+                target,
+                clips[depth],
+                glyphs orelse unreachable,
+                shapes orelse unreachable,
+            ),
+            .paragraph => |paragraph| self.drawParagraph(
+                paragraph,
+                target,
+                clips[depth],
+                glyphs orelse unreachable,
+                paragraphs orelse unreachable,
+            ),
+        }
+    }
 }
 
-fn drawCoverage(self: *Renderer, target: *const Target, clip: RectI, color: Color, mask_bounds: RectI, resource: *const CoverageUploads.Resource) void {
+fn drawCoverage(self: *Renderer, target: *const Target, clip: RectI, color: Color, mask_bounds: RectI, resource: *const CoverageUploads.Resource, gradient_index: u32) void {
     const bounds = RectI.intersect(clip, mask_bounds);
     if (bounds.isEmpty()) return;
     c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.glyph_pipeline);
@@ -2592,6 +2736,7 @@ fn drawCoverage(self: *Renderer, target: *const Target, clip: RectI, color: Colo
         .bottom = @intCast(@as(i64, bounds.y) + bounds.height),
         .atlas_x = @intCast(@as(i64, bounds.x) - mask_bounds.x),
         .atlas_y = @intCast(@as(i64, bounds.y) - mask_bounds.y),
+        .gradient_index = gradient_index,
     };
     c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(GlyphPush), &push);
     const count = @as(u64, bounds.width) * bounds.height;
@@ -2604,7 +2749,7 @@ fn drawCoverage(self: *Renderer, target: *const Target, clip: RectI, color: Colo
     c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 }
 
-fn drawPresentationCoverage(self: *Renderer, target: *const DmabufTarget, clip: RectI, color: Color, mask_bounds: RectI, resource: *const CoverageUploads.Resource) void {
+fn drawPresentationCoverage(self: *Renderer, target: *const DmabufTarget, clip: RectI, color: Color, mask_bounds: RectI, resource: *const CoverageUploads.Resource, gradient_index: u32) void {
     const bounds = RectI.intersect(clip, mask_bounds);
     if (bounds.isEmpty()) return;
     var scissor: c.VkRect2D = .{
@@ -2629,6 +2774,7 @@ fn drawPresentationCoverage(self: *Renderer, target: *const DmabufTarget, clip: 
         .bounds = .{ bounds.x, bounds.y, @intCast(@as(i64, bounds.x) + bounds.width), @intCast(@as(i64, bounds.y) + bounds.height) },
         .atlas_origin = .{ @intCast(@as(i64, bounds.x) - mask_bounds.x), @intCast(@as(i64, bounds.y) - mask_bounds.y) },
         .atlas_width_value = mask_bounds.width,
+        .gradient_index = gradient_index,
     };
     c.vkCmdPushConstants(target.command_buffer, self.presentation_glyph_pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT, 0, @sizeOf(PresentationGlyphPush), &push);
     c.vkCmdDraw(target.command_buffer, 6, 1, 0, 0);
@@ -2750,6 +2896,7 @@ fn decoratedRectangle(
     target: *const Target,
     clipped_bounds: RectI,
     rectangle: scene.DecoratedRectangle,
+    gradient_index: u32,
 ) void {
     if (clipped_bounds.isEmpty()) return;
     c.vkCmdBindPipeline(self.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
@@ -2769,9 +2916,10 @@ fn decoratedRectangle(
         .border = packedLinear(border),
         .corner_radius = rectangle.corner_radius,
         .border_width = rectangle.border_width,
-        .flags = @as(u32, @intFromBool(rectangle.background != null)) |
+        .flags = @as(u32, @intFromBool(rectangle.background != null or gradient_index != 0)) |
             (@as(u32, @intFromBool(rectangle.border_color != null)) << 1),
         .source_over = @intFromBool(rectangle.blend == .source_over),
+        .gradient_index = gradient_index,
     };
     c.vkCmdPushConstants(self.command_buffer, self.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(Push), &push);
     const count = @as(u64, clipped_bounds.width) * clipped_bounds.height;
@@ -3357,6 +3505,36 @@ test "Vulkan glyph atlas matches exact software text rendering" {
     try renderer.renderText(list, &target, &glyphs, &shapes);
     try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);
+
+    // A8 path descriptors must restore the atlas before text; rebinding text's
+    // set 0 must in turn preserve the gradient table used by the next solid.
+    const triangle = try path.Path.create(std.testing.allocator, &.{
+        .{ .move = .{} }, .{ .line = .{ .x = 8 } }, .{ .line = .{ .x = 4, .y = 3 } }, .close,
+    }, .{ .fill = .nonzero });
+    defer triangle.release();
+    const gradient = try paint.LinearGradient.init(.{ .x = 8 }, .{ .x = 32 }, &.{
+        .{ .offset = 0, .color = Color.rgba(240, 80, 10, 255) },
+        .{ .offset = 1, .color = Color.rgba(20, 80, 230, 180) },
+    });
+    const mixed = [_]scene.Command{
+        commands[0],
+        commands[1],
+        .{ .path = .{ .path = triangle, .identity = triangle.identity, .origin = .{ .x = 8, .y = 30 }, .scale = 1, .bounds = try path.deviceBounds(triangle, .{ .x = 8, .y = 30 }, 1), .color = Color.rgba(0, 0, 0, 0), .gradient = gradient } },
+        commands[2],
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 24, .y = 30, .width = 8, .height = 3 }, .background_gradient = gradient } },
+        .pop_clip,
+    };
+    const mixed_list: scene.DisplayList = .{ .commands = &mixed };
+    try software.renderText(mixed_list, .{ .pixels = &expected, .width = 160, .height = 36, .stride = 160 * 4, .format = .rgba8_unorm }, &software_glyphs, &shapes);
+    try renderer.renderText(mixed_list, &target, &glyphs, &shapes);
+    try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    for ([_]*GraphicsReadback{ &graphics, &direct_graphics }) |output| {
+        try renderer.renderGraphicsResources(mixed_list, &output.target, &glyphs, &shapes, null, null, false);
+        try output.target.wait(&renderer);
+        for (0..36) |y| for (0..160) |x|
+            try output.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
+    }
 }
 
 test "Vulkan positioned paragraphs match exact software text rendering" {
@@ -3643,7 +3821,9 @@ test "graphics image sampling matches software and upload copies outlive source 
         .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = 32, .height = 12 } },
     };
     c.vkCmdBeginRenderPass(renderer.command_buffer, &pass, c.VK_SUBPASS_CONTENTS_INLINE);
-    renderer.renderPresentationRegion(&commands, &target, .{ .x = 0, .y = 0, .width = 32, .height = 12 }, null, null, null, &uploads, &.{});
+    var gradients = try GradientUploads.init(&renderer, &commands);
+    defer gradients.deinit(&renderer);
+    renderer.renderPresentationRegion(&commands, &target, .{ .x = 0, .y = 0, .width = 32, .height = 12 }, null, null, null, &uploads, &.{}, &gradients);
     renderer.convertPresentation(&target);
     c.vkCmdEndRenderPass(renderer.command_buffer);
     barrier.srcAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -4494,5 +4674,265 @@ test "Vulkan shadows interleave with paths and outlive CPU caches on both graphi
     for (0..32) |y| for (0..48) |x| {
         try linear.expectPixel(x, y, transparent[(y * 48 + x) * 4 ..][0..4].*);
         try std.testing.expectEqual(encoded_steps[(y * 48 + x) * 4 ..][0..4].*, direct.pixel(x, y));
+    };
+}
+
+test "Vulkan gradient tables copy prepared stops and enforce budgets before target changes" {
+    try std.testing.expectEqual(@as(usize, 160), @sizeOf(GradientRecord));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(GradientRecord, "direction"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(GradientRecord, "count"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(GradientRecord, "stops"));
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const gradient = try paint.LinearGradient.init(.{ .x = -2 }, .{ .x = 6 }, &.{
+        .{ .offset = 0, .color = Color.rgba(255, 0, 0, 255) },
+        .{ .offset = 1, .color = Color.rgba(0, 255, 0, 128) },
+    });
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(11, 22, 33, 255) },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 4, .height = 2 }, .background_gradient = gradient } },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 4, .height = 2 }, .background_gradient = gradient } },
+    };
+    var uploads = try GradientUploads.init(&renderer, &commands);
+    defer uploads.deinit(&renderer);
+    const records = @as([*]const GradientRecord, @ptrCast(@alignCast(uploads.pixels.?.mapping)))[0..2];
+    try std.testing.expectEqual(@as(u64, 320), uploads.pixels.?.byte_size);
+    try std.testing.expectEqual([2]f32{ -2, 0 }, records[0].start);
+    try std.testing.expectEqual([2]f32{ 0.125, 0 }, records[0].direction);
+    try std.testing.expectEqual([4]u32{ 0, 65535, 0xffff0000, 0 }, records[0].stops[0]);
+    try std.testing.expectEqual([4]u32{ 65535, 0x80800000, 0x80800000, 0 }, records[1].stops[1]);
+    try std.testing.expectEqual([4]u32{ 0, 0, 0, 0 }, records[1].stops[7]);
+    commands[1].decorated_rectangle.background_gradient.?.stops[0].color = Color.rgba(0, 0, 255, 0);
+    try std.testing.expectEqual(@as(u32, 65535), records[0].stops[0][1]);
+    commands[1].decorated_rectangle.background_gradient = gradient;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator, r: *Renderer, batch: []const scene.Command) !void {
+            const original = r.allocator;
+            r.allocator = allocator;
+            defer r.allocator = original;
+            var copies = try GradientUploads.init(r, batch);
+            defer copies.deinit(r);
+        }
+    }.check, .{ &renderer, @as([]const scene.Command, &commands) });
+    var target = try Target.init(&renderer, 4, 2);
+    defer target.deinit(&renderer);
+    try renderer.render(.{ .commands = commands[0..1] }, &target);
+    var before: [32]u8 = undefined;
+    try target.readPixels(&before, 16, .rgba8_unorm);
+    var linear = try GraphicsReadback.init(&renderer, 4, 2);
+    defer linear.deinit(&renderer);
+    var direct = try GraphicsReadback.initMode(&renderer, 4, 2, null, true);
+    defer direct.deinit(&renderer);
+    const original_limit = renderer.max_image_pixels;
+    renderer.max_image_pixels = 79; // One word below two 160-byte records.
+    try std.testing.expectError(error.GradientUploadBudgetExceeded, renderer.render(.{ .commands = &commands }, &target));
+    var after: [32]u8 = undefined;
+    try target.readPixels(&after, 16, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &before, &after);
+    for ([_]*DmabufTarget{ &linear.target, &direct.target }) |output| {
+        try std.testing.expectError(error.GradientUploadBudgetExceeded, renderer.renderGraphicsResources(.{ .commands = &commands }, output, null, null, null, null, false));
+        try std.testing.expect(!output.gpu_pending);
+        try std.testing.expectEqual(@as(c.VkImageLayout, c.VK_IMAGE_LAYOUT_UNDEFINED), output.layout);
+        try std.testing.expect(output.gradient_uploads.pixels == null);
+        if (output.linear) |attachment| try std.testing.expect(!attachment.initialized);
+    }
+    renderer.max_image_pixels = 80;
+    var exact = try GradientUploads.init(&renderer, &commands);
+    exact.deinit(&renderer);
+    renderer.max_image_pixels = original_limit;
+    commands[2].decorated_rectangle.background_gradient.?.count = 9;
+    try std.testing.expectError(error.InvalidGradient, renderer.render(.{ .commands = &commands }, &target));
+    try target.readPixels(&after, 16, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &before, &after);
+}
+
+test "Vulkan gradients sample exact linear16 stops ties and projection" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var target = try Target.init(&renderer, 17, 9);
+    defer target.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 17, 9);
+    defer linear.deinit(&renderer);
+    var direct = try GraphicsReadback.initMode(&renderer, 17, 9, null, true);
+    defer direct.deinit(&renderer);
+    const gradients = [_]paint.LinearGradient{
+        try paint.LinearGradient.init(.{ .x = -1.5, .y = 3.5 }, .{ .x = 6.5, .y = 3.5 }, &.{
+            .{ .offset = 0, .color = Color.rgba(128, 64, 32, 192) },
+            .{ .offset = 1, .color = Color.rgba(16, 200, 250, 85) },
+        }),
+        try paint.LinearGradient.init(.{ .x = 3.5, .y = 2.5 }, .{ .x = 11.5, .y = 6.5 }, &.{
+            .{ .offset = 0.1, .color = Color.rgba(255, 0, 0, 255) },
+            .{ .offset = 0.25, .color = Color.rgba(0, 255, 0, 255) },
+            .{ .offset = 0.25, .color = Color.rgba(0, 0, 255, 128) },
+            .{ .offset = 0.5, .color = Color.rgba(255, 255, 255, 255) },
+            .{ .offset = 0.500001, .color = Color.rgba(0, 255, 255, 0) },
+            .{ .offset = 0.75, .color = Color.rgba(80, 180, 30, 180) },
+            .{ .offset = 0.9, .color = Color.rgba(255, 255, 255, 255) },
+            .{ .offset = 1, .color = Color.rgba(255, 255, 255, 255) },
+        }),
+        try paint.LinearGradient.init(.{ .x = 11.25, .y = -3.5 }, .{ .x = -7.5, .y = 13.125 }, &.{
+            .{ .offset = 0, .color = Color.rgba(255, 0, 0, 255) },
+            .{ .offset = 1, .color = Color.rgba(0, 0, 255, 0) },
+        }),
+        // Translate the native no-FMA adversarial point to pixel (0.5,0.5).
+        // Both endpoint deltas remain exactly (17,13) in binary32.
+        try paint.LinearGradient.init(.{ .x = -15.5810546875, .y = -5.9951171875 }, .{ .x = 1.4189453125, .y = 7.0048828125 }, &.{
+            .{ .offset = 0, .color = Color.rgba(255, 0, 0, 255) },
+            .{ .offset = 1, .color = Color.rgba(0, 0, 255, 255) },
+        }),
+    };
+    for (gradients, 0..) |gradient, index| {
+        const commands = [_]scene.Command{.{
+            .decorated_rectangle = .{
+                .bounds = .{ .x = 0, .y = 0, .width = 17, .height = 9 },
+                .background = Color.rgba(255, 0, 255, 255), // Must be overridden.
+                .background_gradient = gradient,
+                .blend = .source,
+            },
+        }};
+        try renderer.render(.{ .commands = &commands }, &target);
+        const pixels = @as([*]const LinearRgba16, @ptrCast(@alignCast(target.mapping)))[0 .. 17 * 9];
+        const prepared = try gradient.prepare();
+        for (pixels, 0..) |pixel, i| try std.testing.expectEqual(prepared.sample(.{
+            .x = @as(f32, @floatFromInt(i % 17)) + 0.5,
+            .y = @as(f32, @floatFromInt(i / 17)) + 0.5,
+        }), pixel);
+        // Independent asymmetric native golden at t=1/4, now sampled by GPU.
+        if (index == 0) try std.testing.expectEqual(LinearRgba16{ .r = 8016, .g = 5052, .b = 5756, .a = 42469 }, pixels[0]);
+        if (index == 1) {
+            // (7.5,4.5) is exactly halfway: the quantized transparent tie wins.
+            try std.testing.expectEqual(LinearRgba16.transparent, pixels[4 * 17 + 7]);
+            try std.testing.expectEqual(LinearRgba16{ .r = 0, .g = 0, .b = 32896, .a = 32896 }, pixels[3 * 17 + 5]);
+        }
+        if (index == 3) try std.testing.expectEqual(LinearRgba16{ .r = 14335, .g = 0, .b = 51200, .a = 65535 }, pixels[0]);
+        const list: scene.DisplayList = .{ .commands = &commands };
+        // Legacy opaque background cannot make a translucent gradient opaque.
+        if (!gradient.isOpaque()) try std.testing.expectError(error.OpaqueSceneRequired, renderer.renderGraphicsResources(list, &direct.target, null, null, null, null, false));
+        const output = if (gradient.isOpaque()) &direct else &linear;
+        try renderer.renderGraphicsResources(list, &output.target, null, null, null, null, false);
+        try output.target.wait(&renderer);
+        for (pixels, 0..) |pixel, i| {
+            const encoded = pixel.toSrgba8();
+            try output.expectPixel(i % 17, i / 17, .{ encoded.r, encoded.g, encoded.b, encoded.a });
+        }
+    }
+}
+
+test "Vulkan gradients interleave paths images solids and survive damage and async lifetimes" {
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const geometry = try path.Path.create(std.testing.allocator, &.{
+        .{ .move = .{ .x = 0, .y = 0 } },
+        .{ .line = .{ .x = 35, .y = 11 } },
+        .{ .line = .{ .x = 8, .y = 29 } },
+        .close,
+    }, .{ .fill = .nonzero });
+    defer geometry.release();
+    const empty = try path.Path.create(std.testing.allocator, &.{}, .{ .fill = .nonzero });
+    defer empty.release();
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try @import("../image_test.zig").insertFixture(&images);
+    const gradient = try paint.LinearGradient.init(.{ .x = 3.5, .y = 2.5 }, .{ .x = 56.5, .y = 33.5 }, &.{
+        .{ .offset = 0, .color = Color.rgba(250, 100, 30, 230) },
+        .{ .offset = 0.5, .color = Color.rgba(80, 210, 160, 180) },
+        .{ .offset = 0.5, .color = Color.rgba(190, 60, 220, 200) },
+        .{ .offset = 1, .color = Color.rgba(30, 80, 250, 0) },
+    });
+    const reverse = try paint.LinearGradient.init(.{ .x = 56.5, .y = 33.5 }, .{ .x = 3.5, .y = 2.5 }, gradient.stops[0..gradient.count]);
+    const origin: paint.PointF = .{ .x = -1.25, .y = 3.5 };
+    const translated: paint.PointF = .{ .x = 26.75, .y = 6.5 };
+    var commands = [_]scene.Command{
+        .{ .clear = Color.rgba(24, 42, 65, 255) },
+        .{ .push_clip_rect = .{ .x = 2, .y = 1, .width = 60, .height = 37 } },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 1, .y = 1, .width = 61, .height = 36 }, .background_gradient = gradient, .corner_radius = 4, .border_width = 1, .border_color = Color.rgba(150, 170, 200, 220) } },
+        .{ .path = .{ .path = empty, .identity = empty.identity, .origin = .{}, .scale = 1, .bounds = try path.deviceBounds(empty, .{}, 1), .color = Color.rgba(255, 0, 0, 255), .gradient = reverse } },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = -99, .y = 0, .width = 1, .height = 1 }, .background_gradient = reverse } },
+        .{ .image = .{ .image = image, .bounds = .{ .x = 5, .y = 6, .width = 13, .height = 9 }, .fit = .fill } },
+        .{ .path = .{ .path = geometry, .identity = geometry.identity, .origin = origin, .scale = 1, .bounds = try path.deviceBounds(geometry, origin, 1), .color = Color.rgba(255, 0, 0, 255), .gradient = reverse } },
+        .{ .path = .{ .path = geometry, .identity = geometry.identity, .origin = translated, .scale = 1, .bounds = try path.deviceBounds(geometry, translated, 1), .color = Color.rgba(20, 170, 230, 120) } },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 38, .y = 24, .width = 19, .height = 10 }, .background_gradient = gradient, .corner_radius = 2 } },
+        .{ .solid_rectangle = .{ .bounds = .{ .x = 41, .y = 5, .width = 7, .height = 5 }, .color = Color.rgba(220, 170, 40, 160) } },
+        .pop_clip,
+    };
+    const list: scene.DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{
+        .{ .x = 0, .y = 0, .width = 21, .height = 40 },
+        .{ .x = 21, .y = 0, .width = 43, .height = 40 },
+    } } };
+    const software = @import("../software/root.zig");
+    var expected: [64 * 40 * 4]u8 = undefined;
+    const expected_target: software.Target = .{ .pixels = &expected, .width = 64, .height = 40, .stride = 64 * 4, .format = .rgba8_unorm };
+    try software.renderResources(list, expected_target, null, null, null, &images);
+    var target = try Target.init(&renderer, 64, 40);
+    defer target.deinit(&renderer);
+    try renderer.renderResources(list, &target, null, null, null, &images);
+    var actual: [expected.len]u8 = undefined;
+    try target.readPixels(&actual, 64 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    var direct = try GraphicsReadback.initMode(&renderer, 64, 40, null, true);
+    defer direct.deinit(&renderer);
+    // Keep the existing one-byte direct tolerance, comparing each added draw
+    // over the prior quantized destination rather than accumulated drift.
+    try software.render(.{ .commands = commands[0..1] }, expected_target);
+    for (commands[2 .. commands.len - 1], 2..) |command, index| {
+        const batch = [_]scene.Command{ commands[1], command, .pop_clip };
+        try software.renderResources(.{ .commands = &batch }, expected_target, null, null, null, &images);
+        var prefix: [commands.len]scene.Command = undefined;
+        @memcpy(prefix[0 .. index + 1], commands[0 .. index + 1]);
+        prefix[index + 1] = .pop_clip;
+        try renderer.renderGraphicsResources(.{ .commands = prefix[0 .. index + 2] }, &direct.target, null, null, null, &images, false);
+        try direct.target.wait(&renderer);
+        for (0..40) |y| for (0..64) |x| {
+            const pixel = expected[(y * 64 + x) * 4 ..][0..4];
+            try direct.expectPixel(x, y, pixel.*);
+            pixel.* = direct.pixel(x, y);
+        };
+    }
+    try renderer.renderGraphicsResources(list, &direct.target, null, null, null, &images, false);
+    commands[0].clear.a = 0;
+    // Source blending exercises the erase/add presentation pair with a table.
+    commands[8].decorated_rectangle.blend = .source;
+    var transparent: [expected.len]u8 = undefined;
+    const transparent_target: software.Target = .{ .pixels = &transparent, .width = 64, .height = 40, .stride = 64 * 4, .format = .rgba8_unorm };
+    try software.renderResources(list, transparent_target, null, null, null, &images);
+    try renderer.renderResources(list, &target, null, null, null, &images);
+    try target.readPixels(&actual, 64 * 4, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &transparent, &actual);
+    var linear = try GraphicsReadback.init(&renderer, 64, 40);
+    defer linear.deinit(&renderer);
+    var shared = try GraphicsReadback.initWithLinear(&renderer, 64, 40, linear.target.linear);
+    defer shared.deinit(&renderer);
+    try renderer.renderGraphicsResources(list, &linear.target, null, null, null, &images, false);
+    // A second queued slot updates only the source rectangle in shared storage.
+    // Every command is traversed, so clipped and empty gradients retain indexes.
+    commands[8].decorated_rectangle.background_gradient = reverse;
+    try software.renderResources(.{ .commands = &commands }, transparent_target, null, null, null, &images);
+    try renderer.renderGraphicsResources(.{ .commands = &commands, .damage = .{ .regions = &.{commands[8].decorated_rectangle.bounds} } }, &shared.target, null, null, null, &images, false);
+    for ([_]*DmabufTarget{ &direct.target, &linear.target, &shared.target }) |output| {
+        try std.testing.expect(output.gpu_pending);
+        try std.testing.expectEqual(@as(u64, 5 * 160), output.gradient_uploads.pixels.?.byte_size);
+        try std.testing.expect(output.gradient_uploads.descriptor != null);
+    }
+    // Poison every caller-owned stop table before fences are collected.
+    @memset(&commands, .{ .clear = Color.rgba(0, 0, 0, 0) });
+    try images.release(image);
+    try linear.target.wait(&renderer);
+    try shared.target.wait(&renderer);
+    try vk(c.vkWaitForFences(renderer.device, 1, &direct.target.fence, c.VK_TRUE, std.math.maxInt(u64)), error.DeviceLost);
+    try std.testing.expect(try direct.target.ready(&renderer));
+    for ([_]*DmabufTarget{ &direct.target, &linear.target, &shared.target }) |output|
+        try std.testing.expect(output.gradient_uploads.pixels == null and output.gradient_uploads.descriptor == null);
+    for (0..40) |y| for (0..64) |x| {
+        try shared.expectPixel(x, y, transparent[(y * 64 + x) * 4 ..][0..4].*);
+        try std.testing.expectEqual(expected[(y * 64 + x) * 4 ..][0..4].*, direct.pixel(x, y));
     };
 }

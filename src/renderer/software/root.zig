@@ -11,6 +11,7 @@ const ImagePlacement = @import("../image_sampling.zig").Placement;
 const GlyphPosition = @import("../glyph_position.zig").Position;
 const paths = @import("../../path/root.zig");
 const shadows = @import("../../shadow/root.zig");
+const paint = @import("../../paint/root.zig");
 
 pub const has_freetype = build_options.freetype;
 pub const GlyphCache = if (has_freetype)
@@ -191,19 +192,20 @@ fn renderRegion(
         },
         .decorated_rectangle => |rectangle| {
             const bounds = RectI.intersect(rectangle.bounds, clips[depth]);
-            drawDecoratedRectangle(target, bounds, rectangle);
+            try drawDecoratedRectangle(target, bounds, rectangle);
         },
         .path => |value| {
             const bounds = RectI.intersect(value.bounds, clips[depth]);
             if (bounds.isEmpty()) continue;
             const mask = try masks.get(value.path, value.origin, value.scale);
-            drawCoverage(target, bounds, mask.bounds, mask.pixels, value.color);
+            const gradient = if (value.gradient) |g| try g.prepare() else null;
+            drawCoverage(target, bounds, mask.bounds, mask.pixels, value.color, gradient);
         },
         .shadow => |value| {
             const bounds = RectI.intersect(value.bounds, clips[depth]);
             if (bounds.isEmpty()) continue;
             const mask = try shadow_masks.get(value.shape);
-            drawCoverage(target, bounds, mask.bounds, mask.pixels, value.color);
+            drawCoverage(target, bounds, mask.bounds, mask.pixels, value.color, null);
         },
         .image => |value| {
             const bitmap = try images.?.get(value.image);
@@ -364,7 +366,7 @@ fn fill(target: RasterTarget, bounds: RectI, color: Color, blend: scene.BlendMod
     }
 }
 
-fn drawCoverage(target: RasterTarget, bounds: RectI, mask_bounds: RectI, pixels: []const u8, color: Color) void {
+fn drawCoverage(target: RasterTarget, bounds: RectI, mask_bounds: RectI, pixels: []const u8, color: Color, gradient: ?paint.Prepared) void {
     const source_color = LinearRgba16.fromColor(color);
     const left: usize = @intCast(bounds.x);
     const top: usize = @intCast(bounds.y);
@@ -372,7 +374,8 @@ fn drawCoverage(target: RasterTarget, bounds: RectI, mask_bounds: RectI, pixels:
     const source_y: usize = @intCast(@as(i64, bounds.y) - mask_bounds.y);
     for (0..bounds.height) |row| for (0..bounds.width) |column| {
         const coverage = pixels[(source_y + row) * mask_bounds.width + source_x + column];
-        const source = source_color.scaled(@as(u16, coverage) * 257);
+        const sampled = if (gradient) |g| g.sample(.{ .x = @as(f32, @floatFromInt(left + column)) + 0.5, .y = @as(f32, @floatFromInt(top + row)) + 0.5 }) else source_color;
+        const source = sampled.scaled(@as(u16, coverage) * 257);
         const offset = (top + row) * target.width + left + column;
         target.pixels[offset] = source.over(target.pixels[offset]);
     };
@@ -382,8 +385,9 @@ fn drawDecoratedRectangle(
     target: RasterTarget,
     clipped_bounds: RectI,
     rectangle: scene.DecoratedRectangle,
-) void {
+) !void {
     if (clipped_bounds.isEmpty()) return;
+    const gradient = if (rectangle.background_gradient) |g| try g.prepare() else null;
     const left: u32 = @intCast(clipped_bounds.x);
     const top: u32 = @intCast(clipped_bounds.y);
     const right: u32 = @intCast(@as(i64, clipped_bounds.x) + clipped_bounds.width);
@@ -408,14 +412,17 @@ fn drawDecoratedRectangle(
                 multiply(outer_coverage, 255 - inner_coverage)
             else
                 0;
-            const background_coverage = if (rectangle.background != null)
+            const background_coverage = if (rectangle.background != null or gradient != null)
                 multiply(outer_coverage, inner_coverage)
             else
                 0;
             const coverage = addSaturating(border_coverage, background_coverage);
             if (coverage == 0) continue;
             const source = coveredColor(rectangle.border_color, border_coverage).plus(
-                coveredColor(rectangle.background, background_coverage),
+                if (gradient) |g|
+                    g.sample(.{ .x = @as(f32, @floatFromInt(x)) + 0.5, .y = @as(f32, @floatFromInt(y)) + 0.5 }).scaled(@as(u16, background_coverage) * 257)
+                else
+                    coveredColor(rectangle.background, background_coverage),
             );
             blendCoveredPixel(target, x, y, source, coverage, rectangle.blend);
         }
@@ -796,6 +803,40 @@ test "repeated faint blends retain linear precision until presentation" {
     try render(.{ .commands = &commands }, .{ .pixels = &pixel, .width = 1, .height = 1, .stride = 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
     // sRGB-encode((254/255)^100) = 214.372, unlike per-draw encoding.
     try std.testing.expectEqualSlices(u8, &.{ 214, 214, 214, 255 }, &pixel);
+}
+
+test "gradient rectangles sample device centers in linear light without transparent color halos" {
+    const black = Color.rgba(0, 0, 0, 255);
+    const white = Color.rgba(255, 255, 255, 255);
+    const ramp = try paint.LinearGradient.init(.{ .x = 0.5 }, .{ .x = 4.5 }, &.{
+        .{ .offset = 0, .color = black }, .{ .offset = 1, .color = white },
+    });
+    const fade = try paint.LinearGradient.init(.{ .x = 0.5 }, .{ .x = 4.5 }, &.{
+        .{ .offset = 0, .color = Color.rgba(255, 0, 0, 255) },
+        .{ .offset = 1, .color = Color.rgba(0, 0, 255, 0) },
+    });
+    const commands = [_]scene.Command{
+        .{ .clear = white },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 5, .height = 1 }, .background_gradient = ramp } },
+        .{ .decorated_rectangle = .{ .bounds = .{ .x = 0, .y = 1, .width = 5, .height = 1 }, .background_gradient = fade } },
+    };
+    var pixels: [5 * 2 * 4]u8 = undefined;
+    const target: Target = .{ .pixels = &pixels, .width = 5, .height = 2, .stride = 20, .format = .rgba8_unorm, .allocator = std.testing.allocator };
+    try render(.{ .commands = &commands }, target);
+    // Independently sRGB-encoded linear 0, .25, .5, .75, 1. A wrong encoded
+    // interpolation gives 0,64,128,191,255; straight-alpha mixes blue into row2.
+    for ([_]u8{ 0, 137, 188, 225, 255 }, 0..) |v, x| {
+        try std.testing.expectEqualSlices(u8, &.{ v, v, v, 255 }, pixels[x * 4 ..][0..4]);
+        try std.testing.expectEqualSlices(u8, &.{ 255, v, v, 255 }, pixels[20 + x * 4 ..][0..4]);
+    }
+    const expected = pixels;
+    @memset(&pixels, 23);
+    const damage = [_]RectI{
+        .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        .{ .x = 2, .y = 0, .width = 3, .height = 2 },
+    };
+    try render(.{ .commands = &commands, .damage = .{ .regions = &damage } }, target);
+    try std.testing.expectEqualSlices(u8, &expected, &pixels);
 }
 
 test "glyph masks are linear coverage in both polarities and transparent output" {

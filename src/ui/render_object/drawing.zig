@@ -3,13 +3,17 @@ const geometry = @import("../../core/geometry.zig");
 const Color = @import("../../core/color.zig").Color;
 const Builder = @import("scene_builder.zig").Builder;
 const Path = @import("../../path/root.zig").Path;
+const LinearGradient = @import("../../paint/root.zig").LinearGradient;
 
 pub const Rectangle = struct {
     bounds: geometry.RectF,
-    color: Color,
+    color: Color = Color.rgba(0, 0, 0, 0),
+    /// Overrides color; endpoints use recording coordinates, not rectangle bounds.
+    gradient: ?LinearGradient = null,
     corner_radius: f32 = 0,
 
     fn validate(self: Rectangle) !void {
+        if (self.gradient) |gradient| try gradient.validate();
         const bounds = self.bounds;
         if (!std.math.isFinite(bounds.x) or !std.math.isFinite(bounds.y) or
             !std.math.isFinite(bounds.width) or !std.math.isFinite(bounds.height) or
@@ -26,7 +30,9 @@ pub const Rectangle = struct {
             .width = self.bounds.width,
             .height = self.bounds.height,
         };
-        if (self.corner_radius == 0)
+        if (self.gradient) |gradient|
+            try builder.gradientRectangle(positioned, gradient, .{ .x = origin.x, .y = origin.y }, null, 0, self.corner_radius)
+        else if (self.corner_radius == 0)
             try builder.solidRectangle(positioned, self.color)
         else
             try builder.decoratedRectangle(positioned, self.color, null, 0, self.corner_radius);
@@ -35,7 +41,7 @@ pub const Rectangle = struct {
 
 pub const Command = union(enum) {
     rectangle: Rectangle,
-    path: struct { path: *Path, color: Color },
+    path: struct { path: *Path, color: Color = Color.rgba(0, 0, 0, 0), gradient: ?LinearGradient = null },
 };
 
 /// Host-owned, immutable logical-coordinate paint snapshot. Leases belong to
@@ -68,7 +74,7 @@ pub const Drawing = struct {
         if (commands.len > max_rectangles) return error.DrawingCapacityExceeded;
         for (commands) |command| switch (command) {
             .rectangle => |rectangle| try rectangle.validate(),
-            .path => {},
+            .path => |value| if (value.gradient) |gradient| try gradient.validate(),
         };
         const self = try create(allocator, size, &.{});
         errdefer self.release();
@@ -107,7 +113,10 @@ pub const Drawing = struct {
         for (self.rectangles) |rectangle| try rectangle.paint(builder, bounds);
         for (self.commands) |command| switch (command) {
             .rectangle => |rectangle| try rectangle.paint(builder, bounds),
-            .path => |value| try builder.path(value.path, .{ .x = bounds.x, .y = bounds.y }, value.color),
+            .path => |value| if (value.gradient) |gradient|
+                try builder.gradientPath(value.path, .{ .x = bounds.x, .y = bounds.y }, gradient)
+            else
+                try builder.path(value.path, .{ .x = bounds.x, .y = bounds.y }, value.color),
         };
         try builder.popClip();
     }
