@@ -566,7 +566,7 @@ pub const Tree = struct {
             var current: ?InstanceHandle = target;
             while (current) |candidate| {
                 if (try self.semanticId(candidate) == slot.id) break;
-                current = try self.parentOf(candidate);
+                current = try self.scrollParent(candidate);
                 // The direct child's offset is exactly the viewport's scroll
                 // translation. Exclude it rather than canceling large floats.
                 if (current) |parent| if (try self.semanticId(parent) != slot.id) {
@@ -605,9 +605,20 @@ pub const Tree = struct {
             const slot = try self.activeSlot(handle);
             const object = try self.render_tree.objectAt(slot.render.?);
             if (object == .scroll and object.scroll.axis == axis) return handle;
-            current = try self.parentOf(handle);
+            current = try self.scrollParent(handle);
         }
         return null;
+    }
+
+    /// Floating content keeps logical ancestry for events and focus, but is
+    /// outside ancestor scroll viewports for wheel routing and reveal requests.
+    pub fn scrollParent(self: *Tree, handle: InstanceHandle) !?InstanceHandle {
+        const parent = (try self.parentOf(handle)) orelse return null;
+        const render = try self.renderObject(parent);
+        if ((try self.render_tree.objectAt(render)) == .anchored and
+            !std.meta.eql(self.render_tree.firstChild(render).?, try self.renderObject(handle)))
+            return null;
+        return parent;
     }
 
     /// Layout may reduce a scroll extent after content changes. Synchronize
@@ -942,6 +953,46 @@ test "scroll offset is retained by keyed instance and clamped by layout" {
     try std.testing.expectEqual(@as(f32, 25), try instances.scrollOffset(scroll));
     try std.testing.expect(try instances.scrollBy(scroll, 1000));
     try std.testing.expectEqual(@as(f32, 70), try instances.scrollOffset(scroll));
+
+    try instances.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try instances.collectRetired();
+    try scheduler.destroyScope(window_scope);
+}
+
+test "floating subtrees fence scroll lookup and reveal but retain inner scrolling" {
+    const Constraints = @import("../layout/constraints.zig").Constraints;
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 16, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 10);
+    defer renders.deinit();
+    var instances: Tree = undefined;
+    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 10);
+    defer instances.deinit();
+    try instances.reconcile(&.{
+        .{ .id = 1, .parent = null, .object = .{ .scroll = .{} }, .ensure_visible = 8 },
+        .{ .id = 2, .parent = 1, .object = .{ .stack = .{} } },
+        .{ .id = 3, .parent = 2, .object = .{ .anchored = .{} }, .parent_data = .{ .stack = .{ .y = 20 } } },
+        .{ .id = 4, .parent = 3, .object = .{ .box = .{ .width = 23, .height = 17 } } },
+        .{ .id = 5, .parent = 3, .object = .{ .box = .{ .width = 60, .height = 40 } } },
+        .{ .id = 6, .parent = 5, .object = .{ .scroll = .{} }, .ensure_visible = 8 },
+        .{ .id = 7, .parent = 6, .object = .{ .stack = .{} } },
+        .{ .id = 8, .parent = 7, .object = .{ .box = .{ .width = 31, .height = 19 } }, .parent_data = .{ .stack = .{ .y = 110 } } },
+        .{ .id = 9, .parent = 2, .object = .{ .box = .{ .width = 13, .height = 21 } }, .parent_data = .{ .stack = .{ .y = 160 } } },
+    });
+    _ = try renders.layout((try instances.rootRenderObject()).?, Constraints.tight(.{ .width = 100, .height = 60 }));
+    const outer = instances.handleForId(1).?;
+    const inner = instances.handleForId(6).?;
+    try std.testing.expectEqual(outer, (try instances.nearestScroll(instances.handleForId(4).?, .vertical)).?);
+    try std.testing.expect((try instances.nearestScroll(instances.handleForId(5).?, .vertical)) == null);
+    try std.testing.expectEqual(inner, (try instances.nearestScroll(instances.handleForId(8).?, .vertical)).?);
+    try std.testing.expect(try instances.revealScrollTargets());
+    try std.testing.expectEqual(@as(f32, 0), try instances.scrollOffset(outer));
+    try std.testing.expectEqual(@as(f32, 89), try instances.scrollOffset(inner));
+    try std.testing.expect(!try instances.revealScrollTargets());
 
     try instances.reconcile(&.{});
     try scheduler.applyQueuedCancellations();

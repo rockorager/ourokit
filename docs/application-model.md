@@ -845,9 +845,10 @@ constraints, but fixed/auto tracks and their children may extend beyond it;
 they do not silently shrink to fit. Grid and wrapping Flex do not clip paint.
 Use an `ouro.scroll` viewport to clip it; native callers can also use
 `Box.clip=true` (not currently exposed by Lua's Box constructor).
-Existing hit testing always gates traversal at every ancestor's layout bounds,
+Ordinary hit testing gates traversal at every ancestor's layout bounds,
 even without paint clipping: visible overflow outside those bounds is not
-clickable. Clip does not enlarge hit regions.
+clickable. Clip does not enlarge hit regions. Anchored floating children use
+the separate overlay traversal described below.
 
 Native callers use `types.Flex.wrap/run_gap`, `types.Grid`,
 `GridTracks.init(&.{ .{.fixed=112}, .auto, .{.fr=2} })`, and zero-based
@@ -915,6 +916,58 @@ default zero). Public `ouro.stack`, however, currently lowers children through
 the `.overlay` context and leaves them at the origin; those offset properties
 are not applied there. Stack's own `flex` property works only when its parent
 is a nonwrapping row or column; stack children cannot use `flex`.
+
+#### In-window anchored overlays
+
+`ouro.anchored` takes one inline trigger and an optional second child containing
+floating content. Its normal layout size is exactly the trigger's size; opening
+the floating child does not move surrounding content. The floating child is
+measured against the window viewport, positioned after normal layout, and drawn
+after ordinary content. Its paint and hit testing escape ancestor Scroll clips
+and layout bounds, while event routing and retained identity keep their logical
+ancestry. Later overlays draw above earlier ones; nested overlays draw above
+their containing overlay. Hidden ancestors suppress their overlays.
+
+Options are `side="top" | "bottom" | "left" | "right"` (default `"bottom"`),
+`alignment="start" | "center" | "end"` (default `"start"`, along the side's
+cross axis), `gap=4`, `margin=8`, and `flip=true`. Gap and margin are finite,
+non-negative logical pixels. The floating child receives loose bounds inside
+the viewport margin. Placement tries the opposite side when it fits better,
+then clamps to the viewport margin. Resizing, scrolling the trigger, and changing
+content size update placement natively. Use an inner Scroll for oversized content.
+The primitive itself neither clips nor decorates the floating child.
+Wheel routing and focus/`ensure_visible` scrolling stop at the floating child's
+boundary: they may scroll a viewport inside the popup, but not the trigger's
+ancestor viewport. Scrolling the trigger itself still moves the popup.
+
+Lua owns visibility, dismissal and focus policy. Omit the second child to close
+the overlay; the trigger retains its identity. Use existing Box keyboard hooks
+for Escape and `on_pointer_down_outside` for outside dismissal. A floating Box
+with `role="dialog"` opts into existing modal focus containment and restoration;
+without that role the overlay does not automatically move or trap focus. A
+nonmodal recipe can restore its trigger with `focus_request` on close.
+
+```lua
+local opened = ouro.signal(false)
+local function close() opened:set(false) end
+-- Inside a build function:
+return ouro.anchored {
+  key="menu", side="bottom", alignment="start", gap=6,
+  ouro.button {key="trigger", label="Actions", on_press=function() opened:set(true) end},
+  opened() and ouro.box {
+    key="panel", role="dialog", label="Actions", width=200, padding=12, surface="popover",
+    on_cancel=close,
+    on_pointer_down_outside={button=272, propagate=false, handler=close},
+    ouro.button {key="done", label="Done", on_press=close},
+  } or nil,
+}
+```
+
+This is not `ouro.popup`: it creates no Wayland surface, takes no compositor
+grab, requires no real-input token, and cannot draw outside the current window.
+Use `ouro.popup` when a compositor-managed popup surface is required. Neither
+API is implicitly substituted for the other. Native callers use
+`Object.anchored = types.Anchored{...}` with `.none` on both child edges.
 
 ### Inherited visual defaults
 
@@ -2090,6 +2143,17 @@ Unknown filter fields and invalid values reject the build instead of becoming
 catch-all handlers. `enter`/`leave` describe hit-target transitions, including
 transitions between descendants. Pointer capture after a press retains the
 original target through motion and release even when the press was consumed.
+
+`on_pointer_down_outside` is a separate Box hook with required `handler` and
+`propagate`, plus an optional `button` filter. It only observes pointer presses,
+so it accepts no `kinds`, `keys`, or `states`. Before normal capture/default
+dispatch, visible outside listeners run in reverse logical child order, children
+before parents. A hit on the listening Box or any logical descendant—including
+a floating descendant—is inside and does not invoke it. Modal boundaries limit
+eligible listeners to the modal subtree, but those listeners can observe a press
+outside the modal. `propagate=false` consumes the press without activating the
+underlying control, even if Lua ignores the dismissal request. Dismissal itself
+is still a Lua state change; returning a value never closes an overlay.
 
 Each callback receives a fresh, owned event table:
 

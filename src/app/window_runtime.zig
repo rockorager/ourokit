@@ -977,6 +977,16 @@ pub const WindowRuntime = struct {
                 .text_input, .text_input_focus => unreachable,
             };
             if (!self.instances.isActive(target) or !self.instances.isVisible(target)) continue;
+            if (event == .pointer and event.pointer.event == .button and event.pointer.event.button.state == .pressed) {
+                const has_outside = for (self.pointer_bindings.entries) |entry| {
+                    if (entry.handler) |handler| if (handler.kind == .pointer_down_outside) break true;
+                } else false;
+                if (has_outside) if (try self.instances.rootRenderObject()) |root| {
+                    var input = pointerListenerEvent(event).?;
+                    input.phase = .capture;
+                    if (try self.dispatchOutsidePointer(root, target, input, callback_service)) continue;
+                };
+            }
             if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, target)) continue;
             if (pointerListenerEvent(event)) |input| {
                 // Release bookkeeping is not a vetoable default action: a
@@ -1241,6 +1251,21 @@ pub const WindowRuntime = struct {
         if (!handler.filter.matches(event)) return false;
         try self.spawnCallback(callbacks, handler.id, try self.instances.scope(target), &.{.{ .input = event }});
         return !handler.propagate;
+    }
+
+    // Outside listeners are composition policy, not an overlay lifetime rule.
+    // Reverse logical order gives nested/later scopes the first opportunity to
+    // consume a press. Descendants, including floated descendants, are inside.
+    fn dispatchOutsidePointer(self: *WindowRuntime, render: ui.render_object.NodeHandle, hit: ui.instance.InstanceHandle, event: listener.Event, callbacks: anytype) anyerror!bool {
+        if (!try self.tree.isVisible(render)) return false;
+        var child = self.tree.lastChild(render);
+        while (child) |node| : (child = self.tree.previousSibling(node)) {
+            if (try self.dispatchOutsidePointer(node, hit, event, callbacks)) return true;
+        }
+        const target = self.instances.instanceForRenderObject(render) orelse return false;
+        if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, target)) return false;
+        if (try self.containsTarget(target, hit)) return false;
+        return self.invokeListener(target, event, .pointer_down_outside, callbacks);
     }
 
     /// Routing decisions are entirely native. Lua runs later, in scheduler
@@ -1803,7 +1828,7 @@ pub const WindowRuntime = struct {
                     try self.queueVirtualBuild();
                 return scroll;
             }
-            current = try self.instances.parentOf(scroll);
+            current = try self.instances.scrollParent(scroll);
         }
         return null;
     }

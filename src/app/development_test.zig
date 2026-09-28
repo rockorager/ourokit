@@ -1006,6 +1006,60 @@ test "invalid range candidates preserve committed geometry and handlers" {
     try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
 }
 
+test "outside pointer listeners skip descendants and hidden scopes and can propagate" {
+    const f = try Fixture.create(
+        \\shown=ouro.signal(true); outside=0; presses=0; inside=0
+        \\function build() return ouro.row {key='root',gap=20,
+        \\ ouro.box {key='scope',hidden=not shown(),
+        \\   on_pointer_down_outside={button=272,propagate=true,handler=function(e)
+        \\     assert(e.phase=='capture' and e.kind=='press'); outside=outside+3;shown:set(false)
+        \\   end},
+        \\   ouro.button {key='inside',label='Inside',on_press=function() inside=inside+5 end}},
+        \\ ouro.button {key='outside',label='Outside',on_press=function() presses=presses+7 end}}
+        \\end
+    );
+    defer f.destroy();
+    try f.play(.{ .click = "root/scope/inside" });
+    try f.play(.{ .click = "root/outside" });
+    try f.play(.{ .click = "root/outside" });
+    const check = "assert(inside==5 and outside==3 and presses==14)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@check-outside", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+}
+
+test "floating scroll at its limit does not chain to the trigger viewport" {
+    const f = try Fixture.create(
+        \\function build() return ouro.box {key='frame',height=70,
+        \\ ouro.scroll {key='outer',ouro.column {key='body',
+        \\  ouro.anchored {key='anchor',side='right',
+        \\   ouro.box {key='trigger',width=30,height=20},
+        \\   ouro.scroll {key='popup',ouro.box {key='content',width=80,height=500}}},
+        \\  ouro.box {key='tail',height=400}}}} end
+    );
+    defer f.destroy();
+    try f.play(.{ .scroll = .{ .target = "frame/outer/body/anchor/popup", .delta = 1000 } });
+    var bottom = try f.snapshot();
+    defer bottom.deinit();
+    try std.testing.expect((try node(bottom, "frame/outer/body/anchor/popup")).scroll_offset.? > 0);
+    try f.play(.{ .scroll = .{ .target = "frame/outer/body/anchor/popup", .delta = 37 } });
+    var after = try f.snapshot();
+    defer after.deinit();
+    try std.testing.expectEqual(@as(f32, 0), (try node(after, "frame/outer")).scroll_offset.?);
+    try std.testing.expectEqual((try node(bottom, "frame/outer/body/anchor/popup")).scroll_offset.?, (try node(after, "frame/outer/body/anchor/popup")).scroll_offset.?);
+}
+
+test "anchored declarations reject invalid options and child counts" {
+    for ([_][]const u8{
+        "function build() return ouro.anchored {key='a'} end",
+        "function build() return ouro.anchored {key='a',side='middle',ouro.box {key='t'}} end",
+        "function build() return ouro.anchored {key='a',alignment='stretch',ouro.box {key='t'}} end",
+        "function build() return ouro.anchored {key='a',gap=-1,ouro.box {key='t'}} end",
+        "function build() return ouro.anchored {key='a',margin=0/0,ouro.box {key='t'}} end",
+        "function build() return ouro.anchored {key='a',flip=0,ouro.box {key='t'}} end",
+        "function build() return ouro.anchored {key='a',ouro.box {key='t'},ouro.box {key='p'},ouro.box {key='extra'}} end",
+    }) |source| try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
+}
+
 test "forms dialog contains focus and restores opener after escape" {
     const f = try Fixture.create(
         \\opened=ouro.signal(false)

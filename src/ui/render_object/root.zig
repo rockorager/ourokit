@@ -4,6 +4,7 @@ pub const Tree = @import("tree.zig").Tree;
 pub const types = @import("types.zig");
 
 test {
+    _ = @import("anchored_tests.zig");
     _ = @import("box.zig");
     _ = @import("flex.zig");
     _ = @import("layout_tests.zig");

@@ -100,6 +100,20 @@ pub const Stack = struct {
     unbounded_height: bool = false,
 };
 
+/// The first child participates in normal layout; the optional second child
+/// floats in the root viewport and paints above normal content. Both edges use
+/// ParentData.none. Alignment is physical (start means left or top).
+pub const Anchored = struct {
+    pub const Side = enum { top, bottom, left, right };
+    pub const Alignment = enum { start, center, end };
+
+    side: Side = .bottom,
+    alignment: Anchored.Alignment = .start,
+    gap: f32 = 4,
+    margin: f32 = 8,
+    flip: bool = true,
+};
+
 /// A single-child viewport. Offset is retained by the corresponding instance,
 /// not declared widget data, and is applied to this render object separately.
 pub const Scroll = struct {
@@ -168,6 +182,7 @@ pub const Object = union(enum) {
     grid: Grid,
     split: Split,
     stack: Stack,
+    anchored: Anchored,
     scroll: Scroll,
     image: Image,
     canvas: *@import("drawing.zig").Drawing,

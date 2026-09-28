@@ -10,6 +10,7 @@ pub const Kind = enum {
     split,
     box,
     stack,
+    anchored,
     grid,
     row,
     column,
@@ -21,7 +22,7 @@ pub const Kind = enum {
 
     fn acceptsChildren(self: Kind) bool {
         return switch (self) {
-            .split, .box, .stack, .grid, .row, .column, .scroll, .theme, .stateful, .stateless => true,
+            .split, .box, .stack, .anchored, .grid, .row, .column, .scroll, .theme, .stateful, .stateless => true,
             else => false,
         };
     }

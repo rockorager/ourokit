@@ -643,6 +643,7 @@ pub const UiBuild = struct {
             .split => emitSplit,
             .box => emitBox,
             .stack => emitStack,
+            .anchored => emitAnchored,
             .grid => emitGrid,
             .row => emitRow,
             .column => emitColumn,
@@ -1447,6 +1448,37 @@ pub const UiBuild = struct {
         return self.emitChildren(state, .{ .id = id, .kind = .overlay, .semantic_id = if (semantic) id else semanticParent(parent) });
     }
 
+    fn emitAnchored(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
+        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
+        const parent = self.currentParent() orelse return luaError(state, "anchored requires a widget parent");
+        const key = tableString(state, 1, "key") orelse return luaError(state, "anchored key is required");
+        const count = c.lua_rawlen(state, c.upvalueIndex(2));
+        if (count < 1 or count > 2) return luaError(state, "anchored requires a trigger and optional floating content");
+        const value: render_types.Anchored = .{
+            .side = tableOptionalEnum(render_types.Anchored.Side, state, 1, "side", .bottom) orelse
+                return luaError(state, "invalid anchored side"),
+            .alignment = tableOptionalEnum(render_types.Anchored.Alignment, state, 1, "alignment", .start) orelse
+                return luaError(state, "invalid anchored alignment"),
+            .gap = tableOptionalExtent(state, 1, "gap", 4) orelse return luaError(state, "invalid anchored gap"),
+            .margin = tableOptionalExtent(state, 1, "margin", 8) orelse return luaError(state, "invalid anchored margin"),
+            .flip = tableOptionalBoolean(state, 1, "flip", true) orelse return luaError(state, "anchored flip must be boolean"),
+        };
+        const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
+        const parent_data = declarativeParentData(self, state, 1) catch |err|
+            return luaError(state, parentDataErrorMessage(err));
+        const id = semanticId(key, 0x616e63686f726564 ^ parent.id ^ self.component_namespace);
+        self.append(.{ .id = id, .parent = parent.id, .object = .{ .anchored = value }, .parent_data = parent_data }) catch
+            return luaError(state, "cannot append anchored descriptor");
+        if (semantic) self.appendSemantic(.{
+            .id = id,
+            .parent = semanticParent(parent),
+            .role = .group,
+            .key = key,
+        }) catch return luaError(state, "cannot append anchored semantics");
+        return self.emitChildren(state, .{ .id = id, .kind = .overlay, .semantic_id = if (semantic) id else semanticParent(parent) });
+    }
+
     fn emitBox(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1629,7 +1661,7 @@ pub const UiBuild = struct {
     fn stageInput(self: *UiBuild, state: *c.State, id: u64) !void {
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
-        inline for (.{ "on_key_capture", "on_key", "on_pointer_capture", "on_pointer" }, .{ .key_capture, .key_bubble, .pointer_capture, .pointer_bubble }) |name, kind| {
+        inline for (.{ "on_key_capture", "on_key", "on_pointer_capture", "on_pointer", "on_pointer_down_outside" }, .{ .key_capture, .key_bubble, .pointer_capture, .pointer_bubble, .pointer_down_outside }) |name, kind| {
             const value_type = c.lua_getfield(state, 1, name);
             if (value_type != c.type_nil) {
                 if (value_type != c.type_table) return error.InvalidInputHandler;
@@ -1641,7 +1673,8 @@ pub const UiBuild = struct {
                     const field = string(state, -2) orelse return error.InvalidInputHandler;
                     if (!std.mem.eql(u8, field, "handler") and !std.mem.eql(u8, field, "propagate") and
                         !(keyboard and (std.mem.eql(u8, field, "keys") or std.mem.eql(u8, field, "states"))) and
-                        !(!keyboard and (std.mem.eql(u8, field, "kinds") or std.mem.eql(u8, field, "button"))))
+                        !(!keyboard and (std.mem.eql(u8, field, "button") or
+                            (kind != .pointer_down_outside and std.mem.eql(u8, field, "kinds")))))
                         return error.InvalidInputFilter;
                     c.lua_settop(state, -2);
                 }
@@ -2395,6 +2428,7 @@ test "contextual input validates filters commands and shortcut ambiguity transac
         .{ .source = "{on_key={propagate=false,handler=function() end,states={'press'}}}", .failure = error.InvalidInputFilter },
         .{ .source = "{on_pointer={propagate=false,handler=function() end,kinds={'key'}}}", .failure = error.InvalidInputFilter },
         .{ .source = "{on_pointer={propagate=false,handler=function() end,button=-1}}", .failure = error.InvalidInputFilter },
+        .{ .source = "{on_pointer_down_outside={propagate=false,handler=function() end,kinds={'press'}}}", .failure = error.InvalidInputFilter },
         .{ .source = "{commands={unused=1}}", .failure = error.InvalidCommands },
         .{ .source = "{commands={},shortcuts={['Ctrl+S']='typo'}}", .failure = error.UnknownCommand },
         .{ .source = "{commands={go=function() end},shortcuts={['Ctrl+S']='go',['ctrl+s']='go'}}", .failure = error.AmbiguousShortcut },

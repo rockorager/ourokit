@@ -24,6 +24,7 @@ pub const HandlerKind = enum {
     key_bubble,
     pointer_capture,
     pointer_bubble,
+    pointer_down_outside,
     shortcut,
 
     fn primary(self: HandlerKind) bool {

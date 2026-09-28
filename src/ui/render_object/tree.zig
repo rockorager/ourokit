@@ -5,6 +5,7 @@ const PointF = @import("../../core/geometry.zig").PointF;
 const RectF = @import("../../core/geometry.zig").RectF;
 const SizeF = @import("../../core/geometry.zig").SizeF;
 const Constraints = @import("../layout/constraints.zig").Constraints;
+const anchored_impl = @import("anchored.zig");
 const box_impl = @import("box.zig");
 const flex_impl = @import("flex.zig");
 const grid_impl = @import("grid.zig");
@@ -31,6 +32,7 @@ pub const LayoutError = error{
     ScrollInUnboundedAxis,
     UnboundedSplitConstraints,
     SplitRequiresThreeChildren,
+    AnchoredRequiresOneOrTwoChildren,
     InvalidParentData,
     TextHasChildren,
     TextInputHasChildren,
@@ -59,6 +61,8 @@ const Slot = struct {
     has_layout: bool = false,
     needs_layout: bool = true,
     needs_paint: bool = true,
+    /// Recomputed during layout, so ordinary subtrees need no deferred walks.
+    contains_overlays: bool = false,
     layout_count: usize = 0,
     paragraph_layout: ?text.ParagraphHandle = null,
     placeholder_layout: ?text.ParagraphHandle = null,
@@ -196,6 +200,8 @@ pub const Tree = struct {
             parent_slot.first_child != null) return error.BoxAlreadyHasChild;
         if (parent_slot.object == .split and self.childCount(parent) >= 3)
             return error.SplitRequiresThreeChildren;
+        if (parent_slot.object == .anchored and self.childCount(parent) >= 2)
+            return error.AnchoredRequiresOneOrTwoChildren;
         if (parent_slot.object == .text) return error.TextHasChildren;
         if (parent_slot.object == .text_input) return error.TextInputHasChildren;
 
@@ -228,6 +234,8 @@ pub const Tree = struct {
             !same(target.first_child.?, target.last_child.?)) return error.BoxAlreadyHasChild;
         if (object == .split and self.childCount(handle) > 3)
             return error.SplitRequiresThreeChildren;
+        if (object == .anchored and self.childCount(handle) > 2)
+            return error.AnchoredRequiresOneOrTwoChildren;
         var child = target.first_child;
         while (child) |child_handle| : (child = (try self.slot(child_handle)).next_sibling)
             try validateParentData(object, (try self.slot(child_handle)).parent_data);
@@ -271,7 +279,11 @@ pub const Tree = struct {
         const root_slot = try self.slot(root);
         if (root_slot.parent != null) return error.LayoutRootHasParent;
         root_slot.offset = .{};
-        return self.layoutNode(root, constraints);
+        const result = try self.layoutNode(root, constraints);
+        // A failed floating layout must not leave a seemingly current root.
+        errdefer self.markNeedsLayout(root);
+        try self.placeOverlays(root, .{}, self.rootViewport(root_slot));
+        return result;
     }
 
     pub fn buildScene(
@@ -282,11 +294,13 @@ pub const Tree = struct {
         const root_slot = try self.slot(root);
         if (!root_slot.has_layout or root_slot.needs_layout) return error.LayoutRequired;
         try self.paintNode(root, builder, .{});
+        try self.paintOverlays(root, builder, .{});
     }
 
     pub fn hitTest(self: *Tree, root: NodeHandle, point: PointF) !?NodeHandle {
         const root_slot = try self.slot(root);
         if (!root_slot.has_layout or root_slot.needs_layout) return error.LayoutRequired;
+        if (try self.hitTestOverlays(root, point)) |hit| return hit;
         return self.hitTestNode(root, point);
     }
 
@@ -475,6 +489,14 @@ pub const Tree = struct {
         return (self.slot(handle) catch unreachable).next_sibling;
     }
 
+    pub fn lastChild(self: *Tree, handle: NodeHandle) ?NodeHandle {
+        return (self.slot(handle) catch unreachable).last_child;
+    }
+
+    pub fn previousSibling(self: *Tree, handle: NodeHandle) ?NodeHandle {
+        return (self.slot(handle) catch unreachable).previous_sibling;
+    }
+
     pub fn childCount(self: *Tree, handle: NodeHandle) usize {
         var count: usize = 0;
         var child = self.firstChild(handle);
@@ -525,6 +547,11 @@ pub const Tree = struct {
         if (target.first_child) |child|
             try self.setChildOffset(child, scroll_impl.childOffset(scroll.axis, offset));
         self.markNeedsPaint(handle);
+        var root = handle;
+        while ((try self.slot(root)).parent) |parent| root = parent;
+        const root_slot = try self.slot(root);
+        if (root_slot.has_layout and !root_slot.needs_layout)
+            try self.placeOverlays(root, .{}, self.rootViewport(root_slot));
         return offset;
     }
 
@@ -563,6 +590,7 @@ pub const Tree = struct {
             .grid => |value| try grid_impl.layout(value, self, handle, constraints),
             .split => |value| try split_impl.layout(value, self, handle, constraints),
             .stack => |value| try stack_impl.layout(value, self, handle, constraints),
+            .anchored => try anchored_impl.layout(self, handle, constraints),
             .scroll => |value| try scroll_impl.layout(value, self, handle, constraints),
             .image => |value| try self.layoutImage(value, constraints),
             .canvas => |value| constraints.constrain(value.size),
@@ -578,6 +606,14 @@ pub const Tree = struct {
         target.has_layout = true;
         target.needs_layout = false;
         target.needs_paint = true;
+        target.contains_overlays = floatingChild(target) != null;
+        var child = target.first_child;
+        while (!target.contains_overlays) {
+            const child_handle = child orelse break;
+            const child_slot = try self.slot(child_handle);
+            target.contains_overlays = child_slot.contains_overlays;
+            child = child_slot.next_sibling;
+        }
         target.layout_count += 1;
         return result;
     }
@@ -636,6 +672,7 @@ pub const Tree = struct {
             .grid => false,
             .split => false,
             .stack => |value| value.clip,
+            .anchored => false,
             .scroll => true,
             .image => |value| paint: {
                 if (value.image) |image| try builder.image(image, bounds, value.fit);
@@ -708,7 +745,7 @@ pub const Tree = struct {
             const child_slot = try self.slot(child_handle);
             const next = child_slot.next_sibling;
             try self.paintNode(child_handle, builder, PointF.add(origin, child_slot.offset));
-            child = next;
+            child = if (target.object == .anchored) null else next;
         }
         if (clips) try builder.popClip();
         target.needs_paint = false;
@@ -719,7 +756,7 @@ pub const Tree = struct {
         if (target.object == .box and target.object.box.hidden) return null;
         if (!(RectF{ .x = 0, .y = 0, .width = target.size.width, .height = target.size.height }).contains(point))
             return null;
-        var child = target.last_child;
+        var child = if (target.object == .anchored) target.first_child else target.last_child;
         while (child) |child_handle| {
             const child_slot = try self.slot(child_handle);
             const previous = child_slot.previous_sibling;
@@ -730,6 +767,84 @@ pub const Tree = struct {
             child = previous;
         }
         return handle;
+    }
+
+    fn rootViewport(_: *Tree, root: *const Slot) SizeF {
+        // Bounded root constraints describe the window even when its inline
+        // content shrink-wraps. Unbounded axes fall back to the root's size.
+        return .{
+            .width = if (root.last_constraints.hasBoundedWidth()) root.last_constraints.max_width else root.size.width,
+            .height = if (root.last_constraints.hasBoundedHeight()) root.last_constraints.max_height else root.size.height,
+        };
+    }
+
+    fn floatingChild(target: *const Slot) ?NodeHandle {
+        if (target.object != .anchored) return null;
+        const first = target.first_child orelse return null;
+        const last = target.last_child.?;
+        return if (same(first, last)) null else last;
+    }
+
+    /// Run after inline layout, with final ancestor offsets. Measuring a popup
+    /// may lay out more anchors; recurse only after their containing popup has
+    /// its final offset. No allocation or layout work for unchanged children.
+    fn placeOverlays(self: *Tree, handle: NodeHandle, origin: PointF, window: SizeF) LayoutError!void {
+        const target = try self.slot(handle);
+        if (!target.contains_overlays) return;
+        if (floatingChild(target)) |popup| {
+            const value = target.object.anchored;
+            const viewport_rect = anchored_impl.inset(window, value.margin);
+            const popup_size = try self.layoutNode(popup, .{
+                .max_width = viewport_rect.width,
+                .max_height = viewport_rect.height,
+            });
+            const trigger = try self.slot(target.first_child.?);
+            const position = anchored_impl.place(value, .{
+                .x = origin.x + trigger.offset.x,
+                .y = origin.y + trigger.offset.y,
+                .width = trigger.size.width,
+                .height = trigger.size.height,
+            }, popup_size, viewport_rect);
+            try self.setChildOffset(popup, .{ .x = position.x - origin.x, .y = position.y - origin.y });
+        }
+        var child = target.first_child;
+        while (child) |current| : (child = self.nextSibling(current)) {
+            const offset = (try self.slot(current)).offset;
+            try self.placeOverlays(current, PointF.add(origin, offset), window);
+        }
+    }
+
+    /// Deferred order is parent popup, then descendants in declaration order.
+    /// Thus nested overlays cover parent content, and later sibling subtrees
+    /// cover earlier ones. All ordinary ancestor clips have been popped.
+    fn paintOverlays(self: *Tree, handle: NodeHandle, builder: *scene_builder.Builder, origin: PointF) !void {
+        const target = try self.slot(handle);
+        if (!target.contains_overlays) return;
+        if (target.object == .box and target.object.box.hidden) return;
+        if (floatingChild(target)) |popup|
+            try self.paintNode(popup, builder, PointF.add(origin, (try self.slot(popup)).offset));
+        var child = target.first_child;
+        while (child) |current| : (child = self.nextSibling(current))
+            try self.paintOverlays(current, builder, PointF.add(origin, (try self.slot(current)).offset));
+    }
+
+    /// Exact reverse of paintOverlays, intentionally without ancestor bounds
+    /// gating. Ordinary hitTestNode keeps its existing bounds rules.
+    fn hitTestOverlays(self: *Tree, handle: NodeHandle, point: PointF) !?NodeHandle {
+        const target = try self.slot(handle);
+        if (!target.contains_overlays) return null;
+        if (target.object == .box and target.object.box.hidden) return null;
+        var child = target.last_child;
+        while (child) |current| : (child = self.previousSibling(current)) {
+            const offset = (try self.slot(current)).offset;
+            if (try self.hitTestOverlays(current, .{ .x = point.x - offset.x, .y = point.y - offset.y })) |hit|
+                return hit;
+        }
+        if (floatingChild(target)) |popup| {
+            const offset = (try self.slot(popup)).offset;
+            return self.hitTestNode(popup, .{ .x = point.x - offset.x, .y = point.y - offset.y });
+        }
+        return null;
     }
 
     fn detach(self: *Tree, handle: NodeHandle) !void {
@@ -1032,6 +1147,7 @@ pub const Tree = struct {
 
 fn validateObject(object: types.Object) !void {
     switch (object) {
+        .anchored => |value| try anchored_impl.validate(value),
         .box => |value| try box_impl.validate(value),
         .flex => |value| try flex_impl.validate(value),
         .grid => |value| try grid_impl.validate(value),
@@ -1062,7 +1178,7 @@ fn validateObject(object: types.Object) !void {
 
 fn validateParentData(parent: types.Object, data: types.ParentData) !void {
     switch (parent) {
-        .box => if (data != .none) return error.InvalidParentData,
+        .box, .anchored => if (data != .none) return error.InvalidParentData,
         .flex => |value| {
             if (data != .none and data != .flex) return error.InvalidParentData;
             if (value.wrap and data == .flex and data.flex.factor != 0) return error.FlexInWrap;
@@ -1099,6 +1215,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .grid => |old_grid| !std.meta.eql(old_grid, new.grid),
         .split => |old_split| !std.meta.eql(old_split, new.split),
         .stack => |old_stack| old_stack.unbounded_height != new.stack.unbounded_height,
+        .anchored => |old_anchored| !std.meta.eql(old_anchored, new.anchored),
         .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
         .image => |old_image| (old_image.width == null or old_image.height == null) and
             !std.meta.eql(old_image.image, new.image.image) or
