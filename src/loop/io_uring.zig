@@ -443,7 +443,30 @@ pub const Loop = struct {
                 self.signal_poll_active = true;
             }
         }
-        return self.ring.submit();
+        return self.submitRing();
+    }
+
+    /// Submits queued SQEs without synchronizing the logical-timer alarm.
+    /// Signal delivery, including the freezer thaw after system resume, can
+    /// interrupt io_uring_enter. SQEs stay queued until the kernel consumes
+    /// them, so retrying resubmits only what is still pending.
+    pub fn submitRing(self: *Loop) !u32 {
+        while (true) return self.ring.submit() catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => return err,
+        };
+    }
+
+    /// Runs deferred kernel task work without waiting for a completion.
+    /// cq_ready alone cannot see work behind IORING_SETUP_DEFER_TASKRUN.
+    pub fn flushTaskWork(self: *Loop) !void {
+        while (true) {
+            _ = self.ring.enter(0, 0, linux.IORING_ENTER_GETEVENTS) catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                else => return err,
+            };
+            return;
+        }
     }
 
     pub fn operationCapacity(self: *const Loop) usize {
@@ -459,8 +482,13 @@ pub const Loop = struct {
         return self.alarm_active or self.retired_alarm_generation != null or self.control != .none;
     }
 
+    /// Blocks for the next completion. An interrupted wait consumes nothing,
+    /// so a signal or a thaw after system resume simply repeats the wait.
     pub fn wait(self: *Loop) !linux.io_uring_cqe {
-        return self.ring.copy_cqe();
+        while (true) return self.ring.copy_cqe() catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => return err,
+        };
     }
 
     /// Returns every logical timer whose deadline has passed. Callers dispatch
@@ -980,4 +1008,36 @@ test "signal watch does not prevent normal teardown with an outstanding poll" {
     _ = try loop.submit();
     try std.testing.expect(loop.signal_poll_active);
     try std.testing.expect(!loop.hasPendingOperations());
+}
+
+fn ignoreTestSignal(_: linux.SIG) callconv(.c) void {}
+
+fn interruptWaitingThread(pid: linux.pid_t, tid: linux.pid_t) void {
+    const delay: linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&delay, null);
+    _ = linux.tgkill(pid, tid, .USR1);
+}
+
+test "a signal interrupting the completion wait does not fail the loop" {
+    // Without SA_RESTART the kernel returns EINTR from io_uring_enter, the
+    // same result a freezer thaw produces when the system resumes.
+    const action: linux.Sigaction = .{
+        .handler = .{ .handler = ignoreTestSignal },
+        .mask = linux.sigemptyset(),
+        .flags = 0,
+    };
+    var previous: linux.Sigaction = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sigaction(.USR1, &action, &previous)));
+    defer _ = linux.sigaction(.USR1, &previous, null);
+
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, 4, 1);
+    defer loop.deinit();
+
+    const timeout = try loop.prepareTimeout(100 * std.time.ns_per_ms);
+    _ = try loop.submit();
+    const interrupter = try std.Thread.spawn(.{}, interruptWaitingThread, .{ linux.getpid(), linux.gettid() });
+    defer interrupter.join();
+    try std.testing.expectEqual(Dispatch.timer_wakeup, loop.dispatch(try loop.wait()));
+    try std.testing.expectEqual(timeout, (try loop.takeExpired()).?.operation);
 }

@@ -1213,8 +1213,8 @@ fn runSourceInternal(
             // task work without waiting before deciding the input batch ended.
             // cq_ready alone cannot see work behind IORING_SETUP_DEFER_TASKRUN.
             // Do not resynchronize the alarm until due timers are consumed.
-            _ = try loop.ring.submit();
-            _ = try loop.ring.enter(0, 0, std.os.linux.IORING_ENTER_GETEVENTS);
+            _ = try loop.submitRing();
+            try loop.flushTaskWork();
             if (loop.ring.cq_ready() == 0) break;
             completion = try loop.wait();
         }
