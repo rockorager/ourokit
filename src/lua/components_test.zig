@@ -153,7 +153,7 @@ const counters =
     \\    return ouro.box { key = "counter", width = count() + props.extra + extra, height = 9, flex = props.flex }
     \\  end
     \\end
-    \\Counter, Other = ouro.component(initialize), ouro.component(initialize)
+    \\Counter, Other = ouro.stateful(initialize), ouro.stateful(initialize)
     \\unused = Counter { key = "never", initial = 900 }
     \\function build(width)
     \\  root_renders = root_renders + 1
@@ -169,6 +169,66 @@ const counters =
     \\  return ouro.row { key = "counters", children = children }
     \\end
 ;
+
+test "stateless and stateful constructors replace the old API names and reject non-functions" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.expect("ouro.compose == nil and ouro.component == nil");
+    for ([_]struct { source: []const u8, message: []const u8 }{
+        .{ .source = "ouro.stateless()", .message = "ouro.stateless expects one render function" },
+        .{ .source = "ouro.stateful({})", .message = "ouro.stateful expects one initializer function" },
+    }) |case| {
+        const top = c.lua_gettop(f.state);
+        defer c.lua_settop(f.state, top);
+        try load(f.state, case.source);
+        try std.testing.expect(c.lua_pcallk(f.state, 0, 0, 0, 0, null) != c.ok);
+        var length: usize = 0;
+        const message = c.lua_tolstring(f.state, -1, &length) orelse return error.ExpectedErrorMessage;
+        try std.testing.expect(std.mem.endsWith(u8, message[0..length], case.message));
+    }
+}
+
+test "stateless compositions replace signal dependencies independently of retained components" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\a, b, choose, visible = ouro.signal(13), ouro.signal(29), ouro.signal(true), ouro.signal(true)
+        \\root_renders, component_renders, compose_renders = 0, 0, 0
+        \\local View = ouro.stateless(function(p)
+        \\  compose_renders=compose_renders+1
+        \\  return ouro.box {key=p.key, width=choose() and a() or b()}
+        \\end)
+        \\local Retained = ouro.stateful(function()
+        \\  return function()
+        \\    component_renders=component_renders+1
+        \\    return View {key='value'}
+        \\  end
+        \\end)
+        \\function build()
+        \\  root_renders=root_renders+1
+        \\  return ouro.row {key='root', visible() and Retained {key='retained'} or nil}
+        \\end
+    );
+    try f.build();
+    const original = (try f.snapshot.findPath("root/retained/value")).id;
+    try f.exec("a:set(17)");
+    try f.build();
+    try f.expect("root_renders==1 and component_renders==1 and compose_renders==2");
+    try std.testing.expectEqual(@as(f32, 17), try f.width("root/retained/value"));
+    try f.exec("choose:set(false)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 29), try f.width("root/retained/value"));
+    try f.exec("a:set(41)");
+    try f.clean();
+    try f.exec("b:set(37)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 37), try f.width("root/retained/value"));
+    try std.testing.expectEqual(original, (try f.snapshot.findPath("root/retained/value")).id);
+    try f.exec("visible:set(false)");
+    try f.build();
+    try f.exec("b:set(53); choose:set(true)");
+    try f.clean();
+}
 
 test "components retain keyed state and execute only subscribed Lua readers" {
     const f = try Fixture.create();
@@ -263,7 +323,7 @@ test "failed component evaluation and reconcile roll back props output dependenc
     try f.exec(
         \\offset, mode, late = ouro.signal(3), ouro.signal(0), ouro.signal(7)
         \\initializations = 0
-        \\Counter = ouro.component(function(props)
+        \\Counter = ouro.stateful(function(props)
         \\  escaped = props
         \\  initializations = initializations + 1
         \\  local count = ouro.signal(10)
@@ -314,7 +374,7 @@ test "component children forward through read-only props without layout wrappers
     defer f.destroy();
     try f.exec(
         \\size = ouro.signal(23)
-        \\Forward = ouro.component(function(props)
+        \\Forward = ouro.stateful(function(props)
         \\  return function() return ouro.row { key = "row", children = props.children } end
         \\end)
         \\function build()
@@ -347,7 +407,7 @@ test "one Lua generation isolates identical component keys in distinct window re
     try f.exec(
         \\states, runs, roots = {}, {}, { 0, 0 }
         \\shared = ouro.signal(7)
-        \\Counter = ouro.component(function(props)
+        \\Counter = ouro.stateful(function(props)
         \\  local count = ouro.signal(props.initial)
         \\  states[props.index] = count
         \\  return function()
@@ -388,7 +448,7 @@ test "nil component output retains state and callable non-function initializers 
     try f.exec(
         \\inits = 0
         \\visible = ouro.signal(true)
-        \\Counter = ouro.component(function(props)
+        \\Counter = ouro.stateful(function(props)
         \\  inits = inits + 1
         \\  local count = ouro.signal(31)
         \\  state = count
@@ -411,7 +471,7 @@ test "nil component output retains state and callable non-function initializers 
     try std.testing.expectEqual(@as(f32, 47), try f.width("maybe/value"));
     try f.expect("inits == 1");
     try f.exec(
-        \\Bad = ouro.component(function() return ouro.signal(ouro.box { key = "bad" }) end)
+        \\Bad = ouro.stateful(function() return ouro.signal(ouro.box { key = "bad" }) end)
         \\function build() return Bad { key = "bad" } end
     );
     _ = try f.owners.markDirty(f.owner);
@@ -431,7 +491,7 @@ test "prepared component descriptions remain pinned when the same mount rebuilds
     c.lua_setglobal(f.state, "weak");
     try f.exec(
         \\size = ouro.signal(23)
-        \\Component = ouro.component(function()
+        \\Component = ouro.stateful(function()
         \\  return function()
         \\    local output = ouro.box { key = "value", width = size() }
         \\    weak[size()] = output
@@ -453,4 +513,37 @@ test "prepared component descriptions remain pinned when the same mount rebuilds
     prepared.reset();
     _ = c.lua_gc(f.state, 2);
     try f.expect("weak[23] == nil and weak[47] ~= nil");
+}
+
+test "prepared stateless output survives later expansions and collection" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    c.lua_createtable(f.state, 0, 2);
+    c.lua_createtable(f.state, 0, 1);
+    _ = c.lua_pushstring(f.state, "v");
+    c.lua_setfield(f.state, -2, "__mode");
+    _ = c.lua_setmetatable(f.state, -2);
+    c.lua_setglobal(f.state, "weak");
+    try f.exec(
+        \\size=ouro.signal(19)
+        \\local View=ouro.stateless(function(p)
+        \\  local result=ouro.box {key=p.key, width=size()}
+        \\  weak[size()]=result
+        \\  return result
+        \\end)
+        \\function build() return View {key='view'} end
+    );
+    try f.build();
+    var prepared: @import("prepared_build.zig").PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, f.state, null, 64, 4096);
+    defer prepared.deinit();
+    try f.ui.capturePrepared(&prepared, f.ui.storage[0..f.ui.count]);
+    try f.exec("size:set(43)");
+    try f.build();
+    _ = c.lua_gc(f.state, 2);
+    try f.expect("weak[19] ~= nil and weak[43] ~= nil");
+    try std.testing.expectEqual(@as(?f32, 19), prepared.descriptors()[2].object.box.width);
+    prepared.reset();
+    _ = c.lua_gc(f.state, 2);
+    try f.expect("weak[19] == nil and weak[43] ~= nil");
 }

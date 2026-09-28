@@ -16,9 +16,6 @@ const instance = @import("../ui/instance/tree.zig");
 const PointerBindings = @import("../ui/input/bindings.zig").PointerBindings;
 const Buttons = @import("../ui/widget/buttons.zig").Buttons;
 const ButtonStyle = @import("../ui/widget/buttons.zig").Style;
-const ButtonRecipe = @import("../ui/widget/buttons.zig").Recipe;
-const ButtonVariant = @import("../ui/widget/buttons.zig").Variant;
-const ButtonTone = @import("../ui/widget/buttons.zig").Tone;
 const TextInputs = @import("../ui/text_input/registry.zig").Registry;
 const TextInputValueMode = @import("../ui/text_input/registry.zig").ValueMode;
 const TextInputSession = @import("../ui/text_input/session.zig").Session;
@@ -92,6 +89,8 @@ pub const UiBuild = struct {
     components: Components = .{},
     component_namespace: u64 = 0,
     component_scope_clean: bool = true,
+    interaction_owner: ?u64 = null,
+    composition_depth: usize = 0,
     virtual_lists: virtual_list.Snapshot = .{},
     semantic_storage: []SemanticDescriptor = &.{},
     semantic_count: usize = 0,
@@ -211,6 +210,8 @@ pub const UiBuild = struct {
         self.theme_count = 0;
         self.component_namespace = 0;
         self.component_scope_clean = true;
+        self.interaction_owner = null;
+        self.composition_depth = 0;
         self.virtual_lists = .{};
         self.pending_button_count = 0;
         self.pending_text_input_count = 0;
@@ -637,9 +638,6 @@ pub const UiBuild = struct {
             .image => emitImage,
             .canvas => emitCanvas,
             .icon => emitIcon,
-            .button => emitButton,
-            .@"switch" => emitSwitch,
-            .checkbox => emitCheckbox,
             .radio_group => emitRadioGroup,
             .radio => emitOption,
             .slider => emitSlider,
@@ -658,13 +656,32 @@ pub const UiBuild = struct {
             .column => emitColumn,
             .scroll => emitScroll,
             .theme => emitTheme,
-            .component => return self.lowerComponent(state),
+            .stateful => return self.lowerComponent(state),
+            .stateless => return self.lowerComposition(state),
             .virtual_list => return self.lowerVirtualList(state),
         };
         c.lua_pushlightuserdata(state, self);
         _ = c.lua_getiuservalue(state, 1, 2);
         c.lua_pushcclosure(state, emit, 2);
         _ = c.lua_getiuservalue(state, 1, 1);
+        if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) return c.lua_error(state);
+        return 0;
+    }
+
+    fn lowerComposition(self: *UiBuild, state: *c.State) c_int {
+        if (self.composition_depth == 32) return luaError(state, "composition nesting too deep");
+        self.composition_depth += 1;
+        defer self.composition_depth -= 1;
+        const theme = self.currentStyle() orelse return luaError(state, "composition requires a theme");
+        self.components.push("compose");
+        _ = c.lua_getiuservalue(state, 1, 3);
+        _ = c.lua_getiuservalue(state, 1, 1);
+        _ = c.lua_getiuservalue(state, 1, 2);
+        @import("tokens.zig").push(state, theme);
+        if (c.lua_pcallk(state, 4, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, lowerDescription, 1);
+        c.lua_pushvalue(state, -2);
         if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) return c.lua_error(state);
         return 0;
     }
@@ -1000,162 +1017,6 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn emitButton(state: *c.State) callconv(.c) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
-        const defaults = self.currentStyle().?;
-        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
-            return luaError(state, "ouro.button expects one declaration table");
-        const variant = tableOptionalEnum(ButtonVariant, state, 1, "variant", .solid) orelse
-            return luaError(state, "button variant must be 'solid', 'soft', 'surface', or 'ghost'");
-        const tone = tableOptionalEnum(ButtonTone, state, 1, "tone", .accent) orelse
-            return luaError(state, "button tone must be 'accent', 'neutral', or 'destructive'");
-        // Theme-wide button colors style the default solid accent button.
-        // Geometry applies to every variant; per-button colors always win.
-        var inherited = defaults.widgets.button;
-        if (variant != .solid or tone != .accent) inline for (std.meta.fields(theming.Overrides)) |field| {
-            if (field.type == ?@import("../core/color.zig").Color) @field(inherited, field.name) = null;
-        };
-        const visual = widgetOverrides(state, inherited, true) catch |err| return luaError(state, @errorName(err));
-        const recipe = ButtonRecipe.init(theme, variant, tone);
-        const key = tableString(state, 1, "key") orelse return luaError(state, "button key is required");
-        const label = tableString(state, 1, "label") orelse return luaError(state, "button label is required");
-        const child_count = c.lua_rawlen(state, c.upvalueIndex(2));
-        if (child_count > 1) return luaError(state, "button accepts one content child");
-        const parent = self.currentParent() orelse return luaError(state, "button requires a widget parent");
-        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
-            return luaError(state, "invalid button enabled state");
-        const width = tableOptionalNullableExtent(state, 1, "width") orelse
-            return luaError(state, "invalid button width");
-        const auto_height = if (tableString(state, 1, "height")) |value| std.mem.eql(u8, value, "auto") else false;
-        const height: ?f32 = if (auto_height) null else tableOptionalExtent(
-            state,
-            1,
-            "height",
-            visual.height orelse defaults.controls.height,
-        ) orelse return luaError(state, "invalid button height");
-        if (height) |value| if (value <= 0) return luaError(state, "invalid button height");
-        const parent_data = declarativeParentData(self, state, 1) catch |err|
-            return luaError(state, parentDataErrorMessage(err));
-        const button_id = semanticId(key, 0x627574746f6e ^ parent.id ^ self.component_namespace);
-        const label_id = semanticId(key, 0x6c6162656c ^ button_id);
-        const border_width = visual.border_width orelse defaults.controls.border_width orelse
-            if (recipe.bordered) design.tokens.foundation.border_width_default else 0;
-        const style: ButtonStyle = .{
-            .idle = visual.background orelse recipe.style.idle,
-            .hovered = visual.hover orelse recipe.style.hovered,
-            .pressed = visual.pressed orelse visual.hover orelse recipe.style.pressed,
-            .disabled = visual.disabled orelse recipe.style.disabled,
-            .border = visual.border orelse if (enabled) recipe.style.border else theme.border,
-            .focus = visual.focus orelse recipe.style.focus,
-        };
-        const foreground = if (enabled)
-            visual.foreground orelse recipe.foreground
-        else
-            visual.disabled_foreground orelse recipe.disabled_foreground;
-        const font_size = visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_2;
-        self.append(.{
-            .id = button_id,
-            .parent = parent.id,
-            .object = .{ .box = .{
-                .width = width.value,
-                .height = height,
-                .padding = .{
-                    .left = visual.padding_x orelse design.tokens.foundation.spacing_3,
-                    .right = visual.padding_x orelse design.tokens.foundation.spacing_3,
-                },
-                .alignment = .center,
-                .background = if (enabled) style.idle else style.disabled,
-                .border_color = if (border_width > 0) style.border else null,
-                .border_width = border_width,
-                .corner_radius = visual.radius orelse defaults.controls.radius orelse design.tokens.foundation.radius_2,
-            } },
-            .focusable = enabled,
-            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
-            .parent_data = parent_data,
-        }) catch return luaError(state, "cannot append button descriptor");
-
-        if (child_count == 0) {
-            const sources = self.text_sources orelse return luaError(state, "text service unavailable");
-            const source = sources.acquire(.{
-                .utf8 = label,
-                .language = "und",
-                .logical_size = font_size,
-                .candidates = self.themedFonts(true) catch |err| return luaError(state, @errorName(err)),
-                .configuration_revision = self.text_configuration_revision,
-            }) catch return luaError(state, "cannot retain button label");
-            self.append(.{
-                .id = label_id,
-                .parent = button_id,
-                .object = .{ .text = .{
-                    .source = source,
-                    .color = foreground,
-                    .alignment = .center,
-                    .max_lines = 1,
-                    .overflow = .ellipsis,
-                } },
-            }) catch {
-                sources.release(source) catch unreachable;
-                return luaError(state, "cannot append button label descriptor");
-            };
-            self.sources_staged = true;
-        }
-        if (self.pending_button_count == self.pending_buttons.len)
-            return luaError(state, "button capacity exceeded");
-        self.pending_buttons[self.pending_button_count] = .{
-            .id = button_id,
-            .enabled = enabled,
-            .style = style,
-        };
-        self.pending_button_count += 1;
-        self.appendSemantic(.{
-            .id = button_id,
-            .parent = semanticParent(parent),
-            .role = .button,
-            .key = key,
-            .label = label,
-            .enabled = enabled,
-        }) catch return luaError(state, "cannot append button semantics");
-
-        if (child_count != 0) {
-            // Custom content inherits the variant's label color and size, so
-            // text and tinted icons match the automatic label in every state.
-            var content_theme = defaults;
-            content_theme.colors.foreground = foreground;
-            content_theme.widgets.text.foreground = null;
-            content_theme.typography.size = font_size;
-            self.pushTheme(content_theme) catch return luaError(state, "widget nesting is too deep");
-            defer self.popTheme();
-            _ = self.emitChildren(state, .{ .id = button_id, .kind = .box });
-        }
-        self.stageCallback(state, button_id, "on_interaction_change", .interaction_change) catch |err|
-            return luaError(state, @errorName(err));
-        self.stageCallback(state, button_id, "on_cancel", .cancel) catch |err|
-            return luaError(state, @errorName(err));
-        const callback_type = c.lua_getfield(state, 1, "on_press");
-        defer c.lua_settop(state, -2);
-        if (callback_type == c.type_nil) return 0;
-        if (callback_type != c.type_function) return luaError(state, "button on_press must be a function");
-        if (self.pending_handler_count == self.pending_handlers.len)
-            return luaError(state, "pointer handler capacity exceeded");
-        c.lua_pushvalue(state, -1);
-        self.pending_handlers[self.pending_handler_count] = .{
-            .id = button_id,
-            .reference = c.luaL_ref(state, c.registry_index),
-            .kind = .button,
-        };
-        self.pending_handler_count += 1;
-        return 0;
-    }
-
-    fn emitSwitch(state: *c.State) callconv(.c) c_int {
-        return emitToggle(state, false);
-    }
-
-    fn emitCheckbox(state: *c.State) callconv(.c) c_int {
-        return emitToggle(state, true);
-    }
-
     fn emitSlider(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1213,102 +1074,6 @@ pub const UiBuild = struct {
         return self.emitChildren(state, .{ .id = panel, .kind = .box, .semantic_id = id });
     }
 
-    fn emitToggle(state: *c.State, checkbox: bool) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "switch key is required");
-        const label = tableString(state, 1, "label") orelse return luaError(state, "switch label is required");
-        if (key.len == 0 or label.len == 0) return luaError(state, "switch key and label must not be empty");
-        if (c.lua_getfield(state, 1, "checked") != c.type_boolean)
-            return luaError(state, "switch checked must be a boolean");
-        const checked = c.lua_toboolean(state, -1) != 0;
-        c.lua_settop(state, -2);
-        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
-            return luaError(state, "invalid switch enabled state");
-        const parent = self.currentParent() orelse return luaError(state, "switch requires a widget parent");
-        const parent_data = declarativeParentData(self, state, 1) catch |err|
-            return luaError(state, parentDataErrorMessage(err));
-        const id = semanticId(key, 0x737769746368 ^ parent.id ^ self.component_namespace);
-        const track_id = semanticId("track", id);
-        var recipe = @import("../ui/widget/switch.zig").Switch.init(theme, checked, enabled, self.currentStyle().?.controls.radius);
-        if (checkbox) {
-            recipe.root.width = recipe.root.height;
-            recipe.root.corner_radius = design.tokens.foundation.radius_2;
-            recipe.track.width = recipe.track.height;
-            recipe.track.corner_radius = design.tokens.foundation.radius_1;
-            recipe.track.alignment = .center;
-            recipe.thumb.width = 10;
-            recipe.thumb.height = 10;
-            recipe.thumb.corner_radius = 1;
-            recipe.thumb.border_width = 0;
-            recipe.thumb.border_color = null;
-            recipe.thumb.background = if (checked) theme.primary_foreground else recipe.track.background;
-        }
-        self.append(.{
-            .id = id,
-            .parent = parent.id,
-            .object = .{ .box = recipe.root },
-            .focusable = enabled,
-            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
-            .parent_data = parent_data,
-        }) catch return luaError(state, "cannot append switch descriptor");
-        self.append(.{
-            .id = track_id,
-            .parent = id,
-            .object = .{ .box = recipe.track },
-        }) catch return luaError(state, "cannot append switch track");
-        if (checkbox and checked) {
-            const sources = self.text_sources orelse return luaError(state, "text service unavailable");
-            const source = sources.acquire(.{
-                .utf8 = "✓",
-                .language = "und",
-                .logical_size = 16,
-                .candidates = self.themedFonts(true) catch |err| return luaError(state, @errorName(err)),
-                .configuration_revision = self.text_configuration_revision,
-            }) catch return luaError(state, "cannot retain checkbox mark");
-            self.append(.{
-                .id = semanticId("thumb", id),
-                .parent = track_id,
-                .object = .{ .text = .{ .source = source, .color = if (enabled) theme.primary_foreground else theme.disabled_foreground, .max_lines = 1 } },
-            }) catch {
-                sources.release(source) catch unreachable;
-                return luaError(state, "cannot append checkbox mark");
-            };
-            self.sources_staged = true;
-        } else self.append(.{
-            .id = semanticId("thumb", id),
-            .parent = track_id,
-            .object = .{ .box = recipe.thumb },
-        }) catch return luaError(state, "cannot append switch thumb");
-        if (self.pending_button_count == self.pending_buttons.len)
-            return luaError(state, "button capacity exceeded");
-        self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled, .style = recipe.style };
-        self.pending_button_count += 1;
-        self.appendSemantic(.{
-            .id = id,
-            .parent = semanticParent(parent),
-            .role = if (checkbox) .checkbox else .@"switch",
-            .key = key,
-            .label = label,
-            .enabled = enabled,
-            .checked = checked,
-        }) catch return luaError(state, "cannot append switch semantics");
-        const callback_type = c.lua_getfield(state, 1, "on_change");
-        defer c.lua_settop(state, -2);
-        if (callback_type == c.type_nil) return 0;
-        if (callback_type != c.type_function) return luaError(state, "switch on_change must be a function");
-        if (self.pending_handler_count == self.pending_handlers.len)
-            return luaError(state, "pointer handler capacity exceeded");
-        c.lua_pushvalue(state, -1);
-        self.pending_handlers[self.pending_handler_count] = .{
-            .id = id,
-            .reference = c.luaL_ref(state, c.registry_index),
-            .kind = .@"switch",
-        };
-        self.pending_handler_count += 1;
-        return 0;
-    }
-
     fn emitAuthInput(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1360,7 +1125,7 @@ pub const UiBuild = struct {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.text_input, false) catch |err| return luaError(state, @errorName(err));
+        const visual = theming.widgetOverrides(state, defaults.widgets.text_input, false) catch |err| return luaError(state, @errorName(err));
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.text_input expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "text_input requires a widget parent");
@@ -1600,7 +1365,7 @@ pub const UiBuild = struct {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.option, false) catch |err| return luaError(state, @errorName(err));
+        const visual = theming.widgetOverrides(state, defaults.widgets.option, false) catch |err| return luaError(state, @errorName(err));
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
             return luaError(state, "ouro.option expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "option requires a listbox parent");
@@ -1857,7 +1622,7 @@ pub const UiBuild = struct {
     fn emitDeclarativeText(self: *UiBuild, state: *c.State) c_int {
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
         const defaults = self.currentStyle().?;
-        const visual = widgetOverrides(state, defaults.widgets.text, false) catch |err| return luaError(state, @errorName(err));
+        const visual = theming.widgetOverrides(state, defaults.widgets.text, false) catch |err| return luaError(state, @errorName(err));
         const parent = self.currentParent() orelse return luaError(state, "text requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "text key is required");
         const value = tableString(state, 1, "text") orelse return luaError(state, "text content is required");
@@ -1878,11 +1643,13 @@ pub const UiBuild = struct {
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
+        const weight = tableOptionalEnum(enum { normal, medium }, state, 1, "weight", .normal) orelse
+            return luaError(state, "text weight must be normal or medium");
         const source = sources.acquire(.{
             .utf8 = value,
             .language = "und",
             .logical_size = logical_size,
-            .candidates = self.themedFonts(false) catch |err| return luaError(state, @errorName(err)),
+            .candidates = self.themedFonts(weight == .medium) catch |err| return luaError(state, @errorName(err)),
             .configuration_revision = self.text_configuration_revision,
         }) catch return luaError(state, "cannot retain text");
         const id = semanticId(key, 0x6c6162656c ^ parent.id ^ self.component_namespace);
@@ -1902,7 +1669,8 @@ pub const UiBuild = struct {
             return luaError(state, "cannot append text descriptor");
         };
         self.sources_staged = true;
-        self.appendSemantic(.{
+        const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
+        if (semantic) self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
             .role = .text,
@@ -1968,12 +1736,16 @@ pub const UiBuild = struct {
             return luaError(state, "box height must be at least min_height");
         const padding = tableOptionalExtent(state, 1, "padding", 0) orelse
             return luaError(state, "invalid box padding");
+        const padding_x = tableOptionalExtent(state, 1, "padding_x", padding) orelse
+            return luaError(state, "invalid box padding_x");
+        const padding_y = tableOptionalExtent(state, 1, "padding_y", padding) orelse
+            return luaError(state, "invalid box padding_y");
         const alignment = tableOptionalBoxAlignment(state, 1) orelse
             return luaError(state, "invalid box alignment");
         const surface = tableOptionalSurface(state, 1, theme) orelse
             return luaError(state, "box surface must be 'background', 'card', 'popover', or 'sidebar'");
         var visual: theming.Overrides = .{};
-        inline for (.{ "background", "border", "border_width", "radius" }) |field| {
+        inline for (.{ "background", "foreground", "border", "border_width", "radius" }) |field| {
             if (c.lua_getfield(state, 1, field) != c.type_nil) {
                 @field(visual, field) = if (@TypeOf(@field(visual, field)) == ?f32)
                     theming.extent(state, -1, false) catch |err| return luaError(state, @errorName(err))
@@ -1986,9 +1758,55 @@ pub const UiBuild = struct {
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const id = semanticId(key, 0x626f78 ^ parent.id ^ self.component_namespace);
+        const activate = tableOptionalBoolean(state, 1, "activate", false) orelse return luaError(state, "activate must be boolean");
+        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse return luaError(state, "enabled must be boolean");
+        const role = tableOptionalEnum(@import("../ui/semantics/snapshot.zig").Role, state, 1, "role", .group) orelse return luaError(state, "invalid semantic role");
+        if (role != .group and role != .button and role != .checkbox and role != .@"switch")
+            return luaError(state, "box role must be group, button, checkbox, or switch");
+        const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
+        if (activate and !semantic) return luaError(state, "activation requires semantics");
+        const checked = tableOptionalBoolean(state, 1, "checked", false) orelse return luaError(state, "checked must be boolean");
+        var paint: ?instance.InteractionPaint = null;
+        const states_type = c.lua_getfield(state, 1, "states");
+        if (states_type != c.type_nil) {
+            if (states_type != c.type_table) return luaError(state, "states must be a table");
+            paint = .{ .source = if (activate) id else self.interaction_owner orelse return luaError(state, "states require an activation ancestor"), .idle = visual.background orelse surface.value, .border = visual.border orelse theme.border };
+            inline for (.{ "hover", "pressed", "disabled", "focus" }) |field| {
+                if (c.lua_getfield(state, -1, field) != c.type_nil)
+                    @field(paint.?, field) = theming.color(state, -1) catch |err| return luaError(state, @errorName(err));
+                c.lua_settop(state, -2);
+            }
+        }
+        c.lua_settop(state, -2);
+        if (activate) {
+            if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "activation capacity exceeded");
+            const press_type = c.lua_getfield(state, 1, "on_press");
+            const change_type = c.lua_getfield(state, 1, "on_change");
+            c.lua_settop(state, -3);
+            if (press_type != c.type_nil and change_type != c.type_nil)
+                return luaError(state, "activation accepts on_press or on_change, not both");
+            const clear = @import("../core/color.zig").Color.rgba(0, 0, 0, 0);
+            const idle = visual.background orelse surface.value orelse clear;
+            self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled, .style = .{
+                .idle = idle,
+                .hovered = if (paint) |p| p.hover orelse idle else idle,
+                .pressed = if (paint) |p| p.pressed orelse p.hover orelse idle else idle,
+                .disabled = if (paint) |p| p.disabled orelse idle else idle,
+                .border = visual.border orelse theme.border,
+                .focus = if (paint) |p| p.focus else null,
+                .declarative = true,
+            } };
+            self.pending_button_count += 1;
+            self.stageCallback(state, id, "on_press", .button) catch |err| return luaError(state, @errorName(err));
+            self.stageCallback(state, id, "on_change", .@"switch") catch |err| return luaError(state, @errorName(err));
+            self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
+        }
         self.append(.{
             .id = id,
             .parent = parent.id,
+            .focusable = activate and enabled,
+            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
+            .interaction_paint = paint,
             .object = .{ .box = .{
                 .width = width.extent(),
                 .hidden = tableOptionalBoolean(state, 1, "hidden", false) orelse
@@ -1998,20 +1816,23 @@ pub const UiBuild = struct {
                 .fill_height = height.isFill(),
                 .min_width = min_width,
                 .min_height = min_height,
-                .padding = .all(padding),
+                .padding = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y },
                 .alignment = alignment.value,
-                .background = visual.background orelse surface.value,
+                .background = if (!enabled and paint != null) paint.?.disabled orelse paint.?.idle else visual.background orelse surface.value,
                 .border_color = if (border_width > 0) visual.border orelse theme.border else null,
                 .border_width = border_width,
                 .corner_radius = visual.radius orelse 0,
             } },
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append box descriptor");
-        self.appendSemantic(.{
+        if (semantic) self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
-            .role = .group,
+            .role = role,
             .key = key,
+            .label = tableString(state, 1, "label") orelse "",
+            .enabled = enabled,
+            .checked = checked,
         }) catch return luaError(state, "cannot append box semantics");
         self.stageCallback(state, id, "on_interaction_change", .interaction_change) catch |err|
             return luaError(state, @errorName(err));
@@ -2019,7 +1840,25 @@ pub const UiBuild = struct {
             return luaError(state, @errorName(err));
         self.stageCallback(state, id, "on_drop_uris", .drop_uris) catch |err|
             return luaError(state, @errorName(err));
-        return self.emitChildren(state, .{ .id = id, .kind = .box });
+        const previous_owner = self.interaction_owner;
+        if (activate) self.interaction_owner = id;
+        defer self.interaction_owner = previous_owner;
+        const content_theme_type = c.lua_getfield(state, 1, "content_theme");
+        const has_content_theme = content_theme_type != c.type_nil or visual.foreground != null;
+        if (has_content_theme) {
+            var content_theme = if (content_theme_type != c.type_nil)
+                theming.apply(state, -1, self.currentStyle().?) catch |err| return luaError(state, @errorName(err))
+            else
+                self.currentStyle().?;
+            if (visual.foreground) |foreground| {
+                content_theme.colors.foreground = foreground;
+                content_theme.widgets.text.foreground = null;
+            }
+            self.pushTheme(content_theme) catch return luaError(state, "theme nesting too deep");
+        }
+        c.lua_settop(state, -2);
+        defer if (has_content_theme) self.popTheme();
+        return self.emitChildren(state, .{ .id = id, .kind = .box, .semantic_id = if (semantic) id else semanticParent(parent) });
     }
 
     fn stageCallback(self: *UiBuild, state: *c.State, id: u64, name: [*:0]const u8, kind: @import("../ui/input/bindings.zig").HandlerKind) !void {
@@ -2343,26 +2182,10 @@ fn tableOptionalBoxAlignment(state: *c.State, table: c_int) ?OptionalAlignment {
     defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return .{ .value = null };
     const value = string(state, -1) orelse return null;
-    if (!std.mem.eql(u8, value, "center")) return null;
-    return .{ .value = .center };
-}
-
-fn widgetOverrides(state: *c.State, inherited: theming.Overrides, comptime omit_height: bool) !theming.Overrides {
-    const top = c.lua_gettop(state);
-    defer c.lua_settop(state, top);
-    var result = inherited;
-    inline for (std.meta.fields(theming.Overrides)) |field| {
-        // Buttons parse height as geometry, including the intrinsic "auto" size.
-        if (comptime omit_height and std.mem.eql(u8, field.name, "height")) continue;
-        if (c.lua_getfield(state, 1, field.name) != c.type_nil) {
-            @field(result, field.name) = if (field.type == ?f32)
-                try theming.extent(state, -1, std.mem.eql(u8, field.name, "height") or std.mem.eql(u8, field.name, "font_size"))
-            else
-                try theming.color(state, -1);
-        }
-        c.lua_settop(state, -2);
-    }
-    return result;
+    if (std.mem.eql(u8, value, "center")) return .{ .value = .center };
+    if (std.mem.eql(u8, value, "left")) return .{ .value = .{ .horizontal = .minimum, .vertical = .center } };
+    if (std.mem.eql(u8, value, "right")) return .{ .value = .{ .horizontal = .maximum, .vertical = .center } };
+    return null;
 }
 
 fn tableOptionalBoolean(

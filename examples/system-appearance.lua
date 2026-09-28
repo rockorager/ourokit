@@ -1,7 +1,7 @@
 local ouro = require("ouro")
 local count = ouro.signal(0)
 
-local Counter = ouro.component(function()
+local Counter = ouro.stateful(function()
   return function()
     return ouro.button {
       key = "counter",

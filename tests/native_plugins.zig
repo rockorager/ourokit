@@ -301,7 +301,7 @@ test "native drawing signal rebuilds a canvas and retained paint outlives Lua an
         defer prepared.deinit();
         try host.run(
             \\local ouro, counter = require('ouro'), require('counter')
-            \\local Meter = ouro.component(function()
+            \\local Meter = ouro.stateful(function()
             \\  return function() return ouro.canvas { key='meter', drawing=counter.paint(), alt='Native level' } end
             \\end)
             \\function build() return Meter { key='component' } end

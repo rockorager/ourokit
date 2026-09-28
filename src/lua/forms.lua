@@ -10,7 +10,7 @@ local chevron_down = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height=
 local cross = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">'
   .. '<path d="m4.5 4.5 7 7m0-7-7 7" fill="none" stroke="#000" stroke-width="1.5" stroke-linecap="round"/></svg>'
 local space = ouro.tokens.foundation
-ouro.spinbox = ouro.component(function(props)
+ouro.spinbox = ouro.stateful(function(props)
   local draft = ouro.signal({base=props.value, text=tostring(props.value)})
   local function reset() draft:set({base=props.value, text=tostring(props.value)}) end
   local function request(candidate)
@@ -44,7 +44,7 @@ ouro.spinbox = ouro.component(function(props)
   end
 end)
 
-ouro.select = ouro.component(function(props)
+ouro.select = ouro.stateful(function(props)
   local selected = ouro.signal(props.selected)
   local popup
   local function choose(value)
@@ -96,7 +96,7 @@ ouro.select = ouro.component(function(props)
   end
 end)
 
-ouro.tabs = ouro.component(function(props)
+ouro.tabs = ouro.stateful(function(props)
   return function()
     assert(type(props.key)=='string' and type(props.label)=='string', 'tabs requires key and label')
     assert(type(props.tabs)=='table' and #props.tabs>0, 'tabs requires nonempty tabs')

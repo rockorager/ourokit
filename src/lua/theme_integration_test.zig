@@ -152,6 +152,118 @@ const Fixture = struct {
     }
 };
 
+test "stock Lua controls preserve asymmetric root stack offsets" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    for ([_][]const u8{ "button", "checkbox", "switch" }) |name| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.{s} {{key='control', label='Offset', checked=true, x=17, y=31}} end", .{name});
+        defer std.testing.allocator.free(source);
+        try f.exec(source);
+        try f.build();
+        const render = try f.runtime.instances.renderObject(try f.handle("control"));
+        try std.testing.expectEqual(core.PointF{ .x = 17, .y = 31 }, try f.runtime.tree.nodeOffset(render));
+    }
+}
+
+test "Lua composition uses inherited themes and nested native activation paint without rebuilding" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    const Input = struct {
+        fn flush(value: *Fixture) !void {
+            try value.runtime.dispatchInput(&value.callbacks);
+            while (value.scheduler.takeRunnable()) |handle|
+                try std.testing.expectEqual(.completed, try value.vm.resumeRunnable(handle));
+            try value.runtime.prepareFrame(1);
+        }
+        fn key(value: *Fixture, logical: @import("../platform/window.zig").LogicalKey, state: @import("../platform/window.zig").KeyState) !void {
+            try value.runtime.routeKeyboard(.{ .key = .{ .window = value.runtime.window, .serial = 1, .time_ms = 1, .state = state, .translated = .{ .keycode = 0, .logical = logical } } });
+            try flush(value);
+        }
+    };
+    try f.exec(
+        \\builds, renders, calls = 0, 0, 0
+        \\enabled, failure, changed = ouro.signal(true), ouro.signal(false), ouro.signal(false)
+        \\local Custom = ouro.stateless(function(p, children, theme)
+        \\  renders = renders + 1
+        \\  assert(theme.colors.background == ouro.tokens.dark.background)
+        \\  assert(theme.controls.height == 47 and theme.widgets.button.padding_x == 13)
+        \\  local idle = theme.colors.primary
+        \\  theme.colors.primary = '#ffffff' -- The theme argument is an isolated value.
+        \\  return ouro.box {key=p.key, activate=true, role='button', label='Custom',
+        \\    enabled=p.enabled, width=140, height=60, alignment='center',
+        \\    on_press=function() calls=calls+1 end,
+        \\    ouro.row {key='content', cross_alignment='center',
+        \\      ouro.box {key='chrome', width=31, height=23, border_width=1, border='#010305',
+        \\        background=idle, states={hover='#234567', pressed='#456789', disabled='#6789ab', focus='#abcdef'},
+        \\        children=children},
+        \\      ouro.text {key='label', text='Nested content'},
+        \\    },
+        \\  }
+        \\end)
+        \\function build()
+        \\  builds=builds+1
+        \\  return ouro.column {key='root',
+        \\    ouro.theme {key='scope', color_scheme='dark', controls={height=47},
+        \\      widgets={button={padding_x=13}}, colors={primary=changed() and '#192837' or '#123456'},
+        \\      Custom {key='control', enabled=enabled(), ouro.box {key='inside', width=7, height=9}},
+        \\    },
+        \\    ouro.box {key='tail', radius=failure() and -1 or 0},
+        \\  }
+        \\end
+    );
+    try f.build();
+    try f.runtime.prepareFrame(1);
+    const path = "root/scope/control";
+    const chrome_path = "root/scope/control/content/chrome";
+    const target = try f.handle(path);
+    const scope = try f.runtime.instances.scope(target);
+    const render_root = (try f.runtime.instances.rootRenderObject()).?;
+    const layouts = try f.runtime.tree.layoutCount(render_root);
+    try std.testing.expectEqual(core.Color.rgba(0x12, 0x34, 0x56, 255), (try f.object(chrome_path)).box.background.?);
+    const position = (try f.runtime.semanticTarget(chrome_path ++ "/inside")).center;
+    try f.runtime.routePointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = position } });
+    try Input.flush(f);
+    try std.testing.expectEqual(core.Color.rgba(0x23, 0x45, 0x67, 255), (try f.object(chrome_path)).box.background.?);
+    try Input.key(f, .tab, .pressed);
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    try std.testing.expectEqual(core.Color.rgba(0xab, 0xcd, 0xef, 255), (try f.object(chrome_path)).box.border_color.?);
+    try Input.key(f, .space, .pressed);
+    try std.testing.expectEqual(core.Color.rgba(0x45, 0x67, 0x89, 255), (try f.object(chrome_path)).box.background.?);
+    try Input.key(f, .space, .repeated);
+    try Input.key(f, .space, .released);
+    try Input.key(f, .enter, .pressed);
+    try Input.key(f, .enter, .repeated);
+    try f.exec("assert(builds==1 and renders==1 and calls==2)");
+    try std.testing.expectEqual(layouts, try f.runtime.tree.layoutCount(render_root));
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 2, .time_ms = 2, .button = 0x110, .state = .pressed } });
+    try Input.flush(f);
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 2, .time_ms = 2, .button = 0x110, .state = .released } });
+    try Input.flush(f);
+    try f.exec("assert(calls==3)");
+    try f.runtime.routePointer(.{ .leave = .{ .window = f.runtime.window, .serial = 3 } });
+    try Input.flush(f);
+    try f.exec("failure:set(true); changed:set(true)");
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try std.testing.expectEqual(core.Color.rgba(0x12, 0x34, 0x56, 255), (try f.object(chrome_path)).box.background.?);
+    try std.testing.expectEqual(scope, try f.runtime.instances.scope(target));
+    try Input.key(f, .enter, .pressed);
+    try f.exec("assert(calls==4); failure:set(false); enabled:set(false)");
+    try f.build();
+    try std.testing.expectEqual(target, try f.handle(path));
+    try std.testing.expect(f.runtime.focus.current() == null);
+    try std.testing.expectEqual(core.Color.rgba(0x67, 0x89, 0xab, 255), (try f.object(chrome_path)).box.background.?);
+    try f.runtime.routePointer(.{ .enter = .{ .window = f.runtime.window, .serial = 4, .position = position } });
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 4, .time_ms = 4, .button = 0x110, .state = .pressed } });
+    try Input.flush(f);
+    try Input.key(f, .space, .pressed);
+    try f.exec("assert(calls==4); enabled:set(true)");
+    try f.build();
+    try f.runtime.routePointer(.{ .leave = .{ .window = f.runtime.window, .serial = 5 } });
+    try Input.flush(f);
+    try std.testing.expectEqual(core.Color.rgba(0x19, 0x28, 0x37, 255), (try f.object(chrome_path)).box.background.?);
+    try std.testing.expectEqual(target, try f.handle(path));
+}
+
 test "Switch controlled callbacks, pointer and keyboard preserve state and focus" {
     const platform = @import("../platform/window.zig");
     const tokens = @import("../design/root.zig").tokens;
@@ -381,6 +493,14 @@ test "Lua decoration, stack and input hints reject invalid declarations atomical
         "ouro.box {key='bad', radius=1e-100}",
         "ouro.box {key='bad', border_width='2'}",
         "ouro.box {key='bad', surface='invalid', background='#123456'}",
+        "ouro.box {key='bad', states={hover='#123456'}}",
+        "ouro.box {key='bad', activate=true, states=false}",
+        "ouro.box {key='bad', activate=true, role='slider'}",
+        "ouro.box {key='bad', activate=true, on_press=function() end, on_change=function() end}",
+        "ouro.button {key='bad', label='Invalid variant', variant=false}",
+        "ouro.button {key='bad', label='Invalid tone', tone=false}",
+        "ouro.button {key='bad', label='Invalid off state', disabled_foreground=false}",
+        "ouro.button {key='bad', label='Invalid inactive field', enabled=false, foreground='#xyzxyz'}",
         "ouro.text_input {key='bad', text='', placeholder=3}",
         "ouro.text_input {key='bad', default_text='', label=false}",
         "ouro.switch {key='bad', label='Missing checked'}",
@@ -793,6 +913,31 @@ test "button variants use semantic recipes and tint custom content" {
     }
 }
 
+test "button content foreground permits nested theme and explicit text overrides" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\function build()
+        \\  return ouro.theme { key='scope', widgets={text={foreground='#ab4567'}},
+        \\    ouro.column { key='root',
+        \\      ouro.button { key='button', label='Custom', foreground='#137ba9',
+        \\        ouro.column { key='content',
+        \\          ouro.text { key='plain', text='Button foreground' },
+        \\          ouro.theme { key='nested', colors={foreground='#369c52'},
+        \\            ouro.text { key='label', text='Nested foreground' } },
+        \\          ouro.text { key='explicit', text='Explicit foreground', foreground='#e89224' },
+        \\        } },
+        \\      ouro.text { key='outside', text='Outer widget foreground' },
+        \\    } }
+        \\end
+    );
+    try f.build();
+    try std.testing.expectEqual(core.Color.rgba(19, 123, 169, 255), (try f.object("scope/root/button/content/plain")).text.color);
+    try std.testing.expectEqual(core.Color.rgba(54, 156, 82, 255), (try f.object("scope/root/button/content/nested/label")).text.color);
+    try std.testing.expectEqual(core.Color.rgba(232, 146, 36, 255), (try f.object("scope/root/button/content/explicit")).text.color);
+    try std.testing.expectEqual(core.Color.rgba(171, 69, 103, 255), (try f.object("scope/root/outside")).text.color);
+}
+
 test "theme inheritance and explicit precedence retheme clean components without remounting" {
     const f = try Fixture.create();
     defer f.destroy();
@@ -800,7 +945,7 @@ test "theme inheritance and explicit precedence retheme clean components without
     f.ui.widget_theme.?.controls.radius = 9;
     try f.exec(
         \\changed = ouro.signal(false)
-        \\local Child = ouro.component(function()
+        \\local Child = ouro.stateful(function()
         \\  return function() return ouro.button { key = 'button', label = 'Child' } end
         \\end)
         \\function build()
@@ -908,7 +1053,7 @@ test "host appearance rethemes retained components while app and nested override
     const f = try Fixture.create();
     defer f.destroy();
     try f.exec(
-        \\local Child = ouro.component(function()
+        \\local Child = ouro.stateful(function()
         \\  return function() return ouro.button { key = 'button', label = 'Retained' } end
         \\end)
         \\function build()

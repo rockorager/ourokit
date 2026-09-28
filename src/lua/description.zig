@@ -6,9 +6,6 @@ pub const Kind = enum {
     image,
     canvas,
     icon,
-    button,
-    @"switch",
-    checkbox,
     radio_group,
     radio,
     slider,
@@ -28,11 +25,12 @@ pub const Kind = enum {
     scroll,
     virtual_list,
     theme,
-    component,
+    stateful,
+    stateless,
 
     fn acceptsChildren(self: Kind) bool {
         return switch (self) {
-            .button, .listbox, .radio_group, .tab_bar, .tab, .split_view, .dialog, .box, .stack, .row, .column, .scroll, .theme, .component => true,
+            .listbox, .radio_group, .tab_bar, .tab, .split_view, .dialog, .box, .stack, .row, .column, .scroll, .theme, .stateful, .stateless => true,
             else => false,
         };
     }
@@ -57,13 +55,15 @@ pub const Description = struct {
         _ = c.luaL_newmetatable(state, metatable);
         c.lua_settop(state, -2);
         inline for (std.meta.fields(Kind)) |field| {
-            if (field.value == @intFromEnum(Kind.component)) continue;
+            if (field.value == @intFromEnum(Kind.stateful) or field.value == @intFromEnum(Kind.stateless)) continue;
             c.lua_pushinteger(state, field.value);
             c.lua_pushcclosure(state, construct, 1);
             c.lua_setfield(state, -2, field.name);
         }
-        c.lua_pushcclosure(state, component, 0);
-        c.lua_setfield(state, -2, "component");
+        c.lua_pushcclosure(state, stateful, 0);
+        c.lua_setfield(state, -2, "stateful");
+        c.lua_pushcclosure(state, stateless, 0);
+        c.lua_setfield(state, -2, "stateless");
         c.lua_createtable(state, 0, 1);
         c.lua_pushinteger(state, @intFromEnum(Kind.icon));
         c.lua_pushcclosure(state, construct, 1);
@@ -71,10 +71,19 @@ pub const Description = struct {
         c.lua_setfield(state, -2, "xdg");
     }
 
-    fn component(state: *c.State) callconv(.c) c_int {
+    fn stateless(state: *c.State) callconv(.c) c_int {
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_function)
-            return fail(state, "ouro.component expects one initializer function");
-        c.lua_pushinteger(state, @intFromEnum(Kind.component));
+            return fail(state, "ouro.stateless expects one render function");
+        c.lua_pushinteger(state, @intFromEnum(Kind.stateless));
+        c.lua_pushvalue(state, 1);
+        c.lua_pushcclosure(state, construct, 2);
+        return 1;
+    }
+
+    fn stateful(state: *c.State) callconv(.c) c_int {
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_function)
+            return fail(state, "ouro.stateful expects one initializer function");
+        c.lua_pushinteger(state, @intFromEnum(Kind.stateful));
         // A fresh definition token distinguishes even two definitions that use
         // the same initializer. Neither definition nor construction runs it.
         c.lua_createtable(state, 1, 0);
@@ -146,7 +155,7 @@ pub const Description = struct {
             c.lua_rawseti(state, 4, @intCast(index + 1));
         }
         _ = c.lua_setiuservalue(state, 3, 2);
-        if (kind == .component) {
+        if (kind == .stateful or kind == .stateless) {
             c.lua_pushvalue(state, c.upvalueIndex(2));
             _ = c.lua_setiuservalue(state, 3, 3);
         }

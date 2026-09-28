@@ -519,10 +519,10 @@ test "virtual clean scopes preserve providers but honor reader render and host i
         \\    return ouro.box { key = 'row', height = row_height() }
         \\  end,
         \\}
-        \\local Counter = ouro.component(function()
+        \\local Counter = ouro.stateful(function()
         \\  return function() return ouro.box { key = 'value', width = counter() + 1, height = 10 } end
         \\end)
-        \\local List = ouro.component(function()
+        \\local List = ouro.stateful(function()
         \\  return function() owners = owners + 1; local read = owner(); return description end
         \\end)
         \\function build()
@@ -598,7 +598,7 @@ test "virtual nested list providers follow executed outer row scope" {
         \\  item_key = function(i) keys = keys + 1; return 'inner-' .. (i + captured) end,
         \\  render_item = function() return ouro.box { key = 'box', height = 40 } end,
         \\}
-        \\local Counter = ouro.component(function()
+        \\local Counter = ouro.stateful(function()
         \\  return function() local read = counter(); return nil end
         \\end)
         \\function build() return ouro.stack { key = 'layout', Counter { key = 'counter' },
@@ -626,11 +626,11 @@ test "virtual retained rows still follow nested measurements and focus pin chang
     try f.exec(
         \\keys, rows = 0, 0
         \\height, counter = ouro.signal(40), ouro.signal(0)
-        \\local Row = ouro.component(function(props)
+        \\local Row = ouro.stateful(function(props)
         \\  return function() return ouro.box { key = 'box', height = props.index == 1 and height() or 40,
         \\    ouro.button { key = 'button', label = 'Focus' } } end
         \\end)
-        \\local Counter = ouro.component(function()
+        \\local Counter = ouro.stateful(function()
         \\  return function() local read = counter(); return nil end
         \\end)
         \\function build() return ouro.stack { key = 'layout', Counter { key = 'counter' },
@@ -904,7 +904,7 @@ test "virtual rows retire component readers and remount with fresh local state" 
     defer f.destroy();
     try f.exec(
         \\renders, roots = 0, 0
-        \\local Row = ouro.component(function(props)
+        \\local Row = ouro.stateful(function(props)
         \\  local value = ouro.signal(7)
         \\  if props.index == 1 then first_signal = value end
         \\  return function()
@@ -1105,7 +1105,7 @@ test "ensure_visible scroll paths use actual nested layout on both axes" {
         try f.exec(if (horizontal) "horizontal=true" else "horizontal=false");
         try f.exec(
             \\selected, gap, large = ouro.signal('rows/last'), ouro.signal(13), ouro.signal(false)
-            \\local Last = ouro.component(function(props)
+            \\local Last = ouro.stateful(function(props)
             \\  return function() return ouro.box {key='body',
             \\    width=horizontal and props.extent or 20, height=horizontal and 20 or props.extent} end
             \\end)

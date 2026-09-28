@@ -102,6 +102,13 @@ focus does not show this ring. Button pressed state uses the Radix
 hover color but omits its brightness/saturation filter until Ourokit has a
 justified color-filter primitive.
 
+Button, checkbox, and switch composition lives in `src/lua/controls.lua`, using
+the public theme-aware `ouro.stateless` and activation/paint properties of boxes.
+There are no native stock visual recipes or description kinds for these three
+controls. Native retained activation state drives declared paint bindings on
+the control or its descendants; rendering never calls Lua. The effective
+inherited theme is supplied at lowering, not copied from static light tokens.
+
 Buttons support Radix Themes' solid, soft, surface, and ghost variants in
 accent, neutral, and destructive tones. Outline and classic are omitted to
 keep the vocabulary small; surface covers the bordered case. The recipes use
@@ -160,7 +167,7 @@ Switch uses the Radix Themes size-2 surface recipe: a 35×20 logical-pixel
 track, 18×18 thumb, 1-pixel inset, and pill radius. Geometry derives from
 `spacing_5` and border-width foundations; `controls.radius` can override the
 radius, but shared button/input height and border-width defaults do not resize
-the switch. The native recipe composes root, track, and thumb Boxes and shares
+the switch. The Lua recipe composes root, track, and thumb Boxes and shares
 the retained button press/focus policy without adding a render-object kind.
 
 `switch_track` and `switch_border` map to Slate alpha steps 5 and 8 in light
@@ -174,8 +181,8 @@ The 43×28 hit bounds reserve space for a 2-pixel focus ring and 2-pixel gap,
 so parent clips cannot cut off the ring. Focus changes only the root border
 color, not layout. A 1-pixel `switch_border` thumb edge replaces shadows and
 keeps disabled thumb positions discernible in light mode.
-Unlike Radix's focus-visible selector, Ourokit shows it for pointer focus too.
-State changes are immediate: this first native recipe omits Radix's animation,
+Focus is keyboard-visible; pointer activation does not show a focus ring.
+State changes are immediate: this recipe omits Radix's animation,
 thumb shadows, blend modes, and active filters. Enabled checked borders use `primary`
 rather than compositing Radix's gray inset shadow over the accent track.
 

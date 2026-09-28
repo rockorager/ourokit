@@ -35,6 +35,9 @@ function M.root(callback, ...)
         t.root_clean = true
     end
     t.callback, t.args = callback, args
+    -- All stateless expansions run on every lowering. Replace their shared
+    -- read set even when the new tree no longer contains any compositions.
+    select_reader(-2)
     return t.root
 end
 
@@ -77,6 +80,16 @@ function M.render(definition, props, children, parent, visual_parent)
     -- Pin immutable output cells, not just the mutable retained mount table.
     t.outputs[#t.outputs + 1] = update.output
     return update.output.value, record.token, retained
+end
+
+-- Stateless expansion output must outlive lowering too: semantic strings and
+-- prepared descriptions borrow its storage until the candidate is released.
+function M.compose(render, props, children, theme)
+    select_reader(-2)
+    local value = render(props, children, theme)
+    local outputs = transaction.outputs
+    outputs[#outputs + 1] = value
+    return value
 end
 
 function M.virtual(props, id, scope_clean, capacity)

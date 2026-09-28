@@ -2239,6 +2239,10 @@ pub const WindowRuntime = struct {
         next: ?core.Color,
     ) !void {
         const color = next orelse return;
+        if (self.buttons.styleFor(button).?.declarative) {
+            return self.applyInteractionPaint(button, self.keyboard_focus_visible and
+                if (self.focus.current()) |focused| sameHandle(focused, button) else false);
+        }
         const render = try self.instances.renderObject(button);
         var object = try self.tree.objectAt(render);
         if (object != .box) return error.ButtonRenderObjectMismatch;
@@ -2246,6 +2250,30 @@ pub const WindowRuntime = struct {
         object.box.background = color;
         try self.tree.update(render, object);
         self.frame_state.invalidatePaint();
+    }
+
+    fn applyInteractionPaint(self: *WindowRuntime, target: ui.instance.InstanceHandle, focused: bool) !void {
+        const id = try self.instances.semanticId(target);
+        for (0..self.instances.slots.len) |index| {
+            const binding = self.instances.paintAt(index) orelse continue;
+            if (binding.paint.source != id) continue;
+            var object = try self.tree.objectAt(binding.render);
+            const previous = object;
+            // These bindings are emitted by the Box primitive, not inferred
+            // from a stock control's role, root, or child positions.
+            object.box.background = self.buttons.paintColor(target, binding.paint);
+            if (binding.paint.focus) |focus_color| {
+                if (object.box.border_width == 0) {
+                    object.box.outline_color = if (focused) focus_color else null;
+                    object.box.outline_width = if (focused) 2 else 0;
+                    object.box.outline_gap = 0;
+                    object.box.outline_inset = true;
+                } else object.box.border_color = if (focused) focus_color else binding.paint.border;
+            }
+            if (std.meta.eql(previous, object)) continue;
+            try self.tree.update(binding.render, object);
+            self.frame_state.invalidatePaint();
+        }
     }
 
     fn applyButtonUpdate(self: *WindowRuntime, update: ?ui.widget.ButtonVisualUpdate) !void {
@@ -2348,6 +2376,8 @@ pub const WindowRuntime = struct {
 
     fn setFocusBorder(self: *WindowRuntime, target: ui.instance.InstanceHandle, requested: bool) !void {
         const focused = requested and (self.keyboard_focus_visible or self.text_inputs.contains(target));
+        if (self.buttons.styleFor(target)) |style| if (style.declarative)
+            return self.applyInteractionPaint(target, focused);
         if (self.listboxes.contains(target)) {
             for (0..self.listboxes.optionSlots()) |index| {
                 const option = self.listboxes.optionAt(index) orelse continue;

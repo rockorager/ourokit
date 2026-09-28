@@ -37,6 +37,7 @@ pub extern fn lua_gettop(state: *State) c_int;
 pub extern fn lua_checkstack(state: *State, extra: c_int) c_int;
 pub extern fn lua_xmove(from: *State, to: *State, count: c_int) void;
 pub extern fn lua_type(state: *State, index: c_int) c_int;
+pub extern fn lua_typename(state: *State, kind: c_int) [*:0]const u8;
 pub extern fn lua_resume(state: *State, from: ?*State, nargs: c_int, nresults: *c_int) c_int;
 pub extern fn lua_pcallk(state: *State, nargs: c_int, nresults: c_int, error_function: c_int, context: KContext, continuation: ?KFunction) c_int;
 pub extern fn lua_yieldk(state: *State, nresults: c_int, context: KContext, continuation: KFunction) c_int;

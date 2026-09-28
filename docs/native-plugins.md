@@ -131,7 +131,7 @@ Successful result setters replace the previous result, including its resources.
 
 ```lua
 local ouro, counter = require("ouro"), require("example.counter")
-local Meter = ouro.component(function()
+local Meter = ouro.stateful(function()
   return function(props)
     return ouro.canvas {
       key = "paint",

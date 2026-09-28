@@ -89,6 +89,25 @@ pub fn apply(state: *c.State, index: c_int, base: Theme) !Theme {
     return merge(Theme, state, index, base, "theme");
 }
 
+/// Validate the shared visual field schema without choosing a widget recipe.
+/// Intrinsic-height compositions parse height separately from numeric metrics.
+pub fn widgetOverrides(state: *c.State, inherited: Overrides, comptime omit_height: bool) !Overrides {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    var result = inherited;
+    inline for (std.meta.fields(Overrides)) |field| {
+        if (comptime omit_height and std.mem.eql(u8, field.name, "height")) continue;
+        if (c.lua_getfield(state, 1, field.name) != c.type_nil) {
+            @field(result, field.name) = if (field.type == ?f32)
+                try extent(state, -1, std.mem.eql(u8, field.name, "height") or std.mem.eql(u8, field.name, "font_size"))
+            else
+                try color(state, -1);
+        }
+        c.lua_settop(state, -2);
+    }
+    return result;
+}
+
 fn merge(comptime T: type, state: *c.State, index: c_int, base: T, comptime owner: []const u8) !T {
     if (c.lua_type(state, index) != c.type_table) return error.InvalidThemeType;
     const table = if (index < 0 and index > c.registry_index) c.lua_gettop(state) + index + 1 else index;

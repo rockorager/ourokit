@@ -244,9 +244,25 @@ root description or nil. Containers accept array entries or an explicit dense
 `children` table, never callback children. Native lowering walks the returned
 tree parent-first: rows and columns become Flex, scroll becomes a single-child
 viewport with instance-retained offset, text becomes Text, and buttons become
-Box plus Text and a typed widget binding. A bounded lowering context derives
+Lua-composed Box plus Text and a typed activation binding. A bounded lowering context derives
 identity and parent links from stable local keys and resolves inherited themes
 and parent data. No Button render object or Lua theme mirror is introduced.
+
+Stock button, checkbox, and switch recipes live only in `lua/controls.lua`.
+`ouro.stateless` expands stateless descriptions with a fresh effective native
+theme value during lowering, without mounting a component or adding a
+VM-specific identity namespace. Its output is pinned in the build transaction,
+including prepared candidates; failures discard callbacks and dependencies
+through the same ownership paths as other descriptions. Retained components
+may cache these declarations, but theme-aware expansion always runs at lowering.
+
+Boxes opt into shared native activation and semantics independently of their
+content. Explicit paint bindings connect boxes to their nearest activation
+owner by stable ID, so nested visual chrome need not follow a stock structure.
+Hover, press, disabled, and keyboard-visible focus resolve from retained native
+state; they update paint without Lua or layout. The window coordinator applies
+these bindings, while native editing/IME, selection, and range policies remain
+specialized. This is not an arbitrary renderer callback or an everything-node.
 
 Layout uses one-way Flutter-style box constraints in logical `f32` units. A
 parent passes minimum/maximum width and height, each child returns one finite
@@ -614,7 +630,7 @@ the returned Lua tree stays anchored for that lifetime. Prepared reload builds
 retain their own description reference across later window builds. Applications
 use stable string keys and constructor tables; numeric descriptor IDs, parent
 links, and renderer objects are not exposed. Reusable rendering helpers are
-ordinary Lua functions returning descriptions. `ouro.component` additionally
+ordinary Lua functions returning descriptions. `ouro.stateful` additionally
 retains an initializer's returned rebuild function, stable props, and keyed
 instance identity. Component descriptions do not initialize until mounted.
 Production windows retain one native build owner; component readers beneath it

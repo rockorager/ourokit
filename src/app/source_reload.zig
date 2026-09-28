@@ -1017,7 +1017,7 @@ test "a later window build failure leaves every retained window on the active ge
 
     const initial_two_windows =
         \\local ouro = require("ouro")
-        \\local Panel = ouro.component(function(props)
+        \\local Panel = ouro.stateful(function(props)
         \\  local label = ouro.signal(props.label)
         \\  return function()
         \\    return ouro.virtual_list {
@@ -1041,7 +1041,7 @@ test "a later window build failure leaves every retained window on the active ge
     ;
     const failing_second_window =
         \\local ouro = require("ouro")
-        \\local Panel = ouro.component(function(props)
+        \\local Panel = ouro.stateful(function(props)
         \\  local label = ouro.signal(props.label)
         \\  return function()
         \\    if props.fail then return false end

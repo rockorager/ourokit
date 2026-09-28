@@ -8,6 +8,18 @@ const AuthInput = @import("../widget/auth_input.zig").Input;
 
 pub const InstanceHandle = Handle;
 
+/// Paint-only box properties driven by a retained activation owner. The source
+/// is a semantic ID, never a Lua reference or a position in a widget recipe.
+pub const InteractionPaint = struct {
+    source: u64,
+    idle: ?@import("../../core/color.zig").Color = null,
+    hover: ?@import("../../core/color.zig").Color = null,
+    pressed: ?@import("../../core/color.zig").Color = null,
+    disabled: ?@import("../../core/color.zig").Color = null,
+    border: ?@import("../../core/color.zig").Color = null,
+    focus: ?@import("../../core/color.zig").Color = null,
+};
+
 pub const ReconcilePlan = struct {
     revision: u64,
     topology_changed: bool,
@@ -28,6 +40,7 @@ pub const Descriptor = struct {
     /// A changed nonzero token requests focus after the build commits.
     focus_request: u64 = 0,
     auth_input: ?AuthInput = null,
+    interaction_paint: ?InteractionPaint = null,
 };
 
 const State = enum { free, active, retiring };
@@ -50,6 +63,7 @@ const Slot = struct {
     focus_request: u64 = 0,
     focus_request_pending: bool = false,
     auth_input: ?AuthInput = null,
+    interaction_paint: ?InteractionPaint = null,
     traversal_order: usize = 0,
     reconcile_child: ?render_object.NodeHandle = null,
     rebuild_children: bool = false,
@@ -343,6 +357,7 @@ pub const Tree = struct {
                 slot.focus_request = 0;
             }
             slot.focusable = descriptor.focusable;
+            slot.interaction_paint = descriptor.interaction_paint;
             slot.ensure_visible = descriptor.ensure_visible;
             if (descriptor.ensure_visible == null) slot.revealed = null;
             slot.focus_request_pending = descriptor.focus_request != 0 and descriptor.focus_request != slot.focus_request;
@@ -409,6 +424,13 @@ pub const Tree = struct {
         const slot = self.slots[index];
         if (slot.state != .active or slot.id != id) return null;
         return handleFor(slot, index);
+    }
+
+    pub fn paintAt(self: *const Tree, index: usize) ?struct { render: render_object.NodeHandle, paint: InteractionPaint } {
+        if (index >= self.slots.len) return null;
+        const slot = self.slots[index];
+        if (slot.state != .active) return null;
+        return .{ .render = slot.render.?, .paint = slot.interaction_paint orelse return null };
     }
 
     pub fn authInput(self: *Tree, handle: InstanceHandle) ?AuthInput {
@@ -670,6 +692,15 @@ pub const Tree = struct {
             } else {
                 roots += 1;
                 if (descriptor.parent_data != .none) return error.RootHasParentData;
+            }
+            if (descriptor.interaction_paint) |paint| {
+                if (descriptor.object != .box) return error.InvalidInteractionPaint;
+                var source: ?u64 = descriptor.id;
+                while (source != null and source.? != paint.source) {
+                    const source_index = descriptor_index.get(source.?) orelse return error.InvalidInteractionPaint;
+                    source = descriptors[source_index].parent;
+                }
+                if (source == null) return error.InvalidInteractionPaint;
             }
         }
         for (descriptors) |parent| if (parent.object == .box) {

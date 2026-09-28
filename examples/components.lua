@@ -1,6 +1,6 @@
 local ouro = require("ouro")
 
-local Counter = ouro.component(function(props)
+local Counter = ouro.stateful(function(props)
   local count = ouro.signal(props.initial)
   local renders = 0
   return function()
@@ -17,7 +17,7 @@ local Counter = ouro.component(function(props)
   end
 end)
 
-local Demo = ouro.component(function()
+local Demo = ouro.stateful(function()
   local renamed, reversed, visible = ouro.signal(false), ouro.signal(false), ouro.signal(true)
   local renders = 0
   return function()
@@ -46,7 +46,7 @@ local Demo = ouro.component(function()
   end
 end)
 
-local Option = ouro.component(function(props)
+local Option = ouro.stateful(function(props)
   return function() return ouro.option { key = "option", value = props.value, label = props.label } end
 end)
 local selected = ouro.signal(1)

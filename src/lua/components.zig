@@ -137,7 +137,7 @@ pub const Components = struct {
         _ = c.lua_newuserdatauv(state, 0, 1);
         c.lua_pushvalue(state, 1);
         _ = c.lua_setiuservalue(state, -2, 1);
-        if (c.luaL_newmetatable(state, "ouro.component.props") != 0) {
+        if (c.luaL_newmetatable(state, "ouro.stateful.props") != 0) {
             c.lua_pushcclosure(state, readProp, 0);
             c.lua_setfield(state, -2, "__index");
             c.lua_pushcclosure(state, writeProp, 0);
@@ -168,7 +168,7 @@ pub const Components = struct {
         const reader = c.lua_tointegerx(state, 1, &number);
         if (reader == -1) {
             signals.preserveRoot();
-        } else signals.selectReader(@intCast(reader)) catch {
+        } else signals.selectReader(@bitCast(reader)) catch {
             _ = c.lua_pushstring(state, "component dependency capacity exceeded");
             return c.lua_error(state);
         };

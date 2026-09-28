@@ -126,13 +126,40 @@ return ouro.column {
 
 Build dynamic child lists in a local table, append descriptions in order, and
 pass that table as `children`. Keep explicit stable keys on each widget.
-Event handlers such as `on_press` and `on_select` remain callbacks. Ordinary
-Lua rendering helpers can return descriptions without owning state. Use
-`ouro.component` when a reusable component needs its own mounted state and
-signal dependencies:
+Event handlers such as `on_press` and `on_select` remain callbacks.
+
+**Choose stateless by default; use stateful for per-instance state.**
+
+Both constructors define reusable components, following the state-ownership
+distinction of Flutter's `StatelessWidget` and `StatefulWidget`:
+
+| Constructor | Use when | Function returns |
+| --- | --- | --- |
+| `ouro.stateless(render)` | UI is derived from props, children, inherited theme, or externally owned signals | A description or nil |
+| `ouro.stateful(initialize)` | Each mounted instance needs its own persistent state or setup | A render function that returns a description or nil |
+
+Stateless does not mean static or noninteractive. A stateless component can
+read existing signals and pass callbacks to controls; it just does not create
+its own persistent Lua state. Ordinary Lua helpers can also return descriptions,
+but `ouro.stateless` waits until the inherited theme is known before rendering.
+
+For example, a Card only arranges its inputs:
 
 ```lua
-local Counter = ouro.component(function(props)
+local Card = ouro.stateless(function(props, children, theme)
+  return ouro.box {
+    key = props.key,
+    padding = 16,
+    background = theme.colors.card,
+    children = children,
+  }
+end)
+```
+
+Use `ouro.stateful` for a Counter that owns a separate count per instance:
+
+```lua
+local Counter = ouro.stateful(function(props)
   -- Initialize once for each mounted instance.
   local count = ouro.signal(props.initial or 0)
   local function increment()
@@ -190,20 +217,78 @@ clean components reuse their retained descriptions. Native lowering and
 reconciliation still consume a complete window snapshot. This is component-level
 Lua rebuilding, not property-level bindings or partial native-tree updates.
 
-Children supplied to a component are available as `props.children`. A wrapper
-can forward them to a native container without knowing their widget types:
+Children supplied to a stateful component are available as `props.children`.
+Stateless components receive children as their second render argument, as in
+the Card example above.
+
+**Theme-aware stateless composition and activation.**
+
+`ouro.stateless(function(props, children, theme) ... end)` defines a stateless
+description constructor. Its render function runs during native lowering, at
+the same non-yielding safe point as component rendering, and returns a description
+or nil. `theme` is a fresh value of the effective inherited native theme:
+`colors`, `typography`, `controls`, and `widgets`, including host appearance,
+application defaults, and enclosing overrides. It is not `ouro.tokens.light`.
+Changing this value does not change native defaults. Treat props and children
+as read-only snapshots. Do not create state, write signals, perform effects, or
+yield inside the render function; create state outside and pass its values in
+props, or read existing signals. Composition signal dependencies are replaced
+transactionally on each lowering, independently of retained component readers.
+
+Unlike `ouro.stateful`, a stateless component creates no mounted state,
+semantic namespace, or layout wrapper. Forward `props.key` to the returned root to preserve keyed
+native identity across rebuilds and source reload. Every full lowering expands
+it again, including when enclosing components retain their descriptions, so
+inherited themes cannot become stale. Hover, pressed, and keyboard-focus paint
+updates do not lower descriptions or run composition functions.
+
+Buttons, checkboxes, and switches are stock Lua compositions over `ouro.box`
+and `ouro.text`. Applications have the same primitive boundary:
 
 ```lua
-local Card = ouro.component(function(props)
-  return function()
-    return ouro.box {
-      key = "body",
-      padding = 16,
-      children = props.children,
-    }
-  end
+local Action = ouro.stateless(function(props, children, theme)
+  return ouro.box {
+    key=props.key, activate=true, role='button', label=props.label,
+    enabled=props.enabled, on_press=props.on_press,
+    padding_x=12, padding_y=6, radius=theme.controls.radius or 4,
+    background=theme.colors.accent,
+    states={hover=theme.colors.accent_hover,
+            pressed=theme.colors.accent_selected,
+            disabled=theme.colors.disabled, focus=theme.colors.ring},
+    content_theme={colors={foreground=theme.colors.accent_text}},
+    ouro.row {key='content', children=children},
+  }
 end)
 ```
+
+`box.activate=true` opts into native primary-button capture, press activation,
+Space/Enter activation, repeat suppression, focus traversal, and cancellation.
+`enabled=false` blocks activation and focus and cancels an armed press.
+`focus_request`, `on_cancel`, and `on_interaction_change` use the existing control
+contracts. Supply either `on_press()` or `on_change(not checked)`, not both;
+`checked` remains application-controlled. Box roles are `group` (default),
+`button`, `checkbox`, and `switch`; declaring a role alone does not enable input.
+`label`, `checked`, and `enabled` are copied to the semantic snapshot.
+
+Any box under an activation owner can declare `states`, independently of the
+owner's visual structure. It binds to the nearest activation ancestor, or itself
+when `activate=true`. `hover`, `pressed`, and `disabled` are background colors;
+precedence is disabled, pressed, hover, then the box's ordinary background.
+Missing pressed falls back to hover; other missing states use the ordinary
+background. `focus` recolors an existing border for keyboard-visible focus,
+or draws a 2-pixel inset outline when borderless. These properties change paint
+only. Omit `states` for chrome that never changes with interaction.
+
+`content_theme` applies native theme inheritance to a box's descendants without
+adding a layout node. A box's explicit `foreground` then sets the descendant
+foreground and clears the text-widget foreground override, so nested themes
+and explicit text colors can override it. `padding_x`/`padding_y` override the corresponding sides
+of `padding`. Box alignment accepts `center`, `left`, or `right` (left/right are
+vertically centered). `text.weight` accepts `normal` or `medium`, using the
+host's matching font candidates. Decorative boxes/text may set `semantic=false`;
+their descendants keep the nearest semantic parent. Activation owners must
+remain semantic. Text editing, IME, selection, sliders, and other specialized
+native policies are unchanged by this composition boundary.
 
 Desktop components use a distinct layer-shell declaration rather than a mode
 bit on `ouro.window`. Layer-surface content fills the configured rectangle
@@ -753,7 +838,7 @@ The supported defaults are:
 
 ### Controlled switches
 
-`ouro.switch` is a native binary control with a required boolean `checked`
+`ouro.switch` is a Lua-composed binary control with a required boolean `checked`
 value and non-empty accessible `label`:
 
 ```lua
@@ -790,7 +875,7 @@ The fixed size-2 control has a 35×20 track within 43×28 hit bounds that reserv
 space for the focus ring. It uses inherited semantic colors and a pill radius;
 `theme.controls.radius` overrides the radius. It accepts contextual `flex` but
 no children or button-style dimension/visual props. See the
-[native recipe and intentional Radix departures](design-system.md) and
+[Lua recipe and intentional Radix departures](design-system.md) and
 `switch/*` stories in `examples/storybook.lua` for both palettes, on/off,
 disabled, keyboard focus, and controlled pointer activation.
 

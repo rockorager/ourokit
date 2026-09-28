@@ -14,7 +14,7 @@ pub fn install(state: *c.State) void {
     c.lua_setfield(state, -2, "tokens");
 }
 
-fn push(state: *c.State, value: anytype) void {
+pub fn push(state: *c.State, value: anytype) void {
     @setEvalBranchQuota(100_000);
     const T = @TypeOf(value);
     if (T == type) {
@@ -26,9 +26,13 @@ fn push(state: *c.State, value: anytype) void {
         }
     } else if (T == Color) {
         @import("color.zig").push(state, value);
+    } else if (T == @import("theme.zig").Family) {
+        const name = value.name();
+        _ = c.lua_pushlstring(state, name.ptr, name.len);
     } else if (T == []const u8) {
         _ = c.lua_pushlstring(state, value.ptr, value.len);
     } else switch (@typeInfo(T)) {
+        .optional => if (value) |present| push(state, present) else c.lua_pushnil(state),
         .float => c.lua_pushnumber(state, value),
         .@"struct" => {
             const fields = comptime std.meta.fields(T);
