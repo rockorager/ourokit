@@ -281,9 +281,36 @@ color. Box-only `focus` recolors an existing border for keyboard-visible focus,
 or draws a 2-pixel inset outline when borderless. These properties change paint
 only. Omit `states` for chrome that never changes with interaction.
 
+**Selection groups.** Rows and columns can opt into native selection policy:
+
+```lua
+ouro.row {
+  key='choices', selection='radio_group', selected=choice(),
+  on_select=function(value) choice:set(value) end,
+  main_axis_size='min', gap=12, cross_alignment='center',
+  ouro.box {key='first', option=17, label='First', width=80, height=40},
+  ouro.box {key='second', option=29, label='Second', width=140, height=64},
+}
+```
+
+`selection` is `listbox`, `radio_group`, or `tab_list`. It supplies the semantic
+role and native input policy without adding a wrapper. `selected` must be an
+integer and `on_select(value)` must be a function. `enabled`, `focus_request`,
+`label`, `on_activate(value)`, and `on_cancel()` keep the stock group contracts;
+`semantic=false` is not allowed. `appearance='default' | 'sidebar'` is passed
+to item recipes through `context.selection`; it does not choose group layout.
+
+Layout and keyboard policy are independent: listbox arrows remain vertical,
+tab-list arrows horizontal, and radio-group arrows work on both axes. Rows and
+columns accept `main_axis_size='min' | 'max'` (default `min`) and normal child
+`flex` factors, including when selection is enabled. `max` uses the available
+bounded main-axis extent; `min` uses the children's extent. The stock
+`listbox`, `radio_group`, and `tab_bar` constructors are Lua recipes that choose
+their usual axis, spacing, stretch alignment, and `main_axis_size='max'`.
+
 **Selection items.** `ouro.box {key='entry', option=17, label='Entry', ...}`
-registers custom content as a direct child of `listbox`, `radio_group`, or
-`tab_bar`. Values must be unique integers. The native group supplies role,
+registers custom content as a direct child of a selection-enabled row or column,
+including the stock groups. Values must be unique integers. The native group supplies role,
 selected/checked state, enabled state, focus, and keyboard policy; the item
 must not override `activate`, `role`, `checked`, or `enabled`, or disable its
 semantics. Nested activation controls remain independent, as with tab close

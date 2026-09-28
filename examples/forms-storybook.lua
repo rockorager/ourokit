@@ -46,6 +46,36 @@ local function separators()
   }
 end
 
+local Choice = o.stateless(function(p, children, theme, context)
+  local active = context.selection.enabled
+  return o.box {key=p.key, option=p.value, label=p.label, width=p.width,
+    height=p.height or 48, flex=p.flex, padding=12, radius=6, alignment='left',
+    background=theme.colors.secondary,
+    states={hover=theme.colors.accent_hover, selected=active and theme.colors.accent_selected or theme.colors.disabled},
+    o.text {key='label', text=p.label, semantic=false,
+      foreground=active and theme.colors.foreground or theme.colors.disabled_foreground}}
+end)
+
+local function selection_layout(disabled)
+  local selected = o.signal(-7)
+  return function()
+    return o.column {key='layout', gap=16,
+      o.text {key='title', text='Selection without stock layout', size=24},
+      o.text {key='intrinsic-label', text='Intrinsic width · centered, unequal heights'},
+      o.row {key='intrinsic', selection='radio_group', selected=selected(), enabled=not disabled,
+        on_select=function(v) selected:set(v) end, main_axis_size='min', gap=12, cross_alignment='center',
+        Choice {key='first', value=41, label='Compact', width=110},
+        Choice {key='second', value=-7, label='Expanded', width=190, height=72}},
+      o.text {key='flex-label', text='Available width · 1:3 flex children'},
+      o.row {key='weighted', selection='radio_group', selected=selected(), enabled=not disabled,
+        on_select=function(v) selected:set(v) end, main_axis_size='max', gap=12,
+        Choice {key='first', value=41, label='One', flex=1},
+        Choice {key='second', value=-7, label='Three', flex=3}},
+      o.text {key='value', text='Selected value: '..selected()},
+    }
+  end
+end
+
 return o.storybook {id='forms', title='Form controls', stories={
   o.story {id='forms/light', name='Light', viewport={width=540,height=640}, content=content()},
   o.story {id='forms/dark', name='Dark', color_scheme='dark', viewport={width=540,height=640}, content=content()},
@@ -59,4 +89,9 @@ return o.storybook {id='forms', title='Form controls', stories={
   end},
   o.story {id='separator/light', name='Separators', viewport={width=480,height=300}, snapshot_scale=2, content=separators},
   o.story {id='separator/dark', name='Separators (dark)', color_scheme='dark', viewport={width=480,height=300}, snapshot_scale=2, content=separators},
+  o.story {id='selection-layout/light', name='Custom selection layout', viewport={width=560,height=340}, snapshot_scale=2, content=selection_layout(false)},
+  o.story {id='selection-layout/dark', name='Custom selection layout (dark)', color_scheme='dark', viewport={width=560,height=340}, snapshot_scale=2, content=selection_layout(false)},
+  o.story {id='selection-layout/disabled', name='Custom selection layout (disabled)', viewport={width=560,height=340}, snapshot_scale=2, content=selection_layout(true)},
+  o.story {id='selection-layout/changed', name='Custom selection layout (changed)', viewport={width=560,height=340}, snapshot_scale=2, content=selection_layout(false),
+    actions={{type='click',target='layout/intrinsic/first'}}},
 }}

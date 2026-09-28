@@ -643,13 +643,10 @@ pub const UiBuild = struct {
             .image => emitImage,
             .canvas => emitCanvas,
             .icon => emitIcon,
-            .radio_group => emitRadioGroup,
             .slider => emitSlider,
             .dialog => emitDialog,
             .text_input => emitTextInput,
             .auth_input => emitAuthInput,
-            .listbox => emitListBox,
-            .tab_bar => emitTabBar,
             .split_view => emitSplitView,
             .box => emitBox,
             .stack => emitStack,
@@ -1302,84 +1299,6 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn emitListBox(state: *c.State) callconv(.c) c_int {
-        return emitSelectionGroup(state, false, false);
-    }
-
-    fn emitRadioGroup(state: *c.State) callconv(.c) c_int {
-        return emitSelectionGroup(state, true, false);
-    }
-
-    fn emitTabBar(state: *c.State) callconv(.c) c_int {
-        return emitSelectionGroup(state, false, true);
-    }
-
-    fn emitSelectionGroup(state: *c.State, radio: bool, tabs: bool) c_int {
-        const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
-        if (self.currentTheme() == null) return luaError(state, "declarative widgets unavailable");
-        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
-            return luaError(state, "ouro.listbox expects one declaration table");
-        const parent = self.currentParent() orelse return luaError(state, "listbox requires a widget parent");
-        const key = tableString(state, 1, "key") orelse return luaError(state, "listbox key is required");
-        const selected = tableRequiredInteger(state, 1, "selected") orelse
-            return luaError(state, "listbox selected must be an integer");
-        const enabled = tableOptionalBoolean(state, 1, "enabled", true) orelse
-            return luaError(state, "selection group enabled must be boolean");
-        const appearance = tableOptionalListBoxAppearance(state, 1) orelse
-            return luaError(state, "listbox appearance must be 'default' or 'sidebar'");
-        const gap = tableOptionalExtent(state, 1, "gap", if (tabs) 0 else design.tokens.foundation.spacing_1) orelse
-            return luaError(state, "invalid listbox gap");
-        const parent_data = declarativeParentData(self, state, 1) catch |err|
-            return luaError(state, parentDataErrorMessage(err));
-        const id = semanticId(key, 0x6c697374626f78 ^ parent.id ^ self.component_namespace);
-        self.append(.{
-            .id = id,
-            .parent = parent.id,
-            .object = .{ .flex = .{ .axis = if (tabs) .horizontal else .vertical, .gap = gap, .cross_axis_alignment = .stretch } },
-            .focusable = enabled,
-            .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
-            .parent_data = parent_data,
-        }) catch return luaError(state, "cannot append listbox descriptor");
-        self.appendSemantic(.{
-            .id = id,
-            .parent = semanticParent(parent),
-            .role = if (radio) .radio_group else if (tabs) .tab_list else .listbox,
-            .key = key,
-            .label = tableString(state, 1, "label") orelse "",
-            .enabled = enabled,
-        }) catch return luaError(state, "cannot append listbox semantics");
-        if (self.pending_listbox_count == self.pending_listboxes.len)
-            return luaError(state, "listbox capacity exceeded");
-        self.pending_listboxes[self.pending_listbox_count] = .{
-            .id = id,
-            .selected = selected,
-            .appearance = appearance,
-            .enabled = enabled,
-        };
-        self.pending_listbox_count += 1;
-
-        const callback_type = c.lua_getfield(state, 1, "on_select");
-        if (callback_type != c.type_function) {
-            c.lua_settop(state, -2);
-            return luaError(state, "listbox on_select must be a function");
-        }
-        if (self.pending_handler_count == self.pending_handlers.len) {
-            c.lua_settop(state, -2);
-            return luaError(state, "pointer handler capacity exceeded");
-        }
-        c.lua_pushvalue(state, -1);
-        self.pending_handlers[self.pending_handler_count] = .{
-            .id = id,
-            .reference = c.luaL_ref(state, c.registry_index),
-            .kind = .listbox,
-        };
-        self.pending_handler_count += 1;
-        c.lua_settop(state, -2);
-        self.stageCallback(state, id, "on_activate", .selection_activate) catch |err| return luaError(state, @errorName(err));
-        self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
-        return self.emitChildren(state, .{ .id = id, .kind = if (radio) .radio_group else if (tabs) .tab_bar else .listbox });
-    }
-
     fn emitSplitView(state: *c.State) callconv(.c) c_int {
         const self = bridge(state) orelse return luaError(state, "invalid Ouro UI build context");
         const theme = self.currentTheme() orelse return luaError(state, "declarative widgets unavailable");
@@ -1884,6 +1803,16 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         "cross_alignment",
         .start,
     ) orelse return luaError(state, "invalid container cross_alignment");
+    const main_axis_size = tableOptionalEnum(render_types.MainAxisSize, state, 1, "main_axis_size", .min) orelse
+        return luaError(state, "main_axis_size must be min or max");
+    const selection_type = c.lua_getfield(state, 1, "selection");
+    c.lua_settop(state, -2);
+    const selection = if (selection_type == c.type_nil) null else tableOptionalEnum(enum { listbox, radio_group, tab_list }, state, 1, "selection", .listbox) orelse
+        return luaError(state, "selection must be listbox, radio_group, or tab_list");
+    const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
+    if (selection != null and !semantic) return luaError(state, "selection requires semantics");
+    const enabled = if (selection != null) tableOptionalBoolean(state, 1, "enabled", true) orelse
+        return luaError(state, "selection group enabled must be boolean") else true;
     const parent_data = declarativeParentData(self, state, 1) catch |err|
         return luaError(state, parentDataErrorMessage(err));
     const id = semanticId(
@@ -1893,22 +1822,46 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
     self.append(.{
         .id = id,
         .parent = parent.id,
+        .focusable = selection != null and enabled,
+        .focus_request = if (selection != null) tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)) else 0,
         .object = .{ .flex = .{
             .axis = axis,
-            .main_axis_size = .min,
+            .main_axis_size = main_axis_size,
             .cross_axis_alignment = cross_alignment,
             .gap = gap,
         } },
         .parent_data = parent_data,
     }) catch return luaError(state, "cannot append container descriptor");
-    const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
     if (semantic) self.appendSemantic(.{
         .id = id,
         .parent = semanticParent(parent),
-        .role = .group,
+        .role = if (selection) |kind| switch (kind) {
+            .listbox => .listbox,
+            .radio_group => .radio_group,
+            .tab_list => .tab_list,
+        } else .group,
         .key = key,
+        .label = if (selection != null) tableString(state, 1, "label") orelse "" else "",
+        .enabled = enabled,
     }) catch return luaError(state, "cannot append container semantics");
-    return self.emitChildren(state, .{ .id = id, .kind = .flex, .semantic_id = if (semantic) id else semanticParent(parent) });
+    if (selection != null) {
+        const selected = tableRequiredInteger(state, 1, "selected") orelse return luaError(state, "selection selected must be an integer");
+        const appearance = tableOptionalListBoxAppearance(state, 1) orelse return luaError(state, "selection appearance must be default or sidebar");
+        if (self.pending_listbox_count == self.pending_listboxes.len) return luaError(state, "listbox capacity exceeded");
+        self.pending_listboxes[self.pending_listbox_count] = .{ .id = id, .selected = selected, .enabled = enabled, .appearance = appearance };
+        self.pending_listbox_count += 1;
+        const callback_type = c.lua_getfield(state, 1, "on_select");
+        c.lua_settop(state, -2);
+        if (callback_type != c.type_function) return luaError(state, "selection on_select must be a function");
+        self.stageCallback(state, id, "on_select", .listbox) catch |err| return luaError(state, @errorName(err));
+        self.stageCallback(state, id, "on_activate", .selection_activate) catch |err| return luaError(state, @errorName(err));
+        self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
+    }
+    return self.emitChildren(state, .{ .id = id, .kind = if (selection) |kind| switch (kind) {
+        .listbox => .listbox,
+        .radio_group => .radio_group,
+        .tab_list => .tab_bar,
+    } else .flex, .semantic_id = if (semantic) id else semanticParent(parent) });
 }
 
 fn readInteractionPaint(state: *c.State, owner: ?InteractionOwner, idle: ?@import("../core/color.zig").Color, border: ?@import("../core/color.zig").Color, box: bool) !?instance.InteractionPaint {
@@ -2214,8 +2167,8 @@ fn declarativeParentData(
     const parent = self.currentParent() orelse return error.WidgetParentMissing;
     const flex = try tableOptionalFlexFactor(state, table);
     return switch (parent.kind) {
-        .flex => if (flex) |factor| .{ .flex = .{ .factor = factor } } else .none,
-        .box, .overlay, .scroll, .listbox, .radio_group, .tab_bar, .split => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
+        .flex, .listbox, .radio_group, .tab_bar => if (flex) |factor| .{ .flex = .{ .factor = factor } } else .none,
+        .box, .overlay, .scroll, .split => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
         .stack => stack: {
             if (flex != null) return error.FlexRequiresRowOrColumnParent;
             const x = tableOptionalExtent(state, table, "x", 0) orelse return error.InvalidPosition;

@@ -102,9 +102,9 @@ focus does not show this ring. Button pressed state uses the Radix
 hover color but omits its brightness/saturation filter until Ourokit has a
 justified color-filter primitive.
 
-Button, checkbox, switch, separator, option, radio, and tab composition lives in
-`src/lua/controls.lua`, using the public theme-aware `ouro.stateless` and
-activation/selection properties of boxes. These controls have no native stock
+Button, checkbox, switch, separator, option, radio, tab, and selection-group
+composition lives in `src/lua/controls.lua`, using the public theme-aware
+`ouro.stateless`, box activation, and row/column selection policy. These controls have no native stock
 visual recipes or description kinds. Native retained interaction state drives
 declared background and text-color paint bindings on
 the control or its descendants; rendering never calls Lua. The effective

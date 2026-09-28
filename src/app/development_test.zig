@@ -160,6 +160,56 @@ test "custom selection items repaint nested content without rebuilding and isola
     try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
 }
 
+test "selection groups keep layout independent of native keyboard and controlled policies" {
+    inline for (.{ "listbox", "radio_group", "tab_list" }) |policy| {
+        const f = try Fixture.create("policy='" ++ policy ++ "'\n" ++
+            \\builds=0; requested=0; activated=0; canceled=0
+            \\local Item=ouro.stateless(function(p, children, theme, context)
+            \\ assert(context.selection.role==policy and context.selection.selected==41)
+            \\ assert(context.selection.enabled and context.selection.appearance=='sidebar')
+            \\ return ouro.box {key=p.key,option=p.value,label=p.key,width=p.width,height=p.height}
+            \\end)
+            \\function build() builds=builds+1; return ouro.column {key='root',gap=0,
+            \\ ouro.row {key='choices',selection=policy,selected=41,appearance='sidebar',
+            \\   gap=11,cross_alignment='center',main_axis_size='min',
+            \\   on_select=function(v) requested=requested+v end,
+            \\   on_activate=function(v) activated=activated+v end,
+            \\   on_cancel=function() canceled=canceled+1 end,
+            \\   Item {key='first',value=41,width=30,height=20},
+            \\   Item {key='second',value=-7,width=50,height=80}},
+            \\ ouro.row {key='flex',selection=policy,selected=41,gap=0,main_axis_size='max',on_select=function() end,
+            \\   ouro.box {key='first',option=41,label='First',flex=1,height=20},
+            \\   ouro.box {key='second',option=-7,label='Second',flex=3,height=20}}} end
+        );
+        defer f.destroy();
+        const group = try f.runtime.semanticTarget("root/choices");
+        const first = try f.runtime.semanticTarget("root/choices/first");
+        const second = try f.runtime.semanticTarget("root/choices/second");
+        try std.testing.expectEqual(@as(f32, 91), group.bounds.width);
+        try std.testing.expectEqual(@as(f32, 80), group.bounds.height);
+        try std.testing.expectEqual(@as(f32, 41), second.bounds.x - first.bounds.x);
+        try std.testing.expectEqual(@as(f32, 30), first.bounds.y - second.bounds.y);
+        // The 324px window has 12px root padding on each side. Split the
+        // remaining 300px in a 1:3 ratio, not equal-width stock items.
+        try std.testing.expectEqual(@as(f32, 75), (try f.runtime.semanticTarget("root/flex/first")).bounds.width);
+        try std.testing.expectEqual(@as(f32, 225), (try f.runtime.semanticTarget("root/flex/second")).bounds.width);
+        try f.play(.{ .click = "root/choices/second" });
+        try f.play(.{ .key = .{ .keycode = 0, .logical = if (comptime std.mem.eql(u8, policy, "tab_list")) .arrow_right else .arrow_down } });
+        var snapshot = try f.snapshot();
+        defer snapshot.deinit();
+        try std.testing.expect((try node(snapshot, "root/choices")).focused);
+        try std.testing.expectEqual(comptime std.mem.eql(u8, policy, "listbox"), (try node(snapshot, "root/choices/second")).selected);
+        try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+        try f.play(.{ .key = .{ .keycode = 0, .logical = .escape } });
+        const assertions = if (comptime std.mem.eql(u8, policy, "listbox"))
+            "assert(builds==1 and requested==-14 and activated==-14 and canceled==1)"
+        else
+            "assert(builds==1 and requested==-14 and activated==34 and canceled==1)";
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, assertions.ptr, assertions.len, "@check-group", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    }
+}
+
 test "selection primitive rejects conflicting policies and rolls back staged items and text" {
     const f = try Fixture.create("function build() return ouro.box {key='original'} end");
     defer f.destroy();
@@ -183,6 +233,16 @@ test "selection primitive rejects conflicting policies and rolls back staged ite
         "ouro.option {key='bad',value=23,label='Bad',hover=false}",
         "ouro.option {key='bad',value=23,label='Bad',height=0}",
         "ouro.option {key='bad',value=23,label='Bad',height='auto'}",
+        "ouro.row {key='bad',selection=false}",
+        "ouro.column {key='bad',selection='multiple'}",
+        "ouro.row {key='bad',selection='listbox',selected=23,on_select=function() end,semantic=false}",
+        "ouro.row {key='bad',selection='listbox',on_select=function() end}",
+        "ouro.row {key='bad',selection='listbox',selected=1.5,on_select=function() end}",
+        "ouro.row {key='bad',selection='listbox',selected=23}",
+        "ouro.row {key='bad',selection='listbox',selected=23,on_select=false}",
+        "ouro.row {key='bad',selection='listbox',selected=23,on_select=function() end,enabled=0}",
+        "ouro.row {key='bad',selection='listbox',selected=23,on_select=function() end,appearance=false}",
+        "ouro.row {key='bad',main_axis_size='fill'}",
     };
     for (cases) |invalid| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.listbox {{key='list',selected=17,on_select=function() end," ++
@@ -194,6 +254,8 @@ test "selection primitive rejects conflicting policies and rolls back staged ite
         try std.testing.expectError(error.LuaBuildFailed, f.settle());
         try std.testing.expectEqual(original, f.runtime.instances.handleForId((try f.runtime.semantics.findPath("original")).id).?);
         try std.testing.expectEqual(@as(usize, 0), f.builder.pending_option_count);
+        try std.testing.expectEqual(@as(usize, 0), f.builder.pending_listbox_count);
+        try std.testing.expectEqual(@as(usize, 0), f.builder.pending_handler_count);
         try std.testing.expectEqual(@as(usize, 0), f.sources.count());
     }
 }

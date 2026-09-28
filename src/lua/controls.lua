@@ -114,6 +114,20 @@ ouro.separator = ouro.stateless(function(p, children, theme)
   }
 end)
 
+local function selection_group(p, children, policy)
+  local gap = p.gap
+  if gap == nil then gap = policy == 'tab_list' and 0 or f.spacing_1 end
+  local layout = policy == 'tab_list' and ouro.row or ouro.column
+  return layout {key=p.key, selection=policy, selected=p.selected, enabled=p.enabled,
+    label=p.label, appearance=p.appearance, on_select=p.on_select,
+    on_activate=p.on_activate, on_cancel=p.on_cancel, focus_request=p.focus_request,
+    flex=p.flex, x=p.x, y=p.y, main_axis_size='max', cross_alignment='stretch',
+    gap=gap, children=children}
+end
+ouro.listbox = ouro.stateless(function(p, children) return selection_group(p, children, 'listbox') end)
+ouro.radio_group = ouro.stateless(function(p, children) return selection_group(p, children, 'radio_group') end)
+ouro.tab_bar = ouro.stateless(function(p, children) return selection_group(p, children, 'tab_list') end)
+
 local function selection_item(p, children, theme, context, tab)
   validate_appearance(p)
   local group = context.selection
