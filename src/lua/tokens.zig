@@ -33,6 +33,7 @@ pub fn push(state: *c.State, value: anytype) void {
         _ = c.lua_pushlstring(state, value.ptr, value.len);
     } else switch (@typeInfo(T)) {
         .optional => if (value) |present| push(state, present) else c.lua_pushnil(state),
+        .bool => c.lua_pushboolean(state, @intFromBool(value)),
         .float => c.lua_pushnumber(state, value),
         .@"struct" => {
             const fields = comptime std.meta.fields(T);

@@ -5,6 +5,7 @@ const tokens = @import("../design/root.zig").tokens;
 
 pub const Theme = struct {
     colors: tokens.Theme,
+    reduced_motion: bool = false,
     typography: Typography = .{},
     controls: Controls = .{},
     widgets: Widgets = .{},
@@ -158,6 +159,10 @@ fn supportsWidgetField(comptime widget: []const u8, comptime field: []const u8) 
 }
 
 fn value(comptime T: type, state: *c.State, index: c_int, base: T, comptime key: []const u8) !T {
+    if (T == bool) {
+        if (c.lua_type(state, index) != c.type_boolean) return error.InvalidThemeType;
+        return c.lua_toboolean(state, index) != 0;
+    }
     if (@typeInfo(T) == .optional) {
         const Child = @typeInfo(T).optional.child;
         return try value(Child, state, index, base orelse std.mem.zeroes(Child), key);

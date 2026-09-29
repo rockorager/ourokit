@@ -487,6 +487,7 @@ fn runSourceInternal(
         .font_candidates = font_candidates,
         .medium_font_candidates = medium_font_candidates,
         .theme = theme,
+        .reduced_motion = appearance.current.reduced_motion,
         .callbacks = &callbacks,
         .theme_fonts = &theme_fonts,
         .workspaces = &workspaces,
@@ -610,7 +611,7 @@ fn runSourceInternal(
         const lua_ui = &active_generation.ui_build;
         if (appearance.takeEvent()) |event| switch (event) {
             .appearance_changed => |snapshot_value| {
-                if (source_reload.setTheme(appearanceTheme(snapshot_value))) {
+                if (source_reload.setTheme(appearanceTheme(snapshot_value), snapshot_value.reduced_motion)) {
                     for (runtime_slots) |*slot| if (slot.runtime.initialized)
                         try slot.runtime.setTheme(lua_ui.widget_theme.?.colors);
                 }

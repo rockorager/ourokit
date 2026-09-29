@@ -89,10 +89,13 @@ pub const SourceReload = struct {
         return self.active_generation;
     }
 
-    pub fn setTheme(self: *SourceReload, theme: @import("../design/root.zig").tokens.Theme) bool {
-        if (self.services) |*services| services.theme = theme;
-        if (self.candidate) |candidate| _ = candidate.setTheme(theme);
-        return self.active_generation.setTheme(theme);
+    pub fn setTheme(self: *SourceReload, theme: @import("../design/root.zig").tokens.Theme, reduced_motion: bool) bool {
+        if (self.services) |*services| {
+            services.theme = theme;
+            services.reduced_motion = reduced_motion;
+        }
+        if (self.candidate) |candidate| _ = candidate.setTheme(theme, reduced_motion);
+        return self.active_generation.setTheme(theme, reduced_motion);
     }
 
     pub fn attachModuleRoot(self: *SourceReload, directory: std.os.linux.fd_t) void {
@@ -1193,8 +1196,10 @@ test "a later window build failure leaves every retained window on the active ge
     try std.testing.expectEqual(@as(f32, 57), reload.candidate.?.ui_build.widget_theme.?.controls.height);
     // Host appearance reaches both generations, without replacing their
     // different declaration overrides. A failed candidate cannot undo it.
-    try std.testing.expect(reload.setTheme(design.tokens.dark));
-    try std.testing.expect(!reload.setTheme(design.tokens.dark));
+    try std.testing.expect(reload.setTheme(design.tokens.dark, true));
+    try std.testing.expect(!reload.setTheme(design.tokens.dark, true));
+    try std.testing.expect(initial.ui_build.widget_theme.?.reduced_motion);
+    try std.testing.expect(reload.candidate.?.ui_build.widget_theme.?.reduced_motion);
     try std.testing.expectEqualDeep(design.tokens.dark, initial.ui_build.widget_theme.?.colors);
     try std.testing.expectEqualDeep(design.tokens.dark, reload.candidate.?.ui_build.widget_theme.?.colors);
     const targets = [_]WindowTarget{

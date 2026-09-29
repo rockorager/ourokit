@@ -227,7 +227,7 @@ the Card example above.
 description constructor. Its render function runs during native lowering, at
 the same non-yielding safe point as component rendering, and returns a description
 or nil. `theme` is a fresh value of the effective inherited native theme:
-`colors`, `typography`, `controls`, and `widgets`, including host appearance,
+`colors`, `typography`, `controls`, `widgets`, and `reduced_motion`, including host appearance,
 application defaults, and enclosing overrides. It is not `ouro.tokens.light`.
 Changing this value does not change native defaults. Treat props and children
 as read-only snapshots. Do not create state, write signals, perform effects, or
@@ -1145,10 +1145,9 @@ at their initial progress unless the host explicitly advances the runtime
 clock. Native hosts use the existing `advanceAnimations`/`animationDelay` pair.
 The language-neutral core is `ui.animation.Registry`.
 
-This primitive does not include springs, pause/seek, completion callbacks,
-automatic reduced-motion preference detection, or exit animations after a
-declaration is removed. Applications can choose zero-duration one-shots or
-omit looping animations when their own motion policy calls for it.
+This primitive does not include pause/seek, completion callbacks, or exit
+animations after a declaration is removed. Numeric springs and shared motion
+policy are described below; retained exits use `ouro.presence`.
 
 #### Interruptible numeric transitions
 
@@ -1170,7 +1169,8 @@ return ouro.transition {
 }
 ```
 
-`key`, `target`, `duration`, and `render(value)` are required. Duration and easing
+`key`, `target`, and `render(value)` are required, plus `duration` or a `spring`
+configuration (see below). Duration and easing
 use the same units and options as `ouro.animation`. Target and optional `initial`
 must be finite numbers; numeric strings are rejected. Without `initial`, a new
 transition starts already at its target and requests no frames. With `initial`,
@@ -1196,12 +1196,59 @@ The render callback has the same non-yielding description-only contract as
 and capacity. Transitions add no layout node; changing only opacity/transform
 keeps layout cached. Width/height changes can still require layout. Invisible
 opacity-zero content remains interactive unless the application disables it.
-Springs, completion callbacks, and automatic reduced-motion
-preferences are not included; use duration zero for an application motion policy.
+Completion callbacks are not included.
 
 Run `examples/transition-composition.lua` for hover scaling, an interruptible
 sliding panel, and a group fade. `tests/transition_composition.py` exercises real
 native input, reversal, idle completion, independent windows, and source reload.
+
+#### Springs and reduced motion
+
+Use `spring` instead of `duration`/`easing` on a numeric transition:
+
+```lua
+ouro.transition {
+  key = "slide", target = opened() and 1 or 0,
+  spring = {mass = 1, stiffness = 170, damping = 26},
+  motion = "auto",
+  render = function(value)
+    return ouro.box {key = "panel", width = 180, height = 120,
+      transform = {x = 200 * value}, background = "#389ac0"}
+  end,
+}
+```
+
+An empty spring table uses the values above. Each parameter must be a finite
+number between 0.000001 and 1000000 inclusive; unknown fields and numeric strings
+are rejected. Targets, initial values, and positions used when retargeting into
+a spring must have magnitude at most 1000000000000. Springs cannot specify
+duration/easing, cannot loop, and are only supported by `ouro.transition`.
+
+Underdamped, critically damped, and overdamped springs use an analytic solution
+in seconds, independent of frame count. Retargeting or changing spring parameters
+preserves the last committed position **and velocity**; converting from a duration
+transition starts with zero velocity. Springs can overshoot: clamp a value used
+for opacity yourself. A spring settles to the exact target when displacement is
+at most 0.0001 and speed at most 0.001 units/second, or after a hard 10-second cap
+per retarget. Settled springs request no wakeups.
+
+All three wrappers (`animation`, `transition`, `presence`) accept `motion`:
+`"auto"` (default) follows the inherited theme's `reduced_motion` boolean;
+`"reduce"` always settles immediately; `"full"` always animates. The native host
+reads `org.freedesktop.appearance/reduced-motion` from the Settings portal and
+responds to changes without polling. Missing/unknown preferences mean full motion.
+Override that default in the application `theme` or with
+`ouro.theme {reduced_motion = true, ...}`; explicit false also overrides it.
+
+Reduced mode uses the transition target or animation progress 1 immediately,
+suppresses looping wakeups, and removes exiting presence immediately. Restoring
+full motion restarts duration animations (including loops); settled numeric
+transitions stay settled until retargeted. Policy changes preserve keyed identity
+and remain transactional across failed builds/reloads.
+
+`examples/spring-composition.lua` demonstrates interruption and policy changes;
+`tests/spring_composition.py` verifies native overshoot, no relayout, exact rest,
+loop suppression, presence removal, and reload rollback.
 
 #### Retained enter/exit transitions
 
@@ -1273,6 +1320,7 @@ Resolution order is host appearance → app theme → enclosing `ouro.theme`
 overrides → explicit widget props. Nested tables merge field by field; missing
 fields inherit. `color_scheme = "light" | "dark"` replaces the inherited color
 palette, then explicit `colors` apply; it does not reset typography or metrics.
+`reduced_motion` is a strict boolean, inherited independently of the palette.
 Colors use the generated semantic token names and `#RRGGBB` or `#RRGGBBAA`.
 Unknown theme fields and invalid colors/metrics are errors, not ignored typos.
 
@@ -1283,7 +1331,8 @@ generated values instead of repeating literals: `ouro.tokens.foundation.spacing_
 the currently inherited theme; their colors act as explicit overrides.
 
 The standard runner follows the [Settings portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Settings.html)
-over the session D-Bus automatically (`org.freedesktop.appearance`, `color-scheme`).
+over the session D-Bus automatically (`org.freedesktop.appearance`, keys
+`color-scheme` and `reduced-motion`).
 Omit `theme.color_scheme` to follow the
 system; typography, metrics, and individual color overrides still apply. Set
 `color_scheme = "light"` or `"dark"` on the app or a nested `ouro.theme` to pin
@@ -1309,7 +1358,8 @@ Native hosts can use `app.appearance.Store`: `current` is a typed `Snapshot`,
 `update(snapshot)` publishes changes, and `takeEvent()` returns
 `.appearance_changed` with the newest snapshot. Equal updates are suppressed and
 multiple pending changes coalesce. `Snapshot.color_scheme` is `.default`,
-`.light`, or `.dark`. Pass a process-lifetime store as `app.WaylandRunOptions.appearance`
+`.light`, or `.dark`; `Snapshot.reduced_motion` is a boolean, defaulting to false.
+Pass a process-lifetime store as `app.WaylandRunOptions.appearance`
 to supply appearance instead of connecting to the portal. The store is not
 thread-safe: update it on the owning event-loop thread and wake that loop. The
 runner consumes its events at the UI safe point. Its built-in portal

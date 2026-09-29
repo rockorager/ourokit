@@ -16,17 +16,70 @@ pub const Easing = enum {
     }
 };
 
+/// Damped oscillator in seconds. Absolute-time evaluation avoids integration
+/// drift and makes skipped frames equivalent to densely sampled frames.
+pub const Spring = struct {
+    mass: f64 = 1,
+    stiffness: f64 = 170,
+    damping: f64 = 26,
+
+    pub fn validate(self: Spring) !void {
+        inline for (.{ self.mass, self.stiffness, self.damping }) |value| {
+            if (!std.math.isFinite(value) or value < 1e-6 or value > 1e6) return error.InvalidSpringConfig;
+        }
+    }
+
+    fn sample(self: Spring, x: f64, velocity: f64, seconds: f64) struct { displacement: f64, velocity: f64 } {
+        if (seconds == 0) return .{ .displacement = x, .velocity = velocity };
+        const a = self.damping / (2 * self.mass);
+        const w2 = self.stiffness / self.mass;
+        const difference = a * a - w2;
+        if (@abs(difference) <= 1e-10 * w2) {
+            const b = velocity + a * x;
+            const decay = @exp(-a * seconds);
+            return .{ .displacement = decay * (x + b * seconds), .velocity = decay * (velocity - a * b * seconds) };
+        }
+        if (difference < 0) {
+            const w = @sqrt(-difference);
+            const sine = @sin(w * seconds);
+            const cosine = @cos(w * seconds);
+            const b = (velocity + a * x) / w;
+            const decay = @exp(-a * seconds);
+            return .{ .displacement = decay * (x * cosine + b * sine), .velocity = decay * (velocity * cosine - (a * b + w * x) * sine) };
+        }
+        const q = @sqrt(difference);
+        const fast = -a - q;
+        const slow = -w2 / (a + q); // Avoid cancellation in -a+q.
+        const b = (velocity - fast * x) / (slow - fast);
+        const slow_part = b * @exp(slow * seconds);
+        const fast_part = (x - b) * @exp(fast * seconds);
+        return .{ .displacement = slow_part + fast_part, .velocity = slow * slow_part + fast * fast_part };
+    }
+};
+
+const spring_deadline_ns = 10 * std.time.ns_per_s;
+
 pub const Config = struct {
-    duration_ns: u64,
+    duration_ns: u64 = 0,
     easing: Easing = .linear,
     loop: bool = false,
+    spring: ?Spring = null,
+    reduced_motion: bool = false,
 
     pub fn validate(self: Config) !void {
         if (self.duration_ns == 0 and self.loop) return error.InvalidAnimationConfig;
+        if (self.spring) |spring| {
+            try spring.validate();
+            if (self.duration_ns != 0 or self.easing != .linear or self.loop) return error.InvalidSpringConfig;
+        }
+    }
+
+    fn instant(self: Config) bool {
+        return self.reduced_motion or (self.spring == null and self.duration_ns == 0);
     }
 
     fn initial(self: Config) f64 {
-        return if (self.duration_ns == 0) 1 else 0;
+        return if (self.instant()) 1 else 0;
     }
 };
 
@@ -41,12 +94,14 @@ pub const Descriptor = struct {
             if (self.config.loop or !std.math.isFinite(transition.target) or
                 (transition.initial != null and !std.math.isFinite(transition.initial.?)))
                 return error.InvalidTransitionConfig;
-        }
+            if (self.config.spring != null and (@abs(transition.target) > 1e12 or
+                (transition.initial != null and @abs(transition.initial.?) > 1e12))) return error.InvalidSpringConfig;
+        } else if (self.config.spring != null) return error.InvalidSpringConfig;
     }
 
     pub fn initial(self: Descriptor) f64 {
         if (self.transition) |transition|
-            return if (self.config.duration_ns == 0) transition.target else transition.initial orelse transition.target;
+            return if (self.config.instant()) transition.target else transition.initial orelse transition.target;
         return self.config.initial();
     }
 };
@@ -57,6 +112,10 @@ const Track = struct {
     value: f64,
     from: f64,
     presented: f64,
+    velocity: f64 = 0,
+    from_velocity: f64 = 0,
+    presented_velocity: f64 = 0,
+    settled: bool = false,
 
     fn elapsed(self: Track, clock_ns: ?u64) u64 {
         const origin = self.origin_ns orelse return 0;
@@ -64,7 +123,7 @@ const Track = struct {
     }
 };
 
-/// Keyed, duration-based timelines. The caller owns time and schedules wakeups
+/// Keyed duration and spring timelines. The caller owns time and schedules wakeups
 /// using delay(); this registry owns no callbacks, UI instances, or resources.
 /// Storage is fixed at init. Reconciliation and lookup are quadratic and linear
 /// respectively; advancing and finding the next delay are linear in track count.
@@ -103,6 +162,8 @@ pub const Registry = struct {
         if (descriptors.len > self.tracks.len) return error.AnimationCapacityExceeded;
         for (descriptors, 0..) |descriptor, i| {
             try descriptor.validate();
+            if (descriptor.config.spring != null and @abs(self.preview(descriptor).from) > 1e12)
+                return error.InvalidSpringConfig;
             for (descriptors[0..i]) |previous| {
                 if (previous.id == descriptor.id) return error.DuplicateAnimationId;
             }
@@ -118,6 +179,7 @@ pub const Registry = struct {
         for (descriptors, 0..) |descriptor, i| {
             self.scratch[i] = self.preview(descriptor);
             self.scratch[i].presented = self.scratch[i].value;
+            self.scratch[i].presented_velocity = self.scratch[i].velocity;
         }
         std.mem.swap([]Track, &self.tracks, &self.scratch);
         self.len = descriptors.len;
@@ -140,7 +202,22 @@ pub const Registry = struct {
             if (track.origin_ns == null) track.origin_ns = self.clock_ns;
             const config = track.descriptor.config;
             const elapsed = track.elapsed(self.clock_ns);
-            const progress: f64 = if (config.duration_ns == 0 or
+            if (config.spring) |spring| {
+                if (track.settled) continue;
+                const target = track.descriptor.transition.?.target;
+                const state = spring.sample(track.from - target, track.from_velocity, @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s);
+                track.settled = config.reduced_motion or elapsed >= spring_deadline_ns or
+                    (@abs(state.displacement) <= 0.0001 and @abs(state.velocity) <= 0.001);
+                const value = if (track.settled) target else target + state.displacement;
+                // Velocity changes must be committed even on a turning-point
+                // sample whose position happens to equal the previous one.
+                const velocity = if (track.settled) 0 else state.velocity;
+                changed = changed or value != track.value or velocity != track.velocity;
+                track.value = value;
+                track.velocity = velocity;
+                continue;
+            }
+            const progress: f64 = if (config.instant() or
                 (!config.loop and elapsed >= config.duration_ns)) 1 else progress: {
                 const phase = if (config.loop) elapsed % config.duration_ns else elapsed;
                 const fraction = @as(f64, @floatFromInt(phase)) /
@@ -169,6 +246,13 @@ pub const Registry = struct {
         var result: ?u64 = null;
         for (self.tracks[0..self.len]) |track| {
             const config = track.descriptor.config;
+            if (config.reduced_motion) continue;
+            if (config.spring != null) {
+                if (track.settled) continue;
+                const next = @min(16 * std.time.ns_per_ms, spring_deadline_ns -| track.elapsed(self.clock_ns));
+                result = @min(result orelse next, next);
+                continue;
+            }
             if (track.descriptor.transition) |transition| if (track.from == transition.target) continue;
             const elapsed = track.elapsed(self.clock_ns);
             if (config.duration_ns == 0 or (!config.loop and elapsed >= config.duration_ns)) continue;
@@ -182,6 +266,7 @@ pub const Registry = struct {
 
     fn preview(self: *const Registry, descriptor: Descriptor) Track {
         var from = descriptor.initial();
+        var velocity: f64 = 0;
         for (self.tracks[0..self.len]) |*track| {
             if (track.descriptor.id != descriptor.id) continue;
             if (descriptor.transition) |transition| {
@@ -192,16 +277,26 @@ pub const Registry = struct {
                         return retained;
                     }
                     from = track.presented;
+                    if (descriptor.config.spring != null and track.descriptor.config.spring != null)
+                        velocity = track.presented_velocity;
                 }
             } else if (std.meta.eql(track.descriptor, descriptor)) return track.*;
             break;
         }
+        if (descriptor.config.instant()) {
+            from = descriptor.initial();
+            velocity = 0;
+        }
         return .{
             .descriptor = descriptor,
             .origin_ns = self.clock_ns,
-            .value = if (descriptor.config.duration_ns == 0) descriptor.initial() else from,
+            .value = from,
             .from = from,
             .presented = from,
+            .velocity = velocity,
+            .from_velocity = velocity,
+            .presented_velocity = velocity,
+            .settled = if (descriptor.transition) |transition| from == transition.target and velocity == 0 else false,
         };
     }
 };
@@ -603,4 +698,106 @@ test "empty capacity is valid and initialization cleans up partial allocation fa
             defer allocated.deinit();
         }
     }.check, .{});
+}
+
+test "spring analytic samples under critical and over damping with nonzero velocity" {
+    // Independent closed forms: e^-t(2 cos(t)+sin(t)),
+    // e^-2t(3+7t), and 3e^-t-e^-2t respectively.
+    const half_pi: f64 = std.math.pi / 2.0;
+    const under = (Spring{ .mass = 1, .stiffness = 2, .damping = 2 }).sample(2, -1, half_pi);
+    try std.testing.expectApproxEqAbs(@exp(-half_pi), under.displacement, 1e-12);
+    try std.testing.expectApproxEqAbs(-3 * @exp(-half_pi), under.velocity, 1e-12);
+    const critical = (Spring{ .mass = 1, .stiffness = 4, .damping = 4 }).sample(3, 1, 0.5);
+    try std.testing.expectApproxEqAbs(6.5 / std.math.e, critical.displacement, 1e-12);
+    try std.testing.expectApproxEqAbs(-6.0 / std.math.e, critical.velocity, 1e-12);
+    const over = (Spring{ .mass = 1, .stiffness = 2, .damping = 3 }).sample(2, -1, @log(@as(f64, 2)));
+    try std.testing.expectApproxEqAbs(1.25, over.displacement, 1e-12);
+    try std.testing.expectApproxEqAbs(-1, over.velocity, 1e-12);
+}
+
+test "spring retarget retains committed velocity ignores unpublished samples and converges exactly" {
+    const ms = std.time.ns_per_ms;
+    var registry = try Registry.init(std.testing.allocator, 2);
+    defer registry.deinit();
+    var motion: Descriptor = .{ .id = 1, .config = .{ .spring = .{ .stiffness = 2, .damping = 2 } }, .transition = .{ .target = 1, .initial = 0 } };
+    try registry.reconcile(&.{motion});
+    _ = registry.advance(0);
+    _ = registry.advance(500 * ms);
+    // Unit step response 1-e^-t(cos(t)+sin(t)), velocity 2e^-t sin(t).
+    const position = 1 - @exp(@as(f64, -0.5)) * (@cos(@as(f64, 0.5)) + @sin(@as(f64, 0.5)));
+    const speed = 2 * @exp(@as(f64, -0.5)) * @sin(@as(f64, 0.5));
+    try std.testing.expectApproxEqAbs(position, registry.sample(motion), 1e-12);
+    try registry.reconcile(&.{motion});
+    _ = registry.advance(800 * ms); // Not committed.
+    motion.transition.?.target = -1;
+    try std.testing.expectApproxEqAbs(position, registry.sample(motion), 1e-12);
+    const rejected = registry.tracks[0];
+    try std.testing.expectError(error.DuplicateAnimationId, registry.validate(&.{ motion, motion }));
+    try std.testing.expectEqualDeep(rejected, registry.tracks[0]);
+    try registry.reconcile(&.{motion});
+    try std.testing.expectApproxEqAbs(speed, registry.tracks[0].velocity, 1e-12);
+    _ = registry.advance(801 * ms);
+    try std.testing.expect(registry.sample(motion) > position); // Still moving right.
+    _ = registry.advance(1800 * ms);
+    const x = position + 1;
+    const expected = -1 + @exp(@as(f64, -1)) * (x * @cos(@as(f64, 1)) + (speed + x) * @sin(@as(f64, 1)));
+    try std.testing.expectApproxEqAbs(expected, registry.sample(motion), 1e-12);
+    _ = registry.advance(10_800 * ms);
+    try std.testing.expectEqual(-1, registry.sample(motion));
+    try std.testing.expectEqual(null, registry.delay());
+
+    registry.clear();
+    motion.config.spring = .{};
+    try registry.reconcile(&.{motion});
+    _ = registry.advance(0);
+    _ = registry.advance(2000 * ms);
+    try std.testing.expectEqual(-1, registry.sample(motion));
+    try std.testing.expectEqual(null, registry.delay()); // Tolerance, before cap.
+}
+
+test "spring bounds reject nonfinite parameters and unsafe duration to spring conversion" {
+    var registry = try Registry.init(std.testing.allocator, 1);
+    defer registry.deinit();
+    var motion: Descriptor = .{ .id = 1, .config = .{}, .transition = .{ .target = 1e100 } };
+    try registry.reconcile(&.{motion});
+    motion.config.spring = .{};
+    motion.transition.?.target = 1;
+    try std.testing.expectError(error.InvalidSpringConfig, registry.reconcile(&.{motion}));
+    inline for (std.meta.fields(Spring)) |field| {
+        for ([_]f64{ 0, -1, 1e-7, 1e7, std.math.inf(f64), std.math.nan(f64) }) |bad| {
+            var spring: Spring = .{};
+            @field(spring, field.name) = bad;
+            try std.testing.expectError(error.InvalidSpringConfig, spring.validate());
+        }
+    }
+    // Extreme accepted parameters must also produce finite samples.
+    for ([_]f64{ 1e-6, 1e6 }) |mass| for ([_]f64{ 1e-6, 1e6 }) |stiffness| for ([_]f64{ 1e-6, 1e6 }) |damping| {
+        const state = (Spring{ .mass = mass, .stiffness = stiffness, .damping = damping }).sample(-1e12, 1e12, 0.13);
+        try std.testing.expect(std.math.isFinite(state.displacement) and std.math.isFinite(state.velocity));
+    };
+}
+
+test "reduced motion settles springs and loops immediately and full restores only loops" {
+    var registry = try Registry.init(std.testing.allocator, 2);
+    defer registry.deinit();
+    var spring: Descriptor = .{ .id = 1, .config = .{ .spring = .{} }, .transition = .{ .target = 1, .initial = 0 } };
+    var loop: Descriptor = .{ .id = 2, .config = .{ .duration_ns = 100, .loop = true } };
+    try registry.reconcile(&.{ spring, loop });
+    _ = registry.advance(0);
+    _ = registry.advance(25);
+    try registry.reconcile(&.{ spring, loop });
+    spring.config.reduced_motion = true;
+    loop.config.reduced_motion = true;
+    try registry.reconcile(&.{ spring, loop });
+    try std.testing.expectEqual(1, registry.sample(spring));
+    try std.testing.expectEqual(1, registry.sample(loop));
+    try std.testing.expectEqual(null, registry.delay());
+    try std.testing.expect(!registry.advance(999));
+    spring.config.reduced_motion = false;
+    loop.config.reduced_motion = false;
+    try registry.reconcile(&.{ spring, loop });
+    try std.testing.expectEqual(1, registry.sample(spring));
+    try std.testing.expectEqual(0, registry.sample(loop));
+    _ = registry.advance(1024);
+    try std.testing.expectEqual(0.25, registry.sample(loop));
 }

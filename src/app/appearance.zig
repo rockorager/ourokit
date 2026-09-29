@@ -9,14 +9,16 @@ const portal = "org.freedesktop.portal.Desktop";
 const portal_path = "/org/freedesktop/portal/desktop";
 const settings = "org.freedesktop.portal.Settings";
 const namespace = "org.freedesktop.appearance";
-const key = "color-scheme";
+const color_scheme_key = "color-scheme";
+const reduced_motion_key = "reduced-motion";
 const owner_match = "type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.freedesktop.portal.Desktop'";
-const setting_match = "type='signal',sender='org.freedesktop.portal.Desktop',path='/org/freedesktop/portal/desktop',interface='org.freedesktop.portal.Settings',member='SettingChanged',arg0='org.freedesktop.appearance',arg1='color-scheme'";
+const setting_match = "type='signal',sender='org.freedesktop.portal.Desktop',path='/org/freedesktop/portal/desktop',interface='org.freedesktop.portal.Settings',member='SettingChanged',arg0='org.freedesktop.appearance'";
 
 pub const ColorScheme = enum { default, light, dark };
 
 pub const Snapshot = struct {
     color_scheme: ColorScheme = .default,
+    reduced_motion: bool = false,
 };
 
 pub const Event = union(enum) {
@@ -75,6 +77,8 @@ pub const Client = struct {
     activation_serial: ?u32 = null,
     owner_serial: ?u32 = null,
     read_serial: ?u32 = null,
+    color_scheme_dirty: bool = false,
+    reduced_motion_dirty: bool = false,
 
     /// A null address disables the built-in service (for host-supplied Stores).
     pub fn init(self: *Client, allocator: std.mem.Allocator, loop: *io.Loop, store: *Store, address: ?[]const u8) !void {
@@ -168,6 +172,8 @@ pub const Client = struct {
         self.activation_serial = null;
         self.owner_serial = null;
         self.read_serial = null;
+        self.color_scheme_dirty = false;
+        self.reduced_motion_dirty = false;
         // The address worked at startup, so init can only fail on transient
         // resource exhaustion; count that as another failed attempt.
         self.bus.init(self.allocator, self.loop, self.address) catch return self.scheduleRetry();
@@ -215,12 +221,22 @@ pub const Client = struct {
                     !equal(message.header.interface, settings) or !equal(message.header.member, "SettingChanged") or
                     !std.mem.eql(u8, message.bodySignature(), "ssv")) return;
                 var body = message.bodyDecoder();
-                if (!std.mem.eql(u8, try body.string(), namespace) or !std.mem.eql(u8, try body.string(), key)) return;
-                const scheme = readScheme(&body) catch return;
+                if (!std.mem.eql(u8, try body.string(), namespace)) return;
+                const changed_key = try body.string();
+                var snapshot = self.store.current;
+                if (std.mem.eql(u8, changed_key, color_scheme_key)) {
+                    snapshot.color_scheme = readScheme(&body) catch return;
+                } else if (std.mem.eql(u8, changed_key, reduced_motion_key)) {
+                    snapshot.reduced_motion = readReducedMotion(&body) catch return;
+                } else return;
                 try body.end();
-                // Never let an older snapshot overwrite a newer signal.
-                self.read_serial = null;
-                self.store.update(.{ .color_scheme = scheme });
+                if (std.mem.eql(u8, changed_key, color_scheme_key))
+                    self.color_scheme_dirty = self.read_serial != null
+                else
+                    self.reduced_motion_dirty = self.read_serial != null;
+                // Keep the read alive: its other key may still be newer than
+                // our fallback, while this key must retain the signal value.
+                self.store.update(snapshot);
             }
             return;
         }
@@ -255,7 +271,13 @@ pub const Client = struct {
             const owner = self.owner orelse return;
             if (!equal(message.header.sender, owner) and !(message.messageType() == .error_reply and equal(message.header.sender, daemon))) return;
             self.read_serial = null;
-            self.store.update(.{ .color_scheme = if (ok) readAll(message) catch .default else .default });
+            const initial = if (ok) readAll(message) catch Snapshot{} else Snapshot{};
+            var snapshot = self.store.current;
+            if (!self.color_scheme_dirty) snapshot.color_scheme = initial.color_scheme;
+            if (!self.reduced_motion_dirty) snapshot.reduced_motion = initial.reduced_motion;
+            self.color_scheme_dirty = false;
+            self.reduced_motion_dirty = false;
+            self.store.update(snapshot);
         }
     }
 
@@ -270,6 +292,8 @@ pub const Client = struct {
         if (self.owner) |owner| self.allocator.free(owner);
         self.owner = next;
         self.read_serial = null;
+        self.color_scheme_dirty = false;
+        self.reduced_motion_dirty = false;
         self.store.update(.{});
         const owner = self.owner orelse return;
         var body = wire.Encoder.init(self.allocator);
@@ -303,10 +327,15 @@ fn readScheme(body: *wire.Decoder) !ColorScheme {
     };
 }
 
-fn readAll(message: *const wire.Message) !ColorScheme {
+fn readReducedMotion(body: *wire.Decoder) !bool {
+    if (!std.mem.eql(u8, try body.variantSignature(), "u")) return error.InvalidReducedMotion;
+    return try body.uint32() == 1;
+}
+
+fn readAll(message: *const wire.Message) !Snapshot {
     if (!std.mem.eql(u8, message.bodySignature(), "a{sa{sv}}")) return error.InvalidSettings;
     var body = message.bodyDecoder();
-    var scheme: ColorScheme = .default;
+    var snapshot: Snapshot = .{};
     const namespaces_end = try body.beginArray(8);
     while (!try body.arrayFinished(namespaces_end)) {
         try body.structAlignment();
@@ -315,15 +344,28 @@ fn readAll(message: *const wire.Message) !ColorScheme {
         while (!try body.arrayFinished(keys_end)) {
             try body.structAlignment();
             const name_key = try body.string();
-            if (std.mem.eql(u8, name, namespace) and std.mem.eql(u8, name_key, key)) {
-                scheme = try readScheme(&body);
+            if (std.mem.eql(u8, name, namespace) and std.mem.eql(u8, name_key, color_scheme_key)) {
+                const signature = try body.variantSignature();
+                if (std.mem.eql(u8, signature, "u")) {
+                    snapshot.color_scheme = switch (try body.uint32()) {
+                        1 => .dark,
+                        2 => .light,
+                        else => .default,
+                    };
+                } else try body.skipSignatureValue(signature);
+            } else if (std.mem.eql(u8, name, namespace) and std.mem.eql(u8, name_key, reduced_motion_key)) {
+                const signature = try body.variantSignature();
+                if (std.mem.eql(u8, signature, "u"))
+                    snapshot.reduced_motion = try body.uint32() == 1
+                else
+                    try body.skipSignatureValue(signature);
             } else try body.skipSignatureValue("v");
         }
         try body.endArray(keys_end);
     }
     try body.endArray(namespaces_end);
     try body.end();
-    return scheme;
+    return snapshot;
 }
 
 test "appearance Store suppresses equality and coalesces changes" {
@@ -343,18 +385,58 @@ test "appearance portal decodes unsigned preferences and missing or invalid sett
         defer body.deinit();
         var message = try testMessage(.{ .message_type = .method_return, .reply_serial = 42, .signature = "a{sa{sv}}" }, body.bytes());
         defer message.deinit();
-        try std.testing.expectEqual(expected, try readAll(&message));
+        try std.testing.expectEqual(expected, (try readAll(&message)).color_scheme);
     }
     var missing = try testSettings(null);
     defer missing.deinit();
     var message = try testMessage(.{ .message_type = .method_return, .reply_serial = 42, .signature = "a{sa{sv}}" }, missing.bytes());
     defer message.deinit();
-    try std.testing.expectEqual(ColorScheme.default, try readAll(&message));
+    try std.testing.expectEqual(ColorScheme.default, (try readAll(&message)).color_scheme);
     // Signed integers and nested variants are not this setting's wire type.
     for ([_][]const u8{ &.{ 1, 'i', 0, 0, 1, 0, 0, 0 }, &.{ 1, 'v', 0, 1, 'u', 0, 0, 0, 1, 0, 0, 0 } }) |bytes| {
         var body: wire.Decoder = .{ .data = bytes, .endian = .little };
         try std.testing.expectError(error.InvalidColorScheme, readScheme(&body));
     }
+    for ([_]u32{ 0, 1, 2, std.math.maxInt(u32) }, [_]bool{ false, true, false, false }) |value, expected| {
+        var body = try testSettingsPreferences(null, value);
+        defer body.deinit();
+        var reduced = try testMessage(.{ .message_type = .method_return, .reply_serial = 42, .signature = "a{sa{sv}}" }, body.bytes());
+        defer reduced.deinit();
+        try std.testing.expectEqual(expected, (try readAll(&reduced)).reduced_motion);
+    }
+    var invalid: wire.Decoder = .{ .data = &.{ 1, 'i', 0, 0, 1, 0, 0, 0 }, .endian = .little };
+    try std.testing.expectError(error.InvalidReducedMotion, readReducedMotion(&invalid));
+}
+
+test "appearance portal merges interleaved initial snapshots per preference" {
+    var store: Store = .{};
+    var client: Client = .{ .allocator = std.testing.allocator, .store = &store, .watching = true, .bus = .{ .allocator = std.testing.allocator, .phase = .ready } };
+    defer testDeinit(&client);
+
+    try client.setOwner(":1.20");
+    const first_read = client.read_serial.?;
+    try testChanged(&client, ":1.20", namespace, reduced_motion_key, 1);
+    try std.testing.expect(store.takeEvent().?.appearance_changed.reduced_motion);
+    try testSnapshotPreferences(&client, ":1.20", first_read, 1, 0);
+    const first = store.takeEvent().?.appearance_changed;
+    try std.testing.expectEqual(ColorScheme.dark, first.color_scheme);
+    try std.testing.expect(first.reduced_motion);
+
+    try client.setOwner(":1.21");
+    _ = store.takeEvent(); // Replacement resets both preferences.
+    const second_read = client.read_serial.?;
+    try testChanged(&client, ":1.21", namespace, color_scheme_key, 2);
+    try testSnapshotPreferences(&client, ":1.21", second_read, 1, 1);
+    const second = store.takeEvent().?.appearance_changed;
+    try std.testing.expectEqual(ColorScheme.light, second.color_scheme);
+    try std.testing.expect(second.reduced_motion);
+
+    try testChanged(&client, ":1.20", namespace, reduced_motion_key, 0);
+    try std.testing.expect(store.takeEvent() == null);
+    try testChanged(&client, ":1.21", namespace, reduced_motion_key, 99);
+    try std.testing.expect(!store.takeEvent().?.appearance_changed.reduced_motion);
+    try client.setOwner("");
+    try std.testing.expectEqual(Snapshot{}, store.takeEvent().?.appearance_changed);
 }
 
 test "appearance portal subscribes before activation and survives absence and owner replacement" {
@@ -381,7 +463,7 @@ test "appearance portal subscribes before activation and survives absence and ow
     try testOwner(&client, "", ":1.71");
     try testRequest(&client, 4, "ReadAll", "as", ":1.71", namespace);
     const stale_read = client.read_serial.?;
-    try testChanged(&client, ":1.71", namespace, key, 1);
+    try testChanged(&client, ":1.71", namespace, color_scheme_key, 1);
     try std.testing.expectEqual(ColorScheme.dark, store.takeEvent().?.appearance_changed.color_scheme);
     try testSnapshot(&client, ":1.71", stale_read, 2);
     try std.testing.expect(store.takeEvent() == null); // Late light snapshot loses to dark signal.
@@ -394,12 +476,12 @@ test "appearance portal subscribes before activation and survives absence and ow
     try std.testing.expectEqual(new_read, client.read_serial.?);
     try testSnapshot(&client, ":1.92", new_read, 2);
     try std.testing.expectEqual(ColorScheme.light, store.takeEvent().?.appearance_changed.color_scheme);
-    try testChanged(&client, ":1.71", namespace, key, 1);
-    try testChanged(&client, ":1.92", "org.example.other", key, 1);
+    try testChanged(&client, ":1.71", namespace, color_scheme_key, 1);
+    try testChanged(&client, ":1.92", "org.example.other", color_scheme_key, 1);
     try testChanged(&client, ":1.92", namespace, "contrast", 1);
-    try testChanged(&client, ":1.92", namespace, key, 2);
+    try testChanged(&client, ":1.92", namespace, color_scheme_key, 2);
     try std.testing.expect(store.takeEvent() == null);
-    try testChanged(&client, ":1.92", namespace, key, 42);
+    try testChanged(&client, ":1.92", namespace, color_scheme_key, 42);
     try std.testing.expectEqual(ColorScheme.default, store.takeEvent().?.appearance_changed.color_scheme);
     try std.testing.expectEqual(@as(usize, 6), client.bus.outgoing.items.len);
 }
@@ -423,7 +505,7 @@ test "appearance portal owner signal supersedes lookup and direct replacement re
     try testSnapshot(&client, ":1.9", client.read_serial.?, 1);
     try std.testing.expectEqual(ColorScheme.dark, store.takeEvent().?.appearance_changed.color_scheme);
     client.stopping = true;
-    try testChanged(&client, ":1.9", namespace, key, 2);
+    try testChanged(&client, ":1.9", namespace, color_scheme_key, 2);
     try std.testing.expect(store.takeEvent() == null);
 }
 
@@ -674,7 +756,7 @@ test "appearance portal live bus recovers service restart without polling and dr
             var changed = wire.Encoder.init(std.testing.allocator);
             defer changed.deinit();
             try changed.string(namespace);
-            try changed.string(key);
+            try changed.string(color_scheme_key);
             try changed.variantSignature("u");
             try changed.uint32(2);
             _ = try service.send(.{ .message_type = .signal, .path = portal_path, .interface = settings, .member = "SettingChanged", .signature = "ssv" }, changed.bytes(), &.{});
@@ -741,6 +823,10 @@ fn testChanged(client: *Client, sender: []const u8, name: []const u8, name_key: 
 }
 
 fn testSettings(value: ?u32) !wire.Encoder {
+    return testSettingsPreferences(value, null);
+}
+
+fn testSettingsPreferences(color_scheme: ?u32, reduced_motion: ?u32) !wire.Encoder {
     var body = wire.Encoder.init(std.testing.allocator);
     errdefer body.deinit();
     const namespaces = try body.beginArray(8);
@@ -752,9 +838,15 @@ fn testSettings(value: ?u32) !wire.Encoder {
     try body.string("contrast");
     try body.variantSignature("u");
     try body.uint32(1);
-    if (value) |number| {
+    if (color_scheme) |number| {
         try body.structAlignment();
-        try body.string(key);
+        try body.string(color_scheme_key);
+        try body.variantSignature("u");
+        try body.uint32(number);
+    }
+    if (reduced_motion) |number| {
+        try body.structAlignment();
+        try body.string(reduced_motion_key);
         try body.variantSignature("u");
         try body.uint32(number);
     }
@@ -765,6 +857,12 @@ fn testSettings(value: ?u32) !wire.Encoder {
 
 fn testSnapshot(client: *Client, sender: []const u8, serial: u32, value: ?u32) !void {
     var body = try testSettings(value);
+    defer body.deinit();
+    try testAccept(client, .{ .message_type = .method_return, .sender = sender, .reply_serial = serial, .signature = "a{sa{sv}}" }, body.bytes());
+}
+
+fn testSnapshotPreferences(client: *Client, sender: []const u8, serial: u32, color_scheme: ?u32, reduced_motion: ?u32) !void {
+    var body = try testSettingsPreferences(color_scheme, reduced_motion);
     defer body.deinit();
     try testAccept(client, .{ .message_type = .method_return, .sender = sender, .reply_serial = serial, .signature = "a{sa{sv}}" }, body.bytes());
 }

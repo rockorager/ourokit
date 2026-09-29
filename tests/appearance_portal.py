@@ -14,6 +14,7 @@ import tempfile
 import time
 
 from gi.repository import Gio, GLib
+from application_services import call, development_path
 
 ROOT = Path(__file__).resolve().parents[1]
 PORTAL = "org.freedesktop.portal.Desktop"
@@ -28,8 +29,9 @@ XML = f"""<node><interface name='{INTERFACE}'>
 
 
 class Portal:
-    def __init__(self, address, value):
+    def __init__(self, address, value, reduced=0):
         self.value = value
+        self.reduced = reduced
         self.reads = 0
         self.bus = Gio.DBusConnection.new_for_address_sync(
             address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
@@ -46,13 +48,20 @@ class Portal:
         assert method == "ReadAll" and parameters.unpack() == ([NAMESPACE],)
         self.reads += 1
         invocation.return_value(GLib.Variant("(a{sa{sv}})", ({
-            NAMESPACE: {"color-scheme": GLib.Variant("u", self.value)},
+            NAMESPACE: {"color-scheme": GLib.Variant("u", self.value),
+                        "reduced-motion": GLib.Variant("u", self.reduced)},
         },)))
 
     def change(self, value):
         self.value = value
         self.bus.emit_signal(None, PATH, INTERFACE, "SettingChanged",
                              GLib.Variant("(ssv)", (NAMESPACE, "color-scheme", GLib.Variant("u", value))))
+        self.bus.flush_sync(None)
+
+    def motion(self, value):
+        self.reduced = value
+        self.bus.emit_signal(None, PATH, INTERFACE, "SettingChanged",
+                             GLib.Variant("(ssv)", (NAMESPACE, "reduced-motion", GLib.Variant("u", value))))
         self.bus.flush_sync(None)
 
     def close(self):
@@ -128,10 +137,48 @@ def main():
                 assert lost == fallback, "owner loss did not reset to fallback"
                 stop(app)
                 assert app.returncode == 143, app.returncode
+                # Reuse the public spring example with host inheritance rather
+                # than its interactive local policy, and an initially live loop.
+                source = (ROOT / 'examples/spring-composition.lua').read_text()
+                source = source.replace("key='policy',reduced_motion=reduced(),", "key='policy',")
+                source = source.replace('local looping = o.signal(false)', 'local looping = o.signal(true)')
+                fixture = directory / 'motion.lua'
+                fixture.write_text(source)
+                portal = Portal(address, 2, reduced=1)
+                app = subprocess.Popen([str(ROOT / 'zig-out/bin/ouroctl'), 'run', str(fixture), '--software', '--dev'],
+                                       env=env, stdout=subprocess.DEVNULL, stderr=errors)
+                endpoint = development_path(directory, app)
+                pump(.6)
+
+                def invoke(name, args=None):
+                    reply = call(endpoint, name, args)
+                    assert not reply.get('isError') and 'rpcError' not in reply, reply
+                    return reply['structuredContent']
+
+                def loop_value():
+                    tree = invoke('runtime.inspect', {'window': 'main'})['windows'][0]
+                    return float(next(n['label'] for n in tree['nodes'] if n['path'].endswith('/loop/pulse')).split()[-1])
+
+                def builds():
+                    return invoke('runtime.metrics', {'window': 'main'})['windows'][0]['metrics']['builds']['count']
+
+                assert portal.reads == 1 and loop_value() == 1
+                before = builds(); pump(.15); assert builds() == before
+                portal.motion(0); pump(.3)
+                assert 0 < loop_value() < 1 and builds() > before
+                portal.motion(1); pump(.15)
+                assert loop_value() == 1
+                before = builds(); pump(.2); assert builds() == before
+                assert portal.reads == 1, 'motion signals must not poll the portal'
+                portal.close(); portal = None; pump(.3)
+                assert 0 < loop_value() < 1, 'owner loss must restore full motion'
+                portal = Portal(address, 2, reduced=1); pump(.3)
+                assert loop_value() == 1 and portal.reads == 1
+                stop(app)
             stderr = (directory / "app.stderr").read_text()
-            assert all(line.startswith(("info: application socket: ", "info: Wayland output available: "))
+            assert all(line.startswith(("info: application socket: ", "debug: Wayland output available: ", "info: development socket: "))
                        for line in stderr.splitlines()), stderr
-            print("PASS: no-portal startup, dark initial read, light signal, dark restart, owner-loss fallback, clean shutdown")
+            print("PASS: color and motion initial reads, live signals, idle suppression, owner loss/restart, clean shutdown")
         finally:
             if portal is not None:
                 portal.close()

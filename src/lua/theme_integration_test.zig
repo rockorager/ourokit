@@ -1130,10 +1130,11 @@ test "host appearance rethemes retained components while app and nested override
         \\}
     );
     defer application.deinit();
-    f.ui.widget_theme = application.resolvedTheme(tokens.light);
+    f.ui.widget_theme = application.resolvedTheme(tokens.light, false);
     try f.build();
     const child = try f.handle("root/child/button");
-    f.ui.widget_theme = application.resolvedTheme(tokens.dark);
+    f.ui.widget_theme = application.resolvedTheme(tokens.dark, true);
+    try std.testing.expect(f.ui.widget_theme.?.reduced_motion);
     try f.runtime.setTheme(f.ui.widget_theme.?.colors);
     try f.build();
     try std.testing.expectEqual(child, try f.handle("root/child/button"));
@@ -1145,12 +1146,13 @@ test "host appearance rethemes retained components while app and nested override
 
     var pinned = try Application.load(std.testing.allocator, f.state,
         \\return ouro.app {
-        \\  id = 'dev.test.pinned', theme = {color_scheme = 'light'},
+        \\  id = 'dev.test.pinned', theme = {color_scheme = 'light', reduced_motion = false},
         \\  run = function() return {windows = {ouro.window {id = 'main', title = 'Pinned', content = build}}} end,
         \\}
     );
     defer pinned.deinit();
-    try std.testing.expectEqualDeep(tokens.light, pinned.resolvedTheme(tokens.dark).colors);
+    try std.testing.expectEqualDeep(tokens.light, pinned.resolvedTheme(tokens.dark, true).colors);
+    try std.testing.expect(!pinned.resolvedTheme(tokens.dark, true).reduced_motion);
 }
 
 test "app and field keymaps dispatch edits and clipboard actions across retained rebuilds" {
@@ -1788,4 +1790,34 @@ test "popup focus is isolated and selected activation survives visual scope disp
     try fake.request.?.complete(fake.request.?.context, "selected-token");
     try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
     try f.exec("assert(selected)");
+}
+
+test "motion policy honors inherited themes explicit false and wrapper overrides" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    f.ui.widget_theme = .{ .colors = @import("../design/root.zig").tokens.light, .reduced_motion = true };
+    try f.exec(
+        \\local function sample(key, motion)
+        \\  return ouro.animation {key=key,duration=500,motion=motion,render=function(v)
+        \\    observed[key]=v
+        \\    return ouro.box {key='box',width=10,height=10}
+        \\  end}
+        \\end
+        \\function build()
+        \\  observed={}
+        \\  return ouro.column {key='root',
+        \\    sample('auto'), sample('full','full'), sample('reduce','reduce'),
+        \\    ouro.theme {key='child',reduced_motion=false,sample('child-auto')},
+        \\    ouro.presence {key='exit',present=false,duration=500,render=function() error('hidden') end},
+        \\  }
+        \\end
+    );
+    try f.build();
+    try f.exec("assert(observed.auto==1 and observed.full==0 and observed.reduce==1 and observed['child-auto']==0)");
+    const original = try f.handle("root/auto/box");
+    f.ui.widget_theme.?.reduced_motion = false;
+    try f.runtime.setTheme(f.ui.widget_theme.?.colors);
+    try f.build();
+    try f.exec("assert(observed.auto==0 and observed.full==0 and observed.reduce==1 and observed['child-auto']==0)");
+    try std.testing.expectEqual(original, try f.handle("root/auto/box"));
 }

@@ -685,14 +685,32 @@ pub const UiBuild = struct {
         var parent = self.compositionParent(state, 2) catch |err| return luaError(state, parentDataErrorMessage(err));
         const key = tableString(state, 2, "key") orelse return luaError(state, "animation key is required");
         if (key.len == 0) return luaError(state, "animation key is required");
-        const duration = tableRequiredInteger(state, 2, "duration") orelse return luaError(state, "animation duration must be non-negative integer milliseconds");
-        if (duration < 0) return luaError(state, "animation duration must be non-negative integer milliseconds");
+        const spring = tableOptionalSpring(state, 2) catch return luaError(state, "invalid spring configuration");
+        var duration: c.Integer = 0;
+        if (spring != null) {
+            if (kind != .transition) return luaError(state, "spring requires a transition");
+            inline for (.{ "duration", "easing" }) |field| {
+                const specified = c.lua_getfield(state, 2, field) != c.type_nil;
+                c.lua_settop(state, -2);
+                if (specified) return luaError(state, "spring cannot specify duration or easing");
+            }
+        } else {
+            duration = tableRequiredInteger(state, 2, "duration") orelse return luaError(state, "animation duration must be non-negative integer milliseconds");
+            if (duration < 0) return luaError(state, "animation duration must be non-negative integer milliseconds");
+        }
+        const motion = tableOptionalEnum(enum { auto, reduce, full }, state, 2, "motion", .auto) orelse return luaError(state, "invalid motion policy");
         var descriptor: animation.Descriptor = .{
             .id = semanticId(key, (if (presence) @as(u64, 0x70726573656e74) else if (transition) @as(u64, 0x7472616e736974) else 0x616e696d617465) ^ parent.id ^ self.component_namespace),
             .config = .{
                 .duration_ns = std.math.mul(u64, @intCast(duration), std.time.ns_per_ms) catch return luaError(state, "animation duration too large"),
                 .easing = tableOptionalEnum(animation.Easing, state, 2, "easing", .linear) orelse return luaError(state, "invalid animation easing"),
                 .loop = tableOptionalBoolean(state, 2, "loop", false) orelse return luaError(state, "animation loop must be boolean"),
+                .spring = spring,
+                .reduced_motion = switch (motion) {
+                    .auto => if (self.currentStyle()) |style| style.reduced_motion else false,
+                    .reduce => true,
+                    .full => false,
+                },
             },
         };
         var present = true;
@@ -714,7 +732,7 @@ pub const UiBuild = struct {
             }
             c.lua_settop(state, -2);
         }
-        descriptor.validate() catch return luaError(state, if (transition) "transition requires finite values and cannot loop" else "looping animation requires positive duration");
+        descriptor.validate() catch return luaError(state, "invalid animation or transition configuration");
         if (self.pending_animation_count == self.pending_animations.len) return luaError(state, "animation capacity exceeded");
         for (self.animationDescriptors()) |existing| if (existing.id == descriptor.id) return luaError(state, "duplicate animation key");
         self.pending_animations[self.pending_animation_count] = descriptor;
@@ -2500,6 +2518,32 @@ fn tableOptionalParagraphOverflow(
     if (std.mem.eql(u8, value, "clip")) return .clip;
     if (std.mem.eql(u8, value, "ellipsis")) return .ellipsis;
     return null;
+}
+
+fn tableOptionalSpring(state: *c.State, table: c_int) !?animation.Spring {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    const kind = c.lua_getfield(state, table, "spring");
+    if (kind == c.type_nil) return null;
+    if (kind != c.type_table) return error.InvalidSpringConfig;
+    const index = c.lua_gettop(state);
+    var result: animation.Spring = .{};
+    c.lua_pushnil(state);
+    while (c.lua_next(state, index) != 0) {
+        const key = string(state, -2) orelse return error.InvalidSpringConfig;
+        if (c.lua_type(state, -1) != c.type_number) return error.InvalidSpringConfig;
+        var valid: c_int = 0;
+        const number = c.lua_tonumberx(state, -1, &valid);
+        inline for (std.meta.fields(animation.Spring)) |field| {
+            if (std.mem.eql(u8, key, field.name)) {
+                @field(result, field.name) = number;
+                break;
+            }
+        } else return error.InvalidSpringConfig;
+        c.lua_settop(state, -2);
+    }
+    try result.validate();
+    return result;
 }
 
 fn tableOptionalEnum(

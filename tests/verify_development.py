@@ -26,6 +26,7 @@ TESTS = (
     'animation_composition.py',
     'transition_composition.py',
     'presence_composition.py',
+    'spring_composition.py',
     'rich_text_composition.py',
     'drag_composition.py',
     'drawing_composition.py',

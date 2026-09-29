@@ -40,6 +40,7 @@ pub const UiServices = struct {
     font_candidates: []const text.FontHandle,
     medium_font_candidates: []const text.FontHandle,
     theme: design.tokens.Theme,
+    reduced_motion: bool = false,
     callbacks: *lua.CallbackRegistry,
     theme_fonts: ?*@import("../lua/theme_fonts.zig").ThemeFonts = null,
     workspaces: ?*shell.workspaces.Store = null,
@@ -497,7 +498,7 @@ pub const SourceGeneration = struct {
         self.ui_build.text_input_bindings = self.application.text_input_bindings;
         _ = try self.refreshWindows();
         if (services) |value| {
-            self.ui_build.widget_theme = self.application.resolvedTheme(value.theme);
+            self.ui_build.widget_theme = self.application.resolvedTheme(value.theme, value.reduced_motion);
         }
         try self.validateApplicationIdentity(diagnostic);
         self.application_ready = true;
@@ -614,7 +615,7 @@ pub const SourceGeneration = struct {
         try self.ui_build.attachText(services.paragraph_sources, services.font_candidates, 1);
         try self.ui_build.attachMediumText(services.medium_font_candidates);
         self.ui_build.enableDeclarativeWidgets(services.theme);
-        self.ui_build.widget_theme = self.application.resolvedTheme(services.theme);
+        self.ui_build.widget_theme = self.application.resolvedTheme(services.theme, services.reduced_motion);
         self.ui_build.text_input_bindings = self.application.text_input_bindings;
         self.ui_build.theme_fonts = services.theme_fonts;
         try self.attachImages(services.images, services.icon_roots);
@@ -694,11 +695,12 @@ pub const SourceGeneration = struct {
 
     /// Apply host defaults at a safe point, retaining declaration overrides.
     /// The caller invalidates mounted build owners when this returns true.
-    pub fn setTheme(self: *SourceGeneration, theme: design.tokens.Theme) bool {
+    pub fn setTheme(self: *SourceGeneration, theme: design.tokens.Theme, reduced_motion: bool) bool {
         const services = if (self.services) |*value| value else return false;
         services.theme = theme;
+        services.reduced_motion = reduced_motion;
         if (!self.application_ready) return false;
-        const resolved = self.application.resolvedTheme(theme);
+        const resolved = self.application.resolvedTheme(theme, reduced_motion);
         if (std.meta.eql(self.ui_build.widget_theme, @as(@TypeOf(self.ui_build.widget_theme), resolved))) return false;
         self.ui_build.widget_theme = resolved;
         return true;
@@ -844,7 +846,7 @@ pub const SourceGeneration = struct {
         }
         _ = try self.refreshWindows();
         if (self.services) |value| {
-            self.ui_build.widget_theme = application.resolvedTheme(value.theme);
+            self.ui_build.widget_theme = application.resolvedTheme(value.theme, value.reduced_motion);
         }
         try self.validateApplicationIdentity(diagnostic);
         const prepared_builds = self.allocator.alloc(
