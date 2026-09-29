@@ -35,6 +35,8 @@ pub const Descriptor = struct {
     object: render_types.Object,
     parent_data: render_types.ParentData = .none,
     focusable: bool = false,
+    /// False keeps paint/layout/state but suppresses subtree input.
+    interactive: bool = true,
     /// Descendant instance to reveal after layout; null leaves scrolling alone.
     ensure_visible: ?u64 = null,
     /// A changed nonzero token requests focus after the build commits.
@@ -350,6 +352,7 @@ pub const Tree = struct {
 
         for (descriptors, 0..) |descriptor, traversal_order| {
             const slot = self.findActiveById(descriptor.id).?;
+            try self.render_tree.setInteractive(slot.render.?, descriptor.interactive);
             slot.focusable = descriptor.focusable;
             slot.interaction_paint = descriptor.interaction_paint;
             slot.range_inset = descriptor.range_inset;
@@ -475,9 +478,14 @@ pub const Tree = struct {
         return self.render_tree.isVisible(slot.render.?) catch false;
     }
 
+    pub fn isInteractive(self: *Tree, handle: InstanceHandle) bool {
+        const slot = self.activeSlot(handle) catch return false;
+        return self.render_tree.isInteractive(slot.render.?) catch false;
+    }
+
     pub fn isFocusable(self: *Tree, handle: InstanceHandle) bool {
         const slot = self.activeSlot(handle) catch return false;
-        return slot.focusable and (self.render_tree.isVisible(slot.render.?) catch false);
+        return slot.focusable and self.isInteractive(handle);
     }
 
     /// Consume requests in declaration order, including ineligible targets:
@@ -509,7 +517,7 @@ pub const Tree = struct {
         var wrapped: ?usize = null;
         for (self.slots, 0..) |slot, index| {
             if (slot.state != .active or !slot.focusable or
-                !(self.render_tree.isVisible(slot.render.?) catch false)) continue;
+                !(self.render_tree.isInteractive(slot.render.?) catch false)) continue;
             if (wrapped == null or orderBefore(slot.traversal_order, self.slots[wrapped.?].traversal_order, reverse))
                 wrapped = index;
             const eligible = if (current == null)

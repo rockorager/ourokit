@@ -1282,6 +1282,196 @@ test "transition validates finite numeric declarations and mounts settled by def
     try std.testing.expectEqual(null, try f.runtime.animationDelay());
 }
 
+test "presence retains exit state reverses continuously and disposes at zero" {
+    const f = try Fixture.create(
+        \\shown=ouro.signal(true); mounted=ouro.signal(true); initializes=0; value=0
+        \\local Child=ouro.stateful(function()
+        \\ initializes=initializes+1
+        \\ return function() return ouro.box {key='child',width=40,height=17,background='#234567'} end
+        \\end)
+        \\function build() return ouro.column {key='root',mounted() and ouro.presence {
+        \\ key='life',present=shown(),duration=100,render=function(p)
+        \\  value=p
+        \\  return ouro.box {key='paint',width=40,height=17,opacity=p,transform={x=32*p},Child {key='state'}}
+        \\ end} or nil} end
+    );
+    defer f.destroy();
+    const path = "root/life/paint/state/child";
+    const id = (try f.runtime.semantics.findPath(path)).id;
+    const handle = f.runtime.instances.handleForId(id).?;
+    const render = try f.runtime.instances.renderObject(handle);
+    const root = (try f.runtime.instances.rootRenderObject()).?;
+    const layouts = try f.runtime.tree.layoutCount(root);
+    const origin = (try f.runtime.semanticTarget(path)).bounds.x;
+    for ([_]struct { time: u64, source: []const u8 = "", value: f32, interactive: bool = true }{
+        .{ .time = 0, .value = 0 },
+        .{ .time = 100, .value = 1 },
+        .{ .time = 100, .source = "shown:set(false)", .value = 1, .interactive = false },
+        .{ .time = 125, .value = 0.75, .interactive = false },
+        .{ .time = 125, .source = "shown:set(true)", .value = 0.75 },
+        .{ .time = 150, .value = 0.8125 },
+        .{ .time = 225, .value = 1 },
+        .{ .time = 225, .source = "shown:set(false)", .value = 1, .interactive = false },
+    }) |step| {
+        try f.runtime.advanceAnimations(step.time * std.time.ns_per_ms);
+        if (step.source.len != 0) {
+            try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, step.source.ptr, step.source.len, "@presence", "t"));
+            try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        }
+        try f.settle();
+        try std.testing.expectEqual(origin + 32 * step.value, (try f.runtime.semanticTarget(path)).bounds.x);
+        try std.testing.expectEqual(handle, f.runtime.instances.handleForId(id).?);
+        try std.testing.expectEqual(render, try f.runtime.instances.renderObject(handle));
+        try std.testing.expectEqual(layouts, try f.runtime.tree.layoutCount(root));
+        try std.testing.expect(f.runtime.instances.isVisible(handle));
+        try std.testing.expectEqual(step.interactive, f.runtime.instances.isInteractive(handle));
+        try std.testing.expectEqual(step.interactive, (try f.runtime.semantics.findPath(path)).enabled);
+    }
+    try f.runtime.advanceAnimations(325 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expect(f.runtime.instances.handleForId(id) == null);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    const builds = f.runtime.metrics.builds.count;
+    try f.runtime.advanceAnimations(400 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(builds, f.runtime.metrics.builds.count);
+    for ([_][]const u8{ "assert(initializes==1);shown:set(true)", "assert(initializes==2);mounted:set(false)" }, 0..) |source, i| {
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@presence-remount", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        try f.settle();
+        if (i == 0) {
+            try std.testing.expect(!std.meta.eql(handle, f.runtime.instances.handleForId((try f.runtime.semantics.findPath(path)).id).?));
+            try std.testing.expectEqual(origin, (try f.runtime.semanticTarget(path)).bounds.x);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), f.runtime.animations.count());
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+}
+
+test "presence exit releases modal focus and capture while nested content stays painted" {
+    const f = try Fixture.create(
+        \\opened=ouro.signal(false); hits=0
+        \\function build() return ouro.stack {key='root',
+        \\ ouro.button {key='open',label='Open',on_press=function() opened:set(true) end},
+        \\ ouro.presence {key='life',present=opened(),duration=100,render=function(p)
+        \\  return ouro.dialog {key='dialog',label='Confirm',width=240,on_cancel=function() opened:set(false) end,
+        \\   ouro.presence {key='nested',present=true,duration=0,render=function()
+        \\    return ouro.button {key='save',label='Save',on_press=function() hits=hits+1 end}
+        \\   end}}
+        \\ end}} end
+    );
+    defer f.destroy();
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    try f.play(.{ .click = "root/open" });
+    try f.runtime.advanceAnimations(0);
+    try f.runtime.advanceAnimations(100 * std.time.ns_per_ms);
+    try f.settle();
+    const path = "root/life/dialog/nested/save";
+    const handle = f.runtime.instances.handleForId((try f.runtime.semantics.findPath(path)).id).?;
+    try f.play(.{ .pointer_down = path });
+    try std.testing.expect(f.runtime.router.captured != null);
+    // Native buttons activate on press, before exit is requested.
+    var valid: c_int = 0;
+    _ = c.lua_getglobal(f.vm.state, "hits");
+    try std.testing.expectEqual(@as(c.Integer, 1), c.lua_tointegerx(f.vm.state, -1, &valid));
+    c.lua_settop(f.vm.state, -2);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .escape } });
+    try std.testing.expect(f.runtime.instances.isVisible(handle));
+    try std.testing.expect(!f.runtime.instances.isInteractive(handle));
+    try std.testing.expect(f.runtime.router.captured == null);
+    try std.testing.expect(f.runtime.buttons.armed == null);
+    try std.testing.expect(f.runtime.focus.boundary == null);
+    const opener = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("root/open")).id).?;
+    try std.testing.expectEqual(opener, f.runtime.focus.current().?);
+    try std.testing.expectError(error.DevelopmentTargetDisabled, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = path }));
+    // Reopen while the old dialog still paints. Hit testing must fall through it.
+    try f.play(.{ .click = "root/open" });
+    try std.testing.expectEqual(handle, f.runtime.instances.handleForId((try f.runtime.semantics.findPath(path)).id).?);
+    try std.testing.expect(f.runtime.instances.isInteractive(handle));
+    try f.play(.{ .click = path });
+    _ = c.lua_getglobal(f.vm.state, "hits");
+    try std.testing.expectEqual(@as(c.Integer, 2), c.lua_tointegerx(f.vm.state, -1, &valid));
+    c.lua_settop(f.vm.state, -2);
+}
+
+test "presence excludes floated hits outside listeners and queued input and rolls back failed exits" {
+    const f = try Fixture.create(
+        \\shown=ouro.signal(true); broken=ouro.signal(false); hits=0; outside=0
+        \\function build() return ouro.row {key='root',gap=100,
+        \\ ouro.presence {key='life',present=shown(),duration=100,render=function()
+        \\  return ouro.box {key='scope',on_pointer_down_outside={propagate=true,handler=function() outside=outside+1 end},
+        \\   broken() and 'invalid description' or ouro.anchored {key='anchor',side='bottom',gap=8,
+        \\    ouro.box {key='trigger',width=40,height=20},
+        \\    ouro.button {key='popup',label='Popup',on_press=function() hits=hits+1 end}}}
+        \\ end},ouro.button {key='other',label='Other'}} end
+    );
+    defer f.destroy();
+    try f.runtime.advanceAnimations(0);
+    try f.runtime.advanceAnimations(100 * std.time.ns_per_ms);
+    try f.settle();
+    const path = "root/life/scope/anchor/popup";
+    const handle = f.runtime.instances.handleForId((try f.runtime.semantics.findPath(path)).id).?;
+    const center = (try f.runtime.semanticTarget(path)).center;
+    // A rejected exit must not disable the still-committed tree or retarget it.
+    const bad = "shown:set(false);broken:set(true)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, bad.ptr, bad.len, "@presence-bad", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try std.testing.expectError(error.LuaBuildFailed, f.settle());
+    try std.testing.expect(f.runtime.instances.isInteractive(handle));
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    const repair = "broken:set(false)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, repair.ptr, repair.len, "@presence-repair", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.runtime.routePointer(.{ .enter = .{ .window = f.runtime.window, .serial = 0, .position = center } });
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 0, .time_ms = 0, .button = 272, .state = .pressed } });
+    // Commit exit before draining already-routed events.
+    _ = c.lua_getglobal(f.vm.state, "build");
+    const reference = c.luaL_ref(f.vm.state, c.registry_index);
+    defer c.luaL_unref(f.vm.state, c.registry_index, reference);
+    try f.runtime.reconcile(.{ .width = 324, .height = 224 }, &f.builder, reference);
+    try f.settle();
+    const root = (try f.runtime.instances.rootRenderObject()).?;
+    const hit = try f.runtime.tree.hitTest(root, center);
+    if (hit) |target| try std.testing.expect(try f.runtime.tree.isInteractive(target));
+    try std.testing.expect(f.runtime.instances.isVisible(handle));
+    try std.testing.expect(!f.runtime.instances.isInteractive(handle));
+    try f.play(.{ .click = "root/other" });
+    const check = "assert(hits==0 and outside==0);shown:set(true)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, check.ptr, check.len, "@presence-check", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try f.play(.{ .click = path });
+    const fresh = "assert(hits==1 and outside==0)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, fresh.ptr, fresh.len, "@presence-fresh", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+}
+
+test "presence validates declarations even absent and zero duration removes immediately" {
+    for ([_][]const u8{
+        "duration=100",                               "present=1,duration=100",                  "present='false',duration=100",
+        "present=false,duration=-1",                  "present=false,duration=1.5",              "present=false,duration=100,loop=true",
+        "present=false,duration=100,easing='spring'", "present=false,duration=100,render=false",
+    }) |properties| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.presence {{key='p',render=function() end,{s}}} end", .{properties});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
+    }
+    const f = try Fixture.create(
+        \\shown=ouro.signal(true)
+        \\function build() return ouro.presence {key='p',present=shown(),duration=0,render=function(p)
+        \\ assert(p==1);return ouro.box {key='paint',width=20,height=20}
+        \\end} end
+    );
+    defer f.destroy();
+    const id = (try f.runtime.semantics.findPath("p/paint")).id;
+    const source = "shown:set(false)";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@presence-zero", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+    try std.testing.expect(f.runtime.instances.handleForId(id) == null);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+}
+
 test "forms dialog contains focus and restores opener after escape" {
     const f = try Fixture.create(
         \\opened=ouro.signal(false)

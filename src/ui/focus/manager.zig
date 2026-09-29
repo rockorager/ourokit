@@ -20,7 +20,7 @@ pub const Manager = struct {
             self.revision +%= 1;
         };
         if (self.boundary) |boundary| {
-            if (!tree.isActive(boundary)) {
+            if (!tree.isInteractive(boundary)) {
                 self.boundary = null;
                 self.focused = if (self.restore_target) |target|
                     if (tree.isFocusable(target)) target else null
@@ -74,7 +74,7 @@ pub const Manager = struct {
         new_boundary: ?instance.InstanceHandle,
     ) !bool {
         if (sameOptionalOptional(self.boundary, new_boundary)) return false;
-        if (new_boundary) |boundary| if (!tree.isActive(boundary)) return false;
+        if (new_boundary) |boundary| if (!tree.isInteractive(boundary)) return false;
 
         if (self.boundary == null and new_boundary != null)
             self.restore_target = self.focused;

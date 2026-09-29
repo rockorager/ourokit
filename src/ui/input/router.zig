@@ -74,9 +74,7 @@ pub const Router = struct {
 
     pub fn route(self: *Router, event: platform_window.PointerEvent) !void {
         if (!sameWindow(pointerWindow(event), self.window)) return error.WrongWindow;
-        if (self.hovered) |hovered| if (!self.instances.isActive(hovered)) {
-            self.hovered = null;
-        };
+        self.reconcile();
         switch (event) {
             .enter => |enter| {
                 self.pointer_position = enter.position;
@@ -161,6 +159,15 @@ pub const Router = struct {
                 } });
             },
         }
+    }
+
+    pub fn reconcile(self: *Router) void {
+        if (self.hovered) |target| if (!self.instances.isInteractive(target)) {
+            self.hovered = null;
+        };
+        if (self.captured) |target| if (!self.instances.isInteractive(target)) {
+            self.captured = null;
+        };
     }
 
     pub fn routeKeyboard(self: *Router, event: platform_window.KeyboardEvent) !void {

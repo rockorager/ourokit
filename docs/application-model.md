@@ -1191,12 +1191,55 @@ The render callback has the same non-yielding description-only contract as
 and capacity. Transitions add no layout node; changing only opacity/transform
 keeps layout cached. Width/height changes can still require layout. Invisible
 opacity-zero content remains interactive unless the application disables it.
-Springs, exit/unmount retention, completion callbacks, and automatic reduced-motion
+Springs, completion callbacks, and automatic reduced-motion
 preferences are not included; use duration zero for an application motion policy.
 
 Run `examples/transition-composition.lua` for hover scaling, an interruptible
 sliding panel, and a group fade. `tests/transition_composition.py` exercises real
 native input, reversal, idle completion, independent windows, and source reload.
+
+#### Retained enter/exit transitions
+
+`ouro.presence` adds subtree lifetime to numeric transitions:
+
+```lua
+return ouro.presence {
+  key = "panel-lifetime", present = opened(), duration = 200, easing = "ease_out",
+  render = function(value)
+    return ouro.box {
+      key = "panel", width = 180, height = 120, background = "#389ac0",
+      opacity = value, transform = { x = 24 * (1 - value) },
+      ouro.text { text = "Panel" },
+    }
+  end,
+}
+```
+
+Keep the declaration mounted and change the required boolean `present` rather
+than conditionally returning the declaration. `key`, `duration`, and `render`
+are required; easing follows `ouro.transition`. Presence cannot loop. A new
+present subtree enters from 0 toward 1. An initially absent subtree does not
+call `render` or request frames. Zero duration mounts/removes immediately.
+
+Setting `present=false` transitions toward 0 while retaining the keyed subtree,
+including component state and layout space. At zero it stops calling `render`
+and removes that subtree. Reopening before removal reverses from the last
+committed value with the same identities and state; reopening after removal
+mounts fresh state. Reversals take the full configured duration, as numeric
+transitions do. Presence adds no layout node and applies no paint effects itself.
+
+Exiting content still paints but becomes non-interactive immediately, including
+nested presence and floated descendants. It loses pointer capture and focus,
+is skipped by hit testing and focus traversal, and reports disabled semantics.
+Exiting dialogs release their focus boundary and restore the eligible opener.
+Entering content is interactive immediately, even at opacity zero. Removing the
+presence declaration or its parent, or closing its window, cancels immediately;
+it does not wait for descendant exits. Accepted source reload starts fresh;
+rejected candidates leave the live lifetime and state untouched.
+
+Run `examples/presence-composition.lua` for a dismissible toast and sliding panel.
+`tests/presence_composition.py` checks native lifetime, reversals, state retention,
+disabled exit input, idle completion, independent windows, and atomic reload.
 
 ### Inherited visual defaults
 

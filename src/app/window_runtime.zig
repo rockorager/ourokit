@@ -276,7 +276,7 @@ pub const WindowRuntime = struct {
         const root = (try self.instances.rootRenderObject()) orelse return null;
         const render = (try self.tree.hitTest(root, .{ .x = position.x, .y = position.y })) orelse return null;
         var current: ?ui.instance.InstanceHandle = self.instances.instanceForRenderObject(render);
-        if (current) |target| if (!self.instances.isVisible(target)) return null;
+        if (current) |target| if (!self.instances.isInteractive(target)) return null;
         if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, current)) return null;
         while (current) |target| {
             if (uri_offer) if (self.pointer_bindings.getKind(target, .drop_uris)) |handler|
@@ -290,7 +290,7 @@ pub const WindowRuntime = struct {
 
     pub fn deliverDrop(self: *WindowRuntime, callbacks: *lua.CallbackRegistry, selection: DropSelection, bytes: []const u8) !bool {
         if (!self.ready) return false;
-        if (!self.instances.isVisible(selection.target)) return false;
+        if (!self.instances.isInteractive(selection.target)) return false;
         if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, selection.target)) return false;
         const kind: ui.input.HandlerKind = if (selection.mime == .text) .drop_text else .drop_uris;
         const current = self.pointer_bindings.getKind(selection.target, kind) orelse return false;
@@ -885,7 +885,7 @@ pub const WindowRuntime = struct {
     }
 
     fn splitCursor(self: *WindowRuntime, target: ui.instance.InstanceHandle) !?platform.PointerCursor {
-        if (!self.instances.isVisible(target)) return null;
+        if (!self.instances.isInteractive(target)) return null;
         var current = target;
         while (true) {
             if (self.pointer_bindings.get(current)) |binding| {
@@ -1011,7 +1011,7 @@ pub const WindowRuntime = struct {
                 .keyboard => unreachable,
                 .text_input, .text_input_focus => unreachable,
             };
-            if (!self.instances.isActive(target) or !self.instances.isVisible(target)) continue;
+            if (!self.instances.isInteractive(target)) continue;
             if (event == .pointer and event.pointer.event == .button and event.pointer.event.button.state == .pressed) {
                 const has_outside = for (self.pointer_bindings.entries) |entry| {
                     if (entry.handler) |handler| if (handler.kind == .pointer_down_outside) break true;
@@ -1184,12 +1184,19 @@ pub const WindowRuntime = struct {
     }
 
     fn syncDialogFocus(self: *WindowRuntime) !void {
+        const captured = self.router.captured;
+        self.router.reconcile();
+        if (captured != null and self.router.captured == null)
+            try self.applyButtonUpdate(self.buttons.release());
+        for (&self.scroll_motions) |*motion| if (motion.active and !self.instances.isInteractive(motion.target.?)) {
+            motion.* = .{};
+        };
         var boundary: ?ui.instance.InstanceHandle = null;
         for (0..self.semantics.count()) |index| {
             const node = try self.semantics.node(index);
             if (node.role == .dialog) {
                 if (self.instances.handleForId(node.id)) |candidate| {
-                    if (self.instances.isVisible(candidate)) boundary = candidate;
+                    if (self.instances.isInteractive(candidate)) boundary = candidate;
                 }
             }
         }
@@ -1201,10 +1208,10 @@ pub const WindowRuntime = struct {
                 self.semantics.findId(try self.instances.semanticId(target))
             else
                 null;
-            if (semantic == null or semantic.?.range == null or !semantic.?.enabled or !self.instances.isVisible(target)) self.range_drag = null;
+            if (semantic == null or semantic.?.range == null or !semantic.?.enabled or !self.instances.isInteractive(target)) self.range_drag = null;
         }
         if (self.split_drag) |drag| {
-            if (!self.instances.isActive(drag.target) or !self.instances.isVisible(drag.target) or
+            if (!self.instances.isInteractive(drag.target) or
                 self.pointer_bindings.getKind(drag.target, .split_change) == null)
                 self.split_drag = null;
         }
@@ -1245,7 +1252,7 @@ pub const WindowRuntime = struct {
         const focused = if (self.keyboard_focused) self.focus.current() else null;
         for (self.pointer_bindings.entries) |entry| {
             const handler = entry.handler orelse continue;
-            if (handler.kind != .interaction_change or !self.instances.isActive(entry.target)) continue;
+            if (handler.kind != .interaction_change or !self.instances.isInteractive(entry.target)) continue;
             const active = try self.containsTarget(entry.target, hovered) or try self.containsTarget(entry.target, focused) or
                 try self.containsTarget(entry.target, self.popup_target);
             if (self.pointer_bindings.interactionChanged(&self.instances, entry.target, active))
@@ -1255,7 +1262,7 @@ pub const WindowRuntime = struct {
 
     fn keyboardTarget(self: *WindowRuntime) !?ui.instance.InstanceHandle {
         if (self.focus.current()) |target| {
-            if (!self.instances.isActive(target) or !self.instances.isVisible(target)) return null;
+            if (!self.instances.isInteractive(target)) return null;
             if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, target)) return null;
             return target;
         }
@@ -1266,7 +1273,7 @@ pub const WindowRuntime = struct {
         while (self.tree.firstChild(root)) |child| {
             if (self.tree.nextSibling(child) != null) break;
             const target = self.instances.instanceForRenderObject(child) orelse break;
-            if (!self.instances.isVisible(target)) break;
+            if (!self.instances.isInteractive(target)) break;
             root = child;
         }
         return self.instances.instanceForRenderObject(root);
@@ -1284,6 +1291,7 @@ pub const WindowRuntime = struct {
     }
 
     fn invokeListener(self: *WindowRuntime, target: ui.instance.InstanceHandle, event: listener.Event, kind: ui.input.HandlerKind, callbacks: anytype) !bool {
+        if (!self.instances.isInteractive(target)) return false;
         const handler = self.pointer_bindings.getKind(target, kind) orelse return false;
         if (!handler.filter.matches(event)) return false;
         try self.spawnCallback(callbacks, handler.id, try self.instances.scope(target), &.{.{ .input = event }});
@@ -1294,7 +1302,7 @@ pub const WindowRuntime = struct {
     // Reverse logical order gives nested/later scopes the first opportunity to
     // consume a press. Descendants, including floated descendants, are inside.
     fn dispatchOutsidePointer(self: *WindowRuntime, render: ui.render_object.NodeHandle, hit: ui.instance.InstanceHandle, event: listener.Event, callbacks: anytype) anyerror!bool {
-        if (!try self.tree.isVisible(render)) return false;
+        if (!try self.tree.isInteractive(render)) return false;
         var child = self.tree.lastChild(render);
         while (child) |node| : (child = self.tree.previousSibling(node)) {
             if (try self.dispatchOutsidePointer(node, hit, event, callbacks)) return true;
@@ -1328,7 +1336,7 @@ pub const WindowRuntime = struct {
         const pending = self.pending_shortcut orelse return;
         if (pending.deadline_ns <= self.input_now_ns or pending.revision != self.pointer_bindings.revision or
             pending.focus_revision != self.focus.revision or
-            !self.instances.isActive(pending.target) or !self.instances.isVisible(pending.target))
+            !self.instances.isInteractive(pending.target))
             self.pending_shortcut = null;
     }
 

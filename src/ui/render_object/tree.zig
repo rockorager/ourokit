@@ -50,6 +50,7 @@ pub const LayoutError = error{
 const Slot = struct {
     generation: u32 = 0,
     active: bool = false,
+    interactive: bool = true,
     object: types.Object = .{ .box = .{} },
     parent: ?NodeHandle = null,
     first_child: ?NodeHandle = null,
@@ -509,6 +510,21 @@ pub const Tree = struct {
         return (try self.slot(handle)).needs_paint;
     }
 
+    /// Interaction can be suppressed without changing paint or layout.
+    pub fn setInteractive(self: *Tree, handle: NodeHandle, interactive: bool) !void {
+        (try self.slot(handle)).interactive = interactive;
+    }
+
+    pub fn isInteractive(self: *Tree, handle: NodeHandle) !bool {
+        var current: ?NodeHandle = handle;
+        while (current) |value| {
+            const target = try self.slot(value);
+            if (!target.interactive or (target.object == .box and target.object.box.hidden)) return false;
+            current = target.parent;
+        }
+        return true;
+    }
+
     /// Whether a node is paint/hit-test visible through all retained Box ancestors.
     pub fn isVisible(self: *Tree, handle: NodeHandle) !bool {
         var current: ?NodeHandle = handle;
@@ -809,6 +825,7 @@ pub const Tree = struct {
 
     fn hitTestNode(self: *Tree, handle: NodeHandle, parent_point: PointF) !?NodeHandle {
         const target = try self.slot(handle);
+        if (!target.interactive) return null;
         if (target.object == .box and target.object.box.hidden) return null;
         const point = if (target.object == .box) target.object.box.transform.inversePoint(parent_point) else parent_point;
         if (!validPoint(point)) return null;
@@ -900,6 +917,7 @@ pub const Tree = struct {
     /// gating. Ordinary hitTestNode keeps its existing bounds rules.
     fn hitTestOverlays(self: *Tree, handle: NodeHandle, point: PointF) !?NodeHandle {
         const target = try self.slot(handle);
+        if (!target.interactive) return null;
         if (!target.contains_overlays) return null;
         if (target.object == .box and target.object.box.hidden) return null;
         var child = target.last_child;

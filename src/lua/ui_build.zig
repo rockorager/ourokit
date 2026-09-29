@@ -102,6 +102,7 @@ pub const UiBuild = struct {
     component_namespace: u64 = 0,
     component_scope_clean: bool = true,
     interaction_owner: ?InteractionOwner = null,
+    interactive: bool = true,
     composition_depth: usize = 0,
     virtual_lists: virtual_list.Snapshot = .{},
     animations: ?*const animation.Registry = null,
@@ -226,6 +227,7 @@ pub const UiBuild = struct {
         self.component_namespace = 0;
         self.component_scope_clean = true;
         self.interaction_owner = null;
+        self.interactive = true;
         self.composition_depth = 0;
         self.virtual_lists = .{};
         self.pending_animation_count = 0;
@@ -662,8 +664,7 @@ pub const UiBuild = struct {
             .theme => emitTheme,
             .stateful => return self.lowerComponent(state),
             .stateless => return self.lowerComposition(state),
-            .animation => return self.lowerAnimation(state, false),
-            .transition => return self.lowerAnimation(state, true),
+            .animation, .transition, .presence => return self.lowerAnimation(state, description.kind),
             .virtual_list => return self.lowerVirtualList(state),
         };
         c.lua_pushlightuserdata(state, self);
@@ -674,7 +675,9 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn lowerAnimation(self: *UiBuild, state: *c.State, transition: bool) c_int {
+    fn lowerAnimation(self: *UiBuild, state: *c.State, kind: @import("description.zig").Kind) c_int {
+        const transition = kind != .animation;
+        const presence = kind == .presence;
         if (self.composition_depth == 32) return luaError(state, "composition nesting too deep");
         self.composition_depth += 1;
         defer self.composition_depth -= 1;
@@ -685,14 +688,20 @@ pub const UiBuild = struct {
         const duration = tableRequiredInteger(state, 2, "duration") orelse return luaError(state, "animation duration must be non-negative integer milliseconds");
         if (duration < 0) return luaError(state, "animation duration must be non-negative integer milliseconds");
         var descriptor: animation.Descriptor = .{
-            .id = semanticId(key, (if (transition) @as(u64, 0x7472616e736974) else 0x616e696d617465) ^ parent.id ^ self.component_namespace),
+            .id = semanticId(key, (if (presence) @as(u64, 0x70726573656e74) else if (transition) @as(u64, 0x7472616e736974) else 0x616e696d617465) ^ parent.id ^ self.component_namespace),
             .config = .{
                 .duration_ns = std.math.mul(u64, @intCast(duration), std.time.ns_per_ms) catch return luaError(state, "animation duration too large"),
                 .easing = tableOptionalEnum(animation.Easing, state, 2, "easing", .linear) orelse return luaError(state, "invalid animation easing"),
                 .loop = tableOptionalBoolean(state, 2, "loop", false) orelse return luaError(state, "animation loop must be boolean"),
             },
         };
-        if (transition) {
+        var present = true;
+        if (presence) {
+            if (c.lua_getfield(state, 2, "present") != c.type_boolean) return luaError(state, "presence present must be boolean");
+            present = c.lua_toboolean(state, -1) != 0;
+            c.lua_settop(state, -2);
+            descriptor.transition = .{ .target = if (present) 1 else 0, .initial = 0 };
+        } else if (transition) {
             if (c.lua_getfield(state, 2, "target") != c.type_number) return luaError(state, "transition target must be a finite number");
             var valid: c_int = 0;
             const target = c.lua_tonumberx(state, -1, &valid);
@@ -710,9 +719,15 @@ pub const UiBuild = struct {
         for (self.animationDescriptors()) |existing| if (existing.id == descriptor.id) return luaError(state, "duplicate animation key");
         self.pending_animations[self.pending_animation_count] = descriptor;
         self.pending_animation_count += 1;
+        if (c.lua_getfield(state, 2, "render") != c.type_function) return luaError(state, "animation render must be a function");
+        c.lua_settop(state, -2);
+        const progress = if (self.animations) |registry| registry.sample(descriptor) else descriptor.initial();
+        if (presence and !present and progress == 0) return 0;
+        const previous_interactive = self.interactive;
+        self.interactive = self.interactive and (!presence or present);
+        defer self.interactive = previous_interactive;
         self.appendSemantic(.{ .id = descriptor.id, .parent = semanticParent(parent), .role = .group, .key = key }) catch
             return luaError(state, "cannot append animation semantics");
-        const progress = if (self.animations) |registry| registry.sample(descriptor) else descriptor.initial();
         self.components.push("compose");
         if (c.lua_getfield(state, 2, "render") != c.type_function) return luaError(state, "animation render must be a function");
         c.lua_pushnumber(state, progress);
@@ -953,6 +968,7 @@ pub const UiBuild = struct {
         if (self.active_owner == null) return error.ConstructorOutsideBuild;
         if (self.count == self.storage.len) return error.DescriptorCapacityExceeded;
         self.storage[self.count] = descriptor;
+        self.storage[self.count].interactive = descriptor.interactive and self.interactive;
         self.count += 1;
     }
 
@@ -960,6 +976,7 @@ pub const UiBuild = struct {
         if (self.semantic_count == self.semantic_storage.len)
             return error.SemanticDescriptorCapacityExceeded;
         self.semantic_storage[self.semantic_count] = descriptor;
+        self.semantic_storage[self.semantic_count].enabled = descriptor.enabled and self.interactive;
         self.semantic_count += 1;
     }
 
