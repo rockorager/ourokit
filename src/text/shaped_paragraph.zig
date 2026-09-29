@@ -3,6 +3,8 @@
 const std = @import("std");
 const api = @import("api.zig");
 const itemization = @import("itemization.zig");
+const styled = @import("styled_run.zig");
+const Color = @import("../core/color.zig").Color;
 
 pub const ShapedItemizedRun = struct {
     /// Document-relative source range.
@@ -13,6 +15,9 @@ pub const ShapedItemizedRun = struct {
     paragraph_content_len: usize,
     level: u8,
     script: api.Script,
+    candidates: []const api.FallbackCandidate,
+    logical_size: f32,
+    color: ?Color = null,
     result: api.FallbackResult,
 };
 
@@ -25,6 +30,9 @@ pub const ShapedParagraphs = struct {
     language: []const u8,
     logical_size: f32,
     runs: []ShapedItemizedRun,
+    /// Borrowed authored styles also supply metrics for empty lines, where
+    /// itemization has no glyph run. Must outlive this result.
+    styles: []const styled.StyledRun = &.{},
 
     pub fn deinit(self: *ShapedParagraphs) void {
         for (self.runs) |*run| run.result.deinit();
@@ -46,6 +54,19 @@ pub fn shapeItemizedParagraphs(
     language: []const u8,
     logical_size: f32,
 ) !ShapedParagraphs {
+    return shapeStyledItemizedParagraphs(allocator, utf8, analysis, candidates, language, logical_size, &.{});
+}
+
+pub fn shapeStyledItemizedParagraphs(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    analysis: *const itemization.ItemizedAnalysis,
+    candidates: []const api.FallbackCandidate,
+    language: []const u8,
+    logical_size: f32,
+    styles: []const styled.StyledRun,
+) !ShapedParagraphs {
+    try styled.validate(allocator, utf8, candidates.len, styles);
     const owned_language = try allocator.dupe(u8, language);
     errdefer allocator.free(owned_language);
     var runs: std.ArrayList(ShapedItemizedRun) = .empty;
@@ -53,7 +74,7 @@ pub fn shapeItemizedParagraphs(
         for (runs.items) |*run| run.result.deinit();
         runs.deinit(allocator);
     }
-    try runs.ensureTotalCapacity(allocator, analysis.runs.len);
+    try runs.ensureTotalCapacity(allocator, analysis.runs.len + styles.len);
 
     var expected_run: usize = 0;
     for (analysis.paragraphs) |paragraph| {
@@ -62,20 +83,51 @@ pub fn shapeItemizedParagraphs(
                 run.byte_start != analysis.runs[expected_run].byte_start or
                 run.byte_len != analysis.runs[expected_run].byte_len)
                 return error.InvalidItemization;
-            const result = try api.shapeWithFallback(
-                allocator,
-                candidates,
-                try run.runSpec(utf8, paragraph, language, logical_size),
-            );
-            runs.appendAssumeCapacity(.{
-                .byte_start = run.byte_start,
-                .byte_len = run.byte_len,
-                .paragraph_start = paragraph.byte_start,
-                .paragraph_content_len = paragraph.contentLen(),
-                .level = run.level,
-                .script = run.script,
-                .result = result,
-            });
+            const run_end = run.byte_start + run.byte_len;
+            var style_index: usize = 0;
+            while (style_index < styles.len and styles[style_index].byte_end <= run.byte_start) : (style_index += 1) {}
+            while (style_index < styles.len and styles[style_index].byte_start < run_end) : (style_index += 1) {
+                const style = styles[style_index];
+                const start = @max(run.byte_start, style.byte_start);
+                const end = @min(run_end, style.byte_end);
+                const selected = candidates[style.candidate_start..][0..style.candidate_count];
+                var spec = try run.runSpec(utf8, paragraph, language, style.logical_size);
+                spec.byte_start = start - paragraph.byte_start;
+                spec.byte_len = end - start;
+                var result = try api.shapeWithFallback(allocator, selected, spec);
+                runs.append(allocator, .{
+                    .byte_start = start,
+                    .byte_len = end - start,
+                    .paragraph_start = paragraph.byte_start,
+                    .paragraph_content_len = paragraph.contentLen(),
+                    .level = run.level,
+                    .script = run.script,
+                    .result = result,
+                    .candidates = selected,
+                    .logical_size = style.logical_size,
+                    .color = style.color,
+                }) catch |err| {
+                    result.deinit();
+                    return err;
+                };
+            }
+            if (styles.len == 0) {
+                var result = try api.shapeWithFallback(allocator, candidates, try run.runSpec(utf8, paragraph, language, logical_size));
+                runs.append(allocator, .{
+                    .byte_start = run.byte_start,
+                    .byte_len = run.byte_len,
+                    .paragraph_start = paragraph.byte_start,
+                    .paragraph_content_len = paragraph.contentLen(),
+                    .level = run.level,
+                    .script = run.script,
+                    .result = result,
+                    .candidates = candidates,
+                    .logical_size = logical_size,
+                }) catch |err| {
+                    result.deinit();
+                    return err;
+                };
+            }
             expected_run += 1;
         }
     }
@@ -87,6 +139,7 @@ pub fn shapeItemizedParagraphs(
         .language = owned_language,
         .logical_size = logical_size,
         .runs = try runs.toOwnedSlice(allocator),
+        .styles = styles,
     };
 }
 

@@ -221,4 +221,7 @@ pub const ParentData = union(enum) {
         x: f32 = 0,
         y: f32 = 0,
     },
+    /// Inline interaction geometry belongs to the paragraph, not a second
+    /// text layout. The child Box supplies underline and focus colors.
+    text_range: TextRange,
 };

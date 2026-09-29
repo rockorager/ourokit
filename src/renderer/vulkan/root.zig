@@ -3332,7 +3332,7 @@ fn prepareTextPass(
                 const baseline = value.origin.y + (line.top + line.baseline) * value.scale;
                 for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
                     const position = GlyphPosition.init(value.origin.x + (line.left + glyph.origin.x) * value.scale, baseline + glyph.origin.y * value.scale);
-                    _ = try glyphs.get(span.font, glyph.id, layout.logical_size * value.scale, position.phase);
+                    _ = try glyphs.get(span.font, glyph.id, (span.logical_size orelse layout.logical_size) * value.scale, position.phase);
                 };
             }
         },
@@ -3463,12 +3463,12 @@ fn drawPresentationParagraph(
 ) void {
     if (!has_freetype) unreachable;
     const layout = paragraphs.get(command.layout) catch unreachable;
-    const color = LinearRgba16.fromColor(command.color);
     for (layout.positioned.lines) |line| {
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
+            const color = LinearRgba16.fromColor(span.color orelse command.color);
             const position = GlyphPosition.init(command.origin.x + (line.left + glyph.origin.x) * command.scale, baseline + glyph.origin.y * command.scale);
-            const atlas = cache.prepared(span.font, glyph.id, layout.logical_size * command.scale, position.phase);
+            const atlas = cache.prepared(span.font, glyph.id, (span.logical_size orelse layout.logical_size) * command.scale, position.phase);
             const glyph_bounds: RectI = .{
                 .x = position.x + atlas.left,
                 .y = position.y - atlas.top,
@@ -3692,12 +3692,12 @@ fn drawParagraph(
     if (!has_freetype) unreachable;
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 3, 1, &cache.descriptor_set, 0, null);
     const layout = paragraphs.get(command.layout) catch unreachable;
-    const source = packedLinear(LinearRgba16.fromColor(command.color));
     for (layout.positioned.lines) |line| {
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
+            const source = packedLinear(LinearRgba16.fromColor(span.color orelse command.color));
             const position = GlyphPosition.init(command.origin.x + (line.left + glyph.origin.x) * command.scale, baseline + glyph.origin.y * command.scale);
-            const atlas = cache.prepared(span.font, glyph.id, layout.logical_size * command.scale, position.phase);
+            const atlas = cache.prepared(span.font, glyph.id, (span.logical_size orelse layout.logical_size) * command.scale, position.phase);
             const glyph_bounds: RectI = .{
                 .x = position.x + atlas.left,
                 .y = position.y - atlas.top,
@@ -6227,4 +6227,121 @@ test "Vulkan rounded clips cover mixed draws damage and queued table lifetimes" 
         try shared.expectPixel(x, y, transparent[(y * 64 + x) * 4 ..][0..4].*);
         try std.testing.expectEqual(expected[(y * 64 + x) * 4 ..][0..4].*, direct.pixel(x, y));
     };
+}
+
+test "Vulkan styled paragraphs rasterize run fonts sizes colors and wrapping" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    const software = @import("../software/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const sans = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
+    defer fonts.release(sans) catch unreachable;
+    const serif = try text.bundled.acquire(&fonts, .serif, .bold, .italic);
+    defer fonts.release(serif) catch unreachable;
+    const mono = try text.bundled.acquire(&fonts, .monospace, .semibold, .roman);
+    defer fonts.release(mono) catch unreachable;
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+
+    const pieces = [_][]const u8{ "small ", "DISPLAY ", "finish" };
+    const sizes = [_]f32{ 10.25, 23.5, 14.75 };
+    const colors = [_]Color{
+        Color.rgba(235, 65, 75, 255),
+        Color.rgba(45, 205, 115, 230),
+        Color.rgba(75, 125, 245, 210),
+    };
+    const candidates = [_]text.FontHandle{ sans, serif, mono };
+    var plain: [pieces.len]text.ParagraphHandle = undefined;
+    var acquired: usize = 0;
+    defer for (plain[0..acquired]) |handle| paragraphs.release(handle) catch unreachable;
+    var widest: f32 = 0;
+    for (pieces, 0..) |piece, i| {
+        plain[i] = try paragraphs.acquire(.{
+            .utf8 = piece,
+            .language = "en",
+            .logical_size = sizes[i],
+            .max_width = 500,
+            .candidates = candidates[i..][0..1],
+            .configuration_revision = 1,
+        });
+        acquired += 1;
+        const layout = try paragraphs.get(plain[i]);
+        try std.testing.expectEqual(@as(usize, 1), layout.positioned.lines.len);
+        widest = @max(widest, layout.positioned.lines[0].advance);
+    }
+
+    const source = pieces[0] ++ pieces[1] ++ pieces[2];
+    const runs = [_]text.StyledRun{
+        .{ .byte_start = 0, .byte_end = pieces[0].len, .logical_size = sizes[0], .candidate_start = 0, .candidate_count = 1, .color = colors[0] },
+        .{ .byte_start = pieces[0].len, .byte_end = pieces[0].len + pieces[1].len, .logical_size = sizes[1], .candidate_start = 1, .candidate_count = 1, .color = colors[1] },
+        .{ .byte_start = pieces[0].len + pieces[1].len, .byte_end = source.len, .logical_size = sizes[2], .candidate_start = 2, .candidate_count = 1, .color = colors[2] },
+    };
+    const rich = try paragraphs.acquire(.{
+        .utf8 = source,
+        .language = "en",
+        .logical_size = 17,
+        .max_width = widest + 0.5,
+        .candidates = &candidates,
+        .runs = &runs,
+        .configuration_revision = 1,
+    });
+    defer paragraphs.release(rich) catch unreachable;
+    const rich_layout = try paragraphs.get(rich);
+    try std.testing.expectEqual(@as(usize, pieces.len), rich_layout.positioned.lines.len);
+    for (rich_layout.positioned.lines, runs) |line, run| {
+        try std.testing.expectEqual(run.byte_start, line.byte_start);
+        try std.testing.expectEqual(run.byte_end - run.byte_start, line.byte_len);
+    }
+
+    // Build the golden from independently laid-out, single-style paragraphs.
+    // Their own advances selected the wrap width above, and their own heights
+    // determine each baseline; the rich paragraph renderer cannot make this
+    // reference agree by incorrectly applying its default size or color.
+    const origin = @import("../../core/geometry.zig").PointF{ .x = 7.375, .y = 4.625 };
+    const scale: f32 = 1.375;
+    var reference_commands: [pieces.len + 1]scene.Command = undefined;
+    reference_commands[0] = .{ .clear = Color.rgba(19, 27, 41, 255) };
+    var y: f32 = 0;
+    for (plain, 0..) |handle, i| {
+        reference_commands[i + 1] = .{ .paragraph = .{
+            .layout = handle,
+            .origin = .{ .x = origin.x, .y = origin.y + y * scale },
+            .scale = scale,
+            .color = colors[i],
+        } };
+        y += (try paragraphs.get(handle)).positioned.height();
+    }
+    const rich_commands = [_]scene.Command{
+        reference_commands[0],
+        .{ .paragraph = .{ .layout = rich, .origin = origin, .scale = scale, .color = Color.rgba(245, 210, 35, 255) } },
+    };
+    var software_glyphs = try software.GlyphCache.init(std.testing.allocator, &fonts);
+    defer software_glyphs.deinit();
+    var expected: [180 * 130 * 4]u8 = undefined;
+    try software.renderResources(.{ .commands = &reference_commands }, .{ .pixels = &expected, .width = 180, .height = 130, .stride = 720, .format = .rgba8_unorm, .allocator = std.testing.allocator }, &software_glyphs, null, &paragraphs, null);
+
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var glyphs = try GlyphCache.init(std.testing.allocator, &fonts, &renderer);
+    defer glyphs.deinit();
+    var target = try Target.init(&renderer, 180, 130);
+    defer target.deinit(&renderer);
+    try renderer.renderResources(.{ .commands = &rich_commands }, &target, &glyphs, null, &paragraphs, null);
+    var actual: [expected.len]u8 = undefined;
+    try target.readPixels(&actual, 720, .rgba8_unorm);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+
+    var direct = try GraphicsReadback.initMode(&renderer, 180, 130, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 180, 130);
+    defer linear.deinit(&renderer);
+    for ([_]*GraphicsReadback{ &direct, &linear }) |output| {
+        try renderer.renderGraphicsResources(.{ .commands = &rich_commands }, &output.target, &glyphs, null, &paragraphs, null, false);
+        try output.target.wait(&renderer);
+        for (0..130) |py| for (0..180) |px|
+            try output.expectPixel(px, py, expected[(py * 180 + px) * 4 ..][0..4].*);
+    }
 }

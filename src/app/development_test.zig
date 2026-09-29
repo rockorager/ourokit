@@ -101,6 +101,34 @@ fn node(snapshot: dev.Snapshot, path: []const u8) !dev.Node {
     return error.TestPathMissing;
 }
 
+test "inline links reuse keyboard activation and skip disabled or truncated ranges" {
+    const f = try Fixture.create(
+        \\local count=ouro.signal(0)
+        \\function build() return ouro.column {key='root',gap=5,
+        \\ ouro.text {key='rich',size=20,spans={
+        \\  {text='before '}, {key='link',text='link\nnext',on_press=function() count:set(count()+3) end},
+        \\  {text=' after '}, {key='disabled',text='disabled',enabled=false,on_press=function() count:set(999) end}}},
+        \\ ouro.box {key='narrow',width=40,ouro.text {key='short',size=20,max_lines=1,overflow='ellipsis',spans={
+        \\  {text='before '}, {key='hidden',text='hidden',on_press=function() count:set(999) end}}}},
+        \\ ouro.text {key='status',text='Count '..count()}}
+        \\end
+    );
+    defer f.destroy();
+    const first = try f.runtime.semanticTarget("root/rich/link");
+    try std.testing.expectEqual(.link, first.role);
+    try f.play(.{ .click = "root/rich/link" });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    try std.testing.expectEqualStrings("Count 9", (try node(snapshot, "root/status")).label);
+    try std.testing.expect((try node(snapshot, "root/rich/link")).focused);
+    try std.testing.expect(!(try node(snapshot, "root/rich/disabled")).enabled);
+    try std.testing.expect(!(try node(snapshot, "root/narrow/short/hidden")).visible);
+    try std.testing.expectError(error.DevelopmentTargetHidden, dev.Playback.init(&f.runtime, snapshot.token, .{ .click = "root/narrow/short/hidden" }));
+}
+
 test "custom selection items repaint nested content without rebuilding and isolate child activation" {
     const f = try Fixture.create(
         \\builds=0; requests=0; closes=0

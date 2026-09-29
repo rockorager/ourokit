@@ -1613,6 +1613,42 @@ or snapshot `examples/forms-storybook.lua` for light, dark, disabled, changed,
 and modal states. These controls reuse Box/Text/Flex/Stack render primitives;
 Lua composes the standard parts and Zig owns input, focus, and range policy.
 
+### Rich text and inline links
+
+`ouro.text` accepts either a `text` string or a dense, nonempty `spans` array.
+Spans form **one paragraph**, sharing wrapping, alignment, bidi ordering and
+ellipsis. Each span has nonempty `text` and may override `size`, `weight`
+(`normal` or `medium`), and `foreground`; omitted values inherit the text's
+defaults. Sizes must be finite and positive. Span boundaries must fall between
+extended graphemes, not inside combining sequences or joined emoji.
+
+```lua
+ouro.text {key='help', size=16, spans={
+  {text='Read the '},
+  {text='composition guide', key='guide', weight='medium',
+    on_press=function() open_guide() end},
+  {text=' before continuing.', foreground='#526579'},
+}}
+```
+
+`on_press` makes a span an inline link and requires a stable `key`. Links use
+normal pointer-press activation, Tab/Shift-Tab focus, Enter/Space activation,
+and `enabled=false` to suppress activation and focus. Their default ink is the
+theme's accent text color; disabled links use disabled foreground. Underlines
+and keyboard-focus outlines follow each visible fragment, including wrapped
+and bidirectional ranges. Unrelated text inside a link's overall bounding box
+does not activate it. Ellipsis does not create a link target for hidden text.
+Links require text semantics and cannot be nested inside another control.
+Callbacks decide what activation means; links do not automatically open URLs.
+
+Text and style data are copied when a description is lowered into native
+storage. Mutating an original Lua span table after mounting cannot alter the
+retained paragraph until a subsequent build reads it. The paragraph retains
+font leases, and rejected reloads leave its layout, callbacks and focus intact.
+Software and Vulkan rasterize each span's own font, size and color.
+Run `examples/rich-text-composition.lua` for mixed styling, wrapped links,
+bidirectional text, disabled links, and live width/color updates.
+
 ### Text inputs
 
 `ouro.text_input` is a theme-aware Lua recipe over the native `ouro.text_editor`

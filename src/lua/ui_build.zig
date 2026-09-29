@@ -1405,7 +1405,6 @@ pub const UiBuild = struct {
         const visual = theming.widgetOverrides(state, defaults.widgets.text, false) catch |err| return luaError(state, @errorName(err));
         const parent = self.currentParent() orelse return luaError(state, "text requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "text key is required");
-        const value = tableString(state, 1, "text") orelse return luaError(state, "text content is required");
         const logical_size = tableOptionalExtent(
             state,
             1,
@@ -1423,17 +1422,13 @@ pub const UiBuild = struct {
         const parent_data = declarativeParentData(self, state, 1) catch |err|
             return luaError(state, parentDataErrorMessage(err));
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
-        const weight = tableOptionalEnum(enum { normal, medium }, state, 1, "weight", .normal) orelse
+        const weight = tableOptionalEnum(TextWeight, state, 1, "weight", .normal) orelse
             return luaError(state, "text weight must be normal or medium");
         const paint = readInteractionPaint(state, self.interaction_owner, visual.foreground orelse theme.foreground, null, false) catch |err|
             return luaError(state, @errorName(err));
-        const source = sources.acquire(.{
-            .utf8 = value,
-            .language = "und",
-            .logical_size = logical_size,
-            .candidates = self.themedFonts(weight == .medium) catch |err| return luaError(state, @errorName(err)),
-            .configuration_revision = self.text_configuration_revision,
-        }) catch return luaError(state, "cannot retain text");
+        const source = self.retainDeclarativeText(state, logical_size, weight) catch |err|
+            return luaError(state, @errorName(err));
+        const value = (sources.get(source) catch unreachable).utf8;
         const id = semanticId(key, 0x6c6162656c ^ parent.id ^ self.component_namespace);
         self.append(.{
             .id = id,
@@ -1460,7 +1455,118 @@ pub const UiBuild = struct {
             .key = key,
             .label = value,
         }) catch return luaError(state, "cannot append text semantics");
+        self.emitTextLinks(state, id, source, semantic) catch |err| return luaError(state, @errorName(err));
         return 0;
+    }
+
+    const TextWeight = enum { normal, medium };
+
+    fn emitTextLinks(self: *UiBuild, state: *c.State, parent: u64, source: text.ParagraphSourceHandle, semantic: bool) !void {
+        const top = c.lua_gettop(state);
+        defer c.lua_settop(state, top);
+        if (c.lua_getfield(state, 1, "spans") == c.type_nil) return;
+        const spans = c.lua_gettop(state);
+        const retained = try self.text_sources.?.get(source);
+        const theme = self.currentTheme().?;
+        for (retained.runs, 0..) |run, i| {
+            _ = c.lua_rawgeti(state, spans, @intCast(i + 1));
+            const span = c.lua_gettop(state);
+            if (c.lua_getfield(state, span, "on_press") != c.type_nil) {
+                if (!semantic) return error.LinkRequiresSemantics;
+                if (self.interaction_owner != null) return error.LinkInsideControl;
+                const key = tableString(state, span, "key") orelse return error.LinkKeyRequired;
+                const enabled = tableOptionalBoolean(state, span, "enabled", true) orelse return error.InvalidLinkEnabled;
+                const id = semanticId(key, 0x6c696e6b ^ parent ^ self.component_namespace);
+                if (self.pending_button_count == self.pending_buttons.len) return error.InputHandlerCapacityExceeded;
+                self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled };
+                self.pending_button_count += 1;
+                try self.stageCallbackAt(state, span, id, "on_press", .button);
+                const color = run.color orelse theme.accent_text;
+                try self.append(.{
+                    .id = id,
+                    .parent = parent,
+                    .focusable = enabled,
+                    .object = .{ .box = .{ .background = color } },
+                    .parent_data = .{ .text_range = .{ .start = run.byte_start, .end = run.byte_end } },
+                    .interaction_paint = .{ .source = id, .idle = color, .hover = theme.accent_text, .pressed = theme.foreground, .focus = theme.ring },
+                });
+                try self.appendSemantic(.{ .id = id, .parent = parent, .role = .link, .key = key, .label = retained.utf8[run.byte_start..run.byte_end], .enabled = enabled });
+            }
+            c.lua_settop(state, spans);
+        }
+    }
+
+    fn retainDeclarativeText(self: *UiBuild, state: *c.State, size: f32, weight: TextWeight) !text.ParagraphSourceHandle {
+        const top = c.lua_gettop(state);
+        defer c.lua_settop(state, top);
+        const sources = self.text_sources.?;
+        const candidates = try self.themedFonts(weight == .medium);
+        const spans_type = c.lua_getfield(state, 1, "spans");
+        if (spans_type == c.type_nil) return sources.acquire(.{
+            .utf8 = tableString(state, 1, "text") orelse return error.TextContentRequired,
+            .language = "und",
+            .logical_size = size,
+            .candidates = candidates,
+            .configuration_revision = self.text_configuration_revision,
+        });
+        if (spans_type != c.type_table) return error.InvalidTextSpans;
+        const spans = c.lua_gettop(state);
+        if (c.lua_getfield(state, 1, "text") != c.type_nil) return error.TextAndSpansAreExclusive;
+        c.lua_settop(state, spans);
+        const count = c.lua_rawlen(state, spans);
+        if (count == 0) return error.InvalidTextSpans;
+        // Reject sparse arrays and named entries, rather than silently losing text.
+        c.lua_pushnil(state);
+        while (c.lua_next(state, spans) != 0) {
+            var valid: c_int = 0;
+            const index = c.lua_tointegerx(state, -2, &valid);
+            if (c.lua_isinteger(state, -2) == 0 or valid == 0 or index < 1 or index > count)
+                return error.InvalidTextSpans;
+            c.lua_settop(state, -2);
+        }
+        const allocator = sources.allocator;
+        var utf8: std.ArrayList(u8) = .empty;
+        defer utf8.deinit(allocator);
+        var runs: std.ArrayList(text.StyledRun) = .empty;
+        defer runs.deinit(allocator);
+        var fonts: std.ArrayList(text.FontHandle) = .empty;
+        defer fonts.deinit(allocator);
+        for (0..count) |i| {
+            if (c.lua_rawgeti(state, spans, @intCast(i + 1)) != c.type_table) return error.InvalidTextSpans;
+            const span = c.lua_gettop(state);
+            const content = tableString(state, span, "text") orelse return error.TextContentRequired;
+            if (content.len == 0) return error.EmptyTextSpan;
+            const span_size = tableOptionalExtent(state, span, "size", size) orelse return error.InvalidTextSize;
+            const span_weight = tableOptionalEnum(TextWeight, state, span, "weight", weight) orelse return error.InvalidTextWeight;
+            var color: ?@import("../core/color.zig").Color = if (c.lua_getfield(state, span, "foreground") == c.type_nil) null else try theming.color(state, -1);
+            c.lua_settop(state, span);
+            if (c.lua_getfield(state, span, "on_press") != c.type_nil) {
+                const enabled = tableOptionalBoolean(state, span, "enabled", true) orelse return error.InvalidLinkEnabled;
+                color = if (enabled) color orelse self.currentTheme().?.accent_text else self.currentTheme().?.disabled_foreground;
+            }
+            c.lua_settop(state, span);
+            const selected = try self.themedFonts(span_weight == .medium);
+            const start = utf8.items.len;
+            try utf8.appendSlice(allocator, content);
+            try runs.append(allocator, .{
+                .byte_start = start,
+                .byte_end = utf8.items.len,
+                .logical_size = span_size,
+                .candidate_start = fonts.items.len,
+                .candidate_count = selected.len,
+                .color = color,
+            });
+            try fonts.appendSlice(allocator, selected);
+            c.lua_settop(state, spans);
+        }
+        return sources.acquire(.{
+            .utf8 = utf8.items,
+            .language = "und",
+            .logical_size = size,
+            .candidates = fonts.items,
+            .runs = runs.items,
+            .configuration_revision = self.text_configuration_revision,
+        });
     }
 
     fn emitRow(state: *c.State) callconv(.c) c_int {
@@ -1837,7 +1943,11 @@ pub const UiBuild = struct {
     }
 
     fn stageCallback(self: *UiBuild, state: *c.State, id: u64, name: [*:0]const u8, kind: @import("../ui/input/bindings.zig").HandlerKind) !void {
-        const callback_type = c.lua_getfield(state, 1, name);
+        return self.stageCallbackAt(state, 1, id, name, kind);
+    }
+
+    fn stageCallbackAt(self: *UiBuild, state: *c.State, table: c_int, id: u64, name: [*:0]const u8, kind: @import("../ui/input/bindings.zig").HandlerKind) !void {
+        const callback_type = c.lua_getfield(state, table, name);
         defer c.lua_settop(state, -2);
         if (callback_type == c.type_nil) return;
         if (callback_type != c.type_function) return error.CallbackMustBeFunction;

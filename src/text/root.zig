@@ -13,6 +13,7 @@ const positioned_lines = @import("positioned_lines.zig");
 const script_itemization = @import("script_itemization.zig");
 const shape_cache = @import("shape_cache.zig");
 const shaped_paragraph = @import("shaped_paragraph.zig");
+const styled_run = @import("styled_run.zig");
 const word_break = @import("word_break.zig");
 
 pub const has_fontconfig = api.has_fontconfig;
@@ -60,6 +61,8 @@ pub const analyzeWordBreaks = word_break.analyze;
 pub const ShapedItemizedRun = shaped_paragraph.ShapedItemizedRun;
 pub const ShapedParagraphs = shaped_paragraph.ShapedParagraphs;
 pub const shapeItemizedParagraphs = shaped_paragraph.shapeItemizedParagraphs;
+pub const shapeStyledItemizedParagraphs = shaped_paragraph.shapeStyledItemizedParagraphs;
+pub const StyledRun = styled_run.StyledRun;
 pub const MeasuredBreakSegment = measurement.Segment;
 pub const BreakMeasurement = measurement.Measurement;
 pub const measureBreakSegments = measurement.measureBreakSegments;

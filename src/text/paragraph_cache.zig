@@ -5,6 +5,8 @@ const api = @import("api.zig");
 const paragraph = @import("paragraph.zig");
 const paragraph_layout = @import("paragraph_layout.zig");
 const paragraph_style = @import("paragraph_style.zig");
+const styled = @import("styled_run.zig");
+pub const StyledRun = styled.StyledRun;
 
 pub const ParagraphHandle = struct {
     slot: u32,
@@ -36,6 +38,7 @@ pub const ParagraphCache = struct {
         /// Noninteractive labels avoid extra per-grapheme storage and work.
         include_caret_stops: bool = false,
         candidates: []const api.FontHandle,
+        runs: []const StyledRun = &.{},
         /// Increment when Fontconfig substitutions/candidate policy changes.
         configuration_revision: u64,
     };
@@ -51,6 +54,7 @@ pub const ParagraphCache = struct {
         overflow: paragraph_style.Overflow,
         include_caret_stops: bool,
         candidates: []const api.FontHandle,
+        runs: []const StyledRun,
         configuration_revision: u64,
     };
 
@@ -85,6 +89,15 @@ pub const ParagraphCache = struct {
                 hashValue(&hasher, candidate.slot);
                 hashValue(&hasher, candidate.generation);
             }
+            for (key.runs) |run| {
+                hashValue(&hasher, run.byte_start);
+                hashValue(&hasher, run.byte_end);
+                hashValue(&hasher, @as(u32, @bitCast(run.logical_size)));
+                hashValue(&hasher, run.candidate_start);
+                hashValue(&hasher, run.candidate_count);
+                hashValue(&hasher, if (run.color) |color| @as(u32, @bitCast(color)) else 0);
+                hashValue(&hasher, run.color != null);
+            }
             hashValue(&hasher, key.configuration_revision);
             return hasher.final();
         }
@@ -100,13 +113,20 @@ pub const ParagraphCache = struct {
                 a.configuration_revision == b.configuration_revision and
                 std.mem.eql(u8, a.utf8, b.utf8) and
                 std.mem.eql(u8, a.language, b.language) and
-                handlesEqual(a.candidates, b.candidates);
+                handlesEqual(a.candidates, b.candidates) and runsEqual(a.runs, b.runs);
         }
 
         fn handlesEqual(a: []const api.FontHandle, b: []const api.FontHandle) bool {
             if (a.len != b.len) return false;
             for (a, b) |left, right|
                 if (left.slot != right.slot or left.generation != right.generation) return false;
+            return true;
+        }
+        fn runsEqual(a: []const StyledRun, b: []const StyledRun) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |x, y| if (x.byte_start != y.byte_start or x.byte_end != y.byte_end or
+                @as(u32, @bitCast(x.logical_size)) != @as(u32, @bitCast(y.logical_size)) or
+                x.candidate_start != y.candidate_start or x.candidate_count != y.candidate_count or x.color != y.color) return false;
             return true;
         }
 
@@ -138,7 +158,7 @@ pub const ParagraphCache = struct {
     }
 
     pub fn acquire(self: *ParagraphCache, request: Request) !ParagraphHandle {
-        const transient_key = try requestKey(request);
+        const transient_key = try self.requestKey(request);
         if (self.index.get(transient_key)) |handle| {
             const slot = try self.require(handle);
             if (slot.references == std.math.maxInt(u32)) return error.ReferenceOverflow;
@@ -152,6 +172,8 @@ pub const ParagraphCache = struct {
         errdefer self.allocator.free(language);
         const candidate_handles = try self.allocator.dupe(api.FontHandle, request.candidates);
         errdefer self.allocator.free(candidate_handles);
+        const runs = try self.allocator.dupe(StyledRun, request.runs);
+        errdefer self.allocator.free(runs);
 
         const fallback_candidates = try self.allocator.alloc(api.FallbackCandidate, request.candidates.len);
         defer self.allocator.free(fallback_candidates);
@@ -164,7 +186,7 @@ pub const ParagraphCache = struct {
             retained += 1;
         }
 
-        var layout = try paragraph_layout.build(
+        var layout = try paragraph_layout.buildStyled(
             self.allocator,
             utf8,
             transient_key.base_direction,
@@ -178,6 +200,7 @@ pub const ParagraphCache = struct {
                 .overflow = transient_key.overflow,
             },
             transient_key.include_caret_stops,
+            request.runs,
         );
         errdefer layout.deinit();
         try self.index.ensureUnusedCapacity(self.allocator, 1);
@@ -194,6 +217,7 @@ pub const ParagraphCache = struct {
             .overflow = transient_key.overflow,
             .include_caret_stops = transient_key.include_caret_stops,
             .candidates = candidate_handles,
+            .runs = runs,
             .configuration_revision = transient_key.configuration_revision,
         };
         slot.* = .{
@@ -237,7 +261,7 @@ pub const ParagraphCache = struct {
         return self.active_count;
     }
 
-    fn requestKey(request: Request) !Key {
+    fn requestKey(self: *ParagraphCache, request: Request) !Key {
         if (request.candidates.len == 0) return error.NoFallbackCandidates;
         if (!std.math.isFinite(request.logical_size) or request.logical_size <= 0)
             return error.InvalidLogicalSize;
@@ -246,6 +270,8 @@ pub const ParagraphCache = struct {
         if (request.style.max_lines == 0) return error.InvalidMaxLines;
         if (request.style.overflow == .ellipsis and request.style.max_lines == null)
             return error.EllipsisRequiresMaxLines;
+        if (!std.unicode.utf8ValidateSlice(request.utf8)) return error.InvalidUtf8;
+        try styled.validate(self.allocator, request.utf8, request.candidates.len, request.runs);
         return .{
             .utf8 = request.utf8,
             .base_direction = request.base_direction,
@@ -257,6 +283,7 @@ pub const ParagraphCache = struct {
             .overflow = request.style.overflow,
             .include_caret_stops = request.include_caret_stops,
             .candidates = request.candidates,
+            .runs = request.runs,
             .configuration_revision = request.configuration_revision,
         };
     }
@@ -265,6 +292,7 @@ pub const ParagraphCache = struct {
         entry.layout.deinit();
         for (entry.key.candidates) |handle| self.font_cache.release(handle) catch unreachable;
         self.allocator.free(entry.key.candidates);
+        self.allocator.free(entry.key.runs);
         self.allocator.free(entry.key.language);
         self.allocator.free(entry.key.utf8);
     }
@@ -587,6 +615,10 @@ fn exerciseParagraphAllocationFailure(
         .max_width = 80,
         .style = .{ .max_lines = 1, .overflow = .ellipsis },
         .candidates = &candidates,
+        .runs = &.{
+            .{ .byte_start = 0, .byte_end = 5, .logical_size = 12, .candidate_start = 0, .candidate_count = 1 },
+            .{ .byte_start = 5, .byte_end = "Save حفظ now and continue to the next workflow step".len, .logical_size = 24, .candidate_start = 0, .candidate_count = 2 },
+        },
         .configuration_revision = 1,
     });
     try cache.release(handle);
@@ -611,4 +643,104 @@ test "paragraph layout allocation failures unwind font leases" {
         .{ &fonts, [2]api.FontHandle{ latin, arabic } },
     );
     try std.testing.expectEqual(@as(usize, 2), fonts.count());
+}
+
+test "styled paragraph sizes fonts bidi wrapping and ellipsis retain authored styles" {
+    const Color = @import("../core/color.zig").Color;
+    const red = Color.rgba(210, 40, 70, 255);
+    const blue = Color.rgba(30, 70, 190, 255);
+    var fonts = api.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{ .key = .{ .file = "latin", .index = 0 }, .bytes = @embedFile("ourokit_test_font") });
+    defer fonts.release(latin) catch unreachable;
+    const arabic = try fonts.acquire(.{ .key = .{ .file = "arabic", .index = 0 }, .bytes = @embedFile("ourokit_arabic_test_font") });
+    defer fonts.release(arabic) catch unreachable;
+    var cache = ParagraphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    const utf8 = "Hi حفظ next word";
+    const runs = [_]StyledRun{
+        .{ .byte_start = 0, .byte_end = 3, .logical_size = 12, .candidate_start = 0, .candidate_count = 1, .color = red },
+        .{ .byte_start = 3, .byte_end = 9, .logical_size = 27, .candidate_start = 1, .candidate_count = 1, .color = blue },
+        .{ .byte_start = 9, .byte_end = utf8.len, .logical_size = 18, .candidate_start = 0, .candidate_count = 1 },
+    };
+    var request: ParagraphCache.Request = .{ .utf8 = utf8, .language = "und", .logical_size = 16, .max_width = 500, .include_caret_stops = true, .candidates = &.{ latin, arabic }, .runs = &runs, .configuration_revision = 1 };
+    const wide = try cache.acquire(request);
+    defer cache.release(wide) catch unreachable;
+    const layout = try cache.get(wide);
+    try std.testing.expectEqual(@as(usize, 1), layout.positioned.lines.len);
+    var expected_advance: f32 = 0;
+    for (runs, 0..) |run, i| {
+        var reference = try (try fonts.get(if (i == 1) arabic else latin)).shape(std.testing.allocator, .{
+            .paragraph = utf8,
+            .byte_start = run.byte_start,
+            .byte_len = run.byte_end - run.byte_start,
+            .direction = if (i == 1) .right_to_left else .left_to_right,
+            .script = if (i == 1) .arabic else .latin,
+            .language = "und",
+            .logical_size = run.logical_size,
+        });
+        defer reference.deinit();
+        expected_advance += reference.advance.x;
+    }
+    try std.testing.expectApproxEqAbs(expected_advance, layout.positioned.lines[0].advance, 0.001);
+    var rtl = false;
+    for (layout.positioned.spans) |span| {
+        const authored = if (span.byte_start < 3) runs[0] else if (span.byte_start < 9) runs[1] else runs[2];
+        try std.testing.expectEqual(authored.color, span.color);
+        try std.testing.expectEqual(@as(?f32, authored.logical_size), span.logical_size);
+        if (span.direction == .right_to_left) {
+            rtl = true;
+            try std.testing.expectEqual(arabic, span.font);
+        }
+    }
+    try std.testing.expect(rtl);
+    var rectangles = try layout.positioned.selectionRectangleIterator(.{ .start = 3, .end = 9 });
+    try std.testing.expect((try rectangles.next()) != null);
+    request.max_width = 80;
+    const narrow = try cache.acquire(request);
+    defer cache.release(narrow) catch unreachable;
+    try std.testing.expect((try cache.get(narrow)).positioned.lines.len > 1);
+    request.style = .{ .max_lines = 1, .overflow = .ellipsis };
+    const short = try cache.acquire(request);
+    defer cache.release(short) catch unreachable;
+    const ellipsized = try cache.get(short);
+    const offset = ellipsized.positioned.ellipsis_byte_offset.?;
+    const inherited = if (offset <= 3) runs[0] else if (offset <= 9) runs[1] else runs[2];
+    try std.testing.expectEqual(@as(usize, 1), ellipsized.positioned.lines.len);
+    var found = false;
+    for (ellipsized.positioned.spans) |span| if (span.byte_start == offset) {
+        found = true;
+        try std.testing.expectEqual(inherited.color, span.color);
+        try std.testing.expectEqual(@as(?f32, inherited.logical_size), span.logical_size);
+    };
+    try std.testing.expect(found);
+
+    const blank = try cache.acquire(.{
+        .utf8 = "\n\n",
+        .language = "und",
+        .logical_size = 16,
+        .max_width = 80,
+        .include_caret_stops = true,
+        .candidates = &.{ latin, arabic },
+        .configuration_revision = 1,
+        .runs = &.{
+            .{ .byte_start = 0, .byte_end = 1, .logical_size = 9, .candidate_start = 0, .candidate_count = 1 },
+            .{ .byte_start = 1, .byte_end = 2, .logical_size = 31, .candidate_start = 1, .candidate_count = 1 },
+        },
+    });
+    defer cache.release(blank) catch unreachable;
+    const blank_layout = try cache.get(blank);
+    try std.testing.expectEqual(@as(usize, 3), blank_layout.positioned.lines.len);
+    for (blank_layout.positioned.lines, 0..) |line, i| {
+        var empty = try (try fonts.get(if (i == 0) latin else arabic)).shape(std.testing.allocator, .{
+            .paragraph = "",
+            .direction = .left_to_right,
+            .script = .latin,
+            .language = "und",
+            .logical_size = if (i == 0) 9 else 31,
+        });
+        defer empty.deinit();
+        try std.testing.expectApproxEqAbs(empty.metrics.ascender, line.ascender, 0.001);
+        try std.testing.expectApproxEqAbs(empty.metrics.descender, line.descender, 0.001);
+    }
 }

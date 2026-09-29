@@ -4,6 +4,7 @@ const std = @import("std");
 const uucode = @import("uucode");
 const PointF = @import("../core/geometry.zig").PointF;
 const RectF = @import("../core/geometry.zig").RectF;
+const Color = @import("../core/color.zig").Color;
 const api = @import("api.zig");
 const line_layout = @import("line_layout.zig");
 const paragraph = @import("paragraph.zig");
@@ -31,6 +32,8 @@ pub const Span = struct {
     advance: f32,
     glyph_start: usize,
     glyph_count: usize,
+    logical_size: ?f32 = null,
+    color: ?Color = null,
 };
 
 pub const CaretAffinity = enum {
@@ -538,6 +541,8 @@ const Fragment = struct {
     paragraph_start: usize,
     borrowed: *const api.FallbackResult,
     owned: ?api.FallbackResult = null,
+    logical_size: ?f32 = null,
+    color: ?Color = null,
 
     fn result(self: *const Fragment) *const api.FallbackResult {
         return if (self.owned) |*value| value else self.borrowed;
@@ -710,12 +715,19 @@ pub fn positionLinesWithOptions(
             // Empty lines have no shaped fragments, but still occupy a font
             // line and need a full-height insertion caret.
             if (shaped.candidates.len == 0) return error.NoFallbackCandidates;
-            var empty = try (try shaped.candidates[0].resolve()).shape(allocator, .{
+            var candidate = shaped.candidates[0];
+            var logical_size = shaped.logical_size;
+            for (shaped.styles) |authored| {
+                candidate = shaped.candidates[authored.candidate_start];
+                logical_size = authored.logical_size;
+                if (selected_line.byte_start < authored.byte_end) break;
+            }
+            var empty = try (try candidate.resolve()).shape(allocator, .{
                 .paragraph = "",
                 .direction = if (selected_line.base_level & 1 == 0) .left_to_right else .right_to_left,
                 .script = .latin,
                 .language = shaped.language,
-                .logical_size = shaped.logical_size,
+                .logical_size = logical_size,
             });
             defer empty.deinit();
             metrics = empty.metrics;
@@ -949,7 +961,7 @@ fn appendClusterCarets(
             return error.InvalidFontHandle;
         const total = try font.ligatureCarets(
             span.direction,
-            shaped.logical_size,
+            span.logical_size orelse shaped.logical_size,
             cluster_glyphs[0].id,
             ligature_positions.items,
         );
@@ -1119,6 +1131,8 @@ fn buildFragments(
             .byte_len = byte_end - byte_start,
             .paragraph_start = run.paragraph_start,
             .borrowed = &run.result,
+            .logical_size = run.logical_size,
+            .color = run.color,
         };
         if (line.reshape_start or line.reshape_end) {
             const paragraph_end = std.math.add(
@@ -1129,7 +1143,7 @@ fn buildFragments(
             if (paragraph_end > utf8.len) return error.InvalidShaping;
             fragment.owned = try api.shapeWithFallback(
                 allocator,
-                shaped.candidates,
+                run.candidates,
                 .{
                     .paragraph = utf8[run.paragraph_start..paragraph_end],
                     .byte_start = byte_start - run.paragraph_start,
@@ -1137,7 +1151,7 @@ fn buildFragments(
                     .direction = if (run.level & 1 == 0) .left_to_right else .right_to_left,
                     .script = run.script,
                     .language = shaped.language,
-                    .logical_size = shaped.logical_size,
+                    .logical_size = run.logical_size,
                 },
             );
         }
@@ -1222,6 +1236,8 @@ fn appendFragment(
             fragment.paragraph_start,
             byte_start,
             byte_end,
+            fragment.logical_size,
+            fragment.color,
         );
     } else {
         var index = source_spans.len;
@@ -1236,6 +1252,8 @@ fn appendFragment(
                 fragment.paragraph_start,
                 byte_start,
                 byte_end,
+                fragment.logical_size,
+                fragment.color,
             );
         }
     }
@@ -1250,6 +1268,8 @@ fn appendShapedSpan(
     paragraph_start: usize,
     byte_start: usize,
     byte_end: usize,
+    logical_size: ?f32,
+    color: ?Color,
 ) !void {
     const span_start = std.math.add(usize, paragraph_start, span.run.byte_start) catch
         return error.InvalidShaping;
@@ -1286,6 +1306,8 @@ fn appendShapedSpan(
         .advance = pen_x.* - pen_start,
         .glyph_start = glyph_start,
         .glyph_count = glyph_count,
+        .logical_size = logical_size,
+        .color = color,
     });
 }
 

@@ -205,7 +205,6 @@ pub const Tree = struct {
             return error.SplitRequiresThreeChildren;
         if (parent_slot.object == .anchored and self.childCount(parent) >= 2)
             return error.AnchoredRequiresOneOrTwoChildren;
-        if (parent_slot.object == .text) return error.TextHasChildren;
         if (parent_slot.object == .text_input) return error.TextInputHasChildren;
 
         child_slot.parent = parent;
@@ -333,6 +332,45 @@ pub const Tree = struct {
     pub fn paintBounds(self: *Tree, handle: NodeHandle) !RectF {
         const extent = try self.nodeSize(handle);
         return (try self.paintTransform(handle)).rect(.{ .x = 0, .y = 0, .width = extent.width, .height = extent.height });
+    }
+
+    /// A wrapped or bidi link's bounding-box center can fall in unrelated
+    /// text. Playback targets a real visible fragment instead.
+    pub fn textRangePoint(self: *Tree, handle: NodeHandle) !?PointF {
+        const target = try self.slot(handle);
+        if (target.parent_data != .text_range) return null;
+        var rectangles = try self.textRangeRectangles(handle, (try self.slot(target.parent.?)).size);
+        const rect = (try rectangles.next()) orelse return null;
+        return (try self.paintTransform(target.parent.?)).point(.{ .x = rect.x + rect.width / 2, .y = rect.y + rect.height / 2 });
+    }
+
+    const TextRangeRectangles = struct {
+        selection: text.SelectionRectangleIterator,
+        viewport: SizeF,
+
+        fn next(self: *TextRangeRectangles) !?RectF {
+            while (try self.selection.next()) |rect| {
+                const left = @max(0, rect.x);
+                const top = @max(0, rect.y);
+                const right = @min(self.viewport.width, rect.x + rect.width);
+                const bottom = @min(self.viewport.height, rect.y + rect.height);
+                if (right > left and bottom > top)
+                    return .{ .x = left, .y = top, .width = right - left, .height = bottom - top };
+            }
+            return null;
+        }
+    };
+
+    fn textRangeRectangles(self: *Tree, handle: NodeHandle, viewport: SizeF) !TextRangeRectangles {
+        const target = try self.slot(handle);
+        const parent = try self.slot(target.parent.?);
+        const paragraph_layout = try self.paragraphs.?.get(parent.paragraph_layout orelse return error.LayoutRequired);
+        const range = target.parent_data.text_range;
+        const end = @min(range.end, paragraph_layout.positioned.ellipsis_byte_offset orelse range.end);
+        return .{
+            .selection = try paragraph_layout.positioned.selectionRectangleIterator(.{ .start = @min(range.start, end), .end = end }),
+            .viewport = viewport,
+        };
     }
 
     pub fn hitTest(self: *Tree, root: NodeHandle, point: PointF) !?NodeHandle {
@@ -520,6 +558,8 @@ pub const Tree = struct {
         while (current) |value| {
             const target = try self.slot(value);
             if (!target.interactive or (target.object == .box and target.object.box.hidden)) return false;
+            if (target.parent_data == .text_range and target.has_layout and
+                (target.size.width == 0 or target.size.height == 0)) return false;
             current = target.parent;
         }
         return true;
@@ -531,6 +571,8 @@ pub const Tree = struct {
         while (current) |value| {
             const target = try self.slot(value);
             if (target.object == .box and target.object.box.hidden) return false;
+            if (target.parent_data == .text_range and target.has_layout and
+                (target.size.width == 0 or target.size.height == 0)) return false;
             current = target.parent;
         }
         return true;
@@ -815,7 +857,21 @@ pub const Tree = struct {
         while (child) |child_handle| {
             const child_slot = try self.slot(child_handle);
             const next = child_slot.next_sibling;
-            try self.paintNode(child_handle, builder, PointF.add(origin, child_slot.offset));
+            if (target.object == .text) {
+                const appearance = child_slot.object.box;
+                var rectangles = try self.textRangeRectangles(child_handle, target.size);
+                while (try rectangles.next()) |rect| {
+                    const fragment: RectF = .{ .x = origin.x + rect.x, .y = origin.y + rect.y, .width = rect.width, .height = rect.height };
+                    if (appearance.background) |color| try builder.solidRectangle(.{
+                        .x = fragment.x,
+                        .y = fragment.y + fragment.height - 1,
+                        .width = fragment.width,
+                        .height = 1,
+                    }, color);
+                    if (appearance.outline_color) |color| try builder.decoratedRectangle(fragment, null, color, appearance.outline_width, 0);
+                }
+                child_slot.needs_paint = false;
+            } else try self.paintNode(child_handle, builder, PointF.add(origin, child_slot.offset));
             child = if (target.object == .anchored) null else next;
         }
         if (clips) try builder.popClip();
@@ -844,7 +900,12 @@ pub const Tree = struct {
         while (child) |child_handle| {
             const child_slot = try self.slot(child_handle);
             const previous = child_slot.previous_sibling;
-            if (try self.hitTestNode(child_handle, .{
+            if (target.object == .text) {
+                if (child_slot.interactive) {
+                    var rectangles = try self.textRangeRectangles(child_handle, target.size);
+                    while (try rectangles.next()) |rect| if (rect.contains(point)) return child_handle;
+                }
+            } else if (try self.hitTestNode(child_handle, .{
                 .x = point.x - child_slot.offset.x,
                 .y = point.y - child_slot.offset.y,
             })) |hit| return hit;
@@ -1035,6 +1096,8 @@ pub const Tree = struct {
             else
                 std.math.floatMax(f32),
             .candidates = source.candidates,
+            .runs = source.runs,
+            .include_caret_stops = (try self.slot(handle)).first_child != null,
             .configuration_revision = source.configuration_revision,
             .style = .{
                 .alignment = value.alignment,
@@ -1060,6 +1123,25 @@ pub const Tree = struct {
         const target = try self.slot(handle);
         self.releaseParagraphLayout(target);
         target.paragraph_layout = layout_handle;
+        errdefer target.paragraph_layout = null;
+        var child = target.first_child;
+        while (child) |link| : (child = self.nextSibling(link)) {
+            const link_slot = try self.slot(link);
+            if (link_slot.object != .box or link_slot.first_child != null or
+                link_slot.parent_data.text_range.end > source.utf8.len) return error.InvalidParentData;
+            var rectangles = self.textRangeRectangles(link, result) catch return error.InvalidParentData;
+            var bounds: ?RectF = null;
+            while (rectangles.next() catch return error.InvalidParentData) |rect| {
+                if (bounds) |old| {
+                    const x = @min(old.x, rect.x);
+                    const y = @min(old.y, rect.y);
+                    bounds = .{ .x = x, .y = y, .width = @max(old.x + old.width, rect.x + rect.width) - x, .height = @max(old.y + old.height, rect.y + rect.height) - y };
+                } else bounds = rect;
+            }
+            const rect = bounds orelse RectF{ .x = 0, .y = 0, .width = 0, .height = 0 };
+            _ = try self.layoutChild(link, Constraints.tight(.{ .width = rect.width, .height = rect.height }));
+            try self.setChildOffset(link, .{ .x = rect.x, .y = rect.y });
+        }
         return result;
     }
 
@@ -1280,7 +1362,10 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
         .scroll => if (data != .none) return error.InvalidParentData,
         .image => return error.ImageHasChildren,
         .canvas => return error.CanvasHasChildren,
-        .text => return error.TextHasChildren,
+        .text => {
+            if (data != .text_range) return error.TextHasChildren;
+            if (data.text_range.start >= data.text_range.end) return error.InvalidParentData;
+        },
         .text_input => return error.TextInputHasChildren,
     }
 }
@@ -2678,4 +2763,64 @@ test "image tree deinit releases every shared image lease" {
         try std.testing.expectEqual(@as(u32, 90), (try images.get(image)).intrinsic_width);
     }
     try std.testing.expectError(error.StaleImageHandle, images.get(image));
+}
+
+test "inline text links hit only visible fragments and retain focus geometry through reflow" {
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{ .key = .{ .file = "link-font", .index = 0 }, .bytes = @embedFile("ourokit_test_font") });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const source = try sources.acquire(.{
+        .utf8 = "before link\nnext after",
+        .language = "en",
+        .logical_size = 20,
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    defer sources.release(source) catch unreachable;
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 3);
+    defer tree.deinit();
+    tree.attachTextCaches(&sources, &paragraphs);
+    const paragraph_node = try tree.create(.{ .text = .{ .source = source, .color = Color.rgba(10, 20, 30, 255) } });
+    const link = try tree.create(.{ .box = .{ .background = Color.rgba(20, 80, 160, 255), .outline_color = Color.rgba(160, 20, 40, 255), .outline_width = 2 } });
+    try tree.appendChild(paragraph_node, link, .{ .text_range = .{ .start = 7, .end = 16 } });
+    _ = try tree.layout(paragraph_node, .{ .max_width = 300, .max_height = 200 });
+    const layout_value = try paragraphs.get((try tree.slot(paragraph_node)).paragraph_layout.?);
+    const first = layout_value.positioned.lines[0];
+    const second = layout_value.positioned.lines[1];
+    const before: PointF = .{ .x = 1, .y = first.top + first.baseline / 2 };
+    const next: PointF = .{ .x = 1, .y = second.top + second.baseline / 2 };
+    const end: PointF = .{ .x = first.advance - 1, .y = before.y };
+    const union_bounds = try tree.paintBounds(link);
+    try std.testing.expect(union_bounds.contains(before));
+    try std.testing.expectEqual(paragraph_node, (try tree.hitTest(paragraph_node, before)).?);
+    try std.testing.expectEqual(link, (try tree.hitTest(paragraph_node, next)).?);
+    try std.testing.expectEqual(link, (try tree.hitTest(paragraph_node, end)).?);
+    try std.testing.expectEqual(link, (try tree.hitTest(paragraph_node, (try tree.textRangePoint(link)).?)).?);
+    var commands: [24]@import("../../scene/root.zig").Command = undefined;
+    var builder = try scene_builder.Builder.init(&commands, 1);
+    try tree.buildScene(paragraph_node, &builder);
+    var underlines: usize = 0;
+    var outlines: usize = 0;
+    for (builder.displayList().commands) |command| switch (command) {
+        .solid_rectangle => underlines += 1,
+        .decorated_rectangle => outlines += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), underlines);
+    try std.testing.expectEqual(@as(usize, 2), outlines);
+    _ = try tree.layout(paragraph_node, .{ .max_width = 80, .max_height = 200 });
+    try std.testing.expectEqual(link, (try tree.hitTest(paragraph_node, (try tree.textRangePoint(link)).?)).?);
+    // Truncated-away links have no synthetic ellipsis hit area.
+    try tree.update(paragraph_node, .{ .text = .{ .source = source, .color = Color.rgba(0, 0, 0, 255), .max_lines = 1, .overflow = .ellipsis } });
+    _ = try tree.layout(paragraph_node, .{ .max_width = 40, .max_height = 200 });
+    try std.testing.expectEqual(@as(?PointF, null), try tree.textRangePoint(link));
+    try std.testing.expectEqual(@as(f32, 0), (try tree.nodeSize(link)).width);
+    try std.testing.expect(!try tree.isVisible(link));
+    try std.testing.expect(!try tree.isInteractive(link));
 }

@@ -11,6 +11,7 @@ const paragraph = @import("paragraph.zig");
 const paragraph_style = @import("paragraph_style.zig");
 const positioned_lines = @import("positioned_lines.zig");
 const shaped_paragraph = @import("shaped_paragraph.zig");
+const StyledRun = @import("styled_run.zig").StyledRun;
 
 pub const Layout = struct {
     positioned: positioned_lines.PositionedLines,
@@ -34,6 +35,21 @@ pub fn build(
     style: paragraph_style.Style,
     include_caret_stops: bool,
 ) !Layout {
+    return buildStyled(allocator, utf8, base_direction, candidates, language, logical_size, max_width, style, include_caret_stops, &.{});
+}
+
+pub fn buildStyled(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    base_direction: paragraph.BaseDirection,
+    candidates: []const api.FallbackCandidate,
+    language: []const u8,
+    logical_size: f32,
+    max_width: f32,
+    style: paragraph_style.Style,
+    include_caret_stops: bool,
+    runs: []const StyledRun,
+) !Layout {
     var positioned = try buildPositioned(
         allocator,
         utf8,
@@ -44,6 +60,7 @@ pub fn build(
         max_width,
         style,
         include_caret_stops,
+        runs,
     );
     errdefer positioned.deinit();
     return .{
@@ -63,16 +80,18 @@ fn buildPositioned(
     max_width: f32,
     style: paragraph_style.Style,
     include_caret_stops: bool,
+    runs: []const StyledRun,
 ) !positioned_lines.PositionedLines {
     var itemized = try itemization.itemizeParagraphs(allocator, utf8, base_direction);
     defer itemized.deinit();
-    var shaped = try shaped_paragraph.shapeItemizedParagraphs(
+    var shaped = try shaped_paragraph.shapeStyledItemizedParagraphs(
         allocator,
         utf8,
         &itemized,
         candidates,
         language,
         logical_size,
+        runs,
     );
     defer shaped.deinit();
     var breaks = try line_break.analyzeLineBreaks(allocator, utf8);
@@ -110,6 +129,7 @@ fn buildPositioned(
         max_width,
         style,
         include_caret_stops,
+        runs,
         selected.lines[@as(usize, style.max_lines.?) - 1],
         breaks.breaks,
     );
@@ -125,16 +145,18 @@ fn buildPlainPositioned(
     max_width: f32,
     style: paragraph_style.Style,
     include_caret_stops: bool,
+    runs: []const StyledRun,
 ) !positioned_lines.PositionedLines {
     var itemized = try itemization.itemizeParagraphs(allocator, utf8, base_direction);
     defer itemized.deinit();
-    var shaped = try shaped_paragraph.shapeItemizedParagraphs(
+    var shaped = try shaped_paragraph.shapeStyledItemizedParagraphs(
         allocator,
         utf8,
         &itemized,
         candidates,
         language,
         logical_size,
+        runs,
     );
     defer shaped.deinit();
     var breaks = try line_break.analyzeLineBreaks(allocator, utf8);
@@ -282,6 +304,7 @@ fn buildEllipsized(
     max_width: f32,
     style: paragraph_style.Style,
     include_caret_stops: bool,
+    runs: []const StyledRun,
     final_line: line_layout.Line,
     breaks: []const line_break.LineBreak,
 ) !positioned_lines.PositionedLines {
@@ -292,6 +315,21 @@ fn buildEllipsized(
         defer allocator.free(synthesized);
         @memcpy(synthesized[0..prefix_len], utf8[0..prefix_len]);
         @memcpy(synthesized[prefix_len..], ellipsis_utf8);
+        var synthesized_runs: []StyledRun = &.{};
+        defer if (synthesized_runs.len != 0) allocator.free(synthesized_runs);
+        if (runs.len != 0) {
+            var kept: usize = 0;
+            while (kept < runs.len and runs[kept].byte_start < prefix_len) : (kept += 1) {}
+            synthesized_runs = try allocator.alloc(StyledRun, kept + 1);
+            for (runs[0..kept], 0..) |run, i| {
+                synthesized_runs[i] = run;
+                synthesized_runs[i].byte_end = @min(run.byte_end, prefix_len);
+            }
+            const inherited = if (kept == 0) runs[0] else synthesized_runs[kept - 1];
+            synthesized_runs[kept] = inherited;
+            synthesized_runs[kept].byte_start = prefix_len;
+            synthesized_runs[kept].byte_end = prefix_len + ellipsis_utf8.len;
+        }
         var candidate = try buildPlainPositioned(
             allocator,
             synthesized,
@@ -302,6 +340,7 @@ fn buildEllipsized(
             max_width,
             .{ .alignment = style.alignment },
             include_caret_stops,
+            synthesized_runs,
         );
         if (candidate.lines.len <= style.max_lines.?) {
             remapEllipsis(&candidate, utf8.len, prefix_len);

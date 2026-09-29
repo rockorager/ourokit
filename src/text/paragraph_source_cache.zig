@@ -3,6 +3,8 @@
 const std = @import("std");
 const api = @import("api.zig");
 const paragraph = @import("paragraph.zig");
+const styled = @import("styled_run.zig");
+pub const StyledRun = styled.StyledRun;
 
 pub const ParagraphSourceHandle = struct {
     slot: u32,
@@ -15,6 +17,7 @@ pub const ParagraphSource = struct {
     language: []const u8,
     logical_size: f32,
     candidates: []const api.FontHandle,
+    runs: []const StyledRun,
     configuration_revision: u64,
 };
 
@@ -37,6 +40,7 @@ pub const ParagraphSourceCache = struct {
         language: []const u8,
         logical_size: f32,
         candidates: []const api.FontHandle,
+        runs: []const StyledRun = &.{},
         configuration_revision: u64,
     };
 
@@ -46,6 +50,7 @@ pub const ParagraphSourceCache = struct {
         language: []const u8,
         logical_size_bits: u32,
         candidates: []const api.FontHandle,
+        runs: []const StyledRun,
         configuration_revision: u64,
     };
 
@@ -70,6 +75,7 @@ pub const ParagraphSourceCache = struct {
                 hashValue(&hasher, candidate.slot);
                 hashValue(&hasher, candidate.generation);
             }
+            hashRuns(&hasher, key.runs);
             hashValue(&hasher, key.configuration_revision);
             return hasher.final();
         }
@@ -80,7 +86,7 @@ pub const ParagraphSourceCache = struct {
                 a.configuration_revision == b.configuration_revision and
                 std.mem.eql(u8, a.utf8, b.utf8) and
                 std.mem.eql(u8, a.language, b.language) and
-                handlesEqual(a.candidates, b.candidates);
+                handlesEqual(a.candidates, b.candidates) and runsEqual(a.runs, b.runs);
         }
 
         fn handlesEqual(a: []const api.FontHandle, b: []const api.FontHandle) bool {
@@ -93,6 +99,26 @@ pub const ParagraphSourceCache = struct {
         fn hashValue(hasher: *std.hash.Wyhash, value: anytype) void {
             var copy = value;
             hasher.update(std.mem.asBytes(&copy));
+        }
+
+        fn hashRuns(hasher: *std.hash.Wyhash, runs: []const StyledRun) void {
+            for (runs) |run| {
+                hashValue(hasher, run.byte_start);
+                hashValue(hasher, run.byte_end);
+                hashValue(hasher, @as(u32, @bitCast(run.logical_size)));
+                hashValue(hasher, run.candidate_start);
+                hashValue(hasher, run.candidate_count);
+                hashValue(hasher, if (run.color) |c| @as(u32, @bitCast(c)) else 0);
+                hashValue(hasher, run.color != null);
+            }
+        }
+        fn runsEqual(a: []const StyledRun, b: []const StyledRun) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |x, y| if (x.byte_start != y.byte_start or x.byte_end != y.byte_end or
+                @as(u32, @bitCast(x.logical_size)) != @as(u32, @bitCast(y.logical_size)) or
+                x.candidate_start != y.candidate_start or x.candidate_count != y.candidate_count or
+                x.color != y.color) return false;
+            return true;
         }
     };
 
@@ -118,7 +144,7 @@ pub const ParagraphSourceCache = struct {
     }
 
     pub fn acquire(self: *ParagraphSourceCache, request: Request) !ParagraphSourceHandle {
-        const key = try requestKey(request);
+        const key = try self.requestKey(request);
         if (self.index.get(key)) |handle| {
             try self.retain(handle);
             return handle;
@@ -130,6 +156,8 @@ pub const ParagraphSourceCache = struct {
         errdefer self.allocator.free(language);
         const candidates = try self.allocator.dupe(api.FontHandle, key.candidates);
         errdefer self.allocator.free(candidates);
+        const runs = try self.allocator.dupe(StyledRun, key.runs);
+        errdefer self.allocator.free(runs);
         var retained: usize = 0;
         errdefer for (key.candidates[0..retained]) |handle|
             self.font_cache.release(handle) catch unreachable;
@@ -151,6 +179,7 @@ pub const ParagraphSourceCache = struct {
                 .language = language,
                 .logical_size = @bitCast(key.logical_size_bits),
                 .candidates = candidates,
+                .runs = runs,
                 .configuration_revision = key.configuration_revision,
             },
         };
@@ -195,17 +224,19 @@ pub const ParagraphSourceCache = struct {
         return self.active_count;
     }
 
-    fn requestKey(request: Request) !Key {
+    fn requestKey(self: *ParagraphSourceCache, request: Request) !Key {
         if (request.candidates.len == 0) return error.NoFallbackCandidates;
         if (!std.unicode.utf8ValidateSlice(request.utf8)) return error.InvalidUtf8;
         if (!std.math.isFinite(request.logical_size) or request.logical_size <= 0)
             return error.InvalidLogicalSize;
+        try styled.validate(self.allocator, request.utf8, request.candidates.len, request.runs);
         return .{
             .utf8 = request.utf8,
             .base_direction = request.base_direction,
             .language = request.language,
             .logical_size_bits = @bitCast(request.logical_size),
             .candidates = request.candidates,
+            .runs = request.runs,
             .configuration_revision = request.configuration_revision,
         };
     }
@@ -217,6 +248,7 @@ pub const ParagraphSourceCache = struct {
             .language = source.language,
             .logical_size_bits = @bitCast(source.logical_size),
             .candidates = source.candidates,
+            .runs = source.runs,
             .configuration_revision = source.configuration_revision,
         };
     }
@@ -224,6 +256,7 @@ pub const ParagraphSourceCache = struct {
     fn destroySource(self: *ParagraphSourceCache, source: *ParagraphSource) void {
         for (source.candidates) |handle| self.font_cache.release(handle) catch unreachable;
         self.allocator.free(source.candidates);
+        self.allocator.free(source.runs);
         self.allocator.free(source.language);
         self.allocator.free(source.utf8);
     }
@@ -318,6 +351,10 @@ fn exerciseSourceAllocationFailure(
         .language = "und",
         .logical_size = 16,
         .candidates = &candidates,
+        .runs = &.{
+            .{ .byte_start = 0, .byte_end = 5, .logical_size = 12, .candidate_start = 0, .candidate_count = 1 },
+            .{ .byte_start = 5, .byte_end = "Save حفظ".len, .logical_size = 24, .candidate_start = 1, .candidate_count = 1 },
+        },
         .configuration_revision = 1,
     });
     try cache.release(handle);
@@ -342,4 +379,32 @@ test "paragraph source allocation failures unwind font leases" {
         .{ &fonts, [2]api.FontHandle{ latin, arabic } },
     );
     try std.testing.expectEqual(@as(usize, 2), fonts.count());
+}
+
+test "styled paragraph sources copy runs and distinguish style only changes" {
+    const Color = @import("../core/color.zig").Color;
+    var fonts = api.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(font) catch unreachable;
+    var cache = ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    var runs = [_]StyledRun{.{ .byte_start = 0, .byte_end = 1, .logical_size = 12, .candidate_start = 0, .candidate_count = 1 }};
+    const request: ParagraphSourceCache.Request = .{ .utf8 = "X", .language = "en", .logical_size = 16, .candidates = &.{font}, .runs = &runs, .configuration_revision = 1 };
+    const first = try cache.acquire(request);
+    defer cache.release(first) catch unreachable;
+    const same = try cache.acquire(request);
+    defer cache.release(same) catch unreachable;
+    try std.testing.expectEqual(first, same);
+    runs[0].logical_size = 27;
+    runs[0].color = Color.rgba(210, 40, 70, 255);
+    const changed = try cache.acquire(request);
+    defer cache.release(changed) catch unreachable;
+    try std.testing.expect(!std.meta.eql(first, changed));
+    try std.testing.expectEqual(@as(f32, 12), (try cache.get(first)).runs[0].logical_size);
+    try std.testing.expectEqual(@as(?Color, null), (try cache.get(first)).runs[0].color);
+    try std.testing.expectEqual(runs[0], (try cache.get(changed)).runs[0]);
 }

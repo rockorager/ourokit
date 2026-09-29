@@ -249,6 +249,8 @@ test "unsafe cluster boundaries are explicit" {
         .paragraph_content_len = 4,
         .level = 0,
         .script = .latin,
+        .candidates = &.{},
+        .logical_size = 12,
         .result = .{
             .allocator = std.testing.allocator,
             .spans = &spans,

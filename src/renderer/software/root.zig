@@ -369,7 +369,7 @@ fn drawParagraph(
                 const bitmap = try cache.getPhase(
                     span.font,
                     glyph.id,
-                    layout.logical_size * command.scale,
+                    (span.logical_size orelse layout.logical_size) * command.scale,
                     position.phase,
                 );
                 drawMask(
@@ -378,7 +378,7 @@ fn drawParagraph(
                     position.x + bitmap.left,
                     position.y - bitmap.top,
                     bitmap,
-                    command.color,
+                    span.color orelse command.color,
                 );
             }
         }

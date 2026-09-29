@@ -1928,7 +1928,9 @@ pub const WindowRuntime = struct {
         };
         const bounds = try self.tree.paintBounds(render);
         var center: core.PointF = .{ .x = bounds.x + bounds.width / 2, .y = bounds.y + bounds.height / 2 };
-        if (self.listboxes.option(target) != null) {
+        if (try self.tree.textRangePoint(render)) |point| {
+            center = point;
+        } else if (self.listboxes.option(target) != null) {
             // Custom selection content can contain independent controls. Find
             // a point routed to the item, not its close button or text input.
             center = try self.selectionPoint(target, render) orelse center;

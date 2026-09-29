@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Role = enum { group, text, button, text_field, listbox, option, tab_list, tab, separator, image, @"switch", checkbox, radio_group, radio, slider, dialog };
+pub const Role = enum { group, text, button, text_field, listbox, option, tab_list, tab, separator, image, @"switch", checkbox, radio_group, radio, slider, dialog, link };
 const Range = @import("../widget/range.zig").Range;
 
 /// Borrowed normalized semantic data emitted beside render descriptors during
@@ -110,7 +110,7 @@ pub const Snapshot = struct {
             if (descriptor.parent) |parent| if (!indexContains(self.validation_index, parent))
                 return error.SemanticParentMustPrecedeChild;
             if (!indexPut(self.validation_index, descriptor.id)) return error.DuplicateSemanticId;
-            if ((descriptor.role == .text or descriptor.role == .button or descriptor.role == .option or descriptor.role == .tab or descriptor.role == .@"switch") and descriptor.label.len == 0)
+            if ((descriptor.role == .text or descriptor.role == .button or descriptor.role == .link or descriptor.role == .option or descriptor.role == .tab or descriptor.role == .@"switch") and descriptor.label.len == 0)
                 return error.SemanticLabelRequired;
         }
     }
