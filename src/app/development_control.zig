@@ -221,6 +221,9 @@ fn parseAction(args: mcp.Value) !dev.Action {
     const action = try stringField(args, "action");
     if (std.mem.eql(u8, action, "click")) return .{ .click = try stringField(args, "target") };
     if (std.mem.eql(u8, action, "hover")) return .{ .hover = try stringField(args, "target") };
+    if (std.mem.eql(u8, action, "pointer_down")) return .{ .pointer_down = try stringField(args, "target") };
+    if (std.mem.eql(u8, action, "pointer_move")) return .{ .pointer_move = try stringField(args, "target") };
+    if (std.mem.eql(u8, action, "pointer_up")) return .pointer_up;
     if (std.mem.eql(u8, action, "text")) return .{ .text = try stringField(args, "text") };
     if (std.mem.eql(u8, action, "scroll")) {
         const number = mcp.get(args, "delta") orelse return error.MissingDevelopmentArgument;

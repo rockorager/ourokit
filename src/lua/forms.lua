@@ -117,7 +117,8 @@ ouro.tabs = ouro.stateful(function(props)
           on_press=function() props.on_close(item.value) end,
           ouro.icon {key='icon', bytes=cross, width=14, height=14}}
       end
-      headers[#headers+1]=ouro.tab {key=key, value=item.value, label=item.label, children=children}
+      headers[#headers+1]=ouro.tab {key=key, value=item.value, label=item.label, children=children,
+        drag=item.drag, drop=item.drop}
       panels[#panels+1]=ouro.box {key=key, width='fill', height='fill', hidden=item.value~=props.selected, item.content}
     end
     assert(selected, 'tabs selected value must exist')

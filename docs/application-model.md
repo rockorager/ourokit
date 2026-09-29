@@ -650,8 +650,9 @@ explicitly above 1,024 nodes or 64 KiB of text instead of silently truncating.
 
 Input and capture require a fresh token from inspection. Reinspect after
 `StaleDevelopmentTarget`; tokens cover window identity, source generation and
-runtime/scene revisions, not just the path. Input accepts `click` or `hover`
-with `target`, `scroll` with `target` and signed `delta`, `key` with a logical
+runtime/scene revisions, not just the path. Input accepts `click`, `hover`,
+`pointer_down`, or `pointer_move` with `target`, `pointer_up` without a target,
+`scroll` with `target` and signed `delta`, `key` with a logical
 `key` name and optional `shift`/`control`/`alt`/`logo`, or `text` with UTF-8 `text`.
 Keys include `tab`, `enter`, `space`, `escape`, `backspace`, `delete`, `home`,
 `end`, `page_up`, `page_down`, `arrow_left/right/up/down`, and lowercase letters.
@@ -659,6 +660,10 @@ Text types printable characters into the focused editable field through normal
 translated key events (up to 16 KiB); active IME composition and control
 characters are rejected. Use key actions for navigation or Enter. Disabled,
 read-only, stale, occluded, or noninteractive targets fail explicitly.
+
+To exercise an internal drag, press its source with `pointer_down`, move to a
+destination with `pointer_move`, then `pointer_up`. Inspect between actions;
+you can capture the live preview before release. Escape cancels the drag.
 
 Input runs normal routing, dispatch, runnable tasks, reconciliation and backend
 submission before returning a fresh token and
@@ -1612,6 +1617,48 @@ Run `ouroctl run examples/forms.lua` for the interactive settings smoke app,
 or snapshot `examples/forms-storybook.lua` for light, dark, disabled, changed,
 and modal states. These controls reuse Box/Text/Flex/Stack render primitives;
 Lua composes the standard parts and Zig owns input, focus, and range policy.
+
+### Internal drag-and-drop and reordering
+
+Boxes accept `drag={kind='card',value='document-7'}` and
+`drop={kind='card',on_drop=function(value,x,y) ... end}`. `kind` and `value`
+are nonempty UTF-8 strings of at most 127 bytes with no NUL. Unknown fields,
+non-string values, and missing callbacks reject the build. Native instances
+copy the parsed strings; mutating a Lua table does not change an already built
+source. A subsequent rebuild reads its current declaration normally.
+
+A primary-button press arms the nearest source, retaining normal press
+activation and focus behavior. Six logical pixels of motion start a drag.
+Nested controls/editors own their gestures; use a separate handle if a card
+contains interactive children. Once active, native motion/release handling
+takes precedence over generic pointer hooks. The source subtree replays above
+the scene at 75% opacity on an opaque theme-surface backing, offset from the
+grabbed position by (12,24) logical pixels and without ancestor clipping. A
+matching target gets a focus-color outline. The preview has no hit-test or
+semantic nodes and does not change layout. Both renderers use the ordinary
+scene commands.
+
+Release invokes the nearest matching drop ancestor with the copied `value`
+and target-local logical `x,y` (including inverse paint transforms). Hidden,
+noninteractive, disabled, mismatched and source-descendant targets cannot
+accept. Modal boundaries still apply. Escape, pointer/keyboard leave, source
+removal/hiding/configuration changes, or an accepted source reload cancel the
+session. A rejected reload preserves it. This is in-window only: it does not
+export OS data, cross windows, or automatically scroll/reorder collections.
+Use the [desktop drag API](desktop-services.md#text-and-file-uri-drag-and-drop)
+for external text and file transfers.
+
+The drop callback updates the application's ordered data. Keep stable keys
+while changing sibling order to retain native editor text, selection, undo and
+focus. `ouro.option`, `ouro.radio`, and `ouro.tab` forward `drag`/`drop` to their
+boxes; each `ouro.tabs.tabs` entry can also provide them for its header. Tab
+panels stay keyed by integer `value`, independent of array order. Choose a
+different `kind` for independent reorder groups. Tab presses still select the
+tab before dragging; close buttons keep their normal gesture.
+
+Run `examples/drag-composition.lua` for retained card and tab reordering, or
+`python3 tests/drag_composition.py zig-out/bin/ouroctl --capture-dir <directory>`
+for native preview pixels, input/focus, cancellation and atomic-reload checks.
 
 ### Rich text and inline links
 

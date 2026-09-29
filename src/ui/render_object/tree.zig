@@ -301,6 +301,20 @@ pub const Tree = struct {
         try self.paintOverlays(root, builder, .{});
     }
 
+    /// Replay a source in the window paint plane, without its ancestor clips.
+    /// The caller owns window clipping and preview opacity. Floating popups are
+    /// deliberately excluded, just as they are from ordinary subtree painting.
+    pub fn buildPreview(self: *Tree, handle: NodeHandle, builder: *scene_builder.Builder, delta: PointF) !void {
+        const target = try self.slot(handle);
+        const own: Transform = if (target.object == .box) target.object.box.transform else .{};
+        const inverse: Transform = .{ .scale = 1 / own.scale, .translation = own.inversePoint(.{}) };
+        const saved = builder.transform;
+        defer builder.transform = saved;
+        const moved = try (Transform{ .translation = delta }).compose(try self.paintTransform(handle));
+        builder.transform = try saved.compose(try moved.compose(inverse));
+        try self.paintNode(handle, builder, .{});
+    }
+
     /// Map local layout coordinates to window logical pixels. Floating children
     /// start a new paint plane, retaining their placed position but not ancestor
     /// scale. Paint, semantic targeting and captured input share this mapping.
@@ -2426,6 +2440,54 @@ test "paint transforms compose origins without layout and hit overflowing childr
     try tree.buildScene(root, &builder);
     for ([_]NodeHandle{ root, parent, stack, child }) |node|
         try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(node));
+}
+
+test "internal drag preview replays source geometry without ancestor clips" {
+    const scene = @import("../../scene/root.zig");
+    const RectI = @import("../../core/geometry.zig").RectI;
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 3);
+    defer tree.deinit();
+    const root = try tree.create(.{ .stack = .{} });
+    const ancestor = try tree.create(.{ .box = .{
+        .width = 90,
+        .height = 70,
+        .clip = true,
+        .transform = .{ .translation = .{ .x = 11, .y = -3 }, .scale = 1.5, .origin = .{ .x = 7, .y = 13 } },
+    } });
+    const source = try tree.create(.{ .box = .{
+        .width = 24,
+        .height = 16,
+        .clip = true,
+        .corner_radius = 3,
+        .background = Color.rgba(20, 40, 60, 255),
+        .shadow = .{ .offset = .{ .x = 2, .y = -1 }, .color = Color.rgba(0, 0, 0, 255) },
+        .transform = .{ .translation = .{ .x = -5, .y = 9 }, .scale = 0.5, .origin = .{ .x = 3, .y = 6 } },
+    } });
+    try tree.appendChild(root, ancestor, .{ .stack = .{ .x = 17, .y = 23 } });
+    try tree.appendChild(ancestor, source, .none);
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 180, .height = 140 }));
+
+    var storage: [4]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&storage, 2);
+    try tree.buildPreview(source, &builder, .{ .x = 8, .y = -4 });
+    try builder.displayList().validate();
+    try std.testing.expectEqual(@as(f32, 2), builder.transform.scale);
+    try std.testing.expectEqual(PointF{}, builder.transform.translation);
+    try std.testing.expectEqual(@as(usize, 4), builder.count);
+    try std.testing.expect(storage[0] == .shadow);
+    try std.testing.expect(storage[1] == .decorated_rectangle);
+    try std.testing.expect(storage[2] == .push_clip_rounded);
+    try std.testing.expect(storage[3] == .pop_clip);
+    // The only clip is the source's own clip. Its bounds include both unequal
+    // transforms exactly once and retain the builder's output scale.
+    const bounds = storage[1].decorated_rectangle.bounds;
+    try std.testing.expectEqual(RectI{ .x = 55, .y = 55, .width = 135, .height = 105 }, bounds);
+    try std.testing.expectEqual(bounds, storage[2].push_clip_rounded.bounds);
+
+    var short: [3]scene.Command = undefined;
+    var short_builder = try scene_builder.Builder.init(&short, 2);
+    try std.testing.expectError(error.SceneCapacityExceeded, tree.buildPreview(source, &short_builder, .{}));
 }
 
 test "box opacity wraps own paint and children without layout or hit changes" {

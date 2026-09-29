@@ -20,6 +20,7 @@ pub const HandlerKind = enum {
     cancel,
     drop_text,
     drop_uris,
+    drop_internal,
     key_capture,
     key_bubble,
     pointer_capture,

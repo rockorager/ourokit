@@ -9,7 +9,9 @@ The toolkit is under development. It includes retained components and signals,
 text editing and shaping, images, themes, scrolling and virtual lists, scoped
 asynchronous tasks, source reload, and a native Storybook with headless snapshots.
 Desktop services include portal file choosers, URI opening, notifications, and
-text/file drag-and-drop. Form controls include checkboxes, radio groups, selects,
+text/file drag-and-drop. App-local typed drags include previews and retained
+card/tab reordering; see the [drag example](examples/drag-composition.lua).
+Form controls include checkboxes, radio groups, selects,
 sliders, spinboxes, split views, tabs, and in-window modal dialogs; native text
 inputs support multiline editing. See the
 [form controls example](examples/forms.lua). It is not yet a complete desktop

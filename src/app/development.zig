@@ -179,6 +179,8 @@ fn copyText(storage: []u8, used: *usize, bytes: []const u8) ![]const u8 {
 pub const Action = union(enum) {
     hover: []const u8,
     pointer_down: []const u8,
+    pointer_move: []const u8,
+    pointer_up,
     click: []const u8,
     scroll: struct { target: []const u8, delta: f32 },
     key: platform.TranslatedKey,
@@ -186,9 +188,9 @@ pub const Action = union(enum) {
 
     fn path(self: Action) ?[]const u8 {
         return switch (self) {
-            .hover, .pointer_down, .click => |path_value| path_value,
+            .hover, .pointer_down, .pointer_move, .click => |path_value| path_value,
             .scroll => |value| value.target,
-            .key, .text => null,
+            .key, .text, .pointer_up => null,
         };
     }
 };
@@ -222,6 +224,7 @@ pub const Playback = struct {
                 semantic.role != .tab and semantic.role != .tab_list and semantic.role != .separator and
                 semantic.role != .text_field and semantic.role != .option and semantic.role != .listbox and
                 !runtime.instances.isFocusable(target.?) and
+                (try runtime.instances.dragOptions(target.?)).source == null and
                 runtime.pointer_bindings.getKind(target.?, .pointer_capture) == null and
                 runtime.pointer_bindings.getKind(target.?, .pointer_bubble) == null)
                 return error.DevelopmentTargetNotInteractive;
@@ -259,7 +262,7 @@ pub const Playback = struct {
         try requireSettled(runtime);
         if (self.step == 0) try self.token.validate(runtime);
         const steps: usize = switch (self.action) {
-            .hover => 1,
+            .hover, .pointer_move, .pointer_up => 1,
             .text => if (self.text_offset == self.action.text.len) 0 else std.math.maxInt(usize),
             .scroll, .pointer_down, .key => 2,
             .click => 3,
@@ -281,7 +284,11 @@ pub const Playback = struct {
             if (self.step == 0) {
                 try checkHit(runtime, self.target.?, geometry.center);
                 // Unlike a real seat, headless playback may not have entered.
-                try runtime.routePointer(.{ .enter = .{ .window = window, .serial = 0, .position = geometry.center } });
+                if (self.action == .pointer_move) {
+                    try runtime.routePointer(.{ .motion = .{ .window = window, .time_ms = 0, .position = geometry.center } });
+                } else {
+                    try runtime.routePointer(.{ .enter = .{ .window = window, .serial = 0, .position = geometry.center } });
+                }
             } else if (self.action == .scroll) {
                 const axis = geometry.scroll_axis orelse return error.DevelopmentTargetNotScrollable;
                 try checkHit(runtime, self.target.?, runtime.router.pointer_position);
@@ -291,6 +298,7 @@ pub const Playback = struct {
                 try runtime.routePointer(.{ .button = .{ .window = window, .serial = 0, .time_ms = 0, .button = 0x110, .state = .pressed } });
             }
         } else switch (self.action) {
+            .pointer_up => try runtime.routePointer(.{ .button = .{ .window = window, .serial = 0, .time_ms = 0, .button = 0x110, .state = .released } }),
             .key => |key| try runtime.routeKeyboard(.{ .key = .{ .window = window, .serial = 0, .time_ms = 0, .state = if (self.step == 0) .pressed else .released, .translated = key } }),
             .text => |bytes| {
                 if (!std.meta.eql(runtime.focus.current(), self.target)) return error.DevelopmentTargetNotFocused;

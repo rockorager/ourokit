@@ -14,6 +14,7 @@ const ui = @import("../ui/root.zig");
 const virtual_list = @import("../ui/widget/virtual_list.zig");
 const listener = @import("../ui/input/listener.zig");
 const KeySequence = @import("../ui/input/key_chord.zig").Sequence;
+const internal_drag = @import("../ui/input/drag.zig");
 
 pub const Config = struct {
     node_capacity: usize = 256,
@@ -113,6 +114,7 @@ pub const WindowRuntime = struct {
     selection_pointer: ?core.PointF = null,
     range_drag: ?ui.instance.InstanceHandle = null,
     split_drag: ?struct { target: ui.instance.InstanceHandle, grab_offset: f32 } = null,
+    drag_session: ?internal_drag.Session = null,
     selection_tick_ns: ?u64 = null,
     scroll_motions: [2]scroll_motion.Motion = @splat(.{}),
     // Headless windows act focused; native hosts start false until keyboard enter.
@@ -338,6 +340,7 @@ pub const WindowRuntime = struct {
         self.focus = .{};
         self.range_drag = null;
         self.split_drag = null;
+        self.cancelInternalDrag();
         self.text_input_owner = null;
         self.text_input_generation +%= 1;
         self.clicks.reset();
@@ -531,6 +534,7 @@ pub const WindowRuntime = struct {
         signals: *lua.Signals,
     ) void {
         self.validatePreparedSourceCommit(prepared) catch unreachable;
+        self.cancelInternalDrag();
         self.development_generation +%= 1;
         self.semantics.stage(prepared.semanticDescriptors());
         self.instances.applyReconcile(prepared.reconcile_plan.?) catch unreachable;
@@ -793,6 +797,7 @@ pub const WindowRuntime = struct {
         }
         try self.updateVirtualLayout();
         if (try self.instances.revealScrollTargets()) self.frame_state.invalidatePaint();
+        try self.reconcileInternalDrag();
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
             const started = self.phaseStart();
             self.frame_state.invalidatePaint();
@@ -801,6 +806,33 @@ pub const WindowRuntime = struct {
             // translucent root never blends with the previous frame.
             if (self.background != null) try builder.clear(core.Color.rgba(0, 0, 0, 0));
             try self.tree.buildScene(root, &builder);
+            if (self.drag_session) |drag| if (drag.active) {
+                try builder.pushClip(.{ .x = 0, .y = 0, .width = width, .height = height });
+                if (drag.target) |target| try builder.decoratedRectangle(
+                    try self.tree.paintBounds(try self.instances.renderObject(target)),
+                    null,
+                    self.focus_color,
+                    2,
+                    0,
+                );
+                const source = try self.instances.renderObject(drag.source);
+                const offset: core.PointF = .{
+                    .x = drag.position.x - drag.start.x + 12,
+                    .y = drag.position.y - drag.start.y + 24,
+                };
+                var bounds = try self.tree.paintBounds(source);
+                bounds.x += offset.x;
+                bounds.y += offset.y;
+                // Transparent sources (e.g. tab labels) need an opaque plate
+                // so destination text cannot show through the moving glyphs.
+                var plate = self.surface_color;
+                plate.a = 255;
+                try builder.decoratedRectangle(bounds, plate, self.border_color, 1, 4);
+                try builder.pushOpacity(0.75);
+                try self.tree.buildPreview(source, &builder, offset);
+                try builder.popOpacity();
+                try builder.popClip();
+            };
             self.command_count = builder.displayList().commands.len;
             _ = try self.frame_state.sceneBuilt();
             self.metrics.paints.finish(started);
@@ -861,6 +893,7 @@ pub const WindowRuntime = struct {
 
     pub fn routePointer(self: *WindowRuntime, event: platform.PointerEvent) !void {
         try self.router.route(event);
+        if (event == .leave) self.cancelInternalDrag();
         // A press outside the hit tree is not queued, but must still stop a fling.
         if (event == .button and event.button.state == .pressed) {
             self.pending_shortcut = null;
@@ -932,6 +965,9 @@ pub const WindowRuntime = struct {
         self.validatePendingShortcut();
         while (self.router.takeEvent()) |event| {
             defer self.router.releaseEvent(event);
+            // A platform leave may be queued behind the press that arms the
+            // session. Motion-generated hover leaves have no platform serial.
+            if (event == .hover_leave and event.hover_leave.serial != null) self.cancelInternalDrag();
             self.development_revision +%= 1;
             self.metrics.input_events +|= 1;
             self.activation_input = null;
@@ -984,6 +1020,9 @@ pub const WindowRuntime = struct {
                 try self.dispatchKeyboard(event.keyboard, callback_service);
                 continue;
             }
+            // Once captured as a drag, motion/release belong to the native
+            // session, including a release outside the hit tree or modal scope.
+            if (try self.dispatchInternalDrag(event, callback_service)) continue;
             if (event == .pointer) switch (event.pointer.event) {
                 .button => |button| if (button.state == .pressed) {
                     self.pending_shortcut = null;
@@ -1040,6 +1079,9 @@ pub const WindowRuntime = struct {
                 }
                 if (try self.dispatchListeners(target, input, callback_service)) continue;
             }
+            if (event == .pointer and event.pointer.event == .button and
+                event.pointer.event.button.button == 0x110 and event.pointer.event.button.state == .pressed)
+                try self.armInternalDrag(target, event.pointer.position);
             try self.updateTextInputPointer(target, event);
             const activated_button = try self.updateButtonState(event);
             if (event == .pointer and event.pointer.event == .button and
@@ -1175,6 +1217,99 @@ pub const WindowRuntime = struct {
         return false;
     }
 
+    fn cancelInternalDrag(self: *WindowRuntime) void {
+        if (self.drag_session != null) self.frame_state.invalidatePaint();
+        self.drag_session = null;
+    }
+
+    fn armInternalDrag(self: *WindowRuntime, hit: ui.instance.InstanceHandle, position: core.PointF) !void {
+        self.cancelInternalDrag();
+        var current: ?ui.instance.InstanceHandle = hit;
+        while (current) |target| {
+            if (self.text_inputs.contains(target)) return;
+            if ((try self.instances.dragOptions(target)).source) |payload| {
+                self.drag_session = .{ .source = target, .payload = payload, .start = position, .position = position };
+                return;
+            }
+            // A nested control owns its gesture, rather than dragging its card.
+            if (self.instances.isFocusable(target) or self.buttons.contains(target) or self.pointer_bindings.get(target) != null) return;
+            if (self.focus.boundary) |boundary| if (sameHandle(boundary, target)) return;
+            current = try self.instances.parentOf(target);
+        }
+    }
+
+    fn internalDropTarget(self: *WindowRuntime, drag: internal_drag.Session) !?ui.instance.InstanceHandle {
+        const root = (try self.instances.rootRenderObject()) orelse return null;
+        const render = (try self.tree.hitTest(root, drag.position)) orelse return null;
+        var current = self.instances.instanceForRenderObject(render);
+        if (current) |hit| if (!self.instances.isInteractive(hit)) return null;
+        if (try self.containsTarget(drag.source, current)) return null;
+        if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, current)) return null;
+        while (current) |target| {
+            if ((try self.instances.dragOptions(target)).accept) |kind| {
+                if (internal_drag.Name.eql(kind, drag.payload.kind) and self.pointer_bindings.getKind(target, .drop_internal) != null)
+                    return target;
+            }
+            if (self.focus.boundary) |boundary| if (sameHandle(boundary, target)) break;
+            current = try self.instances.parentOf(target);
+        }
+        return null;
+    }
+
+    fn reconcileInternalDrag(self: *WindowRuntime) !void {
+        const drag = self.drag_session orelse return;
+        if (!self.instances.isInteractive(drag.source) or
+            !std.meta.eql((try self.instances.dragOptions(drag.source)).source, @as(?internal_drag.Payload, drag.payload)))
+        {
+            self.cancelInternalDrag();
+            return;
+        }
+        if (self.focus.boundary) |boundary| if (!try self.containsTarget(boundary, drag.source)) {
+            self.cancelInternalDrag();
+            return;
+        };
+        if (drag.active) {
+            const target = try self.internalDropTarget(drag);
+            if (!std.meta.eql(target, drag.target)) self.frame_state.invalidatePaint();
+            self.drag_session.?.target = target;
+        }
+    }
+
+    fn dispatchInternalDrag(self: *WindowRuntime, event: ui.input.Event, callbacks: anytype) !bool {
+        if (event != .pointer or self.drag_session == null) return false;
+        try self.reconcileInternalDrag();
+        if (self.drag_session == null) return false;
+        const pointer = event.pointer;
+        if (pointer.event == .motion) {
+            self.drag_session.?.move(pointer.position);
+            if (!self.drag_session.?.active) return false;
+            self.drag_session.?.target = try self.internalDropTarget(self.drag_session.?);
+            self.frame_state.invalidatePaint();
+            try self.applyButtonUpdate(self.buttons.release());
+            self.range_drag = null;
+            self.split_drag = null;
+            return true;
+        }
+        if (pointer.event == .button and pointer.event.button.button == 0x110 and pointer.event.button.state == .released) {
+            var drag = self.drag_session.?;
+            drag.position = pointer.position;
+            self.cancelInternalDrag();
+            if (!drag.active) return false;
+            try self.applyButtonUpdate(self.buttons.release());
+            self.range_drag = null;
+            self.split_drag = null;
+            if (try self.internalDropTarget(drag)) |target| {
+                const binding = self.pointer_bindings.getKind(target, .drop_internal).?;
+                const local = (try self.tree.paintTransform(try self.instances.renderObject(target))).inversePoint(drag.position);
+                try self.spawnCallback(callbacks, binding.id, try self.instances.scope(target), &.{
+                    .{ .string = drag.payload.value.slice() }, .{ .number = local.x }, .{ .number = local.y },
+                });
+            }
+            return true;
+        }
+        return false;
+    }
+
     fn applyFocusRequests(self: *WindowRuntime) !void {
         const previous = self.focus.current();
         while (self.instances.takeFocusRequest()) |target|
@@ -1217,6 +1352,7 @@ pub const WindowRuntime = struct {
         }
         if (changed) {
             self.pending_shortcut = null;
+            self.cancelInternalDrag();
             self.range_drag = null;
             self.split_drag = null;
             try self.applyButtonUpdate(self.buttons.release());
@@ -1397,6 +1533,7 @@ pub const WindowRuntime = struct {
             .leave => {
                 self.pending_shortcut = null;
                 self.keyboard_focused = false;
+                self.cancelInternalDrag();
                 self.range_drag = null;
                 self.split_drag = null;
                 self.resetCaretBlink();
@@ -1412,6 +1549,11 @@ pub const WindowRuntime = struct {
             },
             .key => |value| value,
         };
+        if (self.drag_session != null and key.state == .pressed and key.translated.logical == .escape) {
+            self.cancelInternalDrag();
+            try self.applyButtonUpdate(self.buttons.release());
+            return;
+        }
         // Secret editors and composition own the entire raw key stream,
         // including releases and Tab. Generic Lua never sees those keys.
         const private_keys = if (self.focus.current()) |focused| blk: {
@@ -2650,6 +2792,17 @@ pub const WindowRuntime = struct {
         var builder = try ui.render_object.Builder.init(commands, self.output_scale);
         if (transparent_clear) try builder.clear(core.Color.rgba(0, 0, 0, 0));
         try tree.buildScene(handles[root_index], &builder);
+        const count = builder.count;
+        for (descriptors, handles) |descriptor, handle| if (descriptor.drag.source != null) {
+            builder.count = count;
+            try builder.pushClip(.{ .x = 0, .y = 0, .width = width, .height = height });
+            try builder.decoratedRectangle(.{ .x = 0, .y = 0, .width = width, .height = height }, null, self.focus_color, 2, 0);
+            try builder.decoratedRectangle(.{ .x = 0, .y = 0, .width = width, .height = height }, self.surface_color, self.border_color, 1, 4);
+            try builder.pushOpacity(0.75);
+            try tree.buildPreview(handle, &builder, .{});
+            try builder.popOpacity();
+            try builder.popClip();
+        };
     }
 
     fn applyFocusVisual(
@@ -3096,6 +3249,123 @@ test "transformed range and split pointer drags dispatch local values with captu
         try std.testing.expect(r.router.captured == null and r.range_drag == null and r.split_drag == null);
         try std.testing.expectEqual(@as(usize, 1), try r.tree.layoutCount(root));
     }
+}
+
+test "internal drag dispatches compatible ancestor with transformed local coordinates" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 16, 16, 4);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var loop: @import("../loop/io_uring.zig").Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var vm: lua.Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    var callbacks: lua.CallbackRegistry = undefined;
+    try callbacks.init(std.testing.allocator, 1);
+    defer callbacks.deinit();
+    const source_code = "return function(value,x,y) result_value=value; result_x=x; result_y=y; calls=(calls or 0)+1 end";
+    try std.testing.expectEqual(lua_c.ok, lua_c.luaL_loadbufferx(vm.state, source_code.ptr, source_code.len, "@internal-drag", "t"));
+    try std.testing.expectEqual(lua_c.ok, lua_c.lua_pcallk(vm.state, 0, 1, 0, 0, null));
+    const callback = try callbacks.adoptReference(&vm, lua_c.luaL_ref(vm.state, lua_c.registry_index));
+    defer callbacks.release(callback) catch unreachable;
+
+    const window: platform.WindowHandle = .{ .slot = 1, .generation = 1 };
+    var r: WindowRuntime = .{};
+    try r.tree.init(std.testing.allocator, 6);
+    try r.instances.init(std.testing.allocator, &scheduler, &r.tree, scope, 6);
+    try r.router.init(std.testing.allocator, &r.tree, &r.instances, window, 16);
+    try r.pointer_bindings.init(std.testing.allocator, 1);
+    try r.buttons.init(std.testing.allocator, 6);
+    try r.text_inputs.init(std.testing.allocator, 1);
+    defer {
+        r.text_inputs.deinit();
+        r.buttons.deinit();
+        r.pointer_bindings.deinit();
+        r.router.deinit();
+        r.instances.reconcile(&.{}) catch unreachable;
+        scheduler.applyQueuedCancellations() catch unreachable;
+        r.instances.collectRetired() catch unreachable;
+        r.instances.deinit();
+        r.tree.deinit();
+        scheduler.destroyScope(scope) catch unreachable;
+    }
+    const card = internal_drag.Payload{ .kind = try internal_drag.Name.init("card"), .value = try internal_drag.Name.init("item-42") };
+    const descriptors = [_]ui.instance.Descriptor{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .stack = .{} }, .parent_data = .{ .stack = .{ .x = 10, .y = 10 } }, .drag = .{ .source = card } },
+        .{ .id = 3, .parent = 2, .object = .{ .box = .{} } },
+        .{ .id = 4, .parent = 1, .object = .{ .box = .{ .width = 60, .height = 50, .transform = .{ .translation = .{ .x = 7, .y = -3 }, .scale = 1.5, .origin = .{ .x = 4, .y = 8 } } } }, .parent_data = .{ .stack = .{ .x = 90, .y = 20 } }, .drag = .{ .accept = try internal_drag.Name.init("card") } },
+        .{ .id = 5, .parent = 4, .object = .{ .box = .{} }, .drag = .{ .accept = try internal_drag.Name.init("other") } },
+        .{ .id = 6, .parent = 2, .object = .{ .box = .{} }, .focusable = true },
+    };
+    try r.instances.reconcile(&descriptors);
+    const root = (try r.instances.rootRenderObject()).?;
+    _ = try r.tree.layout(root, ui.layout.Constraints.tight(.{ .width = 200, .height = 120 }));
+    const source = r.instances.handleForId(2).?;
+    const source_child = r.instances.handleForId(3).?;
+    const target = r.instances.handleForId(4).?;
+    const control = r.instances.handleForId(6).?;
+    _ = try r.pointer_bindings.set(.{ .slot = 0, .generation = 1 }, target, .{ .id = callback, .kind = .drop_internal });
+
+    try r.armInternalDrag(source_child, .{ .x = 15, .y = 15 });
+    const motion = ui.input.Event{ .pointer = .{ .target = target, .hovered = target, .position = .{ .x = 21, .y = 15 }, .event = .{ .motion = .{ .window = window, .time_ms = 1, .position = .{ .x = 21, .y = 15 } } } } };
+    try std.testing.expect(try r.dispatchInternalDrag(motion, &callbacks)); // exactly six pixels
+    try std.testing.expect(r.drag_session.?.active);
+    // A source descendant is never a target.
+    try std.testing.expect((try r.internalDropTarget(r.drag_session.?)) == null);
+
+    const drop_position: core.PointF = .{ .x = 130, .y = 47 };
+    // Target map is (95,13)+local*1.5, independently of the helper under test.
+    const release = ui.input.Event{ .pointer = .{ .target = target, .hovered = target, .position = drop_position, .event = .{ .button = .{ .window = window, .serial = 0, .time_ms = 2, .button = 0x110, .state = .released } } } };
+    r.drag_session.?.position = drop_position;
+    try std.testing.expect(try r.dispatchInternalDrag(release, &callbacks));
+    while (scheduler.takeRunnable()) |handle| _ = try vm.resumeRunnable(handle);
+    _ = lua_c.lua_getglobal(vm.state, "result_value");
+    var result_len: usize = 0;
+    const result = lua_c.lua_tolstring(vm.state, -1, &result_len).?;
+    try std.testing.expectEqualStrings("item-42", result[0..result_len]);
+    lua_c.lua_settop(vm.state, -2);
+    var valid: c_int = 0;
+    _ = lua_c.lua_getglobal(vm.state, "result_x");
+    try std.testing.expectEqual(@as(f64, @as(f32, 70.0 / 3.0)), lua_c.lua_tonumberx(vm.state, -1, &valid));
+    try std.testing.expectEqual(@as(c_int, 1), valid);
+    lua_c.lua_settop(vm.state, -2);
+    _ = lua_c.lua_getglobal(vm.state, "result_y");
+    try std.testing.expectEqual(@as(f64, @as(f32, 68.0 / 3.0)), lua_c.lua_tonumberx(vm.state, -1, &valid));
+    try std.testing.expectEqual(@as(c_int, 1), valid);
+    lua_c.lua_settop(vm.state, -2);
+
+    // Nested controls own presses, and changing/removing the source cancels.
+    try r.armInternalDrag(control, .{ .x = 15, .y = 15 });
+    try std.testing.expect(r.drag_session == null);
+    try r.armInternalDrag(source, .{ .x = 15, .y = 15 });
+    r.drag_session.?.move(.{ .x = 400, .y = 300 });
+    var outside_release = release;
+    outside_release.pointer.position = .{ .x = 400, .y = 300 };
+    try std.testing.expect(try r.dispatchInternalDrag(outside_release, &callbacks));
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    try std.testing.expect(r.drag_session == null);
+    try r.armInternalDrag(source, .{ .x = 15, .y = 15 });
+    try r.dispatchKeyboard(.{ .key = .{ .window = window, .serial = 0, .time_ms = 3, .state = .pressed, .translated = .{ .keycode = 0, .logical = .escape } } }, &callbacks);
+    try std.testing.expect(r.drag_session == null);
+    try r.armInternalDrag(source, .{ .x = 15, .y = 15 });
+    r.focus.boundary = target;
+    try r.reconcileInternalDrag();
+    try std.testing.expect(r.drag_session == null);
+    r.focus.boundary = null;
+    try r.armInternalDrag(source, .{ .x = 15, .y = 15 });
+    var changed = descriptors;
+    changed[1].drag = .{};
+    try r.instances.reconcile(&changed);
+    try r.reconcileInternalDrag();
+    try std.testing.expect(r.drag_session == null);
+    try r.instances.reconcile(&descriptors);
+    try r.armInternalDrag(source, .{ .x = 15, .y = 15 });
+    try r.instances.reconcile(&.{descriptors[0]});
+    try r.reconcileInternalDrag();
+    try std.testing.expect(r.drag_session == null);
 }
 
 test "resize lays out a clean render tree before rebuilding its scene" {

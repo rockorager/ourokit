@@ -44,6 +44,7 @@ pub const Descriptor = struct {
     interaction_paint: ?InteractionPaint = null,
     /// Horizontal distance from each outer edge to the range's endpoint.
     range_inset: f32 = 0,
+    drag: @import("../input/drag.zig").Options = .{},
 };
 
 const State = enum { free, active, retiring };
@@ -67,6 +68,7 @@ const Slot = struct {
     focus_request_pending: bool = false,
     interaction_paint: ?InteractionPaint = null,
     range_inset: f32 = 0,
+    drag: @import("../input/drag.zig").Options = .{},
     traversal_order: usize = 0,
     reconcile_child: ?render_object.NodeHandle = null,
     rebuild_children: bool = false,
@@ -356,6 +358,7 @@ pub const Tree = struct {
             slot.focusable = descriptor.focusable;
             slot.interaction_paint = descriptor.interaction_paint;
             slot.range_inset = descriptor.range_inset;
+            slot.drag = descriptor.drag;
             slot.ensure_visible = descriptor.ensure_visible;
             if (descriptor.ensure_visible == null) slot.revealed = null;
             slot.focus_request_pending = descriptor.focus_request != 0 and descriptor.focus_request != slot.focus_request;
@@ -455,6 +458,10 @@ pub const Tree = struct {
 
     pub fn semanticId(self: *Tree, handle: InstanceHandle) !u64 {
         return (try self.activeSlot(handle)).id;
+    }
+
+    pub fn dragOptions(self: *Tree, handle: InstanceHandle) !@import("../input/drag.zig").Options {
+        return (try self.activeSlot(handle)).drag;
     }
 
     pub fn parentOf(self: *Tree, handle: InstanceHandle) !?InstanceHandle {
@@ -687,6 +694,7 @@ pub const Tree = struct {
         var roots: usize = 0;
         for (descriptors, 0..) |descriptor, index| {
             if (descriptor.id == 0) return error.InvalidInstanceId;
+            try descriptor.drag.validate();
             if (!std.math.isFinite(descriptor.range_inset) or descriptor.range_inset < 0)
                 return error.InvalidRangeInset;
             try render_object.Tree.validate(descriptor.object);

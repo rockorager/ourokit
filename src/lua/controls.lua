@@ -244,7 +244,7 @@ local function selection_item(p, children, theme, context, tab)
       ouro.box {key='indicator', semantic=false, width=12, height=12, radius=6,
         background=selected and fg or nil, border_width=selected and 0 or 1, border=fg}, label}
   end
-  return ouro.box {key=p.key, option=p.value, label=p.label,
+  return ouro.box {key=p.key, option=p.value, label=p.label, drag=p.drag, drop=p.drop,
     height=metric('height', tab and f.spacing_7 or theme.controls.height),
     padding_x=tab and 0 or metric('padding_x', f.spacing_2), alignment=not tab and 'left' or nil,
     background=metric('background'), border=metric('border', c.border),

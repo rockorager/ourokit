@@ -1798,6 +1798,7 @@ pub const UiBuild = struct {
         if (activate or range != null or role == .dialog) self.stageCallback(state, id, "on_cancel", .cancel) catch |err| return luaError(state, @errorName(err));
         const focusable = tableOptionalBoolean(state, 1, "focusable", false) orelse
             return luaError(state, "focusable must be boolean");
+        const drag = self.readDrag(state, id) catch |err| return luaError(state, @errorName(err));
         self.append(.{
             .id = id,
             .parent = parent.id,
@@ -1805,6 +1806,7 @@ pub const UiBuild = struct {
             .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)),
             .interaction_paint = paint,
             .range_inset = range_inset,
+            .drag = if (enabled) drag else .{},
             .object = .{ .box = .{
                 .width = width.extent(),
                 .hidden = tableOptionalBoolean(state, 1, "hidden", false) orelse
@@ -1866,6 +1868,38 @@ pub const UiBuild = struct {
         c.lua_settop(state, -2);
         defer if (has_content_theme) self.popTheme();
         return self.emitChildren(state, .{ .id = id, .kind = .box, .semantic_id = if (semantic) id else semanticParent(parent) });
+    }
+
+    fn readDrag(self: *UiBuild, state: *c.State, id: u64) !@import("../ui/input/drag.zig").Options {
+        const drag = @import("../ui/input/drag.zig");
+        const top = c.lua_gettop(state);
+        defer c.lua_settop(state, top);
+        var result: drag.Options = .{};
+        inline for (.{ "drag", "drop" }) |field| {
+            const kind = c.lua_getfield(state, 1, field);
+            if (kind != c.type_nil) {
+                if (kind != c.type_table) return error.InvalidDragDeclaration;
+                const table = c.lua_gettop(state);
+                c.lua_pushnil(state);
+                while (c.lua_next(state, table) != 0) {
+                    const name = string(state, -2) orelse return error.InvalidDragDeclaration;
+                    if (!std.mem.eql(u8, name, "kind") and !std.mem.eql(u8, name, if (comptime std.mem.eql(u8, field, "drag")) "value" else "on_drop"))
+                        return error.InvalidDragDeclaration;
+                    c.lua_settop(state, -2);
+                }
+                const tag = try drag.Name.init(tableString(state, table, "kind") orelse return error.DragKindRequired);
+                if (comptime std.mem.eql(u8, field, "drag")) {
+                    result.source = .{ .kind = tag, .value = try drag.Name.init(tableString(state, table, "value") orelse return error.DragValueRequired) };
+                } else {
+                    if (c.lua_getfield(state, table, "on_drop") != c.type_function) return error.DropCallbackRequired;
+                    c.lua_settop(state, table);
+                    try self.stageCallbackAt(state, table, id, "on_drop", .drop_internal);
+                    result.accept = tag;
+                }
+            }
+            c.lua_settop(state, top);
+        }
+        return result;
     }
 
     fn stageInput(self: *UiBuild, state: *c.State, id: u64) !void {
