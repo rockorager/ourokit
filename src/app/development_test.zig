@@ -1200,6 +1200,88 @@ test "animation validates declarations and zero duration settles immediately" {
     try std.testing.expect((try f.runtime.animationDelay()) == null);
 }
 
+test "transition retargets committed paint without layout and cancels on removal" {
+    const f = try Fixture.create(
+        \\target=ouro.signal(90); shown=ouro.signal(true); initial=ouro.signal(10)
+        \\duration=ouro.signal(100); noise=ouro.signal(0); measured=0
+        \\function build()
+        \\ local ignored=noise()
+        \\ return ouro.column {key='root', shown() and ouro.transition {
+        \\  key='motion',target=target(),initial=initial(),duration=duration(),
+        \\  render=function(value)
+        \\   measured=value
+        \\   return ouro.box {key='bar',width=40,height=17,transform={x=value},background='#234567'}
+        \\  end} or nil}
+        \\end
+    );
+    defer f.destroy();
+    const path = "root/motion/bar";
+    const id = (try f.runtime.semantics.findPath(path)).id;
+    const handle = f.runtime.instances.handleForId(id).?;
+    const root = (try f.runtime.instances.rootRenderObject()).?;
+    const layouts = try f.runtime.tree.layoutCount(root);
+    const origin = (try f.runtime.semanticTarget("root")).bounds.x;
+    const ms = std.time.ns_per_ms;
+    // At t=30 an unpublished sample is 34. Retarget must keep the displayed
+    // 30, then reverse a second time from 20 rather than jumping to an endpoint.
+    for ([_]struct { time: u64, source: []const u8 = "", x: f32 }{
+        .{ .time = 0, .x = 10 },
+        .{ .time = 25, .x = 30 },
+        .{ .time = 30, .source = "assert(measured==30);target:set(-10)", .x = 30 },
+        .{ .time = 55, .x = 20 },
+        .{ .time = 56, .source = "target:set(60)", .x = 20 },
+        .{ .time = 81, .x = 30 },
+        .{ .time = 81, .source = "noise:set(1);initial:set(-999)", .x = 30 },
+        .{ .time = 156, .x = 60 },
+        .{ .time = 200, .source = "target:set(123);duration:set(0)", .x = 123 },
+    }) |step| {
+        try f.runtime.advanceAnimations(step.time * ms);
+        if (step.source.len != 0) {
+            try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, step.source.ptr, step.source.len, "@transition-retarget", "t"));
+            try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        }
+        try f.settle();
+        try std.testing.expectEqual(origin + step.x, (try f.runtime.semanticTarget(path)).bounds.x);
+        try std.testing.expectEqual(handle, f.runtime.instances.handleForId(id).?);
+        try std.testing.expectEqual(layouts, try f.runtime.tree.layoutCount(root));
+    }
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    const builds = f.runtime.metrics.builds.count;
+    try f.runtime.advanceAnimations(400 * ms);
+    try f.settle();
+    try std.testing.expectEqual(builds, f.runtime.metrics.builds.count);
+    for ([_][]const u8{
+        "duration:set(100);target:set(-20)",
+        "shown:set(false)",
+        "shown:set(true);initial:set(7)",
+    }, 0..) |source, index| {
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@transition-lifecycle", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+        try f.settle();
+        try std.testing.expectEqual(index == 1, (try f.runtime.animationDelay()) == null);
+    }
+    try std.testing.expectEqual(origin + 7, (try f.runtime.semanticTarget(path)).bounds.x);
+}
+
+test "transition validates finite numeric declarations and mounts settled by default" {
+    for ([_][]const u8{
+        "duration=100",                    "target='3',duration=100",             "target=0/0,duration=100",
+        "target=math.huge,duration=100",   "target=1,initial=false,duration=100", "target=1,initial=-math.huge,duration=100",
+        "target=1,duration=100,loop=true", "target=1,duration=0,loop=true",       "target=1,duration=-1",
+        "target=1,duration=1.5",           "target=1,duration='100'",             "target=1,duration=100,easing='spring'",
+    }) |properties| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.transition {{key='t',{s},render=function() end}} end", .{properties});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
+    }
+    const f = try Fixture.create(
+        \\function build() return ouro.transition {key='t',target=-12.5,duration=100,
+        \\ render=function(value) assert(value==-12.5);return ouro.box {key='bar',width=40,height=17} end} end
+    );
+    defer f.destroy();
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+}
+
 test "forms dialog contains focus and restores opener after escape" {
     const f = try Fixture.create(
         \\opened=ouro.signal(false)

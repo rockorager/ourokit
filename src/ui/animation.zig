@@ -33,12 +33,30 @@ pub const Config = struct {
 pub const Descriptor = struct {
     id: u64,
     config: Config,
+    transition: ?struct { target: f64, initial: ?f64 = null } = null,
+
+    pub fn validate(self: Descriptor) !void {
+        try self.config.validate();
+        if (self.transition) |transition| {
+            if (self.config.loop or !std.math.isFinite(transition.target) or
+                (transition.initial != null and !std.math.isFinite(transition.initial.?)))
+                return error.InvalidTransitionConfig;
+        }
+    }
+
+    pub fn initial(self: Descriptor) f64 {
+        if (self.transition) |transition|
+            return if (self.config.duration_ns == 0) transition.target else transition.initial orelse transition.target;
+        return self.config.initial();
+    }
 };
 
 const Track = struct {
     descriptor: Descriptor,
     origin_ns: ?u64,
-    progress: f64,
+    value: f64,
+    from: f64,
+    presented: f64,
 
     fn elapsed(self: Track, clock_ns: ?u64) u64 {
         const origin = self.origin_ns orelse return 0;
@@ -84,7 +102,7 @@ pub const Registry = struct {
     pub fn validate(self: *const Registry, descriptors: []const Descriptor) !void {
         if (descriptors.len > self.tracks.len) return error.AnimationCapacityExceeded;
         for (descriptors, 0..) |descriptor, i| {
-            try descriptor.config.validate();
+            try descriptor.validate();
             for (descriptors[0..i]) |previous| {
                 if (previous.id == descriptor.id) return error.DuplicateAnimationId;
             }
@@ -92,25 +110,24 @@ pub const Registry = struct {
     }
 
     /// Commits a complete declaration. An unchanged id and config retain their
-    /// origin and sampled value regardless of order. Changed or remounted tracks
-    /// start at the current clock, or at the first advance if no clock is known.
+    /// origin and sampled value regardless of order. Transitions retarget from
+    /// the last committed output; unpublished clock samples never cause a jump.
+    /// New tracks start at the current clock, or at the first advance.
     pub fn reconcile(self: *Registry, descriptors: []const Descriptor) !void {
         try self.validate(descriptors);
         for (descriptors, 0..) |descriptor, i| {
-            self.scratch[i] = if (self.find(descriptor)) |track| track.* else .{
-                .descriptor = descriptor,
-                .origin_ns = self.clock_ns,
-                .progress = descriptor.config.initial(),
-            };
+            self.scratch[i] = self.preview(descriptor);
+            self.scratch[i].presented = self.scratch[i].value;
         }
         std.mem.swap([]Track, &self.tracks, &self.scratch);
         self.len = descriptors.len;
     }
 
     /// Read-only preview for a declaration, including one not yet reconciled.
-    /// A new id or changed config samples its initial value, not an old track.
+    /// The preview is exactly what reconcile will commit, without mutating a
+    /// live track when a candidate build fails.
     pub fn sample(self: *const Registry, descriptor: Descriptor) f64 {
-        return if (self.find(descriptor)) |track| track.progress else descriptor.config.initial();
+        return self.preview(descriptor).value;
     }
 
     /// Samples from absolute elapsed time, never accumulated frame deltas.
@@ -130,8 +147,18 @@ pub const Registry = struct {
                     @as(f64, @floatFromInt(config.duration_ns));
                 break :progress config.easing.apply(fraction);
             };
-            changed = changed or progress != track.progress;
-            track.progress = progress;
+            const value = if (track.descriptor.transition) |transition| value: {
+                if (progress == 1) break :value transition.target;
+                if (progress == 0 or track.from == transition.target) break :value track.from;
+                // Opposite-sign endpoints can overflow target-from. Same-sign
+                // endpoints use a bounded difference to avoid weighted-sum overflow.
+                break :value if ((track.from < 0) != (transition.target < 0))
+                    track.from * (1 - progress) + transition.target * progress
+                else
+                    track.from + (transition.target - track.from) * progress;
+            } else progress;
+            changed = changed or value != track.value;
+            track.value = value;
         }
         return changed;
     }
@@ -142,6 +169,7 @@ pub const Registry = struct {
         var result: ?u64 = null;
         for (self.tracks[0..self.len]) |track| {
             const config = track.descriptor.config;
+            if (track.descriptor.transition) |transition| if (track.from == transition.target) continue;
             const elapsed = track.elapsed(self.clock_ns);
             if (config.duration_ns == 0 or (!config.loop and elapsed >= config.duration_ns)) continue;
             const phase = if (config.loop) elapsed % config.duration_ns else elapsed;
@@ -152,11 +180,29 @@ pub const Registry = struct {
         return result;
     }
 
-    fn find(self: *const Registry, descriptor: Descriptor) ?*const Track {
+    fn preview(self: *const Registry, descriptor: Descriptor) Track {
+        var from = descriptor.initial();
         for (self.tracks[0..self.len]) |*track| {
-            if (std.meta.eql(track.descriptor, descriptor)) return track;
+            if (track.descriptor.id != descriptor.id) continue;
+            if (descriptor.transition) |transition| {
+                if (track.descriptor.transition) |previous| {
+                    if (previous.target == transition.target and std.meta.eql(track.descriptor.config, descriptor.config)) {
+                        var retained = track.*;
+                        retained.descriptor = descriptor; // initial is mount-only.
+                        return retained;
+                    }
+                    from = track.presented;
+                }
+            } else if (std.meta.eql(track.descriptor, descriptor)) return track.*;
+            break;
         }
-        return null;
+        return .{
+            .descriptor = descriptor,
+            .origin_ns = self.clock_ns,
+            .value = if (descriptor.config.duration_ns == 0) descriptor.initial() else from,
+            .from = from,
+            .presented = from,
+        };
     }
 };
 
@@ -418,6 +464,130 @@ test "large timestamps avoid deadline overflow and modulo precedes float convers
     try std.testing.expectApproxEqAbs(0.15, registry.sample(looping), 1e-12);
     try std.testing.expectEqual(1, registry.sample(long));
     try std.testing.expectEqual(@as(?u64, 85), registry.delay());
+}
+
+test "transition reversals start at committed values and retain full duration" {
+    var registry = try Registry.init(std.testing.allocator, 2);
+    defer registry.deinit();
+    var motion: Descriptor = .{ .id = 1, .config = .{ .duration_ns = 100 }, .transition = .{ .target = 90, .initial = 10 } };
+    const peer: Descriptor = .{ .id = 2, .config = .{ .duration_ns = 200 }, .transition = .{ .target = -30 } };
+    try registry.reconcile(&.{ motion, peer });
+    _ = registry.advance(1000);
+    _ = registry.advance(1025);
+    try std.testing.expectEqual(30, registry.sample(motion));
+    try registry.reconcile(&.{ peer, motion }); // Publish 30, retaining origins.
+    _ = registry.advance(1040); // 42 has not reached a committed UI build.
+    try std.testing.expectEqual(42, registry.sample(motion));
+    motion.transition.?.target = -10;
+    try std.testing.expectEqual(30, registry.sample(motion));
+    try registry.reconcile(&.{ motion, peer });
+    try std.testing.expect(!registry.advance(1040));
+    _ = registry.advance(1065);
+    try std.testing.expectEqual(20, registry.sample(motion));
+    try registry.reconcile(&.{ motion, peer });
+    motion.transition.?.target = 60;
+    try std.testing.expectEqual(20, registry.sample(motion));
+    try registry.reconcile(&.{ motion, peer });
+    _ = registry.advance(1090);
+    try std.testing.expectEqual(30, registry.sample(motion));
+    // Updating mount-only initial and rebuilding must not restart the interval.
+    motion.transition.?.initial = -900;
+    try registry.reconcile(&.{ motion, peer });
+    _ = registry.advance(1164);
+    try std.testing.expectApproxEqAbs(59.6, registry.sample(motion), 1e-12);
+    try std.testing.expectEqual(@as(?u64, 1), registry.delay());
+    _ = registry.advance(1165);
+    try std.testing.expectEqual(60, registry.sample(motion));
+    try std.testing.expectEqual(-30, registry.sample(peer));
+    try std.testing.expectEqual(null, registry.delay());
+    try std.testing.expect(!registry.advance(9000));
+}
+
+test "transition config changes retarget while instant equal and removed tracks stay idle" {
+    var registry = try Registry.init(std.testing.allocator, 1);
+    defer registry.deinit();
+    var motion: Descriptor = .{ .id = 1, .config = .{ .duration_ns = 100 }, .transition = .{ .target = 80 } };
+    try registry.reconcile(&.{motion});
+    try std.testing.expectEqual(80, registry.sample(motion));
+    try std.testing.expectEqual(null, registry.delay());
+    _ = registry.advance(0);
+    motion.transition.?.target = 0;
+    try registry.reconcile(&.{motion});
+    _ = registry.advance(25);
+    try registry.reconcile(&.{motion});
+    try std.testing.expectEqual(60, registry.sample(motion));
+    motion.config = .{ .duration_ns = 200, .easing = .ease_in };
+    try registry.reconcile(&.{motion});
+    _ = registry.advance(75);
+    try std.testing.expectEqual(56.25, registry.sample(motion));
+    try registry.reconcile(&.{motion});
+    motion.transition.?.target = 56.25;
+    try registry.reconcile(&.{motion});
+    try std.testing.expectEqual(null, registry.delay());
+    motion.transition.?.target = 123;
+    motion.config.duration_ns = 0;
+    try std.testing.expectEqual(123, registry.sample(motion));
+    try registry.reconcile(&.{motion});
+    try std.testing.expectEqual(null, registry.delay());
+    try registry.reconcile(&.{});
+    motion.config.duration_ns = 100;
+    motion.transition.?.initial = 3;
+    try registry.reconcile(&.{motion});
+    try std.testing.expectEqual(3, registry.sample(motion));
+    _ = registry.advance(100);
+    try std.testing.expectEqual(10.5, registry.sample(motion)); // Retained quadratic easing at 1/4.
+    registry.clear(); // Accepted reload resets, unlike ordinary rebuilds.
+    try registry.reconcile(&.{motion});
+    try std.testing.expectEqual(3, registry.sample(motion));
+    _ = registry.advance(2000);
+    try std.testing.expectEqual(3, registry.sample(motion));
+}
+
+test "transition preview and rejected declarations cannot retarget live tracks" {
+    var registry = try Registry.init(std.testing.allocator, 2);
+    defer registry.deinit();
+    const original: Descriptor = .{ .id = 1, .config = .{ .duration_ns = 100 }, .transition = .{ .target = 40, .initial = -20 } };
+    try registry.reconcile(&.{original});
+    _ = registry.advance(0);
+    _ = registry.advance(25);
+    try registry.reconcile(&.{original});
+    var replacement = original;
+    replacement.transition.?.target = 100;
+    try std.testing.expectEqual(-5, registry.sample(replacement));
+    var invalid = replacement;
+    invalid.id = 2;
+    invalid.transition.?.target = std.math.nan(f64);
+    try std.testing.expectError(error.InvalidTransitionConfig, registry.reconcile(&.{ replacement, invalid }));
+    try std.testing.expectError(error.DuplicateAnimationId, registry.reconcile(&.{ replacement, original }));
+    for ([_]f64{ std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |bad| {
+        invalid.transition = .{ .target = bad };
+        try std.testing.expectError(error.InvalidTransitionConfig, invalid.validate());
+        invalid.transition = .{ .target = 1, .initial = bad };
+        try std.testing.expectError(error.InvalidTransitionConfig, invalid.validate());
+    }
+    invalid.transition = .{ .target = 0 };
+    invalid.config.loop = true;
+    try std.testing.expectError(error.InvalidTransitionConfig, invalid.validate());
+    _ = registry.advance(50);
+    try std.testing.expectEqual(10, registry.sample(original));
+    try std.testing.expectEqual(@as(?u64, 50), registry.delay());
+}
+
+test "transition interpolation remains finite for extreme endpoints" {
+    var registry = try Registry.init(std.testing.allocator, 1);
+    defer registry.deinit();
+    const maximum = std.math.floatMax(f64);
+    const motion: Descriptor = .{ .id = 1, .config = .{ .duration_ns = 100 }, .transition = .{ .target = maximum, .initial = -maximum } };
+    try registry.reconcile(&.{motion});
+    _ = registry.advance(0);
+    _ = registry.advance(25);
+    try std.testing.expectApproxEqRel(-maximum / 2, registry.sample(motion), 1e-15);
+    _ = registry.advance(50);
+    try std.testing.expectEqual(0, registry.sample(motion));
+    _ = registry.advance(75);
+    try std.testing.expectApproxEqRel(maximum / 2, registry.sample(motion), 1e-15);
+    _ = registry.advance(100);
+    try std.testing.expectEqual(maximum, registry.sample(motion));
 }
 
 test "empty capacity is valid and initialization cleans up partial allocation failures" {

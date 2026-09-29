@@ -1145,6 +1145,59 @@ automatic reduced-motion preference detection, or exit animations after a
 declaration is removed. Applications can choose zero-duration one-shots or
 omit looping animations when their own motion policy calls for it.
 
+#### Interruptible numeric transitions
+
+`ouro.transition` animates a finite numeric value toward a changing target:
+
+```lua
+local opened = ouro.signal(false)
+-- Inside a content/component render callback:
+return ouro.transition {
+  key = "panel-motion", target = opened() and 1 or 0,
+  duration = 200, easing = "ease_out",
+  render = function(value)
+    return ouro.box {
+      key = "panel", width = 180, height = 120, background = "#389ac0",
+      opacity = value, transform = { x = 24 * (1 - value) },
+      ouro.text { text = "Panel" },
+    }
+  end,
+}
+```
+
+`key`, `target`, `duration`, and `render(value)` are required. Duration and easing
+use the same units and options as `ouro.animation`. Target and optional `initial`
+must be finite numbers; numeric strings are rejected. Without `initial`, a new
+transition starts already at its target and requests no frames. With `initial`,
+it animates from that value on mount. Zero duration immediately uses the target.
+Transitions cannot loop.
+
+A changed target starts from the last value committed to the UI build, even if
+the native clock has sampled a newer value that has not yet been published.
+It takes the full configured duration from that point, so rapid reversals are
+continuous in value, not necessarily in velocity. Changing duration or easing
+also retargets from the committed value. Rebuilding with unchanged target and
+timing does not restart; changing only `initial` has no effect until remount.
+Equal endpoints and completed transitions request no timer wakeups.
+
+Identity is keyed within the logical parent/component and independent per window.
+Removal cancels the transition immediately; remount and accepted source reload
+start fresh using `initial` or the target. A rejected build or source reload does
+not retarget live state. Returning nil from `render` keeps a mounted transition
+alive, just like `ouro.animation`.
+
+The render callback has the same non-yielding description-only contract as
+`ouro.animation`. Both primitives share the native registry, clock, frame cadence,
+and capacity. Transitions add no layout node; changing only opacity/transform
+keeps layout cached. Width/height changes can still require layout. Invisible
+opacity-zero content remains interactive unless the application disables it.
+Springs, exit/unmount retention, completion callbacks, and automatic reduced-motion
+preferences are not included; use duration zero for an application motion policy.
+
+Run `examples/transition-composition.lua` for hover scaling, an interruptible
+sliding panel, and a group fade. `tests/transition_composition.py` exercises real
+native input, reversal, idle completion, independent windows, and source reload.
+
 ### Inherited visual defaults
 
 Set `theme` on `ouro.app` to style every window without repeating widget props:

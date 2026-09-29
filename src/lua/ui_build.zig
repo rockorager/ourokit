@@ -662,7 +662,8 @@ pub const UiBuild = struct {
             .theme => emitTheme,
             .stateful => return self.lowerComponent(state),
             .stateless => return self.lowerComposition(state),
-            .animation => return self.lowerAnimation(state),
+            .animation => return self.lowerAnimation(state, false),
+            .transition => return self.lowerAnimation(state, true),
             .virtual_list => return self.lowerVirtualList(state),
         };
         c.lua_pushlightuserdata(state, self);
@@ -673,7 +674,7 @@ pub const UiBuild = struct {
         return 0;
     }
 
-    fn lowerAnimation(self: *UiBuild, state: *c.State) c_int {
+    fn lowerAnimation(self: *UiBuild, state: *c.State, transition: bool) c_int {
         if (self.composition_depth == 32) return luaError(state, "composition nesting too deep");
         self.composition_depth += 1;
         defer self.composition_depth -= 1;
@@ -683,22 +684,35 @@ pub const UiBuild = struct {
         if (key.len == 0) return luaError(state, "animation key is required");
         const duration = tableRequiredInteger(state, 2, "duration") orelse return luaError(state, "animation duration must be non-negative integer milliseconds");
         if (duration < 0) return luaError(state, "animation duration must be non-negative integer milliseconds");
-        const descriptor: animation.Descriptor = .{
-            .id = semanticId(key, 0x616e696d617465 ^ parent.id ^ self.component_namespace),
+        var descriptor: animation.Descriptor = .{
+            .id = semanticId(key, (if (transition) @as(u64, 0x7472616e736974) else 0x616e696d617465) ^ parent.id ^ self.component_namespace),
             .config = .{
                 .duration_ns = std.math.mul(u64, @intCast(duration), std.time.ns_per_ms) catch return luaError(state, "animation duration too large"),
                 .easing = tableOptionalEnum(animation.Easing, state, 2, "easing", .linear) orelse return luaError(state, "invalid animation easing"),
                 .loop = tableOptionalBoolean(state, 2, "loop", false) orelse return luaError(state, "animation loop must be boolean"),
             },
         };
-        descriptor.config.validate() catch return luaError(state, "looping animation requires positive duration");
+        if (transition) {
+            if (c.lua_getfield(state, 2, "target") != c.type_number) return luaError(state, "transition target must be a finite number");
+            var valid: c_int = 0;
+            const target = c.lua_tonumberx(state, -1, &valid);
+            c.lua_settop(state, -2);
+            descriptor.transition = .{ .target = target };
+            const initial_kind = c.lua_getfield(state, 2, "initial");
+            if (initial_kind != c.type_nil) {
+                if (initial_kind != c.type_number) return luaError(state, "transition initial must be a finite number");
+                descriptor.transition.?.initial = c.lua_tonumberx(state, -1, &valid);
+            }
+            c.lua_settop(state, -2);
+        }
+        descriptor.validate() catch return luaError(state, if (transition) "transition requires finite values and cannot loop" else "looping animation requires positive duration");
         if (self.pending_animation_count == self.pending_animations.len) return luaError(state, "animation capacity exceeded");
         for (self.animationDescriptors()) |existing| if (existing.id == descriptor.id) return luaError(state, "duplicate animation key");
         self.pending_animations[self.pending_animation_count] = descriptor;
         self.pending_animation_count += 1;
         self.appendSemantic(.{ .id = descriptor.id, .parent = semanticParent(parent), .role = .group, .key = key }) catch
             return luaError(state, "cannot append animation semantics");
-        const progress = if (self.animations) |registry| registry.sample(descriptor) else if (duration == 0) @as(f64, 1) else 0;
+        const progress = if (self.animations) |registry| registry.sample(descriptor) else descriptor.initial();
         self.components.push("compose");
         if (c.lua_getfield(state, 2, "render") != c.type_function) return luaError(state, "animation render must be a function");
         c.lua_pushnumber(state, progress);

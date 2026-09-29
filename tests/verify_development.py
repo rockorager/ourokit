@@ -24,6 +24,7 @@ TESTS = (
     'input_composition.py',
     'overlay_composition.py',
     'animation_composition.py',
+    'transition_composition.py',
     'drawing_composition.py',
     'path_composition.py',
     'shadow_composition.py',
