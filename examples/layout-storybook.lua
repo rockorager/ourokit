@@ -240,6 +240,53 @@ local function baseline_wrap()
   }
 end
 
+local function ratio_card(key, label, ratio, color, flex)
+  return ouro.box {key=key,aspect_ratio=ratio,flex=flex,padding=6,background=color,radius=6,
+    ouro.layout_builder {key='bounds',render=function(c)
+      return ouro.box {key='center',alignment='center',
+        ouro.column {key='labels',gap=3,cross_alignment='center',
+          ouro.text {key='ratio',text=label,size=16},
+          ouro.text {key='size',text=string.format('%.0f × %.0f',c.max_width+12,c.max_height+12),size=11},
+        }}
+    end}}
+end
+
+local Ratios=ouro.stateful(function()
+  local square=ouro.signal(false)
+  return function()
+    return ouro.column {key='page',gap=18,
+      ouro.text {key='title',text='Shape from constraints',size=22},
+      ouro.text {key='hint',text='Equal flex widths; each card derives its own height. Ratios include padding.'},
+      ouro.button {key='toggle',label=square() and 'Restore 16:9 preview' or 'Make preview square',
+        on_press=function() square:set(not square()) end},
+      ouro.row {key='cards',gap=12,
+        ratio_card('preview',square() and '1:1' or '16:9',square() and 1 or 16/9,'#DCEBFA',1),
+        ratio_card('square','1:1',1,'#DDEFD8',1),
+        ratio_card('portrait','3:4',3/4,'#F5E5CC',1)},
+      ouro.text {key='note',text='The same keyed cards resize with their parent. Changing a ratio changes layout, not just paint.',size=13},
+    }
+  end
+end)
+
+local function ratios()
+  return Ratios {key='ratios'}
+end
+
+local function ratio_bounds()
+  return ouro.column {key='page',gap=16,
+    ouro.text {key='title',text='Parent constraints still win',size=22},
+    ouro.text {key='width-label',text='Loose 160 × 130 parent · 2:1 resolves to 160 × 80'},
+    ouro.box {key='width',width=160,height=130,alignment='center',background='#EEF2F6',
+      ratio_card('card','2:1',2,'#DCEBFA')},
+    ouro.text {key='height-label',text='Loose 210 × 64 parent · 3:2 resolves to 96 × 64'},
+    ouro.box {key='height',width=210,height=64,alignment='center',background='#EEF2F6',
+      ratio_card('card','3:2',1.5,'#DDEFD8')},
+    ouro.text {key='tight-label',text='Tight 140 × 90 parent · overrides the requested 2:1'},
+    ouro.box {key='tight',width=140,height=90,
+      ratio_card('card','2:1 requested',2,'#F5E5CC')},
+  }
+end
+
 return ouro.storybook {
   title = "Layout mechanics",
   stories = {
@@ -261,5 +308,10 @@ return ouro.storybook {
     ouro.story { id = "baseline/changed", group = "Baseline", name = "Font-size playback", viewport = {width = 700, height = 440}, snapshot_scale = 2, color_scheme = "light", content = baselines,
       actions = {{type='click',target='baseline/page/toggle'}} },
     ouro.story { id = "baseline/wrap", group = "Baseline", name = "Independent run metrics", viewport = {width = 420, height = 400}, snapshot_scale = 2, color_scheme = "light", content = baseline_wrap },
+    ouro.story { id = "aspect/wide", group = "Aspect ratio", name = "Flexible cards · wide", viewport = {width = 740, height = 520}, snapshot_scale = 2, color_scheme = "light", content = ratios },
+    ouro.story { id = "aspect/narrow", group = "Aspect ratio", name = "Flexible cards · narrow", viewport = {width = 380, height = 440}, snapshot_scale = 2, color_scheme = "light", content = ratios },
+    ouro.story { id = "aspect/changed", group = "Aspect ratio", name = "Ratio change playback", viewport = {width = 740, height = 520}, snapshot_scale = 2, color_scheme = "light", content = ratios,
+      actions = {{type='click',target='ratios/page/toggle'}} },
+    ouro.story { id = "aspect/bounds", group = "Aspect ratio", name = "Bounded and tight parents", viewport = {width = 580, height = 540}, snapshot_scale = 2, color_scheme = "light", content = ratio_bounds },
   },
 }

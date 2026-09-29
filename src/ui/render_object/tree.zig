@@ -31,6 +31,7 @@ pub const LayoutError = error{
     UnconstrainedLayoutSize,
     FlexInUnboundedAxis,
     FlexInWrap,
+    AspectRatioInUnboundedAxes,
     ScrollInUnboundedAxis,
     UnboundedSplitConstraints,
     SplitRequiresThreeChildren,
@@ -1461,6 +1462,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
                 old_box.min_width != new_box.min_width or old_box.min_height != new_box.min_height or
                 old_box.max_width != new_box.max_width or old_box.max_height != new_box.max_height or
                 old_box.fill_width != new_box.fill_width or old_box.fill_height != new_box.fill_height or
+                old_box.aspect_ratio != new_box.aspect_ratio or
                 old_box.border_width != new_box.border_width or
                 !std.meta.eql(old_box.padding, new_box.padding) or
                 !std.meta.eql(old_box.alignment, new_box.alignment);

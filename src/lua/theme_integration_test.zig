@@ -2192,3 +2192,103 @@ test "baseline composition aligns mixed text and retained inputs across size cha
     try f.build();
     try std.testing.expectEqual(input, try f.handle("row/input"));
 }
+
+test "aspect ratio composition updates local builder constraints and preserves identities in grids and scrolls" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\ratio=ouro.signal(2); builds=0; hits=0
+        \\local Body=ouro.stateful(function()
+        \\  builds=builds+1
+        \\  return function() return ouro.box {key='paint',background='#446688'} end
+        \\end)
+        \\function build() return ouro.column {key='root',gap=7,
+        \\  ouro.box {key='preview',width=160,aspect_ratio=ratio(),padding=6,border_width=2,border='#223344',
+        \\    activate=true,on_press=function() hits=hits+3 end,
+        \\    ouro.layout_builder {key='bounds',render=function(c)
+        \\      assert(c.min_width==144 and c.max_width==144)
+        \\      assert(c.min_height==160/ratio()-16 and c.max_height==c.min_height)
+        \\      return Body {key='body'}
+        \\    end}},
+        \\  ouro.box {key='after',width=17,height=11},
+        \\  ouro.grid {key='grid',columns={70,110},rows={'auto'},column_gap=5,
+        \\    ouro.box {key='a',row=1,column=1,aspect_ratio=2},
+        \\    ouro.box {key='b',row=1,column=2,aspect_ratio=1.25}},
+        \\  ouro.box {key='vertical',width=120,height=70,ouro.scroll {key='scroll',
+        \\    ouro.box {key='content',aspect_ratio=.5}}},
+        \\  ouro.box {key='horizontal',width=90,height=60,ouro.scroll {key='scroll',axis='horizontal',
+        \\    ouro.box {key='content',aspect_ratio=3}}}}
+        \\end
+        \\saved_build=build
+    );
+    try f.build();
+    const preview = try f.handle("root/preview");
+    const paint = try f.handle("root/preview/bounds/body/paint");
+    const render = try f.runtime.instances.renderObject(preview);
+    const paint_render = try f.runtime.instances.renderObject(paint);
+    const after = try f.runtime.instances.renderObject(try f.handle("root/after"));
+    for ([_]struct { path: []const u8, size: core.SizeF }{
+        .{ .path = "root/grid/a", .size = .{ .width = 70, .height = 35 } },
+        .{ .path = "root/grid/b", .size = .{ .width = 110, .height = 88 } },
+        .{ .path = "root/grid", .size = .{ .width = 185, .height = 88 } },
+        .{ .path = "root/vertical/scroll/content", .size = .{ .width = 120, .height = 240 } },
+        .{ .path = "root/horizontal/scroll/content", .size = .{ .width = 180, .height = 60 } },
+    }) |case| try std.testing.expectEqual(case.size, try f.runtime.tree.nodeSize(try f.runtime.instances.renderObject(try f.handle(case.path))));
+    for ([_]f32{ 2, 1, 2 }) |ratio| {
+        const expression = try std.fmt.allocPrint(std.testing.allocator, "ratio:set({d})", .{ratio});
+        defer std.testing.allocator.free(expression);
+        try f.exec(expression);
+        try f.build();
+        try std.testing.expectEqual(preview, try f.handle("root/preview"));
+        try std.testing.expectEqual(paint, try f.handle("root/preview/bounds/body/paint"));
+        try std.testing.expectEqual(core.SizeF{ .width = 160, .height = 160 / ratio }, try f.runtime.tree.nodeSize(render));
+        try std.testing.expectEqual(core.SizeF{ .width = 144, .height = 160 / ratio - 16 }, try f.runtime.tree.nodeSize(paint_render));
+        try std.testing.expectEqual(@as(f32, 160 / ratio + 7), (try f.runtime.tree.nodeOffset(after)).y);
+        const point = (try f.runtime.semanticTarget("root/preview")).center;
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 0, .position = point } });
+        for ([_]@import("../platform/window.zig").PointerButtonState{ .pressed, .released }) |state| {
+            try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 0, .button = 0x110, .state = state } });
+            try f.runtime.dispatchInput(&f.callbacks);
+            while (f.scheduler.takeRunnable()) |handle| try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(handle));
+        }
+    }
+    try f.exec("assert(builds==1 and hits==9)");
+    for ([_][]const u8{ "0", "-1", "false", "'2'", "{}", "0/0", "1/0", "1e300", "1e-60" }) |invalid| {
+        const script = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.box{{key='bad',aspect_ratio={s}}} end", .{invalid});
+        defer std.testing.allocator.free(script);
+        try f.exec(script);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(preview, try f.handle("root/preview"));
+    }
+    try f.exec("build=saved_build");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(preview, try f.handle("root/preview"));
+}
+
+test "aspect ratio rejects unbounded candidate layout before replacing the committed tree" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("function build() return ouro.box {key='old',width=75,height=29} end");
+    try f.build();
+    const old = try f.handle("old");
+    var prepared: @import("prepared_build.zig").PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, f.state, &f.sources, 128, 4096);
+    defer prepared.deinit();
+    try f.exec(
+        \\function candidate() return ouro.column {key='column',ouro.row {key='row',
+        \\  ouro.box {key='unbounded',aspect_ratio=2}}} end
+    );
+    _ = c.lua_getglobal(f.state, "candidate");
+    const callback = c.luaL_ref(f.state, c.registry_index);
+    defer c.luaL_unref(f.state, c.registry_index, callback);
+    try std.testing.expectError(error.AspectRatioInUnboundedAxes, f.runtime.prepareSourceBuild(.{ .width = 600, .height = 500 }, &f.ui, &prepared, callback, 2));
+    try std.testing.expectEqual(old, try f.handle("old"));
+    try std.testing.expectEqual(@as(usize, 0), prepared.descriptor_count);
+    try f.exec("function build() return ouro.box {key='old',max_width=90,aspect_ratio=1.5} end");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expectEqual(old, try f.handle("old"));
+    try std.testing.expectEqual(core.SizeF{ .width = 90, .height = 60 }, try f.runtime.tree.nodeSize(try f.runtime.instances.renderObject(old)));
+}

@@ -10,6 +10,8 @@ pub fn validate(value: types.Box) !void {
     try value.transform.validate();
     if (value.width) |width| if (!validExtent(width)) return error.InvalidExtent;
     if (value.height) |height| if (!validExtent(height)) return error.InvalidExtent;
+    if (value.aspect_ratio) |ratio| if (!std.math.isFinite(ratio) or ratio <= 0)
+        return error.InvalidAspectRatio;
     if (!validExtent(value.min_width) or !validExtent(value.min_height) or
         !validExtent(value.border_width) or !validExtent(value.corner_radius) or
         !validExtent(value.outline_width) or !validExtent(value.outline_gap))
@@ -67,6 +69,8 @@ pub fn layout(value: types.Box, context: anytype, node: anytype, incoming: Const
         constraints.min_height = resolved;
         constraints.max_height = resolved;
     }
+    if (value.aspect_ratio) |ratio|
+        constraints = Constraints.tight(try aspectSize(constraints, ratio));
 
     const content_insets = @import("../../core/geometry.zig").Insets{
         .left = value.padding.left + value.border_width,
@@ -99,6 +103,46 @@ pub fn layout(value: types.Box, context: anytype, node: anytype, incoming: Const
         try context.setChildOffset(handle, offset);
     }
     return size;
+}
+
+/// Flutter-style finite constraint solving, with no intrinsic child probe.
+/// The final clamp deliberately sacrifices the ratio when bounds conflict.
+fn aspectSize(constraints: Constraints, aspect_ratio: f32) !SizeF {
+    if (!constraints.hasBoundedWidth() and !constraints.hasBoundedHeight())
+        return error.AspectRatioInUnboundedAxes;
+    if (constraints.min_width == constraints.max_width and constraints.min_height == constraints.max_height)
+        return .{ .width = constraints.min_width, .height = constraints.min_height };
+
+    // Wider intermediates let a height cap recover from width / tiny_ratio
+    // overflowing f32, rather than losing the intended width to infinity.
+    const ratio: f64 = aspect_ratio;
+    var width: f64 = constraints.max_width;
+    var height: f64 = width / ratio;
+    if (!constraints.hasBoundedWidth()) {
+        height = constraints.max_height;
+        width = height * ratio;
+    }
+    if (width > constraints.max_width) {
+        width = constraints.max_width;
+        height = width / ratio;
+    }
+    if (height > constraints.max_height) {
+        height = constraints.max_height;
+        width = height * ratio;
+    }
+    if (width < constraints.min_width) {
+        width = constraints.min_width;
+        height = width / ratio;
+    }
+    if (height < constraints.min_height) {
+        height = constraints.min_height;
+        width = height * ratio;
+    }
+    width = std.math.clamp(width, constraints.min_width, constraints.max_width);
+    height = std.math.clamp(height, constraints.min_height, constraints.max_height);
+    if (width > std.math.floatMax(f32) or height > std.math.floatMax(f32))
+        return error.InvalidLayoutSize;
+    return .{ .width = @floatCast(width), .height = @floatCast(height) };
 }
 
 fn axisOffset(alignment: types.AxisAlignment, available: f32, child: f32) f32 {

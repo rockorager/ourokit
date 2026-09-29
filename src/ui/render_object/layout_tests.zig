@@ -6,6 +6,86 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const PointF = @import("../../core/geometry.zig").PointF;
 const Color = @import("../../core/color.zig").Color;
 
+test "aspect ratio solves outer box bounds and yields to explicit sizes and incompatible constraints" {
+    const Case = struct { box: types.Box, bounds: Constraints = .{}, expected: SizeF };
+    const cases = [_]Case{
+        .{ .box = .{ .aspect_ratio = 2 }, .bounds = .{ .max_width = 300, .max_height = 200 }, .expected = .{ .width = 300, .height = 150 } },
+        .{ .box = .{ .aspect_ratio = 0.5 }, .bounds = .{ .max_width = 300, .max_height = 80 }, .expected = .{ .width = 40, .height = 80 } },
+        .{ .box = .{ .aspect_ratio = 1.5 }, .bounds = .{ .max_height = 60 }, .expected = .{ .width = 90, .height = 60 } },
+        .{ .box = .{ .aspect_ratio = 0.25 }, .bounds = .{ .max_width = 50 }, .expected = .{ .width = 50, .height = 200 } },
+        .{ .box = .{ .aspect_ratio = 2 }, .bounds = .{ .min_width = 140, .max_width = 200, .max_height = 50 }, .expected = .{ .width = 140, .height = 50 } },
+        .{ .box = .{ .aspect_ratio = 2 }, .bounds = .{ .max_width = 160, .min_height = 100, .max_height = 180 }, .expected = .{ .width = 160, .height = 100 } },
+        .{ .box = .{ .aspect_ratio = 2 }, .bounds = Constraints.tight(.{ .width = 70, .height = 90 }), .expected = .{ .width = 70, .height = 90 } },
+        .{ .box = .{ .aspect_ratio = 2 }, .bounds = .{ .min_width = 100, .max_width = 160, .min_height = 70, .max_height = 100 }, .expected = .{ .width = 160, .height = 80 } },
+        .{ .box = .{ .aspect_ratio = 3 }, .bounds = .{ .max_width = 0 }, .expected = .{ .width = 0, .height = 0 } },
+        .{ .box = .{ .aspect_ratio = 3 }, .bounds = .{ .max_height = 0 }, .expected = .{ .width = 0, .height = 0 } },
+        .{ .box = .{ .aspect_ratio = 3, .max_width = 120, .max_height = 60 }, .expected = .{ .width = 120, .height = 40 } },
+        .{ .box = .{ .aspect_ratio = 2, .width = 80 }, .bounds = .{ .max_width = 200, .max_height = 200 }, .expected = .{ .width = 80, .height = 40 } },
+        .{ .box = .{ .aspect_ratio = 2, .height = 80 }, .bounds = .{ .max_width = 200, .max_height = 200 }, .expected = .{ .width = 160, .height = 80 } },
+        .{ .box = .{ .aspect_ratio = 2, .width = 80, .height = 70 }, .expected = .{ .width = 80, .height = 70 } },
+        .{ .box = .{ .aspect_ratio = 2, .fill_width = true }, .bounds = .{ .max_width = 200, .max_height = 60 }, .expected = .{ .width = 200, .height = 60 } },
+        .{ .box = .{ .aspect_ratio = 2, .fill_height = true }, .bounds = .{ .max_width = 200, .max_height = 60 }, .expected = .{ .width = 120, .height = 60 } },
+        .{ .box = .{ .aspect_ratio = 2, .max_width = 80 }, .bounds = .{ .min_width = 100, .max_width = 200 }, .expected = .{ .width = 100, .height = 50 } },
+        .{ .box = .{ .aspect_ratio = 2, .min_height = 90 }, .bounds = .{ .max_width = 200, .max_height = 50 }, .expected = .{ .width = 100, .height = 50 } },
+    };
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    defer tree.deinit();
+    const box = try tree.create(.{ .box = .{} });
+    for (cases) |case| {
+        try tree.update(box, .{ .box = case.box });
+        try std.testing.expectEqual(case.expected, try tree.layout(box, case.bounds));
+    }
+    for ([_]f32{ 0, -1, std.math.inf(f32), std.math.nan(f32) }) |ratio|
+        try std.testing.expectError(error.InvalidAspectRatio, tree.update(box, .{ .box = .{ .aspect_ratio = ratio } }));
+    try tree.update(box, .{ .box = .{ .aspect_ratio = 2, .min_width = 40, .min_height = 20 } });
+    try std.testing.expectError(error.AspectRatioInUnboundedAxes, tree.layout(box, .{}));
+    // Extreme ratios must survive bounded corrections without f32 overflow.
+    try tree.update(box, .{ .box = .{ .aspect_ratio = 1e-30 } });
+    const tiny = try tree.layout(box, .{ .max_width = 1e30, .max_height = 1e30 });
+    try std.testing.expectApproxEqAbs(@as(f32, 1), tiny.width, 0.00001);
+    try std.testing.expectEqual(@as(f32, 1e30), tiny.height);
+    try std.testing.expectError(error.InvalidLayoutSize, tree.layout(box, .{ .max_width = 1e30 }));
+    try tree.update(box, .{ .box = .{ .aspect_ratio = 1e30 } });
+    const huge = try tree.layout(box, .{ .max_width = 1e30, .max_height = 1e30 });
+    try std.testing.expectEqual(@as(f32, 1e30), huge.width);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), huge.height, 0.00001);
+    try std.testing.expectError(error.InvalidLayoutSize, tree.layout(box, .{ .max_height = 1e30 }));
+}
+
+test "aspect ratio lays out one child once with padded bounds and invalidates retained geometry" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    var box: types.Box = .{ .aspect_ratio = 2, .padding = .{ .left = 3, .right = 5, .top = 7, .bottom = 11 }, .border_width = 2, .border_color = Color.rgba(0, 0, 0, 255) };
+    const root = try tree.create(.{ .box = box });
+    const child = try tree.create(.{ .box = .{ .width = 20, .height = 16 } });
+    try tree.appendChild(root, child, .none);
+    const bounds: Constraints = .{ .max_width = 180, .max_height = 200 };
+    try std.testing.expectEqual(SizeF{ .width = 180, .height = 90 }, try tree.layout(root, bounds));
+    try std.testing.expectEqual(SizeF{ .width = 168, .height = 68 }, try tree.nodeSize(child));
+    try std.testing.expectEqual(PointF{ .x = 5, .y = 9 }, try tree.nodeOffset(child));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(child));
+    _ = try tree.layout(root, bounds);
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(child));
+    box.alignment = .center;
+    try tree.update(root, .{ .box = box });
+    _ = try tree.layout(root, bounds);
+    try std.testing.expectEqual(SizeF{ .width = 20, .height = 16 }, try tree.nodeSize(child));
+    try std.testing.expectEqual(PointF{ .x = 79, .y = 35 }, try tree.nodeOffset(child));
+    box.aspect_ratio = 3;
+    try tree.update(root, .{ .box = box });
+    try std.testing.expect(try tree.layoutDirty(root));
+    try std.testing.expectEqual(SizeF{ .width = 180, .height = 60 }, try tree.layout(root, bounds));
+    try std.testing.expectEqual(PointF{ .x = 79, .y = 20 }, try tree.nodeOffset(child));
+    try std.testing.expectEqual(@as(usize, 3), try tree.layoutCount(child));
+    // Removing the ratio restores ordinary intrinsic Box sizing.
+    box.aspect_ratio = null;
+    try tree.update(root, .{ .box = box });
+    try std.testing.expectEqual(SizeF{ .width = 32, .height = 38 }, try tree.layout(root, bounds));
+    try std.testing.expectEqual(PointF{ .x = 5, .y = 9 }, try tree.nodeOffset(child));
+}
+
 test "baseline rows reserve independent ascents and descents and align each wrapped run" {
     const text = @import("../../text/root.zig");
     var fonts = text.FontCache.init(std.testing.allocator);

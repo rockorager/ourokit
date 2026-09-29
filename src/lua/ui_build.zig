@@ -1776,6 +1776,14 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box width");
         const height = tableOptionalSize(state, 1, "height", .auto) orelse
             return luaError(state, "invalid box height");
+        const ratio_kind = c.lua_getfield(state, 1, "aspect_ratio");
+        const aspect_ratio: ?f32 = if (ratio_kind == c.type_nil) null else if (ratio_kind == c.type_number)
+            finiteFloat(state, -1) orelse return luaError(state, "aspect_ratio must be a finite positive number")
+        else
+            return luaError(state, "aspect_ratio must be a finite positive number");
+        c.lua_settop(state, -2);
+        if (aspect_ratio) |ratio| if (ratio <= 0)
+            return luaError(state, "aspect_ratio must be a finite positive number");
         const min_width = tableOptionalExtent(state, 1, "min_width", 0) orelse
             return luaError(state, "invalid box min_width");
         const min_height = tableOptionalExtent(state, 1, "min_height", 0) orelse
@@ -1928,6 +1936,7 @@ pub const UiBuild = struct {
                 .min_height = min_height,
                 .max_width = max_width.value,
                 .max_height = max_height.value,
+                .aspect_ratio = aspect_ratio,
                 .padding = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y },
                 .alignment = alignment.value,
                 .background = if (paint) |p| owner.?.initialColor(p) else visual.background orelse surface.value,

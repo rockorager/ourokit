@@ -31,6 +31,9 @@ pub const Box = struct {
     min_height: f32 = 0,
     max_width: ?f32 = null,
     max_height: ?f32 = null,
+    /// Preferred outer width / height, resolved from constraints before laying
+    /// out the child. Explicit sizes, fill, and parent bounds take precedence.
+    aspect_ratio: ?f32 = null,
     padding: Insets = .{},
     /// When present, the child receives loose inner constraints and is placed
     /// within the resolved padded content box. Null preserves tight propagation.

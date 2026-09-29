@@ -1015,6 +1015,41 @@ Fill uses the resulting maximum; a local cap therefore makes fill finite even
 on an otherwise unbounded scroll axis. These bounds constrain the Box, not
 arbitrary overflowing child paint; clipping remains explicit.
 
+`aspect_ratio` is an optional finite positive number expressing **outer width
+divided by outer height**, including padding and border. It sizes arbitrary
+content, not just images:
+
+```lua
+ouro.box {key="preview", max_width=480, aspect_ratio=16/9, padding=12,
+  background="#DCEBFA", alignment="center",
+  ouro.text {key="label", text="Preview"},
+}
+```
+
+The Box first applies its ordinary bounds, explicit dimensions, and fill rules
+within the parent's constraints. It then starts from the available maximum
+width and derives height; if width is unbounded, it starts from maximum height
+instead. Maximum bounds are checked before minimum bounds, recomputing the
+other dimension to preserve the ratio. If no matching size fits, the final
+clamp respects the constraints and sacrifices the ratio. Tight width and height
+therefore override a conflicting ratio. Avoid setting both axes to fill when
+you want the ratio to determine one of them.
+
+With both axes unbounded, ratio sizing fails with `AspectRatioInUnboundedAxes`;
+provide a numeric dimension or a local maximum. Minima alone do not choose a
+preferred size. A vertical Scroll usually supplies bounded width, and a
+horizontal Scroll bounded height, so the other dimension can follow the ratio.
+An extreme ratio whose resulting size cannot fit finite native coordinates
+fails with `InvalidLayoutSize`. Zero, negative, non-finite, and non-number ratio
+declarations are rejected.
+
+The child is laid out once after the outer size is resolved, with tight inner
+constraints after subtracting padding/border, or loose inner constraints when
+Box alignment is set. Child content does not determine ratio sizing. Changing
+or removing the ratio invalidates layout while preserving keyed identity.
+See the `aspect/*` stories in `examples/layout-storybook.lua` for wide/narrow
+flex cards, ratio-change playback, and tight-parent precedence.
+
 For a centered, capped-width form that still fits narrow parents:
 
 ```lua
