@@ -153,6 +153,46 @@ local function distribution()
   return ouro.column {key='content',gap=12,children=rows}
 end
 
+local function responsive_form(key, cap)
+  return ouro.box {key=key,width='fill',max_width=cap,padding=16,background='#EEF2F6',radius=8,
+    ouro.layout_builder {key='layout',render=function(c)
+      local wide=c.max_width>=440
+      local function field(id,label,value)
+        return ouro.box {key=id,width='fill',flex=wide and 1 or nil,
+          ouro.column {key='field',gap=6,
+            ouro.text {key='label',text=label,size=13},
+            ouro.text_input {key='input',default_text=value},
+          }}
+      end
+      local fields={key='fields',gap=12,children={field('name','Name','Ada Lovelace'),field('team','Team','Research')}}
+      return ouro.column {key='content',gap=12,
+        ouro.text {key='mode',text=string.format('%g px available · %s',c.max_width,wide and 'two columns' or 'stacked fields'),size=17},
+        wide and ouro.row(fields) or ouro.column(fields),
+        ouro.row {key='actions',main_axis_size='max',main_alignment='end',gap=8,
+          ouro.button {key='save',label='Save',variant='soft'}},
+      }
+    end}}
+end
+
+local Responsive=ouro.stateful(function()
+  local compact=ouro.signal(false)
+  return function()
+    return ouro.column {key='page',gap=16,
+      ouro.text {key='title',text='Composition from local constraints',size=22},
+      ouro.text {key='hint',text='The same form chooses its arrangement from parent bounds, not window size.'},
+      ouro.button {key='toggle',label=compact() and 'Expand first form' or 'Cap first form at 320',
+        on_press=function() compact:set(not compact()) end},
+      responsive_form('first',compact() and 320 or 680),
+      ouro.text {key='caption',text='A second instance, always capped to 320 pixels:'},
+      responsive_form('second',320),
+    }
+  end
+end)
+
+local function responsive()
+  return Responsive {key='responsive'}
+end
+
 return ouro.storybook {
   title = "Layout mechanics",
   stories = {
@@ -166,5 +206,9 @@ return ouro.storybook {
     ouro.story { id = "constraints/wide", group = "Constraints", name = "Capped form · wide", viewport = {width = 760, height = 590}, snapshot_scale = 2, color_scheme = "light", content = constraints },
     ouro.story { id = "constraints/narrow", group = "Constraints", name = "Capped form · narrow", viewport = {width = 380, height = 670}, snapshot_scale = 2, color_scheme = "light", content = constraints },
     ouro.story { id = "constraints/alignment", group = "Constraints", name = "Main-axis distribution", viewport = {width = 580, height = 510}, snapshot_scale = 2, color_scheme = "light", content = distribution },
+    ouro.story { id = "builder/wide", group = "Layout builder", name = "Local widths", viewport = {width = 740, height = 650}, snapshot_scale = 2, color_scheme = "light", content = responsive },
+    ouro.story { id = "builder/narrow", group = "Layout builder", name = "Narrow parent", viewport = {width = 380, height = 720}, snapshot_scale = 2, color_scheme = "light", content = responsive },
+    ouro.story { id = "builder/changed", group = "Layout builder", name = "Local resize playback", viewport = {width = 740, height = 700}, snapshot_scale = 2, color_scheme = "light", content = responsive,
+      actions = {{type='click',target='responsive/page/toggle'}} },
   },
 }

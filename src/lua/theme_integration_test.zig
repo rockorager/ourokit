@@ -1854,11 +1854,20 @@ test "constraint layout Lua loose flex and caps update retained geometry and rej
     try std.testing.expectEqual(@as(f32, 25), (try f.runtime.tree.nodeOffset(loose)).x);
 
     const invalid = [_][]const u8{
-        "ouro.box{max_width=-1}",                                    "ouro.box{max_height=1/0}",                        "ouro.box{min_width=10,max_width=9}",
-        "ouro.box{width=11,max_width=10}",                           "ouro.box{max_width='40'}",                        "ouro.box{max_height=false}",
-        "ouro.row{main_alignment='sideways'}",                       "ouro.row{main_alignment=1}",                      "ouro.row{ouro.box{flex={factor=1,fit='wide'}}}",
-        "ouro.row{ouro.box{flex={factor=0}}}",                       "ouro.row{ouro.box{flex={factor=1,typo=2}}}",      "ouro.row{ouro.box{flex={fit='loose'}}}",
-        "ouro.row{wrap=true,ouro.box{flex={factor=1,fit='loose'}}}", "ouro.box{ouro.box{flex={factor=1,fit='loose'}}}",
+        "ouro.box{key='box',max_width=-1}",
+        "ouro.box{key='box',max_height=1/0}",
+        "ouro.box{key='box',min_width=10,max_width=9}",
+        "ouro.box{key='box',width=11,max_width=10}",
+        "ouro.box{key='box',max_width='40'}",
+        "ouro.box{key='box',max_height=false}",
+        "ouro.row{key='row',main_alignment='sideways'}",
+        "ouro.row{key='row',main_alignment=1}",
+        "ouro.row{key='row',ouro.box{key='box',flex={factor=1,fit='wide'}}}",
+        "ouro.row{key='row',ouro.box{key='box',flex={factor=0}}}",
+        "ouro.row{key='row',ouro.box{key='box',flex={factor=1,typo=2}}}",
+        "ouro.row{key='row',ouro.box{key='box',flex={fit='loose'}}}",
+        "ouro.row{key='row',wrap=true,ouro.box{key='box',flex={factor=1,fit='loose'}}}",
+        "ouro.box{key='outer',ouro.box{key='box',flex={factor=1,fit='loose'}}}",
     };
     for (invalid) |declaration| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
@@ -1869,4 +1878,248 @@ test "constraint layout Lua loose flex and caps update retained geometry and rej
         try std.testing.expectEqual(handle, try f.handle("root/frame/row/loose"));
         try std.testing.expectEqual(@as(f32, 50), (try f.runtime.tree.nodeSize(loose)).width);
     }
+}
+
+test "layout builder measures local constraints in native order and initializes nested components once" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\calls={root=0,init=0,producer=0,consumer=0,scroll=0}
+        \\local Panel=ouro.stateful(function(p)
+        \\  calls.init=calls.init+1
+        \\  return function()
+        \\    return ouro.box {key='frame',width=300,height=120,padding=10,
+        \\      ouro.row {key='row',gap=7,
+        \\        -- Lowered first, but measured after the non-flex producer.
+        \\        ouro.layout_builder {key='consumer',flex=1,render=function(c)
+        \\          calls.consumer=calls.consumer+1
+        \\          assert(c.min_width==200 and c.max_width==200)
+        \\          assert(c.min_height==0 and c.max_height==100)
+        \\          c.max_width=1 -- Must not alter the retained cache or native input.
+        \\          return ouro.box {key='result',width='fill',height=19}
+        \\        end},
+        \\        ouro.layout_builder {key='producer',render=function(c)
+        \\          calls.producer=calls.producer+1
+        \\          assert(c.min_width==0 and c.max_width==1/0 and c.max_height==100)
+        \\          return ouro.box {key='result',width=73,height=31}
+        \\        end},
+        \\      }}
+        \\  end
+        \\end)
+        \\function build()
+        \\  calls.root=calls.root+1
+        \\  return ouro.column {key='root',gap=9,Panel {key='panel'},
+        \\    ouro.box {key='viewport',width=151,height=61,
+        \\      ouro.scroll {key='scroll',ouro.layout_builder {key='builder',render=function(c)
+        \\        calls.scroll=calls.scroll+1
+        \\        assert(c.min_width==0 and c.max_width==151)
+        \\        assert(c.min_height==0 and c.max_height==1/0)
+        \\        return ouro.box {key='content',height=99}
+        \\      end}}}}
+        \\end
+    );
+    try f.build();
+    try f.exec("assert(calls.root==1 and calls.init==1 and calls.consumer==1 and calls.producer==1 and calls.scroll==1)");
+    const consumer = try f.handle("root/panel/frame/row/consumer/result");
+    const render = try f.runtime.instances.renderObject(consumer);
+    try std.testing.expectEqual(core.SizeF{ .width = 200, .height = 19 }, try f.runtime.tree.nodeSize(render));
+    try std.testing.expectEqual(@as(usize, 3), f.runtime.layout_builders.count);
+    // A native-only rebuild retains callbacks and dependencies, despite the probe passes.
+    _ = try f.runtime.build_owners.markReaderDirty(f.runtime.root_owner);
+    f.runtime.native_work = true;
+    try f.build();
+    try f.exec("assert(calls.root==1 and calls.init==1 and calls.consumer==1 and calls.producer==1 and calls.scroll==1)");
+    try std.testing.expectEqual(consumer, try f.handle("root/panel/frame/row/consumer/result"));
+}
+
+test "layout builder reacts to local sizing and signals without remounting and rolls back failed branches" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\width=ouro.signal(241); color=ouro.signal('#224466'); fail=ouro.signal(false)
+        \\roots=0; renders=0; inits=0
+        \\local Child=ouro.stateful(function(p)
+        \\  inits=inits+1
+        \\  return function() return ouro.box {key='paint',width=p.width,height=17,background=color()} end
+        \\end)
+        \\local responsive=ouro.layout_builder {key='responsive',render=function(c)
+        \\  renders=renders+1
+        \\  if fail() and c.max_width<200 then error('narrow failure') end
+        \\  return ouro.box {key='inset',padding=3,
+        \\    ouro.layout_builder {key='nested',render=function(inner)
+        \\      assert(inner.max_width==c.max_width-6)
+        \\      return Child {key='child',width=inner.max_width>=200 and 97 or 43}
+        \\    end}}
+        \\end}
+        \\local Host=ouro.stateful(function(p)
+        \\  return function() return ouro.box {key='host',width=width(),height=53,alignment='center',responsive} end
+        \\end)
+        \\function build() roots=roots+1; return Host {key='app'} end
+    );
+    try f.build();
+    const path = "app/host/responsive/inset/nested/child/paint";
+    const handle = try f.handle(path);
+    const render = try f.runtime.instances.renderObject(handle);
+    try std.testing.expectEqual(@as(f32, 97), (try f.runtime.tree.nodeSize(render)).width);
+    try f.exec("assert(roots==1 and renders==1 and inits==1); width:set(199)");
+    try f.build();
+    try std.testing.expectEqual(handle, try f.handle(path));
+    try std.testing.expectEqual(@as(f32, 43), (try f.runtime.tree.nodeSize(render)).width);
+    try f.exec("assert(roots==1 and renders==2 and inits==1); color:set('#aabbcc')");
+    try f.build();
+    try f.exec("assert(roots==1 and renders==2 and inits==1)");
+    try std.testing.expectEqual(core.Color.rgba(0xaa, 0xbb, 0xcc, 255), (try f.object(path)).box.background.?);
+    try f.exec("fail:set(true)");
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try std.testing.expectEqual(handle, try f.handle(path));
+    try std.testing.expectEqual(@as(f32, 43), (try f.runtime.tree.nodeSize(render)).width);
+    // Don't call the rejected narrow branch with stale bounds during recovery.
+    try f.exec("width:set(241)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 97), (try f.runtime.tree.nodeSize(render)).width);
+    try std.testing.expectEqual(handle, try f.handle(path));
+}
+
+test "layout builder rejects intrinsic feedback and invalid declarations before committing" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("function build() return ouro.box {key='old',width=71,height=29} end");
+    try f.build();
+    const old = try f.handle("old");
+    const cases = [_]struct { expression: []const u8, err: anyerror }{
+        .{ .expression = "ouro.layout_builder{key='bad',render=false}", .err = error.LuaBuildFailed },
+        .{ .expression = "ouro.layout_builder{key='bad',render=function() return {} end}", .err = error.LuaBuildFailed },
+        .{ .expression = "ouro.layout_builder{key='bad',render=function() end,ouro.box{}}", .err = error.LuaBuildFailed },
+        .{ .expression = "ouro.column{key='column',ouro.layout_builder{key='dup',render=function() end},ouro.layout_builder{key='dup',render=function() end}}", .err = error.LuaBuildFailed },
+        .{ .expression = "ouro.grid{key='grid',columns={'auto'},rows={40},ouro.layout_builder{key='auto',column=1,row=1,render=function() return ouro.box{key='box',width=30,height=20} end}}", .err = error.LayoutBuilderIntrinsicMeasurement },
+        .{ .expression = "ouro.row{key='row',cross_alignment='stretch',ouro.layout_builder{key='stretch',render=function() return ouro.box{key='box',width=30,height=20} end}}", .err = error.LayoutBuilderIntrinsicMeasurement },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.column{{key='root',{s}}} end", .{case.expression});
+        defer std.testing.allocator.free(source);
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(case.err, f.build());
+        try std.testing.expectEqual(old, try f.handle("old"));
+    }
+    // Fixed sizing shields the builder from the auto track's speculative pass.
+    try f.exec(
+        \\function build() return ouro.grid {key='grid',columns={'auto'},rows={40},
+        \\  ouro.box {key='fixed',column=1,row=1,width=100,height=40,
+        \\    ouro.layout_builder {key='bounded',render=function(c)
+        \\      assert(c.min_width==100 and c.max_width==100 and c.min_height==40 and c.max_height==40)
+        \\      return ouro.box {key='result',width='fill',height='fill'}
+        \\    end}}} end
+    );
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    const result = try f.handle("grid/fixed/bounded/result");
+    try std.testing.expectEqual(core.SizeF{ .width = 100, .height = 40 }, try f.runtime.tree.nodeSize(try f.runtime.instances.renderObject(result)));
+}
+
+test "layout builder preparation validates newly selected branches and preserves old handlers on rejection" {
+    const click = struct {
+        fn run(f: *Fixture) !void {
+            const target = try f.runtime.semanticTarget("frame/builder/button");
+            try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 0, .position = target.center } });
+            for ([_]@import("../platform/window.zig").PointerButtonState{ .pressed, .released }) |state| {
+                try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 0, .button = 0x110, .state = state } });
+                try f.runtime.dispatchInput(&f.callbacks);
+                while (f.scheduler.takeRunnable()) |handle|
+                    try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(handle));
+            }
+        }
+    }.run;
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\hits=0
+        \\function build() return ouro.box {key='frame',width=240,height=60,
+        \\  ouro.layout_builder {key='builder',render=function(c)
+        \\    assert(c.max_width==240)
+        \\    return ouro.button {key='button',label='Original',on_press=function() hits=hits+3 end}
+        \\  end}} end
+    );
+    try f.build();
+    const handle = try f.handle("frame/builder/button");
+    var prepared: @import("prepared_build.zig").PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, f.state, &f.sources, 128, 4096);
+    defer prepared.deinit();
+    try f.exec(
+        \\function candidate() return ouro.box {key='frame',width=199,height=60,
+        \\  ouro.layout_builder {key='builder',render=function(c)
+        \\    -- The old 240px branch is valid; the new local bounds must be checked.
+        \\    if c.max_width<200 then error('candidate narrow failure') end
+        \\    return ouro.button {key='button',label='Invalid candidate'}
+        \\  end}} end
+    );
+    _ = c.lua_getglobal(f.state, "candidate");
+    const rejected = c.luaL_ref(f.state, c.registry_index);
+    defer c.luaL_unref(f.state, c.registry_index, rejected);
+    try std.testing.expectError(error.LuaBuildFailed, f.runtime.prepareSourceBuild(.{ .width = 600, .height = 500 }, &f.ui, &prepared, rejected, 2));
+    try std.testing.expectEqual(handle, try f.handle("frame/builder/button"));
+    try std.testing.expectEqual(@as(usize, 0), prepared.descriptor_count);
+    try click(f);
+    try f.exec("assert(hits==3)");
+    try f.exec(
+        \\function candidate() return ouro.box {key='frame',width=199,height=60,
+        \\  ouro.layout_builder {key='builder',render=function(c)
+        \\    assert(c.max_width==199)
+        \\    return ouro.button {key='button',label='Accepted',on_press=function() hits=hits+7 end}
+        \\  end}} end
+    );
+    _ = c.lua_getglobal(f.state, "candidate");
+    const accepted = c.luaL_ref(f.state, c.registry_index);
+    defer c.luaL_unref(f.state, c.registry_index, accepted);
+    try f.runtime.prepareSourceBuild(.{ .width = 600, .height = 500 }, &f.ui, &prepared, accepted, 2);
+    try f.callbacks.ensureAvailable(prepared.handler_count);
+    f.runtime.commitPreparedSource(&prepared, &f.callbacks, &f.vm, &f.signals);
+    try f.runtime.prepareFrame(1);
+    try std.testing.expectEqual(handle, try f.handle("frame/builder/button"));
+    try click(f);
+    try f.exec("assert(hits==10)");
+}
+
+test "layout builder uses retained editor geometry and removes subscriptions with its branch" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\show=ouro.signal(true); color=ouro.signal('#abcdef'); seen=0
+        \\local Child=ouro.stateful(function()
+        \\  return function() return ouro.box {key='paint',background=color()} end
+        \\end)
+        \\function build() return ouro.box {key='frame',width=220,height=240,
+        \\  ouro.column {key='column',gap=11,
+        \\    ouro.text_editor {key='editor',default_text='one',multiline=true,autofocus=true},
+        \\    ouro.layout_builder {key='remaining',flex=1,render=function(c)
+        \\      seen=c.max_height
+        \\      return show() and Child {key='child'} or nil
+        \\    end}}} end
+    );
+    try f.build();
+    const editor = try f.handle("frame/column/editor");
+    const session = try f.runtime.text_inputs.session(editor);
+    _ = try session.apply(.{ .commit = .{ .text = "\ntwo\nthree\nfour" } });
+    // A real input safe point updates the retained paragraph and its height.
+    try f.runtime.routeKeyboard(.{ .key = .{ .window = f.runtime.window, .serial = 1, .time_ms = 0, .state = .pressed, .translated = .{ .keycode = 0, .logical = .end } } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try f.runtime.prepareFrame(1);
+    const editor_height = (try f.runtime.tree.nodeSize(try f.runtime.instances.renderObject(editor))).height;
+    try std.testing.expect(editor_height > 60);
+    // This feedback build must not measure default_text='one' and loop forever.
+    try f.build();
+    _ = c.lua_getglobal(f.state, "seen");
+    var valid: c_int = 0;
+    const seen = c.lua_tonumberx(f.state, -1, &valid);
+    c.lua_settop(f.state, -2);
+    try std.testing.expectApproxEqAbs(@as(f64, 240 - 11 - editor_height), seen, 0.001);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\nfour", (try f.runtime.text_inputs.session(editor)).model.text());
+    try f.exec("show:set(false)");
+    try f.build();
+    try std.testing.expectEqual(@as(usize, 0), f.runtime.build_owners.dirty.pendingCount());
+    try f.exec("color:set('#123456')");
+    try std.testing.expectEqual(@as(usize, 0), f.runtime.build_owners.dirty.pendingCount());
+    try f.exec("show:set(true)");
+    try f.build();
+    try std.testing.expectEqual(core.Color.rgba(0x12, 0x34, 0x56, 255), (try f.object("frame/column/remaining/child/paint")).box.background.?);
 }

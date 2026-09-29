@@ -155,6 +155,19 @@ pub const Signals = struct {
         self.reader_count += 1;
     }
 
+    /// Replace a speculative reader's reads without ending the transaction.
+    /// An empty replacement also removes the committed edges of an omitted reader.
+    pub fn restartReader(self: *Signals, reader: u64) !void {
+        try self.selectReader(reader);
+        var count: usize = 0;
+        for (self.pending[0..self.pending_count]) |read| {
+            if (read.reader == reader) continue;
+            self.pending[count] = read;
+            count += 1;
+        }
+        self.pending_count = count;
+    }
+
     pub fn preserveRoot(self: *Signals) void {
         std.debug.assert(self.phase == .evaluating and self.pending_count == 0);
         self.reader_count = 0;

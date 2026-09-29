@@ -1,6 +1,6 @@
 -- Private retained-description runtime. All records belong to this Lua VM;
 -- preparing a generation never mounts native owners or changes live scopes.
-local select_reader, dirty, next, assert, make_props, is_function, build_list, geometry = ...
+local select_reader, dirty, next, assert, make_props, is_function, build_list, geometry, restart_reader = ...
 local windows, serial, transaction = {}, 0, nil
 local M = {}
 
@@ -16,11 +16,22 @@ function M.begin(registry, owner, invalidation, native_update)
     assert(not transaction, "component transaction already active")
     local group = windows[registry]
     if not group then group = {}; windows[registry] = group end
-    local old = group[owner] or { mounts = {}, lists = {} }
+    local old = group[owner] or { mounts = {}, lists = {}, builders = {} }
     group[owner] = old -- Reserve the commit slot before native reconciliation.
     transaction = { group = group, owner = owner, old = old,
-        mounts = {}, lists = {}, updates = {}, outputs = {}, invalidation = invalidation,
+        mounts = {}, lists = {}, builders = {}, updates = {}, proposals = {}, outputs = {},
+        staged_mounts = {}, staged_lists = {}, staged_builders = {}, invalidation = invalidation,
+        changed_builders = {},
         native_update = native_update }
+end
+
+-- Keep proposals and reader dependencies alive while native measurement
+-- refines the constraints. In particular, initializers must run only once.
+function M.relower()
+    local t = transaction
+    t.mounts, t.lists, t.builders = {}, {}, {}
+    t.outputs = {}
+    restart_reader(-2)
 end
 
 function M.root(callback, ...)
@@ -46,7 +57,7 @@ function M.render(definition, props, children, parent, visual_parent)
     -- Length-prefix the arbitrary user key; parent tokens are mount identities.
     local identity = parent .. ":" .. visual_parent .. ":" .. #props.key .. ":" .. props.key
     assert(not t.mounts[identity], "duplicate component key")
-    local old = t.old.mounts[identity]
+    local old = t.staged_mounts[identity] or t.old.mounts[identity]
     if old and old.definition ~= definition then old = nil end
     local values = {}
     for k, v in next, props do values[k] = v end
@@ -57,19 +68,24 @@ function M.render(definition, props, children, parent, visual_parent)
         record = { token = serial, definition = definition, output = {}, values = values }
         record.proxy = make_props(record)
     end
-    t.mounts[identity] = record
+    t.mounts[identity], t.staged_mounts[identity] = record, record
     local changed = not old or not equal(record.values.children, children)
     if old and not changed then values.children = record.values.children end
     changed = changed or not equal(record.values, values)
     -- The proxy reads staged props during rendering. Rollback restores its
     -- committed backing table before native event dispatch can resume.
-    local update = { record = record, previous = record.values, values = values,
-        output = record.output }
-    t.updates[#t.updates + 1] = update
+    local update = t.proposals[record]
+    local repeated = update ~= nil
+    if not update then
+        update = { record = record, previous = record.values, output = record.output, retained = true }
+        t.proposals[record] = update
+        t.updates[#t.updates + 1] = update
+    end
     record.values = values
-    local retained = old and not changed and not dirty(record.token)
+    local retained = old and not changed and (repeated or not dirty(record.token))
     if not retained then
-        select_reader(record.token)
+        update.retained = false
+        restart_reader(record.token)
         if not old then
             record.render = definition[1](record.proxy)
             assert(is_function(record.render), "component initializer must return a render function")
@@ -79,7 +95,7 @@ function M.render(definition, props, children, parent, visual_parent)
     -- Prepared snapshots outlive later updates to the same mounted record.
     -- Pin immutable output cells, not just the mutable retained mount table.
     t.outputs[#t.outputs + 1] = update.output
-    return update.output.value, record.token, retained
+    return update.output.value, record.token, update.retained
 end
 
 -- Stateless expansion output must outlive lowering too: semantic strings and
@@ -92,10 +108,34 @@ function M.compose(render, ...)
     return value
 end
 
+function M.layout(props, id, constraints, scope_clean)
+    local t = transaction
+    assert(not t.builders[id], "duplicate layout_builder key")
+    local staged = t.staged_builders[id]
+    local old = staged or t.old.builders[id]
+    local token
+    if old then token = old.token else serial = serial + 1; token = serial end
+    local retained = old and equal(old.props, props) and equal(old.constraints, constraints)
+        and (staged or (t.root_clean and scope_clean and not dirty(token)))
+    local record = old
+    if not retained then
+        t.changed_builders[id] = true
+        restart_reader(token)
+        -- Keep a private copy: mutation of the argument cannot falsify the cache key.
+        local argument = {}
+        for k, v in next, constraints do argument[k] = v end
+        record = { token = token, props = props, constraints = constraints,
+            output = props.render(argument) }
+    end
+    t.builders[id], t.staged_builders[id] = record, record
+    t.outputs[#t.outputs + 1] = record
+    return record.output, not t.changed_builders[id]
+end
+
 function M.virtual(props, id, scope_clean, capacity)
     local t = transaction
     assert(not t.lists[id], "duplicate virtual list key")
-    local old = t.old.lists[id]
+    local old = t.staged_lists[id] or t.old.lists[id]
     local token, key_token
     if old then token, key_token = old.token, old.key_token
     else serial = serial + 2; token, key_token = serial - 1, serial end
@@ -105,22 +145,31 @@ function M.virtual(props, id, scope_clean, capacity)
     local plan = build_list(props, old, id, geometry, select_reader, key_token, token,
         reuse_keys, reuse_keys and not dirty(token), capacity)
     if plan ~= old then plan.token, plan.key_token = token, key_token end
-    t.lists[id] = plan
+    t.lists[id], t.staged_lists[id] = plan, plan
     return plan, plan == old
 end
 
 function M.finish()
     local t = transaction
-    for identity, record in next, t.old.mounts do
-        if t.mounts[identity] ~= record then select_reader(record.token) end
-    end
-    for id, record in next, t.old.lists do
-        if not t.lists[id] then
-            select_reader(record.token)
-            select_reader(record.key_token)
+    for _, records in next, { t.old.mounts, t.staged_mounts } do
+        for identity, record in next, records do
+            if t.mounts[identity] ~= record then restart_reader(record.token) end
         end
     end
-    t.next = { root = t.root, mounts = t.mounts, lists = t.lists, callback = t.callback,
+    for _, records in next, { t.old.lists, t.staged_lists } do
+        for id, record in next, records do
+            if not t.lists[id] then
+                restart_reader(record.token)
+                restart_reader(record.key_token)
+            end
+        end
+    end
+    for _, records in next, { t.old.builders, t.staged_builders } do
+        for id, record in next, records do
+            if not t.builders[id] then restart_reader(record.token) end
+        end
+    end
+    t.next = { root = t.root, mounts = t.mounts, lists = t.lists, builders = t.builders, callback = t.callback,
         args = t.args, invalidation = t.invalidation }
     -- This table also pins every lowered description until prepared output
     -- or borrowed semantic strings no longer need it.
@@ -135,6 +184,7 @@ function M.commit()
     end
     t.group[t.owner] = t.next
     t.old, t.updates, t.group = nil, nil, nil
+    t.proposals, t.staged_mounts, t.staged_lists, t.staged_builders = nil, nil, nil, nil
     transaction = nil
 end
 

@@ -38,7 +38,9 @@ pub const Components = struct {
         if (c.lua_pcallk(state, 2, 1, 0, 0, null) != c.ok) return error.ComponentRuntimeLoadFailed;
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, geometry, 1);
-        if (c.lua_pcallk(state, 8, 1, 0, 0, null) != c.ok) return error.ComponentRuntimeLoadFailed;
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, restartReader, 1);
+        if (c.lua_pcallk(state, 9, 1, 0, 0, null) != c.ok) return error.ComponentRuntimeLoadFailed;
         self.reference = c.luaL_ref(state, c.registry_index);
     }
 
@@ -181,5 +183,16 @@ pub const Components = struct {
         const signals = runtime(state).signals;
         c.lua_pushboolean(state, @intFromBool(if (signals) |value| value.readerDirty(reader) else false));
         return 1;
+    }
+
+    fn restartReader(state: *c.State) callconv(.c) c_int {
+        const signals = runtime(state).signals orelse return 0;
+        var valid: c_int = 0;
+        const reader: u64 = @bitCast(c.lua_tointegerx(state, 1, &valid));
+        signals.restartReader(reader) catch {
+            _ = c.lua_pushstring(state, "component dependency capacity exceeded");
+            return c.lua_error(state);
+        };
+        return 0;
     }
 };

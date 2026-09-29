@@ -797,6 +797,58 @@ ouro.row {main_axis_size="max", main_alignment="space_between", gap=12,
 }
 ```
 
+#### Constraint-aware composition
+
+`ouro.layout_builder {key=..., render=function(constraints) ... end}` chooses
+one returned description (or nil) from its **local incoming constraints**.
+The argument contains `min_width`, `max_width`, `min_height`, and `max_height`
+in logical pixels, not the window size or the child's measured size. Unbounded
+maxima are positive infinity (`math.huge`), as on a Scroll's scrolling axis.
+The child receives the same constraints; the builder adds no padding or size
+policy. Put sizing, caps, or alignment on an enclosing Box. Contextual `flex`
+and grid placement belong on the builder itself.
+
+```lua
+ouro.box {key="form", width="fill", max_width=640, padding=16,
+  ouro.layout_builder {key="arrangement", render=function(c)
+    local wide = c.max_width >= 440
+    local fields = {key="fields", gap=12,
+      ouro.box {key="name", width="fill", flex=wide and 1 or nil,
+        ouro.text_input {key="input", placeholder="Name"}},
+      ouro.box {key="team", width="fill", flex=wide and 1 or nil,
+        ouro.text_input {key="input", placeholder="Team"}},
+    }
+    return wide and ouro.row(fields) or ouro.column(fields)
+  end},
+}
+```
+
+The callback runs during a protected build, never inside live native layout or
+paint. Candidate measurement pauses at each unresolved builder; lowering then
+resumes with those bounds, in native measurement order. Only a fully measured
+candidate can commit. A failed callback or selected subtree leaves the previous
+instances, handlers, and signal dependencies intact, including during reload.
+Root callbacks and stateful initializers are not repeated by these probe passes.
+Keyed children with the same parent retain identity across arrangement changes.
+
+Builder output is retained when constraints, declaration, enclosing build
+scope, and signal dependencies are unchanged. Signal reads in `render` belong
+to that builder; child components keep their own dependencies. As with other
+render functions, keep callbacks deterministic and free of side effects.
+The argument is a private table; modifying it does not change native bounds.
+
+**No intrinsic feedback:** a builder cannot be measured with different inputs
+within one native layout pass. This rejects, for example, an auto grid track
+that sizes itself from the builder, or stretch on an unbounded cross axis.
+Give that child a fixed-size Box, or use bounded non-intrinsic tracks. Ordinary
+unbounded constraints are allowed; circular size-dependent composition is not.
+There are at most 128 builders per window build, with bounded probe passes and
+the existing nesting/node-capacity limits. Apps without builders do no probes.
+
+See `builder/wide`, `builder/narrow`, and `builder/changed` in
+`examples/layout-storybook.lua`; the last story clicks a local width toggle
+without resizing the window.
+
 #### Wrapping rows and columns
 
 `ouro.row` and `ouro.column` accept `wrap=true` (default false) and `run_gap`

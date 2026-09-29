@@ -45,6 +45,8 @@ pub const LayoutError = error{
     StaleParagraph,
     ParagraphLayoutFailed,
     InvalidTextInputRange,
+    LayoutBuilderPending,
+    LayoutBuilderIntrinsicMeasurement,
 };
 
 const Slot = struct {
@@ -80,11 +82,20 @@ const Slot = struct {
 /// layout is allocation-free; dirty Text objects may populate the paragraph cache.
 /// This is deliberately not the widget/instance tree.
 pub const Tree = struct {
+    /// Used only by isolated candidate trees. Stop before an unresolved child;
+    /// the build phase supplies its description before layout restarts.
+    pub const LayoutProbe = struct {
+        pub const Entry = struct { handle: NodeHandle, constraints: ?Constraints, visited: bool = false };
+        entries: []Entry,
+        request: ?struct { index: usize, constraints: Constraints } = null,
+    };
+
     allocator: std.mem.Allocator,
     slots: []Slot,
     paragraph_sources: ?*text.ParagraphSourceCache = null,
     paragraphs: ?*text.ParagraphCache = null,
     images: ?*ImageCache = null,
+    layout_probe: ?*LayoutProbe = null,
 
     pub fn init(self: *Tree, allocator: std.mem.Allocator, capacity: usize) !void {
         if (capacity == 0) return error.InvalidCapacity;
@@ -554,6 +565,12 @@ pub const Tree = struct {
         return (try self.slot(handle)).layout_count;
     }
 
+    /// Last completed input, also usable as a proposal before a dirty relayout.
+    pub fn lastConstraints(self: *Tree, handle: NodeHandle) !?Constraints {
+        const target = try self.slot(handle);
+        return if (target.has_layout) target.last_constraints else null;
+    }
+
     pub fn layoutDirty(self: *Tree, handle: NodeHandle) !bool {
         return (try self.slot(handle)).needs_layout;
     }
@@ -692,6 +709,16 @@ pub const Tree = struct {
     fn layoutNode(self: *Tree, handle: NodeHandle, constraints: Constraints) LayoutError!SizeF {
         try constraints.validate();
         const current = try self.slot(handle);
+        if (self.layout_probe) |probe| for (probe.entries, 0..) |*entry, index| {
+            if (!std.meta.eql(entry.handle, handle)) continue;
+            if (entry.constraints == null or !std.meta.eql(entry.constraints.?, constraints)) {
+                if (entry.visited) return error.LayoutBuilderIntrinsicMeasurement;
+                probe.request = .{ .index = index, .constraints = constraints };
+                return error.LayoutBuilderPending;
+            }
+            entry.visited = true;
+            break;
+        };
         if (!current.needs_layout and current.has_layout and
             std.meta.eql(current.last_constraints, constraints)) return current.size;
         const object = current.object;

@@ -19,6 +19,7 @@ pub const Kind = enum {
     column,
     scroll,
     virtual_list,
+    layout_builder,
     theme,
     stateful,
     stateless,

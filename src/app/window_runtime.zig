@@ -12,6 +12,7 @@ const task = @import("../task/root.zig");
 const text = @import("../text/root.zig");
 const ui = @import("../ui/root.zig");
 const virtual_list = @import("../ui/widget/virtual_list.zig");
+const layout_builder = @import("../ui/widget/layout_builder.zig");
 const listener = @import("../ui/input/listener.zig");
 const KeySequence = @import("../ui/input/key_chord.zig").Sequence;
 const internal_drag = @import("../ui/input/drag.zig");
@@ -156,6 +157,7 @@ pub const WindowRuntime = struct {
     text_input_owner: ?struct { target: ui.instance.InstanceHandle, session: u64 } = null,
     text_input_generation: u64 = 0,
     virtual_lists: virtual_list.Snapshot = .{},
+    layout_builders: layout_builder.Snapshot = .{},
     native_work: bool = false,
     virtual_offsets_pending: bool = false,
     development_generation: u64 = 1,
@@ -364,6 +366,7 @@ pub const WindowRuntime = struct {
         self.frame_state = .{};
         self.damage_tracker.invalidate();
         self.virtual_lists = .{};
+        self.layout_builders = .{};
         self.native_work = false;
         self.virtual_offsets_pending = false;
     }
@@ -405,6 +408,9 @@ pub const WindowRuntime = struct {
         lua_ui.root_padding = self.root_padding;
         if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
         defer lua_ui.components.instances = null;
+        var measurement: LayoutMeasurement = .{ .runtime = self, .size = size, .lua_ui = lua_ui };
+        lua_ui.layout_measurement = .{ .context = &measurement, .measure = LayoutMeasurement.measure };
+        defer lua_ui.layout_measurement = null;
         const descriptors = try lua_ui.buildCallback(
             &self.build_owners,
             work,
@@ -439,9 +445,24 @@ pub const WindowRuntime = struct {
                 return error.ButtonInstanceMissing;
             }
         }
-        for (prepared.text_inputs[0..prepared.text_input_count]) |*input| {
-            if (!containsDescriptorId(prepared.descriptors(), input.target_id) or
-                !containsDescriptorId(prepared.descriptors(), input.content_id))
+        try self.retainTextInputPresentation(prepared.descriptor_storage[0..prepared.descriptor_count], prepared.text_inputs[0..prepared.text_input_count]);
+        const plan = try self.instances.prepareReconcile(prepared.descriptors());
+        try self.animations.validate(prepared.animations[0..prepared.animation_count]);
+        _ = try self.validatePreparedFrame(prepared.descriptors(), size, lua_ui.root_background != null, null);
+        try lua_ui.commitDependencies(&self.build_owners, work);
+        dependencies_pending = false;
+        prepared.reconcile_plan = plan;
+        prepared.size = size;
+        captured = false;
+        self.metrics.builds.finish(started);
+    }
+
+    /// Measure candidates using the presentation that mountPrepared will retain,
+    /// rather than the declaration's possibly obsolete default_text.
+    fn retainTextInputPresentation(self: *WindowRuntime, descriptors: []ui.instance.Descriptor, inputs: anytype) !void {
+        for (inputs) |*input| {
+            if (!containsDescriptorId(descriptors, input.target_id) or
+                !containsDescriptorId(descriptors, input.content_id))
                 return error.TextInputInstanceMissing;
             if (self.instances.handleForId(input.target_id)) |target| {
                 try self.text_inputs.prepareMount(target, input.mode, &input.session);
@@ -449,10 +470,10 @@ pub const WindowRuntime = struct {
                 const retained = try self.text_inputs.session(target);
                 const candidate = &input.session.?.model;
                 const descriptor_index = descriptorIndexForId(
-                    prepared.descriptors(),
+                    descriptors,
                     input.content_id,
                 ).?;
-                var object = &prepared.descriptor_storage[descriptor_index].object;
+                var object = &descriptors[descriptor_index].object;
                 if (object.* != .text_input) return error.TextInputRenderObjectMismatch;
                 const retained_secret = (try self.text_inputs.getBehavior(target)).secret;
                 const same_secret = if (retained_secret) |value|
@@ -503,15 +524,6 @@ pub const WindowRuntime = struct {
                 }
             }
         }
-        const plan = try self.instances.prepareReconcile(prepared.descriptors());
-        try self.animations.validate(prepared.animations[0..prepared.animation_count]);
-        try self.validatePreparedFrame(prepared.descriptors(), size, lua_ui.root_background != null);
-        try lua_ui.commitDependencies(&self.build_owners, work);
-        dependencies_pending = false;
-        prepared.reconcile_plan = plan;
-        prepared.size = size;
-        captured = false;
-        self.metrics.builds.finish(started);
     }
 
     pub fn validatePreparedSourceCommit(
@@ -620,6 +632,7 @@ pub const WindowRuntime = struct {
         self.damage_tracker.invalidate();
         self.ready = true;
         self.virtual_lists = prepared.virtual_lists;
+        self.layout_builders = prepared.layout_builders;
         self.virtual_offsets_pending = true;
         self.native_work = false;
         if (self.virtual_lists.count != 0) self.queueNativeBuild() catch unreachable;
@@ -647,6 +660,9 @@ pub const WindowRuntime = struct {
         lua_ui.root_background = self.background;
         if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
         defer lua_ui.components.instances = null;
+        var measurement: LayoutMeasurement = .{ .runtime = self, .size = size, .lua_ui = lua_ui };
+        lua_ui.layout_measurement = .{ .context = &measurement, .measure = LayoutMeasurement.measure };
+        defer lua_ui.layout_measurement = null;
         var builds = self.build_owners.beginCycle();
         while (try builds.take()) |work| {
             const started = self.phaseStart();
@@ -751,6 +767,7 @@ pub const WindowRuntime = struct {
             try self.refreshListBoxVisuals();
             try self.applyFocusVisual(null, self.focus.current());
             self.virtual_lists = lua_ui.virtual_lists;
+            self.layout_builders = lua_ui.layout_builders;
             self.animations.reconcile(lua_ui.animationDescriptors()) catch unreachable;
             // This build consumed current samples, including an external
             // invalidation between animation frames. Never postpone a wakeup.
@@ -796,6 +813,11 @@ pub const WindowRuntime = struct {
             self.metrics.layouts.finish(started);
         }
         try self.updateVirtualLayout();
+        for (self.layout_builders.entries[0..self.layout_builders.count]) |entry| {
+            const target = self.instances.handleForId(entry.id) orelse continue;
+            const bounds = try self.tree.lastConstraints(try self.instances.renderObject(target));
+            if (!std.meta.eql(bounds, entry.constraints)) try self.queueNativeBuild();
+        }
         if (try self.instances.revealScrollTargets()) self.frame_state.invalidatePaint();
         try self.reconcileInternalDrag();
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
@@ -2759,13 +2781,27 @@ pub const WindowRuntime = struct {
     /// storage. This closes the transaction boundary before retained instances
     /// change, including command-capacity and descriptor-dependent layout
     /// failures that ordinary reconciliation only encounters during framing.
+    const LayoutMeasurement = struct {
+        runtime: *WindowRuntime,
+        size: core.SizeU,
+        lua_ui: *lua.UiBuild,
+
+        fn measure(context: *anyopaque, descriptors: []ui.instance.Descriptor, builders: *layout_builder.Snapshot) !bool {
+            const self: *LayoutMeasurement = @ptrCast(@alignCast(context));
+            try self.runtime.retainTextInputPresentation(descriptors, self.lua_ui.pending_text_inputs[0..self.lua_ui.pending_text_input_count]);
+            _ = try self.runtime.instances.prepareReconcile(descriptors);
+            return self.runtime.validatePreparedFrame(descriptors, self.size, self.lua_ui.root_background != null, builders);
+        }
+    };
+
     fn validatePreparedFrame(
         self: *WindowRuntime,
         descriptors: []const ui.instance.Descriptor,
         size: core.SizeU,
         transparent_clear: bool,
-    ) !void {
-        if (descriptors.len == 0) return;
+        builders: ?*layout_builder.Snapshot,
+    ) !bool {
+        if (descriptors.len == 0) return true;
         var tree: ui.render_object.Tree = undefined;
         try tree.init(self.allocator, descriptors.len);
         defer tree.deinit();
@@ -2783,10 +2819,25 @@ pub const WindowRuntime = struct {
         const root_index = descriptorRootIndex(descriptors).?;
         const width: f32 = @floatFromInt(size.width);
         const height: f32 = @floatFromInt(size.height);
-        _ = try tree.layout(
+        var probe_entries: [128]ui.render_object.Tree.LayoutProbe.Entry = undefined;
+        var probe: ui.render_object.Tree.LayoutProbe = .{ .entries = &.{} };
+        if (builders) |snapshot| {
+            for (snapshot.entries[0..snapshot.count], 0..) |entry, index|
+                probe_entries[index] = .{ .handle = handles[descriptorIndexForId(descriptors, entry.id).?], .constraints = entry.constraints };
+            probe.entries = probe_entries[0..snapshot.count];
+            tree.layout_probe = &probe;
+        }
+        _ = tree.layout(
             handles[root_index],
             ui.layout.Constraints.tight(.{ .width = width, .height = height }),
-        );
+        ) catch |err| switch (err) {
+            error.LayoutBuilderPending => {
+                const request = probe.request.?;
+                builders.?.entries[request.index].constraints = request.constraints;
+                return false;
+            },
+            else => return err,
+        };
         const commands = try self.allocator.alloc(scene.Command, self.commands.len);
         defer self.allocator.free(commands);
         var builder = try ui.render_object.Builder.init(commands, self.output_scale);
@@ -2803,6 +2854,7 @@ pub const WindowRuntime = struct {
             try builder.popOpacity();
             try builder.popClip();
         };
+        return true;
     }
 
     fn applyFocusVisual(

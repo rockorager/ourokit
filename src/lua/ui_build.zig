@@ -3,6 +3,7 @@ const c = @import("c.zig");
 const Description = @import("description.zig").Description;
 const Components = @import("components.zig").Components;
 const virtual_list = @import("../ui/widget/virtual_list.zig");
+const layout_builder = @import("../ui/widget/layout_builder.zig");
 const animation = @import("../ui/animation.zig");
 const theming = @import("theme.zig");
 const ThemeFonts = @import("theme_fonts.zig").ThemeFonts;
@@ -105,6 +106,12 @@ pub const UiBuild = struct {
     interactive: bool = true,
     composition_depth: usize = 0,
     virtual_lists: virtual_list.Snapshot = .{},
+    layout_builders: layout_builder.Snapshot = .{},
+    layout_proposals: layout_builder.Snapshot = .{},
+    layout_measurement: ?struct {
+        context: *anyopaque,
+        measure: *const fn (*anyopaque, []instance.Descriptor, *layout_builder.Snapshot) anyerror!bool,
+    } = null,
     animations: ?*const animation.Registry = null,
     pending_animations: [256]animation.Descriptor = undefined,
     pending_animation_count: usize = 0,
@@ -220,6 +227,72 @@ pub const UiBuild = struct {
         };
         if (callback_type != c.type_function)
             return error.LuaBuildFunctionMissing;
+        self.layout_proposals = .{};
+        self.active_owner = .{ .owners = owners, .handle = work.owner };
+        defer self.active_owner = null;
+        if (self.images) |images| try images.beginOwner(owners, work.owner);
+        errdefer if (self.images) |images| images.rollbackOwner(owners, work.owner);
+        const signal_owner: SignalOwnerRef = .{ .owners = owners, .handle = work.owner };
+        if (self.signals) |signals| try signals.beginEvaluation(signal_owner, work.revision);
+        errdefer {
+            self.discardHandlers();
+            self.discardPendingTextInputs();
+            self.discardSources();
+            self.pending_button_count = 0;
+            self.pending_listbox_count = 0;
+            self.pending_option_count = 0;
+            if (self.signals) |signals| signals.abortEvaluation(signal_owner, work.revision) catch unreachable;
+        }
+        for (arguments) |argument| switch (argument) {
+            .number => |value| c.lua_pushnumber(self.state, value),
+            .integer => |value| c.lua_pushinteger(self.state, value),
+            .boolean => |value| c.lua_pushboolean(self.state, @intFromBool(value)),
+        };
+        var status = c.lua_pcallk(self.state, @intCast(arguments.len + 1), 1, 0, 0, null);
+        if (status == c.ok) {
+            c.lua_pushvalue(self.state, -1);
+            self.root_reference = c.luaL_ref(self.state, c.registry_index);
+        }
+        var pass: usize = 0;
+        while (status == c.ok) : (pass += 1) {
+            if (pass > self.layout_builders.entries.len) return error.LayoutBuilderDidNotSettle;
+            if (pass != 0) {
+                self.discardHandlers();
+                self.discardPendingTextInputs();
+                self.discardSources();
+                try self.components.call("relower");
+                if (self.images) |images| {
+                    images.rollbackOwner(owners, work.owner);
+                    try images.beginOwner(owners, work.owner);
+                }
+            }
+            try self.beginLowering();
+            c.lua_pushlightuserdata(self.state, self);
+            c.lua_pushcclosure(self.state, lowerDescription, 1);
+            _ = c.lua_rawgeti(self.state, c.registry_index, self.root_reference);
+            status = c.lua_pcallk(self.state, 1, 0, 0, 0, null);
+            if (status != c.ok or self.layout_builders.count == 0) break;
+            const measurement = self.layout_measurement orelse return error.LayoutBuilderMeasurementRequired;
+            if (try measurement.measure(measurement.context, self.storage[0..self.count], &self.layout_builders)) break;
+            self.layout_proposals = self.layout_builders;
+        }
+        if (status == c.ok) {
+            self.components.push("finish");
+            status = c.lua_pcallk(self.state, 0, 1, 0, 0, null);
+            if (status == c.ok) {
+                c.luaL_unref(self.state, c.registry_index, self.root_reference);
+                self.root_reference = c.luaL_ref(self.state, c.registry_index);
+            }
+        }
+        if (status != c.ok) {
+            if (status == c.yield) return error.LuaBuildYielded;
+            return error.LuaBuildFailed;
+        }
+        if (self.signals) |signals| try signals.finishEvaluation(signal_owner, work.revision);
+        return self.storage[0..self.count];
+    }
+
+    fn beginLowering(self: *UiBuild) !void {
         self.count = 0;
         self.semantic_count = 0;
         self.parent_count = 0;
@@ -230,15 +303,12 @@ pub const UiBuild = struct {
         self.interactive = true;
         self.composition_depth = 0;
         self.virtual_lists = .{};
+        self.layout_builders = .{};
         self.pending_animation_count = 0;
         self.pending_button_count = 0;
         self.pending_text_input_count = 0;
         self.pending_listbox_count = 0;
         self.pending_option_count = 0;
-        self.active_owner = .{ .owners = owners, .handle = work.owner };
-        defer self.active_owner = null;
-        if (self.images) |images| try images.beginOwner(owners, work.owner);
-        errdefer if (self.images) |images| images.rollbackOwner(owners, work.owner);
         if (self.widget_theme) |theme| {
             try self.append(.{
                 .id = 1,
@@ -250,49 +320,8 @@ pub const UiBuild = struct {
             });
             self.parent_stack[0] = .{ .id = 2, .kind = .stack };
             self.parent_count = 1;
-            try self.append(.{
-                .id = 2,
-                .parent = 1,
-                .object = .{ .stack = .{ .clip = true } },
-            });
+            try self.append(.{ .id = 2, .parent = 1, .object = .{ .stack = .{ .clip = true } } });
         }
-        const signal_owner: SignalOwnerRef = .{ .owners = owners, .handle = work.owner };
-        if (self.signals) |signals| try signals.beginEvaluation(signal_owner, work.revision);
-        for (arguments) |argument| switch (argument) {
-            .number => |value| c.lua_pushnumber(self.state, value),
-            .integer => |value| c.lua_pushinteger(self.state, value),
-            .boolean => |value| c.lua_pushboolean(self.state, @intFromBool(value)),
-        };
-        var status = c.lua_pcallk(self.state, @intCast(arguments.len + 1), 1, 0, 0, null);
-        if (status == c.ok) {
-            c.lua_pushvalue(self.state, -1);
-            self.root_reference = c.luaL_ref(self.state, c.registry_index);
-            c.lua_pushlightuserdata(self.state, self);
-            c.lua_pushcclosure(self.state, lowerDescription, 1);
-            c.lua_pushvalue(self.state, -2);
-            status = c.lua_pcallk(self.state, 1, 0, 0, 0, null);
-        }
-        if (status == c.ok) {
-            self.components.push("finish");
-            status = c.lua_pcallk(self.state, 0, 1, 0, 0, null);
-            if (status == c.ok) {
-                c.luaL_unref(self.state, c.registry_index, self.root_reference);
-                self.root_reference = c.luaL_ref(self.state, c.registry_index);
-            }
-        }
-        if (status != c.ok) {
-            self.discardHandlers();
-            self.pending_button_count = 0;
-            self.discardPendingTextInputs();
-            self.pending_listbox_count = 0;
-            self.pending_option_count = 0;
-            self.discardSources();
-            if (self.signals) |signals| try signals.abortEvaluation(signal_owner, work.revision);
-            if (status == c.yield) return error.LuaBuildYielded;
-            return error.LuaBuildFailed;
-        }
-        if (self.signals) |signals| try signals.finishEvaluation(signal_owner, work.revision);
-        return self.storage[0..self.count];
     }
 
     /// Reserve callback storage and validate capacity before the native tree
@@ -458,6 +487,7 @@ pub const UiBuild = struct {
         @memcpy(prepared.descriptor_storage[0..descriptors.len], descriptors);
         prepared.descriptor_count = descriptors.len;
         prepared.virtual_lists = self.virtual_lists;
+        prepared.layout_builders = self.layout_builders;
         @memcpy(prepared.animations[0..self.pending_animation_count], self.animationDescriptors());
         prepared.animation_count = self.pending_animation_count;
         var text_offset: usize = 0;
@@ -666,6 +696,7 @@ pub const UiBuild = struct {
             .stateless => return self.lowerComposition(state),
             .animation, .transition, .presence => return self.lowerAnimation(state, description.kind),
             .virtual_list => return self.lowerVirtualList(state),
+            .layout_builder => return self.lowerLayoutBuilder(state),
         };
         c.lua_pushlightuserdata(state, self);
         _ = c.lua_getiuservalue(state, 1, 2);
@@ -868,6 +899,50 @@ pub const UiBuild = struct {
         const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
         self.component_namespace = previous;
         self.component_scope_clean = previous_clean;
+        self.popParent();
+        if (status != c.ok) return c.lua_error(state);
+        return 0;
+    }
+
+    fn lowerLayoutBuilder(self: *UiBuild, state: *c.State) c_int {
+        const parent = self.currentParent() orelse return luaError(state, "layout_builder requires a parent");
+        _ = c.lua_getiuservalue(state, 1, 1);
+        const key = tableString(state, 2, "key") orelse return luaError(state, "layout_builder key is required");
+        if (key.len == 0) return luaError(state, "layout_builder key is required");
+        if (c.lua_getfield(state, 2, "render") != c.type_function) return luaError(state, "layout_builder render must be a function");
+        c.lua_settop(state, -2);
+        const id = semanticId(key, 0x6c61796f7574 ^ parent.id ^ self.component_namespace);
+        for (self.layout_builders.entries[0..self.layout_builders.count]) |entry|
+            if (entry.id == id) return luaError(state, "duplicate layout_builder key");
+        if (self.layout_builders.count == self.layout_builders.entries.len) return luaError(state, "layout_builder capacity exceeded");
+        const constraints = self.layout_proposals.find(id);
+        self.layout_builders.entries[self.layout_builders.count] = .{ .id = id, .constraints = constraints };
+        self.layout_builders.count += 1;
+        const parent_data = declarativeParentData(self, state, 2) catch |err| return luaError(state, parentDataErrorMessage(err));
+        self.append(.{ .id = id, .parent = parent.id, .parent_data = parent_data, .object = .{ .box = .{} } }) catch
+            return luaError(state, "cannot append layout_builder");
+        self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .group, .key = key }) catch
+            return luaError(state, "cannot append layout_builder semantics");
+        const bounds = constraints orelse return 0;
+        self.components.push("layout");
+        c.lua_pushvalue(state, 2);
+        c.lua_pushinteger(state, @bitCast(id));
+        c.lua_createtable(state, 0, 4);
+        inline for (.{ "min_width", "max_width", "min_height", "max_height" }) |field| {
+            c.lua_pushnumber(state, @field(bounds, field));
+            c.lua_setfield(state, -2, field);
+        }
+        c.lua_pushboolean(state, @intFromBool(self.component_scope_clean));
+        if (c.lua_pcallk(state, 4, 2, 0, 0, null) != c.ok) return c.lua_error(state);
+        const previous_clean = self.component_scope_clean;
+        self.component_scope_clean = previous_clean and c.lua_toboolean(state, -1) != 0;
+        defer self.component_scope_clean = previous_clean;
+        c.lua_settop(state, -2);
+        self.pushParent(.{ .id = id, .kind = .box }) catch return luaError(state, "layout_builder nesting too deep");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, lowerDescription, 1);
+        c.lua_pushvalue(state, -2);
+        const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
         self.popParent();
         if (status != c.ok) return c.lua_error(state);
         return 0;
@@ -1705,6 +1780,11 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box min_width");
         const min_height = tableOptionalExtent(state, 1, "min_height", 0) orelse
             return luaError(state, "invalid box min_height");
+        inline for (.{ "max_width", "max_height" }) |field| {
+            const kind = c.lua_getfield(state, 1, field);
+            c.lua_settop(state, -2);
+            if (kind != c.type_nil and kind != c.type_number) return luaError(state, "box maxima must be numbers");
+        }
         const max_width = tableOptionalNullableExtent(state, 1, "max_width") orelse
             return luaError(state, "invalid box max_width");
         const max_height = tableOptionalNullableExtent(state, 1, "max_height") orelse

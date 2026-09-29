@@ -49,6 +49,7 @@ pub const PreparedBuild = struct {
     state: *c.State,
     description_reference: c_int = c.no_reference,
     virtual_lists: @import("../ui/widget/virtual_list.zig").Snapshot = .{},
+    layout_builders: @import("../ui/widget/layout_builder.zig").Snapshot = .{},
     animations: [256]@import("../ui/animation.zig").Descriptor = undefined,
     animation_count: usize = 0,
     shapes: ?*text.ParagraphSourceCache,
@@ -132,6 +133,7 @@ pub const PreparedBuild = struct {
         c.luaL_unref(self.state, c.registry_index, self.description_reference);
         self.description_reference = c.no_reference;
         self.virtual_lists = .{};
+        self.layout_builders = .{};
         self.animation_count = 0;
         for (self.handlers[0..self.handler_count]) |handler|
             c.luaL_unref(self.state, c.registry_index, handler.reference);
