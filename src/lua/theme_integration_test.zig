@@ -1821,3 +1821,52 @@ test "motion policy honors inherited themes explicit false and wrapper overrides
     try f.exec("assert(observed.auto==0 and observed.full==0 and observed.reduce==1 and observed['child-auto']==0)");
     try std.testing.expectEqual(original, try f.handle("root/auto/box"));
 }
+
+test "constraint layout Lua loose flex and caps update retained geometry and reject invalid declarations" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\cap=ouro.signal(45); fit=ouro.signal('loose')
+        \\function build()
+        \\  return ouro.column {key='root',ouro.box {key='frame',width=230,height=60,
+        \\    ouro.row {key='row',gap=5,main_alignment='end',
+        \\      ouro.box {key='fixed',width=20,height=10},
+        \\      ouro.box {key='loose',width='fill',max_width=cap(),height=10,flex={factor=1,fit=fit()}},
+        \\      ouro.box {key='tight',height=10,max_width=1,flex=3},
+        \\    }}}
+        \\end
+    );
+    try f.build();
+    const handle = try f.handle("root/frame/row/loose");
+    const loose = try f.runtime.instances.renderObject(handle);
+    const tight = try f.runtime.instances.renderObject(try f.handle("root/frame/row/tight"));
+    try std.testing.expectEqual(@as(f32, 45), (try f.runtime.tree.nodeSize(loose)).width);
+    try std.testing.expectEqual(@as(f32, 150), (try f.runtime.tree.nodeSize(tight)).width);
+    try std.testing.expectEqual(@as(f32, 30), (try f.runtime.tree.nodeOffset(loose)).x);
+    try f.exec("cap:set(20)");
+    try f.build();
+    try std.testing.expectEqual(handle, try f.handle("root/frame/row/loose"));
+    try std.testing.expectEqual(@as(f32, 20), (try f.runtime.tree.nodeSize(loose)).width);
+    try std.testing.expectEqual(@as(f32, 55), (try f.runtime.tree.nodeOffset(loose)).x);
+    try f.exec("fit:set('tight')");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 50), (try f.runtime.tree.nodeSize(loose)).width);
+    try std.testing.expectEqual(@as(f32, 25), (try f.runtime.tree.nodeOffset(loose)).x);
+
+    const invalid = [_][]const u8{
+        "ouro.box{max_width=-1}",                                    "ouro.box{max_height=1/0}",                        "ouro.box{min_width=10,max_width=9}",
+        "ouro.box{width=11,max_width=10}",                           "ouro.box{max_width='40'}",                        "ouro.box{max_height=false}",
+        "ouro.row{main_alignment='sideways'}",                       "ouro.row{main_alignment=1}",                      "ouro.row{ouro.box{flex={factor=1,fit='wide'}}}",
+        "ouro.row{ouro.box{flex={factor=0}}}",                       "ouro.row{ouro.box{flex={factor=1,typo=2}}}",      "ouro.row{ouro.box{flex={fit='loose'}}}",
+        "ouro.row{wrap=true,ouro.box{flex={factor=1,fit='loose'}}}", "ouro.box{ouro.box{flex={factor=1,fit='loose'}}}",
+    };
+    for (invalid) |declaration| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(source);
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(handle, try f.handle("root/frame/row/loose"));
+        try std.testing.expectEqual(@as(f32, 50), (try f.runtime.tree.nodeSize(loose)).width);
+    }
+}

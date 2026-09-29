@@ -1391,6 +1391,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
             const new_box = new.box;
             break :changed old_box.width != new_box.width or old_box.height != new_box.height or
                 old_box.min_width != new_box.min_width or old_box.min_height != new_box.min_height or
+                old_box.max_width != new_box.max_width or old_box.max_height != new_box.max_height or
                 old_box.fill_width != new_box.fill_width or old_box.fill_height != new_box.fill_height or
                 old_box.border_width != new_box.border_width or
                 !std.meta.eql(old_box.padding, new_box.padding) or

@@ -29,6 +29,8 @@ pub const Box = struct {
     fill_height: bool = false,
     min_width: f32 = 0,
     min_height: f32 = 0,
+    max_width: ?f32 = null,
+    max_height: ?f32 = null,
     padding: Insets = .{},
     /// When present, the child receives loose inner constraints and is placed
     /// within the resolved padded content box. Null preserves tight propagation.
@@ -53,6 +55,7 @@ pub const Box = struct {
 
 pub const Axis = enum { horizontal, vertical };
 pub const MainAxisSize = enum { min, max };
+pub const MainAxisAlignment = enum { start, center, end, space_between, space_around, space_evenly };
 /// Stretch uses the parent's bounded cross axis, or measures the largest child
 /// first when unbounded. The latter takes an extra child-layout pass; prefer
 /// bounded constraints for deeply nested stretch containers.
@@ -61,6 +64,7 @@ pub const CrossAxisAlignment = enum { start, center, end, stretch };
 pub const Flex = struct {
     axis: Axis = .horizontal,
     main_axis_size: MainAxisSize = .max,
+    main_axis_alignment: MainAxisAlignment = .start,
     cross_axis_alignment: CrossAxisAlignment = .start,
     gap: f32 = 0,
     /// Greedy runs within the bounded main axis. Flex factors are not supported.

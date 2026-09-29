@@ -72,7 +72,8 @@ pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Cons
             },
         };
 
-        var cursor: f32 = 0;
+        const spacing = distribute(value.main_axis_alignment, @max(0, mainExtent(value.axis, size) - occupied_main), child_count);
+        var cursor: f32 = spacing.leading;
         child = context.firstChild(node);
         while (child) |handle| : (child = context.nextSibling(handle)) {
             const child_size = try context.size(handle);
@@ -82,7 +83,7 @@ pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Cons
                 .end => crossExtent(value.axis, size) - crossExtent(value.axis, child_size),
             };
             try context.setChildOffset(handle, pointFromExtents(value.axis, cursor, cross_offset));
-            cursor += mainExtent(value.axis, child_size) + value.gap;
+            cursor += mainExtent(value.axis, child_size) + value.gap + spacing.between;
         }
         return size;
     }
@@ -102,12 +103,26 @@ fn layoutWrap(value: types.Flex, context: anytype, node: anytype, constraints: C
     // A child is measured against the whole run, never the leftover space.
     // This gives exact-fit boundaries and keeps greedy packing predictable.
     const child_constraints = constraints.loosen();
+    var measured_main: f32 = 0;
+    var line_main: f32 = 0;
+    var line_count: usize = 0;
     var child = context.firstChild(node);
     while (child) |handle| : (child = context.nextSibling(handle)) {
         if ((try flexData(try context.parentData(handle))).factor != 0)
             return error.FlexInWrap;
-        _ = try context.layoutChild(handle, child_constraints);
+        const extent = mainExtent(value.axis, try context.layoutChild(handle, child_constraints));
+        const next = line_main + value.gap + extent;
+        if (line_count != 0 and next > mainMaximum(value.axis, constraints)) {
+            measured_main = @max(measured_main, line_main);
+            line_count = 0;
+        }
+        line_main = if (line_count == 0) extent else next;
+        line_count += 1;
     }
+    measured_main = @max(measured_main, line_main);
+    if (value.main_axis_size == .max and mainBounded(value.axis, constraints))
+        measured_main = mainMaximum(value.axis, constraints);
+    const resolved_main = mainExtent(value.axis, constraints.constrain(fromExtents(value.axis, measured_main, 0)));
 
     var run_start = context.firstChild(node);
     var cross_cursor: f32 = 0;
@@ -116,16 +131,19 @@ fn layoutWrap(value: types.Flex, context: anytype, node: anytype, constraints: C
         var run_end = context.nextSibling(first);
         var run_main = mainExtent(value.axis, try context.size(first));
         var run_cross = crossExtent(value.axis, try context.size(first));
+        var run_count: usize = 1;
         while (run_end) |handle| {
             const size = try context.size(handle);
             const next_main = run_main + value.gap + mainExtent(value.axis, size);
             if (next_main > mainMaximum(value.axis, constraints)) break;
             run_main = next_main;
             run_cross = @max(run_cross, crossExtent(value.axis, size));
+            run_count += 1;
             run_end = context.nextSibling(handle);
         }
 
-        var cursor: f32 = 0;
+        const spacing = distribute(value.main_axis_alignment, @max(0, resolved_main - run_main), run_count);
+        var cursor: f32 = spacing.leading;
         child = run_start;
         while (child) |handle| : (child = context.nextSibling(handle)) {
             if (std.meta.eql(child, run_end)) break;
@@ -154,7 +172,7 @@ fn layoutWrap(value: types.Flex, context: anytype, node: anytype, constraints: C
                 .end => run_cross - crossExtent(value.axis, size),
             };
             try context.setChildOffset(handle, pointFromExtents(value.axis, cursor, cross_cursor + offset));
-            cursor += mainExtent(value.axis, size) + value.gap;
+            cursor += mainExtent(value.axis, size) + value.gap + spacing.between;
         }
         main_extent = @max(main_extent, run_main);
         cross_cursor += run_cross;
@@ -164,6 +182,19 @@ fn layoutWrap(value: types.Flex, context: anytype, node: anytype, constraints: C
     if (value.main_axis_size == .max and mainBounded(value.axis, constraints))
         main_extent = mainMaximum(value.axis, constraints);
     return constraints.constrain(fromExtents(value.axis, main_extent, cross_cursor));
+}
+
+fn distribute(alignment: types.MainAxisAlignment, free: f32, count: usize) struct { leading: f32 = 0, between: f32 = 0 } {
+    if (count == 0) return .{};
+    const n: f32 = @floatFromInt(count);
+    return switch (alignment) {
+        .start => .{},
+        .center => .{ .leading = free / 2 },
+        .end => .{ .leading = free },
+        .space_between => .{ .between = if (count > 1) free / (n - 1) else 0 },
+        .space_around => .{ .leading = free / n / 2, .between = free / n },
+        .space_evenly => .{ .leading = free / (n + 1), .between = free / (n + 1) },
+    };
 }
 
 fn nonFlexConstraints(value: types.Flex, constraints: Constraints) Constraints {

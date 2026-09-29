@@ -113,6 +113,46 @@ local function overflow()
   }
 end
 
+local function constraints()
+  return ouro.column {key='content',gap=18,
+    ouro.text {key='title',text='Constraints down · sizes up',size=22},
+    ouro.text {key='hint',text='The same layout at two widths. No window-size arithmetic.'},
+    ouro.box {key='toolbar',width='fill',height=56,padding=8,background='#EEF2F6',
+      ouro.row {key='row',gap=10,main_alignment='space_between',cross_alignment='center',
+        ouro.button {key='back',label='Back'},
+        ouro.box {key='search',flex={factor=1,fit='loose'},width='fill',max_width=260,padding=10,background='#DCEBFA',radius=6,
+          ouro.text {key='label',text='Search documents',max_lines=1,overflow='ellipsis'}},
+        ouro.button {key='save',label='Save'},
+      }},
+    ouro.box {key='center',width='fill',alignment='center',
+      ouro.box {key='form',width='fill',max_width=420,padding=20,background='#DDEFD8',radius=8,
+        ouro.column {key='body',gap=12,
+          ouro.text {key='heading',text='A capped-width form',size=18},
+          ouro.text {key='explanation',text='This form fills its available width up to 420 pixels. Narrower parent constraints win, and the paragraph reflows normally.'},
+          ouro.row {key='actions',main_axis_size='max',main_alignment='end',gap=8,
+            ouro.button {key='cancel',label='Cancel',variant='soft'},ouro.button {key='confirm',label='Confirm'}},
+        }}},
+    ouro.text {key='scroll-label',text='A bounded viewport, with capped content on its unbounded axis'},
+    ouro.box {key='viewport',width='fill',height=100,background='#EEF2F6',
+      ouro.scroll {key='scroll',
+        ouro.box {key='inner',width='fill',alignment='center',padding=10,
+          ouro.box {key='capped',width='fill',max_width=360,height='fill',min_height=100,max_height=140,padding=12,background='#F5E5CC',
+            ouro.text {key='text',text='A local height cap makes fill finite even inside a vertical scroll viewport. Scroll to see the rest of this card.'}}}}},
+  }
+end
+
+local function distribution()
+  local rows={ouro.text {key='title',text='Main-axis alignment · gap remains the minimum',size=20}}
+  for _,alignment in ipairs({'start','center','end','space_between','space_around','space_evenly'}) do
+    rows[#rows+1]=ouro.column {key=alignment,gap=5,
+      ouro.text {key='label',text=alignment,size=13},
+      ouro.box {key='track',width='fill',background='#EEF2F6',
+        ouro.row {key='row',gap=8,main_axis_size='max',main_alignment=alignment,
+          tile('a','A',46,40),tile('b','B',74,40),tile('c','C',58,40)}}}
+  end
+  return ouro.column {key='content',gap=12,children=rows}
+end
+
 return ouro.storybook {
   title = "Layout mechanics",
   stories = {
@@ -123,5 +163,8 @@ return ouro.storybook {
     ouro.story { id = "grid/narrow", group = "Grid", name = "Spans · narrow", viewport = {width = 420, height = 470}, snapshot_scale = 2, color_scheme = "light", content = grid },
     ouro.story { id = "grid/components", group = "Grid", name = "Component placement", viewport = {width = 660, height = 240}, snapshot_scale = 2, color_scheme = "light", content = components },
     ouro.story { id = "grid/overflow", group = "Grid", name = "Overflow and clipping", viewport = {width = 560, height = 330}, snapshot_scale = 2, color_scheme = "light", content = overflow },
+    ouro.story { id = "constraints/wide", group = "Constraints", name = "Capped form · wide", viewport = {width = 760, height = 590}, snapshot_scale = 2, color_scheme = "light", content = constraints },
+    ouro.story { id = "constraints/narrow", group = "Constraints", name = "Capped form · narrow", viewport = {width = 380, height = 670}, snapshot_scale = 2, color_scheme = "light", content = constraints },
+    ouro.story { id = "constraints/alignment", group = "Constraints", name = "Main-axis distribution", viewport = {width = 580, height = 510}, snapshot_scale = 2, color_scheme = "light", content = distribution },
   },
 }

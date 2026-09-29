@@ -1705,6 +1705,18 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box min_width");
         const min_height = tableOptionalExtent(state, 1, "min_height", 0) orelse
             return luaError(state, "invalid box min_height");
+        const max_width = tableOptionalNullableExtent(state, 1, "max_width") orelse
+            return luaError(state, "invalid box max_width");
+        const max_height = tableOptionalNullableExtent(state, 1, "max_height") orelse
+            return luaError(state, "invalid box max_height");
+        if (max_width.value) |maximum| {
+            if (maximum < min_width or (width.extent() != null and width.extent().? > maximum))
+                return luaError(state, "box max_width conflicts with minimum or width");
+        }
+        if (max_height.value) |maximum| {
+            if (maximum < min_height or (height.extent() != null and height.extent().? > maximum))
+                return luaError(state, "box max_height conflicts with minimum or height");
+        }
         const opacity = tableOptionalFraction(state, 1, "opacity", 1) orelse
             return luaError(state, "box opacity must be a finite number from zero to one");
         const transform = tableOptionalTransform(state, 1) catch
@@ -1834,6 +1846,8 @@ pub const UiBuild = struct {
                 .fill_height = height.isFill(),
                 .min_width = min_width,
                 .min_height = min_height,
+                .max_width = max_width.value,
+                .max_height = max_height.value,
                 .padding = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y },
                 .alignment = alignment.value,
                 .background = if (paint) |p| owner.?.initialColor(p) else visual.background orelse surface.value,
@@ -2191,6 +2205,8 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
     ) orelse return luaError(state, "invalid container cross_alignment");
     const main_axis_size = tableOptionalEnum(render_types.MainAxisSize, state, 1, "main_axis_size", .min) orelse
         return luaError(state, "main_axis_size must be min or max");
+    const main_alignment = tableOptionalEnum(render_types.MainAxisAlignment, state, 1, "main_alignment", .start) orelse
+        return luaError(state, "invalid container main_alignment");
     const selection_type = c.lua_getfield(state, 1, "selection");
     c.lua_settop(state, -2);
     const selection = if (selection_type == c.type_nil) null else tableOptionalEnum(enum { listbox, radio_group, tab_list }, state, 1, "selection", .listbox) orelse
@@ -2213,6 +2229,7 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         .object = .{ .flex = .{
             .axis = axis,
             .main_axis_size = main_axis_size,
+            .main_axis_alignment = main_alignment,
             .cross_axis_alignment = cross_alignment,
             .gap = gap,
             .wrap = wrap,
@@ -2669,10 +2686,10 @@ fn declarativeParentData(
     table: c_int,
 ) !render_types.ParentData {
     const parent = self.currentParent() orelse return error.WidgetParentMissing;
-    const flex = try tableOptionalFlexFactor(state, table);
+    const flex = try tableOptionalFlex(state, table);
     if (parent.wrap and flex != null) return error.FlexInWrap;
     return switch (parent.kind) {
-        .flex, .listbox, .radio_group, .tab_bar => if (flex) |factor| .{ .flex = .{ .factor = factor } } else .none,
+        .flex, .listbox, .radio_group, .tab_bar => if (flex) |value| .{ .flex = value } else .none,
         .grid => grid: {
             if (flex != null) return error.FlexRequiresRowOrColumnParent;
             const column = tableOptionalPositiveInteger(state, table, "column", if (parent.grid_cell) |cell| @as(u32, cell.column) + 1 else 0) orelse return error.InvalidGridPlacement;
@@ -2699,15 +2716,28 @@ fn declarativeParentData(
     };
 }
 
-fn tableOptionalFlexFactor(state: *c.State, table: c_int) !?u16 {
+fn tableOptionalFlex(state: *c.State, table: c_int) !?@FieldType(render_types.ParentData, "flex") {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
     const value_type = c.lua_getfield(state, table, "flex");
-    defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return null;
+    var fit: render_types.FlexFit = .tight;
+    if (value_type == c.type_table) {
+        const index = c.lua_gettop(state);
+        c.lua_pushnil(state);
+        while (c.lua_next(state, index) != 0) {
+            const key = string(state, -2) orelse return error.InvalidFlexFactor;
+            if (!std.mem.eql(u8, key, "factor") and !std.mem.eql(u8, key, "fit")) return error.InvalidFlexFactor;
+            c.lua_settop(state, -2);
+        }
+        fit = tableOptionalEnum(render_types.FlexFit, state, index, "fit", .tight) orelse return error.InvalidFlexFactor;
+        if (c.lua_getfield(state, index, "factor") != c.type_number) return error.InvalidFlexFactor;
+    }
     var is_number: c_int = 0;
     const value = c.lua_tointegerx(state, -1, &is_number);
     if (is_number == 0 or value <= 0 or value > std.math.maxInt(u16))
         return error.InvalidFlexFactor;
-    return @intCast(value);
+    return .{ .factor = @intCast(value), .fit = fit };
 }
 
 fn tableRequiredInteger(state: *c.State, table: c_int, field: [*:0]const u8) ?i64 {
@@ -2721,7 +2751,7 @@ fn tableRequiredInteger(state: *c.State, table: c_int, field: [*:0]const u8) ?i6
 
 fn parentDataErrorMessage(err: anyerror) [*:0]const u8 {
     return switch (err) {
-        error.InvalidFlexFactor => "flex must be a positive integer",
+        error.InvalidFlexFactor => "flex requires a positive integer or {factor=integer, fit='tight'|'loose'}",
         error.FlexInWrap => "flex is not supported in wrapping rows or columns",
         error.InvalidGridPlacement => "grid children require row and column with spans inside declared tracks",
         error.FlexRequiresRowOrColumnParent => "flex requires a direct row or column parent",

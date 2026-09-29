@@ -6,6 +6,119 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const PointF = @import("../../core/geometry.zig").PointF;
 const Color = @import("../../core/color.zig").Color;
 
+test "box maxima cap fill but always yield to parent constraints and invalidate cached layout" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    var box: types.Box = .{ .fill_width = true, .fill_height = true, .min_width = 31, .min_height = 17, .max_width = 97, .max_height = 43, .padding = .{ .left = 3, .right = 5, .top = 2, .bottom = 7 } };
+    const root = try tree.create(.{ .box = box });
+    const child = try tree.create(.{ .box = .{ .fill_width = true, .fill_height = true } });
+    try tree.appendChild(root, child, .none);
+    for ([_]Constraints{ .{}, .{ .max_width = 200, .max_height = 80 } }) |bounds| {
+        try std.testing.expectEqual(SizeF{ .width = 97, .height = 43 }, try tree.layout(root, bounds));
+        try std.testing.expectEqual(SizeF{ .width = 89, .height = 34 }, try tree.nodeSize(child));
+    }
+    try std.testing.expectEqual(SizeF{ .width = 120, .height = 10 }, try tree.layout(root, .{ .min_width = 120, .max_width = 150, .max_height = 10 }));
+    const tight = Constraints.tight(.{ .width = 150, .height = 60 });
+    try std.testing.expectEqual(SizeF{ .width = 150, .height = 60 }, try tree.layout(root, tight));
+    _ = try tree.layout(root, .{});
+    const count = try tree.layoutCount(root);
+    _ = try tree.layout(root, .{});
+    try std.testing.expectEqual(count, try tree.layoutCount(root));
+    box.max_width = 71;
+    box.max_height = 29;
+    try tree.update(root, .{ .box = box });
+    try std.testing.expect(try tree.layoutDirty(root));
+    try std.testing.expectEqual(SizeF{ .width = 71, .height = 29 }, try tree.layout(root, .{}));
+    try std.testing.expectEqual(count + 1, try tree.layoutCount(root));
+    for ([_]types.Box{
+        .{ .min_width = 2, .max_width = 1 }, .{ .height = 3, .max_height = 2 },
+        .{ .max_width = -1 },                .{ .max_height = std.math.inf(f32) },
+        .{ .max_width = std.math.nan(f32) },
+    }) |invalid| try std.testing.expectError(error.InvalidExtent, tree.update(root, .{ .box = invalid }));
+    try tree.update(root, .{ .box = .{ .fill_width = true, .max_width = 0 } });
+    try std.testing.expectEqual(@as(f32, 0), (try tree.layout(root, .{})).width);
+}
+
+test "flex alignment distributes actual loose remainder without growing its tight peer" {
+    for ([_]types.Axis{ .horizontal, .vertical }) |axis| {
+        const horizontal = axis == .horizontal;
+        var tree: Tree = undefined;
+        try tree.init(std.testing.allocator, 4);
+        defer tree.deinit();
+        var flex: types.Flex = .{ .axis = axis, .gap = 5 };
+        const root = try tree.create(.{ .flex = flex });
+        const fixed = try tree.create(.{ .box = .{ .width = 20, .height = 20 } });
+        const loose = try tree.create(.{ .box = .{ .width = 30, .height = 30 } });
+        const tight = try tree.create(.{ .box = .{} });
+        try tree.appendChild(root, fixed, .none);
+        try tree.appendChild(root, loose, .{ .flex = .{ .factor = 1, .fit = .loose } });
+        try tree.appendChild(root, tight, .{ .flex = .{ .factor = 3 } });
+        // 230 - 20 - 10 = 200; allocations 50/150, actual 30/150.
+        // The remaining 20 goes into alignment, not into the tight sibling.
+        const cases = [_]struct { alignment: types.MainAxisAlignment, offsets: [3]f32 }{
+            .{ .alignment = .start, .offsets = .{ 0, 25, 60 } },
+            .{ .alignment = .center, .offsets = .{ 10, 35, 70 } },
+            .{ .alignment = .end, .offsets = .{ 20, 45, 80 } },
+            .{ .alignment = .space_between, .offsets = .{ 0, 35, 80 } },
+            .{ .alignment = .space_around, .offsets = .{ 10.0 / 3.0, 35, 230.0 / 3.0 } },
+            .{ .alignment = .space_evenly, .offsets = .{ 5, 35, 75 } },
+        };
+        for (cases) |case| {
+            flex.main_axis_alignment = case.alignment;
+            try tree.update(root, .{ .flex = flex });
+            _ = try tree.layout(root, if (horizontal) .{ .max_width = 230 } else .{ .max_height = 230 });
+            try std.testing.expectEqual(@as(f32, 150), if (horizontal) (try tree.nodeSize(tight)).width else (try tree.nodeSize(tight)).height);
+            for ([_]@import("tree.zig").NodeHandle{ fixed, loose, tight }, case.offsets) |handle, expected| {
+                const offset = try tree.nodeOffset(handle);
+                try std.testing.expectApproxEqAbs(expected, if (horizontal) offset.x else offset.y, 0.0001);
+            }
+        }
+        flex.main_axis_size = .min;
+        try tree.update(root, .{ .flex = flex });
+        const size = try tree.layout(root, if (horizontal) .{ .max_width = 230 } else .{ .max_height = 230 });
+        try std.testing.expectEqual(@as(f32, 210), if (horizontal) size.width else size.height);
+        try std.testing.expectEqual(PointF{}, try tree.nodeOffset(fixed));
+        // Loose Flexible is still invalid on an unbounded main axis.
+        try std.testing.expectError(error.FlexInUnboundedAxis, tree.layout(root, .{}));
+    }
+}
+
+test "main alignment handles single empty overflowing and wrapped runs without changing line breaks" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    defer tree.deinit();
+    var flex: types.Flex = .{ .main_axis_alignment = .space_evenly, .gap = 5 };
+    const root = try tree.create(.{ .flex = flex });
+    try std.testing.expectEqual(SizeF{ .width = 100, .height = 0 }, try tree.layout(root, .{ .max_width = 100 }));
+    const a = try tree.create(.{ .box = .{ .width = 31, .height = 11 } });
+    try tree.appendChild(root, a, .none);
+    _ = try tree.layout(root, .{ .max_width = 100 });
+    try std.testing.expectEqual(@as(f32, 34.5), (try tree.nodeOffset(a)).x);
+    flex.main_axis_alignment = .space_between;
+    try tree.update(root, .{ .flex = flex });
+    _ = try tree.layout(root, .{ .max_width = 100 });
+    try std.testing.expectEqual(PointF{}, try tree.nodeOffset(a));
+    const b = try tree.create(.{ .box = .{ .width = 64, .height = 23 } });
+    const c = try tree.create(.{ .box = .{ .width = 27, .height = 9 } });
+    try tree.appendChild(root, b, .none);
+    try tree.appendChild(root, c, .none);
+    _ = try tree.layout(root, .{ .max_width = 100 });
+    try std.testing.expectEqual(@as(f32, 105), (try tree.nodeOffset(c)).x); // No negative spacing on overflow.
+    flex.wrap = true;
+    flex.main_axis_alignment = .end;
+    flex.main_axis_size = .min;
+    flex.run_gap = 7;
+    try tree.update(root, .{ .flex = flex });
+    _ = try tree.layout(root, .{ .max_width = 100 });
+    try std.testing.expectEqual(PointF{ .x = 73, .y = 30 }, try tree.nodeOffset(c));
+    _ = try tree.layout(root, .{ .max_width = 99 });
+    // Widest run is 96, not the maximum 99. First run aligns within 96.
+    try std.testing.expectEqual(PointF{ .x = 65, .y = 0 }, try tree.nodeOffset(a));
+    try std.testing.expectEqual(PointF{ .x = 0, .y = 18 }, try tree.nodeOffset(b));
+    try std.testing.expectEqual(PointF{ .x = 69, .y = 18 }, try tree.nodeOffset(c));
+}
+
 test "wrap exact boundary, overflow by one, unbounded main, and line-local alignment" {
     for ([_]types.Axis{ .horizontal, .vertical }) |axis| {
         var tree: Tree = undefined;

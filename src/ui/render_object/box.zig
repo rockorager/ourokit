@@ -16,6 +16,14 @@ pub fn validate(value: types.Box) !void {
         return error.InvalidExtent;
     if (value.width) |width| if (width < value.min_width) return error.InvalidExtent;
     if (value.height) |height| if (height < value.min_height) return error.InvalidExtent;
+    if (value.max_width) |maximum| {
+        if (!validExtent(maximum) or maximum < value.min_width) return error.InvalidExtent;
+        if (value.width) |width| if (width > maximum) return error.InvalidExtent;
+    }
+    if (value.max_height) |maximum| {
+        if (!validExtent(maximum) or maximum < value.min_height) return error.InvalidExtent;
+        if (value.height) |height| if (height > maximum) return error.InvalidExtent;
+    }
     if ((value.width != null and value.fill_width) or (value.height != null and value.fill_height))
         return error.ConflictingExtent;
     if ((value.border_width == 0) != (value.border_color == null))
@@ -31,6 +39,12 @@ pub fn validate(value: types.Box) !void {
 
 pub fn layout(value: types.Box, context: anytype, node: anytype, incoming: Constraints) !SizeF {
     var constraints = incoming;
+    // Additional constraints are enforced within the parent's interval. A
+    // tighter parent (including Expanded/stretch) always wins.
+    if (value.max_width) |maximum|
+        constraints.max_width = std.math.clamp(maximum, incoming.min_width, incoming.max_width);
+    if (value.max_height) |maximum|
+        constraints.max_height = std.math.clamp(maximum, incoming.min_height, incoming.max_height);
     constraints.min_width = @min(
         @max(constraints.min_width, value.min_width),
         constraints.max_width,

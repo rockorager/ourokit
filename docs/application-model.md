@@ -767,8 +767,35 @@ testing without Wayland or Lua.
 Declarative rows and columns expose that edge metadata as a contextual
 `flex = <positive integer>` child property. It is rejected anywhere except on
 a direct nonwrapping row or column child. `cross_alignment = "start" | "center" | "end" |
-"stretch"` controls the container's cross axis; flex children use tight fitting
-and divide the remaining bounded main-axis space according to their factors.
+"stretch"` controls the container's cross axis. `flex=N` uses tight fitting
+(Expanded): after measuring non-flex children, divide the remaining bounded
+main-axis space by the flex factors and require each child to occupy its share.
+
+Use `flex={factor=N, fit="loose"}` for Flexible: the child receives zero as its
+minimum and its share as its maximum, so it may choose a smaller size. `factor`
+is a positive integer up to 65535; `fit` defaults to `"tight"`. Unused allocation
+is **not redistributed** to siblings. Both fits still require a bounded main
+axis and are rejected on direct Wrap children. These are parent constraints,
+not CSS grow/shrink/basis rules. Stock controls that forward `flex` also accept
+the table form; custom components forward it to their returned root.
+
+`main_alignment` accepts `"start"` (default), `"center"`, `"end"`,
+`"space_between"`, `"space_around"`, or `"space_evenly"`. It distributes the
+space left after the children's **actual** sizes and mandatory gaps. `gap`
+remains a minimum; the space modes add to it. No negative spacing is introduced
+when content overflows. A single child centers for around/evenly and starts for
+between. Directions are physical (left-to-right rows, top-to-bottom columns).
+`main_axis_size="min"` shrink-wraps actual content, subject to parent minima;
+use `"max"` to fill a bounded axis when you want alignment space.
+
+```lua
+ouro.row {main_axis_size="max", main_alignment="space_between", gap=12,
+  ouro.button {label="Back"},
+  ouro.box {flex={factor=1, fit="loose"}, width="fill", max_width=320,
+    ouro.text_input {key="search", placeholder="Search"}},
+  ouro.button {label="Save"},
+}
+```
 
 #### Wrapping rows and columns
 
@@ -787,6 +814,10 @@ bounded main axis. Incoming minimum constraints still apply. Runs can overflow
 the bounded cross axis. Fill children use the whole bounded axis; they do not
 share the remaining line space. **Direct wrapped children cannot use `flex`**;
 put a nonwrapping row/column inside a sized child for weighted subdivisions.
+
+`main_alignment` aligns the items independently within each run, using the
+Wrap container's resolved main size; it does not alter greedy line breaking.
+It does not distribute the runs along the cross axis.
 
 ```lua
 ouro.row {
@@ -886,8 +917,28 @@ layout alongside padding. Boxes do not inherit control geometry or introduce a
 new widget-default section. An invalid `surface` remains an error even when
 `background` is supplied.
 `width` and `height` accept a non-negative number or `"fill"`; omitted values
-remain intrinsic. Optional `min_width` and `min_height` participate in the same
-one-way constraints and yield when a parent supplies a tighter maximum.
+remain intrinsic. Optional `min_width`, `min_height`, `max_width`, and
+`max_height` add constraints in logical border-box units (including padding and
+border). Minima default to zero; omitted maxima add no cap. Values must be
+finite and nonnegative, each minimum must not exceed its maximum, and an
+explicit numeric width/height must lie within its declared interval.
+
+Parent constraints always win: a tighter parent maximum overrides a child
+minimum, and a larger parent minimum overrides a child maximum. In particular,
+tight Expanded or cross-axis stretch can force a Box beyond its own maximum.
+Use loose Flexible or an aligned parent Box when the child should stay capped.
+Fill uses the resulting maximum; a local cap therefore makes fill finite even
+on an otherwise unbounded scroll axis. These bounds constrain the Box, not
+arbitrary overflowing child paint; clipping remains explicit.
+
+For a centered, capped-width form that still fits narrow parents:
+
+```lua
+ouro.box {width="fill", alignment="center",
+  ouro.box {width="fill", max_width=640, padding=24,
+    form_content},
+}
+```
 
 Set `clip = true` to clip children to the Box's rounded border-box shape:
 
