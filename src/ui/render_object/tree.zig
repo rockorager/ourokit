@@ -33,6 +33,7 @@ pub const LayoutError = error{
     FlexInWrap,
     AspectRatioInUnboundedAxes,
     ScrollInUnboundedAxis,
+    PositionedStackInUnboundedAxis,
     UnboundedSplitConstraints,
     SplitRequiresThreeChildren,
     AnchoredRequiresOneOrTwoChildren,
@@ -785,6 +786,7 @@ pub const Tree = struct {
         var child = target.first_child;
         while (child) |handle| : (child = self.nextSibling(handle)) {
             const slot_value = try self.slot(handle);
+            if (slot_value.parent_data == .positioned) continue;
             if (slot_value.baseline) |value| {
                 const distance = slot_value.offset.y + value;
                 result = if (result) |old| @min(old, distance) else distance;
@@ -1440,6 +1442,7 @@ fn validateParentData(parent: types.Object, data: types.ParentData) !void {
             .none => {},
             .stack => |value| if (!validPoint(.{ .x = value.x, .y = value.y }))
                 return error.InvalidParentData,
+            .positioned => |value| try value.validate(),
             else => return error.InvalidParentData,
         },
         .scroll => if (data != .none) return error.InvalidParentData,

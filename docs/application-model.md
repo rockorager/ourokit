@@ -336,9 +336,16 @@ updates their declared value.
 `content_theme` applies native theme inheritance to a box's descendants without
 adding a layout node. A box's explicit `foreground` then sets the descendant
 foreground and clears the text-widget foreground override, so nested themes
-and explicit text colors can override it. `padding_x`/`padding_y` override the corresponding sides
-of `padding`. Box alignment accepts `center`, `left`, or `right` (left/right are
-vertically centered). `text.weight` accepts `normal` or `medium`, using the
+and explicit text colors can override it. Box padding resolves per edge: explicit
+`padding_left/right/top/bottom` overrides `padding_x`/`padding_y`, which override
+`padding` (default zero). Edge values must be finite, non-negative numbers;
+an explicit zero overrides a broader inset. Box alignment accepts all nine
+positions: `top_left`, `top`, `top_right`, `left`, `center`, `right`,
+`bottom_left`, `bottom`, `bottom_right`. Left/right remain vertically centered;
+top/bottom are horizontally centered. Positions are physical, not text-direction
+dependent. Alignment loosens child constraints and places the child inside the
+padding and border; omitting it preserves the existing constraint propagation.
+`text.weight` accepts `normal` or `medium`, using the
 host's matching font candidates. Decorative boxes/text may set `semantic=false`;
 their descendants keep the nearest semantic parent. Activation owners must
 remain semantic. Text editing, IME, selection, sliders, and other specialized
@@ -1000,6 +1007,21 @@ color; zero hides it even if `border` is supplied. Border width participates in
 layout alongside padding. Boxes do not inherit control geometry or introduce a
 new widget-default section. An invalid `surface` remains an error even when
 `background` is supplied.
+
+Use asymmetric padding and alignment without an extra layout wrapper:
+
+```lua
+ouro.box {key="card", width=240, height=120, padding=12, padding_x=20,
+  padding_left=0, padding_bottom=24, alignment="bottom_right",
+  ouro.button {key="action", label="Save", on_press=save},
+}
+```
+
+Here the content insets are left 0, right 20, top 12, bottom 24, plus any
+border width. Parent constraints still win when insets exceed available space;
+padding does not imply clipping. Per-edge properties belong to Box, not control
+theme defaults. Custom control recipes can forward them to their root Box.
+
 `width` and `height` accept a non-negative number or `"fill"`; omitted values
 remain intrinsic. Optional `min_width`, `min_height`, `max_width`, and
 `max_height` add constraints in logical border-box units (including padding and
@@ -1186,10 +1208,9 @@ and foreground controls last so the background cannot intercept their hits.
 Hit testing uses transformed layout bounds and explicit rounded Box clips, not
 alpha-based click-through.
 
-Stack uses the existing native layout: children receive loose parent bounds,
-and its size is their maximum extent constrained by the parent. Fill children
-expand it to bounded space; unbounded axes remain intrinsic. Use a fill Box to
-center foreground content without a positioning API:
+Ordinary children receive loose parent bounds; their maximum extent determines
+Stack's size, constrained by its parent. Fill children expand it to bounded
+space; unbounded axes remain intrinsic. A fill Box can center foreground content:
 
 ```lua
 ouro.stack {
@@ -1205,12 +1226,45 @@ ouro.stack {
 }
 ```
 
-The native Stack supports `ParentData.stack {x,y}` offsets. The internal Lua
-`.stack` parent context also reads non-negative `x`/`y` child properties (both
-default zero). Public `ouro.stack`, however, currently lowers children through
-the `.overlay` context and leaves them at the origin; those offset properties
-are not applied there. Stack's own `flex` property works only when its parent
-is a nonwrapping row or column; stack children cannot use `flex`.
+To anchor or stretch a child, give it `positioned={left,top,right,bottom,width,height}`.
+Insets and extents are logical pixels. Positioned children do **not** contribute
+to Stack's size or baseline. They receive constraints after ordinary children
+have determined the Stack's size; no iterative solver or intrinsic prepass is
+involved.
+
+```lua
+ouro.box { key="preview", width="fill", aspect_ratio=16/9,
+  ouro.stack { key="layers",
+    ouro.box { key="background", width="fill", height="fill", background="#DCEBFA" },
+    ouro.button { key="badge", label="Open", positioned={right=12,top=12}, on_press=open },
+    ouro.box { key="caption", positioned={left=12,right=12,bottom=12,height=40},
+      padding=8, background="#FFFFFF",
+      ouro.text { key="text", text="Stretches between the side insets" } },
+  } }
+```
+
+Opposing edges give the child a tight extent, clamped to zero when the insets
+exceed the Stack's size. Otherwise `positioned.width`/`height` give tight extents;
+an unspecified extent is unbounded so the child can choose its natural size.
+Leading edges win positioning; a lone trailing edge subtracts the child's size.
+An axis with neither edge starts at zero. Each axis accepts at most two of its
+leading edge, trailing edge, and extent. Values must be finite, extents must be
+non-negative, and the table must specify at least one field. Negative insets
+allow overflow; Stack does not add clipping. Use an enclosing clipped Box when
+needed.
+
+A Stack containing only positioned children fills finite parent bounds on both
+axes. It rejects an unbounded axis: supply a sized/aspect-ratio Box or an ordinary
+child to establish the size. An empty Stack retains its minimum-constrained size.
+Placement passes through stateless/stateful controls and animations to their
+native root; explicit root placement overrides the inherited table. It does not
+leak into descendants. Layout builders receive the resolved positioned constraints.
+Other parents reject `positioned`.
+
+The native `ParentData.stack {x,y}` remains for internal offset-based layout,
+including virtual lists; these children still contribute to the Stack's size.
+Public Stack children do not interpret bare `x`/`y`. Stack's own `flex` works only
+inside a nonwrapping row or column; stack children cannot use `flex`.
 
 #### In-window anchored overlays
 

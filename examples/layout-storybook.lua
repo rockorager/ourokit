@@ -287,6 +287,65 @@ local function ratio_bounds()
   }
 end
 
+local Positioned=ouro.stateful(function()
+  local moved=ouro.signal(false)
+  local hits=ouro.signal(0)
+  return function()
+    return ouro.column {key='page',gap=16,
+      ouro.text {key='title',text='Pin edges, keep normal layout',size=22},
+      ouro.text {key='hint',text='The badge keeps its natural size. The caption stretches between asymmetric insets.'},
+      ouro.button {key='toggle',label=moved() and 'Restore top-right badge' or 'Move badge to top-left',
+        on_press=function() moved:set(not moved()) end},
+      ouro.box {key='preview',width='fill',aspect_ratio=2,clip=true,radius=10,
+        ouro.stack {key='layers',
+          ouro.box {key='background',width='fill',height='fill',background='#DCEBFA',alignment='center',
+            ouro.text {key='label',text='Ordinary background · 2:1',size=17}},
+          ouro.box {key='caption',positioned={left=12,right=28,bottom=12,height=36},
+            background='#FFFFFF',padding=8,
+            ouro.layout_builder {key='bounds',render=function(c)
+              return ouro.text {key='label',size=13,text=string.format('Caption · %.0f px wide',c.max_width+16)}
+            end}},
+          ouro.button {key='badge',label='Open · '..hits(),appearance='primary',
+            positioned=moved() and {left=12,top=12} or {right=12,top=12},
+            on_press=function() hits:set(hits()+1) end},
+        }},
+      ouro.text {key='note',text='Moving the badge does not resize the Stack or move this line.',size=13},
+    }
+  end
+end)
+
+local function positioned()
+  return Positioned {key='positioned'}
+end
+
+local Insets=ouro.stateful(function()
+  local changed=ouro.signal(false)
+  return function()
+    local cells={key='matrix',columns={{fr=1},{fr=1},{fr=1}},rows={116,116,116},column_gap=12,row_gap=12}
+    for i,alignment in ipairs({'top_left','top','top_right','left','center','right','bottom_left','bottom','bottom_right'}) do
+      cells[#cells+1]=ouro.box {key=alignment,column=(i-1)%3+1,row=math.floor((i-1)/3)+1,
+        width='fill',height='fill',background='#DCEBFA',border='#AAC2D8',border_width=2,
+        padding=12,padding_x=20,padding_left=changed() and 36 or 8,
+        padding_right=changed() and 4 or nil,padding_bottom=changed() and 8 or 24,
+        alignment=alignment,
+        ouro.box {key='label',width=96,height=28,background='#FFFFFF',alignment='center',
+          ouro.text {key='text',text=alignment,size=12}}}
+    end
+    return ouro.column {key='page',gap=16,
+      ouro.text {key='title',text='Nine positions, one constraint model',size=22},
+      ouro.text {key='hint',text=changed() and 'Insets: left 36 · right 4 · top 12 · bottom 8' or 'Insets: left 8 · right 20 · top 12 · bottom 24'},
+      ouro.button {key='toggle',label=changed() and 'Restore insets' or 'Change insets',
+        on_press=function() changed:set(not changed()) end},
+      ouro.grid(cells),
+      ouro.text {key='note',text='Each child keeps its size and identity. Padding is inside the 2 px border.',size=13},
+    }
+  end
+end)
+
+local function insets()
+  return Insets {key='insets'}
+end
+
 return ouro.storybook {
   title = "Layout mechanics",
   stories = {
@@ -313,5 +372,14 @@ return ouro.storybook {
     ouro.story { id = "aspect/changed", group = "Aspect ratio", name = "Ratio change playback", viewport = {width = 740, height = 520}, snapshot_scale = 2, color_scheme = "light", content = ratios,
       actions = {{type='click',target='ratios/page/toggle'}} },
     ouro.story { id = "aspect/bounds", group = "Aspect ratio", name = "Bounded and tight parents", viewport = {width = 580, height = 540}, snapshot_scale = 2, color_scheme = "light", content = ratio_bounds },
+    ouro.story { id = "positioned/wide", group = "Positioned", name = "Anchored and stretched", viewport = {width = 700, height = 570}, snapshot_scale = 2, color_scheme = "light", content = positioned },
+    ouro.story { id = "positioned/narrow", group = "Positioned", name = "Narrow parent", viewport = {width = 400, height = 450}, snapshot_scale = 2, color_scheme = "light", content = positioned },
+    ouro.story { id = "positioned/changed", group = "Positioned", name = "Move and activate", viewport = {width = 700, height = 570}, snapshot_scale = 2, color_scheme = "light", content = positioned,
+      actions = {{type='click',target='positioned/page/preview/layers/badge'},
+        {type='click',target='positioned/page/toggle'},
+        {type='click',target='positioned/page/preview/layers/badge'}} },
+    ouro.story { id = "insets/positions", group = "Box insets", name = "Nine alignment positions", viewport = {width = 720, height = 580}, snapshot_scale = 2, color_scheme = "light", content = insets },
+    ouro.story { id = "insets/changed", group = "Box insets", name = "Per-edge inset playback", viewport = {width = 720, height = 580}, snapshot_scale = 2, color_scheme = "light", content = insets,
+      actions = {{type='click',target='insets/page/toggle'}} },
   },
 }

@@ -6,6 +6,64 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const PointF = @import("../../core/geometry.zig").PointF;
 const Color = @import("../../core/color.zig").Color;
 
+test "positioned stack resolves edges after normal children without contributing size" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 3);
+    defer tree.deinit();
+    const root = try tree.create(.{ .stack = .{} });
+    const overlay = try tree.create(.{ .box = .{ .width = 27, .height = 19 } });
+    const base = try tree.create(.{ .box = .{ .width = 120, .height = 80 } });
+    // Positioned first deliberately: traversal order must not affect sizing.
+    try tree.appendChild(root, overlay, .{ .positioned = .{ .right = 7, .bottom = 11 } });
+    try tree.appendChild(root, base, .{ .stack = .{ .x = 3, .y = 5 } });
+    const Case = struct { p: types.Positioned, size: SizeF, offset: PointF };
+    for ([_]Case{
+        .{ .p = .{ .right = 7, .bottom = 11 }, .size = .{ .width = 27, .height = 19 }, .offset = .{ .x = 89, .y = 55 } },
+        .{ .p = .{ .left = 9, .right = 14, .top = 6, .bottom = 17 }, .size = .{ .width = 100, .height = 62 }, .offset = .{ .x = 9, .y = 6 } },
+        .{ .p = .{ .right = 8, .width = 31, .bottom = 4, .height = 23 }, .size = .{ .width = 31, .height = 23 }, .offset = .{ .x = 84, .y = 58 } },
+        .{ .p = .{ .left = -12, .top = -7, .width = 170 }, .size = .{ .width = 170, .height = 19 }, .offset = .{ .x = -12, .y = -7 } },
+        .{ .p = .{ .left = 100, .right = 50, .top = 70, .bottom = 20 }, .size = .{ .width = 0, .height = 0 }, .offset = .{ .x = 100, .y = 70 } },
+        .{ .p = .{ .width = 46 }, .size = .{ .width = 46, .height = 19 }, .offset = .{} },
+    }) |case| {
+        try tree.setParentData(overlay, .{ .positioned = case.p });
+        try std.testing.expectEqual(SizeF{ .width = 123, .height = 85 }, try tree.layout(root, .{}));
+        try std.testing.expectEqual(case.size, try tree.nodeSize(overlay));
+        try std.testing.expectEqual(case.offset, try tree.nodeOffset(overlay));
+    }
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(base));
+    try tree.setParentData(overlay, .{ .positioned = .{ .left = 4, .right = 9, .bottom = 3, .height = 12 } });
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 200, .height = 100 }));
+    try std.testing.expectEqual(SizeF{ .width = 187, .height = 12 }, try tree.nodeSize(overlay));
+    try std.testing.expectEqual(PointF{ .x = 4, .y = 85 }, try tree.nodeOffset(overlay));
+}
+
+test "positioned stack requires bounded all-positioned size and validates edges atomically" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    const root = try tree.create(.{ .stack = .{} });
+    const child = try tree.create(.{ .box = .{ .aspect_ratio = 2 } });
+    try std.testing.expectEqual(SizeF{ .width = 7, .height = 3 }, try tree.layout(root, .{ .min_width = 7, .max_width = 200, .min_height = 3, .max_height = 100 }));
+    const data: types.ParentData = .{ .positioned = .{ .right = 5, .top = 9, .width = 70 } };
+    try tree.appendChild(root, child, data);
+    for ([_]Constraints{ .{}, .{ .max_width = 200 }, .{ .max_height = 100 } }) |bounds|
+        try std.testing.expectError(error.PositionedStackInUnboundedAxis, tree.layout(root, bounds));
+    try std.testing.expectEqual(SizeF{ .width = 200, .height = 100 }, try tree.layout(root, .{ .max_width = 200, .max_height = 100 }));
+    try std.testing.expectEqual(SizeF{ .width = 70, .height = 35 }, try tree.nodeSize(child));
+    try std.testing.expectEqual(PointF{ .x = 125, .y = 9 }, try tree.nodeOffset(child));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(child));
+    for ([_]types.Positioned{
+        .{},                              .{ .left = 1, .right = 2, .width = 3 }, .{ .top = 1, .bottom = 2, .height = 3 },
+        .{ .width = -1 },                 .{ .height = -1 },                      .{ .left = std.math.nan(f32) },
+        .{ .bottom = std.math.inf(f32) },
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidParentData, tree.setParentData(child, .{ .positioned = invalid }));
+        try std.testing.expectEqualDeep(data, try tree.parentData(child));
+        try std.testing.expect(!(try tree.layoutDirty(root)));
+    }
+    try std.testing.expectError(error.InvalidParentData, tree.update(root, .{ .box = .{} }));
+}
+
 test "aspect ratio solves outer box bounds and yields to explicit sizes and incompatible constraints" {
     const Case = struct { box: types.Box, bounds: Constraints = .{}, expected: SizeF };
     const cases = [_]Case{

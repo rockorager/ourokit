@@ -211,6 +211,31 @@ pub const Object = union(enum) {
 
 pub const FlexFit = enum { loose, tight };
 
+/// Out-of-flow Stack placement in logical pixels. Each axis may specify at
+/// most two of its leading inset, trailing inset, and extent.
+pub const Positioned = struct {
+    left: ?f32 = null,
+    top: ?f32 = null,
+    right: ?f32 = null,
+    bottom: ?f32 = null,
+    width: ?f32 = null,
+    height: ?f32 = null,
+
+    pub fn validate(self: Positioned) !void {
+        var specified = false;
+        inline for (.{ "left", "top", "right", "bottom", "width", "height" }) |field| {
+            if (@field(self, field)) |value| {
+                specified = true;
+                if (!@import("std").math.isFinite(value)) return error.InvalidParentData;
+            }
+        }
+        if (!specified or (self.width orelse 0) < 0 or (self.height orelse 0) < 0 or
+            (self.left != null and self.right != null and self.width != null) or
+            (self.top != null and self.bottom != null and self.height != null))
+            return error.InvalidParentData;
+    }
+};
+
 /// Layout metadata owned by the parent-child edge. Padding, flex factors, and
 /// positioned offsets are not wrapper render objects.
 pub const ParentData = union(enum) {
@@ -230,6 +255,7 @@ pub const ParentData = union(enum) {
         x: f32 = 0,
         y: f32 = 0,
     },
+    positioned: Positioned,
     /// Inline interaction geometry belongs to the paragraph, not a second
     /// text layout. The child Box supplies underline and focus colors.
     text_range: TextRange,

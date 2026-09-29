@@ -2292,3 +2292,230 @@ test "aspect ratio rejects unbounded candidate layout before replacing the commi
     try std.testing.expectEqual(old, try f.handle("old"));
     try std.testing.expectEqual(core.SizeF{ .width = 90, .height = 60 }, try f.runtime.tree.nodeSize(try f.runtime.instances.renderObject(old)));
 }
+
+test "positioned stack composes components and layout builders with retained geometry and input" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\wide=ouro.signal(true); hits=0; builds=0
+        \\local Leaf=ouro.stateless(function(p)
+        \\  return ouro.box {key='target',width=30,height=20,activate=true,
+        \\    on_press=function() hits=hits+3 end}
+        \\end)
+        \\local Badge=ouro.stateful(function()
+        \\  builds=builds+1
+        \\  return function() return Leaf {key='leaf'} end
+        \\end)
+        \\local Override=ouro.stateless(function()
+        \\  return ouro.box {key='override',positioned={left=4,top=6},width=11,height=13}
+        \\end)
+        \\function build() return ouro.column {key='page',gap=9,
+        \\  ouro.stack {key='layers',
+        \\    ouro.layout_builder {key='bar',positioned={left=9,right=17,bottom=8,height=24},render=function(c)
+        \\      assert(c.min_width==(wide() and 174 or 114) and c.max_width==c.min_width)
+        \\      assert(c.min_height==24 and c.max_height==24)
+        \\      return ouro.box {key='paint',background='#445566'}
+        \\    end},
+        \\    ouro.box {key='base',width=wide() and 200 or 140,height=100},
+        \\    Badge {key='badge',positioned={right=7,top=5}},
+        \\    Override {key='ignored',positioned={right=50,bottom=50}},
+        \\    ouro.animation {key='anim',duration=0,positioned={left=12,top=32,width=19,height=14},
+        \\      render=function() return ouro.box {key='animated'} end},
+        \\    ouro.text {key='floating',text='Floating baseline',size=10,positioned={top=-30}},
+        \\  }, ouro.box {key='after',width=21,height=15}}
+        \\end
+    );
+    try f.build();
+    const target = try f.handle("page/layers/badge/target");
+    const target_render = try f.runtime.instances.renderObject(target);
+    const layers = try f.runtime.instances.renderObject(try f.handle("page/layers"));
+    for ([_]bool{ true, false, true }) |wide| {
+        try f.exec(if (wide) "wide:set(true)" else "wide:set(false)");
+        try f.build();
+        const width: f32 = if (wide) 200 else 140;
+        try std.testing.expectEqual(target, try f.handle("page/layers/badge/target"));
+        try std.testing.expectEqual(core.SizeF{ .width = width, .height = 100 }, try f.runtime.tree.nodeSize(layers));
+        try std.testing.expectEqual(@as(?f32, null), try f.runtime.tree.baseline(layers));
+        for ([_]struct { path: []const u8, offset: core.PointF, size: core.SizeF }{
+            .{ .path = "page/layers/badge/target", .offset = .{ .x = width - 37, .y = 5 }, .size = .{ .width = 30, .height = 20 } },
+            .{ .path = "page/layers/bar", .offset = .{ .x = 9, .y = 68 }, .size = .{ .width = width - 26, .height = 24 } },
+            .{ .path = "page/layers/override", .offset = .{ .x = 4, .y = 6 }, .size = .{ .width = 11, .height = 13 } },
+            .{ .path = "page/layers/anim/animated", .offset = .{ .x = 12, .y = 32 }, .size = .{ .width = 19, .height = 14 } },
+            .{ .path = "page/after", .offset = .{ .x = 0, .y = 109 }, .size = .{ .width = 21, .height = 15 } },
+        }) |case| {
+            const render = try f.runtime.instances.renderObject(try f.handle(case.path));
+            try std.testing.expectEqual(case.offset, try f.runtime.tree.nodeOffset(render));
+            try std.testing.expectEqual(case.size, try f.runtime.tree.nodeSize(render));
+        }
+        const point = (try f.runtime.semanticTarget("page/layers/badge/target")).center;
+        try std.testing.expectEqual(target_render, (try f.runtime.tree.hitTest(layers, .{ .x = width - 22, .y = 15 })).?);
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 0, .position = point } });
+        for ([_]@import("../platform/window.zig").PointerButtonState{ .pressed, .released }) |state| {
+            try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 0, .button = 0x110, .state = state } });
+            try f.runtime.dispatchInput(&f.callbacks);
+            while (f.scheduler.takeRunnable()) |handle| try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(handle));
+        }
+    }
+    try f.exec("assert(builds==1 and hits==9)");
+}
+
+test "positioned stack rejects invalid declarations and unbounded reloads without replacing the tree" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("function build() return ouro.box {key='old',width=75,height=29} end");
+    try f.build();
+    const old = try f.handle("old");
+    for ([_][]const u8{
+        "{}",                       "true",                      "4",               "{left='4'}", "{height=-1}", "{left=0/0}", "{right=1/0}", "{top=1e300}",
+        "{left=1,right=2,width=3}", "{top=1,bottom=2,height=3}", "{left=0,typo=3}", "{[1]=3}",
+    }) |invalid| {
+        const script = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.stack {{key='stack',ouro.box{{key='bad',positioned={s}}}}} end", .{invalid});
+        defer std.testing.allocator.free(script);
+        try f.exec(script);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(old, try f.handle("old"));
+    }
+    for ([_][]const u8{
+        "ouro.box {key='bad',positioned={left=3}}",
+        "ouro.button {key='bad',label='Bad',positioned={left=3}}",
+        "ouro.anchored {key='bad',ouro.box{key='trigger',positioned={left=3}}}",
+    }) |declaration| {
+        const script = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(script);
+        try f.exec(script);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(old, try f.handle("old"));
+    }
+    var prepared: @import("prepared_build.zig").PreparedBuild = undefined;
+    try prepared.init(std.testing.allocator, f.state, &f.sources, 128, 4096);
+    defer prepared.deinit();
+    try f.exec(
+        \\function candidate() return ouro.column {key='column',ouro.stack {key='stack',
+        \\  ouro.box {key='badge',positioned={right=4,top=5},width=20,height=10}}} end
+    );
+    _ = c.lua_getglobal(f.state, "candidate");
+    const callback = c.luaL_ref(f.state, c.registry_index);
+    defer c.luaL_unref(f.state, c.registry_index, callback);
+    try std.testing.expectError(error.PositionedStackInUnboundedAxis, f.runtime.prepareSourceBuild(.{ .width = 600, .height = 500 }, &f.ui, &prepared, callback, 2));
+    try std.testing.expectEqual(old, try f.handle("old"));
+    try std.testing.expectEqual(@as(usize, 0), prepared.descriptor_count);
+}
+
+test "positioned stack copies placement and paints moved children inside ancestor clips" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    f.runtime.root_padding = 0;
+    try f.exec(
+        \\placement={left=100,top=20}
+        \\function build() return ouro.stack {key='root',
+        \\  ouro.box {key='ground',width=240,height=120,background='#204060'},
+        \\  ouro.box {key='clip',width=120,height=80,clip=true,background='#208040',
+        \\    ouro.stack {key='layers',
+        \\      ouro.box {key='badge',positioned=placement,width=40,height=20,background='#C04020'}}}}
+        \\end
+    );
+    try f.build();
+    const badge = try f.handle("root/clip/layers/badge");
+    // Mutating the Lua table cannot change the already-built native edge.
+    try f.exec("placement.left=20");
+    for ([_]bool{ false, true }) |rebuild| {
+        if (rebuild) {
+            _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+            try f.build();
+        }
+        try std.testing.expectEqual(badge, try f.handle("root/clip/layers/badge"));
+        const pixels = try f.pixels();
+        defer std.testing.allocator.free(pixels);
+        for ([_]struct { x: usize, rgba: [4]u8 }{
+            .{ .x = 30, .rgba = if (rebuild) .{ 192, 64, 32, 255 } else .{ 32, 128, 64, 255 } },
+            .{ .x = 110, .rgba = if (rebuild) .{ 32, 128, 64, 255 } else .{ 192, 64, 32, 255 } },
+            .{ .x = 130, .rgba = .{ 32, 64, 96, 255 } },
+        }) |sample| {
+            const offset = (30 * 600 + sample.x) * 4;
+            try std.testing.expectEqualSlices(u8, &sample.rgba, pixels[offset..][0..4]);
+        }
+    }
+}
+
+test "box insets align nine positions inside asymmetric padding and retain child identity" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    f.runtime.root_padding = 0;
+    try f.exec(
+        \\alignment=ouro.signal('top_left'); hits=0
+        \\function build() return ouro.box {key='frame',width=140,height=100,
+        \\  padding=7,padding_x=11,padding_y=13,padding_left=0,padding_bottom=19,
+        \\  border_width=2,border='#112233',background='#204060',alignment=alignment(),
+        \\  ouro.box {key='child',width=30,height=20,background='#C04020',activate=true,
+        \\    on_press=function() hits=hits+1 end}}
+        \\end
+    );
+    try f.build();
+    const child = try f.handle("frame/child");
+    const render = try f.runtime.instances.renderObject(child);
+    const Case = struct { name: []const u8, x: f32, y: f32 };
+    for ([_]Case{
+        .{ .name = "top_left", .x = 2, .y = 15 },    .{ .name = "top", .x = 49.5, .y = 15 },    .{ .name = "top_right", .x = 97, .y = 15 },
+        .{ .name = "left", .x = 2, .y = 37 },        .{ .name = "center", .x = 49.5, .y = 37 }, .{ .name = "right", .x = 97, .y = 37 },
+        .{ .name = "bottom_left", .x = 2, .y = 59 }, .{ .name = "bottom", .x = 49.5, .y = 59 }, .{ .name = "bottom_right", .x = 97, .y = 59 },
+    }) |case| {
+        const script = try std.fmt.allocPrint(std.testing.allocator, "alignment:set('{s}')", .{case.name});
+        defer std.testing.allocator.free(script);
+        try f.exec(script);
+        try f.build();
+        try std.testing.expectEqual(child, try f.handle("frame/child"));
+        try std.testing.expectEqual(core.PointF{ .x = case.x, .y = case.y }, try f.runtime.tree.nodeOffset(render));
+        try std.testing.expectEqual(core.SizeF{ .width = 30, .height = 20 }, try f.runtime.tree.nodeSize(render));
+        try std.testing.expectEqual(@as(usize, 1), try f.runtime.tree.layoutCount(render));
+        const point = (try f.runtime.semanticTarget("frame/child")).center;
+        try std.testing.expectEqual(core.PointF{ .x = case.x + 15, .y = case.y + 10 }, point);
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 0, .position = point } });
+        for ([_]@import("../platform/window.zig").PointerButtonState{ .pressed, .released }) |state| {
+            try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 0, .button = 0x110, .state = state } });
+            try f.runtime.dispatchInput(&f.callbacks);
+            while (f.scheduler.takeRunnable()) |handle| try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(handle));
+        }
+    }
+    try f.exec("assert(hits==9)");
+}
+
+test "box insets precedence feeds builders and invalid declarations preserve committed layout" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\changed=ouro.signal(false)
+        \\function build() return ouro.box {key='frame',width=140,height=100,
+        \\  padding=7,padding_x=11,padding_left=changed() and 3 or 0,
+        \\  padding_right=changed() and 5 or nil,padding_top=changed() and 3 or nil,padding_bottom=changed() and 0 or 19,
+        \\  border_width=2,border='#112233',
+        \\  ouro.layout_builder {key='bounds',render=function(c)
+        \\    assert(c.min_width==(changed() and 128 or 125) and c.max_width==c.min_width)
+        \\    assert(c.min_height==(changed() and 93 or 70) and c.max_height==c.min_height)
+        \\    return ouro.box {key='child'}
+        \\  end}}
+        \\end
+    );
+    try f.build();
+    const frame = try f.handle("frame");
+    const child = try f.handle("frame/bounds/child");
+    for ([_]bool{ false, true, false }) |changed| {
+        try f.exec(if (changed) "changed:set(true)" else "changed:set(false)");
+        try f.build();
+        try std.testing.expectEqual(child, try f.handle("frame/bounds/child"));
+        const box = (try f.object("frame")).box;
+        try std.testing.expectEqual(core.Insets{ .left = if (changed) 3 else 0, .right = if (changed) 5 else 11, .top = if (changed) 3 else 7, .bottom = if (changed) 0 else 19 }, box.padding);
+        const bounds = try f.runtime.instances.renderObject(try f.handle("frame/bounds"));
+        try std.testing.expectEqual(core.PointF{ .x = if (changed) 5 else 2, .y = if (changed) 5 else 9 }, try f.runtime.tree.nodeOffset(bounds));
+    }
+    for ([_][]const u8{ "padding_left=-1", "padding_right=false", "padding_top='2'", "padding_bottom={}", "padding_left=0/0", "padding_right=1/0", "padding_bottom=1e300", "alignment='top_middle'", "alignment={}", "alignment=false" }) |invalid| {
+        const script = try std.fmt.allocPrint(std.testing.allocator, "function build() return ouro.box {{key='bad',{s}}} end", .{invalid});
+        defer std.testing.allocator.free(script);
+        try f.exec(script);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try std.testing.expectError(error.LuaBuildFailed, f.build());
+        try std.testing.expectEqual(frame, try f.handle("frame"));
+        try std.testing.expectEqual(child, try f.handle("frame/bounds/child"));
+    }
+}

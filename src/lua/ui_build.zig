@@ -64,7 +64,7 @@ const PendingTextInput = struct {
     session: ?TextInputSession,
 };
 
-const ParentKind = enum { box, flex, grid, stack, overlay, scroll, listbox, radio_group, tab_bar, split };
+const ParentKind = enum { box, flex, grid, stack, positioned_stack, overlay, scroll, listbox, radio_group, tab_bar, split };
 const BuildParent = struct {
     id: u64,
     kind: ParentKind,
@@ -73,6 +73,7 @@ const BuildParent = struct {
     grid_columns: u8 = 0,
     grid_rows: u8 = 0,
     grid_cell: ?@FieldType(render_types.ParentData, "grid") = null,
+    positioned: ?render_types.Positioned = null,
 };
 
 pub const Argument = union(enum) {
@@ -827,22 +828,26 @@ pub const UiBuild = struct {
             c.lua_setfield(state, -2, "selection");
         }
         if (c.lua_pcallk(state, 5, 1, 0, 0, null) != c.ok) return c.lua_error(state);
-        if (parent.kind == .grid) self.pushParent(parent) catch return luaError(state, "composition nesting too deep");
+        if (parent.kind == .grid or parent.kind == .positioned_stack) self.pushParent(parent) catch return luaError(state, "composition nesting too deep");
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, lowerDescription, 1);
         c.lua_pushvalue(state, -2);
         const status = c.lua_pcallk(state, 1, 0, 0, 0, null);
-        if (parent.kind == .grid) self.popParent();
+        if (parent.kind == .grid or parent.kind == .positioned_stack) self.popParent();
         if (status != c.ok) return c.lua_error(state);
         return 0;
     }
 
-    // A composition contributes no layout node. Carry its grid edge through
+    // A composition contributes no layout node. Carry its placement through
     // its returned root, without mutating descriptions or individual recipes.
     // Root properties can override inherited placement; descendants cannot
     // inherit it once a real container has pushed its own parent context.
     fn compositionParent(self: *UiBuild, state: *c.State, props: c_int) !BuildParent {
         var parent = self.currentParent() orelse return error.WidgetParentMissing;
+        if (try tableOptionalPositioned(state, props)) |placement| {
+            if (parent.kind != .positioned_stack) return error.PositionedRequiresStackParent;
+            parent.positioned = placement;
+        }
         if (parent.kind == .grid) {
             for ([_][:0]const u8{ "column", "row", "column_span", "row_span" }) |field| {
                 const kind = c.lua_getfield(state, props, field);
@@ -1729,9 +1734,8 @@ pub const UiBuild = struct {
             .role = .group,
             .key = key,
         }) catch return luaError(state, "cannot append stack semantics");
-        // Public stacks overlay children at the origin; the internal root's
-        // legacy positioned edge metadata is not part of this constructor.
-        return self.emitChildren(state, .{ .id = id, .kind = .overlay, .semantic_id = if (semantic) id else semanticParent(parent) });
+        // Keep public placement separate from the internal root's legacy x/y.
+        return self.emitChildren(state, .{ .id = id, .kind = .positioned_stack, .semantic_id = if (semantic) id else semanticParent(parent) });
     }
 
     fn emitAnchored(state: *c.State) callconv(.c) c_int {
@@ -1819,6 +1823,14 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box padding_x");
         const padding_y = tableOptionalExtent(state, 1, "padding_y", padding) orelse
             return luaError(state, "invalid box padding_y");
+        var insets: @import("../core/geometry.zig").Insets = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y };
+        inline for (.{ "left", "right", "top", "bottom" }) |edge| {
+            const kind = c.lua_getfield(state, 1, "padding_" ++ edge);
+            c.lua_settop(state, -2);
+            if (kind != c.type_nil and kind != c.type_number) return luaError(state, "box edge padding must be a finite non-negative number");
+            @field(insets, edge) = tableOptionalExtent(state, 1, "padding_" ++ edge, @field(insets, edge)) orelse
+                return luaError(state, "box edge padding must be a finite non-negative number");
+        }
         const alignment = tableOptionalBoxAlignment(state, 1) orelse
             return luaError(state, "invalid box alignment");
         const surface = tableOptionalSurface(state, 1, theme) orelse
@@ -1937,7 +1949,7 @@ pub const UiBuild = struct {
                 .max_width = max_width.value,
                 .max_height = max_height.value,
                 .aspect_ratio = aspect_ratio,
-                .padding = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y },
+                .padding = insets,
                 .alignment = alignment.value,
                 .background = if (paint) |p| owner.?.initialColor(p) else visual.background orelse surface.value,
                 .background_gradient = background_gradient,
@@ -2495,6 +2507,12 @@ fn tableOptionalBoxAlignment(state: *c.State, table: c_int) ?OptionalAlignment {
     if (std.mem.eql(u8, value, "center")) return .{ .value = .center };
     if (std.mem.eql(u8, value, "left")) return .{ .value = .{ .horizontal = .minimum, .vertical = .center } };
     if (std.mem.eql(u8, value, "right")) return .{ .value = .{ .horizontal = .maximum, .vertical = .center } };
+    if (std.mem.eql(u8, value, "top_left")) return .{ .value = .{ .horizontal = .minimum, .vertical = .minimum } };
+    if (std.mem.eql(u8, value, "top")) return .{ .value = .{ .horizontal = .center, .vertical = .minimum } };
+    if (std.mem.eql(u8, value, "top_right")) return .{ .value = .{ .horizontal = .maximum, .vertical = .minimum } };
+    if (std.mem.eql(u8, value, "bottom_left")) return .{ .value = .{ .horizontal = .minimum, .vertical = .maximum } };
+    if (std.mem.eql(u8, value, "bottom")) return .{ .value = .{ .horizontal = .center, .vertical = .maximum } };
+    if (std.mem.eql(u8, value, "bottom_right")) return .{ .value = .{ .horizontal = .maximum, .vertical = .maximum } };
     return null;
 }
 
@@ -2780,6 +2798,8 @@ fn declarativeParentData(
     const parent = self.currentParent() orelse return error.WidgetParentMissing;
     const flex = try tableOptionalFlex(state, table);
     if (parent.wrap and flex != null) return error.FlexInWrap;
+    const positioned = try tableOptionalPositioned(state, table);
+    if (positioned != null and parent.kind != .positioned_stack) return error.PositionedRequiresStackParent;
     return switch (parent.kind) {
         .flex, .listbox, .radio_group, .tab_bar => if (flex) |value| .{ .flex = value } else .none,
         .grid => grid: {
@@ -2799,6 +2819,10 @@ fn declarativeParentData(
             } };
         },
         .box, .overlay, .scroll, .split => if (flex == null) .none else error.FlexRequiresRowOrColumnParent,
+        .positioned_stack => positioned_stack: {
+            if (flex != null) return error.FlexRequiresRowOrColumnParent;
+            break :positioned_stack if (positioned orelse parent.positioned) |value| .{ .positioned = value } else .none;
+        },
         .stack => stack: {
             if (flex != null) return error.FlexRequiresRowOrColumnParent;
             const x = tableOptionalExtent(state, table, "x", 0) orelse return error.InvalidPosition;
@@ -2806,6 +2830,32 @@ fn declarativeParentData(
             break :stack .{ .stack = .{ .x = x, .y = y } };
         },
     };
+}
+
+fn tableOptionalPositioned(state: *c.State, table: c_int) !?render_types.Positioned {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    const kind = c.lua_getfield(state, table, "positioned");
+    if (kind == c.type_nil) return null;
+    if (kind != c.type_table) return error.InvalidPositioned;
+    const index = c.lua_gettop(state);
+    var result: render_types.Positioned = .{};
+    c.lua_pushnil(state);
+    while (c.lua_next(state, index) != 0) {
+        const key = string(state, -2) orelse return error.InvalidPositioned;
+        var known = false;
+        inline for (.{ "left", "top", "right", "bottom", "width", "height" }) |field| {
+            if (std.mem.eql(u8, key, field)) {
+                if (c.lua_type(state, -1) != c.type_number) return error.InvalidPositioned;
+                @field(result, field) = finiteFloat(state, -1) orelse return error.InvalidPositioned;
+                known = true;
+            }
+        }
+        if (!known) return error.InvalidPositioned;
+        c.lua_settop(state, -2);
+    }
+    result.validate() catch return error.InvalidPositioned;
+    return result;
 }
 
 fn tableOptionalFlex(state: *c.State, table: c_int) !?@FieldType(render_types.ParentData, "flex") {
@@ -2848,6 +2898,8 @@ fn parentDataErrorMessage(err: anyerror) [*:0]const u8 {
         error.InvalidGridPlacement => "grid children require row and column with spans inside declared tracks",
         error.FlexRequiresRowOrColumnParent => "flex requires a direct row or column parent",
         error.InvalidPosition => "invalid widget position",
+        error.InvalidPositioned => "positioned requires finite insets and non-negative extents, at most two per axis",
+        error.PositionedRequiresStackParent => "positioned requires a direct stack parent",
         error.WidgetParentMissing => "widget parent is missing",
         else => "invalid widget parent data",
     };
