@@ -843,12 +843,11 @@ container; its descendants use their own parent's layout contract.
 **Overflow is not implicit clipping.** The grid's own size obeys its incoming
 constraints, but fixed/auto tracks and their children may extend beyond it;
 they do not silently shrink to fit. Grid and wrapping Flex do not clip paint.
-Use an `ouro.scroll` viewport to clip it; native callers can also use
-`Box.clip=true` (not currently exposed by Lua's Box constructor).
-Ordinary hit testing gates traversal at every ancestor's layout bounds,
-even without paint clipping: visible overflow outside those bounds is not
-clickable. Clip does not enlarge hit regions. Anchored floating children use
-the separate overlay traversal described below.
+Use an `ouro.scroll` viewport or a Box with `clip=true` to clip it. Unclipped
+ancestors allow hits on overflowing children, including transformed children;
+explicit clips and the window viewport still gate hits. Each node's own hit
+region remains its transformed layout bounds, not its shadow or pixel alpha.
+Anchored floating children use the separate overlay traversal described below.
 
 Native callers use `types.Flex.wrap/run_gap`, `types.Grid`,
 `GridTracks.init(&.{ .{.fixed=112}, .auto, .{.fr=2} })`, and zero-based
@@ -941,6 +940,42 @@ and shadows, and limited to 64 MiB of pixels per submission, 1024 groups, and
 silently dropping the effect. See `examples/opacity-storybook.lua` and
 `examples/opacity-composition.lua` for overlap, nested clips, input, and fades.
 
+Set `transform` on a Box to move or uniformly scale its paint without relayout:
+
+```lua
+ouro.box {
+  width = 80, height = 60, background = "#389ac0",
+  transform = { x = 40, y = -8, scale = 1.5, origin = { x = 40, y = 30 } },
+  ouro.text { text = "Paint only" },
+}
+```
+
+The map is `translation + origin + scale * (point - origin)`, in local logical
+pixels. Translation and origin default to zero; scale defaults to one. Omitted
+or nil `transform` is identity. All fields must be finite numbers, and scale
+must be positive with a finite reciprocal. Zero, negative scale, numeric strings,
+and malformed tables are errors. Rotation, skew, and nonuniform scale are not
+supported. Nested maps apply child first, then parent. The native build copies
+the parsed values; later mutations of the source table do not change retained
+paint until another build reads it.
+
+Transforms include background, border, outline, shadow, and descendants, including
+text, images, drawing paths, gradients, and internal clips. Ancestor clips stay
+in the ancestor's coordinate system. Opacity still isolates the complete group.
+Existing device-coordinate, shadow, gradient, and layer limits apply after
+scaling; unrepresentable compositions fail rather than silently dropping a map.
+
+Layout sizes, offsets, sibling placement, scroll extents, identity, state, and
+focus stay unchanged. Semantic inspection reports transformed visual bounds;
+pointer hit testing maps back into local coordinates. Text selection, caret/IME
+positioning, slider/split dragging, and wheel input account for the visual scale.
+Raw pointer listener coordinates remain window coordinates. Layout-based
+`ensure_visible` and virtual-list measurements do not change. `ouro.animation`
+can drive transform fields without relayout. Anchored popups follow the visual
+trigger bounds but do not inherit its scale; apply a transform to the floating
+Box to transform the popup itself. See `examples/transform-storybook.lua` and
+`examples/transform-composition.lua` for nested origins, clipping, input, and motion.
+
 Boxes accept one optional outset `shadow`:
 
 ```lua
@@ -973,8 +1008,8 @@ the same origin. It also accepts `children = { ... }`, following the same dense
 array and key conventions as rows and columns. Children paint in declaration
 order; hit testing starts with the last child. Put decorative backgrounds first
 and foreground controls last so the background cannot intercept their hits.
-Hit testing uses layout bounds and explicit rounded Box clips, not alpha-based
-click-through.
+Hit testing uses transformed layout bounds and explicit rounded Box clips, not
+alpha-based click-through.
 
 Stack uses the existing native layout: children receive loose parent bounds,
 and its size is their maximum extent constrained by the parent. Fill children
@@ -1013,6 +1048,8 @@ and layout bounds, while event routing and retained identity keep their logical
 ancestry. Later overlays draw above earlier ones; nested overlays draw above
 their containing overlay. Hidden ancestors suppress their overlays. Inline
 ancestor opacity does not fade floating content; set it on the floating Box.
+Placement follows transformed trigger bounds, but inline ancestor transforms
+do not scale floating content. A transform on the floating Box still applies.
 
 Options are `side="top" | "bottom" | "left" | "right"` (default `"bottom"`),
 `alignment="start" | "center" | "end"` (default `"start"`, along the side's
@@ -1929,9 +1966,9 @@ ouro.box {width = 180, height = 90, radius = 12, background = ramp}
 
 Gradients work as Box `background` and drawing rectangle/fill/stroke `color`.
 Endpoints are explicit logical pixels relative to the Box border-box origin or
-the **recording origin**, not each drawing primitive. Display scaling transforms
-the endpoints; a constrained canvas crops without stretching the ramp. Text,
-borders, and shadows still require solid colors.
+the **recording origin**, not each drawing primitive. Display scaling and Box
+transforms move the endpoints; a constrained canvas crops without stretching the
+ramp. Text, borders, and shadows still require solid colors.
 
 The constructor copies the endpoint and stop tables into immutable userdata.
 It requires distinct finite endpoints and a dense array of 2–8 stops, with finite

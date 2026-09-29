@@ -154,7 +154,7 @@ test "grid overflow and overlap retain paint order, hit coordinates and ancestor
     _ = try tree.layout(root, Constraints.tight(.{ .width = 90, .height = 20 }));
     try std.testing.expectEqual(SizeF{ .width = 90, .height = 20 }, try tree.nodeSize(grid));
     try std.testing.expectEqual(SizeF{ .width = 40, .height = 30 }, try tree.nodeSize(back));
-    // Existing hit testing gates every ancestor's bounds, even without paint clipping.
+    // The window viewport gates hits even when inline ancestors do not clip.
     try std.testing.expect((try tree.hitTest(root, .{ .x = 93, .y = 7 })) == null);
     try std.testing.expect((try tree.hitTest(root, .{ .x = 111, .y = 24 })) == null);
     try std.testing.expectEqual(front, (try tree.hitTest(root, .{ .x = 83, .y = 7 })).?);

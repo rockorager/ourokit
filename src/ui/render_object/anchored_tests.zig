@@ -229,6 +229,45 @@ test "anchored follows scrolling before geometry inspection paint and hit withou
         try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(handle));
 }
 
+test "anchored follows paint-only transforms while popup keeps an independent scale" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 5);
+    defer tree.deinit();
+    const root = try tree.create(.{ .stack = .{} });
+    const container = try tree.create(.{ .box = .{ .width = 31, .height = 17 } });
+    const anchor = try tree.create(.{ .anchored = .{ .gap = 7 } });
+    const trigger = try tree.create(.{ .box = .{} });
+    const popup = try tree.create(.{ .box = .{ .width = 53, .height = 29, .background = Color.rgba(1, 2, 3, 255) } });
+    try tree.appendChild(root, container, .{ .stack = .{ .x = 71, .y = 59 } });
+    try tree.appendChild(container, anchor, .none);
+    try tree.appendChild(anchor, trigger, .none);
+    try tree.appendChild(anchor, popup, .none);
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 300, .height = 240 }));
+    try tree.update(container, .{ .box = .{ .width = 31, .height = 17, .transform = .{
+        .translation = .{ .x = 12, .y = -4 },
+        .scale = 1.5,
+        .origin = .{ .x = 10, .y = 6 },
+    } } });
+    var commands: [4]scene.Command = undefined;
+    var builder = try Builder.init(&commands, 2);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(geometry.RectF{ .x = 78, .y = 52, .width = 46.5, .height = 25.5 }, try tree.paintBounds(trigger));
+    try std.testing.expectEqual(geometry.RectF{ .x = 78, .y = 84.5, .width = 53, .height = 29 }, try tree.paintBounds(popup));
+    try std.testing.expectEqual(geometry.RectI{ .x = 156, .y = 169, .width = 106, .height = 58 }, commands[0].solid_rectangle.bounds);
+    try std.testing.expectEqual(popup, (try tree.hitTest(root, .{ .x = 128, .y = 110 })).?);
+    try std.testing.expectEqual(root, (try tree.hitTest(root, .{ .x = 140, .y = 110 })).?);
+    // A transform on the popup itself still applies, but never inherits the
+    // trigger's 1.5 scale. Its placement remains anchored to the visual trigger.
+    try tree.update(popup, .{ .box = .{ .width = 53, .height = 29, .transform = .{ .scale = 0.5, .translation = .{ .x = 3 } } } });
+    builder = try Builder.init(&commands, 2);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(geometry.RectF{ .x = 81, .y = 84.5, .width = 26.5, .height = 14.5 }, try tree.paintBounds(popup));
+    try std.testing.expectEqual(popup, (try tree.hitTest(root, .{ .x = 105, .y = 98 })).?);
+    try std.testing.expectEqual(root, (try tree.hitTest(root, .{ .x = 128, .y = 110 })).?);
+    for ([_]@import("tree.zig").NodeHandle{ root, container, anchor, trigger, popup }) |handle|
+        try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(handle));
+}
+
 test "anchored validates declarations edges child counts and failed deferred layouts" {
     var tree: Tree = undefined;
     try tree.init(std.testing.allocator, 5);

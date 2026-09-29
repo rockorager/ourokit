@@ -21,6 +21,8 @@ pub const Box = struct {
     hidden: bool = false,
     /// Isolated opacity of own paint and children. Does not affect hit testing.
     opacity: f32 = 1,
+    /// Paint and input mapping only; origin is local to the border box.
+    transform: @import("../../core/geometry.zig").Transform = .{},
     width: ?f32 = null,
     height: ?f32 = null,
     fill_width: bool = false,

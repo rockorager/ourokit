@@ -842,12 +842,12 @@ pub const WindowRuntime = struct {
         const content = try self.text_inputs.content(focused);
         const render = try self.instances.renderObject(content);
         const local = try self.tree.textCaretRectangle(render);
-        const origin = try self.instanceOrigin(content);
+        const rectangle = (try self.tree.paintTransform(render)).rect(local);
         state.cursor_rectangle = .{
-            .x = @intFromFloat(@floor(origin.x + local.x)),
-            .y = @intFromFloat(@floor(origin.y + local.y)),
-            .width = @intFromFloat(@ceil(local.width)),
-            .height = @intFromFloat(@ceil(local.height)),
+            .x = @intFromFloat(@floor(rectangle.x)),
+            .y = @intFromFloat(@floor(rectangle.y)),
+            .width = @intFromFloat(@ceil(rectangle.width)),
+            .height = @intFromFloat(@ceil(rectangle.height)),
         };
         return .{
             .state = state,
@@ -1080,23 +1080,24 @@ pub const WindowRuntime = struct {
                 const object = try self.tree.objectAt(parent_render);
                 if (object != .split) continue;
                 const axis = object.split.axis;
+                const transform = try self.tree.paintTransform(parent_render);
+                const local_pointer = transform.inversePoint(pointer.position);
                 if (pointer.event == .button and pointer.event.button.button == 0x110) {
                     if (pointer.event.button.state == .pressed) {
-                        const divider_origin = try self.instanceOrigin(bound_target);
+                        const divider_origin = transform.inversePoint((try self.tree.paintTransform(try self.instances.renderObject(bound_target))).point(.{}));
                         self.split_drag = .{
                             .target = bound_target,
-                            .grab_offset = axisCoordinate(axis, pointer.position) - axisCoordinate(axis, divider_origin),
+                            .grab_offset = axisCoordinate(axis, local_pointer) - axisCoordinate(axis, divider_origin),
                         };
                     } else self.split_drag = null;
                 }
                 const drag = self.split_drag orelse continue;
                 if (!sameHandle(drag.target, bound_target) or
                     (pointer.event != .motion and pointer.event != .button)) continue;
-                const origin = try self.instanceOrigin(parent);
                 const size = try self.tree.nodeSize(parent_render);
                 const extent = if (axis == .horizontal) size.width else size.height;
                 const resolution = @import("../ui/render_object/split.zig").resolve(object.split, extent);
-                const requested = axisCoordinate(axis, pointer.position) - axisCoordinate(axis, origin) - drag.grab_offset;
+                const requested = axisCoordinate(axis, local_pointer) - drag.grab_offset;
                 const first = std.math.clamp(requested, resolution.min, resolution.max);
                 const fraction = if (resolution.available == 0) @as(f32, 0) else first / resolution.available;
                 if (fraction != object.split.position)
@@ -1116,11 +1117,12 @@ pub const WindowRuntime = struct {
                 }
                 if (self.range_drag == null or !sameHandle(self.range_drag.?, bound_target)) continue;
                 if (pointer.event != .motion and pointer.event != .button) continue;
-                const origin = try self.instanceOrigin(bound_target);
-                const size = try self.tree.nodeSize(try self.instances.renderObject(bound_target));
+                const render = try self.instances.renderObject(bound_target);
+                const local_pointer = (try self.tree.paintTransform(render)).inversePoint(pointer.position);
+                const size = try self.tree.nodeSize(render);
                 const range = semantic.range.?;
                 const inset = try self.instances.rangeInset(bound_target);
-                const value = range.atFraction((pointer.position.x - origin.x - inset) / @max(1, size.width - 2 * inset));
+                const value = range.atFraction((local_pointer.x - inset) / @max(1, size.width - 2 * inset));
                 if (value != range.value) try self.spawnCallback(callback_service, binding.id, try self.instances.scope(bound_target), &.{.{ .number = value }});
                 continue;
             }
@@ -1778,18 +1780,12 @@ pub const WindowRuntime = struct {
     }
 
     pub fn anchorRectangle(self: *WindowRuntime, target: ui.instance.InstanceHandle) !core.RectI {
-        const size = try self.tree.nodeSize(try self.instances.renderObject(target));
-        var origin: core.PointF = .{};
-        var current: ?ui.instance.InstanceHandle = target;
-        while (current) |candidate| {
-            origin = core.PointF.add(origin, try self.tree.nodeOffset(try self.instances.renderObject(candidate)));
-            current = try self.instances.parentOf(candidate);
-        }
+        const bounds = try self.tree.paintBounds(try self.instances.renderObject(target));
         const viewport = self.frame_state.size orelse return error.WindowNotConfigured;
-        const left = @max(0, @floor(origin.x));
-        const top = @max(0, @floor(origin.y));
-        const right = @min(@as(f32, @floatFromInt(viewport.width)), @ceil(origin.x + size.width));
-        const bottom = @min(@as(f32, @floatFromInt(viewport.height)), @ceil(origin.y + size.height));
+        const left = @max(0, @floor(bounds.x));
+        const top = @max(0, @floor(bounds.y));
+        const right = @min(@as(f32, @floatFromInt(viewport.width)), @ceil(bounds.x + bounds.width));
+        const bottom = @min(@as(f32, @floatFromInt(viewport.height)), @ceil(bounds.y + bounds.height));
         if (right <= left or bottom <= top) return error.PopupAnchorNotVisible;
         return .{ .x = @intFromFloat(left), .y = @intFromFloat(top), .width = @intFromFloat(right - left), .height = @intFromFloat(bottom - top) };
     }
@@ -1830,7 +1826,7 @@ pub const WindowRuntime = struct {
         if (try self.textInputAncestor(target)) |input| {
             const render = try self.instances.renderObject(try self.text_inputs.content(input));
             const axis: ui.render_object.types.Axis = if (axis_event.axis == .vertical) .vertical else .horizontal;
-            if (try self.tree.scrollTextInput(render, axis, axis_event.delta)) {
+            if (try self.tree.scrollTextInput(render, axis, axis_event.delta / (try self.tree.paintTransform(render)).scale)) {
                 self.scroll_motions[@intFromEnum(axis_event.axis)] = .{};
                 return true;
             }
@@ -1858,7 +1854,8 @@ pub const WindowRuntime = struct {
         var current: ?ui.instance.InstanceHandle = target;
         while (current) |start| {
             const scroll = (try self.instances.nearestScroll(start, axis)) orelse return null;
-            if (try self.instances.scrollBy(scroll, delta)) {
+            const scale = (try self.tree.paintTransform(try self.instances.renderObject(scroll))).scale;
+            if (try self.instances.scrollBy(scroll, delta / scale)) {
                 if (self.virtual_lists.find(try self.instances.semanticId(scroll)) != null)
                     try self.queueNativeBuild();
                 return scroll;
@@ -1921,25 +1918,16 @@ pub const WindowRuntime = struct {
             },
             else => null,
         };
-        const size = try self.tree.nodeSize(render);
-        var origin: core.PointF = .{};
-        var current: ?ui.instance.InstanceHandle = target;
-        while (current) |instance_handle| {
-            origin = core.PointF.add(
-                origin,
-                try self.tree.nodeOffset(try self.instances.renderObject(instance_handle)),
-            );
-            current = try self.instances.parentOf(instance_handle);
-        }
-        var center: core.PointF = .{ .x = origin.x + size.width / 2, .y = origin.y + size.height / 2 };
+        const bounds = try self.tree.paintBounds(render);
+        var center: core.PointF = .{ .x = bounds.x + bounds.width / 2, .y = bounds.y + bounds.height / 2 };
         if (self.listboxes.option(target) != null) {
             // Custom selection content can contain independent controls. Find
             // a point routed to the item, not its close button or text input.
-            center = try self.selectionPoint(target, render, origin) orelse center;
+            center = try self.selectionPoint(target, render) orelse center;
         }
         return .{
             .center = center,
-            .bounds = .{ .x = origin.x, .y = origin.y, .width = size.width, .height = size.height },
+            .bounds = bounds,
             .role = semantic.role,
             .enabled = semantic.enabled,
             .visible = self.instances.isVisible(target),
@@ -1947,9 +1935,9 @@ pub const WindowRuntime = struct {
         };
     }
 
-    fn selectionPoint(self: *WindowRuntime, target: ui.instance.InstanceHandle, render: ui.render_object.NodeHandle, origin: core.PointF) anyerror!?core.PointF {
-        const size = try self.tree.nodeSize(render);
-        const center: core.PointF = .{ .x = origin.x + size.width / 2, .y = origin.y + size.height / 2 };
+    fn selectionPoint(self: *WindowRuntime, target: ui.instance.InstanceHandle, render: ui.render_object.NodeHandle) anyerror!?core.PointF {
+        const bounds = try self.tree.paintBounds(render);
+        const center: core.PointF = .{ .x = bounds.x + bounds.width / 2, .y = bounds.y + bounds.height / 2 };
         const root = (try self.instances.rootRenderObject()).?;
         if (try self.tree.hitTest(root, center)) |hit| {
             var current = self.instances.instanceForRenderObject(hit);
@@ -1961,7 +1949,7 @@ pub const WindowRuntime = struct {
         }
         var child = self.tree.firstChild(render);
         while (child) |node| : (child = self.tree.nextSibling(node)) {
-            if (try self.selectionPoint(target, node, core.PointF.add(origin, try self.tree.nodeOffset(node)))) |point| return point;
+            if (try self.selectionPoint(target, node)) |point| return point;
         }
         return null;
     }
@@ -2098,13 +2086,12 @@ pub const WindowRuntime = struct {
 
     fn clampSelectionPointer(self: *WindowRuntime, input: ui.instance.InstanceHandle, position: core.PointF) !core.PointF {
         const content = try self.text_inputs.content(input);
-        const origin = try self.instanceOrigin(content);
-        const size = try self.tree.nodeSize(try self.instances.renderObject(content));
+        const bounds = try self.tree.paintBounds(try self.instances.renderObject(content));
         const multiline = (try self.text_inputs.session(input)).model.multiline;
-        return .{ .x = std.math.clamp(position.x, origin.x, origin.x + size.width), .y = if (multiline)
-            std.math.clamp(position.y, origin.y, origin.y + size.height)
+        return .{ .x = std.math.clamp(position.x, bounds.x, bounds.x + bounds.width), .y = if (multiline)
+            std.math.clamp(position.y, bounds.y, bounds.y + bounds.height)
         else
-            origin.y + size.height / 2 };
+            bounds.y + bounds.height / 2 };
     }
 
     const SelectionScroll = struct { input: ui.instance.InstanceHandle, render: ui.render_object.NodeHandle, axis: ui.render_object.types.Axis, speed: f32 };
@@ -2121,8 +2108,8 @@ pub const WindowRuntime = struct {
         const axis: ui.render_object.types.Axis = if (session.model.multiline and position.y != edge.y) .vertical else .horizontal;
         const distance = if (axis == .vertical) position.y - edge.y else position.x - edge.x;
         if (distance == 0) return null;
-        const speed = std.math.sign(distance) * std.math.clamp(@abs(distance) * 12, 40, 800);
         const render = try self.instances.renderObject(try self.text_inputs.content(input));
+        const speed = std.math.sign(distance) * std.math.clamp(@abs(distance) * 12, 40, 800) / (try self.tree.paintTransform(render)).scale;
         if (try self.tree.textScrollDelta(render, axis, speed) == 0) return null;
         return .{ .input = input, .render = render, .axis = axis, .speed = speed };
     }
@@ -2255,11 +2242,8 @@ pub const WindowRuntime = struct {
     ) !text.CaretStop {
         const content = try self.text_inputs.content(input);
         const render = try self.instances.renderObject(content);
-        const origin = try self.instanceOrigin(content);
-        var caret = (try self.tree.hitTestText(render, .{
-            .x = position.x - origin.x,
-            .y = position.y - origin.y,
-        })).caret;
+        const point = (try self.tree.paintTransform(render)).inversePoint(position);
+        var caret = (try self.tree.hitTestText(render, point)).caret;
         // Masked layout holds dots; translate the hit back to the value.
         const model = &(try self.text_inputs.session(input)).model;
         if (model.isSecret()) caret.byte_offset = ui.text_input.maskedToModel(model, caret.byte_offset);
@@ -2551,19 +2535,6 @@ pub const WindowRuntime = struct {
             if (self.text_inputs.contains(current)) return current;
             current = (try self.instances.parentOf(current)) orelse return null;
         }
-    }
-
-    fn instanceOrigin(self: *WindowRuntime, target: ui.instance.InstanceHandle) !core.PointF {
-        var origin: core.PointF = .{};
-        var current: ?ui.instance.InstanceHandle = target;
-        while (current) |handle| {
-            origin = core.PointF.add(
-                origin,
-                try self.tree.nodeOffset(try self.instances.renderObject(handle)),
-            );
-            current = try self.instances.parentOf(handle);
-        }
-        return origin;
     }
 
     fn buttonAncestor(
@@ -3035,6 +3006,88 @@ test "contextual input scopes timeouts privacy and task lifetime" {
     try std.testing.expectEqual(lua.ResumeResult.canceled, try f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
 }
 
+test "transformed range and split pointer drags dispatch local values with capture" {
+    for ([_]bool{ false, true }) |split| {
+        var scheduler: task.Scheduler = undefined;
+        try scheduler.init(std.testing.allocator, 16, 16, 4);
+        defer scheduler.deinit();
+        const scope = try scheduler.createScope(scheduler.application_scope);
+        var loop: @import("../loop/io_uring.zig").Loop = undefined;
+        try loop.init(std.testing.allocator, 8, 4);
+        defer loop.deinit();
+        var vm: lua.Vm = undefined;
+        try vm.init(std.testing.allocator, &scheduler, &loop);
+        defer vm.deinit();
+        var callbacks: lua.CallbackRegistry = undefined;
+        try callbacks.init(std.testing.allocator, 1);
+        defer callbacks.deinit();
+        const source = "return function(value) last=value; calls=(calls or 0)+1 end";
+        try std.testing.expectEqual(lua_c.ok, lua_c.luaL_loadbufferx(vm.state, source.ptr, source.len, "@transformed-drag", "t"));
+        try std.testing.expectEqual(lua_c.ok, lua_c.lua_pcallk(vm.state, 0, 1, 0, 0, null));
+        const callback = try callbacks.adoptReference(&vm, lua_c.luaL_ref(vm.state, lua_c.registry_index));
+        defer callbacks.release(callback) catch unreachable;
+        const window: platform.WindowHandle = .{ .slot = 1, .generation = 1 };
+        var r: WindowRuntime = .{};
+        try r.tree.init(std.testing.allocator, 5);
+        try r.instances.init(std.testing.allocator, &scheduler, &r.tree, scope, 5);
+        try r.router.init(std.testing.allocator, &r.tree, &r.instances, window, 16);
+        try r.pointer_bindings.init(std.testing.allocator, 1);
+        try r.buttons.init(std.testing.allocator, 5);
+        try r.text_inputs.init(std.testing.allocator, 1);
+        try r.semantics.init(std.testing.allocator, 1, 32);
+        defer {
+            r.text_inputs.deinit();
+            r.buttons.deinit();
+            r.semantics.deinit();
+            r.pointer_bindings.deinit();
+            r.router.deinit();
+            r.instances.reconcile(&.{}) catch unreachable;
+            scheduler.applyQueuedCancellations() catch unreachable;
+            r.instances.collectRetired() catch unreachable;
+            r.instances.deinit();
+            r.tree.deinit();
+            scheduler.destroyScope(scope) catch unreachable;
+        }
+        const descriptors = [_]ui.instance.Descriptor{
+            .{ .id = 1, .parent = null, .object = .{ .box = .{ .transform = .{ .translation = .{ .x = 30, .y = 3 }, .scale = 0.75, .origin = .{ .x = 8, .y = 4 } } } } },
+            .{ .id = 2, .parent = 1, .object = if (split) .{ .split = .{ .position = 0.25, .divider = 8 } } else .{ .box = .{} }, .range_inset = 8 },
+            .{ .id = 3, .parent = 2, .object = .{ .box = .{} } },
+            .{ .id = 4, .parent = 2, .object = .{ .box = .{} } },
+            .{ .id = 5, .parent = 2, .object = .{ .box = .{} } },
+        };
+        try r.instances.reconcile(descriptors[0..if (split) @as(usize, 5) else 2]);
+        r.semantics.stage(&.{.{ .id = 2, .parent = null, .role = .slider, .range = .{ .value = 10, .min = 10, .max = 110, .step = 1 } }});
+        r.semantics.commitStaged();
+        const target = r.instances.handleForId(if (split) 5 else 2).?;
+        _ = try r.pointer_bindings.set(.{ .slot = 0, .generation = 1 }, target, .{ .id = callback, .kind = if (split) .split_change else .range_change });
+        const root = (try r.instances.rootRenderObject()).?;
+        _ = try r.tree.layout(root, ui.layout.Constraints.tight(.{ .width = 120, .height = 80 }));
+        // Map is window=(32,4)+local*0.75. Range endpoints are x=8,112;
+        // split divider starts at x=28, grabbed three local pixels from its edge.
+        try r.routePointer(.{ .enter = .{ .window = window, .serial = 0, .position = .{ .x = if (split) 55.25 else 57.5, .y = 13 } } });
+        try r.routePointer(.{ .button = .{ .window = window, .serial = 0, .time_ms = 0, .button = 272, .state = .pressed } });
+        try r.dispatchInput(&callbacks);
+        while (scheduler.takeRunnable()) |handle| _ = try vm.resumeRunnable(handle);
+        try std.testing.expectEqual(target, r.router.captured.?);
+        try r.routePointer(.{ .motion = .{ .window = window, .time_ms = 1, .position = .{ .x = if (split) 76.25 else 96.5, .y = 13 } } });
+        try r.dispatchInput(&callbacks);
+        while (scheduler.takeRunnable()) |handle| _ = try vm.resumeRunnable(handle);
+        _ = lua_c.lua_getglobal(vm.state, "last");
+        var valid: c_int = 0;
+        try std.testing.expectEqual(@as(f64, if (split) 0.5 else 85), lua_c.lua_tonumberx(vm.state, -1, &valid));
+        try std.testing.expectEqual(@as(c_int, 1), valid);
+        lua_c.lua_settop(vm.state, -2);
+        _ = lua_c.lua_getglobal(vm.state, "calls");
+        try std.testing.expectEqual(@as(i64, if (split) 1 else 2), lua_c.lua_tointegerx(vm.state, -1, &valid));
+        try std.testing.expectEqual(@as(c_int, 1), valid);
+        lua_c.lua_settop(vm.state, -2);
+        try r.routePointer(.{ .button = .{ .window = window, .serial = 0, .time_ms = 2, .button = 272, .state = .released } });
+        try r.dispatchInput(&callbacks);
+        try std.testing.expect(r.router.captured == null and r.range_drag == null and r.split_drag == null);
+        try std.testing.expectEqual(@as(usize, 1), try r.tree.layoutCount(root));
+    }
+}
+
 test "resize lays out a clean render tree before rebuilding its scene" {
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 4, 1, 0);
@@ -3091,20 +3144,20 @@ test "resize lays out a clean render tree before rebuilding its scene" {
     try std.testing.expect((try runtime.displayList()).damage == .full);
 }
 
-test "queued pointer axis scrolls retained instance only during input dispatch" {
+test "queued pointer axis applies transformed logical deltas only during input dispatch" {
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 6, 1, 0);
     defer scheduler.deinit();
     const window_scope = try scheduler.createScope(scheduler.application_scope);
     const window: platform.WindowHandle = .{ .slot = 2, .generation = 1 };
     var runtime: WindowRuntime = .{};
-    try runtime.tree.init(std.testing.allocator, 2);
+    try runtime.tree.init(std.testing.allocator, 3);
     try runtime.instances.init(
         std.testing.allocator,
         &scheduler,
         &runtime.tree,
         window_scope,
-        2,
+        3,
     );
     try runtime.router.init(
         std.testing.allocator,
@@ -3127,7 +3180,8 @@ test "queued pointer axis scrolls retained instance only during input dispatch" 
         scheduler.destroyScope(window_scope) catch unreachable;
     }
     try runtime.instances.reconcile(&.{
-        .{ .id = 1, .parent = null, .object = .{ .scroll = .{} } },
+        .{ .id = 3, .parent = null, .object = .{ .box = .{} } },
+        .{ .id = 1, .parent = 3, .object = .{ .scroll = .{} } },
         .{ .id = 2, .parent = 1, .object = .{ .box = .{ .width = 40, .height = 120 } } },
     });
     const root = (try runtime.instances.rootRenderObject()).?;
@@ -3157,6 +3211,11 @@ test "queued pointer axis scrolls retained instance only during input dispatch" 
     ));
     try std.testing.expect(!(try runtime.tree.layoutDirty(root)));
     try std.testing.expect(try runtime.tree.paintDirty(root));
+    try runtime.tree.update(root, .{ .box = .{ .transform = .{ .translation = .{ .x = 3, .y = 4 }, .scale = 1.5 } } });
+    try runtime.routePointer(.{ .axis = .{ .window = window, .time_ms = 3, .axis = .vertical, .delta = 18 } });
+    try runtime.dispatchInput(&unused_vm);
+    try std.testing.expectEqual(@as(f32, 30), try runtime.instances.scrollOffset(runtime.instances.handleForId(1).?));
+    try std.testing.expectEqual(@as(usize, 1), try runtime.tree.layoutCount(root));
 }
 
 test "queued Tab navigation updates retained focus at the input safe point" {
@@ -3231,7 +3290,7 @@ test "queued Tab navigation updates retained focus at the input safe point" {
     try std.testing.expectEqual(runtime.instances.handleForId(3).?, runtime.focus.current().?);
 }
 
-test "text input protocol batches mutate retained sessions only at the input safe point" {
+test "text input protocol batches and transformed pointer selection use retained sessions at the input safe point" {
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 8, 1, 0);
     defer scheduler.deinit();
@@ -3558,10 +3617,22 @@ test "text input protocol batches mutate retained sessions only at the input saf
     const expected_drag_start = try runtime.textCaretAtPointer(target, drag_start);
     const expected_drag_end = try runtime.textCaretAtPointer(target, drag_end);
     try std.testing.expect(expected_drag_start.byte_offset != expected_drag_end.byte_offset);
+    const input_render = try runtime.instances.renderObject(target);
+    const untransformed = try runtime.tree.objectAt(input_render);
+    var transformed = untransformed;
+    transformed.box.transform = .{ .translation = .{ .x = 30, .y = 2 }, .scale = 0.75, .origin = .{ .x = 10, .y = 6 } };
+    try runtime.tree.update(input_render, transformed);
+    try std.testing.expect(!try runtime.tree.layoutDirty(input_render));
+    try std.testing.expectEqual(core.RectI{ .x = 32, .y = 3, .width = 121, .height = 25 }, try runtime.anchorRectangle(target));
+    const local_caret = try runtime.tree.textCaretRectangle(render);
+    const transformed_status = (try runtime.textInputStatus()).?.state.cursor_rectangle.?;
+    try std.testing.expectEqual(@as(i32, @intFromFloat(@floor(32.5 + 0.75 * (1 + local_caret.x)))), transformed_status.x);
+    try std.testing.expectEqual(@as(i32, @intFromFloat(@floor(3.5 + 0.75 * (1 + local_caret.y)))), transformed_status.y);
+    try std.testing.expectEqual(@as(i32, @intFromFloat(@ceil(0.75 * local_caret.height))), transformed_status.height);
     try runtime.routePointer(.{ .enter = .{
         .window = window,
         .serial = 8,
-        .position = drag_start,
+        .position = .{ .x = 33.25, .y = 11 },
     } });
     try runtime.dispatchInput(&callbacks);
     try runtime.routePointer(.{ .button = .{
@@ -3576,7 +3647,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
     try runtime.routePointer(.{ .motion = .{
         .window = window,
         .time_ms = 10,
-        .position = drag_end,
+        .position = .{ .x = 85, .y = 11 },
     } });
     try runtime.dispatchInput(&callbacks);
     const dragged = (try runtime.text_inputs.session(target)).model.selection;
@@ -3593,6 +3664,7 @@ test "text input protocol batches mutate retained sessions only at the input saf
     } });
     try runtime.dispatchInput(&callbacks);
     try std.testing.expect(!(try runtime.text_inputs.session(target)).isSelecting());
+    try runtime.tree.update(input_render, untransformed);
 
     const editing = try runtime.text_inputs.session(target);
     _ = editing.model.selectAll();

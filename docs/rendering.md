@@ -38,8 +38,24 @@ transfer; PNG files contain straight sRGB rather than Wayland premultiplied RGB.
 
 Rectangular damage regions must not overlap, preventing source-over commands
 from being applied twice. Rectangles use integer device-pixel bounds; paths and
-glyphs carry antialiased coverage. Arbitrary transforms and path clipping remain
-unsupported.
+glyphs carry antialiased coverage. Box paint supports translation and positive
+uniform scaling about a local origin. Rotation, skew, nonuniform scaling, and
+path clipping remain unsupported.
+
+The scene builder composes Box transforms with output scaling, lowers bounds,
+origins, extents, gradient endpoints, and text/path scales into existing commands,
+then restores the parent map for siblings. No transform command, rasterized
+subtree, new GPU pipeline, or intermediate surface is required for the transform
+itself. Opacity groups still use their ordinary isolation surfaces. Device
+rounding rules are unchanged: coverage bounds round outward; decorated bounds
+snap origin and extent separately. Damage compares lowered commands, including
+old and new transformed extents. Layout geometry and layout cache keys stay fixed.
+
+Input uses the inverse local-to-window map, independent of output pixel scale.
+Explicit ancestor clips remain in their own coordinate spaces. Anchored overlays
+follow the visual trigger while starting a new unscaled window paint plane;
+their own Box transforms apply normally. `examples/transform-storybook.lua`
+and `tests/transform_composition.py` exercise this retained paint-only contract.
 
 Rounded child clips carry integer device bounds and a clamped corner radius.
 Software and Vulkan evaluate the same strict f32 signed-distance expression at

@@ -3,6 +3,7 @@ const Color = @import("../../core/color.zig").Color;
 const PointF = @import("../../core/geometry.zig").PointF;
 const RectF = @import("../../core/geometry.zig").RectF;
 const RectI = @import("../../core/geometry.zig").RectI;
+const Transform = @import("../../core/geometry.zig").Transform;
 const scene = @import("../../scene/root.zig");
 const ParagraphHandle = @import("../../text/paragraph_cache.zig").ParagraphHandle;
 const ShapeHandle = @import("../../text/shape_cache.zig").ShapeHandle;
@@ -15,12 +16,12 @@ const ImageFit = @import("../../image/pixels.zig").Fit;
 pub const Builder = struct {
     storage: []scene.Command,
     count: usize = 0,
-    scale: f32,
+    transform: Transform,
 
     pub fn init(storage: []scene.Command, scale: f32) !Builder {
         if (storage.len == 0 or !std.math.isFinite(scale) or scale <= 0)
             return error.InvalidSceneBuilder;
-        return .{ .storage = storage, .scale = scale };
+        return .{ .storage = storage, .transform = .{ .scale = scale } };
     }
 
     pub fn clear(self: *Builder, color: Color) !void {
@@ -38,20 +39,20 @@ pub const Builder = struct {
     }
 
     pub fn path(self: *Builder, value: *const @import("../../path/root.zig").Path, origin: PointF, color: Color) !void {
-        const device: PointF = .{ .x = origin.x * self.scale, .y = origin.y * self.scale };
-        const bounds = try @import("../../path/root.zig").deviceBounds(value, device, self.scale);
+        const device = self.transform.point(origin);
+        const bounds = try @import("../../path/root.zig").deviceBounds(value, device, self.transform.scale);
         if (!bounds.isEmpty()) try self.append(.{ .path = .{
             .path = value,
             .identity = value.identity,
             .origin = device,
-            .scale = self.scale,
+            .scale = self.transform.scale,
             .bounds = bounds,
             .color = color,
         } });
     }
 
     pub fn gradientPath(self: *Builder, value: *const @import("../../path/root.zig").Path, origin: PointF, gradient: @import("../../paint/root.zig").LinearGradient) !void {
-        const device = try gradient.transformed(.{ .x = origin.x * self.scale, .y = origin.y * self.scale }, self.scale);
+        const device = try gradient.transformed(self.transform.point(origin), self.transform.scale);
         const start = self.count;
         try self.path(value, origin, Color.rgba(0, 0, 0, 0));
         if (self.count != start) self.storage[start].path.gradient = device;
@@ -60,7 +61,7 @@ pub const Builder = struct {
     /// The paint origin is independent of rectangle bounds so retained drawings
     /// can share one gradient across multiple primitives without stretching it.
     pub fn gradientRectangle(self: *Builder, bounds: RectF, gradient: @import("../../paint/root.zig").LinearGradient, origin: PointF, border_color: ?Color, border_width: f32, radius: f32) !void {
-        const device = try gradient.transformed(.{ .x = origin.x * self.scale, .y = origin.y * self.scale }, self.scale);
+        const device = try gradient.transformed(self.transform.point(origin), self.transform.scale);
         const start = self.count;
         try self.decoratedRectangle(bounds, null, border_color, border_width, radius);
         if (self.count != start) self.storage[start].decorated_rectangle.background_gradient = device;
@@ -73,9 +74,9 @@ pub const Builder = struct {
         const shape: @import("../../shadow/root.zig").Shape = .{
             .box = device,
             .corner_radius = @min(try self.deviceExtent(radius), @min(device.width, device.height) / 2),
-            .offset = .{ .x = style.offset.x * self.scale, .y = style.offset.y * self.scale },
-            .blur = style.blur * self.scale,
-            .spread = style.spread * self.scale,
+            .offset = .{ .x = style.offset.x * self.transform.scale, .y = style.offset.y * self.transform.scale },
+            .blur = style.blur * self.transform.scale,
+            .spread = style.spread * self.transform.scale,
         };
         const painted = try @import("../../shadow/root.zig").deviceBounds(shape);
         if (!painted.isEmpty()) try self.append(.{ .shadow = .{ .shape = shape, .bounds = painted, .color = style.color } });
@@ -136,8 +137,8 @@ pub const Builder = struct {
     ) !void {
         try self.append(.{ .glyph_run = .{
             .shape = shape,
-            .origin = .{ .x = baseline.x * self.scale, .y = baseline.y * self.scale },
-            .scale = self.scale,
+            .origin = self.transform.point(baseline),
+            .scale = self.transform.scale,
             .color = color,
         } });
     }
@@ -150,8 +151,8 @@ pub const Builder = struct {
     ) !void {
         try self.append(.{ .paragraph = .{
             .layout = layout,
-            .origin = .{ .x = origin.x * self.scale, .y = origin.y * self.scale },
-            .scale = self.scale,
+            .origin = self.transform.point(origin),
+            .scale = self.transform.scale,
             .color = color,
         } });
     }
@@ -168,16 +169,22 @@ pub const Builder = struct {
 
     fn deviceRect(self: *const Builder, bounds: RectF, rounding: enum { outward, preserve_size }) !RectI {
         if (!validRect(bounds)) return error.InvalidLogicalRectangle;
-        const left = if (rounding == .outward) @floor(bounds.x * self.scale) else @round(bounds.x * self.scale);
-        const top = if (rounding == .outward) @floor(bounds.y * self.scale) else @round(bounds.y * self.scale);
-        const right = if (rounding == .outward) @ceil((bounds.x + bounds.width) * self.scale) else left + @ceil(bounds.width * self.scale);
-        const bottom = if (rounding == .outward) @ceil((bounds.y + bounds.height) * self.scale) else top + @ceil(bounds.height * self.scale);
+        const start = self.transform.point(.{ .x = bounds.x, .y = bounds.y });
+        const end = self.transform.point(.{ .x = bounds.x + bounds.width, .y = bounds.y + bounds.height });
+        const left = if (rounding == .outward) @floor(start.x) else @round(start.x);
+        const top = if (rounding == .outward) @floor(start.y) else @round(start.y);
+        const right = if (rounding == .outward) @ceil(end.x) else left + @ceil(bounds.width * self.transform.scale);
+        const bottom = if (rounding == .outward) @ceil(end.y) else top + @ceil(bounds.height * self.transform.scale);
         const left64: f64 = left;
         const top64: f64 = top;
         const right64: f64 = right;
         const bottom64: f64 = bottom;
-        if (left64 < @as(f64, @floatFromInt(std.math.minInt(i32))) or
+        if (!std.math.isFinite(left64) or !std.math.isFinite(top64) or
+            !std.math.isFinite(right64) or !std.math.isFinite(bottom64) or
+            left64 < @as(f64, @floatFromInt(std.math.minInt(i32))) or
             top64 < @as(f64, @floatFromInt(std.math.minInt(i32))) or
+            left64 > @as(f64, @floatFromInt(std.math.maxInt(i32))) or
+            top64 > @as(f64, @floatFromInt(std.math.maxInt(i32))) or
             right64 > @as(f64, @floatFromInt(std.math.maxInt(i32))) or
             bottom64 > @as(f64, @floatFromInt(std.math.maxInt(i32))))
             return error.DeviceRectangleOverflow;
@@ -191,7 +198,7 @@ pub const Builder = struct {
 
     fn deviceExtent(self: *const Builder, value: f32) !u32 {
         if (value == 0) return 0;
-        const scaled = @ceil(@as(f64, value) * self.scale);
+        const scaled = @ceil(@as(f64, value) * self.transform.scale);
         if (!std.math.isFinite(scaled) or scaled > @as(f64, @floatFromInt(std.math.maxInt(u32))))
             return error.DeviceExtentOverflow;
         return @intFromFloat(scaled);

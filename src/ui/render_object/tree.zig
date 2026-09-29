@@ -4,6 +4,7 @@ const Handle = @import("../../core/handle.zig").Handle;
 const PointF = @import("../../core/geometry.zig").PointF;
 const RectF = @import("../../core/geometry.zig").RectF;
 const SizeF = @import("../../core/geometry.zig").SizeF;
+const Transform = @import("../../core/geometry.zig").Transform;
 const Constraints = @import("../layout/constraints.zig").Constraints;
 const anchored_impl = @import("anchored.zig");
 const box_impl = @import("box.zig");
@@ -26,6 +27,7 @@ pub const LayoutError = error{
     BoxHasMultipleChildren,
     InvalidChildOffset,
     InvalidLayoutSize,
+    InvalidTransform,
     UnconstrainedLayoutSize,
     FlexInUnboundedAxis,
     FlexInWrap,
@@ -293,13 +295,50 @@ pub const Tree = struct {
     ) !void {
         const root_slot = try self.slot(root);
         if (!root_slot.has_layout or root_slot.needs_layout) return error.LayoutRequired;
+        // A paint-only transform can move a trigger without invalidating layout.
+        try self.placeOverlays(root, .{}, self.rootViewport(root_slot));
         try self.paintNode(root, builder, .{});
         try self.paintOverlays(root, builder, .{});
+    }
+
+    /// Map local layout coordinates to window logical pixels. Floating children
+    /// start a new paint plane, retaining their placed position but not ancestor
+    /// scale. Paint, semantic targeting and captured input share this mapping.
+    pub fn paintTransform(self: *Tree, handle: NodeHandle) !Transform {
+        var result: Transform = .{};
+        var current: ?NodeHandle = handle;
+        while (current) |node| {
+            const target = try self.slot(node);
+            const local: Transform = if (target.object == .box) target.object.box.transform else .{};
+            const positioned = try (Transform{ .translation = target.offset }).compose(local);
+            result = try positioned.compose(result);
+            if (target.parent) |parent| {
+                if (floatingChild(try self.slot(parent))) |popup| if (same(popup, node)) {
+                    var origin: PointF = .{};
+                    var ancestor: ?NodeHandle = parent;
+                    while (ancestor) |item| {
+                        const slot_value = try self.slot(item);
+                        origin = PointF.add(origin, slot_value.offset);
+                        ancestor = slot_value.parent;
+                    }
+                    return (Transform{ .translation = origin }).compose(result);
+                };
+            }
+            current = target.parent;
+        }
+        return result;
+    }
+
+    pub fn paintBounds(self: *Tree, handle: NodeHandle) !RectF {
+        const extent = try self.nodeSize(handle);
+        return (try self.paintTransform(handle)).rect(.{ .x = 0, .y = 0, .width = extent.width, .height = extent.height });
     }
 
     pub fn hitTest(self: *Tree, root: NodeHandle, point: PointF) !?NodeHandle {
         const root_slot = try self.slot(root);
         if (!root_slot.has_layout or root_slot.needs_layout) return error.LayoutRequired;
+        const viewport = self.rootViewport(root_slot);
+        if (!(RectF{ .x = 0, .y = 0, .width = viewport.width, .height = viewport.height }).contains(point)) return null;
         if (try self.hitTestOverlays(root, point)) |hit| return hit;
         return self.hitTestNode(root, point);
     }
@@ -629,6 +668,13 @@ pub const Tree = struct {
             self.clearPaintSubtree(handle);
             return;
         }
+        const saved_transform = builder.transform;
+        defer builder.transform = saved_transform;
+        if (target.object == .box) {
+            var local = target.object.box.transform;
+            local.origin = PointF.add(origin, local.origin);
+            builder.transform = try saved_transform.compose(local);
+        }
         const bounds: RectF = .{
             .x = origin.x,
             .y = origin.y,
@@ -761,11 +807,19 @@ pub const Tree = struct {
         target.needs_paint = false;
     }
 
-    fn hitTestNode(self: *Tree, handle: NodeHandle, point: PointF) !?NodeHandle {
+    fn hitTestNode(self: *Tree, handle: NodeHandle, parent_point: PointF) !?NodeHandle {
         const target = try self.slot(handle);
         if (target.object == .box and target.object.box.hidden) return null;
-        if (!(RectF{ .x = 0, .y = 0, .width = target.size.width, .height = target.size.height }).contains(point))
-            return null;
+        const point = if (target.object == .box) target.object.box.transform.inversePoint(parent_point) else parent_point;
+        if (!validPoint(point)) return null;
+        const inside = (RectF{ .x = 0, .y = 0, .width = target.size.width, .height = target.size.height }).contains(point);
+        const clips = switch (target.object) {
+            .box => |value| value.clip,
+            .stack => |value| value.clip,
+            .scroll, .text, .text_input, .canvas => true,
+            else => false,
+        };
+        if (!inside and clips) return null;
         if (target.object == .box and target.object.box.clip and
             !(RectF{ .x = 0, .y = 0, .width = target.size.width, .height = target.size.height }).containsRounded(point, target.object.box.corner_radius))
             return null;
@@ -779,7 +833,7 @@ pub const Tree = struct {
             })) |hit| return hit;
             child = previous;
         }
-        return handle;
+        return if (inside) handle else null;
     }
 
     fn rootViewport(_: *Tree, root: *const Slot) SizeF {
@@ -812,12 +866,13 @@ pub const Tree = struct {
                 .max_height = viewport_rect.height,
             });
             const trigger = try self.slot(target.first_child.?);
-            const position = anchored_impl.place(value, .{
-                .x = origin.x + trigger.offset.x,
-                .y = origin.y + trigger.offset.y,
+            const trigger_bounds = (try self.paintTransform(target.first_child.?)).rect(.{
+                .x = 0,
+                .y = 0,
                 .width = trigger.size.width,
                 .height = trigger.size.height,
-            }, popup_size, viewport_rect);
+            });
+            const position = anchored_impl.place(value, trigger_bounds, popup_size, viewport_rect);
             try self.setChildOffset(popup, .{ .x = position.x - origin.x, .y = position.y - origin.y });
         }
         var child = target.first_child;
@@ -2217,6 +2272,57 @@ test "box outlines stay paint-only and inset rings paint above the background" {
         try std.testing.expectEqual(@as(u32, if (inset) 2 else 8), outline.corner_radius);
         try std.testing.expectEqual(@as(u32, 2), outline.border_width);
     }
+}
+
+test "paint transforms compose origins without layout and hit overflowing children through real clips" {
+    const scene = @import("../../scene/root.zig");
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    defer tree.deinit();
+    const root = try tree.create(.{ .stack = .{ .clip = true } });
+    var outer: types.Box = .{ .width = 100, .height = 80, .opacity = 0.5, .transform = .{ .translation = .{ .x = 10, .y = 6 }, .scale = 1.5, .origin = .{ .x = 20, .y = 10 } } };
+    const parent = try tree.create(.{ .box = outer });
+    const stack = try tree.create(.{ .stack = .{} });
+    var inner: types.Box = .{ .width = 40, .height = 30, .background = Color.rgba(255, 0, 0, 255), .transform = .{ .translation = .{ .x = 4, .y = -2 }, .scale = 0.5, .origin = .{ .x = 10, .y = 6 } } };
+    const child = try tree.create(.{ .box = inner });
+    try tree.appendChild(root, parent, .{ .stack = .{ .x = 20, .y = 30 } });
+    try tree.appendChild(parent, stack, .none);
+    try tree.appendChild(stack, child, .{ .stack = .{ .x = 20, .y = 15 } });
+    _ = try tree.layout(root, Constraints.tight(.{ .width = 240, .height = 160 }));
+    try std.testing.expectEqual(RectF{ .x = 63.5, .y = 55, .width = 30, .height = 22.5 }, try tree.paintBounds(child));
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 64, .y = 56 })).?);
+    try std.testing.expect(!same(child, (try tree.hitTest(root, .{ .x = 41, .y = 46 })).?));
+    var storage: [8]scene.Command = undefined;
+    var builder = try scene_builder.Builder.init(&storage, 2);
+    try tree.buildScene(root, &builder);
+    try std.testing.expectEqual(@as(f32, 2), builder.transform.scale);
+    try std.testing.expectEqual(PointF{}, builder.transform.translation);
+    try std.testing.expectEqual(@as(usize, 5), builder.count);
+    try std.testing.expectEqual(@import("../../core/geometry.zig").RectI{ .x = 127, .y = 110, .width = 60, .height = 45 }, storage[2].solid_rectangle.bounds);
+    var pixels: [480 * 320 * 4]u8 = @splat(255);
+    try @import("../../renderer/software/root.zig").render(builder.displayList(), .{
+        .pixels = &pixels,
+        .width = 480,
+        .height = 320,
+        .stride = 480 * 4,
+        .format = .rgba8_unorm,
+        .allocator = std.testing.allocator,
+    });
+    try std.testing.expectEqualSlices(u8, &.{ 255, 188, 188, 255 }, pixels[(112 * 480 + 128) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[(92 * 480 + 82) * 4 ..][0..4]);
+    inner.transform.translation.x = 80;
+    try tree.update(child, .{ .box = inner });
+    try std.testing.expect(!try tree.layoutDirty(root));
+    try std.testing.expectEqual(PointF{ .x = 20, .y = 15 }, try tree.nodeOffset(child));
+    try std.testing.expectEqual(SizeF{ .width = 40, .height = 30 }, try tree.nodeSize(child));
+    try std.testing.expectEqual(child, (try tree.hitTest(root, .{ .x = 178, .y = 56 })).?);
+    outer.clip = true;
+    try tree.update(parent, .{ .box = outer });
+    try std.testing.expectEqual(root, (try tree.hitTest(root, .{ .x = 178, .y = 56 })).?);
+    builder = try scene_builder.Builder.init(&storage, 1);
+    try tree.buildScene(root, &builder);
+    for ([_]NodeHandle{ root, parent, stack, child }) |node|
+        try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(node));
 }
 
 test "box opacity wraps own paint and children without layout or hit changes" {

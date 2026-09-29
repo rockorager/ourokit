@@ -1552,6 +1552,8 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box min_height");
         const opacity = tableOptionalFraction(state, 1, "opacity", 1) orelse
             return luaError(state, "box opacity must be a finite number from zero to one");
+        const transform = tableOptionalTransform(state, 1) catch
+            return luaError(state, "box transform requires finite x/y/origin and a positive uniform scale");
         if (width.extent()) |value| if (value < min_width)
             return luaError(state, "box width must be at least min_width");
         if (height.extent()) |value| if (value < min_height)
@@ -1684,6 +1686,7 @@ pub const UiBuild = struct {
                 .corner_radius = visual.radius orelse 0,
                 .shadow = shadow,
                 .opacity = opacity,
+                .transform = transform,
                 .clip = tableOptionalBoolean(state, 1, "clip", false) orelse
                     return luaError(state, "box clip must be boolean"),
             } },
@@ -2226,6 +2229,40 @@ fn tableOptionalParagraphAlignment(
 
 const OptionalSurface = struct { value: ?@TypeOf(design.tokens.light.background) };
 
+fn tableOptionalTransform(state: *c.State, table: c_int) !@import("../core/geometry.zig").Transform {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    const kind = c.lua_getfield(state, table, "transform");
+    if (kind == c.type_nil) return .{};
+    if (kind != c.type_table) return error.InvalidTransform;
+    const index = c.lua_gettop(state);
+    var result: @import("../core/geometry.zig").Transform = .{};
+    inline for (.{ "x", "y", "scale" }) |field| {
+        const field_kind = c.lua_getfield(state, index, field);
+        if (field_kind != c.type_nil) {
+            if (field_kind != c.type_number) return error.InvalidTransform;
+            const value = finiteFloat(state, -1) orelse return error.InvalidTransform;
+            if (comptime std.mem.eql(u8, field, "scale")) result.scale = value else @field(result.translation, field) = value;
+        }
+        c.lua_settop(state, index);
+    }
+    const origin_kind = c.lua_getfield(state, index, "origin");
+    if (origin_kind != c.type_nil) {
+        if (origin_kind != c.type_table) return error.InvalidTransform;
+        const origin_index = c.lua_gettop(state);
+        inline for (.{ "x", "y" }) |field| {
+            const field_kind = c.lua_getfield(state, origin_index, field);
+            if (field_kind != c.type_nil) {
+                if (field_kind != c.type_number) return error.InvalidTransform;
+                @field(result.origin, field) = finiteFloat(state, -1) orelse return error.InvalidTransform;
+            }
+            c.lua_settop(state, origin_index);
+        }
+    }
+    try result.validate();
+    return result;
+}
+
 fn tableOptionalShadow(state: *c.State, table: c_int) !?@import("../shadow/root.zig").Style {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
@@ -2544,6 +2581,33 @@ test "contextual input validates filters commands and shortcut ambiguity transac
         ui.rollbackHandlers();
         c.lua_settop(state, 0);
     }
+}
+
+test "Lua box transforms copy finite uniform values and reject malformed declarations" {
+    const Transform = @import("../core/geometry.zig").Transform;
+    const state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(state);
+    for ([_][]const u8{
+        "false",   "1",        "{scale=0}",   "{scale=-1}",     "{scale=1/0}",      "{scale=1e-45}",
+        "{x=0/0}", "{y=1e39}", "{scale='2'}", "{origin=false}", "{origin={x='3'}}", "{origin={y=1/0}}",
+    }) |invalid| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "return {{transform={s}}}", .{invalid});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source.ptr, source.len, "@transform-validation", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 1, 0, 0, null));
+        try std.testing.expectError(error.InvalidTransform, tableOptionalTransform(state, 1));
+        try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));
+        c.lua_settop(state, 0);
+    }
+    const valid = "return {transform={x=-3.25,y=7.5,scale=1.25,origin={x=9,y=-4}}}, {transform={}}, {}";
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, valid.ptr, valid.len, "@transform-validation", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 3, 0, 0, null));
+    const value = try tableOptionalTransform(state, 1);
+    try std.testing.expectEqual(Transform{ .translation = .{ .x = -3.25, .y = 7.5 }, .scale = 1.25, .origin = .{ .x = 9, .y = -4 } }, value);
+    try std.testing.expectEqual(Transform{}, try tableOptionalTransform(state, 2));
+    try std.testing.expectEqual(Transform{}, try tableOptionalTransform(state, 3));
+    c.lua_settop(state, 0);
+    try std.testing.expectEqual(@as(f32, 9), value.origin.x);
 }
 
 test "Lua box shadows validate signed numbers defaults and rejected declarations" {

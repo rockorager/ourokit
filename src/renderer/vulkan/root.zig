@@ -5307,6 +5307,284 @@ test "Vulkan gradients interleave paths images solids and survive damage and asy
     };
 }
 
+test "Vulkan transforms lower nested Tree origins and reconstruct changed paint damage" {
+    const ui = @import("../../ui/render_object/root.zig");
+    const geometry = @import("../../core/geometry.zig");
+    var tree: ui.Tree = undefined;
+    try tree.init(std.testing.allocator, 4);
+    defer tree.deinit();
+    const root = try tree.create(.{ .stack = .{ .clip = true } });
+    const outer = try tree.create(.{ .box = .{
+        .width = 32,
+        .height = 24,
+        .padding = .{ .left = 3, .top = 5 },
+        .alignment = .{},
+        .opacity = 0.5,
+        .transform = .{ .translation = .{ .x = 7, .y = -3 }, .scale = 1.5, .origin = .{ .x = 4, .y = 10 } },
+    } });
+    var inner_style: ui.types.Box = .{
+        .width = 12,
+        .height = 8,
+        .background = Color.rgba(255, 0, 0, 255),
+        .transform = .{ .translation = .{ .x = -2, .y = 4 }, .scale = 0.5, .origin = .{ .x = 6, .y = 2 } },
+    };
+    const inner = try tree.create(.{ .box = inner_style });
+    const sibling = try tree.create(.{ .box = .{ .width = 6, .height = 4, .background = Color.rgba(0, 0, 255, 255) } });
+    try tree.appendChild(root, outer, .{ .stack = .{ .x = 8, .y = 6 } });
+    try tree.appendChild(outer, inner, .none);
+    try tree.appendChild(root, sibling, .{ .stack = .{ .x = 50, .y = 8 } });
+    _ = try tree.layout(root, @import("../../ui/layout/constraints.zig").Constraints.tight(.{ .width = 80, .height = 60 }));
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var target = try Target.init(&renderer, 100, 75);
+    defer target.deinit(&renderer);
+    var direct = try GraphicsReadback.initMode(&renderer, 100, 75, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 100, 75);
+    defer linear.deinit(&renderer);
+    var tracker = try @import("../../scene/damage.zig").Tracker.init(std.testing.allocator, 12);
+    defer tracker.deinit();
+    const viewport: RectI = .{ .x = 0, .y = 0, .width = 100, .height = 75 };
+    // Before output scaling the first composition is .75*p+(10.75,4.75),
+    // where p is the absolute layout point. Inner starts at (11,11), hence
+    // (19,13), then 1.25 output scaling gives (23.75,16.25), size 11.25x7.5.
+    // The second composition is 1.875*p+(3.625,-15.875), giving device
+    // (30.3125,5.9375), size 28.125x18.75. Bounds round outward independently.
+    const red_bounds = [_]RectI{
+        .{ .x = 23, .y = 16, .width = 12, .height = 8 },
+        .{ .x = 30, .y = 5, .width = 29, .height = 20 },
+    };
+    const blue_bounds: RectI = .{ .x = 62, .y = 10, .width = 8, .height = 5 };
+    for (red_bounds, 0..) |red, frame| {
+        if (frame == 1) {
+            inner_style.transform = .{ .translation = .{ .x = 6, .y = 0 }, .scale = 1.25, .origin = .{ .x = 6, .y = 2 } };
+            try tree.update(inner, .{ .box = inner_style });
+            try std.testing.expect(!try tree.layoutDirty(root));
+        }
+        var storage: [12]scene.Command = undefined;
+        var builder = try ui.Builder.init(&storage, 1.25);
+        try builder.clear(Color.rgba(255, 255, 255, 255));
+        try tree.buildScene(root, &builder);
+        try std.testing.expectEqual(@as(usize, 7), builder.count);
+        try std.testing.expectEqual(red, storage[3].solid_rectangle.bounds);
+        try std.testing.expectEqual(blue_bounds, storage[5].solid_rectangle.bounds);
+        try std.testing.expectEqual(geometry.Transform{ .scale = 1.25 }, builder.transform);
+        try std.testing.expectEqual(geometry.SizeF{ .width = 12, .height = 8 }, try tree.nodeSize(inner));
+        for ([_]ui.NodeHandle{ root, outer, inner, sibling }) |node|
+            try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(node));
+        var list = builder.displayList();
+        list.damage = try tracker.compare(list.commands, viewport);
+        if (frame == 0) {
+            try std.testing.expect(list.damage == .full);
+        } else {
+            try std.testing.expectEqualSlices(RectI, &.{.{ .x = 23, .y = 5, .width = 36, .height = 20 }}, list.damage.regions);
+        }
+        try renderer.render(list, &target);
+        var actual: [100 * 75 * 4]u8 = undefined;
+        try target.readPixels(&actual, 400, .rgba8_unorm);
+        var expected: [actual.len]u8 = @splat(255);
+        // Independent raster golden: red isolation over white gives 255,188,188;
+        // the untransformed blue sibling stays outside the opacity scope.
+        for (@intCast(red.y)..@as(usize, @intCast(red.y)) + red.height) |y|
+            for (@intCast(red.x)..@as(usize, @intCast(red.x)) + red.width) |x| {
+                expected[(y * 100 + x) * 4 ..][0..4].* = .{ 255, 188, 188, 255 };
+            };
+        for (10..15) |y| for (62..70) |x| {
+            expected[(y * 100 + x) * 4 ..][0..4].* = .{ 0, 0, 255, 255 };
+        };
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        for ([_]*GraphicsReadback{ &direct, &linear }) |output| {
+            try renderer.renderGraphicsResources(list, &output.target, null, null, null, null, false);
+            try output.target.wait(&renderer);
+            for (0..75) |y| for (0..100) |x| try output.expectPixel(x, y, expected[(y * 100 + x) * 4 ..][0..4].*);
+        }
+        tracker.submitted();
+        try std.testing.expectEqual(@as(usize, 0), (try tracker.compare(list.commands, viewport)).regions.len);
+    }
+}
+
+test "Vulkan transforms lower mixed Builder coverage gradients images and rounded opacity" {
+    const Builder = @import("../../ui/render_object/scene_builder.zig").Builder;
+    const PointF = @import("../../core/geometry.zig").PointF;
+    const RectF = @import("../../core/geometry.zig").RectF;
+    const software = @import("../software/root.zig");
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var images = try ImageCache.init(std.testing.allocator, 1);
+    defer images.deinit();
+    const image = try @import("../image_test.zig").insertFixture(&images);
+    const native_path = try path.Path.create(std.testing.allocator, &.{
+        .{ .move = .{ .x = 0, .y = 0 } }, .{ .line = .{ .x = 20, .y = 0 } }, .{ .line = .{ .x = 4, .y = 16 } }, .close,
+    }, .{ .fill = .nonzero });
+    defer native_path.release();
+    const gradient = try paint.LinearGradient.init(.{ .x = 0, .y = 0 }, .{ .x = 32, .y = 24 }, &.{
+        .{ .offset = 0, .color = Color.rgba(240, 60, 20, 220) },
+        .{ .offset = 0.375, .color = Color.rgba(40, 200, 70, 90) },
+        .{ .offset = 1, .color = Color.rgba(30, 80, 240, 170) },
+    });
+    var storage: [24]scene.Command = undefined;
+    var builder = try Builder.init(&storage, 1.25);
+    const output_transform = builder.transform;
+    try builder.clear(Color.rgba(25, 40, 65, 255));
+    // Parent maps p to 1.875*p+(8.125,9.375) in device pixels. The child
+    // composes to .9375*p+(10.9375,15.9375), not a scaled parent translation.
+    builder.transform = try builder.transform.compose(.{ .translation = .{ .x = 8, .y = 10 }, .scale = 1.5, .origin = .{ .x = 3, .y = 5 } });
+    const parent_transform = builder.transform;
+    try builder.pushOpacity(0.6);
+    const box: RectF = .{ .x = 2, .y = 2, .width = 32, .height = 24 };
+    const shadow_index = builder.count;
+    try builder.boxShadow(box, 4, .{ .offset = .{ .x = -3, .y = 2 }, .blur = 4, .spread = 1.5, .color = Color.rgba(10, 20, 30, 190) });
+    const rectangle_index = builder.count;
+    try builder.gradientRectangle(box, gradient, .{ .x = 2, .y = 2 }, Color.rgba(230, 190, 70, 255), 1.2, 4);
+    const rounded_index = builder.count;
+    try builder.pushRoundedClip(box, 4);
+    builder.transform = try builder.transform.compose(.{ .translation = .{ .x = -2, .y = 3 }, .scale = 0.5, .origin = .{ .x = 7, .y = 1 } });
+    const clip_index = builder.count;
+    try builder.pushClip(.{ .x = 4, .y = 3, .width = 44, .height = 30 });
+    const image_index = builder.count;
+    try builder.image(image, .{ .x = 5, .y = 5, .width = 25, .height = 18 }, .fill);
+    const path_index = builder.count;
+    try builder.gradientPath(native_path, .{ .x = 5, .y = 7 }, gradient);
+    try builder.popClip();
+    builder.transform = parent_transform;
+    try builder.solidRectangle(.{ .x = 26, .y = 15, .width = 6, .height = 5 }, Color.rgba(240, 100, 180, 150));
+    try builder.popClip();
+    try builder.popOpacity();
+    builder.transform = output_transform;
+    try builder.solidRectangle(.{ .x = 2, .y = 2, .width = 4, .height = 3 }, Color.rgba(0, 255, 0, 255));
+    const snapped: RectI = .{ .x = 12, .y = 13, .width = 60, .height = 45 };
+    const shadow_value = storage[shadow_index].shadow.shape;
+    try std.testing.expectEqual(snapped, shadow_value.box);
+    try std.testing.expectEqual(@as(u32, 8), shadow_value.corner_radius);
+    try std.testing.expectEqual(PointF{ .x = -5.625, .y = 3.75 }, shadow_value.offset);
+    try std.testing.expectEqual(@as(f32, 7.5), shadow_value.blur);
+    try std.testing.expectEqual(@as(f32, 2.8125), shadow_value.spread);
+    const rectangle = storage[rectangle_index].decorated_rectangle;
+    try std.testing.expectEqual(snapped, rectangle.bounds);
+    try std.testing.expectEqual(@as(u32, 3), rectangle.border_width);
+    try std.testing.expectEqual(@as(u32, 8), rectangle.corner_radius);
+    try std.testing.expectEqual(PointF{ .x = 11.875, .y = 13.125 }, rectangle.background_gradient.?.start);
+    try std.testing.expectEqual(PointF{ .x = 71.875, .y = 58.125 }, rectangle.background_gradient.?.end);
+    try std.testing.expectEqual(scene.RoundedClip{ .bounds = snapped, .corner_radius = 8 }, storage[rounded_index].push_clip_rounded);
+    try std.testing.expectEqual(RectI{ .x = 14, .y = 18, .width = 42, .height = 29 }, storage[clip_index].push_clip_rect);
+    try std.testing.expectEqual(RectI{ .x = 15, .y = 20, .width = 25, .height = 18 }, storage[image_index].image.bounds);
+    const path_value = storage[path_index].path;
+    try std.testing.expectEqual(PointF{ .x = 15.625, .y = 22.5 }, path_value.origin);
+    try std.testing.expectEqual(@as(f32, 0.9375), path_value.scale);
+    try std.testing.expectEqual(PointF{ .x = 15.625, .y = 22.5 }, path_value.gradient.?.start);
+    try std.testing.expectEqual(PointF{ .x = 45.625, .y = 45 }, path_value.gradient.?.end);
+    var target = try Target.init(&renderer, 96, 72);
+    defer target.deinit(&renderer);
+    var direct = try GraphicsReadback.initMode(&renderer, 96, 72, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 96, 72);
+    defer linear.deinit(&renderer);
+    for ([_]u8{ 255, 0 }) |alpha| {
+        storage[0].clear.a = alpha;
+        var list = builder.displayList();
+        list.damage = .{ .regions = &.{
+            .{ .x = 0, .y = 0, .width = 29, .height = 72 },
+            .{ .x = 29, .y = 0, .width = 67, .height = 72 },
+        } };
+        var expected: [96 * 72 * 4]u8 = undefined;
+        var actual: [expected.len]u8 = undefined;
+        try software.renderResources(list, .{ .pixels = &expected, .width = 96, .height = 72, .stride = 384, .format = .rgba8_unorm, .allocator = std.testing.allocator }, null, null, null, &images);
+        try renderer.renderResources(list, &target, null, null, null, &images);
+        try target.readPixels(&actual, 384, .rgba8_unorm);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, actual[(3 * 96 + 3) * 4 ..][0..4].*);
+        try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, actual[(6 * 96 + 7) * 4 ..][0..4].*);
+        try std.testing.expectEqual([4]u8{ if (alpha == 0) 0 else 25, if (alpha == 0) 0 else 40, if (alpha == 0) 0 else 65, alpha }, actual[(3 * 96 + 8) * 4 ..][0..4].*);
+        const output = if (alpha == 255) &direct else &linear;
+        try renderer.renderGraphicsResources(list, &output.target, null, null, null, &images, false);
+        try output.target.wait(&renderer);
+        for (0..72) |y| for (0..96) |x| try output.expectPixel(x, y, expected[(y * 96 + x) * 4 ..][0..4].*);
+    }
+}
+
+test "Vulkan transforms lower fractional glyph and paragraph positions with restored sibling scale" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    const Builder = @import("../../ui/render_object/scene_builder.zig").Builder;
+    const PointF = @import("../../core/geometry.zig").PointF;
+    const software = @import("../software/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try text.bundled.acquire(&fonts, .sans, .regular, .roman);
+    defer fonts.release(font) catch unreachable;
+    const emoji = try fonts.acquire(.{ .key = .{ .file = "/fixtures/EmojiTest.ttf", .index = 0 }, .bytes = @embedFile("../../text/fonts/EmojiTest.ttf") });
+    defer fonts.release(emoji) catch unreachable;
+    var shapes = text.ShapeCache.init(std.testing.allocator, &fonts);
+    defer shapes.deinit();
+    const shape = try shapes.acquire(.{
+        .spec = .{ .paragraph = "🚀 Wa", .direction = .left_to_right, .script = .latin, .language = "en", .logical_size = 13.25 },
+        .candidates = &.{ font, emoji },
+        .configuration_revision = 1,
+    });
+    defer shapes.release(shape) catch unreachable;
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const paragraph = try paragraphs.acquire(.{ .utf8 = "paint 👋 scale", .language = "en", .logical_size = 11.25, .max_width = 58, .candidates = &.{ font, emoji }, .configuration_revision = 1 });
+    defer paragraphs.release(paragraph) catch unreachable;
+    var storage: [10]scene.Command = undefined;
+    var builder = try Builder.init(&storage, 1.5);
+    const output_transform = builder.transform;
+    try builder.clear(Color.rgba(25, 40, 65, 255));
+    // Device parent: 1.125*p+(-1.5,12). Nested device map:
+    // 1.6875*p+(3,6.375). Expected origins below are calculated directly.
+    builder.transform = try builder.transform.compose(.{ .translation = .{ .x = -3, .y = 7 }, .scale = 0.75, .origin = .{ .x = 8, .y = 4 } });
+    try builder.pushRoundedClip(.{ .x = 0, .y = 0, .width = 100, .height = 64 }, 8);
+    try builder.pushOpacity(0.6);
+    builder.transform = try builder.transform.compose(.{ .translation = .{ .x = 5, .y = -2 }, .scale = 1.5, .origin = .{ .x = 2, .y = 6 } });
+    try builder.glyphRun(shape, .{ .x = 4, .y = 16 }, Color.rgba(250, 230, 180, 220));
+    try builder.paragraph(paragraph, .{ .x = 18, .y = 24 }, Color.rgba(140, 240, 200, 230));
+    try builder.popOpacity();
+    try builder.popClip();
+    builder.transform = output_transform;
+    try builder.glyphRun(shape, .{ .x = 76, .y = 16 }, Color.rgba(190, 220, 250, 255));
+    try std.testing.expectEqual(scene.RoundedClip{ .bounds = .{ .x = -2, .y = 12, .width = 113, .height = 72 }, .corner_radius = 9 }, storage[1].push_clip_rounded);
+    try std.testing.expectEqual(PointF{ .x = 9.75, .y = 33.375 }, storage[3].glyph_run.origin);
+    try std.testing.expectEqual(@as(f32, 1.6875), storage[3].glyph_run.scale);
+    try std.testing.expectEqual(PointF{ .x = 33.375, .y = 46.875 }, storage[4].paragraph.origin);
+    try std.testing.expectEqual(@as(f32, 1.6875), storage[4].paragraph.scale);
+    try std.testing.expectEqual(PointF{ .x = 114, .y = 24 }, storage[7].glyph_run.origin);
+    try std.testing.expectEqual(@as(f32, 1.5), storage[7].glyph_run.scale);
+    var renderer = init(std.testing.allocator) catch |err| switch (err) {
+        error.VulkanUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var glyphs = try GlyphCache.init(std.testing.allocator, &fonts, &renderer);
+    defer glyphs.deinit();
+    var software_glyphs = try software.GlyphCache.init(std.testing.allocator, &fonts);
+    defer software_glyphs.deinit();
+    var target = try Target.init(&renderer, 192, 120);
+    defer target.deinit(&renderer);
+    var direct = try GraphicsReadback.initMode(&renderer, 192, 120, null, true);
+    defer direct.deinit(&renderer);
+    var linear = try GraphicsReadback.init(&renderer, 192, 120);
+    defer linear.deinit(&renderer);
+    for ([_]u8{ 255, 0 }) |alpha| {
+        storage[0].clear.a = alpha;
+        const list = builder.displayList();
+        var expected: [192 * 120 * 4]u8 = undefined;
+        var actual: [expected.len]u8 = undefined;
+        try software.renderResources(list, .{ .pixels = &expected, .width = 192, .height = 120, .stride = 768, .format = .rgba8_unorm, .allocator = std.testing.allocator }, &software_glyphs, &shapes, &paragraphs, null);
+        try renderer.renderResources(list, &target, &glyphs, &shapes, &paragraphs, null);
+        try target.readPixels(&actual, 768, .rgba8_unorm);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        const output = if (alpha == 255) &direct else &linear;
+        try renderer.renderGraphicsResources(list, &output.target, &glyphs, &shapes, &paragraphs, null, false);
+        try output.target.wait(&renderer);
+        for (0..120) |y| for (0..192) |x| try output.expectPixel(x, y, expected[(y * 192 + x) * 4 ..][0..4].*);
+    }
+}
+
 test "Vulkan opacity isolates overlaps erasure and nested cropped layers" {
     var renderer = init(std.testing.allocator) catch |err| switch (err) {
         error.VulkanUnavailable => return error.SkipZigTest,

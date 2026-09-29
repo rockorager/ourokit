@@ -14,6 +14,57 @@ pub const PointF = struct {
     }
 };
 
+/// Positive uniform paint transform. Translation follows scaling about origin;
+/// layout geometry is not changed. Compositions normalize the origin to zero.
+pub const Transform = struct {
+    translation: PointF = .{},
+    scale: f32 = 1,
+    origin: PointF = .{},
+
+    pub fn validate(self: Transform) !void {
+        if (!std.math.isFinite(self.scale) or self.scale <= 0 or
+            !std.math.isFinite(1 / self.scale) or
+            !std.math.isFinite(self.translation.x) or !std.math.isFinite(self.translation.y) or
+            !std.math.isFinite(self.origin.x) or !std.math.isFinite(self.origin.y))
+            return error.InvalidTransform;
+    }
+
+    pub fn point(self: Transform, value: PointF) PointF {
+        return .{
+            .x = @floatCast(@as(f64, self.translation.x) + self.origin.x + @as(f64, self.scale) * (@as(f64, value.x) - self.origin.x)),
+            .y = @floatCast(@as(f64, self.translation.y) + self.origin.y + @as(f64, self.scale) * (@as(f64, value.y) - self.origin.y)),
+        };
+    }
+
+    pub fn inversePoint(self: Transform, value: PointF) PointF {
+        return .{
+            .x = @floatCast((@as(f64, value.x) - self.translation.x - self.origin.x) / self.scale + self.origin.x),
+            .y = @floatCast((@as(f64, value.y) - self.translation.y - self.origin.y) / self.scale + self.origin.y),
+        };
+    }
+
+    pub fn rect(self: Transform, value: RectF) RectF {
+        const start = self.point(.{ .x = value.x, .y = value.y });
+        return .{ .x = start.x, .y = start.y, .width = value.width * self.scale, .height = value.height * self.scale };
+    }
+
+    /// Apply child first, then this parent. f64 intermediates avoid overflow
+    /// before cancellation; the stored map and its inverse must remain finite.
+    pub fn compose(self: Transform, child: Transform) !Transform {
+        try self.validate();
+        try child.validate();
+        const result: Transform = .{
+            .scale = @floatCast(@as(f64, self.scale) * child.scale),
+            .translation = .{
+                .x = @floatCast(@as(f64, self.translation.x) + @as(f64, self.origin.x) * (1 - @as(f64, self.scale)) + @as(f64, self.scale) * (@as(f64, child.translation.x) + @as(f64, child.origin.x) * (1 - @as(f64, child.scale)))),
+                .y = @floatCast(@as(f64, self.translation.y) + @as(f64, self.origin.y) * (1 - @as(f64, self.scale)) + @as(f64, self.scale) * (@as(f64, child.translation.y) + @as(f64, child.origin.y) * (1 - @as(f64, child.scale)))),
+            },
+        };
+        try result.validate();
+        return result;
+    }
+};
+
 pub const SizeF = struct {
     width: f32,
     height: f32,
@@ -119,6 +170,22 @@ test "logical rectangles use half-open hit-test bounds" {
     try std.testing.expect(rect.contains(.{ .x = 2, .y = 3 }));
     try std.testing.expect(rect.contains(.{ .x = 5.999, .y = 7.999 }));
     try std.testing.expect(!rect.contains(.{ .x = 6, .y = 4 }));
+}
+
+test "transform composition preserves asymmetric origins and rejects collapsed or overflowing maps" {
+    const outer: Transform = .{ .translation = .{ .x = 17, .y = -9 }, .scale = 1.5, .origin = .{ .x = 8, .y = 4 } };
+    const inner: Transform = .{ .translation = .{ .x = -3, .y = 11 }, .scale = 0.5, .origin = .{ .x = 10, .y = -6 } };
+    const combined = try outer.compose(inner);
+    // Inner maps (6,14) to (5,15); outer maps that to (20.5,11.5).
+    try std.testing.expectEqual(PointF{ .x = 20.5, .y = 11.5 }, combined.point(.{ .x = 6, .y = 14 }));
+    try std.testing.expectEqual(PointF{ .x = 6, .y = 14 }, combined.inversePoint(.{ .x = 20.5, .y = 11.5 }));
+    try std.testing.expectEqual(RectF{ .x = 20.5, .y = 11.5, .width = 9, .height = 5.25 }, combined.rect(.{ .x = 6, .y = 14, .width = 12, .height = 7 }));
+    for ([_]f32{ 0, -1, std.math.inf(f32), std.math.nan(f32), std.math.floatTrueMin(f32) }) |bad|
+        try std.testing.expectError(error.InvalidTransform, (Transform{ .scale = bad }).validate());
+    try std.testing.expectError(error.InvalidTransform, (Transform{ .origin = .{ .y = std.math.inf(f32) } }).validate());
+    try std.testing.expectError(error.InvalidTransform, (Transform{ .scale = 1e30 }).compose(.{ .scale = 1e20 }));
+    try std.testing.expectError(error.InvalidTransform, (Transform{ .scale = 1e-30 }).compose(.{ .scale = 1e-20 }));
+    try std.testing.expectError(error.InvalidTransform, (Transform{ .translation = .{ .x = std.math.floatMax(f32) } }).compose(.{ .translation = .{ .x = std.math.floatMax(f32) } }));
 }
 
 test "rounded logical hit contours clamp oversized radii and retain half-open edges" {
