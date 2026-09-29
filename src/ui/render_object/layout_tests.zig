@@ -6,6 +6,149 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const PointF = @import("../../core/geometry.zig").PointF;
 const Color = @import("../../core/color.zig").Color;
 
+test "baseline rows reserve independent ascents and descents and align each wrapped run" {
+    const text = @import("../../text/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{ .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 }, .bytes = @embedFile("ourokit_test_font") });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const source = try sources.acquire(.{ .utf8 = "Ag", .language = "und", .logical_size = 20, .candidates = &.{font}, .configuration_revision = 1 });
+    defer sources.release(source) catch unreachable;
+    // Expectations come directly from the font, not Tree's baseline reporting.
+    var shaped = try (try fonts.get(font)).shape(std.testing.allocator, .{ .paragraph = "Ag", .direction = .left_to_right, .script = .latin, .language = "und", .logical_size = 20 });
+    defer shaped.deinit();
+    const ascent = shaped.metrics.ascender;
+    const height = ascent - shaped.metrics.descender + shaped.metrics.line_gap;
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 9);
+    defer tree.deinit();
+    tree.attachTextCaches(&sources, &paragraphs);
+    var flex: types.Flex = .{ .main_axis_size = .min, .cross_axis_alignment = .baseline, .gap = 5, .run_gap = 7 };
+    const row = try tree.create(.{ .flex = flex });
+    var first_box: types.Box = .{ .width = 40, .padding = .{ .top = 11, .bottom = 2 } };
+    const first = try tree.create(.{ .box = first_box });
+    const second = try tree.create(.{ .box = .{ .width = 50, .padding = .{ .top = 3, .bottom = 23 } } });
+    const third = try tree.create(.{ .box = .{ .width = 31, .padding = .{ .top = 1, .bottom = 4 } } });
+    const marker = try tree.create(.{ .box = .{ .width = 12, .height = 9 } });
+    for ([_]@import("tree.zig").NodeHandle{ first, second, third }) |parent| {
+        const label = try tree.create(.{ .text = .{ .source = source, .color = Color.rgba(0, 0, 0, 255) } });
+        try tree.appendChild(parent, label, .none);
+        try tree.appendChild(row, parent, .none);
+    }
+    try tree.appendChild(row, marker, .none);
+    const natural = try tree.layout(row, .{});
+    try std.testing.expectApproxEqAbs(height + 34, natural.height, 0.001);
+    try std.testing.expectEqual(@as(f32, 148), natural.width);
+    for ([_]@import("tree.zig").NodeHandle{ first, second, third, marker }, [_]f32{ 0, 8, 10, 0 }) |child, y|
+        try std.testing.expectApproxEqAbs(y, (try tree.nodeOffset(child)).y, 0.001);
+    try std.testing.expectApproxEqAbs(ascent + 11, (try tree.baseline(row)).?, 0.001);
+    try std.testing.expectEqual(null, try tree.baseline(marker));
+    const count = try tree.layoutCount(row);
+    _ = try tree.layout(row, .{});
+    try std.testing.expectEqual(count, try tree.layoutCount(row));
+    // Tight/minimum heights leave surplus below the aligned children.
+    _ = try tree.layout(row, .{ .min_height = 120 });
+    try std.testing.expectEqual(@as(f32, 8), (try tree.nodeOffset(second)).y);
+    _ = try tree.layout(row, .{ .max_height = 35 });
+    try std.testing.expectEqual(@as(f32, 35), (try tree.nodeSize(row)).height);
+    try std.testing.expectApproxEqAbs(ascent + 11, (try tree.nodeOffset(second)).y + (try tree.baseline(second)).?, 0.001);
+
+    flex.wrap = true;
+    try tree.update(row, .{ .flex = flex });
+    // 40 + 5 + 50 is an exact first-run fit. Third/marker start a new run.
+    _ = try tree.layout(row, .{ .max_width = 95 });
+    const next_y = height + 34 + 7;
+    try std.testing.expectApproxEqAbs(next_y, (try tree.nodeOffset(third)).y, 0.001);
+    try std.testing.expectApproxEqAbs(next_y, (try tree.nodeOffset(marker)).y, 0.001);
+    try std.testing.expectApproxEqAbs(2 * height + 46, (try tree.nodeSize(row)).height, 0.001);
+    _ = try tree.layout(row, .{ .max_width = 94 });
+    try std.testing.expectApproxEqAbs(height + 13 + 7, (try tree.nodeOffset(second)).y, 0.001);
+    try std.testing.expectApproxEqAbs(height + 13 + 7 + 2, (try tree.nodeOffset(third)).y, 0.001);
+
+    // A layout change must refresh the metric, unlike paint-only transforms.
+    flex.wrap = false;
+    try tree.update(row, .{ .flex = flex });
+    first_box.padding.top = 17;
+    try tree.update(first, .{ .box = first_box });
+    _ = try tree.layout(row, .{});
+    try std.testing.expectEqual(@as(f32, 14), (try tree.nodeOffset(second)).y);
+    const before_paint = try tree.layoutCount(row);
+    first_box.transform = .{ .translation = .{ .y = 10 }, .scale = 1.5 };
+    try tree.update(first, .{ .box = first_box });
+    _ = try tree.layout(row, .{});
+    try std.testing.expectEqual(before_paint, try tree.layoutCount(row));
+    try std.testing.expectApproxEqAbs(ascent + 17, (try tree.baseline(row)).?, 0.001);
+    try tree.update(marker, .{ .box = .{ .width = 12, .height = 120 } });
+    _ = try tree.layout(row, .{});
+    try std.testing.expectEqual(@as(f32, 120), (try tree.nodeSize(row)).height);
+    try std.testing.expectEqual(@as(f32, 14), (try tree.nodeOffset(second)).y);
+    try std.testing.expectError(error.BaselineRequiresRow, tree.create(.{ .flex = .{ .axis = .vertical, .cross_axis_alignment = .baseline } }));
+}
+
+test "baseline metrics exclude viewports and floating content and ignore editor scroll" {
+    const text = @import("../../text/root.zig");
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{ .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 }, .bytes = @embedFile("ourokit_test_font") });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    const source = try sources.acquire(.{ .utf8 = "Ag\nAg\nAg", .language = "und", .logical_size = 18, .candidates = &.{font}, .configuration_revision = 1 });
+    defer sources.release(source) catch unreachable;
+    var shaped = try (try fonts.get(font)).shape(std.testing.allocator, .{ .paragraph = "Ag", .direction = .left_to_right, .script = .latin, .language = "und", .logical_size = 18 });
+    defer shaped.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 6);
+    defer tree.deinit();
+    tree.attachTextCaches(&sources, &paragraphs);
+    var input: types.TextInput = .{
+        .source = source,
+        .multiline = true,
+        .color = Color.rgba(0, 0, 0, 255),
+        .selection_color = Color.rgba(0, 0, 0, 255),
+        .caret_color = Color.rgba(0, 0, 0, 255),
+        .selection_start = 8,
+        .selection_end = 8,
+        .caret_offset = 8,
+        .show_caret = true,
+    };
+    const editor = try tree.create(.{ .text_input = input });
+    _ = try tree.layout(editor, Constraints.tight(.{ .width = 80, .height = 24 }));
+    try std.testing.expectApproxEqAbs(shaped.metrics.ascender, (try tree.baseline(editor)).?, 0.001);
+    const count = try tree.layoutCount(editor);
+    input.caret_offset = 0;
+    input.selection_start = 0;
+    input.selection_end = 0;
+    try tree.update(editor, .{ .text_input = input });
+    _ = try tree.layout(editor, Constraints.tight(.{ .width = 80, .height = 24 }));
+    try std.testing.expectEqual(count, try tree.layoutCount(editor));
+    try std.testing.expectApproxEqAbs(shaped.metrics.ascender, (try tree.baseline(editor)).?, 0.001);
+
+    const viewport = try tree.create(.{ .scroll = .{} });
+    try tree.appendChild(viewport, editor, .none);
+    _ = try tree.layout(viewport, Constraints.tight(.{ .width = 80, .height = 24 }));
+    try std.testing.expectEqual(null, try tree.baseline(viewport));
+    _ = try tree.setScrollOffset(viewport, 12);
+    try std.testing.expectEqual(null, try tree.baseline(viewport));
+
+    const overlay = try tree.create(.{ .anchored = .{} });
+    const trigger = try tree.create(.{ .box = .{ .width = 30, .height = 20 } });
+    const popup = try tree.create(.{ .text = .{ .source = source, .color = Color.rgba(0, 0, 0, 255) } });
+    try tree.appendChild(overlay, trigger, .none);
+    try tree.appendChild(overlay, popup, .none);
+    _ = try tree.layout(overlay, .{ .max_width = 200, .max_height = 200 });
+    try std.testing.expectEqual(null, try tree.baseline(overlay));
+    try tree.update(trigger, .{ .text = .{ .source = source, .color = Color.rgba(0, 0, 0, 255) } });
+    _ = try tree.layout(overlay, .{ .max_width = 200, .max_height = 200 });
+    try std.testing.expectApproxEqAbs(shaped.metrics.ascender, (try tree.baseline(overlay)).?, 0.001);
+}
+
 test "box maxima cap fill but always yield to parent constraints and invalidate cached layout" {
     var tree: Tree = undefined;
     try tree.init(std.testing.allocator, 2);

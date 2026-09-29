@@ -2123,3 +2123,72 @@ test "layout builder uses retained editor geometry and removes subscriptions wit
     try f.build();
     try std.testing.expectEqual(core.Color.rgba(0x12, 0x34, 0x56, 255), (try f.object("frame/column/remaining/child/paint")).box.background.?);
 }
+
+test "baseline composition aligns mixed text and retained inputs across size changes and rejected builds" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\size=ouro.signal(32); vertical=ouro.signal(false); inits=0
+        \\local Label=ouro.stateful(function()
+        \\  inits=inits+1
+        \\  return function() return ouro.box {key='frame',width=86,padding_y=7,border_width=2,border='#ccddee',
+        \\    ouro.column {key='lines',gap=6,
+        \\      ouro.text {key='label',text='Ag\nyp',size=14},
+        \\      ouro.text {key='note',text='Note',size=11}}} end
+        \\end)
+        \\function build()
+        \\  local container=vertical() and ouro.column or ouro.row
+        \\  return container {key='row',cross_alignment='baseline',gap=9,
+        \\    ouro.text {key='title',text='Ag',size=size()},
+        \\    Label {key='composed'},
+        \\    ouro.text_input {key='input',default_text='',placeholder='Ag',font_size=20,width=140,height=48,
+        \\      flex=size()==32 and 1 or {factor=1,fit='loose'}},
+        \\    ouro.box {key='marker',width=12,height=60}}
+        \\end
+    );
+    var ascents: [3]f32 = undefined;
+    var heights: [3]f32 = undefined;
+    for ([_]f32{ 14, 20, 32 }, 0..) |size, i| {
+        var shape = try (try f.fonts.get(f.font[0])).shape(std.testing.allocator, .{ .paragraph = "Ag", .direction = .left_to_right, .script = .latin, .language = "und", .logical_size = size });
+        defer shape.deinit();
+        ascents[i] = shape.metrics.ascender;
+        heights[i] = shape.metrics.ascender - shape.metrics.descender + shape.metrics.line_gap;
+    }
+    try f.build();
+    const input = try f.handle("row/input");
+    const label = try f.handle("row/composed/frame/lines/label");
+    for (0..2) |phase| {
+        if (phase == 1) {
+            try f.exec("size:set(20)");
+            try f.build();
+            try std.testing.expectEqual(input, try f.handle("row/input"));
+            try std.testing.expectEqual(label, try f.handle("row/composed/frame/lines/label"));
+        }
+        const title_ascent = ascents[if (phase == 0) 2 else 1];
+        const input_baseline = (48 - heights[1]) / 2 + ascents[1];
+        const shared = @max(title_ascent, @max(9 + ascents[0], input_baseline));
+        const row = try f.runtime.instances.renderObject(try f.handle("row"));
+        const origin = (try f.runtime.tree.paintBounds(row)).y;
+        const title = try f.runtime.instances.renderObject(try f.handle("row/title"));
+        const label_render = try f.runtime.instances.renderObject(label);
+        const field = try f.runtime.instances.renderObject(input);
+        const editor = f.runtime.tree.firstChild(field).?;
+        if (phase == 0)
+            try std.testing.expect((try f.runtime.tree.nodeSize(field)).width > 140)
+        else
+            try std.testing.expectEqual(@as(f32, 140), (try f.runtime.tree.nodeSize(field)).width);
+        try std.testing.expectApproxEqAbs(origin + shared, (try f.runtime.tree.paintBounds(title)).y + title_ascent, 0.001);
+        try std.testing.expectApproxEqAbs(origin + shared, (try f.runtime.tree.paintBounds(label_render)).y + ascents[0], 0.001);
+        try std.testing.expectApproxEqAbs(origin + shared, (try f.runtime.tree.paintBounds(editor)).y + ascents[1], 0.001);
+        try std.testing.expectApproxEqAbs(2 * heights[0], (try f.runtime.tree.nodeSize(label_render)).height, 0.001);
+        try std.testing.expectApproxEqAbs(shared, (try f.runtime.tree.baseline(row)).?, 0.001);
+        const marker = try f.runtime.instances.renderObject(try f.handle("row/marker"));
+        try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.nodeOffset(marker)).y);
+    }
+    try f.exec("assert(inits==1); vertical:set(true)");
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try std.testing.expectEqual(input, try f.handle("row/input"));
+    try f.exec("vertical:set(false)");
+    try f.build();
+    try std.testing.expectEqual(input, try f.handle("row/input"));
+}

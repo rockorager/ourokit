@@ -59,7 +59,9 @@ pub const MainAxisAlignment = enum { start, center, end, space_between, space_ar
 /// Stretch uses the parent's bounded cross axis, or measures the largest child
 /// first when unbounded. The latter takes an extra child-layout pass; prefer
 /// bounded constraints for deeply nested stretch containers.
-pub const CrossAxisAlignment = enum { start, center, end, stretch };
+/// Baseline aligns first text baselines in horizontal runs; non-text children
+/// remain at the top. It is not a vertical-axis alignment.
+pub const CrossAxisAlignment = enum { start, center, end, stretch, baseline };
 
 pub const Flex = struct {
     axis: Axis = .horizontal,

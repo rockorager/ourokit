@@ -771,6 +771,38 @@ a direct nonwrapping row or column child. `cross_alignment = "start" | "center" 
 (Expanded): after measuring non-flex children, divide the remaining bounded
 main-axis space by the flex factors and require each child to occupy its share.
 
+Rows also accept `cross_alignment="baseline"`: align the first alphabetic text
+baseline of each child, rather than its bounding box. This works with both flex
+fits and with `wrap=true`, where every run gets its own baseline. Columns reject
+this horizontal-only alignment. Children without a text baseline stay at the
+top; they still contribute their full height. Surplus height stays below the
+children, and tighter parent constraints still win (overflow is not clipped
+implicitly).
+
+The row reserves the largest distance above **and** below the baseline, even
+when those distances come from different children. Text and rich text report
+the first laid-out line's baseline. Boxes include padding, borders, and child
+alignment. Columns forward the first baseline-bearing child; rows, grids,
+stacks, and splits forward the topmost child baseline. Anchored content forwards
+only its trigger. Stateful/stateless composition and layout builders preserve
+these metrics through their returned native subtree.
+
+Images, canvas drawings, empty boxes, and Scroll viewports have no baseline.
+Text editors report their first logical line (or visible placeholder), not the
+caret's line or the internally scrolled position. Paint transforms, opacity,
+and scrolling do not change baseline layout. For example:
+
+```lua
+ouro.row {key="name", gap=12, cross_alignment="baseline",
+  ouro.text {key="label", text="Name", size=18},
+  ouro.text_input {key="input", default_text="Ada", flex=1, height=46},
+  ouro.button {key="save", label="Save"},
+}
+```
+
+See `baseline/mixed`, `baseline/changed` (font-size click playback), and
+`baseline/wrap` in `examples/layout-storybook.lua`.
+
 Use `flex={factor=N, fit="loose"}` for Flexible: the child receives zero as its
 minimum and its share as its maximum, so it may choose a smaller size. `factor`
 is a positive integer up to 65535; `fit` defaults to `"tight"`. Unused allocation

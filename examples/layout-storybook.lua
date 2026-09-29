@@ -193,6 +193,53 @@ local function responsive()
   return Responsive {key='responsive'}
 end
 
+local Baselines=ouro.stateful(function()
+  local large=ouro.signal(true)
+  return function()
+    return ouro.column {key='page',gap=20,
+      ouro.text {key='title',text='Align the text, not the boxes',size=22},
+      ouro.text {key='hint',text='First-line baselines cross padding, borders, and composed controls.'},
+      ouro.button {key='toggle',label=large() and 'Reduce headline size' or 'Restore headline size',
+        on_press=function() large:set(not large()) end},
+      ouro.box {key='mixed',width='fill',padding=16,background='#EEF2F6',radius=8,
+        ouro.row {key='row',gap=18,cross_alignment='baseline',
+          ouro.text {key='headline',text='Agate',size=large() and 38 or 22},
+          ouro.box {key='tag',padding_x=12,padding_y=8,border_width=1,border='#B8CCD9',background='#DCEBFA',radius=6,
+            ouro.text {key='text',text='small label',size=14}},
+          ouro.column {key='lines',gap=5,
+            ouro.text {key='first',text='First line',size=20},
+            ouro.text {key='second',text='Second line stays below',size=13}},
+          ouro.box {key='marker',width=10,height=54,background='#B87B36',radius=3},
+        }},
+      ouro.text {key='marker-hint',text='The gold marker has no text baseline, so it stays at the top.',size=13},
+      ouro.box {key='form',width='fill',padding=16,background='#EEF2F6',radius=8,
+        ouro.row {key='row',gap=14,cross_alignment='baseline',
+          ouro.text {key='label',text='Name',size=18},
+          ouro.text_input {key='input',default_text='Ada Lovelace',font_size=16,height=46,flex=1},
+          ouro.button {key='save',label='Save',height=34},
+        }},
+      ouro.text {key='note',text='Changing the headline size repositions siblings without replacing their state.',size=13},
+    }
+  end
+end)
+
+local function baselines()
+  return Baselines {key='baseline'}
+end
+
+local function baseline_wrap()
+  local children={key='row',wrap=true,cross_alignment='baseline',gap=12,run_gap=18}
+  for i,spec in ipairs({{'Quartz',30,8},{'small',13,14},{'Topaz',24,3},{'Agate',36,6},{'Opal',16,12}}) do
+    children[#children+1]=ouro.box {key='tile'..i,padding_x=12,padding_y=spec[3],background='#DCEBFA',radius=6,
+      ouro.text {key='text',text=spec[1],size=spec[2]}}
+  end
+  return ouro.column {key='page',gap=18,
+    ouro.text {key='title',text='A baseline for each wrapped run',size=22},
+    ouro.text {key='hint',text='Different font sizes and padding. Each run reserves its own ascent and descent.'},
+    ouro.row(children),
+  }
+end
+
 return ouro.storybook {
   title = "Layout mechanics",
   stories = {
@@ -210,5 +257,9 @@ return ouro.storybook {
     ouro.story { id = "builder/narrow", group = "Layout builder", name = "Narrow parent", viewport = {width = 380, height = 720}, snapshot_scale = 2, color_scheme = "light", content = responsive },
     ouro.story { id = "builder/changed", group = "Layout builder", name = "Local resize playback", viewport = {width = 740, height = 700}, snapshot_scale = 2, color_scheme = "light", content = responsive,
       actions = {{type='click',target='responsive/page/toggle'}} },
+    ouro.story { id = "baseline/mixed", group = "Baseline", name = "Mixed fonts and controls", viewport = {width = 700, height = 440}, snapshot_scale = 2, color_scheme = "light", content = baselines },
+    ouro.story { id = "baseline/changed", group = "Baseline", name = "Font-size playback", viewport = {width = 700, height = 440}, snapshot_scale = 2, color_scheme = "light", content = baselines,
+      actions = {{type='click',target='baseline/page/toggle'}} },
+    ouro.story { id = "baseline/wrap", group = "Baseline", name = "Independent run metrics", viewport = {width = 420, height = 400}, snapshot_scale = 2, color_scheme = "light", content = baseline_wrap },
   },
 }

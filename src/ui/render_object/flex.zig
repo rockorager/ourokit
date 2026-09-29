@@ -7,6 +7,8 @@ const types = @import("types.zig");
 pub fn validate(value: types.Flex) !void {
     if (!std.math.isFinite(value.gap) or value.gap < 0) return error.InvalidGap;
     if (!std.math.isFinite(value.run_gap) or value.run_gap < 0) return error.InvalidGap;
+    if (value.cross_axis_alignment == .baseline and value.axis != .horizontal)
+        return error.BaselineRequiresRow;
 }
 
 pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Constraints) !SizeF {
@@ -18,6 +20,7 @@ pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Cons
         var occupied_main = total_gap;
         var cross_extent: f32 = 0;
         var total_flex: u64 = 0;
+        var baselines: BaselineExtents = .{};
 
         var child = context.firstChild(node);
         while (child) |handle| : (child = context.nextSibling(handle)) {
@@ -29,6 +32,8 @@ pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Cons
             const size = try context.layoutChild(handle, nonFlexConstraints(value, constraints));
             occupied_main += mainExtent(value.axis, size);
             cross_extent = @max(cross_extent, crossExtent(value.axis, size));
+            if (value.cross_axis_alignment == .baseline)
+                baselines.add(try context.baseline(handle), size.height);
         }
 
         const bounded_main = mainBounded(value.axis, constraints);
@@ -48,8 +53,11 @@ pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Cons
             );
             occupied_main += mainExtent(value.axis, size);
             cross_extent = @max(cross_extent, crossExtent(value.axis, size));
+            if (value.cross_axis_alignment == .baseline)
+                baselines.add(try context.baseline(handle), size.height);
         }
 
+        cross_extent = @max(cross_extent, baselines.above + baselines.below);
         var desired = fromExtents(value.axis, occupied_main, cross_extent);
         if (value.main_axis_size == .max and bounded_main)
             setMainExtent(value.axis, &desired, available_main);
@@ -81,6 +89,7 @@ pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Cons
                 .start, .stretch => 0,
                 .center => (crossExtent(value.axis, size) - crossExtent(value.axis, child_size)) / 2,
                 .end => crossExtent(value.axis, size) - crossExtent(value.axis, child_size),
+                .baseline => if (try context.baseline(handle)) |distance| baselines.above - distance else 0,
             };
             try context.setChildOffset(handle, pointFromExtents(value.axis, cursor, cross_offset));
             cursor += mainExtent(value.axis, child_size) + value.gap + spacing.between;
@@ -88,6 +97,20 @@ pub fn layout(value: types.Flex, context: anytype, node: anytype, incoming: Cons
         return size;
     }
 }
+
+/// A tall ascender and a deep descender may come from different children.
+/// Merely taking the tallest child's height would under-size the row.
+const BaselineExtents = struct {
+    above: f32 = 0,
+    below: f32 = 0,
+
+    fn add(self: *BaselineExtents, distance: ?f32, height: f32) void {
+        if (distance) |value| {
+            self.above = @max(self.above, value);
+            self.below = @max(self.below, height - value);
+        }
+    }
+};
 
 const FlexData = struct { factor: u16, fit: types.FlexFit };
 
@@ -132,16 +155,22 @@ fn layoutWrap(value: types.Flex, context: anytype, node: anytype, constraints: C
         var run_main = mainExtent(value.axis, try context.size(first));
         var run_cross = crossExtent(value.axis, try context.size(first));
         var run_count: usize = 1;
+        var baselines: BaselineExtents = .{};
+        if (value.cross_axis_alignment == .baseline)
+            baselines.add(try context.baseline(first), run_cross);
         while (run_end) |handle| {
             const size = try context.size(handle);
             const next_main = run_main + value.gap + mainExtent(value.axis, size);
             if (next_main > mainMaximum(value.axis, constraints)) break;
             run_main = next_main;
             run_cross = @max(run_cross, crossExtent(value.axis, size));
+            if (value.cross_axis_alignment == .baseline)
+                baselines.add(try context.baseline(handle), size.height);
             run_count += 1;
             run_end = context.nextSibling(handle);
         }
 
+        run_cross = @max(run_cross, baselines.above + baselines.below);
         const spacing = distribute(value.main_axis_alignment, @max(0, resolved_main - run_main), run_count);
         var cursor: f32 = spacing.leading;
         child = run_start;
@@ -170,6 +199,7 @@ fn layoutWrap(value: types.Flex, context: anytype, node: anytype, constraints: C
                 .start, .stretch => 0,
                 .center => (run_cross - crossExtent(value.axis, size)) / 2,
                 .end => run_cross - crossExtent(value.axis, size),
+                .baseline => if (try context.baseline(handle)) |distance| baselines.above - distance else 0,
             };
             try context.setChildOffset(handle, pointFromExtents(value.axis, cursor, cross_cursor + offset));
             cursor += mainExtent(value.axis, size) + value.gap + spacing.between;

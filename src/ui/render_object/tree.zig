@@ -62,6 +62,8 @@ const Slot = struct {
     parent_data: types.ParentData = .none,
     size: SizeF = .{ .width = 0, .height = 0 },
     offset: PointF = .{},
+    /// First logical text baseline, independent of paint transforms/scrolling.
+    baseline: ?f32 = null,
     last_constraints: Constraints = .{},
     has_layout: bool = false,
     needs_layout: bool = true,
@@ -648,6 +650,14 @@ pub const Tree = struct {
         return target.size;
     }
 
+    /// Layout metric, not a painted-coordinate query. Children have completed
+    /// layout when a parent uses this, even while the parent's layout is dirty.
+    pub fn baseline(self: *Tree, handle: NodeHandle) LayoutError!?f32 {
+        const target = try self.slot(handle);
+        if (!target.has_layout or target.needs_layout) return error.InvalidLayoutSize;
+        return target.baseline;
+    }
+
     pub fn layoutChild(self: *Tree, handle: NodeHandle, constraints: Constraints) LayoutError!SizeF {
         return self.layoutNode(handle, constraints);
     }
@@ -740,6 +750,7 @@ pub const Tree = struct {
         if (!std.meta.eql(result, constrained)) return error.UnconstrainedLayoutSize;
         const target = try self.slot(handle);
         target.size = result;
+        target.baseline = try self.computeBaseline(target);
         target.last_constraints = constraints;
         target.has_layout = true;
         target.needs_layout = false;
@@ -753,6 +764,36 @@ pub const Tree = struct {
             child = child_slot.next_sibling;
         }
         target.layout_count += 1;
+        return result;
+    }
+
+    fn computeBaseline(self: *Tree, target: *const Slot) LayoutError!?f32 {
+        switch (target.object) {
+            .text, .text_input => {
+                const paragraph = self.paragraphs.?.get(target.placeholder_layout orelse target.paragraph_layout.?) catch
+                    return error.StaleParagraph;
+                if (paragraph.positioned.lines.len == 0) return null;
+                const line = paragraph.positioned.lines[0];
+                return line.top + line.baseline;
+            },
+            // A viewport must not move its parent's alignment as it scrolls.
+            .scroll, .image, .canvas => return null,
+            else => {},
+        }
+        var result: ?f32 = null;
+        var child = target.first_child;
+        while (child) |handle| : (child = self.nextSibling(handle)) {
+            const slot_value = try self.slot(handle);
+            if (slot_value.baseline) |value| {
+                const distance = slot_value.offset.y + value;
+                result = if (result) |old| @min(old, distance) else distance;
+                // Columns expose their first baseline-bearing child. Other
+                // multi-child containers expose the topmost laid-out baseline.
+                if (target.object == .flex and target.object.flex.axis == .vertical) break;
+            }
+            // Floating content neither contributes size nor a baseline.
+            if (target.object == .anchored) break;
+        }
         return result;
     }
 

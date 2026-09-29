@@ -2283,6 +2283,8 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
         "cross_alignment",
         .start,
     ) orelse return luaError(state, "invalid container cross_alignment");
+    if (cross_alignment == .baseline and axis != .horizontal)
+        return luaError(state, "baseline alignment requires a row");
     const main_axis_size = tableOptionalEnum(render_types.MainAxisSize, state, 1, "main_axis_size", .min) orelse
         return luaError(state, "main_axis_size must be min or max");
     const main_alignment = tableOptionalEnum(render_types.MainAxisAlignment, state, 1, "main_alignment", .start) orelse
@@ -2696,6 +2698,7 @@ fn tableOptionalCrossAxisAlignment(
     if (std.mem.eql(u8, value, "center")) return .center;
     if (std.mem.eql(u8, value, "end")) return .end;
     if (std.mem.eql(u8, value, "stretch")) return .stretch;
+    if (std.mem.eql(u8, value, "baseline")) return .baseline;
     return null;
 }
 
