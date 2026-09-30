@@ -313,7 +313,7 @@ pub fn build(b: *std.Build) void {
     development_step.dependOn(&development.step);
 
     const session_tests = b.step("test-session", "Exercise native session protocols and asynchronous PAM with disposable peers");
-    inline for (.{ "session_native.py", "auth_native.py", "secure_entry.py" }) |file| {
+    inline for (.{ "native_harness.py", "session_native.py", "auth_native.py", "secure_entry.py" }) |file| {
         const check = b.addSystemCommand(&.{"python3"});
         check.addFileArg(b.path("tests/" ++ file));
         check.addArtifactArg(host);

@@ -20,16 +20,29 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("OUROKIT_TEST_BINARY", ROOT / "zig-out/bin/ouroctl")).resolve()
 
 
-def development_path(directory, process, exclude=()):
+def development_path(directory, process, exclude=(), windows=()):
+    """Find the endpoint, optionally waiting for initial configured windows."""
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
         assert process.poll() is None, f"application exited: {process.returncode}"
         paths = [p for p in (directory / "ourokit/dev").glob("*") if p.is_socket() and p not in exclude]
         if paths:
             assert len(paths) == 1, paths
-            return paths[0]
+            if not windows:
+                return paths[0]
+            # Publishing the control socket precedes native configure. Listing
+            # windows is valid even when none are ready; targeted inspect is not.
+            try:
+                reply = call(paths[0], 'runtime.inspect')
+            except ConnectionRefusedError:  # Socket bound, not listening yet.
+                time.sleep(.01)
+                continue
+            assert not reply.get('isError') and 'rpcError' not in reply, reply
+            ready = {w['window'] for w in reply['structuredContent']['windows'] if w['ready']}
+            if set(windows) <= ready:
+                return paths[0]
         time.sleep(.01)
-    raise AssertionError("development endpoint never appeared")
+    raise AssertionError(f"development endpoint or initial windows never appeared: {windows}")
 
 
 def record(method, params=None, request_id=1):

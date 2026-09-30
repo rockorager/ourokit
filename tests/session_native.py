@@ -125,6 +125,7 @@ class Peer:
         self.failure = None
         self.hotplug_at = None
         self.click_at = None
+        self.write_closed = False
 
     def send(self, obj, event, *values):
         interface = self.objects[obj][0]
@@ -142,14 +143,21 @@ class Peer:
             else:
                 body += u32(value)
         wire = u32(obj) + u32(((len(body) + 8) << 16) | opcode) + body
-        if fds:
-            assert self.socket.sendmsg([wire], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))]) == len(wire)
-        else:
-            self.socket.sendall(wire)
+        if self.write_closed: return
+        try:
+            if fds:
+                assert self.socket.sendmsg([wire], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))]) == len(wire)
+            else:
+                self.socket.sendall(wire)
+        except (BrokenPipeError, ConnectionResetError):
+            # Exit can close the client's read side before we reply to its last
+            # requests. Keep validating/draining those requests through EOF:
+            # an unlock may follow a destructor whose delete_id cannot be sent.
+            self.write_closed = True
 
     def destroy(self, obj):
-        self.send(1, 'delete_id', obj)
         del self.objects[obj]
+        self.send(1, 'delete_id', obj)
 
     def request(self, obj, opcode, body):
         interface, data = self.objects[obj]
@@ -354,6 +362,7 @@ def verify(loss=False, remove_managers=False):
         finally:
             if process.poll() is None: process.terminate(); process.wait(timeout=5)
             thread.join(timeout=3)
+        assert not thread.is_alive(), 'Wayland peer did not drain client shutdown'
         assert peer.failure is None, peer.failure
         assert peer.idles == 2 and peer.powers == 2
         assert peer.unlocks == (0 if loss else 1 if remove_managers else 2), peer.unlocks
@@ -397,6 +406,7 @@ end}
         result = subprocess.run([str(BINARY), 'run', str(app), '--software', '--dev'], env=env,
                                 capture_output=True, text=True, timeout=10)
         thread.join(timeout=3)
+        assert not thread.is_alive(), 'Wayland peer did not drain client shutdown'
         assert result.returncode == 0 and 'PASS unavailable' in result.stdout, (result.stdout, result.stderr)
         assert peer.failure is None, peer.failure
         assert peer.locks == peer.idles == peer.powers == 0, 'must not downgrade or use a different protocol'

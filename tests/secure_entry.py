@@ -177,12 +177,21 @@ def verify(cancel=False, custom=False, reject=None):
         env.pop('WAYLAND_SOCKET', None)
         process = subprocess.Popen([str(BINARY), 'run', str(app), '--software', '--dev'], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def finish():
+            result = process.communicate(timeout=5)
+            # Process exit does not mean the peer consumed its final requests.
+            thread.join(timeout=3)
+            assert not thread.is_alive(), 'Wayland peer did not drain client shutdown'
+            assert peer.failure is None, peer.failure
+            return result
+
         try:
             assert peer.locked.wait(5), ('lock did not render', peer.failure)
             if reject:
-                stdout, stderr = process.communicate(timeout=5)
+                stdout, stderr = finish()
                 assert process.returncode != 0 and 'LuaBuildFailed' in stderr, (stdout, stderr)
-                assert peer.unlocks == 0 and peer.failure is None
+                assert peer.unlocks == 0
                 print(f'PASS masked text_input: rejects {reject}=false')
                 return
             endpoint = next((root / 'ourokit/dev').glob('*'))
@@ -201,7 +210,7 @@ def verify(cancel=False, custom=False, reject=None):
                 if custom:
                     restyle(peer, env, endpoint, windows)
                 peer.keys(7, [1])
-                stdout, stderr = process.communicate(timeout=5)
+                stdout, stderr = finish()
                 assert process.returncode == 0 and 'PASS secure Escape' in stdout, (stdout, stderr)
                 assert peer.unlocks == 0
                 print(stdout.strip())
@@ -244,7 +253,7 @@ def verify(cancel=False, custom=False, reject=None):
                 assert background not in second and border not in second
                 assert foreground in first and foreground in second
             peer.keys(7, [28])
-            stdout, stderr = process.communicate(timeout=5)
+            stdout, stderr = finish()
             assert process.returncode == 0 and 'PASS secure lock entry' in stdout, (stdout, stderr)
             assert peer.unlocks == 1, peer.unlocks
             print(stdout.strip())

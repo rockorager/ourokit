@@ -40,7 +40,7 @@ def session():
             process = subprocess.Popen([str(BINARY), 'run', str(app), '--dev', '--software'],
                                        env=env, stdout=subprocess.DEVNULL, stderr=log)
         try:
-            endpoint = development_path(root, process)
+            endpoint = development_path(root, process, windows=('main',))
 
             def snapshot():
                 return inspect(env, endpoint, 'main')

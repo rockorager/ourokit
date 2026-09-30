@@ -37,7 +37,7 @@ def session():
             process = subprocess.Popen([str(BINARY), 'run', str(app), '--dev', '--software'],
                                        env=env, stdout=subprocess.DEVNULL, stderr=log)
         try:
-            endpoint = development_path(root, process)
+            endpoint = development_path(root, process, windows=('main', 'peer'))
 
             def invoke(name, args=None):
                 reply = call(endpoint, name, args)
