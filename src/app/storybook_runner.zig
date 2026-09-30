@@ -235,6 +235,10 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     );
     try runtime.prepareFrame(story.snapshot_scale);
     try settleImages(&runtime, &lua_ui, story, &loop);
+    if (runtime.hasPendingScrollEvents()) {
+        vm.disableSleep();
+        try dispatchAndSettle(&runtime, &vm, &callbacks, &scheduler, &lua_ui, story);
+    }
     if (story.actions.len != 0) {
         vm.disableSleep();
         for (story.actions) |action| try playAction(
@@ -332,20 +336,24 @@ fn dispatchAndSettle(
     lua_ui: *lua.UiBuild,
     story: *const lua.StorybookStory,
 ) !void {
-    try runtime.dispatchInput(callbacks);
-    try scheduler.applyQueuedCancellations();
-    while (scheduler.takeRunnable()) |handle| switch (try vm.resumeRunnable(handle)) {
-        .completed, .canceled => {},
-        .waiting => return error.StoryActionDidNotSettle,
-    };
-    try runtime.collectRetired();
-    try runtime.reconcile(
-        .{ .width = story.viewport.width, .height = story.viewport.height },
-        lua_ui,
-        story.content_reference,
-    );
-    try runtime.prepareFrame(story.snapshot_scale);
-    try settleImages(runtime, lua_ui, story, vm.loop);
+    for (0..32) |_| {
+        try runtime.dispatchInput(callbacks);
+        try scheduler.applyQueuedCancellations();
+        while (scheduler.takeRunnable()) |handle| switch (try vm.resumeRunnable(handle)) {
+            .completed, .canceled => {},
+            .waiting => return error.StoryActionDidNotSettle,
+        };
+        try runtime.collectRetired();
+        try runtime.reconcile(
+            .{ .width = story.viewport.width, .height = story.viewport.height },
+            lua_ui,
+            story.content_reference,
+        );
+        try runtime.prepareFrame(story.snapshot_scale);
+        try settleImages(runtime, lua_ui, story, vm.loop);
+        if (!runtime.hasPendingScrollEvents() and !runtime.native_work) return;
+    }
+    return error.StoryActionDidNotSettle;
 }
 
 fn settleImages(runtime: *WindowRuntime, lua_ui: *lua.UiBuild, story: *const lua.StorybookStory, loop: *io_loop.Loop) !void {

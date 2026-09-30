@@ -16,6 +16,7 @@ pub const HandlerKind = enum {
     selection_activate,
     range_change,
     split_change,
+    scroll_change,
     interaction_change,
     cancel,
     drop_text,
@@ -47,6 +48,11 @@ const Entry = struct {
     handler: ?Handler = null,
 };
 
+const ScrollState = struct {
+    target: instance.InstanceHandle = .invalid,
+    metrics: ?@import("../render_object/scroll.zig").Metrics = null,
+};
+
 const InteractionState = struct {
     target: instance.InstanceHandle = .invalid,
     active: bool = false,
@@ -58,21 +64,43 @@ pub const PointerBindings = struct {
     allocator: std.mem.Allocator,
     entries: []Entry,
     interactions: []InteractionState,
+    scrolls: []ScrollState,
     revision: u64 = 0,
 
     pub fn init(self: *PointerBindings, allocator: std.mem.Allocator, capacity: usize) !void {
         const entries = try allocator.alloc(Entry, capacity);
         errdefer allocator.free(entries);
         const interactions = try allocator.alloc(InteractionState, capacity);
+        errdefer allocator.free(interactions);
+        const scrolls = try allocator.alloc(ScrollState, capacity);
         @memset(entries, .{});
         @memset(interactions, .{});
-        self.* = .{ .allocator = allocator, .entries = entries, .interactions = interactions };
+        @memset(scrolls, .{});
+        self.* = .{ .allocator = allocator, .entries = entries, .interactions = interactions, .scrolls = scrolls };
     }
 
     pub fn deinit(self: *PointerBindings) void {
+        self.allocator.free(self.scrolls);
         self.allocator.free(self.interactions);
         self.allocator.free(self.entries);
         self.* = undefined;
+    }
+
+    pub fn pruneScrollStates(self: *PointerBindings, tree: *instance.Tree) void {
+        for (self.scrolls) |*state| {
+            if (!tree.isActive(state.target) or self.getKind(state.target, .scroll_change) == null) state.* = .{};
+        }
+    }
+
+    /// Callback references are replaced during builds; observation is retained
+    /// until the instance or its on_scroll subscription is removed.
+    pub fn scrollObservation(self: *PointerBindings, target: instance.InstanceHandle) *?@import("../render_object/scroll.zig").Metrics {
+        for (self.scrolls) |*state| if (same(state.target, target)) return &state.metrics;
+        for (self.scrolls) |*state| if (same(state.target, .invalid)) {
+            state.target = target;
+            return &state.metrics;
+        };
+        unreachable; // Each observed target has a live binding.
     }
 
     pub fn get(self: *const PointerBindings, target: instance.InstanceHandle) ?Handler {

@@ -137,6 +137,8 @@ pub const Anchored = struct {
 /// not declared widget data, and is applied to this render object separately.
 pub const Scroll = struct {
     axis: Axis = .vertical,
+    /// A reserved gutter; thumb geometry follows retained native scroll state.
+    scrollbar: ?struct { track: Color, thumb: Color } = null,
 };
 
 /// A retained bitmap leaf. Null represents pending or failed loading and paints

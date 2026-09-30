@@ -269,6 +269,9 @@ For large generic collections, `ouro.virtual_list { key = "people",
 item_count = 10000, item_key = person_key, item_height = 40, render_item =
 render_person }` mounts only viewport rows; see
 [`examples/virtual-list.lua`](examples/virtual-list.lua).
+Both ordinary and virtual viewports support native `scrollbar=true`, deferred
+`on_scroll(metrics)` observation, and one-shot `scroll_to={offset=...,token=...}`
+requests; see [`examples/scroll-storybook.lua`](examples/scroll-storybook.lua).
 Direction-aware alignment, whole-line clipping, and shaped ellipsis
 remain text-layer policy; renderers never inject the ellipsis. Editing and
 selection remain deferred. Software and Vulkan consume the identical positioned

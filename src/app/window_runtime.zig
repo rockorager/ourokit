@@ -2,6 +2,7 @@ const std = @import("std");
 const clipboard_module = @import("clipboard.zig");
 const frame = @import("frame.zig");
 const scroll_motion = @import("scroll.zig");
+const scroll_geometry = @import("../ui/render_object/scroll.zig");
 const text_input_coordinator = @import("text_input.zig");
 const core = @import("../core/root.zig");
 const lua = @import("../lua/root.zig");
@@ -115,6 +116,7 @@ pub const WindowRuntime = struct {
     selection_pointer: ?core.PointF = null,
     range_drag: ?ui.instance.InstanceHandle = null,
     split_drag: ?struct { target: ui.instance.InstanceHandle, grab_offset: f32 } = null,
+    scrollbar_drag: ?struct { target: ui.instance.InstanceHandle, grab_offset: f32 } = null,
     drag_session: ?internal_drag.Session = null,
     selection_tick_ns: ?u64 = null,
     scroll_motions: [2]scroll_motion.Motion = @splat(.{}),
@@ -342,6 +344,7 @@ pub const WindowRuntime = struct {
         self.focus = .{};
         self.range_drag = null;
         self.split_drag = null;
+        self.scrollbar_drag = null;
         self.cancelInternalDrag();
         self.text_input_owner = null;
         self.text_input_generation +%= 1;
@@ -626,6 +629,8 @@ pub const WindowRuntime = struct {
         self.semantics.commitStaged();
         self.syncDialogFocus() catch unreachable;
         self.applyFocusRequests() catch unreachable;
+        self.scrollbar_drag = null;
+        @memset(self.pointer_bindings.scrolls, .{});
         while (self.router.takeEvent() != null) {}
         _ = self.frame_state.configure(prepared.size.?) catch unreachable;
         self.frame_state.invalidatePaint();
@@ -819,6 +824,17 @@ pub const WindowRuntime = struct {
             if (!std.meta.eql(bounds, entry.constraints)) try self.queueNativeBuild();
         }
         if (try self.instances.revealScrollTargets()) self.frame_state.invalidatePaint();
+        if (try self.instances.applyScrollRequests()) {
+            self.scroll_motions = @splat(.{});
+            self.scrollbar_drag = null;
+            if (self.virtual_lists.count != 0) try self.queueNativeBuild();
+        }
+        if (self.scrollbar_drag) |drag| {
+            const render = if (self.instances.isInteractive(drag.target)) try self.instances.renderObject(drag.target) else null;
+            const object = if (render) |node| try self.tree.objectAt(node) else null;
+            if (object == null or object.? != .scroll or object.?.scroll.scrollbar == null)
+                self.scrollbar_drag = null;
+        }
         try self.reconcileInternalDrag();
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
             const started = self.phaseStart();
@@ -871,7 +887,8 @@ pub const WindowRuntime = struct {
         var changed = false;
         for (self.virtual_lists.lists[0..self.virtual_lists.count]) |list| {
             const target = self.instances.handleForId(list.id) orelse continue;
-            const size = try self.tree.nodeSize(try self.instances.renderObject(target));
+            const render = try self.instances.renderObject(target);
+            const size = scroll_geometry.contentViewport((try self.tree.objectAt(render)).scroll, try self.tree.nodeSize(render));
             if (self.virtual_offsets_pending) {
                 if (try self.instances.scrollBy(target, list.offset - try self.instances.scrollOffset(target)))
                     self.frame_state.invalidatePaint();
@@ -915,7 +932,10 @@ pub const WindowRuntime = struct {
 
     pub fn routePointer(self: *WindowRuntime, event: platform.PointerEvent) !void {
         try self.router.route(event);
-        if (event == .leave) self.cancelInternalDrag();
+        if (event == .leave) {
+            self.cancelInternalDrag();
+            self.scrollbar_drag = null;
+        }
         // A press outside the hit tree is not queued, but must still stop a fling.
         if (event == .button and event.button.state == .pressed) {
             self.pending_shortcut = null;
@@ -1091,6 +1111,7 @@ pub const WindowRuntime = struct {
                     try self.applyButtonUpdate(self.buttons.release());
                     self.range_drag = null;
                     self.split_drag = null;
+                    self.scrollbar_drag = null;
                     if (try self.textInputAncestor(target)) |field|
                         (try self.text_inputs.session(field)).endSelectionDrag();
                     self.selection_pointer = null;
@@ -1101,6 +1122,7 @@ pub const WindowRuntime = struct {
                 }
                 if (try self.dispatchListeners(target, input, callback_service)) continue;
             }
+            if (try self.dispatchScrollbar(target, event)) continue;
             if (event == .pointer and event.pointer.event == .button and
                 event.pointer.event.button.button == 0x110 and event.pointer.event.button.state == .pressed)
                 try self.armInternalDrag(target, event.pointer.position);
@@ -1226,7 +1248,79 @@ pub const WindowRuntime = struct {
                 &arguments,
             );
         }
+        // A queued press may have preceded a platform leave in this batch.
+        if (!self.router.pointer_inside) self.scrollbar_drag = null;
         try self.syncInteractions(callback_service);
+        try self.publishScrollEvents(callback_service);
+    }
+
+    fn observedScrollMetrics(self: *WindowRuntime, target: ui.instance.InstanceHandle) ?scroll_geometry.Metrics {
+        if (!self.ready or self.native_work or self.frame_state.needsLayout()) return null;
+        const root = (self.instances.rootRenderObject() catch return null) orelse return null;
+        if (self.tree.layoutDirty(root) catch return null) return null;
+        const render = self.instances.renderObject(target) catch return null;
+        return self.tree.scrollMetrics(render) catch null;
+    }
+
+    pub fn hasPendingScrollEvents(self: *WindowRuntime) bool {
+        self.pointer_bindings.pruneScrollStates(&self.instances);
+        for (self.pointer_bindings.entries) |entry| {
+            const handler = entry.handler orelse continue;
+            if (handler.kind != .scroll_change) continue;
+            const metrics = self.observedScrollMetrics(entry.target) orelse continue;
+            const observed = self.pointer_bindings.scrollObservation(entry.target).*;
+            if (observed == null or !std.meta.eql(observed.?, metrics)) return true;
+        }
+        return false;
+    }
+
+    fn publishScrollEvents(self: *WindowRuntime, callback_service: anytype) !void {
+        self.pointer_bindings.pruneScrollStates(&self.instances);
+        for (self.pointer_bindings.entries) |*entry| {
+            const handler = entry.handler orelse continue;
+            if (handler.kind != .scroll_change) continue;
+            const metrics = self.observedScrollMetrics(entry.target) orelse continue;
+            const observed = self.pointer_bindings.scrollObservation(entry.target);
+            if (observed.* != null and std.meta.eql(observed.*.?, metrics)) continue;
+            try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{.{ .scroll = metrics }});
+            observed.* = metrics;
+        }
+    }
+
+    fn dispatchScrollbar(self: *WindowRuntime, target: ui.instance.InstanceHandle, event: ui.input.Event) !bool {
+        if (event != .pointer) return false;
+        const pointer = event.pointer;
+        const render = try self.instances.renderObject(target);
+        const object = try self.tree.objectAt(render);
+        if (object != .scroll or object.scroll.scrollbar == null) return false;
+        const size = try self.tree.nodeSize(render);
+        const local = (try self.tree.paintTransform(render)).inversePoint(pointer.position);
+        const metrics = try self.tree.scrollMetrics(render);
+        const thumb = scroll_geometry.thumb(metrics);
+        const coordinate = axisCoordinate(object.scroll.axis, local);
+        if (pointer.event == .button and pointer.event.button.button == 0x110 and pointer.event.button.state == .pressed) {
+            if (!scroll_geometry.track(object.scroll, size).contains(local)) return false;
+            if (self.instances.isFocusable(target)) {
+                const previous = self.focus.current();
+                _ = try self.focus.request(&self.instances, target);
+                try self.applyFocusVisual(previous, self.focus.current());
+            }
+            if (coordinate >= thumb.start and coordinate < thumb.start + thumb.length) {
+                self.scrollbar_drag = .{ .target = target, .grab_offset = coordinate - thumb.start };
+            } else {
+                const delta = if (coordinate < thumb.start) -metrics.viewport else metrics.viewport;
+                if (try self.instances.scrollBy(target, delta))
+                    if (self.virtual_lists.find(try self.instances.semanticId(target)) != null) try self.queueNativeBuild();
+            }
+            return true;
+        }
+        const drag = self.scrollbar_drag orelse return false;
+        if (!sameHandle(drag.target, target) or pointer.event != .motion) return false;
+        const travel = metrics.viewport - thumb.length;
+        const offset = if (travel > 0) std.math.clamp((coordinate - drag.grab_offset) / travel, 0, 1) * metrics.max_offset else 0;
+        if (try self.instances.scrollBy(target, offset - metrics.offset))
+            if (self.virtual_lists.find(try self.instances.semanticId(target)) != null) try self.queueNativeBuild();
+        return true;
     }
 
     fn containsTarget(self: *WindowRuntime, ancestor: ui.instance.InstanceHandle, descendant: ?ui.instance.InstanceHandle) !bool {
@@ -1343,6 +1437,7 @@ pub const WindowRuntime = struct {
     fn syncDialogFocus(self: *WindowRuntime) !void {
         const captured = self.router.captured;
         self.router.reconcile();
+        if (self.router.captured == null) self.scrollbar_drag = null;
         if (captured != null and self.router.captured == null)
             try self.applyButtonUpdate(self.buttons.release());
         for (&self.scroll_motions) |*motion| if (motion.active and !self.instances.isInteractive(motion.target.?)) {
@@ -1377,6 +1472,7 @@ pub const WindowRuntime = struct {
             self.cancelInternalDrag();
             self.range_drag = null;
             self.split_drag = null;
+            self.scrollbar_drag = null;
             try self.applyButtonUpdate(self.buttons.release());
         }
         try self.applyFocusVisual(previous, self.focus.current());

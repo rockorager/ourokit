@@ -72,16 +72,25 @@ const Fixture = struct {
     }
 
     fn settle(self: *Fixture) !void {
-        try self.runtime.dispatchInput(&self.callbacks);
-        try self.scheduler.applyQueuedCancellations();
-        while (self.scheduler.takeRunnable()) |handle|
-            try std.testing.expectEqual(.completed, try self.vm.resumeRunnable(handle));
-        try self.runtime.collectRetired();
-        _ = c.lua_getglobal(self.vm.state, "build");
-        const reference = c.luaL_ref(self.vm.state, c.registry_index);
-        defer c.luaL_unref(self.vm.state, c.registry_index, reference);
-        try self.runtime.reconcile(.{ .width = 324, .height = 224 }, &self.builder, reference);
-        if (self.runtime.frame_state.readyForSubmission()) try self.runtime.frameSubmitted();
+        for (0..32) |_| {
+            try self.runtime.dispatchInput(&self.callbacks);
+            try self.scheduler.applyQueuedCancellations();
+            while (self.scheduler.takeRunnable()) |handle|
+                try std.testing.expectEqual(.completed, try self.vm.resumeRunnable(handle));
+            try self.runtime.collectRetired();
+            _ = c.lua_getglobal(self.vm.state, "build");
+            const reference = c.luaL_ref(self.vm.state, c.registry_index);
+            defer c.luaL_unref(self.vm.state, c.registry_index, reference);
+            try self.runtime.reconcile(.{ .width = 324, .height = 224 }, &self.builder, reference);
+            if (self.runtime.frame_state.readyForSubmission()) try self.runtime.frameSubmitted();
+            if (!self.runtime.hasPendingScrollEvents()) return;
+        }
+        return error.TestDidNotSettle;
+    }
+
+    fn exec(self: *Fixture, source: []const u8) !void {
+        try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(self.vm.state, source.ptr, source.len, "@scroll-test", "t"));
+        try std.testing.expectEqual(c.ok, c.lua_pcallk(self.vm.state, 0, 0, 0, 0, null));
     }
 
     fn play(self: *Fixture, action: dev.Action) !void {
@@ -1951,4 +1960,165 @@ test "development scrolling, actual phase counts and full PNG replay after submi
     try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x20, 0x10, 0xff }, decoded.pixels[red..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 0x10, 0x30, 0xc0, 0xff }, decoded.pixels[blue..][0..4]);
     try std.testing.expectError(error.StaleDevelopmentTarget, dev.capture(std.testing.allocator, &f.runtime, scrolled.token));
+}
+
+test "scrollbars capture transformed thumbs on both axes without relayout and publish copied metrics" {
+    const source =
+        \\calls=0; feedback=ouro.signal(0)
+        \\function build()
+        \\ feedback()
+        \\ return ouro.box {key='frame',width=120,height=80,transform={x=20,y=5,scale=.75},
+        \\  ouro.scroll {key='view',axis=horizontal and 'horizontal' or 'vertical',scrollbar=true,
+        \\   on_scroll=function(m) calls=calls+1; latest=m; feedback:set(calls) end,
+        \\   ouro.box {key='body',width=horizontal and 480 or 'fill',height=horizontal and 'fill' or 320,
+        \\    background='#d02010'}}}
+        \\end
+    ;
+    for ([_]bool{ false, true }) |horizontal| {
+        const f = try Fixture.create(if (horizontal) "horizontal=true;" ++ source else source);
+        defer f.destroy();
+        try f.exec("assert(calls==1 and latest.offset==0); saved=latest; latest.offset=999");
+        try f.settle();
+        try f.exec("assert(calls==1)"); // Mutating the copied table cannot cause another notification.
+        const id = (try f.runtime.semantics.findPath("frame/view")).id;
+        const target = f.runtime.instances.handleForId(id).?;
+        const render = try f.runtime.instances.renderObject(target);
+        const transform = try f.runtime.tree.paintTransform(render);
+        const root = (try f.runtime.instances.rootRenderObject()).?;
+        const layouts = try f.runtime.tree.layoutCount(root);
+        const child = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("frame/view/body")).id).?;
+        const size = try f.runtime.tree.nodeSize(try f.runtime.instances.renderObject(child));
+        try std.testing.expectEqual(@as(f32, if (horizontal) 68 else 108), if (horizontal) size.height else size.width);
+        // Viewport/content=1/4. Horizontal thumb is 30, vertical is minimum 24.
+        // Grab seven pixels into the thumb; move its leading edge to half travel.
+        const start = transform.point(if (horizontal) .{ .x = 7, .y = 74 } else .{ .x = 114, .y = 7 });
+        const half = transform.point(if (horizontal) .{ .x = 52, .y = 74 } else .{ .x = 114, .y = 35 });
+        try f.runtime.routePointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = start } });
+        try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 1, .button = 272, .state = .pressed } });
+        try f.settle();
+        try std.testing.expectEqual(target, f.runtime.router.captured.?);
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 2, .position = half } });
+        try f.settle();
+        try std.testing.expectEqual(@as(f32, if (horizontal) 180 else 120), try f.runtime.instances.scrollOffset(target));
+        try f.exec(if (horizontal) "assert(calls==2 and latest.axis=='horizontal' and latest.offset==180 and latest.max_offset==360)" else "assert(calls==2 and latest.axis=='vertical' and latest.offset==120 and latest.max_offset==240)");
+        // Capture remains active outside both the viewport and window.
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 3, .position = .{ .x = 1000, .y = 1000 } } });
+        try f.settle();
+        try std.testing.expectEqual(@as(f32, if (horizontal) 360 else 240), try f.runtime.instances.scrollOffset(target));
+        try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 4, .button = 272, .state = .released } });
+        try f.settle();
+        try std.testing.expect(f.runtime.scrollbar_drag == null and f.runtime.router.captured == null);
+        // Clicking above the thumb pages this viewport rather than activating content.
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 5, .position = start } });
+        try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 6, .button = 272, .state = .pressed } });
+        try f.settle();
+        try std.testing.expectEqual(@as(f32, if (horizontal) 240 else 160), try f.runtime.instances.scrollOffset(target));
+        try std.testing.expect(f.runtime.scrollbar_drag == null);
+        try std.testing.expectEqual(layouts, try f.runtime.tree.layoutCount(root));
+        try f.exec("assert(calls==4 and saved.offset==999)");
+        // A press and compositor leave may both arrive before the task safe
+        // point. The queued press must not re-arm a drag after pointer leave.
+        try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 7, .button = 272, .state = .released } });
+        try f.settle();
+        const thumb_point = transform.point(if (horizontal) .{ .x = 70, .y = 74 } else .{ .x = 114, .y = 50 });
+        try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 8, .position = thumb_point } });
+        try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 9, .button = 272, .state = .pressed } });
+        try f.runtime.routePointer(.{ .leave = .{ .window = f.runtime.window, .serial = 2 } });
+        try f.settle();
+        try std.testing.expect(f.runtime.scrollbar_drag == null);
+    }
+}
+
+test "scroll requests are tokened clamped and transactional and callbacks survive replacement" {
+    const f = try Fixture.create(
+        \\request=ouro.signal({offset=155,token=1}); extent=ouro.signal(400); bar=ouro.signal(true)
+        \\watch=ouro.signal(true); calls=0
+        \\function build() return ouro.box {key='frame',width=120,height=80,
+        \\ ouro.scroll {key='view',scrollbar=bar(),scroll_to=request(),
+        \\ on_scroll=watch() and function(m) calls=calls+1; latest=m end or nil,
+        \\ ouro.box {key='body',height=extent(),width='fill'}}} end
+    );
+    defer f.destroy();
+    const id = (try f.runtime.semantics.findPath("frame/view")).id;
+    const target = f.runtime.instances.handleForId(id).?;
+    try f.exec("assert(calls==1 and latest.offset==155 and latest.content==400 and latest.viewport==80)");
+    try f.play(.{ .scroll = .{ .target = "frame/view", .delta = 23 } });
+    try f.exec("assert(calls==2 and latest.offset==178); request:set({offset=0,token=1})");
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 178), try f.runtime.instances.scrollOffset(target));
+    try f.exec("assert(calls==2); request:set({offset=9999,token=2})");
+    try f.settle();
+    try f.exec("assert(calls==3 and latest.offset==320); extent:set(110)");
+    try f.settle();
+    try f.exec("assert(calls==4 and latest.offset==30 and latest.max_offset==30); watch:set(false)");
+    try f.settle();
+    try f.exec("watch:set(true)");
+    try f.settle();
+    try f.exec("assert(calls==5)");
+    const invalid = [_][]const u8{
+        "request:set({offset=-1,token=3})",           "request:set({offset=0/0,token=3})",
+        "request:set({offset=1/0,token=3})",          "request:set({offset=0,token=0})",
+        "request:set({offset=0,token=1.5})",          "request:set({offset='2',token=3})",
+        "request:set({offset=2,token=3,extra=true})", "bar:set(1)",
+    };
+    for (invalid) |mutation| {
+        try f.exec(mutation);
+        try std.testing.expectError(error.LuaBuildFailed, f.settle());
+        try std.testing.expectEqual(target, f.runtime.instances.handleForId(id).?);
+        try std.testing.expectEqual(@as(f32, 30), try f.runtime.instances.scrollOffset(target));
+        try f.exec("request:set({offset=9999,token=2}); bar:set(true)");
+        try f.settle();
+    }
+    try f.exec("assert(calls==5); request:set({offset=11,token=3})");
+    try f.settle();
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    const metrics = (try node(snapshot, "frame/view")).scroll_metrics.?;
+    try std.testing.expectEqual(@as(f32, 11), metrics.offset);
+    try std.testing.expectEqual(@as(f32, 110), metrics.content);
+    try f.exec("assert(calls==6 and latest.offset==11)");
+}
+
+test "virtual scrollbars share metrics and token requests while keeping distant rows bounded" {
+    const f = try Fixture.create(
+        \\request=ouro.signal({offset=200003,token=1}); count=ouro.signal(10000); calls=0; renders=0
+        \\function build() return ouro.virtual_list {key='rows',scrollbar=true,scroll_to=request(),
+        \\ item_count=count(),item_height=40,item_key=function(i) return 'item-'..i end,
+        \\ on_scroll=function(m) calls=calls+1; latest=m end,
+        \\ render_item=function(i) renders=renders+1; return ouro.box {key='body',height=40,width='fill'} end} end
+    );
+    defer f.destroy();
+    try f.exec("assert(calls==1 and latest.offset==200003 and latest.viewport==200 and latest.content==400000 and renders<100)");
+    const list = f.runtime.virtual_lists.lists[0];
+    try std.testing.expectEqual(@as(f32, 288), list.width);
+    try std.testing.expect(f.runtime.virtual_lists.row_count < 20);
+    _ = try f.runtime.semantics.findPath("rows/item-5001/body");
+    try f.play(.{ .scroll = .{ .target = "rows", .delta = 57 } });
+    try f.exec("assert(calls==2 and latest.offset==200060); request:set({offset=1,token=1})");
+    try f.settle();
+    try f.exec("assert(calls==2 and latest.offset==200060); request:set({offset=403,token=2})");
+    try f.settle();
+    _ = try f.runtime.semantics.findPath("rows/item-11/body");
+    try f.exec("assert(calls==3 and latest.offset==403); count:set(4)");
+    try f.settle();
+    try f.exec("assert(calls==4 and latest.offset==0 and latest.max_offset==0 and latest.content==160)");
+    try f.exec("count:set(10000)");
+    try f.settle();
+    // Grabbing the virtual thumb focuses the viewport; recycling rows must
+    // preserve capture until release and retain keyboard navigation afterward.
+    const target = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("rows")).id).?;
+    try f.runtime.routePointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = .{ .x = 306, .y = 19 } } });
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 1, .button = 272, .state = .pressed } });
+    try f.settle();
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    try f.runtime.routePointer(.{ .motion = .{ .window = f.runtime.window, .time_ms = 2, .position = .{ .x = 306, .y = 1000 } } });
+    try f.settle();
+    try std.testing.expectEqual(target, f.runtime.router.captured.?);
+    try std.testing.expectEqual(@as(f32, 399800), try f.runtime.instances.scrollOffset(target));
+    _ = try f.runtime.semantics.findPath("rows/item-10000/body");
+    try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 1, .time_ms = 3, .button = 272, .state = .released } });
+    try f.settle();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .home } });
+    try std.testing.expectEqual(@as(f32, 0), try f.runtime.instances.scrollOffset(target));
+    try std.testing.expect(f.runtime.scrollbar_drag == null and f.runtime.router.captured == null);
 }

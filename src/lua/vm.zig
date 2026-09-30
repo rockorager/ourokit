@@ -23,6 +23,7 @@ pub const Argument = union(enum) {
     string: []const u8,
     registry: c_int,
     input: @import("../ui/input/listener.zig").Event,
+    scroll: @import("../ui/render_object/scroll.zig").Metrics,
 };
 
 const YieldRequest = enum {
@@ -313,6 +314,7 @@ pub const Vm = struct {
             .string => |value| _ = c.lua_pushlstring(thread, value.ptr, value.len),
             .registry => |reference| _ = c.lua_rawgeti(thread, c.registry_index, reference),
             .input => |event| pushInputEvent(thread, event),
+            .scroll => |metrics| pushScrollMetrics(thread, metrics),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -359,6 +361,7 @@ pub const Vm = struct {
             .string => |value| _ = c.lua_pushlstring(thread, value.ptr, value.len),
             .registry => |value| _ = c.lua_rawgeti(thread, c.registry_index, value),
             .input => |event| pushInputEvent(thread, event),
+            .scroll => |metrics| pushScrollMetrics(thread, metrics),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -1007,6 +1010,16 @@ const timer_lifecycle: task.ResourceLifecycle = .{
     .request_cancel = TimerResource.requestCancel,
     .destroy = TimerResource.destroy,
 };
+
+fn pushScrollMetrics(state: *c.State, metrics: @import("../ui/render_object/scroll.zig").Metrics) void {
+    c.lua_createtable(state, 0, 5);
+    _ = c.lua_pushstring(state, @tagName(metrics.axis));
+    c.lua_setfield(state, -2, "axis");
+    inline for (.{ "offset", "viewport", "content", "max_offset" }) |field| {
+        c.lua_pushnumber(state, @field(metrics, field));
+        c.lua_setfield(state, -2, field);
+    }
+}
 
 fn pushInputEvent(state: *c.State, event: @import("../ui/input/listener.zig").Event) void {
     c.lua_createtable(state, 0, 8);

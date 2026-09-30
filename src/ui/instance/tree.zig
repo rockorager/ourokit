@@ -39,6 +39,9 @@ pub const Descriptor = struct {
     interactive: bool = true,
     /// Descendant instance to reveal after layout; null leaves scrolling alone.
     ensure_visible: ?u64 = null,
+    /// A changed token applies one absolute offset after layout, then releases
+    /// control back to native scrolling.
+    scroll_to: ?@import("../render_object/scroll.zig").Request = null,
     /// A changed nonzero token requests focus after the build commits.
     focus_request: u64 = 0,
     interaction_paint: ?InteractionPaint = null,
@@ -61,6 +64,8 @@ const Slot = struct {
     render: ?render_object.NodeHandle = null,
     state_revision: u64 = 0,
     scroll_offset: f32 = 0,
+    scroll_to: ?@import("../render_object/scroll.zig").Request = null,
+    scroll_request_pending: bool = false,
     ensure_visible: ?u64 = null,
     revealed: ?RevealGeometry = null,
     focusable: bool = false,
@@ -361,6 +366,9 @@ pub const Tree = struct {
             slot.drag = descriptor.drag;
             slot.ensure_visible = descriptor.ensure_visible;
             if (descriptor.ensure_visible == null) slot.revealed = null;
+            slot.scroll_request_pending = descriptor.scroll_to != null and
+                (slot.scroll_request_pending or slot.scroll_to == null or descriptor.scroll_to.?.token != slot.scroll_to.?.token);
+            slot.scroll_to = descriptor.scroll_to;
             slot.focus_request_pending = descriptor.focus_request != 0 and descriptor.focus_request != slot.focus_request;
             slot.focus_request = descriptor.focus_request;
             slot.traversal_order = traversal_order;
@@ -564,6 +572,18 @@ pub const Tree = struct {
         return (try self.activeSlot(handle)).scroll_offset;
     }
 
+    pub fn applyScrollRequests(self: *Tree) !bool {
+        var applied = false;
+        for (self.slots, 0..) |*slot, index| {
+            if (slot.state != .active or !slot.scroll_request_pending) continue;
+            const handle: InstanceHandle = .{ .slot = @intCast(index), .generation = slot.generation };
+            _ = try self.scrollBy(handle, slot.scroll_to.?.offset - slot.scroll_offset);
+            slot.scroll_request_pending = false;
+            applied = true;
+        }
+        return applied;
+    }
+
     /// Reveal changed targets or changed geometry, without undoing manual
     /// scrolling when the same declaration is rebuilt unchanged.
     pub fn revealScrollTargets(self: *Tree) !bool {
@@ -698,6 +718,10 @@ pub const Tree = struct {
             if (!std.math.isFinite(descriptor.range_inset) or descriptor.range_inset < 0)
                 return error.InvalidRangeInset;
             try render_object.Tree.validate(descriptor.object);
+            if (descriptor.scroll_to) |request| {
+                if (descriptor.object != .scroll or descriptor.ensure_visible != null or request.token == 0 or
+                    !std.math.isFinite(request.offset) or request.offset < 0) return error.InvalidScrollRequest;
+            }
             if (!(try descriptor_index.put(descriptor.id, index)))
                 return error.DuplicateInstanceId;
             if (descriptor.parent) |parent_id| {

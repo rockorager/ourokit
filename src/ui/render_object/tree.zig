@@ -701,6 +701,21 @@ pub const Tree = struct {
         return target.scroll_offset;
     }
 
+    pub fn scrollMetrics(self: *Tree, handle: NodeHandle) !scroll_impl.Metrics {
+        const target = try self.slot(handle);
+        if (target.object != .scroll) return error.NotScrollObject;
+        if (!target.has_layout or target.needs_layout) return error.LayoutRequired;
+        const axis = target.object.scroll.axis;
+        const content = if (target.first_child) |child| try self.nodeSize(child) else SizeF{ .width = 0, .height = 0 };
+        return .{
+            .axis = axis,
+            .offset = target.scroll_offset,
+            .viewport = if (axis == .vertical) target.size.height else target.size.width,
+            .content = if (axis == .vertical) content.height else content.width,
+            .max_offset = target.scroll_extent,
+        };
+    }
+
     pub fn finishScrollLayout(
         self: *Tree,
         handle: NodeHandle,
@@ -935,8 +950,10 @@ pub const Tree = struct {
         if (clips and target.object != .text and target.object != .text_input) {
             if (target.object == .box)
                 try builder.pushRoundedClip(bounds, target.object.box.corner_radius)
-            else
-                try builder.pushClip(bounds);
+            else if (target.object == .scroll) {
+                const inner = scroll_impl.contentViewport(target.object.scroll, target.size);
+                try builder.pushClip(.{ .x = bounds.x, .y = bounds.y, .width = inner.width, .height = inner.height });
+            } else try builder.pushClip(bounds);
         }
         var child = target.first_child;
         while (child) |child_handle| {
@@ -960,6 +977,21 @@ pub const Tree = struct {
             child = if (target.object == .anchored) null else next;
         }
         if (clips) try builder.popClip();
+        if (target.object == .scroll) if (target.object.scroll.scrollbar) |style| {
+            var track = scroll_impl.track(target.object.scroll, target.size);
+            track.x += origin.x;
+            track.y += origin.y;
+            try builder.solidRectangle(track, style.track);
+            const metrics = try self.scrollMetrics(handle);
+            if (metrics.max_offset > 0) {
+                const thumb = scroll_impl.thumb(metrics);
+                const rect: RectF = if (metrics.axis == .vertical)
+                    .{ .x = track.x + @min(2, track.width / 2), .y = track.y + thumb.start, .width = @max(0, track.width - 4), .height = thumb.length }
+                else
+                    .{ .x = track.x + thumb.start, .y = track.y + @min(2, track.height / 2), .width = thumb.length, .height = @max(0, track.height - 4) };
+                try builder.decoratedRectangle(rect, style.thumb, null, 0, 4);
+            }
+        };
         if (isolated) try builder.popOpacity();
         target.needs_paint = false;
     }
@@ -981,6 +1013,8 @@ pub const Tree = struct {
         if (target.object == .box and target.object.box.clip and
             !(RectF{ .x = 0, .y = 0, .width = target.size.width, .height = target.size.height }).containsRounded(point, target.object.box.corner_radius))
             return null;
+        if (target.object == .scroll and target.object.scroll.scrollbar != null and
+            scroll_impl.track(target.object.scroll, target.size).contains(point)) return handle;
         var child = if (target.object == .anchored) target.first_child else target.last_child;
         while (child) |child_handle| {
             const child_slot = try self.slot(child_handle);
@@ -1475,7 +1509,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
         .split => |old_split| !std.meta.eql(old_split, new.split),
         .stack => |old_stack| old_stack.unbounded_height != new.stack.unbounded_height,
         .anchored => |old_anchored| !std.meta.eql(old_anchored, new.anchored),
-        .scroll => |old_scroll| old_scroll.axis != new.scroll.axis,
+        .scroll => |old_scroll| old_scroll.axis != new.scroll.axis or (old_scroll.scrollbar == null) != (new.scroll.scrollbar == null),
         .image => |old_image| (old_image.width == null or old_image.height == null) and
             !std.meta.eql(old_image.image, new.image.image) or
             old_image.width != new.image.width or old_image.height != new.image.height or

@@ -36,6 +36,7 @@ pub fn requireSettled(runtime: *WindowRuntime) !void {
     if (!runtime.initialized or !runtime.ready) return error.WindowRuntimeNotReady;
     if (runtime.reconciling or runtime.router.count != 0 or
         runtime.build_owners.dirty.pendingCount() != 0 or
+        runtime.hasPendingScrollEvents() or
         runtime.frame_state.needsScene() or runtime.frame_state.scene_revision == 0)
         return error.DevelopmentRuntimeNotSettled;
     const root = (try runtime.instances.rootRenderObject()) orelse return error.WindowRuntimeNotReady;
@@ -67,6 +68,7 @@ pub const Node = struct {
     selection: ?ui.text_input.Selection,
     scroll_axis: ?platform.PointerAxis,
     scroll_offset: ?f32,
+    scroll_metrics: ?@import("../ui/render_object/scroll.zig").Metrics = null,
     read_only: bool,
     multiline: bool,
 };
@@ -161,6 +163,10 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             .scroll_offset = if (multiline)
                 try runtime.tree.textScrollOffset(try runtime.instances.renderObject(try runtime.text_inputs.content(handle)), .vertical)
             else if (target.scroll_axis != null) try runtime.instances.scrollOffset(handle) else null,
+            .scroll_metrics = if (!multiline and target.scroll_axis != null)
+                try runtime.tree.scrollMetrics(try runtime.instances.renderObject(handle))
+            else
+                null,
             .read_only = read_only,
             .multiline = multiline,
         };

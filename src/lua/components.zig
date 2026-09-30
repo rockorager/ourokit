@@ -117,7 +117,9 @@ pub const Components = struct {
         }
         const target = instances.handleForId(id) orelse return 0;
         const render = instances.renderObject(target) catch return 0;
-        const size = instances.render_tree.nodeSize(render) catch return 0;
+        var size = instances.render_tree.nodeSize(render) catch return 0;
+        const object = instances.render_tree.objectAt(render) catch return 0;
+        if (object == .scroll) size = @import("../ui/render_object/scroll.zig").contentViewport(object.scroll, size);
         const offset = instances.render_tree.scrollOffset(render) catch 0;
         var focused = self.focused;
         var contains_focus = false;

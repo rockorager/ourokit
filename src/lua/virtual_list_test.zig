@@ -1169,3 +1169,44 @@ test "ensure_visible rejects invalid declarations without replacing the committe
         try std.testing.expectEqual(row, try f.handle("people/person-1/row"));
     }
 }
+
+test "virtual scrollbar gutter remeasures wrapping rows without losing their within-row anchor" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\bar=ouro.signal(false); request=ouro.signal({offset=13,token=1})
+        \\function build() return ouro.virtual_list {key='people',scrollbar=bar(),scroll_to=request(),
+        \\ item_count=10000,estimated_item_height=40,item_key=function(i) return 'row-'..i end,
+        \\ render_item=function() return ouro.row {key='tiles',wrap=true,gap=5,run_gap=0,
+        \\  ouro.box {key='a',width=145,height=40}, ouro.box {key='b',width=145,height=40}} end} end
+    );
+    try f.build();
+    const row = try f.handle("people/row-1");
+    const render = try f.runtime.instances.renderObject(row);
+    try std.testing.expectEqual(@as(f32, 40), (try f.runtime.tree.nodeSize(render)).height);
+    try std.testing.expectEqual(@as(f32, 13), try f.offset());
+    try f.exec("bar:set(true)");
+    try f.build();
+    try std.testing.expectEqual(row, try f.handle("people/row-1"));
+    try std.testing.expectEqual(@as(f32, 288), f.runtime.virtual_lists.lists[0].width);
+    try std.testing.expectEqual(@as(f32, 80), (try f.runtime.tree.nodeSize(render)).height);
+    try std.testing.expectEqual(@as(f32, 13), try f.offset());
+    try f.wheel(17);
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 30), try f.offset());
+    try f.exec("bar:set(false); request:set(nil)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 40), (try f.runtime.tree.nodeSize(render)).height);
+    try std.testing.expectEqual(@as(f32, 30), try f.offset());
+    try f.exec("request:set({offset=13,token=1})");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 13), try f.offset());
+    try std.testing.expect(f.runtime.instances.activeCount() < 70);
+    // Conflicting requests must fail before replacing the retained viewport.
+    const viewport = try f.handle("people");
+    try f.exec("function build() return ouro.virtual_list {key='people',item_count=1,item_height=40,scroll_to={offset=0,token=2},ensure_visible=1,item_key=function() return 'a' end,render_item=function() return ouro.box {key='body'} end} end");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try std.testing.expectEqual(viewport, try f.handle("people"));
+    try std.testing.expectEqual(@as(f32, 13), try f.offset());
+}

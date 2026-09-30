@@ -48,7 +48,9 @@ end
 return function(props, old, id, geometry, select_reader, key_token, row_token, reuse_keys, reuse_rows, capacity)
     local width, viewport, scroll = geometry(id)
     width, viewport, scroll = width or 0, viewport or 0, scroll or 0
-    if reuse_rows and old.width == width and old.viewport == viewport and old.offset == scroll then
+    local scroll_token = props.scroll_to and props.scroll_to.token
+    local requested = scroll_token and (not old or old.scroll_token ~= scroll_token)
+    if not requested and reuse_rows and old.width == width and old.viewport == viewport and old.offset == scroll then
         local unchanged, pinned = true, nil
         for i = 1, #old.rows do
             local row = old.rows[i]
@@ -147,6 +149,7 @@ return function(props, old, id, geometry, select_reader, key_token, row_token, r
         end
     end
     local total = count * estimate + (measurements and measurements.sum or 0)
+    if requested then scroll = props.scroll_to.offset end
     local limit = total > viewport and total - viewport or 0
     if scroll > limit then scroll = limit end
     if scroll < 0 then scroll = 0 end
@@ -178,5 +181,6 @@ return function(props, old, id, geometry, select_reader, key_token, row_token, r
     return { props = props, keys = keys, positions = positions, measurements = measurements,
         estimate = estimate, count = count, width = width, viewport = viewport,
         offset = scroll, total = total, rows = rows, pinned = pinned,
+        scroll_token = scroll_token,
         reveal_key = reveal_key, reveal_top = reveal_top, reveal_height = reveal_height }
 end

@@ -36,6 +36,7 @@ TESTS = (
     'clip_composition.py',
     'opacity_composition.py',
     'transform_composition.py',
+    'scroll_composition.py',
     'desktop_activation.py',
     'application_services.py',
     'catalog_export.py',

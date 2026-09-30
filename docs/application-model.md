@@ -2585,6 +2585,70 @@ runners configure these paths automatically.
 See `examples/xdg-icons.lua` for light/dark, color, symbolic, and missing states.
 It requires an installed Adwaita theme; icons are not bundled with the example.
 
+### Scrollbars and retained scroll state
+
+Both `ouro.scroll` and `ouro.virtual_list` accept `scrollbar=true`,
+`on_scroll=function(metrics) ... end`, and `scroll_to={offset=..., token=...}`.
+The native viewport owns the offset; callbacks observe it rather than supplying
+a controlled offset on every render.
+
+```lua
+local request = ouro.signal(nil)
+local position = ouro.signal(0)
+local token = 0
+-- Inside a content function:
+return ouro.column {
+  key = "page", gap = 12,
+  ouro.button { key = "top", label = "Back to top", on_press = function()
+    token = token + 1
+    request:set({offset = 0, token = token})
+  end },
+  ouro.text { key = "position", text = "Offset: " .. position() },
+  ouro.scroll {
+    key = "results", flex = 1, scrollbar = true,
+    scroll_to = request(),
+    on_scroll = function(metrics) position:set(metrics.offset) end,
+    ouro.column { key = "rows", children = result_rows },
+  },
+}
+```
+
+The optional scrollbar reserves a **12-logical-pixel gutter** on the right
+(vertical) or bottom (horizontal), including when content fits. Children receive
+the remaining cross-axis constraint, so wrapped text and variable virtual rows
+measure at their actual content width. The themed thumb is proportional to the
+visible fraction, with a 24-pixel minimum capped at the viewport length; fitting
+content has no thumb. Dragging preserves the grab position and captures motion
+outside the viewport. Clicking the track pages one viewport. Wheel, finger
+momentum, and virtual-list keyboard navigation use the same retained offset.
+Paint transforms scale the scrollbar and its input coordinates together.
+
+`on_scroll` receives a new table with `axis` (`"vertical"` or `"horizontal"`),
+`offset`, `viewport`, `content`, and `max_offset`. Extents and offset are logical
+units along the scrolling axis. It runs at the deferred task safe point after
+initial layout and whenever these metrics change, including resize, reveal,
+and content shrink. Changes before a safe point may coalesce. An unchanged
+rebuild or callback replacement does not notify again; removing and re-adding
+the subscription, or accepting a source reload, publishes an initial snapshot.
+Mutating the callback table does not change native state. Updating a signal
+from the callback is supported, but applications must avoid feedback that
+continually changes content size or issues new requests.
+
+`scroll_to` is a one-shot, nonanimated request, applied after layout and clamped
+to `0..max_offset`. Supply a finite nonnegative `offset` and a positive integer
+`token`; unknown fields are rejected. Change the token to issue another request,
+even for the same offset. Keeping a token unchanged does not undo manual
+scrolling, even if its offset field changes. Setting the request to `nil` clears
+it so it can be issued again. Do not combine it with `ensure_visible`.
+Virtual lists mount the requested neighborhood without enumerating all rows;
+variable-row extents still use estimates for unmeasured content and retain their
+existing anchor correction. These options do not add horizontal virtual lists,
+two-axis scrolling, or selection state. Development inspection exposes the same
+`scroll_metrics` alongside `scroll_offset`.
+
+See `examples/scroll-storybook.lua` for both axes, request playback, and a
+10,000-row virtual viewport.
+
 ### Bringing a selection into view
 
 Set `ensure_visible` on a viewport to reveal an application-selected child

@@ -401,6 +401,7 @@ pub const UiBuild = struct {
             ) catch unreachable;
             if (old) |handler| callbacks.?.release(handler.id) catch unreachable;
         }
+        bindings.pruneScrollStates(tree);
         buttons.beginOwner(owner);
         for (self.pending_buttons[0..self.pending_button_count]) |pending| buttons.set(
             owner,
@@ -995,6 +996,9 @@ pub const UiBuild = struct {
         if (estimate <= 0) return luaError(state, "item height must be positive");
         const width = tableOptionalSize(state, props, "width", .fill) orelse return luaError(state, "invalid virtual_list width");
         const height = tableOptionalSize(state, props, "height", .fill) orelse return luaError(state, "invalid virtual_list height");
+        const scroll = tableScroll(state, props, self.currentTheme().?) catch return luaError(state, "invalid virtual_list scrollbar or axis");
+        if (scroll.axis != .vertical) return luaError(state, "virtual_list only supports a vertical axis");
+        const scroll_to = tableScrollRequest(state, props) catch return luaError(state, "scroll_to requires a finite non-negative offset and positive integer token; cannot combine with ensure_visible");
         const parent_data = declarativeParentData(self, state, props) catch |err| return luaError(state, parentDataErrorMessage(err));
         const outer = semanticId(key, 0x7669727475616c ^ parent.id ^ self.component_namespace);
         const id = semanticId("viewport", outer);
@@ -1025,7 +1029,8 @@ pub const UiBuild = struct {
             .row_count = 0,
         };
         self.append(.{ .id = outer, .parent = parent.id, .parent_data = parent_data, .object = .{ .box = .{ .width = width.extent(), .fill_width = width.isFill(), .height = height.extent(), .fill_height = height.isFill() } } }) catch return luaError(state, "cannot append virtual list");
-        self.append(.{ .id = id, .parent = outer, .focusable = true, .focus_request = tableFocusRequest(state, props) catch |err| return luaError(state, @errorName(err)), .object = .{ .scroll = .{} } }) catch return luaError(state, "cannot append virtual viewport");
+        self.append(.{ .id = id, .parent = outer, .focusable = true, .focus_request = tableFocusRequest(state, props) catch |err| return luaError(state, @errorName(err)), .scroll_to = scroll_to, .object = .{ .scroll = scroll } }) catch return luaError(state, "cannot append virtual viewport");
+        self.stageCallbackAt(state, props, id, "on_scroll", .scroll_change) catch |err| return luaError(state, @errorName(err));
         self.appendSemantic(.{ .id = id, .parent = semanticParent(parent), .role = .group, .key = key }) catch return luaError(state, "cannot append virtual semantics");
         self.append(.{ .id = extent, .parent = id, .object = .{ .box = .{ .height = total, .fill_width = true } } }) catch return luaError(state, "cannot append virtual extent");
         self.append(.{ .id = stack, .parent = extent, .object = .{ .stack = .{ .unbounded_height = true } } }) catch return luaError(state, "cannot append virtual rows");
@@ -2183,8 +2188,8 @@ pub const UiBuild = struct {
             return luaError(state, "ouro.scroll expects one declaration table");
         const parent = self.currentParent() orelse return luaError(state, "scroll requires a widget parent");
         const key = tableString(state, 1, "key") orelse return luaError(state, "scroll key is required");
-        const axis = tableOptionalAxis(state, 1, "axis", .vertical) orelse
-            return luaError(state, "invalid scroll axis");
+        const scroll = tableScroll(state, 1, self.currentTheme().?) catch return luaError(state, "invalid scrollbar or scroll axis");
+        const scroll_to = tableScrollRequest(state, 1) catch return luaError(state, "scroll_to requires a finite non-negative offset and positive integer token; cannot combine with ensure_visible");
         const reveal_kind = c.lua_getfield(state, 1, "ensure_visible");
         c.lua_settop(state, -2);
         if (reveal_kind != c.type_nil and reveal_kind != c.type_string)
@@ -2203,9 +2208,11 @@ pub const UiBuild = struct {
         self.append(.{
             .id = id,
             .parent = parent.id,
-            .object = .{ .scroll = .{ .axis = axis } },
+            .object = .{ .scroll = scroll },
+            .scroll_to = scroll_to,
             .parent_data = parent_data,
         }) catch return luaError(state, "cannot append scroll descriptor");
+        self.stageCallback(state, id, "on_scroll", .scroll_change) catch |err| return luaError(state, @errorName(err));
         self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
@@ -2830,6 +2837,39 @@ fn declarativeParentData(
             break :stack .{ .stack = .{ .x = x, .y = y } };
         },
     };
+}
+
+fn tableScroll(state: *c.State, table: c_int, theme: design.tokens.Theme) !render_types.Scroll {
+    return .{
+        .axis = tableOptionalAxis(state, table, "axis", .vertical) orelse return error.InvalidScrollAxis,
+        .scrollbar = if (tableOptionalBoolean(state, table, "scrollbar", false) orelse return error.InvalidScrollbar)
+            .{ .track = theme.background, .thumb = theme.muted_foreground }
+        else
+            null,
+    };
+}
+
+fn tableScrollRequest(state: *c.State, table: c_int) !?@import("../ui/render_object/scroll.zig").Request {
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    const kind = c.lua_getfield(state, table, "scroll_to");
+    if (kind == c.type_nil) return null;
+    if (kind != c.type_table) return error.InvalidScrollRequest;
+    const index = c.lua_gettop(state);
+    if (c.lua_getfield(state, table, "ensure_visible") != c.type_nil) return error.InvalidScrollRequest;
+    c.lua_settop(state, index);
+    c.lua_pushnil(state);
+    while (c.lua_next(state, index) != 0) {
+        const key = string(state, -2) orelse return error.InvalidScrollRequest;
+        if (!std.mem.eql(u8, key, "offset") and !std.mem.eql(u8, key, "token")) return error.InvalidScrollRequest;
+        c.lua_settop(state, -2);
+    }
+    if (c.lua_getfield(state, index, "offset") != c.type_number) return error.InvalidScrollRequest;
+    const offset = requiredExtent(state, -1) orelse return error.InvalidScrollRequest;
+    c.lua_settop(state, index);
+    const token = tableRequiredInteger(state, index, "token") orelse return error.InvalidScrollRequest;
+    if (token <= 0) return error.InvalidScrollRequest;
+    return .{ .offset = offset, .token = @intCast(token) };
 }
 
 fn tableOptionalPositioned(state: *c.State, table: c_int) !?render_types.Positioned {
