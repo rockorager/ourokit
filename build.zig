@@ -732,14 +732,17 @@ fn addWaylandProtocol(
 }
 
 fn addLua(module: *std.Build.Module, lua: *std.Build.Dependency) void {
+    // More C API string-cache sets cost 3264 bytes per 64-bit Lua state.
+    // Lua requires both dimensions when overriding the default 53 x 2 cache.
+    const flags: []const []const u8 = &.{ "-std=c99", "-DLUA_USE_LINUX", "-DSTRCACHE_N=257", "-DSTRCACHE_M=2" };
     module.addCSourceFiles(.{
         .root = lua.path(""),
         .files = lua_sources,
-        .flags = &.{ "-std=c99", "-DLUA_USE_LINUX" },
+        .flags = flags,
     });
     module.addCSourceFile(.{
         .file = module.owner.path("src/lua/safe_libraries.c"),
-        .flags = &.{ "-std=c99", "-DLUA_USE_LINUX" },
+        .flags = flags,
     });
     module.addCSourceFile(.{
         .file = module.owner.path("src/lua/auth.c"),

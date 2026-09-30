@@ -3917,6 +3917,9 @@ test "Lua constructors are pure and reject callback children" {
     for ([_][]const u8{
         "ouro.column { key = 'content', children = function() end }",
         "ouro.column { children = {}, ouro.box { key = 'child' } }",
+        "ouro.column { key = 'content', [false] = 'invalid' }",
+        "ouro.column { key = 'content', [{}] = 'invalid' }",
+        "ouro.column { [1.5] = ouro.box { key = 'child' } }",
         "ouro.column { [0] = ouro.box { key = 'child' } }",
         "ouro.column { [2] = ouro.box { key = 'child' } }",
         "ouro.column { children = { [2] = ouro.box { key = 'child' } } }",

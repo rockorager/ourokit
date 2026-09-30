@@ -103,15 +103,28 @@ pub const Description = struct {
         const count = c.lua_rawlen(state, children_index);
         if (count != 0 and !kind.acceptsChildren())
             return fail(state, "this widget does not accept children");
-        // Validate keys as well as rawlen: a sparse table has no reliable length.
+        const pointer = c.lua_newuserdatauv(state, @sizeOf(Description), 3) orelse
+            return fail(state, "cannot allocate widget description");
+        const description: *Description = @ptrCast(@alignCast(pointer));
+        description.* = .{ .kind = kind };
+        _ = c.luaL_newmetatable(state, metatable);
+        _ = c.lua_setmetatable(state, 3);
+        c.lua_createtable(state, 0, 8);
+        // Snapshot properties while validating keys. A sparse child array has
+        // no reliable rawlen, so every numeric key must be checked as well.
         c.lua_pushnil(state);
         while (c.lua_next(state, 1) != 0) {
-            if (c.lua_type(state, -2) == c.type_number) {
+            const key_type = c.lua_type(state, -2);
+            if (key_type == c.type_number) {
                 const index = c.lua_tointegerx(state, -2, &is_number);
                 if (is_number == 0 or index < 1 or index > count or explicit == c.type_table)
                     return fail(state, "use a dense child array or children table, not both");
-            } else if (c.lua_type(state, -2) != c.type_string) {
+            } else if (key_type != c.type_string) {
                 return fail(state, "widget property names must be strings");
+            } else {
+                c.lua_pushvalue(state, -2);
+                c.lua_pushvalue(state, -2);
+                c.lua_settable(state, 4);
             }
             c.lua_settop(state, -2);
         }
@@ -123,22 +136,6 @@ pub const Description = struct {
                     return fail(state, "children must be a dense array");
                 c.lua_settop(state, -2);
             }
-        }
-        const pointer = c.lua_newuserdatauv(state, @sizeOf(Description), 3) orelse
-            return fail(state, "cannot allocate widget description");
-        const description: *Description = @ptrCast(@alignCast(pointer));
-        description.* = .{ .kind = kind };
-        _ = c.luaL_newmetatable(state, metatable);
-        _ = c.lua_setmetatable(state, 3);
-        c.lua_createtable(state, 0, 8);
-        c.lua_pushnil(state);
-        while (c.lua_next(state, 1) != 0) {
-            if (c.lua_type(state, -2) == c.type_string) {
-                c.lua_pushvalue(state, -2);
-                c.lua_pushvalue(state, -2);
-                c.lua_settable(state, 4);
-            }
-            c.lua_settop(state, -2);
         }
         c.lua_pushnil(state);
         c.lua_setfield(state, 4, "children");
