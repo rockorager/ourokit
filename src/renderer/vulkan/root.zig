@@ -2300,7 +2300,7 @@ pub fn renderResources(
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     var opacity_layers = try OpacityLayers.init(self, list.commands, bounds);
     defer opacity_layers.deinit(self);
-    if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
+    if (glyphs) |cache| try prepareText(list.commands, bounds, cache, shapes, paragraphs);
     var image_uploads = try ImageUploads.init(self, list.commands, images, target);
     defer image_uploads.deinit(self);
     var coverage_uploads = try CoverageUploads.init(self, list.commands, target);
@@ -2485,9 +2485,9 @@ pub fn renderGraphicsResources(
     try list.validate();
     if (target.direct and !list.isOpaque(.{ .x = 0, .y = 0, .width = target.width, .height = target.height })) return error.OpaqueSceneRequired;
     try validateClipDepth(list.commands, glyphs != null and shapes != null, glyphs != null and paragraphs != null);
-    if (glyphs) |cache| try prepareText(list.commands, cache, shapes, paragraphs);
-    if (!try target.ready(self)) return error.TargetBusy;
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
+    if (glyphs) |cache| try prepareText(list.commands, bounds, cache, shapes, paragraphs);
+    if (!try target.ready(self)) return error.TargetBusy;
     var opacity_layers = try OpacityLayers.init(self, list.commands, bounds);
     errdefer opacity_layers.deinit(self);
     var image_uploads = try ImageUploads.init(self, list.commands, images, null);
@@ -3292,30 +3292,44 @@ fn normalizedColor(source: LinearRgba16) [4]f32 {
 
 fn prepareText(
     commands: []const scene.Command,
+    bounds: RectI,
     glyphs: *GlyphCache,
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
 ) !void {
     if (!has_freetype) return error.FreeTypeDisabled;
-    prepareTextPass(commands, glyphs, shapes, paragraphs) catch |err| {
+    prepareTextPass(commands, bounds, glyphs, shapes, paragraphs) catch |err| {
         if (err != error.GlyphAtlasFull) return err;
         // Discard old frames' phases and pack just this frame once. A frame
         // exceeding the fixed budget fails before recording/uploading, rather
         // than evicting masks already referenced by this frame's draws.
         try glyphs.reset();
-        try prepareTextPass(commands, glyphs, shapes, paragraphs);
+        try prepareTextPass(commands, bounds, glyphs, shapes, paragraphs);
     };
 }
 
 fn prepareTextPass(
     commands: []const scene.Command,
+    bounds: RectI,
     glyphs: *GlyphCache,
     shapes: ?*const text.ShapeCache,
     paragraphs: ?*const text.ParagraphCache,
 ) !void {
+    // Use the full target, not damage: opacity layers render their complete
+    // cropped bounds. Rounded clips use conservative rectangular bounds.
+    var clips: [max_clip_depth + 1]RectI = undefined;
+    clips[0] = bounds;
+    var depth: usize = 0;
     for (commands) |command| switch (command) {
+        .push_clip_rect, .push_clip_rounded => {
+            const clip = if (command == .push_clip_rect) command.push_clip_rect else command.push_clip_rounded.bounds;
+            clips[depth + 1] = RectI.intersect(clips[depth], clip);
+            depth += 1;
+        },
+        .pop_clip => depth -= 1,
         .glyph_run => |run| {
             const shaped = try (shapes orelse return error.TextResourcesRequired).get(run.shape);
+            if (clips[depth].isEmpty()) continue;
             var pen = run.origin;
             for (shaped.spans) |span| {
                 for (span.run.glyphs) |glyph| {
@@ -3328,6 +3342,7 @@ fn prepareTextPass(
         },
         .paragraph => |value| {
             const layout = try (paragraphs orelse return error.TextResourcesRequired).get(value.layout);
+            if (clips[depth].isEmpty()) continue;
             for (layout.positioned.lines) |line| {
                 const baseline = value.origin.y + (line.top + line.baseline) * value.scale;
                 for (layout.positioned.spansFor(line)) |span| for (layout.positioned.glyphsFor(span)) |glyph| {
@@ -3349,6 +3364,7 @@ fn drawGlyphRun(
     shapes: *const text.ShapeCache,
 ) void {
     if (!has_freetype) unreachable;
+    if (clip.isEmpty()) return;
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 3, 1, &cache.descriptor_set, 0, null);
     const shaped = shapes.get(command.shape) catch unreachable;
     const source = packedLinear(LinearRgba16.fromColor(command.color));
@@ -3402,6 +3418,7 @@ fn drawPresentationGlyphRun(
     shapes: *const text.ShapeCache,
 ) void {
     if (!has_freetype) unreachable;
+    if (clip.isEmpty()) return;
     const shaped = shapes.get(command.shape) catch unreachable;
     const color = LinearRgba16.fromColor(command.color);
     var pen = command.origin;
@@ -3462,6 +3479,7 @@ fn drawPresentationParagraph(
     paragraphs: *const text.ParagraphCache,
 ) void {
     if (!has_freetype) unreachable;
+    if (clip.isEmpty()) return;
     const layout = paragraphs.get(command.layout) catch unreachable;
     for (layout.positioned.lines) |line| {
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
@@ -3690,6 +3708,7 @@ fn drawParagraph(
     paragraphs: *const text.ParagraphCache,
 ) void {
     if (!has_freetype) unreachable;
+    if (clip.isEmpty()) return;
     c.vkCmdBindDescriptorSets(target.command_buffer, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 3, 1, &cache.descriptor_set, 0, null);
     const layout = paragraphs.get(command.layout) catch unreachable;
     for (layout.positioned.lines) |line| {
@@ -3763,6 +3782,13 @@ test "Vulkan glyph atlas matches exact software text rendering" {
     const commands = [_]scene.Command{
         .{ .clear = Color.rgba(240, 240, 240, 255) },
         .{ .push_clip_rect = .{ .x = 8, .y = 3, .width = 140, .height = 30 } },
+        // Both clips are nonempty, but their intersection is empty. A
+        // distinct scale must not enter the atlas, including inside opacity.
+        .{ .push_clip_rounded = .{ .bounds = .{ .x = 150, .y = 3, .width = 10, .height = 30 }, .corner_radius = 2 } },
+        .{ .push_opacity = 32768 },
+        .{ .glyph_run = .{ .shape = shape, .origin = .{ .x = 0, .y = 25 }, .scale = 2, .color = Color.rgba(255, 0, 0, 255) } },
+        .pop_opacity,
+        .pop_clip,
         .{ .glyph_run = .{
             .shape = shape,
             .origin = .{ .x = -2.296875, .y = 25.203125 },
@@ -3799,8 +3825,9 @@ test "Vulkan glyph atlas matches exact software text rendering" {
     glyphs.row_height = 0;
     try renderer.renderText(list, &target, &glyphs, &shapes);
     try std.testing.expect(glyphs.next_y < atlas_height);
+    try std.testing.expect(!glyphs.entries.contains(try AtlasKey.init(font, (try fonts.get(font)).nominalGlyph('W').?, 36.5, .{})));
     const count = glyphs.entries.count();
-    try prepareText(list.commands, &glyphs, &shapes, null);
+    try prepareText(list.commands, .{ .x = 0, .y = 0, .width = 160, .height = 36 }, &glyphs, &shapes, null);
     try std.testing.expectEqual(count, glyphs.entries.count());
     try std.testing.expectEqual(@as(usize, atlas_bytes), glyphs.dirty_start);
     var actual = [_]u8{0} ** expected.len;
@@ -3830,7 +3857,7 @@ test "Vulkan glyph atlas matches exact software text rendering" {
         try direct_graphics.expectPixel(x, y, expected[(y * 160 + x) * 4 ..][0..4].*);
     };
     var oversized = commands;
-    oversized[2].glyph_run.scale = 20;
+    oversized[7].glyph_run.scale = 20;
     try std.testing.expectError(error.GlyphAtlasFull, renderer.renderText(.{ .commands = &oversized }, &target, &glyphs, &shapes));
     try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);
@@ -3852,7 +3879,7 @@ test "Vulkan glyph atlas matches exact software text rendering" {
         commands[0],
         commands[1],
         .{ .path = .{ .path = triangle, .identity = triangle.identity, .origin = .{ .x = 8, .y = 30 }, .scale = 1, .bounds = try path.deviceBounds(triangle, .{ .x = 8, .y = 30 }, 1), .color = Color.rgba(0, 0, 0, 0), .gradient = gradient } },
-        commands[2],
+        commands[7],
         .{ .decorated_rectangle = .{ .bounds = .{ .x = 24, .y = 30, .width = 8, .height = 3 }, .background_gradient = gradient } },
         .pop_clip,
     };
@@ -3915,6 +3942,9 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
     try fonts.release(arabic);
     const commands = [_]scene.Command{
         .{ .clear = Color.rgba(0, 0, 0, 0) },
+        .{ .push_clip_rect = .{ .x = 0, .y = 72, .width = 160, .height = 10 } },
+        .{ .paragraph = .{ .layout = layout, .origin = .{ .x = 0, .y = 72 }, .scale = 2, .color = Color.rgba(255, 0, 0, 255) } },
+        .pop_clip,
         .{ .push_clip_rect = .{ .x = 8, .y = 3, .width = 130, .height = 66 } },
         .{ .paragraph = .{
             .layout = layout,
@@ -3946,6 +3976,8 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
     var target = try Target.init(&renderer, 160, 72);
     defer target.deinit(&renderer);
     try renderer.renderParagraphs(list, &target, &glyphs, &paragraphs);
+    var entries = glyphs.entries.keyIterator();
+    while (entries.next()) |key| try std.testing.expect(key.size_26_6 != 1824); // 14.25 * 2 * 64
     var actual = [_]u8{0} ** expected.len;
     try target.readPixels(&actual, 160 * 4, .rgba8_unorm);
     try std.testing.expectEqualSlices(u8, &expected, &actual);
@@ -3978,8 +4010,8 @@ test "Vulkan positioned paragraphs match exact software text rendering" {
     var clipped = [_]scene.Command{
         commands[0],
         .{ .push_clip_rounded = .{ .bounds = .{ .x = 5, .y = 1, .width = 120, .height = 60 }, .corner_radius = 25 } },
-        commands[1],
-        commands[2],
+        commands[4],
+        commands[5],
         .pop_clip,
         .pop_clip,
     };

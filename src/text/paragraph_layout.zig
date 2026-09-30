@@ -82,7 +82,9 @@ fn buildPositioned(
     include_caret_stops: bool,
     runs: []const StyledRun,
 ) !positioned_lines.PositionedLines {
-    var itemized = try itemization.itemizeParagraphs(allocator, utf8, base_direction);
+    var resolved = try paragraph.Resolved.init(allocator, utf8, base_direction);
+    defer resolved.deinit();
+    var itemized = try itemization.itemizeResolvedParagraphs(allocator, &resolved);
     defer itemized.deinit();
     var shaped = try shaped_paragraph.shapeStyledItemizedParagraphs(
         allocator,
@@ -98,10 +100,9 @@ fn buildPositioned(
     defer breaks.deinit();
     var measured = try measurement.measureBreakSegments(allocator, breaks.breaks, &shaped);
     defer measured.deinit();
-    var selected = try line_layout.selectGreedyLines(
+    var selected = try line_layout.selectResolvedGreedyLines(
         allocator,
-        utf8,
-        base_direction,
+        &resolved,
         breaks.breaks,
         &measured,
         max_width,
@@ -109,8 +110,7 @@ fn buildPositioned(
     defer selected.deinit();
     var positioned = try positionWithReflow(
         allocator,
-        utf8,
-        base_direction,
+        &resolved,
         &shaped,
         &selected,
         breaks.breaks,
@@ -147,7 +147,9 @@ fn buildPlainPositioned(
     include_caret_stops: bool,
     runs: []const StyledRun,
 ) !positioned_lines.PositionedLines {
-    var itemized = try itemization.itemizeParagraphs(allocator, utf8, base_direction);
+    var resolved = try paragraph.Resolved.init(allocator, utf8, base_direction);
+    defer resolved.deinit();
+    var itemized = try itemization.itemizeResolvedParagraphs(allocator, &resolved);
     defer itemized.deinit();
     var shaped = try shaped_paragraph.shapeStyledItemizedParagraphs(
         allocator,
@@ -163,10 +165,9 @@ fn buildPlainPositioned(
     defer breaks.deinit();
     var measured = try measurement.measureBreakSegments(allocator, breaks.breaks, &shaped);
     defer measured.deinit();
-    var selected = try line_layout.selectGreedyLines(
+    var selected = try line_layout.selectResolvedGreedyLines(
         allocator,
-        utf8,
-        base_direction,
+        &resolved,
         breaks.breaks,
         &measured,
         max_width,
@@ -174,8 +175,7 @@ fn buildPlainPositioned(
     defer selected.deinit();
     return positionWithReflow(
         allocator,
-        utf8,
-        base_direction,
+        &resolved,
         &shaped,
         &selected,
         breaks.breaks,
@@ -186,8 +186,7 @@ fn buildPlainPositioned(
 
 fn positionWithReflow(
     allocator: std.mem.Allocator,
-    utf8: []const u8,
-    base_direction: paragraph.BaseDirection,
+    resolved: *const paragraph.Resolved,
     shaped: *const shaped_paragraph.ShapedParagraphs,
     selected: *line_layout.GreedyLines,
     breaks: []const line_break.LineBreak,
@@ -197,7 +196,7 @@ fn positionWithReflow(
     const width = if (selected.max_width == std.math.floatMax(f32)) null else selected.max_width;
     return positioned_lines.positionLinesWithOptions(
         allocator,
-        utf8,
+        resolved.utf8,
         shaped,
         selected,
         style,
@@ -205,12 +204,12 @@ fn positionWithReflow(
         include_caret_stops,
     ) catch |err| {
         if (err != error.ReflowRequired) return err;
-        const reflowed = try reflowLines(allocator, utf8, base_direction, shaped, breaks, selected.max_width);
+        const reflowed = try reflowLines(allocator, resolved, shaped, breaks, selected.max_width);
         selected.deinit();
         selected.* = reflowed;
         return positioned_lines.positionLinesWithOptions(
             allocator,
-            utf8,
+            resolved.utf8,
             shaped,
             selected,
             style,
@@ -226,8 +225,7 @@ fn positionWithReflow(
 /// between provisional and reshaped widths.
 fn reflowLines(
     allocator: std.mem.Allocator,
-    utf8: []const u8,
-    base_direction: paragraph.BaseDirection,
+    resolved: *const paragraph.Resolved,
     shaped: *const shaped_paragraph.ShapedParagraphs,
     breaks: []const line_break.LineBreak,
     max_width: f32,
@@ -243,7 +241,7 @@ fn reflowLines(
             const candidate = breaks[next];
             const measured = try positioned_lines.measureReshapedLine(
                 allocator,
-                utf8,
+                resolved.utf8,
                 shaped,
                 start,
                 candidate.byte_offset - start,
@@ -274,7 +272,7 @@ fn reflowLines(
         .byte_start = line.byte_start,
         .byte_len = line.byte_len,
     };
-    var visual = try paragraph.reorderLines(allocator, utf8, base_direction, ranges);
+    var visual = try paragraph.reorderResolvedLines(allocator, resolved, ranges);
     defer visual.deinit();
     for (lines.items, visual.lines) |*line, visual_line| {
         line.base_level = visual_line.base_level;

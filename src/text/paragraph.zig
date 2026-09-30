@@ -11,6 +11,56 @@ pub const BaseDirection = enum {
     right_to_left,
 };
 
+/// Borrowed text with resolved SheenBidi paragraphs. Keep the input alive until
+/// deinit; shaping itemization and line ordering can share this resolution.
+pub const Resolved = struct {
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    direction: BaseDirection,
+    algorithm: c.SBAlgorithmRef,
+    paragraphs: []Entry,
+
+    const Entry = struct { handle: c.SBParagraphRef, separator_len: usize };
+
+    pub fn init(allocator: std.mem.Allocator, utf8: []const u8, direction: BaseDirection) !Resolved {
+        if (!std.unicode.utf8ValidateSlice(utf8)) return error.InvalidUtf8;
+        const sequence: c.SBCodepointSequence = .{
+            .stringEncoding = c.SBStringEncodingUTF8,
+            .stringBuffer = utf8.ptr,
+            .stringLength = utf8.len,
+        };
+        const algorithm = if (utf8.len == 0) null else c.SBAlgorithmCreate(&sequence) orelse return error.OutOfMemory;
+        errdefer if (algorithm) |value| c.SBAlgorithmRelease(value);
+        var entries: std.ArrayList(Entry) = .empty;
+        errdefer {
+            for (entries.items) |entry| c.SBParagraphRelease(entry.handle);
+            entries.deinit(allocator);
+        }
+        var offset: usize = 0;
+        while (offset < utf8.len) {
+            var length: usize = 0;
+            var separator: usize = 0;
+            c.SBAlgorithmGetParagraphBoundary(algorithm, offset, utf8.len - offset, &length, &separator);
+            if (length == 0 or length > utf8.len - offset or separator > length)
+                return error.InvalidBidiResult;
+            const handle = c.SBAlgorithmCreateParagraph(algorithm, offset, length, sheenBaseLevel(direction)) orelse return error.OutOfMemory;
+            errdefer c.SBParagraphRelease(handle);
+            if (c.SBParagraphGetOffset(handle) != offset or c.SBParagraphGetLength(handle) != length)
+                return error.InvalidBidiResult;
+            try entries.append(allocator, .{ .handle = handle, .separator_len = separator });
+            offset += length;
+        }
+        return .{ .allocator = allocator, .utf8 = utf8, .direction = direction, .algorithm = algorithm, .paragraphs = try entries.toOwnedSlice(allocator) };
+    }
+
+    pub fn deinit(self: *Resolved) void {
+        for (self.paragraphs) |entry| c.SBParagraphRelease(entry.handle);
+        self.allocator.free(self.paragraphs);
+        if (self.algorithm) |algorithm| c.SBAlgorithmRelease(algorithm);
+        self.* = undefined;
+    }
+};
+
 /// One maximal embedding-level run in logical input order. Byte ranges always
 /// index the original UTF-8 input; odd levels are right-to-left. Visual order
 /// is intentionally deferred until line boundaries are known.
@@ -108,7 +158,13 @@ pub fn reorderLines(
     direction: BaseDirection,
     ranges: []const LineRange,
 ) !VisualLines {
-    if (!std.unicode.utf8ValidateSlice(utf8)) return error.InvalidUtf8;
+    var resolved = try Resolved.init(allocator, utf8, direction);
+    defer resolved.deinit();
+    return reorderResolvedLines(allocator, &resolved, ranges);
+}
+
+pub fn reorderResolvedLines(allocator: std.mem.Allocator, resolved: *const Resolved, ranges: []const LineRange) !VisualLines {
+    const utf8 = resolved.utf8;
     try validateLineRanges(utf8, ranges);
 
     var lines: std.ArrayList(VisualLine) = .empty;
@@ -119,7 +175,7 @@ pub fn reorderLines(
         try lines.append(allocator, .{
             .byte_start = 0,
             .byte_len = 0,
-            .base_level = switch (direction) {
+            .base_level = switch (resolved.direction) {
                 .auto_left_to_right, .left_to_right => 0,
                 .auto_right_to_left, .right_to_left => 1,
             },
@@ -129,36 +185,12 @@ pub fn reorderLines(
         return ownedVisualLines(allocator, &lines, &runs);
     }
 
-    const sequence: c.SBCodepointSequence = .{
-        .stringEncoding = c.SBStringEncodingUTF8,
-        .stringBuffer = utf8.ptr,
-        .stringLength = utf8.len,
-    };
-    const algorithm = c.SBAlgorithmCreate(&sequence) orelse return error.OutOfMemory;
-    defer c.SBAlgorithmRelease(algorithm);
-
-    var paragraph_offset: usize = 0;
     var range_index: usize = 0;
-    while (paragraph_offset < utf8.len) {
-        var paragraph_len: usize = 0;
-        var separator_len: usize = 0;
-        c.SBAlgorithmGetParagraphBoundary(
-            algorithm,
-            paragraph_offset,
-            utf8.len - paragraph_offset,
-            &paragraph_len,
-            &separator_len,
-        );
-        if (paragraph_len == 0 or paragraph_len > utf8.len - paragraph_offset)
-            return error.InvalidBidiResult;
+    for (resolved.paragraphs) |entry| {
+        const paragraph = entry.handle;
+        const paragraph_offset = c.SBParagraphGetOffset(paragraph);
+        const paragraph_len = c.SBParagraphGetLength(paragraph);
         const paragraph_end = paragraph_offset + paragraph_len;
-        const paragraph = c.SBAlgorithmCreateParagraph(
-            algorithm,
-            paragraph_offset,
-            paragraph_len,
-            sheenBaseLevel(direction),
-        ) orelse return error.OutOfMemory;
-        defer c.SBParagraphRelease(paragraph);
         const base_level = c.SBParagraphGetBaseLevel(paragraph);
 
         while (range_index < ranges.len and ranges[range_index].byte_start < paragraph_end) {
@@ -203,7 +235,6 @@ pub fn reorderLines(
             });
             range_index += 1;
         }
-        paragraph_offset = paragraph_end;
     }
     if (range_index != ranges.len) return error.InvalidLineRanges;
     return ownedVisualLines(allocator, &lines, &runs);
@@ -253,16 +284,13 @@ pub fn analyzeBidi(
     utf8: []const u8,
     direction: BaseDirection,
 ) !BidiAnalysis {
-    if (!std.unicode.utf8ValidateSlice(utf8)) return error.InvalidUtf8;
-    if (utf8.len == 0) return emptyAnalysis(allocator, direction);
+    var resolved = try Resolved.init(allocator, utf8, direction);
+    defer resolved.deinit();
+    return analyzeResolvedBidi(allocator, &resolved);
+}
 
-    const sequence: c.SBCodepointSequence = .{
-        .stringEncoding = c.SBStringEncodingUTF8,
-        .stringBuffer = utf8.ptr,
-        .stringLength = utf8.len,
-    };
-    const algorithm = c.SBAlgorithmCreate(&sequence) orelse return error.OutOfMemory;
-    defer c.SBAlgorithmRelease(algorithm);
+pub fn analyzeResolvedBidi(allocator: std.mem.Allocator, resolved: *const Resolved) !BidiAnalysis {
+    if (resolved.utf8.len == 0) return emptyAnalysis(allocator, resolved.direction);
 
     var paragraphs: std.ArrayList(BidiParagraph) = .empty;
     errdefer paragraphs.deinit(allocator);
@@ -271,29 +299,10 @@ pub fn analyzeBidi(
     var runs: std.ArrayList(BidiRun) = .empty;
     errdefer runs.deinit(allocator);
 
-    var offset: usize = 0;
-    while (offset < utf8.len) {
-        var actual_length: usize = 0;
-        var separator_length: usize = 0;
-        c.SBAlgorithmGetParagraphBoundary(
-            algorithm,
-            offset,
-            utf8.len - offset,
-            &actual_length,
-            &separator_length,
-        );
-        if (actual_length == 0 or actual_length > utf8.len - offset or
-            separator_length > actual_length) return error.InvalidBidiResult;
-        const paragraph = c.SBAlgorithmCreateParagraph(
-            algorithm,
-            offset,
-            actual_length,
-            sheenBaseLevel(direction),
-        ) orelse return error.OutOfMemory;
-        defer c.SBParagraphRelease(paragraph);
-        if (c.SBParagraphGetOffset(paragraph) != offset or
-            c.SBParagraphGetLength(paragraph) != actual_length) return error.InvalidBidiResult;
-
+    for (resolved.paragraphs) |entry| {
+        const paragraph = entry.handle;
+        const offset = c.SBParagraphGetOffset(paragraph);
+        const actual_length = c.SBParagraphGetLength(paragraph);
         const level_pointer = c.SBParagraphGetLevelsPtr(paragraph) orelse
             return error.InvalidBidiResult;
         const level_start = levels.items.len;
@@ -317,13 +326,12 @@ pub fn analyzeBidi(
         try paragraphs.append(allocator, .{
             .byte_start = offset,
             .byte_len = actual_length,
-            .separator_len = separator_length,
+            .separator_len = entry.separator_len,
             .base_level = c.SBParagraphGetBaseLevel(paragraph),
             .level_start = level_start,
             .run_start = run_start,
             .run_count = runs.items.len - run_start,
         });
-        offset += actual_length;
     }
 
     const owned_paragraphs = try paragraphs.toOwnedSlice(allocator);
@@ -502,6 +510,46 @@ fn exerciseVisualAllocationFailure(allocator: std.mem.Allocator) !void {
         .{ .byte_start = 4, .byte_len = 6 },
     });
     defer visual.deinit();
+}
+
+test "resolved paragraphs reuse analysis without leaking line-local whitespace resets" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseResolvedReuse, .{});
+}
+
+fn exerciseResolvedReuse(allocator: std.mem.Allocator) !void {
+    var resolved = try Resolved.init(allocator, "abc אבג  דה\nNEXT", .auto_left_to_right);
+    defer resolved.deinit();
+    var initial = try analyzeResolvedBidi(allocator, &resolved);
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(usize, 2), initial.paragraphs.len);
+    // Spaces between Hebrew words have level 1 until they end a chosen line.
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1 }, initial.levels[10..12]);
+    for (0..2) |_| {
+        var wrapped = try reorderResolvedLines(allocator, &resolved, &.{
+            .{ .byte_start = 0, .byte_len = 12 },
+            .{ .byte_start = 12, .byte_len = 5 },
+            .{ .byte_start = 17, .byte_len = 4 },
+        });
+        defer wrapped.deinit();
+        try std.testing.expectEqualSlices(VisualRun, &.{
+            .{ .byte_start = 0, .byte_len = 4, .level = 0 },
+            .{ .byte_start = 4, .byte_len = 6, .level = 1 },
+            .{ .byte_start = 10, .byte_len = 2, .level = 0 },
+        }, wrapped.runsFor(wrapped.lines[0]));
+        var whole = try reorderResolvedLines(allocator, &resolved, &.{
+            .{ .byte_start = 0, .byte_len = 17 },
+            .{ .byte_start = 17, .byte_len = 4 },
+        });
+        defer whole.deinit();
+        try std.testing.expectEqualSlices(VisualRun, &.{
+            .{ .byte_start = 0, .byte_len = 4, .level = 0 },
+            .{ .byte_start = 4, .byte_len = 12, .level = 1 },
+            .{ .byte_start = 16, .byte_len = 1, .level = 0 },
+        }, whole.runsFor(whole.lines[0]));
+        var after = try analyzeResolvedBidi(allocator, &resolved);
+        defer after.deinit();
+        try std.testing.expectEqualSlices(u8, initial.levels, after.levels);
+    }
 }
 
 test "bidi analysis defines empty input and rejects malformed UTF-8" {

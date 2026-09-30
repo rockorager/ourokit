@@ -48,6 +48,18 @@ pub fn selectGreedyLines(
     measured: *const measurement.Measurement,
     max_width: f32,
 ) !GreedyLines {
+    var resolved = try paragraph.Resolved.init(allocator, utf8, base_direction);
+    defer resolved.deinit();
+    return selectResolvedGreedyLines(allocator, &resolved, breaks, measured, max_width);
+}
+
+pub fn selectResolvedGreedyLines(
+    allocator: std.mem.Allocator,
+    resolved: *const paragraph.Resolved,
+    breaks: []const line_break.LineBreak,
+    measured: *const measurement.Measurement,
+    max_width: f32,
+) !GreedyLines {
     if (breaks.len != measured.segments.len) return error.InvalidMeasurements;
     const advances = try measured.advances(allocator);
     defer allocator.free(advances);
@@ -60,7 +72,7 @@ pub fn selectGreedyLines(
         .byte_start = line.byte_start,
         .byte_len = line.byte_len,
     };
-    var visual = try paragraph.reorderLines(allocator, utf8, base_direction, ranges);
+    var visual = try paragraph.reorderResolvedLines(allocator, resolved, ranges);
     defer visual.deinit();
     if (visual.lines.len != wrapped.lines.len) return error.InvalidVisualOrder;
 

@@ -92,7 +92,14 @@ pub fn itemizeParagraphs(
     utf8: []const u8,
     base_direction: bidi_module.BaseDirection,
 ) !ItemizedAnalysis {
-    var bidi = try bidi_module.analyzeBidi(allocator, utf8, base_direction);
+    var resolved = try bidi_module.Resolved.init(allocator, utf8, base_direction);
+    defer resolved.deinit();
+    return itemizeResolvedParagraphs(allocator, &resolved);
+}
+
+pub fn itemizeResolvedParagraphs(allocator: std.mem.Allocator, resolved: *const bidi_module.Resolved) !ItemizedAnalysis {
+    const utf8 = resolved.utf8;
+    var bidi = try bidi_module.analyzeResolvedBidi(allocator, resolved);
     errdefer bidi.deinit();
 
     var paragraphs: std.ArrayList(ItemizedParagraph) = .empty;
