@@ -19,6 +19,7 @@ const Entry = struct {
 pub const Buttons = struct {
     allocator: std.mem.Allocator,
     entries: []Entry,
+    entry_limit: usize = 0,
     armed: ?instance.InstanceHandle = null,
 
     pub fn init(self: *Buttons, allocator: std.mem.Allocator, capacity: usize) !void {
@@ -29,21 +30,21 @@ pub const Buttons = struct {
     }
 
     pub fn deinit(self: *Buttons) void {
-        for (self.entries) |entry| std.debug.assert(!entry.active);
+        for (self.entries[0..self.entry_limit]) |entry| std.debug.assert(!entry.active);
         self.allocator.free(self.entries);
         self.* = undefined;
     }
 
     pub fn availableForOwner(self: *const Buttons, owner: BuildOwnerHandle) usize {
-        var count: usize = 0;
-        for (self.entries) |entry| if (!entry.active or same(entry.owner, owner)) {
+        var count: usize = self.entries.len - self.entry_limit;
+        for (self.entries[0..self.entry_limit]) |entry| if (!entry.active or same(entry.owner, owner)) {
             count += 1;
         };
         return count;
     }
 
     pub fn beginOwner(self: *Buttons, owner: BuildOwnerHandle) void {
-        for (self.entries) |*entry| {
+        for (self.entries[0..self.entry_limit]) |*entry| {
             if (entry.active and same(entry.owner, owner)) entry.seen = false;
         }
     }
@@ -54,7 +55,7 @@ pub const Buttons = struct {
         target: instance.InstanceHandle,
         is_enabled: bool,
     ) void {
-        for (self.entries) |*entry| if (entry.active and same(entry.target, target)) {
+        for (self.entries[0..self.entry_limit]) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.enabled = is_enabled;
             entry.seen = true;
@@ -64,7 +65,7 @@ pub const Buttons = struct {
             }
             return;
         };
-        for (self.entries) |*entry| if (!entry.active) {
+        for (self.entries, 0..) |*entry, index| if (!entry.active) {
             entry.* = .{
                 .owner = owner,
                 .target = target,
@@ -72,32 +73,38 @@ pub const Buttons = struct {
                 .active = true,
                 .seen = true,
             };
+            self.entry_limit = @max(self.entry_limit, index + 1);
             return;
         };
         unreachable;
     }
 
     pub fn finishOwner(self: *Buttons, owner: BuildOwnerHandle) void {
-        for (self.entries) |*entry| {
+        for (self.entries[0..self.entry_limit]) |*entry| {
             if (entry.active and same(entry.owner, owner) and !entry.seen) {
                 if (self.armed != null and same(self.armed.?, entry.target)) self.armed = null;
                 entry.* = .{};
             }
         }
+        while (self.entry_limit > 0 and !self.entries[self.entry_limit - 1].active)
+            self.entry_limit -= 1;
     }
 
     pub fn clear(self: *Buttons) void {
-        @memset(self.entries, .{});
+        @memset(self.entries[0..self.entry_limit], .{});
+        self.entry_limit = 0;
         self.armed = null;
     }
 
     pub fn removeInactive(self: *Buttons, tree: *instance.Tree) void {
-        for (self.entries) |*entry| {
+        for (self.entries[0..self.entry_limit]) |*entry| {
             if (entry.active and !tree.isActive(entry.target)) {
                 if (self.armed != null and same(self.armed.?, entry.target)) self.armed = null;
                 entry.* = .{};
             }
         }
+        while (self.entry_limit > 0 and !self.entries[self.entry_limit - 1].active)
+            self.entry_limit -= 1;
     }
 
     pub fn contains(self: *const Buttons, target: instance.InstanceHandle) bool {
@@ -149,17 +156,49 @@ pub const Buttons = struct {
     }
 
     pub fn slotCount(self: *const Buttons) usize {
-        return self.entries.len;
+        return self.entry_limit;
     }
 
     fn find(self: anytype, target: instance.InstanceHandle) ?if (@TypeOf(self) == *Buttons) *Entry else *const Entry {
-        for (self.entries) |*entry| if (entry.active and same(entry.target, target)) return entry;
+        for (self.entries[0..self.entry_limit]) |*entry| if (entry.active and same(entry.target, target)) return entry;
         return null;
     }
 };
 
 fn same(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+test "button scan bounds preserve holes and shrink after owner removal" {
+    var buttons: Buttons = undefined;
+    try buttons.init(std.testing.allocator, 8);
+    defer buttons.deinit();
+    defer buttons.clear();
+    const owner: BuildOwnerHandle = .{ .slot = 1, .generation = 1 };
+    const other: BuildOwnerHandle = .{ .slot = 2, .generation = 1 };
+    const first: instance.InstanceHandle = .{ .slot = 10, .generation = 1 };
+    const middle: instance.InstanceHandle = .{ .slot = 20, .generation = 1 };
+    const last: instance.InstanceHandle = .{ .slot = 30, .generation = 1 };
+    try std.testing.expectEqual(@as(usize, 0), buttons.slotCount());
+    buttons.set(owner, first, true);
+    buttons.set(other, middle, true);
+    buttons.set(owner, last, true);
+    buttons.beginOwner(other);
+    buttons.finishOwner(other);
+    try std.testing.expectEqual(@as(usize, 3), buttons.slotCount());
+    try std.testing.expectEqual(@as(usize, 6), buttons.availableForOwner(other));
+    try std.testing.expect(buttons.contains(last));
+    buttons.beginOwner(owner);
+    buttons.set(owner, first, true);
+    buttons.finishOwner(owner);
+    try std.testing.expectEqual(@as(usize, 1), buttons.slotCount());
+    buttons.set(other, middle, true);
+    try std.testing.expectEqual(middle, buttons.targetAt(1).?);
+    buttons.clear();
+    try std.testing.expectEqual(@as(usize, 0), buttons.slotCount());
+    buttons.set(owner, last, false);
+    try std.testing.expect(!buttons.isEnabled(last));
+    try std.testing.expectEqual(@as(usize, 1), buttons.slotCount());
 }
 
 test "activation updates report changed targets and preserve state across rebuilds" {

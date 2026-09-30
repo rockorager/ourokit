@@ -131,6 +131,9 @@ pub const Tree = struct {
     render_tree: *render_object.Tree,
     owner_scope: ScopeHandle,
     slots: []Slot,
+    /// Stable slots in ascending order, including scopes still draining.
+    occupied: []usize,
+    occupied_count: usize = 0,
     descriptor_entries: []IndexEntry,
     instance_entries: []IndexEntry,
     render_entries: []IndexEntry,
@@ -149,6 +152,8 @@ pub const Tree = struct {
             return error.InvalidInstanceOwner;
         const slots = try allocator.alloc(Slot, capacity);
         errdefer allocator.free(slots);
+        const occupied = try allocator.alloc(usize, capacity);
+        errdefer allocator.free(occupied);
         const index_capacity = try indexCapacity(capacity);
         const descriptor_entries = try allocator.alloc(IndexEntry, index_capacity);
         errdefer allocator.free(descriptor_entries);
@@ -168,6 +173,7 @@ pub const Tree = struct {
             .render_tree = render_tree,
             .owner_scope = owner_scope,
             .slots = slots,
+            .occupied = occupied,
             .descriptor_entries = descriptor_entries,
             .instance_entries = instance_entries,
             .render_entries = render_entries,
@@ -176,13 +182,18 @@ pub const Tree = struct {
     }
 
     pub fn deinit(self: *Tree) void {
-        for (self.slots) |slot| std.debug.assert(slot.state == .free);
+        std.debug.assert(self.occupied_count == 0);
         self.allocator.free(self.box_has_child);
         self.allocator.free(self.render_entries);
         self.allocator.free(self.instance_entries);
         self.allocator.free(self.descriptor_entries);
+        self.allocator.free(self.occupied);
         self.allocator.free(self.slots);
         self.* = undefined;
+    }
+
+    pub fn occupiedSlots(self: *const Tree) []const usize {
+        return self.occupied[0..self.occupied_count];
     }
 
     /// Compatibility wrapper for ordinary single-window builds. Application
@@ -226,11 +237,11 @@ pub const Tree = struct {
                     return error.ScopeCanceled;
             }
         }
-        for (self.slots) |slot| if (slot.state == .active and
-            self.descriptorForId(descriptors, slot.id) == null)
-        {
-            omitted_count += 1;
-        };
+        for (self.occupiedSlots()) |index| {
+            const slot = self.slots[index];
+            if (slot.state == .active and self.descriptorForId(descriptors, slot.id) == null)
+                omitted_count += 1;
+        }
         if (create_count > self.freeCount()) return error.InstanceCapacityExceeded;
         if (create_count > self.scheduler.availableScopeCapacity())
             return error.ScopeCapacityExceeded;
@@ -239,9 +250,11 @@ pub const Tree = struct {
 
         var topology_changed = create_count != 0 or omitted_count != 0;
         if (!topology_changed) {
-            for (self.slots) |*slot| if (slot.state == .active) {
+            for (self.occupiedSlots()) |index| {
+                const slot = &self.slots[index];
+                if (slot.state != .active) continue;
                 slot.reconcile_child = self.render_tree.firstChild(slot.render.?);
-            };
+            }
             for (descriptors) |descriptor| {
                 const parent_id = descriptor.parent orelse continue;
                 const child = self.findActiveById(descriptor.id).?;
@@ -258,7 +271,8 @@ pub const Tree = struct {
                 }
                 parent.reconcile_child = self.render_tree.nextSibling(expected);
             }
-            if (!topology_changed) for (self.slots) |slot| {
+            if (!topology_changed) for (self.occupiedSlots()) |index| {
+                const slot = self.slots[index];
                 if (slot.state == .active and slot.reconcile_child != null) {
                     topology_changed = true;
                     break;
@@ -291,10 +305,12 @@ pub const Tree = struct {
             // Identify only parents whose ordered, typed edge list changed.
             // Detaching a whole affected list keeps append semantics simple
             // without invalidating unrelated branches.
-            for (self.slots) |*slot| if (slot.state == .active) {
+            for (self.occupiedSlots()) |index| {
+                const slot = &self.slots[index];
+                if (slot.state != .active) continue;
                 slot.reconcile_child = self.render_tree.firstChild(slot.render.?);
                 slot.rebuild_children = false;
-            };
+            }
             for (descriptors) |descriptor| {
                 const parent_id = descriptor.parent orelse continue;
                 const parent = self.findActiveById(parent_id) orelse continue;
@@ -308,18 +324,22 @@ pub const Tree = struct {
                     parent.reconcile_child = self.render_tree.nextSibling(expected.?);
                 }
             }
-            for (self.slots) |*slot| {
+            for (self.occupiedSlots()) |index| {
+                const slot = &self.slots[index];
                 if (slot.state == .active and slot.reconcile_child != null)
                     slot.rebuild_children = true;
             }
-            for (self.slots) |slot| if (slot.state == .active and slot.parent_id != null) {
+            for (self.occupiedSlots()) |index| {
+                const slot = self.slots[index];
+                if (slot.state != .active or slot.parent_id == null) continue;
                 const parent = self.findActiveById(slot.parent_id.?).?;
                 if (parent.rebuild_children)
                     self.render_tree.detachChild(slot.render.?) catch unreachable;
-            };
+            }
         }
 
-        for (self.slots) |*slot| {
+        for (self.occupiedSlots()) |index| {
+            const slot = &self.slots[index];
             if (slot.state != .active or self.descriptorForId(descriptors, slot.id) != null) continue;
             self.scheduler.queueScopeCancellation(slot.scope) catch unreachable;
             self.render_tree.destroy(slot.render.?) catch unreachable;
@@ -339,6 +359,11 @@ pub const Tree = struct {
                 self.owner_scope) catch unreachable;
             const render = self.render_tree.create(descriptor.object) catch unreachable;
             const slot_index = self.freeIndex().?;
+            var position = self.occupied_count;
+            while (position > 0 and self.occupied[position - 1] > slot_index) : (position -= 1)
+                self.occupied[position] = self.occupied[position - 1];
+            self.occupied[position] = slot_index;
+            self.occupied_count += 1;
             const slot = &self.slots[slot_index];
             var generation = slot.generation +% 1;
             if (generation == 0) generation = 1;
@@ -408,14 +433,24 @@ pub const Tree = struct {
         var changed = false;
         while (progress) {
             progress = false;
-            for (self.slots) |*slot| {
-                if (slot.state != .retiring) continue;
+            var index: usize = 0;
+            while (index < self.occupied_count) {
+                const slot = &self.slots[self.occupied[index]];
+                if (slot.state != .retiring) {
+                    index += 1;
+                    continue;
+                }
                 self.scheduler.destroyScope(slot.scope) catch |err| switch (err) {
-                    error.ScopeNotEmpty => continue,
+                    error.ScopeNotEmpty => {
+                        index += 1;
+                        continue;
+                    },
                     else => return err,
                 };
                 const generation = slot.generation;
                 slot.* = .{ .generation = generation };
+                self.occupied_count -= 1;
+                std.mem.copyForwards(usize, self.occupied[index..self.occupied_count], self.occupied[index + 1 .. self.occupied_count + 1]);
                 progress = true;
                 changed = true;
             }
@@ -425,7 +460,8 @@ pub const Tree = struct {
 
     pub fn rootRenderObject(self: *Tree) !?render_object.NodeHandle {
         var root: ?render_object.NodeHandle = null;
-        for (self.slots) |slot| {
+        for (self.occupiedSlots()) |index| {
+            const slot = self.slots[index];
             if (slot.state != .active or slot.parent_id != null) continue;
             if (root != null) return error.MultipleInstanceRoots;
             root = slot.render.?;
@@ -512,7 +548,8 @@ pub const Tree = struct {
     /// rejected requests must not become delayed focus steals on later builds.
     pub fn takeFocusRequest(self: *Tree) ?InstanceHandle {
         var selected: ?usize = null;
-        for (self.slots, 0..) |slot, index| {
+        for (self.occupiedSlots()) |index| {
+            const slot = self.slots[index];
             if (slot.state != .active or !slot.focus_request_pending) continue;
             if (selected == null or slot.traversal_order < self.slots[selected.?].traversal_order)
                 selected = index;
@@ -535,7 +572,8 @@ pub const Tree = struct {
             0;
         var selected: ?usize = null;
         var wrapped: ?usize = null;
-        for (self.slots, 0..) |slot, index| {
+        for (self.occupiedSlots()) |index| {
+            const slot = self.slots[index];
             if (slot.state != .active or !slot.focusable or
                 !(self.render_tree.isInteractive(slot.render.?) catch false)) continue;
             if (wrapped == null or orderBefore(slot.traversal_order, self.slots[wrapped.?].traversal_order, reverse))
@@ -579,7 +617,8 @@ pub const Tree = struct {
 
     pub fn applyScrollRequests(self: *Tree) !bool {
         var applied = false;
-        for (self.slots, 0..) |*slot, index| {
+        for (self.occupiedSlots()) |index| {
+            const slot = &self.slots[index];
             if (slot.state != .active or !slot.scroll_request_pending) continue;
             const handle: InstanceHandle = .{ .slot = @intCast(index), .generation = slot.generation };
             _ = try self.scrollBy(handle, slot.scroll_to.?.offset - slot.scroll_offset);
@@ -593,7 +632,8 @@ pub const Tree = struct {
     /// scrolling when the same declaration is rebuilt unchanged.
     pub fn revealScrollTargets(self: *Tree) !bool {
         var changed = false;
-        for (self.slots) |*slot| {
+        for (self.occupiedSlots()) |index| {
+            const slot = &self.slots[index];
             if (slot.state != .active) continue;
             const id = slot.ensure_visible orelse continue;
             const object = try self.render_tree.objectAt(slot.render.?);
@@ -664,7 +704,8 @@ pub const Tree = struct {
     /// Layout may reduce a scroll extent after content changes. Synchronize
     /// clamped renderer values back into their authoritative instance slots.
     pub fn syncScrollOffsets(self: *Tree) !void {
-        for (self.slots) |*slot| {
+        for (self.occupiedSlots()) |index| {
+            const slot = &self.slots[index];
             if (slot.state != .active) continue;
             if ((try self.render_tree.objectAt(slot.render.?)) != .scroll) continue;
             slot.scroll_offset = try self.render_tree.scrollOffset(slot.render.?);
@@ -673,9 +714,9 @@ pub const Tree = struct {
 
     pub fn activeCount(self: *const Tree) usize {
         var count: usize = 0;
-        for (self.slots) |slot| if (slot.state == .active) {
-            count += 1;
-        };
+        for (self.occupiedSlots()) |index| {
+            if (self.slots[index].state == .active) count += 1;
+        }
         return count;
     }
 
@@ -705,11 +746,7 @@ pub const Tree = struct {
     }
 
     fn freeCount(self: *const Tree) usize {
-        var count: usize = 0;
-        for (self.slots) |slot| if (slot.state == .free) {
-            count += 1;
-        };
-        return count;
+        return self.slots.len - self.occupied_count;
     }
 
     fn validateSnapshot(self: *Tree, descriptors: []const Descriptor) !void {
@@ -769,8 +806,8 @@ pub const Tree = struct {
         const render_index = IdIndex{ .entries = self.render_entries };
         instance_index.clear();
         render_index.clear();
-        for (self.slots, 0..) |slot, index| {
-            if (slot.state == .free) continue;
+        for (self.occupiedSlots()) |index| {
+            const slot = self.slots[index];
             _ = try instance_index.put(slot.id, index);
             if (slot.render) |render| _ = try render_index.put(renderKey(render), index);
         }
@@ -932,6 +969,60 @@ test "topology reconciliation relayouts only the affected sibling branch" {
     try scheduler.applyQueuedCancellations();
     try instances.collectRetired();
     try scheduler.destroyScope(window_scope);
+}
+
+test "occupied slots retain draining scopes and reuse holes without moving handles" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 20, 1, 0);
+    defer scheduler.deinit();
+    const owner = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 16);
+    defer renders.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, &scheduler, &renders, owner, 1024);
+    defer tree.deinit();
+    const initial = [_]Descriptor{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .box = .{} }, .focusable = true },
+        .{ .id = 3, .parent = 1, .object = .{ .box = .{} }, .focusable = true },
+        .{ .id = 4, .parent = 1, .object = .{ .box = .{} }, .focusable = true },
+    };
+    try tree.reconcile(&initial);
+    const removed = tree.handleForId(2).?;
+    const retained = tree.handleForId(4).?;
+    const child_scope = try scheduler.createScope(try tree.scope(removed));
+    try tree.reconcile(&.{ initial[0], initial[3] });
+    try tree.collectRetired();
+    try std.testing.expectEqual(@as(usize, 3), tree.occupiedSlots().len);
+    try std.testing.expectEqual(@as(usize, 2), tree.activeCount());
+    try std.testing.expectEqual(retained, tree.handleForId(4).?);
+    try std.testing.expectError(error.InstanceRetiring, tree.prepareReconcile(&initial));
+    try scheduler.applyQueuedCancellations();
+    try scheduler.destroyScope(child_scope);
+    try tree.collectRetired();
+    try std.testing.expectEqual(@as(usize, 2), tree.occupiedSlots().len);
+    try std.testing.expectEqual(@as(usize, 1022), tree.freeCount());
+
+    // Reusing holes preserves ascending slot order, not insertion order.
+    try tree.reconcile(&initial);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3 }, tree.occupiedSlots());
+    const replacement = tree.handleForId(2).?;
+    try std.testing.expectEqual(removed.slot, replacement.slot);
+    try std.testing.expect(removed.generation != replacement.generation);
+    try std.testing.expect(!tree.isActive(removed));
+    try std.testing.expectEqual(retained, tree.handleForId(4).?);
+    try std.testing.expectEqual(replacement, (try tree.nextFocusable(null, false)).?);
+    try std.testing.expectEqual(retained, (try tree.nextFocusable(null, true)).?);
+    const plan = try tree.prepareReconcile(&initial);
+    try std.testing.expect(!plan.topology_changed);
+    try tree.applyReconcile(plan);
+    try tree.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try tree.collectRetired();
+    try std.testing.expectEqual(@as(usize, 0), tree.occupiedSlots().len);
+    try std.testing.expectEqual(@as(usize, 1024), tree.freeCount());
+    try scheduler.destroyScope(owner);
 }
 
 test "invalid snapshots are transactional and retirement waits for scope drain" {

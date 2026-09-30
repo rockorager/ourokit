@@ -1205,6 +1205,16 @@ pub const Tree = struct {
         const sources = self.paragraph_sources orelse return error.ParagraphResourcesRequired;
         const paragraphs = self.paragraphs orelse return error.ParagraphResourcesRequired;
         const source = sources.get(value.source) catch return error.StaleParagraphSource;
+        const current = try self.slot(handle);
+        // Height constrains the box, not paragraph shaping or line placement.
+        // Dirty nodes still resolve style/source/child changes through acquire.
+        if (!current.needs_layout and current.has_layout and current.first_child == null and
+            current.last_constraints.min_width == constraints.min_width and
+            current.last_constraints.max_width == constraints.max_width)
+        {
+            const retained = paragraphs.get(current.paragraph_layout.?) catch return error.StaleParagraph;
+            return constraints.constrain(retained.size);
+        }
         var request: text.ParagraphCache.Request = .{
             .utf8 = source.utf8,
             .base_direction = source.base_direction,
@@ -1216,7 +1226,7 @@ pub const Tree = struct {
                 std.math.floatMax(f32),
             .candidates = source.candidates,
             .runs = source.runs,
-            .include_caret_stops = (try self.slot(handle)).first_child != null,
+            .include_caret_stops = current.first_child != null,
             .configuration_revision = source.configuration_revision,
             .style = .{
                 .alignment = value.alignment,
@@ -2056,9 +2066,22 @@ test "text objects cache width-specific mixed-script paragraphs across unchanged
     try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(paragraph));
     try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
 
+    // The retained layout was fitted to content width. Reacquiring at the
+    // original maximum would allocate a temporary paragraph before fitting.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    paragraphs.allocator = failing.allocator();
+    const clipped_size = try tree.layout(paragraph, .{ .max_width = 180, .max_height = 7 });
+    try std.testing.expectEqual(SizeF{ .width = wide_size.width, .height = 7 }, clipped_size);
+    const tall_size = try tree.layout(paragraph, .{ .max_width = 180, .min_height = 150, .max_height = 200 });
+    try std.testing.expectEqual(SizeF{ .width = wide_size.width, .height = 150 }, tall_size);
+    try std.testing.expectEqual(wide_size, try tree.layout(paragraph, .{ .max_width = 180, .max_height = 200 }));
+    try std.testing.expectEqual(wide_layout, (try tree.slot(paragraph)).paragraph_layout.?);
+    try std.testing.expect(!failing.has_induced_failure);
+    paragraphs.allocator = std.testing.allocator;
+
     const narrow_size = try tree.layout(paragraph, .{ .max_width = 70, .max_height = 200 });
     try std.testing.expect(narrow_size.height > wide_size.height);
-    try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(paragraph));
+    try std.testing.expectEqual(@as(usize, 5), try tree.layoutCount(paragraph));
     try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
     builder = try scene_builder.Builder.init(&commands, 1);
     try tree.buildScene(paragraph, &builder);
@@ -2071,8 +2094,21 @@ test "text objects cache width-specific mixed-script paragraphs across unchanged
         .max_height = 200,
     });
     try std.testing.expectEqual(@as(f32, 180), tight_size.width);
-    try std.testing.expectEqual(@as(usize, 3), try tree.layoutCount(paragraph));
+    try std.testing.expectEqual(@as(usize, 6), try tree.layoutCount(paragraph));
     try std.testing.expectEqual(@as(usize, 1), paragraphs.count());
+
+    // A minimum-width change still needs content fitting, even at the same max.
+    try std.testing.expectEqual(wide_size, try tree.layout(paragraph, .{ .max_width = 180, .max_height = 200 }));
+
+    // Same width must not reuse a layout after style changes mark it dirty.
+    const before_style = (try tree.slot(paragraph)).paragraph_layout.?;
+    var restyled = try tree.objectAt(paragraph);
+    restyled.text.max_lines = 1;
+    try tree.update(paragraph, restyled);
+    _ = try tree.layout(paragraph, .{ .max_width = 180, .max_height = 200 });
+    const after_style = (try tree.slot(paragraph)).paragraph_layout.?;
+    try std.testing.expect(!sameParagraph(before_style, after_style));
+    try std.testing.expectEqual(@as(usize, 1), (try paragraphs.get(after_style)).positioned.lines.len);
 
     try tree.destroy(paragraph);
     try std.testing.expectEqual(@as(usize, 0), sources.count());

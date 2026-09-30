@@ -41,6 +41,7 @@ const Entry = struct {
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     entries: []Entry,
+    entry_limit: usize = 0,
 
     pub fn init(self: *Registry, allocator: std.mem.Allocator, capacity: usize) !void {
         if (capacity == 0) return error.InvalidTextInputCapacity;
@@ -50,21 +51,21 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry) void {
-        for (self.entries) |entry| std.debug.assert(!entry.active);
+        for (self.entries[0..self.entry_limit]) |entry| std.debug.assert(!entry.active);
         self.allocator.free(self.entries);
         self.* = undefined;
     }
 
     pub fn availableForOwner(self: *const Registry, owner: build_owner.BuildOwnerHandle) usize {
-        var count: usize = 0;
-        for (self.entries) |entry| if (!entry.active or same(entry.owner, owner)) {
+        var count: usize = self.entries.len - self.entry_limit;
+        for (self.entries[0..self.entry_limit]) |entry| if (!entry.active or same(entry.owner, owner)) {
             count += 1;
         };
         return count;
     }
 
     pub fn beginOwner(self: *Registry, owner: build_owner.BuildOwnerHandle) void {
-        for (self.entries) |*entry| {
+        for (self.entries[0..self.entry_limit]) |*entry| {
             if (entry.active and same(entry.owner, owner)) entry.seen = false;
         }
     }
@@ -113,7 +114,7 @@ pub const Registry = struct {
         behavior: Behavior,
         prepared: *?Session,
     ) !void {
-        for (self.entries) |*entry| if (entry.active and same(entry.target, target)) {
+        for (self.entries[0..self.entry_limit]) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.content = content_handle;
             if (entry.behavior.enabled != behavior.enabled or entry.behavior.read_only != behavior.read_only)
@@ -136,7 +137,7 @@ pub const Registry = struct {
             }
             return;
         };
-        for (self.entries) |*entry| if (!entry.active) {
+        for (self.entries, 0..) |*entry, index| if (!entry.active) {
             entry.* = .{
                 .owner = owner,
                 .target = target,
@@ -147,6 +148,7 @@ pub const Registry = struct {
                 .seen = true,
                 .autofocus_pending = behavior.enabled and behavior.autofocus,
             };
+            self.entry_limit = @max(self.entry_limit, index + 1);
             prepared.* = null;
             return;
         };
@@ -154,17 +156,22 @@ pub const Registry = struct {
     }
 
     pub fn finishOwner(self: *Registry, owner: build_owner.BuildOwnerHandle) void {
-        for (self.entries) |*entry|
+        for (self.entries[0..self.entry_limit]) |*entry|
             if (entry.active and same(entry.owner, owner) and !entry.seen) destroy(entry);
+        while (self.entry_limit > 0 and !self.entries[self.entry_limit - 1].active)
+            self.entry_limit -= 1;
     }
 
     pub fn removeInactive(self: *Registry, tree: *instance.Tree) void {
-        for (self.entries) |*entry|
+        for (self.entries[0..self.entry_limit]) |*entry|
             if (entry.active and !tree.isActive(entry.target)) destroy(entry);
+        while (self.entry_limit > 0 and !self.entries[self.entry_limit - 1].active)
+            self.entry_limit -= 1;
     }
 
     pub fn clear(self: *Registry) void {
-        for (self.entries) |*entry| if (entry.active) destroy(entry);
+        for (self.entries[0..self.entry_limit]) |*entry| if (entry.active) destroy(entry);
+        self.entry_limit = 0;
     }
 
     pub fn contains(self: *const Registry, target: instance.InstanceHandle) bool {
@@ -181,7 +188,7 @@ pub const Registry = struct {
 
     /// Whether any mounted field sends its text to an authentication prompt.
     pub fn hasSecret(self: *const Registry) bool {
-        for (self.entries) |entry| if (entry.active and entry.behavior.secret != null) return true;
+        for (self.entries[0..self.entry_limit]) |entry| if (entry.active and entry.behavior.secret != null) return true;
         return false;
     }
 
@@ -210,12 +217,12 @@ pub const Registry = struct {
     }
 
     pub fn slotCount(self: *const Registry) usize {
-        return self.entries.len;
+        return self.entry_limit;
     }
 
     /// Returns autofocus once, only for a newly mounted input.
     pub fn takeAutofocus(self: *Registry) ?instance.InstanceHandle {
-        for (self.entries) |*entry| if (entry.active and entry.autofocus_pending) {
+        for (self.entries[0..self.entry_limit]) |*entry| if (entry.active and entry.autofocus_pending) {
             entry.autofocus_pending = false;
             return entry.target;
         };
@@ -228,7 +235,7 @@ pub const Registry = struct {
     }
 
     fn find(self: anytype, target: instance.InstanceHandle) ?if (@TypeOf(self) == *Registry) *Entry else *const Entry {
-        for (self.entries) |*entry|
+        for (self.entries[0..self.entry_limit]) |*entry|
             if (entry.active and same(entry.target, target)) return entry;
         return null;
     }
@@ -236,6 +243,37 @@ pub const Registry = struct {
 
 fn same(a: anytype, b: @TypeOf(a)) bool {
     return a.slot == b.slot and a.generation == b.generation;
+}
+
+test "text input scan bounds retain higher sessions across holes and regrowth" {
+    var registry: Registry = undefined;
+    try registry.init(std.testing.allocator, 8);
+    defer registry.deinit();
+    defer registry.clear();
+    const owner: build_owner.BuildOwnerHandle = .{ .slot = 1, .generation = 1 };
+    const other: build_owner.BuildOwnerHandle = .{ .slot = 2, .generation = 1 };
+    const first: instance.InstanceHandle = .{ .slot = 10, .generation = 1 };
+    const middle: instance.InstanceHandle = .{ .slot = 20, .generation = 1 };
+    const last: instance.InstanceHandle = .{ .slot = 30, .generation = 1 };
+    try std.testing.expectEqual(@as(usize, 0), registry.slotCount());
+    try registry.mount(owner, first, first, "first");
+    try registry.mount(other, middle, middle, "middle");
+    try registry.mount(owner, last, last, "last");
+    registry.beginOwner(other);
+    registry.finishOwner(other);
+    try std.testing.expectEqual(@as(usize, 3), registry.slotCount());
+    try std.testing.expectEqual(@as(usize, 6), registry.availableForOwner(other));
+    try std.testing.expectEqualStrings("last", (try registry.session(last)).model.text());
+    registry.beginOwner(owner);
+    try registry.mount(owner, first, first, "ignored");
+    registry.finishOwner(owner);
+    try std.testing.expectEqual(@as(usize, 1), registry.slotCount());
+    try registry.mount(other, middle, middle, "new");
+    try std.testing.expectEqualStrings("new", registry.mountedAt(1).?.session.model.text());
+    registry.clear();
+    try std.testing.expectEqual(@as(usize, 0), registry.slotCount());
+    try registry.mount(owner, last, last, "fresh");
+    try std.testing.expectEqualStrings("fresh", (try registry.session(last)).model.text());
 }
 
 test "retained sessions survive rediscovery and dispose with their owner" {

@@ -631,6 +631,7 @@ pub const WindowRuntime = struct {
         self.applyFocusRequests() catch unreachable;
         self.scrollbar_drag = null;
         @memset(self.pointer_bindings.scrolls, .{});
+        self.pointer_bindings.scroll_limit = 0;
         while (self.router.takeEvent() != null) {}
         _ = self.frame_state.configure(prepared.size.?) catch unreachable;
         self.frame_state.invalidatePaint();
@@ -1094,7 +1095,7 @@ pub const WindowRuntime = struct {
             };
             if (!self.instances.isInteractive(target)) continue;
             if (event == .pointer and event.pointer.event == .button and event.pointer.event.button.state == .pressed) {
-                const has_outside = for (self.pointer_bindings.entries) |entry| {
+                const has_outside = for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
                     if (entry.handler) |handler| if (handler.kind == .pointer_down_outside) break true;
                 } else false;
                 if (has_outside) if (try self.instances.rootRenderObject()) |root| {
@@ -1264,7 +1265,7 @@ pub const WindowRuntime = struct {
 
     pub fn hasPendingScrollEvents(self: *WindowRuntime) bool {
         self.pointer_bindings.pruneScrollStates(&self.instances);
-        for (self.pointer_bindings.entries) |entry| {
+        for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
             const handler = entry.handler orelse continue;
             if (handler.kind != .scroll_change) continue;
             const metrics = self.observedScrollMetrics(entry.target) orelse continue;
@@ -1276,7 +1277,7 @@ pub const WindowRuntime = struct {
 
     fn publishScrollEvents(self: *WindowRuntime, callback_service: anytype) !void {
         self.pointer_bindings.pruneScrollStates(&self.instances);
-        for (self.pointer_bindings.entries) |*entry| {
+        for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |*entry| {
             const handler = entry.handler orelse continue;
             if (handler.kind != .scroll_change) continue;
             const metrics = self.observedScrollMetrics(entry.target) orelse continue;
@@ -1484,7 +1485,7 @@ pub const WindowRuntime = struct {
     }
 
     fn syncInteractions(self: *WindowRuntime, callback_service: anytype) !void {
-        const observing = for (self.pointer_bindings.entries) |entry| {
+        const observing = for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
             if (entry.handler != null and entry.handler.?.kind == .interaction_change) break true;
         } else false;
         if (!observing) return;
@@ -1504,7 +1505,7 @@ pub const WindowRuntime = struct {
             }
         }
         const focused = if (self.keyboard_focused) self.focus.current() else null;
-        for (self.pointer_bindings.entries) |entry| {
+        for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
             const handler = entry.handler orelse continue;
             if (handler.kind != .interaction_change or !self.instances.isInteractive(entry.target)) continue;
             const active = try self.containsTarget(entry.target, hovered) or try self.containsTarget(entry.target, focused) or
@@ -1620,7 +1621,7 @@ pub const WindowRuntime = struct {
     }
 
     fn matchShortcut(self: *WindowRuntime, target: ui.instance.InstanceHandle, prefix: KeySequence, callbacks: anytype) !bool {
-        for (self.pointer_bindings.entries) |entry| {
+        for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
             const handler = entry.handler orelse continue;
             if (handler.kind != .shortcut or !sameHandle(entry.target, target) or
                 handler.sequence.len < prefix.len or !prefix.overlaps(handler.sequence)) continue;
@@ -2821,7 +2822,7 @@ pub const WindowRuntime = struct {
     fn applyInteractionPaint(self: *WindowRuntime, target: ui.instance.InstanceHandle, focused: bool) !void {
         const id = try self.instances.semanticId(target);
         const selection = self.listboxes.option(target) != null;
-        for (0..self.instances.slots.len) |index| {
+        for (self.instances.occupiedSlots()) |index| {
             const binding = self.instances.paintAt(index) orelse continue;
             if (binding.paint.source != id) continue;
             var object = try self.tree.objectAt(binding.render);
