@@ -22,6 +22,7 @@ pub const ParagraphCache = struct {
     font_cache: *api.FontCache,
     slabs: std.ArrayListUnmanaged(*Slab) = .empty,
     index: Index = .empty,
+    index_removals: usize = 0,
     free_head: u32 = invalid_slot,
     active_count: usize = 0,
 
@@ -244,6 +245,13 @@ pub const ParagraphCache = struct {
         slot.references -= 1;
         if (slot.references != 0) return;
         _ = self.index.remove(slot.entry.key);
+        // Keep deleted buckets below 1/8 capacity in addition to HashMap's
+        // 80% live-entry bound. Rehashing leaves slab-backed layouts in place.
+        self.index_removals += 1;
+        if (self.index_removals >= self.index.capacity() / 8) {
+            self.index.rehash(KeyContext{});
+            self.index_removals = 0;
+        }
         self.destroyEntry(&slot.entry);
         slot.active = false;
         slot.generation +%= 1;
@@ -414,6 +422,52 @@ test "paragraph cache owns mixed-script positioned layouts and font leases" {
     try std.testing.expectError(error.StaleParagraph, cache.get(first));
     try std.testing.expectError(error.StaleFont, fonts.get(latin));
     try std.testing.expectError(error.StaleFont, fonts.get(arabic));
+}
+
+test "paragraph index churn preserves live layouts and stale generations" {
+    var fonts = api.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(font) catch unreachable;
+    var cache = ParagraphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    var request: ParagraphCache.Request = .{
+        .utf8 = "retained anchor",
+        .language = "und",
+        .logical_size = 14,
+        .max_width = 200,
+        .candidates = &.{font},
+        .configuration_revision = 3,
+    };
+    const anchor = try cache.acquire(request);
+    const layout = try cache.get(anchor);
+    const size = layout.size;
+    const glyphs = layout.positioned.glyphs;
+    var handles: [40]ParagraphHandle = undefined;
+    var buffer: [64]u8 = undefined;
+    for (0..16) |generation| {
+        for (&handles, 0..) |*handle, index| {
+            request.utf8 = try std.fmt.bufPrint(&buffer, "transient {d}/{d}", .{ generation, index });
+            handle.* = try cache.acquire(request);
+        }
+        for (0..handles.len) |index| try cache.release(handles[handles.len - 1 - index]);
+        try std.testing.expectEqual(@as(usize, 1), cache.count());
+        try std.testing.expectEqual(@as(u32, 1), cache.index.count());
+        try std.testing.expect(cache.index_removals < cache.index.capacity() / 8);
+        try std.testing.expectEqual(layout, try cache.get(anchor));
+        try std.testing.expectEqual(size, layout.size);
+        try std.testing.expectEqual(glyphs.ptr, layout.positioned.glyphs.ptr);
+        try std.testing.expectError(error.StaleParagraph, cache.get(handles[0]));
+        request.utf8 = "retained anchor";
+        const duplicate = try cache.acquire(request);
+        try std.testing.expectEqual(anchor, duplicate);
+        try cache.release(duplicate);
+    }
+    try cache.release(anchor);
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
 }
 
 test "ellipsis is shaped in paragraph context and maps to a source boundary" {

@@ -339,16 +339,17 @@ pub const UiBuild = struct {
             null
         else
             return error.CallbackServiceUnavailable;
-        if (self.pending_handler_count > bindings.availableAfterReconcile(tree, owner))
+        if (self.pending_handler_count != 0 and
+            self.pending_handler_count > bindings.availableAfterReconcile(tree, owner))
             return error.PointerBindingCapacityExceeded;
-        if (self.pending_button_count > buttons.availableForOwner(owner))
+        if (self.pending_button_count != 0 and self.pending_button_count > buttons.availableForOwner(owner))
             return error.ButtonCapacityExceeded;
-        if (self.pending_text_input_count > text_inputs.availableForOwner(owner))
+        if (self.pending_text_input_count != 0 and self.pending_text_input_count > text_inputs.availableForOwner(owner))
             return error.TextInputCapacityExceeded;
-        if (callbacks) |registry| {
+        if (self.pending_handler_count != 0) {
             const reclaimable = bindings.reclaimableForOwner(tree, owner);
             if (self.pending_handler_count > reclaimable)
-                try registry.ensureAvailable(self.pending_handler_count - reclaimable);
+                try callbacks.?.ensureAvailable(self.pending_handler_count - reclaimable);
         }
     }
 

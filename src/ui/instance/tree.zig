@@ -134,6 +134,7 @@ pub const Tree = struct {
     descriptor_entries: []IndexEntry,
     instance_entries: []IndexEntry,
     render_entries: []IndexEntry,
+    box_has_child: []bool,
     revision: u64 = 0,
 
     pub fn init(
@@ -155,6 +156,8 @@ pub const Tree = struct {
         errdefer allocator.free(instance_entries);
         const render_entries = try allocator.alloc(IndexEntry, index_capacity);
         errdefer allocator.free(render_entries);
+        const box_has_child = try allocator.alloc(bool, capacity);
+        errdefer allocator.free(box_has_child);
         @memset(slots, .{});
         @memset(descriptor_entries, .{});
         @memset(instance_entries, .{});
@@ -168,11 +171,13 @@ pub const Tree = struct {
             .descriptor_entries = descriptor_entries,
             .instance_entries = instance_entries,
             .render_entries = render_entries,
+            .box_has_child = box_has_child,
         };
     }
 
     pub fn deinit(self: *Tree) void {
         for (self.slots) |slot| std.debug.assert(slot.state == .free);
+        self.allocator.free(self.box_has_child);
         self.allocator.free(self.render_entries);
         self.allocator.free(self.instance_entries);
         self.allocator.free(self.descriptor_entries);
@@ -747,14 +752,14 @@ pub const Tree = struct {
                 if (source == null) return error.InvalidInteractionPaint;
             }
         }
-        for (descriptors) |parent| if (parent.object == .box) {
-            var child_count: usize = 0;
-            for (descriptors) |candidate| if (candidate.parent != null and
-                candidate.parent.? == parent.id)
-            {
-                child_count += 1;
-                if (child_count > 1) return error.BoxAlreadyHasChild;
-            };
+        // Parent IDs were validated above. Count direct edges once rather
+        // than scanning the complete snapshot separately for every box.
+        @memset(self.box_has_child[0..descriptors.len], false);
+        for (descriptors) |descriptor| if (descriptor.parent) |parent| {
+            const parent_index = descriptor_index.get(parent).?;
+            if (descriptors[parent_index].object != .box) continue;
+            if (self.box_has_child[parent_index]) return error.BoxAlreadyHasChild;
+            self.box_has_child[parent_index] = true;
         };
         if (descriptors.len != 0 and roots != 1) return error.InvalidRootCount;
     }
@@ -960,6 +965,42 @@ test "invalid snapshots are transactional and retirement waits for scope drain" 
     try instances.reconcile(&.{.{ .id = 1, .parent = null, .object = .{ .box = .{} } }});
     try std.testing.expect(original.generation != instances.handleForId(1).?.generation);
 
+    try instances.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try instances.collectRetired();
+    try scheduler.destroyScope(window_scope);
+}
+
+test "box child validation handles interleaved descendants and resets after rejection" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 16, 1, 0);
+    defer scheduler.deinit();
+    const window_scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 8);
+    defer renders.deinit();
+    var instances: Tree = undefined;
+    try instances.init(std.testing.allocator, &scheduler, &renders, window_scope, 8);
+    defer instances.deinit();
+    const valid = [_]Descriptor{
+        .{ .id = 100, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 80, .parent = 100, .object = .{ .box = .{} } },
+        .{ .id = 12, .parent = 100, .object = .{ .box = .{} } },
+        .{ .id = 400, .parent = 80, .object = .{ .box = .{} } },
+        .{ .id = 22, .parent = 12, .object = .{ .box = .{} } },
+        .{ .id = 401, .parent = 400, .object = .{ .box = .{} } },
+    };
+    try instances.reconcile(&valid);
+    const parent = instances.handleForId(80).?;
+    const child = try instances.renderObject(instances.handleForId(400).?);
+    const invalid = valid ++ [_]Descriptor{.{ .id = 77, .parent = 80, .object = .{ .box = .{} } }};
+    try std.testing.expectError(error.BoxAlreadyHasChild, instances.prepareReconcile(&invalid));
+    try std.testing.expectEqual(parent, instances.handleForId(80).?);
+    try std.testing.expectEqual(child, renders.firstChild(try instances.renderObject(parent)).?);
+    try std.testing.expectEqual(@as(?InstanceHandle, null), instances.handleForId(77));
+    try instances.reconcile(&valid);
+    try instances.reconcile(&valid);
+    try std.testing.expectEqual(parent, instances.handleForId(80).?);
     try instances.reconcile(&.{});
     try scheduler.applyQueuedCancellations();
     try instances.collectRetired();

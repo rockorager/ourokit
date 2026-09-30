@@ -430,13 +430,13 @@ pub const WindowRuntime = struct {
         try lua_ui.capturePrepared(prepared, descriptors);
         var captured = true;
         errdefer if (captured) prepared.reset();
-        if (prepared.handler_count > self.pointer_bindings.availableAfterReconcile(
+        if (prepared.handler_count != 0 and prepared.handler_count > self.pointer_bindings.availableAfterReconcile(
             &self.instances,
             self.root_owner,
         )) return error.PointerBindingCapacityExceeded;
-        if (prepared.button_count > self.buttons.availableForOwner(self.root_owner))
+        if (prepared.button_count != 0 and prepared.button_count > self.buttons.availableForOwner(self.root_owner))
             return error.ButtonCapacityExceeded;
-        if (prepared.text_input_count > self.text_inputs.availableForOwner(self.root_owner))
+        if (prepared.text_input_count != 0 and prepared.text_input_count > self.text_inputs.availableForOwner(self.root_owner))
             return error.TextInputCapacityExceeded;
         for (prepared.handlers[0..prepared.handler_count]) |handler|
             if (!containsDescriptorId(prepared.descriptors(), handler.id))

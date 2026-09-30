@@ -28,6 +28,7 @@ pub const ParagraphSourceCache = struct {
     font_cache: *api.FontCache,
     slabs: std.ArrayListUnmanaged(*Slab) = .empty,
     index: Index = .empty,
+    index_removals: usize = 0,
     free_head: u32 = invalid_slot,
     active_count: usize = 0,
 
@@ -207,6 +208,13 @@ pub const ParagraphSourceCache = struct {
         slot.references -= 1;
         if (slot.references != 0) return;
         _ = self.index.remove(keyForSource(slot.source));
+        // HashMap growth tracks live entries, not deleted buckets. Bound
+        // tombstones under label churn without allocating or moving sources.
+        self.index_removals += 1;
+        if (self.index_removals >= self.index.capacity() / 8) {
+            self.index.rehash(KeyContext{});
+            self.index_removals = 0;
+        }
         self.destroySource(&slot.source);
         slot.active = false;
         slot.generation +%= 1;
@@ -337,6 +345,48 @@ test "paragraph sources deduplicate independently of layout width" {
     try cache.release(second);
     try std.testing.expectError(error.StaleParagraphSource, cache.get(first));
     try std.testing.expectError(error.StaleFont, fonts.get(font));
+}
+
+test "paragraph source index churn preserves live sources and stale generations" {
+    var fonts = api.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(font) catch unreachable;
+    var cache = ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    var request: ParagraphSourceCache.Request = .{
+        .utf8 = "retained anchor",
+        .language = "und",
+        .logical_size = 14,
+        .candidates = &.{font},
+        .configuration_revision = 3,
+    };
+    const anchor = try cache.acquire(request);
+    const source = try cache.get(anchor);
+    var handles: [40]ParagraphSourceHandle = undefined;
+    var buffer: [64]u8 = undefined;
+    for (0..32) |generation| {
+        for (&handles, 0..) |*handle, index| {
+            request.utf8 = try std.fmt.bufPrint(&buffer, "transient {d}/{d}", .{ generation, index });
+            handle.* = try cache.acquire(request);
+        }
+        for (0..handles.len) |index| try cache.release(handles[handles.len - 1 - index]);
+        try std.testing.expectEqual(@as(usize, 1), cache.count());
+        try std.testing.expectEqual(@as(u32, 1), cache.index.count());
+        try std.testing.expect(cache.index_removals < cache.index.capacity() / 8);
+        try std.testing.expectEqual(source, try cache.get(anchor));
+        try std.testing.expectEqualStrings("retained anchor", source.utf8);
+        try std.testing.expectError(error.StaleParagraphSource, cache.get(handles[0]));
+        request.utf8 = "retained anchor";
+        const duplicate = try cache.acquire(request);
+        try std.testing.expectEqual(anchor, duplicate);
+        try cache.release(duplicate);
+    }
+    try cache.release(anchor);
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
 }
 
 fn exerciseSourceAllocationFailure(
