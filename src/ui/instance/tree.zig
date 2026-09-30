@@ -137,6 +137,7 @@ pub const Tree = struct {
     descriptor_entries: []IndexEntry,
     instance_entries: []IndexEntry,
     render_entries: []IndexEntry,
+    indices_dirty: bool = false,
     box_has_child: []bool,
     revision: u64 = 0,
 
@@ -211,7 +212,7 @@ pub const Tree = struct {
         descriptors: []const Descriptor,
     ) !ReconcilePlan {
         try self.validateSnapshot(descriptors);
-        try self.rebuildIndices();
+        if (self.indices_dirty) try self.rebuildIndices();
 
         var create_count: usize = 0;
         var omitted_count: usize = 0;
@@ -345,6 +346,7 @@ pub const Tree = struct {
             self.render_tree.destroy(slot.render.?) catch unreachable;
             slot.render = null;
             slot.state = .retiring;
+            self.indices_dirty = true;
         }
 
         for (descriptors) |descriptor| {
@@ -449,6 +451,7 @@ pub const Tree = struct {
                 };
                 const generation = slot.generation;
                 slot.* = .{ .generation = generation };
+                self.indices_dirty = true;
                 self.occupied_count -= 1;
                 std.mem.copyForwards(usize, self.occupied[index..self.occupied_count], self.occupied[index + 1 .. self.occupied_count + 1]);
                 progress = true;
@@ -811,6 +814,7 @@ pub const Tree = struct {
             _ = try instance_index.put(slot.id, index);
             if (slot.render) |render| _ = try render_index.put(renderKey(render), index);
         }
+        self.indices_dirty = false;
     }
 
     fn descriptorForId(
@@ -1022,6 +1026,45 @@ test "occupied slots retain draining scopes and reuse holes without moving handl
     try tree.collectRetired();
     try std.testing.expectEqual(@as(usize, 0), tree.occupiedSlots().len);
     try std.testing.expectEqual(@as(usize, 1024), tree.freeCount());
+    try scheduler.destroyScope(owner);
+}
+
+test "identity indexes survive unchanged builds and repeated slot reuse" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    const owner = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 1);
+    defer renders.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, &scheduler, &renders, owner, 1);
+    defer tree.deinit();
+    var previous_render: ?render_object.NodeHandle = null;
+    for (1..20) |id| {
+        const snapshot = [_]Descriptor{.{ .id = id, .parent = null, .object = .{ .box = .{ .width = @floatFromInt(id) } } }};
+        try tree.reconcile(&snapshot);
+        const handle = tree.handleForId(id).?;
+        const render = try tree.renderObject(handle);
+        try std.testing.expectEqual(handle, tree.instanceForRenderObject(render).?);
+        if (previous_render) |old| {
+            try std.testing.expectEqual(@as(?InstanceHandle, null), tree.instanceForRenderObject(old));
+            try std.testing.expectEqual(@as(?InstanceHandle, null), tree.handleForId(id - 1));
+        }
+        try std.testing.expect(!tree.indices_dirty);
+        try tree.reconcile(&snapshot);
+        try std.testing.expectEqual(handle, tree.handleForId(id).?);
+        try std.testing.expectEqual(render, try tree.renderObject(handle));
+        const plan = try tree.prepareReconcile(&snapshot);
+        try tree.reconcile(&.{});
+        try std.testing.expect(tree.indices_dirty);
+        try std.testing.expectEqual(@as(?InstanceHandle, null), tree.instanceForRenderObject(render));
+        try std.testing.expectError(error.StaleReconcilePlan, tree.applyReconcile(plan));
+        try scheduler.applyQueuedCancellations();
+        try tree.collectRetired();
+        try std.testing.expect(tree.indices_dirty);
+        previous_render = render;
+    }
     try scheduler.destroyScope(owner);
 }
 

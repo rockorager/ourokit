@@ -1798,15 +1798,15 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box min_width");
         const min_height = tableOptionalExtent(state, 1, "min_height", 0) orelse
             return luaError(state, "invalid box min_height");
-        inline for (.{ "max_width", "max_height" }) |field| {
-            const kind = c.lua_getfield(state, 1, field);
-            c.lua_settop(state, -2);
-            if (kind != c.type_nil and kind != c.type_number) return luaError(state, "box maxima must be numbers");
-        }
-        const max_width = tableOptionalNullableExtent(state, 1, "max_width") orelse
-            return luaError(state, "invalid box max_width");
-        const max_height = tableOptionalNullableExtent(state, 1, "max_height") orelse
-            return luaError(state, "invalid box max_height");
+        const max_width_kind = c.lua_getfield(state, 1, "max_width");
+        if (max_width_kind != c.type_nil and max_width_kind != c.type_number)
+            return luaError(state, "box maxima must be numbers");
+        const max_height_kind = c.lua_getfield(state, 1, "max_height");
+        if (max_height_kind != c.type_nil and max_height_kind != c.type_number)
+            return luaError(state, "box maxima must be numbers");
+        const max_width: OptionalExtent = .{ .value = if (max_width_kind == c.type_nil) null else requiredExtent(state, -2) orelse return luaError(state, "invalid box max_width") };
+        const max_height: OptionalExtent = .{ .value = if (max_height_kind == c.type_nil) null else requiredExtent(state, -1) orelse return luaError(state, "invalid box max_height") };
+        c.lua_settop(state, -3);
         if (max_width.value) |maximum| {
             if (maximum < min_width or (width.extent() != null and width.extent().? > maximum))
                 return luaError(state, "box max_width conflicts with minimum or width");
@@ -1832,10 +1832,10 @@ pub const UiBuild = struct {
         var insets: @import("../core/geometry.zig").Insets = .{ .left = padding_x, .right = padding_x, .top = padding_y, .bottom = padding_y };
         inline for (.{ "left", "right", "top", "bottom" }) |edge| {
             const kind = c.lua_getfield(state, 1, "padding_" ++ edge);
-            c.lua_settop(state, -2);
             if (kind != c.type_nil and kind != c.type_number) return luaError(state, "box edge padding must be a finite non-negative number");
-            @field(insets, edge) = tableOptionalExtent(state, 1, "padding_" ++ edge, @field(insets, edge)) orelse
+            if (kind != c.type_nil) @field(insets, edge) = requiredExtent(state, -1) orelse
                 return luaError(state, "box edge padding must be a finite non-negative number");
+            c.lua_settop(state, -2);
         }
         const alignment = tableOptionalBoxAlignment(state, 1) orelse
             return luaError(state, "invalid box alignment");
@@ -3640,6 +3640,58 @@ test "declarative Lua text flows through layout scene and software glyph cache" 
     try instances.collectRetired();
     try owners.collectRetired();
     try scheduler.destroyScope(window_scope);
+}
+
+test "box maxima and edge padding preserve strict validation and defaults" {
+    const Scheduler = @import("../task/scheduler.zig").Scheduler;
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 4);
+    c.lua_setglobal(state, "ouro");
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var owners: build_owner.BuildOwners = undefined;
+    try owners.init(std.testing.allocator, &scheduler, scope, 1, 4);
+    defer owners.deinit();
+    const owner = try owners.mount(null, 1);
+    var storage: [3]instance.Descriptor = undefined;
+    var ui: UiBuild = undefined;
+    try ui.init(state, &storage);
+    ui.enableDeclarativeWidgets(design.tokens.light);
+    try execute(state, "function build() return ouro.box(props) end");
+
+    for ([_][]const u8{
+        "max_width='20'",      "max_height=false",      "max_width=-1",                "max_height=0/0",
+        "max_width=1/0",       "width=21,max_width=20", "min_height=31,max_height=30", "padding_left='4'",
+        "padding_right=false", "padding_top=-1",        "padding_bottom=1/0",
+    }) |fields| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "props={{key='box',semantic=false,{s}}}", .{fields});
+        defer std.testing.allocator.free(source);
+        try execute(state, source);
+        _ = try owners.markDirty(owner);
+        var cycle = owners.beginCycle();
+        const work = (try cycle.take()).?;
+        try std.testing.expectError(error.LuaBuildFailed, ui.build(&owners, work, "build", &.{}));
+        ui.rollbackHandlers();
+        try owners.complete(work);
+    }
+    try execute(state, "props={key='box',semantic=false,max_width=71,max_height=93,padding=3,padding_x=5,padding_left=0,padding_bottom=7}");
+    _ = try owners.markDirty(owner);
+    var cycle = owners.beginCycle();
+    const work = (try cycle.take()).?;
+    const descriptors = try ui.build(&owners, work, "build", &.{});
+    const box = descriptors[2].object.box;
+    try std.testing.expectEqual(@as(?f32, 71), box.max_width);
+    try std.testing.expectEqual(@as(?f32, 93), box.max_height);
+    try std.testing.expectEqual(@import("../core/geometry.zig").Insets{ .left = 0, .right = 5, .top = 3, .bottom = 7 }, box.padding);
+    ui.rollbackHandlers();
+    try owners.complete(work);
+    try owners.retire(owner);
+    try scheduler.applyQueuedCancellations();
+    try owners.collectRetired();
+    try scheduler.destroyScope(scope);
 }
 
 test "nested declarative widgets include constrained boxes and scoped themes" {
