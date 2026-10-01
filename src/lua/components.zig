@@ -181,7 +181,7 @@ pub const Components = struct {
 
     fn readerDirty(state: *c.State) callconv(.c) c_int {
         var number: c_int = 0;
-        const reader: ?u64 = if (c.lua_gettop(state) == 0) null else @intCast(c.lua_tointegerx(state, 1, &number));
+        const reader: ?u64 = if (c.lua_gettop(state) == 0) null else @bitCast(c.lua_tointegerx(state, 1, &number));
         const signals = runtime(state).signals;
         c.lua_pushboolean(state, @intFromBool(if (signals) |value| value.readerDirty(reader) else false));
         return 1;

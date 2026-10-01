@@ -39,6 +39,7 @@ const Fixture = struct {
         try self.snapshot.init(std.testing.allocator, 64, 4096);
         try self.ui.init(self.state, &self.descriptors);
         self.ui.attachSignals(&self.signals);
+        self.ui.components.instances = &self.instances;
         self.ui.enableDeclarativeWidgets(@import("../design/root.zig").tokens.light);
         try self.ui.attachSemantics(&self.semantic_storage);
         return self;
@@ -299,6 +300,46 @@ test "components retain keyed state and execute only subscribed Lua readers" {
     try std.testing.expect(remounted != (try f.snapshot.findPath("counters/first/counter")).id);
 }
 
+test "reused component declarations preserve committed props across failed updates" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\choose, bad, count = ouro.signal(false), ouro.signal(false), ouro.signal(0)
+        \\renders = 0
+        \\local View = ouro.stateful(function(props)
+        \\  escaped = props
+        \\  return function()
+        \\    renders = renders + 1
+        \\    return ouro.box {key='value', width=props.width + count()}
+        \\  end
+        \\end)
+        \\local a = View {key='view', width=13}
+        \\local b = View {key='view', width=31}
+        \\function build()
+        \\  local view = choose() and b or a
+        \\  if bad() then
+        \\    return ouro.row {key='root', view, ouro.box {key='dup'}, ouro.box {key='dup'}}
+        \\  end
+        \\  return ouro.row {key='root', view}
+        \\end
+    );
+    try f.build();
+    try f.exec("choose:set(true); bad:set(true)");
+    try std.testing.expectError(error.DuplicateInstanceId, f.build());
+    try f.expect("escaped.width == 13 and renders == 2");
+    try f.exec("bad:set(false)");
+    try f.build(); // Reuses the exact declaration from the failed transaction.
+    try f.expect("escaped.width == 31 and renders == 3");
+    try std.testing.expectEqual(@as(f32, 31), try f.width("root/view/value"));
+    _ = try f.owners.markDirty(f.owner);
+    try f.build(); // Clean declaration takes the no-update path.
+    try f.expect("renders == 3");
+    try f.exec("count:set(7)");
+    try f.build(); // Same props must not hide a dirty component reader.
+    try f.expect("renders == 4");
+    try std.testing.expectEqual(@as(f32, 38), try f.width("root/view/value"));
+}
+
 test "host invalidation callback replacement and changed arguments outrank reader-only caching" {
     const f = try Fixture.create();
     defer f.destroy();
@@ -546,4 +587,187 @@ test "prepared stateless output survives later expansions and collection" {
     prepared.reset();
     _ = c.lua_gc(f.state, 2);
     try f.expect("weak[19] == nil and weak[43] ~= nil");
+}
+
+test "component boundaries retain native descendants and preserve nested composition dependencies" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\a,b,choose,tick=ouro.signal(17),ouro.signal(39),ouro.signal(true),ouro.signal(3)
+        \\inits,expansions=0,0
+        \\local View=ouro.stateless(function()
+        \\  expansions=expansions+1
+        \\  return ouro.box {key='value',width=choose() and a() or b()}
+        \\end)
+        \\local Child=ouro.stateful(function()
+        \\  inits=inits+1
+        \\  return function() return View {} end
+        \\end)
+        \\local Parent=ouro.stateful(function()
+        \\  return function() return ouro.column {key='inside',Child {key='child'}} end
+        \\end)
+        \\local Other=ouro.stateful(function()
+        \\  return function() return ouro.box {key='tick',width=tick()} end
+        \\end)
+        \\function build() return ouro.row {key='root',Parent {key='parent'},Other {key='other'}} end
+    );
+    try f.build();
+    const path = "root/parent/inside/child/value";
+    const value_id = (try f.snapshot.findPath(path)).id;
+    const handle = f.instances.handleForId(value_id).?;
+    const render = try f.instances.renderObject(handle);
+    try f.instances.bumpStateRevision(handle);
+    try f.exec("tick:set(7)");
+    try f.build();
+    try std.testing.expectEqual(@as(usize, 5), f.ui.count); // Root chrome, row, retained parent, changed sibling.
+    try std.testing.expect(f.descriptors[3].retain_subtree);
+    try std.testing.expect(f.instances.isRetained(handle));
+    try std.testing.expectEqual(render, try f.instances.renderObject(handle));
+    try std.testing.expectEqual(@as(u64, 1), try f.instances.stateRevision(handle));
+    try std.testing.expectEqual(@as(f32, 17), try f.width(path));
+    try f.expect("inits==1 and expansions==1");
+    // A nested stateless reader must still invalidate through the retained parent.
+    try f.exec("a:set(23)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 23), try f.width(path));
+    try f.expect("inits==1 and expansions==2");
+    try f.exec("choose:set(false)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 39), try f.width(path));
+    try f.exec("a:set(51)");
+    try f.clean();
+    try f.exec("tick:set(11)");
+    try f.build();
+    try f.exec("b:set(43)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 43), try f.width(path));
+    try std.testing.expectEqual(handle, f.instances.handleForId(value_id).?);
+    try f.expect("inits==1 and expansions==4");
+}
+
+test "component boundary context changes relower clean compositions without remounting" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\tick=ouro.signal(0)
+        \\local Styled=ouro.stateless(function(_,_,theme)
+        \\ return ouro.box {key='value',width=theme.controls.height}
+        \\end)
+        \\local Stable=ouro.stateful(function() return function() return Styled {} end end)
+        \\local Other=ouro.stateful(function() return function() return ouro.box {key='value',width=7+tick()} end end)
+        \\function build() return ouro.row {key='root',Stable {key='stable'},Other {key='other'}} end
+    );
+    try f.build();
+    const id = (try f.snapshot.findPath("root/stable/value")).id;
+    const handle = f.instances.handleForId(id).?;
+    try f.exec("tick:set(1)");
+    try f.build();
+    try std.testing.expect(f.instances.isRetained(handle));
+    f.ui.widget_theme.?.controls.height = 53;
+    try f.exec("tick:set(2)");
+    try f.build();
+    try std.testing.expect(!f.instances.isRetained(handle));
+    try std.testing.expectEqual(@as(f32, 53), try f.width("root/stable/value"));
+    try std.testing.expectEqual(handle, f.instances.handleForId(id).?);
+}
+
+test "component boundary proposals roll back when a dirty sibling fails validation" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\value,bad,tick=ouro.signal(13),ouro.signal(false),ouro.signal(2)
+        \\local Good=ouro.stateful(function()
+        \\  return function() return ouro.box {key='value',width=value()} end
+        \\end)
+        \\local Bad=ouro.stateful(function()
+        \\  return function() return ouro.box {key='value',width=bad() and -1 or tick()} end
+        \\end)
+        \\function build() return ouro.row {key='root',Good {key='good'},Bad {key='bad'}} end
+    );
+    try f.build();
+    try f.exec("bad:set(true)");
+    try std.testing.expectError(error.LuaBuildFailed, f.build());
+    try std.testing.expectEqual(@as(f32, 13), try f.width("root/good/value"));
+    try f.exec("bad:set(false);value:set(29)");
+    try f.build();
+    try std.testing.expectEqual(@as(f32, 29), try f.width("root/good/value"));
+    try f.exec("tick:set(5)");
+    try f.build();
+    try std.testing.expect(f.descriptors[3].retain_subtree);
+    try std.testing.expectEqual(@as(f32, 29), try f.width("root/good/value"));
+}
+
+test "signal dirty scans track live extent through holes rollback and retirement" {
+    const OwnerRef = @import("signals.zig").OwnerRef;
+    const SignalHandle = @import("signals.zig").SignalHandle;
+    const subscribe = struct {
+        fn run(signals: *Signals, owner: OwnerRef, reader: u64, signal: ?SignalHandle) !void {
+            try signals.beginEvaluation(owner, 1);
+            try signals.selectReader(reader);
+            if (signal) |handle| try signals.readExternal(handle);
+            try signals.finishEvaluation(owner, 1);
+            try signals.commit(owner, 1);
+        }
+    }.run;
+    const f = try Fixture.create();
+    defer f.destroy();
+    const first: OwnerRef = .{ .owners = &f.owners, .handle = f.owner };
+    const second: OwnerRef = .{ .owners = &f.owners, .handle = try f.owners.mount(null, 2) };
+    defer {
+        f.signals.disposeOwner(second) catch unreachable;
+        if (f.owners.isActive(second.handle)) f.owners.retire(second.handle) catch unreachable;
+        f.scheduler.applyQueuedCancellations() catch unreachable;
+        f.owners.collectRetired() catch unreachable;
+    }
+    const a = try f.signals.createExternal();
+    defer f.signals.releaseExternal(a);
+    const b = try f.signals.createExternal();
+    defer f.signals.releaseExternal(b);
+    const c_signal = try f.signals.createExternal();
+    defer f.signals.releaseExternal(c_signal);
+
+    try subscribe(&f.signals, first, 11, a);
+    try subscribe(&f.signals, first, 22, b);
+    try subscribe(&f.signals, second, 33, c_signal);
+    try std.testing.expectEqual(@as(usize, 3), f.signals.edge_extent);
+    try f.signals.publishExternal(a);
+    try f.signals.publishExternal(c_signal);
+    try f.signals.beginEvaluation(first, 2);
+    try std.testing.expect(f.signals.readerDirty(null));
+    try std.testing.expect(f.signals.readerDirty(11));
+    try std.testing.expect(!f.signals.readerDirty(22));
+    try std.testing.expect(!f.signals.readerDirty(33)); // Other owner's dirty edge.
+    try f.signals.selectReader(44);
+    try f.signals.readExternal(c_signal);
+    try f.signals.finishEvaluation(first, 2);
+    try f.signals.rollback(first, 2);
+    try std.testing.expectEqual(@as(usize, 3), f.signals.edge_extent);
+
+    // An interior hole must not hide a later subscription or change its slot.
+    f.signals.releaseExternal(b);
+    try std.testing.expectEqual(@as(usize, 3), f.signals.edge_extent);
+    try f.signals.beginEvaluation(second, 2);
+    try std.testing.expect(f.signals.readerDirty(33));
+    try std.testing.expect(!f.signals.readerDirty(11));
+    try f.signals.abortEvaluation(second, 2);
+    try subscribe(&f.signals, first, 44, c_signal);
+    try std.testing.expectEqual(@as(usize, 3), f.signals.edge_extent);
+    try std.testing.expectEqual(@as(u64, 44), f.signals.edges[1].reader);
+    try std.testing.expectEqual(@as(u64, 33), f.signals.edges[2].reader);
+    try f.signals.disposeOwner(second);
+    try std.testing.expectEqual(@as(usize, 2), f.signals.edge_extent);
+
+    // Empty committed reads trim the suffix; rollback above did not.
+    try subscribe(&f.signals, first, 44, null);
+    try std.testing.expectEqual(@as(usize, 1), f.signals.edge_extent);
+    f.signals.releaseExternal(a);
+    try std.testing.expectEqual(@as(usize, 0), f.signals.edge_extent);
+    try subscribe(&f.signals, second, 55, c_signal);
+    try std.testing.expectEqual(@as(usize, 1), f.signals.edge_extent);
+    try f.owners.retire(second.handle);
+    try f.signals.publishExternal(c_signal); // Stale owner cleanup also trims.
+    try std.testing.expectEqual(@as(usize, 0), f.signals.edge_extent);
+    try f.signals.beginEvaluation(first, 3);
+    try std.testing.expect(!f.signals.readerDirty(null));
+    try f.signals.abortEvaluation(first, 3);
 }

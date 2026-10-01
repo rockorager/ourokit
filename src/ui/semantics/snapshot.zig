@@ -15,6 +15,8 @@ pub const Descriptor = struct {
     selected: bool = false,
     checked: bool = false,
     range: ?Range = null,
+    /// Reuse this group's existing semantic descendants from the active snapshot.
+    retain_subtree: bool = false,
 };
 
 const StoredNode = struct {
@@ -29,7 +31,11 @@ const StoredNode = struct {
     selected: bool,
     checked: bool,
     range: ?Range,
+    first_child: ?usize,
+    next_sibling: ?usize,
 };
+
+const IndexEntry = struct { id: u64 = 0, index: usize = 0 };
 
 pub const Node = struct {
     id: u64,
@@ -50,6 +56,9 @@ pub const Snapshot = struct {
     nodes: [2][]StoredNode,
     text: [2][]u8,
     validation_index: []u64,
+    active_index: []IndexEntry,
+    output_index: []IndexEntry,
+    last_child: []?usize,
     active: usize = 0,
     node_count: usize = 0,
     text_count: usize = 0,
@@ -73,15 +82,27 @@ pub const Snapshot = struct {
         const text_b = try allocator.alloc(u8, text_capacity);
         errdefer allocator.free(text_b);
         const validation_index = try allocator.alloc(u64, try indexCapacity(node_capacity));
+        errdefer allocator.free(validation_index);
+        const active_index = try allocator.alloc(IndexEntry, try indexCapacity(node_capacity));
+        errdefer allocator.free(active_index);
+        const output_index = try allocator.alloc(IndexEntry, try indexCapacity(node_capacity));
+        errdefer allocator.free(output_index);
+        const last_child = try allocator.alloc(?usize, node_capacity);
         self.* = .{
             .allocator = allocator,
             .nodes = .{ nodes_a, nodes_b },
             .text = .{ text_a, text_b },
             .validation_index = validation_index,
+            .active_index = active_index,
+            .output_index = output_index,
+            .last_child = last_child,
         };
     }
 
     pub fn deinit(self: *Snapshot) void {
+        self.allocator.free(self.last_child);
+        self.allocator.free(self.output_index);
+        self.allocator.free(self.active_index);
         self.allocator.free(self.validation_index);
         self.allocator.free(self.text[1]);
         self.allocator.free(self.text[0]);
@@ -91,27 +112,23 @@ pub const Snapshot = struct {
     }
 
     pub fn validate(self: *Snapshot, descriptors: []const Descriptor) !void {
-        if (descriptors.len > self.nodes[0].len) return error.SemanticNodeCapacityExceeded;
         @memset(self.validation_index, 0);
+        self.buildActiveIndex();
+        var node_count: usize = 0;
         var text_count: usize = 0;
         var dialog_seen = false;
         for (descriptors) |descriptor| {
-            if (descriptor.role == .dialog) {
-                if (dialog_seen) return error.MultipleDialogsUnsupported;
-                dialog_seen = true;
+            try self.validateOne(descriptor.id, descriptor.parent, descriptor.role, descriptor.key, descriptor.label, descriptor.range, &node_count, &text_count, &dialog_seen);
+            if (descriptor.retain_subtree) {
+                const old_index = lookup(self.active_index, descriptor.id) orelse return error.RetainedSemanticIdNotFound;
+                if (!optionalIdEqual(self.nodes[self.active][old_index].parent, descriptor.parent))
+                    return error.RetainedSemanticReparented;
+                var child = self.nodes[self.active][old_index].first_child;
+                while (child) |index| {
+                    try self.validateRetained(index, &node_count, &text_count, &dialog_seen);
+                    child = self.nodes[self.active][index].next_sibling;
+                }
             }
-            if (descriptor.range) |range| try range.validate();
-            if (descriptor.id == 0) return error.InvalidSemanticId;
-            text_count = std.math.add(usize, text_count, descriptor.key.len) catch
-                return error.SemanticTextCapacityExceeded;
-            text_count = std.math.add(usize, text_count, descriptor.label.len) catch
-                return error.SemanticTextCapacityExceeded;
-            if (text_count > self.text[0].len) return error.SemanticTextCapacityExceeded;
-            if (descriptor.parent) |parent| if (!indexContains(self.validation_index, parent))
-                return error.SemanticParentMustPrecedeChild;
-            if (!indexPut(self.validation_index, descriptor.id)) return error.DuplicateSemanticId;
-            if ((descriptor.role == .text or descriptor.role == .button or descriptor.role == .link or descriptor.role == .option or descriptor.role == .tab or descriptor.role == .@"switch") and descriptor.label.len == 0)
-                return error.SemanticLabelRequired;
         }
     }
 
@@ -120,31 +137,91 @@ pub const Snapshot = struct {
     /// remains unchanged until `commitStaged` completes the build transaction.
     pub fn stage(self: *Snapshot, descriptors: []const Descriptor) void {
         const next = 1 - self.active;
+        self.buildActiveIndex();
+        @memset(self.last_child, null);
+        @memset(self.output_index, .{});
+        var node_count: usize = 0;
         var text_count: usize = 0;
-        for (descriptors, self.nodes[next][0..descriptors.len]) |descriptor, *stored_node| {
-            const key_start = text_count;
-            @memcpy(self.text[next][text_count..][0..descriptor.key.len], descriptor.key);
-            text_count += descriptor.key.len;
-            const label_start = text_count;
-            @memcpy(self.text[next][text_count..][0..descriptor.label.len], descriptor.label);
-            stored_node.* = .{
-                .id = descriptor.id,
-                .parent = descriptor.parent,
-                .role = descriptor.role,
-                .key_start = key_start,
-                .key_len = descriptor.key.len,
-                .label_start = label_start,
-                .label_len = descriptor.label.len,
-                .enabled = descriptor.enabled,
-                .selected = descriptor.selected,
-                .checked = descriptor.checked,
-                .range = descriptor.range,
-            };
-            text_count += descriptor.label.len;
+        for (descriptors) |descriptor| {
+            self.stageOne(next, descriptor.id, descriptor.parent, descriptor.role, descriptor.key, descriptor.label, descriptor.enabled, descriptor.selected, descriptor.checked, descriptor.range, &node_count, &text_count);
+            if (descriptor.retain_subtree) {
+                const old_index = lookup(self.active_index, descriptor.id).?;
+                var child = self.nodes[self.active][old_index].first_child;
+                while (child) |index| {
+                    self.stageRetained(next, index, &node_count, &text_count);
+                    child = self.nodes[self.active][index].next_sibling;
+                }
+            }
         }
-        self.staged_node_count = descriptors.len;
+        self.staged_node_count = node_count;
         self.staged_text_count = text_count;
         self.has_staged = true;
+    }
+
+    fn buildActiveIndex(self: *Snapshot) void {
+        @memset(self.active_index, .{});
+        for (self.nodes[self.active][0..self.node_count], 0..) |node_value, index|
+            putLookup(self.active_index, node_value.id, index);
+    }
+
+    fn validateOne(self: *Snapshot, id: u64, parent: ?u64, role: Role, key: []const u8, label: []const u8, range: ?Range, node_count: *usize, text_count: *usize, dialog_seen: *bool) !void {
+        if (role == .dialog) {
+            if (dialog_seen.*) return error.MultipleDialogsUnsupported;
+            dialog_seen.* = true;
+        }
+        if (range) |value| try value.validate();
+        if (id == 0) return error.InvalidSemanticId;
+        node_count.* = std.math.add(usize, node_count.*, 1) catch return error.SemanticNodeCapacityExceeded;
+        if (node_count.* > self.nodes[0].len) return error.SemanticNodeCapacityExceeded;
+        text_count.* = std.math.add(usize, text_count.*, key.len) catch return error.SemanticTextCapacityExceeded;
+        text_count.* = std.math.add(usize, text_count.*, label.len) catch return error.SemanticTextCapacityExceeded;
+        if (text_count.* > self.text[0].len) return error.SemanticTextCapacityExceeded;
+        if (parent) |parent_id| if (!indexContains(self.validation_index, parent_id)) return error.SemanticParentMustPrecedeChild;
+        if (!indexPut(self.validation_index, id)) return error.DuplicateSemanticId;
+        if ((role == .text or role == .button or role == .link or role == .option or role == .tab or role == .@"switch") and label.len == 0)
+            return error.SemanticLabelRequired;
+    }
+
+    fn validateRetained(self: *Snapshot, old_index: usize, node_count: *usize, text_count: *usize, dialog_seen: *bool) !void {
+        const old = self.nodes[self.active][old_index];
+        const key = self.text[self.active][old.key_start..][0..old.key_len];
+        const label = self.text[self.active][old.label_start..][0..old.label_len];
+        try self.validateOne(old.id, old.parent, old.role, key, label, old.range, node_count, text_count, dialog_seen);
+        var child = old.first_child;
+        while (child) |index| {
+            try self.validateRetained(index, node_count, text_count, dialog_seen);
+            child = self.nodes[self.active][index].next_sibling;
+        }
+    }
+
+    fn stageOne(self: *Snapshot, next: usize, id: u64, parent: ?u64, role: Role, key: []const u8, label: []const u8, enabled: bool, selected: bool, checked: bool, range: ?Range, node_count: *usize, text_count: *usize) void {
+        const index = node_count.*;
+        const key_start = text_count.*;
+        @memcpy(self.text[next][text_count.*..][0..key.len], key);
+        text_count.* += key.len;
+        const label_start = text_count.*;
+        @memcpy(self.text[next][text_count.*..][0..label.len], label);
+        text_count.* += label.len;
+        self.nodes[next][index] = .{ .id = id, .parent = parent, .role = role, .key_start = key_start, .key_len = key.len, .label_start = label_start, .label_len = label.len, .enabled = enabled, .selected = selected, .checked = checked, .range = range, .first_child = null, .next_sibling = null };
+        putLookup(self.output_index, id, index);
+        if (parent) |parent_id| {
+            const parent_index = lookup(self.output_index, parent_id).?;
+            if (self.last_child[parent_index]) |previous| self.nodes[next][previous].next_sibling = index else self.nodes[next][parent_index].first_child = index;
+            self.last_child[parent_index] = index;
+        }
+        node_count.* += 1;
+    }
+
+    fn stageRetained(self: *Snapshot, next: usize, old_index: usize, node_count: *usize, text_count: *usize) void {
+        const old = self.nodes[self.active][old_index];
+        const key = self.text[self.active][old.key_start..][0..old.key_len];
+        const label = self.text[self.active][old.label_start..][0..old.label_len];
+        self.stageOne(next, old.id, old.parent, old.role, key, label, old.enabled, old.selected, old.checked, old.range, node_count, text_count);
+        var child = old.first_child;
+        while (child) |index| {
+            self.stageRetained(next, index, node_count, text_count);
+            child = self.nodes[self.active][index].next_sibling;
+        }
     }
 
     pub fn commitStaged(self: *Snapshot) void {
@@ -251,6 +328,22 @@ fn indexContains(index: []const u64, key: u64) bool {
     return false;
 }
 
+fn putLookup(index: []IndexEntry, key: u64, value: usize) void {
+    var slot = hash(key) & (index.len - 1);
+    while (index[slot].id != 0) slot = (slot + 1) & (index.len - 1);
+    index[slot] = .{ .id = key, .index = value };
+}
+
+fn lookup(index: []const IndexEntry, key: u64) ?usize {
+    var slot = hash(key) & (index.len - 1);
+    for (0..index.len) |_| {
+        if (index[slot].id == 0) return null;
+        if (index[slot].id == key) return index[slot].index;
+        slot = (slot + 1) & (index.len - 1);
+    }
+    return null;
+}
+
 fn hash(key: u64) usize {
     var value = key +% 0x9e3779b97f4a7c15;
     value = (value ^ (value >> 30)) *% 0xbf58476d1ce4e5b9;
@@ -281,4 +374,71 @@ test "semantic snapshots are deterministic, validated, and replace atomically" {
         .{ .id = 4, .parent = 9, .role = .text, .label = "Invalid" },
     }));
     try std.testing.expectEqualStrings("Settings", (try snapshot.node(1)).label);
+}
+
+test "retained semantic subtree is merged, reordered, and transactional" {
+    var snapshot: Snapshot = undefined;
+    try snapshot.init(std.testing.allocator, 8, 128);
+    defer snapshot.deinit();
+    const initial = [_]Descriptor{
+        .{ .id = 1, .parent = null, .role = .group, .key = "root" },
+        .{ .id = 2, .parent = 1, .role = .group, .key = "component" },
+        .{ .id = 3, .parent = 2, .role = .group, .key = "nested" },
+        .{ .id = 4, .parent = 3, .role = .text, .key = "title", .label = "Owned label" },
+        .{ .id = 5, .parent = 2, .role = .button, .key = "action", .label = "Act", .enabled = false },
+        .{ .id = 6, .parent = 1, .role = .text, .key = "tail", .label = "Tail" },
+    };
+    try snapshot.validate(&initial);
+    snapshot.stage(&initial);
+    snapshot.commitStaged();
+
+    const reordered = [_]Descriptor{
+        .{ .id = 1, .parent = null, .role = .group, .key = "root" },
+        .{ .id = 6, .parent = 1, .role = .text, .key = "tail", .label = "New tail" },
+        .{ .id = 2, .parent = 1, .role = .group, .key = "component-new", .retain_subtree = true },
+    };
+    try snapshot.validate(&reordered);
+    snapshot.stage(&reordered);
+    try std.testing.expectEqualStrings("Owned label", (snapshot.findId(4).?).label);
+    snapshot.discardStaged();
+    try std.testing.expectEqualStrings("Tail", (snapshot.findId(6).?).label);
+    try snapshot.validate(&reordered);
+    snapshot.stage(&reordered);
+    snapshot.commitStaged();
+    try std.testing.expectEqual(@as(usize, 6), snapshot.count());
+    try std.testing.expectEqualStrings("Owned label", (try snapshot.findPath("root/component-new/nested/title")).label);
+    try std.testing.expect(!(snapshot.findId(5).?).enabled);
+    try std.testing.expectEqualStrings("New tail", (try snapshot.node(1)).label);
+}
+
+test "retained semantic subtree rejects conflicts and capacity overflow" {
+    var snapshot: Snapshot = undefined;
+    try snapshot.init(std.testing.allocator, 4, 32);
+    defer snapshot.deinit();
+    const initial = [_]Descriptor{
+        .{ .id = 1, .parent = null, .role = .group },
+        .{ .id = 2, .parent = 1, .role = .group },
+        .{ .id = 3, .parent = 2, .role = .text, .label = "child" },
+    };
+    try snapshot.validate(&initial);
+    snapshot.stage(&initial);
+    snapshot.commitStaged();
+    try std.testing.expectError(error.RetainedSemanticIdNotFound, snapshot.validate(&.{
+        .{ .id = 1, .parent = null, .role = .group }, .{ .id = 9, .parent = 1, .role = .group, .retain_subtree = true },
+    }));
+    try std.testing.expectError(error.RetainedSemanticReparented, snapshot.validate(&.{
+        .{ .id = 2, .parent = null, .role = .group, .retain_subtree = true },
+    }));
+    try std.testing.expectError(error.DuplicateSemanticId, snapshot.validate(&.{
+        .{ .id = 1, .parent = null, .role = .group }, .{ .id = 2, .parent = 1, .role = .group, .retain_subtree = true }, .{ .id = 3, .parent = 2, .role = .text, .label = "duplicate" },
+    }));
+    try std.testing.expectError(error.DuplicateSemanticId, snapshot.validate(&.{
+        .{ .id = 1, .parent = null, .role = .group, .retain_subtree = true }, .{ .id = 2, .parent = 1, .role = .group, .retain_subtree = true },
+    }));
+    try snapshot.validate(&.{
+        .{ .id = 1, .parent = null, .role = .group, .retain_subtree = true }, .{ .id = 4, .parent = 1, .role = .group },
+    });
+    try std.testing.expectError(error.SemanticNodeCapacityExceeded, snapshot.validate(&.{
+        .{ .id = 1, .parent = null, .role = .group, .retain_subtree = true }, .{ .id = 4, .parent = 1, .role = .group }, .{ .id = 5, .parent = 1, .role = .group },
+    }));
 }

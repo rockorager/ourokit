@@ -21,7 +21,7 @@ function M.begin(registry, owner, invalidation, native_update)
     transaction = { group = group, owner = owner, old = old,
         mounts = {}, lists = {}, builders = {}, updates = {}, proposals = {}, outputs = {},
         staged_mounts = {}, staged_lists = {}, staged_builders = {}, invalidation = invalidation,
-        changed_builders = {},
+        changed_builders = {}, boundaries = {},
         native_update = native_update }
 end
 
@@ -31,6 +31,7 @@ function M.relower()
     local t = transaction
     t.mounts, t.lists, t.builders = {}, {}, {}
     t.outputs = {}
+    t.boundaries, t.current = {}, nil
     restart_reader(-2)
 end
 
@@ -46,8 +47,8 @@ function M.root(callback, ...)
         t.root_clean = true
     end
     t.callback, t.args = callback, args
-    -- All stateless expansions run on every lowering. Replace their shared
-    -- read set even when the new tree no longer contains any compositions.
+    -- Root compositions have their own reader. Each mounted boundary owns a
+    -- separate composition reader, preserved when its native subtree is kept.
     select_reader(-2)
     return t.root
 end
@@ -59,13 +60,23 @@ function M.render(definition, props, children, parent, visual_parent)
     assert(not t.mounts[identity], "duplicate component key")
     local old = t.staged_mounts[identity] or t.old.mounts[identity]
     if old and old.definition ~= definition then old = nil end
+    -- Constructor property snapshots are private and immutable. A clean,
+    -- unchanged declaration needs neither a props copy nor a staged update.
+    -- Proposals must use the transactional path, not committed output/props.
+    local unchanged = old and old.props == props and old.values.children == children and not t.proposals[old]
+    local reader_dirty = unchanged and dirty(old.token)
+    if unchanged and not reader_dirty then
+        t.mounts[identity], t.staged_mounts[identity] = old, old
+        t.outputs[#t.outputs + 1] = old.output
+        return old.output.value, old.token, true, old
+    end
     local values = {}
     for k, v in next, props do values[k] = v end
     values.children = children
     local record = old
     if not record then
         serial = serial + 1
-        record = { token = serial, definition = definition, output = {}, values = values }
+        record = { token = serial, identity = identity, definition = definition, output = {}, values = values }
         record.proxy = make_props(record)
     end
     t.mounts[identity], t.staged_mounts[identity] = record, record
@@ -81,8 +92,9 @@ function M.render(definition, props, children, parent, visual_parent)
         t.proposals[record] = update
         t.updates[#t.updates + 1] = update
     end
+    update.props = props
     record.values = values
-    local retained = old and not changed and (repeated or not dirty(record.token))
+    local retained = old and not changed and (repeated or not (reader_dirty or dirty(record.token)))
     if not retained then
         update.retained = false
         restart_reader(record.token)
@@ -95,13 +107,63 @@ function M.render(definition, props, children, parent, visual_parent)
     -- Prepared snapshots outlive later updates to the same mounted record.
     -- Pin immutable output cells, not just the mutable retained mount table.
     t.outputs[#t.outputs + 1] = update.output
-    return update.output.value, record.token, update.retained
+    return update.output.value, record.token, update.retained, record
+end
+
+local function subtree_clean(record)
+    if dirty(record.token) or dirty(-record.token - 2) then return false end
+    local boundary = record.boundary
+    if not boundary then return false end
+    for index = 1, #boundary.children do
+        if not subtree_clean(boundary.children[index]) then return false end
+    end
+    return true
+end
+
+-- Boundaries own identities and dependency relationships, not another copy of
+-- their descriptions. Native metadata records only context and the live root.
+function M.enter(record, retained)
+    local t = transaction
+    local parent = t.current
+    if parent then parent.children[#parent.children + 1] = record end
+    t.current = { record = record, children = {}, parent = parent }
+    if retained and t.root_clean and not t.native_update and subtree_clean(record) then
+        return record.boundary.native
+    end
+end
+
+function M.lower()
+    restart_reader(-transaction.current.record.token - 2)
+end
+
+local function keep_descendants(record)
+    local t = transaction
+    for index = 1, #record.boundary.children do
+        local child = record.boundary.children[index]
+        assert(not t.mounts[child.identity], "duplicate component key")
+        t.mounts[child.identity], t.staged_mounts[child.identity] = child, child
+        keep_descendants(child)
+    end
+end
+
+function M.retain()
+    local t = transaction
+    keep_descendants(t.current.record)
+    t.current = t.current.parent
+end
+
+function M.leave(native)
+    local t = transaction
+    local current = t.current
+    t.boundaries[current.record] = { native = native, children = current.children }
+    t.current = current.parent
 end
 
 -- Stateless expansion output must outlive lowering too: semantic strings and
 -- prepared descriptions borrow its storage until the candidate is released.
 function M.compose(render, ...)
-    select_reader(-2)
+    local current = transaction.current
+    select_reader(current and -current.record.token - 2 or -2)
     local value = render(...)
     local outputs = transaction.outputs
     outputs[#outputs + 1] = value
@@ -153,7 +215,10 @@ function M.finish()
     local t = transaction
     for _, records in next, { t.old.mounts, t.staged_mounts } do
         for identity, record in next, records do
-            if t.mounts[identity] ~= record then restart_reader(record.token) end
+            if t.mounts[identity] ~= record then
+                restart_reader(record.token)
+                restart_reader(-record.token - 2)
+            end
         end
     end
     for _, records in next, { t.old.lists, t.staged_lists } do
@@ -178,9 +243,12 @@ end
 
 function M.commit()
     local t = transaction
+    for record, boundary in next, t.boundaries do record.boundary = boundary end
+    t.boundaries = nil
     for index = 1, #t.updates do
         local update = t.updates[index]
         update.record.output = update.output
+        update.record.props = update.props
     end
     t.group[t.owner] = t.next
     t.old, t.updates, t.group = nil, nil, nil

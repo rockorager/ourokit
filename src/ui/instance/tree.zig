@@ -22,7 +22,10 @@ pub const InteractionPaint = struct {
 
 pub const ReconcilePlan = struct {
     revision: u64,
+    preparation: u64,
     topology_changed: bool,
+    creates_instances: bool,
+    removes_instances: bool,
     descriptors: []const Descriptor,
 };
 
@@ -33,6 +36,9 @@ pub const Descriptor = struct {
     id: u64,
     parent: ?u64,
     object: render_types.Object,
+    /// Preserve this live root and all descendants. Only identity and edge
+    /// placement are read; object and other presentation fields are ignored.
+    retain_subtree: bool = false,
     parent_data: render_types.ParentData = .none,
     focusable: bool = false,
     /// False keeps paint/layout/state but suppresses subtree input.
@@ -75,6 +81,7 @@ const Slot = struct {
     range_inset: f32 = 0,
     drag: @import("../input/drag.zig").Options = .{},
     traversal_order: usize = 0,
+    retained: bool = false,
     reconcile_child: ?render_object.NodeHandle = null,
     rebuild_children: bool = false,
 };
@@ -140,6 +147,7 @@ pub const Tree = struct {
     indices_dirty: bool = false,
     box_has_child: []bool,
     revision: u64 = 0,
+    preparation: u64 = 0,
 
     pub fn init(
         self: *Tree,
@@ -211,19 +219,43 @@ pub const Tree = struct {
         self: *Tree,
         descriptors: []const Descriptor,
     ) !ReconcilePlan {
-        try self.validateSnapshot(descriptors);
+        self.preparation +%= 1;
         if (self.indices_dirty) try self.rebuildIndices();
+        for (self.occupiedSlots()) |index| self.slots[index].retained = false;
+        errdefer for (self.occupiedSlots()) |index| {
+            self.slots[index].retained = false;
+        };
+        for (descriptors) |descriptor| if (descriptor.retain_subtree) {
+            const root = self.findActiveById(descriptor.id) orelse return error.RetainedInstanceMissing;
+            if (!optionalIdEqual(root.parent_id, descriptor.parent)) return error.InstanceReparented;
+            if (!std.meta.eql(try self.render_tree.parentData(root.render.?), descriptor.parent_data))
+                return error.RetainedInstanceEdgeChanged;
+            try self.markRetained(root.render.?);
+        };
+        for (descriptors) |descriptor| if (!descriptor.retain_subtree) {
+            if (self.findActiveById(descriptor.id)) |slot| if (slot.retained) return error.OverlappingRetainedSubtree;
+        };
+        try self.validateSnapshot(descriptors);
 
         var create_count: usize = 0;
         var omitted_count: usize = 0;
         for (descriptors) |descriptor| {
+            if (descriptor.retain_subtree) continue;
             if (self.findAnyById(descriptor.id)) |existing| switch (existing.state) {
                 .active => {
                     if (!optionalIdEqual(existing.parent_id, descriptor.parent))
                         return error.InstanceReparented;
-                    const current = try self.render_tree.objectAt(existing.render.?);
-                    if (!std.meta.eql(current, descriptor.object))
-                        try self.render_tree.validateRetain(descriptor.object);
+                    // Only these objects acquire cache references on update.
+                    // Comparing geometry-only objects here repeats the large
+                    // property comparison performed by render_tree.update.
+                    switch (descriptor.object) {
+                        .text, .text_input, .image => {
+                            const current = try self.render_tree.objectAt(existing.render.?);
+                            if (!std.meta.eql(current, descriptor.object))
+                                try self.render_tree.validateRetain(descriptor.object);
+                        },
+                        else => {},
+                    }
                 },
                 .retiring => return error.InstanceRetiring,
                 .free => unreachable,
@@ -240,21 +272,23 @@ pub const Tree = struct {
         }
         for (self.occupiedSlots()) |index| {
             const slot = self.slots[index];
-            if (slot.state == .active and self.descriptorForId(descriptors, slot.id) == null)
+            if (slot.state == .active and !slot.retained and self.descriptorForId(descriptors, slot.id) == null)
                 omitted_count += 1;
         }
-        if (create_count > self.freeCount()) return error.InstanceCapacityExceeded;
-        if (create_count > self.scheduler.availableScopeCapacity())
-            return error.ScopeCapacityExceeded;
-        if (create_count > self.render_tree.availableCapacity() + omitted_count)
-            return error.RenderObjectCapacityExceeded;
+        if (create_count != 0) {
+            if (create_count > self.freeCount()) return error.InstanceCapacityExceeded;
+            if (create_count > self.scheduler.availableScopeCapacity())
+                return error.ScopeCapacityExceeded;
+            if (create_count > self.render_tree.availableCapacity() + omitted_count)
+                return error.RenderObjectCapacityExceeded;
+        }
 
         var topology_changed = create_count != 0 or omitted_count != 0;
         if (!topology_changed) {
             for (self.occupiedSlots()) |index| {
                 const slot = &self.slots[index];
                 if (slot.state != .active) continue;
-                slot.reconcile_child = self.render_tree.firstChild(slot.render.?);
+                slot.reconcile_child = if (slot.retained) null else self.render_tree.firstChild(slot.render.?);
             }
             for (descriptors) |descriptor| {
                 const parent_id = descriptor.parent orelse continue;
@@ -283,7 +317,10 @@ pub const Tree = struct {
 
         return .{
             .revision = self.revision,
+            .preparation = self.preparation,
             .topology_changed = topology_changed,
+            .creates_instances = create_count != 0,
+            .removes_instances = omitted_count != 0,
             .descriptors = descriptors,
         };
     }
@@ -291,7 +328,7 @@ pub const Tree = struct {
     /// Applies a previously validated plan. A retained-tree change between
     /// prepare and apply invalidates the plan rather than misapplying it.
     pub fn validateReconcilePlan(self: *const Tree, plan: ReconcilePlan) !void {
-        if (plan.revision != self.revision) return error.StaleReconcilePlan;
+        if (plan.revision != self.revision or plan.preparation != self.preparation) return error.StaleReconcilePlan;
     }
 
     pub fn applyReconcile(
@@ -309,7 +346,7 @@ pub const Tree = struct {
             for (self.occupiedSlots()) |index| {
                 const slot = &self.slots[index];
                 if (slot.state != .active) continue;
-                slot.reconcile_child = self.render_tree.firstChild(slot.render.?);
+                slot.reconcile_child = if (slot.retained) null else self.render_tree.firstChild(slot.render.?);
                 slot.rebuild_children = false;
             }
             for (descriptors) |descriptor| {
@@ -339,17 +376,17 @@ pub const Tree = struct {
             }
         }
 
-        for (self.occupiedSlots()) |index| {
+        if (plan.removes_instances) for (self.occupiedSlots()) |index| {
             const slot = &self.slots[index];
-            if (slot.state != .active or self.descriptorForId(descriptors, slot.id) != null) continue;
+            if (slot.state != .active or slot.retained or self.descriptorForId(descriptors, slot.id) != null) continue;
             self.scheduler.queueScopeCancellation(slot.scope) catch unreachable;
             self.render_tree.destroy(slot.render.?) catch unreachable;
             slot.render = null;
             slot.state = .retiring;
             self.indices_dirty = true;
-        }
+        };
 
-        for (descriptors) |descriptor| {
+        if (plan.creates_instances) for (descriptors) |descriptor| {
             if (self.findActiveById(descriptor.id) != null) continue;
             const parent_slot = if (descriptor.parent) |parent_id|
                 self.findActiveById(parent_id).?
@@ -387,10 +424,20 @@ pub const Tree = struct {
                 renderKey(render),
                 slot_index,
             ) catch unreachable;
-        }
+        };
 
-        for (descriptors, 0..) |descriptor, traversal_order| {
+        var traversal_order: usize = 0;
+        for (descriptors) |descriptor| {
             const slot = self.findActiveById(descriptor.id).?;
+            if (descriptor.retain_subtree) {
+                self.orderRetained(slot.render.?, &traversal_order);
+                if (topology_changed) if (descriptor.parent) |parent_id| {
+                    const parent = self.findActiveById(parent_id).?;
+                    if (parent.rebuild_children)
+                        self.render_tree.appendChild(parent.render.?, slot.render.?, descriptor.parent_data) catch unreachable;
+                };
+                continue;
+            }
             try self.render_tree.setInteractive(slot.render.?, descriptor.interactive);
             slot.focusable = descriptor.focusable;
             slot.interaction_paint = descriptor.interaction_paint;
@@ -404,6 +451,7 @@ pub const Tree = struct {
             slot.focus_request_pending = descriptor.focus_request != 0 and descriptor.focus_request != slot.focus_request;
             slot.focus_request = descriptor.focus_request;
             slot.traversal_order = traversal_order;
+            traversal_order += 1;
             const previous = try self.render_tree.objectAt(slot.render.?);
             try self.render_tree.update(slot.render.?, descriptor.object);
             if (descriptor.object == .scroll) {
@@ -528,6 +576,41 @@ pub const Tree = struct {
     pub fn isActive(self: *Tree, handle: InstanceHandle) bool {
         _ = self.activeSlot(handle) catch return false;
         return true;
+    }
+
+    pub fn isRetained(self: *Tree, handle: InstanceHandle) bool {
+        return (self.activeSlot(handle) catch return false).retained;
+    }
+
+    pub fn traversalOrder(self: *Tree, handle: InstanceHandle) !usize {
+        return (try self.activeSlot(handle)).traversal_order;
+    }
+
+    pub fn retainDescriptor(self: *Tree, id: u64) !Descriptor {
+        const slot = self.findActiveById(id) orelse return error.RetainedInstanceMissing;
+        return .{ .id = id, .parent = slot.parent_id, .object = undefined, .parent_data = try self.render_tree.parentData(slot.render.?), .retain_subtree = true };
+    }
+
+    fn markRetained(self: *Tree, render: render_object.NodeHandle) !void {
+        const slot = try self.activeSlot(self.instanceForRenderObject(render).?);
+        if (slot.retained) return error.OverlappingRetainedSubtree;
+        slot.retained = true;
+        var child = self.render_tree.firstChild(render);
+        while (child) |node| {
+            try self.markRetained(node);
+            child = self.render_tree.nextSibling(node);
+        }
+    }
+
+    fn orderRetained(self: *Tree, render: render_object.NodeHandle, order: *usize) void {
+        const slot = self.activeSlot(self.instanceForRenderObject(render).?) catch unreachable;
+        slot.traversal_order = order.*;
+        order.* += 1;
+        var child = self.render_tree.firstChild(render);
+        while (child) |node| {
+            self.orderRetained(node, order);
+            child = self.render_tree.nextSibling(node);
+        }
     }
 
     /// Visibility includes every retained Box ancestor. Hidden instances stay
@@ -756,16 +839,19 @@ pub const Tree = struct {
         if (descriptors.len > self.slots.len) return error.InstanceCapacityExceeded;
         const descriptor_index = IdIndex{ .entries = self.descriptor_entries };
         descriptor_index.clear();
+        @memset(self.box_has_child[0..descriptors.len], false);
         var roots: usize = 0;
         for (descriptors, 0..) |descriptor, index| {
             if (descriptor.id == 0) return error.InvalidInstanceId;
-            try descriptor.drag.validate();
-            if (!std.math.isFinite(descriptor.range_inset) or descriptor.range_inset < 0)
-                return error.InvalidRangeInset;
-            try render_object.Tree.validate(descriptor.object);
-            if (descriptor.scroll_to) |request| {
-                if (descriptor.object != .scroll or descriptor.ensure_visible != null or request.token == 0 or
-                    !std.math.isFinite(request.offset) or request.offset < 0) return error.InvalidScrollRequest;
+            if (!descriptor.retain_subtree) {
+                try descriptor.drag.validate();
+                if (!std.math.isFinite(descriptor.range_inset) or descriptor.range_inset < 0)
+                    return error.InvalidRangeInset;
+                try render_object.Tree.validate(descriptor.object);
+                if (descriptor.scroll_to) |request| {
+                    if (descriptor.object != .scroll or descriptor.ensure_visible != null or request.token == 0 or
+                        !std.math.isFinite(request.offset) or request.offset < 0) return error.InvalidScrollRequest;
+                }
             }
             if (!(try descriptor_index.put(descriptor.id, index)))
                 return error.DuplicateInstanceId;
@@ -773,15 +859,20 @@ pub const Tree = struct {
                 const parent_index = descriptor_index.get(parent_id) orelse
                     return error.ParentMustPrecedeChild;
                 if (parent_index == index) return error.ParentMustPrecedeChild;
+                if (descriptors[parent_index].retain_subtree) return error.OverlappingRetainedSubtree;
                 try render_object.Tree.validateEdge(
                     descriptors[parent_index].object,
                     descriptor.parent_data,
                 );
+                if (descriptors[parent_index].object == .box) {
+                    if (self.box_has_child[parent_index]) return error.BoxAlreadyHasChild;
+                    self.box_has_child[parent_index] = true;
+                }
             } else {
                 roots += 1;
                 if (descriptor.parent_data != .none) return error.RootHasParentData;
             }
-            if (descriptor.interaction_paint) |paint| {
+            if (!descriptor.retain_subtree) if (descriptor.interaction_paint) |paint| {
                 if (descriptor.object != .box and descriptor.object != .text) return error.InvalidInteractionPaint;
                 if (descriptor.object == .text and (paint.idle == null or paint.focus != null)) return error.InvalidInteractionPaint;
                 var source: ?u64 = descriptor.id;
@@ -790,17 +881,8 @@ pub const Tree = struct {
                     source = descriptors[source_index].parent;
                 }
                 if (source == null) return error.InvalidInteractionPaint;
-            }
+            };
         }
-        // Parent IDs were validated above. Count direct edges once rather
-        // than scanning the complete snapshot separately for every box.
-        @memset(self.box_has_child[0..descriptors.len], false);
-        for (descriptors) |descriptor| if (descriptor.parent) |parent| {
-            const parent_index = descriptor_index.get(parent).?;
-            if (descriptors[parent_index].object != .box) continue;
-            if (self.box_has_child[parent_index]) return error.BoxAlreadyHasChild;
-            self.box_has_child[parent_index] = true;
-        };
         if (descriptors.len != 0 and roots != 1) return error.InvalidRootCount;
     }
 
@@ -927,6 +1009,59 @@ test "typed snapshots preserve keyed state and reorder render children" {
     try scheduler.destroyScope(window_scope);
 }
 
+test "retained subtree plans preserve descendants reorder focus and reject overlap transactionally" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 16, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 5);
+    defer renders.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, &scheduler, &renders, scope, 5);
+    defer tree.deinit();
+    const initial = [_]Descriptor{
+        .{ .id = 1, .parent = null, .object = .{ .stack = .{} } },
+        .{ .id = 2, .parent = 1, .object = .{ .box = .{ .width = 27 } } },
+        .{ .id = 3, .parent = 2, .object = .{ .box = .{ .height = 13 } }, .focusable = true },
+        .{ .id = 4, .parent = 1, .object = .{ .box = .{ .width = 41 } }, .focusable = true },
+    };
+    try tree.reconcile(&initial);
+    const child = tree.handleForId(3).?;
+    const sibling = tree.handleForId(4).?;
+    const retained = try tree.retainDescriptor(2);
+    const retained_child = try tree.retainDescriptor(3);
+    const partial = [_]Descriptor{ initial[0], retained, initial[3] };
+    const plan = try tree.prepareReconcile(&partial);
+    try std.testing.expect(!plan.topology_changed);
+    try tree.applyReconcile(plan);
+    try std.testing.expectEqual(@as(usize, 4), tree.activeCount());
+    try std.testing.expect(tree.isRetained(child));
+    try std.testing.expectEqual(initial[2].object, try renders.objectAt(try tree.renderObject(child)));
+    try std.testing.expectEqual(@as(?InstanceHandle, child), try tree.nextFocusable(null, false));
+    const reordered = [_]Descriptor{ initial[0], initial[3], retained };
+    try tree.reconcile(&reordered);
+    try std.testing.expectEqual(child, tree.handleForId(3).?);
+    try std.testing.expectEqual(@as(?InstanceHandle, sibling), try tree.nextFocusable(null, false));
+    try std.testing.expectEqual(@as(?InstanceHandle, child), try tree.nextFocusable(sibling, false));
+    try std.testing.expectError(error.OverlappingRetainedSubtree, tree.prepareReconcile(&.{ initial[0], retained, retained_child }));
+    try std.testing.expectError(error.OverlappingRetainedSubtree, tree.prepareReconcile(&.{ initial[0], retained, initial[2] }));
+    try std.testing.expectEqual(@as(usize, 4), tree.activeCount());
+    // Even a failed later preparation invalidates the earlier scratch plan.
+    const stale = try tree.prepareReconcile(&partial);
+    try std.testing.expectError(error.OverlappingRetainedSubtree, tree.prepareReconcile(&.{ initial[0], retained, retained_child }));
+    try std.testing.expectError(error.StaleReconcilePlan, tree.applyReconcile(stale));
+    try tree.reconcile(&.{initial[0]});
+    try std.testing.expect(!tree.isActive(child));
+    try scheduler.applyQueuedCancellations();
+    try tree.collectRetired();
+    try std.testing.expectError(error.RetainedInstanceMissing, tree.prepareReconcile(&partial));
+    try tree.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try tree.collectRetired();
+    try scheduler.destroyScope(scope);
+}
+
 test "topology reconciliation relayouts only the affected sibling branch" {
     const Constraints = @import("../layout/constraints.zig").Constraints;
     var scheduler: Scheduler = undefined;
@@ -955,7 +1090,10 @@ test "topology reconciliation relayouts only the affected sibling branch" {
     const count = try renders.layoutCount(unchanged);
 
     const reordered = [_]Descriptor{ initial[0], initial[1], initial[2], initial[3], initial[5], initial[4] };
-    try instances.reconcile(&reordered);
+    const reorder_plan = try instances.prepareReconcile(&reordered);
+    try std.testing.expect(reorder_plan.topology_changed);
+    try std.testing.expect(!reorder_plan.creates_instances and !reorder_plan.removes_instances);
+    try instances.applyReconcile(reorder_plan);
     _ = try renders.layout(root, Constraints.tight(.{ .width = 100, .height = 80 }));
     try std.testing.expectEqual(count, try renders.layoutCount(unchanged));
 
@@ -1103,6 +1241,56 @@ test "invalid snapshots are transactional and retirement waits for scope drain" 
     try scheduler.applyQueuedCancellations();
     try instances.collectRetired();
     try scheduler.destroyScope(window_scope);
+}
+
+test "reconcile plans distinguish property updates removals and creations at capacity" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 2);
+    defer renders.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, &scheduler, &renders, scope, 3);
+    defer tree.deinit();
+    const root: Descriptor = .{ .id = 1, .parent = null, .object = .{ .stack = .{} } };
+    const child: Descriptor = .{ .id = 2, .parent = 1, .object = .{ .box = .{ .width = 17 } } };
+    try tree.reconcile(&.{ root, child });
+    const original = tree.handleForId(2).?;
+    try std.testing.expectEqual(@as(usize, 0), scheduler.availableScopeCapacity());
+    try std.testing.expectEqual(@as(usize, 0), renders.availableCapacity());
+
+    var changed = child;
+    changed.object.box.width = 39;
+    const update = try tree.prepareReconcile(&.{ root, changed });
+    try std.testing.expect(!update.creates_instances and !update.removes_instances and !update.topology_changed);
+    try tree.applyReconcile(update);
+    try std.testing.expectEqual(original, tree.handleForId(2).?);
+    try std.testing.expectEqual(@as(?f32, 39), (try renders.objectAt(try tree.renderObject(original))).box.width);
+    changed.object.box.width = -1;
+    try std.testing.expectError(error.InvalidExtent, tree.prepareReconcile(&.{ root, changed }));
+    try std.testing.expectEqual(@as(?f32, 39), (try renders.objectAt(try tree.renderObject(original))).box.width);
+
+    var replacement = child;
+    replacement.id = 3;
+    // Replacement still needs a new scope before the retiring scope drains.
+    try std.testing.expectError(error.ScopeCapacityExceeded, tree.prepareReconcile(&.{ root, replacement }));
+    const removal = try tree.prepareReconcile(&.{root});
+    try std.testing.expect(removal.removes_instances and !removal.creates_instances);
+    try tree.applyReconcile(removal);
+    try std.testing.expect(!tree.isActive(original));
+    try scheduler.applyQueuedCancellations();
+    try tree.collectRetired();
+    const creation = try tree.prepareReconcile(&.{ root, replacement });
+    try std.testing.expect(creation.creates_instances and !creation.removes_instances);
+    try tree.applyReconcile(creation);
+    try std.testing.expect(tree.handleForId(3) != null);
+
+    try tree.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try tree.collectRetired();
+    try scheduler.destroyScope(scope);
 }
 
 test "box child validation handles interleaved descendants and resets after rejection" {

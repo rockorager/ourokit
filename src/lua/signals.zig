@@ -42,6 +42,8 @@ pub const Signals = struct {
     state: *c.State,
     slots: []SignalSlot,
     edges: []Edge,
+    // One past the last active edge; holes remain reusable without moving edges.
+    edge_extent: usize = 0,
     pending: []Read,
     pending_count: usize = 0,
     readers: []u64,
@@ -175,9 +177,14 @@ pub const Signals = struct {
 
     pub fn readerDirty(self: *Signals, reader: ?u64) bool {
         const owner = self.evaluation_owner orelse return false;
-        for (self.edges) |edge| if (edge.active and edge.dirty and sameOwner(edge.owner, owner) and
+        for (self.edges[0..self.edge_extent]) |edge| if (edge.active and edge.dirty and sameOwner(edge.owner, owner) and
             (reader == null or edge.reader == reader.?)) return true;
         return false;
+    }
+
+    fn trimEdges(self: *Signals) void {
+        while (self.edge_extent > 0 and !self.edges[self.edge_extent - 1].active)
+            self.edge_extent -= 1;
     }
 
     fn readerEvaluated(self: *Signals, reader: u64) bool {
@@ -215,9 +222,11 @@ pub const Signals = struct {
         for (self.edges) |*edge| {
             if (edge.active and sameOwner(edge.owner, owner) and self.readerEvaluated(edge.reader)) edge.* = .{};
         }
+        self.trimEdges();
         for (self.pending[0..self.pending_count]) |read| {
-            for (self.edges) |*edge| if (!edge.active) {
+            for (self.edges, 0..) |*edge, index| if (!edge.active) {
                 edge.* = .{ .active = true, .signal = read.signal, .owner = owner, .reader = read.reader };
+                self.edge_extent = @max(self.edge_extent, index + 1);
                 break;
             };
         }
@@ -235,6 +244,7 @@ pub const Signals = struct {
         for (self.edges) |*edge| {
             if (edge.active and sameOwner(edge.owner, owner)) edge.* = .{};
         }
+        self.trimEdges();
     }
 
     /// Reserves a dependency node whose value is owned by another Lua binding.
@@ -298,6 +308,7 @@ pub const Signals = struct {
         for (self.edges) |*edge| {
             if (edge.active and sameHandle(edge.signal, signal)) edge.* = .{};
         }
+        self.trimEdges();
         const generation = slot.generation;
         slot.* = .{ .generation = generation };
     }
@@ -316,6 +327,7 @@ pub const Signals = struct {
     fn publish(self: *Signals, signal: SignalHandle) !void {
         if (self.phase != .idle) return error.SignalWriteDuringBuildTransaction;
         _ = try self.signalSlot(signal);
+        defer self.trimEdges();
         for (self.edges) |*edge| {
             if (!edge.active or !sameHandle(edge.signal, signal)) continue;
             edge.dirty = true;

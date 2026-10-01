@@ -213,9 +213,18 @@ nil hides its UI without unmounting the component itself.
 
 Signal dependencies belong to the component render that reads them. A changed
 signal schedules its owning window, but only affected Lua renders execute;
-clean components reuse their retained descriptions. Native lowering and
-reconciliation still consume a complete window snapshot. This is component-level
-Lua rebuilding, not property-level bindings or partial native-tree updates.
+clean components reuse their retained descriptions. When the enclosing build,
+inherited context, and descendant dependencies are also unchanged, native
+lowering retains the component's existing subtree in place. It does not emit
+another descriptor snapshot of that subtree. Native handles, callbacks, editor
+state, and semantic descendants survive this skip. Dirty descendants prevent an
+ancestor skip and are visited through its retained description.
+
+These are build boundaries, not layout or paint boundaries: native layout still
+responds to changed constraints, and interaction paint still updates normally.
+The window retains one transactional commit and rollback. Native-sampled output
+(animations, virtual lists, images, canvases, and scroll declarations) continues
+to lower; builds requiring layout-builder measurement use complete descriptors.
 
 Children supplied to a stateful component are available as `props.children`.
 Stateless components receive children as their second render argument, as in
@@ -233,13 +242,15 @@ Changing this value does not change native defaults. Treat props and children
 as read-only snapshots. Do not create state, write signals, perform effects, or
 yield inside the render function; create state outside and pass its values in
 props, or read existing signals. Composition signal dependencies are replaced
-transactionally on each lowering, independently of retained component readers.
+transactionally when lowered, independently of component render dependencies.
+Each mounted component owns its composition reads; skipping its native subtree
+preserves those reads, including dependencies of nested components.
 
 Unlike `ouro.stateful`, a stateless component creates no mounted state,
 semantic namespace, or layout wrapper. Forward `props.key` to the returned root to preserve keyed
 native identity across rebuilds and source reload. Every full lowering expands
-it again, including when enclosing components retain their descriptions, so
-inherited themes cannot become stale. Hover, pressed, and keyboard-focus paint
+it again. A clean enclosing native boundary may skip expansion, but a changed
+inherited theme or composition dependency prevents that skip. Hover, pressed, and keyboard-focus paint
 updates do not lower descriptions or run composition functions.
 
 Buttons, checkboxes, switches, separators, options, radios, tabs, selection

@@ -172,8 +172,8 @@ pub const PointerBindings = struct {
     ) usize {
         var count: usize = self.entries.len - self.entry_limit;
         for (self.entries[0..self.entry_limit]) |entry|
-            if (entry.handler == null or same(entry.owner, owner) or
-                !tree.isActive(entry.target))
+            if (entry.handler == null or !tree.isActive(entry.target) or
+                (same(entry.owner, owner) and !tree.isRetained(entry.target)))
             {
                 count += 1;
             };
@@ -188,7 +188,8 @@ pub const PointerBindings = struct {
         var count: usize = 0;
         for (self.entries[0..self.entry_limit]) |entry|
             if (entry.handler != null and
-                (same(entry.owner, owner) or !tree.isActive(entry.target)))
+                (!tree.isActive(entry.target) or
+                    (same(entry.owner, owner) and !tree.isRetained(entry.target))))
             {
                 count += 1;
             };
@@ -197,6 +198,24 @@ pub const PointerBindings = struct {
 
     pub fn takeOwner(self: *PointerBindings, owner: BuildOwnerHandle) ?Handler {
         for (self.entries[0..self.entry_limit]) |*entry| if (entry.handler != null and same(entry.owner, owner)) {
+            self.revision +%= 1;
+            const old = entry.handler;
+            entry.* = .{};
+            self.trim();
+            return old;
+        };
+        return null;
+    }
+
+    pub fn takeUnretainedOwner(
+        self: *PointerBindings,
+        owner: BuildOwnerHandle,
+        tree: *instance.Tree,
+    ) ?Handler {
+        for (self.entries[0..self.entry_limit]) |*entry| if (entry.handler != null and
+            same(entry.owner, owner) and
+            (!tree.isActive(entry.target) or !tree.isRetained(entry.target)))
+        {
             self.revision +%= 1;
             const old = entry.handler;
             entry.* = .{};

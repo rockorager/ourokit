@@ -64,9 +64,35 @@ pub const Registry = struct {
         return count;
     }
 
+    pub fn availableForOwnerRetaining(
+        self: *const Registry,
+        owner: build_owner.BuildOwnerHandle,
+        tree: *instance.Tree,
+    ) usize {
+        var count: usize = self.entries.len - self.entry_limit;
+        for (self.entries[0..self.entry_limit]) |entry| if (!entry.active or
+            (same(entry.owner, owner) and
+                (!tree.isActive(entry.target) or !tree.isRetained(entry.target))))
+        {
+            count += 1;
+        };
+        return count;
+    }
+
     pub fn beginOwner(self: *Registry, owner: build_owner.BuildOwnerHandle) void {
         for (self.entries[0..self.entry_limit]) |*entry| {
             if (entry.active and same(entry.owner, owner)) entry.seen = false;
+        }
+    }
+
+    pub fn beginOwnerRetaining(
+        self: *Registry,
+        owner: build_owner.BuildOwnerHandle,
+        tree: *instance.Tree,
+    ) void {
+        for (self.entries[0..self.entry_limit]) |*entry| {
+            if (entry.active and same(entry.owner, owner))
+                entry.seen = tree.isActive(entry.target) and tree.isRetained(entry.target);
         }
     }
 

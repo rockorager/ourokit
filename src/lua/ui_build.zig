@@ -92,6 +92,25 @@ pub const ActiveBuildOwner = struct {
     handle: build_owner.BuildOwnerHandle,
 };
 
+// A boundary refers to the already-owned native root. It stores no descriptor,
+// callback, text, or render-object snapshot. Inherited context is compared by
+// value before skipping lowering.
+const BoundaryContext = struct {
+    parent: BuildParent,
+    theme: ?theming.Theme,
+    interaction: ?InteractionOwner,
+    selection: ?PendingListBox,
+    interactive: bool,
+    parent_depth: usize,
+    composition_depth: usize,
+    text_revision: u64,
+};
+const Boundary = struct {
+    context: BoundaryContext,
+    root: ?u64,
+    safe: bool,
+};
+
 /// Lowers returned Lua descriptions into typed native descriptors, parent first.
 /// Constructor evaluation has no UI side effects. Contextual layout, theme, and
 /// widget policy remain here, not in the description constructors.
@@ -106,6 +125,9 @@ pub const UiBuild = struct {
     interaction_owner: ?InteractionOwner = null,
     interactive: bool = true,
     composition_depth: usize = 0,
+    native_dependent_count: usize = 0,
+    full_lowering: bool = false,
+    retention_blocked: bool = false,
     virtual_lists: virtual_list.Snapshot = .{},
     layout_builders: layout_builder.Snapshot = .{},
     layout_proposals: layout_builder.Snapshot = .{},
@@ -229,6 +251,7 @@ pub const UiBuild = struct {
         if (callback_type != c.type_function)
             return error.LuaBuildFunctionMissing;
         self.layout_proposals = .{};
+        self.full_lowering = false;
         self.active_owner = .{ .owners = owners, .handle = work.owner };
         defer self.active_owner = null;
         if (self.images) |images| try images.beginOwner(owners, work.owner);
@@ -273,6 +296,12 @@ pub const UiBuild = struct {
             _ = c.lua_rawgeti(self.state, c.registry_index, self.root_reference);
             status = c.lua_pcallk(self.state, 1, 0, 0, 0, null);
             if (status != c.ok or self.layout_builders.count == 0) break;
+            // Isolated measurement requires a complete tree. A builder may
+            // appear after a retained sibling, so restart before measuring.
+            if (!self.full_lowering) {
+                self.full_lowering = true;
+                continue;
+            }
             const measurement = self.layout_measurement orelse return error.LayoutBuilderMeasurementRequired;
             if (try measurement.measure(measurement.context, self.storage[0..self.count], &self.layout_builders)) break;
             self.layout_proposals = self.layout_builders;
@@ -303,6 +332,8 @@ pub const UiBuild = struct {
         self.interaction_owner = null;
         self.interactive = true;
         self.composition_depth = 0;
+        self.native_dependent_count = 0;
+        self.retention_blocked = false;
         self.virtual_lists = .{};
         self.layout_builders = .{};
         self.pending_animation_count = 0;
@@ -342,9 +373,9 @@ pub const UiBuild = struct {
         if (self.pending_handler_count != 0 and
             self.pending_handler_count > bindings.availableAfterReconcile(tree, owner))
             return error.PointerBindingCapacityExceeded;
-        if (self.pending_button_count != 0 and self.pending_button_count > buttons.availableForOwner(owner))
+        if (self.pending_button_count != 0 and self.pending_button_count > buttons.availableForOwnerRetaining(owner, tree))
             return error.ButtonCapacityExceeded;
-        if (self.pending_text_input_count != 0 and self.pending_text_input_count > text_inputs.availableForOwner(owner))
+        if (self.pending_text_input_count != 0 and self.pending_text_input_count > text_inputs.availableForOwnerRetaining(owner, tree))
             return error.TextInputCapacityExceeded;
         if (self.pending_handler_count != 0) {
             const reclaimable = bindings.reclaimableForOwner(tree, owner);
@@ -388,7 +419,7 @@ pub const UiBuild = struct {
                 return error.ListBoxOptionInstanceMissing;
         while (bindings.takeInactive(tree)) |old|
             callbacks.?.release(old.id) catch unreachable;
-        while (bindings.takeOwner(owner)) |old|
+        while (bindings.takeUnretainedOwner(owner, tree)) |old|
             callbacks.?.release(old.id) catch unreachable;
         for (self.pending_handlers[0..self.pending_handler_count]) |pending| {
             const handle = callbacks.?.adoptReference(
@@ -403,14 +434,14 @@ pub const UiBuild = struct {
             if (old) |handler| callbacks.?.release(handler.id) catch unreachable;
         }
         bindings.pruneScrollStates(tree);
-        buttons.beginOwner(owner);
+        buttons.beginOwnerRetaining(owner, tree);
         for (self.pending_buttons[0..self.pending_button_count]) |pending| buttons.set(
             owner,
             tree.handleForId(pending.id).?,
             pending.enabled,
         );
         buttons.finishOwner(owner);
-        text_inputs.beginOwner(owner);
+        text_inputs.beginOwnerRetaining(owner, tree);
         for (self.pending_text_inputs[0..self.pending_text_input_count]) |*pending| {
             try text_inputs.mountPrepared(
                 owner,
@@ -425,7 +456,7 @@ pub const UiBuild = struct {
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
         self.discardPendingTextInputs();
-        listboxes.beginOwner(owner);
+        listboxes.beginOwnerRetaining(owner, tree);
         for (self.pending_listboxes[0..self.pending_listbox_count]) |pending| try listboxes.setList(
             owner,
             tree.handleForId(pending.id).?,
@@ -437,7 +468,7 @@ pub const UiBuild = struct {
             tree.handleForId(pending.id).?,
             pending.value,
         );
-        listboxes.finishOwner(owner);
+        listboxes.finishOwnerRetaining(owner, tree);
         self.pending_handler_count = 0;
         self.pending_button_count = 0;
         self.pending_listbox_count = 0;
@@ -464,6 +495,8 @@ pub const UiBuild = struct {
     ) !void {
         if (prepared.state != self.state or descriptors.len != self.count or
             descriptors.ptr != self.storage.ptr) return error.InvalidPreparedBuildSource;
+        for (descriptors) |descriptor| if (descriptor.retain_subtree)
+            return error.RetainedPreparedBuild;
         if (descriptors.len > prepared.descriptor_storage.len or
             self.semantic_count > prepared.semantic_storage.len or
             self.pending_handler_count > prepared.handlers.len or
@@ -680,6 +713,12 @@ pub const UiBuild = struct {
         if (c.lua_type(state, 1) == c.type_nil) return 0;
         const description = Description.get(state, 1) orelse
             return luaError(state, "build must return a widget description or nil");
+        // These owners still consume complete snapshots or native samples.
+        // Keep lowering them until their own retention contracts support skips.
+        switch (description.kind) {
+            .animation, .transition, .presence, .virtual_list, .layout_builder, .image, .icon, .canvas, .scroll => self.native_dependent_count += 1,
+            else => {},
+        }
         const emit: c.CFunction = switch (description.kind) {
             .text => emitText,
             .image => emitImage,
@@ -883,13 +922,41 @@ pub const UiBuild = struct {
         _ = c.lua_getiuservalue(state, 1, 2);
         c.lua_pushinteger(state, @bitCast(self.component_namespace));
         c.lua_pushinteger(state, @bitCast(parent.id));
-        if (c.lua_pcallk(state, 5, 3, 0, 0, null) != c.ok) return c.lua_error(state);
-        const retained = c.lua_toboolean(state, -1) != 0;
-        c.lua_settop(state, -2);
+        if (c.lua_pcallk(state, 5, 4, 0, 0, null) != c.ok) return c.lua_error(state);
+        // Stack: description, output, token, clean, mounted record.
+        const retained = c.lua_toboolean(state, 4) != 0;
         var number: c_int = 0;
-        const token: u64 = @intCast(c.lua_tointegerx(state, -1, &number));
-        c.lua_settop(state, -2);
+        const token: u64 = @intCast(c.lua_tointegerx(state, 3, &number));
         const group = semanticId("component", token ^ @as(u64, @intFromPtr(state)));
+        const context: BoundaryContext = .{
+            .parent = parent,
+            .theme = self.currentStyle(),
+            .interaction = self.interaction_owner,
+            .selection = self.currentSelection(),
+            .interactive = self.interactive,
+            .parent_depth = self.parent_count,
+            .composition_depth = self.composition_depth,
+            .text_revision = self.text_configuration_revision,
+        };
+        self.components.push("enter");
+        c.lua_pushvalue(state, 5);
+        c.lua_pushboolean(state, @intFromBool(retained and self.component_scope_clean));
+        if (c.lua_pcallk(state, 2, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        if (!self.full_lowering and !self.retention_blocked and c.lua_type(state, -1) != c.type_nil) {
+            const old: *const Boundary = @ptrCast(@alignCast(c.lua_touserdata(state, -1).?));
+            if (old.safe and std.meta.eql(old.context, context)) if (self.components.instances) |tree| {
+                if (old.root) |root| {
+                    const marker = tree.retainDescriptor(root) catch return luaError(state, "retained component root missing");
+                    self.append(marker) catch return luaError(state, "cannot retain component root");
+                }
+                self.appendSemantic(.{ .id = group, .parent = semanticParent(parent), .role = .group, .key = key, .retain_subtree = true }) catch
+                    return luaError(state, "cannot retain component semantics");
+                self.components.call("retain") catch return luaError(state, "cannot retain component mounts");
+                return 0;
+            };
+        }
+        c.lua_settop(state, 2);
+        self.components.call("lower") catch return luaError(state, "cannot begin component lowering");
         self.appendSemantic(.{ .id = group, .parent = semanticParent(parent), .role = .group, .key = key }) catch
             return luaError(state, "cannot append component semantics");
         var component_parent = parent;
@@ -900,6 +967,8 @@ pub const UiBuild = struct {
         self.component_namespace = group;
         const previous_clean = self.component_scope_clean;
         self.component_scope_clean = previous_clean and retained;
+        const start = self.count;
+        const dependent_start = self.native_dependent_count;
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, lowerDescription, 1);
         c.lua_pushvalue(state, -2);
@@ -908,6 +977,14 @@ pub const UiBuild = struct {
         self.component_scope_clean = previous_clean;
         self.popParent();
         if (status != c.ok) return c.lua_error(state);
+        self.components.push("leave");
+        const boundary: *Boundary = @ptrCast(@alignCast(c.lua_newuserdatauv(state, @sizeOf(Boundary), 0)));
+        boundary.* = .{
+            .context = context,
+            .root = if (self.count > start) self.storage[start].id else null,
+            .safe = self.native_dependent_count == dependent_start,
+        };
+        if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) return c.lua_error(state);
         return 0;
     }
 
@@ -2220,6 +2297,9 @@ pub const UiBuild = struct {
             .role = .group,
             .key = key,
         }) catch return luaError(state, "cannot append scroll semantics");
+        const previous_blocked = self.retention_blocked;
+        self.retention_blocked = previous_blocked or reveal != null;
+        defer self.retention_blocked = previous_blocked;
         const status = self.emitChildren(state, .{ .id = id, .kind = .scroll });
         if (reveal) |path| {
             var target: ?u64 = id;
@@ -2266,17 +2346,17 @@ pub const UiBuild = struct {
     }
 
     fn discardSources(self: *UiBuild) void {
-        if (self.drawings_staged) for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
+        if (self.drawings_staged) for (self.storage[0..self.count]) |descriptor| if (!descriptor.retain_subtree) switch (descriptor.object) {
             .canvas => |value| value.release(),
             else => {},
         };
         self.drawings_staged = false;
-        if (self.images_staged) for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
+        if (self.images_staged) for (self.storage[0..self.count]) |descriptor| if (!descriptor.retain_subtree) switch (descriptor.object) {
             .image => |value| if (value.image) |handle| self.images.?.cache.release(handle) catch unreachable,
             else => {},
         };
         self.images_staged = false;
-        if (self.sources_staged) for (self.storage[0..self.count]) |descriptor| switch (descriptor.object) {
+        if (self.sources_staged) for (self.storage[0..self.count]) |descriptor| if (!descriptor.retain_subtree) switch (descriptor.object) {
             .text => |value| self.text_sources.?.release(value.source) catch unreachable,
             .text_input => |input| {
                 self.text_sources.?.release(input.source) catch unreachable;

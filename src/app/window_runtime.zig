@@ -430,10 +430,6 @@ pub const WindowRuntime = struct {
         try lua_ui.capturePrepared(prepared, descriptors);
         var captured = true;
         errdefer if (captured) prepared.reset();
-        if (prepared.handler_count != 0 and prepared.handler_count > self.pointer_bindings.availableAfterReconcile(
-            &self.instances,
-            self.root_owner,
-        )) return error.PointerBindingCapacityExceeded;
         if (prepared.button_count != 0 and prepared.button_count > self.buttons.availableForOwner(self.root_owner))
             return error.ButtonCapacityExceeded;
         if (prepared.text_input_count != 0 and prepared.text_input_count > self.text_inputs.availableForOwner(self.root_owner))
@@ -450,6 +446,10 @@ pub const WindowRuntime = struct {
         }
         try self.retainTextInputPresentation(prepared.descriptor_storage[0..prepared.descriptor_count], prepared.text_inputs[0..prepared.text_input_count]);
         const plan = try self.instances.prepareReconcile(prepared.descriptors());
+        if (prepared.handler_count != 0 and prepared.handler_count > self.pointer_bindings.availableAfterReconcile(
+            &self.instances,
+            self.root_owner,
+        )) return error.PointerBindingCapacityExceeded;
         try self.animations.validate(prepared.animations[0..prepared.animation_count]);
         _ = try self.validatePreparedFrame(prepared.descriptors(), size, lua_ui.root_background != null, null);
         try lua_ui.commitDependencies(&self.build_owners, work);

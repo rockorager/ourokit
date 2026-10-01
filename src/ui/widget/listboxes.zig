@@ -70,6 +70,21 @@ pub const ListBoxes = struct {
         }
     }
 
+    pub fn beginOwnerRetaining(
+        self: *ListBoxes,
+        owner: BuildOwnerHandle,
+        tree: *instance.Tree,
+    ) void {
+        for (self.lists[0..self.list_limit]) |*entry| {
+            if (entry.active and same(entry.owner, owner))
+                entry.seen = tree.isActive(entry.target) and tree.isRetained(entry.target);
+        }
+        for (self.options[0..self.option_limit]) |*entry| {
+            if (entry.active and same(entry.owner, owner))
+                entry.seen = tree.isActive(entry.target) and tree.isRetained(entry.target);
+        }
+    }
+
     pub fn setList(self: *ListBoxes, owner: BuildOwnerHandle, target: instance.InstanceHandle, selected: i64) !void {
         for (self.lists[0..self.list_limit]) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
@@ -128,6 +143,16 @@ pub const ListBoxes = struct {
             if (entry.active and same(entry.owner, owner) and !entry.seen) entry.* = .{};
         }
         self.trim();
+    }
+
+    pub fn finishOwnerRetaining(self: *ListBoxes, owner: BuildOwnerHandle, tree: *instance.Tree) void {
+        self.finishOwner(owner);
+        // Emitted options alone no longer describe sibling order when some
+        // component boundaries were skipped. Use the reconciled native order.
+        for (self.options[0..self.option_limit]) |*entry| {
+            if (entry.active and same(entry.owner, owner))
+                entry.order = tree.traversalOrder(entry.target) catch unreachable;
+        }
     }
 
     pub fn removeInactive(self: *ListBoxes, tree: *instance.Tree) void {

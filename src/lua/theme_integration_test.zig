@@ -1038,6 +1038,85 @@ test "theme inheritance and explicit precedence retheme clean components without
     try std.testing.expectEqual(@as(f32, 41), (try f.object("root/sibling")).box.height.?);
 }
 
+test "component boundaries keep callback identity editor state and semantic descendants" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\tick,shown=ouro.signal(0),ouro.signal(true)
+        \\calls=0
+        \\local Controls=ouro.stateful(function()
+        \\ return function() return ouro.column {key='controls',
+        \\   ouro.button {key='action',label='Retained action',on_press=function() calls=calls+1 end},
+        \\   ouro.text_input {key='editor',default_text='start',label='Retained editor'},
+        \\ } end
+        \\end)
+        \\local Counter=ouro.stateful(function()
+        \\ return function() return ouro.box {key='counter',width=10+tick(),height=7} end
+        \\end)
+        \\function build()
+        \\ local children={}
+        \\ if shown() then children[1]=Controls {key='stable'} end
+        \\ children[#children+1]=Counter {key='changing'}
+        \\ return ouro.column {key='root',children=children}
+        \\end
+    );
+    try f.build();
+    const button = try f.handle("root/stable/controls/action");
+    const editor = try f.handle("root/stable/controls/editor");
+    const callback = f.runtime.pointer_bindings.get(button).?.id;
+    const callback_count = f.callbacks.countForVm(&f.vm);
+    const session = try f.runtime.text_inputs.session(editor);
+    _ = try session.apply(.{ .commit = .{ .text = "!" } });
+    const edited = try std.testing.allocator.dupe(u8, session.model.text());
+    defer std.testing.allocator.free(edited);
+    try f.exec("tick:set(1)");
+    try f.build();
+    try std.testing.expect(f.runtime.instances.isRetained(editor));
+    try std.testing.expectEqual(editor, try f.handle("root/stable/controls/editor"));
+    try std.testing.expectEqual(callback, f.runtime.pointer_bindings.get(button).?.id);
+    try std.testing.expectEqual(callback_count, f.callbacks.countForVm(&f.vm));
+    try std.testing.expect(f.runtime.buttons.contains(button));
+    try std.testing.expectEqual(session, try f.runtime.text_inputs.session(editor));
+    try std.testing.expectEqualStrings(edited, session.model.text());
+    try std.testing.expectEqualStrings("Retained action", (try f.runtime.semantics.findPath("root/stable/controls/action")).label);
+    _ = try f.callbacks.spawn(callback, try f.runtime.instances.scope(button), &.{});
+    while (f.scheduler.takeRunnable()) |handle|
+        try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(handle));
+    try f.exec("assert(calls==1)");
+    try f.exec("shown:set(false)");
+    try f.build();
+    try std.testing.expect(!f.runtime.instances.isActive(editor));
+    try std.testing.expect(!f.runtime.text_inputs.contains(editor));
+    try std.testing.expect(!f.runtime.buttons.contains(button));
+    try std.testing.expect(f.runtime.pointer_bindings.get(button) == null);
+    try std.testing.expectEqual(@as(usize, 0), f.callbacks.countForVm(&f.vm));
+}
+
+test "component boundaries preserve list option order across mixed retained and rebuilt options" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\tick=ouro.signal(0)
+        \\local Option=ouro.stateful(function(p)
+        \\ return function() return ouro.option {key='option',value=p.value,
+        \\   label=p.value==29 and ('Changed '..tick()) or 'Unchanged'} end
+        \\end)
+        \\function build() return ouro.listbox {key='list',selected=11,on_select=function() end,
+        \\ Option {key='a',value=11},Option {key='b',value=29},Option {key='c',value=47}} end
+    );
+    try f.build();
+    const list = try f.handle("list");
+    const first = try f.handle("list/a/option");
+    const last = try f.handle("list/c/option");
+    try f.exec("tick:set(1)");
+    try f.build();
+    try std.testing.expect(f.runtime.instances.isRetained(first));
+    try std.testing.expect(f.runtime.instances.isRetained(last));
+    try std.testing.expectEqual(@as(i64, 29), f.runtime.listboxes.move(list, 1).?.value);
+    try std.testing.expectEqual(@as(i64, 47), f.runtime.listboxes.move(list, 1).?.value);
+    try std.testing.expectEqual(@as(i64, 29), f.runtime.listboxes.move(list, -1).?.value);
+}
+
 test "theme input typography and focus survive rebuilds and zero borders remain valid" {
     const f = try Fixture.create();
     defer f.destroy();
@@ -1930,6 +2009,30 @@ test "layout builder measures local constraints in native order and initializes 
     try f.build();
     try f.exec("assert(calls.root==1 and calls.init==1 and calls.consumer==1 and calls.producer==1 and calls.scroll==1)");
     try std.testing.expectEqual(consumer, try f.handle("root/panel/frame/row/consumer/result"));
+}
+
+test "component boundaries fall back to full descriptors before layout builder measurement" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\tick=ouro.signal(0)
+        \\local Stable=ouro.stateful(function()
+        \\ return function() return ouro.box {key='value',width=17,height=13} end
+        \\end)
+        \\function build() return ouro.column {key='root',Stable {key='stable'},
+        \\ ouro.box {key='frame',width=100,height=40,
+        \\   ouro.layout_builder {key='bounds',render=function(c)
+        \\     assert(c.max_width==100)
+        \\     return ouro.box {key='value',width=23+tick(),height=11}
+        \\   end}}} end
+    );
+    try f.build();
+    const stable = try f.handle("root/stable/value");
+    try f.exec("tick:set(8)");
+    try f.build();
+    try std.testing.expectEqual(stable, try f.handle("root/stable/value"));
+    try std.testing.expectEqual(@as(?f32, 31), (try f.object("root/frame/bounds/value")).box.width);
+    for (f.ui.storage[0..f.ui.count]) |descriptor| try std.testing.expect(!descriptor.retain_subtree);
 }
 
 test "layout builder reacts to local sizing and signals without remounting and rolls back failed branches" {
