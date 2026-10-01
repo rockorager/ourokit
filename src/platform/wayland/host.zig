@@ -601,6 +601,7 @@ const Window = struct {
     toplevel: ?Handle = null,
     popup: ?Handle = null,
     popup_parent: ?WindowHandle = null,
+    popup_grabbing: bool = false,
     popup_keyboard_promoted: bool = false,
     layer_surface: ?Handle = null,
     lock_surface: ?Handle = null,
@@ -1965,21 +1966,23 @@ pub const Host = struct {
             .popup => |popup| {
                 try popup.validate();
                 if (self.wm_base == null) return error.XdgShellUnavailable;
-                if (self.seat == null) return error.SeatUnavailable;
-                const input = self.popup_input orelse return error.NoPopupInput;
-                if (input.serial != popup.input.serial or !sameWindow(input.window, popup.input.window))
-                    return error.StalePopupInput;
-                const parent = try self.windowFor(popup.input.window);
+                if (popup.input) |authorization| {
+                    if (self.seat == null) return error.SeatUnavailable;
+                    const input = self.popup_input orelse return error.NoPopupInput;
+                    if (input.serial != authorization.serial or !sameWindow(input.window, authorization.window))
+                        return error.StalePopupInput;
+                }
+                const parent = try self.windowFor(popup.anchor.window);
                 if (parent.lock_surface != null) return error.LockSurfacePopupUnsupported;
                 if (parent.state != .open or !parent.configured or parent.frames_presented == 0)
                     return error.PopupParentNotMapped;
                 if (parent.popup != null) return error.NestedPopupUnsupported;
-                for (self.windows) |other| if (other.popup != null) return error.PopupAlreadyOpen;
-                const anchor = popup.input.anchor.?;
+                for (self.windows) |other| if (other.popup != null and other.popup_grabbing) return error.PopupAlreadyOpen;
+                const anchor = popup.anchor.rectangle;
                 if (@as(u64, @intCast(anchor.x)) + anchor.width > parent.width or
                     @as(u64, @intCast(anchor.y)) + anchor.height > parent.height)
                     return error.InvalidPopupAnchor;
-                if (parent.layer_state != null and parent.layer_state.?.keyboard_interactivity == .none and self.layer_shell_version < 4)
+                if (popup.input != null and parent.layer_state != null and parent.layer_state.?.keyboard_interactivity == .none and self.layer_shell_version < 4)
                     return error.LayerShellVersionTooOld;
             },
             .layer_surface => |value| {
@@ -1993,6 +1996,12 @@ pub const Host = struct {
                     return error.LayerShellVersionTooOld;
             },
         }
+        if (declaration == .popup) for (self.windows) |*other| {
+            if (other.popup != null) {
+                try self.sink.closeRequested(other.handle);
+                try self.destroySurfaces(other);
+            }
+        };
         if (declaration == .layer_surface) {
             const layer_state = try LayerState.init(self.allocator, declaration.layer_surface);
             window.* = .{
@@ -2038,8 +2047,8 @@ pub const Host = struct {
         var promoted = false;
         if (declaration == .popup) {
             const value = declaration.popup;
-            const parent = try self.windowFor(value.input.window);
-            if (parent.layer_state != null and parent.layer_state.?.keyboard_interactivity == .none) {
+            const parent = try self.windowFor(value.anchor.window);
+            if (value.input != null and parent.layer_state != null and parent.layer_state.?.keyboard_interactivity == .none) {
                 // on_demand only permits focus; changing an already mapped
                 // banner does not request it. This explicit user-opened menu
                 // needs keys immediately, and dismissal restores the policy.
@@ -2049,8 +2058,8 @@ pub const Host = struct {
                 try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, parent.surface.?, .{ .commit = .{} });
                 promoted = true;
             }
-            popup = try createPopupRole(objects, transmit, self.wm_base.?, self.seat.?, xdg_surface, parent, value);
-            self.popup_input = null;
+            popup = try createPopupRole(objects, transmit, self.wm_base.?, self.seat, xdg_surface, parent, value);
+            if (value.input != null) self.popup_input = null else try setInputRegion(objects, transmit, self.compositor.?, surface, .{ .x = 0, .y = 0, .width = 0, .height = 0 });
         }
         if (declaration == .toplevel) {
             const toplevel_declaration = declaration.toplevel;
@@ -2122,7 +2131,8 @@ pub const Host = struct {
             .xdg_surface = xdg_surface,
             .toplevel = toplevel,
             .popup = popup,
-            .popup_parent = if (declaration == .popup) declaration.popup.input.window else null,
+            .popup_parent = if (declaration == .popup) declaration.popup.anchor.window else null,
+            .popup_grabbing = declaration == .popup and declaration.popup.input != null,
             .popup_keyboard_promoted = promoted,
             .viewport = viewport,
             .fractional_scale = fractional_scale,
@@ -2297,7 +2307,7 @@ pub const Host = struct {
             // Preserve user-initiated popup keyboard access across reactive
             // parent updates; retain the declared policy for dismissal.
             for (self.windows) |*child| if (child.popup_parent) |parent| {
-                if (sameWindow(parent, handle) and child.popup != null and effective.keyboard_interactivity == .none) {
+                if (sameWindow(parent, handle) and child.popup != null and child.popup_grabbing and effective.keyboard_interactivity == .none) {
                     effective.keyboard_interactivity = .exclusive;
                     child.popup_keyboard_promoted = true;
                 }
@@ -3502,25 +3512,40 @@ fn createPopupRole(
     objects: *wayring.objects.ClientObjects,
     transmit: *wayring.tx.Queue,
     wm_base: Handle,
-    seat: Handle,
+    seat: ?Handle,
     xdg_surface: Handle,
     parent: *const Window,
     declaration: platform_window.PopupDeclaration,
 ) !Handle {
     const positioner = (try protocol.xdg_wm_base.construct_create_positioner(objects, transmit, wm_base, .{})).id;
-    const anchor = declaration.input.anchor.?;
+    const anchor = declaration.anchor.rectangle;
     try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_size = .{
         .width = @intCast(declaration.width),
         .height = @intCast(declaration.height),
     } });
+    // Include the gap in the anchor, not set_offset: offsets do not reverse
+    // when the compositor flips gravity, which would overlap the trigger.
+    const gap: i32 = if (declaration.input == null) @intCast(declaration.gap) else 0;
     try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_anchor_rect = .{
-        .x = anchor.x,
-        .y = anchor.y,
-        .width = @intCast(anchor.width),
-        .height = @intCast(anchor.height),
+        .x = anchor.x - gap,
+        .y = anchor.y - gap,
+        .width = @as(i32, @intCast(anchor.width)) + 2 * gap,
+        .height = @as(i32, @intCast(anchor.height)) + 2 * gap,
     } });
-    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_anchor = .{ .anchor = .bottom_right } });
-    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_gravity = .{ .gravity = .bottom_left } });
+    const placement: protocol.xdg_positioner.anchor = if (declaration.input != null) .bottom_right else switch (declaration.side) {
+        .top => .top,
+        .bottom => .bottom,
+        .left => .left,
+        .right => .right,
+    };
+    const gravity: protocol.xdg_positioner.gravity = if (declaration.input != null) .bottom_left else switch (declaration.side) {
+        .top => .top,
+        .bottom => .bottom,
+        .left => .left,
+        .right => .right,
+    };
+    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_anchor = .{ .anchor = placement } });
+    try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_gravity = .{ .gravity = gravity } });
     try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_constraint_adjustment = .{
         .constraint_adjustment = protocol.xdg_positioner.constraint_adjustment.fromInt(15),
     } });
@@ -3530,7 +3555,8 @@ fn createPopupRole(
     })).id;
     // A layer parent must adopt the NULL-parent popup before grab/initial commit.
     if (parent.layer_surface) |layer| try wayring.client.sendRequest(protocol.zwlr_layer_surface_v1, objects, transmit, layer, .{ .get_popup = .{ .popup = popup.id } });
-    try wayring.client.sendRequest(protocol.xdg_popup, objects, transmit, popup, .{ .grab = .{ .seat = seat.id, .serial = declaration.input.serial } });
+    if (declaration.input) |input|
+        try wayring.client.sendRequest(protocol.xdg_popup, objects, transmit, popup, .{ .grab = .{ .seat = seat.?.id, .serial = input.serial } });
     try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .destroy = .{} });
     return popup;
 }
@@ -4760,7 +4786,7 @@ test "native popup validates input, positions independently and tears down befor
     defer windows[0].layer_state.?.deinit(allocator);
     host.windows = &windows;
     const input: Activation.Input = .{ .window = windows[0].handle, .serial = 347, .anchor = .{ .x = 293, .y = 127, .width = 83, .height = 31 } };
-    const declaration: platform_window.SurfaceDeclaration = .{ .popup = .{ .id = "popup", .input = input, .width = 211, .height = 93 } };
+    const declaration: platform_window.SurfaceDeclaration = .{ .popup = .{ .id = "popup", .input = input, .anchor = .{ .window = input.window, .target = input.target, .rectangle = input.anchor.? }, .width = 211, .height = 93 } };
     const popup_window: WindowHandle = .{ .slot = 8, .generation = 2 };
     const transmit = try host.queue();
     host.popup_input = null;
@@ -4884,10 +4910,82 @@ test "native popup validates input, positions independently and tears down befor
     try transmit.begin(dismissal);
     try transmit.complete(dismissal.byteCount());
 
+    // Hover popups need neither a seat nor press authority. They adopt the
+    // layer parent but send no grab/promotion and commit an empty input region.
     windows[1] = .{};
+    var passive = declaration;
+    passive.popup.input = null;
+    passive.popup.side = .top;
+    passive.popup.gap = 7;
+    const seat = host.seat;
+    host.seat = null;
+    host.popup_input = null;
+    try Host.nativeCreate(&host, popup_window, .invalid, passive);
+    try std.testing.expect(!windows[1].popup_grabbing and !windows[1].popup_keyboard_promoted);
+    const passive_id = windows[1].popup.?.id;
+    const passive_surface = windows[1].surface.?.id;
+    const passive_requests = try transmit.snapshot(&.{}, &.{});
+    bytes = passive_requests.first;
+    var input_regions: usize = 0;
+    var adoptions: usize = 0;
+    var passive_positioner: u32 = 0;
+    var anchor_rectangles: usize = 0;
+    while (bytes.len > 0) {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expect(message.header.object_id != passive_id); // No grab.
+        if (message.header.object_id == host.wm_base.?.id and message.header.opcode == 1) {
+            args = message.arguments();
+            passive_positioner = try args.uint();
+        }
+        if (message.header.object_id == passive_positioner) {
+            try std.testing.expect(message.header.opcode != 6); // No unflippable offset.
+            args = message.arguments();
+            if (message.header.opcode == 2) {
+                for ([_]i32{ 286, 120, 97, 45 }) |expected| try std.testing.expectEqual(expected, try args.int());
+                anchor_rectangles += 1;
+            } else if (message.header.opcode == 3 or message.header.opcode == 4) {
+                try std.testing.expectEqual(@as(u32, 1), try args.uint()); // top anchor/gravity
+            }
+        }
+        if (message.header.object_id == windows[0].layer_surface.?.id) {
+            try std.testing.expectEqual(@as(u16, 5), message.header.opcode); // get_popup, never keyboard mode.
+            adoptions += 1;
+        }
+        if (message.header.object_id == passive_surface and message.header.opcode == 5) {
+            args = message.arguments();
+            try std.testing.expect((try args.uint()) != 0); // Empty region, not null/full surface.
+            input_regions += 1;
+        }
+        bytes = bytes[message.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 1), adoptions);
+    try std.testing.expectEqual(@as(usize, 1), input_regions);
+    try std.testing.expectEqual(@as(usize, 1), anchor_rectangles);
+    try transmit.begin(passive_requests);
+    try transmit.complete(passive_requests.byteCount());
+    try Host.nativeUpdateLayerSurface(&host, input.window, .{ .id = "banner", .namespace = "test", .width = 421, .height = 199, .layer = .overlay });
+    const passive_update = try transmit.snapshot(&.{}, &.{});
+    bytes = passive_update.first;
+    while (bytes.len > 0) {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        if (message.header.object_id == windows[0].layer_surface.?.id and message.header.opcode == 4) {
+            args = message.arguments();
+            try std.testing.expectEqual(@as(u32, 0), try args.uint());
+        }
+        bytes = bytes[message.header.size..];
+    }
+    try transmit.begin(passive_update);
+    try transmit.complete(passive_update.byteCount());
+    host.seat = seat;
+    // A menu can supersede the tooltip without waiting for another user click.
     host.popup_input = input;
     recorder.closed = false;
-    try Host.nativeCreate(&host, popup_window, .invalid, declaration);
+    const replacement: WindowHandle = .{ .slot = 9, .generation = 2 };
+    try Host.nativeCreate(&host, replacement, .invalid, declaration);
+    try std.testing.expect(recorder.closed and windows[1].popup == null);
+    windows[1] = windows[2];
+    windows[2] = .{};
+    recorder.closed = false;
     const reopened = try transmit.snapshot(&.{}, &.{});
     try transmit.begin(reopened);
     try transmit.complete(reopened.byteCount());

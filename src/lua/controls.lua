@@ -175,6 +175,63 @@ ouro.accordion = ouro.stateless(function(p, children)
   return ouro.column {key=p.key, flex=p.flex, x=p.x, y=p.y, gap=0, cross_alignment='stretch', children=rows}
 end)
 
+local TooltipTrigger = ouro.stateless(function(p, children, theme)
+  return ouro.box {key='anchor', flex=p.flex, x=p.x, y=p.y,
+    on_interaction_change=p.enabled and function(active, anchor) p.change(active, anchor, theme) end or nil,
+    on_pointer_capture={kinds={'press'}, propagate=true, handler=p.dismiss},
+    on_key_capture={keys={'Escape'}, states={'pressed'}, propagate=true, handler=p.dismiss},
+    children=children}
+end)
+
+ouro.tooltip = ouro.stateful(function(p)
+  local popup, generation = nil, 0
+  local function dismiss()
+    generation = generation + 1
+    if popup then popup:close(); popup=nil end
+  end
+  local function change(active, anchor, theme)
+    dismiss()
+    if not active or not anchor or p.enabled == false then return end
+    local request = generation
+    ouro.sleep(p.delay or 500)
+    if request ~= generation or p.enabled == false then return end
+    local handle, err = ouro.popup {
+      anchor=anchor, side=p.side or 'bottom', gap=p.gap or 6,
+      width=p.width or 240, height=p.height or 40,
+      on_close=function() if request == generation then popup=nil end end,
+      content=function()
+        return ouro.theme {key='policy', reduced_motion=theme.reduced_motion, colors={background=transparent},
+          ouro.transition {key='fade', initial=0, target=1, duration=p.duration or 120,
+            motion=p.motion, easing='ease_out', render=function(value)
+              return ouro.box {key='body', width='fill', height='fill', padding_x=12,
+                alignment='center', radius=6, background=theme.colors.foreground, opacity=value,
+                ouro.text {key='text', text=p.text, foreground=theme.colors.background,
+                  size=13, max_lines=1, overflow='ellipsis'}}
+            end}}
+      end,
+    }
+    if handle then popup=handle
+    elseif p.on_error then p.on_error(err) end
+  end
+  return function()
+    check(#p.children == 1, 'tooltip requires one trigger child')
+    check(kind(p.text) == 'string' and #p.text > 0, 'tooltip text required')
+    local active = enabled(p)
+    motion(p)
+    for name, fallback in pairs({delay=500, width=240, height=40, gap=6}) do
+      local value = p[name]
+      if value == nil then value = fallback end
+      local maximum = name == 'delay' and 60000 or (name == 'gap' and 1024 or 16384)
+      local minimum = (name == 'width' or name == 'height') and 1 or 0
+      check(kind(value) == 'number' and value % 1 == 0 and value >= minimum and value <= maximum, 'invalid tooltip '..name)
+    end
+    check(p.side == nil or p.side == 'top' or p.side == 'bottom' or p.side == 'left' or p.side == 'right', 'invalid tooltip side')
+    check(p.on_error == nil or kind(p.on_error) == 'function', 'invalid tooltip on_error')
+    return TooltipTrigger {key='trigger', flex=p.flex, x=p.x, y=p.y, enabled=active,
+      change=change, dismiss=dismiss, children=p.children}
+  end
+end)
+
 ouro.separator = ouro.stateless(function(p, children, theme)
   check(#children == 0, 'separator does not accept children')
   local orientation = p.orientation

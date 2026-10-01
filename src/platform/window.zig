@@ -363,20 +363,35 @@ pub const LayerSurfaceDeclaration = struct {
 
 /// Surface roles remain distinct because their configure and update contracts
 /// are not interchangeable.
+pub const PopupAnchor = struct {
+    window: WindowHandle,
+    target: @import("../core/handle.zig").Handle,
+    rectangle: RectI,
+};
+
 pub const PopupDeclaration = struct {
     id: []const u8,
-    input: @import("activation.zig").Input,
+    anchor: PopupAnchor,
+    /// Only menu-like popups grab input. Passive surfaces carry no input authority.
+    input: ?@import("activation.zig").Input = null,
     width: u32,
     height: u32,
+    side: enum { top, bottom, left, right } = .bottom,
+    gap: u32 = 0,
 
     pub fn validate(self: PopupDeclaration) !void {
-        const anchor = self.input.anchor orelse return error.PopupAnchorRequired;
+        const anchor = self.anchor.rectangle;
         if (self.width == 0 or self.height == 0 or self.width > 16384 or self.height > 16384)
             return error.InvalidPopupSize;
         if (anchor.x < 0 or anchor.y < 0 or anchor.width == 0 or anchor.height == 0 or
             anchor.width > @import("std").math.maxInt(i32) or anchor.height > @import("std").math.maxInt(i32))
             return error.InvalidPopupAnchor;
-        if (self.input.serial == 0) return error.NoPopupInput;
+        if (self.gap > 1024) return error.InvalidPopupGap;
+        if (self.input) |input| {
+            if (input.serial == 0) return error.NoPopupInput;
+            if (!@import("std").meta.eql(input.window, self.anchor.window) or
+                !@import("std").meta.eql(input.target, self.anchor.target)) return error.InvalidPopupAnchor;
+        }
     }
 };
 

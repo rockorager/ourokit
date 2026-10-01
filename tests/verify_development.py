@@ -28,6 +28,7 @@ TESTS = (
     'presence_composition.py',
     'spring_composition.py',
     'motion_components.py',
+    'tooltip_native.py',
     'rich_text_composition.py',
     'drag_composition.py',
     'drawing_composition.py',
@@ -99,11 +100,13 @@ def environment(root, binary):
 
 
 def verify(binary):
-    missing = [name for name in ('sway', 'swaymsg', 'dbus-run-session', 'dbus-daemon', 'gdbus')
+    missing = [name for name in ('sway', 'swaymsg', 'dbus-run-session', 'dbus-daemon', 'gdbus',
+                                'grim', 'wtype', 'wayland-scanner', 'cc', 'pkg-config')
                if shutil.which(name) is None]
     if missing:
         raise RuntimeError('missing native test dependencies: ' + ', '.join(missing) +
-                           '; on Debian/Ubuntu install sway dbus-daemon libglib2.0-bin')
+                           '; on Debian/Ubuntu install sway dbus-daemon libglib2.0-bin '
+                           'grim wtype libwayland-bin libwayland-dev gcc pkg-config')
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise RuntimeError(f'ouroctl is not executable: {binary}')
     with tempfile.TemporaryDirectory(prefix='ourokit-verify-') as directory:

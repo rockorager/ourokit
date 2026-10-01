@@ -529,6 +529,58 @@ the actual keyboard serial, never a previous pointer serial. Compositors that
 only accept pointer serials for popup grabs cannot support keyboard opening;
 use an Ouro build with keyboard-initiated popup-grab support.
 
+### Tooltips outside the parent window
+
+Wrap exactly one trigger child with `ouro.tooltip`. It uses a **non-grabbing
+native `xdg_popup`**, so a tooltip on a narrow layer-shell bar can extend beyond
+the bar without resizing it or taking keyboard focus from another application.
+The popup has an empty input region: clicks go through it. Tooltips work with
+ordinary windows and layer surfaces, not lock surfaces or nested popups.
+
+```lua
+ouro.tooltip {
+  key = 'network-tip', text = 'Connected to the studio network',
+  width = 260, side = 'bottom',
+  ouro.button {key = 'network', label = 'Network', on_press = open_network},
+}
+```
+
+Hover or keyboard focus within the child starts a cancellable opening delay.
+Leaving both states, disabling/removing the tooltip, moving its anchor, or
+closing the parent dismisses it. A pointer press on the trigger or Escape
+also dismisses it without consuming the event. A keyboard-inactive bar does
+not receive Escape from the independently focused application. Moving between
+descendants does not restart the timer. Opening a select or menu replaces a
+tooltip; an already-open grabbing menu takes priority.
+
+Options are `text` (required nonempty string), `enabled` (default true),
+`delay` (integer milliseconds, 0–60000; default 500), `width`/`height`
+(integer logical pixels, 1–16384; defaults 240×40), `gap` (0–1024; default 6),
+and `side` (`top`, `bottom`, `left`, `right`; default `bottom`). Side is a
+preference: the compositor can flip or slide the surface at screen edges.
+This initial text-only tooltip is single-line and ellipsizes; it does not
+automatically measure its native surface size. Keep the child's accessible
+label meaningful rather than relying on the tooltip for essential information.
+
+An enter fade defaults to 120ms; `duration` and `motion = 'auto' | 'reduce' |
+'full'` use the existing animation policy. Auto inherits the trigger's effective
+reduced-motion preference when opening. Dismissal is immediate. Colors inherit
+the trigger's theme. Optional `on_error(error)` receives popup-creation failures.
+See `examples/tooltip-bar.lua` for a 36px bar, including a tooltip around a select.
+
+For custom passive content, `on_interaction_change(active, anchor)` supplies an
+opaque anchor when the active target has visible bounds. Pass it as
+`ouro.popup {anchor=anchor, width=..., height=..., side='bottom', gap=6,
+content=function() ... end}`; unlike menus this may follow a delay. The runtime
+rechecks the target's lifetime, current interaction state, and bounds before
+opening and while visible. A caller cannot forge a parent or reuse a removed
+target. Omitting `anchor` retains the synchronous, input-authorized menu
+contract above. Passive content should be noninteractive; its surface receives
+neither pointer nor keyboard input. Its root is transparent.
+
+This does not change `ouro.anchored` or `ouro.dialog`: those remain in-window
+compositions, not native popup surfaces.
+
 ## Application lifetime and UI activation
 
 An application can run without windows. Its entry module declares shared state,
@@ -2879,7 +2931,7 @@ Lua-build path for both windows. Both mounted
 window owners also read one shared signal, proving dependency identity across
 separate per-window registries sharing one VM.
 
-Boxes and buttons accept `on_interaction_change(active)`. It reports changes
+Boxes and buttons accept `on_interaction_change(active, anchor)`. It reports changes
 to the combined pointer-within or keyboard-focus-within state, including
 descendants, without taking focus or consuming their clicks. Moving between
 children does not toggle the state; losing window keyboard focus stops counting
@@ -2887,6 +2939,9 @@ its retained focus target. Each new observed instance emits its initial state.
 Callbacks run as tasks, not during native input dispatch, and retained instance
 state survives callback replacement. Use a component-owned signal to reveal
 controls while active, with a stable placeholder if layout must not move.
+The optional second argument is an opaque native-popup anchor when active and
+visible; existing one-argument callbacks are unchanged. It carries geometry
+and lifetime identity, not permission to activate a window or grab input.
 
 Buttons also accept `on_cancel()`. Escape from that button or a descendant
 invokes the nearest such handler and returns focus to its button before the

@@ -109,10 +109,12 @@ const PopupHost = struct {
 
     fn open(context: *anyopaque, vm: *lua.Vm, options: @import("../lua/popup.zig").Options) !core.Handle {
         const self: *PopupHost = @ptrCast(@alignCast(context));
-        const parent = runtimeSlotForHandle(self.slots, options.input.window) orelse return error.StalePopupParent;
-        if (!parent.desired or !parent.runtime.instances.isActive(options.input.target)) return error.StalePopupParent;
+        const parent = runtimeSlotForHandle(self.slots, options.anchor.window) orelse return error.StalePopupParent;
+        if (!parent.desired or !parent.runtime.instances.isInteractive(options.anchor.target)) return error.StalePopupParent;
+        if (options.input == null and !passiveAnchorLive(parent, options.anchor)) return error.StalePopupAnchor;
         if (parent.popup != null) return error.NestedPopupUnsupported;
-        for (self.slots) |slot| if (slot.popup != null and slot.desired) return error.PopupAlreadyOpen;
+        for (self.slots) |slot| if (slot.popup != null and slot.desired and slot.popup.?.window.declaration.popup.input != null)
+            return error.PopupAlreadyOpen;
         const slot = for (self.slots) |*candidate| {
             if (candidate.id == null) break candidate;
         } else return error.WindowCapacityExceeded;
@@ -124,11 +126,19 @@ const PopupHost = struct {
         try self.callbacks.ensureAvailable(1);
         const declaration: platform.window.SurfaceDeclaration = .{ .popup = .{
             .id = id,
+            .anchor = options.anchor,
             .input = options.input,
             .width = options.width,
             .height = options.height,
+            .side = options.side,
+            .gap = options.gap,
         } };
         try self.windows.create(declaration);
+        // Native creation retires any passive surface before mapping its
+        // replacement. A tooltip must never prevent a menu from opening.
+        for (self.slots) |*old| if (old.popup != null) {
+            old.desired = false;
+        };
         const handle = self.windows.activeHandleForId(id).?;
         slot.* = .{ .id = id, .desired = true, .popup = .{
             .window = .{ .declaration = declaration, .content_reference = options.content },
@@ -139,8 +149,15 @@ const PopupHost = struct {
             .on_close = options.on_close,
             .handle = handle,
         } };
-        parent.runtime.popup_target = options.input.target;
+        if (options.input != null) parent.runtime.popup_target = options.anchor.target;
         return handle;
+    }
+
+    fn passiveAnchorLive(parent: *RuntimeSlot, anchor: platform.window.PopupAnchor) bool {
+        if (!parent.runtime.instances.isInteractive(anchor.target) or
+            !parent.runtime.pointer_bindings.interactionActive(anchor.target)) return false;
+        const rectangle = parent.runtime.anchorRectangle(anchor.target) catch return false;
+        return std.meta.eql(rectangle, anchor.rectangle);
     }
 
     fn close(context: *anyopaque, handle: core.Handle) void {
@@ -152,13 +169,15 @@ const PopupHost = struct {
 
     fn closing(self: *PopupHost) !void {
         for (self.slots) |*slot| if (slot.popup) |*popup| {
-            const input = popup.window.declaration.popup.input;
-            const parent = runtimeSlotForHandle(self.slots, input.window);
-            if (parent == null or !parent.?.desired or !parent.?.runtime.instances.isActive(input.target) or
+            const declaration = popup.window.declaration.popup;
+            const anchor = declaration.anchor;
+            const parent = runtimeSlotForHandle(self.slots, anchor.window);
+            if (parent == null or !parent.?.desired or !parent.?.runtime.instances.isActive(anchor.target) or
                 self.windows.activeHandleForId(slot.id.?) == null) slot.desired = false;
+            if (slot.desired and declaration.input == null and !passiveAnchorLive(parent.?, anchor)) slot.desired = false;
             if (slot.desired or popup.notified) continue;
             popup.notified = true;
-            if (parent) |value| try value.runtime.restorePopupFocus(input.target);
+            if (declaration.input != null) if (parent) |value| try value.runtime.restorePopupFocus(anchor.target);
             if (popup.on_close >= 0) {
                 _ = popup.vm.spawnReference(popup.owner, popup.on_close, &.{}) catch |err| switch (err) {
                     error.ScopeCanceled => core.Handle.invalid,
@@ -670,6 +689,7 @@ fn runSourceInternal(
                     if (pointer == .button and pointer.button.state == .pressed) {
                         var dismissed = false;
                         for (runtime_slots) |*candidate| if (candidate.popup != null and candidate.desired and
+                            candidate.popup.?.window.declaration.popup.input != null and
                             !sameHandle(candidate.popup.?.handle, pointer.button.window))
                         {
                             candidate.desired = false;
@@ -959,7 +979,7 @@ fn runSourceInternal(
                 );
                 // Grabs are user-initiated. Some layer-shell compositors keep
                 // physical focus on the parent; popupKeyboard routes its keys.
-                slot.runtime.keyboard_focused = slot.popup != null;
+                slot.runtime.keyboard_focused = slot.popup != null and slot.popup.?.window.declaration.popup.input != null;
                 slot.runtime.text_input_surface_focused = false;
                 // Desktop surfaces own their entire configured rectangle.
                 if (window.?.declaration != .toplevel) slot.runtime.root_padding = 0;
@@ -971,7 +991,8 @@ fn runSourceInternal(
             }
             try slot.runtime.setBackground(switch (window.?.declaration) {
                 .layer_surface => |layer| layer.background,
-                .toplevel, .popup => null,
+                .popup => |popup| if (popup.input == null) core.Color{ .r = 0, .g = 0, .b = 0, .a = 0 } else null,
+                .toplevel => null,
             });
             if (slot.configured_size != null and !(try dirty.hasPending(handle)))
                 _ = try dirty.markDirty(handle);
@@ -1956,7 +1977,8 @@ fn popupKeyboard(slots: []RuntimeSlot, event: platform.window.KeyboardEvent) pla
     const source = keyboardWindow(event);
     for (slots) |slot| if (slot.desired) {
         const popup = slot.popup orelse continue;
-        if (!sameHandle(popup.window.declaration.popup.input.window, source)) continue;
+        const input = popup.window.declaration.popup.input orelse continue;
+        if (!sameHandle(input.window, source)) continue;
         var routed = event;
         switch (routed) {
             .enter => |*value| value.window = popup.handle,
@@ -2196,6 +2218,7 @@ test "layer popup keyboard routing isolates parent and preserves physical proven
         .window = .{ .declaration = .{ .popup = .{
             .id = "popup",
             .input = .{ .window = parent, .serial = 123 },
+            .anchor = .{ .window = parent, .target = .invalid, .rectangle = .{ .x = 1, .y = 2, .width = 30, .height = 40 } },
             .width = 200,
             .height = 90,
         } }, .content_reference = -2 },
@@ -2224,6 +2247,8 @@ test "layer popup keyboard routing isolates parent and preserves physical proven
     var direct = key;
     direct.key.window = child;
     try std.testing.expectEqualDeep(direct, popupKeyboard(&slots, direct));
+    slots[0].popup.?.window.declaration.popup.input = null;
+    try std.testing.expectEqualDeep(key, popupKeyboard(&slots, key));
     slots[0].desired = false;
     try std.testing.expectEqualDeep(key, popupKeyboard(&slots, key));
 }

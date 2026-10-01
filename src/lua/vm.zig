@@ -24,6 +24,7 @@ pub const Argument = union(enum) {
     registry: c_int,
     input: @import("../ui/input/listener.zig").Event,
     scroll: @import("../ui/render_object/scroll.zig").Metrics,
+    popup_anchor: @import("../platform/window.zig").PopupAnchor,
 };
 
 const YieldRequest = enum {
@@ -315,6 +316,7 @@ pub const Vm = struct {
             .registry => |reference| _ = c.lua_rawgeti(thread, c.registry_index, reference),
             .input => |event| pushInputEvent(thread, event),
             .scroll => |metrics| pushScrollMetrics(thread, metrics),
+            .popup_anchor => |anchor| @import("popup.zig").pushAnchor(thread, anchor),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;
@@ -362,6 +364,7 @@ pub const Vm = struct {
             .registry => |value| _ = c.lua_rawgeti(thread, c.registry_index, value),
             .input => |event| pushInputEvent(thread, event),
             .scroll => |metrics| pushScrollMetrics(thread, metrics),
+            .popup_anchor => |anchor| @import("popup.zig").pushAnchor(thread, anchor),
         };
         const scheduler_handle = try self.scheduler.createTask(scope);
         var scheduler_created = true;

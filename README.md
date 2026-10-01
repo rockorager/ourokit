@@ -16,7 +16,9 @@ sliders, spinboxes, split views, tabs, and in-window modal dialogs; native text
 inputs support multiline editing. See the
 [form controls example](examples/forms.lua). Animated switches, checkboxes,
 collapsibles, and accordions inherit reduced-motion policy; try the
-[motion components example](examples/motion-components.lua). It is not yet a complete desktop
+[motion components example](examples/motion-components.lua). Native tooltips extend
+outside windows and layer-shell bars without stealing input; try the
+[tooltip bar example](examples/tooltip-bar.lua). It is not yet a complete desktop
 toolkit: OS accessibility and richer data widgets remain unfinished.
 
 ## Application surface
@@ -79,8 +81,11 @@ It tests the CLI artifact from this build, not a previously installed binary,
 and runs again even when the build is cached.
 
 Run as a regular user with Python 3, Sway (including `swaymsg`),
-`dbus-run-session`, `dbus-daemon`, `gdbus`, and system fonts installed. On
-Debian/Ubuntu the additional packages are `sway dbus-daemon libglib2.0-bin`.
+`dbus-run-session`, `dbus-daemon`, `gdbus`, and system fonts installed.
+Native tooltip checks also use `grim`, `wtype`, `wayland-scanner`, and a C
+compiler with Wayland client headers to create a private virtual pointer.
+On Debian/Ubuntu the additional packages are `sway dbus-daemon libglib2.0-bin
+grim wtype libwayland-bin libwayland-dev gcc pkg-config`.
 Missing tools, compositor startup failures, timeouts and failed tests are errors,
 not skipped checks. The compositor and test process groups are stopped on exit.
 This verifies software-rendered native behavior, not GPU presentation latency or

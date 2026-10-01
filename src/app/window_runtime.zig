@@ -1510,8 +1510,18 @@ pub const WindowRuntime = struct {
             if (handler.kind != .interaction_change or !self.instances.isInteractive(entry.target)) continue;
             const active = try self.containsTarget(entry.target, hovered) or try self.containsTarget(entry.target, focused) or
                 try self.containsTarget(entry.target, self.popup_target);
-            if (self.pointer_bindings.interactionChanged(&self.instances, entry.target, active))
-                try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{.{ .boolean = active }});
+            if (self.pointer_bindings.interactionChanged(&self.instances, entry.target, active)) {
+                if (active) {
+                    const rectangle: ?core.RectI = self.anchorRectangle(entry.target) catch |err| switch (err) {
+                        error.LayoutRequired, error.PopupAnchorNotVisible => null,
+                        else => return err,
+                    };
+                    if (rectangle) |bounds| try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{
+                        .{ .boolean = true },
+                        .{ .popup_anchor = .{ .window = self.window, .target = entry.target, .rectangle = bounds } },
+                    }) else try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{.{ .boolean = true }});
+                } else try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{.{ .boolean = false }});
+            }
         }
     }
 

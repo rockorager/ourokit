@@ -2295,6 +2295,26 @@ test "accordion controls a single expanded key and skips disabled triggers" {
     try std.testing.expectEqual(null, try f.runtime.animationDelay());
 }
 
+test "tooltip declarations reject invalid trigger timing placement and dimensions" {
+    for ([_][]const u8{
+        "ouro.tooltip {key='t',text='Tip'}",
+        "ouro.tooltip {key='t',text='',ouro.box{key='child'}}",
+        "ouro.tooltip {key='t',text='Tip',ouro.box{key='one'},ouro.box{key='two'}}",
+        "ouro.tooltip {key='t',text='Tip',delay=-1,ouro.box{key='child'}}",
+        "ouro.tooltip {key='t',text='Tip',delay=false,ouro.box{key='child'}}",
+        "ouro.tooltip {key='t',text='Tip',width=0,ouro.box{key='child'}}",
+        "ouro.tooltip {key='t',text='Tip',height=1.5,ouro.box{key='child'}}",
+        "ouro.tooltip {key='t',text='Tip',gap=1025,ouro.box{key='child'}}",
+        "ouro.tooltip {key='t',text='Tip',side='above',ouro.box{key='child'}}",
+        "ouro.tooltip {key='t',text='Tip',enabled=0,ouro.box{key='child'}}",
+        "ouro.tooltip {key='t',text='Tip',motion='sometimes',ouro.box{key='child'}}",
+    }) |declaration| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
+    }
+}
+
 test "animated component declarations reject invalid motion disclosure and factor inputs" {
     for ([_][]const u8{
         "ouro.switch {key='s',label='Switch',checked=true,motion='sometimes'}",

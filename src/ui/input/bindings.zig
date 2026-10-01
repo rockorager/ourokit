@@ -116,6 +116,12 @@ pub const PointerBindings = struct {
     }
 
     /// State survives callback replacement, but never instance removal or reuse.
+    pub fn interactionActive(self: *const PointerBindings, target: instance.InstanceHandle) bool {
+        if (self.getKind(target, .interaction_change) == null) return false;
+        for (self.interactions) |state| if (same(state.target, target)) return state.active;
+        return false;
+    }
+
     pub fn interactionChanged(self: *PointerBindings, tree: *instance.Tree, target: instance.InstanceHandle, active: bool) bool {
         var empty: ?*InteractionState = null;
         for (self.interactions) |*state| {
