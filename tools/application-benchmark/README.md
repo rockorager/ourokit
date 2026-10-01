@@ -1,13 +1,13 @@
 # Application benchmark
 
-This benchmark compares three small Wayland applications using either of two
+This benchmark compares small Wayland applications using either of two
 matched profiles:
 
 - `button` (default): one 480×320 window and one 160×44 clickable,
   text-labelled control;
 - `settings`: one 560×360 window with a heading, a counter label, and a row of
   160×40 Increment and disabled controls. Increment updates the counter in all
-  three applications.
+  applications.
 
 Ourokit uses its Lua instance/reconciliation path, HarfBuzz shaping, FreeType
 software glyph cache, display list, Wayring adapter, and shared raw `io_uring`.
@@ -20,7 +20,7 @@ Build the release binaries:
 ZIG=/path/to/zig-0.16.0 tools/application-benchmark/build.sh
 ```
 
-The benchmark entry point explicitly disables Vulkan. `settings.lua` is a
+The benchmark entry point defaults to software rendering. `settings.lua` is a
 benchmark-owned fixture, not the evolving widget gallery. Do not compare old
 results that initialized Vulkan or included the gallery's text field to this
 software-only matched workload.
@@ -56,6 +56,186 @@ in RSS but mostly discounted by PSS and private-memory figures, so retain all
 three columns. The GTK/Qt comparison does not claim event latency:
 a valid comparison needs the same injected input timestamp and a compositor-
 observed presentation timestamp for all three applications.
+
+## Optional pinned GPUI comparison
+
+`gpui/` implements the same button and settings workloads with GPUI entities,
+flex layout, text, and clickable divs. Its disabled control has no handler.
+It uses a real Wayland window via `gpui_platform`, not GPUI's headless mode.
+Cargo pins both crates to the same Zed revision and checks in the dependency
+lockfile; `rust-toolchain.toml` pins the upstream Rust version. Linux build
+prerequisites include a C/C++ toolchain, pkg-config, and development libraries
+for Wayland, xkbcommon, fontconfig, FreeType, and Vulkan/GL drivers at runtime.
+Python 3.11+ is required by the build helper.
+
+```sh
+zig build build-application-benchmark -Doptimize=ReleaseFast
+strip zig-out/benchmark-apps/ourokit zig-out/benchmark-apps/ourokit-settings
+python3 tools/application-benchmark/build_gpui.py --jobs 2
+python3 tools/application-benchmark/run.py --toolkits ourokit gpui \
+  --ourokit-renderer vulkan --iterations 20 --warmups 3 --idle-seconds 5 \
+  --environment-description 'Record GPU, driver, Sway backend, and validation evidence here' \
+  --output gpui-button.json
+python3 tools/application-benchmark/run.py --toolkits ourokit gpui \
+  --ourokit-renderer vulkan --profile settings --iterations 20 --warmups 3 \
+  --idle-seconds 5 --output gpui-settings.json
+```
+
+`--toolkits` defaults to the original Ourokit/GTK/Qt comparison; installing
+GPUI is optional. The build helper records compiler, source, lockfile, and
+binary hashes beside the executable. The harness rejects a GPUI binary that
+does not match that metadata. JSON retains launch diagnostics, warmup samples,
+selected command arguments, and the local worktree status.
+
+**Requesting Vulkan is not proof of GPU presentation.** Ourokit can fall back
+to software if DMA-BUF export/import is unavailable. Outside measurements,
+verify its Wayland DMA-BUF creation, surface attachment, and presentation
+feedback, and retain GPUI's adapter/backend diagnostic. Both must use the
+intended hardware device for a hardware comparison. Turn protocol tracing off
+before measuring; llvmpipe results are not hardware GPU results.
+
+This measures whole-application startup, CPU memory, and idle activity—not
+layout throughput, scrolling throughput, frame latency, or shader performance.
+GPU allocations are not included in the process memory columns. Headless
+Sway can exercise hardware rendering but cannot establish physical-display
+latency. Controls match dimensions and behavior, not font shaping or pixels;
+this fixture is not the full Zed application. Keep binary versions, compositor,
+power conditions, and measurement protocol with any reported result.
+
+## Matched large-list and rebuild frame workloads
+
+The optional `workload` binary compares three programmatically driven workloads
+against GPUI on the same Wayland Vulkan setup:
+
+- `scroll`: 10,000 virtualized rows, moving down 14 pixels each generation;
+- `rebuild`: 1,000 nonvirtualized keyed rows, changing every label each generation;
+- `relayout`: 1,000 nonvirtualized keyed rows with unchanged labels, alternating
+  every row's height between 28 and 32 pixels.
+
+Both implementations use a 640×720 viewport at scale 1, the repository's embedded
+Source Sans 3 Regular at 14 pixels, a natural 18.5625-pixel text line, four-pixel
+row padding, alternating row backgrounds, and the same labels. Ordinary rows
+are 28 pixels high. This pins typography separately from the earlier small
+application fixtures, whose default fonts and line heights differ.
+
+```sh
+zig build build-frame-workload -Doptimize=ReleaseFast
+python3 tools/application-benchmark/build_gpui.py --workload --jobs 2
+python3 tools/application-benchmark/workload.py --iterations 5 \
+  --frames 331 --warmup-frames 31 \
+  --environment-description 'GPU; driver; compositor backend/mode; power conditions' \
+  --output workload-results.json
+```
+
+Run inside the same disposable, unobstructed compositor/session bus used above.
+Finish builds and screenshot/protocol checks before measuring. GPUI profiling is
+enabled only for the opt-in workload build. Validate hardware selection and
+DMA-BUF presentation outside measurements; the native workload refuses software
+fallback. Both workloads require keyboard focus and scale 1. A headless seat
+without a keyboard leaves GPUI inactive and triggers its default 30 Hz animation
+throttle; use a persistent private virtual keyboard with a keymap, but no injected
+keys, rather than changing toolkit throttling policy. Verify focus before measuring.
+For capture checks, either executable accepts `--hold-ms 5000` after
+its arguments: Ourokit uses `scroll 2`, GPUI uses `--profile scroll --frames 2`.
+
+`build_ns` measures Ourokit reconciliation/layout/display-list generation or
+GPUI's public `Draw` span. `submit_ns` measures native GPU encoding/host submission
+or GPUI's synchronous platform `Present` span. Their sum, `work_ns`, is **CPU-side
+wall time**, including any blocking inside those spans, not GPU execution time.
+State mutation, initialization, and callback waits are outside these spans.
+Ourokit acquires a reusable buffer outside its submission span; GPUI's platform
+span includes surface-texture acquisition. Instrumentation boundaries therefore
+differ; phase names do not imply identical internal work. GPUI requires exactly one
+same-window Draw/Present pair for each generation and collects the final pair
+before quitting. Logging and serialization happen after the timed loop.
+
+Both workloads are paced by Wayland frame callbacks. Submission intervals are
+recorded separately and are **not presentation timestamps**. Work exceeding
+16.67 ms is not a dropped-frame count. This does not measure physical input
+latency, display latency, or uncapped throughput.
+
+The harness randomizes toolkit/profile order within each independent iteration,
+discards the first 31 of 331 frames by default, and reports nearest-rank
+percentiles within each run. Do not pool frames as independent experiments.
+JSON preserves every raw frame, diagnostics, hashes, environment, and failure;
+completed runs are saved before starting the next. Retained row/offset checks
+guard against measuring an unchanged scene. Report virtualized scrolling
+separately from full-list rebuilding rather than treating them as interchangeable
+list benchmarks.
+
+## Sparse updates and sustained churn
+
+`retained.py` runs four diagnostic profiles, optionally paired with GPUI.
+The original three matched workloads remain available.
+
+- `sparse-parent`: rebuild the parent of 1,000 rows when only row 7's label
+  changes. All other labels and row geometry stay unchanged.
+- `sparse-leaf`: make the same change through a signal read by one retained
+  stateful row. Report root and row callback counts rather than assuming that
+  isolation avoids all native reconciliation or layout work.
+- `sustained-scroll`: traverse a 10,000-row virtual list at four rows per
+  generation, reversing every 2,400 generations. The default long run covers
+  two full out-and-back cycles after warmup. This updates the root's
+  `scroll_to` request through a signal; it does not inject wheel input or
+  isolate the native input-driven scroll path.
+- `keyed-churn`: repeatedly reverse, rotate by 17 rows, then replace the oldest
+  eight of 1,000 rows with new identities. The native probe checks every row's
+  text/geometry and verifies that surviving row handles do not change.
+
+```sh
+zig build build-frame-workload -Doptimize=ReleaseFast
+python3 tools/application-benchmark/retained.py \
+  --binary zig-out/benchmark-apps/ourokit-workload \
+  --environment-description 'GPU, driver, compositor mode, CPU and governors' \
+  --output retained-results.json
+```
+
+For a quick matched comparison (one process per toolkit/profile, 300 measured
+frames each, roughly 45 seconds of timing after setup):
+
+```sh
+python3 tools/application-benchmark/build_gpui.py --workload --jobs 2
+python3 tools/application-benchmark/retained.py \
+  --binary zig-out/benchmark-apps/ourokit-workload \
+  --gpui-binary zig-out/benchmark-apps/gpui-workload \
+  --iterations 1 --sparse-frames 331 --sustained-frames 331 --warmup-frames 31 \
+  --environment-description 'GPU, driver, compositor mode, CPU and governors' \
+  --output retained-comparison.json
+```
+
+Each toolkit pair runs consecutively, with alternating starting toolkit across
+profiles and repetitions. GPUI's leaf profile retains 1,000 cached row entities
+and notifies only row 7; actual root/row callbacks are reported, not assumed to
+match Ourokit's invalidation behavior. Keys, values, order, typography, geometry
+and scroll offsets match. GPUI checks row values/order and bounds; native checks
+also cover instance-handle survival. Validate screenshots before timing.
+The short run does not reach scroll reversal and cannot establish memory trends.
+Acquisition boundaries still differ as documented above; compare CPU work, not
+presentation latency. Native cache/layout gauges and `cycle_work` have no GPUI
+equivalent in this probe.
+
+Use the same focused private Wayland/Vulkan setup described above. Defaults are
+three independent runs per profile, 331 sparse or 9,631 sustained generations,
+with 31 warmups excluded. At 60 Hz, each sustained run takes about 160 seconds;
+the native-only suite takes roughly 17 minutes plus setup (twice that paired).
+No builds, profiling or
+captures should overlap measurement. Existing output paths are rejected.
+
+Each run preserves raw samples, phase distributions and 600-generation windows
+for early/late comparisons. `work` remains build plus submit; `cycle_work` also
+includes state mutation, cancellation/retirement and acquisition calls. Neither
+includes callback waits, diagnostic validation, all event-loop overhead, or
+display latency. Callback counters add instrumentation overhead. Layout counts
+count entire layout phases, **not individual nodes visited**.
+
+Lua heap queries do not force GC: they measure managed bytes, not allocations
+or GC-pause time. Cache fields report live entries, index capacity and slab
+counts, not byte consumption. A 1 Hz `/proc/PID/smaps_rollup` sampler preserves
+RSS/PSS/private KiB and read durations; it excludes startup, warmup and result
+serialization from `measured_memory`. GPU allocations are not included. Sample
+storage is allocated and touched before measurement so filling the trace does
+not look like an application leak. Report memory ranges and trends over the
+observed duration; a plateau is not proof that no longer-term leak exists.
 
 ## Idle accounting is not a wakeup counter
 

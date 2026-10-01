@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Measure matched Ourokit, GTK, and Qt Wayland applications.
+"""Measure matched Ourokit, GTK, Qt, and optional GPUI Wayland applications.
 
 Startup ends at Sway's `window::new` event. That event is emitted when an
-xdg-toplevel maps with its first buffer, giving all three applications one
+xdg-toplevel maps with its first buffer, giving all selected applications one
 compositor-observed boundary rather than toolkit-specific readiness hooks.
 """
 
@@ -197,6 +197,8 @@ def run_once(name, app, settle_seconds, timeout, idle_seconds):
         }
         time.sleep(idle_seconds)
         result["idle"] = idle_delta(before, activity_snapshot(process.pid), os.sysconf("SC_CLK_TCK"))
+        errors.seek(0)
+        result["diagnostics"] = errors.read(65536).decode(errors="replace")
     except Exception as error:
         errors.seek(0)
         diagnostic = errors.read(8192).decode(errors="replace")
@@ -224,6 +226,31 @@ def command_output(arguments):
     return subprocess.check_output(arguments, text=True).strip()
 
 
+def applications(binaries, profile, toolkits, ourokit_renderer):
+    settings = profile == "settings"
+    all_apps = {
+        "ourokit": ("Ourokit", {
+            "binary": binaries / ("ourokit-settings" if settings else "ourokit"),
+            "app_id": "dev.ourokit.benchmark.settings.ourokit" if settings else "dev.ourokit.benchmark.ourokit",
+            "arguments": ["--vulkan"] if ourokit_renderer == "vulkan" else [],
+        }),
+        "gtk": ("GTK 4", {"binary": binaries / "gtk", "app_id": "dev.ourokit.benchmark.gtk",
+                          "arguments": ["--settings"] if settings else []}),
+        "qt": ("Qt 6", {"binary": binaries / "qt", "app_id": "dev.ourokit.benchmark.qt",
+                        "arguments": ["--settings"] if settings else []}),
+        "gpui": ("GPUI", {"binary": binaries / "gpui", "app_id": "dev.ourokit.benchmark.gpui",
+                          "arguments": ["--settings"] if settings else []}),
+    }
+    return dict(all_apps[key] for key in toolkits)
+
+
+def gpui_build_metadata(binary):
+    metadata = json.loads((binary.parent / "gpui-build.json").read_text())
+    if metadata["binary_sha256"] != hashlib.sha256(binary.read_bytes()).hexdigest():
+        raise RuntimeError("GPUI binary does not match its build metadata; rebuild it")
+    return metadata
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=20)
@@ -233,7 +260,14 @@ def main():
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--profile", choices=("button", "settings"), default="button")
+    parser.add_argument("--toolkits", nargs="+", choices=("ourokit", "gtk", "qt", "gpui"),
+                        default=["ourokit", "gtk", "qt"])
+    parser.add_argument("--ourokit-renderer", choices=("software", "vulkan"), default="software")
+    parser.add_argument("--environment-description", default="",
+                        help="GPU/driver, compositor backend, and separately verified renderer evidence")
     args = parser.parse_args()
+    if len(set(args.toolkits)) != len(args.toolkits):
+        parser.error("toolkits must be unique")
     if args.iterations < 1 or args.warmups < 0 or args.settle_ms < 0:
         parser.error("iteration counts and settle time must be non-negative")
     if any(not math.isfinite(value) or value <= 0 for value in (args.idle_seconds, args.timeout)):
@@ -241,43 +275,15 @@ def main():
 
     root = Path(__file__).resolve().parents[2]
     binaries = root / "zig-out" / "benchmark-apps"
-    apps = {
-        "Ourokit": {
-            "binary": binaries / "ourokit",
-            "app_id": "dev.ourokit.benchmark.ourokit",
-        },
-        "GTK 4": {
-            "binary": binaries / "gtk",
-            "app_id": "dev.ourokit.benchmark.gtk",
-        },
-        "Qt 6": {
-            "binary": binaries / "qt",
-            "app_id": "dev.ourokit.benchmark.qt",
-        },
-    }
-    if args.profile == "settings":
-        apps = {
-            "Ourokit": {
-                "binary": binaries / "ourokit-settings",
-                "app_id": "dev.ourokit.benchmark.settings.ourokit",
-            },
-            "GTK 4": {
-                "binary": binaries / "gtk",
-                "app_id": "dev.ourokit.benchmark.gtk",
-                "arguments": ["--settings"],
-            },
-            "Qt 6": {
-                "binary": binaries / "qt",
-                "app_id": "dev.ourokit.benchmark.qt",
-                "arguments": ["--settings"],
-            },
-        }
+    apps = applications(binaries, args.profile, args.toolkits, args.ourokit_renderer)
     missing = [str(app["binary"]) for app in apps.values() if not app["binary"].is_file()]
     if missing:
         raise RuntimeError("build benchmarks first; missing: " + ", ".join(missing))
+    gpui_build = gpui_build_metadata(apps["GPUI"]["binary"]) if "GPUI" in apps else None
 
     randomizer = random.Random(0x0A0B0C)
     samples = {name: [] for name in apps}
+    warmups = {name: [] for name in apps}
     for round_index in range(args.warmups + args.iterations):
         order = list(apps)
         randomizer.shuffle(order)
@@ -286,6 +292,8 @@ def main():
             sample = run_once(name, apps[name], args.settle_ms / 1000.0, args.timeout, args.idle_seconds)
             if measured:
                 samples[name].append(sample)
+            else:
+                warmups[name].append(sample)
         print(
             f"{'measure' if measured else 'warmup'} "
             f"{round_index + 1}/{args.warmups + args.iterations}",
@@ -311,25 +319,31 @@ def main():
 
     if args.output:
         document = {
-            "schema_version": 2,
+            "schema_version": 3,
             "environment": {
+                "description": args.environment_description,
                 "platform": sys.platform,
                 "kernel": command_output(["uname", "-srmo"]),
                 "sway": command_output(["sway", "--version"]),
-                "gtk": command_output(["pkg-config", "--modversion", "gtk4"]),
-                "qt": command_output(["pkg-config", "--modversion", "Qt6Widgets"]),
+                "gtk": command_output(["pkg-config", "--modversion", "gtk4"]) if "GTK 4" in apps else None,
+                "qt": command_output(["pkg-config", "--modversion", "Qt6Widgets"]) if "Qt 6" in apps else None,
+                "gpui_build": gpui_build,
                 "cpu": next(line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")),
                 "affinity": sorted(os.sched_getaffinity(0)),
                 "load_average": os.getloadavg(),
                 "outputs": json.loads(command_output(["swaymsg", "-t", "get_outputs", "-r"])),
                 "revision": command_output(["git", "-C", str(root), "rev-parse", "HEAD"]),
+                "worktree_status": command_output(["git", "-C", str(root), "status", "--porcelain"]),
                 "binaries_sha256": {name: hashlib.sha256(app["binary"].read_bytes()).hexdigest() for name, app in apps.items()},
+                "arguments": {name: app.get("arguments", []) for name, app in apps.items()},
             },
             "protocol": {
                 "startup_boundary": "process launch to Sway window::new",
                 "settle_ms": args.settle_ms,
                 "idle_seconds": args.idle_seconds,
-                "ourokit_renderer": "software explicitly selected; no Vulkan initialization",
+                "ourokit_renderer": "software explicitly selected; no Vulkan initialization" if args.ourokit_renderer == "software" else "Vulkan requested; verify actual dma-buf presentation separately (fallback is possible)",
+                "gpui_renderer": "WGPU Wayland surface; selected adapter/backend retained in diagnostics" if "GPUI" in apps else None,
+                "renderer_limitations": "This is whole-application startup/memory/idle, not renderer throughput or presentation latency. GPU memory and compositor CPU are not included in process memory/CPU.",
                 "cpu_boundary": "process launch through settle; process utime+stime, includes all threads; tick resolution",
                 "idle_boundary": "two /proc snapshots after settle; sum schedstat runtime and status context switches over live tasks",
                 "idle_limitations": "boundary-stable tasks only; threads born and exited between snapshots are invisible to schedstat/status, but included in process CPU ticks; child processes and compositor excluded",
@@ -340,6 +354,7 @@ def main():
                 "profile": args.profile,
             },
             "samples": samples,
+            "warmup_samples": warmups,
         }
         args.output.write_text(json.dumps(document, indent=2) + "\n")
 

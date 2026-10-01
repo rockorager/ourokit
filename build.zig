@@ -683,6 +683,26 @@ fn addWaylandExample(
         .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
         .dest_sub_path = "ourokit-scroll",
     });
+    const workload = b.addExecutable(.{
+        .name = "ourokit-frame-workload",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/application-benchmark/workload.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+        }),
+    });
+    workload.root_module.addAnonymousImport("benchmark_stories", .{
+        .root_source_file = b.path("tools/application-benchmark/workload.lua"),
+    });
+    workload.root_module.addAnonymousImport("benchmark_font", .{
+        .root_source_file = b.path("src/text/fonts/SourceSans3-Regular.otf"),
+    });
+    const install_workload = b.addInstallArtifact(workload, .{
+        .dest_dir = .{ .override = .{ .custom = "benchmark-apps" } },
+        .dest_sub_path = "ourokit-workload",
+    });
+    b.step("build-frame-workload", "Build the matched Vulkan list/rebuild benchmark").dependOn(&install_workload.step);
     const benchmark_step = b.step(
         "build-application-benchmark",
         "Build the Ourokit application used by the GTK/Qt comparison",
