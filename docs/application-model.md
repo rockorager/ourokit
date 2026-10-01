@@ -509,6 +509,11 @@ the button. The compositor may flip or slide it on either axis, without
 resizing the parent. Only one popup may be open; nesting is not supported.
 Failure returns `nil, { name = ..., message = ... }`.
 
+`transparent=true` removes the native root's background for custom fades or
+shaped content; it defaults to false for grabbing popups. This does not change
+the rectangular input region or grab policy. Passive popups always have a
+transparent root.
+
 The first enabled focusable item receives logical focus. Escape, outside
 click, compositor dismissal, `menu:close()`, opener disposal, or parent teardown
 closes the menu. `close()` is idempotent and legal during render: it requests
@@ -528,6 +533,41 @@ popup and preserves the physical source for activation. Keyboard opening uses
 the actual keyboard serial, never a previous pointer serial. Compositors that
 only accept pointer serials for popup grabs cannot support keyboard opening;
 use an Ouro build with keyboard-initiated popup-grab support.
+
+### Animated menus and selects
+
+`ouro.menu_button` combines a button trigger with a grabbing native popup:
+
+```lua
+ouro.menu_button {
+  key='actions', label='Workspace actions', popup_width=240, popup_height=80,
+  content=function(close)
+    return ouro.column {key='items', cross_alignment='stretch',
+      ouro.button {key='save', label='Save', variant='ghost',
+        on_press=function() close(); save_workspace() end},
+      ouro.button {key='settings', label='Settings', variant='ghost',
+        on_press=function() close(); open_settings() end}}
+  end,
+}
+```
+
+`content(close)` is a render callback; invoke `close` from an item action, not
+while constructing the content. `popup_width`/`popup_height` default to 240×200
+integer logical pixels. Button options include `label`, `variant`, `tone`,
+`width`, `height`, `flex`, `enabled`, `focus_request`, and custom children.
+Optional `on_error(error)` handles opening failures. Disabling or removing the
+trigger closes its popup. Content uses ordinary button Tab traversal; this is
+not a menu-item role, roving-arrow menu, or nested-menu implementation.
+
+Menus and `ouro.select` share a 120ms ease-out entry fade and scale from 0.98 to
+1. `duration` overrides the nonnegative integer milliseconds; `motion` accepts
+`'auto'` (default), `'reduce'`, or `'full'`. Auto captures the opener's effective
+reduced-motion preference at opening, including desktop and enclosing-theme
+policy. Reduced motion starts at the endpoint with no animation wakeups.
+Popup colors also inherit the opener's effective theme. The scale origin is
+the nominal top-right anchor; it does not track compositor flips or slides.
+Dismissal is immediate, including during entry, so animation never prolongs a
+grab. Selection preview, commit/cancel, and focus restoration are unchanged.
 
 ### Tooltips outside the parent window
 
@@ -2013,6 +2053,47 @@ bridge. Run `examples/motion-components.lua` for the interactive showcase or
 snapshot `examples/motion-storybook.lua` for light, dark, disabled, focused, and
 expanded states. `tests/motion_components.py` exercises the native application
 and can record compositor videos with `--record-dir` (requires `wf-recorder`).
+
+### Application-owned toasts
+
+`ouro.toast` is a controlled, in-window notification card, not an OS notification
+or a native popup. Place it in a bounded-width column with `gap=0`; each card
+includes an 8px trailing gap that collapses with its height:
+
+```lua
+local saved = ouro.signal(false)
+ouro.column {key='notifications', width=340, gap=0,
+  ouro.toast {key='saved', present=saved(), message='Changes saved',
+    on_dismiss=function(reason) saved:set(false) end}}
+```
+
+Keep the declaration mounted and set `present=false` to animate its exit.
+Entry/exit combine a 16px horizontal slide, opacity, and natural-height reveal
+(180ms ease-out by default). `duration` and `motion` use the toggle policy;
+reduced motion snaps to the endpoint. Exiting content becomes noninteractive
+immediately. Reversals retain the current reveal geometry without jumping.
+Settled toasts request no animation frames.
+
+Required fields are `present` (boolean), `message` (nonempty string), and
+`on_dismiss(reason)`. The callback receives `'manual'` from the labeled dismiss
+button or `'timeout'` from expiration, once per presentation. It requests a
+state change; the caller must update `present`. Messages wrap to at most three
+lines, then ellipsize. `width` defaults to `'fill'`.
+
+`timeout` defaults to 5000 integer milliseconds (0–86400000); 0 makes it sticky.
+The budget begins when the live card mounts, including entry time. Hover or
+keyboard focus within **that card** pauses the budget; leaving both resumes
+the remaining time, not a fresh duration. Other cards continue counting down,
+and window blur does not pause the whole stack. Setting `present=false` or
+removing the card cancels its timer scope. Reopening/reversing an exit or changing
+`timeout` starts a fresh budget. Updating just the message does not reset it.
+There is no global queue, swipe gesture, automatic focus stealing, or screen
+reader live-region bridge. Use desktop notification services for notifications
+that must outlive the window.
+
+Run `examples/menus-and-toasts.lua` for normal/reduced motion and auto-dismiss.
+`tests/menus_and_toasts.py --record-dir <directory>` records both modes using
+`wf-recorder` on a disposable compositor.
 
 ### In-window modal dialogs
 

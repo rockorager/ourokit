@@ -36,15 +36,17 @@ pub fn install(state: *c.State) !void {
     c.lua_pushcclosure(state, valueType, 0);
     c.lua_pushcclosure(state, validateAppearance, 0);
     c.lua_pushcclosure(state, normalize, 0);
-    if (c.lua_pcallk(state, 5, 0, 0, 0, null) != c.ok)
+    if (c.lua_pcallk(state, 5, 1, 0, 0, null) != c.ok)
         return error.FormsInitializationFailed;
     const source = @embedFile("forms.lua");
     if (c.luaL_loadbufferx(state, source, source.len, "=ouro.forms", "t") != c.ok)
         return error.FormsInitializationFailed;
     c.lua_pushvalue(state, api);
     c.lua_pushcclosure(state, normalize, 0);
-    if (c.lua_pcallk(state, 2, 0, 0, 0, null) != c.ok)
+    c.lua_pushvalue(state, api + 1); // Shared menu composition, not public API.
+    if (c.lua_pcallk(state, 3, 0, 0, 0, null) != c.ok)
         return error.FormsInitializationFailed;
+    c.lua_settop(state, api);
 }
 
 fn check(state: *c.State) callconv(.c) c_int {

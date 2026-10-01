@@ -406,3 +406,106 @@ end
 ouro.option = ouro.stateless(function(p, children, theme, context) return selection_item(p, children, theme, context, false) end)
 ouro.radio = ouro.stateless(function(p, children, theme, context) return selection_item(p, children, theme, context, false) end)
 ouro.tab = ouro.stateless(function(p, children, theme, context) return selection_item(p, children, theme, context, true) end)
+
+-- Capture the opener's effective theme in task phase, before crossing into a
+-- new native surface. Animation never delays acquiring or releasing the grab.
+local MenuTrigger = ouro.stateless(function(p, children, theme)
+  return ouro.button {key=p.key, label=p.label, variant=p.variant, tone=p.tone,
+    width=p.width, height=p.height, flex=p.flex, enabled=p.enabled, focus_request=p.focus_request,
+    on_press=function() p.open(theme) end, children=children}
+end)
+local function openMenu(p, theme, content, on_close)
+  local policy = p.motion
+  if policy == nil or policy == 'auto' then policy = theme.reduced_motion and 'reduce' or 'full' end
+  return ouro.popup {width=p.popup_width or 240, height=p.popup_height or 200, transparent=true,
+    on_close=on_close, content=function()
+      return ouro.transition {key='motion', initial=0, target=1, duration=p.duration or 120,
+        motion=policy, easing='ease_out', render=function(value)
+          return ouro.box {key='surface', width='fill', height='fill', opacity=value,
+            transform={scale=0.98+0.02*value, origin={x=p.popup_width or 240,y=0}},
+            ouro.theme {key='theme', colors=theme.colors, reduced_motion=theme.reduced_motion,
+              content()}}
+        end}
+    end}
+end
+
+ouro.menu_button = ouro.stateful(function(p)
+  local popup
+  local function close() if popup then popup:close(); popup=nil end end
+  local function open(theme)
+    local handle, err = openMenu(p, theme, function() return p.content(close) end,
+      function() popup=nil end)
+    if handle then popup=handle
+    elseif p.on_error then p.on_error(err) else error(err.message) end
+  end
+  return function()
+    motion(p)
+    check(kind(p.content) == 'function', 'menu_button content required')
+    for _, name in ipairs({'popup_width','popup_height'}) do
+      check(p[name] == nil or (kind(p[name]) == 'number' and p[name] % 1 == 0 and p[name] >= 1 and p[name] <= 16384), 'invalid '..name)
+    end
+    check(p.on_error == nil or kind(p.on_error) == 'function', 'invalid menu_button on_error')
+    if not enabled(p) then close() end
+    return MenuTrigger {key='trigger', label=p.label, variant=p.variant, tone=p.tone,
+      width=p.width, height=p.height, flex=p.flex, enabled=p.enabled, focus_request=p.focus_request,
+      open=open, children=p.children}
+  end
+end)
+
+local ToastCard = ouro.stateless(function(p, children, theme)
+  return ouro.box {key='card', width='fill', padding=12, radius=8,
+    background=theme.colors.card, border=theme.colors.border, border_width=1,
+    on_interaction_change=p.observe,
+    ouro.row {key='row', gap=12, cross_alignment='center',
+      ouro.text {key='message', text=p.message, flex=1, max_lines=3, overflow='ellipsis'},
+      ouro.button {key='dismiss', label='Dismiss notification', variant='ghost', tone='neutral',
+        width=32, on_press=p.dismiss, ouro.text {key='mark',text='×',semantic=false}}}}
+end)
+-- The live card owns its timer tasks. Exiting replaces it with a paint-only
+-- card, canceling the timer scope; reversal mounts a fresh expiration budget.
+local TimedToast = ouro.stateful(function(p)
+  local remaining, deadline, sleeping, dismissed = p.timeout, nil, false, false
+  local function dismiss(reason)
+    if dismissed then return end
+    dismissed=true; deadline=nil
+    p.on_dismiss(reason)
+  end
+  local function observe(active)
+    if deadline then remaining=math.max(0,deadline-ouro._monotonic_ms()); deadline=nil end
+    if active or dismissed then return end
+    deadline=ouro._monotonic_ms()+remaining
+    -- Keep at most one sleeping task, even with repeated hover/focus changes.
+    -- A resumed deadline can move later while that task is already asleep.
+    if sleeping then return end
+    sleeping=true
+    while deadline do
+      local delay=deadline-ouro._monotonic_ms()
+      if delay <= 0 then dismiss('timeout'); break end
+      ouro.sleep(delay)
+    end
+    sleeping=false
+  end
+  return function()
+    return ToastCard {key='body', message=p.message,
+      observe=p.timeout > 0 and observe or nil, dismiss=function() dismiss('manual') end}
+  end
+end)
+ouro.toast = ouro.stateless(function(p, children)
+  check(#children == 0, 'toast does not accept children')
+  check(kind(p.present) == 'boolean', 'toast present must be boolean')
+  check(kind(p.message) == 'string' and #p.message > 0, 'toast message required')
+  check(kind(p.on_dismiss) == 'function', 'toast on_dismiss required')
+  local timeout=p.timeout
+  if timeout == nil then timeout=5000 end
+  check(kind(timeout) == 'number' and timeout % 1 == 0 and timeout >= 0 and timeout <= 86400000, 'invalid toast timeout')
+  local duration=motion(p)
+  return ouro.presence {key=p.key, present=p.present, duration=duration, easing='ease_out', motion=p.motion,
+    render=function(value)
+      return ouro.box {key='reveal', width=p.width or 'fill', height_factor=value, clip=true,
+        ouro.box {key='spacing', padding_bottom=8, opacity=value, transform={x=16*(1-value)},
+          p.present and TimedToast {key='live-'..timeout, message=p.message, timeout=timeout, on_dismiss=p.on_dismiss}
+          or ToastCard {key='exit', message=p.message}}}
+    end}
+end)
+
+return {open=openMenu, trigger=MenuTrigger, validate=motion}

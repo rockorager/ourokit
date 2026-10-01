@@ -129,11 +129,15 @@ def session():
             draft = node(snapshot(), EDITOR)['value']
             assert '!' in draft, draft
             invoke('Close')
-            closing = snapshot()
-            assert not node(closing, EDITOR)['enabled']
+            # Inspection can consume the entire 240ms exit on a debug software
+            # renderer. Queue reversal before doing a round-trip inspection.
             invoke('Open'); pause()
             assert node(snapshot(), EDITOR)['id'] == editor_id
             assert node(snapshot(), EDITOR)['value'] == draft, (draft, node(snapshot(), EDITOR)['value'])
+            invoke('Close')
+            closing = snapshot()
+            assert not any(n['path'] == EDITOR and n['enabled'] for n in closing['nodes'])
+            invoke('Open'); pause()
             input_(action='click', target=FAQ + 'item-motion/trigger'); pause()
             input_(action='click', target=FAQ + 'item-keyboard/trigger'); pause()
             assert node(snapshot(), FAQ + 'item-motion/trigger')['expanded'] is False

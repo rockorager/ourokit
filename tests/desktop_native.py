@@ -587,8 +587,12 @@ def forms_test(root, env):
             sway(env, 'seat', 'seat0', 'cursor', 'set', str(x), str(y))
             sway(env, 'seat', 'seat0', 'cursor', 'press', 'button1')
             sway(env, 'seat', 'seat0', 'cursor', 'release', 'button1')
-            return wait_for(lambda: next((w['window'] for w in inspect(env, endpoint)['windows']
+            popup = wait_for(lambda: next((w['window'] for w in inspect(env, endpoint)['windows']
                                          if w['window'].startswith('__ouro_popup_')), None), 'select popup unavailable')
+            # This suite replays token-bound inputs against settled geometry.
+            # menus_and_toasts.py tests real seat input during the 120ms entry.
+            time.sleep(.25)
+            return popup
 
         capture(env, endpoint, 'main', 'forms-native.png')
         popup = open_select()
@@ -606,7 +610,7 @@ def forms_test(root, env):
         assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: ASCII'
         popup = open_select()
         # Pointer selection commits and closes, unlike arrow navigation.
-        input_action(popup, retiring=True, action='click', target='scroll/choices/1')
+        input_action(popup, retiring=True, action='click', target='motion/surface/theme/scroll/choices/1')
         wait_for(lambda: len(inspect(env, endpoint)['windows']) == 1, 'pointer selection did not close')
         assert node(env, endpoint, 'main', 'root/form/encoding/trigger')['label'] == 'Encoding: UTF-8'
 

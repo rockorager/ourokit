@@ -29,6 +29,7 @@ TESTS = (
     'spring_composition.py',
     'motion_components.py',
     'tooltip_native.py',
+    'menus_and_toasts.py',
     'rich_text_composition.py',
     'drag_composition.py',
     'drawing_composition.py',

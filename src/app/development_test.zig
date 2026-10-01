@@ -2295,6 +2295,94 @@ test "accordion controls a single expanded key and skips disabled triggers" {
     try std.testing.expectEqual(null, try f.runtime.animationDelay());
 }
 
+test "menu entry samples opacity and scale and inherits the opener motion policy" {
+    const f = try Fixture.create(
+        \\opened=ouro.signal(false); reduced=ouro.signal(false); payload=nil
+        \\ouro.popup=function(p) assert(p.transparent); payload=p.content; opened:set(true)
+        \\ return {close=function() opened:set(false) end} end
+        \\function build() return ouro.theme {key='policy',reduced_motion=reduced(),
+        \\ ouro.column {key='root',
+        \\ ouro.menu_button {key='menu',label='Menu',duration=100,popup_width=120,popup_height=90,
+        \\ content=function(close) return ouro.button {key='item',label='Done',on_press=close} end},
+        \\ opened() and payload() or nil}} end
+    );
+    defer f.destroy();
+    try f.runtime.advanceAnimations(0);
+    try f.play(.{ .click = "policy/root/menu/trigger" });
+    const surface = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("policy/root/motion/surface")).id).?;
+    const render = try f.runtime.instances.renderObject(surface);
+    try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.objectAt(render)).box.opacity);
+    try f.runtime.advanceAnimations(25 * std.time.ns_per_ms);
+    try f.settle();
+    const box = (try f.runtime.tree.objectAt(render)).box;
+    try std.testing.expectEqual(@as(f32, 0.4375), box.opacity);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.98875), box.transform.scale, 0.00001);
+    try std.testing.expectEqual(@as(f32, 120), box.transform.origin.x);
+    try f.runtime.advanceAnimations(100 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 1), (try f.runtime.tree.objectAt(render)).box.opacity);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    try f.play(.{ .click = "policy/root/motion/surface/theme/item" });
+    try f.exec("assert(not opened()); reduced:set(true)");
+    try f.settle();
+    try f.play(.{ .click = "policy/root/menu/trigger" });
+    const reduced_surface = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("policy/root/motion/surface")).id).?;
+    try std.testing.expectEqual(@as(f32, 1), (try f.runtime.tree.objectAt(try f.runtime.instances.renderObject(reduced_surface))).box.opacity);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+}
+
+test "toast exit closes stack space continuously and reversal and reduced motion settle" {
+    const f = try Fixture.create(
+        \\shown=ouro.signal(true); reduced=ouro.signal(false); calls=0
+        \\function build() return ouro.theme {key='policy',reduced_motion=reduced(),
+        \\ ouro.column {key='stack',gap=0,cross_alignment='stretch',
+        \\ ouro.toast {key='first',present=shown(),message='Saved',timeout=0,duration=100,
+        \\ on_dismiss=function(reason) assert(reason=='manual'); calls=calls+1; shown:set(false) end},
+        \\ ouro.toast {key='second',present=true,message='Ready',timeout=0,duration=100,on_dismiss=function() end}}} end
+    );
+    defer f.destroy();
+    try f.runtime.advanceAnimations(0);
+    try f.runtime.advanceAnimations(100 * std.time.ns_per_ms);
+    try f.settle();
+    const first = try f.runtime.semanticTarget("policy/stack/first/reveal");
+    const second = try f.runtime.semanticTarget("policy/stack/second/reveal");
+    try f.play(.{ .click = "policy/stack/first/reveal/spacing/live-0/card/row/dismiss" });
+    try f.exec("assert(calls==1)");
+    try std.testing.expectError(error.DevelopmentTargetDisabled, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = "policy/stack/first/reveal/spacing/card/row/dismiss" }));
+    try f.runtime.advanceAnimations(150 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectApproxEqAbs(first.bounds.height * 0.25, (try f.runtime.semanticTarget("policy/stack/first/reveal")).bounds.height, 0.001);
+    try std.testing.expectApproxEqAbs(second.bounds.y - first.bounds.height * 0.75, (try f.runtime.semanticTarget("policy/stack/second/reveal")).bounds.y, 0.001);
+    try f.exec("shown:set(true)");
+    try f.settle();
+    try std.testing.expectApproxEqAbs(first.bounds.height * 0.25, (try f.runtime.semanticTarget("policy/stack/first/reveal")).bounds.height, 0.001);
+    try f.exec("reduced:set(true)");
+    try f.settle();
+    try std.testing.expectEqual(first.bounds.height, (try f.runtime.semanticTarget("policy/stack/first/reveal")).bounds.height);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    try f.exec("shown:set(false)");
+    try f.settle();
+    try std.testing.expectEqual(first.bounds.y, (try f.runtime.semanticTarget("policy/stack/second/reveal")).bounds.y);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+}
+
+test "menu and toast declarations validate before opening or showing" {
+    for ([_][]const u8{
+        "ouro.menu_button {key='m',label='Menu'}",
+        "ouro.menu_button {key='m',label='Menu',popup_width=0,content=function() end}",
+        "ouro.menu_button {key='m',label='Menu',motion='sometimes',content=function() end}",
+        "ouro.toast {key='t',present=false,message='M',timeout=false,on_dismiss=function() end}",
+        "ouro.toast {key='t',present=false,message='M',timeout=-1,on_dismiss=function() end}",
+        "ouro.toast {key='t',present=false,message='M',timeout=1.5,on_dismiss=function() end}",
+        "ouro.toast {key='t',present=false,message='M'}",
+        "ouro.toast {key='t',present=1,message='M',on_dismiss=function() end}",
+    }) |declaration| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
+    }
+}
+
 test "tooltip declarations reject invalid trigger timing placement and dimensions" {
     for ([_][]const u8{
         "ouro.tooltip {key='t',text='Tip'}",

@@ -378,6 +378,7 @@ pub const PopupDeclaration = struct {
     height: u32,
     side: enum { top, bottom, left, right } = .bottom,
     gap: u32 = 0,
+    transparent: bool = false,
 
     pub fn validate(self: PopupDeclaration) !void {
         const anchor = self.anchor.rectangle;

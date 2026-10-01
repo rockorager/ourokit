@@ -12,6 +12,7 @@ pub const Options = struct {
     height: u32,
     side: @FieldType(platform.PopupDeclaration, "side") = .bottom,
     gap: u32 = 0,
+    transparent: bool = false,
     content: c_int,
     on_close: c_int,
 };
@@ -96,6 +97,10 @@ fn parse(vm: *Vm, state: *c.State) !Options {
     }
     c.lua_settop(state, -2);
     try (platform.PopupDeclaration{ .id = "popup", .anchor = anchor, .input = input, .width = width, .height = height, .side = side, .gap = gap }).validate();
+    const transparency_kind = c.lua_getfield(state, 1, "transparent");
+    if (transparency_kind != c.type_nil and transparency_kind != c.type_boolean) return error.InvalidPopupTransparency;
+    const transparent = c.lua_toboolean(state, -1) != 0;
+    c.lua_settop(state, -2);
     const scope = try vm.currentScope(state);
     if (c.lua_getfield(state, 1, "content") != c.type_function) return error.PopupContentRequired;
     const content = c.luaL_ref(state, c.registry_index);
@@ -103,7 +108,7 @@ fn parse(vm: *Vm, state: *c.State) !Options {
     const kind = c.lua_getfield(state, 1, "on_close");
     if (kind != c.type_function and kind != c.type_nil) return error.InvalidPopupCallback;
     const on_close = c.luaL_ref(state, c.registry_index);
-    return .{ .anchor = anchor, .input = input, .scope = scope, .width = width, .height = height, .side = side, .gap = gap, .content = content, .on_close = on_close };
+    return .{ .anchor = anchor, .input = input, .scope = scope, .width = width, .height = height, .side = side, .gap = gap, .transparent = transparent, .content = content, .on_close = on_close };
 }
 
 fn dimension(state: *c.State, table: c_int, field: [*:0]const u8) !u32 {
@@ -216,10 +221,25 @@ test "popup requires fresh scoped input and transfers only valid callbacks" {
     try std.testing.expectEqual(scheduler.application_scope, fake.options.?.scope);
     try std.testing.expectEqual(@as(u32, 97), fake.options.?.width);
     try std.testing.expectEqual(@as(u32, 53), fake.options.?.height);
+    try std.testing.expect(!fake.options.?.transparent);
     try std.testing.expectEqual(@as(usize, 2), fake.closes);
     try std.testing.expectEqual(@as(usize, 1), fake.resizes);
     release(vm.state, fake.options.?);
     fake.options = null;
+    for ([_][]const u8{ "true", "false" }) |value| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "assert(require('ouro').popup{{width=97,height=53,transparent={s},content=function() end}})", .{value});
+        defer std.testing.allocator.free(source);
+        const opening = try vm.spawnApplication(source);
+        try vm.setActivationInput(opening, input);
+        _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+        try std.testing.expectEqual(std.mem.eql(u8, value, "true"), fake.options.?.transparent);
+        release(vm.state, fake.options.?);
+        fake.options = null;
+    }
+    const invalid_transparency = try vm.spawnApplication("local p,e=require('ouro').popup{width=97,height=53,transparent=1,content=function() end}; assert(p==nil and e.name=='InvalidPopupTransparency')");
+    try vm.setActivationInput(invalid_transparency, input);
+    _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
+    try std.testing.expect(fake.options == null);
     const delayed = try vm.spawnApplication("local o=require('ouro'); o.spawn(function() assert(o.popup{width=97,height=53,content=function() end}==nil) end); o.sleep(0); assert(o.popup{width=97,height=53,content=function() end}==nil)");
     try vm.setActivationInput(delayed, input);
     _ = try vm.resumeRunnable(scheduler.takeRunnable().?);

@@ -134,6 +134,7 @@ const PopupHost = struct {
             .height = options.height,
             .side = options.side,
             .gap = options.gap,
+            .transparent = options.transparent,
         } };
         try self.windows.create(declaration);
         // Native creation retires any passive surface before mapping its
@@ -1024,7 +1025,7 @@ fn runSourceInternal(
             }
             try slot.runtime.setBackground(switch (window.?.declaration) {
                 .layer_surface => |layer| layer.background,
-                .popup => |popup| if (popup.input == null) core.Color{ .r = 0, .g = 0, .b = 0, .a = 0 } else null,
+                .popup => |popup| if (popup.input == null or popup.transparent) core.Color{ .r = 0, .g = 0, .b = 0, .a = 0 } else null,
                 .toplevel => null,
             });
             if (slot.configured_size != null and !(try dirty.hasPending(handle)))

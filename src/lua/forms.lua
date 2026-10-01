@@ -1,4 +1,4 @@
-local ouro, normalize = ...
+local ouro, normalize, menus = ...
 
 -- Standard compositions reuse native editing, selection, popup, and focus
 -- policy. No raw input events or platform objects are handled here.
@@ -51,12 +51,11 @@ ouro.select = ouro.stateful(function(props)
     if popup then popup:close(); popup=nil end
     if props.on_select then props.on_select(value) end
   end
-  local function open()
+  local function open(theme)
     selected:set(props.selected)
-    local handle, err = ouro.popup {
-      width=props.width or 240, height=math.min(320, 24 + #props.options * 36),
-      on_close=function() popup=nil end,
-      content=function()
+    local handle, err = menus.open({popup_width=props.width or 240,
+      popup_height=math.min(320, 24 + #props.options * 36), duration=props.duration, motion=props.motion},
+      theme, function()
         local options={}
         for _, item in ipairs(props.options) do
           options[#options+1]=ouro.option {key=tostring(item.value), value=item.value, label=item.label}
@@ -66,13 +65,13 @@ ouro.select = ouro.stateful(function(props)
             on_select=function(value) selected:set(value) end, on_activate=choose,
             on_cancel=function() if popup then popup:close(); popup=nil end end},
         }
-      end,
-    }
+      end, function() popup=nil end)
     if not handle then
       if props.on_error then props.on_error(err) else error(err.message) end
     else popup=handle end
   end
   return function()
+    menus.validate(props)
     assert(type(props.options)=='table' and #props.options>0, 'select requires options')
     local label
     local seen={}
@@ -85,9 +84,9 @@ ouro.select = ouro.stateful(function(props)
     if props.enabled == false and popup then popup:close(); popup=nil end
     -- Radix Themes surface Select trigger: the field label stays semantic;
     -- the trigger shows only the value and a trailing chevron.
-    return ouro.button {key='trigger', variant='surface', tone='neutral',
+    return menus.trigger {key='trigger', variant='surface', tone='neutral',
       label=(props.label and props.label .. ': ' or '') .. label,
-      width=props.width or (props.flex == nil and 240 or nil), enabled=props.enabled, on_press=open, flex=props.flex,
+      width=props.width or (props.flex == nil and 240 or nil), enabled=props.enabled, open=open, flex=props.flex,
       focus_request=props.focus_request,
       ouro.row {key='content', gap=space.spacing_2, cross_alignment='center',
         ouro.text {key='value', text=label, flex=1, max_lines=1, overflow='ellipsis'},

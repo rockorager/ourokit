@@ -18,8 +18,10 @@ inputs support multiline editing. See the
 collapsibles, and accordions inherit reduced-motion policy; try the
 [motion components example](examples/motion-components.lua). Native tooltips extend
 outside windows and layer-shell bars without stealing input; try the
-[tooltip bar example](examples/tooltip-bar.lua). It is not yet a complete desktop
-toolkit: OS accessibility and richer data widgets remain unfinished.
+[tooltip bar example](examples/tooltip-bar.lua). Animated native menus/selects and
+in-window toasts also respect reduced motion; see
+[menus and toasts](examples/menus-and-toasts.lua). It is not yet a complete
+desktop toolkit: OS accessibility and richer data widgets remain unfinished.
 
 ## Application surface
 

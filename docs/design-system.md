@@ -158,6 +158,18 @@ Spinbox steppers are square neutral soft buttons. Tab close buttons are
 24-pixel neutral ghost buttons with a 14-pixel cross icon. The built-in icons
 are path-only SVGs tinted by the button foreground.
 
+Native menu/select entry deliberately simplifies Radix Themes' popper motion:
+120ms ease-out opacity plus 0.98-to-1 scale, rather than 160ms with translation
+and 0.97 scale. The nominal top-right origin does not follow compositor flips.
+Exit is immediate to release the Wayland grab; no delayed 100ms exit animation.
+See the pinned Themes [popper animations](https://github.com/radix-ui/themes/blob/1faff10ac26ae17f09944d418c6949b93fc6b566/packages/radix-ui-themes/src/components/animations.css).
+
+Toasts reuse the existing card, border, and neutral ghost-button roles. Their
+180ms opacity/16px slide/height-collapse recipe is Ourokit-specific. Remaining-time
+pause/resume follows [Radix Primitives Toast](https://github.com/radix-ui/primitives/blob/f7ecd5ab16f5e1e820eb5786a1419a98a2d594ae/packages/react/toast/src/toast.tsx),
+but applies per hovered/focused card rather than to a shared viewport or window
+blur. No new theme tokens or native widget kinds are introduced.
+
 Disabled buttons use opaque Slate step 5 backgrounds and Slate step 11 text
 instead of faint alpha colors. This keeps button labels readable (at least
 4.5:1 contrast in both default themes) while the neutral fill distinguishes
