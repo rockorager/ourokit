@@ -1863,6 +1863,12 @@ pub const UiBuild = struct {
             return luaError(state, "invalid box width");
         const height = tableOptionalSize(state, 1, "height", .auto) orelse
             return luaError(state, "invalid box height");
+        const height_factor_kind = c.lua_getfield(state, 1, "height_factor");
+        c.lua_settop(state, -2);
+        const height_factor: ?f32 = if (height_factor_kind == c.type_nil) null else tableOptionalFraction(state, 1, "height_factor", 1) orelse
+            return luaError(state, "box height_factor must be a finite number from zero to one");
+        if (height_factor != null and (height.extent() != null or height.isFill()))
+            return luaError(state, "box height_factor conflicts with height");
         const ratio_kind = c.lua_getfield(state, 1, "aspect_ratio");
         const aspect_ratio: ?f32 = if (ratio_kind == c.type_nil) null else if (ratio_kind == c.type_number)
             finiteFloat(state, -1) orelse return luaError(state, "aspect_ratio must be a finite positive number")
@@ -1951,6 +1957,11 @@ pub const UiBuild = struct {
             _ = tableString(state, 1, "label") orelse return luaError(state, "dialog label required");
         }
         var checked = tableOptionalBoolean(state, 1, "checked", false) orelse return luaError(state, "checked must be boolean");
+        const expanded_kind = c.lua_getfield(state, 1, "expanded");
+        c.lua_settop(state, -2);
+        const expanded: ?bool = if (expanded_kind == c.type_nil) null else tableOptionalBoolean(state, 1, "expanded", false) orelse return luaError(state, "expanded must be boolean");
+        if (expanded != null and (!semantic or !activate or role != .button))
+            return luaError(state, "expanded requires an activating semantic button");
         var range: ?@import("../ui/widget/range.zig").Range = null;
         var range_inset: f32 = 0;
         const range_type = c.lua_getfield(state, 1, "range");
@@ -2027,6 +2038,7 @@ pub const UiBuild = struct {
                 .height = height.extent(),
                 .fill_width = width.isFill(),
                 .fill_height = height.isFill(),
+                .height_factor = height_factor,
                 .min_width = min_width,
                 .min_height = min_height,
                 .max_width = max_width.value,
@@ -2055,6 +2067,7 @@ pub const UiBuild = struct {
             .label = tableString(state, 1, "label") orelse "",
             .enabled = enabled,
             .checked = checked,
+            .expanded = expanded,
             .selected = selected,
             .range = range,
         }) catch return luaError(state, "cannot append box semantics");

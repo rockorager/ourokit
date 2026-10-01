@@ -14,6 +14,7 @@ pub const Descriptor = struct {
     enabled: bool = true,
     selected: bool = false,
     checked: bool = false,
+    expanded: ?bool = null,
     range: ?Range = null,
     /// Reuse this group's existing semantic descendants from the active snapshot.
     retain_subtree: bool = false,
@@ -30,6 +31,7 @@ const StoredNode = struct {
     enabled: bool,
     selected: bool,
     checked: bool,
+    expanded: ?bool,
     range: ?Range,
     first_child: ?usize,
     next_sibling: ?usize,
@@ -46,6 +48,7 @@ pub const Node = struct {
     enabled: bool,
     selected: bool,
     checked: bool,
+    expanded: ?bool,
     range: ?Range,
 };
 
@@ -143,7 +146,7 @@ pub const Snapshot = struct {
         var node_count: usize = 0;
         var text_count: usize = 0;
         for (descriptors) |descriptor| {
-            self.stageOne(next, descriptor.id, descriptor.parent, descriptor.role, descriptor.key, descriptor.label, descriptor.enabled, descriptor.selected, descriptor.checked, descriptor.range, &node_count, &text_count);
+            self.stageOne(next, descriptor.id, descriptor.parent, descriptor.role, descriptor.key, descriptor.label, descriptor.enabled, descriptor.selected, descriptor.checked, descriptor.expanded, descriptor.range, &node_count, &text_count);
             if (descriptor.retain_subtree) {
                 const old_index = lookup(self.active_index, descriptor.id).?;
                 var child = self.nodes[self.active][old_index].first_child;
@@ -194,7 +197,7 @@ pub const Snapshot = struct {
         }
     }
 
-    fn stageOne(self: *Snapshot, next: usize, id: u64, parent: ?u64, role: Role, key: []const u8, label: []const u8, enabled: bool, selected: bool, checked: bool, range: ?Range, node_count: *usize, text_count: *usize) void {
+    fn stageOne(self: *Snapshot, next: usize, id: u64, parent: ?u64, role: Role, key: []const u8, label: []const u8, enabled: bool, selected: bool, checked: bool, expanded: ?bool, range: ?Range, node_count: *usize, text_count: *usize) void {
         const index = node_count.*;
         const key_start = text_count.*;
         @memcpy(self.text[next][text_count.*..][0..key.len], key);
@@ -202,7 +205,7 @@ pub const Snapshot = struct {
         const label_start = text_count.*;
         @memcpy(self.text[next][text_count.*..][0..label.len], label);
         text_count.* += label.len;
-        self.nodes[next][index] = .{ .id = id, .parent = parent, .role = role, .key_start = key_start, .key_len = key.len, .label_start = label_start, .label_len = label.len, .enabled = enabled, .selected = selected, .checked = checked, .range = range, .first_child = null, .next_sibling = null };
+        self.nodes[next][index] = .{ .id = id, .parent = parent, .role = role, .key_start = key_start, .key_len = key.len, .label_start = label_start, .label_len = label.len, .enabled = enabled, .selected = selected, .checked = checked, .expanded = expanded, .range = range, .first_child = null, .next_sibling = null };
         putLookup(self.output_index, id, index);
         if (parent) |parent_id| {
             const parent_index = lookup(self.output_index, parent_id).?;
@@ -216,7 +219,7 @@ pub const Snapshot = struct {
         const old = self.nodes[self.active][old_index];
         const key = self.text[self.active][old.key_start..][0..old.key_len];
         const label = self.text[self.active][old.label_start..][0..old.label_len];
-        self.stageOne(next, old.id, old.parent, old.role, key, label, old.enabled, old.selected, old.checked, old.range, node_count, text_count);
+        self.stageOne(next, old.id, old.parent, old.role, key, label, old.enabled, old.selected, old.checked, old.expanded, old.range, node_count, text_count);
         var child = old.first_child;
         while (child) |index| {
             self.stageRetained(next, index, node_count, text_count);
@@ -287,6 +290,7 @@ pub const Snapshot = struct {
             .enabled = stored.enabled,
             .selected = stored.selected,
             .checked = stored.checked,
+            .expanded = stored.expanded,
             .range = stored.range,
         };
     }
@@ -409,6 +413,45 @@ test "retained semantic subtree is merged, reordered, and transactional" {
     try std.testing.expectEqualStrings("Owned label", (try snapshot.findPath("root/component-new/nested/title")).label);
     try std.testing.expect(!(snapshot.findId(5).?).enabled);
     try std.testing.expectEqualStrings("New tail", (try snapshot.node(1)).label);
+}
+
+test "expanded state distinguishes false true and absent across retained transactions" {
+    var snapshot: Snapshot = undefined;
+    try snapshot.init(std.testing.allocator, 6, 96);
+    defer snapshot.deinit();
+    const initial = [_]Descriptor{
+        .{ .id = 1, .parent = null, .role = .group, .key = "root" },
+        .{ .id = 2, .parent = 1, .role = .group, .key = "component" },
+        .{ .id = 3, .parent = 2, .role = .button, .key = "closed", .label = "Closed", .expanded = false },
+        .{ .id = 4, .parent = 2, .role = .button, .key = "open", .label = "Open", .expanded = true },
+        .{ .id = 5, .parent = 2, .role = .button, .key = "plain", .label = "Plain" },
+    };
+    try snapshot.validate(&initial);
+    snapshot.stage(&initial);
+    snapshot.commitStaged();
+    try std.testing.expectEqual(@as(?bool, false), snapshot.findId(3).?.expanded);
+    try std.testing.expectEqual(@as(?bool, true), snapshot.findId(4).?.expanded);
+    try std.testing.expectEqual(@as(?bool, null), snapshot.findId(5).?.expanded);
+
+    const retained = [_]Descriptor{
+        .{ .id = 1, .parent = null, .role = .group, .key = "root", .expanded = true },
+        .{ .id = 2, .parent = 1, .role = .group, .key = "component-new", .retain_subtree = true },
+    };
+    try snapshot.validate(&retained);
+    snapshot.stage(&retained);
+    try std.testing.expectEqual(@as(?bool, null), snapshot.findId(1).?.expanded);
+    try std.testing.expectEqual(@as(?bool, false), snapshot.findId(3).?.expanded);
+    snapshot.discardStaged();
+    try std.testing.expectEqual(@as(?bool, null), snapshot.findId(1).?.expanded);
+    try std.testing.expectEqual(@as(?bool, true), snapshot.findId(4).?.expanded);
+
+    try snapshot.validate(&retained);
+    snapshot.stage(&retained);
+    snapshot.commitStaged();
+    try std.testing.expectEqual(@as(?bool, true), snapshot.findId(1).?.expanded);
+    try std.testing.expectEqual(@as(?bool, false), snapshot.findId(3).?.expanded);
+    try std.testing.expectEqual(@as(?bool, true), snapshot.findId(4).?.expanded);
+    try std.testing.expectEqual(@as(?bool, null), snapshot.findId(5).?.expanded);
 }
 
 test "retained semantic subtree rejects conflicts and capacity overflow" {

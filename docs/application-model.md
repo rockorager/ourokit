@@ -1115,6 +1115,15 @@ effect. Multiple overlapping children blend separately at the clipped edge.
 See `examples/clip-storybook.lua` and `examples/clip-composition.lua` for nested
 clips, shadows, content, and corner hit testing.
 
+`height_factor` is an optional finite number from zero to one. A Box lays out
+its child at natural height within the incoming maximum, then multiplies its
+natural outer height (including padding and border) by this factor. Parent
+minimum/tight constraints still win. The factor does not squeeze the child or
+change its width constraints; changing only the factor can reuse child layout.
+It conflicts with explicit `height` or `height='fill'`. Combine it with
+`clip=true` to reveal natural-height content, and `presence` to manage exit
+input/lifetime. A zero factor alone does not unmount or disable descendants.
+
 Set `opacity = 0.5` on a Box to fade its complete subtree as one group:
 
 ```lua
@@ -1635,6 +1644,15 @@ request leaves the control unchanged. External updates do not emit callbacks.
 There is no `default_checked` or uncontrolled mode. Keep the same `key` to retain
 native identity and focus across state, callback, theme, and sibling-order updates.
 
+Switch thumbs animate with `transition`; checkbox marks fade and scale. Both
+accept `duration` (nonnegative integer milliseconds, default 180) and `motion`
+(`'auto'`, `'reduce'`, or `'full'`, default `'auto'`). Initial values mount settled;
+accepted changes animate from the last committed visual value, including rapid
+reversals. The semantic checked state changes immediately. Motion changes paint
+without relayout. Reduced motion settles immediately, and settled controls request
+no animation wakeups. See [springs and reduced motion](#springs-and-reduced-motion)
+for inherited desktop policy and explicit overrides.
+
 Primary-button press, Space, and Enter request a change. Keyboard repeats and
 releases do not emit changes. Enabled switches are one Tab/Shift+Tab focus stop;
 pointer presses focus them too. Disabled switches cannot focus or activate, and
@@ -1687,7 +1705,7 @@ and does not take focus.
 ### Checkboxes, radio groups, and selects
 
 `ouro.checkbox` has the same controlled `checked`, `label`, `enabled`,
-`on_change`, and keyboard contract as `ouro.switch`, with a square checkmark.
+`on_change`, motion options, and keyboard contract as `ouro.switch`, with a square checkmark.
 Its label is semantic; compose visible text alongside it.
 
 ```lua
@@ -1870,6 +1888,62 @@ the controlled value, and blur does not commit. Up/Down and the buttons request
 one step from the controlled value. The controlled value takes precedence over
 a draft based on a different value.
 The field and enabled buttons participate in ordinary Tab traversal.
+
+### Collapsible content and accordions
+
+`ouro.collapsible` combines a disclosure button, animated indicator, and a
+natural-height reveal. It requires `key`, a visible/semantic `label`, controlled
+boolean `expanded`, `on_change(expanded)`, and exactly one content child:
+
+```lua
+ouro.collapsible {
+  key='details', label='Workspace details', expanded=opened(),
+  on_change=function(value) opened:set(value) end,
+  ouro.column {key='body', gap=12,
+    ouro.text {key='hint', text='No fixed content height required.'},
+    ouro.text_input {key='name', label='Name', default_text='My workspace'},
+  },
+}
+```
+
+Tab/Shift+Tab visits the header; Enter, Space, and primary pointer press request
+a change. `enabled=false` disables the header, not the content of an already
+expanded panel. The header at `details/trigger` reports button role and optional
+`expanded` state; ordinary buttons report null for that state. The underlying
+Box API exposes `expanded` only on activating semantic buttons.
+
+`duration` and `motion` use the toggle defaults above. The body uses `presence`:
+closing makes it non-interactive immediately, clips/fades its natural layout,
+and unmounts it when the exit finishes. Reversing before removal preserves
+native identity and editor drafts; reopening after removal starts fresh. Keep
+long-lived application state outside the body. Reduced motion opens/removes
+immediately. `focus_request` targets the header; `flex`, `x`, and `y` apply to
+the outer column. Give the column bounded width for wrapping content.
+
+`ouro.accordion` composes single-open collapsibles with separators. Supply a
+nonempty `items` array with unique string `key`, `label`, and `content` fields,
+plus optional per-item `enabled`. Its controlled `expanded` is an item key or
+nil; `on_change(key_or_nil)` must update application state. It accepts the same
+`duration`, `motion`, group `enabled`, `flex`, `x`, and `y` options, but no children.
+
+```lua
+ouro.accordion {
+  key='help', expanded=section(), on_change=function(key) section:set(key) end,
+  items={
+    {key='sync', label='Sync settings', content=sync_settings},
+    {key='storage', label='Storage', content=storage_settings},
+  },
+}
+```
+
+Only the selected section is expanded/interactable; the previous section may
+still paint while exiting. Header paths use `help/item-<key>/trigger`. Headers
+use ordinary Tab order, not arrow-key roving focus. These components preserve
+the current toolkit's internal semantics; they do not add an OS accessibility
+bridge. Run `examples/motion-components.lua` for the interactive showcase or
+snapshot `examples/motion-storybook.lua` for light, dark, disabled, focused, and
+expanded states. `tests/motion_components.py` exercises the native application
+and can record compositor videos with `--record-dir` (requires `wf-recorder`).
 
 ### In-window modal dialogs
 

@@ -2122,3 +2122,198 @@ test "virtual scrollbars share metrics and token requests while keeping distant 
     try std.testing.expectEqual(@as(f32, 0), try f.runtime.instances.scrollOffset(target));
     try std.testing.expect(f.runtime.scrollbar_drag == null and f.runtime.router.captured == null);
 }
+
+test "animated controls retain identity reverse in flight and honor reduced motion" {
+    const f = try Fixture.create(
+        \\checked=ouro.signal(false); reduced=ouro.signal(false); active=ouro.signal(true)
+        \\function build() return ouro.theme {key='policy',reduced_motion=reduced(),
+        \\ ouro.column {key='root',gap=8,
+        \\ ouro.switch {key='switch',label='Sync',checked=checked(),duration=100,enabled=active(),on_change=function(v) checked:set(v) end},
+        \\ ouro.checkbox {key='check',label='Save',checked=checked(),duration=100,on_change=function(v) checked:set(v) end}}} end
+    );
+    defer f.destroy();
+    const path = "policy/root/switch";
+    const id = (try f.runtime.semantics.findPath(path)).id;
+    const handle = f.runtime.instances.handleForId(id).?;
+    const root = (try f.runtime.instances.rootRenderObject()).?;
+    const track = f.runtime.tree.firstChild(try f.runtime.instances.renderObject(handle)).?;
+    const thumb = f.runtime.tree.firstChild(track).?;
+    const check_handle = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("policy/root/check")).id).?;
+    const check_track = f.runtime.tree.firstChild(try f.runtime.instances.renderObject(check_handle)).?;
+    const mark = f.runtime.tree.firstChild(check_track).?;
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    try f.runtime.advanceAnimations(0);
+    const layouts = try f.runtime.tree.layoutCount(root);
+    try f.play(.{ .click = path });
+    try std.testing.expect((try f.runtime.semantics.findPath(path)).checked);
+    try std.testing.expectEqual(@as(f32, 0), (try f.runtime.tree.objectAt(thumb)).box.transform.translation.x);
+    try f.runtime.advanceAnimations(50 * std.time.ns_per_ms);
+    try f.settle();
+    // ease_out(1/2) = 3/4; the switch travels 15px and the check fades in.
+    try std.testing.expectEqual(@as(f32, 11.25), (try f.runtime.tree.objectAt(thumb)).box.transform.translation.x);
+    try std.testing.expectEqual(@as(f32, 0.75), (try f.runtime.tree.objectAt(mark)).box.opacity);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
+    try std.testing.expect(!(try f.runtime.semantics.findPath(path)).checked);
+    try std.testing.expectEqual(@as(f32, 11.25), (try f.runtime.tree.objectAt(thumb)).box.transform.translation.x);
+    try f.runtime.advanceAnimations(100 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 2.8125), (try f.runtime.tree.objectAt(thumb)).box.transform.translation.x);
+    try std.testing.expectEqual(layouts, try f.runtime.tree.layoutCount(root));
+    try f.exec("reduced:set(true);checked:set(true)");
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 15), (try f.runtime.tree.objectAt(thumb)).box.transform.translation.x);
+    try std.testing.expectEqual(@as(f32, 1), (try f.runtime.tree.objectAt(mark)).box.opacity);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    try std.testing.expectEqual(handle, f.runtime.instances.handleForId(id).?);
+    try f.exec("active:set(false)");
+    try f.settle();
+    try std.testing.expectError(error.DevelopmentTargetDisabled, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = path }));
+    try f.exec("reduced:set(false)");
+    try f.settle();
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+}
+
+test "collapsible reveals natural height and preserves state during reversals" {
+    const f = try Fixture.create(
+        \\opened=ouro.signal(false); reduced=ouro.signal(false); hits=0
+        \\function build() return ouro.theme {key='policy',reduced_motion=reduced(),
+        \\ ouro.column {key='root',cross_alignment='stretch',
+        \\ ouro.collapsible {key='details',label='Details',expanded=opened(),duration=100,
+        \\ on_change=function(v) opened:set(v) end,
+        \\ ouro.button {key='action',label='Action',height=32,on_press=function() hits=hits+1 end}},
+        \\ ouro.text {key='tail',text='After'}}} end
+    );
+    defer f.destroy();
+    const trigger = "policy/root/details/trigger";
+    const reveal = "policy/root/details/presence/reveal";
+    const child = "policy/root/details/presence/reveal/content/action";
+    try std.testing.expectEqual(@as(?bool, false), (try f.runtime.semantics.findPath(trigger)).expanded);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    try f.runtime.advanceAnimations(0);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+    try std.testing.expectEqual(@as(?bool, true), (try f.runtime.semantics.findPath(trigger)).expanded);
+    const id = (try f.runtime.semantics.findPath(child)).id;
+    const handle = f.runtime.instances.handleForId(id).?;
+    const rendered = try f.runtime.instances.renderObject(handle);
+    try std.testing.expectEqual(@as(f32, 32), (try f.runtime.tree.nodeSize(rendered)).height);
+    try std.testing.expectEqual(@as(f32, 0), (try f.runtime.semanticTarget(reveal)).bounds.height);
+    try f.runtime.advanceAnimations(50 * std.time.ns_per_ms);
+    try f.settle();
+    // 32px content + 12px bottom padding, revealed at ease_out(1/2)=3/4.
+    try std.testing.expectEqual(@as(f32, 33), (try f.runtime.semanticTarget(reveal)).bounds.height);
+    try std.testing.expectEqual(@as(f32, 32), (try f.runtime.tree.nodeSize(rendered)).height);
+    const child_layouts = try f.runtime.tree.layoutCount(rendered);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
+    try std.testing.expectEqual(@as(?bool, false), (try f.runtime.semantics.findPath(trigger)).expanded);
+    try std.testing.expect(!f.runtime.instances.isInteractive(handle));
+    try std.testing.expectError(error.DevelopmentTargetDisabled, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = child }));
+    try f.runtime.advanceAnimations(75 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 18.5625), (try f.runtime.semanticTarget(reveal)).bounds.height);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+    try std.testing.expectEqual(handle, f.runtime.instances.handleForId(id).?);
+    try std.testing.expect(f.runtime.instances.isInteractive(handle));
+    try std.testing.expectEqual(@as(f32, 18.5625), (try f.runtime.semanticTarget(reveal)).bounds.height);
+    try f.runtime.advanceAnimations(175 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 44), (try f.runtime.semanticTarget(reveal)).bounds.height);
+    try std.testing.expectEqual(child_layouts, try f.runtime.tree.layoutCount(rendered));
+    try f.play(.{ .click = child });
+    try f.exec("assert(hits==1);reduced:set(true);opened:set(false)");
+    try f.settle();
+    try std.testing.expect(f.runtime.instances.handleForId(id) == null);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+    try f.exec("opened:set(true)");
+    try f.settle();
+    try std.testing.expectEqual(@as(f32, 44), (try f.runtime.semanticTarget(reveal)).bounds.height);
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+}
+
+test "collapsible reversals preserve the editor session and draft until removal" {
+    const f = try Fixture.create(
+        \\opened=ouro.signal(true)
+        \\function build() return ouro.column {key='root',
+        \\ ouro.collapsible {key='details',label='Details',expanded=opened(),duration=100,
+        \\ on_change=function(v) opened:set(v) end,
+        \\ ouro.text_input {key='editor',label='Name',default_text='draft'}}} end
+    );
+    defer f.destroy();
+    try f.runtime.advanceAnimations(0);
+    try f.runtime.advanceAnimations(100 * std.time.ns_per_ms);
+    try f.settle();
+    const path = "root/details/presence/reveal/content/editor";
+    const id = (try f.runtime.semantics.findPath(path)).id;
+    const handle = f.runtime.instances.handleForId(id).?;
+    const session = try f.runtime.text_inputs.session(handle);
+    _ = try session.apply(.{ .commit = .{ .text = "edited " } });
+    const expected = try std.testing.allocator.dupe(u8, session.model.text());
+    defer std.testing.allocator.free(expected);
+    try f.exec("opened:set(false)");
+    try f.settle();
+    try f.runtime.advanceAnimations(125 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expect(!f.runtime.instances.isInteractive(handle));
+    try f.exec("opened:set(true)");
+    try f.settle();
+    try f.runtime.advanceAnimations(225 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expectEqual(handle, f.runtime.instances.handleForId(id).?);
+    try std.testing.expectEqual(session, try f.runtime.text_inputs.session(handle));
+    try std.testing.expectEqualStrings(expected, session.model.text());
+    try f.exec("opened:set(false)");
+    try f.settle();
+    try f.runtime.advanceAnimations(325 * std.time.ns_per_ms);
+    try f.settle();
+    try std.testing.expect(f.runtime.instances.handleForId(id) == null);
+    try std.testing.expect(!f.runtime.text_inputs.contains(handle));
+}
+
+test "accordion controls a single expanded key and skips disabled triggers" {
+    const f = try Fixture.create(
+        \\selection=ouro.signal(nil)
+        \\function build() return ouro.accordion {key='faq',motion='reduce',expanded=selection(),
+        \\ on_change=function(v) selection:set(v) end,items={
+        \\ {key='one',label='First',content=ouro.text {key='body',text='One'}},
+        \\ {key='two',label='Second',content=ouro.text {key='body',text='Two'}},
+        \\ {key='locked',label='Locked',enabled=false,content=ouro.text {key='body',text='Locked'}}}} end
+    );
+    defer f.destroy();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
+    try f.exec("assert(selection()=='one')");
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .tab } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .enter } });
+    try f.exec("assert(selection()=='two')");
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(?bool, false), (try node(snapshot, "faq/item-one/trigger")).expanded);
+    try std.testing.expectEqual(@as(?bool, true), (try node(snapshot, "faq/item-two/trigger")).expanded);
+    try std.testing.expectError(error.DevelopmentTargetDisabled, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .click = "faq/item-locked/trigger" }));
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .space } });
+    try f.exec("assert(selection()==nil)");
+    try std.testing.expectEqual(null, try f.runtime.animationDelay());
+}
+
+test "animated component declarations reject invalid motion disclosure and factor inputs" {
+    for ([_][]const u8{
+        "ouro.switch {key='s',label='Switch',checked=true,motion='sometimes'}",
+        "ouro.checkbox {key='s',label='Check',checked=true,duration=0/0}",
+        "ouro.collapsible {key='c',label='Details',expanded='yes',on_change=function() end,ouro.text {key='t',text='Text'}}",
+        "ouro.collapsible {key='c',label='Details',expanded=false,ouro.text {key='t',text='Text'}}",
+        "ouro.collapsible {key='c',label='Details',expanded=false,on_change=function() end}",
+        "ouro.accordion {key='a',expanded='missing',on_change=function() end,items={{key='x',label='X',content=ouro.text {key='t',text='Text'}}}}",
+        "ouro.accordion {key='a',on_change=function() end,items={{key='x',label='X',content=ouro.box {key='t'}},{key='x',label='Again',content=ouro.box {key='t'}}}}",
+        "ouro.box {key='b',height_factor='0.5'}",
+        "ouro.box {key='b',height_factor=0/0}",
+        "ouro.box {key='b',height_factor=1.1}",
+        "ouro.box {key='b',height_factor=0.5,height='fill'}",
+        "ouro.box {key='b',height_factor=0.5,height=20}",
+        "ouro.box {key='b',expanded=true}",
+        "ouro.box {key='b',activate=true,role='button',label='B',expanded='yes'}",
+    }) |declaration| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
+    }
+}

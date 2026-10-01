@@ -42,6 +42,10 @@ def session():
         env = dict(os.environ, XDG_RUNTIME_DIR=str(root),
                    WAYLAND_DISPLAY=os.environ['OUROKIT_TEST_WAYLAND_DISPLAY'])
         fixture = (ROOT / 'examples/control-composition.lua').read_text()
+        # These contract checks use separate inspect/input CLI processes and
+        # require stable scene tokens. motion_components tests live animation.
+        for control in ('checkbox', 'switch'):
+            fixture = fixture.replace(f'o.{control} {{', f"o.{control} {{motion='reduce',")
         app = root / 'app.lua'
         atomic_write(app, fixture)
         stderr = root / 'app.stderr'

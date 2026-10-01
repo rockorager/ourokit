@@ -7,6 +7,14 @@ local function enabled(p)
   return p.enabled ~= false
 end
 
+local function motion(p)
+  check(p.motion == nil or p.motion == 'auto' or p.motion == 'reduce' or p.motion == 'full', 'invalid motion policy')
+  local duration = p.duration
+  if duration == nil then duration = 180 end
+  check(kind(duration) == 'number' and duration >= 0 and duration < math.huge, 'duration must be finite and nonnegative')
+  return duration
+end
+
 -- Recipes execute at lowering, with the same effective theme native primitives
 -- see. They do not mount component state or contribute a VM-specific identity.
 ouro.button = ouro.stateless(function(p, children, theme)
@@ -77,29 +85,95 @@ local function toggle(p, children, theme, checkbox)
   local h, inset, ring = f.spacing_5 * 5 / 6, f.border_width_default, f.border_width_strong
   local radius = theme.controls.radius or h / 2
   local background = not active and c.disabled or (p.checked and c.primary or c.switch_track)
-  local thumb
-  if checkbox and p.checked then
-    thumb = ouro.text {key='thumb', text='✓', size=16, weight='medium', max_lines=1,
-      foreground=active and c.primary_foreground or c.disabled_foreground, semantic=false}
-  else
-    thumb = ouro.box {key='thumb', semantic=false, width=checkbox and 10 or h-inset*2,
-      height=checkbox and 10 or h-inset*2, radius=checkbox and 1 or (theme.controls.radius and (radius > inset and radius-inset or 0) or h/2),
-      background=checkbox and background or (active and c.switch_thumb or c.switch_disabled_thumb),
-      border_width=checkbox and 0 or inset, border=c.switch_border}
-  end
+  local duration = motion(p)
+  local thumb = ouro.transition {key='motion', target=p.checked and 1 or 0,
+    duration=duration, easing='ease_out', motion=p.motion,
+    render=function(value)
+      if checkbox then
+        return ouro.box {key='thumb', semantic=false, width=h-inset*2, height=h-inset*2,
+          alignment='center', opacity=value, transform={scale=0.8+0.2*value},
+          ouro.text {key='mark', text='✓', size=16, weight='medium', max_lines=1,
+            foreground=active and c.primary_foreground or c.disabled_foreground, semantic=false}}
+      end
+      return ouro.box {key='thumb', semantic=false, width=h-inset*2, height=h-inset*2,
+        transform={x=h*0.75*value},
+        radius=theme.controls.radius and math.max(0,radius-inset) or h/2,
+        background=active and c.switch_thumb or c.switch_disabled_thumb,
+        border_width=inset, border=c.switch_border}
+    end}
   return ouro.box {key=p.key, role=checkbox and 'checkbox' or 'switch', label=p.label,
     checked=p.checked, activate=true, enabled=active, on_change=p.on_change, flex=p.flex, x=p.x, y=p.y,
     focus_request=p.focus_request, width=(checkbox and h or h*1.75)+ring*4, height=h+ring*4,
     padding=ring, alignment='center', border_width=ring, border=transparent,
     radius=checkbox and f.radius_2 or radius+ring*2, states={focus=c.ring},
     ouro.box {key='track', semantic=false, width=checkbox and h or h*1.75, height=h,
-      alignment=checkbox and 'center' or (p.checked and 'right' or 'left'),
+      alignment=checkbox and 'center' or 'left',
       background=background, border=active and p.checked and c.primary or c.switch_border,
       border_width=inset, radius=checkbox and f.radius_1 or radius, thumb},
   }
 end
 ouro.switch = ouro.stateless(function(p, children, theme) return toggle(p, children, theme, false) end)
 ouro.checkbox = ouro.stateless(function(p, children, theme) return toggle(p, children, theme, true) end)
+
+ouro.collapsible = ouro.stateless(function(p, children, theme)
+  check(kind(p.key) == 'string' and #p.key > 0 and kind(p.label) == 'string' and #p.label > 0, 'collapsible key and label required')
+  check(kind(p.expanded) == 'boolean', 'collapsible expanded must be boolean')
+  check(kind(p.on_change) == 'function', 'collapsible on_change required')
+  check(#children == 1, 'collapsible requires one content child')
+  local active, duration, c = enabled(p), motion(p), theme.colors
+  return ouro.column {key=p.key, flex=p.flex, x=p.x, y=p.y, gap=0, cross_alignment='stretch',
+    ouro.box {key='trigger', role='button', label=p.label, expanded=p.expanded,
+      activate=true, enabled=active, focus_request=p.focus_request,
+      on_press=function() p.on_change(not p.expanded) end,
+      padding_x=f.spacing_3, padding_y=f.spacing_3, border_width=f.border_width_strong,
+      border=transparent, radius=f.radius_2, background=transparent,
+      states={hover=c.accent, pressed=c.accent_selected, focus=c.ring},
+      ouro.row {key='heading', semantic=false, cross_alignment='center', gap=f.spacing_3,
+        ouro.text {key='label', semantic=false, text=p.label, flex=1, weight='medium',
+          foreground=active and c.foreground or c.disabled_foreground},
+        ouro.transition {key='indicator', target=p.expanded and 1 or 0,
+          duration=duration, easing='ease_out', motion=p.motion, render=function(value)
+            local ink = active and c.muted_foreground or c.disabled_foreground
+            return ouro.stack {key='glyph', semantic=false,
+              ouro.box {key='horizontal', semantic=false, width=16, height=16, alignment='center',
+                ouro.box {key='stroke', semantic=false, width=10, height=2, radius=1, background=ink}},
+              ouro.box {key='vertical', semantic=false, width=16, height=16, alignment='center',
+                ouro.box {key='stroke', semantic=false, width=2, height=10*(1-value), radius=1, background=ink}}}
+          end}}},
+    ouro.presence {key='presence', present=p.expanded, duration=duration, easing='ease_out', motion=p.motion,
+      render=function(value)
+        return ouro.box {key='reveal', height_factor=value, clip=true, opacity=value,
+          ouro.box {key='content', padding_x=f.spacing_3, padding_bottom=f.spacing_3, children[1]}}
+      end},
+  }
+end)
+
+-- Single-open, application-controlled disclosure group. Stable item keys own
+-- transition identity; changing selection does not remount unrelated items.
+ouro.accordion = ouro.stateless(function(p, children)
+  check(#children == 0 and kind(p.items) == 'table' and #p.items > 0, 'accordion requires nonempty items and no children')
+  check(kind(p.key) == 'string' and #p.key > 0, 'accordion key required')
+  check(p.expanded == nil or kind(p.expanded) == 'string', 'accordion expanded must be an item key or nil')
+  check(kind(p.on_change) == 'function', 'accordion on_change required')
+  local active = enabled(p)
+  motion(p)
+  local rows, seen, found = {}, {}, p.expanded == nil
+  for _, item in ipairs(p.items) do
+    check(kind(item) == 'table' and kind(item.key) == 'string' and #item.key > 0 and not seen[item.key], 'accordion item keys must be unique nonempty strings')
+    check(item.content ~= nil, 'accordion item content required')
+    seen[item.key] = true
+    if p.expanded == item.key then found = true end
+    local item_enabled = enabled(item)
+    if #rows > 0 then rows[#rows+1] = ouro.separator {key='separator-'..item.key} end
+    rows[#rows+1] = ouro.collapsible {key='item-'..item.key, label=item.label,
+      expanded=p.expanded == item.key, enabled=active and item_enabled,
+      duration=p.duration, motion=p.motion,
+      on_change=function(open) p.on_change(open and item.key or nil) end,
+      item.content}
+  end
+  check(found, 'accordion expanded key must exist')
+  return ouro.column {key=p.key, flex=p.flex, x=p.x, y=p.y, gap=0, cross_alignment='stretch', children=rows}
+end)
 
 ouro.separator = ouro.stateless(function(p, children, theme)
   check(#children == 0, 'separator does not accept children')

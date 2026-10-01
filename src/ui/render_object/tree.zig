@@ -1509,6 +1509,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
                 old_box.min_width != new_box.min_width or old_box.min_height != new_box.min_height or
                 old_box.max_width != new_box.max_width or old_box.max_height != new_box.max_height or
                 old_box.fill_width != new_box.fill_width or old_box.fill_height != new_box.fill_height or
+                old_box.height_factor != new_box.height_factor or
                 old_box.aspect_ratio != new_box.aspect_ratio or
                 old_box.border_width != new_box.border_width or
                 !std.meta.eql(old_box.padding, new_box.padding) or
@@ -1581,7 +1582,8 @@ fn hasCaretBoundary(positioned: *const text.PositionedLines, byte_offset: usize)
 
 test "layout property classification includes geometry and excludes paint-only state" {
     for ([_]types.Box{
-        .{ .min_width = 10 }, .{ .min_height = 5 }, .{ .fill_width = true }, .{ .fill_height = true },
+        .{ .min_width = 10 },      .{ .min_height = 5 }, .{ .fill_width = true }, .{ .fill_height = true },
+        .{ .height_factor = 0.5 },
     }) |box| try std.testing.expect(layoutPropertiesChanged(.{ .box = .{} }, .{ .box = box }));
     try std.testing.expect(layoutPropertiesChanged(
         .{ .stack = .{} },

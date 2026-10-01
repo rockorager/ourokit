@@ -14,7 +14,9 @@ card/tab reordering; see the [drag example](examples/drag-composition.lua).
 Form controls include checkboxes, radio groups, selects,
 sliders, spinboxes, split views, tabs, and in-window modal dialogs; native text
 inputs support multiline editing. See the
-[form controls example](examples/forms.lua). It is not yet a complete desktop
+[form controls example](examples/forms.lua). Animated switches, checkboxes,
+collapsibles, and accordions inherit reduced-motion policy; try the
+[motion components example](examples/motion-components.lua). It is not yet a complete desktop
 toolkit: OS accessibility and richer data widgets remain unfinished.
 
 ## Application surface

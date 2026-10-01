@@ -27,6 +27,9 @@ pub const Box = struct {
     height: ?f32 = null,
     fill_width: bool = false,
     fill_height: bool = false,
+    /// Scales the natural outer height reported to the parent without
+    /// tightening the child's height, for animated reveal/collapse layouts.
+    height_factor: ?f32 = null,
     min_width: f32 = 0,
     min_height: f32 = 0,
     max_width: ?f32 = null,

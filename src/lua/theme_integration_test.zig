@@ -306,7 +306,7 @@ test "Switch controlled callbacks, pointer and keyboard preserve state and focus
         \\function build()
         \\  local toggle = ouro.switch {key='dnd', label='Do Not Disturb', checked=checked(), enabled=enabled(), on_change=changed}
         \\  local other = ouro.switch {key='other', label='Other', checked=true}
-        \\  return ouro.theme {key='theme', color_scheme=dark() and 'dark' or 'light',
+        \\  return ouro.theme {key='theme', color_scheme=dark() and 'dark' or 'light', reduced_motion=true,
         \\    ouro.column {key='row', gap=12, children=reverse() and {other, toggle} or {toggle, other}}}
         \\end
     );
@@ -339,7 +339,8 @@ test "Switch controlled callbacks, pointer and keyboard preserve state and focus
     try f.exec("assert(calls == 1)");
     try input.pointer(f, path, 0x110, .pressed);
     try std.testing.expect((try f.runtime.semantics.findPath(path)).checked);
-    try std.testing.expectEqual(@as(f32, 16), (try f.runtime.tree.nodeOffset(thumb)).x);
+    // Reduced motion reaches the same visual endpoint without changing layout.
+    try std.testing.expectEqual(@as(f32, 16), (try f.runtime.tree.nodeOffset(thumb)).x + (try f.runtime.tree.objectAt(thumb)).box.transform.translation.x);
     try input.pointer(f, path, 0x110, .released);
     try f.exec("assert(calls == 2 and values == 'TT')");
     try input.key(f, .enter, .pressed, false);

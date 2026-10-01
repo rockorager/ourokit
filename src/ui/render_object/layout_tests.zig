@@ -6,6 +6,48 @@ const SizeF = @import("../../core/geometry.zig").SizeF;
 const PointF = @import("../../core/geometry.zig").PointF;
 const Color = @import("../../core/color.zig").Color;
 
+test "box height factor scales natural outer height without relaying out its child" {
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 2);
+    defer tree.deinit();
+    var box: types.Box = .{
+        .height_factor = 0,
+        .padding = .{ .left = 3, .right = 7, .top = 11, .bottom = 5 },
+    };
+    const root = try tree.create(.{ .box = box });
+    const child = try tree.create(.{ .box = .{ .width = 40, .height = 24 } });
+    try tree.appendChild(root, child, .none);
+
+    const loose: Constraints = .{ .max_width = 100, .max_height = 100 };
+    try std.testing.expectEqual(SizeF{ .width = 50, .height = 0 }, try tree.layout(root, loose));
+    try std.testing.expectEqual(SizeF{ .width = 40, .height = 24 }, try tree.nodeSize(child));
+    try std.testing.expectEqual(PointF{ .x = 3, .y = 11 }, try tree.nodeOffset(child));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(child));
+
+    box.height_factor = 0.5;
+    try tree.update(root, .{ .box = box });
+    try std.testing.expectEqual(SizeF{ .width = 50, .height = 20 }, try tree.layout(root, loose));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(child));
+    box.height_factor = 1;
+    try tree.update(root, .{ .box = box });
+    try std.testing.expectEqual(SizeF{ .width = 50, .height = 40 }, try tree.layout(root, loose));
+    try std.testing.expectEqual(@as(usize, 1), try tree.layoutCount(child));
+
+    // Tight parent bounds still win for the reported size. The child receives
+    // a loose height up to the deflated parent maximum, never the factor result.
+    box.height_factor = 0.25;
+    try tree.update(root, .{ .box = box });
+    const tight = Constraints.tight(.{ .width = 80, .height = 30 });
+    try std.testing.expectEqual(SizeF{ .width = 80, .height = 30 }, try tree.layout(root, tight));
+    try std.testing.expectEqual(SizeF{ .width = 70, .height = 14 }, try tree.nodeSize(child));
+    try std.testing.expectEqual(@as(usize, 2), try tree.layoutCount(child));
+
+    for ([_]f32{ -0.01, 1.01, std.math.inf(f32), std.math.nan(f32) }) |factor|
+        try std.testing.expectError(error.InvalidHeightFactor, tree.update(root, .{ .box = .{ .height_factor = factor } }));
+    try std.testing.expectError(error.ConflictingExtent, tree.update(root, .{ .box = .{ .height_factor = 0.5, .height = 20 } }));
+    try std.testing.expectError(error.ConflictingExtent, tree.update(root, .{ .box = .{ .height_factor = 0.5, .fill_height = true } }));
+}
+
 test "positioned stack resolves edges after normal children without contributing size" {
     var tree: Tree = undefined;
     try tree.init(std.testing.allocator, 3);

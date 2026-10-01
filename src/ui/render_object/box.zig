@@ -10,6 +10,8 @@ pub fn validate(value: types.Box) !void {
     try value.transform.validate();
     if (value.width) |width| if (!validExtent(width)) return error.InvalidExtent;
     if (value.height) |height| if (!validExtent(height)) return error.InvalidExtent;
+    if (value.height_factor) |factor| if (!std.math.isFinite(factor) or factor < 0 or factor > 1)
+        return error.InvalidHeightFactor;
     if (value.aspect_ratio) |ratio| if (!std.math.isFinite(ratio) or ratio <= 0)
         return error.InvalidAspectRatio;
     if (!validExtent(value.min_width) or !validExtent(value.min_height) or
@@ -27,6 +29,8 @@ pub fn validate(value: types.Box) !void {
         if (value.height) |height| if (height > maximum) return error.InvalidExtent;
     }
     if ((value.width != null and value.fill_width) or (value.height != null and value.fill_height))
+        return error.ConflictingExtent;
+    if (value.height_factor != null and (value.height != null or value.fill_height))
         return error.ConflictingExtent;
     if ((value.border_width == 0) != (value.border_color == null))
         return error.InvalidBorder;
@@ -82,14 +86,23 @@ pub fn layout(value: types.Box, context: anytype, node: anytype, incoming: Const
     var content: SizeF = .{ .width = 0, .height = 0 };
     if (child) |handle| {
         const inner = constraints.deflate(content_insets);
+        var child_constraints = if (value.alignment == null) inner else inner.loosen();
+        // The collapsed result is this box's reported size, not a constraint on
+        // its child. Keep horizontal propagation unchanged while measuring the
+        // child's natural height within the incoming upper bound.
+        if (value.height_factor != null) child_constraints.min_height = 0;
         content = try context.layoutChild(
             handle,
-            if (value.alignment == null) inner else inner.loosen(),
+            child_constraints,
         );
     }
-    const size = constraints.constrain(.{
+    const natural_outer: SizeF = .{
         .width = content.width + content_insets.horizontal(),
         .height = content.height + content_insets.vertical(),
+    };
+    const size = constraints.constrain(.{
+        .width = natural_outer.width,
+        .height = natural_outer.height * (value.height_factor orelse 1),
     });
     if (child) |handle| {
         const inner_size: SizeF = .{
@@ -170,5 +183,8 @@ test "box module remains a typed layout implementation" {
     try std.testing.expectError(error.InvalidExtent, validate(.{ .height = -1 }));
     try std.testing.expectError(error.InvalidExtent, validate(.{ .width = 10, .min_width = 20 }));
     try std.testing.expectError(error.ConflictingExtent, validate(.{ .width = 10, .fill_width = true }));
+    try std.testing.expectError(error.InvalidHeightFactor, validate(.{ .height_factor = -0.1 }));
+    try std.testing.expectError(error.ConflictingExtent, validate(.{ .height_factor = 0.5, .height = 10 }));
+    try std.testing.expectError(error.ConflictingExtent, validate(.{ .height_factor = 0.5, .fill_height = true }));
     try std.testing.expectError(error.InvalidBorder, validate(.{ .border_width = 1 }));
 }
