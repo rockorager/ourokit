@@ -192,6 +192,7 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     lua_ui.attachSignals(&signals);
     lua_ui.attachCallbacks(&callbacks, &vm);
     try lua_ui.attachText(&paragraph_sources, font_candidates, 1);
+    lua_ui.paragraphs = &paragraphs;
     try lua_ui.attachMediumText(medium_font_candidates);
     try lua_ui.attachSemantics(semantic_storage);
 

@@ -176,8 +176,11 @@ ouro.accordion = ouro.stateless(function(p, children)
 end)
 
 local TooltipTrigger = ouro.stateless(function(p, children, theme)
+  local size = ouro.measure_text {text=p.text, size=13,
+    max_width=math.max(0, (p.width or 240)-18), max_lines=1, overflow='ellipsis'}
+  p.prepare(p.width or math.ceil(size.width + 18), p.height or 40, theme)
   return ouro.box {key='anchor', flex=p.flex, x=p.x, y=p.y,
-    on_interaction_change=p.enabled and function(active, anchor) p.change(active, anchor, theme) end or nil,
+    on_interaction_change=p.enabled and function(active, anchor) p.change(active, anchor) end or nil,
     on_pointer_capture={kinds={'press'}, propagate=true, handler=p.dismiss},
     on_key_capture={keys={'Escape'}, states={'pressed'}, propagate=true, handler=p.dismiss},
     children=children}
@@ -185,11 +188,22 @@ end)
 
 ouro.tooltip = ouro.stateful(function(p)
   local popup, generation = nil, 0
+  local width, height, theme
   local function dismiss()
     generation = generation + 1
     if popup then popup:close(); popup=nil end
   end
-  local function change(active, anchor, theme)
+  local function prepare(w, h, style)
+    width, height, theme = w, h, style
+    if popup then
+      local ok, err = popup:resize {width=width, height=height}
+      if not ok then
+        dismiss()
+        if p.on_error then p.on_error(err) end
+      end
+    end
+  end
+  local function change(active, anchor)
     dismiss()
     if not active or not anchor or p.enabled == false then return end
     local request = generation
@@ -197,16 +211,19 @@ ouro.tooltip = ouro.stateful(function(p)
     if request ~= generation or p.enabled == false then return end
     local handle, err = ouro.popup {
       anchor=anchor, side=p.side or 'bottom', gap=p.gap or 6,
-      width=p.width or 240, height=p.height or 40,
+      width=width, height=height,
       on_close=function() if request == generation then popup=nil end end,
       content=function()
-        return ouro.theme {key='policy', reduced_motion=theme.reduced_motion, colors={background=transparent},
+        return ouro.theme {key='policy', reduced_motion=theme.reduced_motion,
+          typography={family=theme.typography.family ~= '' and theme.typography.family or nil},
+          colors={background=transparent},
           ouro.transition {key='fade', initial=0, target=1, duration=p.duration or 120,
             motion=p.motion, easing='ease_out', render=function(value)
-              return ouro.box {key='body', width='fill', height='fill', padding_x=12,
-                alignment='center', radius=6, background=theme.colors.foreground, opacity=value,
-                ouro.text {key='text', text=p.text, foreground=theme.colors.background,
-                  size=13, max_lines=1, overflow='ellipsis'}}
+              return ouro.box {key='body', width='fill', height='fill', padding_x=8,
+                  alignment='center', radius=6, background=theme.colors.popover, opacity=value,
+                  border=theme.colors.border, border_width=1,
+                  ouro.text {key='text', text=p.text, foreground=theme.colors.popover_foreground,
+                    size=13, max_lines=1, overflow='ellipsis'}}
             end}}
       end,
     }
@@ -228,7 +245,8 @@ ouro.tooltip = ouro.stateful(function(p)
     check(p.side == nil or p.side == 'top' or p.side == 'bottom' or p.side == 'left' or p.side == 'right', 'invalid tooltip side')
     check(p.on_error == nil or kind(p.on_error) == 'function', 'invalid tooltip on_error')
     return TooltipTrigger {key='trigger', flex=p.flex, x=p.x, y=p.y, enabled=active,
-      change=change, dismiss=dismiss, children=p.children}
+      text=p.text, width=p.width, height=p.height,
+      prepare=prepare, change=change, dismiss=dismiss, children=p.children}
   end
 end)
 

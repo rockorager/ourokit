@@ -555,18 +555,35 @@ tooltip; an already-open grabbing menu takes priority.
 
 Options are `text` (required nonempty string), `enabled` (default true),
 `delay` (integer milliseconds, 0–60000; default 500), `width`/`height`
-(integer logical pixels, 1–16384; defaults 240×40), `gap` (0–1024; default 6),
+(integer logical pixels, 1–16384; default height 40), `gap` (0–1024; default 6),
 and `side` (`top`, `bottom`, `left`, `right`; default `bottom`). Side is a
 preference: the compositor can flip or slide the surface at screen edges.
-This initial text-only tooltip is single-line and ellipsizes; it does not
-automatically measure its native surface size. Keep the child's accessible
-label meaningful rather than relying on the tooltip for essential information.
+Without an explicit `width`, the native surface fits its shaped text with 8px
+horizontal padding and a 1px border on each side, rounded up to whole logical
+pixels and capped at 240px. Measurement happens before native creation. The
+surface resizes in place when the label changes; explicit widths remain fixed.
+Text is single-line and ellipsizes at the available width. On xdg-shell versions
+older than 3, a required resize dismisses the tooltip instead; the next hover
+uses the new measured size. Keep the child's accessible label meaningful rather
+than relying on the tooltip for essential information.
 
 An enter fade defaults to 120ms; `duration` and `motion = 'auto' | 'reduce' |
 'full'` use the existing animation policy. Auto inherits the trigger's effective
 reduced-motion preference when opening. Dismissal is immediate. Colors inherit
-the trigger's theme. Optional `on_error(error)` receives popup-creation failures.
+the trigger's theme: `popover`, `popover_foreground`, and `border`, so light mode
+uses a light tooltip and dark mode uses a dark tooltip. Optional
+`on_error(error)` receives popup-creation or resize failures.
 See `examples/tooltip-bar.lua` for a 36px bar, including a tooltip around a select.
+
+`ouro.measure_text {text=..., size=..., max_width=..., max_lines=..., overflow=...}`
+returns `{width, height}` in logical pixels during a UI build. It uses the same
+shaping, fallback fonts, inherited typography, and optional `weight`/`spans` as
+`ouro.text`. The default maximum width is 16384; line count and overflow defaults
+match `ouro.text`. `popup:resize {width=..., height=...}` queues new positive
+integer dimensions, retaining the popup's anchor, side, gap, and input policy.
+It returns `true` or `nil, error`, including `PopupResizeUnsupported` on xdg-shell
+versions older than 3. The host applies the compositor-confirmed dimensions only
+after the subsequent configure handshake.
 
 For custom passive content, `on_interaction_change(active, anchor)` supplies an
 opaque anchor when the active target has visible bounds. Pass it as

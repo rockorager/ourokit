@@ -91,6 +91,7 @@ const Popup = struct {
     on_close: c_int,
     handle: core.Handle,
     notified: bool = false,
+    pending_size: ?core.SizeU = null,
 
     fn cancel(context: *anyopaque) !void {
         const slot: *RuntimeSlot = @ptrCast(@alignCast(context));
@@ -103,6 +104,7 @@ const Popup = struct {
 const PopupHost = struct {
     allocator: std.mem.Allocator,
     windows: *windows_module.WindowSet,
+    host: *platform.wayland.Host,
     callbacks: *lua.CallbackRegistry,
     slots: []RuntimeSlot,
     sequence: u64 = 0,
@@ -164,6 +166,37 @@ const PopupHost = struct {
         const self: *PopupHost = @ptrCast(@alignCast(context));
         for (self.slots) |*slot| if (slot.popup) |popup| {
             if (sameHandle(popup.handle, handle)) slot.desired = false;
+        };
+    }
+
+    fn resize(context: *anyopaque, handle: core.Handle, width: u32, height: u32) !void {
+        const self: *PopupHost = @ptrCast(@alignCast(context));
+        // The handle is usable immediately after open, even before the first
+        // configure has initialized its WindowRuntime.
+        const slot = for (self.slots) |*candidate| {
+            if (candidate.popup) |value| if (sameHandle(value.handle, handle)) break candidate;
+        } else return error.StalePopup;
+        const popup = &slot.popup.?;
+        if (!slot.desired) return error.StalePopup;
+        const declaration = popup.window.declaration.popup;
+        if (declaration.width == width and declaration.height == height) {
+            popup.pending_size = null;
+            return;
+        }
+        if (!try self.host.popupResizeSupported(handle)) return error.PopupResizeUnsupported;
+        popup.pending_size = .{ .width = width, .height = height };
+    }
+
+    fn flushResizes(self: *PopupHost) !void {
+        for (self.slots) |*slot| if (slot.desired) {
+            if (slot.popup) |*popup| if (popup.pending_size) |size| {
+                var declaration = popup.window.declaration.popup;
+                declaration.width = size.width;
+                declaration.height = size.height;
+                try self.host.resizePopup(popup.handle, declaration);
+                popup.window.declaration.popup = declaration;
+                popup.pending_size = null;
+            };
         };
     }
 
@@ -578,8 +611,8 @@ fn runSourceInternal(
     const development_windows = try init.gpa.alloc(development_control.Window, if (options.development) options.application_window_capacity else 0);
     defer init.gpa.free(development_windows);
     try syncRuntimeSlots(init.gpa, runtime_slots, application.windows);
-    var popups: PopupHost = .{ .allocator = init.gpa, .windows = &window_set, .callbacks = &callbacks, .slots = runtime_slots };
-    callbacks.popup_provider = .{ .context = &popups, .open = PopupHost.open, .close = PopupHost.close };
+    var popups: PopupHost = .{ .allocator = init.gpa, .windows = &window_set, .host = &host, .callbacks = &callbacks, .slots = runtime_slots };
+    callbacks.popup_provider = .{ .context = &popups, .open = PopupHost.open, .close = PopupHost.close, .resize = PopupHost.resize };
     var drag_host: DragHost = .{ .host = &host };
     callbacks.drag_provider = .{ .context = &drag_host, .start = DragHost.start };
     var window_export_host: WindowExportHost = .{ .host = &host, .windows = &window_set };
@@ -1034,6 +1067,7 @@ fn runSourceInternal(
             slot.configured_size = null;
             try dirty.complete(work);
         }
+        try popups.flushResizes();
 
         if (if (options.development) reload_requests.take() else null) |sequence| {
             if (active_reload_sequence == null) {
@@ -2102,7 +2136,7 @@ test "render failure drains native and application owners before returning origi
     defer runtime.deinit();
     try runtime.reconcile(.{ .width = 300, .height = 40 }, &initial.ui_build, initial.application.windows[0].content_reference);
     try std.testing.expect(runtime.ready);
-    var popups: PopupHost = .{ .allocator = allocator, .windows = &windows, .callbacks = &callbacks, .slots = &slots };
+    var popups: PopupHost = .{ .allocator = allocator, .windows = &windows, .host = &host, .callbacks = &callbacks, .slots = &slots };
 
     var environment_map: std.process.Environ.Map = .init(allocator);
     defer environment_map.deinit();

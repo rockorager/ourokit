@@ -2247,6 +2247,29 @@ pub const Host = struct {
         _ = try self.driver.schedule();
     }
 
+    pub fn popupResizeSupported(self: *Host, handle: WindowHandle) !bool {
+        const window = try self.windowFor(handle);
+        if (window.state != .open) return error.WindowClosing;
+        const popup = window.popup orelse return error.NotPopup;
+        return self.connection.objects.namespace.resolve(popup).?.version >= 3;
+    }
+
+    pub fn resizePopup(self: *Host, handle: WindowHandle, declaration: platform_window.PopupDeclaration) !void {
+        try declaration.validate();
+        if (!try self.popupResizeSupported(handle)) return error.PopupResizeUnsupported;
+        const window = try self.windowFor(handle);
+        const objects = &self.connection.objects;
+        const transmit = try self.queue();
+        const positioner = try createPopupPositioner(objects, transmit, self.wm_base.?, declaration);
+        try wayring.client.sendRequest(protocol.xdg_popup, objects, transmit, window.popup.?, .{
+            .reposition = .{ .positioner = positioner.id, .token = 0 },
+        });
+        try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .destroy = .{} });
+        // Keep the old buffer geometry until xdg_surface.configure acknowledges
+        // the compositor's popup.configure, exactly as on initial creation.
+        _ = try self.driver.schedule();
+    }
+
     fn nativeUpdateTitle(context: *anyopaque, handle: WindowHandle, title: []const u8) !void {
         const self: *Host = @ptrCast(@alignCast(context));
         const window = try self.windowFor(handle);
@@ -3508,13 +3531,10 @@ fn setMinimumSize(
     });
 }
 
-fn createPopupRole(
+fn createPopupPositioner(
     objects: *wayring.objects.ClientObjects,
     transmit: *wayring.tx.Queue,
     wm_base: Handle,
-    seat: ?Handle,
-    xdg_surface: Handle,
-    parent: *const Window,
     declaration: platform_window.PopupDeclaration,
 ) !Handle {
     const positioner = (try protocol.xdg_wm_base.construct_create_positioner(objects, transmit, wm_base, .{})).id;
@@ -3549,6 +3569,19 @@ fn createPopupRole(
     try wayring.client.sendRequest(protocol.xdg_positioner, objects, transmit, positioner, .{ .set_constraint_adjustment = .{
         .constraint_adjustment = protocol.xdg_positioner.constraint_adjustment.fromInt(15),
     } });
+    return positioner;
+}
+
+fn createPopupRole(
+    objects: *wayring.objects.ClientObjects,
+    transmit: *wayring.tx.Queue,
+    wm_base: Handle,
+    seat: ?Handle,
+    xdg_surface: Handle,
+    parent: *const Window,
+    declaration: platform_window.PopupDeclaration,
+) !Handle {
+    const positioner = try createPopupPositioner(objects, transmit, wm_base, declaration);
     const popup = (try protocol.xdg_surface.construct_get_popup(objects, transmit, xdg_surface, .{
         .parent = if (parent.xdg_surface) |surface| surface.id else null,
         .positioner = positioner.id,
@@ -4963,6 +4996,53 @@ test "native popup validates input, positions independently and tears down befor
     try std.testing.expectEqual(@as(usize, 1), anchor_rectangles);
     try transmit.begin(passive_requests);
     try transmit.complete(passive_requests.byteCount());
+
+    // Resize sends a complete positioner and no new surface/grab. Older
+    // protocol versions reject it before publishing any requests.
+    var resized = passive.popup;
+    resized.width = 137;
+    resized.height = 41;
+    const popup_object = objects.namespace.resolve(windows[1].popup.?).?;
+    popup_object.version = 2;
+    try std.testing.expectError(error.PopupResizeUnsupported, host.resizePopup(popup_window, resized));
+    try std.testing.expectEqual(@as(usize, 0), transmit.queuedBytes());
+    popup_object.version = 5;
+    try host.resizePopup(popup_window, resized);
+    try std.testing.expectEqual(@as(u32, 211), windows[1].width);
+    try std.testing.expectEqual(@as(u32, 93), windows[1].height);
+    const reposition = try transmit.snapshot(&.{}, &.{});
+    bytes = reposition.first;
+    var resize_requests: [8]wayring.wire.Message = undefined;
+    for (&resize_requests) |*request| {
+        request.* = (try wayring.wire.Message.decode(bytes)).?;
+        bytes = bytes[request.header.size..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+    for (resize_requests, [_]u16{ 1, 1, 2, 3, 4, 5, 2, 0 }) |request, opcode|
+        try std.testing.expectEqual(opcode, request.header.opcode);
+    args = resize_requests[1].arguments();
+    try std.testing.expectEqual(@as(i32, 137), try args.int());
+    try std.testing.expectEqual(@as(i32, 41), try args.int());
+    args = resize_requests[2].arguments();
+    for ([_]i32{ 286, 120, 97, 45 }) |expected| try std.testing.expectEqual(expected, try args.int());
+    try std.testing.expectEqual(passive_id, resize_requests[6].header.object_id);
+    args = resize_requests[6].arguments();
+    try std.testing.expectEqual(resize_requests[1].header.object_id, try args.uint());
+    try std.testing.expectEqual(@as(u32, 0), try args.uint());
+    try transmit.begin(reposition);
+    try transmit.complete(reposition.byteCount());
+    try protocol.xdg_popup.encodeEvent(&incoming, passive_id, .{ .repositioned = .{ .token = 0 } });
+    try protocol.xdg_popup.encodeEvent(&incoming, passive_id, .{ .configure = .{ .x = 10, .y = 20, .width = 137, .height = 41 } });
+    try Recorder.dispatch(&host, &incoming, &fds);
+    try std.testing.expectEqual(@as(u32, 211), windows[1].width);
+    try protocol.xdg_surface.encodeEvent(&incoming, windows[1].xdg_surface.?.id, .{ .configure = .{ .serial = 89 } });
+    try Recorder.dispatch(&host, &incoming, &fds);
+    try std.testing.expectEqual(@as(u32, 137), recorder.width);
+    try std.testing.expectEqual(@as(u32, 41), recorder.height);
+    const resized_ack = try transmit.snapshot(&.{}, &.{});
+    try transmit.begin(resized_ack);
+    try transmit.complete(resized_ack.byteCount());
+
     try Host.nativeUpdateLayerSurface(&host, input.window, .{ .id = "banner", .namespace = "test", .width = 421, .height = 199, .layer = .overlay });
     const passive_update = try transmit.snapshot(&.{}, &.{});
     bytes = passive_update.first;

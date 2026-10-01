@@ -399,6 +399,7 @@ pub const SourceGeneration = struct {
         if (services) |value| {
             self.callbacks = value.callbacks;
             self.ui_build.attachCallbacks(value.callbacks, &self.vm);
+            self.ui_build.paragraphs = value.paragraphs;
             self.ui_build.attachText(value.paragraph_sources, value.font_candidates, 1) catch |err| {
                 lua.recordDiagnosticError(
                     diagnostic,
@@ -612,6 +613,7 @@ pub const SourceGeneration = struct {
         self.services = services;
         self.callbacks = services.callbacks;
         self.ui_build.attachCallbacks(services.callbacks, &self.vm);
+        self.ui_build.paragraphs = services.paragraphs;
         try self.ui_build.attachText(services.paragraph_sources, services.font_candidates, 1);
         try self.ui_build.attachMediumText(services.medium_font_candidates);
         self.ui_build.enableDeclarativeWidgets(services.theme);

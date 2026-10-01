@@ -22,6 +22,7 @@ pub const Provider = struct {
     context: *anyopaque,
     open: *const fn (*anyopaque, *Vm, Options) anyerror!Handle,
     close: *const fn (*anyopaque, Handle) void,
+    resize: ?*const fn (*anyopaque, Handle, u32, u32) anyerror!void = null,
 };
 
 const Userdata = struct { provider: Provider, handle: Handle };
@@ -54,6 +55,8 @@ pub fn open(state: *c.State) callconv(.c) c_int {
         c.lua_setfield(state, -2, "__index");
         c.lua_pushcclosure(state, close, 0);
         c.lua_setfield(state, -2, "close");
+        c.lua_pushcclosure(state, resize, 0);
+        c.lua_setfield(state, -2, "resize");
     }
     _ = c.lua_setmetatable(state, -2);
     return 1;
@@ -73,8 +76,8 @@ fn parse(vm: *Vm, state: *c.State) !Options {
         break :blk @as(*platform.PopupAnchor, @ptrCast(@alignCast(raw))).*;
     };
     c.lua_settop(state, -2);
-    const width = try dimension(state, "width");
-    const height = try dimension(state, "height");
+    const width = try dimension(state, 1, "width");
+    const height = try dimension(state, 1, "height");
     var side: @FieldType(platform.PopupDeclaration, "side") = .bottom;
     if (c.lua_getfield(state, 1, "side") != c.type_nil) {
         if (c.lua_type(state, -1) != c.type_string) return error.InvalidPopupSide;
@@ -103,8 +106,8 @@ fn parse(vm: *Vm, state: *c.State) !Options {
     return .{ .anchor = anchor, .input = input, .scope = scope, .width = width, .height = height, .side = side, .gap = gap, .content = content, .on_close = on_close };
 }
 
-fn dimension(state: *c.State, field: [*:0]const u8) !u32 {
-    _ = c.lua_getfield(state, 1, field);
+fn dimension(state: *c.State, table: c_int, field: [*:0]const u8) !u32 {
+    _ = c.lua_getfield(state, table, field);
     defer c.lua_settop(state, -2);
     if (c.lua_isinteger(state, -1) == 0) return error.InvalidPopupSize;
     var valid: c_int = 0;
@@ -123,6 +126,19 @@ fn close(state: *c.State) callconv(.c) c_int {
     const value: *Userdata = @ptrCast(@alignCast(raw));
     value.provider.close(value.provider.context, value.handle);
     return 0;
+}
+
+fn resize(state: *c.State) callconv(.c) c_int {
+    const raw = c.luaL_testudata(state, 1, metatable) orelse return failure(state, error.InvalidPopupHandle);
+    if (c.lua_gettop(state) != 2 or c.lua_type(state, 2) != c.type_table)
+        return failure(state, error.InvalidPopupArguments);
+    const value: *Userdata = @ptrCast(@alignCast(raw));
+    const width = dimension(state, 2, "width") catch |err| return failure(state, err);
+    const height = dimension(state, 2, "height") catch |err| return failure(state, err);
+    const update = value.provider.resize orelse return failure(state, error.PopupResizeUnsupported);
+    update(value.provider.context, value.handle, width, height) catch |err| return failure(state, err);
+    c.lua_pushboolean(state, 1);
+    return 1;
 }
 
 fn failure(state: *c.State, err: anyerror) c_int {
@@ -150,6 +166,7 @@ test "popup requires fresh scoped input and transfers only valid callbacks" {
     const Fake = struct {
         options: ?Options = null,
         closes: usize = 0,
+        resizes: usize = 0,
         fn start(context: *anyopaque, _: *Vm, options: Options) !Handle {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.options = options;
@@ -160,9 +177,16 @@ test "popup requires fresh scoped input and transfers only valid callbacks" {
             std.debug.assert(handle.slot == 4 and handle.generation == 9);
             self.closes += 1;
         }
+        fn update(context: *anyopaque, handle: Handle, width: u32, height: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqual(Handle{ .slot = 4, .generation = 9 }, handle);
+            try std.testing.expectEqual(@as(u32, 137), width);
+            try std.testing.expectEqual(@as(u32, 41), height);
+            self.resizes += 1;
+        }
     };
     var fake: Fake = .{};
-    vm.popup_provider = .{ .context = &fake, .open = Fake.start, .close = Fake.stop };
+    vm.popup_provider = .{ .context = &fake, .open = Fake.start, .close = Fake.stop, .resize = Fake.update };
     const input: @import("../platform/activation.zig").Input = .{
         .window = .{ .slot = 2, .generation = 7 },
         .serial = 719,
@@ -175,7 +199,17 @@ test "popup requires fresh scoped input and transfers only valid callbacks" {
     try vm.setActivationInput(bad, input);
     _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
     try std.testing.expect(fake.options == null);
-    const valid = try vm.spawnApplication("local o=require('ouro'); local p=assert(o.popup{width=97,height=53,content=function() end,on_close=function() end}); p:close(); p:close(); assert(o.popup{width=97,height=53,content=function() end}==nil)");
+    const valid = try vm.spawnApplication(
+        \\local o=require('ouro')
+        \\local p=assert(o.popup{width=97,height=53,content=function() end,on_close=function() end})
+        \\for _, w in ipairs({0, -1, 1.5, 16385}) do
+        \\  local ok, err=p:resize{width=w,height=41}
+        \\  assert(ok==nil and err.name=='InvalidPopupSize')
+        \\end
+        \\assert(p:resize{width=137,height=41})
+        \\p:close(); p:close()
+        \\assert(o.popup{width=97,height=53,content=function() end}==nil)
+    );
     try vm.setActivationInput(valid, input);
     _ = try vm.resumeRunnable(scheduler.takeRunnable().?);
     try std.testing.expectEqual(input, fake.options.?.input.?);
@@ -183,6 +217,7 @@ test "popup requires fresh scoped input and transfers only valid callbacks" {
     try std.testing.expectEqual(@as(u32, 97), fake.options.?.width);
     try std.testing.expectEqual(@as(u32, 53), fake.options.?.height);
     try std.testing.expectEqual(@as(usize, 2), fake.closes);
+    try std.testing.expectEqual(@as(usize, 1), fake.resizes);
     release(vm.state, fake.options.?);
     fake.options = null;
     const delayed = try vm.spawnApplication("local o=require('ouro'); o.spawn(function() assert(o.popup{width=97,height=53,content=function() end}==nil) end); o.sleep(0); assert(o.popup{width=97,height=53,content=function() end}==nil)");

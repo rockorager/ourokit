@@ -145,6 +145,7 @@ pub const UiBuild = struct {
     callbacks: ?*CallbackRegistry = null,
     callback_vm: ?*Vm = null,
     text_sources: ?*text.ParagraphSourceCache = null,
+    paragraphs: ?*text.ParagraphCache = null,
     text_candidates: []const text.FontHandle = &.{},
     medium_candidates: []const text.FontHandle = &.{},
     text_configuration_revision: u64 = 0,
@@ -207,6 +208,9 @@ pub const UiBuild = struct {
             c.lua_getglobal(state, "ouro");
         if (api_type != c.type_table) return error.OuroApiMissing;
         Description.install(state);
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, measureText, 1);
+        c.lua_setfield(state, -2, "measure_text");
         try @import("forms.zig").install(state);
         try self.components.init(state);
     }
@@ -1638,6 +1642,51 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append text semantics");
         self.emitTextLinks(state, id, source, semantic) catch |err| return luaError(state, @errorName(err));
         return 0;
+    }
+
+    /// Uses the same source/font policy and shaping as rendered text. Available
+    /// during builds so inherited typography is unambiguous.
+    fn measureText(state: *c.State) callconv(.c) c_int {
+        const self = bridge(state) orelse return luaError(state, "measure_text requires a UI build");
+        if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+            return luaError(state, "measure_text expects one text declaration table");
+        const defaults = self.currentStyle() orelse return luaError(state, "measure_text requires a theme");
+        const visual = theming.widgetOverrides(state, defaults.widgets.text, false) catch |err| return luaError(state, @errorName(err));
+        const size = tableOptionalExtent(state, 1, "size", visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_3) orelse return luaError(state, "invalid text size");
+        const width = tableOptionalExtent(state, 1, "max_width", 16384) orelse return luaError(state, "invalid text max_width");
+        const weight = tableOptionalEnum(TextWeight, state, 1, "weight", .normal) orelse return luaError(state, "invalid text weight");
+        const max_lines = tableOptionalPositiveInteger(state, 1, "max_lines", 0) orelse return luaError(state, "invalid text max_lines");
+        const overflow = tableOptionalParagraphOverflow(state, 1, "overflow", .clip) orelse return luaError(state, "invalid text overflow");
+        if (overflow == .ellipsis and max_lines == 0) return luaError(state, "text ellipsis requires max_lines");
+        const sources = self.text_sources orelse return luaError(state, "text service unavailable");
+        const paragraphs = self.paragraphs orelse return luaError(state, "text measurement unavailable");
+        const source = self.retainDeclarativeText(state, size, weight) catch |err| return luaError(state, @errorName(err));
+        const value = sources.get(source) catch unreachable;
+        const handle = paragraphs.acquire(.{
+            .utf8 = value.utf8,
+            .base_direction = value.base_direction,
+            .language = value.language,
+            .logical_size = value.logical_size,
+            .max_width = width,
+            .candidates = value.candidates,
+            .runs = value.runs,
+            .configuration_revision = value.configuration_revision,
+            .style = .{ .max_lines = if (max_lines == 0) null else max_lines, .overflow = overflow },
+        }) catch |err| {
+            sources.release(source) catch unreachable;
+            return luaError(state, @errorName(err));
+        };
+        const layout = paragraphs.get(handle) catch unreachable;
+        const measured_width = @min(width, layout.positioned.contentWidth());
+        const measured_height = layout.size.height;
+        paragraphs.release(handle) catch unreachable;
+        sources.release(source) catch unreachable;
+        c.lua_createtable(state, 0, 2);
+        c.lua_pushnumber(state, measured_width);
+        c.lua_setfield(state, -2, "width");
+        c.lua_pushnumber(state, measured_height);
+        c.lua_setfield(state, -2, "height");
+        return 1;
     }
 
     const TextWeight = enum { normal, medium };

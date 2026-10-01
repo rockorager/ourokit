@@ -5,6 +5,7 @@ python3 tests/tooltip_native.py zig-out/bin/ouroctl --capture-dir .amp/in/artifa
 """
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -29,19 +30,22 @@ def session():
         env['SWAYSOCK'] = str(next(Path(env['WAYLAND_DISPLAY']).parent.glob('sway-ipc.*.sock')))
         editor = root / 'editor.lua'
         editor.write_text('''local o=require('ouro'); local hits=0
+local scheme, tip_text = o.signal('light'), o.signal('Bothe Consulting (87%)')
 return o.app{id='dev.ourokit.tooltip-editor',actions={
+Style={description='Set tooltip fixture',inputSchema={type='object',properties={scheme={type='string'},text={type='string'}}},
+outputSchema={type='object'},handler=function(p) scheme:set(p.scheme); tip_text:set(p.text); return {} end},
 Stats={description='Read clicks',inputSchema={type='object'},outputSchema={type='object'},
 handler=function() return {hits=hits} end}},run=function() return {windows={
 o.window{id='main',title='Independent application',width=760,height=400,content=function()
-return o.column{key='root',gap=16,
+return o.theme{key='theme',color_scheme=scheme(),o.column{key='root',gap=16,
 o.button{key='under',label='Underlying application — click through',width=700,height=80,
 on_press=function() hits=hits+1 end},
 o.text{key='title',text='Your editor keeps keyboard focus',size=24},
 o.text_input{key='editor',label='Editor',default_text='Type here: ',autofocus=true,width=700},
-o.tooltip{key='tip',text='A native tooltip in an ordinary window',width=300,
+o.tooltip{key='tip',text=tip_text(),
 o.button{key='button',label='Window tooltip'}},
 o.button{key='through',label='Click through the tooltip',width=700,height=80,
-on_press=function() hits=hits+1 end}} end}}} end}
+on_press=function() hits=hits+1 end}}} end}}} end}
 ''')
         logs, processes, endpoints = [], [], []
         try:
@@ -83,6 +87,8 @@ on_press=function() hits=hits+1 end}} end}}} end}
                 assert not reply.get('isError') and 'rpcError' not in reply, reply
                 return reply['structuredContent']
             def windows(endpoint): return invoke(endpoint, 'runtime.inspect')['windows']
+            def surface_size(endpoint, window):
+                return next(w['size'] for w in windows(endpoint) if w['window'] == window)
             def tree(endpoint, window): return invoke(endpoint, 'runtime.inspect', {'window': window})['windows'][0]
             def node(endpoint, window, suffix):
                 return next(n for n in tree(endpoint, window)['nodes'] if n['path'].endswith(suffix))
@@ -185,6 +191,54 @@ on_press=function() hits=hits+1 end}} end}}} end}
             tip = opened(editor_endpoint); time.sleep(.3)
             capture('window-tooltip.png')
             print('PASS ordinary-window native tooltip')
+            widths = []
+            for scheme, label, background in (('light', 'Bothe Consulting (87%)', (255, 255, 255)),
+                    ('dark', 'Bothe Consulting (87%)', (24, 25, 27)),
+                    ('light', 'iii', (255, 255, 255)), ('light', 'WWW', (255, 255, 255)),
+                    ('light', 'Café 東京', (255, 255, 255))):
+                move(750, 680)
+                wait_for(lambda: not popups(editor_endpoint), 'tooltip did not close')
+                invoke(editor_endpoint, 'Style', {'scheme': scheme, 'text': label})
+                time.sleep(.1)
+                move(rect['x'] + int(b['x'] + b['width']/2), rect['y'] + int(b['y'] + b['height']/2))
+                tip = opened(editor_endpoint); time.sleep(.3)
+                body = node(editor_endpoint, tip, '/body')['bounds']
+                text_bounds = node(editor_endpoint, tip, '/text')['bounds']
+                assert body['width'] == math.ceil(text_bounds['width'] + 18), (body, text_bounds)
+                assert 9 <= text_bounds['x'] - body['x'] < 9.5, (body, text_bounds)
+                assert surface_size(editor_endpoint, tip) == {'width': body['width'], 'height': 40}
+                assert body['x'] == 0, body
+                assert body['width'] < 240, body
+                px = rect['x'] + int(b['x'] + b['width']/2)
+                py = rect['y'] + int(b['y'] + b['height'] + 6 + 5)
+                image = screen()
+                assert tuple(image[(py*1280+px)*3:(py*1280+px+1)*3]) == background, (scheme, label)
+                if label in ('iii', 'WWW'): widths.append(body['width'])
+                if label == 'Bothe Consulting (87%)': capture('fitted-' + scheme + '-tooltip.png')
+            assert widths[1] > widths[0] * 1.5, widths
+            print('PASS inherited light/dark colors, shaped-text width, 8px padding and Unicode')
+            # Resize the same native surface in both directions without leaving
+            # the trigger. A fixed transparent surface or close/reopen fails.
+            live_widths = []
+            for label in ('iii', 'Bothe Consulting (87%)', 'WWW', 'W' * 100, 'Café 東京'):
+                previous = surface_size(editor_endpoint, tip)['width']
+                invoke(editor_endpoint, 'Style', {'scheme': 'light', 'text': label})
+                wait_for(lambda: surface_size(editor_endpoint, tip)['width'] != previous,
+                         'native tooltip did not resize in place')
+                wait_for(lambda: node(editor_endpoint, tip, '/text')['label'] == label,
+                         'open tooltip text did not update')
+                assert popups(editor_endpoint) == [tip]
+                body = node(editor_endpoint, tip, '/body')['bounds']
+                text_bounds = node(editor_endpoint, tip, '/text')['bounds']
+                assert surface_size(editor_endpoint, tip)['width'] == body['width']
+                if len(label) < 100:
+                    assert body['width'] == math.ceil(text_bounds['width'] + 18), (label, body, text_bounds)
+                else:
+                    assert body['width'] == 240, body
+                live_widths.append(body['width'])
+            assert live_widths[0] < live_widths[2] < live_widths[1] < live_widths[3], live_widths
+            capture('resized-tooltip.png')
+            print('PASS live native resize: shrink, grow, Unicode, capped ellipsis, same popup identity')
             # Focus from a real keyboard event, not a development popup bypass.
             entry = node(editor_endpoint, 'main', '/editor')['bounds']
             move(rect['x'] + int(entry['x'] + 50), rect['y'] + int(entry['y'] + 15))
