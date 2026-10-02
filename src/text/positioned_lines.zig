@@ -109,6 +109,28 @@ pub const PositionedLines = struct {
     source_byte_len: usize,
     ellipsis_byte_offset: ?usize,
 
+    /// Give the immutable result its own lifetime, independent of build scratch.
+    pub fn clone(self: *const PositionedLines, allocator: std.mem.Allocator) !PositionedLines {
+        const lines = try allocator.dupe(Line, self.lines);
+        errdefer allocator.free(lines);
+        const spans = try allocator.dupe(Span, self.spans);
+        errdefer allocator.free(spans);
+        const glyphs = try allocator.dupe(Glyph, self.glyphs);
+        errdefer allocator.free(glyphs);
+        const carets = try allocator.dupe(CaretStop, self.carets);
+        return .{
+            .allocator = allocator,
+            .lines = lines,
+            .spans = spans,
+            .glyphs = glyphs,
+            .carets = carets,
+            .layout_width = self.layout_width,
+            .truncated = self.truncated,
+            .source_byte_len = self.source_byte_len,
+            .ellipsis_byte_offset = self.ellipsis_byte_offset,
+        };
+    }
+
     pub fn deinit(self: *PositionedLines) void {
         self.allocator.free(self.carets);
         self.allocator.free(self.glyphs);

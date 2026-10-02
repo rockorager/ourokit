@@ -20,6 +20,7 @@ pub const ParagraphLayout = paragraph_layout.Layout;
 pub const ParagraphCache = struct {
     allocator: std.mem.Allocator,
     font_cache: *api.FontCache,
+    scratch: std.heap.ArenaAllocator,
     slabs: std.ArrayListUnmanaged(*Slab) = .empty,
     index: Index = .empty,
     index_removals: usize = 0,
@@ -145,7 +146,7 @@ pub const ParagraphCache = struct {
     );
 
     pub fn init(allocator: std.mem.Allocator, font_cache: *api.FontCache) ParagraphCache {
-        return .{ .allocator = allocator, .font_cache = font_cache };
+        return .{ .allocator = allocator, .font_cache = font_cache, .scratch = .init(allocator) };
     }
 
     pub fn deinit(self: *ParagraphCache) void {
@@ -155,6 +156,7 @@ pub const ParagraphCache = struct {
             self.allocator.destroy(slab);
         }
         self.slabs.deinit(self.allocator);
+        self.scratch.deinit();
         self.* = undefined;
     }
 
@@ -167,6 +169,10 @@ pub const ParagraphCache = struct {
             return handle;
         }
 
+        // Temporary analysis, shaping and positioning allocations are reused
+        // across misses. Only final immutable arrays escape the arena.
+        errdefer _ = self.scratch.reset(.free_all);
+        const scratch = self.scratch.allocator();
         const utf8 = try self.allocator.dupe(u8, transient_key.utf8);
         errdefer self.allocator.free(utf8);
         const language = try self.allocator.dupe(u8, transient_key.language);
@@ -176,8 +182,7 @@ pub const ParagraphCache = struct {
         const runs = try self.allocator.dupe(StyledRun, request.runs);
         errdefer self.allocator.free(runs);
 
-        const fallback_candidates = try self.allocator.alloc(api.FallbackCandidate, request.candidates.len);
-        defer self.allocator.free(fallback_candidates);
+        const fallback_candidates = try scratch.alloc(api.FallbackCandidate, request.candidates.len);
         var retained: usize = 0;
         errdefer for (request.candidates[0..retained]) |handle|
             self.font_cache.release(handle) catch unreachable;
@@ -188,7 +193,7 @@ pub const ParagraphCache = struct {
         }
 
         var layout = try paragraph_layout.buildStyled(
-            self.allocator,
+            scratch,
             utf8,
             transient_key.base_direction,
             fallback_candidates,
@@ -203,7 +208,11 @@ pub const ParagraphCache = struct {
             transient_key.include_caret_stops,
             request.runs,
         );
+        layout.positioned = try layout.positioned.clone(self.allocator);
         errdefer layout.deinit();
+        // Consolidating arena pages can allocate; fail before publishing an
+        // entry, just as for any other allocation in this transaction.
+        if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
         try self.index.ensureUnusedCapacity(self.allocator, 1);
         const slot_index = try self.takeSlot();
         const slot = self.slotAt(slot_index).?;
@@ -439,6 +448,7 @@ test "paragraph index churn preserves live layouts and stale generations" {
         .language = "und",
         .logical_size = 14,
         .max_width = 200,
+        .include_caret_stops = true,
         .candidates = &.{font},
         .configuration_revision = 3,
     };
@@ -446,6 +456,8 @@ test "paragraph index churn preserves live layouts and stale generations" {
     const layout = try cache.get(anchor);
     const size = layout.size;
     const glyphs = layout.positioned.glyphs;
+    var saved = try layout.positioned.clone(std.testing.allocator);
+    defer saved.deinit();
     var handles: [40]ParagraphHandle = undefined;
     var buffer: [64]u8 = undefined;
     for (0..16) |generation| {
@@ -460,6 +472,10 @@ test "paragraph index churn preserves live layouts and stale generations" {
         try std.testing.expectEqual(layout, try cache.get(anchor));
         try std.testing.expectEqual(size, layout.size);
         try std.testing.expectEqual(glyphs.ptr, layout.positioned.glyphs.ptr);
+        try std.testing.expectEqualDeep(saved.lines, layout.positioned.lines);
+        try std.testing.expectEqualDeep(saved.spans, layout.positioned.spans);
+        try std.testing.expectEqualDeep(saved.glyphs, layout.positioned.glyphs);
+        try std.testing.expectEqualDeep(saved.carets, layout.positioned.carets);
         try std.testing.expectError(error.StaleParagraph, cache.get(handles[0]));
         request.utf8 = "retained anchor";
         const duplicate = try cache.acquire(request);

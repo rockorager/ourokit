@@ -3,6 +3,7 @@ const uucode = @import("uucode");
 const CaretAffinity = @import("../../text/positioned_lines.zig").CaretAffinity;
 const word_break = @import("../../text/word_break.zig");
 const single_line = @import("single_line.zig");
+const GapBuffer = @import("gap_buffer.zig").GapBuffer;
 
 /// A logical selection in UTF-8 byte offsets. Anchor and extent preserve the
 /// direction of an extended selection; `range` returns its normalized bounds.
@@ -48,26 +49,31 @@ const history_limit = 100;
 /// A secret field holds at most one PAM response.
 pub const secret_capacity = 512;
 const HistoryEntry = struct {
-    before: []u8,
-    after: []u8,
+    const Edit = struct { start: usize, data_offset: usize, removed_len: usize, inserted_len: usize };
+    edits: std.ArrayList(Edit) = .empty,
+    // Each edit owns consecutive removed and inserted bytes, not documents.
+    data: std.ArrayList(u8) = .empty,
     selection_before: Selection,
     selection_after: Selection,
 
-    fn deinit(self: HistoryEntry, allocator: std.mem.Allocator) void {
-        allocator.free(self.before);
-        allocator.free(self.after);
+    fn deinit(value: HistoryEntry, allocator: std.mem.Allocator) void {
+        var self = value;
+        self.edits.deinit(allocator);
+        self.data.deinit(allocator);
     }
 };
 
 /// Renderer- and platform-independent state for an editable UTF-8 value.
 ///
 /// Caret positions are always Unicode extended-grapheme boundaries. A compact
-/// boundary index makes repeated cursor movement O(log n); text replacement
-/// remains O(n), matching the contiguous storage appropriate for text fields.
-/// A future long-document editor may use different private storage without
-/// changing this value-level editing contract.
+/// boundary index makes repeated cursor movement O(log n). Normal text uses a
+/// gap buffer with a lazy contiguous read view and grouped, delta-based undo.
 pub const Model = struct {
     allocator: std.mem.Allocator,
+    // Heap ownership permits lazily refreshing the view through const Model
+    // APIs without casting away constness or moving the editing gap.
+    gap: ?*GapBuffer = null,
+    // Only secret fields use this fixed, locked-page buffer.
     bytes: std.ArrayList(u8) = .empty,
     boundaries: std.ArrayList(usize) = .empty,
     word_boundaries: std.ArrayList(usize) = .empty,
@@ -95,7 +101,11 @@ pub const Model = struct {
             return error.OutOfMemory;
         var self: Model = .{ .allocator = allocator, .multiline = multiline };
         errdefer self.deinit();
-        try self.bytes.appendSlice(allocator, initial);
+        const gap = try allocator.create(GapBuffer);
+        gap.* = .{ .allocator = allocator };
+        self.gap = gap;
+        try gap.reserve(initial.len);
+        gap.replaceAssumeCapacity(0, 0, initial);
         try self.boundaries.ensureTotalCapacity(allocator, boundary_capacity);
         try self.word_boundaries.ensureTotalCapacity(allocator, boundary_capacity);
         self.rebuildBoundaries();
@@ -132,7 +142,11 @@ pub const Model = struct {
         if (self.secret_page) |page| {
             std.crypto.secureZero(u8, page);
             std.posix.munmap(page);
-        } else self.bytes.deinit(self.allocator);
+        }
+        if (self.gap) |gap| {
+            gap.deinit();
+            self.allocator.destroy(gap);
+        }
         self.* = undefined;
     }
 
@@ -147,7 +161,11 @@ pub const Model = struct {
     }
 
     pub fn text(self: *const Model) []const u8 {
-        return self.bytes.items;
+        return if (self.gap) |gap| gap.text() else self.bytes.items;
+    }
+
+    fn byteLen(self: *const Model) usize {
+        return if (self.gap) |gap| gap.len() else self.bytes.items.len;
     }
 
     /// Returns a borrowed view of the normalized committed-text selection.
@@ -155,7 +173,7 @@ pub const Model = struct {
     /// retaining it past the current editing phase.
     pub fn selectedText(self: *const Model) []const u8 {
         const range = self.selection.range();
-        return self.bytes.items[range.start..range.end];
+        return self.text()[range.start..range.end];
     }
 
     pub fn setSelection(self: *Model, value: Selection) !bool {
@@ -174,8 +192,8 @@ pub const Model = struct {
     pub fn setSelectionClamped(self: *Model, value: Selection) bool {
         self.breakUndoGroup();
         const next: Selection = .{
-            .anchor = self.boundaryAtOrBefore(@min(value.anchor, self.bytes.items.len)),
-            .extent = self.boundaryAtOrBefore(@min(value.extent, self.bytes.items.len)),
+            .anchor = self.boundaryAtOrBefore(@min(value.anchor, self.byteLen())),
+            .extent = self.boundaryAtOrBefore(@min(value.extent, self.byteLen())),
             .anchor_affinity = value.anchor_affinity,
             .extent_affinity = value.extent_affinity,
         };
@@ -187,7 +205,7 @@ pub const Model = struct {
 
     pub fn selectAll(self: *Model) bool {
         self.breakUndoGroup();
-        const value: Selection = .{ .anchor = 0, .extent = self.bytes.items.len };
+        const value: Selection = .{ .anchor = 0, .extent = self.byteLen() };
         if (std.meta.eql(self.selection, value)) return false;
         self.selection = value;
         self.bumpRevision();
@@ -212,17 +230,18 @@ pub const Model = struct {
     /// boundary or selection movement. IME sessions delimit composition groups.
     pub fn replaceRangeGrouped(self: *Model, range: Range, raw: []const u8, kind: EditKind) !bool {
         if (self.secret_page != null) return self.replaceSecretRange(range, raw);
+        const gap = self.gap.?;
         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8;
-        if (range.start > range.end or range.end > self.bytes.items.len)
+        if (range.start > range.end or range.end > gap.len())
             return error.InvalidTextRange;
-        if (!isUtf8Boundary(self.bytes.items, range.start) or
-            !isUtf8Boundary(self.bytes.items, range.end))
+        if ((range.start < gap.len() and gap.byteAt(range.start) & 0xc0 == 0x80) or
+            (range.end < gap.len() and gap.byteAt(range.end) & 0xc0 == 0x80))
             return error.InvalidTextOffset;
         const normalized = try single_line.normalizeWithMode(self.allocator, raw, self.multiline);
         defer if (normalized) |bytes| self.allocator.free(bytes);
         const replacement = normalized orelse raw;
         const removed_len = range.end - range.start;
-        const retained_len = self.bytes.items.len - removed_len;
+        const retained_len = gap.len() - removed_len;
         const new_len = std.math.add(usize, retained_len, replacement.len) catch
             return error.OutOfMemory;
         const boundary_capacity = std.math.add(usize, new_len, 1) catch
@@ -236,46 +255,57 @@ pub const Model = struct {
         const coalesce = kind != .isolated and self.edit_group == kind and
             self.history_cursor == self.history.items.len and self.history_cursor != 0 and
             std.meta.eql(self.selection, self.history.items[self.history_cursor - 1].selection_after);
-        const before = if (!coalesce) try self.allocator.dupe(u8, self.text()) else null;
-        errdefer if (before) |bytes| self.allocator.free(bytes);
-        const after = try self.allocator.alloc(u8, new_len);
-        errdefer self.allocator.free(after);
-        @memcpy(after[0..range.start], self.bytes.items[0..range.start]);
-        @memcpy(after[range.start..][0..replacement.len], replacement);
-        @memcpy(after[range.start + replacement.len ..], self.bytes.items[range.end..]);
         if (!coalesce) try self.history.ensureTotalCapacity(self.allocator, @min(self.history.items.len + 1, history_limit));
+        var fresh: HistoryEntry = .{ .selection_before = self.selection, .selection_after = self.selection };
+        errdefer if (!coalesce) fresh.deinit(self.allocator);
+        const entry = if (coalesce) &self.history.items[self.history_cursor - 1] else &fresh;
+        const extend_insert = removed_len == 0 and entry.edits.items.len != 0 and
+            entry.edits.items[entry.edits.items.len - 1].start + entry.edits.items[entry.edits.items.len - 1].inserted_len == range.start;
+        if (!extend_insert) try entry.edits.ensureUnusedCapacity(self.allocator, 1);
+        const data_offset = entry.data.items.len;
+        const data_len = std.math.add(usize, removed_len, replacement.len) catch return error.OutOfMemory;
+        try entry.data.ensureUnusedCapacity(self.allocator, data_len);
+        entry.data.items.len += data_len;
+        errdefer entry.data.items.len = data_offset;
+        gap.copyRange(range.start, entry.data.items[data_offset..][0..removed_len]);
+        // Capture borrowed model.text() inputs before reserve can relocate the
+        // contiguous view. Failure rolls back the uncommitted history payload.
+        const inserted = entry.data.items[data_offset + removed_len ..];
+        @memcpy(inserted, replacement);
 
         // One boundary per byte plus the initial zero is a strict upper bound.
         // History and model allocations all precede the first content mutation.
-        try self.bytes.ensureTotalCapacity(self.allocator, new_len);
+        try gap.reserve(new_len);
         try self.boundaries.ensureTotalCapacity(self.allocator, boundary_capacity);
         try self.word_boundaries.ensureTotalCapacity(self.allocator, boundary_capacity);
-        const selection_before = self.selection;
-        self.bytes.clearRetainingCapacity();
-        self.bytes.appendSliceAssumeCapacity(after);
-        self.rebuildBoundaries();
+        const was_ascii = gap.non_ascii_bytes == 0;
+        const old_len = gap.len();
+        gap.replaceAssumeCapacity(range.start, range.end, inserted);
+        if (was_ascii and gap.non_ascii_bytes == 0)
+            self.updateAsciiBoundaries(range, inserted.len, old_len)
+        else
+            self.rebuildBoundaries();
 
         // Text on either side may join the replacement's edge into a larger
         // grapheme. Snap forward so the resulting caret is always valid.
         const requested = range.start + replacement.len;
         self.selection = .collapsed(self.boundaryAtOrAfter(requested));
         self.bumpRevision();
-        if (coalesce) {
-            const last = &self.history.items[self.history_cursor - 1];
-            self.allocator.free(last.after);
-            last.after = after;
-            last.selection_after = self.selection;
-        } else {
-            for (self.history.items[self.history_cursor..]) |entry| entry.deinit(self.allocator);
+        if (extend_insert) {
+            entry.edits.items[entry.edits.items.len - 1].inserted_len += inserted.len;
+        } else entry.edits.appendAssumeCapacity(.{
+            .start = range.start,
+            .data_offset = data_offset,
+            .removed_len = removed_len,
+            .inserted_len = inserted.len,
+        });
+        entry.selection_after = self.selection;
+        if (!coalesce) {
+            for (self.history.items[self.history_cursor..]) |discarded| discarded.deinit(self.allocator);
             self.history.items.len = self.history_cursor;
             if (self.history.items.len == history_limit)
                 self.history.orderedRemove(0).deinit(self.allocator);
-            self.history.appendAssumeCapacity(.{
-                .before = before.?,
-                .after = after,
-                .selection_before = selection_before,
-                .selection_after = self.selection,
-            });
+            self.history.appendAssumeCapacity(fresh);
             self.history_cursor = self.history.items.len;
         }
         self.edit_group = if (kind == .isolated) null else kind;
@@ -322,7 +352,13 @@ pub const Model = struct {
         if (self.history_cursor == 0) return false;
         self.history_cursor -= 1;
         const entry = self.history.items[self.history_cursor];
-        self.restore(entry.before, entry.selection_before);
+        var index = entry.edits.items.len;
+        while (index != 0) {
+            index -= 1;
+            const edit = entry.edits.items[index];
+            self.gap.?.replaceAssumeCapacity(edit.start, edit.start + edit.inserted_len, entry.data.items[edit.data_offset..][0..edit.removed_len]);
+        }
+        self.restoreSelection(entry.selection_before);
         return true;
     }
 
@@ -330,16 +366,17 @@ pub const Model = struct {
         self.breakUndoGroup();
         if (self.history_cursor == self.history.items.len) return false;
         const entry = self.history.items[self.history_cursor];
-        self.restore(entry.after, entry.selection_after);
+        for (entry.edits.items) |edit| {
+            self.gap.?.replaceAssumeCapacity(edit.start, edit.start + edit.removed_len, entry.data.items[edit.data_offset + edit.removed_len ..][0..edit.inserted_len]);
+        }
+        self.restoreSelection(entry.selection_after);
         self.history_cursor += 1;
         return true;
     }
 
-    fn restore(self: *Model, bytes: []const u8, selection: Selection) void {
-        // Every snapshot previously fit these buffers; edits never shrink
-        // their capacity. Undo/redo cannot fail or allocate.
-        self.bytes.clearRetainingCapacity();
-        self.bytes.appendSliceAssumeCapacity(bytes);
+    fn restoreSelection(self: *Model, selection: Selection) void {
+        // Every intermediate historical value previously fit these buffers;
+        // edits never shrink capacity. Undo/redo cannot fail or allocate.
         self.rebuildBoundaries();
         self.selection = selection;
         self.bumpRevision();
@@ -407,8 +444,8 @@ pub const Model = struct {
     /// The Unicode segment touching this insertion edge. Unlike word
     /// navigation, selection includes whitespace and punctuation segments.
     pub fn wordRangeAt(self: *const Model, offset: usize, affinity: CaretAffinity) Range {
-        if (self.bytes.items.len == 0) return .{ .start = 0, .end = 0 };
-        const at = @min(offset, self.bytes.items.len);
+        if (self.byteLen() == 0) return .{ .start = 0, .end = 0 };
+        const at = @min(offset, self.byteLen());
         var index = lowerBound(self.word_boundaries.items, at);
         if (index == self.word_boundaries.items.len - 1 or
             (index != 0 and (self.word_boundaries.items[index] != at or affinity == .upstream))) index -= 1;
@@ -421,17 +458,19 @@ pub const Model = struct {
     /// The logical hard line at an insertion offset, including its terminating
     /// LF when present. Single-line models retain the historical whole-value range.
     pub fn lineRangeAt(self: *const Model, offset: usize) Range {
-        if (!self.multiline) return .{ .start = 0, .end = self.bytes.items.len };
-        const at = @min(offset, self.bytes.items.len);
-        const start = if (std.mem.lastIndexOfScalar(u8, self.bytes.items[0..at], '\n')) |index| index + 1 else 0;
-        const end = if (std.mem.indexOfScalar(u8, self.bytes.items[at..], '\n')) |index| at + index + 1 else self.bytes.items.len;
+        if (!self.multiline) return .{ .start = 0, .end = self.byteLen() };
+        const bytes = self.text();
+        const at = @min(offset, bytes.len);
+        const start = if (std.mem.lastIndexOfScalar(u8, bytes[0..at], '\n')) |index| index + 1 else 0;
+        const end = if (std.mem.indexOfScalar(u8, bytes[at..], '\n')) |index| at + index + 1 else bytes.len;
         return .{ .start = start, .end = end };
     }
 
     fn rebuildBoundaries(self: *Model) void {
+        const bytes = self.text();
         self.boundaries.clearRetainingCapacity();
         self.boundaries.appendAssumeCapacity(0);
-        var iterator = uucode.grapheme.utf8Iterator(self.bytes.items);
+        var iterator = uucode.grapheme.utf8Iterator(bytes);
         while (iterator.nextGrapheme()) |grapheme|
             self.boundaries.appendAssumeCapacity(grapheme.end);
         self.word_boundaries.clearRetainingCapacity();
@@ -441,7 +480,57 @@ pub const Model = struct {
             if (self.bytes.items.len != 0) self.word_boundaries.appendAssumeCapacity(self.bytes.items.len);
             return;
         }
-        word_break.appendAssumeCapacity(self.bytes.items, &self.word_boundaries);
+        word_break.appendAssumeCapacity(bytes, &self.word_boundaries);
+    }
+
+    fn updateAsciiBoundaries(self: *Model, range: Range, inserted_len: usize, old_len: usize) void {
+        const length = self.byteLen();
+        // Normalization removes CR, so every ASCII byte is a whole grapheme.
+        const previous_count = self.boundaries.items.len;
+        self.boundaries.items.len = length + 1;
+        if (length + 1 > previous_count) {
+            for (previous_count..length + 1) |index| self.boundaries.items[index] = index;
+        }
+
+        // ASCII has no ignored characters or RI parity. UAX #29 word rules
+        // inspect at most two bytes on either side of a boundary. Only the
+        // edit and one boundary beyond each edge need reanalysis.
+        const start = range.start -| 1;
+        const old_end = @min(old_len, range.end + 1);
+        const new_end = @min(length, range.start + inserted_len + 1);
+        const first = lowerBound(self.word_boundaries.items, start);
+        const after = lowerBound(self.word_boundaries.items, old_end + 1);
+        const tail_len = self.word_boundaries.items.len - after;
+        var count: usize = 0;
+        for (start..new_end + 1) |offset| {
+            if (self.asciiWordBoundary(offset)) count += 1;
+        }
+        const new_after = first + count;
+        const old_count = self.word_boundaries.items.len;
+        self.word_boundaries.items.len = @max(old_count, new_after + tail_len);
+        const source = self.word_boundaries.items[after..][0..tail_len];
+        const dest = self.word_boundaries.items[new_after..][0..tail_len];
+        if (new_after > after) std.mem.copyBackwards(usize, dest, source) else std.mem.copyForwards(usize, dest, source);
+        for (dest) |*offset| offset.* = offset.* - range.end + range.start + inserted_len;
+        var index = first;
+        for (start..new_end + 1) |offset| {
+            if (self.asciiWordBoundary(offset)) {
+                self.word_boundaries.items[index] = offset;
+                index += 1;
+            }
+        }
+        self.word_boundaries.items.len = new_after + tail_len;
+    }
+
+    fn asciiWordBoundary(self: *const Model, offset: usize) bool {
+        var bytes: [4]u8 = undefined;
+        var positions: [5]usize = undefined;
+        var boundaries = std.ArrayList(usize).initBuffer(&positions);
+        const start = offset -| 2;
+        const end = @min(self.byteLen(), offset + 2);
+        self.gap.?.copyRange(start, bytes[0 .. end - start]);
+        word_break.appendAssumeCapacity(bytes[0 .. end - start], &boundaries);
+        return std.mem.indexOfScalar(usize, boundaries.items, offset - start) != null;
     }
 
     /// Number of extended graphemes, which a masked field draws as dots.
@@ -471,7 +560,7 @@ pub const Model = struct {
 
     fn boundaryAfter(self: *const Model, offset: usize) usize {
         const index = lowerBound(self.boundaries.items, offset);
-        if (index >= self.boundaries.items.len - 1) return self.bytes.items.len;
+        if (index >= self.boundaries.items.len - 1) return self.byteLen();
         return if (self.boundaries.items[index] == offset)
             self.boundaries.items[index + 1]
         else
@@ -495,7 +584,7 @@ pub const Model = struct {
         while (index != 0) {
             const start = self.word_boundaries.items[index - 1];
             const end = self.word_boundaries.items[index];
-            if (word_break.isWordSegment(self.bytes.items[start..end])) return start;
+            if (word_break.isWordSegment(self.text()[start..end])) return start;
             index -= 1;
         }
         return 0;
@@ -508,9 +597,9 @@ pub const Model = struct {
         while (index + 1 < self.word_boundaries.items.len) : (index += 1) {
             const start = self.word_boundaries.items[index];
             const end = self.word_boundaries.items[index + 1];
-            if (word_break.isWordSegment(self.bytes.items[start..end])) return end;
+            if (word_break.isWordSegment(self.text()[start..end])) return end;
         }
-        return self.bytes.items.len;
+        return self.byteLen();
     }
 
     fn setExtent(self: *Model, extent: usize, extend: bool) bool {
@@ -809,6 +898,100 @@ test "text input history survives every edit allocation failure and restores wit
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.run, .{false});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.run, .{true});
+}
+
+test "text input gap edits and grouped history match a reference string" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa917382);
+    const random = prng.random();
+    const ascii = [_][]const u8{ "", "a", "Qz", "_", ".", ":", "'", "\"", "19", ",", " ", "\t", "\n", "abc_12.3", "\x00", "\x7f" };
+    const unicode = ascii ++ [_][]const u8{ "Ω", "\u{301}", "🇦🇧🇨", "👩🏽‍🚀", "אב", "\u{200d}", "\u{600}" };
+    for ([_][]const []const u8{ &ascii, &unicode }) |replacements| {
+        var model = try Model.initWithMode(allocator, "can't 12,345\nright", true);
+        defer model.deinit();
+        var expected = try allocator.dupe(u8, model.text());
+        defer allocator.free(expected);
+        for (0..150) |_| {
+            const before = try allocator.dupe(u8, expected);
+            defer allocator.free(before);
+            const selection_before = model.selection;
+            var changed = false;
+            for (0..10) |_| {
+                var a = random.uintLessThan(usize, expected.len + 1);
+                var b = random.uintLessThan(usize, expected.len + 1);
+                while (!isUtf8Boundary(expected, a)) a -= 1;
+                while (!isUtf8Boundary(expected, b)) b -= 1;
+                const start = @min(a, b);
+                const end = @max(a, b);
+                const replacement = replacements[random.uintLessThan(usize, replacements.len)];
+                const next = try std.mem.concat(allocator, u8, &.{ expected[0..start], replacement, expected[end..] });
+                allocator.free(expected);
+                expected = next;
+                changed = (try model.replaceRangeGrouped(.{ .start = start, .end = end }, replacement, .composition)) or changed;
+                try std.testing.expectEqualStrings(expected, model.text());
+                var words = try word_break.analyze(allocator, expected);
+                defer words.deinit();
+                try std.testing.expectEqualSlices(usize, words.boundaries, model.word_boundaries.items);
+                var graphemes = uucode.grapheme.utf8Iterator(expected);
+                var index: usize = 1;
+                while (graphemes.nextGrapheme()) |grapheme| : (index += 1)
+                    try std.testing.expectEqual(grapheme.end, model.boundaries.items[index]);
+                try std.testing.expectEqual(index, model.boundaries.items.len);
+            }
+            if (changed) {
+                const selection_after = model.selection;
+                try std.testing.expect(model.undo());
+                try std.testing.expectEqualStrings(before, model.text());
+                try std.testing.expectEqual(selection_before, model.selection);
+                try std.testing.expect(model.redo());
+                try std.testing.expectEqualStrings(expected, model.text());
+                try std.testing.expectEqual(selection_after, model.selection);
+            }
+        }
+    }
+}
+
+test "text input borrowed replacement survives growth and every allocation failure" {
+    const scenario = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const initial = "abcdefgh" ** 32;
+            var model = try Model.init(allocator, initial);
+            defer model.deinit();
+            _ = model.replaceRange(.{ .start = 3, .end = 7 }, model.text()) catch |err| {
+                try std.testing.expectEqualStrings(initial, model.text());
+                try std.testing.expect(!model.undo());
+                return err;
+            };
+            try std.testing.expectEqualStrings(initial[0..3] ++ initial ++ initial[7..], model.text());
+            try std.testing.expect(model.undo());
+            try std.testing.expectEqualStrings(initial, model.text());
+            try std.testing.expect(model.redo());
+            try std.testing.expectEqualStrings(initial[0..3] ++ initial ++ initial[7..], model.text());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.run, .{});
+}
+
+test "text input repeated typing amortizes allocations and does not flatten the gap" {
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var model = try Model.init(counter.allocator(), "left right");
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed(5));
+    const allocations = counter.alloc_index;
+    for (0..4096) |_| _ = try model.replaceRangeGrouped(model.selection.range(), "k", .typing);
+    try std.testing.expect(counter.alloc_index - allocations < 100);
+    try std.testing.expect(!model.gap.?.snapshot_valid);
+    try std.testing.expectEqual(@as(usize, 4096), model.history.items[0].data.items.len);
+    try std.testing.expectEqual(@as(usize, 1), model.history.items[0].edits.items.len);
+    try std.testing.expectEqual(@as(usize, 4101), model.gap.?.gap_start);
+    try std.testing.expectEqualStrings("left " ++ "k" ** 4096 ++ "right", model.text());
+    try std.testing.expectEqual(@as(usize, 4101), model.gap.?.gap_start);
+    counter.fail_index = counter.alloc_index;
+    counter.resize_fail_index = counter.resize_index;
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("left right", model.text());
+    try std.testing.expect(model.redo());
+    try std.testing.expectEqualStrings("left " ++ "k" ** 4096 ++ "right", model.text());
 }
 
 test "secret model edits in place, caps length, rejects controls and wipes removed bytes" {
