@@ -950,6 +950,15 @@ fn appendLineCarets(
         const span_glyphs = glyphs[span.glyph_start..][0..span.glyph_count];
         const span_end = std.math.add(usize, span.byte_start, span.byte_len) catch
             return error.InvalidShaping;
+        // HarfBuzz clusters are monotone within a directional span. Locate
+        // its graphemes once, then walk with the glyphs instead of searching
+        // the whole document again for every cluster.
+        var grapheme_cursor = firstGraphemeEndingAfter(graphemes, if (span.direction == .right_to_left)
+            span_end
+        else if (span_glyphs.len != 0)
+            span_glyphs[0].cluster
+        else
+            span.byte_start);
         var glyph_index: usize = 0;
         var cluster_x = span_x;
         while (glyph_index < span_glyphs.len) {
@@ -981,12 +990,22 @@ fn appendLineCarets(
             };
             if (cluster < span.byte_start or cluster_end <= cluster or cluster_end > span_end)
                 return error.InvalidShaping;
+            const previous_cursor = grapheme_cursor;
+            const cluster_graphemes = if (span.direction == .right_to_left) blk: {
+                while (grapheme_cursor != 0 and graphemes[grapheme_cursor - 1].byte_end > cluster)
+                    grapheme_cursor -= 1;
+                break :blk graphemes[grapheme_cursor..previous_cursor];
+            } else blk: {
+                while (grapheme_cursor < graphemes.len and graphemes[grapheme_cursor].byte_start < cluster_end)
+                    grapheme_cursor += 1;
+                break :blk graphemes[previous_cursor..grapheme_cursor];
+            };
             try appendClusterCarets(
                 allocator,
                 carets,
                 line_caret_start,
                 &ligature_positions,
-                graphemes,
+                cluster_graphemes,
                 shaped,
                 span,
                 span_glyphs[glyph_index..glyph_end],
@@ -1010,7 +1029,7 @@ fn appendClusterCarets(
     carets: *std.ArrayList(CaretStop),
     line_caret_start: usize,
     ligature_positions: *std.ArrayList(f32),
-    all_graphemes: []const api.Grapheme,
+    cluster_graphemes: []const api.Grapheme,
     shaped: *const shaped_paragraph.ShapedParagraphs,
     span: Span,
     cluster_glyphs: []const Glyph,
@@ -1019,12 +1038,6 @@ fn appendClusterCarets(
     cluster_x: f32,
     cluster_advance: f32,
 ) !void {
-    const grapheme_start = firstGraphemeEndingAfter(all_graphemes, cluster_start);
-    var grapheme_end = grapheme_start;
-    while (grapheme_end < all_graphemes.len and
-        all_graphemes[grapheme_end].byte_start < cluster_end) : (grapheme_end += 1)
-    {}
-    const cluster_graphemes = all_graphemes[grapheme_start..grapheme_end];
     if (cluster_graphemes.len == 0 or
         cluster_graphemes[0].byte_start != cluster_start or
         cluster_graphemes[cluster_graphemes.len - 1].byte_end != cluster_end)
@@ -1492,6 +1505,62 @@ test "mixed-script selected lines become positioned visual glyph spans" {
 test "unsafe shaping changes demand line reflow" {
     const fixture = @import("positioned_lines_test.zig");
     try fixture.testUnsafeReflow(positionLines);
+}
+
+test "caret traversal handles combining clusters and reverses at directional spans" {
+    const allocator = std.testing.allocator;
+    const utf8 = "a\u{301}bcאבגz";
+    const graphemes = try api.graphemes(allocator, utf8);
+    defer allocator.free(graphemes);
+    const shaped: shaped_paragraph.ShapedParagraphs = .{
+        .allocator = allocator,
+        .text_len = utf8.len,
+        .candidates = &.{},
+        .language = "und",
+        .logical_size = 16,
+        .runs = &.{},
+    };
+    // The b+c cluster has two glyphs, so its two graphemes divide the advance
+    // equally. Unequal widths expose skipped/reversed graphemes in RTL spans.
+    var glyphs: [7]Glyph = undefined;
+    for (&glyphs, [_]usize{ 0, 3, 3, 9, 7, 5, 11 }, [_]f32{ 3, 4, 6, 7, 11, 17, 19 }) |*glyph, cluster, advance| {
+        glyph.* = .{ .id = 1, .cluster = cluster, .origin = .{}, .advance = .{ .x = advance } };
+    }
+    const font: api.FontHandle = .{ .slot = 1, .generation = 1 };
+    const spans = [_]Span{
+        .{ .font = font, .direction = .left_to_right, .byte_start = 0, .byte_len = 5, .advance = 13, .glyph_start = 0, .glyph_count = 3 },
+        .{ .font = font, .direction = .right_to_left, .byte_start = 5, .byte_len = 6, .advance = 35, .glyph_start = 3, .glyph_count = 3 },
+        .{ .font = font, .direction = .left_to_right, .byte_start = 11, .byte_len = 1, .advance = 19, .glyph_start = 6, .glyph_count = 1 },
+    };
+    var carets: std.ArrayList(CaretStop) = .empty;
+    defer carets.deinit(allocator);
+    try appendLineCarets(allocator, &carets, graphemes, &shaped, .{
+        .byte_start = 0,
+        .byte_len = utf8.len,
+        .advance = 67,
+        .mandatory = true,
+        .reshape_start = false,
+        .reshape_end = false,
+        .base_level = 0,
+        .visual_run_start = 0,
+        .visual_run_count = 3,
+    }, 67, &spans, &glyphs);
+    try std.testing.expectEqualDeep(@as([]const CaretStop, &.{
+        .{ .byte_offset = 0, .x = 0, .affinity = .downstream },
+        .{ .byte_offset = 3, .x = 3, .affinity = .upstream },
+        .{ .byte_offset = 3, .x = 3, .affinity = .downstream },
+        .{ .byte_offset = 4, .x = 8, .affinity = .upstream },
+        .{ .byte_offset = 4, .x = 8, .affinity = .downstream },
+        .{ .byte_offset = 5, .x = 13, .affinity = .upstream },
+        .{ .byte_offset = 11, .x = 13, .affinity = .upstream },
+        .{ .byte_offset = 9, .x = 20, .affinity = .downstream },
+        .{ .byte_offset = 9, .x = 20, .affinity = .upstream },
+        .{ .byte_offset = 7, .x = 31, .affinity = .downstream },
+        .{ .byte_offset = 7, .x = 31, .affinity = .upstream },
+        .{ .byte_offset = 5, .x = 48, .affinity = .downstream },
+        .{ .byte_offset = 11, .x = 48, .affinity = .downstream },
+        .{ .byte_offset = 12, .x = 67, .affinity = .upstream },
+    }), carets.items);
 }
 
 test "empty lines retain font height for layout and insertion carets" {

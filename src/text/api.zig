@@ -425,6 +425,23 @@ pub const FallbackResult = struct {
 /// cursoring and selection; HarfBuzz glyph clusters remain a distinct mapping.
 pub fn graphemes(allocator: std.mem.Allocator, utf8: []const u8) ![]Grapheme {
     if (!std.unicode.utf8ValidateSlice(utf8)) return error.InvalidUtf8;
+    // Every ASCII byte is a grapheme except the CRLF pair (UAX #29 GB3).
+    // Count first to allocate exactly once rather than grow a per-byte list.
+    var count = utf8.len;
+    const ascii = for (utf8, 0..) |byte, i| {
+        if (byte >= 0x80) break false;
+        if (byte == '\n' and i != 0 and utf8[i - 1] == '\r') count -= 1;
+    } else true;
+    if (ascii) {
+        const result = try allocator.alloc(Grapheme, count);
+        var offset: usize = 0;
+        for (result) |*grapheme| {
+            const start = offset;
+            offset += if (utf8[offset] == '\r' and offset + 1 < utf8.len and utf8[offset + 1] == '\n') @as(usize, 2) else 1;
+            grapheme.* = .{ .byte_start = start, .byte_end = offset };
+        }
+        return result;
+    }
     var result: std.ArrayList(Grapheme) = .empty;
     errdefer result.deinit(allocator);
     var iterator = uucode.grapheme.utf8Iterator(utf8);
@@ -644,6 +661,21 @@ fn isCodepointBoundary(bytes: []const u8, index: usize) bool {
 
 fn fromFixed(value: c.hb_position_t) f32 {
     return @as(f32, @floatFromInt(value)) / 64.0;
+}
+
+test "ASCII graphemes match Unicode segmentation for every byte pair" {
+    for (0..128) |left| for (0..128) |right| {
+        const bytes = [_]u8{ @intCast(left), @intCast(right) };
+        const actual = try graphemes(std.testing.allocator, &bytes);
+        defer std.testing.allocator.free(actual);
+        var reference = uucode.grapheme.utf8Iterator(&bytes);
+        for (actual) |grapheme| {
+            const expected = reference.nextGrapheme().?;
+            try std.testing.expectEqual(expected.start, grapheme.byte_start);
+            try std.testing.expectEqual(expected.end, grapheme.byte_end);
+        }
+        try std.testing.expectEqual(null, reference.nextGrapheme());
+    };
 }
 
 test "uucode segments extended grapheme clusters independently of shaping clusters" {

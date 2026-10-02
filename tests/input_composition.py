@@ -175,6 +175,29 @@ def session():
             input_(action='text', text='abcd')
             exercise(2, 13, 17, 7)
             print('PASS rejected and accepted reload: retained identities, old/fresh closures and stale-token protection')
+
+            # Exercise the long-line path through real layout and horizontal
+            # caret reveal, then switch from ASCII to a combining grapheme.
+            # Seed a new editor: action=text deliberately plays each scalar
+            # as separate key events, rather than bulk-pasting the fixture.
+            long_fixture = fixture.replace("key='editor',", "key='long_editor',").replace(
+                "default_text='abcd'", "default_text='Wi '..string.rep('k',4096)")
+            atomic_write(app, long_fixture)
+            cli(env, 'reload', endpoint)
+            click(EDITOR.replace('/editor', '/long_editor'))
+            long_line = 'Wi ' + 'k' * 4096
+            key('end')
+            input_(action='text', text='X')
+            assert state()['text'] == long_line + 'X', state()
+            key('home')
+            key('arrow_right')
+            input_(action='text', text='a\u0301')
+            assert state()['text'] == 'Wa\u0301' + long_line[1:] + 'X', state()
+            if os.environ.get('OUROKIT_INPUT_CAPTURE'):
+                tree = snapshot()
+                cli(env, 'capture', endpoint, dict(window='main', token=tree['token']),
+                    output=Path(os.environ['OUROKIT_INPUT_CAPTURE']) / 'long-line-start.png')
+            print('PASS long-line end/start editing and combining-grapheme insertion')
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)

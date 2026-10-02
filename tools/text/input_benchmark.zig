@@ -5,8 +5,9 @@ const ourokit = @import("ourokit");
 const text = ourokit.text;
 const input = ourokit.ui.text_input;
 const render = ourokit.ui.render_object;
-const Workload = enum { alternating, growing, right, hard_lines };
+const Workload = enum { alternating, growing, right, hard_lines, unicode_line };
 const hard_line = "café text line aa\n";
+const unicode_line = "café a\u{301} ";
 
 pub fn main(init: std.process.Init) !void {
     std.debug.print("text input ({s}); times in microseconds/operation\n", .{@tagName(@import("builtin").mode)});
@@ -36,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
     try edits(&counter, &sources, &paragraphs, font, 0, 4096, false, .growing, true);
     try edits(&counter, &sources, &paragraphs, font, 4096, 4096, false, .right, true);
     try edits(&counter, &sources, &paragraphs, font, hard_line.len * 256, 200, true, .hard_lines, true);
+    try edits(&counter, &sources, &paragraphs, font, unicode_line.len * 512, 200, false, .unicode_line, true);
 
     std.debug.print("layout misses (shapes may be warm): bytes | no carets / carets (us)\n", .{});
     for ([_]usize{ 256, 1024, 4096, 16384 }) |length| {
@@ -125,7 +127,11 @@ fn edits(
     // Repeated characters exercise an unbroken held-key run; multiline uses
     // spaces so wrapping is exercised rather than one overflowing word.
     const typed = if (workload == .alternating) "a" else "k";
-    for (initial, 0..) |*byte, i| byte.* = if (workload == .hard_lines) hard_line[i % hard_line.len] else if (multiline and i % 8 == 7) ' ' else typed[0];
+    for (initial, 0..) |*byte, i| byte.* = switch (workload) {
+        .hard_lines => hard_line[i % hard_line.len],
+        .unicode_line => unicode_line[i % unicode_line.len],
+        else => if (multiline and i % 8 == 7) ' ' else typed[0],
+    };
     if (workload == .hard_lines) {
         // Distinct paragraphs measure reuse across edits, not deduplication
         // of repeated copies within one layout.
@@ -181,7 +187,7 @@ fn edits(
         const start = nanoTime();
         const changed = switch (workload) {
             .growing => try session.typeText(typed),
-            .alternating, .hard_lines => if (i % 2 == 0) try session.typeText(typed) else try session.model.deleteBackward(),
+            .alternating, .hard_lines, .unicode_line => if (i % 2 == 0) try session.typeText(typed) else try session.model.deleteBackward(),
             .right => blk: {
                 const current = session.model.selection;
                 const next = try tree.textVisualNeighbor(node, current.extent, current.extent_affinity, .right);
@@ -252,7 +258,7 @@ fn edits(
         total += ns;
     }
     std.debug.print("{s} {d} {d} | {d:.2} {d:.2} {d:.2} {d:.2} | {d:.2} {d:.2} {d:.2}\n", .{
-        if (workload == .growing) "grow-k" else if (workload == .right) "right-k" else if (workload == .hard_lines) "hard-lines" else if (multiline) "wrapped" else "single",
+        if (workload == .growing) "grow-k" else if (workload == .right) "right-k" else if (workload == .hard_lines) "hard-lines" else if (workload == .unicode_line) "unicode-line" else if (multiline) "wrapped" else "single",
         length,
         iterations,
         us[0],

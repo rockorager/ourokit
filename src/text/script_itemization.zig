@@ -41,6 +41,27 @@ const Cluster = struct {
 pub fn analyzeScripts(allocator: std.mem.Allocator, utf8: []const u8) !ScriptAnalysis {
     if (!std.unicode.utf8ValidateSlice(utf8)) return error.InvalidUtf8;
 
+    // ASCII has only Latin letters and Common characters, with no script
+    // extensions. Every cluster (including CRLF) resolves to the same script;
+    // allocating per-cluster sets and resolving brackets cannot change it.
+    var latin = false;
+    const ascii = for (utf8) |byte| {
+        if (byte >= 0x80) break false;
+        latin = latin or std.ascii.isAlphabetic(byte);
+    } else true;
+    if (ascii) {
+        const runs = try allocator.alloc(ScriptRun, @intFromBool(utf8.len != 0));
+        if (runs.len != 0) runs[0] = .{
+            .byte_start = 0,
+            .byte_len = utf8.len,
+            .script = if (latin) .latin else scriptFromTag("Zyyy"),
+        };
+        return .{ .allocator = allocator, .runs = runs };
+    }
+    return analyzeUnicodeScripts(allocator, utf8);
+}
+
+fn analyzeUnicodeScripts(allocator: std.mem.Allocator, utf8: []const u8) !ScriptAnalysis {
     var clusters: std.ArrayList(Cluster) = .empty;
     defer clusters.deinit(allocator);
     var graphemes = uucode.grapheme.utf8Iterator(utf8);
@@ -214,6 +235,26 @@ fn scriptFromTag(tag: *const [4]u8) Script {
 fn scriptFromUnicode(value: UnicodeScript) Script {
     const tag = data.iso15924(value);
     return Script.fromIso15924(&tag);
+}
+
+test "ASCII script shortcut matches Unicode resolution including brackets and controls" {
+    // Exhaust all pairs: punctuation-only must stay Common, while a Latin
+    // letter on either side resolves surrounding Common characters to Latin.
+    for (0..128) |left| for (0..128) |right| {
+        const bytes = [_]u8{ @intCast(left), @intCast(right) };
+        var expected = try analyzeUnicodeScripts(std.testing.allocator, &bytes);
+        defer expected.deinit();
+        var actual = try analyzeScripts(std.testing.allocator, &bytes);
+        defer actual.deinit();
+        try std.testing.expectEqualDeep(expected.runs, actual.runs);
+    };
+    for ([_][]const u8{ "", "([12]) --", "(abc[123])\r\nZ", "abc(γ)xyz", "a\u{301}(b)", "(العربية)abc" }) |bytes| {
+        var expected = try analyzeUnicodeScripts(std.testing.allocator, bytes);
+        defer expected.deinit();
+        var actual = try analyzeScripts(std.testing.allocator, bytes);
+        defer actual.deinit();
+        try std.testing.expectEqualDeep(expected.runs, actual.runs);
+    }
 }
 
 test "script itemization resolves common text and script extensions" {
