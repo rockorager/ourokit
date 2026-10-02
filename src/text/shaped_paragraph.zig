@@ -5,6 +5,7 @@ const api = @import("api.zig");
 const itemization = @import("itemization.zig");
 const styled = @import("styled_run.zig");
 const Color = @import("../core/color.zig").Color;
+const ShapeReuse = @import("shape_cache.zig").Recent;
 
 pub const ShapedItemizedRun = struct {
     /// Document-relative source range.
@@ -19,6 +20,7 @@ pub const ShapedItemizedRun = struct {
     logical_size: f32,
     color: ?Color = null,
     result: api.FallbackResult,
+    borrowed_result: bool = false,
 };
 
 pub const ShapedParagraphs = struct {
@@ -35,7 +37,7 @@ pub const ShapedParagraphs = struct {
     styles: []const styled.StyledRun = &.{},
 
     pub fn deinit(self: *ShapedParagraphs) void {
-        for (self.runs) |*run| run.result.deinit();
+        for (self.runs) |*run| if (!run.borrowed_result) run.result.deinit();
         self.allocator.free(self.runs);
         self.allocator.free(self.language);
         self.* = undefined;
@@ -66,12 +68,25 @@ pub fn shapeStyledItemizedParagraphs(
     logical_size: f32,
     styles: []const styled.StyledRun,
 ) !ShapedParagraphs {
+    return shapeStyledItemizedParagraphsReusing(allocator, utf8, analysis, candidates, language, logical_size, styles, null);
+}
+
+pub fn shapeStyledItemizedParagraphsReusing(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    analysis: *const itemization.ItemizedAnalysis,
+    candidates: []const api.FallbackCandidate,
+    language: []const u8,
+    logical_size: f32,
+    styles: []const styled.StyledRun,
+    reuse: ?*ShapeReuse,
+) !ShapedParagraphs {
     try styled.validate(allocator, utf8, candidates.len, styles);
     const owned_language = try allocator.dupe(u8, language);
     errdefer allocator.free(owned_language);
     var runs: std.ArrayList(ShapedItemizedRun) = .empty;
     errdefer {
-        for (runs.items) |*run| run.result.deinit();
+        for (runs.items) |*run| if (!run.borrowed_result) run.result.deinit();
         runs.deinit(allocator);
     }
     try runs.ensureTotalCapacity(allocator, analysis.runs.len + styles.len);
@@ -112,7 +127,11 @@ pub fn shapeStyledItemizedParagraphs(
                 };
             }
             if (styles.len == 0) {
-                var result = try api.shapeWithFallback(allocator, candidates, try run.runSpec(utf8, paragraph, language, logical_size));
+                const spec = try run.runSpec(utf8, paragraph, language, logical_size);
+                var result = if (reuse) |cache|
+                    try cache.shape(allocator, candidates, spec)
+                else
+                    try api.shapeWithFallback(allocator, candidates, spec);
                 runs.append(allocator, .{
                     .byte_start = run.byte_start,
                     .byte_len = run.byte_len,
@@ -121,10 +140,11 @@ pub fn shapeStyledItemizedParagraphs(
                     .level = run.level,
                     .script = run.script,
                     .result = result,
+                    .borrowed_result = reuse != null,
                     .candidates = candidates,
                     .logical_size = logical_size,
                 }) catch |err| {
-                    result.deinit();
+                    if (reuse == null) result.deinit();
                     return err;
                 };
             }

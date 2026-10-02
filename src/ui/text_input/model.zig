@@ -280,11 +280,15 @@ pub const Model = struct {
         try self.word_boundaries.ensureTotalCapacity(self.allocator, boundary_capacity);
         const was_ascii = gap.non_ascii_bytes == 0;
         const old_len = gap.len();
+        const ascii_edit = was_ascii and for (inserted) |byte| {
+            if (byte >= 0x80) break false;
+        } else true;
+        const old_line = if (ascii_edit) null else affectedHardLines(gap, range.start, range.end);
         gap.replaceAssumeCapacity(range.start, range.end, inserted);
-        if (was_ascii and gap.non_ascii_bytes == 0)
+        if (ascii_edit)
             self.updateAsciiBoundaries(range, inserted.len, old_len)
         else
-            self.rebuildBoundaries();
+            self.updateUnicodeBoundaries(old_line.?, old_line.?.end - range.end + range.start + inserted.len);
 
         // Text on either side may join the replacement's edge into a larger
         // grapheme. Snap forward so the resulting caret is always valid.
@@ -505,6 +509,46 @@ pub const Model = struct {
         word_break.appendAssumeCapacity(bytes, &self.word_boundaries);
     }
 
+    /// LF is a reset point for both segmenters. Replacing all hard lines
+    /// touched by the edit therefore cannot depend on context in the retained
+    /// prefix, while the first retained suffix line cannot depend on the edit.
+    fn updateUnicodeBoundaries(self: *Model, old: Range, new_end: usize) void {
+        const bytes = self.text();
+        spliceBoundaries(&self.boundaries, old, new_end, bytes[old.start..new_end], .grapheme);
+        spliceBoundaries(&self.word_boundaries, old, new_end, bytes[old.start..new_end], .word);
+    }
+
+    fn spliceBoundaries(index: *std.ArrayList(usize), old: Range, new_end: usize, local: []const u8, kind: enum { grapheme, word }) void {
+        const first = lowerBound(index.items, old.start);
+        const after = lowerBound(index.items, old.end + 1);
+        const tail_len = index.items.len - after;
+        const staged = first + local.len + 1;
+        std.debug.assert(staged + tail_len <= index.capacity);
+        index.items.len = @max(index.items.len, staged + tail_len);
+        const source = index.items[after..][0..tail_len];
+        const dest = index.items[staged..][0..tail_len];
+        if (staged > after) std.mem.copyBackwards(usize, dest, source) else std.mem.copyForwards(usize, dest, source);
+        for (dest) |*offset| offset.* = offset.* - old.end + new_end;
+
+        index.items.len = first;
+        switch (kind) {
+            .grapheme => {
+                index.appendAssumeCapacity(old.start);
+                var iterator = uucode.grapheme.utf8Iterator(local);
+                while (iterator.nextGrapheme()) |grapheme|
+                    index.appendAssumeCapacity(old.start + grapheme.end);
+            },
+            .word => {
+                word_break.appendAssumeCapacity(local, index);
+                for (index.items[first..]) |*offset| offset.* += old.start;
+            },
+        }
+        const local_after = index.items.len;
+        index.items.len = staged + tail_len;
+        std.mem.copyForwards(usize, index.items[local_after..][0..tail_len], index.items[staged..][0..tail_len]);
+        index.items.len = local_after + tail_len;
+    }
+
     fn updateAsciiBoundaries(self: *Model, range: Range, inserted_len: usize, old_len: usize) void {
         const length = self.byteLen();
         // Normalization removes CR, so every ASCII byte is a whole grapheme.
@@ -648,6 +692,17 @@ pub const Model = struct {
 fn isUtf8Boundary(text: []const u8, offset: usize) bool {
     if (offset > text.len) return false;
     return offset == text.len or (text[offset] & 0xc0) != 0x80;
+}
+
+fn affectedHardLines(gap: *const GapBuffer, start: usize, end: usize) Range {
+    var line_start = start;
+    while (line_start != 0 and gap.byteAt(line_start - 1) != '\n') : (line_start -= 1) {}
+    var line_end = end;
+    while (line_end < gap.len()) {
+        line_end += 1;
+        if (gap.byteAt(line_end - 1) == '\n') break;
+    }
+    return .{ .start = line_start, .end = line_end };
 }
 
 fn lowerBound(values: []const usize, needle: usize) usize {
@@ -922,12 +977,25 @@ test "text input history survives every edit allocation failure and restores wit
     try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.run, .{true});
 }
 
-test "text input gap edits and grouped history match a reference string" {
+test "random multiline Unicode edits match full grapheme and word analysis" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xa917382);
     const random = prng.random();
     const ascii = [_][]const u8{ "", "a", "Qz", "_", ".", ":", "'", "\"", "19", ",", " ", "\t", "\n", "abc_12.3", "\x00", "\x7f" };
-    const unicode = ascii ++ [_][]const u8{ "Ω", "\u{301}", "🇦🇧🇨", "👩🏽‍🚀", "אב", "\u{200d}", "\u{600}" };
+    const unicode = ascii ++ [_][]const u8{
+        "Ω",
+        "\u{301}",
+        "🇦🇧🇨",
+        "🇦🇧🇨🇩",
+        "👩🏽‍🚀",
+        "אב",
+        "\u{200d}",
+        "\u{200c}",
+        "\u{600}",
+        "a\u{301}\u{200c}\u{301}",
+        "\n🇦🇧🇨\n",
+        "x\n\u{200d}\u{301}y",
+    };
     for ([_][]const []const u8{ &ascii, &unicode }) |replacements| {
         var model = try Model.initWithMode(allocator, "can't 12,345\nright", true);
         defer model.deinit();

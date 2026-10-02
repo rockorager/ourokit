@@ -12,6 +12,7 @@ const paragraph_style = @import("paragraph_style.zig");
 const positioned_lines = @import("positioned_lines.zig");
 const shaped_paragraph = @import("shaped_paragraph.zig");
 const StyledRun = @import("styled_run.zig").StyledRun;
+const ShapeReuse = @import("shape_cache.zig").Recent;
 
 pub const Layout = struct {
     positioned: positioned_lines.PositionedLines,
@@ -35,7 +36,7 @@ pub fn build(
     style: paragraph_style.Style,
     include_caret_stops: bool,
 ) !Layout {
-    return buildStyled(allocator, utf8, base_direction, candidates, language, logical_size, max_width, style, include_caret_stops, &.{});
+    return buildStyled(allocator, utf8, base_direction, candidates, language, logical_size, max_width, style, include_caret_stops, &.{}, null);
 }
 
 pub fn buildStyled(
@@ -49,6 +50,7 @@ pub fn buildStyled(
     style: paragraph_style.Style,
     include_caret_stops: bool,
     runs: []const StyledRun,
+    reuse: ?*ShapeReuse,
 ) !Layout {
     var positioned = try buildPositioned(
         allocator,
@@ -61,6 +63,7 @@ pub fn buildStyled(
         style,
         include_caret_stops,
         runs,
+        reuse,
     );
     errdefer positioned.deinit();
     return .{
@@ -81,12 +84,13 @@ fn buildPositioned(
     style: paragraph_style.Style,
     include_caret_stops: bool,
     runs: []const StyledRun,
+    reuse: ?*ShapeReuse,
 ) !positioned_lines.PositionedLines {
     var resolved = try paragraph.Resolved.init(allocator, utf8, base_direction);
     defer resolved.deinit();
     var itemized = try itemization.itemizeResolvedParagraphs(allocator, &resolved);
     defer itemized.deinit();
-    var shaped = try shaped_paragraph.shapeStyledItemizedParagraphs(
+    var shaped = try shaped_paragraph.shapeStyledItemizedParagraphsReusing(
         allocator,
         utf8,
         &itemized,
@@ -94,6 +98,7 @@ fn buildPositioned(
         language,
         logical_size,
         runs,
+        reuse,
     );
     defer shaped.deinit();
     var breaks = try line_break.analyzeLineBreaks(allocator, utf8);

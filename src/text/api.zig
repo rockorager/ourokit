@@ -396,6 +396,23 @@ pub const FallbackResult = struct {
     metrics: Metrics,
     has_missing_glyphs: bool,
 
+    pub fn clone(self: FallbackResult, allocator: std.mem.Allocator) !FallbackResult {
+        const spans = try allocator.alloc(ShapedSpan, self.spans.len);
+        errdefer allocator.free(spans);
+        var copied: usize = 0;
+        errdefer for (spans[0..copied]) |*span| span.run.deinit();
+        for (self.spans, spans) |source, *dest| {
+            dest.* = source;
+            dest.run.allocator = allocator;
+            dest.run.glyphs = try allocator.dupe(Glyph, source.run.glyphs);
+            copied += 1;
+        }
+        var result = self;
+        result.allocator = allocator;
+        result.spans = spans;
+        return result;
+    }
+
     pub fn deinit(self: *FallbackResult) void {
         for (self.spans) |*span| span.run.deinit();
         self.allocator.free(self.spans);
@@ -439,6 +456,19 @@ pub fn shapeWithFallback(
     const byte_len = spec.byte_len orelse spec.paragraph.len -| spec.byte_start;
     const byte_end = std.math.add(usize, spec.byte_start, byte_len) catch return error.InvalidRange;
     if (byte_end > spec.paragraph.len) return error.InvalidRange;
+    const primary = candidates[0];
+    const whole = spec.byte_start == 0 and byte_end == spec.paragraph.len;
+    var primary_run = if (whole) try primary.probe(allocator, spec) else null;
+    defer if (primary_run) |*run| run.deinit();
+    // Whole paragraphs cannot split a grapheme. If the primary covers every
+    // glyph and no emoji presentation is involved, neither segmentation nor
+    // per-grapheme fallback selection can change the result.
+    if (primary_run) |run| {
+        if (!hasMissingGlyph(run.glyphs) and !containsEmoji(spec.paragraph)) {
+            primary_run = null;
+            return singleSpanResult(allocator, primary.handle, run, spec.logical_size, false);
+        }
+    }
     const all_graphemes = try graphemes(allocator, spec.paragraph);
     defer allocator.free(all_graphemes);
     // The run is a contiguous slice of the paragraph's graphemes. Borrow it
@@ -455,18 +485,18 @@ pub fn shapeWithFallback(
 
     // Only the primary may claim a whole run. A broad-coverage fallback must
     // not replace surrounding text just because it also covers one symbol.
-    const primary = candidates[0];
-    if (try primary.probe(allocator, spec)) |shaped| {
-        var run = shaped;
+    if (!whole) primary_run = try primary.probe(allocator, spec);
+    if (primary_run) |run| {
         const color = (try primary.resolve()).hasColorGlyphs();
         const matches_presentation = for (run_graphemes) |grapheme| {
             if (emojiPresentation(spec.paragraph[grapheme.byte_start..grapheme.byte_end])) |presentation| {
                 if (color != (presentation == .emoji)) break false;
             }
         } else true;
-        if (!hasMissingGlyph(run.glyphs) and matches_presentation)
+        if (!hasMissingGlyph(run.glyphs) and matches_presentation) {
+            primary_run = null;
             return singleSpanResult(allocator, primary.handle, run, spec.logical_size, false);
-        run.deinit();
+        }
     }
 
     const Selection = struct {
@@ -547,6 +577,12 @@ pub fn shapeWithFallback(
 }
 
 const EmojiPresentation = enum { text, emoji };
+
+fn containsEmoji(bytes: []const u8) bool {
+    var iterator = uucode.utf8.Iterator.init(bytes);
+    while (iterator.next()) |codepoint| if (uucode.get(.is_emoji, codepoint)) return true;
+    return false;
+}
 
 /// Presentation belongs to the complete grapheme, not to surrounding Latin
 /// text. Explicit selectors override Unicode's default; keycap, modifier and
@@ -771,6 +807,23 @@ test "fallback shaping keeps supported text in the primary font" {
         try std.testing.expectEqual(handle, span.font);
         try std.testing.expectEqual(start, span.run.byte_start);
         try std.testing.expectEqual(len, span.run.byte_len);
+    }
+}
+
+test "primary covered paragraphs need only glyph and span allocations" {
+    var font = try Font.init(@embedFile("ourokit_test_font"), 0);
+    defer font.deinit();
+    for ([_][]const u8{ "office AVATAR", "(Abcdefx", "(Abcdef)", "a\u{301} café" }) |text| {
+        const spec: RunSpec = .{ .paragraph = text, .direction = .left_to_right, .script = .latin, .language = "en", .logical_size = 17 };
+        var expected = try font.shape(std.testing.allocator, spec);
+        defer expected.deinit();
+        var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var actual = try shapeWithFallback(counted.allocator(), &.{.{ .handle = .{ .slot = 1, .generation = 1 }, .font = &font }}, spec);
+        defer actual.deinit();
+        try std.testing.expectEqual(@as(usize, 2), counted.allocations);
+        try std.testing.expectEqual(@as(usize, 1), actual.spans.len);
+        try std.testing.expectEqualDeep(expected.glyphs, actual.spans[0].run.glyphs);
+        try std.testing.expectEqualDeep(expected.advance, actual.advance);
     }
 }
 

@@ -444,6 +444,73 @@ fn exerciseShapeCacheAllocationFailure(
     try cache.release(handle);
 }
 
+/// Shapes from the previous interactive layout. Exact keys include the whole
+/// hard paragraph, so moving an unchanged paragraph preserves shaping context.
+/// Double-buffered arenas keep only two builds and need no font leases: cached
+/// glyphs are values, and candidate generations/configuration are in the key.
+pub const Recent = struct {
+    allocator: std.mem.Allocator,
+    previous_arena: std.heap.ArenaAllocator,
+    current_arena: std.heap.ArenaAllocator,
+    previous: Map = .empty,
+    current: Map = .empty,
+    revision: u64 = 0,
+    hits: usize = 0,
+
+    const Map = std.HashMapUnmanaged(ShapeCache.Key, api.FallbackResult, ShapeCache.KeyContext, std.hash_map.default_max_load_percentage);
+
+    pub fn init(allocator: std.mem.Allocator) Recent {
+        return .{ .allocator = allocator, .previous_arena = .init(allocator), .current_arena = .init(allocator) };
+    }
+
+    pub fn deinit(self: *Recent) void {
+        self.previous.deinit(self.allocator);
+        self.current.deinit(self.allocator);
+        self.previous_arena.deinit();
+        self.current_arena.deinit();
+    }
+
+    pub fn begin(self: *Recent, revision: u64) !void {
+        self.current.clearRetainingCapacity();
+        if (!self.current_arena.reset(.retain_capacity)) return error.OutOfMemory;
+        self.revision = revision;
+        self.hits = 0;
+    }
+
+    pub fn finish(self: *Recent, success: bool) void {
+        if (success) {
+            std.mem.swap(Map, &self.previous, &self.current);
+            std.mem.swap(std.heap.ArenaAllocator, &self.previous_arena, &self.current_arena);
+        } else {
+            self.current.clearRetainingCapacity();
+            _ = self.current_arena.reset(.free_all);
+        }
+    }
+
+    /// Result is borrowed until the next build; candidates belong to the
+    /// owning ParagraphCache's FontCache. No run is spliced at an edit seam.
+    pub fn shape(self: *Recent, scratch: std.mem.Allocator, candidates: []const api.FallbackCandidate, spec: api.RunSpec) !api.FallbackResult {
+        const handles = try scratch.alloc(api.FontHandle, candidates.len);
+        defer scratch.free(handles);
+        for (candidates, handles) |candidate, *handle| handle.* = candidate.handle;
+        var key = try ShapeCache.requestKey(.{ .spec = spec, .candidates = handles, .configuration_revision = self.revision });
+        if (self.current.get(key)) |result| {
+            self.hits += 1;
+            return result;
+        }
+        const memory = self.current_arena.allocator();
+        const result = if (self.previous.get(key)) |old| blk: {
+            self.hits += 1;
+            break :blk try old.clone(memory);
+        } else try api.shapeWithFallback(memory, candidates, spec);
+        key.paragraph = try memory.dupe(u8, key.paragraph);
+        key.language = try memory.dupe(u8, key.language);
+        key.candidates = try memory.dupe(api.FontHandle, handles);
+        try self.current.put(self.allocator, key, result);
+        return result;
+    }
+};
+
 test "shape cache allocation failures unwind candidate ownership" {
     const inter_bytes = @embedFile("ourokit_test_font");
     const arabic_bytes = @embedFile("ourokit_arabic_test_font");

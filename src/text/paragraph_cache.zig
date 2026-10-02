@@ -6,6 +6,7 @@ const paragraph = @import("paragraph.zig");
 const paragraph_layout = @import("paragraph_layout.zig");
 const paragraph_style = @import("paragraph_style.zig");
 const styled = @import("styled_run.zig");
+const ShapeReuse = @import("shape_cache.zig").Recent;
 pub const StyledRun = styled.StyledRun;
 
 pub const ParagraphHandle = struct {
@@ -21,6 +22,7 @@ pub const ParagraphCache = struct {
     allocator: std.mem.Allocator,
     font_cache: *api.FontCache,
     scratch: std.heap.ArenaAllocator,
+    shape_reuse: ShapeReuse,
     slabs: std.ArrayListUnmanaged(*Slab) = .empty,
     index: Index = .empty,
     index_removals: usize = 0,
@@ -146,7 +148,7 @@ pub const ParagraphCache = struct {
     );
 
     pub fn init(allocator: std.mem.Allocator, font_cache: *api.FontCache) ParagraphCache {
-        return .{ .allocator = allocator, .font_cache = font_cache, .scratch = .init(allocator) };
+        return .{ .allocator = allocator, .font_cache = font_cache, .scratch = .init(allocator), .shape_reuse = .init(allocator) };
     }
 
     pub fn deinit(self: *ParagraphCache) void {
@@ -157,6 +159,7 @@ pub const ParagraphCache = struct {
         }
         self.slabs.deinit(self.allocator);
         self.scratch.deinit();
+        self.shape_reuse.deinit();
         self.* = undefined;
     }
 
@@ -192,6 +195,9 @@ pub const ParagraphCache = struct {
             retained += 1;
         }
 
+        const reuse: ?*ShapeReuse = if (request.include_caret_stops and request.runs.len == 0) &self.shape_reuse else null;
+        if (reuse) |cache| try cache.begin(request.configuration_revision);
+        errdefer if (reuse) |cache| cache.finish(false);
         var layout = try paragraph_layout.buildStyled(
             scratch,
             utf8,
@@ -207,6 +213,7 @@ pub const ParagraphCache = struct {
             },
             transient_key.include_caret_stops,
             request.runs,
+            reuse,
         );
         layout.positioned = try layout.positioned.clone(self.allocator);
         errdefer layout.deinit();
@@ -239,6 +246,7 @@ pub const ParagraphCache = struct {
         const handle: ParagraphHandle = .{ .slot = slot_index, .generation = slot.generation };
         self.index.putAssumeCapacity(stored_key, handle);
         self.active_count += 1;
+        if (reuse) |cache| cache.finish(true);
         return handle;
     }
 
@@ -671,6 +679,67 @@ test "paragraph layout reflows Slack-style links at unsafe boundaries" {
     }
 }
 
+test "interactive shape reuse matches fresh layouts after edits and invalidation" {
+    var fonts = api.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{ .key = .{ .file = "latin", .index = 0 }, .bytes = @embedFile("ourokit_test_font") });
+    defer fonts.release(latin) catch unreachable;
+    const arabic = try fonts.acquire(.{ .key = .{ .file = "arabic", .index = 0 }, .bytes = @embedFile("ourokit_arabic_test_font") });
+    defer fonts.release(arabic) catch unreachable;
+    var cache = ParagraphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    const candidates = [_]api.FallbackCandidate{ .{ .handle = latin, .cache = &fonts }, .{ .handle = arabic, .cache = &fonts } };
+    for ([_][]const u8{
+        "office AVATAR\nمرحبا سلام\nlast line",
+        "office AVATAR\nمرحبا سلاما\nlast line",
+        "(Abcdefx\nمرحبا سلاما\nlast line",
+        "(Abcdef)\nمرحبا سلاما\nlast line",
+        "NEW\n(Abcdef)\nمرحبا سلاما\nlast line",
+        "NEW\n(Abcdef)مرحبا سلاما\nlast line",
+        "NEW\n(Abcdef)مرحبا سلاما\nlast line",
+    }, 0..) |text, i| {
+        const width: f32 = if (i % 2 == 0) 120 else 170;
+        const handle = try cache.acquire(.{
+            .utf8 = text,
+            .language = "und",
+            .logical_size = 16,
+            .max_width = width,
+            .include_caret_stops = true,
+            .candidates = &.{ latin, arabic },
+            .configuration_revision = if (i == 6) 2 else 1,
+        });
+        defer cache.release(handle) catch unreachable;
+        const actual = try cache.get(handle);
+        var expected = try paragraph_layout.build(std.testing.allocator, text, .auto_left_to_right, &candidates, "und", 16, width, .{}, true);
+        defer expected.deinit();
+        try std.testing.expectEqualDeep(expected.positioned.lines, actual.positioned.lines);
+        try std.testing.expectEqualDeep(expected.positioned.spans, actual.positioned.spans);
+        try std.testing.expectEqualDeep(expected.positioned.glyphs, actual.positioned.glyphs);
+        try std.testing.expectEqualDeep(expected.positioned.carets, actual.positioned.carets);
+        try std.testing.expectEqualDeep(expected.size, actual.size);
+        if (i == 0 or i == 6) {
+            try std.testing.expectEqual(@as(usize, 0), cache.shape_reuse.hits);
+        } else try std.testing.expect(cache.shape_reuse.hits > 0);
+    }
+}
+
+fn exerciseInteractiveAllocationFailure(allocator: std.mem.Allocator, fonts: *api.FontCache, candidates: [2]api.FontHandle) !void {
+    var cache = ParagraphCache.init(allocator, fonts);
+    defer cache.deinit();
+    for ([_][]const u8{ "office\nمرحبا", "office\nمرحبا بك", "first\noffice\nمرحبا بك" }) |text| {
+        const handle = try cache.acquire(.{
+            .utf8 = text,
+            .language = "und",
+            .logical_size = 16,
+            .max_width = 120,
+            .include_caret_stops = true,
+            .candidates = &candidates,
+            .configuration_revision = 1,
+        });
+        try cache.release(handle);
+    }
+}
+
 fn exerciseParagraphAllocationFailure(
     allocator: std.mem.Allocator,
     fonts: *api.FontCache,
@@ -710,6 +779,11 @@ test "paragraph layout allocation failures unwind font leases" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         exerciseParagraphAllocationFailure,
+        .{ &fonts, [2]api.FontHandle{ latin, arabic } },
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseInteractiveAllocationFailure,
         .{ &fonts, [2]api.FontHandle{ latin, arabic } },
     );
     try std.testing.expectEqual(@as(usize, 2), fonts.count());
