@@ -56,6 +56,7 @@ pub const ParagraphCache = struct {
         alignment: paragraph_style.Alignment,
         max_lines: u32,
         overflow: paragraph_style.Overflow,
+        break_long_words: bool,
         include_caret_stops: bool,
         candidates: []const api.FontHandle,
         runs: []const StyledRun,
@@ -88,6 +89,7 @@ pub const ParagraphCache = struct {
             hashValue(&hasher, @intFromEnum(key.alignment));
             hashValue(&hasher, key.max_lines);
             hashValue(&hasher, @intFromEnum(key.overflow));
+            hashValue(&hasher, key.break_long_words);
             hashValue(&hasher, key.include_caret_stops);
             for (key.candidates) |candidate| {
                 hashValue(&hasher, candidate.slot);
@@ -113,6 +115,7 @@ pub const ParagraphCache = struct {
                 a.alignment == b.alignment and
                 a.max_lines == b.max_lines and
                 a.overflow == b.overflow and
+                a.break_long_words == b.break_long_words and
                 a.include_caret_stops == b.include_caret_stops and
                 a.configuration_revision == b.configuration_revision and
                 std.mem.eql(u8, a.utf8, b.utf8) and
@@ -210,6 +213,7 @@ pub const ParagraphCache = struct {
                 .alignment = transient_key.alignment,
                 .max_lines = if (transient_key.max_lines == 0) null else transient_key.max_lines,
                 .overflow = transient_key.overflow,
+                .break_long_words = transient_key.break_long_words,
             },
             transient_key.include_caret_stops,
             request.runs,
@@ -232,6 +236,7 @@ pub const ParagraphCache = struct {
             .alignment = transient_key.alignment,
             .max_lines = transient_key.max_lines,
             .overflow = transient_key.overflow,
+            .break_long_words = transient_key.break_long_words,
             .include_caret_stops = transient_key.include_caret_stops,
             .candidates = candidate_handles,
             .runs = runs,
@@ -306,6 +311,7 @@ pub const ParagraphCache = struct {
             .alignment = request.style.alignment,
             .max_lines = request.style.max_lines orelse 0,
             .overflow = request.style.overflow,
+            .break_long_words = request.style.break_long_words,
             .include_caret_stops = request.include_caret_stops,
             .candidates = request.candidates,
             .runs = request.runs,
@@ -886,5 +892,62 @@ test "styled paragraph sizes fonts bidi wrapping and ellipsis retain authored st
         defer empty.deinit();
         try std.testing.expectApproxEqAbs(empty.metrics.ascender, line.ascender, 0.001);
         try std.testing.expectApproxEqAbs(empty.metrics.descender, line.descender, 0.001);
+    }
+}
+
+test "emergency wrapping splits oversized words at graphemes and separates cache policies" {
+    var fonts = api.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const latin = try fonts.acquire(.{ .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 }, .bytes = @embedFile("ourokit_test_font") });
+    defer fonts.release(latin) catch unreachable;
+    const arabic = try fonts.acquire(.{ .key = .{ .file = "/fixtures/Arabic.ttf", .index = 0 }, .bytes = @embedFile("ourokit_arabic_test_font") });
+    defer fonts.release(arabic) catch unreachable;
+    var cache = ParagraphCache.init(std.testing.allocator, &fonts);
+    defer cache.deinit();
+    for ([_][]const u8{ "d" ** 100, "e\u{301}" ** 40, "office" ** 20, "حفظ" ** 20, "👩‍💻" ** 10 }, 0..) |value, index| {
+        var request: ParagraphCache.Request = .{
+            .utf8 = value,
+            .language = "und",
+            .logical_size = 16,
+            .max_width = 37,
+            .candidates = &.{ latin, arabic },
+            .configuration_revision = 1,
+            .include_caret_stops = true,
+        };
+        // Cache identity must distinguish editor wrapping from label overflow.
+        const original = if (index == 0) try cache.acquire(request) else null;
+        defer if (original) |handle| cache.release(handle) catch unreachable;
+        request.style.break_long_words = true;
+        const wrapped = try cache.acquire(request);
+        defer cache.release(wrapped) catch unreachable;
+        if (original) |handle| {
+            try std.testing.expect(!std.meta.eql(handle, wrapped));
+            try std.testing.expectEqual(@as(usize, 1), (try cache.get(handle)).positioned.lines.len);
+        }
+        const layout = try cache.get(wrapped);
+        try std.testing.expect(layout.positioned.lines.len > 1);
+        var offset: usize = 0;
+        for (layout.positioned.lines) |line| {
+            try std.testing.expectEqual(offset, line.byte_start);
+            try std.testing.expect(line.byte_len > 0);
+            try std.testing.expect(line.advance <= 37.001);
+            offset += line.byte_len;
+            var graphemes = @import("uucode").grapheme.utf8Iterator(value);
+            var boundary = false;
+            while (graphemes.nextGrapheme()) |g| {
+                if (g.end == offset) boundary = true;
+            }
+            try std.testing.expect(boundary);
+        }
+        try std.testing.expectEqual(value.len, offset);
+        request.max_width = 1;
+        const tiny = try cache.acquire(request);
+        defer cache.release(tiny) catch unreachable;
+        var graphemes = @import("uucode").grapheme.utf8Iterator(value);
+        for ((try cache.get(tiny)).positioned.lines) |line| {
+            const g = graphemes.nextGrapheme().?;
+            try std.testing.expectEqual(g.end, line.byte_start + line.byte_len);
+        }
+        try std.testing.expect(graphemes.nextGrapheme() == null);
     }
 }

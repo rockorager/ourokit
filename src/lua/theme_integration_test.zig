@@ -1573,6 +1573,90 @@ test "caret blink deadlines survive rebuilds and only caret pixels change" {
     try std.testing.expect((try f.runtime.animationDelay()) == null);
 }
 
+test "caret_blink false paints steadily without a timer across rebuilds" {
+    const ms = std.time.ns_per_ms;
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("blink = true; ctor = ouro.text_input; function build() return ctor {key='input', default_text='Steady', autofocus=true, caret_blink=blink} end");
+    try f.build();
+    try f.runtime.advanceAnimations(0);
+    try f.runtime.advanceAnimations(500 * ms);
+    try std.testing.expect(!f.runtime.caret_visible);
+    try f.exec("blink = false");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    const input = try f.handle("input");
+    const render = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(input));
+    try std.testing.expect((try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+    const before = try f.pixels();
+    defer std.testing.allocator.free(before);
+    for ([_]u64{ 1000, 1500, 2000 }) |tick| {
+        try f.runtime.advanceAnimations(tick * ms);
+        const after = try f.pixels();
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+    }
+    try f.exec("ctor = ouro.text_editor");
+    _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+    try f.build();
+    try std.testing.expect(!(try f.runtime.text_inputs.getBehavior(try f.handle("input"))).caret_blink);
+    try std.testing.expect((try f.runtime.animationDelay()) == null);
+}
+
+test "block caret remains distinct at either active selection end" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec("shape='block'; function build() return ouro.text_editor {key='input', default_text='Wide iii', autofocus=true, caret_blink=false, caret_shape=shape, caret_color='#111111', selection_color='#E8D7BE'} end");
+    try f.build();
+    const input = try f.handle("input");
+    const session = try f.runtime.text_inputs.session(input);
+    const render = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(input));
+    for ([_]@import("../ui/text_input/root.zig").Selection{
+        .{ .anchor = 0, .extent = 3 },
+        .{ .anchor = 3, .extent = 1 },
+    }) |selection| {
+        _ = try session.model.setSelection(selection);
+        try f.runtime.advanceAnimations(1000 * std.time.ns_per_ms);
+        try f.runtime.prepareFrame(1);
+        const object = (try f.runtime.tree.objectAt(render)).text_input;
+        try std.testing.expect(object.show_caret);
+        try std.testing.expectEqual(selection.extent, object.caret_offset);
+        try std.testing.expect((try f.runtime.animationDelay()) == null);
+        var selection_index: ?usize = null;
+        var caret_index: ?usize = null;
+        var text_index: ?usize = null;
+        for ((try f.runtime.displayList()).commands, 0..) |command, index| switch (command) {
+            .solid_rectangle => |rectangle| {
+                if (std.meta.eql(rectangle.color, core.Color.rgba(232, 215, 190, 255))) selection_index = index;
+                if (std.meta.eql(rectangle.color, core.Color.rgba(17, 17, 17, 128))) caret_index = index;
+            },
+            .paragraph => text_index = index,
+            else => {},
+        };
+        try std.testing.expect(selection_index != null and caret_index != null and text_index != null);
+        try std.testing.expect(selection_index.? < caret_index.? and caret_index.? < text_index.?);
+    }
+    _ = try session.apply(.{ .preedit = .{ .text = "x", .cursor = null } });
+    try f.runtime.advanceAnimations(2000 * std.time.ns_per_ms);
+    try std.testing.expect(!(try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    _ = try session.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+    var unused: Vm = undefined;
+    try f.runtime.routeKeyboard(.{ .leave = .{ .window = f.runtime.window, .serial = 2 } });
+    try f.runtime.dispatchInput(&unused);
+    try std.testing.expect(!(try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    try f.runtime.routeKeyboard(.{ .enter = .{ .window = f.runtime.window, .serial = 3 } });
+    try f.runtime.dispatchInput(&unused);
+    for ([_][]const u8{ "shape='beam'", "shape='underline'" }) |source| {
+        try f.exec(source);
+        _ = try f.runtime.build_owners.markDirty(f.runtime.root_owner);
+        try f.build();
+        _ = try session.model.setSelection(.{ .anchor = 3, .extent = 1 });
+        try f.runtime.advanceAnimations(3000 * std.time.ns_per_ms);
+        try std.testing.expect(!(try f.runtime.tree.objectAt(render)).text_input.show_caret);
+    }
+}
+
 test "caret stays steady for composition and pauses for selection and window focus" {
     const ms = std.time.ns_per_ms;
     const f = try Fixture.create();

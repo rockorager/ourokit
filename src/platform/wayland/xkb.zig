@@ -140,6 +140,7 @@ fn logicalKey(keysym: u32) platform.LogicalKey {
         c.XKB_KEY_Page_Down, c.XKB_KEY_KP_Page_Down => .page_down,
         c.XKB_KEY_BackSpace => .backspace,
         c.XKB_KEY_Delete, c.XKB_KEY_KP_Delete => .delete,
+        c.XKB_KEY_colon => .colon,
         else => .unidentified,
     };
 }
@@ -152,6 +153,7 @@ test "bindable letters digits and function keys retain logical identity" {
     }
     try std.testing.expectEqual(platform.LogicalKey.digit_7, logicalKey(c.XKB_KEY_7));
     try std.testing.expectEqual(platform.LogicalKey.f12, logicalKey(c.XKB_KEY_F12));
+    try std.testing.expectEqual(platform.LogicalKey.colon, logicalKey(c.XKB_KEY_colon));
     try std.testing.expectEqual(platform.LogicalKey.unidentified, logicalKey(c.XKB_KEY_F13));
 }
 

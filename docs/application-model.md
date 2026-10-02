@@ -2251,8 +2251,9 @@ initial or externally supplied value does not itself emit `on_change`.
 
 Set `multiline = true` for a native plain-text editor (default height 160;
 set `height` for a different viewport). Hard breaks normalize to LF instead of
-spaces. Text wraps at the viewport width; an unbreakable run can scroll
-horizontally. Enter and Shift+Enter insert a newline. Up/Down move by visual
+spaces. Text wraps at the viewport width; oversized runs gain emergency breaks
+between extended graphemes without changing the stored text. A single grapheme
+wider than the viewport can still overflow. Enter and Shift+Enter insert a newline. Up/Down move by visual
 line, Home/End move to visual line edges, and Ctrl+Home/End move to document
 edges; Shift extends selection. Tab still moves focus, rather than inserting
 a tab. Existing key-binding overrides take precedence over these defaults.
@@ -2297,12 +2298,19 @@ This policy does not supply Vim motions or a Lua selection/range-edit controller
 `caret_shape = 'beam' | 'block' | 'underline'` is available on both controls;
 the default is `beam`. Block and underline follow the shaped advance of the next
 logical grapheme at the caret's visual position, including proportional and bidi
-text. At an empty line, end of line, or upstream wrap edge they use half the
-font-metric line height (at least one logical pixel). Blocks paint behind glyphs
-with alpha capped at 128; underline thickness uses `caret_width`. Shape changes
-do not change wrapping, selection, text, or undo history. Existing focus, blink,
-and nonempty-selection visibility rules still apply. A shape does not imply an
+text. At an empty line, end of line, or upstream wrap edge they use the base
+font's shaped space advance (at least one logical pixel). Blocks paint above
+selection highlights and behind glyphs with alpha capped at 128, and remain
+visible at the active extent of a nonempty selection. Beam and underline carets
+remain hidden for nonempty selections; underline thickness uses `caret_width`.
+Shape changes do not change wrapping, selection, text, or undo history. Focus,
+pointer-drag and IME visibility rules still apply. A shape does not imply an
 editing mode or overwrite behavior.
+
+`caret_blink = false` keeps the focused caret steady and schedules no caret-blink
+timer. It defaults to `true` on both editor controls; focus and selection still
+determine visibility. `Colon` names the colon keysym in key filters and chords;
+use `Shift+Colon` on layouts that produce it with Shift.
 
 Additional native binding actions support command-mode applications:
 

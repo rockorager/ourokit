@@ -2436,7 +2436,7 @@ pub const WindowRuntime = struct {
         if (!self.instances.isActive(target) or !self.instances.isVisible(target) or !self.text_inputs.contains(target)) return false;
         const behavior = try self.text_inputs.getBehavior(target);
         const session = try self.text_inputs.session(target);
-        return behavior.enabled and !behavior.read_only and session.preedit() == null and
+        return behavior.caret_blink and behavior.enabled and !behavior.read_only and session.preedit() == null and
             !session.isSelecting() and session.model.selection.isCollapsed();
     }
 
@@ -3103,8 +3103,9 @@ pub const WindowRuntime = struct {
             object.text_input.caret_offset = presentation.caret_offset;
             object.text_input.caret_affinity = presentation.caret_affinity;
             object.text_input.reveal_caret = optionalSameHandle(self.focus.current(), mounted.target) and !mounted.session.isSelecting();
-            object.text_input.show_caret = presentation.show_caret and object.text_input.reveal_caret and
-                self.keyboard_focused and (self.caret_visible or mounted.session.preedit() != null);
+            const selected_block = object.text_input.caret_shape == .block and presentation.preedit == null;
+            object.text_input.show_caret = (presentation.show_caret or selected_block) and object.text_input.reveal_caret and
+                self.keyboard_focused and (!(try self.text_inputs.getBehavior(mounted.target)).caret_blink or self.caret_visible or mounted.session.preedit() != null);
             object.text_input.preedit = if (presentation.preedit) |range| .{
                 .start = range.start,
                 .end = range.end,

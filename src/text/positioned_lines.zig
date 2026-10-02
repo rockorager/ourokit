@@ -108,6 +108,8 @@ pub const PositionedLines = struct {
     truncated: bool,
     source_byte_len: usize,
     ellipsis_byte_offset: ?usize,
+    /// Advance of one space in the paragraph's base font, for empty/EOL carets.
+    caret_fallback_width: f32 = 1,
 
     /// Give the immutable result its own lifetime, independent of build scratch.
     pub fn clone(self: *const PositionedLines, allocator: std.mem.Allocator) !PositionedLines {
@@ -128,6 +130,7 @@ pub const PositionedLines = struct {
             .truncated = self.truncated,
             .source_byte_len = self.source_byte_len,
             .ellipsis_byte_offset = self.ellipsis_byte_offset,
+            .caret_fallback_width = self.caret_fallback_width,
         };
     }
 
@@ -286,7 +289,7 @@ pub const PositionedLines = struct {
 
     /// Covers the following logical grapheme at the affinity-selected visual
     /// position. At a line end (including an upstream wrap edge) or an empty
-    /// line, use a font-metric-derived positive width instead.
+    /// line, use the base font's space advance instead.
     pub fn caretGraphemeRectangleForOffset(
         self: *const PositionedLines,
         byte_offset: usize,
@@ -312,7 +315,7 @@ pub const PositionedLines = struct {
             }
             break;
         }
-        const fallback = @max(1, beam.height * 0.5);
+        const fallback = self.caret_fallback_width;
         return .{ .x = beam.x - if (rtl) fallback else @as(f32, 0), .y = beam.y, .width = fallback, .height = beam.height };
     }
 
@@ -658,6 +661,19 @@ pub fn positionLinesWithOptions(
     if (style.max_lines == 0) return error.InvalidMaxLines;
     if (available_width) |width|
         if (!std.math.isFinite(width) or width < 0) return error.InvalidWidth;
+    var caret_fallback_width: f32 = 1;
+    if (include_caret_stops) {
+        if (shaped.candidates.len == 0) return error.NoFallbackCandidates;
+        var space = try (try shaped.candidates[0].resolve()).shape(allocator, .{
+            .paragraph = " ",
+            .direction = .left_to_right,
+            .script = .latin,
+            .language = shaped.language,
+            .logical_size = shaped.logical_size,
+        });
+        defer space.deinit();
+        caret_fallback_width = @max(1, space.advance.x);
+    }
     const visible_count = @min(
         selected.lines.len,
         if (style.max_lines) |count| @as(usize, count) else selected.lines.len,
@@ -833,6 +849,7 @@ pub fn positionLinesWithOptions(
         .truncated = display_count < total_count,
         .source_byte_len = utf8.len,
         .ellipsis_byte_offset = null,
+        .caret_fallback_width = caret_fallback_width,
     };
 }
 
@@ -936,23 +953,30 @@ fn appendLineCarets(
         var glyph_index: usize = 0;
         var cluster_x = span_x;
         while (glyph_index < span_glyphs.len) {
-            const cluster = span_glyphs[glyph_index].cluster;
+            // MONOTONE_CHARACTERS (and missing-glyph fallback) can expose
+            // several shaping clusters inside one extended grapheme. Combine
+            // their advances before deriving atomic editor caret positions.
+            const grapheme_index = firstGraphemeEndingAfter(graphemes, span_glyphs[glyph_index].cluster);
+            if (grapheme_index == graphemes.len) return error.InvalidShaping;
+            const cluster = graphemes[grapheme_index].byte_start;
             var glyph_end = glyph_index;
             var cluster_advance: f32 = 0;
-            while (glyph_end < span_glyphs.len and span_glyphs[glyph_end].cluster == cluster) : (glyph_end += 1) {
+            while (glyph_end < span_glyphs.len and
+                firstGraphemeEndingAfter(graphemes, span_glyphs[glyph_end].cluster) == grapheme_index) : (glyph_end += 1)
+            {
                 const advance = span_glyphs[glyph_end].advance.x;
                 if (!std.math.isFinite(advance) or advance < 0) return error.InvalidShaping;
                 cluster_advance += advance;
             }
             const cluster_end = switch (span.direction) {
                 .left_to_right => if (glyph_end < span_glyphs.len)
-                    span_glyphs[glyph_end].cluster
+                    graphemes[firstGraphemeEndingAfter(graphemes, span_glyphs[glyph_end].cluster)].byte_start
                 else
                     span_end,
                 .right_to_left => if (glyph_index == 0)
                     span_end
                 else
-                    span_glyphs[glyph_index - 1].cluster,
+                    graphemes[firstGraphemeEndingAfter(graphemes, span_glyphs[glyph_index - 1].cluster)].byte_start,
                 else => return error.UnsupportedTextDirection,
             };
             if (cluster < span.byte_start or cluster_end <= cluster or cluster_end > span_end)
@@ -1530,7 +1554,18 @@ test "shaped caret rectangles follow proportional graphemes and metric fallbacks
     var empty = try positionLines(std.testing.allocator, "", &empty_fixture.shaped, &empty_fixture.selected);
     defer empty.deinit();
     const fallback = try empty.caretGraphemeRectangleForOffset(0, .downstream);
-    try std.testing.expect(fallback.width >= 1 and fallback.width <= fallback.height);
+    // Compare against a real space, not the fallback implementation's metadata.
+    var space_fixture: Fixture = undefined;
+    try space_fixture.init(" ", 200);
+    defer space_fixture.deinit();
+    var space = try positionLines(std.testing.allocator, " ", &space_fixture.shaped, &space_fixture.selected);
+    defer space.deinit();
+    const space_cell = try space.caretGraphemeRectangleForOffset(0, .downstream);
+    try std.testing.expectApproxEqAbs(space_cell.width, fallback.width, 0.001);
+    try std.testing.expect(fallback.width < fallback.height * 0.5);
+    var cloned = try empty.clone(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqual(fallback, try cloned.caretGraphemeRectangleForOffset(0, .downstream));
 
     var rtl_fixture: Fixture = undefined;
     try rtl_fixture.init("אב", 200);
@@ -1539,6 +1574,7 @@ test "shaped caret rectangles follow proportional graphemes and metric fallbacks
     defer rtl_only.deinit();
     const rtl_end = try rtl_only.caretGraphemeRectangleForOffset(4, .downstream);
     const rtl_beam = try rtl_only.caretRectangleForOffset(4, .downstream, 1);
+    try std.testing.expectApproxEqAbs(space_cell.width, rtl_end.width, 0.001);
     try std.testing.expectApproxEqAbs(rtl_beam.x, rtl_end.x + rtl_end.width, 0.001);
     try std.testing.expectEqual(rtl_end, try rtl_only.caretGraphemeRectangleForOffset(4, .upstream));
 
@@ -1552,7 +1588,7 @@ test "shaped caret rectangles follow proportional graphemes and metric fallbacks
     const before_wrap = try wrapped.caretGraphemeRectangleForOffset(edge, .upstream);
     const after_wrap = try wrapped.caretGraphemeRectangleForOffset(edge, .downstream);
     try std.testing.expect(before_wrap.y < after_wrap.y);
-    try std.testing.expectApproxEqAbs(before_wrap.height * 0.5, before_wrap.width, 0.001);
+    try std.testing.expectApproxEqAbs(space_cell.width, before_wrap.width, 0.001);
 }
 
 test "caret stops preserve graphemes, ligatures, and bidi affinity" {

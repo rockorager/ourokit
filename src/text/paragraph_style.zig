@@ -21,4 +21,6 @@ pub const Style = struct {
     /// Null means unlimited. A value, when present, is always greater than zero.
     max_lines: ?u32 = null,
     overflow: Overflow = .clip,
+    /// Add grapheme opportunities within segments wider than the viewport.
+    break_long_words: bool = false,
 };

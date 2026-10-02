@@ -327,7 +327,7 @@ ouro.text_input = ouro.stateless(function(p, children, theme)
     mask=p.mask, conversation=p.conversation, prompt_id=p.prompt_id,
     label=p.label, placeholder=p.placeholder, multiline=p.multiline,
     enabled=active, read_only=p.read_only, text_entry=p.text_entry, autofocus=p.autofocus,
-    caret_shape=p.caret_shape,
+    caret_shape=p.caret_shape, caret_blink=p.caret_blink,
     key_bindings=p.key_bindings, on_change=p.on_change, on_command=p.on_command,
     focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
     width=p.width, height=height, alignment=alignment,

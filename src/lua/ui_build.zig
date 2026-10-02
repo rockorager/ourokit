@@ -1403,6 +1403,8 @@ pub const UiBuild = struct {
             return luaError(state, "text_input read_only must be a boolean");
         const text_entry = tableOptionalBoolean(state, 1, "text_entry", true) orelse
             return luaError(state, "text_input text_entry must be a boolean");
+        const caret_blink = tableOptionalBoolean(state, 1, "caret_blink", true) orelse
+            return luaError(state, "text_input caret_blink must be a boolean");
         const autofocus = tableOptionalBoolean(state, 1, "autofocus", false) orelse
             return luaError(state, "text_input autofocus must be a boolean");
         var bindings = @import("key_bindings.zig").field(state, 1, "key_bindings", self.text_input_bindings) catch |err|
@@ -1419,7 +1421,7 @@ pub const UiBuild = struct {
             .target_id = target_id,
             .content_id = content_id,
             .mode = mode,
-            .behavior = .{ .enabled = enabled, .read_only = read_only, .text_entry = text_entry, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border, .focus_color = visual.focus orelse theme.ring, .secret = secret },
+            .behavior = .{ .enabled = enabled, .read_only = read_only, .text_entry = text_entry, .caret_blink = caret_blink, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border, .focus_color = visual.focus orelse theme.ring, .secret = secret },
             .session = if (mask)
                 TextInputSession.initSecret(sources.allocator) catch return luaError(state, "cannot create masked text_input session")
             else

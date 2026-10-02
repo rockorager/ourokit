@@ -10,6 +10,7 @@ pub const Behavior = struct {
     read_only: bool = false,
     /// Direct keyboard/IME entry only; native editing commands remain enabled.
     text_entry: bool = true,
+    caret_blink: bool = true,
     autofocus: bool = false,
     key_bindings: @import("keymap.zig").Keymap = .{},
     border_color: ?@import("../../core/color.zig").Color = null,

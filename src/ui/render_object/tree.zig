@@ -919,7 +919,7 @@ pub const Tree = struct {
                         .height = rectangle.height,
                     }, value.selection_color);
                 }
-                if (value.show_caret and value.selection_start == value.selection_end and value.caret_shape == .block) {
+                if (value.show_caret and value.caret_shape == .block) {
                     const rectangle = try textInputCaretRectangle(&paragraph_layout.positioned, value);
                     var block_color = value.caret_color;
                     block_color.a = @min(block_color.a, 128);
@@ -1310,7 +1310,7 @@ pub const Tree = struct {
                 std.math.floatMax(f32),
             .candidates = source.candidates,
             .configuration_revision = source.configuration_revision,
-            .style = .{ .alignment = input.alignment },
+            .style = .{ .alignment = input.alignment, .break_long_words = input.multiline },
             .include_caret_stops = true,
         }) catch return error.ParagraphLayoutFailed;
         errdefer paragraphs.release(layout_handle) catch unreachable;
@@ -1629,8 +1629,7 @@ fn textInputCaretOverhang(
     // Reserve fallback space even while the caret covers an interior grapheme.
     // Otherwise an unbounded field changes intrinsic width at EOL, and a
     // centered field shifts its text when only the selection moved.
-    var reserve: f32 = 1;
-    for (positioned.lines) |line| reserve = @max(reserve, (line.ascender - line.descender) * 0.5);
+    const reserve = positioned.caret_fallback_width;
     const rectangle = try textInputCaretRectangle(positioned, input);
     return @max(reserve, @max(0, -rectangle.x) + @max(0, rectangle.x + rectangle.width - paragraph_width));
 }

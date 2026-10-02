@@ -105,6 +105,7 @@ fn buildPositioned(
     defer breaks.deinit();
     var measured = try measurement.measureBreakSegments(allocator, breaks.breaks, &shaped);
     defer measured.deinit();
+    if (style.break_long_words) try addEmergencyBreaks(allocator, utf8, &breaks, &measured, &shaped, max_width);
     var selected = try line_layout.selectResolvedGreedyLines(
         allocator,
         &resolved,
@@ -170,6 +171,7 @@ fn buildPlainPositioned(
     defer breaks.deinit();
     var measured = try measurement.measureBreakSegments(allocator, breaks.breaks, &shaped);
     defer measured.deinit();
+    if (style.break_long_words) try addEmergencyBreaks(allocator, utf8, &breaks, &measured, &shaped, max_width);
     var selected = try line_layout.selectResolvedGreedyLines(
         allocator,
         &resolved,
@@ -187,6 +189,42 @@ fn buildPlainPositioned(
         style,
         include_caret_stops,
     );
+}
+
+// Keep ordinary word wrapping, but give oversized segments grapheme-safe
+// fallback opportunities. Measurement marks ligature/contextual boundaries for
+// the existing reshape/reflow path; source text and hard lines never change.
+fn addEmergencyBreaks(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    breaks: *line_break.LineBreakAnalysis,
+    measured: *measurement.Measurement,
+    shaped: *const shaped_paragraph.ShapedParagraphs,
+    max_width: f32,
+) !void {
+    var expanded: std.ArrayList(line_break.LineBreak) = .empty;
+    defer expanded.deinit(allocator);
+    var iterator = @import("uucode").grapheme.utf8Iterator(utf8);
+    var index: usize = 0;
+    while (iterator.nextGrapheme()) |grapheme| {
+        // UAX #14 may offer a break inside an extended grapheme (notably
+        // emoji sequences). An editor must not split its atomic caret unit.
+        while (index < breaks.breaks.len and breaks.breaks[index].byte_offset < grapheme.end) : (index += 1) {}
+        if (index < breaks.breaks.len and breaks.breaks[index].byte_offset == grapheme.end) {
+            try expanded.append(allocator, breaks.breaks[index]);
+            index += 1;
+        } else if (index < breaks.breaks.len and measured.segments[index].advance > max_width) {
+            try expanded.append(allocator, .{ .byte_offset = grapheme.end, .kind = .allowed });
+        }
+    }
+    try expanded.appendSlice(allocator, breaks.breaks[index..]);
+    const owned = try expanded.toOwnedSlice(allocator);
+    errdefer allocator.free(owned);
+    const next = try measurement.measureBreakSegments(allocator, owned, shaped);
+    breaks.deinit();
+    measured.deinit();
+    breaks.* = .{ .allocator = allocator, .breaks = owned };
+    measured.* = next;
 }
 
 fn positionWithReflow(
