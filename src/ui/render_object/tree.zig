@@ -948,7 +948,7 @@ pub const Tree = struct {
                 }
                 if (value.show_caret and value.selection_start == value.selection_end and value.caret_shape != .block) {
                     const rectangle = try textInputCaretRectangle(&paragraph_layout.positioned, value);
-                    try builder.solidRectangle(.{
+                    try builder.caretRectangle(.{
                         .x = text_origin.x + rectangle.x,
                         .y = text_origin.y + rectangle.y,
                         .width = rectangle.width,
@@ -2460,6 +2460,18 @@ test "text input paints selection, text, and caret from interactive paragraph ge
         .y = 1,
     });
     try std.testing.expect(hit.caret.byte_offset <= "office حفظ".len);
+
+    // Proportional glyph positions must not change the beam's device width.
+    for (0..7) |offset| {
+        var object = try tree.objectAt(input);
+        object.text_input.selection_start = offset;
+        object.text_input.selection_end = offset;
+        object.text_input.caret_offset = offset;
+        try tree.update(input, object);
+        builder = try scene_builder.Builder.init(&commands, 1.5);
+        try tree.buildScene(input, &builder);
+        try std.testing.expectEqual(@as(u32, 2), builder.displayList().commands[2].solid_rectangle.bounds.width);
+    }
 
     try tree.update(input, .{ .text_input = .{
         .source = source,

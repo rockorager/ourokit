@@ -108,7 +108,7 @@ pub const PositionedLines = struct {
     truncated: bool,
     source_byte_len: usize,
     ellipsis_byte_offset: ?usize,
-    /// Advance of one space in the paragraph's base font, for empty/EOL carets.
+    /// Advance of "0" in the paragraph's base font, for empty/EOL carets.
     caret_fallback_width: f32 = 1,
 
     /// Give the immutable result its own lifetime, independent of build scratch.
@@ -289,7 +289,7 @@ pub const PositionedLines = struct {
 
     /// Covers the following logical grapheme at the affinity-selected visual
     /// position. At a line end (including an upstream wrap edge) or an empty
-    /// line, use the base font's space advance instead.
+    /// line, use the base font's "0" advance instead.
     pub fn caretGraphemeRectangleForOffset(
         self: *const PositionedLines,
         byte_offset: usize,
@@ -664,15 +664,15 @@ pub fn positionLinesWithOptions(
     var caret_fallback_width: f32 = 1;
     if (include_caret_stops) {
         if (shaped.candidates.len == 0) return error.NoFallbackCandidates;
-        var space = try (try shaped.candidates[0].resolve()).shape(allocator, .{
-            .paragraph = " ",
+        var zero = try (try shaped.candidates[0].resolve()).shape(allocator, .{
+            .paragraph = "0",
             .direction = .left_to_right,
             .script = .latin,
             .language = shaped.language,
             .logical_size = shaped.logical_size,
         });
-        defer space.deinit();
-        caret_fallback_width = @max(1, space.advance.x);
+        defer zero.deinit();
+        caret_fallback_width = @max(1, zero.advance.x);
     }
     const visible_count = @min(
         selected.lines.len,
@@ -1623,15 +1623,19 @@ test "shaped caret rectangles follow proportional graphemes and metric fallbacks
     var empty = try positionLines(std.testing.allocator, "", &empty_fixture.shaped, &empty_fixture.selected);
     defer empty.deinit();
     const fallback = try empty.caretGraphemeRectangleForOffset(0, .downstream);
-    // Compare against a real space, not the fallback implementation's metadata.
-    var space_fixture: Fixture = undefined;
-    try space_fixture.init(" ", 200);
-    defer space_fixture.deinit();
-    var space = try positionLines(std.testing.allocator, " ", &space_fixture.shaped, &space_fixture.selected);
-    defer space.deinit();
-    const space_cell = try space.caretGraphemeRectangleForOffset(0, .downstream);
-    try std.testing.expectApproxEqAbs(space_cell.width, fallback.width, 0.001);
-    try std.testing.expect(fallback.width < fallback.height * 0.5);
+    // Compare against a real digit, not the fallback implementation's metadata.
+    // An actual space remains narrow; only empty/EOL positions use the digit.
+    var zero_fixture: Fixture = undefined;
+    try zero_fixture.init("0 ", 200);
+    defer zero_fixture.deinit();
+    var zero = try positionLines(std.testing.allocator, "0 ", &zero_fixture.shaped, &zero_fixture.selected);
+    defer zero.deinit();
+    const zero_cell = try zero.caretGraphemeRectangleForOffset(0, .downstream);
+    const space_cell = try zero.caretGraphemeRectangleForOffset(1, .downstream);
+    const ltr_end = try zero.caretGraphemeRectangleForOffset(2, .downstream);
+    try std.testing.expectApproxEqAbs(zero_cell.width, fallback.width, 0.001);
+    try std.testing.expectApproxEqAbs(zero_cell.width, ltr_end.width, 0.001);
+    try std.testing.expect(fallback.width > space_cell.width);
     var cloned = try empty.clone(std.testing.allocator);
     defer cloned.deinit();
     try std.testing.expectEqual(fallback, try cloned.caretGraphemeRectangleForOffset(0, .downstream));
@@ -1643,7 +1647,7 @@ test "shaped caret rectangles follow proportional graphemes and metric fallbacks
     defer rtl_only.deinit();
     const rtl_end = try rtl_only.caretGraphemeRectangleForOffset(4, .downstream);
     const rtl_beam = try rtl_only.caretRectangleForOffset(4, .downstream, 1);
-    try std.testing.expectApproxEqAbs(space_cell.width, rtl_end.width, 0.001);
+    try std.testing.expectApproxEqAbs(zero_cell.width, rtl_end.width, 0.001);
     try std.testing.expectApproxEqAbs(rtl_beam.x, rtl_end.x + rtl_end.width, 0.001);
     try std.testing.expectEqual(rtl_end, try rtl_only.caretGraphemeRectangleForOffset(4, .upstream));
 
@@ -1657,7 +1661,7 @@ test "shaped caret rectangles follow proportional graphemes and metric fallbacks
     const before_wrap = try wrapped.caretGraphemeRectangleForOffset(edge, .upstream);
     const after_wrap = try wrapped.caretGraphemeRectangleForOffset(edge, .downstream);
     try std.testing.expect(before_wrap.y < after_wrap.y);
-    try std.testing.expectApproxEqAbs(space_cell.width, before_wrap.width, 0.001);
+    try std.testing.expectApproxEqAbs(zero_cell.width, before_wrap.width, 0.001);
 }
 
 test "caret stops preserve graphemes, ligatures, and bidi affinity" {

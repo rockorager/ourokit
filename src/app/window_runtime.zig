@@ -3102,9 +3102,12 @@ pub const WindowRuntime = struct {
             object.text_input.selection_end = presentation.selection.end;
             object.text_input.caret_offset = presentation.caret_offset;
             object.text_input.caret_affinity = presentation.caret_affinity;
-            object.text_input.reveal_caret = optionalSameHandle(self.focus.current(), mounted.target) and !mounted.session.isSelecting();
+            const focused = optionalSameHandle(self.focus.current(), mounted.target);
+            object.text_input.reveal_caret = focused and !mounted.session.isSelecting();
             const selected_block = object.text_input.caret_shape == .block and presentation.preedit == null;
-            object.text_input.show_caret = (presentation.show_caret or selected_block) and object.text_input.reveal_caret and
+            // Drag scrolling owns reveal, but the block must accompany the
+            // selection on press/motion rather than appearing only on release.
+            object.text_input.show_caret = (selected_block or (presentation.show_caret and !mounted.session.isSelecting())) and focused and
                 self.keyboard_focused and (!(try self.text_inputs.getBehavior(mounted.target)).caret_blink or self.caret_visible or mounted.session.preedit() != null);
             object.text_input.preedit = if (presentation.preedit) |range| .{
                 .start = range.start,

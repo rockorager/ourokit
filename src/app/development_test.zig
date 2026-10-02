@@ -649,6 +649,58 @@ test "text entry policy preserves retained editing and multiline command navigat
     try std.testing.expectEqualStrings("alpha\nβeta?", session.model.text());
 }
 
+test "double-click shows block caret with word selection before pointer release" {
+    const f = try Fixture.create(
+        \\shape=ouro.signal('block')
+        \\function build() return ouro.text_editor {key='body',height=64,autofocus=true,
+        \\ default_text='alpha beta',caret_shape=shape(),caret_blink=false} end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    const render = try f.runtime.instances.renderObject(try f.runtime.text_inputs.content(target));
+    const bounds = (try f.runtime.semanticTarget("body")).bounds;
+    try f.runtime.routePointer(.{ .enter = .{
+        .window = f.runtime.window,
+        .serial = 1,
+        .position = .{ .x = bounds.x + 10, .y = bounds.y + 10 },
+    } });
+    try f.settle();
+    for ([_]@import("../platform/window.zig").PointerButtonState{ .pressed, .released, .pressed }, 0..) |state, index| {
+        try f.runtime.routePointer(.{ .button = .{
+            .window = f.runtime.window,
+            .serial = 2,
+            .time_ms = @intCast(index + 1),
+            .button = 0x110,
+            .state = state,
+        } });
+        try f.settle();
+    }
+    try std.testing.expect(session.isSelecting());
+    const pressed = (try f.runtime.tree.objectAt(render)).text_input;
+    try std.testing.expectEqual(@as(usize, 0), pressed.selection_start);
+    try std.testing.expectEqual(@as(usize, 5), pressed.selection_end);
+    try std.testing.expectEqual(@as(usize, 5), pressed.caret_offset);
+    try std.testing.expect(pressed.show_caret);
+    try std.testing.expect(!pressed.reveal_caret); // Drag auto-scroll owns the viewport.
+    try f.play(.pointer_up);
+    const released = (try f.runtime.tree.objectAt(render)).text_input;
+    try std.testing.expect(!session.isSelecting());
+    try std.testing.expect(released.show_caret and released.reveal_caret);
+    try std.testing.expectEqual(pressed.caret_offset, released.caret_offset);
+    try std.testing.expectEqual(pressed.selection_start, released.selection_start);
+    try std.testing.expectEqual(pressed.selection_end, released.selection_end);
+
+    // Ordinary beam fields still hide the caret during pointer selection.
+    try f.exec("shape:set('beam')");
+    try f.settle();
+    try f.play(.{ .pointer_down = "body" });
+    try std.testing.expect(session.isSelecting());
+    const beam = (try f.runtime.tree.objectAt(render)).text_input;
+    try std.testing.expect(!beam.show_caret and !beam.reveal_caret);
+    try f.play(.pointer_up);
+}
+
 test "multiline read-only selection auto-scrolls vertically without editing" {
     const f = try Fixture.create(
         \\function build() return ouro.text_input {key='body', multiline=true, height=64, read_only=true,

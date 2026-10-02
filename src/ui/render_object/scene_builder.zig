@@ -33,6 +33,16 @@ pub const Builder = struct {
         if (!device.isEmpty()) try self.append(.{ .solid_rectangle = .{ .bounds = device, .color = color } });
     }
 
+    /// Thin caret strokes need a stable thickness, not outward coverage of
+    /// both edges. Keep the floored origin so snapping cannot push an otherwise
+    /// visible caret beyond the viewport's outward-rounded right/bottom edge.
+    pub fn caretRectangle(self: *Builder, bounds: RectF, color: Color) !void {
+        var device = try self.deviceRect(bounds, .outward);
+        device.width = try self.deviceExtent(bounds.width);
+        device.height = try self.deviceExtent(bounds.height);
+        if (!device.isEmpty()) try self.append(.{ .solid_rectangle = .{ .bounds = device, .color = color } });
+    }
+
     pub fn image(self: *Builder, handle: ImageHandle, bounds: RectF, fit: ImageFit) !void {
         const device = try self.deviceRect(bounds, .outward);
         if (!device.isEmpty()) try self.append(.{ .image = .{ .image = handle, .bounds = device, .fit = fit } });
@@ -233,6 +243,32 @@ test "scene lowering scales logical rectangles conservatively" {
     const decorated = builder.displayList().commands[1].decorated_rectangle;
     try std.testing.expectEqual(@as(u32, 1), decorated.border_width);
     try std.testing.expectEqual(@as(u32, 5), decorated.corner_radius);
+}
+
+test "caret strokes retain thickness at fractional positions including viewport edges" {
+    const color = Color.rgba(166, 83, 55, 255);
+    for ([_]struct { scale: f32, thickness: u32 }{
+        .{ .scale = 1, .thickness = 1 },
+        .{ .scale = 1.25, .thickness = 2 },
+        .{ .scale = 1.5, .thickness = 2 },
+        .{ .scale = 2, .thickness = 2 },
+    }) |case| {
+        for ([_]f32{ -0.75, 0, 0.25, 0.5, 0.75, 1 }) |offset| {
+            var commands: [3]scene.Command = undefined;
+            var builder = try Builder.init(&commands, case.scale);
+            // Beam at the viewport's right edge, underline at its bottom edge.
+            try builder.pushClip(.{ .x = offset, .y = offset, .width = 20, .height = 40 });
+            try builder.caretRectangle(.{ .x = offset + 19, .y = offset, .width = 1, .height = 20 }, color);
+            try builder.caretRectangle(.{ .x = offset, .y = offset + 39, .width = 10, .height = 1 }, color);
+            const clip = commands[0].push_clip_rect;
+            const beam = commands[1].solid_rectangle.bounds;
+            const underline = commands[2].solid_rectangle.bounds;
+            try std.testing.expectEqual(case.thickness, beam.width);
+            try std.testing.expectEqual(case.thickness, underline.height);
+            try std.testing.expect(beam.x >= clip.x and beam.x + @as(i32, @intCast(beam.width)) <= clip.x + @as(i32, @intCast(clip.width)));
+            try std.testing.expect(underline.y >= clip.y and underline.y + @as(i32, @intCast(underline.height)) <= clip.y + @as(i32, @intCast(clip.height)));
+        }
+    }
 }
 
 test "decorated shapes retain dimensions at fractional origins and scales" {
