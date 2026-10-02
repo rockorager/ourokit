@@ -82,6 +82,8 @@ pub const Model = struct {
     history: std.ArrayList(HistoryEntry) = .empty,
     history_cursor: usize = 0,
     edit_group: ?EditKind = null,
+    explicit_group: bool = false,
+    explicit_group_started: bool = false,
     multiline: bool = false,
     /// Masked secret mode: the bytes live in one locked, dump-excluded page,
     /// are edited in place, wiped when removed and never copied into undo
@@ -164,7 +166,7 @@ pub const Model = struct {
         return if (self.gap) |gap| gap.text() else self.bytes.items;
     }
 
-    fn byteLen(self: *const Model) usize {
+    pub fn byteLen(self: *const Model) usize {
         return if (self.gap) |gap| gap.len() else self.bytes.items.len;
     }
 
@@ -248,11 +250,11 @@ pub const Model = struct {
             return error.OutOfMemory;
 
         if (removed_len == 0 and replacement.len == 0) {
-            if (kind == .isolated) self.breakUndoGroup();
+            if (kind == .isolated and !self.explicit_group) self.breakUndoGroup();
             return false;
         }
 
-        const coalesce = kind != .isolated and self.edit_group == kind and
+        const coalesce = (if (self.explicit_group) self.explicit_group_started else kind != .isolated and self.edit_group == kind) and
             self.history_cursor == self.history.items.len and self.history_cursor != 0 and
             std.meta.eql(self.selection, self.history.items[self.history_cursor - 1].selection_after);
         if (!coalesce) try self.history.ensureTotalCapacity(self.allocator, @min(self.history.items.len + 1, history_limit));
@@ -313,6 +315,7 @@ pub const Model = struct {
             self.history_cursor = self.history.items.len;
         }
         self.edit_group = if (kind == .isolated) null else kind;
+        if (self.explicit_group) self.explicit_group_started = true;
         return true;
     }
 
@@ -347,8 +350,17 @@ pub const Model = struct {
         return true;
     }
 
+    /// Begin a fresh history entry shared by subsequent edits of any kind.
+    /// Selection movement, focus/policy changes and undo/redo still end it.
+    pub fn beginUndoGroup(self: *Model) void {
+        self.breakUndoGroup();
+        if (!self.isSecret()) self.explicit_group = true;
+    }
+
     pub fn breakUndoGroup(self: *Model) void {
         self.edit_group = null;
+        self.explicit_group = false;
+        self.explicit_group_started = false;
     }
 
     pub fn undo(self: *Model) bool {
@@ -923,7 +935,7 @@ pub const Model = struct {
         return self.boundaries.items[@min(index, self.boundaries.items.len - 1)];
     }
 
-    fn isBoundary(self: *const Model, offset: usize) bool {
+    pub fn isBoundary(self: *const Model, offset: usize) bool {
         const index = lowerBound(self.boundaries.items, offset);
         return index < self.boundaries.items.len and self.boundaries.items[index] == offset;
     }
@@ -1663,6 +1675,42 @@ test "register puts preserve hard line structure grapheme carets and undo redo" 
         try std.testing.expectEqualStrings(case.expected, model.text());
         try std.testing.expectEqual(Selection.collapsed(case.caret), model.selection);
     }
+}
+
+test "editor explicit groups mix deltas but end on selection and explicit boundaries" {
+    var model = try Model.initWithMode(std.testing.allocator, "old tail", true);
+    defer model.deinit();
+    const original: Selection = .{ .anchor = 3, .extent = 0 };
+    _ = try model.setSelection(original);
+    model.beginUndoGroup();
+    _ = try model.replaceSelection("");
+    _ = try model.replaceRangeGrouped(model.selection.range(), "β", .typing);
+    _ = try model.replaceRangeGrouped(model.selection.range(), "x", .typing);
+    _ = try model.deleteBackward();
+    _ = try model.replaceSelection("!");
+    try std.testing.expectEqualStrings("β! tail", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("old tail", model.text());
+    try std.testing.expectEqual(original, model.selection);
+    try std.testing.expect(!model.undo());
+    try std.testing.expect(model.redo());
+    try std.testing.expectEqualStrings("β! tail", model.text());
+    model.beginUndoGroup();
+    _ = try model.replaceSelection("1");
+    _ = model.movePrevious(false);
+    _ = try model.replaceSelection("2");
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("β!1 tail", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("β! tail", model.text());
+    model.beginUndoGroup();
+    _ = try model.replaceSelection("3");
+    model.breakUndoGroup();
+    _ = try model.replaceSelection("4");
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("β!3 tail", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("β! tail", model.text());
 }
 
 test "secret model edits in place, caps length, rejects controls and wipes removed bytes" {

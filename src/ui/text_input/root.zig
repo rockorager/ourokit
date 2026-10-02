@@ -13,6 +13,7 @@ pub const Presentation = @import("presentation.zig").Presentation;
 pub const buildPresentation = @import("presentation.zig").build;
 pub const maskedToModel = @import("presentation.zig").maskedToModel;
 pub const Registry = @import("registry.zig").Registry;
+pub const Controller = @import("controller.zig").Controller;
 pub const ValueMode = @import("registry.zig").ValueMode;
 pub const Behavior = @import("registry.zig").Behavior;
 pub const Secret = @import("secret.zig").Secret;

@@ -162,7 +162,7 @@ test "Lua editor sequences validate recipes ambiguity and dense arrays" {
         \\return { good={inherit=false, ['C I W']={'select_word_inner','delete_selection','submit'}, ['C A W']='select_word_around'},
         \\ prefix={C='undo',['C I W']='redo'}, duplicate={['C I W']='undo',['c i w']='redo'},
         \\ empty={X={}}, sparse={X={[1]='undo',[3]='redo'}}, named={X={foo='undo'}},
-        \\ long={X={'undo','undo','undo','undo','undo'}},
+        \\ long={X={'undo','undo','undo','undo','undo','undo'}},
         \\ callback={X={'submit','delete_selection'}}, paste={X={'paste','delete_selection'}}}
     ;
     try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source.ptr, source.len, "@sequences", "t"));

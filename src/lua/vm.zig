@@ -131,6 +131,9 @@ pub const Vm = struct {
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, @import("drag.zig").start, 1);
         c.lua_setfield(state, -2, "start_drag");
+        c.lua_pushlightuserdata(state, self);
+        c.lua_pushcclosure(state, @import("editor.zig").create, 1);
+        c.lua_setfield(state, -2, "editor_controller");
         @import("drawing.zig").install(state, allocator);
         @import("paint.zig").install(state);
         c.lua_pushcclosure(state, c.ouro_os_time, 0);

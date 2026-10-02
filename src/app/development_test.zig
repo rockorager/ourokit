@@ -155,6 +155,169 @@ test "editor recipes yield to mode callbacks but ordinary typing stays batched" 
     try f.settle();
 }
 
+test "editor explicit undo group spans change command and controlled Insert echo" {
+    const f = try Fixture.create(
+        \\local mode=ouro.signal(false); local value=ouro.signal('alpha tail')
+        \\function build() return ouro.text_editor {key='body',autofocus=true,text=value(),text_entry=mode(),
+        \\ key_bindings=mode() and {Escape={'end_undo_group','cancel'}} or
+        \\ {inherit=false,['C W']={'select_vim_change_word','begin_undo_group','delete_selection','submit'},U='undo'},
+        \\ on_command=function(c) mode:set(c=='submit') end, on_change=function(v) value:set(v) end} end
+    );
+    defer f.destroy();
+    const session = try f.runtime.text_inputs.session(f.runtime.focus.current().?);
+    _ = try session.model.setSelection(.collapsed(0));
+    try f.queueKeys(&.{
+        .{ .keycode = 0, .logical = .key_c, .unicode = 'c' },
+        .{ .keycode = 0, .logical = .key_w, .unicode = 'w' },
+        .{ .keycode = 0, .logical = .key_x, .unicode = 'x' },
+        .{ .keycode = 0, .logical = .key_y, .unicode = 'y' },
+        .{ .keycode = 0, .logical = .escape },
+    });
+    try f.settle();
+    try std.testing.expectEqualStrings("xy tail", session.model.text());
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_u } });
+    try std.testing.expectEqualStrings("alpha tail", session.model.text());
+    try std.testing.expect(!session.model.undo());
+    try std.testing.expect(session.model.redo());
+    try std.testing.expectEqualStrings("xy tail", session.model.text());
+}
+
+test "editor controller tasks validate revisions graphemes ownership and normal callbacks" {
+    const f = try Fixture.create(
+        \\editor=ouro.editor_controller(); other=ouro.editor_controller()
+        \\value=ouro.signal('A é 👩‍💻 Z'); changes=0; mounted=ouro.signal(true); duplicate=ouro.signal(false)
+        \\local _,err=editor:state(); assert(err.name=='LuaTaskNotRunning')
+        \\function build() return ouro.column {key='root',
+        \\ mounted() and ouro.text_input {key='body',controller=editor,text=value(),autofocus=true,text_entry=false,
+        \\   on_change=function(v) changes=changes+1; value:set(v) end} or ouro.box {key='absent'},
+        \\ ouro.text_editor {key='other',controller=duplicate() and editor or other,default_text='second'}} end
+    );
+    defer f.destroy();
+    _ = try f.vm.spawn(f.scope,
+        \\saved=assert(editor:state()); assert(saved.bytes==19)
+        \\assert(editor:read(saved.token,2,5)=='é')
+        \\local _,err=editor:replace(saved.token,2,3,'x'); assert(err.name=='InvalidGraphemeBoundary')
+        \\_,err=editor:select(saved.token,{anchor=7,extent=17}); assert(err.name=='InvalidGraphemeBoundary')
+        \\_,err=other:read(saved.token,0,1); assert(err.name=='InvalidEditorRevision')
+        \\selected=assert(editor:select(saved.token,{anchor=17,extent=6,extent_affinity='upstream'}))
+        \\assert(selected.selection.extent==6 and selected.selection.extent_affinity=='upstream')
+        \\_,err=editor:replace(saved.token,0,1,'bad'); assert(err.name=='StaleEditorRevision')
+        \\selected=assert(editor:begin_undo_group(selected.token))
+        \\updated=assert(editor:replace(selected.token,6,17,'β'))
+        \\updated=assert(editor:replace(updated.token,8,8,'!'))
+        \\assert(editor:end_undo_group(updated.token))
+    );
+    try f.settle();
+    try f.exec("assert(changes==2 and value()=='A é β! Z')");
+    const session = try f.runtime.text_inputs.session(f.runtime.focus.current().?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_z, .modifiers = .{ .control = true } } });
+    try std.testing.expectEqualStrings("A é 👩‍💻 Z", session.model.text());
+    try std.testing.expectEqual(@as(usize, 17), session.model.selection.anchor);
+    try std.testing.expectEqual(@as(usize, 6), session.model.selection.extent);
+    try f.exec("assert(changes==3)");
+    _ = try f.vm.spawn(f.scope, "saved=assert(editor:state())");
+    try f.settle();
+    // A controlled replacement can restart model revision at the same value;
+    // session identity must invalidate the old capability as well.
+    try f.exec("value:set('replacement')");
+    try f.settle();
+    _ = try f.vm.spawn(f.scope, "local _,e=editor:read(saved.token,0,1); assert(e.name=='StaleEditorRevision')");
+    try f.settle();
+    try f.exec("duplicate:set(true)");
+    try f.settle();
+    _ = try f.vm.spawn(f.scope, "local _,e=editor:state(); assert(e.name=='EditorControllerAmbiguous')");
+    try f.settle();
+    try f.exec("duplicate:set(false)");
+    try f.settle();
+    _ = try f.vm.spawn(f.scope, "saved=assert(editor:state())");
+    try f.settle();
+    try f.exec("mounted:set(false)");
+    try f.settle();
+    _ = try f.vm.spawn(f.scope, "local _,e=editor:state(); assert(e.name=='EditorNotMounted')");
+    try f.settle();
+    try f.exec("mounted:set(true)");
+    try f.settle();
+    _ = try f.vm.spawn(f.scope, "local _,e=editor:read(saved.token,0,1); assert(e.name=='StaleEditorRevision')");
+    try f.settle();
+}
+
+test "editor controller rejects offsets after a yielding task loses its revision" {
+    const f = try Fixture.create(
+        \\editor=ouro.editor_controller()
+        \\function build() return ouro.text_editor {key='body',controller=editor,default_text='draft',autofocus=true} end
+    );
+    defer f.destroy();
+    _ = try f.vm.spawn(f.scope,
+        \\local s=assert(editor:state())
+        \\ouro.sleep(0)
+        \\local _,e=editor:replace(s.token,0,5,'stale')
+        \\assert(e.name=='StaleEditorRevision'); checked=true
+    );
+    try std.testing.expectEqual(.waiting, try f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
+    try f.play(.{ .text = "!" });
+    try f.vm.markTimeoutCompleted((try f.loop.takeExpired()).?.operation);
+    try f.settle();
+    try f.exec("assert(checked)");
+    const session = try f.runtime.text_inputs.session(f.runtime.focus.current().?);
+    try std.testing.expectEqualStrings("draft!", session.model.text());
+}
+
+test "editor controller rejects readonly disabled masked and composing edits" {
+    const f = try Fixture.create(
+        \\editor=ouro.editor_controller(); locked=ouro.signal(true); disabled=ouro.signal(false); masked=ouro.signal(false)
+        \\function build() return ouro.text_editor {key='body',controller=editor,default_text='guarded',
+        \\ read_only=locked(),enabled=not disabled(),mask=masked(),autofocus=true} end
+    );
+    defer f.destroy();
+    _ = try f.vm.spawn(f.scope,
+        \\local s=assert(editor:state()); assert(editor:read(s.token,0,7)=='guarded')
+        \\s=assert(editor:select(s.token,{anchor=7,extent=1}))
+        \\local _,e=editor:replace(s.token,1,7,''); assert(e.name=='EditorReadOnly')
+        \\_,e=editor:begin_undo_group(s.token); assert(e.name=='EditorReadOnly')
+    );
+    try f.settle();
+    try f.exec("disabled:set(true)");
+    try f.settle();
+    _ = try f.vm.spawn(f.scope, "local _,e=editor:state(); assert(e.name=='EditorDisabled')");
+    try f.settle();
+    try f.exec("disabled:set(false); locked:set(false)");
+    try f.settle();
+    const target = f.runtime.instances.handleForId((try f.runtime.semantics.findPath("body")).id).?;
+    const session = try f.runtime.text_inputs.session(target);
+    _ = try session.apply(.{ .preedit = .{ .text = "候補", .cursor = null } });
+    _ = try f.vm.spawn(f.scope, "local _,e=editor:state(); assert(e.name=='EditorInputInProgress')");
+    try f.settle();
+    session.cancelComposition();
+    try f.exec("masked:set(true)");
+    try f.settle();
+    _ = try f.vm.spawn(f.scope, "local _,e=editor:state(); assert(e.name=='SecureInputProtected')");
+    try f.settle();
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    const masked = try node(snapshot, "body");
+    try std.testing.expect(masked.value == null and masked.selection == null and masked.text_scroll == null and masked.caret_bounds == null);
+}
+
+test "editor inspection exposes both scroll axes and window caret bounds" {
+    const f = try Fixture.create(
+        \\function build() return ouro.box {key='root',padding=19,
+        \\ ouro.text_editor {key='body',default_text=string.rep('line\n',40),multiline=true,height=80,
+        \\ autofocus=true,caret_shape='block',caret_blink=false}} end
+    );
+    defer f.destroy();
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    const input = try node(snapshot, "root/body");
+    try std.testing.expectEqual(@as(f32, 0), input.text_scroll.?.x);
+    try std.testing.expect(input.text_scroll.?.y > 80);
+    try std.testing.expectEqual(input.scroll_offset.?, input.text_scroll.?.y);
+    const caret = input.caret_bounds.?;
+    try std.testing.expect(caret.x >= 19 and caret.y >= 19);
+    try std.testing.expect(caret.x + caret.width <= input.bounds.x + input.bounds.width);
+    try std.testing.expect(caret.y + caret.height <= input.bounds.y + input.bounds.height + 0.01);
+    try std.testing.expect(caret.width > 1 and caret.height > 1);
+}
+
 test "register actions respect read only masking and text entry guards" {
     const f = try Fixture.create(
         \\locked=ouro.signal(false); masked=ouro.signal(false); changes=0

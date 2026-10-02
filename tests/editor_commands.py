@@ -16,19 +16,33 @@ SOURCE = r"""
 local o = require('ouro')
 local entry, shape = o.signal(false), o.signal('block')
 local value = o.signal('Wi á\n\nlast')
+local editor = o.editor_controller()
 return o.app {id='dev.ourokit.editor-commands', run=function()
   return {windows={o.window {id='main',title='Native editing',width=560,height=240,content=function()
     return o.column {key='root',gap=12,padding=16,
       o.text {key='title',text='Native editor · '..shape()..' caret'},
-      o.box {key='keys',on_key={keys={'O','Shift+O','Escape','F1','F2','F3'},
+      o.box {key='keys',on_key={keys={'O','Shift+O','Escape','F1','F2','F3','F4'},
         states={'pressed'},propagate=true,handler=function(e)
           if e.key == 'O' then entry:set(true)
           elseif e.key == 'Escape' then entry:set(false)
           elseif e.key == 'F1' then shape:set('beam')
           elseif e.key == 'F2' then shape:set('block')
-          elseif e.key == 'F3' then shape:set('underline') end
+          elseif e.key == 'F3' then shape:set('underline')
+          elseif e.key == 'F4' then
+            local s=assert(editor:state())
+            assert(editor:read(s.token,3,6)=='á')
+            local _,err=editor:replace(s.token,3,4,'bad')
+            assert(err.name=='InvalidGraphemeBoundary')
+            local selected=assert(editor:select(s.token,{anchor=6,extent=3}))
+            _,err=editor:replace(s.token,3,6,'bad')
+            assert(err.name=='StaleEditorRevision')
+            selected=assert(editor:begin_undo_group(selected.token))
+            local edited=assert(editor:replace(selected.token,3,6,'Ω'))
+            edited=assert(editor:replace(edited.token,5,5,'!'))
+            assert(editor:end_undo_group(edited.token))
+          end
         end},
-        o.text_input {key='editor',multiline=true,width=500,height=150,
+        o.text_input {key='editor',controller=editor,multiline=true,width=500,height=150,
           default_text='Wi á\n\nlast',text_entry=entry(),caret_shape=shape(),
           font_size=28,key_bindings={
             ['O']='insert_line_below',['Shift+O']='insert_line_above',
@@ -163,7 +177,19 @@ def session(controlled=False):
             capture('block-narrow')
             key('end')
             capture('block-eol')
-            print(f'PASS {"controlled echo" if controlled else "uncontrolled"}: native line insertion, collapse at both extents, entry policy, undo/redo, retained caret shapes')
+            key('f4')
+            text('Wi Ω!\n\nlast')
+            selection(6, 6)
+            geometry = editor()
+            assert geometry['text_scroll'] == {'x': 0, 'y': 0}, geometry
+            assert geometry['caret_bounds']['width'] > 1, geometry
+            capture('controller-edit')
+            key('z', control=True)
+            text(original)
+            selection(6, 3)
+            key('z', control=True, shift=True)
+            text('Wi Ω!\n\nlast')
+            print(f'PASS {"controlled echo" if controlled else "uncontrolled"}: native line insertion, collapse at both extents, entry policy, undo/redo, retained caret shapes, revision-checked controller and grouped edits')
         finally:
             if keyboard is not None:
                 keyboard.terminate()

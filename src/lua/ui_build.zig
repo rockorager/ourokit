@@ -1416,6 +1416,7 @@ pub const UiBuild = struct {
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
         if (self.pending_text_input_count == self.pending_text_inputs.len)
             return luaError(state, "text_input capacity exceeded");
+        const controller = @import("editor.zig").fromTable(state, 1) catch |err| return luaError(state, @errorName(err));
         // Stage ownership before any Lua error can longjmp past Zig cleanup.
         self.pending_text_inputs[self.pending_text_input_count] = .{
             .target_id = target_id,
@@ -1432,6 +1433,8 @@ pub const UiBuild = struct {
                 ) catch return luaError(state, "cannot create text_input session"),
         };
         const pending_session = &self.pending_text_inputs[self.pending_text_input_count].session.?;
+        self.pending_text_inputs[self.pending_text_input_count].behavior.controller = controller;
+        if (controller) |value| value.retain();
         self.pending_text_input_count += 1;
         if (mask and secret == null) {
             const value = if (controlled.present) controlled.value else uncontrolled.value;
@@ -2411,8 +2414,10 @@ pub const UiBuild = struct {
     }
 
     fn discardPendingTextInputs(self: *UiBuild) void {
-        for (self.pending_text_inputs[0..self.pending_text_input_count]) |*pending|
+        for (self.pending_text_inputs[0..self.pending_text_input_count]) |*pending| {
             if (pending.session) |*session| session.deinit();
+            if (pending.behavior.controller) |controller| controller.release();
+        }
         self.pending_text_input_count = 0;
     }
 

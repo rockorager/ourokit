@@ -15,6 +15,8 @@ pub const Intent = union(enum) {
     select_paragraph_around,
     collapse_selection,
     collapse_selection_start,
+    begin_undo_group,
+    end_undo_group,
     undo,
     redo,
     insert_newline,

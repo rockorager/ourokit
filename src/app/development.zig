@@ -70,6 +70,10 @@ pub const Node = struct {
     scroll_axis: ?platform.PointerAxis,
     scroll_offset: ?f32,
     scroll_metrics: ?@import("../ui/render_object/scroll.zig").Metrics = null,
+    /// Text viewport offsets in local logical pixels; null for masked fields.
+    text_scroll: ?core.PointF = null,
+    /// Unclipped caret geometry in window logical pixels, even when hidden.
+    caret_bounds: ?core.RectF = null,
     read_only: bool,
     text_entry: bool = false,
     multiline: bool,
@@ -132,12 +136,20 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
         var read_only = false;
         var text_entry = false;
         var multiline = false;
+        var text_scroll: ?core.PointF = null;
+        var caret_bounds: ?core.RectF = null;
         if (runtime.text_inputs.contains(handle)) {
             const session = try runtime.text_inputs.session(handle);
             // Masked fields expose neither their value nor its structure.
             if (!session.model.isSecret()) {
                 value = try copyText(storage, &used, session.model.text());
                 selection = session.model.selection;
+                const render = try runtime.instances.renderObject(try runtime.text_inputs.content(handle));
+                text_scroll = .{
+                    .x = try runtime.tree.textScrollOffset(render, .horizontal),
+                    .y = try runtime.tree.textScrollOffset(render, .vertical),
+                };
+                caret_bounds = (try runtime.tree.paintTransform(render)).rect(try runtime.tree.textCaretRectangle(render));
             }
             multiline = session.model.multiline;
             read_only = (try runtime.text_inputs.getBehavior(handle)).read_only;
@@ -175,6 +187,8 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             .read_only = read_only,
             .text_entry = text_entry,
             .multiline = multiline,
+            .text_scroll = text_scroll,
+            .caret_bounds = caret_bounds,
         };
     }
     return .{ .allocator = allocator, .token = Token.current(runtime), .nodes = nodes, .text = storage, .metrics = runtime.metrics };

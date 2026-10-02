@@ -216,6 +216,20 @@ pub const Font = struct {
             c.hb_ot_color_has_svg(self.face) != 0;
     }
 
+    /// The base font's digit cell is shared by empty/EOL caret paint and the
+    /// editor's wrap gutter, independently of the currently selected shape.
+    pub fn caretFallbackWidth(self: *const Font, allocator: std.mem.Allocator, language: []const u8, logical_size: f32) !f32 {
+        var zero = try self.shape(allocator, .{
+            .paragraph = "0",
+            .direction = .left_to_right,
+            .script = .latin,
+            .language = language,
+            .logical_size = logical_size,
+        });
+        defer zero.deinit();
+        return @max(1, zero.advance.x);
+    }
+
     pub fn shape(self: *const Font, allocator: std.mem.Allocator, spec: RunSpec) !ShapedRun {
         if (!std.math.isFinite(spec.logical_size) or spec.logical_size <= 0) return error.InvalidSize;
         if (!std.unicode.utf8ValidateSlice(spec.paragraph)) return error.InvalidUtf8;

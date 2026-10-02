@@ -1,7 +1,7 @@
 [
   {
     "name": "runtime.inspect",
-    "description": "Inspect live windows, or a window's bounded semantic tree. Use its opaque token with runtime.input or runtime.capture; inspect again after StaleDevelopmentTarget. Bounds use logical window coordinates and may extend beyond clips.",
+    "description": "Inspect live windows, or a window's bounded semantic tree. Use its opaque token with runtime.input or runtime.capture; inspect again after StaleDevelopmentTarget. Bounds and editor caret_bounds use logical window coordinates before clipping. Editor text_scroll reports both x and y offsets in local logical pixels. Caret geometry is reported even when hidden; masked fields omit both editor geometry properties.",
     "inputSchema": {"type":"object","properties":{"window":{"type":"string"}},"additionalProperties":false},
     "outputSchema": {"type":"object"}
   },

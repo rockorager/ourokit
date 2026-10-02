@@ -2263,8 +2263,11 @@ beyond its top/bottom edges. Caret movement and edits reveal the selection
 extent; blinking does not undo manual scrolling. IME composition, clipboard,
 read-only selection, and undo/redo share the single-line editing machinery.
 The development tree reports `multiline`, the vertical `scroll_axis`, and
-`scroll_offset`; development `text` accepts LF only in multiline fields and
-`scroll` targets the editor itself.
+`scroll_offset`. Editors also report `text_scroll = {x, y}` in local logical
+pixels and `caret_bounds` in window logical pixels (after scrolling and paint
+transforms, before clipping). Caret geometry is available even when the caret
+is hidden, but masked fields expose neither property. Development `text` accepts
+LF only in multiline fields and `scroll` targets the editor itself.
 
 By default, Ctrl+Z undoes an edit; Ctrl+Shift+Z or Ctrl+Y redoes it. Each field
 retains up to 100 undo steps, including the selection before and after each
@@ -2274,6 +2277,16 @@ edit kind end the group. Grouping uses editing boundaries, not elapsed time.
 Paste, cut, and word deletion are separate steps. An IME composition, including
 any initial selection replacement, forms one step instead of one per preedit
 update.
+
+`begin_undo_group` starts a fresh explicit group; subsequent native edits of
+different kinds can share one undo step. `end_undo_group` closes it. Navigation,
+selection, focus changes, clipboard/register actions, undo/redo, and disabling
+or making the field read-only still close it. A `submit` mode callback and
+switching `text_entry` from false to true preserve an explicit group; switching
+back to false ends it. Place `begin_undo_group` **after** selection and yank,
+before deletion, to group a modal change with its following Insert typing.
+This is undo grouping, not rollback: callbacks still observe each edit, and
+failure or cancellation does not revert earlier edits. Groups do not nest.
 
 Undo/redo emit the normal `on_change` callback when they restore an edit; an
 empty history does nothing. They are unavailable in disabled/read-only fields
@@ -2290,16 +2303,55 @@ Explicit key-binding actions (including undo, deletion, cut, paste, and newline)
 still work. This is useful for command modes: set `text_entry = mode == 'insert'`
 and supply mode-specific `key_bindings`. Use `read_only` when *all* edits must be
 blocked. Switching entry policy retains text, selection and history, ends the
-current undo group, and cancels uncommitted IME composition. Enabled/read-only
+current automatic undo group, and cancels uncommitted IME composition. Explicit
+groups survive entry into Insert as described above. Enabled/read-only
 guards still take precedence. Development inspection reports `text_entry`;
 text injection into a suppressed field returns `DevelopmentTargetTextEntryDisabled`.
-This policy does not supply Vim motions or a Lua selection/range-edit controller.
+
+For task-driven editing, create `local editor = ouro.editor_controller()` once
+and pass `controller = editor` to a `text_editor` or `text_input`. The controller
+follows the mounted native session; it does not store a second document. Its
+methods are synchronous and run only inside an Ouro task, not during rendering.
+They return a value or `nil, {name=..., message=...}`.
+
+- `editor:state()` returns `{token, selection, bytes}` without copying the text.
+  Selection contains zero-based UTF-8 `anchor` and `extent` byte offsets and
+  `anchor_affinity`/`extent_affinity` (`upstream` or `downstream`).
+- `editor:read(token, start, end)` copies only the half-open range requested.
+- `editor:select(token, selection)` preserves direction and affinity (omitted
+  affinities default to downstream); it returns the new state, without `on_change`.
+- `editor:replace(token, start, end, text)` uses native normalization, caret
+  placement, undo and `on_change`, then returns the new state. Invalid UTF-8,
+  out-of-range positions, and offsets within a grapheme are rejected before editing.
+- `editor:begin_undo_group(token)` and `editor:end_undo_group(token)` return
+  the state and use the same grouping rules as native binding actions.
+
+Tokens are opaque and belong to one controller. Text edits, selection movement,
+composition changes, external controlled replacements, and unmount/remount
+invalidate older tokens. After a yield, use a fresh state and recompute ranges;
+`StaleEditorRevision` never applies an edit. Reads and selection are permitted
+in read-only fields, but edits/grouping are not. Disabled/hidden editors, masked
+fields, active preedit, and pointer selection drags are unavailable. Zero mounts
+return `EditorNotMounted`; sharing a controller across multiple mounted fields
+returns `EditorControllerAmbiguous`. Unmount and reload release native ownership;
+retaining a Lua controller or token cannot keep a retired editor alive.
+
+```lua
+-- Inside a task, e.g. a button or command callback:
+local s, err = editor:state()
+if not s then return nil, err end
+local first = math.min(s.selection.anchor, s.selection.extent)
+local last = math.max(s.selection.anchor, s.selection.extent)
+return editor:replace(s.token, first, last, 'replacement')
+```
 
 `caret_shape = 'beam' | 'block' | 'underline'` is available on both controls;
 the default is `beam`. Block and underline follow the shaped advance of the next
 logical grapheme at the caret's visual position, including proportional and bidi
 text. At an empty line, end of line, or upstream wrap edge they use the base
-font's shaped space advance (at least one logical pixel). Blocks paint above
+font's shaped `0` advance (at least one logical pixel). Bounded multiline fields
+reserve this width for every caret shape so the caret fits at upstream wrap
+edges without horizontal scrolling or rewrapping on mode changes. Blocks paint above
 selection highlights and behind glyphs with alpha capped at 128, and remain
 visible at the active extent of a nonempty selection. Beam and underline carets
 remain hidden for nonempty selections; underline thickness uses `caret_width`.
@@ -2413,10 +2465,10 @@ built-in fallback entries do not count toward this limit.
 
 Keys can also name up to four whitespace-separated strokes, for example
 `["C I W"] = { "select_vim_word_inner", "yank", "delete_selection", "submit" }`.
-Values may be a dense array of one to four native actions, executed in order.
+Values may be a dense array of one to five native actions, executed in order.
 An application command or asynchronous `paste` must be last. Recipes are not
 transactions: each mutating action retains its native undo and `on_change`
-behavior. They do not join later Insert typing into the same undo step.
+behavior. Use `begin_undo_group` explicitly to join later Insert typing.
 A completed sequence may not be a prefix of another explicit binding. Shared
 incomplete prefixes are allowed and override built-in single-chord defaults.
 Escape cancels a pending sequence; a mismatch discards the prefix and processes

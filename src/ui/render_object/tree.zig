@@ -1299,13 +1299,21 @@ pub const Tree = struct {
             return error.InvalidTextInputRange;
         if (input.preedit) |range| if (range.start > range.end or range.end > source.utf8.len)
             return error.InvalidTextInputRange;
+        // Reserve the same EOL cell for every shape. A beam-sized gutter
+        // lets a block at an upstream wrap edge reveal past the viewport;
+        // reserving only in block mode would rewrap on every mode switch.
+        const caret_gutter = if (input.multiline and constraints.hasBoundedWidth()) blk: {
+            const font = sources.font_cache.get(source.candidates[0]) catch return error.ParagraphLayoutFailed;
+            const cell = font.caretFallbackWidth(self.allocator, source.language, source.logical_size) catch return error.ParagraphLayoutFailed;
+            break :blk @max(input.caret_width, cell);
+        } else input.caret_width;
         const layout_handle = paragraphs.acquire(.{
             .utf8 = source.utf8,
             .base_direction = source.base_direction,
             .language = source.language,
             .logical_size = source.logical_size,
             .max_width = if (input.multiline and constraints.hasBoundedWidth())
-                @max(1, constraints.max_width - input.caret_width)
+                @max(1, constraints.max_width - caret_gutter)
             else
                 std.math.floatMax(f32),
             .candidates = source.candidates,
@@ -2253,6 +2261,58 @@ test "multiline viewport wraps reveals trailing caret and preserves manual scrol
     _ = try tree.layout(input, .{ .max_width = 600, .max_height = 200 });
     try std.testing.expect((try paragraphs.get((try tree.slot(input)).paragraph_layout.?)).size.height < narrow_height);
     try std.testing.expectEqual(@as(f32, 0), try tree.textScrollOffset(input, .vertical));
+}
+
+test "wrapped editor caret positions never introduce horizontal scroll" {
+    var fonts = text.FontCache.init(std.testing.allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(font) catch unreachable;
+    var sources = text.ParagraphSourceCache.init(std.testing.allocator, &fonts);
+    defer sources.deinit();
+    var paragraphs = text.ParagraphCache.init(std.testing.allocator, &fonts);
+    defer paragraphs.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, 1);
+    tree.attachTextCaches(&sources, &paragraphs);
+    defer tree.deinit();
+    const source = try sources.acquire(.{ .utf8 = "d" ** 101, .language = "und", .logical_size = 23, .candidates = &.{font}, .configuration_revision = 1 });
+    defer sources.release(source) catch unreachable;
+    var object: types.Object = .{ .text_input = .{
+        .source = source,
+        .multiline = true,
+        .color = Color.rgba(0, 0, 0, 255),
+        .caret_color = Color.rgba(0, 0, 0, 255),
+        .selection_color = Color.rgba(80, 120, 240, 120),
+        .selection_start = 0,
+        .selection_end = 0,
+        .caret_offset = 0,
+        .show_caret = true,
+        .reveal_caret = true,
+    } };
+    const input = try tree.create(object);
+    for ([_]f32{ 150, 91.25 }) |width| {
+        _ = try tree.layout(input, .{ .max_width = width, .max_height = 80 });
+        const layout = (try tree.slot(input)).paragraph_layout.?;
+        const positioned = &(try paragraphs.get(layout)).positioned;
+        try std.testing.expect(positioned.lines.len > 1);
+        for ([_]types.CaretShape{ .beam, .block, .underline }) |shape| {
+            object.text_input.caret_shape = shape;
+            for (positioned.carets) |stop| {
+                object.text_input.caret_offset = stop.byte_offset;
+                object.text_input.caret_affinity = stop.affinity;
+                try tree.update(input, object);
+                _ = try tree.layout(input, .{ .max_width = width, .max_height = 80 });
+                try std.testing.expectEqual(layout, (try tree.slot(input)).paragraph_layout.?);
+                try std.testing.expectApproxEqAbs(@as(f32, 0), try tree.textScrollOffset(input, .horizontal), 0.001);
+                const caret = try tree.textCaretRectangle(input);
+                try std.testing.expect(caret.x >= 0 and caret.x + caret.width <= width + 0.001);
+            }
+        }
+    }
 }
 
 test "text input scrolls one line and shares viewport coordinates with caret hit testing and paint" {

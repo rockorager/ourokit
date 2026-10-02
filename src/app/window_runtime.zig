@@ -102,6 +102,7 @@ pub const WindowRuntime = struct {
     buttons: ui.widget.Buttons = undefined,
     listboxes: ui.widget.ListBoxes = .{},
     text_inputs: ui.text_input.Registry = undefined,
+    editor_callbacks: ?*lua.CallbackRegistry = null,
     focus: ui.focus.Manager = .{},
     clicks: ui.input.Clicks = .{},
     pending_shortcut: ?struct {
@@ -556,6 +557,7 @@ pub const WindowRuntime = struct {
         signals: *lua.Signals,
     ) void {
         self.validatePreparedSourceCommit(prepared) catch unreachable;
+        self.attachEditorHost(callbacks);
         self.cancelInternalDrag();
         self.pending_edit = null;
         self.development_generation +%= 1;
@@ -662,6 +664,7 @@ pub const WindowRuntime = struct {
         std.debug.assert(!self.reconciling);
         self.reconciling = true;
         defer self.reconciling = false;
+        self.attachEditorHost(lua_ui.callbacks);
         const size_changed = try self.frame_state.configure(size);
         if (size_changed and self.ready) _ = try self.build_owners.markDirty(self.root_owner);
         const width: f32 = @floatFromInt(size.width);
@@ -2115,6 +2118,29 @@ pub const WindowRuntime = struct {
         );
     }
 
+    fn attachEditorHost(self: *WindowRuntime, callbacks: ?*lua.CallbackRegistry) void {
+        self.editor_callbacks = callbacks;
+        self.text_inputs.controller_host = .{ .context = self, .validate = validateEditor, .changed = editorChanged };
+    }
+
+    fn validateEditor(context: *anyopaque, target: ui.instance.InstanceHandle) !void {
+        const self: *WindowRuntime = @ptrCast(@alignCast(context));
+        if (!self.ready or self.reconciling or !self.instances.isActive(target)) return error.EditorNotMounted;
+        if (!self.instances.isInteractive(target)) return error.EditorDisabled;
+        if (self.pointer_bindings.getKind(target, .text_input_change) != null and self.editor_callbacks == null)
+            return error.CallbackServiceUnavailable;
+    }
+
+    fn editorChanged(context: *anyopaque, target: ui.instance.InstanceHandle, text_changed: bool) !void {
+        const self: *WindowRuntime = @ptrCast(@alignCast(context));
+        self.pending_edit = null;
+        self.development_revision +%= 1;
+        self.resetCaretBlink();
+        try self.syncTextInputVisuals();
+        try self.tree.revealTextInputCaret(try self.instances.renderObject(try self.text_inputs.content(target)));
+        if (text_changed) if (self.editor_callbacks) |callbacks| try self.notifyTextInputChanged(callbacks, target);
+    }
+
     pub fn wantsSubmission(self: *const WindowRuntime) bool {
         return self.initialized and self.frame_state.readyForSubmission();
     }
@@ -2633,7 +2659,7 @@ pub const WindowRuntime = struct {
             .none => return,
             .edit => |value| value,
             .command => |command| blk: {
-                session.model.breakUndoGroup();
+                if (command != .submit or !session.model.explicit_group) session.model.breakUndoGroup();
                 // Submit sends the text natively; Lua hears only the outcome.
                 const name: []const u8 = if (behavior.secret) |secret| switch (command) {
                     .submit => sent: {
@@ -2728,6 +2754,14 @@ pub const WindowRuntime = struct {
         const session = try self.text_inputs.session(target);
         session.endSelectionDrag();
         return switch (intent) {
+            .begin_undo_group => blk: {
+                session.model.beginUndoGroup();
+                break :blk false;
+            },
+            .end_undo_group => blk: {
+                session.model.breakUndoGroup();
+                break :blk false;
+            },
             .select_all => blk: {
                 session.preferred_x = null;
                 break :blk session.model.selectAll();
@@ -4648,6 +4682,7 @@ fn pointerListenerEvent(event: ui.input.Event) ?listener.Event {
 
 fn intentEditsText(intent: ui.text_input.EditIntent) bool {
     return switch (intent) {
+        .begin_undo_group, .end_undo_group => false,
         .undo, .redo, .insert_newline, .insert_line_above, .insert_line_below, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward, .delete_line, .delete_lines, .clear_lines, .delete_selection => true,
         .select_all, .select_word_inner, .select_word_around, .select_vim_word_inner, .select_vim_word_around, .select_vim_word_forward, .select_vim_change_word, .select_line, .select_lines, .select_paragraph_inner, .select_paragraph_around, .collapse_selection, .collapse_selection_start, .move => false,
     };

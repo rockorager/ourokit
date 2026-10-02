@@ -576,6 +576,20 @@ pub const SelectionRectangleIterator = struct {
             }
             self.line_index += 1;
             self.caret_index = 0;
+            // Empty hard lines have an insertion stop, not a glyph pair.
+            // Give their selected LF a visible cell without inventing a
+            // second insertion position after the newline on this same row.
+            if (stops.len == 1 and line.byte_len != 0 and
+                self.range.start <= line.byte_start and self.range.end >= line.byte_start + line.byte_len)
+            {
+                const width = self.positioned.caret_fallback_width;
+                return .{
+                    .x = line.left + stops[0].x - if (line.base_level & 1 != 0) width else @as(f32, 0),
+                    .y = line.top,
+                    .width = width,
+                    .height = @max(0, line.ascender - line.descender),
+                };
+            }
         }
         return null;
     }
@@ -664,15 +678,7 @@ pub fn positionLinesWithOptions(
     var caret_fallback_width: f32 = 1;
     if (include_caret_stops) {
         if (shaped.candidates.len == 0) return error.NoFallbackCandidates;
-        var zero = try (try shaped.candidates[0].resolve()).shape(allocator, .{
-            .paragraph = "0",
-            .direction = .left_to_right,
-            .script = .latin,
-            .language = shaped.language,
-            .logical_size = shaped.logical_size,
-        });
-        defer zero.deinit();
-        caret_fallback_width = @max(1, zero.advance.x);
+        caret_fallback_width = try (try shaped.candidates[0].resolve()).caretFallbackWidth(allocator, shaped.language, shaped.logical_size);
     }
     const visible_count = @min(
         selected.lines.len,
@@ -933,11 +939,6 @@ fn appendLineCarets(
             .byte_offset = line.byte_start,
             .x = 0,
             .affinity = .downstream,
-        });
-        if (line.byte_len != 0) try appendCaret(allocator, carets, line_caret_start, .{
-            .byte_offset = line.byte_start + line.byte_len,
-            .x = 0,
-            .affinity = .upstream,
         });
         return;
     }
@@ -1593,6 +1594,31 @@ test "empty lines retain font height for layout and insertion carets" {
         }
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(positioned.lines.len)) * advance, positioned.height(), 0.001);
     }
+}
+
+test "empty hard lines hit and navigate to their own insertion offset and show selections" {
+    const Fixture = @import("positioned_lines_test.zig").Fixture;
+    var fixture: Fixture = undefined;
+    try fixture.init("\n\n\n", 200);
+    defer fixture.deinit();
+    var positioned = try positionLines(std.testing.allocator, "\n\n\n", &fixture.shaped, &fixture.selected);
+    defer positioned.deinit();
+    for (positioned.lines, 0..) |line, index| {
+        for ([_]f32{ -10, 0, 100 }) |x|
+            try std.testing.expectEqual(index, positioned.hitTest(line, x).?.byte_offset);
+        if (index > 0) {
+            const up = positioned.verticalNeighbor(index, .downstream, null, .up).?;
+            try std.testing.expectEqual(index - 1, up.caret.byte_offset);
+        }
+    }
+    var storage: [4]RectF = undefined;
+    const selected = try positioned.selectionRectangles(.{ .start = 0, .end = 2 }, &storage);
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    for (selected, 0..) |rect, index| {
+        try std.testing.expectEqual(positioned.lines[index].top, rect.y);
+        try std.testing.expect(rect.width > 1 and rect.height > 1);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try positioned.selectionRectangles(.{ .start = 1, .end = 1 }, &storage)).len);
 }
 
 test "shaped caret rectangles follow proportional graphemes and metric fallbacks" {

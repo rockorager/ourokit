@@ -2,10 +2,12 @@ const std = @import("std");
 const build_owner = @import("../instance/build_owner.zig");
 const instance = @import("../instance/tree.zig");
 const Session = @import("session.zig").Session;
+const Controller = @import("controller.zig").Controller;
 
 pub const ValueMode = enum { uncontrolled, controlled };
 
 pub const Behavior = struct {
+    controller: ?*Controller = null,
     enabled: bool = true,
     read_only: bool = false,
     /// Direct keyboard/IME entry only; native editing commands remain enabled.
@@ -35,6 +37,7 @@ const Entry = struct {
     active: bool = false,
     seen: bool = false,
     autofocus_pending: bool = false,
+    controller_mount: ?Controller.Mount = null,
 };
 
 /// Retained TextInput state keyed by generation-checked instance identity.
@@ -45,6 +48,7 @@ pub const Registry = struct {
     allocator: std.mem.Allocator,
     entries: []Entry,
     entry_limit: usize = 0,
+    controller_host: ?Controller.Host = null,
 
     pub fn init(self: *Registry, allocator: std.mem.Allocator, capacity: usize) !void {
         if (capacity == 0) return error.InvalidTextInputCapacity;
@@ -147,13 +151,15 @@ pub const Registry = struct {
             entry.owner = owner;
             entry.content = content_handle;
             if (entry.behavior.enabled != behavior.enabled or entry.behavior.read_only != behavior.read_only or
-                entry.behavior.text_entry != behavior.text_entry)
+                (entry.behavior.text_entry != behavior.text_entry and
+                    (!behavior.text_entry or !entry.session.?.model.explicit_group)))
                 entry.session.?.model.breakUndoGroup();
             if (!behavior.enabled) entry.session.?.endSelectionDrag();
             entry.seen = true;
             // A new prompt or a mask change starts from a fresh, wiped buffer.
             const replace_secret = entry.session.?.model.isSecret() != prepared.*.?.model.isSecret() or
                 !sameSecret(entry.behavior.secret, behavior.secret);
+            self.setController(entry, behavior.controller);
             entry.behavior = behavior;
             if (replace_secret or entry.session.?.model.multiline != prepared.*.?.model.multiline or (mode == .controlled and !std.mem.eql(
                 u8,
@@ -179,6 +185,7 @@ pub const Registry = struct {
                 .autofocus_pending = behavior.enabled and behavior.autofocus,
             };
             self.entry_limit = @max(self.entry_limit, index + 1);
+            self.setController(entry, behavior.controller);
             prepared.* = null;
             return;
         };
@@ -259,7 +266,20 @@ pub const Registry = struct {
         return null;
     }
 
+    fn setController(self: *Registry, entry: *Entry, controller: ?*Controller) void {
+        if (entry.controller_mount) |*mounted| {
+            if (mounted.controller == controller) return;
+            mounted.controller.detach(mounted);
+            entry.controller_mount = null;
+        }
+        if (controller) |value| {
+            entry.controller_mount = .{ .controller = value, .registry = self, .target = entry.target };
+            value.attach(&entry.controller_mount.?);
+        }
+    }
+
     fn destroy(entry: *Entry) void {
+        if (entry.controller_mount) |*mounted| mounted.controller.detach(mounted);
         entry.session.?.deinit();
         entry.* = .{};
     }

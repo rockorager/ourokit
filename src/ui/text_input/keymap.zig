@@ -52,7 +52,7 @@ pub const Binding = struct {
 /// A command or asynchronous paste must finish the recipe; later operations
 /// must never race its callback/completion.
 pub const Actions = struct {
-    items: [4]Action = @splat(.none),
+    items: [5]Action = @splat(.none),
     len: u8 = 1,
 
     pub fn single(action: Action) Actions {

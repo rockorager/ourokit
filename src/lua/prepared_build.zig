@@ -137,8 +137,10 @@ pub const PreparedBuild = struct {
         self.animation_count = 0;
         for (self.handlers[0..self.handler_count]) |handler|
             c.luaL_unref(self.state, c.registry_index, handler.reference);
-        for (self.text_inputs[0..self.text_input_count]) |*text_input_value|
+        for (self.text_inputs[0..self.text_input_count]) |*text_input_value| {
             if (text_input_value.session) |*session| session.deinit();
+            if (text_input_value.behavior.controller) |controller| controller.release();
+        }
         if (self.owns_shapes) for (self.descriptor_storage[0..self.descriptor_count]) |descriptor|
             switch (descriptor.object) {
                 .text => |value| self.shapes.?.release(value.source) catch unreachable,
