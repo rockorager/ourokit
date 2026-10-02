@@ -61,6 +61,7 @@ pub const SourceGeneration = struct {
     stdio: lua.Stdio,
     files: @import("../lua/files.zig").Binding,
     auth: @import("../lua/auth.zig").Binding,
+    http: @import("../lua/http.zig").Binding,
     session: ?@import("../lua/session.zig").Binding = null,
     applications: lua.Applications,
     image_import: lua.ImageImport,
@@ -203,6 +204,7 @@ pub const SourceGeneration = struct {
         var stdio_initialized = false;
         var files_initialized = false;
         var auth_initialized = false;
+        var http_initialized = false;
         var applications_initialized = false;
         var image_import_initialized = false;
         var signals_initialized = false;
@@ -225,6 +227,7 @@ pub const SourceGeneration = struct {
             if (applications_initialized) self.applications.deinit();
             if (image_import_initialized) self.image_import.deinit();
             if (auth_initialized) self.auth.deinit();
+            if (http_initialized) self.http.deinit();
             if (files_initialized) self.files.deinit();
             if (stdio_initialized) self.stdio.deinit();
             if (dbus_initialized) self.dbus.deinit();
@@ -286,6 +289,8 @@ pub const SourceGeneration = struct {
         try self.auth.init(allocator, &self.vm, loop);
         auth_initialized = true;
         self.auth.stopping = config.session_candidate;
+        self.http.init(&self.vm, loop);
+        http_initialized = true;
         if (services) |value| if (value.session) |store| {
             self.session = @as(@import("../lua/session.zig").Binding, undefined);
             try self.session.?.init(&self.vm, store);
@@ -658,6 +663,7 @@ pub const SourceGeneration = struct {
     }
 
     pub fn dispatchFile(self: *SourceGeneration, completion: io_loop.FileCompletion) !bool {
+        if (self.http.dispatchFile(completion)) return true;
         if (self.images) |*images| if (try images.dispatch(completion)) return true;
         if (try self.applications.dispatch(completion)) return true;
         if (try self.image_import.dispatch(completion)) return true;
@@ -669,11 +675,13 @@ pub const SourceGeneration = struct {
     }
 
     pub fn dispatchSocket(self: *SourceGeneration, completion: io_loop.SocketCompletion) !bool {
+        if (try self.http.dispatch(completion)) return true;
         if (try self.dbus.dispatch(completion)) return true;
         return self.mcp_client.dispatch(completion);
     }
 
     pub fn dispatchTimer(self: *SourceGeneration, operation: io_loop.OperationHandle) !bool {
+        if (try self.http.dispatchTimer(operation)) return true;
         if (try self.dbus.dispatchTimer(operation)) return true;
         if (!self.vm.ownsOperation(operation)) return false;
         try self.vm.markTimeoutCompleted(operation);
@@ -681,6 +689,7 @@ pub const SourceGeneration = struct {
     }
 
     pub fn collectCanceledMcp(self: *SourceGeneration) !void {
+        try self.http.collectCanceled();
         try self.dbus.collectCanceled();
         try self.mcp_client.collectCanceled();
         try self.stdio.collectCanceled();
@@ -926,6 +935,7 @@ pub const SourceGeneration = struct {
         self.image_import.deinit();
         self.files.deinit();
         self.auth.deinit();
+        self.http.deinit();
         self.stdio.deinit();
         self.dbus.deinit();
         self.mcp_client.deinit();

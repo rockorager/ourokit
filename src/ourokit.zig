@@ -12,6 +12,7 @@ pub const mcp = @import("mcp/root.zig");
 pub const dbus = @import("dbus/root.zig");
 pub const loop = @import("loop/root.zig");
 pub const fs = @import("fs/root.zig");
+pub const http = @import("http/root.zig");
 pub const task = @import("task/root.zig");
 pub const bundle = @import("bundle/root.zig");
 pub const lua = @import("lua/root.zig");
@@ -36,6 +37,7 @@ test {
     _ = dbus;
     _ = loop;
     _ = fs;
+    _ = http;
     _ = task;
     _ = bundle;
     _ = lua;

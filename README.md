@@ -35,6 +35,7 @@ the event loop, native resources, rendering, and task lifetimes.
 | `ouro.json` and `ouroctl run` | Application identity, entry point and launch; individual Lua files can also run directly |
 | `ouroctl dev …` and Storybook | Explicit per-instance development and component testing |
 | Desktop hooks and the [D-Bus API](docs/dbus.md) | Standard desktop integration and an escape hatch for application-specific services |
+| [`ouro.http`](docs/http.md) | Scoped, yielding HTTP(S) requests through libcurl and the shared io_uring loop |
 | Declared actions, `--mcp` and `ouroctl mcp export` | Optional production automation; not UI lifecycle or development authority |
 | Layer surfaces and the [shell workspace API](docs/workspaces.md) | Optional shell extensions |
 | [Session services and authentication](docs/session.md) | Native idle, display power, secure lock surfaces and asynchronous PAM |
@@ -61,6 +62,8 @@ Lua and native-extension contracts are also evolving; no stable ABI is promised.
 - Fontconfig development files for native Linux font discovery
 - FreeType development files for native software text rasterization
 - xkbcommon development files for native Wayland keyboard translation
+- libcurl development files, version 7.85 or newer with TLS and asynchronous DNS,
+  plus system CA certificates (Debian: `libcurl4-openssl-dev ca-certificates`)
 - Vulkan loader and headers, plus `glslc` (not required with `-Dvulkan=false`)
 - A C/C++ toolchain is not required separately; Zig compiles embedded Lua and
   HarfBuzz
@@ -74,7 +77,8 @@ zig build verify
 
 `verify` is the routine pre-commit check: Zig tests (including token validation),
 Zig formatting, real-process development/control suites, and disposable native
-session/PAM fixtures. The native development
+session/PAM and HTTP(S) fixtures. HTTP tests require the OpenSSL CLI and run with
+`zig build test-http`. The native development
 suite starts its own headless Sway with software rendering and private D-Bus
 sessions; it does not use your desktop, session bus, or compositor configuration.
 It checks inspection, input, capture pixels, rejected and accepted reloads,

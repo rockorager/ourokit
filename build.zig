@@ -142,6 +142,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     addLua(ourokit, lua);
+    ourokit.linkSystemLibrary("libcurl", .{});
     ourokit.addIncludePath(b.path("include"));
     b.installFile("include/ourokit/plugin.h", "include/ourokit/plugin.h");
     addHarfBuzz(ourokit, harfbuzz);
@@ -312,6 +313,14 @@ pub fn build(b: *std.Build) void {
     const development_step = b.step("test-development", "Verify the development loop and control isolation on a disposable headless Sway");
     development_step.dependOn(&development.step);
 
+    const http_tests = b.addSystemCommand(&.{"python3"});
+    http_tests.addFileArg(b.path("tests/http_native.py"));
+    http_tests.addArtifactArg(host);
+    http_tests.setCwd(b.path("."));
+    http_tests.has_side_effects = true;
+    const http_step = b.step("test-http", "Exercise HTTP, TLS verification and cancellation with disposable loopback peers");
+    http_step.dependOn(&http_tests.step);
+
     const session_tests = b.step("test-session", "Exercise native session protocols and asynchronous PAM with disposable peers");
     inline for (.{ "native_harness.py", "session_native.py", "auth_native.py", "secure_entry.py" }) |file| {
         const check = b.addSystemCommand(&.{"python3"});
@@ -335,6 +344,7 @@ pub fn build(b: *std.Build) void {
     verify.dependOn(test_step);
     verify.dependOn(development_step);
     verify.dependOn(session_tests);
+    verify.dependOn(http_step);
     verify.dependOn(&format.step);
 
     const ui_test_step = b.step("test-ourokit-ui", "Run platform-neutral UI integration tests");

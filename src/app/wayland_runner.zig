@@ -1442,6 +1442,8 @@ fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlSe
     if (reload.candidate) |candidate| candidate.shutdownImages();
     reload.active().dbus.shutdown();
     if (reload.candidate) |candidate| candidate.dbus.shutdown();
+    try reload.active().http.stop();
+    if (reload.candidate) |candidate| try candidate.http.stop();
     reload.active().auth.stop();
     if (reload.active().session) |*binding| binding.stop();
     if (reload.candidate) |candidate| {
@@ -1542,6 +1544,7 @@ fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Schedu
     generation.shutdownImages();
     generation.dbus.shutdown();
     generation.auth.stop();
+    try generation.http.stop();
     if (generation.session) |*binding| binding.stop();
     try generation.vm.requestCancellation();
     while (true) {

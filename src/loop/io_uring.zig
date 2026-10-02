@@ -21,6 +21,7 @@ const Operation = enum(u8) {
     signal_poll = 0xad,
     recvmsg = 0xae,
     sendmsg = 0xaf,
+    poll = 0xb0,
 };
 
 pub const OperationKind = enum {
@@ -38,6 +39,7 @@ pub const SocketOperationKind = enum {
     connect,
     recvmsg,
     sendmsg,
+    poll,
 };
 
 pub const OpenHow = extern struct {
@@ -359,6 +361,18 @@ pub const Loop = struct {
         return reserved.handle;
     }
 
+    /// One-shot readiness notification. The caller owns the descriptor and
+    /// must keep it open until the operation and any cancellation have drained.
+    /// Readiness consumes no bytes; result is a POLL event mask or negative errno.
+    pub fn preparePoll(self: *Loop, fd: linux.fd_t, events: u32) !OperationHandle {
+        const reserved = try self.reserve(.poll);
+        _ = self.ring.poll_add(encodeFile(.poll, reserved.handle), fd, events) catch |err| {
+            reserved.slot.active = false;
+            return err;
+        };
+        return reserved.handle;
+    }
+
     pub fn prepareRecv(self: *Loop, fd: linux.fd_t, buffer: []u8) !OperationHandle {
         if (buffer.len == 0) return error.EmptyReceiveBuffer;
         const reserved = try self.reserve(.recv);
@@ -578,7 +592,7 @@ pub const Loop = struct {
                     .result = cqe.res,
                 } };
             },
-            .accept, .recv, .send, .connect, .recvmsg, .sendmsg => |operation| {
+            .accept, .recv, .send, .connect, .recvmsg, .sendmsg, .poll => |operation| {
                 const handle = decoded.handle orelse return .stale;
                 if (handle.slot >= self.slots.len) return .stale;
                 const slot = &self.slots[handle.slot];
@@ -594,6 +608,7 @@ pub const Loop = struct {
                         .connect => .connect,
                         .recvmsg => .recvmsg,
                         .sendmsg => .sendmsg,
+                        .poll => .poll,
                         else => unreachable,
                     },
                     .result = cqe.res,
@@ -709,6 +724,7 @@ fn decode(value: u64) ?Decoded {
         @intFromEnum(Operation.connect) => .connect,
         @intFromEnum(Operation.recvmsg) => .recvmsg,
         @intFromEnum(Operation.sendmsg) => .sendmsg,
+        @intFromEnum(Operation.poll) => .poll,
         @intFromEnum(Operation.timer_alarm) => .timer_alarm,
         @intFromEnum(Operation.timer_update) => .timer_update,
         @intFromEnum(Operation.timer_remove) => .timer_remove,
@@ -717,7 +733,7 @@ fn decode(value: u64) ?Decoded {
     };
     const generation: u32 = @truncate(value >> 32);
     const handle = switch (operation) {
-        .openat2, .statx, .read, .write, .close, .operation_cancel, .accept, .recv, .send, .connect, .recvmsg, .sendmsg => OperationHandle{
+        .openat2, .statx, .read, .write, .close, .operation_cancel, .accept, .recv, .send, .connect, .recvmsg, .sendmsg, .poll => OperationHandle{
             .slot = @truncate((value >> 8) & 0x00ff_ffff),
             .generation = generation,
         },
