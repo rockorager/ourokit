@@ -1,0 +1,168 @@
+# Publishes a prebuilt x86_64 Linux ouroctl as GitHub release assets that
+# mise's github: backend can install. See "Prebuilt ouroctl" in README.md.
+#
+# - Every push to main publishes prerelease `commit-<full sha>`.
+# - Pushing a `v*` tag publishes a normal release under that tag.
+# - workflow_dispatch backfills `commit-<sha>` for any existing commit.
+name: Release ouroctl
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA to build and publish as commit-<sha>
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.ref || github.sha }}
+  cancel-in-progress: false
+
+env:
+  ASSET: ouroctl-x86_64-linux-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Build against Debian 12 so the binary needs at most glibc 2.36 and the
+    # bookworm sonames of fontconfig, freetype, xkbcommon and curl.
+    container: debian:bookworm
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git xz-utils gcc libc6-dev pkg-config python3 \
+            libfontconfig-dev libfreetype-dev libxkbcommon-dev libcurl4-openssl-dev
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          sha="$(git rev-parse HEAD)"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_EVENT_NAME}" = push ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=commit-${sha}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Zig 0.16.0 fails to fetch .zip dependencies ("failed to create temporary
+      # zip file: FileNotFound") until the global cache has a tmp directory.
+      - name: Prepare Zig cache
+        run: |
+          cache="$(zig env | sed -n 's/^ *\.global_cache_dir = "\(.*\)",$/\1/p')"
+          test -n "$cache"
+          mkdir -p "$cache/tmp"
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain 1.94.0 --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # -Dcpu=baseline keeps the binary portable to any x86_64 CPU instead of
+      # the runner's (the OS, ABI and system libraries remain the host's).
+      - name: Build
+        run: |
+          # Backfilled commits that predate isHostTarget treat any -Dcpu as
+          # cross-compilation; give them the same host check.
+          if ! grep -q isHostTarget build.zig; then
+            sed -i 's/target\.query\.isNative()/(target.query.cpu_arch == null and target.query.isNativeOs() and target.query.isNativeAbi())/' build.zig
+          fi
+          zig build -Doptimize=ReleaseFast -Dvulkan=false -Dcpu=baseline --prefix out
+
+      - name: Package
+        run: |
+          root="dist/${ASSET}"
+          mkdir -p "$root/bin" "$root/include" "$root/share/licenses/ourokit"
+          cp out/bin/ouroctl "$root/bin/"
+          cp -r out/include/ourokit "$root/include/"
+          cp out/share/licenses/ourokit/* docs/licenses/* "$root/share/licenses/ourokit/"
+          cp LICENSE "$root/share/licenses/ourokit/LICENSE"
+          "$root/bin/ouroctl" --help > /dev/null
+          ldd "$root/bin/ouroctl"
+          # Fail if any symbol needs a glibc newer than bookworm's 2.36.
+          newest="$(objdump -T "$root/bin/ouroctl" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "newest glibc symbol: ${newest}"
+          [ "$(printf '%s\nGLIBC_2.36\n' "$newest" | sort -V | tail -1)" = GLIBC_2.36 ]
+          tar -C dist -czf "${ASSET}.tar.gz" "${ASSET}"
+          sha256sum "${ASSET}.tar.gz" > "${ASSET}.tar.gz.sha256"
+          cat "${ASSET}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ASSET }}
+          path: |
+            ${{ env.ASSET }}.tar.gz
+            ${{ env.ASSET }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.build.outputs.tag }}
+      SHA: ${{ needs.build.outputs.sha }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.ASSET }}
+
+      # mise verifies these GitHub artifact attestations when installing.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.ASSET }}.tar.gz
+
+      - name: Publish release assets
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            if [ "$PRERELEASE" = true ]; then
+              flags="--prerelease --latest=false"
+            else
+              flags="--latest"
+            fi
+            cat > notes.md <<EOF
+          ouroctl for x86_64 Linux (glibc ≥ 2.36, e.g. Debian 12) built from ${SHA}
+          with \`zig build -Doptimize=ReleaseFast -Dvulkan=false -Dcpu=baseline\`.
+
+          Runtime libraries: fontconfig, freetype, xkbcommon and curl
+          (Debian: \`libfontconfig1 libfreetype6 libxkbcommon0 libcurl4\`).
+
+          \`\`\`toml
+          [tools]
+          "github:${GH_REPO}" = "${TAG}"
+          \`\`\`
+          EOF
+            # shellcheck disable=SC2086
+            gh release create "$TAG" "${ASSET}.tar.gz" "${ASSET}.tar.gz.sha256" \
+              --target "$SHA" --title "ouroctl ${TAG}" --notes-file notes.md $flags
+          else
+            gh release upload "$TAG" "${ASSET}.tar.gz" "${ASSET}.tar.gz.sha256" --clobber
+          fi

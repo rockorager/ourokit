@@ -68,6 +68,33 @@ Lua and native-extension contracts are also evolving; no stable ABI is promised.
 - A C/C++ toolchain is not required separately; Zig compiles embedded Lua and
   HarfBuzz
 
+## Prebuilt ouroctl
+
+[CI](.github/workflows/release.yml) publishes a software-rendering (`-Dvulkan=false`)
+x86_64 Linux `ouroctl` as GitHub release assets:
+
+- every push to `main` creates prerelease `commit-<full commit SHA>`;
+- a pushed `v*` tag creates a normal release with that name;
+- running the workflow manually with a commit SHA backfills `commit-<sha>`.
+
+Each release has `ouroctl-x86_64-linux-gnu.tar.gz` (`bin/ouroctl`, the plugin
+header and licenses) and its `.sha256`, and a GitHub build-provenance
+attestation. The binary is built on Debian 12 with `-Dcpu=baseline`, so it
+needs glibc 2.36 or newer and any x86_64 CPU. At runtime it needs Fontconfig,
+FreeType, xkbcommon and libcurl (Debian: `libfontconfig1 libfreetype6
+libxkbcommon0 libcurl4`).
+
+Install it with [mise](https://mise.jdx.dev), pinning a commit:
+
+```toml
+[tools]
+"github:rockorager/ourokit" = "commit-<full commit SHA>"
+```
+
+or `mise use "github:rockorager/ourokit@commit-<full commit SHA>"`. mise
+verifies the asset digest and attestation. Commit releases are prereleases,
+so `latest` resolves only to `v*` releases.
+
 ## Build and test
 
 ```sh

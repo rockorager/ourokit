@@ -66,12 +66,12 @@ pub fn build(b: *std.Build) void {
         bool,
         "fontconfig",
         "Enable native Linux font discovery through system Fontconfig",
-    ) orelse (target.query.isNative() and target.result.os.tag == .linux);
+    ) orelse (isHostTarget(target) and target.result.os.tag == .linux);
     const enable_freetype = b.option(
         bool,
         "freetype",
         "Enable software glyph rasterization through system FreeType",
-    ) orelse (target.query.isNative() and target.result.os.tag == .linux);
+    ) orelse (isHostTarget(target) and target.result.os.tag == .linux);
     const enable_vulkan = b.option(
         bool,
         "vulkan",
@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
         bool,
         "xkbcommon",
         "Enable Wayland keyboard translation through system xkbcommon",
-    ) orelse (target.query.isNative() and target.result.os.tag == .linux);
+    ) orelse (isHostTarget(target) and target.result.os.tag == .linux);
     const unicode_ucd = b.dependency("unicode_ucd", .{});
     const uucode_config = addUucodeConfig(b, unicode_ucd);
     const harfbuzz = b.dependency("harfbuzz", .{});
@@ -847,7 +847,7 @@ fn addResvgBridge(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         cargo.addFileArg(manifest);
         const output = cargo.addOutputDirectoryArg("resvg");
         cargo.addArg(b.fmt("{s}-{s}-{s}", .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag), @tagName(target.result.abi) }));
-        cargo.addArg(if (target.query.isNative()) "true" else "false");
+        cargo.addArg(if (isHostTarget(target)) "true" else "false");
         module.addLibraryPath(output);
         module.linkSystemLibrary("ourokit_resvg", .{ .use_pkg_config = .no, .preferred_link_mode = .static });
     }
@@ -857,4 +857,10 @@ fn addResvgBridge(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         module.linkSystemLibrary("m", .{});
     }
     return module;
+}
+
+/// The host OS, ABI and architecture. A CPU model such as -Dcpu=baseline (used
+/// for portable release binaries) still links host libraries and builds Cargo natively.
+fn isHostTarget(target: std.Build.ResolvedTarget) bool {
+    return target.query.cpu_arch == null and target.query.isNativeOs() and target.query.isNativeAbi();
 }
