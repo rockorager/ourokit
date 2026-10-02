@@ -471,6 +471,22 @@ fn addParagraphBenchmark(
     const run = b.addRunArtifact(benchmark);
     const step = b.step("bench-paragraph", "Benchmark headless paragraph analysis and layout");
     step.dependOn(&run.step);
+
+    const input_module = b.createModule(.{
+        .root_source_file = b.path("tools/text/input_benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+    });
+    input_module.addAnonymousImport("ourokit_benchmark_font", .{
+        .root_source_file = latin_font.path("extras/ttf/Inter-Regular.ttf"),
+    });
+    const input_benchmark = b.addExecutable(.{
+        .name = "ourokit-input-benchmark",
+        .root_module = input_module,
+    });
+    b.step("bench-text-input", "Profile repeated text edits, presentation, layout, and scene building")
+        .dependOn(&b.addRunArtifact(input_benchmark).step);
 }
 
 fn addVulkan(b: *std.Build, module: *std.Build.Module) void {

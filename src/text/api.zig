@@ -441,14 +441,17 @@ pub fn shapeWithFallback(
     if (byte_end > spec.paragraph.len) return error.InvalidRange;
     const all_graphemes = try graphemes(allocator, spec.paragraph);
     defer allocator.free(all_graphemes);
-    var run_graphemes: std.ArrayList(Grapheme) = .empty;
-    defer run_graphemes.deinit(allocator);
-    for (all_graphemes) |grapheme| {
-        if (grapheme.byte_end <= spec.byte_start or grapheme.byte_start >= byte_end) continue;
+    // The run is a contiguous slice of the paragraph's graphemes. Borrow it
+    // instead of allocating and growing a second copy on every shape call.
+    var first: usize = 0;
+    while (first < all_graphemes.len and all_graphemes[first].byte_end <= spec.byte_start) : (first += 1) {}
+    var end = first;
+    while (end < all_graphemes.len and all_graphemes[end].byte_start < byte_end) : (end += 1) {
+        const grapheme = all_graphemes[end];
         if (grapheme.byte_start < spec.byte_start or grapheme.byte_end > byte_end)
             return error.RunSplitsGrapheme;
-        try run_graphemes.append(allocator, grapheme);
     }
+    const run_graphemes = all_graphemes[first..end];
 
     // Only the primary may claim a whole run. A broad-coverage fallback must
     // not replace surrounding text just because it also covers one symbol.
@@ -456,7 +459,7 @@ pub fn shapeWithFallback(
     if (try primary.probe(allocator, spec)) |shaped| {
         var run = shaped;
         const color = (try primary.resolve()).hasColorGlyphs();
-        const matches_presentation = for (run_graphemes.items) |grapheme| {
+        const matches_presentation = for (run_graphemes) |grapheme| {
             if (emojiPresentation(spec.paragraph[grapheme.byte_start..grapheme.byte_end])) |presentation| {
                 if (color != (presentation == .emoji)) break false;
             }
@@ -474,7 +477,7 @@ pub fn shapeWithFallback(
     var selections: std.ArrayList(Selection) = .empty;
     defer selections.deinit(allocator);
     var unresolved = false;
-    for (run_graphemes.items) |grapheme| {
+    for (run_graphemes) |grapheme| {
         const presentation = emojiPresentation(spec.paragraph[grapheme.byte_start..grapheme.byte_end]);
         var selected: usize = 0;
         var found = false;
@@ -853,6 +856,40 @@ test "fallback shaping rejects itemized runs that split a grapheme" {
             .logical_size = 16,
         },
     ));
+}
+
+test "fallback grapheme slices exclude surrounding emoji and retain range validation" {
+    var font = try Font.init(@embedFile("ourokit_test_font"), 0);
+    defer font.deinit();
+    const candidates = [_]FallbackCandidate{.{ .handle = .{ .slot = 1, .generation = 1 }, .font = &font }};
+    var spec: RunSpec = .{
+        .paragraph = "🚀Ae\u{301}Z👩🏽‍🚀",
+        .byte_start = "🚀".len,
+        .byte_len = "Ae\u{301}".len,
+        .direction = .left_to_right,
+        .script = .latin,
+        .language = "en",
+        .logical_size = 16,
+    };
+    var result = try shapeWithFallback(std.testing.allocator, &candidates, spec);
+    defer result.deinit();
+    try std.testing.expect(!result.has_missing_glyphs);
+    try std.testing.expectEqual(@as(usize, 1), result.spans.len);
+    try std.testing.expectEqual(spec.byte_start, result.spans[0].run.byte_start);
+    try std.testing.expectEqual(spec.byte_len.?, result.spans[0].run.byte_len);
+    for (result.spans[0].run.glyphs) |glyph| {
+        try std.testing.expect(glyph.cluster >= spec.byte_start);
+        try std.testing.expect(glyph.cluster < spec.byte_start + spec.byte_len.?);
+    }
+    spec.byte_len = "Ae".len;
+    try std.testing.expectError(error.RunSplitsGrapheme, shapeWithFallback(std.testing.allocator, &candidates, spec));
+    spec.byte_start = "🚀Ae".len;
+    spec.byte_len = 0;
+    try std.testing.expectError(error.RunSplitsGrapheme, shapeWithFallback(std.testing.allocator, &candidates, spec));
+    spec.byte_start = "🚀Ae\u{301}".len;
+    var empty = try shapeWithFallback(std.testing.allocator, &candidates, spec);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.spans[0].run.glyphs.len);
 }
 
 test "Fontconfig variable sentinel and variations map to HarfBuzz" {

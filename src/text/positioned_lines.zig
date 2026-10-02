@@ -1279,12 +1279,21 @@ fn appendShapedSpan(
     const selected_end = @min(span_end, byte_end);
     if (selected_start >= selected_end) return;
 
+    // HarfBuzz uses MONOTONE_CHARACTERS: clusters increase in LTR spans
+    // and decrease in RTL spans. Search the selected interval instead of
+    // scanning the entire paragraph's glyphs again for every wrapped line.
+    const rtl = switch (span.run.direction) {
+        .left_to_right => false,
+        .right_to_left => true,
+        else => return error.UnsupportedTextDirection,
+    };
+    const first = glyphBoundary(span.run.glyphs, (if (rtl) selected_end else selected_start) - paragraph_start, rtl);
+    const end = glyphBoundary(span.run.glyphs, (if (rtl) selected_start else selected_end) - paragraph_start, rtl);
     const glyph_start = glyphs.items.len;
     const pen_start = pen_x.*;
-    for (span.run.glyphs) |glyph| {
+    for (span.run.glyphs[first..end]) |glyph| {
         const cluster = std.math.add(usize, paragraph_start, glyph.cluster) catch
             return error.InvalidShaping;
-        if (cluster < selected_start or cluster >= selected_end) continue;
         if (!std.math.isFinite(glyph.advance.x) or !std.math.isFinite(glyph.advance.y) or
             !std.math.isFinite(glyph.offset.x) or !std.math.isFinite(glyph.offset.y) or
             @abs(glyph.advance.y) > 0.001) return error.InvalidShaping;
@@ -1311,6 +1320,19 @@ fn appendShapedSpan(
     });
 }
 
+fn glyphBoundary(glyphs: []const api.Glyph, offset: usize, rtl: bool) usize {
+    var low: usize = 0;
+    var high = glyphs.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (if (rtl) glyphs[middle].cluster >= offset else glyphs[middle].cluster < offset)
+            low = middle + 1
+        else
+            high = middle;
+    }
+    return low;
+}
+
 fn firstOverlappingFragment(fragments: []const Fragment, byte_start: usize) usize {
     var low: usize = 0;
     var high = fragments.len;
@@ -1328,6 +1350,60 @@ fn mergeMetrics(target: *api.Metrics, value: api.Metrics) void {
     target.ascender = @max(target.ascender, value.ascender);
     target.descender = @min(target.descender, value.descender);
     target.line_gap = @max(target.line_gap, value.line_gap);
+}
+
+test "positioned span slices preserve duplicate clusters and paragraph offsets in both directions" {
+    const allocator = std.testing.allocator;
+    for ([_]api.Direction{ .left_to_right, .right_to_left }) |direction| {
+        var source: [7]api.Glyph = undefined;
+        for ([_]u32{ 7, 10, 10, 14, 18, 18, 22 }, 0..) |cluster, i| source[i] = .{
+            .id = @intCast(i + 1),
+            .cluster = cluster,
+            .advance = .{ .x = @floatFromInt(i + 1) },
+            .offset = .{ .x = 0.25, .y = 0.5 },
+            .unsafe_to_break = false,
+        };
+        if (direction == .right_to_left) std.mem.reverse(api.Glyph, &source);
+        const span: api.ShapedSpan = .{
+            .font = .{ .slot = 1, .generation = 1 },
+            .run = .{
+                .allocator = allocator,
+                .glyphs = &source,
+                .direction = direction,
+                .byte_start = 7,
+                .byte_len = 16,
+                .advance = .{ .x = 28 },
+                .metrics = .{ .ascender = 12, .descender = -3, .line_gap = 0 },
+            },
+        };
+        const cases = [_]struct { start: usize, end: usize, ids: []const u32 }{
+            .{ .start = 100, .end = 200, .ids = &.{ 1, 2, 3, 4, 5, 6, 7 } },
+            .{ .start = 110, .end = 118, .ids = &.{ 2, 3, 4 } },
+            .{ .start = 111, .end = 119, .ids = &.{ 4, 5, 6 } },
+            .{ .start = 111, .end = 114, .ids = &.{} },
+            .{ .start = 123, .end = 130, .ids = &.{} },
+        };
+        for (cases) |case| {
+            var spans: std.ArrayList(Span) = .empty;
+            defer spans.deinit(allocator);
+            var glyphs: std.ArrayList(Glyph) = .empty;
+            defer glyphs.deinit(allocator);
+            var pen: f32 = 5;
+            try appendShapedSpan(allocator, &spans, &glyphs, &pen, &span, 100, case.start, case.end, 16, null);
+            try std.testing.expectEqual(case.ids.len, glyphs.items.len);
+            var expected_pen: f32 = 5;
+            for (glyphs.items, 0..) |glyph, i| {
+                const id = case.ids[if (direction == .right_to_left) case.ids.len - 1 - i else i];
+                try std.testing.expectEqual(id, glyph.id);
+                try std.testing.expectEqual(@as(usize, 100) + ([_]u32{ 7, 10, 10, 14, 18, 18, 22 })[id - 1], glyph.cluster);
+                try std.testing.expectEqual(expected_pen + 0.25, glyph.origin.x);
+                try std.testing.expectEqual(@as(f32, -0.5), glyph.origin.y);
+                expected_pen += @floatFromInt(id);
+            }
+            try std.testing.expectEqual(expected_pen, pen);
+            try std.testing.expectEqual(@as(usize, if (case.ids.len == 0) 0 else 1), spans.items.len);
+        }
+    }
 }
 
 test "mixed-script selected lines become positioned visual glyph spans" {

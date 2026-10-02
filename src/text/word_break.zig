@@ -43,12 +43,14 @@ pub fn appendAssumeCapacity(text: []const u8, boundaries: *std.ArrayList(usize))
     if (text.len == 0) return;
     const first = unitAt(text, 0);
     var offset = first.end;
+    var immediate_left = first;
     var regional_indicator_count: usize = if (first.property == .regional_indicator) 1 else 0;
     while (offset < text.len) {
         const unit = unitAt(text, offset);
-        if (breaksAt(text, offset, regional_indicator_count))
+        if (breaksAt(text, immediate_left, unit, regional_indicator_count))
             boundaries.appendAssumeCapacity(offset);
         offset = unit.end;
+        immediate_left = unit;
         if (!isIgnored(unit.property)) regional_indicator_count =
             if (unit.property == .regional_indicator) regional_indicator_count + 1 else 0;
     }
@@ -71,10 +73,7 @@ pub fn isWordSegment(text: []const u8) bool {
     return false;
 }
 
-fn breaksAt(text: []const u8, offset: usize, regional_indicator_count: usize) bool {
-    const immediate_left = previousUnit(text, offset).?;
-    const right = unitAt(text, offset);
-
+fn breaksAt(text: []const u8, immediate_left: Unit, right: Unit, regional_indicator_count: usize) bool {
     // WB3-WB3d are evaluated before format/extend characters are ignored.
     if (immediate_left.property == .cr and right.property == .lf) return false;
     if (isNewline(immediate_left.property) or isNewline(right.property)) return true;
@@ -85,11 +84,19 @@ fn breaksAt(text: []const u8, offset: usize, regional_indicator_count: usize) bo
     // At start-of-text or after a hard boundary they form their own segment,
     // as required by WB1/WB3a rather than being ignored across that boundary.
     if (isIgnored(right.property)) return false;
-    const left = previousSignificant(text, offset) orelse return true;
+    const left = if (!isIgnored(immediate_left.property)) immediate_left else previousSignificant(text, immediate_left.start) orelse return true;
     if (isIgnored(immediate_left.property) and isNewline(left.property)) return true;
 
-    const previous = previousSignificant(text, left.start);
-    const next = nextSignificant(text, right.end);
+    // Most boundaries need only the adjacent significant properties. Decode
+    // lookbehind/lookahead only for punctuation rules that actually use it.
+    const previous = if (isMidLetter(left.property) or isMidNumber(left.property) or left.property == .double_quote)
+        previousSignificant(text, left.start)
+    else
+        null;
+    const next = if (isMidLetter(right.property) or isMidNumber(right.property) or right.property == .double_quote)
+        nextSignificant(text, right.end)
+    else
+        null;
     const left_ah = isAhLetter(left.property);
     const right_ah = isAhLetter(right.property);
 
