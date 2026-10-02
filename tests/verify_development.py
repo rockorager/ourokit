@@ -19,8 +19,10 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = (
     'development_runtime.py',
+    'storybook_native.py',
     'control_composition.py',
     'selection_composition.py',
+    'editor_commands.py',
     'input_composition.py',
     'overlay_composition.py',
     'animation_composition.py',

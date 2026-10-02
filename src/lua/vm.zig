@@ -262,6 +262,7 @@ pub const Vm = struct {
         errdefer c.lua_settop(self.state, main_top);
         const thread = c.lua_newthread(self.state) orelse return error.LuaThreadCreationFailed;
         if (c.luaL_loadbufferx(thread, source.ptr, source.len, chunk_name, null) != c.ok) {
+            @import("diagnostic.zig").logLuaStack(thread);
             _ = c.lua_closethread(thread, null);
             c.lua_settop(thread, 0);
             return error.LuaLoadFailed;
@@ -575,6 +576,10 @@ pub const Vm = struct {
                 return .waiting;
             },
             else => {
+                var length: usize = 0;
+                const message = c.lua_tolstring(slot.thread.?, -1, &length);
+                c.luaL_traceback(slot.thread.?, slot.thread.?, if (message) |ptr| @ptrCast(ptr) else "non-string Lua error", 0);
+                @import("diagnostic.zig").logLuaStack(slot.thread.?);
                 try self.scheduler.complete(scheduler_handle);
                 _ = self.closeTask(handle);
                 return error.LuaRuntimeError;

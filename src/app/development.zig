@@ -71,6 +71,7 @@ pub const Node = struct {
     scroll_offset: ?f32,
     scroll_metrics: ?@import("../ui/render_object/scroll.zig").Metrics = null,
     read_only: bool,
+    text_entry: bool = false,
     multiline: bool,
 };
 
@@ -129,6 +130,7 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
         var value: ?[]const u8 = null;
         var selection: ?ui.text_input.Selection = null;
         var read_only = false;
+        var text_entry = false;
         var multiline = false;
         if (runtime.text_inputs.contains(handle)) {
             const session = try runtime.text_inputs.session(handle);
@@ -139,6 +141,7 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             }
             multiline = session.model.multiline;
             read_only = (try runtime.text_inputs.getBehavior(handle)).read_only;
+            text_entry = (try runtime.text_inputs.getBehavior(handle)).text_entry;
         }
         const selected = if (runtime.listboxes.option(handle)) |option|
             runtime.listboxes.selectedValue(option.listbox) == option.value
@@ -170,6 +173,7 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             else
                 null,
             .read_only = read_only,
+            .text_entry = text_entry,
             .multiline = multiline,
         };
     }
@@ -257,6 +261,7 @@ pub const Playback = struct {
             const behavior = try runtime.text_inputs.getBehavior(focused);
             if (!behavior.enabled) return error.DevelopmentTargetDisabled;
             if (behavior.read_only) return error.DevelopmentTargetReadOnly;
+            if (!behavior.text_entry) return error.DevelopmentTargetTextEntryDisabled;
             if ((try runtime.text_inputs.session(focused)).preedit() != null) return error.DevelopmentCompositionActive;
             target = focused;
         }
@@ -313,6 +318,7 @@ pub const Playback = struct {
                 const behavior = try runtime.text_inputs.getBehavior(self.target.?);
                 if (!behavior.enabled) return error.DevelopmentTargetDisabled;
                 if (behavior.read_only) return error.DevelopmentTargetReadOnly;
+                if (!behavior.text_entry) return error.DevelopmentTargetTextEntryDisabled;
                 if ((try runtime.text_inputs.session(self.target.?)).preedit() != null) return error.DevelopmentCompositionActive;
                 // Native semantic focus need not own a compositor IME session.
                 // Type through translated keys rather than inventing one.

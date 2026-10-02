@@ -171,7 +171,7 @@ pub fn run(
     source: []const u8,
     options: wayland_runner.Options,
 ) !void {
-    var description = try storybook_runner.describe(init, source);
+    var description = try storybook_runner.describeAt(init, source, options.asset_root, "@storybook");
     defer description.deinit();
 
     var application_source: std.Io.Writer.Allocating = .init(init.gpa);

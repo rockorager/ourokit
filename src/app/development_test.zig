@@ -618,6 +618,37 @@ test "multiline development editing preserves lines and navigates visual rows" {
     try std.testing.expect((try node(revealed, "body")).scroll_offset.? > 0);
 }
 
+test "text entry policy preserves retained editing and multiline command navigation" {
+    const f = try Fixture.create(
+        \\entry = ouro.signal(true)
+        \\commands = 0
+        \\function build() return ouro.text_input {key='body', multiline=true, height=64,
+        \\ autofocus=true, text_entry=entry(), default_text='alpha\nβeta',
+        \\ on_command=function() commands=commands+1 end} end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    try f.play(.{ .text = "!" });
+    try f.exec("entry:set(false)");
+    try f.settle();
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    var snapshot = try f.snapshot();
+    defer snapshot.deinit();
+    try std.testing.expect(!(try node(snapshot, "body")).text_entry);
+    try std.testing.expect(!(try node(snapshot, "body")).read_only);
+    try std.testing.expectError(error.DevelopmentTargetTextEntryDisabled, dev.Playback.init(&f.runtime, dev.Token.current(&f.runtime), .{ .text = "blocked" }));
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .arrow_up } });
+    try std.testing.expect(session.model.selection.extent < "alpha\n".len);
+    try f.exec("assert(commands == 0)");
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_z, .modifiers = .{ .control = true } } });
+    try std.testing.expectEqualStrings("alpha\nβeta", session.model.text());
+    try f.exec("entry:set(true)");
+    try f.settle();
+    try f.play(.{ .text = "?" });
+    try std.testing.expectEqualStrings("alpha\nβeta?", session.model.text());
+}
+
 test "multiline read-only selection auto-scrolls vertically without editing" {
     const f = try Fixture.create(
         \\function build() return ouro.text_input {key='body', multiline=true, height=64, read_only=true,

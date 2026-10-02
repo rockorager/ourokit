@@ -58,6 +58,10 @@ pub const Snapshot = struct {
 /// Evaluates a catalog without running any story content and returns metadata
 /// that remains valid after the isolated Lua VM is closed.
 pub fn describe(init: std.process.Init, source: []const u8) !Description {
+    return describeAt(init, source, null, "@storybook");
+}
+
+pub fn describeAt(init: std.process.Init, source: []const u8, module_root: ?std.os.linux.fd_t, chunk_name: [:0]const u8) !Description {
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 8, 1);
     defer loop.deinit();
@@ -86,12 +90,16 @@ pub fn describe(init: std.process.Init, source: []const u8) !Description {
     try lua_ui.initWithApi(vm.state, &descriptor_storage, vm.apiReference());
     lua_ui.attachSignals(&signals);
 
-    var book = try lua.Storybook.loadWithApi(
-        init.gpa,
-        vm.state,
-        vm.apiReference(),
-        source,
-    );
+    var loader: ?lua.ModuleLoader = null;
+    if (module_root) |root| {
+        loader = @as(lua.ModuleLoader, undefined);
+        try loader.?.init(init.gpa, &vm, &loop, root, 64);
+    }
+    defer if (loader) |*value| value.deinit();
+    var book = if (loader) |*value|
+        try evaluateCatalog(init.gpa, &vm, &scheduler, &loop, value, source, chunk_name)
+    else
+        try lua.Storybook.loadWithApi(init.gpa, vm.state, vm.apiReference(), source);
     defer book.deinit();
     const title = try init.gpa.dupe(u8, book.title);
     errdefer init.gpa.free(title);
@@ -127,6 +135,10 @@ pub fn describe(init: std.process.Init, source: []const u8) !Description {
 /// Renders one selected story in a fresh VM and platform-neutral window
 /// runtime, then encodes the software-rendered pixels as PNG.
 pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8, asset_root: ?std.os.linux.fd_t) !Snapshot {
+    return snapshotNamed(init, source, story_id, asset_root, "@storybook");
+}
+
+pub fn snapshotNamed(init: std.process.Init, source: []const u8, story_id: []const u8, asset_root: ?std.os.linux.fd_t, chunk_name: [:0]const u8) !Snapshot {
     if (!renderer.software.has_freetype) return error.FreeTypeDisabled;
     const config: @import("window_runtime.zig").Config = .{};
     var loop: io_loop.Loop = undefined;
@@ -196,12 +208,16 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
     try lua_ui.attachMediumText(medium_font_candidates);
     try lua_ui.attachSemantics(semantic_storage);
 
-    var book = try lua.Storybook.loadWithApi(
-        init.gpa,
-        vm.state,
-        vm.apiReference(),
-        source,
-    );
+    var loader: ?lua.ModuleLoader = null;
+    if (asset_root) |root| {
+        loader = @as(lua.ModuleLoader, undefined);
+        try loader.?.init(init.gpa, &vm, &loop, root, 64);
+    }
+    defer if (loader) |*value| value.deinit();
+    var book = if (loader) |*value|
+        try evaluateCatalog(init.gpa, &vm, &scheduler, &loop, value, source, chunk_name)
+    else
+        try lua.Storybook.loadWithApi(init.gpa, vm.state, vm.apiReference(), source);
     defer book.deinit();
     const story = book.find(story_id) orelse return error.UnknownStory;
     const theme = switch (story.color_scheme) {
@@ -379,6 +395,71 @@ fn drainImages(assets: *image_service.Service, loop: *io_loop.Loop) !void {
         switch (loop.dispatch(try loop.wait())) {
             .file => |completion| if (!(try assets.dispatch(completion))) return error.UnownedImageCompletion,
             else => return error.UnexpectedImageCompletion,
+        }
+    }
+}
+
+/// Evaluates the entry as the ordinary application runner does: `require`
+/// may yield for file I/O, nested modules share one cache, and disk access is
+/// closed once catalog bootstrap completes.
+fn evaluateCatalog(
+    allocator: std.mem.Allocator,
+    vm: *lua.Vm,
+    scheduler: *task.Scheduler,
+    loop: *io_loop.Loop,
+    loader: *lua.ModuleLoader,
+    source: []const u8,
+    chunk_name: [:0]const u8,
+) !lua.Storybook {
+    const c = @import("../lua/c.zig");
+    const top = c.lua_gettop(vm.state);
+    defer c.lua_settop(vm.state, top);
+    // Catalog evaluation permits module I/O, not timers or background jobs.
+    vm.disableSleep();
+    vm.app_spawn_allowed = false;
+    try lua.Storybook.prepareWithApi(vm.state, vm.apiReference());
+    const entry = try vm.spawnRetainedNamed(scheduler.application_scope, source, chunk_name);
+    const entry_task = try vm.schedulerHandle(entry);
+    errdefer drainCatalog(vm, scheduler, loop, loader) catch unreachable;
+
+    while (true) {
+        while (scheduler.takeRunnable()) |runnable| {
+            switch (try vm.resumeRunnable(runnable)) {
+                .completed => {
+                    if (!std.meta.eql(runnable, entry_task)) continue;
+                    vm.takeRetainedResult(entry) catch |err| {
+                        try vm.takeRetainedValue(entry);
+                        return err;
+                    };
+                    loader.freeze();
+                    try drainCatalog(vm, scheduler, loop, loader);
+                    return lua.Storybook.parseStack(allocator, vm.state);
+                },
+                .canceled => return error.StorybookEvaluationCanceled,
+                .waiting => if (vm.exit_code != null) return error.StorybookEvaluationCanceled,
+            }
+        }
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .file => |completion| if (!(try loader.dispatch(completion)))
+                return error.UnownedModuleCompletion,
+            .operation_cancel => {},
+            else => return error.UnexpectedModuleCompletion,
+        }
+    }
+}
+
+fn drainCatalog(vm: *lua.Vm, scheduler: *task.Scheduler, loop: *io_loop.Loop, loader: *lua.ModuleLoader) !void {
+    try vm.requestCancellation();
+    try scheduler.applyQueuedCancellations();
+    while (vm.activeTaskCount() != 0) {
+        while (scheduler.takeRunnable()) |runnable| _ = vm.resumeRunnable(runnable) catch {};
+        if (vm.activeTaskCount() == 0) break;
+        _ = try loop.submit();
+        switch (loop.dispatch(try loop.wait())) {
+            .file => |completion| if (!(try loader.dispatch(completion))) return error.UnownedModuleCompletion,
+            .operation_cancel => {},
+            else => return error.UnexpectedModuleCompletion,
         }
     }
 }

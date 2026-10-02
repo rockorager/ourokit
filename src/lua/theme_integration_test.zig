@@ -152,6 +152,31 @@ const Fixture = struct {
     }
 };
 
+test "empty status text retains layout and joins semantics when populated" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\status = ouro.signal('')
+        \\function build()
+        \\  return ouro.column {key='root',
+        \\    ouro.text {key='status', text=status()},
+        \\    ouro.text {key='hint', text='Ready'},
+        \\  }
+        \\end
+    );
+    try f.build();
+    try std.testing.expectError(error.SemanticPathNotFound, f.runtime.semantics.findPath("root/status"));
+    _ = try f.handle("root/hint");
+    try f.exec("status:set('Saved')");
+    try f.build();
+    const handle = try f.handle("root/status");
+    try std.testing.expectEqualStrings("Saved", (try f.runtime.semantics.findPath("root/status")).label);
+    try f.exec("status:set('')");
+    try f.build();
+    try std.testing.expect(f.runtime.instances.isActive(handle));
+    try std.testing.expectError(error.SemanticPathNotFound, f.runtime.semantics.findPath("root/status"));
+}
+
 test "stock Lua controls preserve asymmetric root stack offsets" {
     const f = try Fixture.create();
     defer f.destroy();

@@ -52,6 +52,17 @@ pub const Storybook = struct {
         return loadWithApiReference(allocator, state, api_reference, source);
     }
 
+    /// Installs Storybook declarations before a yieldable entry task starts.
+    pub fn prepareWithApi(state: *c.State, api_reference: c_int) !void {
+        try installConstructors(state, api_reference);
+    }
+
+    /// Parses the catalog value left on top of the main Lua stack by a
+    /// retained, yieldable entry task.
+    pub fn parseStack(allocator: std.mem.Allocator, state: *c.State) !Storybook {
+        return parseDeclaration(allocator, state);
+    }
+
     fn loadWithApiReference(
         allocator: std.mem.Allocator,
         state: *c.State,
@@ -61,10 +72,21 @@ pub const Storybook = struct {
         try installConstructors(state, api_reference);
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
-        if (c.luaL_loadbufferx(state, source.ptr, source.len, "@storybook", null) != c.ok)
+        if (c.luaL_loadbufferx(state, source.ptr, source.len, "@storybook", null) != c.ok) {
+            @import("diagnostic.zig").logLuaStack(state);
             return error.LuaLoadFailed;
-        if (c.lua_pcallk(state, 0, 1, 0, 0, null) != c.ok)
+        }
+        if (@import("diagnostic.zig").pcall(state, 0, 1) != c.ok) {
+            @import("diagnostic.zig").logLuaStack(state);
             return error.LuaStorybookFailed;
+        }
+        return parseDeclaration(allocator, state);
+    }
+
+    fn parseDeclaration(
+        allocator: std.mem.Allocator,
+        state: *c.State,
+    ) !Storybook {
         if (c.lua_type(state, -1) != c.type_table) return error.StorybookDeclarationRequired;
         try expectTag(state, -1, "storybook");
 

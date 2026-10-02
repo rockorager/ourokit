@@ -304,6 +304,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_codec_tests.step);
     test_step.dependOn(addNativePlugins(b, target, optimize, ourokit));
 
+    const storybook_tests = b.addSystemCommand(&.{"python3"});
+    storybook_tests.addFileArg(b.path("tests/storybook_native.py"));
+    storybook_tests.addArtifactArg(host);
+    storybook_tests.setCwd(b.path("."));
+    storybook_tests.has_side_effects = true;
+    b.step("test-storybook", "Verify headless Storybook modules, diagnostics and snapshots").dependOn(&storybook_tests.step);
+
     const development = b.addSystemCommand(&.{"python3"});
     development.addFileArg(b.path("tests/verify_development.py"));
     development.addArtifactArg(host);
@@ -342,6 +349,7 @@ pub fn build(b: *std.Build) void {
     format.setCwd(b.path("."));
     const verify = b.step("verify", "Run Zig tests, formatting and native development/control verification");
     verify.dependOn(test_step);
+    verify.dependOn(&storybook_tests.step);
     verify.dependOn(development_step);
     verify.dependOn(session_tests);
     verify.dependOn(http_step);

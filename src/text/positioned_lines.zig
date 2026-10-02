@@ -284,6 +284,38 @@ pub const PositionedLines = struct {
         return error.CaretNotFound;
     }
 
+    /// Covers the following logical grapheme at the affinity-selected visual
+    /// position. At a line end (including an upstream wrap edge) or an empty
+    /// line, use a font-metric-derived positive width instead.
+    pub fn caretGraphemeRectangleForOffset(
+        self: *const PositionedLines,
+        byte_offset: usize,
+        affinity: CaretAffinity,
+    ) !RectF {
+        const beam = try self.caretRectangleForOffset(byte_offset, affinity, 1);
+        var rtl = false;
+        for (self.lines) |line| {
+            if (line.top != beam.y) continue;
+            rtl = line.base_level & 1 != 0;
+            const stops = self.caretsFor(line);
+            for (0..stops.len -| 1) |index| {
+                const left = stops[index];
+                const right = stops[index + 1];
+                const range = caretPairRange(left, right) orelse continue;
+                const at_left = left.byte_offset == byte_offset and @abs(line.left + left.x - beam.x) < 0.001;
+                const at_right = right.byte_offset == byte_offset and @abs(line.left + right.x - beam.x) < 0.001;
+                if (!at_left and !at_right) continue;
+                if (range.start == byte_offset) {
+                    const advance = right.x - left.x;
+                    if (advance > 0) return .{ .x = line.left + left.x, .y = beam.y, .width = advance, .height = beam.height };
+                } else if (range.end == byte_offset) rtl = at_left;
+            }
+            break;
+        }
+        const fallback = @max(1, beam.height * 0.5);
+        return .{ .x = beam.x - if (rtl) fallback else @as(f32, 0), .y = beam.y, .width = fallback, .height = beam.height };
+    }
+
     /// Traverses the physical caret sequence produced by bidi reordering. Line
     /// arrays are top-to-bottom and each line's carets are left-to-right.
     /// Co-located upstream/downstream variants are one visual position and are
@@ -1468,6 +1500,59 @@ test "empty lines retain font height for layout and insertion carets" {
         }
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(positioned.lines.len)) * advance, positioned.height(), 0.001);
     }
+}
+
+test "shaped caret rectangles follow proportional graphemes and metric fallbacks" {
+    const Fixture = @import("positioned_lines_test.zig").Fixture;
+    const utf8 = "Wi a\u{301} אב";
+    var fixture: Fixture = undefined;
+    try fixture.init(utf8, 10_000);
+    defer fixture.deinit();
+    var positioned = try positionLines(std.testing.allocator, utf8, &fixture.shaped, &fixture.selected);
+    defer positioned.deinit();
+
+    const wide = try positioned.caretGraphemeRectangleForOffset(0, .downstream);
+    const narrow = try positioned.caretGraphemeRectangleForOffset(1, .downstream);
+    try std.testing.expect(wide.width > narrow.width);
+    try std.testing.expectEqual(narrow, try positioned.caretGraphemeRectangleForOffset(1, .upstream));
+    const combining = try positioned.caretGraphemeRectangleForOffset(3, .downstream);
+    try std.testing.expect(combining.width > 0);
+    try std.testing.expectError(
+        error.CaretNotFound,
+        positioned.caretGraphemeRectangleForOffset(4, .downstream),
+    );
+    const rtl = try positioned.caretGraphemeRectangleForOffset(7, .downstream);
+    try std.testing.expect(rtl.width > 0);
+
+    var empty_fixture: Fixture = undefined;
+    try empty_fixture.init("", 200);
+    defer empty_fixture.deinit();
+    var empty = try positionLines(std.testing.allocator, "", &empty_fixture.shaped, &empty_fixture.selected);
+    defer empty.deinit();
+    const fallback = try empty.caretGraphemeRectangleForOffset(0, .downstream);
+    try std.testing.expect(fallback.width >= 1 and fallback.width <= fallback.height);
+
+    var rtl_fixture: Fixture = undefined;
+    try rtl_fixture.init("אב", 200);
+    defer rtl_fixture.deinit();
+    var rtl_only = try positionLines(std.testing.allocator, "אב", &rtl_fixture.shaped, &rtl_fixture.selected);
+    defer rtl_only.deinit();
+    const rtl_end = try rtl_only.caretGraphemeRectangleForOffset(4, .downstream);
+    const rtl_beam = try rtl_only.caretRectangleForOffset(4, .downstream, 1);
+    try std.testing.expectApproxEqAbs(rtl_beam.x, rtl_end.x + rtl_end.width, 0.001);
+    try std.testing.expectEqual(rtl_end, try rtl_only.caretGraphemeRectangleForOffset(4, .upstream));
+
+    var wrap_fixture: Fixture = undefined;
+    try wrap_fixture.init("Wiiii WWWW", 40);
+    defer wrap_fixture.deinit();
+    var wrapped = try positionLines(std.testing.allocator, "Wiiii WWWW", &wrap_fixture.shaped, &wrap_fixture.selected);
+    defer wrapped.deinit();
+    try std.testing.expect(wrapped.lines.len > 1);
+    const edge = wrapped.lines[1].byte_start;
+    const before_wrap = try wrapped.caretGraphemeRectangleForOffset(edge, .upstream);
+    const after_wrap = try wrapped.caretGraphemeRectangleForOffset(edge, .downstream);
+    try std.testing.expect(before_wrap.y < after_wrap.y);
+    try std.testing.expectApproxEqAbs(before_wrap.height * 0.5, before_wrap.width, 0.001);
 }
 
 test "caret stops preserve graphemes, ligatures, and bidi affinity" {

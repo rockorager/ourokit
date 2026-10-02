@@ -431,7 +431,14 @@ for styling, precedence, and accessibility limitations.
 ## Storybook
 
 Storybook catalogs are explicit Lua entry points containing named, isolated
-component states. Open the native interactive catalog browser with:
+component states. Local `require('view')` imports resolve relative to the catalog
+directory, using the same `view.lua` / `view/init.lua` lookup and module cache as
+applications. Import shared modules during catalog evaluation; cached imports
+remain available in content callbacks, but first-time disk imports after
+bootstrap are rejected. No bundling or working-directory change is required.
+Headless catalogs reject sleeps; any spawned bootstrap tasks are drained before
+rendering. Lua errors and tracebacks are written to stderr, leaving JSON stdout
+machine-readable. Open the native interactive catalog browser with:
 
 ```sh
 zig-out/bin/ouroctl storybook run examples/storybook.lua
@@ -462,6 +469,9 @@ zig-out/bin/ouroctl storybook snapshot examples/storybook.lua
 zig-out/bin/ouroctl storybook snapshot examples/storybook.lua \
   --story button/disabled-dark --output .amp/in/artifacts --json
 ```
+
+Snapshots use lossless compressed PNG by default. Run `zig build test-storybook`
+to verify local imports, diagnostics, empty status text, and headless output.
 
 Each story declares a fixed logical viewport, optional `snapshot_scale`, color
 scheme, and ordinary Ourokit content callback. Snapshot scale affects PNG

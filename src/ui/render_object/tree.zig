@@ -269,6 +269,7 @@ pub const Tree = struct {
             if (object == .text_input and target.has_layout and !target.needs_layout and
                 (previous.text_input.caret_offset != object.text_input.caret_offset or
                     previous.text_input.caret_affinity != object.text_input.caret_affinity or
+                    previous.text_input.caret_shape != object.text_input.caret_shape or
                     previous.text_input.selection_start != object.text_input.selection_start or
                     previous.text_input.selection_end != object.text_input.selection_end or
                     (!previous.text_input.reveal_caret and object.text_input.reveal_caret)))
@@ -445,13 +446,20 @@ pub const Tree = struct {
         const target = try self.ensureTextLayout(handle);
         const paragraph_layout = try self.paragraphs.?.get(target.paragraph_layout.?);
         if (axis == .vertical and !target.object.text_input.multiline) return 0;
+        const overhang = try textInputCaretOverhang(
+            &paragraph_layout.positioned,
+            target.object.text_input,
+            paragraph_layout.size.width,
+        );
         const minimum = @min(0, if (axis == .horizontal)
-            target.size.width - paragraph_layout.size.width - target.object.text_input.caret_width
+            target.size.width - paragraph_layout.size.width - overhang
         else
             target.size.height - paragraph_layout.size.height);
         if (minimum == 0) return 0;
+        const caret = try textInputCaretRectangle(&paragraph_layout.positioned, target.object.text_input);
+        const left = if (axis == .horizontal) @max(0, -caret.x) else 0;
         const offset = if (axis == .horizontal) target.text_offset_x else target.text_offset_y;
-        return offset - std.math.clamp(offset - delta, minimum, 0);
+        return offset - std.math.clamp(offset - delta, minimum + left, left);
     }
 
     pub fn scrollTextInput(self: *Tree, handle: NodeHandle, axis: types.Axis, delta: f32) !bool {
@@ -471,11 +479,7 @@ pub const Tree = struct {
         const paragraph_layout = self.paragraphs.?.get(paragraph_handle) catch
             return error.StaleParagraph;
         const input = target.object.text_input;
-        var rectangle = try paragraph_layout.positioned.caretRectangleForOffset(
-            input.caret_offset,
-            input.caret_affinity,
-            input.caret_width,
-        );
+        var rectangle = try textInputCaretRectangle(&paragraph_layout.positioned, input);
         rectangle.x += target.text_offset_x;
         rectangle.y += target.text_offset_y;
         return rectangle;
@@ -915,6 +919,17 @@ pub const Tree = struct {
                         .height = rectangle.height,
                     }, value.selection_color);
                 }
+                if (value.show_caret and value.selection_start == value.selection_end and value.caret_shape == .block) {
+                    const rectangle = try textInputCaretRectangle(&paragraph_layout.positioned, value);
+                    var block_color = value.caret_color;
+                    block_color.a = @min(block_color.a, 128);
+                    try builder.solidRectangle(.{
+                        .x = text_origin.x + rectangle.x,
+                        .y = text_origin.y + rectangle.y,
+                        .width = rectangle.width,
+                        .height = rectangle.height,
+                    }, block_color);
+                }
                 if (target.placeholder_layout) |placeholder|
                     try builder.paragraph(placeholder, origin, value.placeholder_color)
                 else
@@ -931,12 +946,8 @@ pub const Tree = struct {
                         .height = value.preedit_width,
                     }, value.preedit_color.?);
                 }
-                if (value.show_caret and value.selection_start == value.selection_end) {
-                    const rectangle = try paragraph_layout.positioned.caretRectangleForOffset(
-                        value.caret_offset,
-                        value.caret_affinity,
-                        value.caret_width,
-                    );
+                if (value.show_caret and value.selection_start == value.selection_end and value.caret_shape != .block) {
+                    const rectangle = try textInputCaretRectangle(&paragraph_layout.positioned, value);
                     try builder.solidRectangle(.{
                         .x = text_origin.x + rectangle.x,
                         .y = text_origin.y + rectangle.y,
@@ -1336,7 +1347,11 @@ pub const Tree = struct {
         content_size.width = if (constraints.hasBoundedWidth())
             constraints.max_width
         else
-            content_size.width + input.caret_width;
+            content_size.width + (textInputCaretOverhang(
+                &paragraph_layout.positioned,
+                input,
+                paragraph_layout.size.width,
+            ) catch return error.InvalidTextInputRange);
         const result = constraints.constrain(content_size);
         const target = try self.slot(handle);
         self.releaseParagraphLayout(target);
@@ -1351,33 +1366,36 @@ pub const Tree = struct {
             return error.StaleParagraph;
         const input = target.object.text_input;
         const width = viewport.width;
-        const remaining = width - paragraph_layout.size.width - input.caret_width;
-        const minimum = @min(0, remaining);
+        const overhang = textInputCaretOverhang(
+            &paragraph_layout.positioned,
+            input,
+            paragraph_layout.size.width,
+        ) catch return error.InvalidTextInputRange;
+        const caret = textInputCaretRectangle(&paragraph_layout.positioned, input) catch
+            return error.InvalidTextInputRange;
+        const left = @max(0, -caret.x);
+        const remaining = width - paragraph_layout.size.width - overhang;
+        const minimum = @min(0, remaining) + left;
         if (remaining >= 0 or !target.has_layout) {
             const rtl = paragraph_layout.positioned.lines[0].base_level & 1 != 0;
-            target.text_offset_x = switch (input.alignment) {
+            target.text_offset_x = left + switch (input.alignment) {
                 .start => if (rtl) remaining else 0,
                 .end => if (rtl) 0 else remaining,
                 .center => remaining / 2,
                 .justify => 0,
             };
         } else {
-            target.text_offset_x = std.math.clamp(target.text_offset_x, minimum, 0);
+            target.text_offset_x = std.math.clamp(target.text_offset_x, minimum, left);
         }
         const minimum_y = if (input.multiline) @min(0, viewport.height - paragraph_layout.size.height) else 0;
         target.text_offset_y = std.math.clamp(target.text_offset_y, minimum_y, 0);
         if (!input.reveal_caret and !input.show_caret) return;
-        const caret = paragraph_layout.positioned.caretRectangleForOffset(
-            input.caret_offset,
-            input.caret_affinity,
-            input.caret_width,
-        ) catch return error.InvalidTextInputRange;
         if (caret.x + target.text_offset_x + caret.width > width)
             target.text_offset_x = width - caret.x - caret.width;
         if (caret.x + target.text_offset_x < 0)
             target.text_offset_x = -caret.x;
         if (remaining < 0)
-            target.text_offset_x = std.math.clamp(target.text_offset_x, minimum, 0);
+            target.text_offset_x = std.math.clamp(target.text_offset_x, minimum, left);
         if (caret.y + target.text_offset_y + caret.height > viewport.height)
             target.text_offset_y = viewport.height - caret.y - caret.height;
         if (caret.y + target.text_offset_y < 0)
@@ -1535,6 +1553,7 @@ fn layoutPropertiesChanged(old: types.Object, new: types.Object) bool {
             (old_input.placeholder != null and (old_input.preedit == null) != (new.text_input.preedit == null)) or
             old_input.alignment != new.text_input.alignment or
             old_input.caret_width != new.text_input.caret_width or
+            old_input.caret_shape != new.text_input.caret_shape or
             old_input.multiline != new.text_input.multiline,
     };
 }
@@ -1580,6 +1599,42 @@ fn hasCaretBoundary(positioned: *const text.PositionedLines, byte_offset: usize)
     return false;
 }
 
+fn textInputCaretRectangle(
+    positioned: *const text.PositionedLines,
+    input: types.TextInput,
+) !RectF {
+    if (input.caret_shape == .beam) return positioned.caretRectangleForOffset(
+        input.caret_offset,
+        input.caret_affinity,
+        input.caret_width,
+    );
+    var rectangle = try positioned.caretGraphemeRectangleForOffset(
+        input.caret_offset,
+        input.caret_affinity,
+    );
+    if (input.caret_shape == .underline) {
+        const thickness = @min(input.caret_width, rectangle.height);
+        rectangle.y += rectangle.height - thickness;
+        rectangle.height = thickness;
+    }
+    return rectangle;
+}
+
+fn textInputCaretOverhang(
+    positioned: *const text.PositionedLines,
+    input: types.TextInput,
+    paragraph_width: f32,
+) !f32 {
+    if (input.caret_shape == .beam) return input.caret_width;
+    // Reserve fallback space even while the caret covers an interior grapheme.
+    // Otherwise an unbounded field changes intrinsic width at EOL, and a
+    // centered field shifts its text when only the selection moved.
+    var reserve: f32 = 1;
+    for (positioned.lines) |line| reserve = @max(reserve, (line.ascender - line.descender) * 0.5);
+    const rectangle = try textInputCaretRectangle(positioned, input);
+    return @max(reserve, @max(0, -rectangle.x) + @max(0, rectangle.x + rectangle.width - paragraph_width));
+}
+
 test "layout property classification includes geometry and excludes paint-only state" {
     for ([_]types.Box{
         .{ .min_width = 10 },      .{ .min_height = 5 }, .{ .fill_width = true }, .{ .fill_height = true },
@@ -1602,6 +1657,9 @@ test "layout property classification includes geometry and excludes paint-only s
     var wider_caret = input;
     wider_caret.caret_width = 3;
     try std.testing.expect(layoutPropertiesChanged(.{ .text_input = input }, .{ .text_input = wider_caret }));
+    var block_caret = input;
+    block_caret.caret_shape = .block;
+    try std.testing.expect(layoutPropertiesChanged(.{ .text_input = input }, .{ .text_input = block_caret }));
 
     try std.testing.expect(!layoutPropertiesChanged(
         .{ .box = .{} },
@@ -2154,6 +2212,24 @@ test "multiline viewport wraps reveals trailing caret and preserves manual scrol
     const paragraph = try paragraphs.get((try tree.slot(input)).paragraph_layout.?);
     try std.testing.expect(paragraph.positioned.lines.len > 4);
     const narrow_height = paragraph.size.height;
+    const beam_layout = (try tree.slot(input)).paragraph_layout.?;
+    for ([_]types.CaretShape{ .block, .underline, .beam }) |shape| {
+        object.text_input.caret_shape = shape;
+        try tree.update(input, object);
+        _ = try tree.layout(input, .{ .max_width = 150, .max_height = 60 });
+        // Shape changes must reuse precisely the same shaped/wrapped paragraph.
+        try std.testing.expectEqual(beam_layout, (try tree.slot(input)).paragraph_layout.?);
+        const shaped_caret = try tree.textCaretRectangle(input);
+        try std.testing.expect(shaped_caret.width > 0);
+        try std.testing.expect(shaped_caret.x >= 0 and shaped_caret.x + shaped_caret.width <= 150.001);
+        try std.testing.expect(shaped_caret.y >= 0 and shaped_caret.y + shaped_caret.height <= 60.001);
+        var shape_commands: [8]scene.Command = undefined;
+        var shape_builder = try scene_builder.Builder.init(&shape_commands, 1);
+        try tree.buildScene(input, &shape_builder);
+        const painted_shape = shape_builder.displayList().commands;
+        try std.testing.expect(painted_shape[if (shape == .block) @as(usize, 1) else 2] == .solid_rectangle);
+        try std.testing.expect(painted_shape[if (shape == .block) @as(usize, 2) else 1] == .paragraph);
+    }
     const caret = try tree.textCaretRectangle(input);
     try std.testing.expect(caret.y >= 0 and caret.y + caret.height <= 60.001);
     try std.testing.expectEqual(value.len, (try tree.hitTestText(input, .{ .x = caret.x, .y = caret.y + caret.height / 2 })).caret.byte_offset);
@@ -2286,6 +2362,22 @@ test "text input scrolls one line and shares viewport coordinates with caret hit
         try std.testing.expectApproxEqAbs(intrinsic.width + 4, (try tree.nodeSize(input)).width, 0.001);
         try std.testing.expectEqual(intrinsic.height, (try tree.nodeSize(input)).height);
         try std.testing.expectEqual(@as(f32, 5), (try tree.textCaretRectangle(input)).width);
+        for ([_]types.CaretShape{ .block, .underline }) |shape| {
+            object.text_input.caret_shape = shape;
+            object.text_input.caret_offset = 0;
+            try tree.update(input, object);
+            const start_size = try tree.layout(input, .{ .max_height = 100 });
+            object.text_input.caret_offset = value.len;
+            try tree.update(input, object);
+            try std.testing.expectEqual(start_size, try tree.layout(input, .{ .max_height = 100 }));
+            _ = try tree.layout(input, .{ .max_width = 57, .max_height = 100 });
+            caret = try tree.textCaretRectangle(input);
+            try std.testing.expect(caret.x >= 0 and caret.x + caret.width <= 57.001);
+            if (rtl) {
+                try std.testing.expectApproxEqAbs(@as(f32, 0), caret.x, 0.001);
+                try std.testing.expectEqual(@as(f32, 0), try tree.textScrollDelta(input, .horizontal, -100));
+            }
+        }
         try tree.destroy(input);
     }
 }

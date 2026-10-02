@@ -760,6 +760,7 @@ pub const WindowRuntime = struct {
             };
             self.semantics.commitStaged();
             try self.syncDialogFocus();
+            const previous_focus = self.focus.current();
             if (self.callback_scope != null and self.focus.current() == null)
                 _ = try self.focus.advance(&self.instances, .forward);
             if (self.text_inputs.takeAutofocus()) |target| {
@@ -771,7 +772,9 @@ pub const WindowRuntime = struct {
             for (0..self.buttons.slotCount()) |index|
                 if (self.buttons.targetAt(index)) |target| try self.applyButtonUpdate(target);
             try self.refreshListBoxVisuals();
-            try self.applyFocusVisual(null, self.focus.current());
+            // Refresh paint without inventing a focus transition on every
+            // controlled echo; real focus changes alone delimit typing groups.
+            try self.applyFocusVisual(previous_focus, self.focus.current());
             self.virtual_lists = lua_ui.virtual_lists;
             self.layout_builders = lua_ui.layout_builders;
             self.animations.reconcile(lua_ui.animationDescriptors()) catch unreachable;
@@ -1778,7 +1781,7 @@ pub const WindowRuntime = struct {
             // A wl_keyboard key reaching the client was not consumed by the
             // input method. Advertising text-input-v3 alone does not own text
             // entry; ordinary typing must also work without an active IME.
-            if (behavior.enabled and !behavior.read_only and
+            if (behavior.enabled and !behavior.read_only and behavior.text_entry and
                 session.preedit() == null and !translated.modifiers.control and
                 !translated.modifiers.alt and !translated.modifiers.logo and
                 translated.unicode >= 0x20 and translated.unicode <= 0x10ffff and
@@ -2637,6 +2640,11 @@ pub const WindowRuntime = struct {
                 session.preferred_x = null;
                 break :blk session.model.selectAll();
             },
+            .collapse_selection => blk: {
+                session.preferred_x = null;
+                const selection = session.model.selection;
+                break :blk try session.model.setSelection(.collapsedAt(selection.extent, selection.extent_affinity));
+            },
             .undo, .redo => blk: {
                 session.preferred_x = null;
                 break :blk if (intent == .undo) session.model.undo() else session.model.redo();
@@ -2644,6 +2652,10 @@ pub const WindowRuntime = struct {
             .insert_newline => blk: {
                 session.preferred_x = null;
                 break :blk if (session.model.multiline) try session.model.replaceSelection("\n") else false;
+            },
+            .insert_line_above, .insert_line_below => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.insertLine(intent == .insert_line_above);
             },
             .delete_backward => blk: {
                 session.preferred_x = null;
@@ -2669,6 +2681,10 @@ pub const WindowRuntime = struct {
                 .word_next => blk: {
                     session.preferred_x = null;
                     break :blk session.model.moveWordNext(move.extend);
+                },
+                .logical_line_start, .logical_line_end => blk: {
+                    session.preferred_x = null;
+                    break :blk session.model.moveLogicalLine(move.destination == .logical_line_end, move.extend);
                 },
                 else => try self.moveTextInputCaret(target, session, move),
             },
@@ -2760,7 +2776,7 @@ pub const WindowRuntime = struct {
         };
 
         const next = switch (move.destination) {
-            .word_previous, .word_next => unreachable,
+            .word_previous, .word_next, .logical_line_start, .logical_line_end => unreachable,
             .document_start, .document_end => blk: {
                 session.preferred_x = null;
                 break :blk text.CaretStop{
@@ -3040,7 +3056,7 @@ pub const WindowRuntime = struct {
                 const behavior = try self.text_inputs.getBehavior(target);
                 // Masked text is never shared with an input method.
                 const masked = (try self.text_inputs.session(target)).model.isSecret();
-                if (behavior.enabled and !behavior.read_only and !masked) owner = .{
+                if (behavior.enabled and !behavior.read_only and behavior.text_entry and !masked) owner = .{
                     .target = target,
                     .session = try self.text_inputs.sessionGeneration(target),
                 };
@@ -4377,6 +4393,40 @@ test "text input protocol batches and transformed pointer selection use retained
     _ = runtime.pointer_bindings.remove(target);
     _ = try runtime.pointer_bindings.set(owner, target, .{ .id = callback, .kind = .text_input_change });
 
+    // Modal entry suppression is not read-only: typing and IME are blocked,
+    // while explicit edits and clipboard paste still share native undo.
+    var command_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(std.testing.allocator, "ignored");
+    defer if (command_candidate) |*session_value| session_value.deinit();
+    try runtime.text_inputs.mountPrepared(owner, target, content, .uncontrolled, .{ .text_entry = false }, &command_candidate);
+    try runtime.syncTextInputVisuals();
+    try std.testing.expect((try runtime.textInputStatus()) == null);
+    const before_commands = try std.testing.allocator.dupe(u8, editing.model.text());
+    defer std.testing.allocator.free(before_commands);
+    try runtime.routeKeyboard(character);
+    try runtime.routeTextInput(.{ .batch = .{
+        .window = window,
+        .serial = 11,
+        .serial_matches_state = true,
+        .delete_surrounding = null,
+        .commit = .{ .text = "blocked" },
+        .preedit = null,
+    } });
+    try runtime.dispatchInput(&callbacks);
+    try std.testing.expectEqualStrings(before_commands, editing.model.text());
+    try std.testing.expect(scheduler.takeRunnable() == null);
+    try std.testing.expect(try runtime.applyClipboardPaste(&callbacks, target, "pasted"));
+    _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+    try runtime.applyTextInputAction(target, .{ .edit = .undo }, 0, &callbacks);
+    _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+    try std.testing.expectEqualStrings(before_commands, editing.model.text());
+    _ = editing.model.selectAll();
+    try runtime.applyTextInputAction(target, .{ .edit = .delete_forward }, 0, &callbacks);
+    _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+    try std.testing.expectEqualStrings("", editing.model.text());
+    try runtime.applyTextInputAction(target, .{ .edit = .undo }, 0, &callbacks);
+    _ = try callback_vm.resumeRunnable(scheduler.takeRunnable().?);
+    try std.testing.expectEqualStrings(before_commands, editing.model.text());
+
     var read_only_candidate: ?ui.text_input.Session = try ui.text_input.Session.init(
         std.testing.allocator,
         "ignored",
@@ -4445,8 +4495,8 @@ fn pointerListenerEvent(event: ui.input.Event) ?listener.Event {
 
 fn intentEditsText(intent: ui.text_input.EditIntent) bool {
     return switch (intent) {
-        .undo, .redo, .insert_newline, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
-        .select_all, .move => false,
+        .undo, .redo, .insert_newline, .insert_line_above, .insert_line_below, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
+        .select_all, .collapse_selection, .move => false,
     };
 }
 

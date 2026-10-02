@@ -3,9 +3,12 @@
 /// mutating an editable model directly.
 pub const Intent = union(enum) {
     select_all,
+    collapse_selection,
     undo,
     redo,
     insert_newline,
+    insert_line_above,
+    insert_line_below,
     delete_backward,
     delete_forward,
     delete_word_backward,
@@ -27,6 +30,8 @@ pub const Destination = enum {
     line_down,
     line_start,
     line_end,
+    logical_line_start,
+    logical_line_end,
     document_start,
     document_end,
 };

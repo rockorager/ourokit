@@ -357,6 +357,7 @@ fn runSourceInternal(
     defer if (snapshot_owned) snapshot.deinit();
     const module_root = try provider.openModuleRoot(init.io);
     defer if (module_root) |directory| directory.close(init.io);
+    const module_root_fd = if (module_root) |directory| directory.handle else options.asset_root;
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 128, 32);
     defer loop.deinit();
@@ -410,13 +411,13 @@ fn runSourceInternal(
     };
     // SourceGeneration consumes the snapshot on both success and failure.
     snapshot_owned = false;
-    const initial_generation = if (module_root) |directory|
+    const initial_generation = if (module_root_fd) |root|
         try SourceGeneration.createBootstrap(
             init.gpa,
             &scheduler,
             &loop,
             snapshot,
-            directory.handle,
+            root,
             null,
             generation_config,
             &diagnostic,
@@ -474,7 +475,7 @@ fn runSourceInternal(
         initial_generation,
     );
     source_reload.appearance = &appearance_client;
-    if (module_root) |directory| source_reload.attachModuleRoot(directory.handle);
+    if (module_root_fd) |root| source_reload.attachModuleRoot(root);
     initial_generation_owned = false;
     var sources_destroyed = false;
     defer if (!sources_destroyed) {

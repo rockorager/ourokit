@@ -466,6 +466,28 @@ pub const Model = struct {
         return .{ .start = start, .end = end };
     }
 
+    pub fn moveLogicalLine(self: *Model, end: bool, extend: bool) bool {
+        const line = self.lineRangeAt(self.selection.extent);
+        const offset = if (!end) line.start else if (line.end > line.start and self.text()[line.end - 1] == '\n') line.end - 1 else line.end;
+        return self.setExtent(offset, extend);
+    }
+
+    /// Inserts an empty hard line at the active extent's line, not a wrapped
+    /// visual line. Preserves selected text and records one undoable edit.
+    pub fn insertLine(self: *Model, above: bool) !bool {
+        if (!self.multiline) return false;
+        const line = self.lineRangeAt(self.selection.extent);
+        const offset = if (above) line.start else if (line.end > line.start and self.text()[line.end - 1] == '\n') line.end - 1 else line.end;
+        const changed = try self.replaceRange(.{ .start = offset, .end = offset }, "\n");
+        if (above) {
+            // replaceRange positions after inserted bytes; the new line above
+            // starts before them. Redo must restore this final caret too.
+            self.selection = .collapsed(offset);
+            self.history.items[self.history_cursor - 1].selection_after = self.selection;
+        }
+        return changed;
+    }
+
     fn rebuildBoundaries(self: *Model) void {
         const bytes = self.text();
         self.boundaries.clearRetainingCapacity();
@@ -992,6 +1014,45 @@ test "text input repeated typing amortizes allocations and does not flatten the 
     try std.testing.expectEqualStrings("left right", model.text());
     try std.testing.expect(model.redo());
     try std.testing.expectEqualStrings("left " ++ "k" ** 4096 ++ "right", model.text());
+}
+
+test "logical line edits preserve selected text and restore caret and selection through history" {
+    const original = "Wé\n\nlast";
+    for ([_]bool{ false, true }) |above| {
+        var model = try Model.initWithMode(std.testing.allocator, original, true);
+        defer model.deinit();
+        const reversed: Selection = .{ .anchor = original.len, .extent = 1 };
+        _ = try model.setSelection(reversed);
+        try std.testing.expect(try model.insertLine(above));
+        try std.testing.expectEqualStrings(if (above) "\nWé\n\nlast" else "Wé\n\n\nlast", model.text());
+        const after = Selection.collapsed(if (above) 0 else 4);
+        try std.testing.expectEqual(after, model.selection);
+        try std.testing.expect(model.undo());
+        try std.testing.expectEqualStrings(original, model.text());
+        try std.testing.expectEqual(reversed, model.selection);
+        try std.testing.expect(!model.undo());
+        try std.testing.expect(model.redo());
+        try std.testing.expectEqual(after, model.selection);
+    }
+    var model = try Model.initWithMode(std.testing.allocator, original, true);
+    defer model.deinit();
+    _ = try model.setSelection(.{ .anchor = 1, .extent = 6 });
+    try std.testing.expect(model.moveLogicalLine(false, true));
+    try std.testing.expectEqual(Selection{ .anchor = 1, .extent = 5 }, model.selection);
+    try std.testing.expect(model.moveLogicalLine(true, false));
+    try std.testing.expectEqual(Selection.collapsed(9), model.selection);
+    try std.testing.expect(try model.insertLine(false));
+    try std.testing.expectEqualStrings("Wé\n\nlast\n", model.text());
+    try std.testing.expectEqual(Selection.collapsed(10), model.selection);
+    try std.testing.expect(try model.insertLine(true));
+    try std.testing.expectEqualStrings("Wé\n\nlast\n\n", model.text());
+    try std.testing.expectEqual(Selection.collapsed(10), model.selection);
+
+    var single = try Model.init(std.testing.allocator, "no newline");
+    defer single.deinit();
+    try std.testing.expect(!try single.insertLine(true));
+    try std.testing.expect(!try single.insertLine(false));
+    try std.testing.expect(!single.undo());
 }
 
 test "secret model edits in place, caps length, rejects controls and wipes removed bytes" {

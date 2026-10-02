@@ -170,6 +170,8 @@ pub const TextRange = struct {
     end: usize,
 };
 
+pub const CaretShape = enum { beam, block, underline };
+
 /// Immutable presentation snapshot for retained editable text. The owning
 /// TextInput session remains in `ui/text_input`; application coordination
 /// replaces this value when committed text, selection, or focus changes.
@@ -187,6 +189,8 @@ pub const TextInput = struct {
     selection_end: usize,
     caret_offset: usize,
     caret_affinity: CaretAffinity = .downstream,
+    caret_shape: CaretShape = .beam,
+    /// Beam thickness, and underline thickness for an underline caret.
     caret_width: f32 = 1,
     show_caret: bool = false,
     /// Reveal the selection extent even when a range hides the painted caret.

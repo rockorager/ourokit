@@ -28,6 +28,7 @@ pub extern fn luaL_newmetatable(state: *State, name: [*:0]const u8) c_int;
 pub extern fn luaL_testudata(state: *State, index: c_int, name: [*:0]const u8) ?*anyopaque;
 pub extern fn luaL_ref(state: *State, table_index: c_int) c_int;
 pub extern fn luaL_unref(state: *State, table_index: c_int, reference: c_int) void;
+pub extern fn luaL_traceback(state: *State, from: *State, message: ?[*:0]const u8, level: c_int) void;
 pub extern fn lua_close(state: *State) void;
 pub extern fn lua_gc(state: *State, what: c_int, ...) c_int;
 pub extern fn lua_newthread(state: *State) ?*State;

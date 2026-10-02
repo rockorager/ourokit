@@ -354,12 +354,15 @@ an explicit zero overrides a broader inset. Box alignment accepts all nine
 positions: `top_left`, `top`, `top_right`, `left`, `center`, `right`,
 `bottom_left`, `bottom`, `bottom_right`. Left/right remain vertically centered;
 top/bottom are horizontally centered. Positions are physical, not text-direction
-dependent. Alignment loosens child constraints and places the child inside the
+dependent. Box alignment loosens child constraints and places the child inside the
 padding and border; omitting it preserves the existing constraint propagation.
+Text paragraph alignment instead accepts `start`, `center`, `end`, or `justify`;
+`start` and `end` follow the paragraph direction, not physical left/right.
 `text.weight` accepts `normal` or `medium`, using the
 host's matching font candidates. Decorative boxes/text may set `semantic=false`;
-their descendants keep the nearest semantic parent. Activation owners must
-remain semantic. Text editing, IME, selection, sliders, and other specialized
+empty text is omitted from semantics automatically while retaining its layout
+and native identity. Decorative descendants keep the nearest semantic parent.
+Activation owners must remain semantic. Text editing, IME, selection, sliders, and other specialized
 native policies are unchanged by this composition boundary.
 
 Desktop components use a distinct layer-shell declaration rather than a mode
@@ -2280,6 +2283,46 @@ discards the redo branch. Changing `multiline` replaces the editing session
 from the current declaration, clearing composition and history and clamping
 the retained selection, including for uncontrolled fields.
 
+Set `text_entry = false` on `text_editor` or `text_input` to suppress unbound
+printable keys and input-method entry without making the document read-only.
+Explicit key-binding actions (including undo, deletion, cut, paste, and newline)
+still work. This is useful for command modes: set `text_entry = mode == 'insert'`
+and supply mode-specific `key_bindings`. Use `read_only` when *all* edits must be
+blocked. Switching entry policy retains text, selection and history, ends the
+current undo group, and cancels uncommitted IME composition. Enabled/read-only
+guards still take precedence. Development inspection reports `text_entry`;
+text injection into a suppressed field returns `DevelopmentTargetTextEntryDisabled`.
+This policy does not supply Vim motions or a Lua selection/range-edit controller.
+
+`caret_shape = 'beam' | 'block' | 'underline'` is available on both controls;
+the default is `beam`. Block and underline follow the shaped advance of the next
+logical grapheme at the caret's visual position, including proportional and bidi
+text. At an empty line, end of line, or upstream wrap edge they use half the
+font-metric line height (at least one logical pixel). Blocks paint behind glyphs
+with alpha capped at 128; underline thickness uses `caret_width`. Shape changes
+do not change wrapping, selection, text, or undo history. Existing focus, blink,
+and nonempty-selection visibility rules still apply. A shape does not imply an
+editing mode or overwrite behavior.
+
+Additional native binding actions support command-mode applications:
+
+- `collapse_selection` collapses at the active extent, retaining its affinity,
+  without moving another grapheme or changing text/history.
+- `move_logical_line_start`, `move_logical_line_end`, and their `select_` variants
+  target the extent's hard line, excluding its terminating LF. Existing
+  `move_line_start`/`move_line_end` continue to target visual wrapped lines.
+- `insert_line_above` and `insert_line_below` insert one LF at the extent's hard
+  line boundary and leave the caret on the new empty line. They preserve selected
+  text and form one undoable edit, restoring the previous selection on undo and
+  the new caret on redo. They are no-ops for single-line or read-only fields.
+
+For example, bind `O` to `insert_line_below`, then use an enclosing box's filtered
+`on_key` listener with `propagate=true` to switch an application signal to Insert
+mode. The native action runs at the input safe point; the scheduled Lua listener
+changes mode for the subsequent rebuild. Keep the editor's key and uncontrolled
+`default_text` stable so that mode changes retain its session. These actions do
+not add a callback-accessible mutable editor or implement Vim policy.
+
 Text input shortcuts are configurable. `ouro.app.text_input_bindings` supplies
 app-wide overrides; `ouro.text_input.key_bindings` overrides those for one field.
 Both are tables from key chords to semantic action names:
@@ -2335,7 +2378,13 @@ one of `visual_left`, `visual_right`, `word_previous`, `word_next`, `line_up`,
 `line_down`, `line_start`, `line_end`, `document_start`, or `document_end`.
 `insert_newline` only edits multiline fields. For example, `select_line_end` extends
 the selection to the line end. Without `on_command`, `previous` and `next` fall
-back to line-up/down caret movement. Unbound printable keys still enter text;
+back to line-up/down caret movement. With a handler they are application
+commands (for example, search-result navigation); its return value does not
+trigger a native fallback. Bind Up/Down to `move_line_up`/`move_line_down` to
+keep caret navigation in a single-line command field. Multiline defaults
+already use those direct movement actions. `move_word_next` is native
+Ctrl+Right movement to the current word's end, not Vim `w` to the next word's
+start. Unbound printable keys enter text when `text_entry` is enabled;
 unbound Tab/Shift+Tab still traverse focus. Key releases never invoke actions.
 Editing/navigation may repeat; clipboard, submit, and cancel actions fire only
 on the initial press. Remapping does not bypass enabled/read-only or IME guards.
@@ -2373,7 +2422,8 @@ OS accessibility bridge. Neither prop changes editing or focus behavior.
 
 `ouro.text_input` accepts `autofocus = true` to focus a newly mounted, enabled
 input once (retained rebuilds do not reclaim focus). `on_command(command)` runs
-in the owning task scope for bound command actions. Defaults are unmodified
+in the owning task scope for bound command actions. Single-line defaults are
+unmodified
 `Enter` (`"submit"`), `Escape` (`"cancel"`), `Up` (`"previous"`), and `Down`
 (`"next"`). Navigation may repeat; submit/cancel only fire on the initial press.
 Commands are withheld during IME preedit. `on_command` and `on_change` may be

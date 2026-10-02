@@ -71,7 +71,10 @@ pub const ModuleLoader = struct {
 
     pub fn deinit(self: *ModuleLoader) void {
         for (self.slots) |*slot| {
-            std.debug.assert(slot.state == .free or slot.state == .loaded);
+            // Closing a canceled coroutine may leave an outer module waiting
+            // on a nested require. All I/O must be drained before destruction.
+            std.debug.assert(slot.state == .free or slot.state == .loaded or
+                ((slot.state == .evaluating or slot.state == .ready) and self.vm.activeTaskCount() == 0));
             self.release(slot);
         }
         self.reader.deinit();
@@ -180,9 +183,18 @@ pub const ModuleLoader = struct {
 
     fn loadContinuation(state: *c.State, _: c_int, context: c.KContext) callconv(.c) c_int {
         const slot = slotFromContext(context);
-        if (slot.failure != null) {
+        if (slot.failure) |err| {
+            _ = c.lua_pushstring(state, "module '");
+            _ = c.lua_pushlstring(state, slot.paths.?.canonical.ptr, slot.paths.?.canonical.len);
+            _ = c.lua_pushstring(state, "' could not be read (");
+            _ = c.lua_pushstring(state, @errorName(err));
+            _ = c.lua_pushstring(state, "): tried ");
+            _ = c.lua_pushlstring(state, slot.paths.?.file.ptr, slot.paths.?.file.len);
+            _ = c.lua_pushstring(state, " and ");
+            _ = c.lua_pushlstring(state, slot.paths.?.init.ptr, slot.paths.?.init.len);
+            c.lua_concat(state, 8);
             slot.loader.release(slot);
-            return luaError(state, "module source could not be read");
+            return c.lua_error(state);
         }
         const contents = &slot.contents.?;
         const selected_path = if (slot.used_init_path) slot.paths.?.init else slot.paths.?.file;

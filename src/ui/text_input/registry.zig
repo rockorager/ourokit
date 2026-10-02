@@ -8,6 +8,8 @@ pub const ValueMode = enum { uncontrolled, controlled };
 pub const Behavior = struct {
     enabled: bool = true,
     read_only: bool = false,
+    /// Direct keyboard/IME entry only; native editing commands remain enabled.
+    text_entry: bool = true,
     autofocus: bool = false,
     key_bindings: @import("keymap.zig").Keymap = .{},
     border_color: ?@import("../../core/color.zig").Color = null,
@@ -143,7 +145,8 @@ pub const Registry = struct {
         for (self.entries[0..self.entry_limit]) |*entry| if (entry.active and same(entry.target, target)) {
             entry.owner = owner;
             entry.content = content_handle;
-            if (entry.behavior.enabled != behavior.enabled or entry.behavior.read_only != behavior.read_only)
+            if (entry.behavior.enabled != behavior.enabled or entry.behavior.read_only != behavior.read_only or
+                entry.behavior.text_entry != behavior.text_entry)
                 entry.session.?.model.breakUndoGroup();
             if (!behavior.enabled) entry.session.?.endSelectionDrag();
             entry.seen = true;

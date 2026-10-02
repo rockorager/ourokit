@@ -168,6 +168,10 @@ pub const Snapshot = struct {
     }
 
     fn validateOne(self: *Snapshot, id: u64, parent: ?u64, role: Role, key: []const u8, label: []const u8, range: ?Range, node_count: *usize, text_count: *usize, dialog_seen: *bool) !void {
+        errdefer |err| std.debug.print("semantics: widget '{s}' ({s}): {s}{s}\n", .{
+            key,                                                                           @tagName(role), @errorName(err),
+            if (err == error.SemanticLabelRequired) "; provide a non-empty label" else "",
+        });
         if (role == .dialog) {
             if (dialog_seen.*) return error.MultipleDialogsUnsupported;
             dialog_seen.* = true;

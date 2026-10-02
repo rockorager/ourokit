@@ -217,7 +217,15 @@ fn reloadApplication(init: std.process.Init, socket_path: []const u8) !void {
 fn listStories(init: std.process.Init, options: cli.List) !void {
     const source = try readSource(init, options.path);
     defer init.gpa.free(source);
-    var description = try ourokit.app.storybook.describe(init, source);
+    const parent = std.fs.path.dirname(options.path) orelse ".";
+    var module_root = if (std.fs.path.isAbsolute(parent))
+        try std.Io.Dir.openDirAbsolute(init.io, parent, .{})
+    else
+        try std.Io.Dir.cwd().openDir(init.io, parent, .{});
+    defer module_root.close(init.io);
+    const chunk_name = try std.fmt.allocPrintSentinel(init.gpa, "@{s}", .{std.fs.path.basename(options.path)}, 0);
+    defer init.gpa.free(chunk_name);
+    var description = try ourokit.app.storybook.describeAt(init, source, module_root.handle, chunk_name);
     defer description.deinit();
 
     var output: std.Io.Writer.Allocating = .init(init.gpa);
@@ -261,7 +269,9 @@ fn snapshotStories(init: std.process.Init, options: cli.Snapshot) !void {
     else
         try std.Io.Dir.cwd().openDir(init.io, parent, .{});
     defer asset_root.close(init.io);
-    var description = try ourokit.app.storybook.describe(init, source);
+    const chunk_name = try std.fmt.allocPrintSentinel(init.gpa, "@{s}", .{std.fs.path.basename(options.path)}, 0);
+    defer init.gpa.free(chunk_name);
+    var description = try ourokit.app.storybook.describeAt(init, source, asset_root.handle, chunk_name);
     defer description.deinit();
     if (options.story_id) |id| {
         var found = false;
@@ -285,7 +295,7 @@ fn snapshotStories(init: std.process.Init, options: cli.Snapshot) !void {
 
     for (description.stories) |story| {
         if (options.story_id) |selected| if (!std.mem.eql(u8, story.id, selected)) continue;
-        var snapshot = try ourokit.app.storybook.snapshot(init, source, story.id, asset_root.handle);
+        var snapshot = try ourokit.app.storybook.snapshotNamed(init, source, story.id, asset_root.handle, chunk_name);
         defer snapshot.deinit();
         const file_name = try std.fmt.allocPrint(init.gpa, "{s}.png", .{snapshot.id});
         defer init.gpa.free(file_name);

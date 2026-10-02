@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig");
+const diagnostic = @import("diagnostic.zig");
 const Description = @import("description.zig").Description;
 const Components = @import("components.zig").Components;
 const virtual_list = @import("../ui/widget/virtual_list.zig");
@@ -276,7 +277,7 @@ pub const UiBuild = struct {
             .integer => |value| c.lua_pushinteger(self.state, value),
             .boolean => |value| c.lua_pushboolean(self.state, @intFromBool(value)),
         };
-        var status = c.lua_pcallk(self.state, @intCast(arguments.len + 1), 1, 0, 0, null);
+        var status = diagnostic.pcall(self.state, @intCast(arguments.len + 1), 1);
         if (status == c.ok) {
             c.lua_pushvalue(self.state, -1);
             self.root_reference = c.luaL_ref(self.state, c.registry_index);
@@ -298,7 +299,7 @@ pub const UiBuild = struct {
             c.lua_pushlightuserdata(self.state, self);
             c.lua_pushcclosure(self.state, lowerDescription, 1);
             _ = c.lua_rawgeti(self.state, c.registry_index, self.root_reference);
-            status = c.lua_pcallk(self.state, 1, 0, 0, 0, null);
+            status = diagnostic.pcall(self.state, 1, 0);
             if (status != c.ok or self.layout_builders.count == 0) break;
             // Isolated measurement requires a complete tree. A builder may
             // appear after a retained sibling, so restart before measuring.
@@ -312,13 +313,14 @@ pub const UiBuild = struct {
         }
         if (status == c.ok) {
             self.components.push("finish");
-            status = c.lua_pcallk(self.state, 0, 1, 0, 0, null);
+            status = diagnostic.pcall(self.state, 0, 1);
             if (status == c.ok) {
                 c.luaL_unref(self.state, c.registry_index, self.root_reference);
                 self.root_reference = c.luaL_ref(self.state, c.registry_index);
             }
         }
         if (status != c.ok) {
+            diagnostic.logLuaStack(self.state);
             if (status == c.yield) return error.LuaBuildYielded;
             return error.LuaBuildFailed;
         }
@@ -1383,6 +1385,8 @@ pub const UiBuild = struct {
             return luaError(state, "invalid text_editor padding_y");
         const alignment = tableOptionalBoxAlignment(state, 1) orelse
             return luaError(state, "invalid text_editor alignment");
+        const caret_shape = tableOptionalEnum(render_types.CaretShape, state, 1, "caret_shape", .beam) orelse
+            return luaError(state, "invalid caret_shape; expected beam, block, or underline");
         var colors = .{
             .placeholder_color = theme.muted_foreground,
             .selection_color = theme.selection,
@@ -1397,6 +1401,8 @@ pub const UiBuild = struct {
             return luaError(state, "text_input enabled must be a boolean");
         const read_only = tableOptionalBoolean(state, 1, "read_only", false) orelse
             return luaError(state, "text_input read_only must be a boolean");
+        const text_entry = tableOptionalBoolean(state, 1, "text_entry", true) orelse
+            return luaError(state, "text_input text_entry must be a boolean");
         const autofocus = tableOptionalBoolean(state, 1, "autofocus", false) orelse
             return luaError(state, "text_input autofocus must be a boolean");
         var bindings = @import("key_bindings.zig").field(state, 1, "key_bindings", self.text_input_bindings) catch |err|
@@ -1413,7 +1419,7 @@ pub const UiBuild = struct {
             .target_id = target_id,
             .content_id = content_id,
             .mode = mode,
-            .behavior = .{ .enabled = enabled, .read_only = read_only, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border, .focus_color = visual.focus orelse theme.ring, .secret = secret },
+            .behavior = .{ .enabled = enabled, .read_only = read_only, .text_entry = text_entry, .autofocus = autofocus, .key_bindings = bindings, .border_color = visual.border, .focus_color = visual.focus orelse theme.ring, .secret = secret },
             .session = if (mask)
                 TextInputSession.initSecret(sources.allocator) catch return luaError(state, "cannot create masked text_input session")
             else
@@ -1485,6 +1491,7 @@ pub const UiBuild = struct {
                 .color = visual.foreground orelse theme.foreground,
                 .selection_color = colors.selection_color,
                 .caret_color = colors.caret_color,
+                .caret_shape = caret_shape,
                 .selection_start = initial.len,
                 .selection_end = initial.len,
                 .caret_offset = initial.len,
@@ -1597,7 +1604,7 @@ pub const UiBuild = struct {
             visual.font_size orelse defaults.typography.size orelse design.tokens.foundation.typography_3,
         ) orelse return luaError(state, "invalid text size");
         const alignment = tableOptionalParagraphAlignment(state, 1, "alignment", .start) orelse
-            return luaError(state, "invalid text alignment");
+            return luaError(state, "invalid text alignment; expected start, center, end, or justify (logical, not left/right)");
         const max_lines_value = tableOptionalPositiveInteger(state, 1, "max_lines", 0) orelse
             return luaError(state, "invalid text max_lines");
         const overflow = tableOptionalParagraphOverflow(state, 1, "overflow", .clip) orelse
@@ -1633,7 +1640,7 @@ pub const UiBuild = struct {
         };
         self.sources_staged = true;
         const semantic = tableOptionalBoolean(state, 1, "semantic", true) orelse return luaError(state, "semantic must be boolean");
-        if (semantic) self.appendSemantic(.{
+        if (semantic and value.len != 0) self.appendSemantic(.{
             .id = id,
             .parent = semanticParent(parent),
             .role = .text,
@@ -3117,6 +3124,16 @@ fn finiteFloat(state: *c.State, index: c_int) ?f32 {
 }
 
 fn luaError(state: *c.State, message: [*:0]const u8) c_int {
+    if (c.lua_type(state, 1) == c.type_table) {
+        if (tableString(state, 1, "key")) |key| {
+            _ = c.lua_pushstring(state, "widget '");
+            _ = c.lua_pushlstring(state, key.ptr, key.len);
+            _ = c.lua_pushstring(state, "': ");
+            _ = c.lua_pushstring(state, message);
+            c.lua_concat(state, 4);
+            return c.lua_error(state);
+        }
+    }
     _ = c.lua_pushstring(state, message);
     return c.lua_error(state);
 }
@@ -3281,6 +3298,8 @@ test "declarative text input separates focus identity from editable render conte
         \\      placeholder = "Search",
         \\      label = "Query",
         \\      read_only = true,
+        \\      text_entry = false,
+        \\      caret_shape = 'underline',
         \\      on_change = function(value) changed = value end,
         \\    },
         \\  }
@@ -3304,10 +3323,12 @@ test "declarative text input separates focus identity from editable render conte
     try std.testing.expectEqual(design.tokens.light.surface, descriptors[3].object.box.background.?);
     try std.testing.expectEqual(design.tokens.foundation.radius_2, descriptors[3].object.box.corner_radius);
     try std.testing.expect(descriptors[4].object == .text_input);
+    try std.testing.expectEqual(.underline, descriptors[4].object.text_input.caret_shape);
     try std.testing.expectEqual(descriptors[3].id, descriptors[4].parent.?);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_text_input_count);
     try std.testing.expectEqual(.controlled, ui.pending_text_inputs[0].mode);
     try std.testing.expect(ui.pending_text_inputs[0].behavior.read_only);
+    try std.testing.expect(!ui.pending_text_inputs[0].behavior.text_entry);
     try std.testing.expectEqual(@as(usize, 1), ui.pending_handler_count);
     try std.testing.expectEqual(.text_input_change, ui.pending_handlers[0].kind);
     try std.testing.expectEqual(.text_field, ui.semanticDescriptors()[1].role);

@@ -29,11 +29,26 @@ pub fn encode(
 
     const filtered_row = std.math.add(usize, row_bytes, 1) catch return error.ImageTooLarge;
     const raw_len = std.math.mul(usize, height, filtered_row) catch return error.ImageTooLarge;
-    const blocks = std.math.divCeil(usize, raw_len, 65535) catch unreachable;
-    const block_overhead = std.math.mul(usize, blocks, 5) catch return error.ImageTooLarge;
-    var zlib_len = std.math.add(usize, raw_len, block_overhead) catch return error.ImageTooLarge;
-    zlib_len = std.math.add(usize, zlib_len, 6) catch return error.ImageTooLarge;
+    if (raw_len > std.math.maxInt(u32)) return error.ImageTooLarge;
+
+    var output = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
+    defer output.deinit();
+    var compressor_buffer: [std.compress.flate.max_window_len * 2]u8 = undefined;
+    var compressor = std.compress.flate.Compress.init(
+        &output.writer,
+        &compressor_buffer,
+        .zlib,
+        .default,
+    ) catch return error.OutOfMemory;
+    for (0..height) |row| {
+        compressor.writer.writeByte(0) catch return error.OutOfMemory;
+        compressor.writer.writeAll(rgba[row * stride ..][0..row_bytes]) catch return error.OutOfMemory;
+    }
+    compressor.finish() catch return error.OutOfMemory;
+    const zlib = output.written();
+    const zlib_len = zlib.len;
     if (zlib_len > std.math.maxInt(u32)) return error.ImageTooLarge;
+
     const total_len = std.math.add(usize, zlib_len, 57) catch return error.ImageTooLarge;
 
     const png = try allocator.alloc(u8, total_len);
@@ -49,48 +64,7 @@ pub fn encode(
 
     const idat_start = pos;
     pos += 8; // length and type are filled after the zlib stream.
-    png[pos..][0..2].* = .{ 0x78, 0x01 }; // zlib, 32K window, fastest algorithm
-    pos += 2;
-
-    var adler: std.hash.Adler32 = .{};
-    var raw_remaining = raw_len;
-    var image_offset: usize = 0;
-    var row_offset: usize = 0;
-    while (raw_remaining != 0) {
-        const block_len: u16 = @intCast(@min(raw_remaining, 65535));
-        png[pos] = @intFromBool(raw_remaining == block_len);
-        pos += 1;
-        std.mem.writeInt(u16, png[pos..][0..2], block_len, .little);
-        std.mem.writeInt(u16, png[pos + 2 ..][0..2], ~block_len, .little);
-        pos += 4;
-
-        var left: usize = block_len;
-        while (left != 0) {
-            if (row_offset == 0) {
-                png[pos] = 0;
-                adler.update(png[pos..][0..1]);
-                pos += 1;
-                left -= 1;
-                row_offset = 1;
-            } else {
-                const pixel_offset = row_offset - 1;
-                const n = @min(left, row_bytes - pixel_offset);
-                const source = rgba[image_offset + pixel_offset ..][0..n];
-                @memcpy(png[pos..][0..n], source);
-                adler.update(source);
-                pos += n;
-                left -= n;
-                row_offset += n;
-                if (row_offset == filtered_row) {
-                    row_offset = 0;
-                    image_offset += stride;
-                }
-            }
-        }
-        raw_remaining -= block_len;
-    }
-    std.mem.writeInt(u32, png[pos..][0..4], adler.adler, .big);
-    pos += 4;
+    put(png, &pos, zlib[0..zlib_len]);
 
     std.mem.writeInt(u32, png[idat_start..][0..4], @intCast(zlib_len), .big);
     png[idat_start + 4 ..][0..4].* = "IDAT".*;
@@ -152,6 +126,50 @@ test "PNG chunks, CRCs, and scanlines round trip" {
     var scanlines: [18]u8 = undefined;
     try inflater.reader.readSliceAll(&scanlines);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11, 12, 13, 14, 15, 16 }, &scanlines);
+}
+
+test "compressed large padded image round trips exactly" {
+    const width = 256;
+    const height = 128;
+    const stride = width * 4 + 17;
+    const pixels = try std.testing.allocator.alloc(u8, stride * height);
+    defer std.testing.allocator.free(pixels);
+    for ([_]bool{ false, true }) |incompressible| {
+        @memset(pixels, 0xa5);
+        for (0..height) |y| for (0..width) |x| {
+            const at = y * stride + x * 4;
+            pixels[at..][0..4].* = if ((x / 32 + y / 16) % 2 == 0)
+                .{ 24, 48, 96, 255 }
+            else
+                .{ 240, 240, 232, 160 };
+        };
+        if (incompressible) {
+            var random = std.Random.DefaultPrng.init(927);
+            random.random().bytes(pixels);
+        }
+
+        const png = try encode(std.testing.allocator, pixels, width, height, stride);
+        defer std.testing.allocator.free(png);
+        if (!incompressible) try std.testing.expect(png.len < width * height); // Well below the 131 KiB RGBA input.
+
+        const idat_len = std.mem.readInt(u32, png[33..37], .big);
+        const idat = png[41..][0..idat_len];
+        const filtered_row = width * 4 + 1;
+        const decoded = try std.testing.allocator.alloc(u8, filtered_row * height);
+        defer std.testing.allocator.free(decoded);
+        var input: std.Io.Reader = .fixed(idat);
+        var window: [std.compress.flate.max_window_len]u8 = undefined;
+        var inflater: std.compress.flate.Decompress = .init(&input, .zlib, &window);
+        try inflater.reader.readSliceAll(decoded);
+        for (0..height) |y| {
+            try std.testing.expectEqual(@as(u8, 0), decoded[y * filtered_row]);
+            try std.testing.expectEqualSlices(
+                u8,
+                pixels[y * stride ..][0 .. width * 4],
+                decoded[y * filtered_row + 1 ..][0 .. width * 4],
+            );
+        }
+    }
 }
 
 test "input validation" {
