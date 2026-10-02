@@ -29,6 +29,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     # Build against Debian 12 so the binary needs at most glibc 2.36 and the
     # bookworm sonames of fontconfig, freetype, xkbcommon and curl.
     container: debian:bookworm
@@ -64,9 +65,24 @@ jobs:
           fi
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+      # Not mlugg/setup-zig: it tries a random community mirror with no
+      # timeout, and one stalled a run for over ten minutes.
+      - name: Install Zig
+        timeout-minutes: 15
+        run: |
+          tarball=zig-x86_64-linux-0.16.0.tar.xz
+          sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+          for base in https://ziglang.freetls.fastly.net https://pkg.machengine.org/zig https://ziglang.org/download/0.16.0; do
+            if curl -fsSL --connect-timeout 20 --max-time 300 -o "/tmp/$tarball" "$base/$tarball?source=github-rockorager-ourokit" &&
+              echo "$sha256  /tmp/$tarball" | sha256sum -c -; then
+              break
+            fi
+            rm -f "/tmp/$tarball"
+          done
+          test -f "/tmp/$tarball"
+          mkdir -p /opt/zig
+          tar -C /opt/zig --strip-components=1 -xJf "/tmp/$tarball"
+          echo /opt/zig >> "$GITHUB_PATH"
 
       # Zig 0.16.0 fails to fetch .zip dependencies ("failed to create temporary
       # zip file: FileNotFound") until the global cache has a tmp directory.
