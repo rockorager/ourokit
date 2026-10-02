@@ -368,7 +368,7 @@ fn dispatchAndSettle(
         );
         try runtime.prepareFrame(story.snapshot_scale);
         try settleImages(runtime, lua_ui, story, vm.loop);
-        if (!runtime.hasPendingScrollEvents() and !runtime.native_work) return;
+        if (!runtime.hasQueuedInput() and !runtime.hasPendingScrollEvents() and !runtime.native_work) return;
     }
     return error.StoryActionDidNotSettle;
 }

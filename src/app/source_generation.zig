@@ -1006,7 +1006,7 @@ test "source generation owns a named snapshot and application Lua state" {
         .keycode = 19,
         .logical = .key_r,
         .modifiers = .{ .alt = true },
-    }).?);
+    }).?.items[0]);
 }
 
 test "source generation rejects Lua identity that differs from package metadata" {
@@ -1204,7 +1204,7 @@ test "headless source generation preserves action state when UI is activated lat
         .keycode = 22,
         .logical = .key_u,
         .modifiers = .{ .alt = true },
-    }).?);
+    }).?.items[0]);
     const action = try generation.application.startAction(&generation.vm, scheduler.application_scope, "Change", null);
     _ = try generation.vm.resumeRunnable(scheduler.takeRunnable().?);
     var arena = std.heap.ArenaAllocator.init(allocator);

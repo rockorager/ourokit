@@ -476,6 +476,315 @@ pub const Model = struct {
         return self.setExtent(offset, extend);
     }
 
+    /// Select the Unicode segment under the cursor, independent of the visual
+    /// edge affinity left by the preceding motion. Never include a hard newline.
+    pub fn selectWord(self: *Model, around: bool) !bool {
+        const bytes = self.text();
+        const line = self.lineRangeAt(self.selection.extent);
+        const end = if (line.end > line.start and bytes[line.end - 1] == '\n') line.end - 1 else line.end;
+        if (end == line.start) return self.setSelection(.collapsed(end));
+        const at = if (self.selection.extent >= end) self.boundaryBefore(end) else self.selection.extent;
+        var range = self.wordRangeAt(at, .downstream);
+        range.start = @max(range.start, line.start);
+        range.end = @min(range.end, end);
+        if (around) {
+            const original_end = range.end;
+            while (range.end < end and (bytes[range.end] == ' ' or bytes[range.end] == '\t')) range.end += 1;
+            if (range.end == original_end)
+                while (range.start > line.start and (bytes[range.start - 1] == ' ' or bytes[range.start - 1] == '\t')) {
+                    range.start -= 1;
+                };
+        }
+        return self.setSelection(.{ .anchor = range.start, .extent = range.end, .extent_affinity = .upstream });
+    }
+
+    const VimWordClass = enum { blank, keyword, punctuation };
+    pub const VimWordMotion = enum { next_start, previous_start, next_end };
+
+    fn vimWordClass(self: *const Model, index: usize) VimWordClass {
+        const at = self.boundaries.items[index];
+        const bytes = self.text();
+        if (at == bytes.len) return .blank;
+        if (bytes[at] == ' ' or bytes[at] == '\t' or bytes[at] == '\n') return .blank;
+        if (bytes[at] == '_') return .keyword;
+        const len = std.unicode.utf8ByteSequenceLength(bytes[at]) catch unreachable;
+        const cp = std.unicode.utf8Decode(bytes[at..][0..len]) catch unreachable;
+        return switch (uucode.get(.general_category, cp)) {
+            .letter_uppercase,
+            .letter_lowercase,
+            .letter_titlecase,
+            .letter_modifier,
+            .letter_other,
+            .mark_nonspacing,
+            .mark_spacing_combining,
+            .mark_enclosing,
+            .number_decimal_digit,
+            .number_letter,
+            .number_other,
+            => .keyword,
+            else => .punctuation,
+        };
+    }
+
+    fn vimEmptyLine(self: *const Model, index: usize) bool {
+        const at = self.boundaries.items[index];
+        const bytes = self.text();
+        return (at == bytes.len or bytes[at] == '\n') and (at == 0 or bytes[at - 1] == '\n');
+    }
+
+    fn vimWordTarget(self: *const Model, offset: usize, motion: VimWordMotion) usize {
+        const boundaries = self.boundaries.items;
+        const last = boundaries.len - 1;
+        var i = lowerBound(boundaries, offset);
+        switch (motion) {
+            .next_start => {
+                const class = self.vimWordClass(i);
+                if (class != .blank) {
+                    while (i < last and self.vimWordClass(i) == class) i += 1;
+                } else if (i < last) i += 1;
+                while (i < last and self.vimWordClass(i) == .blank and !self.vimEmptyLine(i)) i += 1;
+            },
+            .previous_start => {
+                if (i > 0) i -= 1;
+                while (i > 0 and self.vimWordClass(i) == .blank and !self.vimEmptyLine(i)) i -= 1;
+                const class = self.vimWordClass(i);
+                if (class != .blank) while (i > 0 and self.vimWordClass(i - 1) == class) {
+                    i -= 1;
+                };
+            },
+            .next_end => {
+                if (i < last) i += 1;
+                while (i < last and self.vimWordClass(i) == .blank) i += 1;
+                const class = self.vimWordClass(i);
+                while (i + 1 < last and self.vimWordClass(i + 1) == class) i += 1;
+            },
+        }
+        return boundaries[i];
+    }
+
+    /// Separate command-mode motions: Ctrl+Arrow retains UAX #29 semantics.
+    /// End motions select inclusively but place a collapsed caret on the last
+    /// grapheme. Word classes are letters/numbers/underscore versus punctuation.
+    pub fn moveVimWord(self: *Model, motion: VimWordMotion, extend: bool) bool {
+        var target = self.vimWordTarget(self.selection.extent, motion);
+        if (extend and motion == .next_end) target = self.boundaryAfter(target);
+        if (!extend and target == self.byteLen() and target > 0 and self.text()[target - 1] != '\n')
+            target = self.boundaryBefore(target);
+        return self.setExtent(target, extend);
+    }
+
+    /// Operator-w stops before the current hard newline. On nonblank text,
+    /// change-word ends at this word's end even on its last grapheme (cw != ce).
+    pub fn selectVimForwardWord(self: *Model, change: bool) !bool {
+        const start = self.selection.extent;
+        const line = self.lineRangeAt(start);
+        const i = lowerBound(self.boundaries.items, start);
+        var end = self.vimWordTarget(start, .next_start);
+        if (change and self.vimWordClass(i) != .blank) {
+            var j = i + 1;
+            while (j + 1 < self.boundaries.items.len and self.vimWordClass(j) == self.vimWordClass(i)) j += 1;
+            end = self.boundaries.items[j];
+        }
+        if (!self.emptyLine(line)) {
+            const line_end = if (line.end > line.start and self.text()[line.end - 1] == '\n') line.end - 1 else line.end;
+            end = @min(end, line_end);
+        } else end = @min(end, line.end);
+        return self.setSelection(.{ .anchor = start, .extent = end });
+    }
+
+    pub fn selectVimWord(self: *Model, around: bool) !bool {
+        const bytes = self.text();
+        const line = self.lineRangeAt(self.selection.extent);
+        const end = if (line.end > line.start and bytes[line.end - 1] == '\n') line.end - 1 else line.end;
+        if (end == line.start) return self.setSelection(.collapsed(end));
+        const at = @min(self.selection.extent, self.boundaryBefore(end));
+        var first = lowerBound(self.boundaries.items, at);
+        var after = first + 1;
+        const class = self.vimWordClass(first);
+        while (first > 0 and self.boundaries.items[first] > line.start and self.vimWordClass(first - 1) == class) first -= 1;
+        while (self.boundaries.items[after] < end and self.vimWordClass(after) == class) after += 1;
+        var range: Range = .{ .start = self.boundaries.items[first], .end = self.boundaries.items[after] };
+        if (around) {
+            // On whitespace, aw includes the following word rather than only
+            // the separator. On a word, prefer its trailing whitespace.
+            if (class == .blank and range.end < end) {
+                const next_class = self.vimWordClass(after);
+                while (self.boundaries.items[after] < end and self.vimWordClass(after) == next_class) after += 1;
+                range.end = self.boundaries.items[after];
+                return self.setSelection(.{ .anchor = range.start, .extent = range.end, .extent_affinity = .upstream });
+            }
+            const old_end = range.end;
+            while (range.end < end and (bytes[range.end] == ' ' or bytes[range.end] == '\t')) range.end += 1;
+            if (old_end == range.end) while (range.start > line.start and (bytes[range.start - 1] == ' ' or bytes[range.start - 1] == '\t')) {
+                range.start -= 1;
+            };
+        }
+        return self.setSelection(.{ .anchor = range.start, .extent = range.end, .extent_affinity = .upstream });
+    }
+
+    pub fn selectLine(self: *Model) !bool {
+        const range = self.lineRangeAt(self.selection.extent);
+        return self.setLineSelection(range, range);
+    }
+
+    /// Extend whole hard lines, retaining the original anchor line through
+    /// shrink and reversal. Upstream end affinity distinguishes a terminating
+    /// LF from the empty final line at the same insertion edge.
+    pub fn selectLines(self: *Model, destination: @import("intent.zig").LineDestination) !bool {
+        const selection = self.selection;
+        const anchor = self.lineRangeAt(if (selection.anchor_affinity == .upstream)
+            self.boundaryBefore(selection.anchor)
+        else
+            selection.anchor);
+        var active = self.lineRangeAt(if (selection.extent_affinity == .upstream)
+            self.boundaryBefore(selection.extent)
+        else
+            selection.extent);
+        const offset = switch (destination) {
+            .up => if (active.start > 0) active.start - 1 else 0,
+            .down => active.end,
+            .start => 0,
+            .end => self.byteLen(),
+            .paragraph_previous, .paragraph_next => self.paragraphOffset(active.start, destination == .paragraph_next),
+        };
+        active = self.lineRangeAt(offset);
+        return self.setLineSelection(anchor, active);
+    }
+
+    fn setLineSelection(self: *Model, anchor: Range, active: Range) !bool {
+        return self.setSelection(if (active.start < anchor.start) .{
+            .anchor = anchor.end,
+            .anchor_affinity = if (anchor.end == anchor.start) .downstream else .upstream,
+            .extent = active.start,
+        } else .{
+            .anchor = anchor.start,
+            .extent = active.end,
+            .extent_affinity = if (active.end == active.start) .downstream else .upstream,
+        });
+    }
+
+    fn emptyLine(self: *const Model, line: Range) bool {
+        return line.start == line.end or (line.end == line.start + 1 and self.text()[line.start] == '\n');
+    }
+
+    /// Paragraphs are runs of nonempty hard lines. Whitespace-only lines are
+    /// content. An empty-line cursor selects the contiguous separator run.
+    pub fn selectParagraph(self: *Model, around: bool) !bool {
+        var range = self.lineRangeAt(self.selection.extent);
+        const empty = self.emptyLine(range);
+        while (range.start > 0) {
+            const previous = self.lineRangeAt(range.start - 1);
+            if (self.emptyLine(previous) != empty) break;
+            range.start = previous.start;
+        }
+        while (range.end < self.byteLen()) {
+            const next = self.lineRangeAt(range.end);
+            if (self.emptyLine(next) != empty) break;
+            range.end = next.end;
+        }
+        if (around and !empty) {
+            const original_end = range.end;
+            while (range.end < self.byteLen()) {
+                const next = self.lineRangeAt(range.end);
+                if (!self.emptyLine(next)) break;
+                range.end = next.end;
+            }
+            if (range.end == original_end) while (range.start > 0) {
+                const previous = self.lineRangeAt(range.start - 1);
+                if (!self.emptyLine(previous)) break;
+                range.start = previous.start;
+            };
+        }
+        return self.setSelection(.{ .anchor = range.start, .extent = range.end, .extent_affinity = .upstream });
+    }
+
+    pub fn moveParagraph(self: *Model, forward: bool, extend: bool) bool {
+        return self.setExtent(self.paragraphOffset(self.selection.extent, forward), extend);
+    }
+
+    fn paragraphOffset(self: *const Model, offset: usize, forward: bool) usize {
+        var line = self.lineRangeAt(offset);
+        var leaving_separator = self.emptyLine(line);
+        while (if (forward) line.end < self.byteLen() else line.start > 0) {
+            line = self.lineRangeAt(if (forward) line.end else line.start - 1);
+            const empty = self.emptyLine(line);
+            if (empty and !leaving_separator) return line.start;
+            if (!empty) leaving_separator = false;
+        }
+        return if (forward) self.byteLen() else 0;
+    }
+
+    /// Removing an unterminated final line also removes its preceding LF.
+    pub fn deleteLine(self: *Model) !bool {
+        return self.deleteLineRange(self.lineRangeAt(self.selection.extent));
+    }
+
+    pub fn deleteLines(self: *Model) !bool {
+        return self.deleteLineRange(self.selection.range());
+    }
+
+    fn deleteLineRange(self: *Model, selected: Range) !bool {
+        var range = selected;
+        var caret = range.start;
+        if (range.end == self.byteLen() and range.start > 0 and
+            (range.end == range.start or self.text()[range.end - 1] != '\n'))
+        {
+            caret = self.lineRangeAt(range.start - 1).start;
+            range.start -= 1;
+        }
+        const changed = try self.replaceRange(range, "");
+        if (changed) self.finishLineEdit(caret);
+        return changed;
+    }
+
+    /// Replace selected whole lines with one empty line, preserving a final
+    /// line terminator and recording the new insertion point in undo history.
+    pub fn clearLines(self: *Model) !bool {
+        const range = self.selection.range();
+        const terminated = range.end > range.start and self.text()[range.end - 1] == '\n';
+        const changed = try self.replaceRange(range, if (terminated) "\n" else "");
+        if (changed) self.finishLineEdit(range.start);
+        return changed;
+    }
+
+    fn finishLineEdit(self: *Model, caret: usize) void {
+        self.selection = .collapsed(@min(caret, self.byteLen()));
+        if (!self.isSecret()) self.history.items[self.history_cursor - 1].selection_after = self.selection;
+    }
+
+    /// Put an owned register at a character or hard-line boundary as one edit.
+    /// A linewise register always ends in LF; preserve an unterminated final
+    /// document line rather than introducing a second, accidental blank line.
+    pub fn put(self: *Model, bytes: []const u8, linewise: bool, after: bool) !bool {
+        if (bytes.len == 0 or self.isSecret()) return false;
+        const at = self.selection.extent;
+        if (!linewise) {
+            const offset = if (after and at < self.byteLen() and self.text()[at] != '\n') self.boundaryAfter(at) else at;
+            const changed = try self.replaceRange(.{ .start = offset, .end = offset }, bytes);
+            if (changed) self.finishLineEdit(if (std.mem.indexOfScalar(u8, bytes, '\n') != null)
+                self.boundaryAtOrBefore(offset)
+            else
+                self.boundaryBefore(offset + bytes.len));
+            return changed;
+        }
+        if (!self.multiline) return false;
+        std.debug.assert(bytes[bytes.len - 1] == '\n');
+        const line = self.lineRangeAt(at);
+        const terminated = line.end > line.start and self.text()[line.end - 1] == '\n';
+        const offset = if (after) line.end else line.start;
+        const append = after and !terminated;
+        const payload = if (append) bytes[0 .. bytes.len - 1] else bytes;
+        const inserted = try std.mem.concat(self.allocator, u8, &.{ if (append) "\n" else "", payload });
+        defer self.allocator.free(inserted);
+        const changed = try self.replaceRange(.{ .start = offset, .end = offset }, inserted);
+        if (changed) {
+            var indent: usize = 0;
+            while (indent < payload.len and (payload[indent] == ' ' or payload[indent] == '\t')) indent += 1;
+            self.finishLineEdit(self.boundaryAtOrBefore(offset + @intFromBool(append) + indent));
+        }
+        return changed;
+    }
+
     /// Inserts an empty hard line at the active extent's line, not a wrapped
     /// visual line. Preserves selected text and records one undoable edit.
     pub fn insertLine(self: *Model, above: bool) !bool {
@@ -1121,6 +1430,239 @@ test "logical line edits preserve selected text and restore caret and selection 
     try std.testing.expect(!try single.insertLine(true));
     try std.testing.expect(!try single.insertLine(false));
     try std.testing.expect(!single.undo());
+}
+
+test "text objects select Unicode words and surrounding space without crossing newlines" {
+    var model = try Model.initWithMode(std.testing.allocator, "one  café!\n\nlast", true);
+    defer model.deinit();
+    _ = try model.setSelection(.collapsedAt(5, .upstream));
+    _ = try model.selectWord(false);
+    try std.testing.expectEqualStrings("café", model.selectedText());
+    _ = try model.setSelection(.collapsed(6));
+    _ = try model.selectWord(true);
+    try std.testing.expectEqualStrings("  café", model.selectedText());
+    _ = try model.replaceSelection("");
+    try std.testing.expectEqualStrings("one!\n\nlast", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqualStrings("  café", model.selectedText());
+    _ = try model.setSelection(.collapsed(1));
+    _ = try model.selectWord(true);
+    try std.testing.expectEqualStrings("one  ", model.selectedText());
+    _ = try model.setSelection(.collapsed(12));
+    _ = try model.selectWord(false);
+    try std.testing.expectEqualStrings("", model.selectedText());
+    try std.testing.expect(!try model.replaceSelection(""));
+    try std.testing.expectEqualStrings("one  café!\n\nlast", model.text());
+
+    var graphemes = try Model.initWithMode(std.testing.allocator, "e\u{301} 👩‍💻", true);
+    defer graphemes.deinit();
+    _ = try graphemes.setSelection(.collapsed(4));
+    _ = try graphemes.selectWord(false);
+    try std.testing.expectEqualStrings("👩‍💻", graphemes.selectedText());
+    _ = try graphemes.setSelection(.collapsed(0));
+    _ = try graphemes.selectWord(false);
+    try std.testing.expectEqualStrings("e\u{301}", graphemes.selectedText());
+}
+
+test "paragraph objects preserve separators and navigate in both directions" {
+    var model = try Model.initWithMode(std.testing.allocator, "first\nα\n\n\nlast\ntail", true);
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed(6));
+    _ = try model.selectParagraph(false);
+    try std.testing.expectEqualStrings("first\nα\n", model.selectedText());
+    _ = try model.setSelection(.collapsed(6));
+    _ = try model.selectParagraph(true);
+    try std.testing.expectEqualStrings("first\nα\n\n\n", model.selectedText());
+    _ = try model.setSelection(.collapsed(model.byteLen()));
+    _ = try model.selectParagraph(true);
+    try std.testing.expectEqualStrings("\n\nlast\ntail", model.selectedText());
+    _ = try model.setSelection(.collapsed(10));
+    _ = try model.selectParagraph(false);
+    try std.testing.expectEqualStrings("\n\n", model.selectedText());
+    _ = try model.setSelection(.collapsed(0));
+    _ = model.moveParagraph(true, false);
+    try std.testing.expectEqual(@as(usize, 9), model.selection.extent);
+    _ = model.moveParagraph(true, false);
+    try std.testing.expectEqual(model.byteLen(), model.selection.extent);
+    _ = model.moveParagraph(false, false);
+    try std.testing.expectEqual(@as(usize, 10), model.selection.extent);
+    _ = model.moveParagraph(false, false);
+    try std.testing.expectEqual(@as(usize, 0), model.selection.extent);
+}
+
+test "whole line selection shrinks reverses and includes a trailing empty line" {
+    var model = try Model.initWithMode(std.testing.allocator, "α\nbeta\nc\n", true);
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed(4));
+    _ = try model.selectLine();
+    try std.testing.expectEqualStrings("beta\n", model.selectedText());
+    _ = try model.selectLines(.down);
+    try std.testing.expectEqualStrings("beta\nc\n", model.selectedText());
+    _ = try model.selectLines(.up);
+    try std.testing.expectEqualStrings("beta\n", model.selectedText());
+    _ = try model.selectLines(.up);
+    try std.testing.expectEqualStrings("α\nbeta\n", model.selectedText());
+    try std.testing.expectEqual(@as(usize, 0), model.selection.extent);
+    _ = try model.selectLines(.down);
+    try std.testing.expectEqualStrings("beta\n", model.selectedText());
+    _ = try model.selectLines(.end);
+    try std.testing.expectEqual(.downstream, model.selection.extent_affinity);
+    _ = try model.selectLines(.up);
+    try std.testing.expectEqual(.upstream, model.selection.extent_affinity);
+    _ = try model.selectLines(.up);
+    try std.testing.expectEqualStrings("beta\n", model.selectedText());
+    _ = try model.setSelection(.collapsed(model.byteLen()));
+    _ = try model.selectLine();
+    _ = try model.selectLines(.up);
+    try std.testing.expectEqualStrings("c\n", model.selectedText());
+    _ = try model.selectLines(.down);
+    try std.testing.expect(model.selection.isCollapsed());
+    try std.testing.expectEqual(model.byteLen(), model.selection.extent);
+}
+
+test "line delete and change retain newline boundaries and native undo selections" {
+    for ([_]struct { text: []const u8, at: usize, expected: []const u8, caret: usize }{
+        .{ .text = "one\ntwo\nlast", .at = 5, .expected = "one\nlast", .caret = 4 },
+        .{ .text = "one\ntwo\nlast", .at = 10, .expected = "one\ntwo", .caret = 4 },
+        .{ .text = "one\n", .at = 4, .expected = "one", .caret = 0 },
+        .{ .text = "one", .at = 1, .expected = "", .caret = 0 },
+    }) |case| {
+        var model = try Model.initWithMode(std.testing.allocator, case.text, true);
+        defer model.deinit();
+        _ = try model.setSelection(.collapsed(case.at));
+        _ = try model.deleteLine();
+        try std.testing.expectEqualStrings(case.expected, model.text());
+        try std.testing.expectEqual(case.caret, model.selection.extent);
+        try std.testing.expect(model.undo());
+        try std.testing.expectEqualStrings(case.text, model.text());
+        try std.testing.expectEqual(case.at, model.selection.extent);
+        try std.testing.expect(model.redo());
+        try std.testing.expectEqual(case.caret, model.selection.extent);
+    }
+    var model = try Model.initWithMode(std.testing.allocator, "one\ntwo\nlast", true);
+    defer model.deinit();
+    _ = try model.selectLine();
+    _ = try model.selectLines(.up);
+    const selected = model.selection;
+    _ = try model.deleteLines();
+    try std.testing.expectEqualStrings("one", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqual(selected, model.selection);
+    _ = try model.clearLines();
+    try std.testing.expectEqualStrings("one\n", model.text());
+    try std.testing.expectEqual(@as(usize, 4), model.selection.extent);
+    try std.testing.expect(model.undo());
+    _ = try model.setSelection(.collapsed(1));
+    _ = try model.selectLine();
+    _ = try model.clearLines();
+    try std.testing.expectEqualStrings("\ntwo\nlast", model.text());
+    try std.testing.expectEqual(@as(usize, 0), model.selection.extent);
+}
+
+test "Vim word motions distinguish starts ends punctuation underscores and blank lines" {
+    var model = try Model.initWithMode(std.testing.allocator, "one_two...  café\n\n  last", true);
+    defer model.deinit();
+    for ([_]struct { at: usize, motion: Model.VimWordMotion, target: usize }{
+        .{ .at = 0, .motion = .next_start, .target = 7 },
+        .{ .at = 7, .motion = .next_start, .target = 12 },
+        .{ .at = 12, .motion = .next_start, .target = 18 },
+        .{ .at = 18, .motion = .next_start, .target = 21 },
+        .{ .at = 21, .motion = .previous_start, .target = 18 },
+        .{ .at = 18, .motion = .previous_start, .target = 12 },
+        .{ .at = 6, .motion = .previous_start, .target = 0 },
+        .{ .at = 0, .motion = .previous_start, .target = 0 },
+        .{ .at = 0, .motion = .next_end, .target = 6 },
+        .{ .at = 6, .motion = .next_end, .target = 9 },
+        .{ .at = 9, .motion = .next_end, .target = 15 },
+        .{ .at = 15, .motion = .next_end, .target = 24 },
+        .{ .at = 24, .motion = .next_start, .target = 24 },
+    }) |case| {
+        _ = try model.setSelection(.collapsed(case.at));
+        _ = model.moveVimWord(case.motion, false);
+        try std.testing.expectEqual(case.target, model.selection.extent);
+        try std.testing.expect(model.selection.isCollapsed());
+    }
+    // The native Ctrl+Right path must not acquire Vim's next-start behavior.
+    _ = try model.setSelection(.collapsed(0));
+    _ = model.moveWordNext(false);
+    try std.testing.expectEqual(@as(usize, 7), model.selection.extent);
+    _ = try model.setSelection(.collapsed(12));
+    _ = model.moveWordNext(false);
+    try std.testing.expectEqual(@as(usize, 17), model.selection.extent);
+}
+
+test "Vim word selection keeps graphemes and differs for cw ce and dw at hard EOL" {
+    var model = try Model.initWithMode(std.testing.allocator, "e\u{301}_é.. 👩‍💻", true);
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed(0));
+    _ = model.moveVimWord(.next_end, false);
+    try std.testing.expectEqual(@as(usize, 4), model.selection.extent);
+    _ = try model.setSelection(.collapsed(0));
+    _ = model.moveVimWord(.next_end, true);
+    try std.testing.expectEqualStrings("e\u{301}_é", model.selectedText());
+    _ = try model.setSelection(.collapsed(6));
+    _ = try model.selectVimWord(false);
+    try std.testing.expectEqualStrings("..", model.selectedText());
+    _ = try model.setSelection(.collapsed(8));
+    _ = try model.selectVimWord(true);
+    try std.testing.expectEqualStrings(" 👩‍💻", model.selectedText());
+    _ = try model.setSelection(.collapsed(9));
+    _ = model.moveVimWord(.next_end, true);
+    try std.testing.expectEqualStrings("👩‍💻", model.selectedText());
+
+    for ([_]struct { bytes: []const u8, at: usize, change: bool, selected: []const u8 }{
+        .{ .bytes = "one  two\nlast", .at = 0, .change = false, .selected = "one  " },
+        .{ .bytes = "one  two\nlast", .at = 0, .change = true, .selected = "one" },
+        .{ .bytes = "one  two\nlast", .at = 2, .change = true, .selected = "e" },
+        .{ .bytes = "one  \n  two", .at = 0, .change = false, .selected = "one  " },
+        .{ .bytes = "one  \n  two", .at = 3, .change = true, .selected = "  " },
+        .{ .bytes = "\n  two", .at = 0, .change = false, .selected = "\n" },
+        .{ .bytes = "", .at = 0, .change = true, .selected = "" },
+    }) |case| {
+        var words = try Model.initWithMode(std.testing.allocator, case.bytes, true);
+        defer words.deinit();
+        _ = try words.setSelection(.collapsed(case.at));
+        _ = try words.selectVimForwardWord(case.change);
+        try std.testing.expectEqualStrings(case.selected, words.selectedText());
+    }
+    var words = try Model.initWithMode(std.testing.allocator, "one  two", true);
+    defer words.deinit();
+    _ = try words.setSelection(.collapsed(2));
+    _ = words.moveVimWord(.next_end, true);
+    try std.testing.expectEqualStrings("e  two", words.selectedText());
+}
+
+test "register puts preserve hard line structure grapheme carets and undo redo" {
+    for ([_]struct { bytes: []const u8, at: usize, value: []const u8, linewise: bool = true, after: bool = true, expected: []const u8, caret: usize }{
+        .{ .bytes = "one\nlast", .at = 1, .value = "  middle\n", .expected = "one\n  middle\nlast", .caret = 6 },
+        .{ .bytes = "one\nlast", .at = 7, .value = "  middle\n", .expected = "one\nlast\n  middle", .caret = 11 },
+        .{ .bytes = "one\nlast", .at = 5, .value = "x\ny\n", .after = false, .expected = "one\nx\ny\nlast", .caret = 4 },
+        .{ .bytes = "one\n", .at = 1, .value = "x\n", .expected = "one\nx\n", .caret = 4 },
+        .{ .bytes = "one\n", .at = 4, .value = "x\n", .expected = "one\n\nx", .caret = 5 },
+        .{ .bytes = "", .at = 0, .value = "x\n", .expected = "\nx", .caret = 1 },
+        .{ .bytes = "", .at = 0, .value = "x\n", .after = false, .expected = "x\n", .caret = 0 },
+        .{ .bytes = "", .at = 0, .value = "\n", .expected = "\n", .caret = 1 },
+        .{ .bytes = "a", .at = 0, .value = " \u{301}x\n", .expected = "a\n \u{301}x", .caret = 2 },
+        .{ .bytes = "éZ", .at = 0, .value = "e\u{301}", .linewise = false, .expected = "ée\u{301}Z", .caret = 2 },
+        .{ .bytes = "éZ", .at = 0, .value = "xy", .linewise = false, .after = false, .expected = "xyéZ", .caret = 1 },
+        .{ .bytes = "eZ", .at = 0, .value = "\u{301}", .linewise = false, .expected = "e\u{301}Z", .caret = 0 },
+        .{ .bytes = "a\nz", .at = 1, .value = "β", .linewise = false, .expected = "aβ\nz", .caret = 1 },
+        .{ .bytes = "az", .at = 0, .value = "q\nr", .linewise = false, .expected = "aq\nrz", .caret = 1 },
+    }) |case| {
+        var model = try Model.initWithMode(std.testing.allocator, case.bytes, true);
+        defer model.deinit();
+        _ = try model.setSelection(.collapsed(case.at));
+        try std.testing.expect(try model.put(case.value, case.linewise, case.after));
+        try std.testing.expectEqualStrings(case.expected, model.text());
+        try std.testing.expectEqual(Selection.collapsed(case.caret), model.selection);
+        try std.testing.expect(model.undo());
+        try std.testing.expectEqualStrings(case.bytes, model.text());
+        try std.testing.expectEqual(Selection.collapsed(case.at), model.selection);
+        try std.testing.expect(!model.undo());
+        try std.testing.expect(model.redo());
+        try std.testing.expectEqualStrings(case.expected, model.text());
+        try std.testing.expectEqual(Selection.collapsed(case.caret), model.selection);
+    }
 }
 
 test "secret model edits in place, caps length, rejects controls and wipes removed bytes" {

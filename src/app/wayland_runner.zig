@@ -1245,7 +1245,8 @@ fn runSourceInternal(
         _ = try loop.submit();
         if (scheduler.hasPendingWork() or development_work) continue;
         const scroll_events = for (runtime_slots) |*slot| {
-            if (slot.desired and slot.runtime.ready and slot.runtime.hasPendingScrollEvents()) break true;
+            if (slot.desired and slot.runtime.ready and
+                (slot.runtime.hasQueuedInput() or slot.runtime.hasPendingScrollEvents())) break true;
         } else false;
         if (scroll_events) continue;
         const control_quiescent = if (control) |server| server.quiescent() else true;

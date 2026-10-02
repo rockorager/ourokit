@@ -141,6 +141,8 @@ fn logicalKey(keysym: u32) platform.LogicalKey {
         c.XKB_KEY_BackSpace => .backspace,
         c.XKB_KEY_Delete, c.XKB_KEY_KP_Delete => .delete,
         c.XKB_KEY_colon => .colon,
+        c.XKB_KEY_braceleft => .brace_left,
+        c.XKB_KEY_braceright => .brace_right,
         else => .unidentified,
     };
 }

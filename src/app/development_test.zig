@@ -83,7 +83,7 @@ const Fixture = struct {
             defer c.luaL_unref(self.vm.state, c.registry_index, reference);
             try self.runtime.reconcile(.{ .width = 324, .height = 224 }, &self.builder, reference);
             if (self.runtime.frame_state.readyForSubmission()) try self.runtime.frameSubmitted();
-            if (!self.runtime.hasPendingScrollEvents()) return;
+            if (!self.runtime.hasQueuedInput() and !self.runtime.hasPendingScrollEvents()) return;
         }
         return error.TestDidNotSettle;
     }
@@ -98,6 +98,13 @@ const Fixture = struct {
         while (try playback.advance(&self.runtime) == .routed) try self.settle();
     }
 
+    fn queueKeys(self: *Fixture, keys: []const @import("../platform/window.zig").TranslatedKey) !void {
+        for (keys) |key| {
+            for ([_]@import("../platform/window.zig").KeyState{ .pressed, .released }) |state|
+                try self.runtime.routeKeyboard(.{ .key = .{ .window = self.runtime.window, .serial = 0, .time_ms = 0, .state = state, .translated = key } });
+        }
+    }
+
     fn snapshot(self: *Fixture) !dev.Snapshot {
         return dev.inspect(std.testing.allocator, &self.runtime, .{});
     }
@@ -108,6 +115,131 @@ fn node(snapshot: dev.Snapshot, path: []const u8) !dev.Node {
         if (std.mem.eql(u8, candidate, path)) return value;
     };
     return error.TestPathMissing;
+}
+
+test "editor recipes yield to mode callbacks but ordinary typing stays batched" {
+    const f = try Fixture.create(
+        \\local mode=ouro.signal(false)
+        \\changes=0; intercepted=0; commands=0
+        \\function build() return ouro.box {key='root',
+        \\ on_key={keys={'I'},states={'pressed'},propagate=true,handler=function() intercepted=intercepted+1 end},
+        \\ ouro.text_editor {key='body',autofocus=true,default_text='alpha tail',text_entry=mode(),
+        \\ key_bindings=mode() and {} or {inherit=false,['C I W']={'select_word_inner','delete_selection','submit'}},
+        \\ on_command=function(c) assert(c=='submit'); commands=commands+1; mode:set(true) end,
+        \\ on_change=function() changes=changes+1 end}}
+        \\end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    _ = try session.model.setSelection(.collapsed(2));
+    try f.queueKeys(&.{
+        .{ .keycode = 0, .logical = .key_c, .unicode = 'c' },
+        .{ .keycode = 0, .logical = .key_i, .unicode = 'i' },
+        .{ .keycode = 0, .logical = .key_w, .unicode = 'w' },
+        .{ .keycode = 0, .logical = .key_x, .unicode = 'x' },
+        .{ .keycode = 0, .logical = .key_y, .unicode = 'y' },
+    });
+    try f.settle();
+    try std.testing.expectEqualStrings("xy tail", session.model.text());
+    try std.testing.expect(!f.runtime.hasQueuedInput());
+    try f.exec("assert(intercepted==0 and commands==1 and changes==3)");
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings(" tail", session.model.text());
+    try std.testing.expect(session.model.undo());
+    try std.testing.expectEqualStrings("alpha tail", session.model.text());
+    try f.queueKeys(&.{ .{ .keycode = 0, .logical = .key_x, .unicode = 'x' }, .{ .keycode = 0, .logical = .key_y, .unicode = 'y' } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expectEqualStrings("xy tail", session.model.text());
+    try std.testing.expect(!f.runtime.hasQueuedInput());
+    try f.settle();
+}
+
+test "register actions respect read only masking and text entry guards" {
+    const f = try Fixture.create(
+        \\locked=ouro.signal(false); masked=ouro.signal(false); changes=0
+        \\function build() return ouro.text_input {key='body',autofocus=true,
+        \\ default_text='word',text_entry=false,read_only=locked(),mask=masked(),
+        \\ key_bindings={inherit=false,Y='yank',P='put_after',U='undo'},
+        \\ on_change=function() changes=changes+1 end} end
+    );
+    defer f.destroy();
+    var clipboard: @import("clipboard.zig").Coordinator = undefined;
+    try clipboard.init(std.testing.allocator, &f.scheduler, 1, 2, 1024);
+    defer clipboard.deinit();
+    f.runtime.setClipboardCoordinator(&clipboard);
+    const session = try f.runtime.text_inputs.session(f.runtime.focus.current().?);
+    _ = session.model.selectAll();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_y } });
+    try std.testing.expectEqualStrings("word", clipboard.register_text.?);
+    _ = try session.model.setSelection(.collapsed(0));
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_p } });
+    try std.testing.expectEqualStrings("wwordord", session.model.text());
+    try f.exec("assert(changes==1)");
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_u } });
+    try std.testing.expectEqualStrings("word", session.model.text());
+    try f.exec("locked:set(true)");
+    try f.settle();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_p } });
+    try f.exec("assert(changes==2)");
+    _ = try session.model.setSelection(.{ .anchor = 1, .extent = 3 });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_y } });
+    try std.testing.expectEqualStrings("or", clipboard.register_text.?);
+    try f.exec("masked:set(true); locked:set(false)");
+    try f.settle();
+    const secret = try f.runtime.text_inputs.session(f.runtime.focus.current().?);
+    _ = secret.model.selectAll();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_y } });
+    try std.testing.expectEqualStrings("or", clipboard.register_text.?);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_p } });
+    try f.exec("assert(changes==2)");
+}
+
+test "editor prefixes cancel on escape mismatch click rebuild focus and reject read only edits" {
+    const f = try Fixture.create(
+        \\locked=ouro.signal(false)
+        \\function build() return ouro.column {key='root',
+        \\ ouro.text_editor {key='body',autofocus=true,default_text='alpha tail',text_entry=false,read_only=locked(),
+        \\ key_bindings={inherit=false,['D I W']={'select_word_inner','delete_selection'},X='delete_forward',U='undo'}},
+        \\ ouro.text_input {key='other',default_text='other'}} end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    _ = try session.model.setSelection(.collapsed(0));
+    try f.queueKeys(&.{ .{ .keycode = 0, .logical = .key_d }, .{ .keycode = 0, .logical = .escape }, .{ .keycode = 0, .logical = .key_i }, .{ .keycode = 0, .logical = .key_w } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expectEqualStrings("alpha tail", session.model.text());
+    try f.queueKeys(&.{ .{ .keycode = 0, .logical = .key_d }, .{ .keycode = 0, .logical = .key_x } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expectEqualStrings("lpha tail", session.model.text());
+    try f.queueKeys(&.{.{ .keycode = 0, .logical = .key_u }});
+    try f.settle();
+    const bounds = (try f.runtime.semanticTarget("root/body")).bounds;
+    try f.queueKeys(&.{.{ .keycode = 0, .logical = .key_d }});
+    try f.runtime.routePointer(.{ .enter = .{ .window = f.runtime.window, .serial = 1, .position = .{ .x = bounds.x + 10, .y = bounds.y + 10 } } });
+    for ([_]@import("../platform/window.zig").PointerButtonState{ .pressed, .released }) |state|
+        try f.runtime.routePointer(.{ .button = .{ .window = f.runtime.window, .serial = 2, .time_ms = 1, .button = 0x110, .state = state } });
+    try f.queueKeys(&.{ .{ .keycode = 0, .logical = .key_i }, .{ .keycode = 0, .logical = .key_w } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expectEqualStrings("alpha tail", session.model.text());
+    _ = try session.model.setSelection(.collapsed(0));
+    try f.queueKeys(&.{.{ .keycode = 0, .logical = .key_d }});
+    try f.runtime.dispatchInput(&f.callbacks);
+    try f.exec("locked:set(true)");
+    try f.settle();
+    try f.queueKeys(&.{ .{ .keycode = 0, .logical = .key_i }, .{ .keycode = 0, .logical = .key_w } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expect(session.model.selection.isCollapsed());
+    try f.queueKeys(&.{ .{ .keycode = 0, .logical = .key_d }, .{ .keycode = 0, .logical = .key_i }, .{ .keycode = 0, .logical = .key_w } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expectEqualStrings("alpha tail", session.model.text());
+    try std.testing.expectEqualStrings("alpha", session.model.selectedText());
+    try f.queueKeys(&.{ .{ .keycode = 0, .logical = .key_d }, .{ .keycode = 0, .logical = .tab }, .{ .keycode = 0, .logical = .key_i, .unicode = 'i' }, .{ .keycode = 0, .logical = .key_w, .unicode = 'w' } });
+    try f.runtime.dispatchInput(&f.callbacks);
+    const other = try f.runtime.text_inputs.session(f.runtime.focus.current().?);
+    try std.testing.expectEqualStrings("otheriw", other.model.text());
+    try std.testing.expectEqualStrings("alpha tail", session.model.text());
 }
 
 test "inline links reuse keyboard activation and skip disabled or truncated ranges" {

@@ -111,6 +111,13 @@ pub const WindowRuntime = struct {
         prefix: KeySequence,
         deadline_ns: u64,
     } = null,
+    pending_edit: ?struct {
+        target: ui.instance.InstanceHandle,
+        focus_revision: u64,
+        revision: u64,
+        prefix: KeySequence,
+    } = null,
+    input_callback_spawned: bool = false,
     input_now_ns: u64 = 0,
     private_keys_down: std.EnumSet(platform.LogicalKey) = std.EnumSet(platform.LogicalKey).initEmpty(),
     selection_pointer: ?core.PointF = null,
@@ -550,6 +557,7 @@ pub const WindowRuntime = struct {
     ) void {
         self.validatePreparedSourceCommit(prepared) catch unreachable;
         self.cancelInternalDrag();
+        self.pending_edit = null;
         self.development_generation +%= 1;
         self.semantics.stage(prepared.semanticDescriptors());
         self.instances.applyReconcile(prepared.reconcile_plan.?) catch unreachable;
@@ -735,6 +743,7 @@ pub const WindowRuntime = struct {
             };
             self.semantics.stage(lua_ui.semanticDescriptors());
             self.instances.applyReconcile(plan) catch unreachable;
+            self.pending_edit = null;
             self.buttons.removeInactive(&self.instances);
             self.listboxes.removeInactive(&self.instances);
             self.text_inputs.removeInactive(&self.instances);
@@ -943,6 +952,7 @@ pub const WindowRuntime = struct {
         // A press outside the hit tree is not queued, but must still stop a fling.
         if (event == .button and event.button.state == .pressed) {
             self.pending_shortcut = null;
+            self.pending_edit = null;
             self.scroll_motions = @splat(.{});
         }
     }
@@ -1011,6 +1021,11 @@ pub const WindowRuntime = struct {
         self.validatePendingShortcut();
         while (self.router.takeEvent()) |event| {
             defer self.router.releaseEvent(event);
+            if (self.pending_edit) |pending| {
+                if (pending.revision != self.pointer_bindings.revision or
+                    pending.focus_revision != self.focus.revision or
+                    !self.instances.isInteractive(pending.target)) self.pending_edit = null;
+            }
             // A platform leave may be queued behind the press that arms the
             // session. Motion-generated hover leaves have no platform serial.
             if (event == .hover_leave and event.hover_leave.serial != null) self.cancelInternalDrag();
@@ -1043,12 +1058,14 @@ pub const WindowRuntime = struct {
             }
             if (event == .text_input_focus) {
                 self.pending_shortcut = null;
+                self.pending_edit = null;
                 self.text_input_surface_focused = event.text_input_focus;
                 try self.syncTextInputVisuals();
                 continue;
             }
             if (event == .text_input) {
                 self.pending_shortcut = null;
+                self.pending_edit = null;
                 _ = try self.refreshTextInputOwner();
                 const focused = (self.text_input_owner orelse continue).target;
                 if (event.text_input.generation != self.text_input_generation) continue;
@@ -1063,7 +1080,11 @@ pub const WindowRuntime = struct {
                 continue;
             }
             if (event == .keyboard) {
+                self.input_callback_spawned = false;
                 try self.dispatchKeyboard(event.keyboard, callback_service);
+                // Let mode/focus callbacks and their rebuild run before the
+                // next queued key is interpreted under an obsolete keymap.
+                if (self.input_callback_spawned) break;
                 continue;
             }
             // Once captured as a drag, motion/release belong to the native
@@ -1072,6 +1093,7 @@ pub const WindowRuntime = struct {
             if (event == .pointer) switch (event.pointer.event) {
                 .button => |button| if (button.state == .pressed) {
                     self.pending_shortcut = null;
+                    self.pending_edit = null;
                     self.scroll_motions = @splat(.{});
                     if (self.keyboard_focus_visible) {
                         self.keyboard_focus_visible = false;
@@ -1264,6 +1286,10 @@ pub const WindowRuntime = struct {
         if (self.tree.layoutDirty(root) catch return null) return null;
         const render = self.instances.renderObject(target) catch return null;
         return self.tree.scrollMetrics(render) catch null;
+    }
+
+    pub fn hasQueuedInput(self: *const WindowRuntime) bool {
+        return self.router.count != 0;
     }
 
     pub fn hasPendingScrollEvents(self: *WindowRuntime) bool {
@@ -1563,6 +1589,7 @@ pub const WindowRuntime = struct {
         const handler = self.pointer_bindings.getKind(target, kind) orelse return false;
         if (!handler.filter.matches(event)) return false;
         try self.spawnCallback(callbacks, handler.id, try self.instances.scope(target), &.{.{ .input = event }});
+        if (event.kind == .key) self.input_callback_spawned = true;
         return !handler.propagate;
     }
 
@@ -1640,6 +1667,7 @@ pub const WindowRuntime = struct {
                 handler.sequence.len < prefix.len or !prefix.overlaps(handler.sequence)) continue;
             if (handler.sequence.len == prefix.len) {
                 try self.spawnCallback(callbacks, handler.id, try self.instances.scope(target), &.{});
+                self.input_callback_spawned = true;
             } else {
                 self.pending_shortcut = .{
                     .target = target,
@@ -1664,6 +1692,7 @@ pub const WindowRuntime = struct {
             },
             .leave => {
                 self.pending_shortcut = null;
+                self.pending_edit = null;
                 self.keyboard_focused = false;
                 self.cancelInternalDrag();
                 self.range_drag = null;
@@ -1708,7 +1737,12 @@ pub const WindowRuntime = struct {
         }
         if (private_keys) {
             self.pending_shortcut = null;
+            self.pending_edit = null;
         } else if (try self.keyboardTarget()) |target| {
+            // Continuations belong to the native recipe, not raw app mode
+            // listeners (the A in C A W must not enter append mode).
+            if (self.pending_edit != null and key.state != .released and
+                try self.dispatchTextInputBinding(target, key, callback_service, true)) return;
             if (key.state == .released and key.translated.logical == .space)
                 try self.applyButtonUpdate(self.buttons.release());
             const input: listener.Event = .{
@@ -1720,7 +1754,10 @@ pub const WindowRuntime = struct {
                     .repeated => .repeated,
                 },
             };
-            if (try self.dispatchListeners(target, input, callback_service)) return;
+            if (try self.dispatchListeners(target, input, callback_service)) {
+                self.pending_edit = null;
+                return;
+            }
         }
         if (key.state != .released) {
             self.clicks.reset();
@@ -1765,18 +1802,7 @@ pub const WindowRuntime = struct {
                 }
                 return;
             }
-            if (behavior.key_bindings.resolve(key.translated)) |resolved| {
-                const action = if (masked) maskedKeyAction(resolved, behavior) else resolved;
-                // Composition and explicit field commands own Escape first.
-                // Otherwise a plain field lets its enclosing dialog cancel.
-                const bubble_cancel = action == .command and action.command == .cancel and
-                    session.preedit() == null and self.pointer_bindings.getKind(focused, .text_input_command) == null;
-                if (!bubble_cancel) {
-                    if (key.state == .pressed or action.repeats())
-                        try self.applyTextInputAction(focused, action, key.serial, callback_service);
-                    return;
-                }
-            }
+            if (try self.dispatchTextInputBinding(focused, key, callback_service, false)) return;
             const translated = key.translated;
             // A wl_keyboard key reaching the client was not consumed by the
             // input method. Advertising text-input-v3 alone does not own text
@@ -2539,12 +2565,58 @@ pub const WindowRuntime = struct {
     fn maskedKeyAction(action: ui.text_input.KeyAction, behavior: ui.text_input.Behavior) ui.text_input.KeyAction {
         return switch (action) {
             .clipboard => |command| if (command == .paste and behavior.secret == null) action else .none,
+            .register => .none,
             .edit => |intent| switch (intent) {
                 .undo, .redo => .none,
                 else => action,
             },
             else => action,
         };
+    }
+
+    fn dispatchTextInputBinding(self: *WindowRuntime, target: ui.instance.InstanceHandle, key: anytype, callbacks: anytype, continuation: bool) !bool {
+        if (continuation and !sameHandle(target, self.pending_edit.?.target)) {
+            self.pending_edit = null;
+            return false;
+        }
+        const behavior = try self.text_inputs.getBehavior(target);
+        const session = try self.text_inputs.session(target);
+        var prefix: KeySequence = .{};
+        if (continuation) {
+            if (key.state == .repeated) return true;
+            const pending = self.pending_edit.?;
+            self.pending_edit = null;
+            if (key.translated.logical == .escape) return false;
+            prefix = pending.prefix;
+        }
+        prefix.strokes[prefix.len] = .{ .key = key.translated.logical, .modifiers = key.translated.modifiers };
+        prefix.len += 1;
+        const match = behavior.key_bindings.match(prefix) orelse return false;
+        switch (match) {
+            .pending => {
+                if (key.state == .pressed and !session.model.isSecret() and session.preedit() == null) self.pending_edit = .{
+                    .target = target,
+                    .focus_revision = self.focus.revision,
+                    .revision = self.pointer_bindings.revision,
+                    .prefix = prefix,
+                };
+            },
+            .actions => |actions| {
+                const first = actions.items[0];
+                // A plain field still lets its enclosing dialog cancel.
+                if (actions.len == 1 and first == .command and first.command == .cancel and
+                    session.preedit() == null and self.pointer_bindings.getKind(target, .text_input_command) == null) return false;
+                if (key.state == .repeated and (continuation or actions.len != 1 or !first.repeats())) return true;
+                if (session.model.isSecret() and (continuation or actions.len != 1)) return true;
+                self.clicks.reset();
+                self.resetCaretBlink();
+                if (actions.len > 1) session.model.breakUndoGroup();
+                for (actions.items[0..actions.len]) |action| {
+                    try self.applyTextInputAction(target, if (session.model.isSecret()) maskedKeyAction(action, behavior) else action, key.serial, callbacks);
+                }
+            },
+        }
+        return true;
     }
 
     fn applyTextInputAction(
@@ -2579,6 +2651,7 @@ pub const WindowRuntime = struct {
                 } else @tagName(command);
                 if (self.pointer_bindings.getKind(target, .text_input_command)) |binding| {
                     try self.spawnCallback(callback_service, binding.id, try self.instances.scope(target), &.{.{ .string = name }});
+                    self.input_callback_spawned = true;
                     return;
                 }
                 if (behavior.secret != null) return;
@@ -2616,6 +2689,25 @@ pub const WindowRuntime = struct {
                 }
                 return;
             },
+            .register => |command| {
+                if (session.model.isSecret()) return;
+                const clipboard = self.clipboard orelse return;
+                session.endSelectionDrag();
+                session.model.breakUndoGroup();
+                switch (command) {
+                    .yank, .yank_lines => try clipboard.setRegister(serial, session.model.selectedText(), command == .yank_lines),
+                    .put_after, .put_before => {
+                        if (behavior.read_only) return;
+                        const bytes = clipboard.register_text orelse return;
+                        session.preferred_x = null;
+                        if (try session.model.put(bytes, clipboard.register_linewise, command == .put_after)) {
+                            try self.syncTextInputVisuals();
+                            try self.notifyTextInputChanged(callback_service, target);
+                        }
+                    },
+                }
+                return;
+            },
         };
         if (behavior.read_only and intentEditsText(intent)) return;
         if (try self.applyTextInputIntent(target, intent)) {
@@ -2640,10 +2732,54 @@ pub const WindowRuntime = struct {
                 session.preferred_x = null;
                 break :blk session.model.selectAll();
             },
+            .select_word_inner, .select_word_around => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.selectWord(intent == .select_word_around);
+            },
+            .select_vim_word_inner, .select_vim_word_around => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.selectVimWord(intent == .select_vim_word_around);
+            },
+            .select_vim_word_forward, .select_vim_change_word => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.selectVimForwardWord(intent == .select_vim_change_word);
+            },
+            .select_line => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.selectLine();
+            },
+            .select_lines => |destination| blk: {
+                session.preferred_x = null;
+                break :blk try session.model.selectLines(destination);
+            },
+            .select_paragraph_inner, .select_paragraph_around => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.selectParagraph(intent == .select_paragraph_around);
+            },
+            .delete_line => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteLine();
+            },
+            .delete_lines => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.deleteLines();
+            },
+            .clear_lines => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.clearLines();
+            },
+            .delete_selection => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.replaceSelection("");
+            },
             .collapse_selection => blk: {
                 session.preferred_x = null;
                 const selection = session.model.selection;
                 break :blk try session.model.setSelection(.collapsedAt(selection.extent, selection.extent_affinity));
+            },
+            .collapse_selection_start => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.setSelection(.collapsed(session.model.selection.range().start));
             },
             .undo, .redo => blk: {
                 session.preferred_x = null;
@@ -2682,9 +2818,22 @@ pub const WindowRuntime = struct {
                     session.preferred_x = null;
                     break :blk session.model.moveWordNext(move.extend);
                 },
+                .vim_word_start_next, .vim_word_start_previous, .vim_word_end_next => blk: {
+                    session.preferred_x = null;
+                    break :blk session.model.moveVimWord(switch (move.destination) {
+                        .vim_word_start_next => .next_start,
+                        .vim_word_start_previous => .previous_start,
+                        .vim_word_end_next => .next_end,
+                        else => unreachable,
+                    }, move.extend);
+                },
                 .logical_line_start, .logical_line_end => blk: {
                     session.preferred_x = null;
                     break :blk session.model.moveLogicalLine(move.destination == .logical_line_end, move.extend);
+                },
+                .paragraph_previous, .paragraph_next => blk: {
+                    session.preferred_x = null;
+                    break :blk session.model.moveParagraph(move.destination == .paragraph_next, move.extend);
                 },
                 else => try self.moveTextInputCaret(target, session, move),
             },
@@ -2776,7 +2925,7 @@ pub const WindowRuntime = struct {
         };
 
         const next = switch (move.destination) {
-            .word_previous, .word_next, .logical_line_start, .logical_line_end => unreachable,
+            .word_previous, .word_next, .vim_word_start_next, .vim_word_start_previous, .vim_word_end_next, .logical_line_start, .logical_line_end, .paragraph_previous, .paragraph_next => unreachable,
             .document_start, .document_end => blk: {
                 session.preferred_x = null;
                 break :blk text.CaretStop{
@@ -4499,8 +4648,8 @@ fn pointerListenerEvent(event: ui.input.Event) ?listener.Event {
 
 fn intentEditsText(intent: ui.text_input.EditIntent) bool {
     return switch (intent) {
-        .undo, .redo, .insert_newline, .insert_line_above, .insert_line_below, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward => true,
-        .select_all, .collapse_selection, .move => false,
+        .undo, .redo, .insert_newline, .insert_line_above, .insert_line_below, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward, .delete_line, .delete_lines, .clear_lines, .delete_selection => true,
+        .select_all, .select_word_inner, .select_word_around, .select_vim_word_inner, .select_vim_word_around, .select_vim_word_forward, .select_vim_change_word, .select_line, .select_lines, .select_paragraph_inner, .select_paragraph_around, .collapse_selection, .collapse_selection_start, .move => false,
     };
 }
 

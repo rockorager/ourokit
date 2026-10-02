@@ -66,6 +66,10 @@ pub const Coordinator = struct {
     action_count: usize = 0,
     max_text_bytes: usize,
     platform_available: bool = false,
+    /// The application's unnamed editing register is independent of later
+    /// system clipboard changes and survives replacing a document widget.
+    register_text: ?[]u8 = null,
+    register_linewise: bool = false,
 
     pub fn init(
         self: *Coordinator,
@@ -97,6 +101,7 @@ pub const Coordinator = struct {
     pub fn deinit(self: *Coordinator) void {
         std.debug.assert(self.action_count == 0);
         for (self.slots) |slot| std.debug.assert(slot.state == .free);
+        if (self.register_text) |text| self.allocator.free(text);
         self.allocator.free(self.actions);
         self.allocator.free(self.slots);
         self.* = undefined;
@@ -108,6 +113,21 @@ pub const Coordinator = struct {
 
     pub fn platformAvailable(self: *const Coordinator) bool {
         return self.platform_available;
+    }
+
+    pub fn setRegister(self: *Coordinator, serial: u32, text: []const u8, linewise: bool) !void {
+        if (text.len == 0 and !linewise) return;
+        const append_lf = linewise and (text.len == 0 or text[text.len - 1] != '\n');
+        if (text.len > self.max_text_bytes - @intFromBool(append_lf)) return error.ClipboardTextTooLarge;
+        if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+        const owned = try std.mem.concat(self.allocator, u8, &.{ text, if (append_lf) "\n" else "" });
+        errdefer self.allocator.free(owned);
+        // Keep explicit yanks useful outside the application as well. Puts
+        // read our register, not an asynchronously changing clipboard offer.
+        if (self.platform_available) try self.setSelection(serial, owned);
+        if (self.register_text) |old| self.allocator.free(old);
+        self.register_text = owned;
+        self.register_linewise = linewise;
     }
 
     /// Copies selected text before a cut can mutate its borrowed model slice.
@@ -304,6 +324,38 @@ const resource_lifecycle: task.ResourceLifecycle = .{
     .request_cancel = requestCancel,
     .destroy = destroy,
 };
+
+test "unnamed register owns bytes and line type independently of clipboard offers" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 1, 1);
+    defer scheduler.deinit();
+    var clipboard: Coordinator = undefined;
+    try clipboard.init(std.testing.allocator, &scheduler, 1, 2, 8);
+    defer clipboard.deinit();
+    // Works without a platform clipboard, including empty final line yanks.
+    try clipboard.setRegister(0, "", true);
+    try std.testing.expectEqualStrings("\n", clipboard.register_text.?);
+    try std.testing.expect(clipboard.register_linewise);
+    var bytes = [_]u8{ 'a', 'b' };
+    try clipboard.setRegister(0, &bytes, true);
+    bytes[0] = 'z';
+    try std.testing.expectEqualStrings("ab\n", clipboard.register_text.?);
+    try clipboard.setRegister(0, "", false);
+    try std.testing.expectEqualStrings("ab\n", clipboard.register_text.?);
+    try std.testing.expectError(error.ClipboardTextTooLarge, clipboard.setRegister(0, "12345678", true));
+    try std.testing.expectError(error.InvalidUtf8, clipboard.setRegister(0, "\xff", false));
+    try std.testing.expectEqualStrings("ab\n", clipboard.register_text.?);
+    clipboard.setPlatformAvailable(true);
+    try clipboard.setRegister(7, "é", false);
+    const published = clipboard.takeAction().?;
+    try std.testing.expectEqualStrings("é", published.set_selection.text);
+    clipboard.releaseAction(published);
+    try clipboard.setSelection(9, "other");
+    const ordinary_copy = clipboard.takeAction().?;
+    clipboard.releaseAction(ordinary_copy);
+    try std.testing.expectEqualStrings("é", clipboard.register_text.?);
+    try std.testing.expect(!clipboard.register_linewise);
+}
 
 test "paste completion owns UTF-8 and preserves generation-checked target" {
     var scheduler: task.Scheduler = undefined;

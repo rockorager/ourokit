@@ -2,23 +2,30 @@ const std = @import("std");
 const platform = @import("../../platform/window.zig");
 const intent = @import("intent.zig");
 pub const KeyChord = @import("../input/key_chord.zig").KeyChord;
+pub const Sequence = @import("../input/key_chord.zig").Sequence;
 
 pub const Command = enum { submit, cancel, previous, next };
 pub const Clipboard = enum { copy, cut, paste };
+pub const Register = enum { yank, yank_lines, put_after, put_before };
 pub const Action = union(enum) {
     none,
     edit: intent.Intent,
     clipboard: Clipboard,
+    register: Register,
     command: Command,
 
     pub fn parse(name: []const u8) !Action {
         if (std.meta.stringToEnum(Command, name)) |value| return .{ .command = value };
         if (std.meta.stringToEnum(Clipboard, name)) |value| return .{ .clipboard = value };
+        if (std.meta.stringToEnum(Register, name)) |value| return .{ .register = value };
         inline for (std.meta.fields(intent.Intent)) |field| {
-            if (comptime !std.mem.eql(u8, field.name, "move")) {
+            if (comptime field.type == void) {
                 if (std.mem.eql(u8, name, field.name)) return .{ .edit = @unionInit(intent.Intent, field.name, {}) };
             }
         }
+        if (std.mem.startsWith(u8, name, "select_lines_")) return .{ .edit = .{
+            .select_lines = std.meta.stringToEnum(intent.LineDestination, name[13..]) orelse return error.InvalidTextInputAction,
+        } };
         const extend = std.mem.startsWith(u8, name, "select_");
         if (extend or std.mem.startsWith(u8, name, "move_")) {
             const destination = std.meta.stringToEnum(intent.Destination, name[if (extend) @as(usize, 7) else 5..]) orelse return error.InvalidTextInputAction;
@@ -31,6 +38,7 @@ pub const Action = union(enum) {
         return switch (self) {
             .edit => true,
             .command => |command| command == .previous or command == .next,
+            .register => |command| command == .put_after or command == .put_before,
             .clipboard, .none => false,
         };
     }
@@ -41,33 +49,81 @@ pub const Binding = struct {
     action: Action = .none,
 };
 
+/// A command or asynchronous paste must finish the recipe; later operations
+/// must never race its callback/completion.
+pub const Actions = struct {
+    items: [4]Action = @splat(.none),
+    len: u8 = 1,
+
+    pub fn single(action: Action) Actions {
+        var result: Actions = .{};
+        result.items[0] = action;
+        return result;
+    }
+
+    pub fn validate(self: Actions) !void {
+        if (self.len == 0 or self.len > self.items.len) return error.InvalidTextInputActions;
+        for (self.items[0 .. self.len - 1]) |action| {
+            if (action == .command or (action == .clipboard and action.clipboard == .paste))
+                return error.InvalidTextInputActions;
+        }
+    }
+};
+
+pub const SequenceBinding = struct {
+    sequence: Sequence = .{},
+    actions: Actions = .{},
+};
+
+pub const Match = union(enum) { pending, actions: Actions };
+
 /// Native-owned overrides; copying a declaration never retains Lua storage.
 /// Defaults are fallback data, not special cases in event dispatch.
 pub const Keymap = struct {
     inherit_defaults: bool = true,
     multiline: bool = false,
-    bindings: [64]Binding = @splat(.{}),
+    bindings: [128]SequenceBinding = @splat(.{}),
     len: usize = 0,
 
     pub fn set(self: *Keymap, chord: KeyChord, action: Action) !void {
+        var sequence: Sequence = .{ .len = 1 };
+        sequence.strokes[0] = chord;
+        return self.setSequence(sequence, Actions.single(action));
+    }
+
+    pub fn setSequence(self: *Keymap, sequence: Sequence, actions: Actions) !void {
+        try actions.validate();
         for (self.bindings[0..self.len]) |*entry| {
-            if (std.meta.eql(entry.chord, chord)) {
-                entry.action = action;
+            if (!entry.sequence.overlaps(sequence)) continue;
+            if (entry.sequence.len == sequence.len) {
+                entry.actions = actions;
                 return;
             }
+            return error.AmbiguousKeyBinding;
         }
         if (self.len == self.bindings.len) return error.KeyBindingCapacityExceeded;
-        self.bindings[self.len] = .{ .chord = chord, .action = action };
+        self.bindings[self.len] = .{ .sequence = sequence, .actions = actions };
         self.len += 1;
     }
 
-    pub fn resolve(self: *const Keymap, key: platform.TranslatedKey) ?Action {
+    pub fn match(self: *const Keymap, prefix: Sequence) ?Match {
+        for (self.bindings[0..self.len]) |entry| {
+            if (entry.sequence.len < prefix.len or !entry.sequence.overlaps(prefix)) continue;
+            return if (entry.sequence.len == prefix.len) .{ .actions = entry.actions } else .pending;
+        }
+        if (prefix.len != 1) return null;
+        const stroke = prefix.strokes[0];
+        const actions = self.resolve(.{ .keycode = 0, .logical = stroke.key, .modifiers = stroke.modifiers }) orelse return null;
+        return .{ .actions = actions };
+    }
+
+    pub fn resolve(self: *const Keymap, key: platform.TranslatedKey) ?Actions {
         for (self.bindings[0..self.len]) |entry|
-            if (entry.chord.matches(key)) return entry.action;
+            if (entry.sequence.len == 1 and entry.sequence.strokes[0].matches(key)) return entry.actions;
         if (self.inherit_defaults and self.multiline) for (multiline_defaults) |entry|
-            if (entry.chord.matches(key)) return entry.action;
+            if (entry.chord.matches(key)) return Actions.single(entry.action);
         if (self.inherit_defaults) for (defaults) |entry|
-            if (entry.chord.matches(key)) return entry.action;
+            if (entry.chord.matches(key)) return Actions.single(entry.action);
         return null;
     }
 };
@@ -148,16 +204,16 @@ pub const defaults = blk: {
 test "text input bindings replace defaults disable exact chords and start empty" {
     var map: Keymap = .{};
     const key: platform.TranslatedKey = .{ .keycode = 44, .logical = .key_z, .modifiers = .{ .control = true } };
-    try std.testing.expectEqual(Action{ .edit = .undo }, map.resolve(key).?);
+    try std.testing.expectEqual(Action{ .edit = .undo }, map.resolve(key).?.items[0]);
     try map.set(try KeyChord.parse("Ctrl+Z"), .none);
-    try std.testing.expectEqual(Action.none, map.resolve(key).?);
+    try std.testing.expectEqual(Action.none, map.resolve(key).?.items[0]);
     try map.set(try KeyChord.parse("Ctrl+Z"), .{ .edit = .redo });
-    try std.testing.expectEqual(Action{ .edit = .redo }, map.resolve(key).?);
+    try std.testing.expectEqual(Action{ .edit = .redo }, map.resolve(key).?.items[0]);
     try std.testing.expectEqual(@as(usize, 1), map.len);
     map = .{ .inherit_defaults = false };
     try std.testing.expect(map.resolve(key) == null);
     try map.set(try KeyChord.parse("Alt+R"), .{ .edit = .redo });
-    try std.testing.expectEqual(Action{ .edit = .redo }, map.resolve(.{ .keycode = 19, .logical = .key_r, .modifiers = .{ .alt = true } }).?);
+    try std.testing.expectEqual(Action{ .edit = .redo }, map.resolve(.{ .keycode = 19, .logical = .key_r, .modifiers = .{ .alt = true } }).?.items[0]);
     try std.testing.expect(map.resolve(.{ .keycode = 19, .logical = .key_r, .modifiers = .{ .alt = true, .shift = true } }) == null);
     try std.testing.expectError(error.InvalidTextInputAction, Action.parse("select_unknown"));
     try std.testing.expectError(error.InvalidTextInputAction, Action.parse("move"));
@@ -182,7 +238,7 @@ test "default text input bindings preserve editing selection clipboard and comma
         .{ .key = .backspace, .modifiers = .{ .control = true, .shift = true }, .action = .{ .edit = .delete_word_backward } },
         .{ .key = .enter, .action = .{ .command = .submit } },
         .{ .key = .arrow_up, .action = .{ .command = .previous } },
-    }) |case| try std.testing.expectEqual(case.action, map.resolve(.{ .keycode = 0, .logical = case.key, .modifiers = case.modifiers }).?);
+    }) |case| try std.testing.expectEqual(case.action, map.resolve(.{ .keycode = 0, .logical = case.key, .modifiers = case.modifiers }).?.items[0]);
     try std.testing.expect(map.resolve(.{ .keycode = 0, .logical = .key_z }) == null);
     try std.testing.expect(map.resolve(.{ .keycode = 0, .logical = .key_v, .modifiers = .{ .control = true, .alt = true } }) == null);
     try std.testing.expect(map.resolve(.{ .keycode = 0, .logical = .enter, .modifiers = .{ .shift = true } }) == null);
@@ -190,11 +246,11 @@ test "default text input bindings preserve editing selection clipboard and comma
 
 test "full keymaps still allow replacing existing bindings" {
     var map: Keymap = .{};
-    const keys = [_]platform.LogicalKey{ .key_a, .key_b, .key_c, .key_d };
-    for (0..64) |i| try map.set(.{ .key = keys[i / 16], .modifiers = @bitCast(@as(u4, @intCast(i % 16))) }, .none);
-    try std.testing.expectEqual(@as(usize, 64), map.len);
-    try std.testing.expectError(error.KeyBindingCapacityExceeded, map.set(.{ .key = .key_e }, .{ .edit = .undo }));
+    const keys = [_]platform.LogicalKey{ .key_a, .key_b, .key_c, .key_d, .key_e, .key_f, .key_g, .key_h };
+    for (0..128) |i| try map.set(.{ .key = keys[i / 16], .modifiers = @bitCast(@as(u4, @intCast(i % 16))) }, .none);
+    try std.testing.expectEqual(@as(usize, 128), map.len);
+    try std.testing.expectError(error.KeyBindingCapacityExceeded, map.set(.{ .key = .key_i }, .{ .edit = .undo }));
     try map.set(.{ .key = .key_d }, .{ .edit = .redo });
-    try std.testing.expectEqual(Action{ .edit = .redo }, map.resolve(.{ .keycode = 0, .logical = .key_d }).?);
-    try std.testing.expectEqual(@as(usize, 64), map.len);
+    try std.testing.expectEqual(Action{ .edit = .redo }, map.resolve(.{ .keycode = 0, .logical = .key_d }).?.items[0]);
+    try std.testing.expectEqual(@as(usize, 128), map.len);
 }

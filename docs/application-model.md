@@ -2316,6 +2316,48 @@ Additional native binding actions support command-mode applications:
 
 - `collapse_selection` collapses at the active extent, retaining its affinity,
   without moving another grapheme or changing text/history.
+- `collapse_selection_start` collapses at the sorted range's start.
+- `select_word_inner` selects the Unicode word segment at the cursor (downstream,
+  or the preceding grapheme at hard-line end). `select_word_around` also includes
+  trailing spaces/tabs, or leading spaces/tabs if there are none after it.
+  Neither crosses a hard newline; empty lines produce an empty selection.
+- `move_vim_word_start_next`, `move_vim_word_start_previous`, and
+  `move_vim_word_end_next` implement command-mode word motions separately from
+  Ctrl+Arrow's Unicode word segmentation. They group letters/numbers/underscore
+  versus punctuation, separated by space/tab/LF, preserving grapheme boundaries.
+  End motions land on the last grapheme; their `select_` variant includes it.
+  `select_vim_word_inner`/`select_vim_word_around` use those same word classes.
+  `select_vim_word_forward` includes trailing spaces but stops before the current
+  nonempty hard line's LF. `select_vim_change_word` excludes trailing spaces when
+  starting on nonblank text, even at its final grapheme. These are fixed word
+  classes, not configurable Vim `iskeyword` or its complete Unicode policy.
+- `yank` copies selected text to an app-scoped characterwise unnamed register;
+  `yank_lines` records whole-line text with a canonical terminating LF. Applications
+  select the appropriate range before these actions. Empty characterwise yanks
+  preserve the register; an empty linewise yank records one empty line. Both
+  also export to the platform clipboard when available. Later clipboard changes
+  do not affect the register; ordinary `copy`/`cut`/`paste` do not update it.
+  `put_after`/`put_before` insert the register after/before the current grapheme,
+  or below/above its hard line for linewise data, as one undoable edit. The
+  register survives widget replacement but not app disposal. Secret fields
+  cannot access it; read-only fields can yank but cannot put. No named/numbered
+  registers or Visual replacement policy is implied.
+- `select_paragraph_inner` selects a run of nonempty hard lines, including its
+  terminating LF. Whitespace-only lines count as content. On blank lines it
+  selects the separator run. `select_paragraph_around` includes following blank
+  lines, or preceding blank lines if there are none after the paragraph.
+- `select_line` selects the active hard line, including LF. `select_lines_up`,
+  `select_lines_down`, `select_lines_start`, `select_lines_end`, and
+  `select_lines_paragraph_previous`/`select_lines_paragraph_next` extend whole
+  lines from that selection. They retain the original anchor line through
+  shrink/reversal and distinguish the trailing empty line from its preceding LF.
+- `delete_selection` deletes only the selected range (an empty range is a no-op).
+  `delete_line` removes the active hard line; `delete_lines` removes a whole-line
+  selection. An unterminated final line also removes its preceding LF, leaving
+  the caret at the preceding line's start. `clear_lines` replaces a whole-line
+  selection with one empty line. These edits preserve native undo history.
+- `move_paragraph_previous`/`move_paragraph_next` and their `select_` variants
+  target blank-line boundaries, skipping the current separator run first.
 - `move_logical_line_start`, `move_logical_line_end`, and their `select_` variants
   target the extent's hard line, excluding its terminating LF. Existing
   `move_line_start`/`move_line_end` continue to target visual wrapped lines.
@@ -2366,13 +2408,32 @@ or another shortcut. `{ inherit = false, ... }` discards both app and built-in
 bindings before adding the listed entries. An empty table inherits unchanged.
 Maps are copied during declaration and updated on retained rebuilds, without
 resetting the editing session or history. Invalid declarations leave the last
-valid map installed. Up to 64 explicit bindings may be retained per field;
+valid map installed. Up to 128 explicit bindings may be retained per field;
 built-in fallback entries do not count toward this limit.
+
+Keys can also name up to four whitespace-separated strokes, for example
+`["C I W"] = { "select_vim_word_inner", "yank", "delete_selection", "submit" }`.
+Values may be a dense array of one to four native actions, executed in order.
+An application command or asynchronous `paste` must be last. Recipes are not
+transactions: each mutating action retains its native undo and `on_change`
+behavior. They do not join later Insert typing into the same undo step.
+A completed sequence may not be a prefix of another explicit binding. Shared
+incomplete prefixes are allowed and override built-in single-chord defaults.
+Escape cancels a pending sequence; a mismatch discards the prefix and processes
+the current key normally. Prefixes have no timeout and cancel on focus change,
+pointer press, IME activity, or binding rebuild. Sequences and recipes are not
+executed in secret fields or during composition. Auto-repeat never completes a
+sequence or repeats a recipe. Native input draining yields after key-listener,
+shortcut, and editor-command callbacks so their synchronous mode/focus updates
+can rebuild before subsequent queued keys; ordinary `on_change` typing stays
+batched. A callback that yields for asynchronous work does not stall later keys.
 
 Chord names are case-insensitive and use `Ctrl`, `Shift`, `Alt`, and `Super`
 modifiers separated by `+`, followed by a logical key. Supported names are
 `A`–`Z`, `0`–`9`, `F1`–`F12`, `Left`, `Right`, `Up`, `Down`, `Home`, `End`,
-`PageUp`, `PageDown`, `Backspace`, `Delete`, `Enter`, `Escape`, `Space`, and `Tab`.
+`PageUp`, `PageDown`, `Backspace`, `Delete`, `Enter`, `Escape`, `Space`, `Tab`,
+`Colon`, `Brace_Left`, and `Brace_Right`. Include Shift for shifted punctuation
+keysyms on layouts that require it.
 Modifiers match exactly: `Ctrl+Z` does not also bind `Ctrl+Shift+Z`; letter case
 in the declaration does not imply Shift. Shifted digit keys retain their digit
 identity for bindings without changing the character inserted when unbound.

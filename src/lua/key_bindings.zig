@@ -26,15 +26,25 @@ pub fn field(state: *c.State, index: c_int, name: [*:0]const u8, base: Keymap) !
         defer c.lua_settop(state, -2);
         const name_bytes = try string(state, -2);
         if (std.mem.eql(u8, name_bytes, "inherit")) continue;
-        const chord = try keymap.KeyChord.parse(name_bytes);
+        const sequence = try keymap.Sequence.parse(name_bytes);
         for (seen.bindings[0..seen.len]) |binding|
-            if (std.meta.eql(binding.chord, chord)) return error.DuplicateKeyBinding;
-        try seen.set(chord, .none);
-        const action: keymap.Action = if (c.lua_type(state, -1) == c.type_boolean and c.lua_toboolean(state, -1) == 0)
-            .none
-        else
-            try keymap.Action.parse(try string(state, -1));
-        try result.set(chord, action);
+            if (binding.sequence.len == sequence.len and binding.sequence.overlaps(sequence)) return error.DuplicateKeyBinding;
+        try seen.setSequence(sequence, .{});
+        var actions: keymap.Actions = .{};
+        if (c.lua_type(state, -1) == c.type_table) {
+            const array = c.lua_gettop(state);
+            const count = denseArray(state, array) catch return error.InvalidTextInputActions;
+            if (count == 0 or count > actions.items.len) return error.InvalidTextInputActions;
+            actions.len = @intCast(count);
+            for (0..count) |i| {
+                _ = c.lua_rawgeti(state, array, @intCast(i + 1));
+                actions.items[i] = try keymap.Action.parse(try string(state, -1));
+                c.lua_settop(state, -2);
+            }
+        } else if (!(c.lua_type(state, -1) == c.type_boolean and c.lua_toboolean(state, -1) == 0)) {
+            actions = keymap.Actions.single(try keymap.Action.parse(try string(state, -1)));
+        }
+        try result.setSequence(sequence, actions);
     }
     return result;
 }
@@ -128,10 +138,10 @@ test "Lua binding maps inherit replace reject ambiguous chords and restore the s
     const app = try field(state, -1, "app", .{});
     const widget = try field(state, -1, "widget", app);
     const alt_r: @import("../platform/window.zig").TranslatedKey = .{ .keycode = 19, .logical = .key_r, .modifiers = .{ .alt = true } };
-    try std.testing.expectEqual(keymap.Action{ .edit = .redo }, app.resolve(alt_r).?);
-    try std.testing.expectEqual(keymap.Action{ .edit = .undo }, widget.resolve(alt_r).?);
-    try std.testing.expectEqual(keymap.Action.none, widget.resolve(.{ .keycode = 44, .logical = .key_z, .modifiers = .{ .control = true } }).?);
-    try std.testing.expectEqual(keymap.Action{ .clipboard = .copy }, widget.resolve(.{ .keycode = 46, .logical = .key_c, .modifiers = .{ .control = true } }).?);
+    try std.testing.expectEqual(keymap.Action{ .edit = .redo }, app.resolve(alt_r).?.items[0]);
+    try std.testing.expectEqual(keymap.Action{ .edit = .undo }, widget.resolve(alt_r).?.items[0]);
+    try std.testing.expectEqual(keymap.Action.none, widget.resolve(.{ .keycode = 44, .logical = .key_z, .modifiers = .{ .control = true } }).?.items[0]);
+    try std.testing.expectEqual(keymap.Action{ .clipboard = .copy }, widget.resolve(.{ .keycode = 46, .logical = .key_c, .modifiers = .{ .control = true } }).?.items[0]);
     const empty = try field(state, -1, "empty", widget);
     try std.testing.expect(!empty.inherit_defaults and empty.len == 0);
     const fresh = try field(state, -1, "fresh", widget);
@@ -142,5 +152,33 @@ test "Lua binding maps inherit replace reject ambiguous chords and restore the s
     try std.testing.expectError(error.InvalidTextInputAction, field(state, -1, "bad_action", app));
     try std.testing.expectError(error.InvalidKeyBindings, field(state, -1, "bad_type", app));
     try std.testing.expectError(error.InvalidKeyBindings, field(state, -1, "bad_inherit", app));
+    try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));
+}
+
+test "Lua editor sequences validate recipes ambiguity and dense arrays" {
+    const state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(state);
+    const source =
+        \\return { good={inherit=false, ['C I W']={'select_word_inner','delete_selection','submit'}, ['C A W']='select_word_around'},
+        \\ prefix={C='undo',['C I W']='redo'}, duplicate={['C I W']='undo',['c i w']='redo'},
+        \\ empty={X={}}, sparse={X={[1]='undo',[3]='redo'}}, named={X={foo='undo'}},
+        \\ long={X={'undo','undo','undo','undo','undo'}},
+        \\ callback={X={'submit','delete_selection'}}, paste={X={'paste','delete_selection'}}}
+    ;
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source.ptr, source.len, "@sequences", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 1, 0, 0, null));
+    const map = try field(state, -1, "good", .{});
+    try std.testing.expectEqual(.pending, map.match(try keymap.Sequence.parse("C")).?);
+    try std.testing.expectEqual(.pending, map.match(try keymap.Sequence.parse("C I")).?);
+    const actions = map.match(try keymap.Sequence.parse("C I W")).?.actions;
+    try std.testing.expectEqual(@as(u8, 3), actions.len);
+    try std.testing.expectEqual(keymap.Action{ .edit = .select_word_inner }, actions.items[0]);
+    try std.testing.expectEqual(keymap.Action{ .edit = .delete_selection }, actions.items[1]);
+    try std.testing.expectEqual(keymap.Action{ .command = .submit }, actions.items[2]);
+    try std.testing.expect(map.match(try keymap.Sequence.parse("C X")) == null);
+    try std.testing.expectError(error.AmbiguousKeyBinding, field(state, -1, "prefix", .{}));
+    try std.testing.expectError(error.DuplicateKeyBinding, field(state, -1, "duplicate", .{}));
+    for ([_][*:0]const u8{ "empty", "sparse", "named", "long", "callback", "paste" }) |name|
+        try std.testing.expectError(error.InvalidTextInputActions, field(state, -1, name, .{}));
     try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));
 }
