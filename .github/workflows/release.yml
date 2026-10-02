@@ -52,6 +52,8 @@ jobs:
       - name: Resolve release tag
         id: meta
         run: |
+          # The container runs as root but the runner user owns the checkout.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           sha="$(git rev-parse HEAD)"
           if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_EVENT_NAME}" = push ]; then
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
