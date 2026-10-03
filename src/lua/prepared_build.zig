@@ -14,6 +14,7 @@ pub const Handler = struct {
     propagate: bool = true,
     filter: @import("../ui/input/listener.zig").Filter = .{},
     sequence: @import("../ui/input/key_chord.zig").Sequence = .{},
+    command: @import("../ui/input/command.zig").Name = .{},
 
     pub fn takeReference(self: *Handler) c_int {
         const reference = self.reference;

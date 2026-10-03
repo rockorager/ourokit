@@ -108,18 +108,19 @@ pub fn main(init: std.process.Init) !void {
     });
     try equal(std.process.Child.Term{ .exited = 0 }, app.term);
     const info = (try std.json.parseFromSlice(std.json.Value, a, app.stdout, .{})).value.object;
-    try equal(@as(i64, 1), info.get("api_level").?.integer);
+    const api_level = info.get("api_level").?.integer;
+    try expect(api_level >= 2);
     const version = try std.process.run(a, init.io, .{ .argv = &.{ binary, "version" } });
     try equal(std.process.Child.Term{ .exited = 0 }, version.term);
-    try strings(try std.fmt.allocPrint(a, "ouroctl {s} (runtime API 1, revision {s})\n", .{
-        info.get("version").?.string, info.get("revision").?.string,
+    try strings(try std.fmt.allocPrint(a, "ouroctl {s} (runtime API {d}, revision {s})\n", .{
+        info.get("version").?.string, api_level, info.get("revision").?.string,
     }), version.stdout);
 
     // A future requirement must fail before trying either source or a library.
-    try fixture.write("ouro.json",
-        \\{"schema_version":1,"id":"dev.example.Editor","entry":"missing.lua","minimum_runtime_api":2,
-        \\ "native_modules":[{"name":"missing","path":"missing.so"}]}
-    );
+    try fixture.write("ouro.json", try std.fmt.allocPrint(a,
+        \\{{"schema_version":1,"id":"dev.example.Editor","entry":"missing.lua","minimum_runtime_api":{d},
+        \\ "native_modules":[{{"name":"missing","path":"missing.so"}}]}}
+    , .{api_level + 1}));
     const rejected = try std.process.run(a, init.io, .{
         .argv = &.{ binary, "run", "--headless" },
         .cwd = .{ .path = root },

@@ -78,6 +78,39 @@ return {
     assert(not t:node('check').checked and not checked())
   end,
 
+  ['native editor recipe finishes with a named mode command'] = function(t)
+    local insert = o.signal(false)
+    local value = o.signal('alpha βeta\nsecond line')
+    t:mount(function()
+      return o.box { key = 'document', commands = {
+        insert = function()
+          assert(value() == 'a\nsecond line', 'native change must precede command')
+          insert:set(true)
+        end,
+        normal = function() insert:set(false) end,
+      }, o.text_editor { key = 'body', autofocus = true, multiline = true,
+        text = value(), text_entry = insert(), on_change = function(v) value:set(v) end,
+        key_bindings = insert() and {
+          Escape = { 'end_undo_group', 'normalize_caret', command = 'normal' },
+        } or {
+          inherit = false, ['G G'] = 'move_document_start', L = 'move_normal_visual_right',
+          ['Shift+C'] = { 'select_logical_line_end', 'begin_undo_group',
+                         'delete_selection', command = 'insert' }, U = 'undo',
+        },
+      } }
+    end)
+    local id = t:node('document/body').id
+    t:key('g'); t:key('g'); t:key('l'); t:key('c', { shift = true })
+    assert(insert())
+    t:text('tail')
+    t:key('escape')
+    assert(not insert())
+    assert(t:node('document/body').value == 'atail\nsecond line')
+    t:key('u')
+    assert(t:node('document/body').value == 'alpha βeta\nsecond line')
+    assert(t:node('document/body').id == id, 'mode change must retain the editor')
+  end,
+
   ['scroll deltas accumulate on the retained list'] = function(t)
     t:mount(function()
       return o.column { key = 'root',

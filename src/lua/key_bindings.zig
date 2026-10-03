@@ -33,8 +33,11 @@ pub fn field(state: *c.State, index: c_int, name: [*:0]const u8, base: Keymap) !
         var actions: keymap.Actions = .{};
         if (c.lua_type(state, -1) == c.type_table) {
             const array = c.lua_gettop(state);
-            const count = denseArray(state, array) catch return error.InvalidTextInputActions;
-            if (count == 0 or count > actions.items.len) return error.InvalidTextInputActions;
+            if (c.lua_getfield(state, array, "command") != c.type_nil)
+                actions.command = try @import("../ui/input/command.zig").Name.init(try string(state, -1));
+            c.lua_settop(state, -2);
+            const count = denseArrayExcept(state, array, "command") catch return error.InvalidTextInputActions;
+            if (count > actions.items.len) return error.InvalidTextInputActions;
             actions.len = @intCast(count);
             for (0..count) |i| {
                 _ = c.lua_rawgeti(state, array, @intCast(i + 1));
@@ -109,10 +112,20 @@ fn enumFilter(comptime E: type, state: *c.State, index: c_int, name: [*:0]const 
 }
 
 fn denseArray(state: *c.State, index: c_int) !usize {
+    return denseArrayExcept(state, index, "");
+}
+
+fn denseArrayExcept(state: *c.State, index: c_int, allowed: []const u8) !usize {
     if (c.lua_type(state, index) != c.type_table) return error.InvalidInputFilter;
     const count = c.lua_rawlen(state, index);
     c.lua_pushnil(state);
     while (c.lua_next(state, index) != 0) {
+        if (allowed.len != 0 and c.lua_type(state, -2) == c.type_string and
+            std.mem.eql(u8, try string(state, -2), allowed))
+        {
+            c.lua_settop(state, -2);
+            continue;
+        }
         var valid: c_int = 0;
         const i = c.lua_tointegerx(state, -2, &valid);
         if (c.lua_type(state, -2) != c.type_number or valid == 0 or i < 1 or i > count)
@@ -180,5 +193,30 @@ test "Lua editor sequences validate recipes ambiguity and dense arrays" {
     try std.testing.expectError(error.DuplicateKeyBinding, field(state, -1, "duplicate", .{}));
     for ([_][*:0]const u8{ "empty", "sparse", "named", "long", "callback", "paste" }) |name|
         try std.testing.expectError(error.InvalidTextInputActions, field(state, -1, name, .{}));
+    try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));
+}
+
+test "named editor recipes copy names and require a synchronous native prefix" {
+    const state = c.luaL_newstate() orelse return error.OutOfMemory;
+    defer c.lua_close(state);
+    const source =
+        \\return {good={X={'delete_selection',command='insert'},I={command='insert'}},
+        \\ paste={X={'paste',command='insert'}}, callback={X={'submit',command='insert'}},
+        \\ typo={X={commnad='insert'}}, empty={X={command=''}},
+        \\ sparse={X={[2]='undo',command='insert'}}, number={X={command=42}}}
+    ;
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source.ptr, source.len, "@named-recipes", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 1, 0, 0, null));
+    const map = try field(state, -1, "good", .{});
+    const actions = map.match(try keymap.Sequence.parse("X")).?.actions;
+    try std.testing.expectEqual(@as(u8, 1), actions.len);
+    try std.testing.expectEqualStrings("insert", actions.command.bytes[0..actions.command.len]);
+    try std.testing.expect(!actions.repeats());
+    try std.testing.expectEqual(@as(u8, 0), map.match(try keymap.Sequence.parse("I")).?.actions.len);
+    for ([_][*:0]const u8{ "paste", "callback", "typo", "sparse" }) |name|
+        try std.testing.expectError(error.InvalidTextInputActions, field(state, -1, name, .{}));
+    try std.testing.expectError(error.InvalidCommandName, field(state, -1, "empty", .{}));
+    try std.testing.expectError(error.InvalidKeyBindings, field(state, -1, "number", .{}));
+    try std.testing.expectError(error.InvalidCommandName, @import("../ui/input/command.zig").Name.init("x" ** 65));
     try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));
 }

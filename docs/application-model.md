@@ -2437,12 +2437,12 @@ Additional native binding actions support command-mode applications:
   text and form one undoable edit, restoring the previous selection on undo and
   the new caret on redo. They are no-ops for single-line or read-only fields.
 
-For example, bind `O` to `insert_line_below`, then use an enclosing box's filtered
-`on_key` listener with `propagate=true` to switch an application signal to Insert
-mode. The native action runs at the input safe point; the scheduled Lua listener
-changes mode for the subsequent rebuild. Keep the editor's key and uncontrolled
-`default_text` stable so that mode changes retain its session. These actions do
-not add a callback-accessible mutable editor or implement Vim policy.
+For example, bind `O` to `{ "insert_line_below", command = "insert" }`, then
+declare `insert` in an enclosing box's `commands` table to switch an application
+signal to Insert mode. Native edits finish before the named callback runs; the
+callback changes mode for the subsequent rebuild. No second key observer is
+needed. Keep the editor's key and uncontrolled `default_text` stable so that mode
+changes retain its session. These actions do not implement Vim policy.
 
 Text input shortcuts are configurable. `ouro.app.text_input_bindings` supplies
 app-wide overrides; `ouro.text_input.key_bindings` overrides those for one field.
@@ -2502,6 +2502,48 @@ Native input draining yields after key-listener,
 shortcut, and editor-command callbacks so their synchronous mode/focus updates
 can rebuild before subsequent queued keys; ordinary `on_change` typing stays
 batched. A callback that yields for asynchronous work does not stall later keys.
+
+Add `command = "name"` to a recipe to finish with a contextual application
+command instead of the enumerated `on_command` bridge:
+
+```lua
+local insert_mode = ouro.signal(false)
+-- Inside content:
+return ouro.box {
+  key = "document",
+  commands = {
+    insert = function() insert_mode:set(true) end,
+    normal = function() insert_mode:set(false) end,
+  },
+  ouro.text_editor {
+    key = "body", default_text = "", text_entry = insert_mode(),
+    key_bindings = insert_mode() and {
+      Escape = { "end_undo_group", command = "normal" },
+    } or {
+      inherit = false,
+      I = { command = "insert" },
+      ["C W"] = { "select_vim_change_word", "begin_undo_group",
+                  "delete_selection", command = "insert" },
+    },
+  },
+}
+```
+
+The array holds zero to five synchronous native actions; the named suffix runs
+last and cannot be combined with `paste`, `submit`, `cancel`, `previous`, or
+`next`. Names are exact, case-sensitive strings of 1–64 bytes, copied natively.
+Resolution starts at the editor and walks enclosing input scopes, stopping at
+the modal boundary. The nearest eligible box declaring the name wins, whether
+or not it also assigns a shortcut. An unresolved name is a consumed no-op;
+already executed native edits are not rolled back. Names never resolve external
+`app.actions`. The callback receives no arguments and uses the same task dispatch
+as shortcuts; native `on_change` notifications queue before it. Its synchronous
+mode changes rebuild before the next queued key. Named recipes do not repeat,
+and retain the existing sequence cancellation, IME, secret-field and enabled
+guards. Read-only still blocks native mutations, but permits commands (for
+example, cancel or navigation). Use app policy to disable an unwanted command.
+Explicit undo groups can span the suffix and subsequent typing; end them in
+the Normal-mode recipe. Keep synchronous mode commands as ordinary functions.
 
 Chord names are case-insensitive and use `Ctrl`, `Shift`, `Alt`, and `Super`
 modifiers separated by `+`, followed by a logical key. Supported names are
@@ -3459,6 +3501,32 @@ is not inherited by spawned tasks. Synthetic development/playback input grants
 no real-input capability, and a multi-stroke command uses only the final press.
 Local commands are neither discoverable nor invocable through external tools
 unless the application separately declares an action.
+
+### Commands that outlive their invoking UI
+
+Declare durable async work once with `ouro.app_command(fn)`. It returns an
+ordinary function usable in `commands`, `on_press`, or a palette's selection
+callback. Invoking it from a running task starts `fn` in application scope using
+`ouro.spawn_app`, forwards all arguments (including nils), and returns nothing:
+
+```lua
+local save = ouro.app_command(function()
+  palette_open:set(false)
+  save_document() -- May yield after the palette's widget scope retires.
+end)
+-- Reuse save in commands = { save = save }, shortcuts = { ["Ctrl+S"] = "save" },
+-- or on_press = save. A palette may simply call its selected command.
+```
+
+Create the wrapper during declaration, not on every invocation. Wrapping is not
+execution: candidate evaluation may create it but may not invoke it. Work
+survives widget/window dismissal, **not source-generation retirement or app
+shutdown**. Ordinary callbacks and `ouro.spawn` remain scope-owned and cancel
+normally. This is fire-and-forget, not a synchronous function call or a way to
+return results; publish results through application state. Arguments are retained
+Lua values, not deep copies. Like `spawn_app`, the new task does not inherit real
+press provenance or popup/drag input capabilities. Acquire any required input
+capability in the originating callback before spawning.
 
 Headless retained layout, software glyph rendering, deterministic scene
 logging, Button interaction state tests, and semantic snapshots are available

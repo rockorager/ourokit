@@ -57,6 +57,7 @@ pub const Binding = struct {
 pub const Actions = struct {
     items: [5]Action = @splat(.none),
     len: u8 = 1,
+    command: @import("../input/command.zig").Name = .{},
 
     pub fn single(action: Action) Actions {
         var result: Actions = .{};
@@ -65,6 +66,7 @@ pub const Actions = struct {
     }
 
     pub fn repeats(self: Actions) bool {
+        if (self.command.len != 0) return false;
         if (self.len == 1) return self.items[0].repeats();
         if (self.len == 2 and self.items[1] == .edit and self.items[1].edit == .normalize_caret)
             return self.items[0].repeats();
@@ -81,8 +83,9 @@ pub const Actions = struct {
     }
 
     pub fn validate(self: Actions) !void {
-        if (self.len == 0 or self.len > self.items.len) return error.InvalidTextInputActions;
-        for (self.items[0 .. self.len - 1]) |action| {
+        if ((self.len == 0 and self.command.len == 0) or self.len > self.items.len) return error.InvalidTextInputActions;
+        const synchronous = if (self.command.len != 0) self.len else self.len - 1;
+        for (self.items[0..synchronous]) |action| {
             if (action == .command or (action == .clipboard and action.clipboard == .paste))
                 return error.InvalidTextInputActions;
         }

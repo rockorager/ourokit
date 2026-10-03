@@ -581,7 +581,7 @@ pub const WindowRuntime = struct {
             const old = self.pointer_bindings.set(
                 self.root_owner,
                 target,
-                .{ .id = callback, .kind = handler.kind, .propagate = handler.propagate, .filter = handler.filter, .sequence = handler.sequence },
+                .{ .id = callback, .kind = handler.kind, .propagate = handler.propagate, .filter = handler.filter, .sequence = handler.sequence, .command = handler.command },
             ) catch unreachable;
             std.debug.assert(old == null);
         }
@@ -1663,6 +1663,20 @@ pub const WindowRuntime = struct {
         return false;
     }
 
+    fn dispatchNamedCommand(self: *WindowRuntime, target: ui.instance.InstanceHandle, name: @import("../ui/input/command.zig").Name, callbacks: anytype) !void {
+        var current: ?ui.instance.InstanceHandle = target;
+        while (current) |candidate| : (current = try self.inputParent(candidate)) {
+            if (!self.instances.isInteractive(candidate)) continue;
+            for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
+                const handler = entry.handler orelse continue;
+                if (handler.kind != .command or !sameHandle(entry.target, candidate) or !handler.command.eql(name)) continue;
+                try self.spawnCallback(callbacks, handler.id, try self.instances.scope(candidate), &.{});
+                self.input_callback_spawned = true;
+                return;
+            }
+        }
+    }
+
     fn matchShortcut(self: *WindowRuntime, target: ui.instance.InstanceHandle, prefix: KeySequence, callbacks: anytype) !bool {
         for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
             const handler = entry.handler orelse continue;
@@ -2630,16 +2644,18 @@ pub const WindowRuntime = struct {
             .actions => |actions| {
                 const first = actions.items[0];
                 // A plain field still lets its enclosing dialog cancel.
-                if (actions.len == 1 and first == .command and first.command == .cancel and
+                if (actions.command.len == 0 and actions.len == 1 and first == .command and first.command == .cancel and
                     session.preedit() == null and self.pointer_bindings.getKind(target, .text_input_command) == null) return false;
                 if (key.state == .repeated and (continuation or !actions.repeats())) return true;
-                if (session.model.isSecret() and (continuation or actions.len != 1)) return true;
+                if (session.model.isSecret() and (continuation or actions.len != 1 or actions.command.len != 0)) return true;
                 self.clicks.reset();
                 self.resetCaretBlink();
-                if (actions.len > 1) session.model.breakUndoGroup();
+                if (actions.len > 1 or actions.command.len != 0) session.model.breakUndoGroup();
                 for (actions.items[0..actions.len]) |action| {
                     try self.applyTextInputAction(target, if (session.model.isSecret()) maskedKeyAction(action, behavior) else action, key.serial, callbacks);
                 }
+                if (actions.command.len != 0 and behavior.enabled and session.preedit() == null)
+                    try self.dispatchNamedCommand(target, actions.command, callbacks);
             },
         }
         return true;

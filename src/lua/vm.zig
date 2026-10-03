@@ -182,6 +182,23 @@ pub const Vm = struct {
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, builtinRequire, 1);
         c.lua_setglobal(state, "require");
+
+        // A reusable declaration of application ownership, with precisely the
+        // same candidate, cancellation and input-capability rules as spawn_app.
+        const commands =
+            \\local ouro = require('ouro')
+            \\local spawn_app, pack, unpack = ouro.spawn_app, table.pack, table.unpack
+            \\function ouro.app_command(fn)
+            \\  assert(type(fn) == 'function', 'app_command expects one function')
+            \\  return function(...)
+            \\    local args = pack(...)
+            \\    spawn_app(function() fn(unpack(args, 1, args.n)) end)
+            \\  end
+            \\end
+        ;
+        if (c.luaL_loadbufferx(state, commands.ptr, commands.len, "@ouro/app_command", "t") != c.ok or
+            c.lua_pcallk(state, 0, 0, 0, 0, null) != c.ok)
+            return error.LuaLibraryInitializationFailed;
     }
 
     /// Publish the host's XDG runtime directory without exposing the environment.
@@ -1211,7 +1228,7 @@ test "safe Lua libraries expose computation helpers and diagnostic print with st
         \\assert(not pcall(require, 'io') and not pcall(require, 'package'))
         \\assert(type(require('ouro').sleep) == 'function')
         \\local runtime = require('ouro').runtime
-        \\assert(runtime.api_level == 1 and runtime.version == '0.1.0')
+        \\assert(runtime.api_level >= 2 and runtime.version == '0.1.0')
         \\assert(type(runtime.revision) == 'string' and #runtime.revision > 0)
         \\assert(tonumber('ff', 16) == 255 and tostring(-23) == '-23')
         \\assert(select('#', 1, nil, 3) == 3)
@@ -1394,6 +1411,64 @@ test "spawn_app survives widget scope cancellation but not generation retirement
     try std.testing.expect(!vm.globalBoolean("promoted"));
     try std.testing.expect(!vm.globalBoolean("local_ran"));
     try std.testing.expect(!vm.app_spawn_allowed);
+    try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
+}
+
+test "app_command forwards arguments and async work outlives dismissal but not its generation" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 8, 4);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 8);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    var pending: TestExternalWait = .{ .vm = &vm };
+    pending.install();
+    _ = try vm.spawnApplication(
+        \\local o=require('ouro')
+        \\save=o.app_command(function(...)
+        \\ assert(select('#',...)==4); local a,b,c,d=...; assert(a=='doc' and b==nil and c==7 and d==nil)
+        \\ local _,err=o.activation_token(); assert(err.name=='NoActivationInput')
+        \\ dismissed=true; wait_external(); finished=true
+        \\end)
+        \\assert(not pcall(o.app_command, 42))
+        \\function activate() assert(save('doc',nil,7,nil)==nil); o.spawn(function() local_ran=true end) end
+    );
+    try std.testing.expectEqual(.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    const widget = try scheduler.createScope(scheduler.application_scope);
+    const activated = try vm.spawnGlobal(widget, "activate", &.{});
+    try vm.setActivationInput(activated, .{ .window = .{ .slot = 3, .generation = 7 }, .serial = 191 });
+    try std.testing.expectEqual(.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expectEqual(.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("dismissed"));
+    try scheduler.queueScopeCancellation(widget);
+    try scheduler.applyQueuedCancellations();
+    while (scheduler.takeRunnable()) |runnable| _ = try vm.resumeRunnable(runnable);
+    try std.testing.expect(!pending.canceled);
+    try std.testing.expect(!vm.globalBoolean("local_ran"));
+    try scheduler.destroyScope(widget);
+    try vm.markExternalCompleted(pending.handle);
+    try std.testing.expectEqual(.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("finished"));
+    try std.testing.expect(pending.destroyed);
+
+    vm.app_spawn_allowed = false;
+    _ = try vm.spawnApplication("assert(not pcall(save,'doc',nil,7,nil)); candidate_rejected=true");
+    try std.testing.expectEqual(.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("candidate_rejected"));
+    vm.app_spawn_allowed = true;
+    pending = .{ .vm = &vm };
+    _ = try vm.spawnApplication("finished=false; save('doc',nil,7,nil)");
+    try std.testing.expectEqual(.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expectEqual(.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try vm.requestCancellation();
+    try std.testing.expect(pending.canceled);
+    try vm.markExternalCompleted(pending.handle);
+    try std.testing.expectEqual(.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(!vm.globalBoolean("finished"));
+    try std.testing.expect(pending.destroyed);
     try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
 }
 

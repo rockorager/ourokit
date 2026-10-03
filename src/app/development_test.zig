@@ -155,6 +155,88 @@ test "editor recipes yield to mode callbacks but ordinary typing stays batched" 
     try f.settle();
 }
 
+test "named editor recipes observe native edits before changing mode and retain undo history" {
+    const f = try Fixture.create(
+        \\local mode=ouro.signal(false); local value=ouro.signal('alpha tail')
+        \\editor=ouro.editor_controller(); entered=0; left=0
+        \\local function insert()
+        \\ local s=assert(editor:state()); assert(editor:read(s.token,0,s.bytes)==' tail')
+        \\ assert(value()==' tail'); entered=entered+1; mode:set(true)
+        \\end
+        \\function build() return ouro.box {key='root', commands={insert=function() error('shadowed') end},
+        \\ ouro.box {key='scope',commands={insert=insert,normal=function() left=left+1; mode:set(false) end},
+        \\ shortcuts={['Ctrl+N']='normal'},
+        \\ ouro.text_editor {key='body',controller=editor,autofocus=true,text=value(),text_entry=mode(),
+        \\ key_bindings=mode() and {Escape={'end_undo_group',command='normal'}} or
+        \\ {inherit=false,['C W']={'select_vim_change_word','begin_undo_group','delete_selection',command='insert'},U='undo',N={command='normal'}},
+        \\ on_change=function(v) value:set(v) end}}} end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    _ = try session.model.setSelection(.collapsed(0));
+    try f.queueKeys(&.{
+        .{ .keycode = 0, .logical = .key_c, .unicode = 'c' },
+        .{ .keycode = 0, .logical = .key_w, .unicode = 'w' },
+        .{ .keycode = 0, .logical = .key_x, .unicode = 'x' },
+        .{ .keycode = 0, .logical = .key_y, .unicode = 'y' },
+        .{ .keycode = 0, .logical = .escape },
+    });
+    try f.settle();
+    try f.exec("assert(entered==1 and left==1)");
+    try std.testing.expectEqual(target, f.runtime.focus.current().?);
+    try std.testing.expectEqualStrings("xy tail", session.model.text());
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_u } });
+    try std.testing.expectEqualStrings("alpha tail", session.model.text());
+    try std.testing.expect(!session.model.undo());
+    // A command-only recipe uses the same local function as a shortcut.
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_n } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_n, .modifiers = .{ .control = true } } });
+    try f.exec("assert(entered==1 and left==3)");
+}
+
+test "named editor recipes preserve guards modal lookup and sequence cancellation" {
+    const f = try Fixture.create(
+        \\locked=ouro.signal(false); masked=ouro.signal(false); calls=0
+        \\function build() return ouro.box {key='root',commands={done=function() calls=calls+1 end},
+        \\ ouro.text_editor {key='body',autofocus=true,default_text='keep',text_entry=false,
+        \\ read_only=locked(),mask=masked(),key_bindings={inherit=false,
+        \\ ['D D']={'select_all','delete_selection',command='done'},
+        \\ X={'select_all','delete_selection',command='done'},I={command='done'},M={command='missing'}}}} end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    const session = try f.runtime.text_inputs.session(target);
+    const d = @import("../platform/window.zig").TranslatedKey{ .keycode = 0, .logical = .key_d };
+    try f.queueKeys(&.{ d, .{ .keycode = 0, .logical = .escape }, d });
+    try f.settle();
+    try f.exec("assert(calls==0)");
+    // A dirty rebuild replaces bindings and discards the incomplete second D.
+    try f.exec("locked:set(true)");
+    try f.settle();
+    try f.queueKeys(&.{d});
+    try f.settle();
+    try f.exec("assert(calls==0)");
+    try std.testing.expectEqualStrings("keep", session.model.text());
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_x } });
+    try f.exec("assert(calls==1)"); // Like legacy commands, read-only permits app policy, not edits.
+    try std.testing.expectEqualStrings("keep", session.model.text());
+    _ = try session.apply(.{ .preedit = .{ .text = "compose", .cursor = null } });
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_i } });
+    try f.exec("assert(calls==1)");
+    _ = try session.apply(.{ .preedit = .{ .text = null, .cursor = null } });
+    _ = try f.runtime.focus.setBoundary(&f.runtime.instances, target);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_i } });
+    try f.exec("assert(calls==1)");
+    _ = try f.runtime.focus.setBoundary(&f.runtime.instances, null);
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_m } });
+    try f.exec("assert(calls==1)");
+    try f.exec("masked:set(true)");
+    try f.settle();
+    try f.play(.{ .key = .{ .keycode = 0, .logical = .key_i } });
+    try f.exec("assert(calls==1)");
+}
+
 test "editor explicit undo group spans change command and controlled Insert echo" {
     const f = try Fixture.create(
         \\local mode=ouro.signal(false); local value=ouro.signal('alpha tail')
@@ -180,6 +262,67 @@ test "editor explicit undo group spans change command and controlled Insert echo
     try std.testing.expect(!session.model.undo());
     try std.testing.expect(session.model.redo());
     try std.testing.expectEqualStrings("xy tail", session.model.text());
+}
+
+test "Shift C recipes retain grouped undo through Escape and Normal with legacy and named commands" {
+    inline for (.{ false, true }) |named| {
+        const f = try Fixture.create(
+            \\local mode=ouro.signal(false); local value=ouro.signal('alpha βeta\nsecond line')
+            \\function build() return ouro.box {key='root',commands={insert=function() mode:set(true) end,normal=function() mode:set(false) end},
+            \\ ouro.text_editor {key='body',autofocus=true,text=value(),text_entry=mode(),multiline=true,
+            \\ key_bindings=mode() and {Escape={'end_undo_group','move_visual_left','normalize_caret',
+        ++ (if (named) "command='normal'" else "'cancel'") ++
+            \\}} or {inherit=false,['G G']='move_document_start',L='move_normal_visual_right',U='undo',
+            \\ ['Shift+C']={'select_logical_line_end','yank','begin_undo_group','delete_selection',
+        ++ (if (named) "command='insert'" else "'submit'") ++
+            \\}},on_command=function(c) mode:set(c=='submit') end,on_change=function(v) value:set(v) end}} end
+        );
+        defer f.destroy();
+        var clipboard: @import("clipboard.zig").Coordinator = undefined;
+        try clipboard.init(std.testing.allocator, &f.scheduler, 1, 2, 1024);
+        defer clipboard.deinit();
+        f.runtime.setClipboardCoordinator(&clipboard);
+        try f.queueKeys(&.{
+            .{ .keycode = 0, .logical = .key_g },
+            .{ .keycode = 0, .logical = .key_g },
+            .{ .keycode = 0, .logical = .key_l },
+            .{ .keycode = 0, .logical = .key_c, .modifiers = .{ .shift = true } },
+            .{ .keycode = 0, .logical = .key_t, .unicode = 't' },
+            .{ .keycode = 0, .logical = .key_a, .unicode = 'a' },
+            .{ .keycode = 0, .logical = .key_i, .unicode = 'i' },
+            .{ .keycode = 0, .logical = .key_l, .unicode = 'l' },
+            .{ .keycode = 0, .logical = .escape },
+        });
+        try f.settle();
+        const session = try f.runtime.text_inputs.session(f.runtime.focus.current().?);
+        try std.testing.expectEqualStrings("atail\nsecond line", session.model.text());
+        try std.testing.expectEqualStrings("lpha βeta", clipboard.register_text.?);
+        try f.play(.{ .key = .{ .keycode = 0, .logical = .key_u } });
+        try std.testing.expectEqualStrings("alpha βeta\nsecond line", session.model.text());
+        try std.testing.expect(!session.model.undo());
+    }
+}
+
+test "app_command shortcut can dismiss its declaring widget before asynchronous completion" {
+    const f = try Fixture.create(
+        \\open=ouro.signal(true)
+        \\local save=ouro.app_command(function() open:set(false); ouro.sleep(0); saved=true end)
+        \\function build() return ouro.box {key='root',open() and ouro.box {key='palette',commands={save=save},
+        \\ shortcuts={['Ctrl+S']='save'},ouro.text_editor {key='query',autofocus=true,default_text=''}} or nil} end
+    );
+    defer f.destroy();
+    const target = f.runtime.focus.current().?;
+    try f.queueKeys(&.{.{ .keycode = 0, .logical = .key_s, .modifiers = .{ .control = true } }});
+    try f.runtime.dispatchInput(&f.callbacks);
+    try std.testing.expectEqual(.completed, try f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
+    try std.testing.expectEqual(.waiting, try f.vm.resumeRunnable(f.scheduler.takeRunnable().?));
+    try f.settle();
+    try f.settle(); // Drain retirement before delivering the pending completion.
+    try std.testing.expect(!f.runtime.instances.isActive(target));
+    try std.testing.expect(!f.vm.globalBoolean("saved"));
+    try f.vm.markTimeoutCompleted((try f.loop.takeExpired()).?.operation);
+    try f.settle();
+    try std.testing.expect(f.vm.globalBoolean("saved"));
 }
 
 test "editor controller tasks validate revisions graphemes ownership and normal callbacks" {

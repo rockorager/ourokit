@@ -28,6 +28,7 @@ pub const HandlerKind = enum {
     pointer_bubble,
     pointer_down_outside,
     shortcut,
+    command,
 
     fn primary(self: HandlerKind) bool {
         return self == .pointer or self == .button or self == .@"switch" or self == .listbox or self == .range_change or self == .split_change;
@@ -40,6 +41,7 @@ pub const Handler = struct {
     propagate: bool = true,
     filter: @import("listener.zig").Filter = .{},
     sequence: @import("key_chord.zig").Sequence = .{},
+    command: @import("command.zig").Name = .{},
 };
 
 const Entry = struct {
@@ -156,7 +158,8 @@ pub const PointerBindings = struct {
         self.revision +%= 1;
         for (self.entries[0..self.entry_limit]) |*entry| if (same(entry.target, target) and entry.handler != null and
             sameBindingKind(entry.handler.?.kind, handler.kind) and
-            (handler.kind != .shortcut or std.meta.eql(entry.handler.?.sequence, handler.sequence)))
+            (handler.kind != .shortcut or std.meta.eql(entry.handler.?.sequence, handler.sequence)) and
+            (handler.kind != .command or entry.handler.?.command.eql(handler.command)))
         {
             const old = entry.handler;
             entry.owner = owner;

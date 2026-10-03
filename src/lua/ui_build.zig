@@ -435,7 +435,7 @@ pub const UiBuild = struct {
             const old = bindings.set(
                 owner,
                 tree.handleForId(pending.id).?,
-                .{ .id = handle, .kind = pending.kind, .propagate = pending.propagate, .filter = pending.filter, .sequence = pending.sequence },
+                .{ .id = handle, .kind = pending.kind, .propagate = pending.propagate, .filter = pending.filter, .sequence = pending.sequence, .command = pending.command },
             ) catch unreachable;
             if (old) |handler| callbacks.?.release(handler.id) catch unreachable;
         }
@@ -2237,6 +2237,16 @@ pub const UiBuild = struct {
             while (c.lua_next(state, commands) != 0) {
                 const name = string(state, -2) orelse return error.InvalidCommands;
                 if (name.len == 0 or c.lua_type(state, -1) != c.type_function) return error.InvalidCommands;
+                const command = try @import("../ui/input/command.zig").Name.init(name);
+                if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+                c.lua_pushvalue(state, -1);
+                self.pending_handlers[self.pending_handler_count] = .{
+                    .id = id,
+                    .reference = c.luaL_ref(state, c.registry_index),
+                    .kind = .command,
+                    .command = command,
+                };
+                self.pending_handler_count += 1;
                 c.lua_settop(state, -2);
             }
         }
@@ -3150,7 +3160,7 @@ test "contextual input validates filters commands and shortcut ambiguity transac
     defer c.lua_close(state);
     var ui: UiBuild = .{ .state = state, .storage = &.{} };
     defer ui.rollbackHandlers();
-    const cases = [_]struct { source: []const u8, failure: ?anyerror }{
+    const cases = [_]struct { source: []const u8, failure: ?anyerror, count: usize = 2 }{
         .{ .source = "{on_key={handler=function() end}}", .failure = error.InputPropagationRequired },
         .{ .source = "{on_key={propagate=false,handler=function() end,key={'A'}}}", .failure = error.InvalidInputFilter },
         .{ .source = "{on_key={propagate=false,handler=function() end,keys={}}}", .failure = error.InvalidInputFilter },
@@ -3163,7 +3173,7 @@ test "contextual input validates filters commands and shortcut ambiguity transac
         .{ .source = "{commands={},shortcuts={['Ctrl+S']='typo'}}", .failure = error.UnknownCommand },
         .{ .source = "{commands={go=function() end},shortcuts={['Ctrl+S']='go',['ctrl+s']='go'}}", .failure = error.AmbiguousShortcut },
         .{ .source = "{commands={go=function() end},shortcuts={['Ctrl+K']='go',['Ctrl+K C']='go'}}", .failure = error.AmbiguousShortcut },
-        .{ .source = "{commands={go=function() end},shortcuts={['Ctrl+K C']='go',['Ctrl+K U']='go'}}", .failure = null },
+        .{ .source = "{commands={go=function() end},shortcuts={['Ctrl+K C']='go',['Ctrl+K U']='go'}}", .failure = null, .count = 3 },
         .{ .source = "{on_key={propagate=false,handler=function() end,keys={'Ctrl+Left'},states={'pressed'}},on_pointer={propagate=true,handler=function() end,kinds={'press'},button=272}}", .failure = null },
     };
     for (cases) |case| {
@@ -3175,7 +3185,7 @@ test "contextual input validates filters commands and shortcut ambiguity transac
             try std.testing.expectError(failure, ui.stageInput(state, 42));
         } else {
             try ui.stageInput(state, 42);
-            try std.testing.expectEqual(@as(usize, 2), ui.pending_handler_count);
+            try std.testing.expectEqual(case.count, ui.pending_handler_count);
         }
         try std.testing.expectEqual(@as(c_int, 1), c.lua_gettop(state));
         ui.rollbackHandlers();

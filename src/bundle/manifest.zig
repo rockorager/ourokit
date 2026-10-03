@@ -159,7 +159,8 @@ test "manifest accepts supported API levels and rejects future or malformed requ
     const cases = .{
         .{ "0", null },
         .{ "1", null },
-        .{ "2", error.UnsupportedRuntimeApi },
+        .{ "2", null },
+        .{ std.fmt.comptimePrint("{d}", .{@import("../runtime.zig").api_level + 1}), error.UnsupportedRuntimeApi },
         .{ "-1", error.InvalidApplicationManifest },
         .{ "1.5", error.InvalidApplicationManifest },
         .{ "\"newer\"", error.InvalidApplicationManifest },

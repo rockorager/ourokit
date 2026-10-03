@@ -47,6 +47,7 @@ for contracts it removed.
 | Level | Baseline |
 | --- | --- |
 | 1 | The documented Lua and development-control API, plus `ouroctl test` and its retained-UI helpers. Includes `text_entry`, `caret_shape`, native editor key bindings, `editor_controller` state/read/select/replace, explicit undo groups, and round-trippable `line_caret` and inclusive `character_caret` selections. |
+| 2 | Editor recipes support a `command = "name"` suffix resolved through enclosing `commands` scopes after native edits. `ouro.app_command(fn)` declares reusable application-scoped, generation-canceled work over `spawn_app`. See [command composition and ownership](application-model.md#contextual-commands-and-custom-input). |
 
 The API 1 baseline also includes host-backed `print(...)` to **stderr** and
 the explicit [`ouro.files.write` save policies](files.md): `permissions`,
