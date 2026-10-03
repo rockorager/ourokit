@@ -2317,6 +2317,13 @@ They return a value or `nil, {name=..., message=...}`.
 - `editor:state()` returns `{token, selection, bytes}` without copying the text.
   Selection contains zero-based UTF-8 `anchor` and `extent` byte offsets and
   `anchor_affinity`/`extent_affinity` (`upstream` or `downstream`).
+  Whole-line selections also have `line_caret = {anchor, extent, column}`:
+  these are the actual cursor offsets and desired grapheme column, separate
+  from the whole-line bounds. Passing it to `select` recomputes those bounds.
+  Its optional `anchor_affinity`/`extent_affinity` preserve soft-wrap edges and
+  default to downstream.
+  Inclusive character selections use `character_caret` with the same fields;
+  their bounds include both cursor graphemes. The two metadata fields are mutually exclusive.
 - `editor:read(token, start, end)` copies only the half-open range requested.
 - `editor:select(token, selection)` preserves direction and affinity (omitted
   affinities default to downstream); it returns the new state, without `on_change`.
@@ -2369,6 +2376,18 @@ Additional native binding actions support command-mode applications:
 - `collapse_selection` collapses at the active extent, retaining its affinity,
   without moving another grapheme or changing text/history.
 - `collapse_selection_start` collapses at the sorted range's start.
+- `collapse_selection_anchor` restores the anchor, useful after a backward yank.
+- `normalize_caret` collapses at the active cursor and clamps hard-line end to
+  its last grapheme (empty lines stay at their start). `move_normal_` plus a
+  movement destination applies the same rule; horizontal motions cannot cross LF.
+  `append_character` moves to the insertion edge after that grapheme without
+  crossing LF. Ordinary `move_`/`select_` insertion-edge behavior is unchanged.
+- `select_character_forward`/`select_character_backward` select the current or
+  previous grapheme within the hard line. An empty line or backward movement
+  at line start yields an empty selection, never a selected LF.
+- `select_characters` enters inclusive selection, retaining separate cursor
+  endpoints. `select_inclusive_` plus a movement destination extends it with
+  Normal cursor rules; `swap_selection` exchanges its active cursor and anchor.
 - `select_word_inner` selects the Unicode word segment at the cursor (downstream,
   or the preceding grapheme at hard-line end). `select_word_around` also includes
   trailing spaces/tabs, or leading spaces/tabs if there are none after it.
@@ -2475,7 +2494,11 @@ Escape cancels a pending sequence; a mismatch discards the prefix and processes
 the current key normally. Prefixes have no timeout and cancel on focus change,
 pointer press, IME activity, or binding rebuild. Sequences and recipes are not
 executed in secret fields or during composition. Auto-repeat never completes a
-sequence or repeats a recipe. Native input draining yields after key-listener,
+sequence. Single-key character-delete recipes may repeat when they start with
+`select_character_forward`/`select_character_backward` and contain only `yank`,
+`delete_selection`, and `normalize_caret` afterward. A repeatable action followed
+by `normalize_caret` also retains repetition. Other recipes do not repeat.
+Native input draining yields after key-listener,
 shortcut, and editor-command callbacks so their synchronous mode/focus updates
 can rebuild before subsequent queued keys; ordinary `on_change` typing stays
 batched. A callback that yields for asynchronous work does not stall later keys.
@@ -2484,8 +2507,9 @@ Chord names are case-insensitive and use `Ctrl`, `Shift`, `Alt`, and `Super`
 modifiers separated by `+`, followed by a logical key. Supported names are
 `A`–`Z`, `0`–`9`, `F1`–`F12`, `Left`, `Right`, `Up`, `Down`, `Home`, `End`,
 `PageUp`, `PageDown`, `Backspace`, `Delete`, `Enter`, `Escape`, `Space`, `Tab`,
-`Colon`, `Brace_Left`, and `Brace_Right`. Include Shift for shifted punctuation
-keysyms on layouts that require it.
+`Colon`, `Brace_Left`, `Brace_Right`, `Equal`, `Plus`, and `Minus`. Include Shift
+for shifted punctuation keysyms on layouts that require it (e.g. `Ctrl+Shift+Plus`
+on a US keyboard). Keypad equals, add, and subtract use the same logical names.
 Modifiers match exactly: `Ctrl+Z` does not also bind `Ctrl+Shift+Z`; letter case
 in the declaration does not imply Shift. Shifted digit keys retain their digit
 identity for bindings without changing the character inserted when unbound.
@@ -2509,6 +2533,15 @@ start. Unbound printable keys enter text when `text_entry` is enabled;
 unbound Tab/Shift+Tab still traverse focus. Key releases never invoke actions.
 Editing/navigation may repeat; clipboard, submit, and cancel actions fire only
 on the initial press. Remapping does not bypass enabled/read-only or IME guards.
+
+`select_line` selects whole hard lines while retaining separate anchor and active
+cursor positions. `select_lines_up`/`down` move by hard line, preserving the desired
+grapheme column through shorter lines. Other `select_lines_` destinations are
+`left`, `right`, `line_start`, `line_end`, `word_start_next`, `word_start_previous`,
+`word_end_next`, `start`, `end`, `paragraph_previous`, `paragraph_next`, and `swap`.
+`swap` exchanges the active cursor and anchor; `select_characters` converts their
+inclusive span back to a character selection. `collapse_selection` leaves the
+cursor at its active position, not at the end of the whole-line range.
 
 Set `mask = true` for a password field. It is the same single-line editor,
 drawing one dot per grapheme; the value is kept in a locked page, copy, cut

@@ -12,6 +12,20 @@ pub const Selection = struct {
     extent: usize,
     anchor_affinity: CaretAffinity = .downstream,
     extent_affinity: CaretAffinity = .downstream,
+    /// Whole-line bounds are distinct from the positions of the two cursors.
+    /// Keep these through reversal and short lines rather than placing the
+    /// active cursor after the selected LF, on the following line.
+    line_caret: ?LineCaret = null,
+    /// Inclusive character bounds likewise retain the actual cursor endpoints.
+    character_caret: ?LineCaret = null,
+
+    pub const LineCaret = struct {
+        anchor: usize,
+        extent: usize,
+        column: usize,
+        anchor_affinity: CaretAffinity = .downstream,
+        extent_affinity: CaretAffinity = .downstream,
+    };
 
     pub fn collapsed(offset: usize) Selection {
         return .{ .anchor = offset, .extent = offset };
@@ -35,6 +49,10 @@ pub const Selection = struct {
 
     pub fn isCollapsed(self: Selection) bool {
         return self.anchor == self.extent;
+    }
+
+    pub fn cursor(self: Selection) ?LineCaret {
+        return self.line_caret orelse self.character_caret;
     }
 };
 
@@ -178,7 +196,13 @@ pub const Model = struct {
         return self.text()[range.start..range.end];
     }
 
-    pub fn setSelection(self: *Model, value: Selection) !bool {
+    pub fn setSelection(self: *Model, raw: Selection) !bool {
+        if (raw.line_caret != null and raw.character_caret != null) return error.InvalidEditorSelection;
+        if (raw.cursor()) |caret| {
+            if (!self.isBoundary(caret.anchor) or !self.isBoundary(caret.extent))
+                return error.InvalidGraphemeBoundary;
+        }
+        const value = if (raw.line_caret) |caret| self.lineSelection(caret) else if (raw.character_caret) |caret| self.characterSelection(caret) else raw;
         if (!self.isBoundary(value.anchor) or !self.isBoundary(value.extent))
             return error.InvalidGraphemeBoundary;
         self.breakUndoGroup();
@@ -193,7 +217,12 @@ pub const Model = struct {
     /// nearest valid caret boundary.
     pub fn setSelectionClamped(self: *Model, value: Selection) bool {
         self.breakUndoGroup();
-        const next: Selection = .{
+        const next: Selection = if (value.cursor()) |caret| blk: {
+            var clamped = caret;
+            clamped.anchor = self.boundaryAtOrBefore(@min(caret.anchor, self.byteLen()));
+            clamped.extent = self.boundaryAtOrBefore(@min(caret.extent, self.byteLen()));
+            break :blk if (value.line_caret != null) self.lineSelection(clamped) else self.characterSelection(clamped);
+        } else .{
             .anchor = self.boundaryAtOrBefore(@min(value.anchor, self.byteLen())),
             .extent = self.boundaryAtOrBefore(@min(value.extent, self.byteLen())),
             .anchor_affinity = value.anchor_affinity,
@@ -635,44 +664,153 @@ pub const Model = struct {
     }
 
     pub fn selectLine(self: *Model) !bool {
-        const range = self.lineRangeAt(self.selection.extent);
-        return self.setLineSelection(range, range);
-    }
-
-    /// Extend whole hard lines, retaining the original anchor line through
-    /// shrink and reversal. Upstream end affinity distinguishes a terminating
-    /// LF from the empty final line at the same insertion edge.
-    pub fn selectLines(self: *Model, destination: @import("intent.zig").LineDestination) !bool {
         const selection = self.selection;
-        const anchor = self.lineRangeAt(if (selection.anchor_affinity == .upstream)
-            self.boundaryBefore(selection.anchor)
-        else
-            selection.anchor);
-        var active = self.lineRangeAt(if (selection.extent_affinity == .upstream)
-            self.boundaryBefore(selection.extent)
-        else
-            selection.extent);
-        const offset = switch (destination) {
-            .up => if (active.start > 0) active.start - 1 else 0,
-            .down => active.end,
-            .start => 0,
-            .end => self.byteLen(),
-            .paragraph_previous, .paragraph_next => self.paragraphOffset(active.start, destination == .paragraph_next),
-        };
-        active = self.lineRangeAt(offset);
-        return self.setLineSelection(anchor, active);
+        if (selection.line_caret != null) return false;
+        if (selection.character_caret) |value| {
+            var caret = value;
+            caret.column = self.lineColumn(caret.extent);
+            return self.setSelection(.{ .anchor = 0, .extent = 0, .line_caret = caret });
+        }
+        // Character selections use an exclusive upper bound; Visual-line
+        // must retain both original cursor positions, not select another row.
+        const anchor = if (selection.anchor > selection.extent) self.boundaryBefore(selection.anchor) else selection.anchor;
+        const extent = if (selection.extent > selection.anchor) self.boundaryBefore(selection.extent) else selection.extent;
+        return self.setSelection(self.lineSelection(.{
+            .anchor = anchor,
+            .extent = extent,
+            .column = self.lineColumn(extent),
+            .anchor_affinity = if (anchor == selection.anchor) selection.anchor_affinity else .downstream,
+            .extent_affinity = if (extent == selection.extent) selection.extent_affinity else .downstream,
+        }));
     }
 
-    fn setLineSelection(self: *Model, anchor: Range, active: Range) !bool {
-        return self.setSelection(if (active.start < anchor.start) .{
+    /// Convert whole lines back to an inclusive character selection without
+    /// discarding its anchor or moving the active cursor to a range boundary.
+    pub fn selectCharacters(self: *Model) !bool {
+        const s = self.selection;
+        const caret = s.cursor() orelse Selection.LineCaret{
+            .anchor = if (s.anchor > s.extent) self.boundaryBefore(s.anchor) else s.anchor,
+            .extent = if (s.extent > s.anchor) self.boundaryBefore(s.extent) else s.extent,
+            .column = 0,
+            .anchor_affinity = s.anchor_affinity,
+            .extent_affinity = if (s.extent > s.anchor) .downstream else s.extent_affinity,
+        };
+        return self.setSelection(.{ .anchor = 0, .extent = 0, .character_caret = caret });
+    }
+
+    fn characterSelection(self: *const Model, caret: Selection.LineCaret) Selection {
+        return if (caret.extent < caret.anchor) .{
+            .anchor = self.boundaryAfter(caret.anchor),
+            .extent = caret.extent,
+            .anchor_affinity = .upstream,
+            .extent_affinity = caret.extent_affinity,
+            .character_caret = caret,
+        } else .{
+            .anchor = caret.anchor,
+            .extent = self.boundaryAfter(caret.extent),
+            .anchor_affinity = caret.anchor_affinity,
+            .extent_affinity = .upstream,
+            .character_caret = caret,
+        };
+    }
+
+    /// Command cursors occupy a grapheme, except on an empty hard line.
+    pub fn normalOffset(self: *const Model, offset: usize) usize {
+        const line = self.lineRangeAt(offset);
+        const end = self.lineContentEnd(line);
+        return if (end > line.start and offset >= end) self.boundaryBefore(end) else offset;
+    }
+
+    pub fn normalizeCaret(self: *Model) !bool {
+        const s = self.selection;
+        const at = if (s.cursor()) |caret| caret.extent else s.extent;
+        const offset = self.normalOffset(at);
+        const affinity = if (offset != at) .downstream else if (s.cursor()) |caret| caret.extent_affinity else s.extent_affinity;
+        return self.setSelection(.collapsedAt(offset, affinity));
+    }
+
+    pub fn appendCharacter(self: *Model) !bool {
+        const at = self.normalOffset(self.selection.extent);
+        const end = self.lineContentEnd(self.lineRangeAt(at));
+        return self.setSelection(.collapsedAt(if (at < end) self.boundaryAfter(at) else at, .upstream));
+    }
+
+    pub fn selectCharacter(self: *Model, backward: bool) !bool {
+        const at = self.normalOffset(self.selection.extent);
+        const line = self.lineRangeAt(at);
+        const start = if (backward and at > line.start) self.boundaryBefore(at) else at;
+        const end = if (backward) at else @min(self.boundaryAfter(at), self.lineContentEnd(line));
+        return self.setSelection(.{ .anchor = start, .extent = end });
+    }
+
+    fn lineColumn(self: *const Model, offset: usize) usize {
+        return lowerBound(self.boundaries.items, offset) - lowerBound(self.boundaries.items, self.lineRangeAt(offset).start);
+    }
+
+    fn lineContentEnd(self: *const Model, line: Range) usize {
+        return if (line.end > line.start and self.text()[line.end - 1] == '\n') line.end - 1 else line.end;
+    }
+
+    /// Extend hard lines while the active cursor moves independently of the
+    /// selected bounds. Preserve the desired grapheme column on short rows.
+    pub fn selectLines(self: *Model, destination: @import("intent.zig").LineDestination) !bool {
+        var caret = self.selection.line_caret orelse Selection.LineCaret{
+            .anchor = self.selection.anchor,
+            .extent = self.selection.extent,
+            .column = self.lineColumn(self.selection.extent),
+        };
+        const previous_extent = caret.extent;
+        const active = self.lineRangeAt(caret.extent);
+        switch (destination) {
+            .up, .down => {
+                const next = self.lineRangeAt(if (destination == .up)
+                    (if (active.start > 0) active.start - 1 else caret.extent)
+                else if (active.end < self.byteLen() or self.lineContentEnd(active) < active.end)
+                    active.end
+                else
+                    caret.extent);
+                const first = lowerBound(self.boundaries.items, next.start);
+                const last = lowerBound(self.boundaries.items, self.lineContentEnd(next));
+                caret.extent = self.boundaries.items[first + @min(caret.column, last - first)];
+            },
+            .start, .end => {
+                const next = self.lineRangeAt(if (destination == .start) 0 else self.byteLen());
+                caret.extent = next.start;
+                while (caret.extent < self.lineContentEnd(next) and
+                    (self.text()[caret.extent] == ' ' or self.text()[caret.extent] == '\t')) caret.extent += 1;
+            },
+            .left => caret.extent = @max(active.start, self.boundaryBefore(caret.extent)),
+            .right => caret.extent = @min(self.lineContentEnd(active), self.boundaryAfter(caret.extent)),
+            .line_start => caret.extent = active.start,
+            .line_end => caret.extent = self.lineContentEnd(active),
+            .word_start_next => caret.extent = self.vimWordTarget(caret.extent, .next_start),
+            .word_start_previous => caret.extent = self.vimWordTarget(caret.extent, .previous_start),
+            .word_end_next => caret.extent = self.vimWordTarget(caret.extent, .next_end),
+            .paragraph_previous, .paragraph_next => caret.extent = self.paragraphOffset(caret.extent, destination == .paragraph_next),
+            .swap => {
+                std.mem.swap(usize, &caret.anchor, &caret.extent);
+                std.mem.swap(CaretAffinity, &caret.anchor_affinity, &caret.extent_affinity);
+            },
+        }
+        if (destination != .swap and caret.extent != previous_extent) caret.extent_affinity = .downstream;
+        if (destination != .up and destination != .down) caret.column = self.lineColumn(caret.extent);
+        return self.setSelection(self.lineSelection(caret));
+    }
+
+    fn lineSelection(self: *const Model, caret: Selection.LineCaret) Selection {
+        const anchor = self.lineRangeAt(caret.anchor);
+        const active = self.lineRangeAt(caret.extent);
+        return if (active.start < anchor.start) .{
             .anchor = anchor.end,
             .anchor_affinity = if (anchor.end == anchor.start) .downstream else .upstream,
             .extent = active.start,
+            .line_caret = caret,
         } else .{
             .anchor = anchor.start,
             .extent = active.end,
             .extent_affinity = if (active.end == active.start) .downstream else .upstream,
-        });
+            .line_caret = caret,
+        };
     }
 
     fn emptyLine(self: *const Model, line: Range) bool {
@@ -1502,6 +1640,60 @@ test "paragraph objects preserve separators and navigate in both directions" {
     try std.testing.expectEqual(@as(usize, 0), model.selection.extent);
 }
 
+test "whole line cursors retain columns and character selections through reversal" {
+    // Neovim: ggllllVjj keeps column 4 across the short middle row.
+    var model = try Model.initWithMode(std.testing.allocator, "alpha bravo\nxy\ncharlie delta\n\nlast", true);
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed(4));
+    _ = try model.selectLine();
+    try std.testing.expectEqualStrings("alpha bravo\n", model.selectedText());
+    try std.testing.expectEqual(@as(usize, 4), model.selection.line_caret.?.extent);
+    _ = try model.selectLines(.down);
+    try std.testing.expectEqual(@as(usize, 14), model.selection.line_caret.?.extent);
+    _ = try model.selectLines(.down);
+    try std.testing.expectEqual(@as(usize, 19), model.selection.line_caret.?.extent);
+    _ = try model.selectLines(.left);
+    try std.testing.expectEqual(@as(usize, 18), model.selection.line_caret.?.extent);
+    const lines = model.selection;
+    _ = try model.selectCharacters();
+    try std.testing.expectEqualStrings("a bravo\nxy\nchar", model.selectedText());
+    _ = try model.selectLine();
+    try std.testing.expectEqual(lines, model.selection);
+    _ = try model.selectLines(.swap);
+    try std.testing.expectEqual(@as(usize, 4), model.selection.line_caret.?.extent);
+    try std.testing.expectEqual(@as(usize, 18), model.selection.line_caret.?.anchor);
+    _ = try model.selectCharacters();
+    try std.testing.expectEqualStrings("a bravo\nxy\nchar", model.selectedText());
+    _ = try model.selectLine();
+    _ = try model.selectLines(.down);
+    _ = try model.selectLines(.down);
+    try std.testing.expectEqualStrings("charlie delta\n", model.selectedText());
+    _ = try model.selectLines(.down);
+    try std.testing.expectEqual(@as(usize, 29), model.selection.line_caret.?.extent);
+    _ = try model.selectLines(.down);
+    try std.testing.expectEqual(@as(usize, 34), model.selection.line_caret.?.extent);
+    // At EOF, another down must not jump back to the start of the last row.
+    try std.testing.expect(!try model.selectLines(.down));
+    const selected = model.selection;
+    _ = try model.deleteLines();
+    try std.testing.expectEqualStrings("alpha bravo\nxy", model.text());
+    try std.testing.expect(model.undo());
+    try std.testing.expectEqual(selected, model.selection);
+}
+
+test "whole line columns follow graphemes and reject invalid cursor ranges" {
+    var model = try Model.initWithMode(std.testing.allocator, "Ae\u{301}🙂z\nx\nB👩‍💻cd", true);
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed("Ae\u{301}🙂".len));
+    _ = try model.selectLine();
+    _ = try model.selectLines(.down);
+    _ = try model.selectLines(.down);
+    try std.testing.expectEqual(@as(usize, "Ae\u{301}🙂z\nx\nB👩‍💻c".len), model.selection.line_caret.?.extent);
+    var invalid = model.selection;
+    invalid.line_caret.?.extent = 2;
+    try std.testing.expectError(error.InvalidGraphemeBoundary, model.setSelection(invalid));
+}
+
 test "whole line selection shrinks reverses and includes a trailing empty line" {
     var model = try Model.initWithMode(std.testing.allocator, "α\nbeta\nc\n", true);
     defer model.deinit();
@@ -1711,6 +1903,58 @@ test "editor explicit groups mix deltas but end on selection and explicit bounda
     try std.testing.expectEqualStrings("β!3 tail", model.text());
     try std.testing.expect(model.undo());
     try std.testing.expectEqualStrings("β! tail", model.text());
+}
+
+test "command character selection excludes hard newlines and clamps after deletes" {
+    var model = try Model.initWithMode(std.testing.allocator, "aβ\n\nend", true);
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed(3));
+    _ = try model.normalizeCaret();
+    try std.testing.expectEqual(@as(usize, 1), model.selection.extent);
+    _ = try model.appendCharacter();
+    try std.testing.expectEqual(@as(usize, 3), model.selection.extent);
+    _ = try model.selectCharacter(false);
+    try std.testing.expectEqualStrings("β", model.selectedText());
+    _ = try model.replaceSelection("");
+    _ = try model.normalizeCaret();
+    try std.testing.expectEqual(@as(usize, 0), model.selection.extent);
+    _ = try model.selectCharacter(false);
+    _ = try model.replaceSelection("");
+    _ = try model.normalizeCaret();
+    _ = try model.selectCharacter(false);
+    try std.testing.expectEqualStrings("", model.selectedText());
+    try std.testing.expectEqualStrings("\n\nend", model.text());
+    _ = try model.setSelection(.collapsed(1));
+    _ = try model.selectCharacter(true);
+    try std.testing.expectEqualStrings("", model.selectedText());
+    _ = try model.setSelection(.collapsed(model.byteLen()));
+    _ = try model.normalizeCaret();
+    try std.testing.expectEqual(@as(usize, 4), model.selection.extent);
+}
+
+test "inclusive selections retain grapheme cursors through reversal line conversion and clamping" {
+    var model = try Model.initWithMode(std.testing.allocator, "aβc\nxyz", true);
+    defer model.deinit();
+    _ = try model.setSelection(.collapsed(1));
+    _ = try model.selectCharacters();
+    try std.testing.expectEqualStrings("β", model.selectedText());
+    try std.testing.expectEqual(@as(usize, 1), model.selection.character_caret.?.extent);
+    _ = try model.setSelection(.{ .anchor = 0, .extent = 0, .character_caret = .{ .anchor = 3, .extent = 1, .column = 0 } });
+    try std.testing.expectEqualStrings("βc", model.selectedText());
+    _ = try model.selectLine();
+    try std.testing.expectEqualStrings("aβc\n", model.selectedText());
+    try std.testing.expectEqual(@as(usize, 1), model.selection.line_caret.?.column);
+    _ = try model.selectCharacters();
+    try std.testing.expectEqualStrings("βc", model.selectedText());
+    try std.testing.expectEqual(@as(usize, 1), model.selection.character_caret.?.extent);
+    try std.testing.expectError(error.InvalidGraphemeBoundary, model.setSelection(.{
+        .anchor = 0,
+        .extent = 0,
+        .character_caret = .{ .anchor = 2, .extent = 1, .column = 0 },
+    }));
+    _ = model.setSelectionClamped(.{ .anchor = 0, .extent = 0, .character_caret = .{ .anchor = 2, .extent = 100, .column = 0 } });
+    try std.testing.expectEqual(@as(usize, 1), model.selection.character_caret.?.anchor);
+    try std.testing.expectEqual(model.byteLen(), model.selection.character_caret.?.extent);
 }
 
 test "secret model edits in place, caps length, rejects controls and wipes removed bytes" {

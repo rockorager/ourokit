@@ -143,6 +143,9 @@ fn logicalKey(keysym: u32) platform.LogicalKey {
         c.XKB_KEY_colon => .colon,
         c.XKB_KEY_braceleft => .brace_left,
         c.XKB_KEY_braceright => .brace_right,
+        c.XKB_KEY_equal, c.XKB_KEY_KP_Equal => .equal,
+        c.XKB_KEY_plus, c.XKB_KEY_KP_Add => .plus,
+        c.XKB_KEY_minus, c.XKB_KEY_KP_Subtract => .minus,
         else => .unidentified,
     };
 }
@@ -156,6 +159,12 @@ test "bindable letters digits and function keys retain logical identity" {
     try std.testing.expectEqual(platform.LogicalKey.digit_7, logicalKey(c.XKB_KEY_7));
     try std.testing.expectEqual(platform.LogicalKey.f12, logicalKey(c.XKB_KEY_F12));
     try std.testing.expectEqual(platform.LogicalKey.colon, logicalKey(c.XKB_KEY_colon));
+    try std.testing.expectEqual(platform.LogicalKey.equal, logicalKey(c.XKB_KEY_equal));
+    try std.testing.expectEqual(platform.LogicalKey.plus, logicalKey(c.XKB_KEY_plus));
+    try std.testing.expectEqual(platform.LogicalKey.minus, logicalKey(c.XKB_KEY_minus));
+    try std.testing.expectEqual(platform.LogicalKey.equal, logicalKey(c.XKB_KEY_KP_Equal));
+    try std.testing.expectEqual(platform.LogicalKey.plus, logicalKey(c.XKB_KEY_KP_Add));
+    try std.testing.expectEqual(platform.LogicalKey.minus, logicalKey(c.XKB_KEY_KP_Subtract));
     try std.testing.expectEqual(platform.LogicalKey.unidentified, logicalKey(c.XKB_KEY_F13));
 }
 
@@ -191,8 +200,11 @@ test "native bindings retain Ctrl letters and shifted digits without changing ty
     try std.testing.expectEqual(platform.LogicalKey.key_r, ctrl_r.logical);
     try std.testing.expectEqual(@as(u32, 18), ctrl_r.unicode);
     try std.testing.expectEqual(platform.Modifiers{ .control = true }, ctrl_r.modifiers);
+    try std.testing.expectEqual(platform.LogicalKey.equal, keyboard.translate(13).logical);
+    try std.testing.expectEqual(platform.LogicalKey.minus, keyboard.translate(12).logical);
     keyboard.updateModifiers(control | shift, 0, 0, 0);
     try std.testing.expectEqual(platform.LogicalKey.key_r, keyboard.translate(19).logical);
+    try std.testing.expectEqual(platform.LogicalKey.plus, keyboard.translate(13).logical);
     keyboard.updateModifiers(shift, 0, 0, 0);
     const shifted_digit = keyboard.translate(10);
     try std.testing.expectEqual(platform.LogicalKey.digit_9, shifted_digit.logical);

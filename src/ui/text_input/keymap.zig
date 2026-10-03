@@ -26,6 +26,9 @@ pub const Action = union(enum) {
         if (std.mem.startsWith(u8, name, "select_lines_")) return .{ .edit = .{
             .select_lines = std.meta.stringToEnum(intent.LineDestination, name[13..]) orelse return error.InvalidTextInputAction,
         } };
+        inline for (.{ "move_normal", "select_inclusive" }) |prefix| {
+            if (std.mem.startsWith(u8, name, prefix ++ "_")) return .{ .edit = @unionInit(intent.Intent, prefix, std.meta.stringToEnum(intent.Destination, name[prefix.len + 1 ..]) orelse return error.InvalidTextInputAction) };
+        }
         const extend = std.mem.startsWith(u8, name, "select_");
         if (extend or std.mem.startsWith(u8, name, "move_")) {
             const destination = std.meta.stringToEnum(intent.Destination, name[if (extend) @as(usize, 7) else 5..]) orelse return error.InvalidTextInputAction;
@@ -59,6 +62,22 @@ pub const Actions = struct {
         var result: Actions = .{};
         result.items[0] = action;
         return result;
+    }
+
+    pub fn repeats(self: Actions) bool {
+        if (self.len == 1) return self.items[0].repeats();
+        if (self.len == 2 and self.items[1] == .edit and self.items[1].edit == .normalize_caret)
+            return self.items[0].repeats();
+        // Only synchronous character-delete recipes opt into repetition.
+        // Mode changes, paste, undo groups and multi-key prefixes must not.
+        if (self.items[0] != .edit or
+            (self.items[0].edit != .select_character_forward and self.items[0].edit != .select_character_backward)) return false;
+        for (self.items[1..self.len]) |action| switch (action) {
+            .edit => |edit| if (edit != .delete_selection and edit != .normalize_caret) return false,
+            .register => |command| if (command != .yank) return false,
+            else => return false,
+        };
+        return true;
     }
 
     pub fn validate(self: Actions) !void {
@@ -221,6 +240,27 @@ test "text input bindings replace defaults disable exact chords and start empty"
     try std.testing.expect(!(try Action.parse("paste")).repeats());
     try std.testing.expect((try Action.parse("previous")).repeats());
     try std.testing.expect((try Action.parse("delete_backward")).repeats());
+}
+
+test "character delete recipes repeat without repeating mode changes or asynchronous operations" {
+    var actions: Actions = .{ .len = 4 };
+    inline for (.{ "select_character_forward", "yank", "delete_selection", "normalize_caret" }, 0..) |name, i|
+        actions.items[i] = try Action.parse(name);
+    try std.testing.expect(actions.repeats());
+    actions.items[0] = try Action.parse("select_character_backward");
+    try std.testing.expect(actions.repeats());
+    actions.items[3] = try Action.parse("submit");
+    try std.testing.expect(!actions.repeats());
+    actions.items[3] = try Action.parse("paste");
+    try std.testing.expect(!actions.repeats());
+    actions.items[3] = try Action.parse("begin_undo_group");
+    try std.testing.expect(!actions.repeats());
+    actions = .{ .len = 2 };
+    actions.items[0] = try Action.parse("undo");
+    actions.items[1] = try Action.parse("normalize_caret");
+    try std.testing.expect(actions.repeats());
+    try std.testing.expectEqual(Action{ .edit = .{ .move_normal = .logical_line_end } }, try Action.parse("move_normal_logical_line_end"));
+    try std.testing.expectEqual(Action{ .edit = .{ .select_inclusive = .visual_left } }, try Action.parse("select_inclusive_visual_left"));
 }
 
 test "default text input bindings preserve editing selection clipboard and commands" {

@@ -2632,7 +2632,7 @@ pub const WindowRuntime = struct {
                 // A plain field still lets its enclosing dialog cancel.
                 if (actions.len == 1 and first == .command and first.command == .cancel and
                     session.preedit() == null and self.pointer_bindings.getKind(target, .text_input_command) == null) return false;
-                if (key.state == .repeated and (continuation or actions.len != 1 or !first.repeats())) return true;
+                if (key.state == .repeated and (continuation or !actions.repeats())) return true;
                 if (session.model.isSecret() and (continuation or actions.len != 1)) return true;
                 self.clicks.reset();
                 self.resetCaretBlink();
@@ -2753,6 +2753,13 @@ pub const WindowRuntime = struct {
     ) !bool {
         const session = try self.text_inputs.session(target);
         session.endSelectionDrag();
+        switch (intent) {
+            .select_vim_word_inner, .select_vim_word_around, .select_paragraph_inner, .select_paragraph_around => {
+                if (session.model.selection.cursor()) |caret|
+                    _ = try session.model.setSelection(.collapsedAt(caret.extent, caret.extent_affinity));
+            },
+            else => {},
+        }
         return switch (intent) {
             .begin_undo_group => blk: {
                 session.model.beginUndoGroup();
@@ -2782,6 +2789,51 @@ pub const WindowRuntime = struct {
                 session.preferred_x = null;
                 break :blk try session.model.selectLine();
             },
+            .select_characters => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.selectCharacters();
+            },
+            .select_character_forward, .select_character_backward => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.selectCharacter(intent == .select_character_backward);
+            },
+            .normalize_caret => try session.model.normalizeCaret(),
+            .append_character => blk: {
+                session.preferred_x = null;
+                break :blk try session.model.appendCharacter();
+            },
+            .swap_selection => blk: {
+                _ = try session.model.selectCharacters();
+                var caret = session.model.selection.character_caret.?;
+                std.mem.swap(usize, &caret.anchor, &caret.extent);
+                std.mem.swap(text.CaretAffinity, &caret.anchor_affinity, &caret.extent_affinity);
+                session.preferred_x = null;
+                break :blk try session.model.setSelection(.{ .anchor = 0, .extent = 0, .character_caret = caret });
+            },
+            .move_normal, .select_inclusive => blk: {
+                const inclusive = intent == .select_inclusive;
+                const destination = if (inclusive) intent.select_inclusive else intent.move_normal;
+                const before = session.model.selection;
+                if (inclusive) _ = try session.model.selectCharacters();
+                const cursor = session.model.selection.character_caret;
+                if (cursor) |caret| _ = try session.model.setSelection(.collapsedAt(caret.extent, caret.extent_affinity));
+                _ = try session.model.normalizeCaret();
+                const origin = session.model.selection;
+                const line = session.model.lineRangeAt(origin.extent);
+                _ = try self.applyTextInputIntent(target, .{ .move = .{ .destination = destination } });
+                var next = session.model.selection;
+                if ((destination == .visual_left or destination == .visual_right) and
+                    (next.extent < line.start or next.extent >= line.end)) next = origin;
+                _ = try session.model.setSelection(next);
+                _ = try session.model.normalizeCaret();
+                if (inclusive) {
+                    var caret = cursor.?;
+                    caret.extent = session.model.selection.extent;
+                    caret.extent_affinity = session.model.selection.extent_affinity;
+                    _ = try session.model.setSelection(.{ .anchor = 0, .extent = 0, .character_caret = caret });
+                }
+                break :blk !std.meta.eql(before, session.model.selection);
+            },
             .select_lines => |destination| blk: {
                 session.preferred_x = null;
                 break :blk try session.model.selectLines(destination);
@@ -2809,11 +2861,19 @@ pub const WindowRuntime = struct {
             .collapse_selection => blk: {
                 session.preferred_x = null;
                 const selection = session.model.selection;
-                break :blk try session.model.setSelection(.collapsedAt(selection.extent, selection.extent_affinity));
+                break :blk try session.model.setSelection(if (selection.cursor()) |caret|
+                    .collapsedAt(caret.extent, caret.extent_affinity)
+                else
+                    .collapsedAt(selection.extent, selection.extent_affinity));
             },
             .collapse_selection_start => blk: {
                 session.preferred_x = null;
                 break :blk try session.model.setSelection(.collapsed(session.model.selection.range().start));
+            },
+            .collapse_selection_anchor => blk: {
+                session.preferred_x = null;
+                const selection = session.model.selection;
+                break :blk try session.model.setSelection(.collapsedAt(selection.anchor, selection.anchor_affinity));
             },
             .undo, .redo => blk: {
                 session.preferred_x = null;
@@ -4683,8 +4743,9 @@ fn pointerListenerEvent(event: ui.input.Event) ?listener.Event {
 fn intentEditsText(intent: ui.text_input.EditIntent) bool {
     return switch (intent) {
         .begin_undo_group, .end_undo_group => false,
+        .normalize_caret, .append_character, .select_character_forward, .select_character_backward, .swap_selection, .move_normal, .select_inclusive, .collapse_selection_anchor => false,
         .undo, .redo, .insert_newline, .insert_line_above, .insert_line_below, .delete_backward, .delete_forward, .delete_word_backward, .delete_word_forward, .delete_line, .delete_lines, .clear_lines, .delete_selection => true,
-        .select_all, .select_word_inner, .select_word_around, .select_vim_word_inner, .select_vim_word_around, .select_vim_word_forward, .select_vim_change_word, .select_line, .select_lines, .select_paragraph_inner, .select_paragraph_around, .collapse_selection, .collapse_selection_start, .move => false,
+        .select_all, .select_word_inner, .select_word_around, .select_vim_word_inner, .select_vim_word_around, .select_vim_word_forward, .select_vim_change_word, .select_line, .select_characters, .select_lines, .select_paragraph_inner, .select_paragraph_around, .collapse_selection, .collapse_selection_start, .move => false,
     };
 }
 

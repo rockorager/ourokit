@@ -106,6 +106,11 @@ test "key chords normalize names and modifier order but match modifiers exactly"
     try std.testing.expectEqual(platform.LogicalKey.page_down, (try KeyChord.parse("Alt+PageDown")).key);
     try std.testing.expectEqual(platform.LogicalKey.f12, (try KeyChord.parse("Super+F12")).key);
     try std.testing.expectEqual(platform.LogicalKey.digit_9, (try KeyChord.parse("9")).key);
+    try std.testing.expectEqual(platform.LogicalKey.equal, (try KeyChord.parse("Ctrl+Equal")).key);
+    try std.testing.expectEqual(platform.LogicalKey.minus, (try KeyChord.parse("Ctrl+Minus")).key);
+    const plus = try KeyChord.parse("Ctrl+Shift+Plus");
+    try std.testing.expect(plus.matches(.{ .keycode = 13, .logical = .plus, .modifiers = .{ .control = true, .shift = true } }));
+    try std.testing.expect(!plus.matches(.{ .keycode = 13, .logical = .plus, .modifiers = .{ .shift = true } }));
     for ([_][]const u8{ "", "Ctrl+", "Ctrl+Ctrl+A", "Ctrl++A", "Meta+A", "Unknown", "F13" }) |invalid|
         try std.testing.expectError(error.InvalidKeyChord, KeyChord.parse(invalid));
 }

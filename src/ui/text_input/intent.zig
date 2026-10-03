@@ -10,11 +10,20 @@ pub const Intent = union(enum) {
     select_vim_word_forward,
     select_vim_change_word,
     select_line,
+    select_characters,
+    select_character_forward,
+    select_character_backward,
+    swap_selection,
+    normalize_caret,
+    append_character,
+    move_normal: Destination,
+    select_inclusive: Destination,
     select_lines: LineDestination,
     select_paragraph_inner,
     select_paragraph_around,
     collapse_selection,
     collapse_selection_start,
+    collapse_selection_anchor,
     begin_undo_group,
     end_undo_group,
     undo,
@@ -38,7 +47,22 @@ pub const Move = struct {
     extend: bool = false,
 };
 
-pub const LineDestination = enum { up, down, start, end, paragraph_previous, paragraph_next };
+pub const LineDestination = enum {
+    up,
+    down,
+    start,
+    end,
+    paragraph_previous,
+    paragraph_next,
+    left,
+    right,
+    line_start,
+    line_end,
+    word_start_next,
+    word_start_previous,
+    word_end_next,
+    swap,
+};
 
 pub const Destination = enum {
     visual_left,

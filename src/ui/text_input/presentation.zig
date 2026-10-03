@@ -34,8 +34,8 @@ pub fn build(allocator: std.mem.Allocator, session: *const Session) !Presentatio
             .allocator = allocator,
             .text = try allocator.dupe(u8, committed),
             .selection = selection.range(),
-            .caret_offset = selection.extent,
-            .caret_affinity = selection.extent_affinity,
+            .caret_offset = if (selection.cursor()) |caret| caret.extent else selection.extent,
+            .caret_affinity = if (selection.cursor()) |caret| caret.extent_affinity else selection.extent_affinity,
             .show_caret = selection.isCollapsed(),
             .preedit = null,
         };
@@ -109,6 +109,18 @@ test "committed presentation preserves directional selection and affinity" {
     try std.testing.expectEqual(.upstream, result.caret_affinity);
     try std.testing.expect(!result.show_caret);
     try std.testing.expect(result.preedit == null);
+}
+
+test "whole line presentation retains the active cursor and soft wrap affinity" {
+    var session = try Session.initWithMode(std.testing.allocator, "alpha bravo\nlast", true);
+    defer session.deinit();
+    _ = try session.model.setSelection(.collapsedAt(4, .upstream));
+    _ = try session.model.selectLine();
+    var result = try build(std.testing.allocator, &session);
+    defer result.deinit();
+    try std.testing.expectEqual(model_module.Range{ .start = 0, .end = 12 }, result.selection);
+    try std.testing.expectEqual(@as(usize, 4), result.caret_offset);
+    try std.testing.expectEqual(.upstream, result.caret_affinity);
 }
 
 test "preedit is shaped in context and code-point cursor expands to graphemes" {

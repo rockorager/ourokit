@@ -80,6 +80,20 @@ fn pushState(state: *c.State, controller: *Controller, value: Controller.State) 
         _ = c.lua_pushstring(state, @tagName(@field(value.selection, name)));
         c.lua_setfield(state, -2, name);
     }
+    inline for (.{ "line_caret", "character_caret" }) |field| {
+        if (@field(value.selection, field)) |caret| {
+            c.lua_createtable(state, 0, 3);
+            inline for (.{ "anchor", "extent", "column" }) |name| {
+                c.lua_pushinteger(state, @intCast(@field(caret, name)));
+                c.lua_setfield(state, -2, name);
+            }
+            inline for (.{ "anchor_affinity", "extent_affinity" }) |name| {
+                _ = c.lua_pushstring(state, @tagName(@field(caret, name)));
+                c.lua_setfield(state, -2, name);
+            }
+            c.lua_setfield(state, -2, field);
+        }
+    }
     c.lua_setfield(state, -2, "selection");
     return 1;
 }
@@ -106,6 +120,28 @@ fn selectionValue(state: *c.State) !Selection {
             var len: usize = 0;
             const bytes = c.lua_tolstring(state, -1, &len).?;
             @field(value, name) = std.meta.stringToEnum(@TypeOf(@field(value, name)), bytes[0..len]) orelse return error.InvalidCaretAffinity;
+        }
+        c.lua_settop(state, -2);
+    }
+    inline for (.{ "line_caret", "character_caret" }) |field| {
+        if (c.lua_getfield(state, 3, field) != c.type_nil) {
+            if (c.lua_type(state, -1) != c.type_table) return error.InvalidEditorSelection;
+            var caret: Selection.LineCaret = .{ .anchor = 0, .extent = 0, .column = 0 };
+            inline for (.{ "anchor", "extent", "column" }) |name| {
+                _ = c.lua_getfield(state, -1, name);
+                @field(caret, name) = try offset(state, -1);
+                c.lua_settop(state, -2);
+            }
+            inline for (.{ "anchor_affinity", "extent_affinity" }) |name| {
+                if (c.lua_getfield(state, -1, name) != c.type_nil) {
+                    if (c.lua_type(state, -1) != c.type_string) return error.InvalidCaretAffinity;
+                    var len: usize = 0;
+                    const bytes = c.lua_tolstring(state, -1, &len).?;
+                    @field(caret, name) = std.meta.stringToEnum(@TypeOf(@field(caret, name)), bytes[0..len]) orelse return error.InvalidCaretAffinity;
+                }
+                c.lua_settop(state, -2);
+            }
+            @field(value, field) = caret;
         }
         c.lua_settop(state, -2);
     }

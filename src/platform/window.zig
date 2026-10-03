@@ -151,6 +151,9 @@ pub const LogicalKey = enum {
     colon,
     brace_left,
     brace_right,
+    equal,
+    plus,
+    minus,
 };
 
 pub const KeyState = enum { released, pressed, repeated };
