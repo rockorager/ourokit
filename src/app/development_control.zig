@@ -217,7 +217,7 @@ fn modifier(args: mcp.Value, name: []const u8) bool {
     return value == .bool and value.bool;
 }
 
-fn parseAction(args: mcp.Value) !dev.Action {
+pub fn parseAction(args: mcp.Value) !dev.Action {
     const action = try stringField(args, "action");
     if (std.mem.eql(u8, action, "click")) return .{ .click = try stringField(args, "target") };
     if (std.mem.eql(u8, action, "hover")) return .{ .hover = try stringField(args, "target") };

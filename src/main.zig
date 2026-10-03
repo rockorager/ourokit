@@ -9,6 +9,13 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2 and std.mem.eql(u8, args[1], "--ourokit-auth-worker")) {
         std.process.exit(@intCast(ouro_auth_worker_main()));
     }
+    if (args.len >= 3 and args.len <= 4 and std.mem.eql(u8, args[1], "--ourokit-test-worker")) {
+        testWorker(init, args[2], if (args.len == 4) args[3] else null) catch |err| {
+            try writeError(init, @errorName(err));
+            std.process.exit(1);
+        };
+        return;
+    }
     const command = cli.parse(args) catch |err| {
         try writeError(init, @errorName(err));
         try writeStdout(init, cli.usage);
@@ -27,6 +34,7 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
     switch (command) {
         .help => try writeStdout(init, cli.usage),
         .version => try writeStdout(init, "ouroctl " ++ version ++ "\n"),
+        .@"test" => |options| return @import("test_command.zig").run(init, options),
         .activate => |target| {
             try ourokit.app.desktop.validateId(target.path.?);
             const source = try std.fmt.allocPrint(init.gpa, "return {{id='{s}'}}", .{target.path.?});
@@ -363,6 +371,14 @@ fn writeViewportJson(json: *std.json.Stringify, viewport: ourokit.lua.StorybookV
     try json.objectField("height");
     try json.write(viewport.height);
     try json.endObject();
+}
+
+fn testWorker(init: std.process.Init, path: []const u8, name: ?[]const u8) !void {
+    const source = try readSource(init, path);
+    defer init.gpa.free(source);
+    const result = try ourokit.app.component_tests.execute(init, source, path, name);
+    defer init.gpa.free(result);
+    try writeStdout(init, result);
 }
 
 fn readSource(init: std.process.Init, path: []const u8) ![]u8 {

@@ -311,6 +311,26 @@ pub fn build(b: *std.Build) void {
     storybook_tests.has_side_effects = true;
     b.step("test-storybook", "Verify headless Storybook modules, diagnostics and snapshots").dependOn(&storybook_tests.step);
 
+    const component_tests = b.addRunArtifact(host);
+    component_tests.addArg("test");
+    component_tests.setCwd(b.path("."));
+    component_tests.has_side_effects = true;
+    const component_contracts = b.addExecutable(.{
+        .name = "component-runner-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/component_runner.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_component_contracts = b.addRunArtifact(component_contracts);
+    run_component_contracts.addArtifactArg(host);
+    run_component_contracts.setCwd(b.path("."));
+    run_component_contracts.has_side_effects = true;
+    const component_step = b.step("test-components", "Run Lua component tests and native runner contracts without a compositor");
+    component_step.dependOn(&component_tests.step);
+    component_step.dependOn(&run_component_contracts.step);
+
     const development = b.addSystemCommand(&.{"python3"});
     development.addFileArg(b.path("tests/verify_development.py"));
     development.addArtifactArg(host);
@@ -350,6 +370,7 @@ pub fn build(b: *std.Build) void {
     const verify = b.step("verify", "Run Zig tests, formatting and native development/control verification");
     verify.dependOn(test_step);
     verify.dependOn(&storybook_tests.step);
+    verify.dependOn(component_step);
     verify.dependOn(development_step);
     verify.dependOn(session_tests);
     verify.dependOn(http_step);

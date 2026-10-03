@@ -10,6 +10,15 @@ pub const Command = union(enum) {
     run: Run,
     storybook: Storybook,
     mcp_export: Export,
+    @"test": Test,
+};
+
+pub const Test = struct {
+    path: []const u8 = "tests",
+    filter: ?[]const u8 = null,
+    list: bool = false,
+    json: bool = false,
+    timeout_ms: u32 = 10_000,
 };
 
 pub const RuntimeTarget = struct {
@@ -77,6 +86,8 @@ pub const usage =
     \\  ouroctl storybook run <stories.lua> [--vulkan|--software] [--exit-after-first-frame]
     \\  ouroctl storybook list <stories.lua> [--json]
     \\  ouroctl storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
+    \\  ouroctl test [file|directory] [--filter <substring>] [--list] [--json]
+    \\              [--timeout-ms <milliseconds>]  (default: tests, 10000 ms per worker)
     \\  ouroctl help
     \\  ouroctl version
     \\
@@ -105,6 +116,7 @@ pub fn parse(args: []const []const u8) !Command {
         return error.ExpectedDevelopmentCommand;
     }
     if (std.mem.eql(u8, command, "run")) return .{ .run = try parseRun(args[2..]) };
+    if (std.mem.eql(u8, command, "test")) return .{ .@"test" = try parseTest(args[2..]) };
     if (std.mem.eql(u8, command, "storybook"))
         return .{ .storybook = try parseStorybook(args[2..]) };
     if (std.mem.eql(u8, command, "mcp")) {
@@ -112,6 +124,38 @@ pub fn parse(args: []const []const u8) !Command {
         return .{ .mcp_export = try parseExport(args[3..]) };
     }
     return error.UnknownCommand;
+}
+
+fn parseTest(args: []const []const u8) !Test {
+    var result: Test = .{};
+    var path_set = false;
+    var timeout_set = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--list")) {
+            if (result.list) return error.DuplicateOption;
+            result.list = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            if (result.json) return error.DuplicateOption;
+            result.json = true;
+        } else if (try optionValue(args, &index, arg, "--filter")) |value| {
+            if (result.filter != null) return error.DuplicateOption;
+            if (std.mem.startsWith(u8, value, "--")) return error.ExpectedOptionValue;
+            result.filter = value;
+        } else if (try optionValue(args, &index, arg, "--timeout-ms")) |value| {
+            if (timeout_set) return error.DuplicateOption;
+            result.timeout_ms = std.fmt.parseInt(u32, value, 10) catch return error.InvalidTestTimeout;
+            if (result.timeout_ms == 0) return error.InvalidTestTimeout;
+            timeout_set = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownOption;
+        } else if (!path_set and arg.len != 0) {
+            result.path = arg;
+            path_set = true;
+        } else return error.UnexpectedArgument;
+    }
+    return result;
 }
 
 fn parseExport(args: []const []const u8) !Export {
@@ -382,6 +426,23 @@ test "CLI parses explicit MCP catalog exports and rejects ambiguous output" {
     try std.testing.expectError(error.ExpectedOptionValue, parse(&.{ "ouroctl", "mcp", "export", "app.lua", "--output" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "ouroctl", "mcp", "export", "a.lua", "b.lua" }));
     try std.testing.expectError(error.DuplicateOption, parse(&.{ "ouroctl", "mcp", "export", "a.lua", "--output=a.json", "--output=b.json" }));
+}
+
+test "CLI parses component test selection and rejects invalid timeouts" {
+    try std.testing.expectEqualDeep(Command{ .@"test" = .{} }, try parse(&.{ "ouroctl", "test" }));
+    try std.testing.expectEqualDeep(Command{ .@"test" = .{
+        .path = "tests/counter_test.lua",
+        .filter = "increment",
+        .list = true,
+        .json = true,
+        .timeout_ms = 250,
+    } }, try parse(&.{ "ouroctl", "test", "--filter=increment", "tests/counter_test.lua", "--list", "--json", "--timeout-ms", "250" }));
+    try std.testing.expectError(error.InvalidTestTimeout, parse(&.{ "ouroctl", "test", "--timeout-ms=0" }));
+    try std.testing.expectError(error.InvalidTestTimeout, parse(&.{ "ouroctl", "test", "--timeout-ms=-1" }));
+    try std.testing.expectError(error.ExpectedOptionValue, parse(&.{ "ouroctl", "test", "--filter", "--list" }));
+    try std.testing.expectError(error.DuplicateOption, parse(&.{ "ouroctl", "test", "--filter=a", "--filter=b" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "ouroctl", "test", "--wat" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "ouroctl", "test", "a", "b" }));
 }
 
 test "CLI separates development production and standard activation" {

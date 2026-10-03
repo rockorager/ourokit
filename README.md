@@ -103,9 +103,9 @@ zig build verify
 ```
 
 `verify` is the routine pre-commit check: Zig tests (including token validation),
-Zig formatting, real-process development/control suites, and disposable native
-session/PAM and HTTP(S) fixtures. HTTP tests require the OpenSSL CLI and run with
-`zig build test-http`. The native development
+Lua component tests, Zig formatting, real-process development/control suites,
+and disposable native session/PAM and HTTP(S) fixtures. HTTP tests require the
+OpenSSL CLI and run with `zig build test-http`. The native development
 suite starts its own headless Sway with software rendering and private D-Bus
 sessions; it does not use your desktop, session bus, or compositor configuration.
 It checks inspection, input, capture pixels, rejected and accepted reloads,
@@ -125,6 +125,8 @@ This verifies software-rendered native behavior, not GPU presentation latency or
 integration with a particular desktop environment.
 
 For focused iteration, `zig build test` runs the Zig suite without a compositor;
+`zig build test-components` runs Lua component tests and the test runner's
+black-box contracts without Python, Sway, or D-Bus.
 `zig build test-development` runs only the isolated native/control suites.
 `zig build test-session` runs strict session-protocol rendering and asynchronous
 mock-PAM tests without touching a real compositor, PAM policy or credentials.
@@ -427,6 +429,77 @@ active IME preedit; it never enters the value or `on_change` data. Optional
 `label` provides an independent semantic accessible name, not a visible label.
 See the [input and box API](docs/application-model.md#inherited-visual-defaults)
 for styling, precedence, and accessibility limitations.
+
+## Lua component tests
+
+Run from the project root with the installed `ouroctl`; neither the Ourokit
+source tree nor Python helpers are needed:
+
+```sh
+ouroctl test                              # recursively find tests/**/*_test.lua
+ouroctl test tests/counter_test.lua       # one file
+ouroctl test tests/editor                 # one directory subtree
+ouroctl test --filter increment          # literal substring in file or test name
+ouroctl test --list                       # evaluate files, but do not run tests
+ouroctl test --json                       # one JSON report on stdout
+ouroctl test --timeout-ms 20000           # default: 10000 per worker
+```
+
+Each file returns a table mapping nonempty names to functions. Import modules
+at file scope: `require('components.counter')` resolves from the working
+directory as `components/counter.lua` or `components/counter/init.lua`.
+As in Storybook, cached imports remain available during tests, but first-time
+disk imports after file evaluation are rejected.
+
+```lua
+local Counter = require('components.counter')
+
+return {
+  ['increment updates the count'] = function(t)
+    t:mount(Counter, { width = 420, height = 300 })
+    assert(t:node('root/count').label == '0')
+    t:click('root/increment')
+    assert(t:node('root/count').label == '1')
+  end,
+}
+```
+
+Files and test names run in lexical order. Every test re-evaluates its file in
+a fresh process, Lua VM, module cache, and retained UI runtime. File evaluation
+must therefore only declare fixtures and tests, not perform external side effects.
+The runner cleans up mounted UI after success or failure, terminates workers
+that exceed their deadline (including infinite Lua loops), and continues with
+remaining tests. Exit status is 0 for success, 1 for failures or no matching
+tests, and 2 for invalid CLI arguments. Failed results include Lua diagnostics;
+JSON reports contain `results`, `passed`, `failed`, `listed`, and `error_message`.
+
+The test context provides:
+
+- `t:mount(content, viewport?)`: mount one content callback per test; default
+  viewport is 640 × 480 logical pixels, light theme, scale 1.
+- `t:node(path)`: copy a public semantic node by slash-separated widget keys.
+  Inspect `label`, `value`, `role`, `bounds`, `focused`, `checked`, `selection`,
+  and other development-inspection fields. IDs are hexadecimal strings;
+  absent optional fields are nil. Missing paths fail explicitly.
+- `t:click(path)`, `t:hover(path)`, `t:scroll(path, delta)`, `t:text(text)`,
+  and `t:key(key, modifiers?)`: drive the normal retained input path. For
+  example, `t:key('a', { control = true })` selects all text in a focused editor.
+- `t:input { action = ..., ... }`: the same action arguments as
+  `ouroctl dev input`, without a window or token, including pointer down/move/up.
+
+Mount and input drain runnable callbacks, reconciliation, layout, and scene
+preparation before returning. They do not wait for animation completion or
+arbitrary async work. Sleeps and callbacks awaiting external work fail rather
+than introduce timing-dependent tests; there is no virtual clock or async-wait
+API yet. Use reduced motion where a test needs stable control state. Assertions
+use ordinary Lua `assert`; no additional framework dependency is required.
+
+These tests cover component behavior and pure Lua models, not real compositor
+delivery, desktop services, or pixel comparisons. Use Lua fakes passed into
+application models for controlled service outcomes, Storybook for snapshots,
+and a small separate desktop integration suite where needed. Ourokit's Python
+protocol and desktop fixtures remain internal regression tests, not an app SDK.
+See [`tests/components_test.lua`](tests/components_test.lua) for complete examples.
 
 ## Storybook
 

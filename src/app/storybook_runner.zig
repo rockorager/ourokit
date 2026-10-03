@@ -140,6 +140,27 @@ pub fn snapshot(init: std.process.Init, source: []const u8, story_id: []const u8
 
 pub fn snapshotNamed(init: std.process.Init, source: []const u8, story_id: []const u8, asset_root: ?std.os.linux.fd_t, chunk_name: [:0]const u8) !Snapshot {
     if (!renderer.software.has_freetype) return error.FreeTypeDisabled;
+    return withEnvironment(init, asset_root, SnapshotJob{ .source = source, .story_id = story_id, .chunk_name = chunk_name });
+}
+
+/// Scoped headless component host shared by snapshots and Lua behavior tests.
+/// All pointers remain stable until the job returns; no compositor is involved.
+pub const Environment = struct {
+    init: std.process.Init,
+    loop: *io_loop.Loop,
+    scheduler: *task.Scheduler,
+    vm: *lua.Vm,
+    signals: *lua.Signals,
+    lua_ui: *lua.UiBuild,
+    callbacks: *lua.CallbackRegistry,
+    paragraph_sources: *text.ParagraphSourceCache,
+    paragraphs: *text.ParagraphCache,
+    glyphs: *renderer.software.GlyphCache,
+    images: *ImageCache,
+    loader: ?*lua.ModuleLoader,
+};
+
+pub fn withEnvironment(init: std.process.Init, asset_root: ?std.os.linux.fd_t, job: anytype) !@TypeOf(job).Result {
     const config: @import("window_runtime.zig").Config = .{};
     var loop: io_loop.Loop = undefined;
     try loop.init(init.gpa, 8, 1);
@@ -214,108 +235,136 @@ pub fn snapshotNamed(init: std.process.Init, source: []const u8, story_id: []con
         try loader.?.init(init.gpa, &vm, &loop, root, 64);
     }
     defer if (loader) |*value| value.deinit();
-    var book = if (loader) |*value|
-        try evaluateCatalog(init.gpa, &vm, &scheduler, &loop, value, source, chunk_name)
-    else
-        try lua.Storybook.loadWithApi(init.gpa, vm.state, vm.apiReference(), source);
-    defer book.deinit();
-    const story = book.find(story_id) orelse return error.UnknownStory;
-    const theme = switch (story.color_scheme) {
-        .light => design.tokens.light,
-        .dark => design.tokens.dark,
-    };
-    lua_ui.enableDeclarativeWidgets(theme);
-
-    const window_scope = try scheduler.createScope(scheduler.application_scope);
-    var runtime: WindowRuntime = .{};
-    try runtime.init(
-        init.gpa,
-        &scheduler,
-        window_scope,
-        .{ .slot = 0, .generation = 1 },
-        theme.background,
-        theme.primary,
-        theme.foreground,
-        theme.input,
-        theme.ring,
-        &signals,
-        &paragraph_sources,
-        &paragraphs,
-        config,
-    );
-    runtime.output_scale = story.snapshot_scale;
-    errdefer teardownRuntime(&runtime, &lua_ui, &scheduler, window_scope) catch {};
-    try runtime.reconcile(
-        .{ .width = story.viewport.width, .height = story.viewport.height },
-        &lua_ui,
-        story.content_reference,
-    );
-    try runtime.prepareFrame(story.snapshot_scale);
-    try settleImages(&runtime, &lua_ui, story, &loop);
-    if (runtime.hasPendingScrollEvents()) {
-        vm.disableSleep();
-        try dispatchAndSettle(&runtime, &vm, &callbacks, &scheduler, &lua_ui, story);
-    }
-    if (story.actions.len != 0) {
-        vm.disableSleep();
-        for (story.actions) |action| try playAction(
-            &runtime,
-            &vm,
-            &callbacks,
-            &scheduler,
-            &lua_ui,
-            story,
-            action,
-        );
-    }
-    const list = try runtime.displayList();
-
-    const pixel_width = try physicalDimension(story.viewport.width, story.snapshot_scale);
-    const pixel_height = try physicalDimension(story.viewport.height, story.snapshot_scale);
-    const stride = std.math.mul(usize, pixel_width, 4) catch return error.ImageTooLarge;
-    const pixel_len = std.math.mul(usize, stride, pixel_height) catch return error.ImageTooLarge;
-    if (pixel_len > 256 * 1024 * 1024) return error.ImageTooLarge;
-    const pixels = try init.gpa.alloc(u8, pixel_len);
-    defer init.gpa.free(pixels);
-    @memset(pixels, 0);
-    try renderer.software.renderResources(list, .{
-        .pixels = pixels,
-        .width = pixel_width,
-        .height = pixel_height,
-        .stride = stride,
-        .format = .rgba8_unorm,
-    }, &glyphs, null, &paragraphs, &images);
-    // PNG stores straight sRGB; presentation stores premultiplied sRGB.
-    for (0..pixel_height) |y| for (0..pixel_width) |x| {
-        const offset = y * stride + x * 4;
-        pixels[offset..][0..4].* = core.srgba8ToStraight(.{
-            .r = pixels[offset],
-            .g = pixels[offset + 1],
-            .b = pixels[offset + 2],
-            .a = pixels[offset + 3],
-        });
-    };
-    const png = try renderer.png.encode(init.gpa, pixels, pixel_width, pixel_height, stride);
-    errdefer init.gpa.free(png);
-    const id = try init.gpa.dupe(u8, story.id);
-    errdefer init.gpa.free(id);
-    const viewport = story.viewport;
-    const snapshot_scale = story.snapshot_scale;
-    const color_scheme = story.color_scheme;
-
-    try teardownRuntime(&runtime, &lua_ui, &scheduler, window_scope);
-
-    return .{
-        .allocator = init.gpa,
-        .id = id,
-        .viewport = viewport,
-        .snapshot_scale = snapshot_scale,
-        .color_scheme = color_scheme,
-        .pixel_width = pixel_width,
-        .pixel_height = pixel_height,
-        .png = png,
-    };
+    return job.run(.{
+        .init = init,
+        .loop = &loop,
+        .scheduler = &scheduler,
+        .vm = &vm,
+        .signals = &signals,
+        .lua_ui = &lua_ui,
+        .callbacks = &callbacks,
+        .paragraph_sources = &paragraph_sources,
+        .paragraphs = &paragraphs,
+        .glyphs = &glyphs,
+        .images = &images,
+        .loader = if (loader) |*value| value else null,
+    });
 }
+
+const SnapshotJob = struct {
+    pub const Result = Snapshot;
+    source: []const u8,
+    story_id: []const u8,
+    chunk_name: [:0]const u8,
+
+    pub fn run(self: SnapshotJob, env: Environment) !Snapshot {
+        const init = env.init;
+        const vm = env.vm;
+        const scheduler = env.scheduler;
+        const lua_ui = env.lua_ui;
+        var book = if (env.loader) |value|
+            try evaluateCatalog(init.gpa, vm, scheduler, env.loop, value, self.source, self.chunk_name)
+        else
+            try lua.Storybook.loadWithApi(init.gpa, vm.state, vm.apiReference(), self.source);
+        defer book.deinit();
+        const story = book.find(self.story_id) orelse return error.UnknownStory;
+        const theme = switch (story.color_scheme) {
+            .light => design.tokens.light,
+            .dark => design.tokens.dark,
+        };
+        lua_ui.enableDeclarativeWidgets(theme);
+
+        const window_scope = try scheduler.createScope(scheduler.application_scope);
+        var runtime: WindowRuntime = .{};
+        try runtime.init(
+            init.gpa,
+            scheduler,
+            window_scope,
+            .{ .slot = 0, .generation = 1 },
+            theme.background,
+            theme.primary,
+            theme.foreground,
+            theme.input,
+            theme.ring,
+            env.signals,
+            env.paragraph_sources,
+            env.paragraphs,
+            .{},
+        );
+        runtime.output_scale = story.snapshot_scale;
+        errdefer teardownRuntime(&runtime, lua_ui, scheduler, window_scope) catch {};
+        try runtime.reconcile(
+            .{ .width = story.viewport.width, .height = story.viewport.height },
+            lua_ui,
+            story.content_reference,
+        );
+        try runtime.prepareFrame(story.snapshot_scale);
+        try settleImages(&runtime, lua_ui, story, env.loop);
+        if (runtime.hasPendingScrollEvents()) {
+            vm.disableSleep();
+            try dispatchAndSettle(&runtime, vm, env.callbacks, scheduler, lua_ui, story);
+        }
+        if (story.actions.len != 0) {
+            vm.disableSleep();
+            for (story.actions) |action| try playAction(
+                &runtime,
+                vm,
+                env.callbacks,
+                scheduler,
+                lua_ui,
+                story,
+                action,
+            );
+        }
+        const list = try runtime.displayList();
+
+        const pixel_width = try physicalDimension(story.viewport.width, story.snapshot_scale);
+        const pixel_height = try physicalDimension(story.viewport.height, story.snapshot_scale);
+        const stride = std.math.mul(usize, pixel_width, 4) catch return error.ImageTooLarge;
+        const pixel_len = std.math.mul(usize, stride, pixel_height) catch return error.ImageTooLarge;
+        if (pixel_len > 256 * 1024 * 1024) return error.ImageTooLarge;
+        const pixels = try init.gpa.alloc(u8, pixel_len);
+        defer init.gpa.free(pixels);
+        @memset(pixels, 0);
+        try renderer.software.renderResources(list, .{
+            .pixels = pixels,
+            .width = pixel_width,
+            .height = pixel_height,
+            .stride = stride,
+            .format = .rgba8_unorm,
+        }, env.glyphs, null, env.paragraphs, env.images);
+        // PNG stores straight sRGB; presentation stores premultiplied sRGB.
+        for (0..pixel_height) |y| for (0..pixel_width) |x| {
+            const offset = y * stride + x * 4;
+            pixels[offset..][0..4].* = core.srgba8ToStraight(.{
+                .r = pixels[offset],
+                .g = pixels[offset + 1],
+                .b = pixels[offset + 2],
+                .a = pixels[offset + 3],
+            });
+        };
+        const png = try renderer.png.encode(init.gpa, pixels, pixel_width, pixel_height, stride);
+        errdefer init.gpa.free(png);
+        const id = try init.gpa.dupe(u8, story.id);
+        errdefer init.gpa.free(id);
+        const viewport = story.viewport;
+        const snapshot_scale = story.snapshot_scale;
+        const color_scheme = story.color_scheme;
+
+        try teardownRuntime(&runtime, lua_ui, scheduler, window_scope);
+
+        return .{
+            .allocator = init.gpa,
+            .id = id,
+            .viewport = viewport,
+            .snapshot_scale = snapshot_scale,
+            .color_scheme = color_scheme,
+            .pixel_width = pixel_width,
+            .pixel_height = pixel_height,
+            .png = png,
+        };
+    }
+};
 
 fn playAction(
     runtime: *WindowRuntime,
@@ -345,13 +394,13 @@ fn playAction(
     }
 }
 
-fn dispatchAndSettle(
+pub fn dispatchAndSettle(
     runtime: *WindowRuntime,
     vm: *lua.Vm,
     callbacks: *lua.CallbackRegistry,
     scheduler: *task.Scheduler,
     lua_ui: *lua.UiBuild,
-    story: *const lua.StorybookStory,
+    story: anytype,
 ) !void {
     for (0..32) |_| {
         try runtime.dispatchInput(callbacks);
@@ -373,7 +422,7 @@ fn dispatchAndSettle(
     return error.StoryActionDidNotSettle;
 }
 
-fn settleImages(runtime: *WindowRuntime, lua_ui: *lua.UiBuild, story: *const lua.StorybookStory, loop: *io_loop.Loop) !void {
+fn settleImages(runtime: *WindowRuntime, lua_ui: *lua.UiBuild, story: anytype, loop: *io_loop.Loop) !void {
     const assets = lua_ui.images orelse return;
     while (assets.hasPending()) {
         try assets.pump();
@@ -414,10 +463,23 @@ fn evaluateCatalog(
     const c = @import("../lua/c.zig");
     const top = c.lua_gettop(vm.state);
     defer c.lua_settop(vm.state, top);
+    try lua.Storybook.prepareWithApi(vm.state, vm.apiReference());
+    try evaluateValue(vm, scheduler, loop, loader, source, chunk_name);
+    return lua.Storybook.parseStack(allocator, vm.state);
+}
+
+/// Leaves the entry's single returned value on the main Lua stack.
+pub fn evaluateValue(
+    vm: *lua.Vm,
+    scheduler: *task.Scheduler,
+    loop: *io_loop.Loop,
+    loader: *lua.ModuleLoader,
+    source: []const u8,
+    chunk_name: [:0]const u8,
+) !void {
     // Catalog evaluation permits module I/O, not timers or background jobs.
     vm.disableSleep();
     vm.app_spawn_allowed = false;
-    try lua.Storybook.prepareWithApi(vm.state, vm.apiReference());
     const entry = try vm.spawnRetainedNamed(scheduler.application_scope, source, chunk_name);
     const entry_task = try vm.schedulerHandle(entry);
     errdefer drainCatalog(vm, scheduler, loop, loader) catch unreachable;
@@ -433,7 +495,7 @@ fn evaluateCatalog(
                     };
                     loader.freeze();
                     try drainCatalog(vm, scheduler, loop, loader);
-                    return lua.Storybook.parseStack(allocator, vm.state);
+                    return;
                 },
                 .canceled => return error.StorybookEvaluationCanceled,
                 .waiting => if (vm.exit_code != null) return error.StorybookEvaluationCanceled,
@@ -464,7 +526,7 @@ fn drainCatalog(vm: *lua.Vm, scheduler: *task.Scheduler, loop: *io_loop.Loop, lo
     }
 }
 
-fn teardownRuntime(
+pub fn teardownRuntime(
     runtime: *WindowRuntime,
     lua_ui: *lua.UiBuild,
     scheduler: *task.Scheduler,
