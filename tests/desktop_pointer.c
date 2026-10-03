@@ -24,9 +24,20 @@ int main(void) {
     struct zwlr_virtual_pointer_v1 *pointer = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(manager, NULL);
     if (wl_display_roundtrip(display) < 0) return 3;
     puts("ready"); fflush(stdout);
-    /* Keeping a virtual device alive gives this otherwise input-less seat
-       pointer capability. The test drives it with private Sway IPC commands. */
-    (void)getchar();
+    /* Existing tests drive the live seat through Sway IPC. Optional commands
+       exercise actual device events, including the compositor's implicit grab. */
+    char line[128];
+    unsigned x, y, button, state, time = 1;
+    while (fgets(line, sizeof(line), stdin)) {
+        if (sscanf(line, "move %u %u", &x, &y) == 2)
+            zwlr_virtual_pointer_v1_motion_absolute(pointer, time++, x, y, 1280, 720);
+        else if (sscanf(line, "button %u %u", &button, &state) == 2)
+            zwlr_virtual_pointer_v1_button(pointer, time++, button, state);
+        else break;
+        zwlr_virtual_pointer_v1_frame(pointer);
+        if (wl_display_roundtrip(display) < 0) break;
+        puts("done"); fflush(stdout);
+    }
     zwlr_virtual_pointer_v1_destroy(pointer);
     wl_display_roundtrip(display);
     wl_display_disconnect(display);

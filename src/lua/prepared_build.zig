@@ -11,6 +11,8 @@ pub const Handler = struct {
     id: u64,
     reference: c_int,
     kind: input.HandlerKind,
+    open_override: ?bool = null,
+    include_capture: bool = false,
     propagate: bool = true,
     filter: @import("../ui/input/listener.zig").Filter = .{},
     sequence: @import("../ui/input/key_chord.zig").Sequence = .{},

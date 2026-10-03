@@ -435,7 +435,7 @@ pub const UiBuild = struct {
             const old = bindings.set(
                 owner,
                 tree.handleForId(pending.id).?,
-                .{ .id = handle, .kind = pending.kind, .propagate = pending.propagate, .filter = pending.filter, .sequence = pending.sequence, .command = pending.command },
+                .{ .id = handle, .kind = pending.kind, .open_override = pending.open_override, .include_capture = pending.include_capture, .propagate = pending.propagate, .filter = pending.filter, .sequence = pending.sequence, .command = pending.command },
             ) catch unreachable;
             if (old) |handler| callbacks.?.release(handler.id) catch unreachable;
         }
@@ -2134,6 +2134,8 @@ pub const UiBuild = struct {
         }) catch return luaError(state, "cannot append box semantics");
         self.stageCallback(state, id, "on_interaction_change", .interaction_change) catch |err|
             return luaError(state, @errorName(err));
+        self.stageCallback(state, id, "_on_popup_anchor", .popup_anchor) catch |err|
+            return luaError(state, @errorName(err));
         self.stageCallback(state, id, "on_drop_text", .drop_text) catch |err|
             return luaError(state, @errorName(err));
         self.stageCallback(state, id, "on_drop_uris", .drop_uris) catch |err|
@@ -2286,11 +2288,24 @@ pub const UiBuild = struct {
         if (callback_type == c.type_nil) return;
         if (callback_type != c.type_function) return error.CallbackMustBeFunction;
         if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+        var open_override: ?bool = null;
+        var include_capture = false;
+        if (kind == .popup_anchor) {
+            const value_type = c.lua_getfield(state, table, "_popup_open");
+            if (value_type != c.type_boolean) return error.InvalidPopoverOpen;
+            open_override = c.lua_toboolean(state, -1) != 0;
+            c.lua_settop(state, -2);
+        }
+        if (kind == .interaction_change or kind == .popup_anchor) {
+            include_capture = tableOptionalBoolean(state, table, "_popover_interaction", false) orelse return error.InvalidPopoverInteraction;
+        }
         c.lua_pushvalue(state, -1);
         self.pending_handlers[self.pending_handler_count] = .{
             .id = id,
             .reference = c.luaL_ref(state, c.registry_index),
             .kind = kind,
+            .open_override = open_override,
+            .include_capture = include_capture,
         };
         self.pending_handler_count += 1;
     }

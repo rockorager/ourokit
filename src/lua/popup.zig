@@ -13,6 +13,7 @@ pub const Options = struct {
     side: @FieldType(platform.PopupDeclaration, "side") = .bottom,
     gap: u32 = 0,
     transparent: bool = false,
+    pointer_input: bool = false,
     content: c_int,
     on_close: c_int,
 };
@@ -101,6 +102,10 @@ fn parse(vm: *Vm, state: *c.State) !Options {
     if (transparency_kind != c.type_nil and transparency_kind != c.type_boolean) return error.InvalidPopupTransparency;
     const transparent = c.lua_toboolean(state, -1) != 0;
     c.lua_settop(state, -2);
+    const pointer_kind = c.lua_getfield(state, 1, "pointer_input");
+    if (pointer_kind != c.type_nil and pointer_kind != c.type_boolean) return error.InvalidPopupPointerInput;
+    const pointer_input = c.lua_toboolean(state, -1) != 0;
+    c.lua_settop(state, -2);
     const scope = try vm.currentScope(state);
     if (c.lua_getfield(state, 1, "content") != c.type_function) return error.PopupContentRequired;
     const content = c.luaL_ref(state, c.registry_index);
@@ -108,7 +113,7 @@ fn parse(vm: *Vm, state: *c.State) !Options {
     const kind = c.lua_getfield(state, 1, "on_close");
     if (kind != c.type_function and kind != c.type_nil) return error.InvalidPopupCallback;
     const on_close = c.luaL_ref(state, c.registry_index);
-    return .{ .anchor = anchor, .input = input, .scope = scope, .width = width, .height = height, .side = side, .gap = gap, .transparent = transparent, .content = content, .on_close = on_close };
+    return .{ .anchor = anchor, .input = input, .scope = scope, .width = width, .height = height, .side = side, .gap = gap, .transparent = transparent, .pointer_input = pointer_input, .content = content, .on_close = on_close };
 }
 
 fn dimension(state: *c.State, table: c_int, field: [*:0]const u8) !u32 {

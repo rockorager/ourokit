@@ -18,6 +18,7 @@ pub const HandlerKind = enum {
     split_change,
     scroll_change,
     interaction_change,
+    popup_anchor,
     cancel,
     drop_text,
     drop_uris,
@@ -38,6 +39,9 @@ pub const HandlerKind = enum {
 pub const Handler = struct {
     id: Handle,
     kind: HandlerKind = .pointer,
+    /// Internal anchored-surface visibility policy.
+    open_override: ?bool = null,
+    include_capture: bool = false,
     propagate: bool = true,
     filter: @import("listener.zig").Filter = .{},
     sequence: @import("key_chord.zig").Sequence = .{},
@@ -57,6 +61,7 @@ const ScrollState = struct {
 
 const InteractionState = struct {
     target: instance.InstanceHandle = .invalid,
+    kind: HandlerKind = .interaction_change,
     active: bool = false,
 };
 
@@ -120,16 +125,16 @@ pub const PointerBindings = struct {
     /// State survives callback replacement, but never instance removal or reuse.
     pub fn interactionActive(self: *const PointerBindings, target: instance.InstanceHandle) bool {
         if (self.getKind(target, .interaction_change) == null) return false;
-        for (self.interactions) |state| if (same(state.target, target)) return state.active;
+        for (self.interactions) |state| if (same(state.target, target) and state.kind == .interaction_change) return state.active;
         return false;
     }
 
-    pub fn interactionChanged(self: *PointerBindings, tree: *instance.Tree, target: instance.InstanceHandle, active: bool) bool {
+    pub fn interactionChanged(self: *PointerBindings, tree: *instance.Tree, target: instance.InstanceHandle, kind: HandlerKind, active: bool) bool {
         var empty: ?*InteractionState = null;
         for (self.interactions) |*state| {
-            if (!tree.isActive(state.target) or self.getKind(state.target, .interaction_change) == null)
+            if (!tree.isActive(state.target) or self.getKind(state.target, state.kind) == null)
                 state.* = .{};
-            if (same(state.target, target)) {
+            if (same(state.target, target) and state.kind == kind) {
                 const changed = state.active != active;
                 state.active = active;
                 return changed;
@@ -137,7 +142,7 @@ pub const PointerBindings = struct {
             if (same(state.target, .invalid)) empty = state;
         }
         // There cannot be more interaction targets than bindings.
-        empty.?.* = .{ .target = target, .active = active };
+        empty.?.* = .{ .target = target, .kind = kind, .active = active };
         // Publish the initial state too: a retained Lua component can replace
         // its observed native instance while keeping its previous signal.
         return true;

@@ -250,6 +250,78 @@ ouro.tooltip = ouro.stateful(function(p)
   end
 end)
 
+local PopoverTrigger = ouro.stateless(function(p, children, theme)
+  p.prepare(theme)
+  return ouro.box {key='anchor', flex=p.flex, x=p.x, y=p.y,
+    _popup_open=p.open, _on_popup_anchor=p.anchor,
+    _popover_interaction=true, on_interaction_change=p.observe,
+    children=children}
+end)
+
+-- Controlled visibility and application-owned styling/expiry. Native anchor
+-- delivery happens after layout, in a task, never as a render side effect.
+ouro.popover = ouro.stateful(function(p)
+  local popup, theme, generation = nil, nil, 0
+  local trigger_active, popup_active, reported = false, false, nil
+  local function report()
+    local active = trigger_active or popup_active
+    if reported ~= active then
+      reported = active
+      if p.on_interaction_change then p.on_interaction_change(active) end
+    end
+  end
+  local function observe_trigger(active) trigger_active=active; report() end
+  local function observe_popup(active) popup_active=active; report() end
+  local function anchor(active, token)
+    if not active then
+      if popup then popup:close() end
+      return
+    end
+    if not token or p.enabled == false then return end
+    generation = generation + 1
+    local request = generation
+    local handle, err = ouro.popup {
+      anchor=token, width=p.width, height=p.height, side=p.side or 'bottom', gap=p.gap or 6,
+      pointer_input=p.interactive ~= false, transparent=true,
+      on_close=function()
+        if request ~= generation then return end
+        popup=nil; popup_active=false; report()
+        if p.on_close then p.on_close() end
+      end,
+      content=function()
+        local colors = {}
+        for name, color in pairs(theme.colors) do colors[name] = color end
+        colors.background = transparent
+        return ouro.theme {key='policy', colors=colors, reduced_motion=theme.reduced_motion,
+          typography={family=theme.typography.family ~= '' and theme.typography.family or nil},
+          ouro.box {key='content', width='fill', height='fill', _popover_interaction=true,
+            on_interaction_change=observe_popup, p.content()}}
+      end,
+    }
+    if handle then popup=handle
+    elseif p.on_error then p.on_error(err) end
+  end
+  return function()
+    check(#p.children == 1, 'popover requires one trigger child')
+    check(kind(p.open) == 'boolean', 'popover open must be boolean')
+    check(kind(p.content) == 'function', 'popover content must be a function')
+    check(p.interactive == nil or kind(p.interactive) == 'boolean', 'popover interactive must be boolean')
+    local active = enabled(p)
+    for _, field in ipairs({'width', 'height'}) do
+      local value = p[field]
+      check(kind(value) == 'number' and value % 1 == 0 and value >= 1 and value <= 16384, 'invalid popover '..field)
+    end
+    local gap = p.gap or 6
+    check(kind(gap) == 'number' and gap % 1 == 0 and gap >= 0 and gap <= 1024, 'invalid popover gap')
+    check(p.side == nil or p.side == 'top' or p.side == 'bottom' or p.side == 'left' or p.side == 'right', 'invalid popover side')
+    for _, field in ipairs({'on_interaction_change', 'on_close', 'on_error'}) do
+      check(p[field] == nil or kind(p[field]) == 'function', 'invalid popover '..field)
+    end
+    return PopoverTrigger {key='trigger', flex=p.flex, x=p.x, y=p.y, open=p.open and active,
+      prepare=function(style) theme=style end, anchor=anchor, observe=observe_trigger, children=p.children}
+  end
+end)
+
 ouro.separator = ouro.stateless(function(p, children, theme)
   check(#children == 0, 'separator does not accept children')
   local orientation = p.orientation

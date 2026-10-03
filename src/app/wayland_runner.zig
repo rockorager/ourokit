@@ -135,11 +135,14 @@ const PopupHost = struct {
             .side = options.side,
             .gap = options.gap,
             .transparent = options.transparent,
+            .pointer_input = options.pointer_input,
         } };
         try self.windows.create(declaration);
         // Native creation retires any passive surface before mapping its
         // replacement. A tooltip must never prevent a menu from opening.
-        for (self.slots) |*old| if (old.popup != null) {
+        for (self.slots) |*old| if (old.popup != null and (options.input != null or
+            sameHandle(old.popup.?.window.declaration.popup.anchor.window, options.anchor.window)))
+        {
             old.desired = false;
         };
         const handle = self.windows.activeHandleForId(id).?;
@@ -157,8 +160,11 @@ const PopupHost = struct {
     }
 
     fn passiveAnchorLive(parent: *RuntimeSlot, anchor: platform.window.PopupAnchor) bool {
-        if (!parent.runtime.instances.isInteractive(anchor.target) or
-            !parent.runtime.pointer_bindings.interactionActive(anchor.target)) return false;
+        if (!parent.runtime.instances.isInteractive(anchor.target)) return false;
+        if (anchor.controlled) {
+            const binding = parent.runtime.pointer_bindings.getKind(anchor.target, .popup_anchor) orelse return false;
+            if (binding.open_override != true) return false;
+        } else if (!parent.runtime.pointer_bindings.interactionActive(anchor.target)) return false;
         const rectangle = parent.runtime.anchorRectangle(anchor.target) catch return false;
         return std.meta.eql(rectangle, anchor.rectangle);
     }
@@ -179,6 +185,9 @@ const PopupHost = struct {
         } else return error.StalePopup;
         const popup = &slot.popup.?;
         if (!slot.desired) return error.StalePopup;
+        // Parent props captured by the content closure are not signal reads in
+        // the popup's owner. Refresh even if its requested size did not change.
+        if (slot.runtime.ready) _ = try slot.runtime.build_owners.markDirty(slot.runtime.root_owner);
         const declaration = popup.window.declaration.popup;
         if (declaration.width == width and declaration.height == height) {
             popup.pending_size = null;
@@ -842,8 +851,10 @@ fn runSourceInternal(
         try scheduler.applyQueuedCancellations();
         try popups.closing();
         for (runtime_slots) |*slot| try slot.runtime.collectRetired();
-        for (runtime_slots) |*slot| if (slot.desired and slot.runtime.ready)
+        for (runtime_slots) |*slot| if (slot.desired and slot.runtime.ready) {
+            slot.runtime.popup_anchors_ready = try host.framesPresented(slot.runtime.window) > 0;
             try slot.runtime.dispatchInput(&callbacks);
+        };
         while (clipboard.takeCompletion()) |completion| {
             if (completion.text) |bytes| {
                 if (slotForNativeHandle(&window_set, runtime_slots, completion.target.window)) |slot| {
@@ -951,10 +962,12 @@ fn runSourceInternal(
             // waiting for ring quiescence, not only in the deferred drain.
             source_reload.active().dbus.shutdown();
             source_reload.active().auth.stop();
+            source_reload.active().audio.stop();
             if (source_reload.active().session) |*binding| binding.stop();
             if (source_reload.candidate) |candidate| {
                 candidate.dbus.shutdown();
                 candidate.auth.stop();
+                candidate.audio.stop();
                 if (candidate.session) |*binding| binding.stop();
                 try candidate.vm.requestCancellation();
             }
@@ -1448,9 +1461,11 @@ fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlSe
     try reload.active().http.stop();
     if (reload.candidate) |candidate| try candidate.http.stop();
     reload.active().auth.stop();
+    reload.active().audio.stop();
     if (reload.active().session) |*binding| binding.stop();
     if (reload.candidate) |candidate| {
         candidate.auth.stop();
+        candidate.audio.stop();
         if (candidate.session) |*binding| binding.stop();
     }
     try reload.active().vm.requestCancellation();
@@ -1547,6 +1562,7 @@ fn drainInitialGeneration(generation: *SourceGeneration, scheduler: *task.Schedu
     generation.shutdownImages();
     generation.dbus.shutdown();
     generation.auth.stop();
+    generation.audio.stop();
     try generation.http.stop();
     if (generation.session) |*binding| binding.stop();
     try generation.vm.requestCancellation();

@@ -1997,7 +1997,9 @@ pub const Host = struct {
             },
         }
         if (declaration == .popup) for (self.windows) |*other| {
-            if (other.popup != null) {
+            if (other.popup != null and (declaration.popup.input != null or
+                (other.popup_parent != null and sameWindow(other.popup_parent.?, declaration.popup.anchor.window))))
+            {
                 try self.sink.closeRequested(other.handle);
                 try self.destroySurfaces(other);
             }
@@ -2023,6 +2025,14 @@ pub const Host = struct {
             _ = try self.driver.schedule();
             return;
         }
+        window.handle = handle;
+        window.scope = scope;
+        try self.activateXdgSurface(window, declaration);
+    }
+
+    // Keep the logical window, content and buffer leases when an old xdg-shell
+    // compositor needs a passive popup remapped instead of repositioned.
+    fn activateXdgSurface(self: *Host, window: *Window, declaration: platform_window.SurfaceDeclaration) !void {
         const objects = &self.connection.objects;
         const transmit = try self.queue();
         const surface = (try protocol.wl_compositor.construct_create_surface(
@@ -2059,7 +2069,8 @@ pub const Host = struct {
                 promoted = true;
             }
             popup = try createPopupRole(objects, transmit, self.wm_base.?, self.seat, xdg_surface, parent, value);
-            if (value.input != null) self.popup_input = null else try setInputRegion(objects, transmit, self.compositor.?, surface, .{ .x = 0, .y = 0, .width = 0, .height = 0 });
+            if (value.input != null) self.popup_input = null else if (!value.pointer_input)
+                try setInputRegion(objects, transmit, self.compositor.?, surface, .{ .x = 0, .y = 0, .width = 0, .height = 0 });
         }
         if (declaration == .toplevel) {
             const toplevel_declaration = declaration.toplevel;
@@ -2123,25 +2134,25 @@ pub const Host = struct {
             fractional_scale_denominator,
         );
         try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, surface, .{ .commit = .{} });
-        window.* = .{
-            .state = .open,
-            .handle = handle,
-            .scope = scope,
-            .surface = surface,
-            .xdg_surface = xdg_surface,
-            .toplevel = toplevel,
-            .popup = popup,
-            .popup_parent = if (declaration == .popup) declaration.popup.anchor.window else null,
-            .popup_grabbing = declaration == .popup and declaration.popup.input != null,
-            .popup_keyboard_promoted = promoted,
-            .viewport = viewport,
-            .fractional_scale = fractional_scale,
-            .sync_surface = sync_surface,
-            .width = initial_width,
-            .height = initial_height,
-            .pending_width = initial_width,
-            .pending_height = initial_height,
-        };
+        window.state = .open;
+        window.surface = surface;
+        window.xdg_surface = xdg_surface;
+        window.toplevel = toplevel;
+        window.popup = popup;
+        window.popup_parent = if (declaration == .popup) declaration.popup.anchor.window else null;
+        window.popup_grabbing = declaration == .popup and declaration.popup.input != null;
+        window.popup_keyboard_promoted = promoted;
+        window.viewport = viewport;
+        window.fractional_scale = fractional_scale;
+        window.sync_surface = sync_surface;
+        window.width = initial_width;
+        window.height = initial_height;
+        window.pending_width = initial_width;
+        window.pending_height = initial_height;
+        window.scale_120 = fractional_scale_denominator;
+        window.configured = false;
+        window.pending_redraw = false;
+        window.damage_history = .{};
         _ = try self.driver.schedule();
     }
 
@@ -2251,13 +2262,20 @@ pub const Host = struct {
         const window = try self.windowFor(handle);
         if (window.state != .open) return error.WindowClosing;
         const popup = window.popup orelse return error.NotPopup;
-        return self.connection.objects.namespace.resolve(popup).?.version >= 3;
+        return !window.popup_grabbing or self.connection.objects.namespace.resolve(popup).?.version >= 3;
     }
 
     pub fn resizePopup(self: *Host, handle: WindowHandle, declaration: platform_window.PopupDeclaration) !void {
         try declaration.validate();
         if (!try self.popupResizeSupported(handle)) return error.PopupResizeUnsupported;
         const window = try self.windowFor(handle);
+        if (self.connection.objects.namespace.resolve(window.popup.?).?.version < 3) {
+            // There is no legal reposition request before v3. Passive surfaces
+            // carry no input serial to replay; replace only the protocol roles.
+            try self.destroySurfaces(window);
+            try self.activateXdgSurface(window, .{ .popup = declaration });
+            return;
+        }
         const objects = &self.connection.objects;
         const transmit = try self.queue();
         const positioner = try createPopupPositioner(objects, transmit, self.wm_base.?, declaration);
@@ -4997,15 +5015,17 @@ test "native popup validates input, positions independently and tears down befor
     try transmit.begin(passive_requests);
     try transmit.complete(passive_requests.byteCount());
 
-    // Resize sends a complete positioner and no new surface/grab. Older
-    // protocol versions reject it before publishing any requests.
+    // Resize sends a complete positioner and no new surface/grab. Grabbed
+    // popups on older protocols cannot replay their consumed input authority.
     var resized = passive.popup;
     resized.width = 137;
     resized.height = 41;
     const popup_object = objects.namespace.resolve(windows[1].popup.?).?;
     popup_object.version = 2;
+    windows[1].popup_grabbing = true;
     try std.testing.expectError(error.PopupResizeUnsupported, host.resizePopup(popup_window, resized));
     try std.testing.expectEqual(@as(usize, 0), transmit.queuedBytes());
+    windows[1].popup_grabbing = false;
     popup_object.version = 5;
     try host.resizePopup(popup_window, resized);
     try std.testing.expectEqual(@as(u32, 211), windows[1].width);
@@ -5042,6 +5062,30 @@ test "native popup validates input, positions independently and tears down befor
     const resized_ack = try transmit.snapshot(&.{}, &.{});
     try transmit.begin(resized_ack);
     try transmit.complete(resized_ack.byteCount());
+
+    // A pre-v3 passive popup replaces its protocol roles without closing its
+    // logical window or stealing input. Storage leases survive until release.
+    objects.namespace.resolve(windows[1].popup.?).?.version = 2;
+    const logical_handle = windows[1].handle;
+    const old_surface = windows[1].surface.?;
+    windows[1].buffers.slots[0].busy = true;
+    recorder.closed = false;
+    resized.width = 97;
+    try host.resizePopup(popup_window, resized);
+    try std.testing.expectEqual(logical_handle, windows[1].handle);
+    try std.testing.expect(!recorder.closed and !windows[1].configured);
+    try std.testing.expect(!std.meta.eql(old_surface, windows[1].surface.?));
+    try std.testing.expect(windows[1].buffers.slots[0].busy);
+    windows[1].buffers.slots[0].busy = false;
+    const remap = try transmit.snapshot(&.{}, &.{});
+    bytes = remap.first;
+    while (bytes.len > 0) {
+        const message = (try wayring.wire.Message.decode(bytes)).?;
+        try std.testing.expect(message.header.object_id != windows[1].popup.?.id); // No grab/reposition.
+        bytes = bytes[message.header.size..];
+    }
+    try transmit.begin(remap);
+    try transmit.complete(remap.byteCount());
 
     try Host.nativeUpdateLayerSurface(&host, input.window, .{ .id = "banner", .namespace = "test", .width = 421, .height = 199, .layer = .overlay });
     const passive_update = try transmit.snapshot(&.{}, &.{});

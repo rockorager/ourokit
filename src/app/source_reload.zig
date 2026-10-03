@@ -338,6 +338,7 @@ pub const SourceReload = struct {
         const retired = self.active_generation;
         if (candidate.session) |*binding| binding.activate();
         candidate.auth.stopping = false;
+        candidate.audio.candidate = false;
         candidate.vm.app_spawn_allowed = true;
         self.active_generation = candidate;
         self.candidate = null;
@@ -358,6 +359,7 @@ pub const SourceReload = struct {
             retiring.generation.dbus.shutdown();
             retiring.generation.files.stop();
             retiring.generation.auth.stop();
+            retiring.generation.audio.stop();
             try retiring.generation.http.stop();
             if (retiring.generation.session) |*binding| binding.stop();
             retiring.cancellation_started = true;
@@ -476,6 +478,7 @@ pub const SourceReload = struct {
             if (!retiring.generation.dbus.canDeinit()) continue;
             if (!retiring.generation.files.canDeinit()) continue;
             if (!retiring.generation.auth.canDeinit()) continue;
+            if (!retiring.generation.audio.canDeinit()) continue;
             if (!retiring.generation.http.canDeinit()) continue;
             if (self.services) |services|
                 if (services.callbacks.countForVm(&retiring.generation.vm) != 0) continue;

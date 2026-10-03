@@ -156,6 +156,8 @@ pub const WindowRuntime = struct {
     /// Popup visual disposal must not cancel a selected asynchronous action.
     callback_scope: ?task.ScopeHandle = null,
     popup_target: ?ui.instance.InstanceHandle = null,
+    /// Native hosts defer controlled anchors until the parent is mapped.
+    popup_anchors_ready: bool = true,
     signals: *lua.Signals = undefined,
     paragraph_sources: *text.ParagraphSourceCache = undefined,
     paragraphs: *text.ParagraphCache = undefined,
@@ -588,7 +590,7 @@ pub const WindowRuntime = struct {
             const old = self.pointer_bindings.set(
                 self.root_owner,
                 target,
-                .{ .id = callback, .kind = handler.kind, .propagate = handler.propagate, .filter = handler.filter, .sequence = handler.sequence, .command = handler.command },
+                .{ .id = callback, .kind = handler.kind, .open_override = handler.open_override, .include_capture = handler.include_capture, .propagate = handler.propagate, .filter = handler.filter, .sequence = handler.sequence, .command = handler.command },
             ) catch unreachable;
             std.debug.assert(old == null);
         }
@@ -1525,7 +1527,7 @@ pub const WindowRuntime = struct {
 
     fn syncInteractions(self: *WindowRuntime, callback_service: anytype) !void {
         const observing = for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
-            if (entry.handler != null and entry.handler.?.kind == .interaction_change) break true;
+            if (entry.handler != null and (entry.handler.?.kind == .interaction_change or entry.handler.?.kind == .popup_anchor)) break true;
         } else false;
         if (!observing) return;
         // Hit-test current geometry, rather than a leaf which may have been
@@ -1546,10 +1548,12 @@ pub const WindowRuntime = struct {
         const focused = if (self.keyboard_focused) self.focus.current() else null;
         for (self.pointer_bindings.entries[0..self.pointer_bindings.entry_limit]) |entry| {
             const handler = entry.handler orelse continue;
-            if (handler.kind != .interaction_change or !self.instances.isInteractive(entry.target)) continue;
-            const active = try self.containsTarget(entry.target, hovered) or try self.containsTarget(entry.target, focused) or
-                try self.containsTarget(entry.target, self.popup_target);
-            if (self.pointer_bindings.interactionChanged(&self.instances, entry.target, active)) {
+            if ((handler.kind != .interaction_change and handler.kind != .popup_anchor) or !self.instances.isInteractive(entry.target)) continue;
+            if (handler.kind == .popup_anchor and !self.popup_anchors_ready) continue;
+            const active = handler.open_override orelse (try self.containsTarget(entry.target, hovered) or try self.containsTarget(entry.target, focused) or
+                try self.containsTarget(entry.target, self.popup_target) or
+                (handler.include_capture and try self.containsTarget(entry.target, self.router.captured)));
+            if (self.pointer_bindings.interactionChanged(&self.instances, entry.target, handler.kind, active)) {
                 if (active) {
                     const rectangle: ?core.RectI = self.anchorRectangle(entry.target) catch |err| switch (err) {
                         error.LayoutRequired, error.PopupAnchorNotVisible => null,
@@ -1557,7 +1561,7 @@ pub const WindowRuntime = struct {
                     };
                     if (rectangle) |bounds| try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{
                         .{ .boolean = true },
-                        .{ .popup_anchor = .{ .window = self.window, .target = entry.target, .rectangle = bounds } },
+                        .{ .popup_anchor = .{ .window = self.window, .target = entry.target, .rectangle = bounds, .controlled = handler.kind == .popup_anchor } },
                     }) else try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{.{ .boolean = true }});
                 } else try self.spawnCallback(callback_service, handler.id, try self.instances.scope(entry.target), &.{.{ .boolean = false }});
             }

@@ -621,15 +621,77 @@ uses a light tooltip and dark mode uses a dark tooltip. Optional
 `on_error(error)` receives popup-creation or resize failures.
 See `examples/tooltip-bar.lua` for a 36px bar, including a tooltip around a select.
 
+### Controlled, pointer-interactive popovers
+
+`ouro.popover` wraps exactly one mounted trigger child and shows custom content
+without an input serial, popup grab, or keyboard-focus promotion. It works on
+ordinary windows and layer surfaces (not lock surfaces or nested popups).
+By default its surface receives pointer input, including slider drags.
+Set `interactive=false` for an informational OSD: the native input region is
+empty, pointer events pass through to the application beneath it, and hovering
+the popup does not hold it open. Trigger interaction is still observed.
+It does not request keyboard access; use a menu or ordinary window for content
+that needs keyboard interaction.
+
+```lua
+ouro.popover {
+  key='volume', open=shown(), width=260, height=100, side='bottom', gap=6,
+  on_interaction_change=function(active) interacting:set(active) end,
+  on_close=function() shown:set(false) end,
+  on_error=function(err) report_error(err.name, err.message) end,
+  content=function()
+    local state = output() -- subscribe this popup's independent render
+    return ouro.slider {key='level', label='Output volume', width=228,
+      value=state.available and math.min(1, state.volume) or 0,
+      enabled=state.available, min=0, max=1, step=0.01,
+      on_change=function(value) output:set_volume(value) end}
+  end,
+  ouro.button {key='trigger', label='Volume'},
+}
+```
+
+`open` is a required boolean; `width` and `height` are required integer logical
+pixels (1–16384). `content` is a required build function. Optional `enabled`
+defaults to true, `interactive` to true, `side` to `bottom`, and `gap` to 6
+(0–1024). Input policy, geometry and the
+trigger's inherited theme are used when opening; close and reopen to apply new
+popup geometry. The compositor may flip or slide it at an output edge. Styling,
+hover opening, cross-gap grace periods and OSD expiry belong to the application.
+Read signals and audio snapshots **inside** `content`, rather than capturing
+values from the parent build: popup rendering has independent dependencies.
+
+`on_interaction_change(active)` observes the union of trigger and popup hover,
+keyboard focus, and pointer capture. Capture keeps it active while dragging
+outside the surface, until release. Crossing the gap may briefly report false;
+applications should allow a short grace period before hiding. Callbacks run as
+tasks, so they can update signals outside rendering.
+Outside-surface pointer capture depends on compositor support: Sway 1.7 does
+not deliver these events for non-grabbing layer-shell popups. The optional
+`tests/tooltip_native.py --drag-outside` check exposes this limitation; it does
+not affect display-only popovers.
+
+Setting `open=false`, disabling, moving/unmounting the trigger, or losing its
+parent/output closes the native surface. Optional `on_close()` runs after
+closure when the owner's task scope is still live. Native invalidation does
+not reopen a still-true `open`: transition false then true to retry. Remounting
+creates a new lifetime. One non-grabbing popup may exist per parent; a new one
+replaces the old one, while bars on separate outputs can coexist. A grabbing
+menu takes precedence. `on_error(error)` receives standard root error tables
+(`name`, `message`) when native creation fails. Neither callback grants input
+authority, and no generic render-side effect API is introduced.
+
 `ouro.measure_text {text=..., size=..., max_width=..., max_lines=..., overflow=...}`
 returns `{width, height}` in logical pixels during a UI build. It uses the same
 shaping, fallback fonts, inherited typography, and optional `weight`/`spans` as
 `ouro.text`. The default maximum width is 16384; line count and overflow defaults
 match `ouro.text`. `popup:resize {width=..., height=...}` queues new positive
 integer dimensions, retaining the popup's anchor, side, gap, and input policy.
-It returns `true` or `nil, error`, including `PopupResizeUnsupported` on xdg-shell
-versions older than 3. The host applies the compositor-confirmed dimensions only
-after the subsequent configure handshake.
+It returns `true` or `nil, error`. On xdg-shell v3+ it repositions in place;
+older compositors remap passive protocol surfaces while retaining the Lua handle
+and content state. Grabbed popups still return `PopupResizeUnsupported` on those
+older versions because their input serial cannot be replayed. The host waits for
+the subsequent configure handshake before submitting the new surface. Resize
+also refreshes captured content, even if the requested dimensions are unchanged.
 
 For custom passive content, `on_interaction_change(active, anchor)` supplies an
 opaque anchor when the active target has visible bounds. Pass it as

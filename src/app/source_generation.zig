@@ -61,6 +61,7 @@ pub const SourceGeneration = struct {
     files: @import("../lua/files.zig").Binding,
     auth: @import("../lua/auth.zig").Binding,
     http: @import("../lua/http.zig").Binding,
+    audio: @import("../lua/audio.zig").Binding,
     session: ?@import("../lua/session.zig").Binding = null,
     applications: lua.Applications,
     image_import: lua.ImageImport,
@@ -204,6 +205,7 @@ pub const SourceGeneration = struct {
         var files_initialized = false;
         var auth_initialized = false;
         var http_initialized = false;
+        var audio_initialized = false;
         var applications_initialized = false;
         var image_import_initialized = false;
         var signals_initialized = false;
@@ -227,6 +229,7 @@ pub const SourceGeneration = struct {
             if (image_import_initialized) self.image_import.deinit();
             if (auth_initialized) self.auth.deinit();
             if (http_initialized) self.http.deinit();
+            if (audio_initialized) self.audio.deinit();
             if (files_initialized) self.files.deinit();
             if (stdio_initialized) self.stdio.deinit();
             if (dbus_initialized) self.dbus.deinit();
@@ -313,6 +316,9 @@ pub const SourceGeneration = struct {
             return err;
         };
         signals_initialized = true;
+        self.audio.init(&self.vm, &self.signals);
+        self.audio.candidate = config.session_candidate;
+        audio_initialized = true;
         if (config.native_modules.len != 0) {
             var modules: native.Registry = undefined;
             modules.init(allocator, &self.vm, &self.signals, config.native_modules) catch |err| {
@@ -668,6 +674,7 @@ pub const SourceGeneration = struct {
         if (try self.image_import.dispatch(completion)) return true;
         if (try self.files.dispatch(completion)) return true;
         if (try self.auth.dispatch(completion)) return true;
+        if (try self.audio.dispatch(completion)) return true;
         if (try self.stdio.dispatch(completion)) return true;
         if (self.module_loader) |*loader| return loader.dispatch(completion);
         return false;
@@ -696,6 +703,7 @@ pub const SourceGeneration = struct {
         self.image_import.collectCanceled();
         self.files.collectCanceled();
         try self.auth.collectCanceled();
+        try self.audio.collectCanceled();
         if (self.session) |*binding| try binding.sync();
     }
 
@@ -935,6 +943,7 @@ pub const SourceGeneration = struct {
         self.files.deinit();
         self.auth.deinit();
         self.http.deinit();
+        self.audio.deinit();
         self.stdio.deinit();
         self.dbus.deinit();
         self.mcp_client.deinit();

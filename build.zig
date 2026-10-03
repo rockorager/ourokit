@@ -358,6 +358,14 @@ pub fn build(b: *std.Build) void {
     const http_step = b.step("test-http", "Exercise HTTP, TLS verification and cancellation with disposable loopback peers");
     http_step.dependOn(&http_tests.step);
 
+    const audio_tests = b.addSystemCommand(&.{"python3"});
+    audio_tests.addFileArg(b.path("tests/audio_native.py"));
+    audio_tests.addArtifactArg(host);
+    audio_tests.setCwd(b.path("."));
+    audio_tests.has_side_effects = true;
+    const audio_step = b.step("test-audio", "Exercise native PipeWire output controls against a disposable daemon");
+    audio_step.dependOn(&audio_tests.step);
+
     const session_tests = b.step("test-session", "Exercise native session protocols and asynchronous PAM with disposable peers");
     inline for (.{ "native_harness.py", "session_native.py", "auth_native.py", "secure_entry.py" }) |file| {
         const check = b.addSystemCommand(&.{"python3"});
@@ -384,6 +392,7 @@ pub fn build(b: *std.Build) void {
     verify.dependOn(development_step);
     verify.dependOn(session_tests);
     verify.dependOn(http_step);
+    verify.dependOn(audio_step);
     verify.dependOn(&format.step);
 
     const ui_test_step = b.step("test-ourokit-ui", "Run platform-neutral UI integration tests");
@@ -833,6 +842,12 @@ fn addLua(module: *std.Build.Module, lua: *std.Build.Dependency) void {
         .file = module.owner.path("src/lua/auth.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
+    module.addCSourceFile(.{
+        .file = module.owner.path("src/lua/audio.c"),
+        .flags = &.{ "-std=gnu11", "-Wall", "-Wextra", "-Werror" },
+    });
+    module.addIncludePath(module.owner.path("src/lua"));
+    module.linkSystemLibrary("libpipewire-0.3", .{});
     module.addIncludePath(lua.path("src"));
     module.link_libc = true;
 }

@@ -376,6 +376,8 @@ pub const PopupAnchor = struct {
     window: WindowHandle,
     target: @import("../core/handle.zig").Handle,
     rectangle: RectI,
+    /// Issued by a mounted declarative popover, independently of hover/focus.
+    controlled: bool = false,
 };
 
 pub const PopupDeclaration = struct {
@@ -388,6 +390,8 @@ pub const PopupDeclaration = struct {
     side: enum { top, bottom, left, right } = .bottom,
     gap: u32 = 0,
     transparent: bool = false,
+    /// Pointer-interactive without a keyboard grab or activation authority.
+    pointer_input: bool = false,
 
     pub fn validate(self: PopupDeclaration) !void {
         const anchor = self.anchor.rectangle;

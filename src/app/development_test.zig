@@ -2924,6 +2924,23 @@ test "tooltip declarations reject invalid trigger timing placement and dimension
     }
 }
 
+test "popover declarations validate closed content dimensions and controlled visibility" {
+    for ([_][]const u8{
+        "ouro.popover {key='p',open=false,width=120,height=80,content=function() end}",
+        "ouro.popover {key='p',width=120,height=80,content=function() end,ouro.box{key='child'}}",
+        "ouro.popover {key='p',open=1,width=120,height=80,content=function() end,ouro.box{key='child'}}",
+        "ouro.popover {key='p',open=false,width=0,height=80,content=function() end,ouro.box{key='child'}}",
+        "ouro.popover {key='p',open=false,width=120,height=80,content='bad',ouro.box{key='child'}}",
+        "ouro.popover {key='p',open=false,width=120,height=80,interactive=1,content=function() end,ouro.box{key='child'}}",
+        "ouro.popover {key='p',open=false,width=120,height=80,side='above',content=function() end,ouro.box{key='child'}}",
+        "ouro.popover {key='p',open=false,width=120,height=80,on_close=true,content=function() end,ouro.box{key='child'}}",
+    }) |declaration| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "function build() return {s} end", .{declaration});
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
+    }
+}
+
 test "animated component declarations reject invalid motion disclosure and factor inputs" {
     for ([_][]const u8{
         "ouro.switch {key='s',label='Switch',checked=true,motion='sometimes'}",

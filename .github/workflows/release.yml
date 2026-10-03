@@ -43,7 +43,7 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates curl git xz-utils gcc libc6-dev pkg-config python3 \
-            libfontconfig-dev libfreetype-dev libxkbcommon-dev libcurl4-openssl-dev
+            libfontconfig-dev libfreetype-dev libxkbcommon-dev libcurl4-openssl-dev libpipewire-0.3-dev
 
       - uses: actions/checkout@v7
         with:
@@ -170,8 +170,8 @@ jobs:
           ouroctl for x86_64 Linux (glibc ≥ 2.36, e.g. Debian 12) built from ${SHA}
           with \`zig build -Doptimize=ReleaseFast -Dvulkan=false -Dcpu=baseline\`.
 
-          Runtime libraries: fontconfig, freetype, xkbcommon and curl
-          (Debian: \`libfontconfig1 libfreetype6 libxkbcommon0 libcurl4\`).
+          Runtime libraries: fontconfig, freetype, xkbcommon, curl and PipeWire
+          (Debian: \`libfontconfig1 libfreetype6 libxkbcommon0 libcurl4 libpipewire-0.3-0\`).
 
           \`\`\`toml
           [tools]

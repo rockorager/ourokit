@@ -73,7 +73,7 @@ on_press=function() hits=hits+1 end}}} end}}} end}
                     stdout=subprocess.DEVNULL, stderr=log)
                 processes.append(process)
                 endpoint = development_path(root, process, exclude=endpoints,
-                                            windows=('bar' if source.stem == 'tooltip-bar' else 'main',))
+                                            windows=('bar' if source.stem.startswith('tooltip-bar') else 'main',))
                 endpoints.append(endpoint)
                 return endpoint
             editor_endpoint = launch(editor)
@@ -93,7 +93,11 @@ on_press=function() hits=hits+1 end}}} end}}} end}
             def node(endpoint, window, suffix):
                 return next(n for n in tree(endpoint, window)['nodes'] if n['path'].endswith(suffix))
             def popups(endpoint): return [w['window'] for w in windows(endpoint) if w['window'].startswith('__ouro_popup_')]
-            def move(x, y): sway(env, 'seat', 'seat0', 'cursor', 'set', str(x), str(y))
+            def pointer_command(command):
+                pointer.stdin.write((command + '\n').encode()); pointer.stdin.flush()
+                assert select.select([pointer.stdout], [], [], 5)[0], 'virtual pointer command timeout'
+                assert pointer.stdout.readline() == b'done\n'
+            def move(x, y): pointer_command(f'move {int(x)} {int(y)}')
             def leave():
                 move(750, 680)
                 wait_for(lambda: not popups(bar_endpoint), 'tooltip did not close on leave')
@@ -185,6 +189,95 @@ on_press=function() hits=hits+1 end}}} end}}} end}
             assert invoke(bar_endpoint, 'Stats')['errors'] == 0
             print('PASS real click replaces passive tooltip with grabbing select, Escape dismisses menu')
 
+            # No pointer or keyboard interaction with the trigger: an action
+            # opens a pointer-interactive, non-grabbing popover.
+            leave()
+            invoke(bar_endpoint, 'OpenVolume')
+            tip = opened(bar_endpoint)
+            assert focused() == 'dev.ourokit.tooltip-editor'
+            invoke(bar_endpoint, 'SetVolume')
+            wait_for(lambda: node(bar_endpoint, tip, '/label')['label'].endswith('63%'), 'popover content did not update')
+            capture('interactive-volume-popover.png')
+            hover('/volume/anchor/button')
+            wait_for(lambda: invoke(bar_endpoint, 'Stats')['volume_active'], 'trigger hover was not reported')
+            trigger = node(bar_endpoint, 'bar', '/volume/anchor/button')['bounds']
+            slider = node(bar_endpoint, tip, '/slider')['bounds']
+            # Bottom-centered positioner, on an unconstrained middle trigger.
+            px = trigger['x'] + trigger['width']/2 - 130
+            py = trigger['y'] + trigger['height'] + 6
+            x = int(px + slider['x'] + slider['width']*.25)
+            y = int(py + slider['y'] + slider['height']/2)
+            move(x, y)
+            wait_for(lambda: invoke(bar_endpoint, 'Stats')['volume_active'], 'popover hover was not reported')
+            assert popups(bar_endpoint) == [tip], 'crossing from trigger closed popover'
+            pointer_command('button 272 1')
+            wait_for(lambda: invoke(bar_endpoint, 'Stats')['volume'] < .4, 'popover slider press ignored')
+            move(int(px + slider['x'] + slider['width']*.8), y)
+            wait_for(lambda: invoke(bar_endpoint, 'Stats')['volume'] > .75, 'held slider drag failed')
+            if os.environ.get('OUROKIT_POPOVER_DRAG_OUTSIDE'):
+                move(int(px + 400), int(py + 150))
+                wait_for(lambda: invoke(bar_endpoint, 'Stats')['volume'] > .99, 'compositor did not deliver outside-popup drag')
+            else:
+                print('NOT CHECKED outside-popup drag (use --drag-outside; Sway 1.7 lacks implicit grabs for layer popups)')
+            assert invoke(bar_endpoint, 'Stats')['volume_active'], 'drag capture did not hold interaction'
+            assert popups(bar_endpoint) == [tip]
+            pointer_command('button 272 0')
+            move(750, 680)
+            wait_for(lambda: not invoke(bar_endpoint, 'Stats')['volume_active'], 'capture remained active after release')
+            # Even a pointer-interactive popup does not promote keyboard access.
+            assert focused() == 'dev.ourokit.tooltip-editor'
+            invoke(bar_endpoint, 'MoveTip')
+            wait_for(lambda: not popups(bar_endpoint), 'popover retained moved anchor')
+            closes = invoke(bar_endpoint, 'Stats')['volume_closes']
+            time.sleep(.25)
+            assert not popups(bar_endpoint) and invoke(bar_endpoint, 'Stats')['volume_closes'] == closes
+            invoke(bar_endpoint, 'CloseVolume'); invoke(bar_endpoint, 'OpenVolume'); opened(bar_endpoint)
+            invoke(bar_endpoint, 'HideVolume')
+            wait_for(lambda: not popups(bar_endpoint), 'unmounted popover retained surface')
+            invoke(bar_endpoint, 'CloseVolume')
+            assert invoke(bar_endpoint, 'Stats')['errors'] == 0
+            print('PASS interactive popover: serial-free, reactive content, cross-surface hover, held slider drag, no focus promotion, invalidation without reopen')
+
+            invoke(bar_endpoint, 'PassiveVolume'); invoke(bar_endpoint, 'ShowVolume')
+            time.sleep(.2)
+            before = screen()
+            invoke(bar_endpoint, 'OpenVolume'); tip = opened(bar_endpoint)
+            invoke(bar_endpoint, 'SetVolume')
+            wait_for(lambda: node(bar_endpoint, tip, '/label')['label'].endswith('63%'), 'passive content not reactive')
+            assert focused() == 'dev.ourokit.tooltip-editor'
+            time.sleep(.2)  # Inspect observes layout before the native frame presents.
+            capture('passive-volume-popover.png')
+            trigger = node(bar_endpoint, 'bar', '/volume/anchor/button')['bounds']
+            px = math.floor(trigger['x']) + math.ceil(trigger['width'])//2 - 130
+            py = math.floor(trigger['y']) + math.ceil(trigger['height']) + 6
+            after = screen()
+            corner = ((py+1)*1280+px+1)*3
+            assert before[corner:corner+3] == after[corner:corner+3], 'opaque root behind rounded popover corner'
+            under = node(editor_endpoint, 'main', '/under')['bounds']
+            rect = editor_rect()
+            x = int(trigger['x'] + trigger['width']/2)
+            y = int(rect['y'] + under['y'] + 10)
+            assert trigger['y'] + trigger['height'] + 6 < y < trigger['y'] + trigger['height'] + 106
+            move(x, y)
+            hits = invoke(editor_endpoint, 'Stats')['hits']
+            pointer_command('button 272 1'); pointer_command('button 272 0')
+            wait_for(lambda: invoke(editor_endpoint, 'Stats')['hits'] == hits+1, 'passive popover intercepted click')
+            assert not invoke(bar_endpoint, 'Stats')['volume_active']
+            assert popups(bar_endpoint) == [tip]
+            invoke(bar_endpoint, 'CloseVolume')
+            wait_for(lambda: not popups(bar_endpoint), 'controlled passive close failed')
+            print('PASS passive popover: serial-free, reactive display-only content, pointer transparency, no focus theft')
+            initial_source = root / 'tooltip-bar-initial.lua'
+            initial_source.write_text((ROOT / 'examples/tooltip-bar.lua').read_text()
+                .replace("volume_open, volume_visible, volume = o.signal(false)", "volume_open, volume_visible, volume = o.signal(true)")
+                .replace("dev.ourokit.tooltip-bar", "dev.ourokit.tooltip-bar-initial"))
+            initial_endpoint = launch(initial_source)
+            opened(initial_endpoint)
+            assert invoke(initial_endpoint, 'Stats')['errors'] == 0
+            terminate(processes[-1])
+            print('PASS popover open=true on initial mount')
+            if os.environ.get('OUROKIT_POPOVERS_ONLY'): return
+
             b = node(editor_endpoint, 'main', '/tip/anchor/button')['bounds']
             rect = editor_rect()
             move(rect['x'] + int(b['x'] + b['width']/2), rect['y'] + int(b['y'] + b['height']/2))
@@ -217,8 +310,8 @@ on_press=function() hits=hits+1 end}}} end}}} end}
                 if label == 'Bothe Consulting (87%)': capture('fitted-' + scheme + '-tooltip.png')
             assert widths[1] > widths[0] * 1.5, widths
             print('PASS inherited light/dark colors, shaped-text width, 8px padding and Unicode')
-            # Resize the same native surface in both directions without leaving
-            # the trigger. A fixed transparent surface or close/reopen fails.
+            # Resize the same logical popup in both directions without leaving
+            # the trigger. Older xdg-shell remaps its protocol surface only.
             live_widths = []
             for label in ('iii', 'Bothe Consulting (87%)', 'WWW', 'W' * 100, 'Café 東京'):
                 previous = surface_size(editor_endpoint, tip)['width']
@@ -239,6 +332,15 @@ on_press=function() hits=hits+1 end}}} end}}} end}
             assert live_widths[0] < live_widths[2] < live_widths[1] < live_widths[3], live_widths
             capture('resized-tooltip.png')
             print('PASS live native resize: shrink, grow, Unicode, capped ellipsis, same popup identity')
+            for label in ('W' * 100, 'i' * 100):
+                invoke(editor_endpoint, 'Style', {'scheme': 'light', 'text': label})
+                wait_for(lambda: surface_size(editor_endpoint, tip) == {'width': 240, 'height': 40},
+                         'capped tooltip size did not settle')
+                wait_for(lambda: node(editor_endpoint, tip, '/text')['label'] == label,
+                         'same-size open tooltip text did not update')
+                assert surface_size(editor_endpoint, tip) == {'width': 240, 'height': 40}
+                assert popups(editor_endpoint) == [tip]
+            print('PASS same-size tooltip content refresh without interaction')
             # Focus from a real keyboard event, not a development popup bypass.
             entry = node(editor_endpoint, 'main', '/editor')['bounds']
             move(rect['x'] + int(entry['x'] + 50), rect['y'] + int(entry['y'] + 15))
@@ -256,9 +358,10 @@ on_press=function() hits=hits+1 end}}} end}}} end}
             move(rect['x'] + int(b['x'] + 50), rect['y'] + int(b['y'] + b['height'] + 24))
             time.sleep(.1)
             assert popups(editor_endpoint) == [tip]
+            hits = invoke(editor_endpoint, 'Stats')['hits']
             sway(env, 'seat', 'seat0', 'cursor', 'press', 'button1')
             sway(env, 'seat', 'seat0', 'cursor', 'release', 'button1')
-            wait_for(lambda: invoke(editor_endpoint, 'Stats')['hits'] == 1, 'tooltip intercepted underlying click')
+            wait_for(lambda: invoke(editor_endpoint, 'Stats')['hits'] == hits+1, 'tooltip intercepted underlying click')
             wait_for(lambda: not popups(editor_endpoint), 'tooltip remained after focus left anchor')
             print('PASS keyboard-focus tooltip, Escape and click-through to underlying control')
         finally:
@@ -277,7 +380,11 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument('binary', nargs='?', type=Path, default=BINARY)
         parser.add_argument('--capture-dir', type=Path)
+        parser.add_argument('--popovers-only', action='store_true', help='run focused popover checks without the subsequent tooltip resize/focus suite')
+        parser.add_argument('--drag-outside', action='store_true', help='require compositor implicit grabs for layer-shell popups (newer than Sway 1.7)')
         args = parser.parse_args()
         if args.capture_dir: os.environ['OUROKIT_TOOLTIP_CAPTURE'] = str(args.capture_dir.resolve())
+        if args.popovers_only: os.environ['OUROKIT_POPOVERS_ONLY'] = '1'
+        if args.drag_outside: os.environ['OUROKIT_POPOVER_DRAG_OUTSIDE'] = '1'
         verify.TESTS = (Path(__file__).name,)
         verify.verify(args.binary.resolve())

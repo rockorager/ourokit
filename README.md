@@ -81,8 +81,9 @@ Each release has `ouroctl-x86_64-linux-gnu.tar.gz` (`bin/ouroctl`, the plugin
 header and licenses) and its `.sha256`, and a GitHub build-provenance
 attestation. The binary is built on Debian 12 with `-Dcpu=baseline`, so it
 needs glibc 2.36 or newer and any x86_64 CPU. At runtime it needs Fontconfig,
-FreeType, xkbcommon and libcurl (Debian: `libfontconfig1 libfreetype6
-libxkbcommon0 libcurl4`).
+FreeType, xkbcommon, libcurl and PipeWire (Debian: `libfontconfig1 libfreetype6
+libxkbcommon0 libcurl4 libpipewire-0.3-0`). System audio observation and controls
+live under [`ouro.audio`](docs/audio.md), using PipeWire directly.
 
 Install it with [mise](https://mise.jdx.dev), pinning a commit:
 
@@ -104,7 +105,10 @@ zig build verify
 
 `verify` is the routine pre-commit check: Zig tests (including token validation),
 Lua component tests, Zig formatting, real-process development/control suites,
-and disposable native session/PAM and HTTP(S) fixtures. HTTP tests require the
+and disposable native session/PAM, PipeWire and HTTP(S) fixtures. Building audio
+requires `libpipewire-0.3-dev`; `zig build test-audio` also needs `pipewire-bin`,
+GCC and pkg-config and uses an isolated daemon with silent null sinks.
+HTTP tests require the
 OpenSSL CLI and run with `zig build test-http`. The native development
 suite starts its own headless Sway with software rendering and private D-Bus
 sessions; it does not use your desktop, session bus, or compositor configuration.
