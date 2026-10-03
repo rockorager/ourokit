@@ -14,6 +14,23 @@
 #include "ltablib.c"
 #include "lutf8lib.c"
 
+/* Lua 5.5 print semantics, but diagnostics belong on stderr, not stdout.
+ * This narrow logging exception is synchronous and can block the Lua thread.
+ * Like upstream print, output errors are ignored. */
+static int ouro_print(lua_State *L) {
+    int arguments = lua_gettop(L);
+    for (int i = 1; i <= arguments; i++) {
+        size_t length;
+        const char *text = luaL_tolstring(L, i, &length);
+        if (i > 1) fwrite("\t", 1, 1, stderr);
+        fwrite(text, 1, length, stderr);
+        lua_pop(L, 1);
+    }
+    fwrite("\n", 1, 1, stderr);
+    fflush(stderr);
+    return 0;
+}
+
 /* Expose only the two clock functions, not luaopen_os or its process/filesystem API. */
 int ouro_os_time(lua_State *L) {
     if (lua_gettop(L) != 0)
@@ -35,6 +52,7 @@ static const luaL_Reg ouro_base[] = {
     {"next", luaB_next},
     {"pairs", luaB_pairs},
     {"pcall", luaB_pcall},
+    {"print", ouro_print},
     {"select", luaB_select},
     {"tonumber", luaB_tonumber},
     {"tostring", luaB_tostring},

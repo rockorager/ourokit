@@ -1154,7 +1154,7 @@ test "Lua XDG runtime directory is copied and absent values clear it" {
     }
 }
 
-test "safe Lua libraries expose only computation helpers with standard UTF-8 semantics" {
+test "safe Lua libraries expose computation helpers and diagnostic print with standard UTF-8 semantics" {
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 1, 2, 2);
     defer scheduler.deinit();
@@ -1174,7 +1174,7 @@ test "safe Lua libraries expose only computation helpers with standard UTF-8 sem
     while (c.lua_next(vm.state, -2) != 0) {
         var length: usize = 0;
         const key = c.lua_tolstring(vm.state, -2, &length).?;
-        const allowed = [_][]const u8{ "assert", "error", "ipairs", "next", "pairs", "pcall", "select", "tonumber", "tostring", "type", "xpcall", "string", "table", "math", "utf8", "require" };
+        const allowed = [_][]const u8{ "assert", "error", "ipairs", "next", "pairs", "pcall", "print", "select", "tonumber", "tostring", "type", "xpcall", "string", "table", "math", "utf8", "require" };
         var found = false;
         for (allowed) |name| if (std.mem.eql(u8, name, key[0..length])) {
             found = true;
@@ -1185,7 +1185,7 @@ test "safe Lua libraries expose only computation helpers with standard UTF-8 sem
         c.lua_settop(vm.state, -2);
     }
     c.lua_settop(vm.state, -2);
-    try std.testing.expectEqual(@as(usize, 16), globals);
+    try std.testing.expectEqual(@as(usize, 17), globals);
 
     _ = try vm.spawnApplication(
         \\local function check_fields(lib, names)
@@ -1243,6 +1243,44 @@ test "safe Lua libraries expose only computation helpers with standard UTF-8 sem
     );
     try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
     try std.testing.expect(vm.globalBoolean("libraries_ok"));
+}
+
+test "Lua print propagates tostring conversion errors" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 1, 1, 1);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    _ = try vm.spawnApplication(
+        \\value = {}
+        \\failure = {}
+        \\function convert()
+        \\  if raise then error(failure) end
+        \\  return false
+        \\end
+    );
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+
+    // Only the host can attach metatables; do not expose setmetatable to apps.
+    _ = c.lua_getglobal(vm.state, "value");
+    c.lua_createtable(vm.state, 0, 1);
+    _ = c.lua_getglobal(vm.state, "convert");
+    c.lua_setfield(vm.state, -2, "__tostring");
+    _ = c.lua_setmetatable(vm.state, -2);
+    c.lua_settop(vm.state, 0);
+    _ = try vm.spawnApplication(
+        \\local ok, err = pcall(print, value)
+        \\assert(not ok and err:find("'__tostring' must return a string", 1, true))
+        \\raise = true
+        \\ok, err = pcall(print, value)
+        \\assert(not ok and err == failure)
+    );
+    try std.testing.expectEqual(ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_gettop(vm.state));
 }
 
 test "Ouro clock and spawned coroutine APIs are scoped and asynchronous" {

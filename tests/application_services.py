@@ -396,6 +396,35 @@ def main():
             env.pop(key, None)
         env.update(XDG_RUNTIME_DIR=temp, WAYLAND_DISPLAY="no-compositor-for-this-test")
 
+        diagnostic = directory / "print.lua"
+        diagnostic.write_text(r"""
+local o = require('ouro')
+assert(io == nil and os == nil and package == nil and debug == nil and coroutine == nil)
+assert(warn == nil and dofile == nil and loadfile == nil and load == nil and setmetatable == nil)
+assert(not pcall(require, 'io'))
+assert(select('#', print()) == 0)
+print('héllo\0world', -23, 2.5, true, false, nil)
+local value, fn = {}, function() end
+print(value, fn)
+-- Lua 5.5 print uses luaL_tolstring, not the replaceable global tostring.
+tostring = function() error('must not be called') end
+print('unaffected', 9007199254740993)
+print(o.dbus.uint64('18446744073709551615'))
+o.exit(0)
+""")
+        result = subprocess.run([str(BINARY), "run", str(diagnostic), "--headless"],
+                                capture_output=True, env=env, timeout=8)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == b"", result.stdout
+        lines = result.stderr.split(b'\n')
+        assert len(lines) == 6 and lines[0] == lines[-1] == b'', result.stderr
+        assert lines[1] == 'héllo\0world\t-23\t2.5\ttrue\tfalse\tnil'.encode(), result.stderr
+        table, function = lines[2].split(b'\t')
+        assert table.startswith(b'table: 0x') and function.startswith(b'function: 0x'), lines[2]
+        assert lines[3] == b'unaffected\t9007199254740993', result.stderr
+        assert lines[4] == b'18446744073709551615', result.stderr
+        print("PASS: Lua print conversions, tabs/newlines, binary strings and stderr-only diagnostics")
+
         echo = directory / "echo.lua"
         echo.write_text("""
 local o = require('ouro')

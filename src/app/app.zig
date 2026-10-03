@@ -148,7 +148,8 @@ test "io_uring completion marks Lua runnable without re-entering it" {
 
     try std.testing.expect(!app.lua_vm.hasGlobal("ouro"));
     try std.testing.expect(app.lua_vm.hasGlobal("require"));
-    try std.testing.expect(!app.lua_vm.hasGlobal("print"));
+    try std.testing.expect(app.lua_vm.hasGlobal("print"));
+    try std.testing.expect(!app.lua_vm.hasGlobal("io"));
     try std.testing.expect(!app.lua_vm.hasGlobal("package"));
     try std.testing.expect(!app.lua_vm.hasGlobal("coroutine"));
     try app.prepareScript("local ouro = require('ouro'); done = false; ouro.sleep(1); done = true");

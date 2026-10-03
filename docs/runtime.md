@@ -67,14 +67,23 @@ Library tables belong to each VM and are available as ordinary Lua globals:
 
 | Surface | Available |
 | --- | --- |
-| Base | `assert`, `error`, `ipairs`, `next`, `pairs`, `pcall`, `select`, `tonumber`, `tostring`, `type`, `xpcall` |
+| Base | `assert`, `error`, `ipairs`, `next`, `pairs`, `pcall`, `print`, `select`, `tonumber`, `tostring`, `type`, `xpcall` |
 | `string` | Standard Lua 5.5.1 functions except `dump`; includes pattern matching, formatting and binary packing. String method syntax works. |
 | `table` | `concat`, `create`, `insert`, `pack`, `unpack`, `remove`, `move`, `sort` |
 | `math` | Standard non-compatibility numeric functions and constants, excluding `random` and `randomseed` |
 | `utf8` | Unchanged Lua `char`, `charpattern`, `codes`, `codepoint`, `len`, `offset`, including strict/lax behavior and byte indexing |
 
+`print(...)` is a host-backed diagnostic helper that writes to **stderr**, never
+stdout. It uses Lua 5.5.1's argument conversion (including `__tostring`, without
+calling a replaced global `tostring`), separates arguments with tabs, and appends
+a newline; `print()` writes just a newline. Embedded NUL bytes are preserved.
+Conversion errors propagate and can leave earlier arguments already written.
+Like upstream Lua `print`, it ignores output errors. This is a narrow synchronous
+logging exception: writing and flushing stderr can block the Lua/runtime thread.
+Use Ouro's asynchronous stream APIs for ordinary application output.
+
 No `io`, `os`, `package`, `debug`, or `coroutine` library is exposed. Base I/O
-(`print`, `warn`, `dofile`, `loadfile`), dynamic `load`, raw/metatable accessors,
+(`warn`, `dofile`, `loadfile`), dynamic `load`, raw/metatable accessors,
 and `collectgarbage` are also absent. Output, file access, module loading,
 process exit and asynchronous task lifetimes remain Ouro-owned. The two clock
 operations exposed under the Ouro API do not install an ambient `os` table.
