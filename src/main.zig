@@ -2,8 +2,6 @@ const std = @import("std");
 const ourokit = @import("ourokit");
 const cli = @import("cli.zig");
 
-const version = "0.1.0";
-
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len == 2 and std.mem.eql(u8, args[1], "--ourokit-auth-worker")) {
@@ -33,7 +31,9 @@ extern fn ouro_auth_worker_main() c_int;
 fn execute(init: std.process.Init, command: cli.Command) !u8 {
     switch (command) {
         .help => try writeStdout(init, cli.usage),
-        .version => try writeStdout(init, "ouroctl " ++ version ++ "\n"),
+        .version => try writeStdout(init, std.fmt.comptimePrint("ouroctl {s} (runtime API {d}, revision {s})\n", .{
+            ourokit.runtime.version, ourokit.runtime.api_level, ourokit.runtime.revision,
+        })),
         .@"test" => |options| return @import("test_command.zig").run(init, options),
         .activate => |target| {
             try ourokit.app.desktop.validateId(target.path.?);

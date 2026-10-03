@@ -86,6 +86,49 @@ pub fn main(init: std.process.Init) !void {
     const empty = try fixture.run(&.{"tests/bad_test.lua"}, 1);
     try strings("NoTestsFound", empty.object.get("error_message").?.string);
     _ = try fixture.run(&.{"missing"}, 1);
+
+    // Run an external app's compatibility test from its own source root. It
+    // depends only on the installed executable, not Ourokit's tests/modules.
+    try fixture.write("tests/runtime_test.lua", @embedFile("runtime_test.lua"));
+    const compatibility = try fixture.run(&.{"tests/runtime_test.lua"}, 0);
+    try equal(@as(i64, 1), compatibility.object.get("passed").?.integer);
+
+    try fixture.write("app.lua",
+        \\local o = require('ouro')
+        \\assert(o.runtime and o.runtime.api_level >= 1, 'requires runtime API 1')
+        \\o.stdout.write(o.json.encode(o.runtime)); o.exit(0)
+    );
+    try fixture.write("ouro.json",
+        \\{"schema_version":1,"id":"dev.example.Editor","entry":"app.lua","minimum_runtime_api":1}
+    );
+    const app = try std.process.run(a, init.io, .{
+        .argv = &.{ binary, "run", "--headless" },
+        .cwd = .{ .path = root },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+    });
+    try equal(std.process.Child.Term{ .exited = 0 }, app.term);
+    const info = (try std.json.parseFromSlice(std.json.Value, a, app.stdout, .{})).value.object;
+    try equal(@as(i64, 1), info.get("api_level").?.integer);
+    const version = try std.process.run(a, init.io, .{ .argv = &.{ binary, "version" } });
+    try equal(std.process.Child.Term{ .exited = 0 }, version.term);
+    try strings(try std.fmt.allocPrint(a, "ouroctl {s} (runtime API 1, revision {s})\n", .{
+        info.get("version").?.string, info.get("revision").?.string,
+    }), version.stdout);
+
+    // A future requirement must fail before trying either source or a library.
+    try fixture.write("ouro.json",
+        \\{"schema_version":1,"id":"dev.example.Editor","entry":"missing.lua","minimum_runtime_api":2,
+        \\ "native_modules":[{"name":"missing","path":"missing.so"}]}
+    );
+    const rejected = try std.process.run(a, init.io, .{
+        .argv = &.{ binary, "run", "--headless" },
+        .cwd = .{ .path = root },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+    });
+    try equal(std.process.Child.Term{ .exited = 1 }, rejected.term);
+    try expect(std.mem.indexOf(u8, rejected.stderr, "UnsupportedRuntimeApi") != null);
+    try strings("", rejected.stdout);
+    try std.Io.File.stdout().writeStreamingAll(init.io, "PASS external-app runtime API and retained editor contract\n");
     try std.Io.File.stdout().writeStreamingAll(init.io, "PASS Lua runner discovery, ordering, imports, isolation, filtering, listing, JSON, failure cleanup and hard timeouts\n");
 }
 

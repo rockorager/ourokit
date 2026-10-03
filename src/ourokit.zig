@@ -1,5 +1,6 @@
 //! Ourokit's public module boundaries.
 
+pub const runtime = @import("runtime.zig");
 pub const core = @import("core/root.zig");
 pub const design = @import("design/root.zig");
 pub const text = @import("text/root.zig");

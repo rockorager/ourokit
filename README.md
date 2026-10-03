@@ -257,7 +257,8 @@ known before mutable Lua source is evaluated:
 {
   "schema_version": 1,
   "id": "dev.example.Contacts",
-  "entry": "app.lua"
+  "entry": "app.lua",
+  "minimum_runtime_api": 1
 }
 ```
 
@@ -265,6 +266,13 @@ From the application directory, `ouroctl run` loads `./ouro.json` and validates
 that the returned `ouro.app` declaration has the same ID. It does not search
 parent directories. `ouroctl run app.lua` remains available as an explicit
 override.
+
+`minimum_runtime_api` is optional and checked before loading application code.
+For direct Lua entries, use `require('ouro').runtime.api_level` with a guard for
+older hosts lacking `runtime`. `ouroctl version` includes the executing host's
+API level and source revision: package version `0.1.0` alone cannot identify
+features in per-commit binaries. See [runtime compatibility](docs/runtime.md#runtime-api-compatibility)
+for the level contract, legacy behavior, and downstream test example.
 
 Native Linux builds enable Fontconfig by default. Minimal/headless builds and
 cross-compilation can omit that system capability with `-Dfontconfig=false`;

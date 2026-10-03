@@ -134,6 +134,15 @@ pub const Vm = struct {
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, @import("editor.zig").create, 1);
         c.lua_setfield(state, -2, "editor_controller");
+        const runtime = @import("../runtime.zig");
+        c.lua_createtable(state, 0, 3);
+        c.lua_pushinteger(state, runtime.api_level);
+        c.lua_setfield(state, -2, "api_level");
+        _ = c.lua_pushstring(state, runtime.version);
+        c.lua_setfield(state, -2, "version");
+        _ = c.lua_pushlstring(state, runtime.revision.ptr, runtime.revision.len);
+        c.lua_setfield(state, -2, "revision");
+        c.lua_setfield(state, -2, "runtime");
         @import("drawing.zig").install(state, allocator);
         @import("paint.zig").install(state);
         c.lua_pushcclosure(state, c.ouro_os_time, 0);
@@ -1201,6 +1210,9 @@ test "safe Lua libraries expose computation helpers and diagnostic print with st
         \\assert(math.random == nil and math.randomseed == nil)
         \\assert(not pcall(require, 'io') and not pcall(require, 'package'))
         \\assert(type(require('ouro').sleep) == 'function')
+        \\local runtime = require('ouro').runtime
+        \\assert(runtime.api_level == 1 and runtime.version == '0.1.0')
+        \\assert(type(runtime.revision) == 'string' and #runtime.revision > 0)
         \\assert(tonumber('ff', 16) == 255 and tostring(-23) == '-23')
         \\assert(select('#', 1, nil, 3) == 3)
         \\local sum = 0

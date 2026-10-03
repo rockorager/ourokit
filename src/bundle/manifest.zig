@@ -9,6 +9,7 @@ const Document = struct {
     schema_version: u32,
     id: []const u8,
     entry: []const u8,
+    minimum_runtime_api: u32 = 0,
     native_modules: []const NativeModule = &.{},
 };
 
@@ -47,6 +48,8 @@ pub const Manifest = struct {
         };
         defer parsed.deinit();
         if (parsed.value.schema_version != 1) return error.UnsupportedManifestVersion;
+        if (parsed.value.minimum_runtime_api > @import("../runtime.zig").api_level)
+            return error.UnsupportedRuntimeApi;
         try validateApplicationId(parsed.value.id);
         try validateEntry(parsed.value.entry);
         const id = try allocator.dupe(u8, parsed.value.id);
@@ -146,6 +149,33 @@ test "manifest rejects unsafe identity and entry metadata" {
     try std.testing.expectError(error.InvalidApplicationId, validateApplicationId("dev..contacts"));
     try std.testing.expectError(error.InvalidApplicationEntry, validateEntry("../app.lua"));
     try std.testing.expectError(error.InvalidApplicationEntry, validateEntry("/app.lua"));
+}
+
+test "manifest accepts supported API levels and rejects future or malformed requirements" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &temporary.sub_path, file_name });
+    defer std.testing.allocator.free(path);
+    const cases = .{
+        .{ "0", null },
+        .{ "1", null },
+        .{ "2", error.UnsupportedRuntimeApi },
+        .{ "-1", error.InvalidApplicationManifest },
+        .{ "1.5", error.InvalidApplicationManifest },
+        .{ "\"newer\"", error.InvalidApplicationManifest },
+    };
+    inline for (cases) |case| {
+        try temporary.dir.writeFile(std.testing.io, .{
+            .sub_path = file_name,
+            .data = "{\"schema_version\":1,\"id\":\"dev.ouro.compatibility\",\"entry\":\"app.lua\",\"minimum_runtime_api\":" ++ case[0] ++ "}",
+        });
+        if (@as(?anyerror, case[1])) |err| {
+            try std.testing.expectError(err, Manifest.load(std.testing.io, std.testing.allocator, path));
+        } else {
+            var manifest = try Manifest.load(std.testing.io, std.testing.allocator, path);
+            manifest.deinit();
+        }
+    }
 }
 
 test "manifest resolves explicit native modules without executing libraries" {

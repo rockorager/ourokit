@@ -1,5 +1,84 @@
 # Loop, tasks, and Lua
 
+## Runtime API compatibility
+
+`require('ouro').runtime` describes the **executing host**, in application,
+headless, Storybook, and `ouroctl test` Lua states:
+
+```lua
+local o = require('ouro')
+assert(o.runtime and o.runtime.api_level >= 1,
+       'This application requires Ourokit runtime API 1 or newer')
+```
+
+The table contains `api_level` (integer), `version` (package-version string),
+and `revision` (build-source identifier). Treat it as host metadata; mutating
+the Lua table does not change host compatibility checks. `ouroctl version`
+prints the same information for diagnostics without starting an application.
+
+Applications using `ouro.json` can declare a requirement before any application
+Lua or native library is loaded:
+
+```json
+{
+  "schema_version": 1,
+  "id": "dev.example.Editor",
+  "entry": "app.lua",
+  "minimum_runtime_api": 1
+}
+```
+
+An omitted requirement or `0` makes no compatibility claim. A requirement above
+the host's level fails with `UnsupportedRuntimeApi`; malformed requirements are
+invalid manifests. Older hosts without this field reject it as an unknown
+manifest field rather than silently accepting it. Direct `.lua` entry points,
+Storybook, and component tests do not load an application manifest: put the Lua
+guard before imports that need newer APIs. A missing `o.runtime` means the
+host predates compatibility discovery, not that its package version is usable.
+
+API levels are cumulative supported contracts, independent of package versions,
+manifest schema versions, native-plugin ABI versions, and release tags. New
+supported Lua, development-control, or component-test contracts increment
+`src/runtime.zig`'s `api_level` and gain an entry here; later levels retain
+earlier contracts. Bug fixes do not automatically increment the level. A
+breaking replacement must not reuse this cumulative sequence to claim support
+for contracts it removed.
+
+| Level | Baseline |
+| --- | --- |
+| 1 | The documented Lua and development-control API, plus `ouroctl test` and its retained-UI helpers. Includes `text_entry`, `caret_shape`, native editor key bindings, `editor_controller` state/read/select/replace, explicit undo groups, and round-trippable `line_caret` and inclusive `character_caret` selections. |
+
+The API 1 baseline also includes host-backed `print(...)` to **stderr** and
+the explicit [`ouro.files.write` save policies](files.md): `permissions`,
+`symlinks`, and `durable`. Two-argument writes preserve existing rwx bits,
+reject destination symlinks, and sync the parent directory by default.
+`DurabilityUncertain` with `committed = true` means replacement is already
+visible; it is not a pre-commit save failure. These contracts landed before
+API-level discovery and are part of level 1, not optional later additions.
+
+These levels describe implemented APIs, not available system services, fonts,
+compositor protocols, optional build backends, or permissions. Continue handling
+operation errors and platform capability checks. MCP clients can use the live
+development endpoint's existing `tools/list` schemas for tool/action discovery;
+the Lua level is not a substitute for a compositor capability negotiation.
+
+Binaries are published per commit and can lag `main`. **Do not use `0.1.0` to
+infer editor actions or test-runner availability.** Check the installed binary,
+pin an actually published commit, and run downstream contract tests with that
+binary. Builds identify their Git commit (with `-dirty` for tracked changes);
+archives or builds without Git report `unknown`. Packagers may supply
+`zig build -Drevision=<source-identifier>`. Revision strings are diagnostic,
+not ordered versions or authenticity proofs; pin commits for particular fixes.
+
+For downstream behavior checks, use the existing [Lua component runner](../README.md#lua-component-tests)
+with the real `ouro` module. [`tests/runtime_test.lua`](../tests/runtime_test.lua)
+exercises a modal editor, UTF-8 boundaries, stale tokens, inclusive selections,
+and grouped undo. The black-box runner also executes this file from a separate
+application source root using only the executable. No imports from Ourokit's
+internal Python tests are supported. These tests do not cover real desktop
+delivery or asynchronous services; retain separate integration tests for those.
+The restricted Lua libraries and scoped/frozen module loader remain unchanged.
+
 ## Raw io_uring
 
 `src/loop` owns ring creation, destruction, preparation, submission, waiting,

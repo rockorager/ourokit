@@ -149,6 +149,16 @@ pub fn build(b: *std.Build) void {
     addSheenBidi(ourokit, sheenbidi);
     if (enable_vulkan) addVulkan(b, ourokit);
     const ourokit_options = b.addOptions();
+    const revision = b.option([]const u8, "revision", "Source revision for runtime diagnostics") orelse revision: {
+        // Use this package's Git directory, not a consuming project's checkout.
+        var code: u8 = 0;
+        const output = b.runAllowFail(&.{
+            "git",      "--git-dir", b.pathFromRoot(".git"), "--work-tree", b.pathFromRoot("."),
+            "describe", "--always",  "--abbrev=40",          "--dirty",     "--exclude=*",
+        }, &code, .ignore) catch break :revision "unknown";
+        break :revision std.mem.trim(u8, output, "\r\n");
+    };
+    ourokit_options.addOption([]const u8, "revision", revision);
     ourokit_options.addOption(bool, "fontconfig", enable_fontconfig);
     ourokit_options.addOption(bool, "freetype", enable_freetype);
     ourokit_options.addOption(bool, "vulkan", enable_vulkan);
