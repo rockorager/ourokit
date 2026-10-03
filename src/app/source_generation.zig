@@ -1,6 +1,5 @@
 const std = @import("std");
 const bundle = @import("../bundle/root.zig");
-const design = @import("../design/root.zig");
 const io_loop = @import("../loop/root.zig");
 const lua = @import("../lua/root.zig");
 const shell = @import("../shell/root.zig");
@@ -39,7 +38,7 @@ pub const UiServices = struct {
     /// Ordered candidates borrowed from the host for the services' lifetime.
     font_candidates: []const text.FontHandle,
     medium_font_candidates: []const text.FontHandle,
-    theme: design.tokens.Theme,
+    color_scheme: @import("../lua/theme.zig").ColorScheme = .light,
     reduced_motion: bool = false,
     callbacks: *lua.CallbackRegistry,
     theme_fonts: ?*@import("../lua/theme_fonts.zig").ThemeFonts = null,
@@ -425,7 +424,7 @@ pub const SourceGeneration = struct {
                 );
                 return err;
             };
-            self.ui_build.enableDeclarativeWidgets(value.theme);
+            self.ui_build.enableDeclarativeWidgets(value.color_scheme);
             self.ui_build.theme_fonts = value.theme_fonts;
             try self.attachImages(value.images, value.icon_roots);
         } else {
@@ -504,7 +503,7 @@ pub const SourceGeneration = struct {
         self.ui_build.text_input_bindings = self.application.text_input_bindings;
         _ = try self.refreshWindows();
         if (services) |value| {
-            self.ui_build.widget_theme = self.application.resolvedTheme(value.theme, value.reduced_motion);
+            self.ui_build.widget_theme = self.application.resolvedTheme(value.color_scheme, value.reduced_motion);
         }
         try self.validateApplicationIdentity(diagnostic);
         self.application_ready = true;
@@ -621,8 +620,8 @@ pub const SourceGeneration = struct {
         self.ui_build.paragraphs = services.paragraphs;
         try self.ui_build.attachText(services.paragraph_sources, services.font_candidates, 1);
         try self.ui_build.attachMediumText(services.medium_font_candidates);
-        self.ui_build.enableDeclarativeWidgets(services.theme);
-        self.ui_build.widget_theme = self.application.resolvedTheme(services.theme, services.reduced_motion);
+        self.ui_build.enableDeclarativeWidgets(services.color_scheme);
+        self.ui_build.widget_theme = self.application.resolvedTheme(services.color_scheme, services.reduced_motion);
         self.ui_build.text_input_bindings = self.application.text_input_bindings;
         self.ui_build.theme_fonts = services.theme_fonts;
         try self.attachImages(services.images, services.icon_roots);
@@ -706,12 +705,12 @@ pub const SourceGeneration = struct {
 
     /// Apply host defaults at a safe point, retaining declaration overrides.
     /// The caller invalidates mounted build owners when this returns true.
-    pub fn setTheme(self: *SourceGeneration, theme: design.tokens.Theme, reduced_motion: bool) bool {
+    pub fn setTheme(self: *SourceGeneration, scheme: @import("../lua/theme.zig").ColorScheme, reduced_motion: bool) bool {
         const services = if (self.services) |*value| value else return false;
-        services.theme = theme;
+        services.color_scheme = scheme;
         services.reduced_motion = reduced_motion;
         if (!self.application_ready) return false;
-        const resolved = self.application.resolvedTheme(theme, reduced_motion);
+        const resolved = self.application.resolvedTheme(scheme, reduced_motion);
         if (std.meta.eql(self.ui_build.widget_theme, @as(@TypeOf(self.ui_build.widget_theme), resolved))) return false;
         self.ui_build.widget_theme = resolved;
         return true;
@@ -857,7 +856,7 @@ pub const SourceGeneration = struct {
         }
         _ = try self.refreshWindows();
         if (self.services) |value| {
-            self.ui_build.widget_theme = application.resolvedTheme(value.theme, value.reduced_motion);
+            self.ui_build.widget_theme = application.resolvedTheme(value.color_scheme, value.reduced_motion);
         }
         try self.validateApplicationIdentity(diagnostic);
         const prepared_builds = self.allocator.alloc(

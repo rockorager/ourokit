@@ -48,6 +48,7 @@ for contracts it removed.
 | --- | --- |
 | 1 | The documented Lua and development-control API, plus `ouroctl test` and its retained-UI helpers. Includes `text_entry`, `caret_shape`, native editor key bindings, `editor_controller` state/read/select/replace, explicit undo groups, and round-trippable `line_caret` and inclusive `character_caret` selections. |
 | 2 | Editor recipes support a `command = "name"` suffix resolved through enclosing `commands` scopes after native edits. `ouro.app_command(fn)` declares reusable application-scoped, generation-canceled work over `spawn_app`. See [command composition and ownership](application-model.md#contextual-commands-and-custom-input). |
+| 3 | Stateless render callbacks receive resolved `theme.color_scheme` (`"light"` or `"dark"`), independently of custom colors, with inherited and live host updates. `ouro.window` accepts `padding` and `background` root overrides, including zero inset and alpha, reactive updates, and atomic source reload. `ouro.story` and `t:mount` options accept matching `padding` overrides; omitted values preserve the 12-pixel default. |
 
 The API 1 baseline also includes host-backed `print(...)` to **stderr** and
 the explicit [`ouro.files.write` save policies](files.md): `permissions`,

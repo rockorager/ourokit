@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
 
-pub const ColorScheme = enum { light, dark };
+pub const ColorScheme = @import("theme.zig").ColorScheme;
 
 pub const Viewport = struct {
     width: u32 = 640,
@@ -23,6 +23,7 @@ pub const Story = struct {
     viewport: Viewport,
     snapshot_scale: f32,
     color_scheme: ColorScheme,
+    padding: f32 = @import("../design/root.zig").tokens.foundation.spacing_3,
     actions: []Action,
     content_reference: c_int,
 };
@@ -117,6 +118,11 @@ pub const Storybook = struct {
             const viewport = try parseViewport(state, -1);
             const snapshot_scale = try optionalSnapshotScale(state, -1);
             const color_scheme = try parseColorScheme(state, -1);
+            const padding = blk: {
+                const kind = c.lua_getfield(state, -1, "padding");
+                defer c.lua_settop(state, -2);
+                break :blk if (kind == c.type_nil) @import("../design/root.zig").tokens.foundation.spacing_3 else try @import("theme.zig").extent(state, -1, false);
+            };
             const actions = try parseActions(allocator, state, -1);
             errdefer deinitActions(allocator, actions);
             if (c.lua_getfield(state, -1, "content") != c.type_function)
@@ -129,6 +135,7 @@ pub const Storybook = struct {
                 .viewport = viewport,
                 .snapshot_scale = snapshot_scale,
                 .color_scheme = color_scheme,
+                .padding = padding,
                 .actions = actions,
                 .content_reference = content_reference,
             };
@@ -403,6 +410,7 @@ test "storybook declarations are owned, defaulted, and selectable" {
     try std.testing.expectEqual(@as(u32, 320), story.viewport.width);
     try std.testing.expectEqual(@as(f32, 2), story.snapshot_scale);
     try std.testing.expectEqual(ColorScheme.dark, story.color_scheme);
+    try std.testing.expectEqual(@as(f32, 12), story.padding);
     try std.testing.expectEqual(@as(usize, 4), story.actions.len);
     try std.testing.expectEqual(ActionKind.pointer_down, story.actions[1].kind);
     try std.testing.expectEqualStrings("content/button", story.actions[1].target);
@@ -410,6 +418,24 @@ test "storybook declarations are owned, defaulted, and selectable" {
     try std.testing.expectEqual(@as(f32, 120), story.actions[2].delta);
     try std.testing.expectEqual(ActionKind.tab, story.actions[3].kind);
     try std.testing.expectEqualStrings("content/switch", story.actions[3].target);
+}
+
+test "storybook padding preserves zero and validates metrics" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 2);
+    c.lua_setglobal(state, "ouro");
+    const prefix = "return ouro.storybook {stories={ouro.story {id='one',name='One',content=function() end,padding=";
+    const suffix = "}}}";
+    var book = try Storybook.load(std.testing.allocator, state, prefix ++ "0" ++ suffix);
+    defer book.deinit();
+    try std.testing.expectEqual(@as(f32, 0), book.stories[0].padding);
+    inline for (.{ "-1", "1/0", "0/0", "3.5e38", "1e-100" }) |value| {
+        try std.testing.expectError(error.InvalidThemeNumber, Storybook.load(std.testing.allocator, state, prefix ++ value ++ suffix));
+    }
+    inline for (.{ "'0'", "false", "{}" }) |value| {
+        try std.testing.expectError(error.InvalidThemeType, Storybook.load(std.testing.allocator, state, prefix ++ value ++ suffix));
+    }
 }
 
 test "storybook rejects unsafe and duplicate IDs" {

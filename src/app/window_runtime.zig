@@ -278,6 +278,12 @@ pub const WindowRuntime = struct {
         if (self.ready) _ = try self.build_owners.markDirty(self.root_owner);
     }
 
+    pub fn setPadding(self: *WindowRuntime, padding: f32) !void {
+        if (self.root_padding == padding) return;
+        self.root_padding = padding;
+        if (self.ready) _ = try self.build_owners.markDirty(self.root_owner);
+    }
+
     pub fn setClipboardCoordinator(self: *WindowRuntime, clipboard: *clipboard_module.Coordinator) void {
         self.clipboard = clipboard;
     }
@@ -416,7 +422,8 @@ pub const WindowRuntime = struct {
         // the live generation's timelines during preparation.
         lua_ui.animations = null;
         lua_ui.image_scale = self.output_scale;
-        lua_ui.root_padding = self.root_padding;
+        // Root padding/background belong to the candidate declaration, not
+        // this runtime's still-live source generation.
         if (lua_ui.images) |images| if (self.tree.images == null) self.tree.attachImageCache(images.cache);
         defer lua_ui.components.instances = null;
         var measurement: LayoutMeasurement = .{ .runtime = self, .size = size, .lua_ui = lua_ui };
@@ -4919,7 +4926,8 @@ test "candidate source build preserves layer background alpha without changing r
     );
     try std.testing.expectEqual(@as(f32, 12), runtime.root_padding);
     runtime.root_padding = 0;
-    candidate.ui_build.enableDeclarativeWidgets(@import("../design/root.zig").tokens.light);
+    candidate.ui_build.enableDeclarativeWidgets(.light);
+    candidate.ui_build.root_padding = 0;
     const tint = core.Color.rgba(17, 24, 32, 184);
     candidate.ui_build.root_background = tint;
     try runtime.prepareSourceBuild(

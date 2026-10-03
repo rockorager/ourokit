@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 
+from development_runtime import png_pixel
+
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ["OUROKIT_TEST_BINARY"]).resolve()
 with tempfile.TemporaryDirectory(prefix="ouro-storybook-") as directory:
@@ -62,6 +64,37 @@ return o.storybook {stories={o.story {
     assert int.from_bytes(png[20:24], "big") == 1520
     assert len(png) < 1_000_000, len(png)
     print(f"module-backed 1920x1520 PNG: {len(png):,} bytes")
+    for name, padding, scheme, ink in (
+        ('default-inset', None, 'light', b'\xb4\x28\x53\xff'),
+        ('zero-inset', 0, 'dark', b'\x19\x3b\xc7\xff'),
+        ('fractional-inset', 3.5, 'light', b'\xb4\x28\x53\xff'),
+    ):
+        field = '' if padding is None else f'padding={padding},'
+        entry.write_text("""local o=require('ouro')
+local Content=o.stateless(function(p, children, theme)
+  assert(theme.color_scheme == '%s')
+  return o.box {key='root',width='fill',height='fill',alignment='center',
+    background=theme.color_scheme == 'dark' and '#193bc7' or '#b42853',
+    o.text {key='label',text='%s',foreground='#ffffff'}}
+end)
+return o.storybook {stories={o.story {id='padding',name='Padding',
+  viewport={width=260,height=130},snapshot_scale=2,color_scheme='%s',%s
+  content=function() return Content {} end}}}
+""" % (scheme, name, scheme, field))
+        run('snapshot', '--output', str(root / 'padding'), '--json')
+        output = root / 'padding' / 'padding.png'
+        inset = int(2 * (12 if padding is None else padding))
+        for x, y in ((0, 0), (519, 0), (0, 259), (519, 259)):
+            assert png_pixel(output, x, y) == (520, 260, ink if inset == 0 else b'\xff\xff\xff\xff')
+        assert png_pixel(output, inset, inset)[2] == ink
+        if inset:
+            assert png_pixel(output, inset-1, inset-1)[2] == b'\xff\xff\xff\xff'
+        if os.environ.get('OUROKIT_WINDOW_THEME_CAPTURE'):
+            target = Path(os.environ['OUROKIT_WINDOW_THEME_CAPTURE'])
+            target.mkdir(parents=True, exist_ok=True)
+            (target / ('storybook-' + name + '.png')).write_bytes(output.read_bytes())
+    print('Storybook resolved schemes and omitted/zero/fractional padding pixels: PASS')
+    entry.write_text(catalog)
     if environment.get("OUROKIT_TEST_WAYLAND_DISPLAY"):
         run("run", "--software", "--exit-after-first-frame")
         print("module-backed native Storybook browser: PASS")

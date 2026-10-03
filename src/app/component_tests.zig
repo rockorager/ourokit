@@ -25,7 +25,7 @@ const Job = struct {
     pub fn run(self: Job, env: host.Environment) ![]u8 {
         const state = env.vm.state;
         const theme = @import("../design/root.zig").tokens.light;
-        env.lua_ui.enableDeclarativeWidgets(theme);
+        env.lua_ui.enableDeclarativeWidgets(.light);
         try host.evaluateValue(env.vm, env.scheduler, env.loop, env.loader.?, self.source, self.chunk);
         if (c.lua_type(state, -1) != c.type_table) return error.TestTableRequired;
         var names: std.ArrayList([]u8) = .empty;
@@ -110,6 +110,10 @@ const Context = struct {
                 }
                 c.lua_settop(state, -2);
             }
+            const kind = c.lua_getfield(state, 3, "padding");
+            defer c.lua_settop(state, -2);
+            if (kind != c.type_nil)
+                try self.runtime.setPadding(try @import("../lua/theme.zig").extent(state, -1, false));
         }
         c.lua_pushvalue(state, 2);
         self.content_reference = c.luaL_ref(state, c.registry_index);

@@ -117,8 +117,9 @@ Run as a regular user with Python 3, Sway (including `swaymsg`),
 `dbus-run-session`, `dbus-daemon`, `gdbus`, and system fonts installed.
 Native tooltip checks also use `grim`, `wtype`, `wayland-scanner`, and a C
 compiler with Wayland client headers to create a private virtual pointer.
+Window-theme checks use `/usr/bin/python3` with PyGObject for a private Settings portal.
 On Debian/Ubuntu the additional packages are `sway dbus-daemon libglib2.0-bin
-grim wtype libwayland-bin libwayland-dev gcc pkg-config`.
+grim wtype libwayland-bin libwayland-dev gcc pkg-config python3-gi`.
 Missing tools, compositor startup failures, timeouts and failed tests are errors,
 not skipped checks. The compositor and test process groups are stopped on exit.
 This verifies software-rendered native behavior, not GPU presentation latency or
@@ -483,8 +484,11 @@ JSON reports contain `results`, `passed`, `failed`, `listed`, and `error_message
 
 The test context provides:
 
-- `t:mount(content, viewport?)`: mount one content callback per test; default
-  viewport is 640 × 480 logical pixels, light theme, scale 1.
+- `t:mount(content, options?)`: mount one content callback per test; options
+  accept `width`, `height`, and `padding`. Defaults are 640 × 480 logical pixels,
+  light theme, scale 1, and 12-pixel root padding. Padding must be a finite,
+  non-negative number; `padding=0` gives content the full viewport, matching
+  `ouro.window {padding=0}` and `ouro.story {padding=0}`.
 - `t:node(path)`: copy a public semantic node by slash-separated widget keys.
   Inspect `label`, `value`, `role`, `bounds`, `focused`, `checked`, `selection`,
   and other development-inspection fields. IDs are hexadecimal strings;
@@ -555,7 +559,10 @@ Snapshots use lossless compressed PNG by default. Run `zig build test-storybook`
 to verify local imports, diagnostics, empty status text, and headless output.
 
 Each story declares a fixed logical viewport, optional `snapshot_scale`, color
-scheme, and ordinary Ourokit content callback. Snapshot scale affects PNG
+scheme, optional `padding`, and ordinary Ourokit content callback. Story padding
+is a finite, non-negative logical number; omitted/nil keeps the 12-pixel inset,
+while `padding=0` renders edge-to-edge. It applies to snapshots and the native
+browser's preview rectangle. Snapshot scale affects PNG
 raster dimensions only; the interactive browser uses its window's native
 output scale. Snapshots use Fontconfig's system fonts, write
 PNG files atomically beneath the output directory, and report SHA-256 hashes.

@@ -13,6 +13,26 @@ local function counter()
 end
 
 return {
+  ['mount keeps the default inset when padding is omitted'] = function(t)
+    t:mount(function() return o.box {key='root', width='fill', height='fill'} end,
+      {width=173, height=109})
+    local bounds = t:node('root').bounds
+    assert(bounds.x == 12 and bounds.y == 12 and bounds.width == 149 and bounds.height == 85)
+  end,
+
+  ['mount validates padding and zero covers the full viewport'] = function(t)
+    local function content()
+      return o.dialog {key='modal', label='Full viewport', o.text {key='label', text='Covered'}}
+    end
+    for _, invalid in ipairs({-1, 1/0, 0/0, 3.5e38, 1e-100, '0', false, {}}) do
+      local ok, err = pcall(function() t:mount(content, {padding=invalid}) end)
+      assert(not ok and err:find('InvalidTheme', 1, true), tostring(err))
+    end
+    t:mount(content, {width=173, height=109, padding=0})
+    local bounds = t:node('modal').bounds
+    assert(bounds.x == 0 and bounds.y == 0 and bounds.width == 173 and bounds.height == 109)
+  end,
+
   -- These checks previously needed application_services/development_runtime
   -- plus Sway. They exercise the same retained input path without a desktop.
   ['click and keyboard activation update component state'] = function(t)

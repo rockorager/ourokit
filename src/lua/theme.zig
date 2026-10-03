@@ -3,8 +3,21 @@ const c = @import("c.zig");
 const core = @import("../core/root.zig");
 const tokens = @import("../design/root.zig").tokens;
 
+pub const ColorScheme = enum {
+    light,
+    dark,
+
+    pub fn colors(self: ColorScheme) tokens.Theme {
+        return switch (self) {
+            .light => tokens.light,
+            .dark => tokens.dark,
+        };
+    }
+};
+
 pub const Theme = struct {
     colors: tokens.Theme,
+    color_scheme: ColorScheme = .light,
     reduced_motion: bool = false,
     typography: Typography = .{},
     controls: Controls = .{},
@@ -119,7 +132,8 @@ fn merge(comptime T: type, state: *c.State, index: c_int, base: T, comptime owne
         _ = c.lua_rawget(state, table);
         if (c.lua_type(state, -1) != c.type_nil) {
             const scheme = try string(state, -1);
-            result.colors = if (std.mem.eql(u8, scheme, "light")) tokens.light else if (std.mem.eql(u8, scheme, "dark")) tokens.dark else return error.InvalidColorScheme;
+            result.color_scheme = std.meta.stringToEnum(ColorScheme, scheme) orelse return error.InvalidColorScheme;
+            result.colors = result.color_scheme.colors();
         }
         c.lua_settop(state, -2);
     }
@@ -172,6 +186,7 @@ fn value(comptime T: type, state: *c.State, index: c_int, base: T, comptime key:
         return extent(state, index, positive);
     }
     if (T == core.Color) return color(state, index);
+    if (T == ColorScheme) return std.meta.stringToEnum(ColorScheme, try string(state, index)) orelse error.InvalidColorScheme;
     if (T == Family) {
         const text = try string(state, index);
         if (text.len == 0 or text.len > 127 or std.mem.indexOfScalar(u8, text, 0) != null or
@@ -279,9 +294,11 @@ test "lua theme color scheme replaces colors only and explicit colors win" {
     );
     const dark = try parseTestValue(state, "return {colors={background='#123456'},color_scheme='dark'}", base);
     var expected = base;
+    expected.color_scheme = .dark;
     expected.colors = tokens.dark;
     expected.colors.background = core.Color.rgba(0x12, 0x34, 0x56, 255);
     try std.testing.expectEqualDeep(expected, dark);
+    expected.color_scheme = .light;
     expected.colors = tokens.light;
     try std.testing.expectEqualDeep(expected, try parseTestValue(state, "return {color_scheme='light'}", dark));
 }

@@ -48,7 +48,7 @@ test "Lua images queue after build, apply icon defaults and retain prepared pixe
     var semantics: [7]ui.semantics.Descriptor = undefined;
     var build: UiBuild = undefined;
     try build.init(state, &descriptors);
-    build.enableDeclarativeWidgets(@import("../design/root.zig").tokens.light);
+    build.enableDeclarativeWidgets(.light);
     build.images = &assets;
     build.image_scale = 2;
     try build.attachSemantics(&semantics);

@@ -1,7 +1,6 @@
 const std = @import("std");
 const core = @import("../core/root.zig");
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
-const design = @import("../design/root.zig");
 const io_loop = @import("../loop/root.zig");
 const lua = @import("../lua/root.zig");
 const renderer = @import("../renderer/root.zig");
@@ -268,11 +267,8 @@ const SnapshotJob = struct {
             try lua.Storybook.loadWithApi(init.gpa, vm.state, vm.apiReference(), self.source);
         defer book.deinit();
         const story = book.find(self.story_id) orelse return error.UnknownStory;
-        const theme = switch (story.color_scheme) {
-            .light => design.tokens.light,
-            .dark => design.tokens.dark,
-        };
-        lua_ui.enableDeclarativeWidgets(theme);
+        const theme = story.color_scheme.colors();
+        lua_ui.enableDeclarativeWidgets(story.color_scheme);
 
         const window_scope = try scheduler.createScope(scheduler.application_scope);
         var runtime: WindowRuntime = .{};
@@ -293,6 +289,7 @@ const SnapshotJob = struct {
         );
         runtime.output_scale = story.snapshot_scale;
         errdefer teardownRuntime(&runtime, lua_ui, scheduler, window_scope) catch {};
+        try runtime.setPadding(story.padding);
         try runtime.reconcile(
             .{ .width = story.viewport.width, .height = story.viewport.height },
             lua_ui,

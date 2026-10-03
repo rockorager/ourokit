@@ -534,13 +534,12 @@ fn runSourceInternal(
     var vulkan_glyphs: renderer.vulkan.GlyphCache = undefined;
     if (options.vulkan) vulkan_glyphs = try renderer.vulkan.GlyphCache.init(init.gpa, &fonts, &vulkan_renderer);
     defer if (options.vulkan) vulkan_glyphs.deinit();
-    const theme = appearanceTheme(appearance.current);
     const services: source_generation.UiServices = .{
         .paragraph_sources = &paragraph_sources,
         .paragraphs = &paragraphs,
         .font_candidates = font_candidates,
         .medium_font_candidates = medium_font_candidates,
-        .theme = theme,
+        .color_scheme = appearanceScheme(appearance.current),
         .reduced_motion = appearance.current.reduced_motion,
         .callbacks = &callbacks,
         .theme_fonts = &theme_fonts,
@@ -665,7 +664,7 @@ fn runSourceInternal(
         const lua_ui = &active_generation.ui_build;
         if (appearance.takeEvent()) |event| switch (event) {
             .appearance_changed => |snapshot_value| {
-                if (source_reload.setTheme(appearanceTheme(snapshot_value), snapshot_value.reduced_motion)) {
+                if (source_reload.setTheme(appearanceScheme(snapshot_value), snapshot_value.reduced_motion)) {
                     for (runtime_slots) |*slot| if (slot.runtime.initialized)
                         try slot.runtime.setTheme(lua_ui.widget_theme.?.colors);
                 }
@@ -1016,18 +1015,20 @@ fn runSourceInternal(
                 // physical focus on the parent; popupKeyboard routes its keys.
                 slot.runtime.keyboard_focused = slot.popup != null and slot.popup.?.window.declaration.popup.input != null;
                 slot.runtime.text_input_surface_focused = false;
-                // Desktop surfaces own their entire configured rectangle.
-                if (window.?.declaration != .toplevel) slot.runtime.root_padding = 0;
                 if (slot.popup) |popup| slot.runtime.callback_scope = popup.owner;
                 try dirty.register(handle);
                 slot.runtime.registered = true;
                 slot.runtime.setDirtyWindowQueue(&dirty);
                 slot.runtime.setClipboardCoordinator(&clipboard);
             }
+            try slot.runtime.setPadding(switch (window.?.declaration) {
+                .toplevel => |toplevel| toplevel.padding orelse design.tokens.foundation.spacing_3,
+                else => 0,
+            });
             try slot.runtime.setBackground(switch (window.?.declaration) {
                 .layer_surface => |layer| layer.background,
                 .popup => |popup| if (popup.input == null or popup.transparent) core.Color{ .r = 0, .g = 0, .b = 0, .a = 0 } else null,
-                .toplevel => null,
+                .toplevel => |toplevel| toplevel.background,
             });
             if (slot.configured_size != null and !(try dirty.hasPending(handle)))
                 _ = try dirty.markDirty(handle);
@@ -1497,10 +1498,10 @@ fn drainSources(reload: *SourceReload, loop: *io_loop.Loop, control: ?*ControlSe
     }
 }
 
-fn appearanceTheme(snapshot: appearance_module.Snapshot) design.tokens.Theme {
+fn appearanceScheme(snapshot: appearance_module.Snapshot) @import("../lua/theme.zig").ColorScheme {
     return switch (snapshot.color_scheme) {
-        .default, .light => design.tokens.light,
-        .dark => design.tokens.dark,
+        .default, .light => .light,
+        .dark => .dark,
     };
 }
 
@@ -1765,7 +1766,6 @@ const PreparedRuntimeSlots = struct {
                 // on the old graph, or commit would erase freshly built edges.
                 const signals = if (suppressed) &candidate.signals else &reload.active().signals;
                 try runtime.init(allocator, reload.scheduler, scope, handle orelse .invalid, theme.background, theme.primary, theme.foreground, theme.input, theme.ring, signals, services.paragraph_sources, services.paragraphs, context.config);
-                if (window.declaration != .toplevel) runtime.root_padding = 0;
             }
             if (prepared.target_count == targets.len) return error.WindowCapacityExceeded;
             targets[prepared.target_count] = .{
@@ -2088,7 +2088,7 @@ test "render failure drains native and application owners before returning origi
         .paragraphs = &paragraphs,
         .font_candidates = &.{font},
         .medium_font_candidates = &.{font},
-        .theme = theme,
+        .color_scheme = .light,
         .callbacks = &callbacks,
     };
     const config: source_generation.Config = .{ .node_capacity = 8, .semantic_text_capacity = 128 };
@@ -2369,7 +2369,7 @@ test "structural reload validates later additions and capacity before retaining 
         .paragraphs = &paragraphs,
         .font_candidates = &.{font},
         .medium_font_candidates = &.{font},
-        .theme = design.tokens.light,
+        .color_scheme = .light,
         .callbacks = &callbacks,
     };
     const config: source_generation.Config = .{ .node_capacity = 16, .semantic_text_capacity = 256 };

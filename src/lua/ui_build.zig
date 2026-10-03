@@ -695,9 +695,9 @@ pub const UiBuild = struct {
         self.medium_candidates = candidates;
     }
 
-    pub fn enableDeclarativeWidgets(self: *UiBuild, theme: design.tokens.Theme) void {
+    pub fn enableDeclarativeWidgets(self: *UiBuild, scheme: theming.ColorScheme) void {
         std.debug.assert(self.active_owner == null and self.widget_theme == null);
-        self.widget_theme = .{ .colors = theme };
+        self.widget_theme = .{ .colors = scheme.colors(), .color_scheme = scheme };
     }
 
     pub fn attachSemantics(self: *UiBuild, storage: []SemanticDescriptor) !void {
@@ -3304,7 +3304,7 @@ test "declarative text input separates focus identity from editable render conte
     try ui.init(state, &storage);
     try ui.attachText(&sources, &.{font}, 1);
     try ui.attachSemantics(&semantic_storage);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
     try execute(state,
         \\function build()
         \\  return ouro.column {
@@ -3421,7 +3421,7 @@ test "declarative sidebar listbox uses paired active visuals" {
     try ui.attachText(&sources, &.{font}, 1);
     try ui.attachMediumText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
     try execute(state,
         \\function build()
         \\  return ouro.listbox {
@@ -3496,7 +3496,7 @@ test "declarative flex is contextual child data and containers expose cross alig
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachSemantics(&semantic_storage);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
     try execute(state,
         \\function build()
         \\  return ouro.row {
@@ -3572,7 +3572,7 @@ test "declarative grid and wrap validate declarations and retain keyed children 
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachSemantics(&semantics);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
     try execute(state,
         \\columns = {31, {fr=2}, "auto"}
         \\row = 1
@@ -3751,7 +3751,7 @@ test "declarative Lua text flows through layout scene and software glyph cache" 
     try ui.init(state, &storage);
     try ui.attachText(&sources, &.{ font, arabic }, 1);
     try ui.attachSemantics(&semantic_storage);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
 
     try execute(state,
         \\function build()
@@ -3839,7 +3839,7 @@ test "box maxima and edge padding preserve strict validation and defaults" {
     var storage: [3]instance.Descriptor = undefined;
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
     try execute(state, "function build() return ouro.box(props) end");
 
     for ([_][]const u8{
@@ -3909,7 +3909,7 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     try ui.attachText(&sources, &.{font}, 1);
     try ui.attachMediumText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
     try execute(state,
         \\function build()
         \\  return ouro.box {
@@ -4037,7 +4037,7 @@ test "buttons retain semantics and input bindings with intrinsic or fixed custom
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachSemantics(&semantics);
-    ui.enableDeclarativeWidgets(design.tokens.dark);
+    ui.enableDeclarativeWidgets(.dark);
     try execute(state,
         \\button_height = "auto"
         \\function build()
@@ -4137,7 +4137,7 @@ test "returned descriptions snapshot props forward children and preserve keyed i
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachSemantics(&semantics);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
     try execute(state,
         \\local function Card(props)
         \\  return ouro.column { key = props.key, gap = 7, children = props.children }
@@ -4233,7 +4233,7 @@ test "prepared descriptions stay alive across builds and release on reset" {
     var ui: UiBuild = undefined;
     try ui.init(state, &storage);
     try ui.attachSemantics(&semantics);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
     try execute(state,
         \\function build()
         \\  local result = ouro.box { key = "prepared", width = 73 }
@@ -4324,7 +4324,7 @@ test "signals dirty only dependent mounted builds and replace dependencies trans
     try ui.init(state, &storage);
     ui.attachSignals(&signals);
     try ui.attachSemantics(&semantic_storage);
-    ui.enableDeclarativeWidgets(design.tokens.light);
+    ui.enableDeclarativeWidgets(.light);
 
     const source =
         \\count = ouro.signal(10)

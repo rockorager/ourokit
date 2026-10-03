@@ -44,7 +44,7 @@ const Fixture = struct {
         try self.builder.attachSemantics(&self.semantics);
         try self.builder.attachText(&self.sources, &self.font, 1);
         const theme = @import("../design/root.zig").tokens.light;
-        self.builder.enableDeclarativeWidgets(theme);
+        self.builder.enableDeclarativeWidgets(.light);
         try self.runtime.init(std.testing.allocator, &self.scheduler, self.scope, .{ .slot = 3, .generation = 9 }, theme.background, theme.primary, theme.foreground, theme.input, theme.ring, &self.signals, &self.sources, &self.paragraphs, .{ .measure_phases = true });
         errdefer self.destroy();
         if (c.luaL_loadbufferx(self.vm.state, source.ptr, source.len, "@development-test", "t") != c.ok or

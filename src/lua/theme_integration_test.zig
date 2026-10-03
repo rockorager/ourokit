@@ -53,7 +53,7 @@ const Fixture = struct {
         try self.ui.attachSemantics(&self.semantic_storage);
         try self.ui.attachText(&self.sources, &self.font, 1);
         const theme = @import("../design/root.zig").tokens.light;
-        self.ui.enableDeclarativeWidgets(theme);
+        self.ui.enableDeclarativeWidgets(.light);
         try self.runtime.init(std.testing.allocator, &self.scheduler, self.scope, .{ .slot = 0, .generation = 1 }, theme.background, theme.primary, theme.foreground, theme.input, theme.ring, &self.signals, &self.sources, &self.paragraphs, .{});
         return self;
     }
@@ -1215,14 +1215,27 @@ test "host appearance rethemes retained components while app and nested override
     const f = try Fixture.create();
     defer f.destroy();
     try f.exec(
+        \\seen = {}
+        \\local Scheme = ouro.stateless(function(props, children, theme)
+        \\  seen[props.key] = theme.color_scheme
+        \\  return ouro.button { key = props.key, label = theme.color_scheme }
+        \\end)
         \\local Child = ouro.stateful(function()
-        \\  return function() return ouro.button { key = 'button', label = 'Retained' } end
+        \\  return function() return Scheme { key = 'button' } end
         \\end)
         \\function build()
         \\  return ouro.column { key = 'root',
         \\    Child {key = 'child'},
         \\    ouro.theme {key = 'fixed', color_scheme = 'light',
         \\      ouro.button {key = 'button', label = 'Pinned'},
+        \\    },
+        \\    ouro.theme {key = 'light', color_scheme = 'light',
+        \\      Scheme {key = 'light'},
+        \\    },
+        \\    ouro.theme {key = 'outer', color_scheme = 'light',
+        \\      ouro.theme {key = 'dark', color_scheme = 'dark', colors = {background = '#ffffff'},
+        \\        ouro.theme {key = 'inherited', controls = {height = 31}, Scheme {key = 'dark'}},
+        \\      },
         \\    },
         \\  }
         \\end
@@ -1235,19 +1248,25 @@ test "host appearance rethemes retained components while app and nested override
         \\}
     );
     defer application.deinit();
-    f.ui.widget_theme = application.resolvedTheme(tokens.light, false);
+    f.ui.widget_theme = application.resolvedTheme(.light, false);
     try f.build();
+    try f.exec("assert(seen.button == 'light' and seen.light == 'light' and seen.dark == 'dark')");
     const child = try f.handle("root/child/button");
-    f.ui.widget_theme = application.resolvedTheme(tokens.dark, true);
+    f.ui.widget_theme = application.resolvedTheme(.dark, true);
     try std.testing.expect(f.ui.widget_theme.?.reduced_motion);
     try f.runtime.setTheme(f.ui.widget_theme.?.colors);
     try f.build();
+    try f.exec("assert(seen.button == 'dark' and seen.light == 'light' and seen.dark == 'dark')");
     try std.testing.expectEqual(child, try f.handle("root/child/button"));
     try std.testing.expectEqual(tokens.dark.primary, (try f.object("root/child/button")).box.background.?);
     try std.testing.expectEqual(tokens.light.primary, (try f.object("root/fixed/button")).box.background.?);
     try std.testing.expectEqual(@as(f32, 45), (try f.object("root/child/button")).box.height.?);
     try std.testing.expectEqual(core.Color.rgba(255, 255, 255, 255), f.ui.widget_theme.?.colors.background);
     try std.testing.expectEqual(tokens.dark.foreground, f.ui.widget_theme.?.colors.foreground);
+    f.ui.widget_theme = application.resolvedTheme(.light, false);
+    try f.runtime.setTheme(f.ui.widget_theme.?.colors);
+    try f.build();
+    try f.exec("assert(seen.button == 'light' and seen.light == 'light' and seen.dark == 'dark')");
 
     var pinned = try Application.load(std.testing.allocator, f.state,
         \\return ouro.app {
@@ -1256,8 +1275,22 @@ test "host appearance rethemes retained components while app and nested override
         \\}
     );
     defer pinned.deinit();
-    try std.testing.expectEqualDeep(tokens.light, pinned.resolvedTheme(tokens.dark, true).colors);
-    try std.testing.expect(!pinned.resolvedTheme(tokens.dark, true).reduced_motion);
+    try std.testing.expectEqualDeep(tokens.light, pinned.resolvedTheme(.dark, true).colors);
+    try std.testing.expectEqual(.light, pinned.resolvedTheme(.dark, true).color_scheme);
+    try std.testing.expect(!pinned.resolvedTheme(.dark, true).reduced_motion);
+    var dark = try Application.load(std.testing.allocator, f.state,
+        \\return ouro.app {
+        \\  id = 'dev.test.dark', theme = {color_scheme = 'dark', colors = {background = '#ffffff'}},
+        \\  run = function() return {windows = {ouro.window {id = 'main', title = 'Dark', content = build}}} end,
+        \\}
+    );
+    defer dark.deinit();
+    for ([_]@import("theme.zig").ColorScheme{ .light, .dark }) |scheme| {
+        f.ui.widget_theme = dark.resolvedTheme(scheme, false);
+        try f.runtime.setTheme(f.ui.widget_theme.?.colors);
+        try f.build();
+        try f.exec("assert(seen.button == 'dark' and seen.light == 'light' and seen.dark == 'dark')");
+    }
 }
 
 test "app and field keymaps dispatch edits and clipboard actions across retained rebuilds" {

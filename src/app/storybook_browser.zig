@@ -141,6 +141,7 @@ const browser_suffix =
     \\                                      key = "preview-" .. preview_key,
     \\                                      width = story_viewport.width or 640,
     \\                                      height = story_viewport.height or 480,
+    \\                                      padding = story.padding or ouro.tokens.foundation.spacing_3,
     \\                                      children = { story.content() },
     \\                                    },
     \\                                  },

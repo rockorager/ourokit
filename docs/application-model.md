@@ -236,8 +236,11 @@ the Card example above.
 description constructor. Its render function runs during native lowering, at
 the same non-yielding safe point as component rendering, and returns a description
 or nil. `theme` is a fresh value of the effective inherited native theme:
-`colors`, `typography`, `controls`, `widgets`, and `reduced_motion`, including host appearance,
+`color_scheme`, `colors`, `typography`, `controls`, `widgets`, and `reduced_motion`, including host appearance,
 application defaults, and enclosing overrides. It is not `ouro.tokens.light`.
+`theme.color_scheme` is always `"light"` or `"dark"`, even when custom colors
+do not resemble that palette. Use it for scheme-dependent composition rather
+than inferring the scheme from background luminance.
 Changing this value does not change native defaults. Treat props and children
 as read-only snapshots. Do not create state, write signals, perform effects, or
 yield inside the render function; create state outside and pass its values in
@@ -857,6 +860,27 @@ remains unfrozen. Constructors are specific native decoders, not one generic
 
 Mutable toplevel title and minimum dimensions are updated in place; initial
 dimensions apply at creation. A zero minimum leaves that axis unconstrained.
+`ouro.window` also accepts `padding` (a finite, non-negative logical number,
+applied on all four sides) and `background` (`#RRGGBB` or `#RRGGBBAA`). Omitted
+or nil values preserve the defaults: `ouro.tokens.foundation.spacing_3` (12)
+padding and the resolved app-theme background. Background paints the whole
+window, including the inset, without changing descendant theme colors. Both
+properties update through reactive window declarations and source reload.
+For preview parity, declare the same `padding` on `ouro.story` and in the
+existing `t:mount(content, {width=..., height=..., padding=0})` options. These
+use the same scalar validation and preserve 12-pixel padding when omitted.
+
+Use `padding = 0` to let content own the entire viewport. Place ordinary page
+padding inside the content, below a root `ouro.dialog` or `ouro.stack`, so modal
+backdrops can cover every window edge without full-viewport anchored layers:
+
+```lua
+ouro.window {
+  id = "main", title = "Edge-to-edge", padding = 0, background = "#18212b",
+  content = content,
+}
+```
+
 Layer surfaces follow their separate configure/acknowledge contract and reuse
 the same retained UI, input, scaling, rendering, frame pacing, and teardown
 paths after configuration.
@@ -1676,6 +1700,9 @@ Resolution order is host appearance → app theme → enclosing `ouro.theme`
 overrides → explicit widget props. Nested tables merge field by field; missing
 fields inherit. `color_scheme = "light" | "dark"` replaces the inherited color
 palette, then explicit `colors` apply; it does not reset typography or metrics.
+The effective `color_scheme` inherits independently of individual color
+overrides and is exposed to stateless render callbacks. A live host preference
+change updates it even if every color has been explicitly overridden.
 `reduced_motion` is a strict boolean, inherited independently of the palette.
 Colors use the generated semantic token names and `#RRGGBB` or `#RRGGBBAA`.
 Unknown theme fields and invalid colors/metrics are errors, not ignored typos.

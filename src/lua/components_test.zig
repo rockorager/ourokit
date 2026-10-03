@@ -40,7 +40,7 @@ const Fixture = struct {
         try self.ui.init(self.state, &self.descriptors);
         self.ui.attachSignals(&self.signals);
         self.ui.components.instances = &self.instances;
-        self.ui.enableDeclarativeWidgets(@import("../design/root.zig").tokens.light);
+        self.ui.enableDeclarativeWidgets(.light);
         try self.ui.attachSemantics(&self.semantic_storage);
         return self;
     }

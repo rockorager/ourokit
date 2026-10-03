@@ -35,6 +35,7 @@ pub fn push(state: *c.State, value: anytype) void {
         .optional => if (value) |present| push(state, present) else c.lua_pushnil(state),
         .bool => c.lua_pushboolean(state, @intFromBool(value)),
         .float => c.lua_pushnumber(state, value),
+        .@"enum" => push(state, @as([]const u8, @tagName(value))),
         .@"struct" => {
             const fields = comptime std.meta.fields(T);
             c.lua_createtable(state, 0, @intCast(fields.len));

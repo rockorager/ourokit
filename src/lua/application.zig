@@ -39,6 +39,7 @@ pub const Definition = struct {
     theme: ?theming.Theme = null,
     text_input_bindings: key_bindings.Keymap = .{},
     inherited_colors: theming.ColorFields = .initEmpty(),
+    inherited_scheme: bool = true,
     inherited_motion: bool = true,
     action_schema: ?ActionSchema = null,
     actions_reference: c_int = c.no_reference,
@@ -79,6 +80,7 @@ pub const Definition = struct {
             .theme = self.theme,
             .text_input_bindings = self.text_input_bindings,
             .inherited_colors = self.inherited_colors,
+            .inherited_scheme = self.inherited_scheme,
             .inherited_motion = self.inherited_motion,
             .action_schema = self.action_schema,
             .actions_reference = self.actions_reference,
@@ -182,6 +184,7 @@ pub const Application = struct {
     theme: ?theming.Theme = null,
     text_input_bindings: key_bindings.Keymap = .{},
     inherited_colors: theming.ColorFields = .initEmpty(),
+    inherited_scheme: bool = true,
     inherited_motion: bool = true,
     action_schema: ?ActionSchema = null,
     actions_reference: c_int,
@@ -292,8 +295,10 @@ pub const Application = struct {
         return 1;
     }
 
-    pub fn resolvedTheme(self: *const Application, base: @import("../design/root.zig").tokens.Theme, reduced_motion: bool) theming.Theme {
-        var result = self.theme orelse return .{ .colors = base, .reduced_motion = reduced_motion };
+    pub fn resolvedTheme(self: *const Application, scheme: theming.ColorScheme, reduced_motion: bool) theming.Theme {
+        const base = scheme.colors();
+        var result = self.theme orelse return .{ .colors = base, .color_scheme = scheme, .reduced_motion = reduced_motion };
+        if (self.inherited_scheme) result.color_scheme = scheme;
         if (self.inherited_motion) result.reduced_motion = reduced_motion;
         inline for (std.meta.fields(@TypeOf(base)), 0..) |field, i| {
             if (self.inherited_colors.contains(@enumFromInt(i)))
@@ -556,6 +561,7 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
     if (windows_kind != c.type_nil) return error.ApplicationWindowsMustBeReturnedFromRun;
     const text_input_bindings = try key_bindings.field(state, -1, "text_input_bindings", .{});
     var inherited_colors = theming.ColorFields.initEmpty();
+    var inherited_scheme = true;
     var inherited_motion = true;
     const theme = blk: {
         const kind = c.lua_getfield(state, -1, "theme");
@@ -565,6 +571,8 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
             .colors = @import("../design/root.zig").tokens.light,
         });
         inherited_colors = theming.inheritedColors(state, -1);
+        inherited_scheme = c.lua_getfield(state, -1, "color_scheme") == c.type_nil;
+        c.lua_settop(state, -2);
         inherited_motion = c.lua_getfield(state, -1, "reduced_motion") == c.type_nil;
         c.lua_settop(state, -2);
         break :blk value;
@@ -586,6 +594,7 @@ fn parseDefinition(allocator: std.mem.Allocator, state: *c.State) !Definition {
         .theme = theme,
         .text_input_bindings = text_input_bindings,
         .inherited_colors = inherited_colors,
+        .inherited_scheme = inherited_scheme,
         .inherited_motion = inherited_motion,
         .action_schema = action_schema,
         .actions_reference = actions_reference,
@@ -771,6 +780,8 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State) ![]Window {
                     .initial_height = height,
                     .min_width = min_width,
                     .min_height = min_height,
+                    .padding = try optionalPadding(state, -1),
+                    .background = try optionalBackground(state, -1),
                 } };
             },
             .layer_surface => blk: {
@@ -948,6 +959,13 @@ fn optionalNullableEnum(
     var length: usize = 0;
     const value = c.lua_tolstring(state, -1, &length) orelse return error.InvalidEnumValue;
     return std.meta.stringToEnum(Enum, value[0..length]) orelse error.InvalidEnumValue;
+}
+
+fn optionalPadding(state: *c.State, table: c_int) !?f32 {
+    const value_type = c.lua_getfield(state, table, "padding");
+    defer c.lua_settop(state, -2);
+    if (value_type == c.type_nil) return null;
+    return try theming.extent(state, -1, false);
 }
 
 fn optionalBackground(state: *c.State, table: c_int) !?@import("../core/color.zig").Color {
@@ -1146,6 +1164,34 @@ test "declarative application owns windows and content callbacks" {
     try std.testing.expectEqual(@as(u32, 320), application.windows[0].declaration.toplevel.initial_width);
     try std.testing.expectEqual(@as(u32, 280), application.windows[0].declaration.toplevel.min_width);
     try std.testing.expectEqual(@as(u32, 160), application.windows[0].declaration.toplevel.min_height);
+    try std.testing.expectEqual(null, application.windows[0].declaration.toplevel.padding);
+    try std.testing.expectEqual(null, application.windows[0].declaration.toplevel.background);
+}
+
+test "window root overrides preserve zero and alpha and reject invalid values" {
+    const state = c.luaL_newstate() orelse return error.LuaStateCreationFailed;
+    defer c.lua_close(state);
+    c.lua_createtable(state, 0, 2);
+    c.lua_setglobal(state, "ouro");
+    const prefix = "return ouro.app {id='dev.test.root',run=function() return {windows={ouro.window {id='main',title='Root',content=function() end,";
+    const suffix = "}}} end}";
+    var application = try Application.load(std.testing.allocator, state, prefix ++ "padding=0,background='#193bc780'" ++ suffix);
+    defer application.deinit();
+    try std.testing.expectEqual(@as(?f32, 0), application.windows[0].declaration.toplevel.padding);
+    try std.testing.expectEqual(@import("../core/color.zig").Color.rgba(25, 59, 199, 128), application.windows[0].declaration.toplevel.background.?);
+    inline for (.{
+        .{ "padding=-1", error.InvalidThemeNumber },
+        .{ "padding=1/0", error.InvalidThemeNumber },
+        .{ "padding=0/0", error.InvalidThemeNumber },
+        .{ "padding=3.5e38", error.InvalidThemeNumber },
+        .{ "padding=1e-100", error.InvalidThemeNumber },
+        .{ "padding='0'", error.InvalidThemeType },
+        .{ "padding=false", error.InvalidThemeType },
+        .{ "background='#abc'", error.InvalidThemeColor },
+        .{ "background=false", error.InvalidThemeType },
+    }) |case| {
+        try std.testing.expectError(case[1], Application.load(std.testing.allocator, state, prefix ++ case[0] ++ suffix));
+    }
 }
 
 test "layer surface constructor parses shell policy into a distinct declaration" {

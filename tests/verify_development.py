@@ -21,6 +21,7 @@ TESTS = (
     'development_runtime.py',
     'storybook_native.py',
     'control_composition.py',
+    'window_theme.py',
     'selection_composition.py',
     'editor_commands.py',
     'input_composition.py',

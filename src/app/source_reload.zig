@@ -89,13 +89,13 @@ pub const SourceReload = struct {
         return self.active_generation;
     }
 
-    pub fn setTheme(self: *SourceReload, theme: @import("../design/root.zig").tokens.Theme, reduced_motion: bool) bool {
+    pub fn setTheme(self: *SourceReload, scheme: @import("../lua/theme.zig").ColorScheme, reduced_motion: bool) bool {
         if (self.services) |*services| {
-            services.theme = theme;
+            services.color_scheme = scheme;
             services.reduced_motion = reduced_motion;
         }
-        if (self.candidate) |candidate| _ = candidate.setTheme(theme, reduced_motion);
-        return self.active_generation.setTheme(theme, reduced_motion);
+        if (self.candidate) |candidate| _ = candidate.setTheme(scheme, reduced_motion);
+        return self.active_generation.setTheme(scheme, reduced_motion);
     }
 
     pub fn attachModuleRoot(self: *SourceReload, directory: std.os.linux.fd_t) void {
@@ -229,7 +229,12 @@ pub const SourceReload = struct {
             };
             candidate.ui_build.root_background = switch (window.declaration) {
                 .layer_surface => |layer| layer.background,
-                .toplevel, .popup => null,
+                .toplevel => |toplevel| toplevel.background,
+                .popup => null,
+            };
+            candidate.ui_build.root_padding = switch (window.declaration) {
+                .toplevel => |toplevel| toplevel.padding orelse @import("../design/root.zig").tokens.foundation.spacing_3,
+                else => 0,
             };
             target.runtime.prepareSourceBuild(
                 target.size,
@@ -299,7 +304,12 @@ pub const SourceReload = struct {
             if (target.disposition == .validate_only) continue;
             target.runtime.background = switch (window.declaration) {
                 .layer_surface => |layer| layer.background,
-                .toplevel, .popup => null,
+                .toplevel => |toplevel| toplevel.background,
+                .popup => null,
+            };
+            target.runtime.root_padding = switch (window.declaration) {
+                .toplevel => |toplevel| toplevel.padding orelse @import("../design/root.zig").tokens.foundation.spacing_3,
+                else => 0,
             };
             target.runtime.commitPreparedSource(
                 prepared,
@@ -1124,7 +1134,7 @@ test "a later window build failure leaves every retained window on the active ge
         .paragraphs = &paragraphs,
         .font_candidates = &.{font},
         .medium_font_candidates = &.{font},
-        .theme = design.tokens.light,
+        .color_scheme = .light,
         .callbacks = &callbacks,
         .images = &images,
     };
@@ -1198,10 +1208,12 @@ test "a later window build failure leaves every retained window on the active ge
     try std.testing.expectEqual(@as(f32, 57), reload.candidate.?.ui_build.widget_theme.?.controls.height);
     // Host appearance reaches both generations, without replacing their
     // different declaration overrides. A failed candidate cannot undo it.
-    try std.testing.expect(reload.setTheme(design.tokens.dark, true));
-    try std.testing.expect(!reload.setTheme(design.tokens.dark, true));
+    try std.testing.expect(reload.setTheme(.dark, true));
+    try std.testing.expect(!reload.setTheme(.dark, true));
     try std.testing.expect(initial.ui_build.widget_theme.?.reduced_motion);
     try std.testing.expect(reload.candidate.?.ui_build.widget_theme.?.reduced_motion);
+    try std.testing.expectEqual(.dark, initial.ui_build.widget_theme.?.color_scheme);
+    try std.testing.expectEqual(.dark, reload.candidate.?.ui_build.widget_theme.?.color_scheme);
     try std.testing.expectEqualDeep(design.tokens.dark, initial.ui_build.widget_theme.?.colors);
     try std.testing.expectEqualDeep(design.tokens.dark, reload.candidate.?.ui_build.widget_theme.?.colors);
     const targets = [_]WindowTarget{

@@ -293,6 +293,9 @@ pub const ToplevelDeclaration = struct {
     initial_height: u32 = 480,
     min_width: u32 = 0,
     min_height: u32 = 0,
+    /// Null selects the host's default content inset and theme background.
+    padding: ?f32 = null,
+    background: ?Color = null,
 };
 
 pub const Layer = enum { background, bottom, top, overlay };
