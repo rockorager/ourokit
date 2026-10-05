@@ -533,6 +533,9 @@ fn runSourceInternal(
     defer icon_paths.deinit();
     var glyphs = try renderer.software.GlyphCache.init(init.gpa, &fonts);
     defer glyphs.deinit();
+    var paragraph_bounds: renderer.software.ParagraphBounds = .{ .glyphs = &glyphs, .paragraphs = &paragraphs };
+    var software_scratch: renderer.software.Scratch = .{};
+    defer software_scratch.deinit(std.heap.page_allocator);
     var path_masks = @import("../path/root.zig").MaskCache.init(init.gpa);
     defer path_masks.deinit();
     var shadow_masks = @import("../shadow/root.zig").MaskCache.init(init.gpa);
@@ -1167,6 +1170,10 @@ fn runSourceInternal(
         for (runtime_slots) |*slot| {
             if (!slot.desired or !slot.runtime.registered) continue;
             if (slot.runtime.wantsSubmission()) {
+                slot.runtime.damage_tracker.paragraph_bounds = if (host.presentationBackend() == .shared_memory)
+                    .{ .context = &paragraph_bounds, .resolve = renderer.software.ParagraphBounds.resolve }
+                else
+                    null;
                 try host.prepareScene(slot.runtime.window, try slot.runtime.displayList());
                 try host.requestRedraw(slot.runtime.window);
             }
@@ -1188,6 +1195,7 @@ fn runSourceInternal(
                         .height = frame_buffer.height,
                         .stride = target.stride,
                         .format = .bgra8_unorm,
+                        .scratch = &software_scratch,
                         .path_masks = &path_masks,
                         .shadow_masks = &shadow_masks,
                     }, &glyphs, null, &paragraphs, &images),

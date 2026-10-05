@@ -535,6 +535,26 @@ fn addParagraphBenchmark(
     });
     b.step("bench-text-input", "Profile repeated text edits, presentation, layout, and scene building")
         .dependOn(&b.addRunArtifact(input_benchmark).step);
+
+    const raster_module = b.createModule(.{
+        .root_source_file = b.path("tools/rendering/text_benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ourokit", .module = ourokit }},
+    });
+    raster_module.addAnonymousImport("ourokit_benchmark_font", .{
+        .root_source_file = latin_font.path("extras/ttf/Inter-Regular.ttf"),
+    });
+    const raster_benchmark = b.addExecutable(.{
+        .name = "ourokit-software-text-benchmark",
+        .root_module = raster_module,
+    });
+    const raster_run = b.addRunArtifact(raster_benchmark);
+    if (b.args) |args| raster_run.addArgs(args);
+    b.step("bench-software-text", "Profile CPU text rasterization, scrolling, and damaged redraws")
+        .dependOn(&raster_run.step);
+    b.step("build-software-text-benchmark", "Install the CPU text benchmark for perf")
+        .dependOn(&b.addInstallArtifact(raster_benchmark, .{}).step);
 }
 
 fn addVulkan(b: *std.Build, module: *std.Build.Module) void {

@@ -20,6 +20,12 @@ pub const Tracker = struct {
     previous_viewport: ?RectI = null,
     candidate_viewport: RectI = undefined,
     region: [1]RectI = undefined,
+    /// Optional backend ink bounds. Without a resolver, text damages its clip.
+    /// Resolve only current resources; submitted snapshots own their bounds.
+    paragraph_bounds: ?struct {
+        context: *anyopaque,
+        resolve: *const fn (*anyopaque, scene.Paragraph, RectI) anyerror!RectI,
+    } = null,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Tracker {
         const previous = try allocator.alloc(Draw, capacity);
@@ -41,10 +47,9 @@ pub const Tracker = struct {
         self.previous_viewport = null;
     }
 
-    /// Returned regions remain valid until the next comparison. Text uses its
-    /// effective clip, not logical font metrics (glyph ink can overhang them).
-    /// Retained text nodes provide a tight clip; unclipped text is conservatively
-    /// bounded by the viewport. Outlines already have expanded scene rectangles.
+    /// Returned regions remain valid until the next comparison. Text uses
+    /// backend ink bounds when available, never logical font metrics (ink can
+    /// overhang them). Outlines already have expanded scene rectangles.
     pub fn compare(self: *Tracker, commands: []const scene.Command, viewport: RectI) !scene.Damage {
         self.candidate_count = 0;
         self.candidate_viewport = viewport;
@@ -88,7 +93,17 @@ pub const Tracker = struct {
                 .image => |value| RectI.intersect(value.bounds, clips[depth]),
                 .path => |value| RectI.intersect(value.bounds, clips[depth]),
                 .shadow => |value| RectI.intersect(value.bounds, clips[depth]),
-                .clear, .glyph_run, .paragraph => clips[depth],
+                .paragraph => |value| ink: {
+                    const resolver = self.paragraph_bounds orelse break :ink clips[depth];
+                    // Unchanged text (e.g. caret movement) needs no glyph walk.
+                    if (self.candidate_count < self.previous_count) {
+                        const previous = self.previous[self.candidate_count];
+                        if (std.meta.eql(previous.command, command) and std.meta.eql(previous.clip, clips[depth]))
+                            break :ink previous.bounds;
+                    }
+                    break :ink RectI.intersect(try resolver.resolve(resolver.context, value, clips[depth]), clips[depth]);
+                },
+                .clear, .glyph_run => clips[depth],
                 else => unreachable,
             };
             if (bounds.isEmpty()) continue;

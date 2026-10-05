@@ -349,6 +349,39 @@ To run the reproducible software-renderer comparison against pinned Pixman
 zig build bench-renderers -Doptimize=ReleaseFast
 ```
 
+To profile CPU text rasterization with a Folio-sized editor (960×760 logical
+pixels, 680 px wrapping width, 23 px text):
+
+```sh
+zig build bench-software-text -Doptimize=ReleaseFast -Dvulkan=false
+# Arguments: mode, frames, prose repetitions, integer output scale.
+zig build bench-software-text -Doptimize=ReleaseFast -Dvulkan=false -- all 120 1024 2
+# Start empty and hold a key; the prose repetition argument is unused here.
+zig build bench-software-text -Doptimize=ReleaseFast -Dvulkan=false -- typing 120 1 2
+zig build build-software-text-benchmark -Doptimize=ReleaseFast -Dvulkan=false
+perf record -e cpu-clock:u -F 499 -g --call-graph dwarf -o /tmp/ouro-text.data -- \
+  zig-out/bin/ourokit-software-text-benchmark warm 3000 1024 1
+perf report -i /tmp/ouro-text.data
+```
+
+Modes are `all`, `blank` (clear and presentation conversion only), `warm`
+(full redraw), `scroll` (integer offsets), `fractional` (quarter-pixel logical
+offsets), `caret` (synthetic 2×27 px damage, not runtime damage tracking), and
+`typing` (retained multiline editor updates starting empty).
+Raster modes report one cold render and timed frames with persistent glyph
+and working buffers, plus cache occupancy. Scrolling can introduce new subpixel phases;
+its timed samples include those misses. Compare 8, 128, and 1024 repetitions
+at the same viewport to expose work on offscreen text. The fixture uses pinned
+Inter for reproducibility, not Folio's system-dependent `serif` font. Pixel
+checks verify visible text, cold/warm equality, scrolling, and damage isolation.
+Frame timings exclude shaping/layout, validation, Lua, Wayland, and compositor
+latency; `perf` covers the whole process, so use enough frames to amortize setup.
+`typing` times edit/layout/scene separately, then compares clip-based damage with
+temporary working storage against raster-ink damage with reused storage. It
+checks identical output after every character and reports damaged pixel counts.
+It does not simulate compositor backpressure or presentation-buffer age.
+These are CPU measurements, not an end-to-end CPU/GPU comparison.
+
 To profile pure headless bidi analysis, script analysis, combined paragraph
 itemization, UAX #14 opportunities, shaped measurement, greedy selection, and
 line-local bidi independently from UI, rendering, and Wayland:

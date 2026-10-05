@@ -30,6 +30,29 @@ pub const PixelFormat = enum {
     bgra8_unorm,
 };
 
+/// Reusable working storage, not retained frame contents. Every damaged pixel
+/// is initialized from a leading clear or the current presentation target.
+pub const Scratch = struct {
+    pixels: std.ArrayList(LinearRgba16) = .empty,
+
+    pub fn deinit(self: *Scratch, allocator: std.mem.Allocator) void {
+        self.pixels.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+/// Exact raster bounds for scene damage, including hinting and bitmap glyphs.
+pub const ParagraphBounds = struct {
+    glyphs: *GlyphCache,
+    paragraphs: *const text.ParagraphCache,
+
+    pub fn resolve(context: *anyopaque, command: scene.Paragraph, clip: RectI) !RectI {
+        if (!has_freetype) return error.FreeTypeDisabled;
+        const self: *ParagraphBounds = @ptrCast(@alignCast(context));
+        return rasterParagraph(command, null, clip, self.glyphs, self.paragraphs);
+    }
+};
+
 pub const Target = struct {
     pixels: []u8,
     width: u32,
@@ -39,6 +62,9 @@ pub const Target = struct {
     /// Allocates the RGBA16 working buffer for a render call. Presentation
     /// bytes store encoded-premultiplied sRGB, never linear-premultiplied sRGB.
     allocator: std.mem.Allocator = std.heap.page_allocator,
+    /// Must be used and deinitialized with this target's allocator. May be
+    /// shared by synchronous renders of different windows and output sizes.
+    scratch: ?*Scratch = null,
     /// Optional persistent coverage cache; one-shot callers get a temporary one.
     path_masks: ?*paths.MaskCache = null,
     shadow_masks: ?*shadows.MaskCache = null,
@@ -130,9 +156,11 @@ pub fn renderResources(
     };
     if (list.commands.len == 0 or target.width == 0 or target.height == 0) return;
     if (list.damage == .regions and list.damage.regions.len == 0) return;
-    const pixels = try target.allocator.alloc(LinearRgba16, try std.math.mul(usize, target.width, target.height));
-    defer target.allocator.free(pixels);
-    const working: RasterTarget = .{ .pixels = pixels, .width = target.width, .height = target.height };
+    var temporary_scratch: Scratch = .{};
+    defer temporary_scratch.deinit(target.allocator);
+    const scratch = target.scratch orelse &temporary_scratch;
+    try scratch.pixels.resize(target.allocator, try std.math.mul(usize, target.width, target.height));
+    const working: RasterTarget = .{ .pixels = scratch.pixels.items, .width = target.width, .height = target.height };
     switch (list.damage) {
         .full => try renderOutputRegion(list.commands, target, working, targetBounds(target), glyphs, shapes, paragraphs, images, masks, shadow_masks, opacity.groups, layer_pixels),
         .regions => |regions| {
@@ -307,7 +335,7 @@ fn renderRegion(
         .paragraph => |paragraph| {
             if (target.rounded_clips.len == 0 and scene.occludedByNextDraw(commands[index + 1 ..], clips[0 .. depth + 1], clips[depth])) continue;
             if (!has_freetype) return error.FreeTypeDisabled;
-            try drawParagraph(
+            _ = try rasterParagraph(
                 paragraph,
                 target,
                 clips[depth],
@@ -350,13 +378,15 @@ fn drawGlyphRun(
     }
 }
 
-fn drawParagraph(
+fn rasterParagraph(
     command: scene.Paragraph,
-    target: RasterTarget,
+    target: ?RasterTarget,
     clip: RectI,
     cache: *GlyphCache,
     paragraphs: *const text.ParagraphCache,
-) !void {
+) !RectI {
+    var ink: RectI = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    if (clip.isEmpty()) return ink;
     const layout = try paragraphs.get(command.layout);
     for (layout.positioned.lines) |line| {
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
@@ -372,17 +402,32 @@ fn drawParagraph(
                     (span.logical_size orelse layout.logical_size) * command.scale,
                     position.phase,
                 );
-                drawMask(
-                    target,
-                    clip,
-                    position.x + bitmap.left,
-                    position.y - bitmap.top,
-                    bitmap,
-                    span.color orelse command.color,
-                );
+                const x = position.x + bitmap.left;
+                const y = position.y - bitmap.top;
+                if (target) |output| {
+                    drawMask(output, clip, x, y, bitmap, span.color orelse command.color);
+                } else {
+                    const bounds = RectI.intersect(clip, .{ .x = x, .y = y, .width = bitmap.width, .height = bitmap.height });
+                    if (bounds.isEmpty()) continue;
+                    if (ink.isEmpty()) {
+                        ink = bounds;
+                    } else {
+                        const left = @min(ink.x, bounds.x);
+                        const top = @min(ink.y, bounds.y);
+                        const right = @max(@as(i64, ink.x) + ink.width, @as(i64, bounds.x) + bounds.width);
+                        const bottom = @max(@as(i64, ink.y) + ink.height, @as(i64, bounds.y) + bounds.height);
+                        ink = .{
+                            .x = left,
+                            .y = top,
+                            .width = @intCast(right - left),
+                            .height = @intCast(bottom - top),
+                        };
+                    }
+                }
             }
         }
     }
+    return ink;
 }
 
 fn drawMask(
@@ -1109,4 +1154,101 @@ test "color glyphs preserve their RGB but inherit text opacity and clipping" {
     pixels[0] = LinearRgba16.fromColor(Color.rgba(255, 255, 255, 255));
     drawMask(target, clip, 0, 0, &bitmap, tint);
     try std.testing.expectEqual(LinearRgba16{ .r = 65535, .g = 32639, .b = 32639, .a = 65535 }, pixels[0]);
+}
+
+test "paragraph ink damage replays edits wrapping deletion and fractional scrolling exactly" {
+    if (comptime !has_freetype) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fonts = text.FontCache.init(allocator);
+    defer fonts.deinit();
+    const font = try fonts.acquire(.{
+        .key = .{ .file = "/fixtures/Inter.ttf", .index = 0 },
+        .bytes = @embedFile("ourokit_test_font"),
+    });
+    defer fonts.release(font) catch unreachable;
+    var paragraphs = text.ParagraphCache.init(allocator, &fonts);
+    defer paragraphs.deinit();
+    var glyphs = try GlyphCache.init(allocator, &fonts);
+    defer glyphs.deinit();
+    var resolver: ParagraphBounds = .{ .glyphs = &glyphs, .paragraphs = &paragraphs };
+    var scratch: Scratch = .{};
+    defer scratch.deinit(allocator);
+    const viewport: RectI = .{ .x = 0, .y = 0, .width = 240, .height = 180 };
+    var full: [240 * 180 * 4]u8 = undefined;
+    var partial: @TypeOf(full) = undefined;
+    const target: Target = .{ .pixels = &full, .width = 240, .height = 180, .stride = 960, .format = .bgra8_unorm, .allocator = allocator };
+    var partial_target = target;
+    partial_target.pixels = &partial;
+    partial_target.scratch = &scratch;
+    var tracker = try scene.DamageTracker.init(allocator, 8);
+    defer tracker.deinit();
+    tracker.paragraph_bounds = .{ .context = &resolver, .resolve = ParagraphBounds.resolve };
+    const edits = [_][]const u8{ "", "j\u{301}\u{302}", "j\u{301}\u{302} words wrap onto several lines here", "j", "", "clipped and moved", "clipped and moved" };
+    for (edits, 0..) |utf8, i| {
+        const layout = try paragraphs.acquire(.{
+            .utf8 = utf8,
+            .language = "en",
+            .logical_size = 23,
+            .max_width = 90,
+            .candidates = &.{font},
+            .configuration_revision = 1,
+        });
+        // The next comparison must not resolve the now-retired old layout.
+        defer paragraphs.release(layout) catch unreachable;
+        const commands = [_]scene.Command{
+            .{ .clear = Color.rgba(231, 239, 247, 255) },
+            .{ .push_clip_rect = .{ .x = 7, .y = 5, .width = 220, .height = 164 } },
+            .{ .paragraph = .{
+                .layout = layout,
+                .origin = .{ .x = if (i >= 5) -9.25 else 19.75, .y = if (i == 6) -18.5 else 15.25 },
+                .scale = 1.5,
+                .color = Color.rgba(70, 20, 110, if (i == 6) 120 else 255),
+            } },
+            // Moving caret must erase the old position even when text vanishes.
+            .{ .solid_rectangle = .{ .bounds = .{ .x = @intCast(21 + i * 3), .y = 16, .width = 2, .height = 34 }, .color = Color.rgba(30, 50, 90, 255) } },
+            .pop_clip,
+            // An unchanged translucent overlay still needs replay over the ink.
+            .{ .solid_rectangle = .{ .bounds = viewport, .color = Color.rgba(210, 90, 30, 17) } },
+        };
+        const damage = try tracker.compare(&commands, viewport);
+        if (i == 1) {
+            const bounds = damage.regions[0];
+            try std.testing.expect(bounds.width * bounds.height < viewport.width * viewport.height / 8);
+        }
+        try renderParagraphs(.{ .commands = &commands }, target, &glyphs, &paragraphs);
+        try renderParagraphs(.{ .commands = &commands, .damage = damage }, partial_target, &glyphs, &paragraphs);
+        try std.testing.expectEqualSlices(u8, &full, &partial);
+        tracker.submitted();
+        try std.testing.expectEqual(@as(usize, 0), (try tracker.compare(&commands, viewport)).regions.len);
+    }
+}
+
+test "software scratch is reusable across targets sizes formats and damaged loads" {
+    const allocator = std.testing.allocator;
+    var scratch: Scratch = .{};
+    defer scratch.deinit(allocator);
+    var actual: [32 * 20 * 4]u8 = undefined;
+    var expected: @TypeOf(actual) = undefined;
+    for ([_]u32{ 13, 32, 7, 31 }, 0..) |width, iteration| {
+        // Different existing presentation contents, without a leading clear:
+        // reading stale working storage instead would leak the prior target.
+        for (&actual, 0..) |*byte, i| byte.* = @intCast((i * 7 + iteration * 31) % 128);
+        expected = actual;
+        const commands = [_]scene.Command{.{ .solid_rectangle = .{
+            .bounds = .{ .x = 3, .y = 2, .width = 20, .height = 12 },
+            .color = Color.rgba(30, 170, 220, 79),
+        } }};
+        const list: scene.DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{.{ .x = 4, .y = 3, .width = 7, .height = 9 }} } };
+        const target: Target = .{ .pixels = &actual, .width = width, .height = 20, .stride = 128, .format = if (iteration % 2 == 0) .rgba8_unorm else .bgra8_unorm, .allocator = allocator, .scratch = &scratch };
+        var reference = target;
+        reference.pixels = &expected;
+        reference.scratch = null;
+        try render(list, reference);
+        try render(list, target);
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        const storage = scratch.pixels.items.ptr;
+        actual = expected;
+        try render(list, target);
+        try std.testing.expectEqual(storage, scratch.pixels.items.ptr);
+    }
 }
