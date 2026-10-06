@@ -85,7 +85,7 @@ pub const Frame = struct {
     window: WindowHandle,
     pool_generation: u32,
     slot: u8,
-    damage_regions: [1]RectI = undefined,
+    damage_regions: [scene.DamageRegions.capacity]RectI = undefined,
     damage_count: u8 = 0,
     requested_damage: DamageSummary = .full,
     damage_prepared: bool = false,
@@ -259,19 +259,18 @@ const DmabufSlot = struct {
 pub const DamageSummary = union(enum) {
     none,
     full,
-    bounds: RectI,
+    regions: scene.DamageRegions,
 };
 
 fn summarizeDamage(damage: scene.Damage, frame_bounds: RectI) DamageSummary {
     return switch (damage) {
         .full => .full,
         .regions => |regions| blk: {
-            var result: DamageSummary = .none;
-            for (regions) |region| {
-                const clipped = RectI.intersect(region, frame_bounds);
-                if (!clipped.isEmpty()) result = unionDamage(result, .{ .bounds = clipped }, frame_bounds);
-            }
-            break :blk result;
+            var result: scene.DamageRegions = .{};
+            for (regions) |region| result.add(RectI.intersect(region, frame_bounds));
+            if (result.count == 0) break :blk .none;
+            if (std.meta.eql(result.storage[0], frame_bounds)) break :blk .full;
+            break :blk .{ .regions = result };
         },
     };
 }
@@ -280,23 +279,9 @@ fn unionDamage(a: DamageSummary, b: DamageSummary, frame_bounds: RectI) DamageSu
     if (a == .full or b == .full) return .full;
     if (a == .none) return b;
     if (b == .none) return a;
-    const a_bounds = a.bounds;
-    const b_bounds = b.bounds;
-    const left = @min(a_bounds.x, b_bounds.x);
-    const top = @min(a_bounds.y, b_bounds.y);
-    const right = @max(@as(i64, a_bounds.x) + a_bounds.width, @as(i64, b_bounds.x) + b_bounds.width);
-    const bottom = @max(@as(i64, a_bounds.y) + a_bounds.height, @as(i64, b_bounds.y) + b_bounds.height);
-    const bounds: RectI = .{
-        .x = left,
-        .y = top,
-        .width = @intCast(right - left),
-        .height = @intCast(bottom - top),
-    };
-    return if (bounds.x == frame_bounds.x and bounds.y == frame_bounds.y and
-        bounds.width == frame_bounds.width and bounds.height == frame_bounds.height)
-        .full
-    else
-        .{ .bounds = bounds };
+    var result = a.regions;
+    for (b.regions.slice()) |region| result.add(region);
+    return if (std.meta.eql(result.storage[0], frame_bounds)) .full else .{ .regions = result };
 }
 
 const DamageRecord = struct {
@@ -1309,9 +1294,9 @@ pub const Host = struct {
                 frame.damage_regions[0] = bounds;
                 frame.damage_count = 1;
             },
-            .bounds => |region| {
-                frame.damage_regions[0] = region;
-                frame.damage_count = 1;
+            .regions => |regions| {
+                @memcpy(frame.damage_regions[0..regions.count], regions.slice());
+                frame.damage_count = @intCast(regions.count);
             },
         }
     }
@@ -1636,17 +1621,13 @@ pub const Host = struct {
     }
 
     fn sendSurfaceDamage(self: *Host, surface: Handle, damage: DamageSummary) !void {
-        const region = switch (damage) {
+        const full = [_]RectI{.{ .x = 0, .y = 0, .width = std.math.maxInt(i32), .height = std.math.maxInt(i32) }};
+        const regions: []const RectI = switch (damage) {
             .none => return,
-            .full => RectI{
-                .x = 0,
-                .y = 0,
-                .width = std.math.maxInt(i32),
-                .height = std.math.maxInt(i32),
-            },
-            .bounds => |bounds| bounds,
+            .full => &full,
+            .regions => |*regions| regions.slice(),
         };
-        try wayring.client.sendRequest(
+        for (regions) |region| try wayring.client.sendRequest(
             protocol.wl_surface,
             &self.connection.objects,
             try self.queue(),
@@ -4163,7 +4144,7 @@ test "Vulkan damage follows shared contents and discarded frames force repair" {
     // This presentation slot has never been used, but the working image has.
     try host.prepareFrameDamage(&frame, .{ .regions = &.{patch} });
     try std.testing.expectEqual(patch, frame.damage_regions[0]);
-    try std.testing.expectEqual(patch, frame.requested_damage.bounds);
+    try std.testing.expectEqualSlices(RectI, &.{patch}, frame.requested_damage.regions.slice());
     try renderer.renderDmabuf(.{ .commands = &.{.{ .clear = @import("../../core/color.zig").Color.rgba(255, 0, 0, 128) }} }, &pool.slots[1].target.?);
     try host.discardFrame(frame);
     try std.testing.expectEqual(@as(u64, 0), pool.last_present_serial);
@@ -4196,10 +4177,10 @@ test "direct Vulkan damage uses slot age and discard invalidates only that slot"
     try host.prepareFrameDamage(&frame, .{ .regions = &.{current} });
     try std.testing.expectEqual(full, frame.damage_regions[0]);
     pool.slots[1].last_present_serial = pool.last_present_serial;
-    pool.last_present_serial = window.damage_history.commit(.{ .bounds = earlier });
+    pool.last_present_serial = window.damage_history.commit(.{ .regions = .init(&.{earlier}) });
     try host.prepareFrameDamage(&frame, .{ .regions = &.{current} });
-    try std.testing.expectEqual(RectI{ .x = 1, .y = 2, .width = 10, .height = 4 }, frame.damage_regions[0]);
-    try std.testing.expectEqual(current, frame.requested_damage.bounds);
+    try std.testing.expectEqualSlices(RectI, &.{ earlier, current }, frame.damage().regions);
+    try std.testing.expectEqualSlices(RectI, &.{current}, frame.requested_damage.regions.slice());
     // A slot can miss a discarded submission even when the present serial did
     // not advance. Its next repaint must not trust the old age.
     if (build_options.vulkan) {
@@ -4625,12 +4606,15 @@ test "layer state owns output identity across hotplug recreation" {
 test "damage history expands a stale slot and falls back when age is unknown" {
     const bounds: RectI = .{ .x = 0, .y = 0, .width = 100, .height = 80 };
     var history: DamageHistory = .{};
-    try std.testing.expect(history.expand(0, .{ .bounds = .{ .x = 1, .y = 1, .width = 2, .height = 2 } }, bounds) == .full);
+    const first_region: RectI = .{ .x = 0, .y = 10, .width = 10, .height = 10 };
+    const earlier: RectI = .{ .x = 20, .y = 10, .width = 10, .height = 10 };
+    const current: RectI = .{ .x = 40, .y = 10, .width = 10, .height = 10 };
+    try std.testing.expect(history.expand(0, .{ .regions = .init(&.{current}) }, bounds) == .full);
 
-    const first = history.commit(.{ .bounds = .{ .x = 0, .y = 10, .width = 10, .height = 10 } });
-    _ = history.commit(.{ .bounds = .{ .x = 20, .y = 10, .width = 10, .height = 10 } });
-    const expanded = history.expand(first, .{ .bounds = .{ .x = 40, .y = 10, .width = 10, .height = 10 } }, bounds);
-    try std.testing.expectEqual(RectI{ .x = 20, .y = 10, .width = 30, .height = 10 }, expanded.bounds);
+    const first = history.commit(.{ .regions = .init(&.{first_region}) });
+    _ = history.commit(.{ .regions = .init(&.{earlier}) });
+    const expanded = history.expand(first, .{ .regions = .init(&.{current}) }, bounds);
+    try std.testing.expectEqualSlices(RectI, &.{ earlier, current }, expanded.regions.slice());
 
     _ = history.commit(.none);
     _ = history.commit(.none);
@@ -4710,11 +4694,21 @@ test "scene damage repairs alternating buffers but presents only the logical cha
         try host.prepareFrameDamage(&frame_buffer, logical);
         if (index == 1) {
             try std.testing.expect(frame_buffer.damage() == .full);
-            try std.testing.expectEqual(RectI{ .x = 2, .y = 3, .width = 14, .height = 7 }, frame_buffer.requested_damage.bounds);
+            try std.testing.expectEqualSlices(RectI, &.{
+                .{ .x = 2, .y = 3, .width = 5, .height = 7 },
+                .{ .x = 11, .y = 3, .width = 5, .height = 7 },
+            }, frame_buffer.requested_damage.regions.slice());
         }
         if (index == 2) {
-            try std.testing.expectEqual(RectI{ .x = 2, .y = 3, .width = 26, .height = 7 }, frame_buffer.damage().regions[0]);
-            try std.testing.expectEqual(RectI{ .x = 11, .y = 3, .width = 17, .height = 7 }, frame_buffer.requested_damage.bounds);
+            try std.testing.expectEqualSlices(RectI, &.{
+                .{ .x = 2, .y = 3, .width = 5, .height = 7 },
+                .{ .x = 11, .y = 3, .width = 5, .height = 7 },
+                .{ .x = 23, .y = 3, .width = 5, .height = 7 },
+            }, frame_buffer.damage().regions);
+            try std.testing.expectEqualSlices(RectI, &.{
+                .{ .x = 11, .y = 3, .width = 5, .height = 7 },
+                .{ .x = 23, .y = 3, .width = 5, .height = 7 },
+            }, frame_buffer.requested_damage.regions.slice());
         }
         try software.render(.{ .commands = current, .damage = frame_buffer.damage() }, .{
             .pixels = &buffers[slot_index],
@@ -4740,8 +4734,10 @@ test "scene damage repairs alternating buffers but presents only the logical cha
     var damage_index: usize = 0;
     const expected_damage = [_]RectI{
         .{ .x = 0, .y = 0, .width = std.math.maxInt(i32), .height = std.math.maxInt(i32) },
-        .{ .x = 2, .y = 3, .width = 14, .height = 7 },
-        .{ .x = 11, .y = 3, .width = 17, .height = 7 },
+        .{ .x = 2, .y = 3, .width = 5, .height = 7 },
+        .{ .x = 11, .y = 3, .width = 5, .height = 7 },
+        .{ .x = 11, .y = 3, .width = 5, .height = 7 },
+        .{ .x = 23, .y = 3, .width = 5, .height = 7 },
         .{ .x = 23, .y = 3, .width = 5, .height = 7 },
     };
     while (bytes.len != 0) {

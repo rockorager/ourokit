@@ -143,7 +143,7 @@ pub fn renderResources(
 ) !void {
     try target.validate();
     try list.validate();
-    var opacity = try scene.opacity.Plan.init(target.allocator, list.commands, targetBounds(target));
+    var opacity = try scene.opacity.Plan.initDamaged(target.allocator, list.commands, targetBounds(target), list.damage);
     defer opacity.deinit();
     const layer_pixels = try target.allocator.alloc(LinearRgba16, opacity.byte_size / @sizeOf(LinearRgba16));
     defer target.allocator.free(layer_pixels);
@@ -252,9 +252,17 @@ fn renderRegion(
                 .origin_x = @intCast(group.bounds.x),
                 .origin_y = @intCast(group.bounds.y),
             };
-            @memset(target.pixels, .{ .r = 0, .g = 0, .b = 0, .a = 0 });
             layer_offset += area;
             clips[depth] = RectI.intersect(clips[depth], group.bounds);
+            const clipped = clips[depth];
+            if (!clipped.isEmpty()) {
+                const left: usize = @intCast(clipped.x);
+                const top: usize = @intCast(clipped.y);
+                for (top..top + clipped.height) |y| {
+                    const start = target.pixelIndex(left, y);
+                    @memset(target.pixels[start..][0..clipped.width], .transparent);
+                }
+            }
             rounded_start = counts[depth];
         },
         .pop_opacity => {
@@ -1018,6 +1026,19 @@ test "opacity isolates overlaps nested groups erasure and split damage" {
         .{ .x = 7, .y = 0, .width = 9, .height = 12 },
     } } }, target);
     try std.testing.expectEqualSlices(u8, &expected, &pixels);
+    const patches = [_]RectI{
+        .{ .x = 3, .y = 2, .width = 3, .height = 4 },
+        .{ .x = 10, .y = 7, .width = 4, .height = 3 },
+    };
+    @memset(&pixels, 19);
+    try render(.{ .commands = &commands, .damage = .{ .regions = &patches } }, target);
+    for (0..12) |y| for (0..16) |x| {
+        const inside = (x >= 3 and x < 6 and y >= 2 and y < 6) or (x >= 10 and x < 14 and y >= 7 and y < 10);
+        const offset = (y * 16 + x) * 4;
+        if (inside) {
+            try std.testing.expectEqualSlices(u8, expected[offset..][0..4], pixels[offset..][0..4]);
+        } else try std.testing.expectEqualSlices(u8, &.{ 19, 19, 19, 19 }, pixels[offset..][0..4]);
+    };
     commands[1].push_opacity = 0;
     try render(.{ .commands = &commands }, target);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[(3 * 16 + 4) * 4 ..][0..4]);
@@ -1059,7 +1080,7 @@ test "opacity preflight rejects excess pixels and invisible missing resources wi
 
 test "opacity includes hard outset shadows beyond decorated bounds" {
     const shape: shadows.Shape = .{ .box = .{ .x = 20, .y = 30, .width = 80, .height = 60 }, .offset = .{ .x = 20, .y = 12 } };
-    const commands = [_]scene.Command{
+    var commands = [_]scene.Command{
         .{ .clear = Color.rgba(232, 238, 244, 255) },
         .{ .push_opacity = 32768 },
         .{ .shadow = .{ .shape = shape, .bounds = try shadows.deviceBounds(shape), .color = Color.rgba(32, 48, 64, 255) } },
@@ -1073,6 +1094,21 @@ test "opacity includes hard outset shadows beyond decorated bounds" {
     try render(.{ .commands = &commands }, .{ .pixels = &pixels, .width = 148, .height = 120, .stride = 148 * 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
     try std.testing.expectEqualSlices(u8, &.{ 172, 177, 184, 255 }, pixels[(60 * 148 + 110) * 4 ..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 172, 177, 184, 255 }, pixels[(100 * 148 + 60) * 4 ..][0..4]);
+    var tracker = try scene.DamageTracker.init(std.testing.allocator, commands.len);
+    defer tracker.deinit();
+    const viewport: RectI = .{ .x = 0, .y = 0, .width = 148, .height = 120 };
+    _ = try tracker.compare(&commands, viewport);
+    tracker.submitted();
+    var expected: @TypeOf(pixels) = undefined;
+    for ([_]u16{ 10000, 0, 65535 }) |opacity| {
+        commands[1].push_opacity = opacity;
+        const damage = try tracker.compare(&commands, viewport);
+        try std.testing.expectEqualSlices(RectI, &.{.{ .x = 20, .y = 30, .width = 101, .height = 73 }}, damage.regions);
+        try render(.{ .commands = &commands, .damage = damage }, .{ .pixels = &pixels, .width = 148, .height = 120, .stride = 148 * 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
+        try render(.{ .commands = &commands }, .{ .pixels = &expected, .width = 148, .height = 120, .stride = 148 * 4, .format = .rgba8_unorm, .allocator = std.testing.allocator });
+        try std.testing.expectEqualSlices(u8, &expected, &pixels);
+        tracker.submitted();
+    }
 }
 
 test "opacity applies ancestor rounded coverage once and keeps internal clips per draw" {

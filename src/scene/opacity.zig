@@ -23,6 +23,12 @@ pub const Plan = struct {
     byte_size: usize,
 
     pub fn init(allocator: std.mem.Allocator, commands: []const scene.Command, viewport: RectI) !Plan {
+        return initDamaged(allocator, commands, viewport, .full);
+    }
+
+    /// Layers are ephemeral. Allocate only the bounding extent of the damaged
+    /// portions of each group; renderers must not read the gaps between them.
+    pub fn initDamaged(allocator: std.mem.Allocator, commands: []const scene.Command, viewport: RectI, damage: scene.Damage) !Plan {
         try (scene.DisplayList{ .commands = commands }).validate();
         var count: usize = 0;
         for (commands) |command| if (command == .push_opacity) {
@@ -77,6 +83,11 @@ pub const Plan = struct {
         for (groups) |*group| {
             if (group.begin < hidden_until) group.bounds = empty;
             if (group.opacity == 0) hidden_until = @max(hidden_until, group.end);
+            if (damage == .regions) {
+                var damaged = empty;
+                for (damage.regions) |region| include(&damaged, RectI.intersect(group.bounds, region));
+                group.bounds = damaged;
+            }
             const area = std.math.mul(usize, group.bounds.width, group.bounds.height) catch return error.OpacityBudgetExceeded;
             const size = std.math.mul(usize, area, 8) catch return error.OpacityBudgetExceeded;
             if (size > max_bytes - bytes) return error.OpacityBudgetExceeded;
@@ -128,6 +139,20 @@ test "opacity plan crops overflow propagates children and excludes invisible all
     try std.testing.expectEqual(Group{ .begin = 0, .end = 7, .bounds = .{ .x = 0, .y = 5, .width = 37, .height = 26 }, .opacity = 32768 }, plan.groups[0]);
     try std.testing.expectEqual(Group{ .begin = 3, .end = 5, .bounds = commands[2].push_clip_rect, .opacity = 16384 }, plan.groups[1]);
     try std.testing.expectEqual(@as(usize, (37 * 26 + 7 * 11) * 8), plan.byte_size);
+    const patch: RectI = .{ .x = 1, .y = 6, .width = 2, .height = 3 };
+    var partial = try Plan.initDamaged(std.testing.allocator, &commands, viewport, .{ .regions = &.{patch} });
+    defer partial.deinit();
+    try std.testing.expectEqual(patch, partial.groups[0].bounds);
+    try std.testing.expect(partial.groups[1].bounds.isEmpty());
+    try std.testing.expectEqual(@as(usize, 2 * 3 * 8), partial.byte_size);
+    var none = try Plan.initDamaged(std.testing.allocator, &commands, viewport, .{ .regions = &.{} });
+    defer none.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none.byte_size);
+    var split = try Plan.initDamaged(std.testing.allocator, &commands, viewport, .{ .regions = &.{ patch, .{ .x = 31, .y = 22, .width = 3, .height = 5 } } });
+    defer split.deinit();
+    try std.testing.expectEqual(RectI{ .x = 1, .y = 6, .width = 33, .height = 21 }, split.groups[0].bounds);
+    try std.testing.expectEqual(RectI{ .x = 31, .y = 22, .width = 3, .height = 5 }, split.groups[1].bounds);
+    try std.testing.expectEqual(@as(usize, (33 * 21 + 3 * 5) * 8), split.byte_size);
     var reversed: RectI = .{ .x = 30, .y = 20, .width = 7, .height = 11 };
     include(&reversed, .{ .x = 0, .y = 5, .width = 8, .height = 9 });
     try std.testing.expectEqual(plan.groups[0].bounds, reversed);

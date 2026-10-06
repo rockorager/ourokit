@@ -688,6 +688,7 @@ const OpacityLayers = struct {
     entries: []Entry = &.{},
     pool: c.VkDescriptorPool = null,
     byte_size: usize = 0,
+    damage: scene.DamageRegions = .{},
 
     const Entry = struct {
         group: scene.opacity.Group,
@@ -698,10 +699,15 @@ const OpacityLayers = struct {
         source: c.VkDescriptorSet = null,
     };
 
-    fn init(renderer: *Renderer, commands: []const scene.Command, viewport: RectI) !OpacityLayers {
-        var plan = try scene.opacity.Plan.init(renderer.allocator, commands, viewport);
+    fn init(renderer: *Renderer, commands: []const scene.Command, viewport: RectI, damage: scene.Damage) !OpacityLayers {
+        var regions: scene.DamageRegions = .{};
+        switch (damage) {
+            .full => regions.add(viewport),
+            .regions => |values| for (values) |value| regions.add(RectI.intersect(value, viewport)),
+        }
+        var plan = try scene.opacity.Plan.initDamaged(renderer.allocator, commands, viewport, .{ .regions = regions.slice() });
         defer plan.deinit();
-        var self: OpacityLayers = .{ .byte_size = plan.byte_size };
+        var self: OpacityLayers = .{ .byte_size = plan.byte_size, .damage = regions };
         self.entries = try renderer.allocator.alloc(Entry, plan.groups.len);
         for (self.entries, plan.groups) |*entry, group| entry.* = .{
             .group = group,
@@ -748,7 +754,17 @@ const OpacityLayers = struct {
             entry.pixels = try Target.init(renderer, bounds.width, bounds.height);
             const pixels = &entry.pixels.?;
             pixels.origin = .{ bounds.x, bounds.y };
-            @memset(@as([*]u8, @ptrCast(pixels.mapping))[0..pixels.byte_size], 0);
+            const bytes = @as([*]u8, @ptrCast(pixels.mapping))[0..pixels.byte_size];
+            for (self.damage.slice()) |region| {
+                const clipped = RectI.intersect(region, bounds);
+                if (clipped.isEmpty()) continue;
+                const left: usize = @intCast(clipped.x - bounds.x);
+                const top: usize = @intCast(clipped.y - bounds.y);
+                for (top..top + clipped.height) |y| {
+                    const start = (y * bounds.width + left) * 8;
+                    @memset(bytes[start..][0 .. @as(usize, clipped.width) * 8], 0);
+                }
+            }
             var layouts = [_]c.VkDescriptorSetLayout{ renderer.descriptor_layout, renderer.atlas_descriptor_layout };
             var allocate: c.VkDescriptorSetAllocateInfo = .{
                 .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -796,7 +812,10 @@ const OpacityLayers = struct {
             const entry = &self.entries[remaining];
             if (entry.pixels) |*pixels| {
                 pixels.command_buffer = command_buffer;
-                renderer.renderRegion(commands, pixels, entry.group.bounds, glyphs, shapes, paragraphs, images, coverage, gradients, rounded, entry.destination, self, entry.body);
+                for (self.damage.slice()) |region| {
+                    const clipped = RectI.intersect(region, entry.group.bounds);
+                    if (!clipped.isEmpty()) renderer.renderRegion(commands, pixels, clipped, glyphs, shapes, paragraphs, images, coverage, gradients, rounded, entry.destination, self, entry.body);
+                }
             }
         }
         barrier.srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT;
@@ -2298,7 +2317,7 @@ pub fn renderResources(
     try list.validate();
     try validateClipDepth(list.commands, glyphs != null and shapes != null, glyphs != null and paragraphs != null);
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
-    var opacity_layers = try OpacityLayers.init(self, list.commands, bounds);
+    var opacity_layers = try OpacityLayers.init(self, list.commands, bounds, list.damage);
     defer opacity_layers.deinit(self);
     if (glyphs) |cache| try prepareText(list.commands, bounds, cache, shapes, paragraphs);
     var image_uploads = try ImageUploads.init(self, list.commands, images, target);
@@ -2488,7 +2507,10 @@ pub fn renderGraphicsResources(
     const bounds: RectI = .{ .x = 0, .y = 0, .width = target.width, .height = target.height };
     if (glyphs) |cache| try prepareText(list.commands, bounds, cache, shapes, paragraphs);
     if (!try target.ready(self)) return error.TargetBusy;
-    var opacity_layers = try OpacityLayers.init(self, list.commands, bounds);
+    // A new direct slot must also build complete opacity layers, even if the
+    // caller requested partial damage against a different presentation slot.
+    const damage: scene.Damage = if (target.direct and target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED) .full else list.damage;
+    var opacity_layers = try OpacityLayers.init(self, list.commands, bounds, damage);
     errdefer opacity_layers.deinit(self);
     var image_uploads = try ImageUploads.init(self, list.commands, images, null);
     errdefer image_uploads.deinit(self);
@@ -2580,7 +2602,6 @@ pub fn renderGraphicsResources(
 
     // A new direct slot has no contents to preserve. The opacity proof also
     // guarantees that replaying the entire scene defines every pixel.
-    const damage: scene.Damage = if (target.direct and target.layout == c.VK_IMAGE_LAYOUT_UNDEFINED) .full else list.damage;
     switch (damage) {
         .full => self.renderPresentationRegion(list.commands, target, bounds, glyphs, shapes, paragraphs, &image_uploads, &coverage_uploads, &gradient_uploads, &clip_uploads, &opacity_layers),
         .regions => |regions| for (regions) |region| {
@@ -5672,6 +5693,35 @@ test "Vulkan opacity isolates overlaps erasure and nested cropped layers" {
             for (0..12) |y| for (0..16) |x| try output.expectPixel(x, y, expected[(y * 16 + x) * 4 ..][0..4].*);
         }
     }
+    const before = expected;
+    commands[1].push_opacity = 32768;
+    try software.render(.{ .commands = &commands }, reference);
+    const partial: scene.DisplayList = .{ .commands = &commands, .damage = .{ .regions = &.{
+        .{ .x = 3, .y = 2, .width = 3, .height = 3 },
+        .{ .x = 10, .y = 7, .width = 2, .height = 2 },
+    } } };
+    try renderer.render(partial, &target);
+    try target.readPixels(&actual, 64, .rgba8_unorm);
+    for ([_]*GraphicsReadback{ &direct, &linear }) |output| {
+        try renderer.renderGraphicsResources(partial, &output.target, null, null, null, null, false);
+        try std.testing.expectEqual(@as(usize, (9 * 7 + 2 * 2) * 8), output.target.opacity_layers.byte_size);
+        try output.target.wait(&renderer);
+        for (0..12) |y| for (0..16) |x| {
+            const inside = (x >= 3 and x < 6 and y >= 2 and y < 5) or (x >= 10 and x < 12 and y >= 7 and y < 9);
+            const offset = (y * 16 + x) * 4;
+            const pixel = if (inside) expected[offset..][0..4].* else before[offset..][0..4].*;
+            try std.testing.expectEqual(pixel, actual[offset..][0..4].*);
+            try output.expectPixel(x, y, pixel);
+        };
+    }
+    // Partial input on a never-used direct image must initialize all layers
+    // as well as all final pixels, including groups outside requested damage.
+    var fresh = try GraphicsReadback.initMode(&renderer, 16, 12, null, true);
+    defer fresh.deinit(&renderer);
+    try renderer.renderGraphicsResources(partial, &fresh.target, null, null, null, null, false);
+    try std.testing.expectEqual(@as(usize, (11 * 8 + 5 * 6) * 8), fresh.target.opacity_layers.byte_size);
+    try fresh.target.wait(&renderer);
+    for (0..12) |y| for (0..16) |x| try fresh.expectPixel(x, y, expected[(y * 16 + x) * 4 ..][0..4].*);
 }
 
 test "Vulkan opacity applies ancestor clips once and inner clips per draw" {
@@ -5901,12 +5951,12 @@ test "Vulkan opacity preflight bounds budgets resources and allocation failures 
         try std.testing.checkAllAllocationFailures(std.testing.allocator, checks.check, .{ &renderer, @as([]const scene.Command, &commands), &target, output });
     const huge: scene.Command = .{ .solid_rectangle = .{ .bounds = .{ .x = 0, .y = 0, .width = 2048, .height = 2048 }, .color = Color.rgba(255, 255, 255, 255) } };
     // Three individually legal32MiB layers exceed the aggregate64MiB cap.
-    try std.testing.expectError(error.OpacityBudgetExceeded, OpacityLayers.init(&renderer, &.{ .{ .push_opacity = 1 }, .{ .push_opacity = 1 }, .{ .push_opacity = 1 }, huge, .pop_opacity, .pop_opacity, .pop_opacity }, huge.solid_rectangle.bounds));
+    try std.testing.expectError(error.OpacityBudgetExceeded, OpacityLayers.init(&renderer, &.{ .{ .push_opacity = 1 }, .{ .push_opacity = 1 }, .{ .push_opacity = 1 }, huge, .pop_opacity, .pop_opacity, .pop_opacity }, huge.solid_rectangle.bounds, .full));
     const original_limit = renderer.max_pixels;
     renderer.max_pixels = 29;
-    try std.testing.expectError(error.InvalidExtent, OpacityLayers.init(&renderer, &commands, .{ .x = 0, .y = 0, .width = 8, .height = 8 }));
+    try std.testing.expectError(error.InvalidExtent, OpacityLayers.init(&renderer, &commands, .{ .x = 0, .y = 0, .width = 8, .height = 8 }, .full));
     renderer.max_pixels = 30;
-    var exact = try OpacityLayers.init(&renderer, &commands, .{ .x = 0, .y = 0, .width = 8, .height = 8 });
+    var exact = try OpacityLayers.init(&renderer, &commands, .{ .x = 0, .y = 0, .width = 8, .height = 8 }, .full);
     try std.testing.expectEqual(@as(usize, 480), exact.byte_size);
     exact.deinit(&renderer);
     renderer.max_pixels = original_limit;

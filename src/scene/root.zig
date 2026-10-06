@@ -13,6 +13,7 @@ const shadows = @import("../shadow/root.zig");
 const paint = @import("../paint/root.zig");
 
 pub const DamageTracker = @import("damage.zig").Tracker;
+pub const DamageRegions = @import("damage.zig").Regions;
 pub const opacity = @import("opacity.zig");
 
 pub const Shadow = struct {

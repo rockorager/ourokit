@@ -84,8 +84,11 @@ native groups isolate even at opacity 65535; the Box API omits scopes at one.
 
 The shared opacity plan computes cropped device bounds from clipped draws,
 including nested groups and outset shadows. Text without a tighter clip uses
-the enclosing viewport conservatively. It limits each submission to 1024 groups,
-16 nested groups, and 64 MiB of RGBA16 layer pixels (apart from the root target).
+the enclosing viewport conservatively. Temporary layers are further cropped to
+the bounding extent of their damaged portions; only damaged rows are cleared
+and rendered, and gaps between damage regions are not sampled. The plan limits
+each submission to 1024 groups, 16 nested groups, and 64 MiB of RGBA16 layer pixels
+(apart from the root target).
 Zero-opacity groups and their descendants require no layer pixels but retain
 command validation and resource checks. Layer preflight/allocation failure leaves the
 destination unchanged. Layers are temporary, not persistent render caches.
@@ -96,7 +99,9 @@ own these buffers through their fence. No CPU raster fallback is used.
 Opacity preserves a parent's established opacity but conservatively cannot
 establish it. Occlusion lookahead stops at group boundaries. Damage snapshots
 retain group boundaries; changing group opacity or scope invalidates the
-enclosing clip, while changing an internal draw retains normal bounded damage.
+affected child extents, including nested groups and outset shadows, while changing
+an internal draw retains normal bounded damage. Software paragraph snapshots
+contribute ink bounds; unresolved text conservatively contributes its clip.
 
 Both backends avoid issuing a draw when the next non-empty draw completely
 replaces its clipped pixels. Opaque source-over rectangles, all source-mode
@@ -356,10 +361,12 @@ converted Vulkan slot uses the existing working image's history, so it does
 not require a full scene redraw. A new direct slot always reconstructs fully,
 even if requested damage is empty. Discard invalidates the converted pool's
 shared age or the affected direct slot's age, respectively.
-Regions are conservatively coalesced to one bounding rectangle. The renderer
-receives expanded damage while `wl_surface.damage_buffer` reports only the
-current visible change. Device-loss recovery, richer region coalescing, and
-larger descriptor/resource caches remain future work.
+Scene comparison and buffer history preserve up to eight disjoint rectangles.
+Overlapping rectangles merge by bounding union, rechecking for new overlaps;
+exceeding the cap conservatively coalesces the set to one bounding rectangle.
+The renderer receives expanded damage while `wl_surface.damage_buffer` reports
+only the current visible change. Device-loss recovery and larger
+descriptor/resource caches remain future work.
 
 ### Reproducing the presentation comparison
 

@@ -2,6 +2,52 @@ const std = @import("std");
 const scene = @import("root.zig");
 const RectI = @import("../core/geometry.zig").RectI;
 
+/// Small owned damage set shared by scene comparison and presentation history.
+/// Bounding merges restart intersection checks: a merge can hit a third region.
+/// The cap bounds replay and protocol costs; overflow conservatively coalesces.
+pub const Regions = struct {
+    pub const capacity = 8;
+    storage: [capacity]RectI = undefined,
+    count: usize = 0,
+
+    pub fn slice(self: *const Regions) []const RectI {
+        return self.storage[0..self.count];
+    }
+
+    pub fn init(values: []const RectI) Regions {
+        var result: Regions = .{};
+        for (values) |value| result.add(value);
+        return result;
+    }
+
+    pub fn add(self: *Regions, value: RectI) void {
+        if (value.isEmpty()) return;
+        var merged: ?RectI = value;
+        var i: usize = 0;
+        while (i < self.count) {
+            if (RectI.intersect(self.storage[i], merged.?).isEmpty()) {
+                i += 1;
+                continue;
+            }
+            include(&merged, self.storage[i]);
+            self.count -= 1;
+            std.mem.copyForwards(RectI, self.storage[i..self.count], self.storage[i + 1 .. self.count + 1]);
+            i = 0;
+        }
+        if (self.count == capacity) {
+            for (self.slice()) |region| include(&merged, region);
+            self.count = 0;
+        }
+        self.storage[self.count] = merged.?;
+        self.count += 1;
+        std.mem.sort(RectI, self.storage[0..self.count], {}, struct {
+            fn less(_: void, a: RectI, b: RectI) bool {
+                return a.y < b.y or (a.y == b.y and a.x < b.x);
+            }
+        }.less);
+    }
+};
+
 /// Compares complete scenes with the last successfully submitted scene, not
 /// the last build. Snapshots compare values only: handles are generation checked
 /// and paths carry unique identities. Old bounds never resolve old resources.
@@ -49,7 +95,10 @@ pub const Tracker = struct {
 
         fn equal(a: Draw, b: Draw) bool {
             // Snapshot offsets may differ after earlier paragraphs change.
-            return std.meta.eql(a.command, b.command) and std.meta.eql(a.clip, b.clip) and std.meta.eql(a.bounds, b.bounds);
+            if (!std.meta.eql(a.command, b.command) or !std.meta.eql(a.clip, b.clip)) return false;
+            // Child edits own their damage. Updated aggregate bounds alone do
+            // not turn an unchanged group boundary into a whole-group repaint.
+            return a.command == .push_opacity or a.command == .pop_opacity or std.meta.eql(a.bounds, b.bounds);
         }
     };
 
@@ -62,7 +111,7 @@ pub const Tracker = struct {
     candidate_count: usize = 0,
     previous_viewport: ?RectI = null,
     candidate_viewport: RectI = undefined,
-    region: [1]RectI = undefined,
+    regions: Regions = .{},
     /// Optional backend ink bounds. Without a resolver, text damages its clip.
     /// Resolve only current resources; submitted snapshots own their bounds.
     paragraph_bounds: ?struct {
@@ -107,12 +156,26 @@ pub const Tracker = struct {
         clips[0] = viewport;
         var rounded = [_]bool{false} ** (scene.max_clip_depth + 1);
         var depth: usize = 0;
+        var groups: [scene.max_opacity_depth]struct { draw: usize, bounds: ?RectI = null } = undefined;
+        var group_depth: usize = 0;
+        const empty: RectI = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
         for (commands) |command| {
             var clip_change: ?RectI = null;
             switch (command) {
-                // Group boundaries conservatively damage their enclosing clip:
-                // children and outset shadows may exceed the Box's layout bounds.
-                .push_opacity, .pop_opacity => clip_change = clips[depth],
+                .push_opacity => {
+                    if (group_depth == groups.len) return error.OpacityStackOverflow;
+                    groups[group_depth] = .{ .draw = self.candidate_count };
+                    group_depth += 1;
+                    clip_change = empty;
+                },
+                .pop_opacity => {
+                    if (group_depth == 0) return error.UnbalancedOpacityStack;
+                    group_depth -= 1;
+                    const group = groups[group_depth];
+                    clip_change = group.bounds orelse empty;
+                    self.candidate[group.draw].bounds = clip_change.?;
+                    if (group_depth != 0) include(&groups[group_depth - 1].bounds, clip_change.?);
+                },
                 .push_clip_rect => |clip| {
                     if (depth == scene.max_clip_depth) return error.ClipStackOverflow;
                     depth += 1;
@@ -168,9 +231,12 @@ pub const Tracker = struct {
                 .clear, .glyph_run => clips[depth],
                 else => unreachable,
             };
+            // Only actual paint contributes, not clip-boundary bookkeeping.
+            // Child ink includes overflow and shadows, including nested groups.
+            if (group_depth != 0 and clip_change == null) include(&groups[group_depth - 1].bounds, bounds);
             // Keep empty paragraph snapshots aligned when text appears or is
             // deleted, rather than treating those edits as command insertion.
-            if (bounds.isEmpty() and !has_lines) continue;
+            if (bounds.isEmpty() and !has_lines and command != .push_opacity and command != .pop_opacity) continue;
             if (self.candidate_count == self.candidate.len) return error.SceneCapacityExceeded;
             self.candidate[self.candidate_count] = .{
                 .command = command,
@@ -181,6 +247,7 @@ pub const Tracker = struct {
             self.candidate_count += 1;
         }
         if (depth != 0) return error.UnbalancedClipStack;
+        if (group_depth != 0) return error.UnbalancedOpacityStack;
         if (self.previous_viewport == null or !std.meta.eql(self.previous_viewport.?, viewport)) return .full;
 
         const old = self.previous[0..self.previous_count];
@@ -196,29 +263,25 @@ pub const Tracker = struct {
         // Compare aligned draws inside the changed middle too. Insertions and
         // removals retain the conservative union; do not match across a reorder.
         // Unchanged draws are still replayed inside damage for composition.
-        var bounds: ?RectI = null;
+        self.regions = .{};
         if (old_end - start == new_end - start) {
             for (old[start..old_end], new[start..new_end]) |before, after| {
                 if (Draw.equal(before, after)) continue;
                 if (before.lines != null and after.lines != null and std.meta.eql(before.clip, after.clip)) {
-                    self.compareLines(&bounds, before.lines.?, after.lines.?);
+                    self.compareLines(before.lines.?, after.lines.?);
                     continue;
                 }
-                include(&bounds, before.bounds);
-                include(&bounds, after.bounds);
+                self.regions.add(before.bounds);
+                self.regions.add(after.bounds);
             }
         } else {
-            for (old[start..old_end]) |draw| include(&bounds, draw.bounds);
-            for (new[start..new_end]) |draw| include(&bounds, draw.bounds);
+            for (old[start..old_end]) |draw| self.regions.add(draw.bounds);
+            for (new[start..new_end]) |draw| self.regions.add(draw.bounds);
         }
-        if (bounds) |value| {
-            self.region[0] = value;
-            return .{ .regions = &self.region };
-        }
-        return .{ .regions = &.{} };
+        return .{ .regions = self.regions.slice() };
     }
 
-    fn compareLines(self: *const Tracker, bounds: *?RectI, before: LineRange, after: LineRange) void {
+    fn compareLines(self: *Tracker, before: LineRange, after: LineRange) void {
         const old = self.previous_text.lines.items[before.first..][0..before.count];
         const new = self.candidate_text.lines.items[after.first..][0..after.count];
         const paired = @min(old.len, new.len);
@@ -231,11 +294,11 @@ pub const Tracker = struct {
                 break :equal true;
             };
             if (equal) continue;
-            include(bounds, a.bounds);
-            include(bounds, b.bounds);
+            self.regions.add(a.bounds);
+            self.regions.add(b.bounds);
         }
-        for (old[paired..]) |line| include(bounds, line.bounds);
-        for (new[paired..]) |line| include(bounds, line.bounds);
+        for (old[paired..]) |line| self.regions.add(line.bounds);
+        for (new[paired..]) |line| self.regions.add(line.bounds);
     }
 
     /// Only advance history after the backend accepts the candidate scene.
@@ -263,6 +326,46 @@ fn include(result: *?RectI, value: RectI) void {
     };
 }
 
+test "damage regions merge transitively and bound fragmentation without losing coverage" {
+    var regions = Regions.init(&.{
+        .{ .x = 5, .y = 0, .width = 2, .height = 1 },
+        .{ .x = 0, .y = 5, .width = 10, .height = 2 },
+    });
+    try std.testing.expectEqual(@as(usize, 2), regions.count);
+    regions.add(.{ .x = 0, .y = 0, .width = 2, .height = 6 });
+    try std.testing.expectEqualSlices(RectI, &.{.{ .x = 0, .y = 0, .width = 10, .height = 7 }}, regions.slice());
+    regions = .{};
+    for (0..Regions.capacity) |i| regions.add(.{ .x = @intCast(i * 3), .y = 9, .width = 1, .height = 1 });
+    try std.testing.expectEqual(@as(usize, Regions.capacity), regions.count);
+    regions.add(.{ .x = 24, .y = 9, .width = 1, .height = 1 });
+    try std.testing.expectEqualSlices(RectI, &.{.{ .x = 0, .y = 9, .width = 25, .height = 1 }}, regions.slice());
+
+    // Check every added pixel remains covered exactly once, including bounding
+    // merges that create intersections and repeated overflow of the cap.
+    var random = std.Random.DefaultPrng.init(0x726567696f6e);
+    var covered = [_]bool{false} ** (32 * 24);
+    regions = .{};
+    for (0..200) |_| {
+        const rect: RectI = .{
+            .x = random.random().intRangeLessThan(i32, 0, 28),
+            .y = random.random().intRangeLessThan(i32, 0, 20),
+            .width = random.random().intRangeAtMost(u32, 0, 4),
+            .height = random.random().intRangeAtMost(u32, 0, 4),
+        };
+        regions.add(rect);
+        for (0..24) |y| for (0..32) |x| {
+            const pixel: RectI = .{ .x = @intCast(x), .y = @intCast(y), .width = 1, .height = 1 };
+            covered[y * 32 + x] = covered[y * 32 + x] or !RectI.intersect(rect, pixel).isEmpty();
+            var count: usize = 0;
+            for (regions.slice()) |region| if (!RectI.intersect(region, pixel).isEmpty()) {
+                count += 1;
+            };
+            try std.testing.expect(count <= 1);
+            if (covered[y * 32 + x]) try std.testing.expectEqual(@as(usize, 1), count);
+        };
+    }
+}
+
 test "aligned changes exclude unchanged middle draws but preserve reorders" {
     const viewport: RectI = .{ .x = 0, .y = 0, .width = 100, .height = 80 };
     const small: RectI = .{ .x = 7, .y = 11, .width = 13, .height = 9 };
@@ -277,7 +380,7 @@ test "aligned changes exclude unchanged middle draws but preserve reorders" {
     tracker.submitted();
     commands[0].solid_rectangle.color.g = 75;
     commands[2].solid_rectangle.bounds.x = 24;
-    try std.testing.expectEqualSlices(RectI, &.{.{ .x = 7, .y = 11, .width = 30, .height = 9 }}, (try tracker.compare(&commands, viewport)).regions);
+    try std.testing.expectEqualSlices(RectI, &.{ small, .{ .x = 24, .y = 11, .width = 13, .height = 9 } }, (try tracker.compare(&commands, viewport)).regions);
     tracker.submitted();
     std.mem.swap(scene.Command, &commands[0], &commands[1]);
     try std.testing.expectEqualSlices(RectI, &.{viewport}, (try tracker.compare(&commands, viewport)).regions);
@@ -303,10 +406,16 @@ test "scene damage includes old and new clipped bounds since submission" {
     try std.testing.expectEqual(@as(usize, 0), (try tracker.compare(&commands, viewport)).regions.len);
 
     commands[2].solid_rectangle.bounds.x = 25;
-    try std.testing.expectEqual(RectI{ .x = 10, .y = 10, .width = 27, .height = 9 }, (try tracker.compare(&commands, viewport)).regions[0]);
+    try std.testing.expectEqualSlices(RectI, &.{
+        .{ .x = 10, .y = 10, .width = 7, .height = 9 },
+        .{ .x = 25, .y = 10, .width = 12, .height = 9 },
+    }, (try tracker.compare(&commands, viewport)).regions);
     // This candidate was never presented; damage is still relative to x=5.
     commands[2].solid_rectangle.bounds.x = 45;
-    try std.testing.expectEqual(RectI{ .x = 10, .y = 10, .width = 47, .height = 9 }, (try tracker.compare(&commands, viewport)).regions[0]);
+    try std.testing.expectEqualSlices(RectI, &.{
+        .{ .x = 10, .y = 10, .width = 7, .height = 9 },
+        .{ .x = 45, .y = 10, .width = 12, .height = 9 },
+    }, (try tracker.compare(&commands, viewport)).regions);
     tracker.submitted();
     const removed = [_]scene.Command{ commands[0], commands[4] };
     try std.testing.expectEqual(RectI{ .x = 45, .y = 10, .width = 12, .height = 9 }, (try tracker.compare(&removed, viewport)).regions[0]);
@@ -370,7 +479,37 @@ test "rounded clip radius and scope changes damage otherwise unchanged draws" {
     try std.testing.expectEqualSlices(RectI, &.{bounds}, (try tracker.compare(&removed, viewport)).regions);
 }
 
-test "opacity changes and moved group boundaries invalidate the enclosing clip" {
+test "opacity damage follows child extents without inflating internal edits" {
+    const viewport: RectI = .{ .x = 0, .y = 0, .width = 100, .height = 80 };
+    const small: RectI = .{ .x = 5, .y = 7, .width = 8, .height = 6 };
+    const distant: RectI = .{ .x = 60, .y = 50, .width = 9, .height = 11 };
+    var commands = [_]scene.Command{
+        .{ .push_opacity = 32768 },
+        .{ .solid_rectangle = .{ .bounds = small, .color = .rgba(255, 0, 0, 255) } },
+        .{ .push_opacity = 16384 },
+        .{ .solid_rectangle = .{ .bounds = distant, .color = .rgba(0, 255, 0, 255) } },
+        .pop_opacity,
+        .pop_opacity,
+    };
+    var tracker = try Tracker.init(std.testing.allocator, commands.len);
+    defer tracker.deinit();
+    _ = try tracker.compare(&commands, viewport);
+    tracker.submitted();
+    commands[0].push_opacity = 12345;
+    try std.testing.expectEqualSlices(RectI, &.{.{ .x = 5, .y = 7, .width = 64, .height = 54 }}, (try tracker.compare(&commands, viewport)).regions);
+    commands[0].push_opacity = 32768;
+    commands[2].push_opacity = 0;
+    try std.testing.expectEqualSlices(RectI, &.{distant}, (try tracker.compare(&commands, viewport)).regions);
+    commands[2].push_opacity = 16384;
+    commands[1].solid_rectangle.bounds.x = 20;
+    try std.testing.expectEqualSlices(RectI, &.{ small, .{ .x = 20, .y = 7, .width = 8, .height = 6 } }, (try tracker.compare(&commands, viewport)).regions);
+    // Moving a boundary must invalidate the child that changes isolation.
+    commands[1].solid_rectangle.bounds = small;
+    std.mem.swap(scene.Command, &commands[3], &commands[4]);
+    try std.testing.expectEqualSlices(RectI, &.{distant}, (try tracker.compare(&commands, viewport)).regions);
+}
+
+test "opacity changes and moved group boundaries respect the enclosing clip" {
     const Color = @import("../core/color.zig").Color;
     const viewport: RectI = .{ .x = 0, .y = 0, .width = 60, .height = 40 };
     const clip: RectI = .{ .x = 4, .y = 3, .width = 25, .height = 20 };
