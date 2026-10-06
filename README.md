@@ -376,8 +376,8 @@ Inter for reproducibility, not Folio's system-dependent `serif` font. Pixel
 checks verify visible text, cold/warm equality, scrolling, and damage isolation.
 Frame timings exclude shaping/layout, validation, Lua, Wayland, and compositor
 latency; `perf` covers the whole process, so use enough frames to amortize setup.
-`typing` times edit/layout/scene separately, then compares clip-based damage with
-temporary working storage against raster-ink damage with reused storage. It
+`typing` times edit/layout/scene separately, then compares whole-paragraph ink
+damage against changed-line ink damage, both with reused working storage. It
 checks identical output after every character and reports damaged pixel counts.
 It does not simulate compositor backpressure or presentation-buffer age.
 These are CPU measurements, not an end-to-end CPU/GPU comparison.

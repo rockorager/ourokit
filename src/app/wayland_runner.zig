@@ -1171,7 +1171,7 @@ fn runSourceInternal(
             if (!slot.desired or !slot.runtime.registered) continue;
             if (slot.runtime.wantsSubmission()) {
                 slot.runtime.damage_tracker.paragraph_bounds = if (host.presentationBackend() == .shared_memory)
-                    .{ .context = &paragraph_bounds, .resolve = renderer.software.ParagraphBounds.resolve }
+                    .{ .context = &paragraph_bounds, .resolve = renderer.software.ParagraphBounds.resolve, .snapshot = renderer.software.ParagraphBounds.snapshot }
                 else
                     null;
                 try host.prepareScene(slot.runtime.window, try slot.runtime.displayList());

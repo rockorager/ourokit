@@ -190,15 +190,19 @@ fn typing(allocator: std.mem.Allocator, fonts: *ouro.text.FontCache, paragraphs:
     defer old_glyphs.deinit();
     var new_glyphs = try software.GlyphCache.init(allocator, fonts);
     defer new_glyphs.deinit();
+    var old_resolver: software.ParagraphBounds = .{ .glyphs = &old_glyphs, .paragraphs = paragraphs };
+    old_tracker.paragraph_bounds = .{ .context = &old_resolver, .resolve = software.ParagraphBounds.resolve };
     var resolver: software.ParagraphBounds = .{ .glyphs = &new_glyphs, .paragraphs = paragraphs };
-    new_tracker.paragraph_bounds = .{ .context = &resolver, .resolve = software.ParagraphBounds.resolve };
+    new_tracker.paragraph_bounds = .{ .context = &resolver, .resolve = software.ParagraphBounds.resolve, .snapshot = software.ParagraphBounds.snapshot };
     var scratch: software.Scratch = .{};
     defer scratch.deinit(std.heap.page_allocator);
+    var old_scratch: software.Scratch = .{};
+    defer old_scratch.deinit(std.heap.page_allocator);
     const old_pixels = try allocator.alloc(u8, 960 * 760 * scale * scale * 4);
     defer allocator.free(old_pixels);
     const new_pixels = try allocator.alloc(u8, old_pixels.len);
     defer allocator.free(new_pixels);
-    const target: software.Target = .{ .pixels = old_pixels, .width = 960 * scale, .height = 760 * scale, .stride = 960 * scale * 4, .format = .bgra8_unorm };
+    const target: software.Target = .{ .pixels = old_pixels, .width = 960 * scale, .height = 760 * scale, .stride = 960 * scale * 4, .format = .bgra8_unorm, .scratch = &old_scratch };
     var new_target = target;
     new_target.pixels = new_pixels;
     new_target.scratch = &scratch;
@@ -247,7 +251,7 @@ fn typing(allocator: std.mem.Allocator, fonts: *ouro.text.FontCache, paragraphs:
         try std.testing.expectEqualSlices(u8, old_pixels, new_pixels);
     }
     const divisor = @as(f64, @floatFromInt(frames));
-    std.debug.print("typing {d} keys: edit/layout/scene {d:.3} ms; damage+render old {d:.3} -> new {d:.3} ms; mean damaged pixels {d} -> {d}; identical pixels\n", .{
+    std.debug.print("typing {d} keys: edit/layout/scene {d:.3} ms; damage+render paragraph {d:.3} -> line {d:.3} ms; mean damaged pixels {d} -> {d}; identical pixels\n", .{
         frames,                                             @as(f64, @floatFromInt(totals[0])) / divisor / 1e6,
         @as(f64, @floatFromInt(totals[1])) / divisor / 1e6, @as(f64, @floatFromInt(totals[2])) / divisor / 1e6,
         areas[0] / frames,                                  areas[1] / frames,

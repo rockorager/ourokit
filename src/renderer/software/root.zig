@@ -49,7 +49,13 @@ pub const ParagraphBounds = struct {
     pub fn resolve(context: *anyopaque, command: scene.Paragraph, clip: RectI) !RectI {
         if (!has_freetype) return error.FreeTypeDisabled;
         const self: *ParagraphBounds = @ptrCast(@alignCast(context));
-        return rasterParagraph(command, null, clip, self.glyphs, self.paragraphs);
+        return rasterParagraph(command, null, clip, self.glyphs, self.paragraphs, null);
+    }
+
+    pub fn snapshot(context: *anyopaque, command: scene.Paragraph, clip: RectI, output: *scene.DamageTracker.ParagraphSnapshot) !RectI {
+        if (!has_freetype) return error.FreeTypeDisabled;
+        const self: *ParagraphBounds = @ptrCast(@alignCast(context));
+        return rasterParagraph(command, null, clip, self.glyphs, self.paragraphs, output);
     }
 };
 
@@ -341,6 +347,7 @@ fn renderRegion(
                 clips[depth],
                 glyphs orelse return error.TextResourcesRequired,
                 paragraphs orelse return error.TextResourcesRequired,
+                null,
             );
         },
     };
@@ -384,50 +391,68 @@ fn rasterParagraph(
     clip: RectI,
     cache: *GlyphCache,
     paragraphs: *const text.ParagraphCache,
+    snapshot: ?*scene.DamageTracker.ParagraphSnapshot,
 ) !RectI {
     var ink: RectI = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
     if (clip.isEmpty()) return ink;
     const layout = try paragraphs.get(command.layout);
     for (layout.positioned.lines) |line| {
+        var line_ink: RectI = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+        const first = if (snapshot) |output| output.glyphs.items.len else 0;
         const baseline = command.origin.y + (line.top + line.baseline) * command.scale;
         for (layout.positioned.spansFor(line)) |span| {
             for (layout.positioned.glyphsFor(span)) |glyph| {
-                const position = GlyphPosition.init(
-                    command.origin.x + (line.left + glyph.origin.x) * command.scale,
-                    baseline + glyph.origin.y * command.scale,
-                );
+                const origin: @import("../../core/geometry.zig").PointF = .{
+                    .x = command.origin.x + (line.left + glyph.origin.x) * command.scale,
+                    .y = baseline + glyph.origin.y * command.scale,
+                };
+                const position = GlyphPosition.init(origin.x, origin.y);
+                const size = (span.logical_size orelse layout.logical_size) * command.scale;
+                const color = span.color orelse command.color;
                 const bitmap = try cache.getPhase(
                     span.font,
                     glyph.id,
-                    (span.logical_size orelse layout.logical_size) * command.scale,
+                    size,
                     position.phase,
                 );
                 const x = position.x + bitmap.left;
                 const y = position.y - bitmap.top;
                 if (target) |output| {
-                    drawMask(output, clip, x, y, bitmap, span.color orelse command.color);
+                    drawMask(output, clip, x, y, bitmap, color);
                 } else {
                     const bounds = RectI.intersect(clip, .{ .x = x, .y = y, .width = bitmap.width, .height = bitmap.height });
                     if (bounds.isEmpty()) continue;
-                    if (ink.isEmpty()) {
-                        ink = bounds;
-                    } else {
-                        const left = @min(ink.x, bounds.x);
-                        const top = @min(ink.y, bounds.y);
-                        const right = @max(@as(i64, ink.x) + ink.width, @as(i64, bounds.x) + bounds.width);
-                        const bottom = @max(@as(i64, ink.y) + ink.height, @as(i64, bounds.y) + bounds.height);
-                        ink = .{
-                            .x = left,
-                            .y = top,
-                            .width = @intCast(right - left),
-                            .height = @intCast(bottom - top),
-                        };
-                    }
+                    line_ink = unionInk(line_ink, bounds);
+                    if (snapshot) |output| try output.glyphs.append(output.allocator, .{
+                        .font = span.font,
+                        .id = glyph.id,
+                        .origin = origin,
+                        .size = size,
+                        .color = color,
+                    });
                 }
             }
         }
+        ink = unionInk(ink, line_ink);
+        if (!line_ink.isEmpty()) {
+            if (snapshot) |output| try output.lines.append(output.allocator, .{
+                .bounds = line_ink,
+                .first = first,
+                .count = output.glyphs.items.len - first,
+            });
+        }
     }
     return ink;
+}
+
+fn unionInk(a: RectI, b: RectI) RectI {
+    if (a.isEmpty()) return b;
+    if (b.isEmpty()) return a;
+    const left = @min(a.x, b.x);
+    const top = @min(a.y, b.y);
+    const right = @max(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width);
+    const bottom = @max(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height);
+    return .{ .x = left, .y = top, .width = @intCast(right - left), .height = @intCast(bottom - top) };
 }
 
 fn drawMask(
@@ -1182,14 +1207,57 @@ test "paragraph ink damage replays edits wrapping deletion and fractional scroll
     partial_target.scratch = &scratch;
     var tracker = try scene.DamageTracker.init(allocator, 8);
     defer tracker.deinit();
-    tracker.paragraph_bounds = .{ .context = &resolver, .resolve = ParagraphBounds.resolve };
-    const edits = [_][]const u8{ "", "j\u{301}\u{302}", "j\u{301}\u{302} words wrap onto several lines here", "j", "", "clipped and moved", "clipped and moved" };
-    for (edits, 0..) |utf8, i| {
+    tracker.paragraph_bounds = .{ .context = &resolver, .resolve = ParagraphBounds.resolve, .snapshot = ParagraphBounds.snapshot };
+    const Edit = struct {
+        utf8: []const u8,
+        origin: @import("../../core/geometry.zig").PointF = .{ .x = 19.75, .y = 15.25 },
+        color: Color = .rgba(70, 20, 110, 255),
+        size: f32 = 23,
+        width: f32 = 90,
+        clip_height: u32 = 164,
+        last_line_only: bool = false,
+        submit: bool = true,
+    };
+    const edits = [_]Edit{
+        .{ .utf8 = "" },
+        .{ .utf8 = "j\u{301}\u{302}" },
+        .{ .utf8 = "j\u{301}\u{302} words wrap onto several lines here" },
+        .{ .utf8 = "j" },
+        .{ .utf8 = "" },
+        .{ .utf8 = "clipped and moved", .origin = .{ .x = -9.25, .y = 15.25 } },
+        .{ .utf8 = "clipped and moved", .origin = .{ .x = -9.25, .y = -18.5 }, .color = .rgba(70, 20, 110, 120) },
+        .{ .utf8 = "alpha\nbravo\ncat" },
+        .{ .utf8 = "alpha\nbravo\ncats", .last_line_only = true },
+        // Same ink extents can still contain different glyphs (tabular digits).
+        .{ .utf8 = "alpha\nbravo\n123" },
+        .{ .utf8 = "alpha\nbravo\n321", .last_line_only = true },
+        .{ .utf8 = "alpha\nbravo\n321", .color = .rgba(20, 110, 70, 120) },
+        .{ .utf8 = "alpha\nbravo\n321", .size = 19 },
+        .{ .utf8 = "alpha\nbravo\n321", .width = 55 },
+        .{ .utf8 = "alpha\n\nbravo\n321" },
+        .{ .utf8 = "alpha\nbravo\n321", .clip_height = 75 },
+        .{ .utf8 = "alpha\nbravo\n321" },
+        // A discarded candidate must never replace submitted line contents.
+        .{ .utf8 = "discarded candidate", .submit = false },
+        .{ .utf8 = "alpha\nbravo\n32", .last_line_only = true },
+        .{ .utf8 = "alpha\nbravo", .last_line_only = true },
+        .{ .utf8 = "" },
+    };
+    const label = try paragraphs.acquire(.{
+        .utf8 = "fixed",
+        .language = "en",
+        .logical_size = 12,
+        .max_width = 80,
+        .candidates = &.{font},
+        .configuration_revision = 1,
+    });
+    defer paragraphs.release(label) catch unreachable;
+    for (edits, 0..) |edit, i| {
         const layout = try paragraphs.acquire(.{
-            .utf8 = utf8,
+            .utf8 = edit.utf8,
             .language = "en",
-            .logical_size = 23,
-            .max_width = 90,
+            .logical_size = edit.size,
+            .max_width = edit.width,
             .candidates = &.{font},
             .configuration_revision = 1,
         });
@@ -1197,20 +1265,30 @@ test "paragraph ink damage replays edits wrapping deletion and fractional scroll
         defer paragraphs.release(layout) catch unreachable;
         const commands = [_]scene.Command{
             .{ .clear = Color.rgba(231, 239, 247, 255) },
-            .{ .push_clip_rect = .{ .x = 7, .y = 5, .width = 220, .height = 164 } },
+            .{ .push_clip_rect = .{ .x = 7, .y = 5, .width = 220, .height = edit.clip_height } },
             .{ .paragraph = .{
                 .layout = layout,
-                .origin = .{ .x = if (i >= 5) -9.25 else 19.75, .y = if (i == 6) -18.5 else 15.25 },
+                .origin = edit.origin,
                 .scale = 1.5,
-                .color = Color.rgba(70, 20, 110, if (i == 6) 120 else 255),
+                .color = edit.color,
             } },
+            // An unchanged large draw between two changes must not inflate damage.
+            .{ .solid_rectangle = .{ .bounds = viewport, .color = Color.rgba(210, 90, 30, 17) } },
             // Moving caret must erase the old position even when text vanishes.
-            .{ .solid_rectangle = .{ .bounds = .{ .x = @intCast(21 + i * 3), .y = 16, .width = 2, .height = 34 }, .color = Color.rgba(30, 50, 90, 255) } },
+            .{ .solid_rectangle = .{ .bounds = .{ .x = 21 + @as(i32, @intCast(@min(i, 7))) * 3, .y = 16, .width = 2, .height = 34 }, .color = Color.rgba(30, 50, 90, 255) } },
             .pop_clip,
+            // Earlier text changes the offsets of this reused snapshot.
+            .{ .paragraph = .{ .layout = label, .origin = .{ .x = 184, .y = 12 }, .scale = 1, .color = .rgba(0, 0, 0, 255) } },
             // An unchanged translucent overlay still needs replay over the ink.
             .{ .solid_rectangle = .{ .bounds = viewport, .color = Color.rgba(210, 90, 30, 17) } },
         };
         const damage = try tracker.compare(&commands, viewport);
+        if (!edit.submit) continue;
+        if (edit.last_line_only) {
+            try std.testing.expectEqual(@as(usize, 1), damage.regions.len);
+            // The first two lines are unchanged; whole-paragraph damage fails.
+            try std.testing.expect(damage.regions[0].y > 75);
+        }
         if (i == 1) {
             const bounds = damage.regions[0];
             try std.testing.expect(bounds.width * bounds.height < viewport.width * viewport.height / 8);
