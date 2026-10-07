@@ -32,6 +32,9 @@ const Job = struct {
     id: u64,
     auth: *native.Auth,
     operation: ?io.OperationHandle = null,
+    /// Ties the whole conversation, not just a pending `next()`, to the scope
+    /// of the task that started it, so exiting that scope stops PAM.
+    resource: ?task.ResourceHandle = null,
     task_handle: vm_module.TaskHandle = .invalid,
     signal: [1]u8 = undefined,
     closed: bool = false,
@@ -127,6 +130,7 @@ pub const Binding = struct {
     fn collectFinished(self: *Binding) void {
         for (&self.jobs) |*slot| if (slot.*) |job| if (job.closed and !job.waiting and !job.resumed and job.operation == null and native.ouro_auth_done(job.auth) != 0) {
             if (job.userdata) |ud| ud.job = null;
+            if (job.resource) |resource| self.vm.scheduler.destroyResource(resource) catch unreachable;
             native.ouro_auth_join_destroy(job.auth);
             self.allocator.destroy(job);
             slot.* = null;
@@ -140,6 +144,8 @@ fn start(L: *c.State) callconv(.c) c_int {
     const service = checked(L, 1, max_service_bytes) orelse return failure(L, "InvalidService");
     for (service) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return failure(L, "InvalidService");
     const user = checked(L, 2, max_user_bytes) orelse return failure(L, "InvalidUsername");
+    const scope = self.vm.currentScope(L) catch return failure(L, "AuthRequiresTask");
+    if (!(self.vm.scheduler.scopeAcceptsResources(scope) catch false)) return failure(L, "ScopeCanceled");
     const slot = for (&self.jobs) |*s| if (s.* == null) break s else continue else return failure(L, "AuthBusy");
     var sbuf: [max_service_bytes + 1]u8 = undefined;
     var ubuf: [max_user_bytes + 1]u8 = undefined;
@@ -157,6 +163,11 @@ fn start(L: *c.State) callconv(.c) c_int {
         return failure(L, "AuthUnavailable");
     };
     job.* = .{ .owner = self, .auth = handle, .id = self.next_id };
+    job.resource = self.vm.scheduler.registerResource(scope, .service, job, &lifecycle) catch {
+        native.ouro_auth_join_destroy(handle);
+        self.allocator.destroy(job);
+        return failure(L, "ResourceCapacityExceeded");
+    };
     self.next_id += 1;
     slot.* = job;
     ud.job = job;
@@ -164,6 +175,7 @@ fn start(L: *c.State) callconv(.c) c_int {
     job.operation = self.loop.prepareRead(native.ouro_auth_fd(handle), &job.signal, std.math.maxInt(u64)) catch {
         ud.job = null;
         slot.* = null;
+        self.vm.scheduler.destroyResource(job.resource.?) catch unreachable;
         native.ouro_auth_join_destroy(handle);
         self.allocator.destroy(job);
         return failure(L, "CouldNotPrepare");
@@ -307,4 +319,50 @@ fn respondSecret(context: *anyopaque, id: u64, prompt: u64, bytes: []const u8) b
         return native.ouro_auth_respond(job.auth, prompt, bytes.ptr, bytes.len) == 1;
     };
     return false;
+}
+
+test "auth conversations need a running task whose scope is still open" {
+    // Both checks run before any PAM worker is created. The live worker path,
+    // which re-executes the host binary, is covered by tests/auth_native.py.
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 2, 2);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 2);
+    defer loop.deinit();
+    var vm: vm_module.Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    var binding: Binding = undefined;
+    try binding.init(std.testing.allocator, &vm, &loop);
+    defer binding.deinit();
+
+    vm.pushApi(vm.state);
+    _ = c.lua_getfield(vm.state, -1, "auth");
+    _ = c.lua_getfield(vm.state, -1, "start");
+    _ = c.lua_pushstring(vm.state, "login");
+    _ = c.lua_pushstring(vm.state, "nobody");
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(vm.state, 2, 2, 0, 0, null));
+    var length: usize = 0;
+    try std.testing.expectEqualStrings("AuthRequiresTask", c.lua_tolstring(vm.state, -1, &length).?[0..length]);
+    c.lua_settop(vm.state, 0);
+
+    c.lua_pushcclosure(vm.state, exitOwnScopeForTest, 0);
+    c.lua_setglobal(vm.state, "exit_own_state");
+    const state = try vm.openScope(scheduler.application_scope);
+    _ = try vm.spawn(state,
+        \\exit_own_state()
+        \\local conversation, err = require('ouro').auth.start('login', 'nobody')
+        \\canceled_ok = conversation == nil and err == 'ScopeCanceled'
+    );
+    try std.testing.expectEqual(vm_module.ResumeResult.completed, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("canceled_ok"));
+    try std.testing.expect(!scheduler.scopeAlive(state));
+    for (binding.jobs) |job| try std.testing.expect(job == null);
+}
+
+fn exitOwnScopeForTest(state: *c.State) callconv(.c) c_int {
+    const vm = vm_module.Vm.fromState(state).?;
+    vm.scheduler.retireScope(vm.currentScope(state) catch unreachable) catch unreachable;
+    return 0;
 }

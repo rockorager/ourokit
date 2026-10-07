@@ -37,6 +37,7 @@ pub const StorybookActionKind = @import("storybook.zig").ActionKind;
 test {
     _ = @import("application.zig");
     _ = @import("applications.zig");
+    _ = @import("auth.zig");
     _ = @import("image_import.zig");
     _ = @import("callbacks.zig");
     _ = @import("components_test.zig");

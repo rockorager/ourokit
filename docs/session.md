@@ -224,6 +224,11 @@ same masking and storage, but its value reaches Lua through `on_change` and
 `text` like any field, and paste is allowed.
 
 `start(service, username)` returns owned conversation userdata or `nil, error`.
+Call it from an Ouro task. The conversation belongs to that task's scope for
+its whole life, not only while `next()` waits. When the scope is canceled (for
+example, its window or widget closes), PAM is canceled and the worker is
+reaped. Outside a task, `start` returns `nil, "AuthRequiresTask"`, and in an
+already-canceled scope it returns `nil, "ScopeCanceled"`.
 Choose a distribution-installed PAM service appropriate to screen unlock and
 the trusted session account; Ourokit installs no PAM policy and derives no
 account from editable lock-screen text. The worker dynamically loads
