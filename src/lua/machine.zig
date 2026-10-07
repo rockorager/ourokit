@@ -39,6 +39,14 @@ pub fn install(state: *c.State) !void {
     _ = c.lua_getfield(state, api, "machine");
     if (c.lua_pcallk(state, 2, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
+    // Generated tests: guard-aware paths to every reachable state.
+    const paths = @embedFile("machine_paths.lua");
+    if (c.luaL_loadbufferx(state, paths, paths.len, "=ouro.machine.paths", "t") != c.ok)
+        return error.MachineInitializationFailed;
+    c.lua_pushvalue(state, api);
+    _ = c.lua_getfield(state, api, "machine");
+    if (c.lua_pcallk(state, 2, 0, 0, 0, null) != c.ok)
+        return error.MachineInitializationFailed;
     c.lua_settop(state, api);
 }
 

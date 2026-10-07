@@ -277,6 +277,9 @@ local function replay_scheduler(start)
   return s
 end
 
+M._replay_scheduler = replay_scheduler
+M._decode_log = nil -- set below
+
 local function decode_lines(source)
   local lines = {}
   if type(source) == 'table' then
@@ -563,10 +566,13 @@ function M.replay_text(report)
   return table.concat(out, '\n')
 end
 
+M._decode_log = decode_lines
+M._canonical_safe = safe
+
 -- `ouroctl replay`: replay_tool(log, options_json) -> text, ok
 function M.replay_tool(log, options_json)
   local options = options_json ~= '' and json.decode(options_json) or {}
-  local report = M.replay(log)
+  local report = M.replay(log, {keep_lines = options.json})
   if options.json then
     report.states = nil
     return json.encode(safe(report)), report.ok

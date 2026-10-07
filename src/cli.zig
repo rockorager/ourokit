@@ -27,6 +27,13 @@ pub const Test = struct {
     list: bool = false,
     json: bool = false,
     timeout_ms: u32 = 10_000,
+    /// `--generate <app>`: write generated chart paths instead of running.
+    generate: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+    /// `--from <log>` recordings that seed payloads and invoke results.
+    from: [8][]const u8 = .{""} ** 8,
+    from_count: usize = 0,
+    depth: ?u32 = null,
 };
 
 pub const RuntimeTarget = struct {
@@ -99,6 +106,7 @@ pub const usage =
     \\  ouroctl storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
     \\  ouroctl test [file|directory] [--filter <substring>] [--list] [--json]
     \\              [--timeout-ms <milliseconds>]  (default: tests, 10000 ms per worker)
+    \\  ouroctl test --generate <application> [--output <dir>] [--from <log.jsonl>]... [--depth <n>]
     \\  ouroctl replay <log.jsonl> [application.lua|ouro.json|directory] [--json]
     \\  ouroctl help
     \\  ouroctl version
@@ -156,6 +164,23 @@ fn parseTest(args: []const []const u8) !Test {
             if (result.filter != null) return error.DuplicateOption;
             if (std.mem.startsWith(u8, value, "--")) return error.ExpectedOptionValue;
             result.filter = value;
+        } else if (try optionValue(args, &index, arg, "--generate")) |value| {
+            if (result.generate != null) return error.DuplicateOption;
+            if (value.len == 0 or std.mem.startsWith(u8, value, "--")) return error.ExpectedOptionValue;
+            result.generate = value;
+        } else if (try optionValue(args, &index, arg, "--output")) |value| {
+            if (result.output != null) return error.DuplicateOption;
+            if (value.len == 0 or std.mem.startsWith(u8, value, "--")) return error.ExpectedOptionValue;
+            result.output = value;
+        } else if (try optionValue(args, &index, arg, "--from")) |value| {
+            if (result.from_count == result.from.len) return error.TooManyRecordings;
+            if (value.len == 0 or std.mem.startsWith(u8, value, "--")) return error.ExpectedOptionValue;
+            result.from[result.from_count] = value;
+            result.from_count += 1;
+        } else if (try optionValue(args, &index, arg, "--depth")) |value| {
+            if (result.depth != null) return error.DuplicateOption;
+            result.depth = std.fmt.parseInt(u32, value, 10) catch return error.InvalidDepth;
+            if (result.depth.? == 0) return error.InvalidDepth;
         } else if (try optionValue(args, &index, arg, "--timeout-ms")) |value| {
             if (timeout_set) return error.DuplicateOption;
             result.timeout_ms = std.fmt.parseInt(u32, value, 10) catch return error.InvalidTestTimeout;

@@ -34,7 +34,7 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
         .version => try writeStdout(init, std.fmt.comptimePrint("ouroctl {s} (runtime API {d}, revision {s})\n", .{
             ourokit.runtime.version, ourokit.runtime.api_level, ourokit.runtime.revision,
         })),
-        .@"test" => |options| return @import("test_command.zig").run(init, options),
+        .@"test" => |options| return if (options.generate != null) generateTests(init, options) else @import("test_command.zig").run(init, options),
         .replay => |options| {
             const log = try readSource(init, options.log_path);
             defer init.gpa.free(log);
@@ -391,6 +391,7 @@ fn writeViewportJson(json: *std.json.Stringify, viewport: ourokit.lua.StorybookV
 }
 
 fn testWorker(init: std.process.Init, path: []const u8, name: ?[]const u8) !void {
+    if (std.mem.endsWith(u8, path, ".jsonl")) return replayWorker(init, path, name);
     const source = try readSource(init, path);
     defer init.gpa.free(source);
     const result = try ourokit.app.component_tests.execute(init, source, path, name);
@@ -424,6 +425,59 @@ fn applicationEntry(init: std.process.Init, path: []const u8) ![]const u8 {
     var manifest = try ourokit.bundle.Manifest.load(init.io, init.gpa, manifest_path);
     defer manifest.deinit();
     return a.dupe(u8, manifest.entry_path);
+}
+
+/// A `*_test.jsonl` statechart log is one test, "replay": it is replayed
+/// against the application found by walking up to the nearest ouro.json.
+fn replayWorker(init: std.process.Init, path: []const u8, name: ?[]const u8) !void {
+    if (name == null) return writeStdout(init, "[\"replay\"]");
+    if (!std.mem.eql(u8, name.?, "replay")) return error.UnknownTest;
+    const a = init.arena.allocator();
+    var directory = std.fs.path.dirname(path) orelse ".";
+    const manifest = while (true) {
+        const candidate = try std.fs.path.join(a, &.{ directory, ourokit.bundle.manifest_file_name });
+        if (std.Io.Dir.cwd().access(init.io, candidate, .{})) |_| break candidate else |_| {}
+        directory = std.fs.path.dirname(directory) orelse return error.ApplicationManifestNotFound;
+    };
+    const entry = try applicationEntry(init, manifest);
+    const log = try readSource(init, path);
+    defer init.gpa.free(log);
+    const result = try ourokit.app.chart_tools.call(init, entry, "replay_tool", log, "");
+    defer init.gpa.free(result.text);
+    if (!result.ok) {
+        try std.Io.File.stderr().writeStreamingAll(init.io, result.text);
+        return error.ReplayDiverged;
+    }
+}
+
+/// `ouroctl test --generate <app>`: writes `<chart>_paths_test.jsonl` files.
+fn generateTests(init: std.process.Init, options: cli.Test) !u8 {
+    const a = init.arena.allocator();
+    const entry = try applicationEntry(init, options.generate.?);
+    var recordings: std.ArrayList(u8) = .empty;
+    for (options.from[0..options.from_count]) |log_path| {
+        const log = try readSource(init, log_path);
+        defer init.gpa.free(log);
+        try recordings.appendSlice(a, log);
+        try recordings.appendSlice(a, "\n\x1e\n");
+    }
+    var options_json: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(.{ .depth = options.depth, .app = std.fs.path.stem(std.fs.path.dirname(entry) orelse entry) }, .{ .emit_null_optional_fields = false }, &options_json.writer);
+    const result = try ourokit.app.chart_tools.call(init, entry, "generate_tool", recordings.items, options_json.written());
+    defer init.gpa.free(result.text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, result.text, .{});
+    const output = options.output orelse try std.fs.path.join(a, &.{ std.fs.path.dirname(entry) orelse ".", "tests" });
+    try std.Io.Dir.cwd().createDirPath(init.io, output);
+    var files = parsed.value.object.get("files").?.object.iterator();
+    var written: std.Io.Writer.Allocating = .init(a);
+    while (files.next()) |file| {
+        const target = try std.fs.path.join(a, &.{ output, file.key_ptr.* });
+        try writeAtomic(init, target, file.value_ptr.string);
+        try written.writer.print("wrote {s}\n", .{target});
+    }
+    try written.writer.print("{s}\n", .{parsed.value.object.get("summary").?.string});
+    try writeStdout(init, written.written());
+    return if (result.ok) 0 else 1;
 }
 
 fn readSource(init: std.process.Init, path: []const u8) ![]u8 {

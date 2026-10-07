@@ -61,6 +61,15 @@ const Job = struct {
             \\  if o[name] == nil then o[name] = function(t) return t end end
             \\end
             \\if o.action_error == nil then o.action_error = function(name, p) return {name = name, parameters = p} end end
+            \\-- Module code may compute paths; replay never touches the user's files.
+            \\o.xdg = o.xdg or {}
+            \\if o.xdg.paths == nil then
+            \\  o.xdg.paths = function(id)
+            \\    local root = '/nonexistent/ourokit-chart-tools/'
+            \\    return {config = root .. 'config/' .. id, data = root .. 'data/' .. id, state = root .. 'state/' .. id,
+            \\      cache = root .. 'cache/' .. id, config_dirs = {}, data_dirs = {}}
+            \\  end
+            \\end
         ;
         if (c.luaL_loadbufferx(state, prelude, prelude.len, "=ouro.chart_tools", "t") != c.ok) return error.StatechartToolFailed;
         env.vm.pushApi(state);

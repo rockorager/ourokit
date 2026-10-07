@@ -92,7 +92,8 @@ return {
     -- Same chart, but ticks count 50 ms: the first tick's context differs.
     local changed = machine.create {
       id = 'stopwatch', type = 'parallel', order = { 'clock', 'settings' },
-      context = { elapsed = 0, laps = {}, max_laps = 5, show_tenths = true, draft_max_laps = 5, draft_show_tenths = true },
+      context = { elapsed = 0, banked = 0, started_at = 0, laps = {}, max_laps = 5, show_tenths = true,
+        draft_max_laps = 5, draft_show_tenths = true },
       states = {
         clock = { initial = 'idle', states = {
           idle = { on = { START = 'running' } },
@@ -157,6 +158,32 @@ return {
     report = machine.replay(lines, { charts = { loader = changed } })
     assert(not report.ok and report.divergence.step == 2, machine.replay_text(report))
     assert(machine.replay_text(report):find('no running invoke', 1, true), machine.replay_text(report))
+  end,
+
+  ['a live logical clock fires late wakes at their deadlines, so the stopwatch does not drift'] = function()
+    -- A live clock whose host wakes it 7 ms late every time.
+    local wall = 1000
+    local clock = machine.logical_clock { wall = function() return wall end }
+    local function scope(parent)
+      local s = { alive = true, children = {} }
+      if type(parent) == 'table' then parent.children[#parent.children + 1] = s end
+      return s
+    end
+    local function close(s) s.alive = false; for _, c in ipairs(s.children) do close(c) end end
+    local scheduler = { open = scope, close = close, alive = function(s) return s.alive end,
+      run = function() end, after = clock.after, clock = clock.now, sync = clock.sync }
+    local sw = charts.stopwatch:start { scheduler = scheduler }
+    sw:send('START')
+    assert(sw:context().started_at == 1000)
+    for _ = 1, 100 do
+      wall = clock.next() + 7
+      clock.sync()
+    end
+    assert(sw:context().elapsed == 10000, 'ticks land on deadlines: ' .. sw:context().elapsed)
+    wall = wall + 50
+    sw:send('STOP') -- an input syncs the clock to wall time first
+    assert(sw:context().elapsed == 10057, sw:context().elapsed)
+    sw:stop()
   end,
 
   ['machine.advance needs a virtual clock'] = function()

@@ -104,7 +104,8 @@ fn discover(init: std.process.Init, path: []const u8, files: *std.ArrayList([]co
     var walker = try dir.walk(a);
     defer walker.deinit();
     while (try walker.next(init.io)) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, "_test.lua"))
+        if (entry.kind == .file and (std.mem.endsWith(u8, entry.basename, "_test.lua") or
+            std.mem.endsWith(u8, entry.basename, "_test.jsonl")))
             try files.append(a, try std.fs.path.join(a, &.{ path, entry.path }));
     }
 }
