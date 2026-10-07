@@ -1038,6 +1038,27 @@ return {
     assert(last(other_records).timers[1] == nil and other:pending_timers()[1].time_ms == 7)
   end,
 
+  ['stopping a never-started or already-canceled actor is safe'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create { id = 'lazy', initial = 'idle', states = {
+      idle = { on = { GO = 'busy' } }, busy = { after = { [100] = 'idle' } } } }
+    local never = chart:actor { scheduler = clock, lazy = true, scope = 'task' }
+    local before = machine.raw(never:snapshot())
+    never:stop()
+    assert(never:status() == 'stopped' and clock.open_scopes == 0)
+    assert(machine.raw(never:snapshot()) == before, 'no signal write for an actor that never committed')
+    assert(select(2, never:send('GO')) == 'stopped')
+    never:stop() -- idempotent
+    local running = chart:actor { scheduler = clock, lazy = true, scope = 'task' }
+    running:send('GO') -- starts lazily and opens its root and state scopes
+    assert(running:status() == 'active' and clock.open_scopes == 2)
+    clock.close(running._root_scope) -- the instance scope was canceled first
+    running:stop()
+    assert(running:status() == 'stopped' and clock.open_scopes == 0)
+    clock.advance(200)
+    assert(running:matches('busy'), 'no timer fires after stop')
+  end,
+
   ['event schemas validate external events and drive accepted()'] = function()
     local chart = machine.create {
       id = 'schema', initial = 'clean',

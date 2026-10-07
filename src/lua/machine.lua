@@ -1352,12 +1352,15 @@ end
 -- may read initial props) and starts on its first event, in the callback's
 -- instance scope: its timers and invokes end when the instance unmounts.
 -- render(self, props) reads self:context()/matches()/can() and returns UI.
+-- When the instance leaves (unmount, key reuse, owner disposal, or a build
+-- that rolled back), the runtime's on_unmount hook stops the actor: its
+-- scope retires and its work ends. Remounting creates a fresh actor.
 function M.component(chart, render)
   if type(chart) ~= 'table' or not chart.__chart then fail('component expects a chart') end
   if type(render) ~= 'function' then fail('component expects a render function') end
   return ouro.stateful(function(props)
     local actor = chart:actor {input = props, lazy = true, scope = 'task'}
-    return function() return render(actor, props) end
+    return function() return render(actor, props) end, function() actor:stop() end
   end)
 end
 
@@ -1538,10 +1541,11 @@ function Actor:restored() return self._restored end
 
 function Actor:snapshot() return view(self:_read()) end
 function Actor:context() return view(self:_read().context) end
--- 'created' until start(), then the snapshot status (active | done | stopped).
+-- 'created' until start(), 'stopped' after stop() (even if it never started),
+-- otherwise the snapshot status (active | done).
 function Actor:status()
   local status = self:_read().status
-  if self._status == 'created' then return 'created' end
+  if self._status == 'created' or self._status == 'stopped' then return self._status end
   return status
 end
 function Actor:started() return self._status ~= 'created' end

@@ -168,6 +168,16 @@ assert(next(watched._waiters) == nil, 'canceled wait kept its subscription')
 watched:send('OPEN'); o.sleep(250)
 assert(not flags.woke)
 
+-- stop() after the native scope was already canceled (an unmounted
+-- instance) is safe: closing a stale scope is a no-op.
+local late = machine.create { id = 'late', initial = 'idle', states = {
+  idle = { on = { GO = 'busy' } }, busy = { after = { [30] = 'idle' } } } }:actor { lazy = true, scope = 'task' }
+late:send('GO')
+machine.default_scheduler.close(late._root_scope)
+late:stop(); late:stop()
+o.sleep(50)
+assert(late:status() == 'stopped' and late:matches('busy'))
+
 o.stdout.write('PASS machine native\n')
 o.exit(0)
 '''
