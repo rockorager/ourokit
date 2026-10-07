@@ -1,0 +1,5 @@
+{"format": "ouro.machine.log", "version": 1, "t0": 0}
+{"k": "invoke", "t": 0, "a": "document", "o": "invoke", "e": {"type": "error.invoke.choose", "error": {"name": "Canceled", "message": "canceled"}}}
+{"k": "invoke", "t": 0, "a": "document", "o": "invoke", "e": {"type": "done.invoke.choose", "output": "file:///tmp/note.ournote"}}
+{"k": "task", "t": 0, "a": "notes", "o": "child", "e": {"type": "done.actor.open.1", "id": "open.1", "output": {"notes": [{"title": "Opened", "text": "body", "path": "file:///tmp/opened.ournote"}]}}}
+{"k": "task", "t": 0, "a": "notes", "o": "child", "e": {"type": "done.actor.read.1", "id": "read.1", "output": {"notes": [{"title": "Read", "text": "text", "path": "file:///tmp/read.ournote"}]}}}

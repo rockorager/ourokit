@@ -1,0 +1,6 @@
+{"app":"contacts","format":"ouro.machine.log","generated":{"chart":"appearance","paths":[{"steps":[],"targets":["sshown"]},{"steps":["STYLE"],"targets":["t1"]}],"states":{"reached":1,"total":1},"transitions":{"reached":1,"total":1},"unreached":[]},"t0":0,"version":1}
+{"a":"appearance","k":"start","m":"appearance","r":[{"a":"appearance","e":"ouro.init","tr":[]}],"s":{"appearance":{"children":[],"context":{"style":"light"},"states":["shown"],"status":"active"}},"t":0}
+{"a":"appearance","k":"stop","r":[],"s":{"appearance":{"status":"stopped"}},"t":0}
+{"a":"appearance","k":"start","m":"appearance","r":[{"a":"appearance","e":"ouro.init","tr":[]}],"s":{"appearance":{"children":[],"context":{"style":"light"},"states":["shown"],"status":"active"}},"t":0}
+{"a":"appearance","e":{"type":"STYLE","value":"light"},"k":"event","o":"generated","r":[{"a":"appearance","e":"STYLE","tr":[1]}],"t":0}
+{"a":"appearance","k":"stop","r":[],"s":{"appearance":{"status":"stopped"}},"t":0}

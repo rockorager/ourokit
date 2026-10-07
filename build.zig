@@ -325,6 +325,11 @@ pub fn build(b: *std.Build) void {
     component_tests.addArg("test");
     component_tests.setCwd(b.path("."));
     component_tests.has_side_effects = true;
+    // Generated chart paths (*_test.jsonl) replay against each example app.
+    const example_tests = b.addRunArtifact(host);
+    example_tests.addArgs(&.{ "test", "examples" });
+    example_tests.setCwd(b.path("."));
+    example_tests.has_side_effects = true;
     const component_contracts = b.addExecutable(.{
         .name = "component-runner-tests",
         .root_module = b.createModule(.{
@@ -339,6 +344,7 @@ pub fn build(b: *std.Build) void {
     run_component_contracts.has_side_effects = true;
     const component_step = b.step("test-components", "Run Lua component tests and native runner contracts without a compositor");
     component_step.dependOn(&component_tests.step);
+    component_step.dependOn(&example_tests.step);
     component_step.dependOn(&run_component_contracts.step);
 
     const stress_tests = b.addRunArtifact(host);

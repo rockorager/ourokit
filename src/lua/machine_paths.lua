@@ -41,7 +41,11 @@ local function harvest(value, strings, numbers, budget)
   elseif math.type(value) == 'integer' then
     numbers[value] = true
   elseif type(value) == 'table' then
-    for _, v in pairs(value) do harvest(v, strings, numbers, budget) end
+    -- Keys too: a field name in context is often a valid payload value.
+    for k, v in pairs(value) do
+      if type(k) == 'string' and #k <= 64 then strings[k] = true end
+      harvest(v, strings, numbers, budget)
+    end
   end
 end
 
@@ -86,7 +90,7 @@ local function payloads(chart, name, context, seeds, limit)
   if not fields then add({type = name}); return out end
   local strings, numbers = {}, {}
   harvest(context, strings, numbers, {left = 400})
-  local string_list, number_list = sorted_keys(strings, 8), sorted_keys(numbers, 4)
+  local string_list, number_list = sorted_keys(strings, 12), sorted_keys(numbers, 4)
   local names = {}
   for field in pairs(fields) do names[#names + 1] = field end
   table.sort(names)
@@ -102,12 +106,19 @@ local function payloads(chart, name, context, seeds, limit)
         for k, x in pairs(base) do e[k] = x end
         e[field] = v
         next_partial[#next_partial + 1] = e
-        if #next_partial >= limit * 4 then break end
+        if #next_partial >= 400 then break end
       end
     end
     partial = next_partial
   end
-  for _, e in ipairs(partial) do add(e) end
+  -- Spread the picks over the whole product instead of its first rows, so
+  -- every field varies.
+  local room = limit - #out
+  if #partial <= room then
+    for _, e in ipairs(partial) do add(e) end
+  elseif room > 0 then
+    for i = 0, room - 1 do add(partial[1 + (i * (#partial - 1)) // math.max(1, room - 1)]) end
+  end
   return out
 end
 
@@ -141,7 +152,9 @@ local function apply(scheduler, root, input)
       for _, actor in ipairs(live_actors(root)) do if actor.path == input.a then target = actor end end
       if not target then return false end
     end
-    local ok, accepted = pcall(target._send, target, copy(input.e), 'external')
+    local ok, accepted
+    if input.o == 'surface' then ok, accepted = pcall(target._deliver, target, copy(input.e), 'surface')
+    else ok, accepted = pcall(target._send, target, copy(input.e), 'external') end
     return ok and accepted ~= false
   elseif input.k == 'timer' then
     local at = scheduler.logical.next()
@@ -215,6 +228,19 @@ local function candidates(chart, actor, scheduler, options)
           end
         end
       end
+      -- Surface events the active states name explicitly (the runtime
+      -- delivers them; failures carry reason and message).
+      local surface = {}
+      for _, id in ipairs({'', table.unpack(target._snapshot.states)}) do
+        for name in pairs(target.chart.by_id[id].on) do
+          if name:find('^surface%.') and not name:find('*', 1, true) then surface[name] = true end
+        end
+      end
+      for _, name in ipairs(sorted_keys(surface, 16)) do
+        local e = {type = name}
+        if name:find('^surface%.failed') then e.reason, e.message = 'generated', 'generated failure' end
+        list[#list + 1] = {k = 'event', o = 'surface', a = target.path, e = e}
+      end
     end
   end
   if scheduler.logical.next() then list[#list + 1] = {k = 'timer'} end
@@ -250,13 +276,18 @@ local function seed(options, logs)
           options.seeds[e.type] = options.seeds[e.type] or {}
           table.insert(options.seeds[e.type], e)
         elseif (entry.k == 'invoke' or entry.k == 'task') and e then
+          -- Keyed by id, and by src for tasks: spawned ids are `<src>.<n>`.
           local id = e.type:match('^%a+%.%a+%.(.+)$')
-          if e.type:find('^done') then
-            options.outputs[id] = options.outputs[id] or {}
-            table.insert(options.outputs[id], e.output == nil and json.null or e.output)
-          else
-            options.errors[id] = options.errors[id] or {}
-            table.insert(options.errors[id], e.error)
+          local keys = {id}
+          if entry.k == 'task' and id:find('%.%d+$') then keys[2] = id:gsub('%.%d+$', '') end
+          for _, key in ipairs(keys) do
+            if e.type:find('^done') then
+              options.outputs[key] = options.outputs[key] or {}
+              table.insert(options.outputs[key], e.output == nil and json.null or e.output)
+            else
+              options.errors[key] = options.errors[key] or {}
+              table.insert(options.errors[key], e.error)
+            end
           end
         end
       end
@@ -270,7 +301,7 @@ end
 function M.paths(chart, options)
   options = options or {}
   seed(options, options.logs)
-  options.depth, options.nodes, options.payloads = options.depth or 8, options.nodes or 1500, options.payloads or 4
+  options.depth, options.nodes, options.payloads = options.depth or 8, options.nodes or 1500, options.payloads or 6
   local saved_strict, saved_origin = M.strict, M._origin
   M.strict, M._origin = true, 'generated'
   local graph = chart:graph()
