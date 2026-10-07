@@ -58,8 +58,8 @@ return {
     -- ouroctl test forbids wall-clock sleeps, so component actors created in
     -- this test use virtual time: the timer really fires on clock.advance, the
     -- invoke stays parked because the clock never runs tasks, and open_scopes
-    -- counts every scope the actors hold. Time advances from a button so the
-    -- runner settles the UI afterwards, as after any input.
+    -- counts every scope the actors hold. t:settle() lets the view catch up
+    -- after the test body advances the clock.
     local clock = machine.manual_scheduler()
     local previous = machine.default_scheduler
     machine.default_scheduler = clock
@@ -79,7 +79,6 @@ return {
       return o.column { key = 'root',
         o.button { key = 'hide', label = 'Hide', on_press = page:sender('HIDE') },
         o.button { key = 'show', label = 'Show', on_press = page:sender('SHOW') },
-        o.button { key = 'second', label = 'Advance', on_press = function() clock.advance(1000) end },
         page:matches('shown') and Ticker { key = 'ticker' } or nil,
       }
     end)
@@ -89,7 +88,7 @@ return {
     local first = latest
     assert(first:matches('running') and first:status() == 'active', first:status())
     assert(t:node('root/ticker/start').label == 'Running')
-    t:click('root/second'); t:click('root/second')
+    clock.advance(2500); t:settle()
     assert(first:context().ticks == 2, first:context().ticks)
     assert(clock.open_scopes > 0 and count(records, first, 'invokes', 'started') >= 1)
 
@@ -99,7 +98,7 @@ return {
     assert(first:status() == 'stopped', first:status())
     assert(count(records, first, 'timers', 'cancelled') >= 1 and count(records, first, 'invokes', 'cancelled') >= 1)
     assert(clock.open_scopes == 0, clock.open_scopes)
-    for _ = 1, 5 do t:click('root/second') end
+    clock.advance(10000); t:settle()
     assert(first:context().ticks == 2)
 
     -- Remounting creates a fresh actor with initial state; it starts on its
@@ -109,7 +108,7 @@ return {
     assert(latest:matches('idle') and latest:context().starts == 0 and latest:context().ticks == 0)
     assert(t:node('root/ticker/start').label == 'Start')
     t:click('root/ticker/start')
-    t:click('root/second')
+    clock.advance(1000); t:settle()
     assert(latest:matches('running') and latest:context().starts == 1 and latest:context().ticks == 1)
     assert(first:status() == 'stopped' and first:context().ticks == 2)
 
@@ -118,5 +117,76 @@ return {
     unsubscribe()
     page:stop()
     machine.default_scheduler = previous
+  end,
+
+  ['t:settle shows state changed from the test body'] = function(t)
+    local clock = machine.manual_scheduler()
+    local light = machine.create {
+      id = 'light', initial = 'red', events = { GO = {} },
+      states = { red = { on = { GO = 'green' } }, green = { after = { [500] = 'red' } } },
+    }:start { scheduler = clock }
+    t:mount(function() return o.text { key = 'state', text = light:matches('green') and 'green' or 'red' } end)
+    assert(t:node('state').label == 'red')
+    light:send('GO')
+    t:settle()
+    assert(t:node('state').label == 'green')
+    clock.advance(500)
+    t:settle()
+    assert(t:node('state').label == 'red')
+    light:stop()
+  end,
+
+  -- Capacity cases from the statecharts review. Each actor holds several
+  -- hidden signals; these used to exhaust a fixed signal capacity of 256.
+  ['capacity: a list of 70 component machines mounts'] = function(t)
+    local Row = machine.component(machine.create {
+      id = 'row', initial = 'closed', context = function(p) return { title = p.title } end,
+      states = { closed = { on = { TOGGLE = 'open' } }, open = { on = { TOGGLE = 'closed' } } },
+    }, function(self)
+      return o.button { key = 'b', label = self:context().title, send = self:event('TOGGLE') }
+    end)
+    t:mount(function()
+      local rows = {}
+      for i = 1, 70 do rows[i] = Row { key = 'r' .. i, title = 'Row ' .. i } end
+      return o.scroll { key = 's', o.column { key = 'c', children = rows } }
+    end, { width = 300, height = 300 })
+    assert(t:node('s/c/r70/b').label == 'Row 70')
+  end,
+
+  ['capacity: 40 component machine rows remount repeatedly'] = function(t)
+    local Row = machine.component(machine.create {
+      id = 'row', initial = 'closed', context = function(p) return { title = p.title } end,
+      states = { closed = { on = { TOGGLE = 'open' } }, open = { on = { TOGGLE = 'closed' } } },
+    }, function(self)
+      return o.text { key = 't', text = self:context().title }
+    end)
+    local page = machine.create {
+      id = 'page', initial = 'shown', events = { TOGGLE = {} },
+      states = { shown = { on = { TOGGLE = 'hidden' } }, hidden = { on = { TOGGLE = 'shown' } } },
+    }:start { scheduler = machine.manual_scheduler() }
+    t:mount(function()
+      local rows = {}
+      if page:matches('shown') then
+        for i = 1, 40 do rows[i] = Row { key = 'r' .. i, title = 'Row ' .. i } end
+      end
+      return o.column { key = 'root',
+        o.button { key = 'toggle', label = 'Toggle', send = page:event('TOGGLE') },
+        o.column { key = 'c', children = rows },
+      }
+    end, { width = 300, height = 1600 })
+    for _ = 1, 20 do
+      t:click('root/toggle')
+      t:click('root/toggle')
+    end
+    assert(t:node('root/c/r40/t').label == 'Row 40')
+    page:stop()
+  end,
+
+  ['capacity: 3000 actors created and stopped'] = function()
+    local chart = machine.create { id = 'tiny', initial = 'idle', states = { idle = { on = { X = 'idle' } } } }
+    for i = 1, 3000 do
+      local ok, err = pcall(function() local a = chart:start { scheduler = machine.manual_scheduler() }; a:stop() end)
+      assert(ok, 'cycle ' .. i .. ': ' .. tostring(err))
+    end
   end,
 }

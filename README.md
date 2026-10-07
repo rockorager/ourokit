@@ -535,12 +535,17 @@ The test context provides:
   example, `t:key('a', { control = true })` selects all text in a focused editor.
 - `t:input { action = ..., ... }`: the same action arguments as
   `ouroctl dev input`, without a window or token, including pointer down/move/up.
+- `t:settle()`: settle after changing state from the test body. This runs pending
+  task-phase work, then dispatch and reconciliation, as after an input. Without
+  it, the next `t:node` or `t:click` fails with `DevelopmentRuntimeNotSettled`.
+  Examples are sending a chart event or advancing a `machine.manual_scheduler()`
+  clock.
 
 Mount and input drain runnable callbacks, reconciliation, layout, and scene
 preparation before returning. They do not wait for animation completion or
 arbitrary async work. Sleeps and callbacks awaiting external work fail rather
-than introduce timing-dependent tests; there is no virtual clock or async-wait
-API yet. Use reduced motion where a test needs stable control state. Assertions
+than introduce timing-dependent tests. For statechart timers, give actors a
+`machine.manual_scheduler()` and call `t:settle()` after advancing it. Use reduced motion where a test needs stable control state. Assertions
 use ordinary Lua `assert`; no additional framework dependency is required.
 
 These tests cover component behavior and pure Lua models, not real compositor

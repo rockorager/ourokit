@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = (
     'development_runtime.py',
     'statechart_inspection.py',
+    'statechart_capacity.py',
     'storybook_native.py',
     'control_composition.py',
     'window_theme.py',

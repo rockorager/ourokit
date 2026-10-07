@@ -62,6 +62,9 @@ const Job = struct {
             c.lua_pushcclosure(state, @field(Context, method), 1);
             c.lua_setfield(state, -2, method);
         }
+        c.lua_pushlightuserdata(state, &context);
+        c.lua_pushcclosure(state, Context.settleTest, 1);
+        c.lua_setfield(state, -2, "settle");
         const api = @embedFile("component_test_api.lua");
         if (c.luaL_loadbufferx(state, api, api.len, "@ouro-test-api", null) != c.ok) return error.TestApiLoadFailed;
         c.lua_pushvalue(state, -2);
@@ -139,6 +142,24 @@ const Context = struct {
         defer self.busy = false;
         var playback = try dev.Playback.init(self.runtime, dev.Token.current(self.runtime), action);
         while (try playback.advance(self.runtime) == .routed) try self.settle();
+    }
+
+    /// t:settle(): runs pending task-phase work, then dispatch and
+    /// reconciliation, as after an input. Use it after changing state from
+    /// the test body (sending events, advancing a manual scheduler) so the
+    /// next t:node or t:click sees the result instead of failing with
+    /// DevelopmentRuntimeNotSettled.
+    fn settleTest(state: *c.State) callconv(.c) c_int {
+        get(state).settleImpl() catch |err| return fail(state, err);
+        return 0;
+    }
+
+    fn settleImpl(self: *Context) !void {
+        if (self.busy) return error.ReentrantTestOperation;
+        if (self.content_reference == c.no_reference) return error.TestNotMounted;
+        self.busy = true;
+        defer self.busy = false;
+        try self.settle();
     }
 
     fn node(state: *c.State) callconv(.c) c_int {

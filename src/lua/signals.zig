@@ -23,7 +23,7 @@ const Edge = struct {
     dirty: bool = false,
 };
 
-const Read = struct { signal: SignalHandle, reader: u64 };
+const Read = struct { signal: SignalHandle = .invalid, reader: u64 = 0 };
 
 const Phase = enum { idle, evaluating, awaiting_commit };
 
@@ -34,9 +34,14 @@ const SignalUserdata = struct {
 
 const metatable_name = "ouro.signal.v1";
 
-/// Fixed-capacity dependency graph for Lua-owned signal values. This object and
-/// every referenced BuildOwners registry must retain stable addresses. Owner
-/// subscriptions must be disposed before their registry is destroyed.
+/// Dependency graph for Lua-owned signal values. The configured capacities are
+/// initial sizes: signal slots grow when a signal is created, pending reads and
+/// readers while a build records reads, and subscription edges while a commit
+/// is validated, so `commit`, `publish`, and release never allocate. Slots are
+/// addressed only through generation-checked handles and indices, never by
+/// retained pointer. This object and every referenced BuildOwners registry must
+/// retain stable addresses. Owner subscriptions must be disposed before their
+/// registry is destroyed.
 pub const Signals = struct {
     allocator: std.mem.Allocator,
     state: *c.State,
@@ -152,7 +157,7 @@ pub const Signals = struct {
         if (self.phase != .evaluating) return error.SignalEvaluationNotActive;
         self.current_reader = reader;
         if (self.readerEvaluated(reader)) return;
-        if (self.reader_count == self.readers.len) return error.DependencyCapacityExceeded;
+        if (self.reader_count == self.readers.len) try self.grow(u64, &self.readers, self.reader_count + 1, 0);
         self.readers[self.reader_count] = reader;
         self.reader_count += 1;
     }
@@ -212,7 +217,9 @@ pub const Signals = struct {
             if (!edge.active) free_count += 1 else if (sameOwner(edge.owner, owner) and
                 self.readerEvaluated(edge.reader)) old_count += 1;
         }
-        if (self.pending_count > free_count + old_count) return error.SubscriptionCapacityExceeded;
+        // Grow here, during validation, so commit itself cannot fail.
+        if (self.pending_count > free_count + old_count)
+            try self.grow(Edge, &self.edges, self.edges.len + self.pending_count - free_count - old_count, .{});
         for (self.pending[0..self.pending_count]) |read| _ = try self.signalSlot(read.signal);
     }
 
@@ -294,13 +301,29 @@ pub const Signals = struct {
     }
 
     fn allocateSignal(self: *Signals) !SignalHandle {
-        for (self.slots, 0..) |*slot, index| if (!slot.active) {
-            var generation = slot.generation +% 1;
-            if (generation == 0) generation = 1;
-            slot.* = .{ .generation = generation, .active = true };
-            return .{ .slot = @intCast(index), .generation = generation };
+        const index = for (self.slots, 0..) |slot, index| {
+            if (!slot.active) break index;
+        } else blk: {
+            const old_len = self.slots.len;
+            try self.grow(SignalSlot, &self.slots, old_len + 1, .{});
+            break :blk old_len;
         };
-        return error.SignalCapacityExceeded;
+        const slot = &self.slots[index];
+        var generation = slot.generation +% 1;
+        if (generation == 0) generation = 1;
+        slot.* = .{ .generation = generation, .active = true };
+        return .{ .slot = @intCast(index), .generation = generation };
+    }
+
+    /// Doubles `items` until it holds at least `minimum` entries. Only creation
+    /// paths call this; new entries are set to `fill`.
+    fn grow(self: *Signals, comptime T: type, items: *[]T, minimum: usize, fill: T) !void {
+        var length = items.len;
+        while (length < minimum) length = std.math.mul(usize, length, 2) catch return error.SignalCapacityExceeded;
+        if (length > std.math.maxInt(u32)) return error.SignalCapacityExceeded;
+        const old_len = items.len;
+        items.* = try self.allocator.realloc(items.*, length);
+        @memset(items.*[old_len..], fill);
     }
 
     fn releaseSignal(self: *Signals, signal: SignalHandle) void {
@@ -319,7 +342,7 @@ pub const Signals = struct {
         if (self.phase != .evaluating) return error.SignalCommitPending;
         for (self.pending[0..self.pending_count]) |existing|
             if (existing.reader == self.current_reader and sameHandle(existing.signal, signal)) return;
-        if (self.pending_count == self.pending.len) return error.DependencyCapacityExceeded;
+        if (self.pending_count == self.pending.len) try self.grow(Read, &self.pending, self.pending_count + 1, .{});
         self.pending[self.pending_count] = .{ .signal = signal, .reader = self.current_reader };
         self.pending_count += 1;
     }
@@ -383,7 +406,9 @@ pub const Signals = struct {
 
     fn readSignal(state: *c.State) callconv(.c) c_int {
         const userdata = signalUserdata(state, 1) orelse return luaError(state, "invalid signal");
-        userdata.runtime.recordRead(userdata.handle) catch return luaError(state, "cannot track signal read");
+        // A released signal keeps its final value, read without tracking.
+        if (!sameHandle(userdata.handle, Handle.invalid))
+            userdata.runtime.recordRead(userdata.handle) catch return luaError(state, "cannot track signal read");
         _ = c.lua_getiuservalue(state, 1, 1);
         return 1;
     }
@@ -391,6 +416,7 @@ pub const Signals = struct {
     fn writeSignal(state: *c.State) callconv(.c) c_int {
         const userdata = signalUserdata(state, 1) orelse return luaError(state, "invalid signal");
         if (c.lua_gettop(state) != 2) return luaError(state, "signal:set expects one value");
+        if (sameHandle(userdata.handle, Handle.invalid)) return luaError(state, "signal was released");
         if (userdata.runtime.phase != .idle)
             return luaError(state, "signals cannot be written during a build transaction");
         _ = c.lua_getiuservalue(state, 1, 1);
@@ -400,6 +426,24 @@ pub const Signals = struct {
         c.lua_pushvalue(state, 2);
         _ = c.lua_setiuservalue(state, 1, 1);
         userdata.runtime.publish(userdata.handle) catch return luaError(state, "cannot publish signal");
+        return 0;
+    }
+
+    /// Pushes the private release function for runtime code (statechart
+    /// actors), passed as a chunk argument like the scope binding and never
+    /// installed on `ouro`. release(signal) frees the signal's slot and edges
+    /// now instead of at garbage collection. It is idempotent and ignores
+    /// values that are not signals. Afterwards the signal reads its final value
+    /// without tracking, and writing it raises.
+    pub fn pushRelease(state: *c.State) void {
+        c.lua_pushcclosure(state, releaseLua, 0);
+    }
+
+    fn releaseLua(state: *c.State) callconv(.c) c_int {
+        const userdata = signalUserdata(state, 1) orelse return 0;
+        if (sameHandle(userdata.handle, Handle.invalid)) return 0;
+        userdata.runtime.releaseSignal(userdata.handle);
+        userdata.handle = .invalid;
         return 0;
     }
 
@@ -432,4 +476,43 @@ fn sameOwner(a: OwnerRef, b: OwnerRef) bool {
 fn luaError(state: *c.State, message: [*:0]const u8) c_int {
     _ = c.lua_pushstring(state, message);
     return c.lua_error(state);
+}
+
+test "signal slots grow on creation and release frees them deterministically" {
+    const state = c.luaL_newstate().?;
+    c.lua_pushcclosure(state, c.ouro_open_safe_libraries, 0);
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(state, 0, 0, 0, 0, null));
+    c.lua_createtable(state, 0, 1);
+    c.lua_setglobal(state, "ouro");
+    var signals: Signals = undefined;
+    try signals.init(std.testing.allocator, state, 1, 1, 1);
+    // Close Lua first so signal finalizers run while the runtime is alive.
+    defer {
+        c.lua_close(state);
+        signals.deinit();
+    }
+    Signals.pushRelease(state);
+    c.lua_setglobal(state, "release");
+    const source =
+        \\local list = {}
+        \\for i = 1, 100 do list[i] = ouro.signal(i) end
+        \\for i = 1, 100 do release(list[i]) end
+        \\release(list[1]); release({}); release(nil)
+        \\assert(list[7]() == 7, 'a released signal keeps its final value')
+        \\assert(not pcall(list[7].set, list[7], 8), 'writing a released signal raises')
+        \\kept = ouro.signal('kept')
+    ;
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(state, source, source.len, "=release", "t"));
+    if (c.lua_pcallk(state, 0, 0, 0, 0, null) != c.ok) {
+        var length: usize = 0;
+        std.debug.print("{s}\n", .{c.lua_tolstring(state, -1, &length).?[0..length]});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(signals.slots.len >= 100);
+    var active: usize = 0;
+    for (signals.slots) |slot| {
+        if (slot.active) active += 1;
+    }
+    // Only `kept` is live: released slots were reused, not leaked to the GC.
+    try std.testing.expectEqual(@as(usize, 1), active);
 }

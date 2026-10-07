@@ -837,3 +837,28 @@ test "a failing unmount hook is reported and does not break the commit" {
     try f.exec("show:set(true)");
     try f.build();
 }
+
+test "one build may read and subscribe to more signals than the initial capacities" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\values = {}
+        \\for i = 1, 300 do values[i] = ouro.signal(1) end
+        \\builds = 0
+        \\function build()
+        \\  builds = builds + 1
+        \\  local sum = 0
+        \\  for i = 1, #values do sum = sum + values[i]() end
+        \\  return ouro.box {key='root', width=sum}
+        \\end
+    );
+    try f.build();
+    try f.expect("builds == 1");
+    // Every one of the 300 reads became a subscription.
+    try f.exec("values[300]:set(2)");
+    try f.build();
+    try f.expect("builds == 2");
+    try f.exec("values[1]:set(2)");
+    try f.build();
+    try f.expect("builds == 3");
+}
