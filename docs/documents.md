@@ -24,6 +24,14 @@ activation callback, offering either the note text or its saved file URI.
 Keyboard or synthetic button activation intentionally cannot supply the pointer
 serial required to begin a compositor drag.
 
+Behavior lives in two statecharts in `charts.lua` (see
+[the statechart design](../design/statecharts.md)): a headless `document` chart
+spawned per note (`open.io` saving, `open.lifecycle` close confirmation) and the
+`notes` application chart (tabs, selection, split, and the close-window walk).
+`app.lua` is the view: it maps snapshots to widgets and widgets to events.
+`model.lua` holds plain functions. `tests/documents.py` drives the charts with
+fake services.
+
 ## Preferences and session restoration
 
 On clean window close, Notes saves the split position under
@@ -50,7 +58,7 @@ desktop/service files, then install (no root required):
 install -Dm644 examples/documents/dev.ourokit.documents.desktop ~/.local/share/applications/dev.ourokit.documents.desktop
 install -Dm644 examples/documents/dev.ourokit.documents.service ~/.local/share/dbus-1/services/dev.ourokit.documents.service
 install -Dm644 examples/documents/dev.ourokit.documents.xml ~/.local/share/mime/packages/dev.ourokit.documents.xml
-install -Dm644 -t ~/.local/share/ourokit/documents examples/documents/{app.lua,model.lua,storage.lua,ouro.json}
+install -Dm644 -t ~/.local/share/ourokit/documents examples/documents/{app.lua,charts.lua,model.lua,storage.lua,ouro.json}
 update-mime-database ~/.local/share/mime
 update-desktop-database ~/.local/share/applications
 ```

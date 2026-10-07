@@ -1,31 +1,17 @@
--- State and validation kept separate so it can be tested without a compositor.
+-- Plain functions over note data. Behavior over time lives in charts.lua.
 return function(json)
-  local M = { documents = {}, next_id = 1, selected_id = nil }
+  local M = {}
 
-  function M.new(title, text, path)
-    local d = { id = "document-" .. M.next_id, tab_value = M.next_id, title = title or "Untitled", text = text or "", path = path,
-      dirty = false, revision = 0, save_serial = 0, saving = false, closing = false, error = nil }
-    M.next_id = M.next_id + 1
-    M.documents[#M.documents + 1] = d
-    M.selected_id = d.id
-    return d
+  -- An edit is a committed field value from the native editor. Returns an
+  -- error message, or nil when the value is acceptable.
+  function M.check_edit(field, value)
+    if field ~= "title" and field ~= "text" then return "unknown field " .. tostring(field) end
+    if type(value) ~= "string" then return field .. " must be text" end
+    if field == "title" and value:find("[\r\n]") then return "title must be a single line" end
+    if field == "text" and value:find("\r") then return "text must use LF line endings" end
   end
-  function M.select(value)
-    for _, d in ipairs(M.documents) do
-      if d.id == value or d.tab_value == value then M.selected_id = d.id; return d end
-    end
-  end
-  function M.selected()
-    return M.select(M.selected_id)
-  end
-  function M.edit(d, field, value)
-    assert(field == "title" or field == "text")
-    if type(value) ~= "string" then return nil, field .. " must be text" end
-    if field == "title" and value:find("[\r\n]") then return nil, "title must be a single line" end
-    if field == "text" and value:find("\r") then return nil, "text must use LF line endings" end
-    if d[field] ~= value then d[field], d.dirty, d.revision = value, true, d.revision + 1 end
-    return true
-  end
+  -- Dirty is a calculation, not a state: a save records the revision it wrote.
+  function M.dirty(d) return d.revision ~= d.saved_revision end
   function M.encode(d)
     return json.encode({ format = "dev.ourokit.ournote", version = 1, title = d.title, text = d.text })
   end
@@ -41,27 +27,6 @@ return function(json)
     end
     return { title = value.title, text = value.text }
   end
-  function M.begin_save(d)
-    if d.saving then return nil, "Save already in progress" end
-    d.save_serial = d.save_serial + 1
-    local operation = { serial = d.save_serial, revision = d.revision, bytes = M.encode(d) }
-    d.saving, d.save_active = true, operation
-    return operation
-  end
-  function M.cancel_save(d, operation)
-    if d.save_active ~= operation then return false end
-    d.saving, d.save_active = false, nil
-    return true
-  end
-  function M.finish_save(d, operation, path, ok, message)
-    if d.save_active ~= operation then return false end
-    d.saving, d.save_active = false, nil
-    if not ok then d.error = message or "Save failed"; return false end
-    d.path, d.error = path, nil
-    -- A late save never marks edits made after its snapshot as saved.
-    if operation.serial == d.save_serial and operation.revision == d.revision then d.dirty = false end
-    return true
-  end
   function M.parse_uri_list(bytes)
     if type(bytes) ~= "string" then return {} end
     local uris = {}
@@ -70,18 +35,12 @@ return function(json)
     end
     return uris
   end
-  function M.remove(d)
-    for i, candidate in ipairs(M.documents) do
-      if candidate == d then
-        local was_selected = M.selected_id == d.id
-        table.remove(M.documents, i)
-        if was_selected then
-          local replacement = M.documents[math.min(i, #M.documents)]
-          M.selected_id = replacement and replacement.id or nil
-        end
-        return true
-      end
-    end
+  function M.message(err)
+    if type(err) == "table" or type(err) == "userdata" then return err.message or err.name or "Unknown error" end
+    return tostring(err)
   end
+  function M.label(d) return d.title ~= "" and d.title or "Untitled" end
+  function M.tab_value(id) return tonumber(id:match("(%d+)$")) end
+  function M.child_id(value) return "document-" .. value end
   return M
 end

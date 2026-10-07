@@ -100,7 +100,7 @@ end
 -- Compilation
 ---------------------------------------------------------------------------
 
-local STATE_KEYS = {type=true, initial=true, states=true, on=true, always=true, after=true, invoke=true,
+local STATE_KEYS = {type=true, initial=true, order=true, states=true, on=true, always=true, after=true, invoke=true,
   entry=true, exit=true, on_done=true, tags=true, description=true, output=true}
 local ROOT_KEYS = {id=true, context=true, guards=true, actions=true, actors=true, events=true}
 local TRANSITION_KEYS = {target=true, guard=true, actions=true, reenter=true, description=true}
@@ -151,6 +151,9 @@ local function compile(def)
     node.order = #chart.nodes + 1
     chart.nodes[node.order] = node
     chart.by_id[node.id] = node
+    if sdef.order ~= nil and node.type ~= 'parallel' then
+      fail('only parallel states declare order (%s)', where(node))
+    end
     if sdef.states then
       local keys = {}
       for k in pairs(sdef.states) do
@@ -159,7 +162,28 @@ local function compile(def)
         end
         keys[#keys + 1] = k
       end
-      table.sort(keys) -- Document order: child keys sort lexically.
+      if sdef.order ~= nil then
+        -- Lua tables have no insertion order, so parallel regions may name
+        -- theirs: it fixes entry, exit and conflict resolution.
+        if type(sdef.order) ~= 'table' then fail('order of %s must be a list of region keys', where(node)) end
+        local seen, count = {}, 0
+        for k in pairs(sdef.order) do
+          if math.type(k) ~= 'integer' then fail('order of %s must be a list of region keys', where(node)) end
+          count = count + 1
+        end
+        if count ~= #sdef.order then fail('order of %s must be a list without holes', where(node)) end
+        for _, k in ipairs(sdef.order) do
+          if type(k) ~= 'string' or sdef.states[k] == nil then fail('order of %s names unknown region %q', where(node), tostring(k)) end
+          if seen[k] then fail('order of %s lists region %q twice', where(node), k) end
+          seen[k] = true
+        end
+        for _, k in ipairs(keys) do
+          if not seen[k] then fail('order of %s is missing region %q', where(node), k) end
+        end
+        keys = sdef.order
+      else
+        table.sort(keys) -- Without order, document order sorts keys.
+      end
       for _, k in ipairs(keys) do node.children[#node.children + 1] = build(sdef.states[k], k, node) end
     end
     if node.type == 'compound' then
@@ -184,12 +208,12 @@ local function compile(def)
     return node
   end
 
-  local function compile_actions(spec, context)
-    if spec == nil then return {} end
-    local list = {}
+  local function compile_actions(spec, context, list, label)
+    list = list or {}
+    if spec == nil then return list end
     local items = (type(spec) == 'table' and not spec.__action) and spec or {spec}
     for i = 1, #items do
-      local item, name = items[i], nil
+      local item, name = items[i], label
       if type(item) == 'string' then
         name = item
         item = actions[name]
@@ -198,6 +222,8 @@ local function compile(def)
       if type(item) == 'function' then list[#list + 1] = {kind = 'fn', fn = item, name = name or 'function'}
       elseif type(item) == 'table' and item.__action then
         local a = copy(item); a.kind = item.__action; a.name = name or item.__action; list[#list + 1] = a
+      elseif type(item) == 'table' and name and is_array(item) then
+        compile_actions(item, context, list, name) -- A named list of actions.
       else fail('invalid action in %s', context) end
     end
     return list
@@ -655,6 +681,12 @@ local function enter_states(m, transitions, step)
       for _, target in ipairs(t.targets) do add_descendants(target) end
       local domain = transition_domain(chart, t)
       for _, target in ipairs(t.targets) do add_ancestors(target, domain) end
+      -- Only a parallel root can be a domain; its exited regions re-enter.
+      if domain.type == 'parallel' then
+        for _, child in ipairs(domain.children) do
+          if not to_enter[child] and not any_descendant(child) then add_descendants(child) end
+        end
+      end
     elseif t.initial then
       add_descendants(chart.root)
     end
@@ -908,6 +940,7 @@ end
 ---------------------------------------------------------------------------
 
 local inspectors = {}
+local commits = 0 -- Global commit order across actors, for records.
 local registry = {}
 local registry_order = {}
 
@@ -1268,6 +1301,8 @@ function Actor:_process()
       local item = table.remove(self._queue, 1)
       local snapshot, effects, record = transition(self.chart, self._snapshot, item.event)
       commit(self, snapshot)
+      commits = commits + 1
+      record.commit = commits
       local effect_error = run_effects(self, effects, record)
       forget_finished_children(self)
       if wants_records(self) then
@@ -1317,6 +1352,8 @@ function Actor:start()
   end
   local pending = self._pending
   self._pending = nil
+  commits = commits + 1
+  pending.record.commit = commits
   self._processing = true
   local ok, err = pcall(function()
     local effect_error = run_effects(self, pending.effects, pending.record)

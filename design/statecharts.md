@@ -16,8 +16,8 @@ We use SCXML semantics with an XState-like Lua surface. Supported:
 
 | Feature | Surface | Notes |
 | --- | --- | --- |
-| Hierarchy | `states = {...}`, `initial = 'key'` | `initial` is required. Lua tables have no order, so it cannot default to the first child. |
-| Parallel | `type = 'parallel'` | Every region is active at once. |
+| Hierarchy | `states = { idle = {...}, saving = {...} }`, `initial = 'idle'` | `initial` is required on compound states, as in XState. |
+| Parallel | `type = 'parallel'`, optional `order = {'io', 'lifecycle'}` | Every region is active at once. `order` sets region document order. |
 | Final | `type = 'final'`, optional `output = fn` | Raises `done.state.<parent>`. A top-level final finishes the machine. |
 | Guards | `guard = 'name' \| fn` | Pure: `(context, event, state) -> boolean`. |
 | `assign` | `machine.assign(fn \| {field = value \| fn})` | The only way to change context. |
@@ -26,7 +26,7 @@ We use SCXML semantics with an XState-like Lua surface. Supported:
 | `after` | `after = { [ms] = transition }` | Integer milliseconds. Started on entry, cancelled on exit. |
 | `invoke` | `invoke = { src, id?, input?, on_done?, on_error? }` | Work that lives exactly as long as its state. |
 | Spawned children | `machine.spawn(chart, {id, input})`, `machine.stop(id)`, `send_to`, `send_parent` | Keyed child actors, such as one per document or tab. |
-| Entry/exit | `entry = action(s)`, `exit = action(s)` | Actions run in document order. |
+| Entry/exit | `entry = action(s)`, `exit = action(s)` | Actions run in document order. Named actions in `actions = {...}` may be a list. |
 | `on_done` | on compound/parallel states | Shorthand for `on = { ['done.state.<id>'] = ... }`. |
 | Tags | `tags = {'busy'}` | Use `actor:has_tag('busy')` in the view. |
 
@@ -34,8 +34,32 @@ Not supported: **history states**, delayed `send`, `<data>`/`<script>`, and
 deep or shallow history targets. The `in` guard is spelled `state.matches(id)`
 inside a guard. Transition order within one state follows the event
 descriptor: the exact type first, then dotted prefixes (`done.actor.*`), then
-`*`. Child state keys sort lexically to give document order. That order fixes
-parallel entry order and conflict resolution.
+`*`.
+
+### Region order
+
+`states` is a map keyed by state name, as in XState, and `initial` is required
+on compound states. Sibling order matters only between parallel regions,
+because a compound state has exactly one active child. For regions it decides:
+- the order regions are entered;
+- the order they exit, which is the reverse;
+- which transition wins a conflict, since the earlier region's does.
+
+XState gets this order for free, because JavaScript objects keep insertion
+order. Lua tables do not, so a parallel state can declare it:
+
+```lua
+open = { type = 'parallel', order = { 'io', 'lifecycle' }, states = {
+  io = { initial = 'idle', states = { ... } },
+  lifecycle = { initial = 'active', states = { ... } },
+} }
+```
+
+`order` must list exactly the region keys: no missing, unknown or duplicated
+keys, and no holes. Only parallel states accept it. Violations fail at
+`machine.create` and name the state. Without `order`, regions and all other
+children sort by key. Document order, as listed by `chart:graph()`, is
+depth-first in that sibling order.
 
 Transition targets resolve as follows:
 - `'sibling'`: a sibling of the source.
@@ -72,7 +96,11 @@ The prototype follows the SCXML algorithm without history:
   reaches the sender.
 - **Effects run after commit:** plain function actions, timers, invokes and
   child messages run after commit. Function actions run in order. Each sees the
-  context as it was when it was reached in the macrostep. Timers and invokes
+  context as it was when it was reached in the macrostep. **Function actions
+  must not yield.** They run in the sender's task, such as a button callback,
+  and the commit they follow can unmount that button and cancel its task. Any
+  work that waits on I/O is an `invoke`. The documents port hit this exactly:
+  saving the session in an exit action was cancelled by the closing dialog. Timers and invokes
   start at the end of the macrostep, only for states that are still active.
   This matches SCXML's end-of-macrostep `<invoke>`. Their cancellation is
   recorded when the state exits.
@@ -135,7 +163,8 @@ A snapshot is immutable. A new table is created only when something changed:
 ```
 
 - **Stable state IDs.** An ID is the dotted path of keys from the root, such as
-  `open.io.saving`. The root is `''`. IDs do not depend on declaration order.
+  `open.io.saving`. The root is `''`. IDs do not depend on sibling order, so
+  changing a parallel state's `order` changes no ID.
   `matches(id)` rejects unknown IDs, so typos fail loudly.
 - **Active configuration.** `states` lists every active state except the root,
   including compound ancestors and every parallel region, in document order.
@@ -322,7 +351,10 @@ There is one record per processed event, including rejected ones:
 
 ```lua
 {
-  kind = 'transition', actor = 'notes/document-2', machine = 'document', sequence = 14,
+  kind = 'transition', actor = 'notes/document-2', machine = 'document', sequence = 14, commit = 203,
+  -- sequence counts this actor's records; commit is the global order in which
+  -- snapshots committed. Records are emitted after their effects, so a child's
+  -- record can arrive before the parent record that caused it: sort by commit.
   origin = 'external',       -- external | timer | invoke | child | init | restore | stop
   event = { type = 'SAVE' },
   handled = true, rejected = false, reason = nil,  -- reason: no_transition | stale | done | stopped
@@ -387,27 +419,30 @@ document = machine.create {
   events = { EDIT = {field='string', value='string'}, SAVE = {}, SAVE_AS = {}, CLOSE = {},
              CANCEL = {}, DISCARD = {}, REPORT = {message='string'} },
   states = {
-    open = { type = 'parallel', states = {
-      io = { initial = 'idle', states = {
-        idle   = { on = { SAVE = 'saving', SAVE_AS = {target='saving', actions=assign{save_as=true}} } },
-        saving = { initial = 'choosing', entry = 'snapshot_save', states = {     -- bytes + revision at save start
-          choosing = { always = {target='writing', guard='has_path'},
-                       invoke = { src='choose', on_done={target='writing', actions='set_target'},
-                                  on_error={target='#open.io.idle', actions='report_unless_canceled'} } },
-          writing  = { invoke = { src='write', on_done={target='#open.io.idle', actions='saved'},
-                                  on_error={target='#open.io.idle', actions='report'} } },
+    open = { type = 'parallel', order = { 'io', 'lifecycle' },
+      on = { EDIT = { {guard='invalid_edit', actions='report_edit'}, {guard='changes', actions='apply_edit'} } },
+      states = {
+        io = { initial = 'idle', states = {
+          idle   = { on = { SAVE = 'saving', SAVE_AS = {target='saving', actions=assign{save_as=true}} } },
+          saving = { initial = 'choosing', entry = 'begin_save', states = {      -- bytes + revision at save start
+            choosing = { always = {target='writing', guard='has_path'},
+                         invoke = { src='choose', on_done={target='writing', actions=...},
+                                    on_error={ {target='#open.io.idle', guard='canceled'},
+                                               {target='#open.io.idle', actions='report'} } } },
+            writing  = { invoke = { src='write', on_done={target='#open.io.idle', actions='saved'},
+                                    on_error={target='#open.io.idle', actions='fail'} } },
+          }},
+        }},
+        lifecycle = { initial = 'active', states = {
+          active     = { on = { CLOSE = { {target='confirming', guard='unsafe'}, {target='#closed'} } } },
+          confirming = { initial = 'prompt', on = { CANCEL = {target='active', actions=send_parent('CLOSE_CANCELED')} },
+            states = {
+              prompt   = { on = { SAVE = {target='awaiting', guard='idle'}, DISCARD = {target='#closed', guard='idle'} } },
+              awaiting = { always = { {target='#closed', guard='saved_clean'}, {target='prompt', guard='idle'} } },
+            }},
         }},
       }},
-      lifecycle = { initial = 'active', states = {
-        active     = { on = { CLOSE = { {target='confirming', guard='unsafe'}, {target='#closed'} } } },
-        confirming = { initial = 'prompt', on = { CANCEL = {target='active', actions=send_parent('CLOSE_CANCELED')} },
-          states = {
-            prompt   = { on = { SAVE = 'awaiting', DISCARD = {target='#closed', guard='idle'} } },
-            awaiting = { always = { {target='#closed', guard='saved_clean'}, {target='prompt', guard='save_finished'} } },
-          }},
-      }},
-    }},
-    closed = { type = 'final' },
+    closed = { type = 'final', output = function(c) return { path = c.path } end },
   },
 }
 ```
@@ -423,10 +458,14 @@ document = machine.create {
   `enabled = not d.saving` checks.
 - `notes` holds `running.open` and `running.closing.walking`. `CLOSE_WINDOW`
   captures the open tabs, then walks: it selects the first unsafe child and
-  sends it `CLOSE`. `done.actor.*` re-enters `walking`. A child's `CANCEL`
-  sends `CLOSE_CANCELED`, which returns to `open`. No unsafe children left, or
-  closing the last tab, leads to the `quitting` final state, whose entry
-  persists the session and exits.
+  sends it `CLOSE`. `done.actor.*` re-enters `walking` but not `closing`, so the
+  captured list survives. That needs the default transition, not
+  `reenter = true`; the first version of the port got this wrong. A child's
+  `CANCEL` sends `CLOSE_CANCELED`, which returns to `open`. When no unsafe
+  children are left, or the last tab closes, `notes` enters `quitting`, which
+  invokes the session save, then `exited`, whose entry exits the process.
+- The parent keeps each child's saved path (`SAVED { id, path }`) for the
+  session, because parent guards and expressions cannot read child snapshots.
 - The view maps `doc:matches('open.lifecycle.confirming')` to the dialog and
   `doc:matches('open.io.saving')` to disabled Save buttons. The compositor
   close request is just `notes:sender('CLOSE_WINDOW')`.
@@ -509,8 +548,11 @@ through the shared schema and MCP surface, and through inspection.
 - **Copy-on-write by convention.** Nested values in context are not frozen;
   views protect reads, but an action can still mutate a table it created
   before assigning it.
-- **Document order from sorted keys** surprises people writing parallel regions
-  whose order matters. Should parallel regions be ordered with an array syntax?
+- ~~Document order from sorted keys~~ **Resolved:** keep XState's map form and
+  required `initial`. Parallel states may declare `order`; without it, keys sort.
+- **Yielding in function actions** cannot be detected without a coroutine
+  library in the sandbox. Phase 2 could run effects outside the sender's
+  scope, or reject yields natively.
 - **Effects see stale context.** Function actions run after commit, with the
   context of their point in the macrostep. This is SCXML-consistent but easy
   to misread.

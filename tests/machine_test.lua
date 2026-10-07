@@ -133,6 +133,56 @@ return {
     assert(join(actor:states()) == 'p,p.r1,p.r1.x,p.r2,p.r2.u')
   end,
 
+  ['order on a parallel state sets region document order; it is validated'] = function()
+    local function parallel(order)
+      return { id = 'p', initial = 'both', states = { both = { type = 'parallel', order = order,
+        states = { alpha = { initial = 'a', states = { a = {} } }, zeta = { initial = 'z', states = { z = {} } } } } } }
+    end
+    fails(function() machine.create(parallel({ 'zeta' })) end, 'order of p.both is missing region "alpha"')
+    fails(function() machine.create(parallel({ 'zeta', 'alpha', 'zeta' })) end, 'lists region "zeta" twice')
+    fails(function() machine.create(parallel({ 'zeta', 'alpha', 'beta' })) end, 'names unknown region "beta"')
+    fails(function() machine.create(parallel({ zeta = 1, alpha = 2 })) end, 'must be a list of region keys')
+    fails(function() machine.create(parallel('zeta')) end, 'must be a list of region keys')
+    fails(function() machine.create { id = 'c', initial = 'a', order = { 'a' }, states = { a = {} } } end, 'only parallel states declare order')
+    fails(function() machine.create { id = 'c', initial = 'a', states = { a = { order = {}, initial = 'x', states = { x = {} } } } } end, 'only parallel states declare order')
+
+    local log = {}
+    local function note(text) return function() log[#log + 1] = text end end
+    local function chart(order)
+      return machine.create {
+        id = 'ordered', type = 'parallel', order = order,
+        states = {
+          zeta = { initial = 'z1', entry = note('enter zeta'), exit = note('exit zeta'), on = { OUT = '#alpha' },
+            states = { z1 = { on = { GO = 'z2' } }, z2 = {} } },
+          alpha = { initial = 'a1', entry = note('enter alpha'), exit = note('exit alpha'),
+            states = { a1 = { on = { GO = '#zeta' } }, a2 = {} } },
+        },
+      }
+    end
+    -- Without order, regions sort by key: alpha, then zeta.
+    local sorted = chart(nil):start { scheduler = machine.manual_scheduler() }
+    assert(join(log) == 'enter alpha,enter zeta' and join(sorted:states()) == 'alpha,alpha.a1,zeta,zeta.z1', join(log))
+    assert(chart(nil):graph().states[2].id == 'alpha')
+    log = {}
+    sorted:send('GO') -- alpha is first, so its GO (re-entering everything) preempts zeta's.
+    assert(sorted:matches('zeta.z1'), join(sorted:states()))
+    assert(join(log) == 'exit zeta,exit alpha,enter alpha,enter zeta', join(log))
+
+    log = {}
+    local ordered = chart({ 'zeta', 'alpha' })
+    local actor = ordered:start { scheduler = machine.manual_scheduler() }
+    assert(join(log) == 'enter zeta,enter alpha' and join(actor:states()) == 'zeta,zeta.z1,alpha,alpha.a1', join(log))
+    local ids = {}
+    for i, state in ipairs(ordered:graph().states) do ids[i] = state.id end
+    assert(join(ids) == ',zeta,zeta.z1,zeta.z2,alpha,alpha.a1,alpha.a2', join(ids))
+    log = {}
+    actor:send('GO') -- zeta is first now: its GO wins and alpha's is preempted.
+    assert(actor:matches('zeta.z2') and actor:matches('alpha.a1') and #log == 0, join(actor:states()))
+    actor:send('OUT') -- the domain is the parallel root: every region exits (in reverse) and re-enters.
+    assert(join(log) == 'exit alpha,exit zeta,enter zeta,enter alpha', join(log))
+    assert(join(actor:states()) == 'zeta,zeta.z1,alpha,alpha.a1', join(actor:states()))
+  end,
+
   ['a transition to its own state re-enters it; deep transitions exit inner first'] = function()
     local log = {}
     local actor = nested(log):start { scheduler = machine.manual_scheduler() }
@@ -280,6 +330,7 @@ return {
     assert(actor:matches('c') and #records == 2 and records[1].event.type == 'GO' and records[2].event.type == 'NEXT')
     assert(join(order) == 'effect,enter b', join(order))
     assert(records[2].sequence == records[1].sequence + 1)
+    assert(records[2].commit > records[1].commit)
   end,
 
   ['final states raise done events for compound and parallel parents'] = function()
@@ -448,6 +499,14 @@ return {
     assert(join(lifecycle) == 'started list,started list/a,started list/b,stopped list/b', join(lifecycle))
     assert(child_records >= 2)
     assert(seen[1].graph.id == 'list')
+    -- Records are emitted after their effects, so a child's record can precede
+    -- its parent's; commit gives the global order snapshots changed in.
+    local ping, pong
+    for _, record in ipairs(seen) do
+      if record.kind == 'transition' and record.actor == 'list' and record.event.type == 'PING' then ping = record end
+      if record.kind == 'transition' and record.actor == 'list' and record.event.type == 'PONG' then pong = record end
+    end
+    assert(ping.commit < pong.commit)
   end,
 
   ['prefix descriptors, the state argument and done.actor positions'] = function()
