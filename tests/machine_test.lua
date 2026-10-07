@@ -923,6 +923,73 @@ return {
     assert(t:node('root/first/box/toggle').label == 'Show First')
   end,
 
+  ['reload hooks persist roots, carry them into new charts and hold their work until release'] = function()
+    local clock = machine.manual_scheduler()
+    local doc_v1 = machine.create {
+      id = 'doc', initial = 'clean', context = function(input) return { title = input.title } end,
+      states = { clean = { on = { EDIT = 'dirty' } }, dirty = { after = { [100] = 'clean' } } },
+    }
+    local app_v1 = machine.create {
+      id = 'app', initial = 'running', context = { n = 0 },
+      states = { running = { initial = 'idle', states = {
+        idle = { on = { ADD = { actions = machine.spawn(doc_v1, { id = function(_, e) return e.id end, input = function(_, e) return { title = e.id } end }) },
+          WAIT = 'waiting' } },
+        waiting = { after = { [50] = 'idle' }, on = { BACK = 'idle' } },
+      } } },
+    }
+    local app = app_v1:start { scheduler = clock }
+    app:send { type = 'ADD', id = 'a' }
+    app:child('a'):send('EDIT')
+    app:send('WAIT')
+    local done = machine.create { id = 'once', initial = 'a', states = { a = { on = { END = 'b' } }, b = { type = 'final' } } }:start { scheduler = clock }
+    done:send('END')
+    local bad = machine.create { id = 'bad', initial = 'a', context = function() return { f = function() end } end, states = { a = {} } }:start { scheduler = clock }
+    local entries, skipped = machine.persist_roots()
+    local ids = {}
+    for _, entry in ipairs(entries) do ids[#ids + 1] = entry.id .. '/' .. entry.machine end
+    table.sort(ids)
+    assert(join(ids) == 'app/app', join(ids)) -- done, unserializable and child actors are left out
+    assert(#skipped == 1 and skipped[1]:find('^bad: machine value is not serializable'), tostring(skipped[1]))
+    local mine
+    for _, entry in ipairs(entries) do if entry.id == 'app' then mine = entry end end
+
+    -- The new source renames waiting, and doc lost its dirty state.
+    local doc_v2 = machine.create {
+      id = 'doc', initial = 'clean', context = function(input) return { title = input.title, pinned = false } end,
+      states = { clean = { on = { EDIT = 'clean' } } },
+    }
+    local app_v2 = machine.create {
+      id = 'app', initial = 'running', context = { n = 0, extra = 'new' },
+      states = { running = { initial = 'idle', states = {
+        idle = { on = { ADD = { actions = machine.spawn(doc_v2, { id = function(_, e) return e.id end, input = function(_, e) return { title = e.id } end }) },
+          WAIT = 'paused' } },
+        paused = { after = { [50] = 'idle' }, on = { BACK = 'idle' } },
+      } } },
+    }
+    local fresh_clock = machine.manual_scheduler()
+    machine.carry({ mine, { id = 'other', machine = 'nope', snapshot = mine.snapshot } })
+    local restored = app_v2:start { scheduler = fresh_clock, renames = { ['running.waiting'] = 'running.paused' } }
+    assert(restored:restored() and restored:matches('running.paused') and restored:context().extra == 'new')
+    local a = restored:child('a')
+    assert(a and a:restored() and a:matches('clean') and a:context().title == 'a', 'the child falls back and keeps its old context')
+    assert(#fresh_clock.timers == 0, 'restored timers wait for release')
+    local unrelated = app_v2:start { scheduler = fresh_clock, id = 'other' }
+    assert(not unrelated:restored(), 'a chart id mismatch starts fresh')
+    machine.release()
+    assert(#fresh_clock.timers == 1)
+    fresh_clock.advance(50)
+    assert(restored:matches('running.idle'))
+    assert(not app_v2:start { scheduler = fresh_clock }:restored(), 'entries are consumed and the hold ends')
+
+    -- A held timer whose state exits before release is skipped.
+    local again = machine.manual_scheduler()
+    machine.carry({ mine })
+    local held = app_v2:start { scheduler = again, renames = { ['running.waiting'] = 'running.paused' } }
+    held:send('BACK') -- transitions after restore behave normally
+    machine.release()
+    assert(held:matches('running.idle') and #again.timers == 0)
+  end,
+
   ['event schemas validate external events and drive accepted()'] = function()
     local chart = machine.create {
       id = 'schema', initial = 'clean',

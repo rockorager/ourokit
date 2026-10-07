@@ -180,7 +180,7 @@ end
 local function compile(def)
   if type(def) ~= 'table' then fail('machine.create expects a table') end
   if type(def.id) ~= 'string' or not def.id:match('^[%a_][%w_%-]*$') then fail('machine id must be an identifier') end
-  local chart = {__chart = true, id = def.id, nodes = {}, by_id = {}, transitions = {}, def = def}
+  local chart = {__chart = true, id = def.id, nodes = {}, by_id = {}, transitions = {}, def = def, child_charts = {}}
   local guards, actions, actors = def.guards or {}, def.actions or {}, def.actors or {}
 
   local function where(node) return node.id == '' and def.id or def.id .. '.' .. node.id end
@@ -286,6 +286,7 @@ local function compile(def)
       elseif type(item) == 'table' and item.__action then
         local a = copy(item); a.kind = item.__action; a.name = name or item.name or item.__action
         a.label = a.kind .. " '" .. a.name .. "' (" .. context .. ')'
+        if a.kind == 'spawn' and a.chart then chart.child_charts[a.chart.id] = a.chart end
         if a.kind == 'spawn' and a.src ~= nil then
           if type(a.src) == 'string' then
             a.src_name = a.src
@@ -1257,6 +1258,77 @@ function M.actions(actor, specs, options)
   return entries
 end
 
+-- Source reload (driven by the host):
+--   old VM:  entries, skipped = machine.persist_roots()   -- read-only
+--   new VM:  machine.carry(entries) before the candidate's source and run()
+--   commit:  machine.release() in the new VM; a failed candidate never calls it
+-- Creating a root actor whose id and chart id match a carried entry restores
+-- it (chart:restore, with options.renames). Restored state is visible at
+-- once, so the candidate's UI builds from it; restored timers and invokes
+-- start when the candidate commits; a failed candidate starts nothing.
+local carried, held = nil, nil
+
+function M.persist_roots()
+  local entries, skipped = {}, {}
+  for _, actor in ipairs(M.actors()) do
+    if not actor._parent and not actor._lazy and actor._status == 'running' and actor._snapshot.status == 'active' then
+      local ok, snapshot = pcall(actor.persist, actor)
+      if ok then entries[#entries + 1] = {id = actor.id, machine = actor.chart.id, snapshot = snapshot}
+      else skipped[#skipped + 1] = actor.id .. ': ' .. tostring(snapshot) end
+    end
+  end
+  return entries, skipped
+end
+
+function M.carry(entries)
+  carried, held = {}, {}
+  for i, entry in ipairs(entries or {}) do carried[i] = entry end
+end
+
+function M._take_carried(chart, actor, options)
+  if not carried or options.parent or options.snapshot or options.lazy then return nil end
+  for i, entry in ipairs(carried) do
+    if entry.id == actor.id and entry.machine == chart.id then
+      table.remove(carried, i)
+      return entry
+    end
+  end
+end
+
+function M._hold(actor, effects)
+  if not held then return effects end
+  local kept = {}
+  for _, effect in ipairs(effects) do
+    if effect.kind == 'timer_start' or effect.kind == 'invoke_start' then held[#held + 1] = {actor = actor, effect = effect}
+    else kept[#kept + 1] = effect end
+  end
+  return kept
+end
+
+function M.release()
+  local list = held or {}
+  carried, held = nil, nil
+  local order, by_actor = {}, {}
+  for _, item in ipairs(list) do
+    local actor, effect = item.actor, item.effect
+    if actor._status == 'created' then
+      -- Not started yet: start() will run it.
+      actor._pending.effects[#actor._pending.effects + 1] = effect
+    elseif actor._status == 'running' and actor._snapshot.status == 'active'
+      and actor._snapshot.entries[effect.state] == effect.token then
+      if not by_actor[actor] then by_actor[actor] = {}; order[#order + 1] = actor end
+      local effects = by_actor[actor]
+      effects[#effects + 1] = effect
+    end -- Stopped, or the state was exited since: skip.
+  end
+  local first_error
+  for _, actor in ipairs(order) do
+    local err = M._run_released(actor, by_actor[actor])
+    first_error = first_error or err
+  end
+  if first_error then error(first_error, 0) end
+end
+
 function M.actors()
   local list, live = {}, {}
   for _, path in ipairs(registry_order) do
@@ -1397,6 +1469,12 @@ local function create_actor(chart, options)
   for name, fn in pairs(Actor) do actor[name] = fn end
   actor.path = options.parent and (options.parent.path .. '/' .. actor.id) or actor.id
   local snapshot, effects, record
+  local carried_entry = M._take_carried(chart, actor, options)
+  if carried_entry then
+    options = copy(options)
+    options.snapshot = chart:restore(carried_entry.snapshot, {renames = options.renames, input = options.input})
+  end
+  actor._restored = options.snapshot ~= nil
   if options.snapshot then
     local persisted = options.snapshot
     if persisted.machine ~= chart.id then fail('snapshot belongs to %s, not %s', tostring(persisted.machine), chart.id) end
@@ -1424,11 +1502,16 @@ local function create_actor(chart, options)
         end
       end
     end
+    -- Restored timers and invokes wait for release() while a reload is held.
+    effects = M._hold(actor, effects)
     for _, child in ipairs(persisted.children or {}) do
-      local child_chart = actor._charts[child.snapshot.machine] or (child.snapshot.machine == chart.id and chart)
-      if not child_chart then fail('no chart for restored child machine %s', tostring(child.snapshot.machine)) end
+      local machine_id = child.snapshot.machine
+      local child_chart = actor._charts[machine_id] or chart.child_charts[machine_id] or (machine_id == chart.id and chart)
+      if not child_chart then fail('no chart for restored child machine %s', tostring(machine_id)) end
       snapshot.children[#snapshot.children + 1] = child.id
-      effects[#effects + 1] = {kind = 'spawn', id = child.id, chart = child_chart, snapshot = child.snapshot}
+      -- Children map onto their chart too: renamed or removed states fall
+      -- back to the nearest surviving ancestor.
+      effects[#effects + 1] = {kind = 'spawn', id = child.id, chart = child_chart, snapshot = child_chart:restore(child.snapshot)}
     end
     record = new_record({type = 'ouro.restore'})
     record.handled = true
@@ -1445,6 +1528,10 @@ end
 function Actor:_read()
   return self._store()
 end
+
+-- True when this actor was created from a persisted snapshot (including
+-- state carried across a source reload); apps skip one-time setup then.
+function Actor:restored() return self._restored end
 
 function Actor:snapshot() return view(self:_read()) end
 function Actor:context() return view(self:_read().context) end
@@ -1727,6 +1814,17 @@ local function forget_finished_children(actor)
   end
 end
 
+function M._run_released(actor, effects)
+  local record = new_record({type = 'ouro.release'})
+  record.handled = true
+  local err = run_effects(actor, effects, record)
+  if wants_records(actor) then
+    finalize(actor, record, 'restore')
+    emit(actor, record)
+  end
+  return err
+end
+
 function Actor:_process()
   if self._processing then return end
   self._processing = true
@@ -1910,7 +2008,12 @@ function M.create(def)
       if id ~= '' then wanted[#wanted + 1] = self.by_id[id] end
     end
     local fresh = self.def.context
-    if type(fresh) == 'function' then fresh = atomic('context of ' .. self.id, fresh, options.input) end
+    if type(fresh) == 'function' then
+      -- A restored child has no input; if the fresh context can't be built,
+      -- the old context is kept as is.
+      local ok, value = pcall(atomic, 'context of ' .. self.id, fresh, options.input)
+      fresh = ok and value or {}
+    end
     fresh = copy(raw(fresh or {}))
     local old = raw(persisted.context or {})
     for k, v in pairs(old) do
