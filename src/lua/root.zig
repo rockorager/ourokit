@@ -44,6 +44,7 @@ test {
     _ = @import("diagnostic.zig");
     _ = @import("images_test.zig");
     _ = @import("prepared_build.zig");
+    _ = @import("scopes.zig");
     _ = @import("signals.zig");
     _ = @import("module_loader.zig");
     _ = @import("shell_workspaces.zig");

@@ -363,6 +363,10 @@ pub const Scheduler = struct {
         return count;
     }
 
+    pub fn scopeCapacity(self: *const Scheduler) usize {
+        return self.scopes.len;
+    }
+
     pub fn taskCapacity(self: *const Scheduler) usize {
         return self.tasks.len;
     }

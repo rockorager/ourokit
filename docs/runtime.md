@@ -162,7 +162,47 @@ point. `sleep` then unwinds it instead of arming a timer; spawning and external
 waits raise errors. `lua.Vm.openScope(parent)` opens a scope owned by
 that VM. Retiring the source generation (`requestCancellation`) retires those
 scopes and leaves retained window scopes and the replacement generation's
-scopes alone. No Lua API exposes scopes yet.
+scopes alone.
+
+`lua.Vm.closeScope` retires a scope. It then discards, at once, any task in the
+canceled subtree that has never started. Such a task has no Lua frames, timers,
+or I/O. Started tasks unwind at the next safe point, as before.
+
+Scope capacity is fixed when the scheduler is created (`scope_capacity`,
+1024 by default in the Wayland runner). It does not grow, because native
+reconcilers prevalidate against `availableScopeCapacity` and rely on infallible
+scope creation at commit. Because never-started work is discarded on close,
+rapid state toggling reuses the same slots, even 10,000 times in one turn.
+Only scopes whose tasks have actually started can wait for drain. Exhaustion
+raises `ScopeCapacityExceeded`, with a message that names the capacity.
+
+### Private scope binding
+
+`src/lua/scopes.zig` exposes scopes only to embedded Lua, never on `ouro`.
+Following the `forms.zig` pattern, a loader pushes the closures as chunk
+arguments:
+
+```zig
+// Loader: chunk on the stack, then its other arguments.
+const extra = @import("scopes.zig").pushChunkArguments(state); // open, spawn, close, alive
+if (c.lua_pcallk(state, other_arguments + extra, 0, 0, 0, null) != c.ok) ...
+```
+
+```lua
+local open, spawn, close, alive = ...   -- after the loader's other arguments
+local scope = open(parent)   -- parent defaults to the running task's scope
+spawn(scope, fn, ...)        -- queues fn(...) in scope (at most 16 arguments)
+close(scope)                 -- cancels the subtree; idempotent, no-op if stale
+alive(scope)                 -- false once closed, canceled, or freed
+```
+
+`pushChunkArguments` always pushes `chunk_argument_count` (4) values. In a
+Lua state without a VM (bare test states), they are nils. The VM is found
+through the registry, so loaders that only have a `lua_State` (such as
+`UiBuild`) can call it. Errors are strings that start with the error name:
+`ScopeCanceled`, `StaleScope`, `ScopeCapacityExceeded`, `NoParentScope`, or
+`InvalidArguments`. Scopes opened this way belong to the source generation's
+VM.
 
 ## Embedded Lua
 

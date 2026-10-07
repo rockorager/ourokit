@@ -50,6 +50,9 @@ const Slot = struct {
     requested_nanoseconds: u64 = 0,
     yield_request: YieldRequest = .none,
     resume_arguments: c_int = 0,
+    /// Set before the first `lua_resume`. A task that never started has no
+    /// Lua frames, timers, or I/O, so closing its scope may discard it at once.
+    started: bool = false,
     retain_result: bool = false,
     completed_result_count: ?c_int = null,
     activation_input: ?platform_activation.Input = null,
@@ -59,6 +62,7 @@ const Slot = struct {
 };
 
 const slots_per_chunk = 32;
+const registry_key = "ouro.vm";
 const invalid_slot = std.math.maxInt(u32);
 
 /// One isolated Lua state with growable stable-address slabs of scoped
@@ -182,6 +186,9 @@ pub const Vm = struct {
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, builtinRequire, 1);
         c.lua_setglobal(state, "require");
+        // Lets native bindings loaded without a *Vm (e.g. by UiBuild) find it.
+        c.lua_pushlightuserdata(state, self);
+        c.lua_setfield(state, c.registry_index, registry_key);
 
         // A reusable declaration of application ownership, with precisely the
         // same candidate, cancellation and input-capability rules as spawn_app.
@@ -249,6 +256,32 @@ pub const Vm = struct {
     /// The scope frees itself once drained; stale handles are rejected.
     pub fn openScope(self: *Vm, parent: task.ScopeHandle) !task.ScopeHandle {
         return self.scheduler.createOwnedScope(parent, self);
+    }
+
+    /// Retires `scope` (see `Scheduler.retireScope`) and immediately discards
+    /// tasks in the canceled subtree that have never started: they hold no Lua
+    /// frames, timers, or I/O. Rapid state toggling therefore frees scopes at
+    /// once instead of accumulating them until the next task phase. Started
+    /// tasks still unwind at the next safe point.
+    pub fn closeScope(self: *Vm, scope: task.ScopeHandle) !void {
+        try self.scheduler.retireScope(scope);
+        for (self.chunks, 0..) |chunk, chunk_index| for (chunk, 0..) |*slot, offset| {
+            if (!slot.active or slot.started or slot.completed_result_count != null) continue;
+            if (!(self.scheduler.cancellationQueuedOrRequested(slot.scheduler_handle) catch false)) continue;
+            self.scheduler.discardRunnableTask(slot.scheduler_handle) catch continue;
+            const handle: TaskHandle = .{
+                .slot = @intCast(chunk_index * slots_per_chunk + offset),
+                .generation = slot.generation,
+            };
+            if (self.closeTask(handle) != c.ok) return error.LuaThreadCloseFailed;
+        };
+    }
+
+    /// The VM that owns `state` (the main state or one of its coroutines).
+    pub fn fromState(state: *c.State) ?*Vm {
+        _ = c.lua_getfield(state, c.registry_index, registry_key);
+        defer c.lua_settop(state, -2);
+        return @ptrCast(@alignCast(c.lua_touserdata(state, -1) orelse return null));
     }
 
     pub fn spawnApplication(self: *Vm, source: []const u8) !TaskHandle {
@@ -558,6 +591,7 @@ pub const Vm = struct {
         }
 
         slot.yield_request = .none;
+        slot.started = true;
         var result_count: c_int = 0;
         const resume_arguments = slot.resume_arguments;
         slot.resume_arguments = 0;
