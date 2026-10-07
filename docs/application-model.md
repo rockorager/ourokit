@@ -753,7 +753,10 @@ allows one custom action in flight; a second receives a `Busy` tool error.
 Runtime status and cancellation remain available while an action sleeps.
 `notifications/cancelled` with `requestId` cancels that action; its terminal tool
 error retires the request. Disconnect and source-generation retirement also
-cancel actions without resuming their old Lua continuations. The server admits
+cancel actions without resuming their old Lua continuations. An action's task
+scope ends with the action. Work it started with `ouro.spawn`, and timers or
+connections it opened there, is canceled once it replies or fails. Use
+`ouro.spawn_app` for work that should outlive the action. The server admits
 at most eight same-UID peers and owns separate bounded read/write operations.
 See the [MCP contract](mcp.md) for request metadata and result-type rules.
 

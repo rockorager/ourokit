@@ -57,6 +57,15 @@ const Action = struct {
     method: []u8,
 };
 
+/// An action's scope is its lifetime. Retiring it cancels whatever the action
+/// left behind (`ouro.spawn` children, timers, connections) and frees the scope
+/// once that drains, so teardown never depends on the scope already being
+/// empty. Work meant to outlive the action belongs in `spawn_app`.
+fn retireActionScope(vm: *lua.Vm, scope: task.ScopeHandle) void {
+    // Only a stale or the application scope can fail; neither needs release.
+    vm.scheduler.retireScope(scope) catch {};
+}
+
 const Failure = struct {
     phase: []u8,
     source: []u8,
@@ -349,7 +358,7 @@ pub const ControlServer = struct {
             const result = action.vm.resumeRunnable(handle) catch |err| {
                 client.action = null;
                 defer self.allocator.free(action.method);
-                defer action.vm.scheduler.destroyScope(action.scope) catch unreachable;
+                defer retireActionScope(action.vm, action.scope);
                 if (!client.closing) if (action.call) |call|
                     try self.sendActionFailure(client, call, @errorName(err));
                 return true;
@@ -357,7 +366,7 @@ pub const ControlServer = struct {
             if (result == .waiting) return true;
             client.action = null;
             defer self.allocator.free(action.method);
-            defer action.vm.scheduler.destroyScope(action.scope) catch unreachable;
+            defer retireActionScope(action.vm, action.scope);
             if (result == .canceled) {
                 if (!client.closing) if (action.call) |call|
                     try self.sendActionFailure(client, call, "action canceled by reload or shutdown");
@@ -767,7 +776,7 @@ pub const ControlServer = struct {
             defer if (!transferred) self.allocator.free(owned_method);
             const scope = try vm.scheduler.createScope(vm.scheduler.application_scope);
             const handle = application.startAction(vm, scope, name, arguments) catch |err| {
-                try vm.scheduler.destroyScope(scope);
+                retireActionScope(vm, scope);
                 try self.sendActionFailure(client, call, @errorName(err));
                 return;
             };
@@ -943,6 +952,12 @@ test "runtime server holds Reload reply until the generation commits" {
         \\      return {applicationId=ouro.mcp.call(p.address,'runtime.status').result.structuredContent.applicationId}
         \\    end),
         \\    Status = action(empty, obj({status=str},{'status'}), function() return {status='custom status'} end),
+        \\    Detached = action(empty, empty, function() ouro.spawn(function() ouro.sleep(60000); left_behind_resumed = true end); return {} end),
+        \\    Lingering = action(empty, empty, function()
+        \\      ouro.spawn(function() ouro.sleep(60000); left_behind_resumed = true end)
+        \\      ouro.sleep(1) -- the child starts and parks on its own timer
+        \\      return {}
+        \\    end),
         \\    Fail = action(obj({code=int},{'code'}), empty, function(p)
         \\      if p.code == 1 then return ouro.action_error('Rejected', {code = 19}) end
         \\      if p.code == 2 then return ouro.action_error('Rejected', {code = 'wrong'}) end
@@ -1082,6 +1097,23 @@ test "runtime server holds Reload reply until the generation commits" {
         const bytes = try testReceive(&control, &vm, &outbound, client, &response);
         try std.testing.expect(std.mem.indexOf(u8, bytes, case.expected) != null);
         try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
+    }
+
+    // An action's scope is its lifetime. Work it spawned and left behind, either
+    // never started or parked on a timer, is canceled once it replies; the scope
+    // frees itself after that drains instead of failing destroyScope.
+    const scopes_before = scheduler.availableScopeCapacity();
+    for ([_][]const u8{ "Detached", "Lingering" }) |method| {
+        const message = try testRequest(method, "{}");
+        defer std.testing.allocator.free(message);
+        try std.testing.expectEqual(message.len, linux.write(client, message.ptr, message.len));
+        var left_behind: [2048]u8 = undefined;
+        const bytes = try testReceive(&control, &vm, &outbound, client, &left_behind);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"structuredContent\":{}") != null);
+        while (vm.activeTaskCount() != 0) try testService(&control, &vm);
+        try std.testing.expect(!vm.globalBoolean("left_behind_resumed"));
+        try std.testing.expectEqual(scopes_before, scheduler.availableScopeCapacity());
+        try std.testing.expectEqual(@as(usize, 0), loop.timers.count());
     }
 
     // An action can call another connection to the same server without blocking
@@ -1252,8 +1284,10 @@ fn testFeedDevelopment(control: *ControlServer, client: *Client, wire: []const u
 fn testService(control: *ControlServer, vm: *lua.Vm) !void {
     try vm.scheduler.applyQueuedCancellations();
     try control.serviceRequests();
-    while (vm.scheduler.takeRunnable()) |handle|
-        try std.testing.expect(try control.resumeRunnable(handle));
+    // Production routes non-action tasks to their VM through source reload.
+    while (vm.scheduler.takeRunnable()) |handle| {
+        if (!(try control.resumeRunnable(handle))) _ = try vm.resumeRunnable(handle);
+    }
     control.collectClosed();
     try control.serviceRequests();
 }
