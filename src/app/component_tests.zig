@@ -140,6 +140,9 @@ const Context = struct {
         const action = try @import("development_control.zig").parseAction(value);
         self.busy = true;
         defer self.busy = false;
+        // State changed outside input, such as a manual scheduler's
+        // clock.advance or a direct actor:send, rebuilds first.
+        try self.settle();
         var playback = try dev.Playback.init(self.runtime, dev.Token.current(self.runtime), action);
         while (try playback.advance(self.runtime) == .routed) try self.settle();
     }
@@ -171,6 +174,12 @@ const Context = struct {
         if (self.busy) return error.ReentrantTestOperation;
         if (self.content_reference == c.no_reference) return error.TestNotMounted;
         const path = try string(state, 2);
+        self.busy = true;
+        self.settle() catch |err| {
+            self.busy = false;
+            return err;
+        };
+        self.busy = false;
         var snapshot = try dev.inspect(self.env.init.gpa, self.runtime, .{});
         defer snapshot.deinit();
         for (snapshot.nodes) |item| {

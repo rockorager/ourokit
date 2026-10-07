@@ -15,6 +15,9 @@ ouro.spinbox = ouro.stateful(function(props)
   local function reset() draft:set({base=props.value, text=tostring(props.value)}) end
   local function request(candidate)
     local value = normalize(props, candidate)
+    -- Native range math is floating point; an integer spinbox reports
+    -- integers, so machine.set(field, 'integer') accepts its values.
+    if math.type(props.value) == 'integer' then value = math.tointeger(value) or value end
     reset()
     local change = menus.main_trigger(props, 'on_change')
     if change and value ~= props.value then menus.handler(change, true)(value) end

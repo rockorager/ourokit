@@ -15,7 +15,8 @@ local transparent = '#00000000'
 -- type at all (actor:handles, guards ignored): their payload is unknown until
 -- the user changes it, and a guard such as "the value changed" would refuse
 -- the current value and lock the widget.
-local valued = {on_change=true, on_select=true, on_activate=true, on_drop_text=true, on_drop_uris=true}
+local valued = {on_change=true, on_select=true, on_activate=true, on_drop_text=true, on_drop_uris=true,
+  on_interaction_change=true, on_scroll=true}
 local function bound(v) return kind(v) == 'table' and v.actor ~= nil and v.event ~= nil end
 local function callable(v) return v == nil or kind(v) == 'function' or bound(v) end
 local function carrying(event, field, value)
@@ -384,7 +385,7 @@ ouro.popover = ouro.stateful(function(p)
     local active = trigger_active or popup_active
     if reported ~= active then
       reported = active
-      if p.on_interaction_change then handler(p.on_interaction_change)(active) end
+      if p.on_interaction_change then handler(p.on_interaction_change, true)(active) end
     end
   end
   local function observe_trigger(active) trigger_active=active; report() end

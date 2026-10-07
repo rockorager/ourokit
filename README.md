@@ -542,7 +542,9 @@ The test context provides:
   clock.
 
 Mount and input drain runnable callbacks, reconciliation, layout, and scene
-preparation before returning. They do not wait for animation completion or
+preparation before returning. `t:node` and input first settle changes made
+outside input, such as a statechart driven directly with `actor:send` or a
+manual scheduler's `clock.advance(ms)`. They do not wait for animation completion or
 arbitrary async work. Sleeps and callbacks awaiting external work fail rather
 than introduce timing-dependent tests. For statechart timers, give actors a
 `machine.manual_scheduler()` and call `t:settle()` after advancing it. Use reduced motion where a test needs stable control state. Assertions

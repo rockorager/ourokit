@@ -21,6 +21,7 @@ local chart = machine.create {
       TAB = { guard = function(_, e) return e.value ~= 3 end, actions = assign { tab = function(_, e) return e.value end } },
       RESIZE = { actions = assign { split = function(_, e) return e.position end } },
       PICK = { actions = assign { picked = function(_, e) return e.name end } },
+      HOVER = machine.set('hovered', 'boolean'),
     } },
     locked = { on = {
       UNLOCK = 'editing',
@@ -142,5 +143,17 @@ return {
     t:click('name')
     t:text('ada')
     assert(doc:context().picked == 'ada')
+  end,
+  ['interaction changes carry the active flag'] = function(t)
+    doc = chart:start { scheduler = machine.manual_scheduler() }
+    t:mount(function()
+      return o.column { key = 'root',
+        o.button { key = 'target', label = 'Target', on_interaction_change = doc:event('HOVER') },
+        o.button { key = 'other', label = 'Other' } }
+    end)
+    t:hover('root/target')
+    assert(doc:context().hovered == true)
+    t:hover('root/other')
+    assert(doc:context().hovered == false)
   end,
 }
