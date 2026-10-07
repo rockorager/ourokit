@@ -1,4 +1,5 @@
-local ouro, view, raw, scope_open, scope_spawn, scope_close, scope_alive, atomic_call = ...
+local ouro, view, raw, scope_open, scope_spawn, scope_close, scope_alive, atomic_call,
+  waiter_new, waiter_park, waiter_wake, waiter_waiting = ...
 -- Guards, assigns, expressions and function actions run as native atomic
 -- sections: waiting, spawning or exiting inside them raises YieldInAction.
 local atomic = atomic_call or function(_, fn, ...) return fn(...) end
@@ -10,6 +11,8 @@ local atomic = atomic_call or function(_, fn, ...) return fn(...) end
 -- effects, and schedule `after` timers and `invoke` work on a scheduler.
 
 local M = {}
+-- machine.wait_for wake codes (the native waiter reports -1 when canceled).
+local WAKE_MATCH, WAKE_TIMEOUT, WAKE_ENDED, WAKE_ERROR = 1, 2, 3, 4
 local unset = {}
 M.unset = unset
 local MAX_MICROSTEPS = 1000
@@ -28,11 +31,25 @@ local function is_array(t)
   return type(t) == 'table' and t[1] ~= nil
 end
 
+-- JSON values from platform APIs (ouro.json.null, arrays marked with
+-- ouro.json.array) survive copies: null passes through, and an empty table
+-- that encodes as [] is marked again (non-empty sequences encode as arrays).
+local json = ouro.json
+local function is_json_null(value) return json ~= nil and value == json.null end
+local function keep_array_mark(source, copy_of)
+  if json and next(copy_of) == nil then
+    local ok, text = pcall(json.encode, source)
+    if ok and text == '[]' then json.array(copy_of) end
+  end
+  return copy_of
+end
+
 -- Deep, serializable copy. Views are unwrapped; functions and cycles fail.
 local function plain(value, seen)
   value = raw(value)
   local kind = type(value)
   if kind == 'nil' or kind == 'boolean' or kind == 'number' or kind == 'string' then return value end
+  if is_json_null(value) then return value end
   if kind ~= 'table' then fail('machine value is not serializable: %s', kind) end
   seen = seen or {}
   if seen[value] then fail('machine value contains a cycle') end
@@ -44,15 +61,17 @@ local function plain(value, seen)
     out[key] = plain(v, seen)
   end
   seen[value] = nil
-  return out
+  return keep_array_mark(value, out)
 end
-M.plain = plain
+-- Only the first argument: machine.plain(f()) must not pass extra returns
+-- as the internal cycle set.
+M.plain = function(value) return plain(value) end
 
 -- Like plain, but never fails: records must survive arbitrary payloads.
 local function inspectable(value, seen)
   value = raw(value)
   local kind = type(value)
-  if kind == 'nil' or kind == 'boolean' or kind == 'number' or kind == 'string' then return value end
+  if kind == 'nil' or kind == 'boolean' or kind == 'number' or kind == 'string' or is_json_null(value) then return value end
   if kind ~= 'table' then return '<' .. kind .. '>' end
   seen = seen or {}
   if seen[value] then return '<cycle>' end
@@ -1040,6 +1059,153 @@ end
 
 function M.inspect(fn) return subscribe(inspectors, fn) end
 
+-- XState's waitFor: yield the running task until predicate(snapshot) holds
+-- and return that snapshot. Wakes on the actor's commits, never polls.
+-- Raises WaitTimeout after options.timeout ms, WaitEnded when the actor
+-- stops or finishes without matching. Inside guards, assigns and actions it
+-- is a wait like any other and raises YieldInAction. Canceling the waiting
+-- task closes its waiter, which drops the subscription and the timer.
+function M.wait_for(actor, predicate, options)
+  options = options or {}
+  if type(actor) ~= 'table' or not actor._waiters then fail('wait_for expects an actor') end
+  if type(predicate) ~= 'function' then fail('wait_for expects a predicate function') end
+  local timeout = options.timeout
+  if timeout ~= nil and (math.type(timeout) ~= 'integer' or timeout < 0) then
+    fail('wait_for timeout must be a nonnegative integer of milliseconds')
+  end
+  local snapshot = actor._snapshot
+  if atomic('wait_for predicate', predicate, view(snapshot)) then return view(snapshot) end
+  if snapshot.status ~= 'active' or actor._status == 'stopped' then
+    fail('WaitEnded: %s is %s', actor.path, actor._status == 'stopped' and 'stopped' or snapshot.status)
+  end
+  if not waiter_new then fail('WaitUnavailable: machine.wait_for needs the Ouro runtime') end
+  local entry = {predicate = predicate}
+  local timer
+  local waiter <close> = waiter_new(function()
+    actor._waiters[entry] = nil
+    if timer then scope_close(timer) end
+  end)
+  entry.waiter = waiter
+  actor._waiters[entry] = true
+  if timeout then
+    timer = scope_open('application')
+    scope_spawn(timer, function() ouro.sleep(timeout); waiter_wake(waiter, WAKE_TIMEOUT) end)
+  end
+  local code = waiter_park(waiter)
+  if code == WAKE_MATCH then return view(entry.snapshot)
+  elseif code == WAKE_TIMEOUT then fail('WaitTimeout: %s did not match within %d ms', actor.path, timeout)
+  elseif code == WAKE_ENDED then fail('WaitEnded: %s is %s', actor.path, entry.snapshot.status)
+  elseif code == WAKE_ERROR then error(entry.error, 0)
+  else fail('WaitCanceled: %s', actor.path) end
+end
+
+-- A memoized derivation over immutable machine data. The cache holds the
+-- last result per raw first argument (a context or snapshot, or their views)
+-- plus raw-equal extra arguments, so a guard, can()/accepted() and the view
+-- share one computation per snapshot. Treat the result as read-only.
+function M.selector(fn)
+  if type(fn) ~= 'function' then fail('selector expects a function') end
+  local last_key, last_args, last_result, has_result = nil, nil, nil, false
+  return function(data, ...)
+    local key, n = raw(data), select('#', ...)
+    if has_result and key == last_key and n == last_args.n then
+      local same = true
+      for i = 1, n do
+        if raw((select(i, ...))) ~= last_args[i] then same = false; break end
+      end
+      if same then return last_result end
+    end
+    local args = {n = n}
+    for i = 1, n do args[i] = raw((select(i, ...))) end
+    last_result = fn(data, ...)
+    last_key, last_args, has_result = key, args, true
+    return last_result
+  end
+end
+
+-- Chart event field types as a JSON Schema for MCP inputSchema.
+local JSON_TYPES = {string = 'string', number = 'number', integer = 'integer', boolean = 'boolean'}
+local function event_schema(chart, event_type)
+  local properties, required = {}, {}
+  for name, field in pairs(chart.events[event_type]) do
+    if field.type == 'any' then properties[name] = true
+    elseif field.type == 'table' then properties[name] = {type = {'object', 'array'}}
+    else properties[name] = {type = JSON_TYPES[field.type]} end
+    if not field.optional then required[#required + 1] = name end
+  end
+  table.sort(required)
+  local schema = {type = 'object', properties = properties, additionalProperties = false}
+  if #required > 0 then schema.required = required end
+  return schema
+end
+
+local EMPTY_OUTPUT = {type = 'object', additionalProperties = false}
+
+-- Build ouro.app `actions` entries whose inputs are chart events:
+--   machine.actions(actor, {
+--     RenameContact = { event = 'RENAME', description = '...',
+--       errors = { no_transition = 'ContactNotFound' },     -- reject reason -> error code
+--       wait = function(snapshot) ... end, timeout = 5000,  -- optional wait_for
+--       output = function(snapshot, event) return {...} end, output_schema = {...} },
+--     GetContacts = { description = '...', output = ..., output_schema = ... },  -- no event: a read
+--   }, { before = function(actor) ... end })  -- may return an ouro.action_error
+-- `actor` may be a function returning the actor (resolved per call). The
+-- inputSchema comes from the chart's declared event schema; the handler
+-- sends the event, turns a rejection into ouro.action_error(code,
+-- {event, reason}) and returns output(snapshot, event).
+function M.actions(actor, specs, options)
+  options = options or {}
+  local function resolve() if type(actor) == 'function' then return actor() end return actor end
+  local function chart_of()
+    if type(actor) == 'table' then return actor.chart end
+    return options.chart or fail('machine.actions with an actor function needs options.chart')
+  end
+  local entries = {}
+  for name, spec in pairs(specs) do
+    if type(spec) ~= 'table' or type(spec.description) ~= 'string' then fail('action %s needs a description', tostring(name)) end
+    local input_schema = EMPTY_OUTPUT
+    if spec.event then
+      local chart = chart_of()
+      if not chart.events or not chart.events[spec.event] then
+        fail('action %s: %s declares no %s event schema', name, chart.id, spec.event)
+      end
+      input_schema = event_schema(chart, spec.event)
+    end
+    entries[name] = {
+      description = spec.description,
+      inputSchema = input_schema,
+      outputSchema = spec.output_schema or EMPTY_OUTPUT,
+      handler = function(params)
+        local target = resolve()
+        if options.before then
+          local err = options.before(target)
+          if err ~= nil then return err end
+        end
+        local event
+        if spec.event then
+          event = {type = spec.event}
+          for key, value in pairs(params or {}) do event[key] = value end
+          local accepted, reason = target:send(event)
+          if not accepted then
+            local code = spec.errors and spec.errors[reason]
+              or (reason == 'no_transition' and 'EventRejected' or 'ActorUnavailable')
+            return ouro.action_error(code, {event = spec.event, reason = reason})
+          end
+        end
+        if spec.wait then
+          local ok, err = pcall(M.wait_for, target, spec.wait, {timeout = spec.timeout})
+          if not ok then
+            local code = tostring(err):match('^(Wait%a+)') or 'WaitFailed'
+            return ouro.action_error(code, {message = tostring(err)})
+          end
+        end
+        if spec.output then return spec.output(target:snapshot(), event) end
+      end,
+    }
+  end
+  return entries
+end
+
 function M.actors()
   local list = {}
   for _, path in ipairs(registry_order) do
@@ -1150,6 +1316,7 @@ local Actor = {}
 local function create_actor(chart, options)
   options = options or {}
   local actor = {chart = chart, id = options.id or chart.id, _observers = {}, _queue = {}, _timers = {}, _invokes = {}, _scopes = {}, _tasks = {},
+    _waiters = {},
     _children = {}, _started = false, _status = 'created', _scheduler = options.scheduler or M.default_scheduler,
     _signal_factory = options.signal or ouro.signal, _parent = options.parent, _charts = options.charts or {}}
   for name, fn in pairs(Actor) do actor[name] = fn end
@@ -1206,7 +1373,13 @@ end
 
 function Actor:snapshot() return view(self:_read()) end
 function Actor:context() return view(self:_read().context) end
-function Actor:status() return self:_read().status end
+-- 'created' until start(), then the snapshot status (active | done | stopped).
+function Actor:status()
+  local status = self:_read().status
+  if self._status == 'created' then return 'created' end
+  return status
+end
+function Actor:started() return self._status ~= 'created' end
 function Actor:states() return view(self:_read().states) end
 function Actor:output() return view(self:_read().output) end
 
@@ -1426,11 +1599,33 @@ local function run_effects(actor, effects, record)
   return first_error
 end
 
+-- Re-check every wait_for on this actor against a newly committed snapshot.
+local function notify_waiters(actor, snapshot)
+  for entry in pairs(actor._waiters) do
+    if not waiter_waiting(entry.waiter) then
+      actor._waiters[entry] = nil
+    else
+      local ok, matched = pcall(atomic, 'wait_for predicate', entry.predicate, view(snapshot))
+      if not ok then
+        entry.error = matched
+        waiter_wake(entry.waiter, WAKE_ERROR)
+      elseif matched then
+        entry.snapshot = snapshot
+        waiter_wake(entry.waiter, WAKE_MATCH)
+      elseif snapshot.status ~= 'active' then
+        entry.snapshot = snapshot
+        waiter_wake(entry.waiter, WAKE_ENDED)
+      end
+    end
+  end
+end
+
 commit = function(actor, snapshot)
   if snapshot ~= actor._snapshot then
     actor._snapshot = snapshot
     actor._store:set(snapshot)
     propagate(actor)
+    if next(actor._waiters) then notify_waiters(actor, snapshot) end
   end
 end
 
@@ -1449,6 +1644,7 @@ function Actor:_process()
     while #self._queue > 0 do
       local item = table.remove(self._queue, 1)
       local snapshot, effects, record = transition(self.chart, self._snapshot, item.event)
+      item.accepted, item.reason = not record.rejected, record.reason
       commit(self, snapshot)
       commits = commits + 1
       record.commit = commits
@@ -1479,9 +1675,28 @@ function Actor:send(event)
   event = normalize_event(event)
   if internal_type(event.type) then fail('InvalidEvent: %q is reserved for the machine runtime', event.type) end
   validate_event(self.chart, event)
-  if self._status == 'stopped' then return end
-  self._queue[#self._queue + 1] = {event = event, origin = 'external'}
+  if self._status == 'stopped' then return false, 'stopped' end
+  local item = {event = event, origin = 'external'}
+  self._queue[#self._queue + 1] = item
   self:_process()
+  -- Sent while this actor is mid-macrostep (from one of its own effects): it
+  -- is queued behind the current step, so the outcome is not known yet.
+  if item.accepted == nil then return nil, 'queued' end
+  return item.accepted, item.reason
+end
+
+-- A plain event binding for widgets: exactly { actor, event, field }.
+-- Validated now, like can(), so typos fail at render; the event is neither
+-- copied nor frozen (send copies payloads). With `field`, the widget sends a
+-- copy of the event with event[field] = its value.
+function Actor:event(event, field)
+  local normalized = normalize_event(event)
+  if internal_type(normalized.type) then fail('InvalidEvent: %q is reserved for the machine runtime', normalized.type) end
+  if self.chart.events and not self.chart.events[normalized.type] then
+    fail('UnknownEvent: %s does not accept %q', self.chart.id, normalized.type)
+  end
+  if field ~= nil and (type(field) ~= 'string' or field == '') then fail('event binding field must be a nonempty string') end
+  return {actor = self, event = event, field = field}
 end
 
 -- Returns a function that sends the event; use for on_press and commands.

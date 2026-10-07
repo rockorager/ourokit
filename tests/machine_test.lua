@@ -689,6 +689,152 @@ return {
     assert(actor:context().log == 'done:A;error:unreadable;done:inner;')
   end,
 
+  ['send reports whether the event was taken, with the record reason'] = function()
+    local chart = machine.create {
+      id = 'reply', initial = 'a',
+      states = {
+        a = { on = {
+          GO = { target = 'b', actions = function(_, _, self) assert(select(2, self:send('NEXT')) == 'queued') end },
+          BOOM = { guard = function() error('boom') end },
+        } },
+        b = { on = { NEXT = 'c' } },
+        c = { on = { END = 'over' } },
+        over = { type = 'final' },
+      },
+    }
+    local actor = chart:actor { scheduler = machine.manual_scheduler() }
+    assert(actor:status() == 'created' and not actor:started())
+    actor:start()
+    assert(actor:status() == 'active' and actor:started())
+    local ok, reason = actor:send('NEXT')
+    assert(ok == false and reason == 'no_transition')
+    fails(function() actor:send('BOOM') end, 'boom') -- guard errors still raise
+    ok, reason = actor:send('GO') -- its effect's NEXT is queued, then taken
+    assert(ok == true and reason == nil and actor:matches('c'))
+    assert(actor:send('END') == true and actor:status() == 'done')
+    ok, reason = actor:send('END')
+    assert(ok == false and reason == 'done')
+    actor:stop()
+    ok, reason = actor:send('END')
+    assert(ok == false and reason == 'stopped')
+  end,
+
+  ['plain uses only its first argument and keeps JSON nulls and empty arrays'] = function()
+    local function two() return { a = 1 }, 2 end
+    assert(machine.plain(two()).a == 1)
+    local entry = { exec = o.json.null, actions = o.json.array({}), keywords = { 'x' } }
+    local copied = machine.plain(entry)
+    assert(copied.exec == o.json.null and copied ~= entry)
+    assert(o.json.encode(copied.actions) == '[]' and o.json.encode(copied.keywords) == '["x"]')
+    assert(o.json.encode(machine.plain({})) == '{}') -- unmarked empty tables stay objects
+    local chart = machine.create { id = 'entries', initial = 'a', context = { entry = entry }, states = { a = {} } }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local saved = actor:persist()
+    assert(saved.context.entry.exec == o.json.null and o.json.encode(saved.context.entry.actions) == '[]')
+  end,
+
+  ['wait_for returns at once when the predicate holds and fails fast otherwise'] = function()
+    local chart = machine.create {
+      id = 'waits', initial = 'a',
+      states = {
+        a = { on = { GO = 'b', WAIT = { actions = function(_, _, self)
+          machine.wait_for(self, function(s) return machine.matches(s, 'b') end)
+        end } } },
+        b = { on = { END = 'over' } },
+        over = { type = 'final' },
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local snapshot = machine.wait_for(actor, function(s) return machine.matches(s, 'a') end)
+    assert(snapshot.states[1] == 'a')
+    -- Waiting inside an action is a wait like any other.
+    fails(function() actor:send('WAIT') end, "action 'function' (waits.a on WAIT) called Ouro I/O")
+    fails(function() machine.wait_for(actor, function() return false end, { timeout = 1.5 }) end, 'nonnegative integer')
+    actor:send('GO'); actor:send('END')
+    fails(function() machine.wait_for(actor, function(s) return machine.matches(s, 'a') end) end, 'WaitEnded: waits is done')
+    assert(next(actor._waiters) == nil)
+  end,
+
+  ['event bindings are plain { actor, event, field } tables validated at creation'] = function()
+    local chart = machine.create {
+      id = 'bind', initial = 'a',
+      events = { SAVE = {}, EDIT = { field = 'string', value = 'string' }, SELECT = { value = 'integer' } },
+      states = { a = { on = { SAVE = {}, EDIT = {}, SELECT = {} } } },
+    }
+    local actor = chart:actor { scheduler = machine.manual_scheduler() }
+    local save = actor:event('SAVE')
+    assert(save.actor == actor and save.event == 'SAVE' and save.field == nil)
+    local keys = 0
+    for _ in pairs(save) do keys = keys + 1 end
+    assert(keys == 2)
+    local edit = { type = 'EDIT', field = 'title' }
+    local binding = actor:event(edit, 'value')
+    assert(binding.event == edit and binding.field == 'value', 'the event is not copied')
+    assert(actor:event('SELECT', 'value').field == 'value')
+    fails(function() actor:event('SAVEE') end, 'UnknownEvent: bind does not accept "SAVEE"')
+    fails(function() actor:event('done.state.a') end, 'reserved')
+    fails(function() actor:event({ title = 'x' }) end, 'string type')
+    fails(function() actor:event('SAVE', '') end, 'nonempty string')
+    fails(function() actor:event('SAVE', 3) end, 'nonempty string')
+  end,
+
+  ['selectors compute once per context for guards, can() and the view'] = function()
+    local runs = 0
+    local matches = machine.selector(function(c, prefix)
+      runs = runs + 1
+      local out = {}
+      for _, item in ipairs(c.items) do if item:sub(1, #prefix) == prefix then out[#out + 1] = item end end
+      return out
+    end)
+    local chart = machine.create {
+      id = 'pick', initial = 'idle', context = { items = { 'apple', 'apricot', 'banana' }, query = 'ap' },
+      states = { idle = { on = {
+        PICK = { guard = function(c) return #matches(c, c.query) > 0 end, actions = assign { picked = function(c) return matches(c, c.query)[1] end } },
+        QUERY = { actions = assign { query = function(_, e) return e.query end } },
+      } } },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    assert(actor:can('PICK') and actor:can('PICK'))
+    assert(#matches(actor:context(), actor:context().query) == 2) -- the view
+    assert(runs == 1, runs)
+    actor:send('PICK') -- the guard and the assign share the result
+    assert(actor:context().picked == 'apple' and runs == 1, runs)
+    actor:send { type = 'QUERY', query = 'ban' } -- a new context recomputes
+    assert(#matches(actor:context(), actor:context().query) == 1 and runs == 2, runs)
+    assert(#matches(actor:context(), 'z') == 0 and runs == 3) -- different arguments recompute
+  end,
+
+  ['actions derive MCP input schemas from chart events'] = function()
+    local chart = machine.create {
+      id = 'book', initial = 'ready', context = { names = { ada = 'Ada' } },
+      events = { RENAME = { id = 'string', name = 'string' }, PING = { count = 'integer?', extra = 'any?', list = 'table?' } },
+      states = { ready = { on = {
+        RENAME = { guard = function(c, e) return c.names[e.id] ~= nil end,
+          actions = assign { names = function(c, e) local names = {}; for k, v in pairs(c.names) do names[k] = v end; names[e.id] = e.name; return names end } },
+        PING = {},
+      } } },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local actions = machine.actions(actor, {
+      Rename = { event = 'RENAME', description = 'Rename', errors = { no_transition = 'ContactNotFound' },
+        output = function(s, e) return { name = s.context.names[e.id] } end,
+        output_schema = { type = 'object', properties = { name = { type = 'string' } }, required = { 'name' }, additionalProperties = false } },
+      Ping = { event = 'PING', description = 'Ping' },
+      Names = { description = 'Read', output = function(s) return { count = #machine.plain(s.context.names) } end },
+    })
+    local rename = actions.Rename.inputSchema
+    assert(rename.type == 'object' and rename.additionalProperties == false and join(rename.required) == 'id,name')
+    assert(rename.properties.id.type == 'string' and rename.properties.name.type == 'string')
+    local ping = actions.Ping.inputSchema
+    assert(ping.required == nil and ping.properties.count.type == 'integer' and ping.properties.extra == true)
+    assert(join(ping.properties.list.type) == 'object,array')
+    assert(actions.Ping.outputSchema.type == 'object' and actions.Names.inputSchema.type == 'object')
+    assert(actions.Rename.handler { id = 'ada', name = 'Lovelace' }.name == 'Lovelace')
+    assert(actions.Ping.handler {} == nil and actions.Names.handler {}.count == 0)
+    fails(function() machine.actions(actor, { Bad = { event = 'NOPE', description = 'x' } }) end, 'declares no NOPE event schema')
+    -- Rejections become ouro.action_error; see tests/machine_native.py for the MCP round trip.
+  end,
+
   ['event schemas validate external events and drive accepted()'] = function()
     local chart = machine.create {
       id = 'schema', initial = 'clean',

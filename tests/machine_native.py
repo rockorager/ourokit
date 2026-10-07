@@ -124,6 +124,48 @@ assert(r:matches('idle') and r:snapshot().children[1] == nil)
 r:send('GO'); r:send('SLOW'); o.sleep(30); r:send('LEAVE'); o.sleep(100)
 assert(table.concat(after_sleep, ',') == '20,60,read 10,read 10,read 10', 'canceled task ran on: ' .. table.concat(after_sleep, ','))
 
+-- wait_for parks the task and wakes on the actor's commits.
+local gate = machine.create { id = 'gate', initial = 'closed', context = { n = 0 }, states = {
+  closed = { on = { OPEN = 'open', BUMP = { actions = machine.assign { n = function(c) return c.n + 1 end } } } },
+  open = { on = { END = 'gone' } }, gone = { type = 'final' } } }
+local g = gate:start()
+local order = {}
+o.spawn(function() o.sleep(20); order[#order + 1] = 'bump'; g:send('BUMP'); o.sleep(10); order[#order + 1] = 'open'; g:send('OPEN') end)
+local snap = machine.wait_for(g, function(s) return machine.matches(s, 'open') end, { timeout = 1000 })
+order[#order + 1] = 'woke'
+assert(table.concat(order, ',') == 'bump,open,woke' and snap.context.n == 1, table.concat(order, ','))
+assert(next(g._waiters) == nil)
+local started = o._monotonic_ms()
+local ok, err = pcall(machine.wait_for, g, function(s) return machine.matches(s, 'closed') end, { timeout = 30 })
+assert(not ok and err:find('WaitTimeout: gate did not match within 30 ms', 1, true), tostring(err))
+assert(o._monotonic_ms() - started >= 25 and next(g._waiters) == nil)
+o.spawn(function() o.sleep(10); g:send('END') end)
+ok, err = pcall(machine.wait_for, g, function(s) return machine.matches(s, 'closed') end)
+assert(not ok and err:find('WaitEnded: gate is done', 1, true), tostring(err))
+local h = gate:start()
+o.spawn(function() o.sleep(5); h:send('BUMP') end)
+ok, err = pcall(machine.wait_for, h, function(s) if s.context.n > 0 then error('bad predicate', 0) end return false end)
+assert(not ok and err == 'bad predicate', tostring(err))
+o.spawn(function() o.sleep(5); h:stop() end)
+ok, err = pcall(machine.wait_for, h, function(s) return machine.matches(s, 'open') end)
+assert(not ok and err:find('WaitEnded: gate is stopped', 1, true), tostring(err))
+-- Canceling the waiting task drops its subscription and timer.
+local watched = gate:start { id = 'watched' }
+local flags = {}
+local watcher = machine.create { id = 'watcher', initial = 'idle', states = {
+  idle = { on = { WATCH = 'watching' } },
+  watching = { entry = machine.spawn(function()
+    machine.wait_for(watched, function(s) return machine.matches(s, 'open') end, { timeout = 200 })
+    flags.woke = true
+  end), on = { STOP = 'idle' } } } }
+local w = watcher:start()
+w:send('WATCH'); o.sleep(10)
+assert(next(watched._waiters) ~= nil, 'watcher is not waiting')
+w:send('STOP'); o.sleep(10); o.sleep(1) -- the canceled task unwinds at the next safe point
+assert(next(watched._waiters) == nil, 'canceled wait kept its subscription')
+watched:send('OPEN'); o.sleep(250)
+assert(not flags.woke)
+
 o.stdout.write('PASS machine native\n')
 o.exit(0)
 '''
@@ -188,4 +230,4 @@ with tempfile.TemporaryDirectory() as temporary:
     process = subprocess.run([str(BINARY), "run", str(app), "--headless"], capture_output=True, text=True, timeout=10)
     assert process.returncode == 0, process.stderr
     assert "PASS machine native" in process.stdout, (process.stdout, process.stderr)
-print("PASS statechart after/invoke and spawned tasks on native scopes: exit and stop cancel sleeping work; actions cannot wait; token fallback drops stale results")
+print("PASS statechart after/invoke, spawned tasks and wait_for on native scopes: exit and stop cancel sleeping work; actions cannot wait; waits wake on commits; token fallback drops stale results")

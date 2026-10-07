@@ -1536,6 +1536,9 @@ fn finishInitialBootstrap(
 ) !void {
     while (!generation.application_ready or generation.desktop_task != null) {
         if (try loop.receivedSignal() != null) return error.ApplicationInterrupted;
+        // The task safe point, as in the main loop: without it, retired scopes
+        // never ask parked external waits to cancel during bootstrap.
+        try scheduler.applyQueuedCancellations();
         while (scheduler.takeRunnable()) |runnable|
             _ = generation.resumeRunnable(runnable, diagnostic) catch |err| {
                 lua.recordDiagnosticError(

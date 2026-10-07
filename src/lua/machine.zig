@@ -6,6 +6,8 @@
 const std = @import("std");
 const c = @import("c.zig");
 const Vm = @import("vm.zig").Vm;
+const TaskHandle = @import("vm.zig").TaskHandle;
+const task = @import("../task/root.zig");
 
 const view_metatable = "ouro.machine.view";
 
@@ -20,7 +22,11 @@ pub fn install(state: *c.State) !void {
     // Native task scopes (open, spawn, close, alive), or four nils without a Vm.
     const extra = @import("scopes.zig").pushChunkArguments(state);
     c.lua_pushcclosure(state, atomic, 0);
-    if (c.lua_pcallk(state, 4 + extra, 0, 0, 0, null) != c.ok)
+    c.lua_pushcclosure(state, waiterNew, 0);
+    c.lua_pushcclosure(state, waiterPark, 0);
+    c.lua_pushcclosure(state, waiterWake, 0);
+    c.lua_pushcclosure(state, waiterWaiting, 0);
+    if (c.lua_pcallk(state, 8 + extra, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     c.lua_settop(state, api);
 }
@@ -62,6 +68,116 @@ fn atomic(state: *c.State) callconv(.c) c_int {
     }
     if (status != c.ok) return c.lua_error(state);
     return c.lua_gettop(state) - 1;
+}
+
+/// A parked task for machine.wait_for. The Lua userdata owns this memory; the
+/// parked coroutine keeps it alive (it is on that task's stack), and the
+/// scheduler only holds it as a resource context while the task waits.
+const Waiter = struct {
+    handle: TaskHandle = .invalid,
+    vm: ?*Vm = null,
+    waiting: bool = false,
+    code: c.Integer = 0,
+};
+const waiter_metatable = "ouro.machine.waiter";
+/// Wake code reported when the scheduler cancels the waiting task.
+const canceled_code = -1;
+
+fn waiterArgument(state: *c.State) *Waiter {
+    return @ptrCast(@alignCast(c.luaL_testudata(state, 1, waiter_metatable) orelse {
+        _ = c.lua_pushstring(state, "machine waiter expected");
+        _ = c.lua_error(state);
+        unreachable;
+    }));
+}
+
+fn raiseText(state: *c.State, text: []const u8) c_int {
+    _ = c.lua_pushlstring(state, text.ptr, text.len);
+    return c.lua_error(state);
+}
+
+/// waiter_new(cleanup) -> waiter. Closing it (a `<close>` local) calls
+/// cleanup once: on return, on error, and when a canceled task unwinds.
+fn waiterNew(state: *c.State) callconv(.c) c_int {
+    const waiter: *Waiter = @ptrCast(@alignCast(c.lua_newuserdatauv(state, @sizeOf(Waiter), 1).?));
+    waiter.* = .{};
+    c.lua_pushvalue(state, 1);
+    _ = c.lua_setiuservalue(state, -2, 1);
+    if (c.luaL_newmetatable(state, waiter_metatable) != 0) {
+        c.lua_pushcclosure(state, waiterClose, 0);
+        c.lua_setfield(state, -2, "__close");
+        c.lua_pushboolean(state, 0);
+        c.lua_setfield(state, -2, "__metatable");
+    }
+    _ = c.lua_setmetatable(state, -2);
+    return 1;
+}
+
+fn waiterClose(state: *c.State) callconv(.c) c_int {
+    const waiter = waiterArgument(state);
+    waiter.waiting = false;
+    if (c.lua_getiuservalue(state, 1, 1) != c.type_function) return 0;
+    c.lua_pushnil(state);
+    _ = c.lua_setiuservalue(state, 1, 1); // Run cleanup once.
+    if (c.lua_pcallk(state, 0, 0, 0, 0, null) != c.ok) return c.lua_error(state);
+    return 0;
+}
+
+fn waiterCancel(context: *anyopaque) !void {
+    const waiter: *Waiter = @ptrCast(@alignCast(context));
+    if (!waiter.waiting) return;
+    waiter.waiting = false;
+    waiter.code = canceled_code;
+    try waiter.vm.?.markExternalCompleted(waiter.handle);
+}
+
+fn waiterDestroy(_: *anyopaque) void {} // Lua owns the waiter.
+
+const waiter_lifecycle: task.ResourceLifecycle = .{ .request_cancel = waiterCancel, .destroy = waiterDestroy };
+
+/// waiter_park(waiter) yields the running task until waiter_wake, then returns
+/// the wake code. Inside an atomic section this fails like any Ouro wait.
+fn waiterPark(state: *c.State) callconv(.c) c_int {
+    const waiter = waiterArgument(state);
+    const vm = Vm.fromState(state) orelse return raiseText(state, "WaitUnavailable: no Ouro runtime");
+    if (waiter.waiting) return raiseText(state, "machine waiter is already parked");
+    waiter.handle = vm.beginExternalWait(state, .operation, waiter, &waiter_lifecycle) catch |err| {
+        if (err == error.YieldInAtomicSection) return raiseText(state, "YieldInAtomicSection: machine.wait_for");
+        var buffer: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "machine.wait_for must run in an Ouro task ({s})", .{@errorName(err)}) catch "machine.wait_for must run in an Ouro task";
+        return raiseText(state, text);
+    };
+    waiter.vm = vm;
+    waiter.waiting = true;
+    waiter.code = 0;
+    return c.lua_yieldk(state, 0, @bitCast(@intFromPtr(waiter)), waiterResumed);
+}
+
+fn waiterResumed(state: *c.State, _: c_int, context: c.KContext) callconv(.c) c_int {
+    const waiter: *Waiter = @ptrFromInt(@as(usize, @bitCast(context)));
+    c.lua_pushinteger(state, waiter.code);
+    return 1;
+}
+
+/// waiter_wake(waiter, code) -> boolean: resumes a parked task with `code`.
+fn waiterWake(state: *c.State) callconv(.c) c_int {
+    const waiter = waiterArgument(state);
+    var valid: c_int = 0;
+    const code = c.lua_tointegerx(state, 2, &valid);
+    if (!waiter.waiting) {
+        c.lua_pushboolean(state, 0);
+        return 1;
+    }
+    waiter.waiting = false;
+    waiter.code = code;
+    waiter.vm.?.markExternalCompleted(waiter.handle) catch |err| return raiseText(state, @errorName(err));
+    c.lua_pushboolean(state, 1);
+    return 1;
+}
+
+fn waiterWaiting(state: *c.State) callconv(.c) c_int {
+    c.lua_pushboolean(state, @intFromBool(waiterArgument(state).waiting));
+    return 1;
 }
 
 /// Replace the value at the top of the stack with a view when it is a table.
