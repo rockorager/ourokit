@@ -122,7 +122,7 @@ def main():
             reloaded = statecharts(endpoint, after=resumed['next'], seed=2)
             assert reloaded['seed'] == 3 and [a['actor'] for a in reloaded['actors']] == ['signal'], reloaded
             assert reloaded['actors'][0]['latest']['origin'] == 'attach', reloaded
-            assert reloaded['actors'][0]['latest']['context']['count'] >= before, reloaded
+            assert reloaded['actors'][0]['latest']['context']['count'] >= before > 1, (before, reloaded)
             after_reload, _ = wait_for(endpoint, lambda s: any(event(e) == 'GO' for e in s), reloaded['next'])
             assert all(e['record']['actor'] == 'signal' for e in after_reload)
             print('PASS runtime.statecharts: attach on demand with seeded actors, transition/rejected/timer '

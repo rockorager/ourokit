@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Statechart state survives `ouroctl dev reload` (examples/documents).
+"""Statechart state survives `ouroctl dev reload`.
 
-Runs a private copy of the documents example on the private compositor that
-verify_development.py provides. It makes a document dirty, renames the state
-that document is in, and reloads. The document must still be dirty: the actor
-was restored, not restarted. A broken candidate must leave the live actor alone.
+Runs private copies of examples on the private compositor that
+verify_development.py provides:
+
+- documents: make a document dirty, rename the state it is in, and reload.
+  The document must still be dirty: the actor was restored, not restarted.
+  A broken candidate must leave the live actor alone.
+- launcher: type a query and reload. The query, which is chart state, and the
+  results it filters must survive; a restarted launcher would reopen empty.
 """
 import json
 import os
@@ -34,7 +38,7 @@ def reload(env, endpoint):
     return result.returncode == 0, result.stdout + result.stderr
 
 
-def main():
+def documents():
     with tempfile.TemporaryDirectory(prefix="ouro-chart-reload-") as temporary:
         root = Path(temporary)
         app_root = root / "documents"
@@ -107,5 +111,59 @@ def main():
                 terminate(app)
 
 
+def launcher():
+    with tempfile.TemporaryDirectory(prefix="ouro-launcher-reload-") as temporary:
+        root = Path(temporary)
+        app_root = root / "launcher"
+        shutil.copytree(ROOT / "examples/launcher", app_root)
+        data = root / "data"
+        (data / "applications").mkdir(parents=True)
+        for name, label in (("alpha", "Alpha Editor"), ("beta", "Beta Terminal"), ("gamma", "Gamma Viewer")):
+            (data / "applications" / f"{name}.desktop").write_text(
+                f"[Desktop Entry]\nType=Application\nName={label}\nExec={name}\n")
+        env = dict(os.environ, WAYLAND_DISPLAY=os.environ["OUROKIT_TEST_WAYLAND_DISPLAY"],
+                   XDG_DATA_HOME=str(data), XDG_DATA_DIRS=str(root / "share"))
+        errors = root / "launcher.stderr"
+        status, search = "scrim/panel/body/status", "scrim/panel/body/search"
+        with errors.open("w+") as error_file:
+            app = subprocess.Popen([str(BINARY), "run", str(app_root / "ouro.json"), "--dev", "--software"],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=error_file)
+            try:
+                endpoint = development_path(Path(env["XDG_RUNTIME_DIR"]), app)
+
+                def label(path):
+                    windows = inspect(env, endpoint).get("windows", [])
+                    if not any(w["window"] == "launcher" for w in windows):
+                        return None
+                    found = [n for n in inspect(env, endpoint, "launcher")["windows"][0]["nodes"] if n["path"] == path]
+                    return found[0].get("label") if found else None
+
+                wait_for(lambda: label(status) == "3 applications", "launcher did not open with three applications")
+                for _ in range(5):  # icons load asynchronously and refresh the token
+                    tree = inspect(env, endpoint, "launcher")["windows"][0]
+                    result = run(str(BINARY), "dev", "input", str(endpoint), json.dumps({
+                        "window": "launcher", "token": tree["token"], "action": "text", "text": "ga"}), env=env, ok=None)
+                    if result.returncode == 0:
+                        break
+                wait_for(lambda: label(status) == "1 application", "the query did not filter")
+
+                # An edit to the view; the chart and its state are carried.
+                view = app_root / "view.lua"
+                view.write_text(view.read_text() + "\n-- edited during the reload test\n")
+                ok, output = reload(env, endpoint)
+                assert ok and "as generation 2" in output, output
+                wait_for(lambda: label(status) is not None, "launcher surface did not come back")
+                assert label(status) == "1 application", f"launcher query did not survive reload: {label(status)}"
+                assert node(env, endpoint, "launcher", search)["value"] == "ga"
+                print("PASS chart reload: the launcher query and its results survive a reload")
+            except BaseException:
+                error_file.flush()
+                print(errors.read_text())
+                raise
+            finally:
+                terminate(app)
+
+
 if __name__ == "__main__":
-    main()
+    documents()
+    launcher()
