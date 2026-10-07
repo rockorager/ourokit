@@ -172,6 +172,21 @@ Transition domains follow XState v5 (`getTransitionDomain`):
   targets.
 - A transition with no `target` only runs its actions.
 
+```lua
+states = {
+  -- Self-target without reenter: stays in `polling`; the 5 s timer fires once.
+  -- With reenter = true: exits and re-enters `polling`, so the timer restarts.
+  polling = { after = { [5000] = { target = 'polling', reenter = true, actions = 'fetch' } } },
+  -- Parallel source targeting a descendant: `open` is not exited (its entry,
+  -- exit, timers and invokes are untouched), but both regions restart:
+  -- SAVE lands in io.saving and `life` goes back to its initial `a`.
+  open = { type = 'parallel', on = { SAVE = '.io.saving' }, states = {
+    io = { initial = 'idle', states = { idle = {}, saving = {} } },
+    life = { initial = 'a', states = { a = { on = { NEXT = 'b' } }, b = {} } },
+  } },
+}
+```
+
 ### Algorithm
 
 The prototype follows the SCXML algorithm without history:
