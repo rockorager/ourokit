@@ -9,15 +9,28 @@ a production MCP server is required to build or inspect its UI.
 ## Declarative surfaces
 
 Applications declare their desired window set rather than imperatively owning
-Wayring objects. `run(context)` is the UI entry point:
+Wayland objects. Application state lives in statecharts
+([`ouro.machine`](../design/statecharts.md)): widgets render an actor's
+snapshot and send it events. `run(context)` is the UI entry point:
 
 ```lua
 local ouro = require("ouro")
+local machine = ouro.machine
+
+-- Behavior and state. Charts are plain definitions; create them at load.
+local example = machine.create {
+  id = "example", initial = "idle",
+  states = {
+    idle = { on = { RUN = "clicked" } },
+    clicked = { on = { RUN = "idle" } },
+  },
+}
 
 return ouro.app {
   id = "dev.ouro.example",
   run = function(context)
-    local clicked = ouro.signal(false)
+    -- run is a task, so root actors start here.
+    local app = example:start { id = "example" }
     return { windows = {
       ouro.window {
         id = "main",
@@ -39,10 +52,8 @@ return ouro.app {
                   ouro.text { key = "title", text = "Example" },
                   ouro.button {
                     key = "run",
-                    label = clicked() and "Clicked" or "Run",
-                    on_press = function()
-                      clicked:set(not clicked())
-                    end,
+                    label = app:matches("clicked") and "Clicked" or "Run",
+                    send = app:event("RUN"),
                   },
                 },
               },
@@ -61,41 +72,58 @@ desktop activation, and source reload. A deliberately headless application may
 omit `run`; it cannot subsequently open a UI. Actions remain optional and do not
 select when `run` executes.
 
-`run` may also return a reactive window declaration function:
+**Root actors.** `run` executes as a task, so it can start actors
+(`chart:start{ id = ... }`) and even wait on I/O before returning windows. A
+root actor lives in application scope until `stop()`, its final state, or
+source reload, whichever task started it. An actor that MCP actions share with
+the UI can be created at load with `chart:actor{ id = ... }`, which is
+render-safe, and started by whichever runs first: `run` or an action handler.
+Give root actors a stable `id`. Reload carries an actor's state only if it is
+created while the reload candidate runs, that is at load or in `run`
+([source reload](hot-reload.md)). The
+[design document](../design/statecharts.md) has a complete app skeleton (§0).
+[`examples/stopwatch`](../examples/stopwatch) is the smallest complete example.
+
+`run` may also return a reactive window declaration function. Here a
+launcher chart's `open` state owns a layer surface:
 
 ```lua
-local launcher_open = ouro.signal(false)
--- An action or input callback calls launcher_open:set(not launcher_open()).
--- Inside run, after creating the persistent panel declaration:
-return { windows = function()
+-- launcher is a started root actor; panel is a persistent declaration.
+return { send = launcher, windows = function()
   local windows = { panel }
-  if launcher_open() then
+  if launcher:matches("open") then
     windows[#windows + 1] = ouro.layer_surface {
       id = "launcher", namespace = "launcher", layer = "overlay",
       width = 640, height = 480, keyboard_interactivity = "exclusive",
-      content = launcher_content,
+      send = launcher, content = launcher_content,
     }
   end
   return windows
 end }
 ```
 
-Signal reads in `windows()` use the same dependency graph as widget builds.
-The function is non-yielding and must not write signals or perform effects;
-create state in `run` or application initialization. New IDs mount native
+Actor reads in `windows()` use the same dependency graph as widget builds.
+The function is non-yielding and must not send events, write signals or
+perform effects; start actors in `run` or at application initialization. New IDs mount native
 surfaces, omitted IDs retire them, and retained IDs preserve their widget
 runtime. Reopening a removed ID mounts fresh widgets after teardown drains.
 An empty reactive list keeps the application alive for later state changes.
-An optional `on_close_request=function() ... end` on a window intercepts a
-compositor close request. The callback runs in that window's task scope; omit
-the window from the reactive declaration to close it after confirmation.
-Without the callback, close requests retain their usual automatic behavior.
+A window bound with `send = actor` reports `surface.close_requested.<id>` to
+its chart instead of closing; the chart decides, and the window closes when
+the declaration drops it ([surfaces bound to a statechart](#surfaces-bound-to-a-statechart)).
+With a static window list nothing can drop it, so only bind a static window
+when the chart handles the request (for example by exiting). Binding the
+declaration with `{ windows = ..., send = actor }` only reports `windows()`
+failures and changes no close behavior. An optional
+`on_close_request = actor:sender(...)` or other function on an unbound
+window also intercepts the request; it runs in that window's task scope.
+Without either, close requests retain their usual automatic behavior.
 Process exit/shutdown does not wait for close confirmation. The
 [document example](documents.md) demonstrates save/discard/cancel and explicitly
 exits after the last document closes.
 Retained windows with the same `content` function do not rerender content just
 because `windows()` reruns or a title changes. Each content function tracks its
-own signal reads; replacing that function invalidates only its window. Store
+own actor and signal reads; replacing that function invalidates only its window. Store
 stable content functions outside `windows()` when their identity should survive
 declaration updates. Geometry and host appearance changes still invalidate the
 affected window as needed.
@@ -147,7 +175,11 @@ ouro.split_view { key = "split", position = c.split, send = notes:event("RESIZE"
   listbox, radio group, tab bar, tabs, split view, collapsible, accordion)
   send a copy of the event with the new value in `field`, `value` by default:
   `{ type = "EDIT", field = "title", value = "Draft" }`. Read the value back
-  from the actor's context. They stay enabled unless `enabled` says otherwise.
+  from the actor's context. Unless `enabled` is set, they are enabled while
+  `actor:handles(type)` holds: some active state has a transition for the
+  event at all, guards ignored. An input therefore disables while its state
+  takes no edits. Checking `can()` would need the payload, which is unknown
+  until the user acts.
 - Every `on_*` hook also accepts a binding: `on_close = notes:event("CLOSE_TAB")`,
   `on_cancel = doc:event("CANCEL")`, `on_drop_text = doc:event { type = "EDIT", field = "text" }`.
   A text input's `on_command` may be a map:
@@ -160,20 +192,17 @@ ouro.split_view { key = "split", position = c.split, send = notes:event("RESIZE"
   them for imperative calls such as `ouro.start_drag` or opening a URI, not for
   holding state.
 
-**Choose stateless by default; use stateful for per-instance state.**
-
-Both constructors define reusable components, following the state-ownership
-distinction of Flutter's `StatelessWidget` and `StatefulWidget`:
+**Choose stateless by default; use a component machine for per-instance state.**
 
 | Constructor | Use when | Function returns |
 | --- | --- | --- |
-| `ouro.stateless(render)` | UI is derived from props, children, inherited theme, or externally owned signals | A description or nil |
-| `ouro.stateful(initialize)` | Each mounted instance needs its own persistent state or setup | A render function that returns a description or nil |
+| `ouro.stateless(render)` | UI is derived from props, children, inherited theme, or actors' snapshots | A description or nil |
+| `ouro.machine.component(chart, render)` | Each mounted instance needs its own state: an open flag, a hover row, a draft | `render(self, props)` returns a description or nil |
 
 Stateless does not mean static or noninteractive. A stateless component can
-read existing signals and pass callbacks to controls; it just does not create
-its own persistent Lua state. Ordinary Lua helpers can also return descriptions,
-but `ouro.stateless` waits until the inherited theme is known before rendering.
+read actors and give controls event bindings; it just has no state of its own.
+Ordinary Lua helpers can also return descriptions, but `ouro.stateless` waits
+until the inherited theme is known before rendering.
 
 For example, a Card only arranges its inputs:
 
@@ -188,25 +217,25 @@ local Card = ouro.stateless(function(props, children, theme)
 end)
 ```
 
-Use `ouro.stateful` for a Counter that owns a separate count per instance:
+A Counter keeps a separate count per mounted instance, so each instance gets
+its own actor of a small chart:
 
 ```lua
-local Counter = ouro.stateful(function(props)
-  -- Initialize once for each mounted instance.
-  local count = ouro.signal(props.initial or 0)
-  local function increment()
-    count:set(count() + 1)
-  end
+local machine = ouro.machine
 
-  -- Rebuild the description when its inputs change.
-  return function()
-    return ouro.column {
-      key = "counter",
-      gap = 12,
-      ouro.text { key = "value", text = props.title .. ": " .. count() },
-      ouro.button { key = "increment", label = "Increment", on_press = increment },
-    }
-  end
+local Counter = machine.component(machine.create {
+  id = "counter", initial = "counting",
+  context = function(props) return { count = props.initial or 0 } end, -- input = props
+  states = { counting = { on = {
+    INCREMENT = { actions = machine.assign { count = function(c) return c.count + 1 end } },
+  } } },
+}, function(self, props)
+  return ouro.column {
+    key = "counter",
+    gap = 12,
+    ouro.text { key = "value", text = props.title .. ": " .. self:context().count },
+    ouro.button { key = "increment", label = "Increment", send = self:event("INCREMENT") },
+  }
 end)
 
 -- Inside a window or story's content function:
@@ -218,14 +247,22 @@ return ouro.row {
 }
 ```
 
-Calling `Counter { ... }` creates a description, not a mounted instance. The
-outer initializer runs when reconciliation mounts that component. Its returned
-function rebuilds UI descriptions; keep it free of side effects, signal writes,
-and yielding operations. Keep state creation outside the rebuild function.
-Define component constructors outside rebuild functions too, so their definition
-identity remains stable. Initialization is provisional until the build commits;
-a failed build can discard it and retry. Initializers must also avoid external
-side effects, signal writes, and yielding operations.
+Calling `Counter { ... }` creates a description, not a mounted instance.
+Mounting creates the instance's actor with `input = props`; it starts on its
+first event and stops when the instance unmounts, which cancels its timers
+and invokes. Keys preserve it across reorders. A remounted instance starts
+over with fresh state. Keep `render` free of side effects and yielding
+operations; it sends nothing itself, it only hands out bindings. Define charts
+and component constructors outside rebuild functions, so their identity stays
+stable. See [component machines](../design/statecharts.md) for the details.
+
+`ouro.stateful(initialize)` is the lower-level primitive under component
+machines and some stock widgets. Its initializer runs once per mounted
+instance and returns a render function. Applications should not keep state in
+it, because the inspector, MCP and reload only see state that lives in charts.
+The rules below apply to both: initializers and renders must avoid external
+side effects, signal writes and yielding operations, and initialization is
+provisional until the build commits.
 
 An initializer may return a second function, `return render, on_unmount`. The
 runtime calls it exactly once when that instance leaves:
@@ -236,9 +273,7 @@ runtime calls it exactly once when that instance leaves:
 
 It runs after the reconciliation transaction, so it may write signals, but it
 must not yield. Errors are reported on stderr; they do not undo the unmount.
-`ouro.machine.component` uses it to stop the instance's actor, which cancels
-the actor's timers and invokes. A remounted instance starts over with fresh
-state.
+`ouro.machine.component` uses it to stop the instance's actor.
 
 Props are read through the stable, read-only `props` userdata captured by the
 initializer. Read changing props inside the rebuild function or event handler;
@@ -256,8 +291,9 @@ also creates a new instance. Rebuilding descriptions does not recreate retained
 native widgets whose identities remain unchanged. A mounted component returning
 nil hides its UI without unmounting the component itself.
 
-Signal dependencies belong to the component render that reads them. A changed
-signal schedules its owning window, but only affected Lua renders execute;
+Dependencies belong to the component render that reads them. Reading an
+actor (`matches`, `context().field`, `can`) depends on exactly what was read;
+a changed field schedules its owning window, but only affected Lua renders execute;
 clean components reuse their retained descriptions. When the enclosing build,
 inherited context, and descendant dependencies are also unchanged, native
 lowering retains the component's existing subtree in place. It does not emit
@@ -271,7 +307,7 @@ The window retains one transactional commit and rollback. Native-sampled output
 (animations, virtual lists, images, canvases, and scroll declarations) continues
 to lower; builds requiring layout-builder measurement use complete descriptors.
 
-Children supplied to a stateful component are available as `props.children`.
+Children supplied to a component machine or stateful component are available as `props.children`.
 Stateless components receive children as their second render argument, as in
 the Card example above.
 
@@ -289,7 +325,7 @@ than inferring the scheme from background luminance.
 Changing this value does not change native defaults. Treat props and children
 as read-only snapshots. Do not create state, write signals, perform effects, or
 yield inside the render function; create state outside and pass its values in
-props, or read existing signals. Composition signal dependencies are replaced
+props, or read actors. Composition dependencies are replaced
 transactionally when lowered, independently of component render dependencies.
 Each mounted component owns its composition reads; skipping its native subtree
 preserves those reads, including dependencies of nested components.
@@ -745,7 +781,7 @@ defaults to true, `interactive` to true, `side` to `bottom`, and `gap` to 6
 trigger's inherited theme are used when opening; close and reopen to apply new
 popup geometry. The compositor may flip or slide it at an output edge. Styling,
 hover opening, cross-gap grace periods and OSD expiry belong to the application.
-Read signals and audio snapshots **inside** `content`, rather than capturing
+Read actors and audio snapshots **inside** `content`, rather than capturing
 values from the parent build: popup rendering has independent dependencies.
 
 `on_interaction_change(active)` observes the union of trigger and popup hover,
@@ -1638,17 +1674,18 @@ without that role the overlay does not automatically move or trap focus. A
 nonmodal recipe can restore its trigger with `focus_request` on close.
 
 ```lua
-local opened = ouro.signal(false)
-local function close() opened:set(false) end
+-- ui's chart has menu = { initial = "closed", states = {
+--   closed = { on = { OPEN = "open" } }, open = { on = { CLOSE = "closed" } } } }
+local close = ui:event("CLOSE")
 -- Inside a build function:
 return ouro.anchored {
   key="menu", side="bottom", alignment="start", gap=6,
-  ouro.button {key="trigger", label="Actions", on_press=function() opened:set(true) end},
-  opened() and ouro.box {
+  ouro.button {key="trigger", label="Actions", send=ui:event("OPEN")},
+  ui:matches("menu.open") and ouro.box {
     key="panel", role="dialog", label="Actions", width=200, padding=12, surface="popover",
     on_cancel=close,
     on_pointer_down_outside={button=272, propagate=false, handler=close},
-    ouro.button {key="done", label="Done", on_press=close},
+    ouro.button {key="done", label="Done", send=close},
   } or nil,
 }
 ```
@@ -1691,7 +1728,7 @@ rejected reloads do not alter the committed timelines. Each window owns its
 own timelines, which are disposed when that window closes.
 
 `render(progress)` follows the same non-yielding, side-effect-free rules as
-component rendering. It may read signals and return a description or nil. It
+component rendering. It may read actors and return a description or nil. It
 does not run as an asynchronous task. The wrapper adds a semantic group but no
 layout node; its returned root receives the ordinary parent constraints and
 can inherit grid placement declared on the animation wrapper. Put other layout
@@ -1716,10 +1753,9 @@ policy are described below; retained exits use `ouro.presence`.
 `ouro.transition` animates a finite numeric value toward a changing target:
 
 ```lua
-local opened = ouro.signal(false)
--- Inside a content/component render callback:
+-- Inside a content/component render callback; ui's chart has a panel.open state:
 return ouro.transition {
-  key = "panel-motion", target = opened() and 1 or 0,
+  key = "panel-motion", target = ui:matches("panel.open") and 1 or 0,
   duration = 200, easing = "ease_out",
   render = function(value)
     return ouro.box {
@@ -1947,19 +1983,18 @@ The supported defaults are:
 value and non-empty accessible `label`:
 
 ```lua
-local dnd = ouro.signal(false)
-
+-- ui's chart handles DND = machine.set("dnd", "boolean").
 ouro.switch {
   key = "do-not-disturb",
   label = "Do Not Disturb",
-  checked = dnd(),
-  enabled = true,
-  on_change = function(value) dnd:set(value) end,
+  checked = ui:context().dnd,
+  send = ui:event("DND"),
 }
 ```
 
-`enabled` defaults to true. `on_change` is optional and receives the boolean
-inverse of the last committed `checked` value. The application must supply the
+`send` (or a function in `on_change`) is optional and receives the boolean
+inverse of the last committed `checked` value. With a binding, `enabled`
+defaults to whether the chart handles the event; otherwise it defaults to true. The application must supply the
 new value on rebuild; the switch never changes it optimistically. Ignoring a
 request leaves the control unchanged. External updates do not emit callbacks.
 There is no `default_checked` or uncontrolled mode. Keep the same `key` to retain
@@ -2273,10 +2308,11 @@ or a native popup. Place it in a bounded-width column with `gap=0`; each card
 includes an 8px trailing gap that collapses with its height:
 
 ```lua
-local saved = ouro.signal(false)
+-- ui's chart: saved = { initial = 'hidden', states = {
+--   hidden = { on = { SAVED = 'shown' } }, shown = { on = { DISMISS = 'hidden' } } } }
 ouro.column {key='notifications', width=340, gap=0,
-  ouro.toast {key='saved', present=saved(), message='Changes saved',
-    on_dismiss=function(reason) saved:set(false) end}}
+  ouro.toast {key='saved', present=ui:matches('saved.shown'), message='Changes saved',
+    on_dismiss=ui:event('DISMISS', 'reason')}}
 ```
 
 Keep the declaration mounted and set `present=false` to animate its exit.
@@ -2287,7 +2323,8 @@ immediately. Reversals retain the current reveal geometry without jumping.
 Settled toasts request no animation frames.
 
 Required fields are `present` (boolean), `message` (nonempty string), and
-`on_dismiss(reason)`. The callback receives `'manual'` from the labeled dismiss
+`on_dismiss`, a function or event binding (the binding's field, if any,
+carries the reason). It receives `'manual'` from the labeled dismiss
 button or `'timeout'` from expiration, once per presentation. It requests a
 state change; the caller must update `present`. Messages wrap to at most three
 lines, then ellipsize. `width` defaults to `'fill'`.
@@ -2647,8 +2684,8 @@ Additional native binding actions support command-mode applications:
   the new caret on redo. They are no-ops for single-line or read-only fields.
 
 For example, bind `O` to `{ "insert_line_below", command = "insert" }`, then
-declare `insert` in an enclosing box's `commands` table to switch an application
-signal to Insert mode. Native edits finish before the named callback runs; the
+declare `insert` in an enclosing box's `commands` table to send the chart an
+event that enters Insert mode. Native edits finish before the named callback runs; the
 callback changes mode for the subsequent rebuild. No second key observer is
 needed. Keep the editor's key and uncontrolled `default_text` stable so that mode
 changes retain its session. These actions do not implement Vim policy.
@@ -2716,17 +2753,16 @@ Add `command = "name"` to a recipe to finish with a contextual application
 command instead of the enumerated `on_command` bridge:
 
 ```lua
-local insert_mode = ouro.signal(false)
+-- ui's chart: mode = { initial = "normal", states = {
+--   normal = { on = { INSERT = "insert" } }, insert = { on = { NORMAL = "normal" } } } }
+local insert = ui:matches("mode.insert")
 -- Inside content:
 return ouro.box {
   key = "document",
-  commands = {
-    insert = function() insert_mode:set(true) end,
-    normal = function() insert_mode:set(false) end,
-  },
+  commands = { insert = ui:event("INSERT"), normal = ui:event("NORMAL") },
   ouro.text_editor {
-    key = "body", default_text = "", text_entry = insert_mode(),
-    key_bindings = insert_mode() and {
+    key = "body", default_text = "", text_entry = insert,
+    key_bindings = insert and {
       Escape = { "end_undo_group", command = "normal" },
     } or {
       inherit = false,
@@ -2835,22 +2871,19 @@ Commands are withheld during IME preedit. `on_command` and `on_change` may be
 used together.
 
 To request keyboard focus again without remounting, set `focus_request` to a
-changed positive integer. Keep the widget's `key` stable and increment a signal
-from an event callback:
+changed positive integer. Keep the widget's `key` stable and increment a
+context field when an event asks for focus:
 
 ```lua
-local focus_request = ouro.signal(0)
-local function refocus()
-  focus_request:set(focus_request() + 1)
-end
-
+-- ui's chart handles REFOCUS = { actions = machine.assign {
+--   focus = function(c) return c.focus + 1 end } }, with context focus = 0.
 local function content()
   return ouro.column { key = "launcher",
     ouro.text_input {
       key = "search", default_text = "", autofocus = true,
-      focus_request = focus_request(),
+      focus_request = ui:context().focus,
     },
-    ouro.button { key = "scope", label = "Applications", on_press = refocus },
+    ouro.button { key = "scope", label = "Applications", send = ui:event("REFOCUS") },
   }
 end
 ```
@@ -2860,8 +2893,8 @@ An unchanged token does not reclaim focus on later rebuilds. Omitted, `nil`, or
 zero means no request (not blur); returning from zero to a positive token requests
 again. Tokens must be non-negative Lua integers; booleans, strings, fractional
 numbers, and negative numbers are errors. Failed builds do not consume requests.
-Use a signal read by the content/component that declares the target; writing an
-ordinary Lua variable alone does not schedule a rebuild.
+Read the token from an actor in the content or component that declares the
+target; writing an ordinary Lua variable alone does not schedule a rebuild.
 
 `focus_request` works on `text_input`, `button`, `switch`, `checkbox`, `slider`,
 `listbox`, `radio_group`, `tab_bar`, `virtual_list` (viewport), and `split_view`
@@ -2946,8 +2979,10 @@ generation-owned Lua component readers distinguish dependency sets and cached
 render output beneath that owner. This keeps component updates compatible with
 whole-window reconciliation and isolated source-reload candidates.
 
-The initial signal primitive is deliberately narrower than a general reactive
-runtime. Lua owns each signal value. A bounded native edge table associates
+Signals are the runtime's dependency primitive, not an application state
+mechanism: each statechart actor keeps hidden per-field signals so renders
+rebuild precisely, and application state lives in charts. The primitive is
+deliberately narrower than a general reactive runtime. Lua owns each signal value. A bounded native edge table associates
 generation-checked signals with reads made by the current owner and component
 reader.
 Dependencies remain provisional until normalized descriptor reconciliation
@@ -3283,25 +3318,23 @@ The native viewport owns the offset; callbacks observe it rather than supplying
 a controlled offset on every render.
 
 ```lua
-local request = ouro.signal(nil)
-local position = ouro.signal(0)
-local token = 0
+-- ui's chart handles TOP = { actions = machine.assign { scroll = function(c)
+--   return { offset = 0, token = (c.scroll and c.scroll.token or 0) + 1 } end } }.
 -- Inside a content function:
 return ouro.column {
   key = "page", gap = 12,
-  ouro.button { key = "top", label = "Back to top", on_press = function()
-    token = token + 1
-    request:set({offset = 0, token = token})
-  end },
-  ouro.text { key = "position", text = "Offset: " .. position() },
+  ouro.button { key = "top", label = "Back to top", send = ui:event("TOP") },
   ouro.scroll {
     key = "results", flex = 1, scrollbar = true,
-    scroll_to = request(),
-    on_scroll = function(metrics) position:set(metrics.offset) end,
+    scroll_to = ui:context().scroll,
     ouro.column { key = "rows", children = result_rows },
   },
 }
 ```
+
+The scroll offset itself is a continuous value and stays native. Use
+`on_scroll` to observe it, and send a chart event only for a committed fact,
+such as reaching the end of a list.
 
 The optional scrollbar reserves a **12-logical-pixel gutter** on the right
 (vertical) or bottom (horizontal), including when content fits. Children receive
@@ -3320,8 +3353,8 @@ initial layout and whenever these metrics change, including resize, reveal,
 and content shrink. Changes before a safe point may coalesce. An unchanged
 rebuild or callback replacement does not notify again; removing and re-adding
 the subscription, or accepting a source reload, publishes an initial snapshot.
-Mutating the callback table does not change native state. Updating a signal
-from the callback is supported, but applications must avoid feedback that
+Mutating the callback table does not change native state. Sending a chart
+event from the callback is supported, but applications must avoid feedback that
 continually changes content size or issues new requests.
 
 `scroll_to` is a one-shot, nonanimated request, applied after layout and clamped
@@ -3374,21 +3407,25 @@ scrolling. Set `nil` to clear the request. It does not select or focus the row,
 and it does not animate. Variable-height virtual rows use estimates to mount
 the target, then correct the reveal using measured layout.
 
-A launcher can keep its search field focused, update `selected` from its
-Up/Down handler, and render all results through one virtual list:
+A launcher can keep its search field focused, move `selected` from its
+Up/Down commands, and render all results through one virtual list
+([`examples/launcher`](../examples/launcher) is the complete version):
 
 ```lua
-local selected = ouro.signal(1)
 -- Inside content; results is the application's complete ordered result set.
+local c = launcher:context()
 return ouro.column {
   key = "launcher", gap = 12,
-  ouro.text_input { key = "search", default_text = "", placeholder = "Search", autofocus = true },
+  ouro.text_input { key = "search", text = c.query, placeholder = "Search", autofocus = true,
+    send = launcher:event("QUERY"),
+    on_command = { next = launcher:event { type = "MOVE", delta = 1 },
+                   previous = launcher:event { type = "MOVE", delta = -1 } } },
   ouro.virtual_list {
     key = "results", flex = 1,
     item_count = #results,
     item_key = function(i) return results[i].id end,
     estimated_item_height = 40,
-    ensure_visible = selected(),
+    ensure_visible = c.selected,
     render_item = function(i)
       return ouro.text { key = "label", text = results[i].label }
     end,
@@ -3490,8 +3527,9 @@ descendants, without taking focus or consuming their clicks. Moving between
 children does not toggle the state; losing window keyboard focus stops counting
 its retained focus target. Each new observed instance emits its initial state.
 Callbacks run as tasks, not during native input dispatch, and retained instance
-state survives callback replacement. Use a component-owned signal to reveal
-controls while active, with a stable placeholder if layout must not move.
+state survives callback replacement. Use a component machine's state to reveal
+controls while active (`on_interaction_change = self:event("ACTIVE")` with
+`ACTIVE = machine.set("active", "boolean")`), with a stable placeholder if layout must not move.
 The optional second argument is an opaque native-popup anchor when active and
 visible; existing one-argument callbacks are unchanged. It carries geometry
 and lifetime identity, not permission to activate a window or grab input.
@@ -3637,7 +3675,7 @@ one table with a `handler` function and an explicit boolean `propagate`.
 checks filters and the committed `propagate` value without running Lua. A
 matching `propagate = false` registration consumes the event; its return value,
 error, or yield cannot change that decision. Callback side effects happen later.
-Change a signal and rebuild to change future filters or propagation policy.
+Change chart state and rebuild to change future filters or propagation policy.
 
 Keyboard filters are `keys` (1–16 exact logical chords using the editor chord
 syntax above) and `states` (`pressed`, `released`, `repeated`). Pointer filters

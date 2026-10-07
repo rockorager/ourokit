@@ -14,6 +14,86 @@ including presentation state such as query text, selection and appearance.
 Signals are not an application state mechanism (§6). Charts do not replace
 plain functions, the view, or the native editor's per-keystroke state (§5).
 
+## 0. Writing an app
+
+[`examples/stopwatch`](../examples/stopwatch) is the smallest complete app,
+first written from this document alone. Its shape:
+
+```lua
+-- charts.lua: behavior. machine.create is pure, so charts are made at load.
+local machine = require('ouro').machine
+local stopwatch = machine.create {
+  id = 'stopwatch', type = 'parallel', order = { 'clock', 'settings' },  -- a parallel root
+  context = { elapsed = 0, laps = {}, max_laps = 5, draft_max_laps = 5 },
+  states = {
+    clock = { initial = 'idle', states = {
+      idle = { on = { START = 'running' } },
+      running = { after = { [100] = { target = 'running', actions = 'tick' } }, on = { STOP = 'paused' } },
+      paused = { on = { START = 'running' } },
+    } },
+    settings = { initial = 'closed', states = { ... MAX_LAPS = machine.set('draft_max_laps', 'integer') ... } },
+  },
+  actions = { tick = machine.assign { elapsed = function(c) return c.elapsed + 100 end } },
+}
+
+-- view.lua: a function of the snapshot that hands widgets event bindings (§7).
+function M.content(sw)
+  return function()
+    local running = sw:matches('clock.running')
+    return ouro.button { key = 'toggle', label = running and 'Stop' or 'Start',
+      send = sw:event(running and 'STOP' or 'START') }
+  end
+end
+
+-- app.lua
+return ouro.app {
+  id = 'dev.ourokit.stopwatch',
+  run = function()
+    local sw = charts.stopwatch:start { id = 'stopwatch' }   -- run is a task
+    return { windows = { ouro.window { id = 'main', title = 'Stopwatch', content = view.content(sw) } } }
+  end,
+}
+```
+
+- **Charts** are created at module load. A root may be a compound state with
+  `initial`, or `type = 'parallel'` with regions and an optional `order`.
+- **Root actors start in a task.** `chart:start(options)` is
+  `chart:actor(options):start()`. `start()` runs deferred effects and writes
+  signals, so it needs the task phase. `run()` is a task: it may start
+  actors and even wait on I/O before returning windows. So are widget
+  callbacks, MCP action handlers and invokes. Module load is not. An actor
+  that MCP actions share with the UI is created at load with
+  `chart:actor { id = ... }`, which is render-safe, and started by whichever
+  needs it first (contacts). Root actors live in application scope whichever
+  task starts them (§8), until `stop()`, a final state, or source reload.
+- **Give root actors stable ids.** Reload restores an actor only when the
+  reload candidate creates one with the same id and chart id (§9). That is
+  only actors created while the candidate runs: at module load or in `run()`.
+  An actor created later, for example lazily in a callback, starts fresh.
+- **Views** are content functions that read `actor:context()`, `matches()`
+  and `can()`, and give widgets `actor:event(...)` bindings. Reads are
+  tracked per field (§6). Content functions must not send events.
+- **Windows.** A static `{ windows = { ... } }` behaves as usual: a close
+  request closes the window, and closing the last window exits.
+  - `send = actor` on a window routes its close request to the chart as
+    `surface.close_requested.<id>`, and nothing closes until the declaration
+    drops the window. A static list never drops it, so bind a static window
+    only if the chart handles the request, for example by entering a state
+    that exits.
+  - For a surface that a state owns, return `windows = function() ... end`
+    and declare the surface while `actor:matches('open')` (launcher, §12).
+  - `{ windows = ..., send = actor }` binds the declaration as a whole. It
+    reports only `surface.failed` when `windows()` fails, and changes no
+    close behavior.
+  - `on_close_request = actor:sender('QUIT')` on an unbound window is the
+    callback form (documents, contacts).
+- **Exiting.** `ouro.exit` is not allowed in actions (§1), so exit from an
+  invoke: `exiting = { invoke = { src = 'exit', on_done = 'exited' } }`.
+- **Tests.** Start actors with `scheduler = machine.manual_scheduler()` and
+  drive time with `clock.advance(ms)` (§8). `ouroctl test` can mount the real
+  view with `t:mount(view.content(actor))` and click through it
+  (`tests/stopwatch_test.lua`).
+
 ## 1. Supported subset
 
 We use SCXML semantics with an XState-like Lua surface. Supported:
@@ -292,6 +372,35 @@ copy.
 Nested tables are replaced, never mutated in place: copy-on-write, by
 convention.
 
+### Callback signatures
+
+`ctx` and `event` are read-only views (`event` is the triggering event; for an
+entry action it is the event of the transition that entered the state).
+`state` is `{ matches = fn(id), children = view }`. `state.matches` rejects
+unknown ids, and `state.children` maps child ids to child snapshots (§3).
+
+| Callback | Called as | Returns |
+| --- | --- | --- |
+| guard: `guard = fn` or `guards = { name = fn }` | `fn(ctx, event, state)` | a boolean |
+| `machine.assign(fn)` | `fn(ctx, event, state)` | a table of updates, `{ field = value }`; `machine.unset` deletes a field; `nil` changes nothing |
+| `machine.assign { field = value_or_fn }` | `fn(ctx, event, state)`, per field | the field's new value; non-function values are used as is |
+| `machine.set(field, type)` | — | assigns `event.value` to `ctx[field]` |
+| function action, in `actions`, `entry`, `exit` or a transition | `fn(ctx, event, actor)`, after commit | ignored |
+| expressions: `raise(fn)`, `send_parent(fn)`, `send_to(id_fn, event_fn)`, `spawn(src, { id = fn, input = fn })`, invoke `input`, final `output` | `fn(ctx, event, state)` | the value |
+| `context = fn` | `fn(input)` once, at `chart:actor` | the initial context |
+| invoke `src`, or `actors = { name = fn }` | `fn(input, send)` as a task | its output becomes `done.invoke.<id>`'s `output`; a throw becomes `error.invoke.<id>`'s `error` |
+| `machine.spawn(fn_or_name, ...)` task | `fn(input)` as a task | `done.actor.<id>` / `error.actor.<id>` |
+| `machine.component(chart, render)` | `render(self, props)` | a description or nil |
+| `machine.wait_for(actor, pred)` | `pred(snapshot)` | a boolean |
+| `machine.selector(fn)` returns `sel` | `sel(data, ...)` calls `fn(data, ...)` | `fn`'s result, memoized while `data` and the arguments are raw-equal |
+| `machine.actions` specs | `before(actor)`; `output(snapshot, event)` | `nil` or an `ouro.action_error`; the output table |
+
+Guards, assigns, expressions and function actions are atomic: they cannot
+wait, spawn or exit (§1). Function actions get the actor for reading and for
+sending; a send from an action queues behind the current macrostep and
+returns `nil, 'queued'`. Each sees the context as it was when it was reached
+in the macrostep, not the final context.
+
 ## 5. Continuous values stay native
 
 Pointer position, hover, drag deltas, scroll offsets, animation progress, caret
@@ -476,7 +585,7 @@ ouro.menu_button { key = 'more', label = 'More', items = {
   enabled while `actor:can(event)` holds. A refused command is left out with
   its shortcuts, so the key falls through to outer scopes as if unbound. A
   refused dialog `on_cancel` leaves Escape unhandled.
-- **Value hooks** (`on_change`, `on_select`, `on_activate`, drops; `send` on
+- **Value hooks** (`on_change`, `on_select`, `on_activate`, `on_interaction_change`, `on_scroll`, drops; `send` on
   text input, switch, checkbox, slider, select, spinbox, listbox, tabs, split
   view, collapsible) send a copy of the event with the new value in
   `field`, which defaults to `value`, matching `machine.set`. The view reads
@@ -557,15 +666,26 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
   no `Vm`, so the binding is nil. Work runs in application scope (`spawn_app`,
   else `spawn`), and closing only drops delivery. A cancelled request still
   runs to completion; only its result is ignored.
-- **Tests (`machine.manual_scheduler()`).** Virtual time comes from
-  `advance(ms)`. Queued invokes run when `run_tasks()` is called.
-  `open_scopes` counts live scopes, including actor roots. `ouroctl test`
+- **Tests (`machine.manual_scheduler()`).** It returns a plain table whose
+  fields are functions, so call them with a dot: `clock.advance(ms)` fires due
+  timers in time order on virtual time, `clock.run_tasks()` runs queued invokes
+  and spawned tasks, and `clock.pending()` returns the timer and task counts.
+  `clock.now` is the virtual time and `clock.open_scopes` counts live scopes,
+  including actor roots. `ouroctl test`
   forbids wall-clock sleeps, and the sandbox has no `coroutine` library, so
   invokes run to completion when they run.
 - **Effects run in the sender's task, not in a state scope.** That is why
   function actions are atomic (§1).
 - **Still open: logical timers.** `after` still uses wall-clock `ouro.sleep`.
   Replay on a virtual clock needs the scope's timers to follow a host clock.
+- **`after` delays are constants.** They are the integer keys of the `after`
+  table, fixed when the chart is created; a delay computed from context is
+  not supported. Use a fixed tick and count, or one state per delay.
+- **Missing: a millisecond clock for apps.** Lua's `os.time()` has one-second
+  resolution, and the runtime's monotonic clock is private. So a stopwatch
+  counts `after` ticks, and its elapsed time falls behind wall time by the
+  timer latency of each tick. The proposed fix is a scheduler-backed clock
+  readable from assigns, virtual under `manual_scheduler`.
 
 An invoke `src` is `function(input, send) ... return output end`. It runs as an
 Ouro task and may yield on Ouro I/O. `send` delivers events to the machine
@@ -599,6 +719,10 @@ host side belongs to the scopes thread:
    through their own chart's `restore`; a child whose fresh context needs
    input keeps its old context.
 3. After the candidate commits, `machine.release()` starts the held work.
+
+Carry only reaches actors the candidate creates while it runs, that is at
+module load or in `run()`. `machine.release()` drops entries nobody claimed,
+so an actor created later (lazily in a callback, say) starts fresh.
 
 Restored state is visible immediately, so the candidate's UI builds from it.
 Restored timers and invokes start when the candidate commits, skipping states
