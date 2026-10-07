@@ -55,14 +55,16 @@ fn open(state: *c.State) callconv(.c) c_int {
     else if (c.lua_type(state, 1) == c.type_string) application: {
         // "application": like spawn_app, outlive the calling task (an MCP
         // action, a widget callback) but not generation retirement. Where
-        // application spawns are unavailable, fall back to the task's scope.
+        // application spawns are unavailable (reload candidates, tests,
+        // Storybook), use the running task's scope if there is one.
         var length: usize = 0;
         const name = c.lua_tolstring(state, 1, &length).?;
         if (!std.mem.eql(u8, name[0..length], "application"))
             return raise(state, "InvalidArguments: open expects an optional parent scope");
         if (vm.app_spawn_allowed) break :application vm.scheduler.application_scope;
-        break :application vm.currentScope(state) catch
-            return raise(state, "NoParentScope: open needs a parent scope outside a running task");
+        // Outside any task (an `ouroctl test` body, a Storybook module), the
+        // host itself is the only owner left: use its application scope.
+        break :application vm.currentScope(state) catch vm.scheduler.application_scope;
     } else (scopeArgument(state, 1) orelse
         return raise(state, "InvalidArguments: open expects an optional parent scope")).handle;
     // Allocate the userdata first so a Lua memory error cannot strand a scope.

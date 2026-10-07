@@ -1213,6 +1213,27 @@ return {
     assert(seen[actor:context().rows[1]] == true, 'unchanged tables keep theirs')
   end,
 
+  ['root actors start in a test body on the native scheduler'] = function(t)
+    assert(machine.native_scopes and machine.default_scheduler.kind == 'native')
+    local chart = machine.create {
+      id = 'plain', initial = 'idle', context = { n = 0 },
+      actors = { load = function() return 41 end },
+      states = {
+        idle = { on = { LOAD = 'loading' } },
+        loading = { invoke = { src = 'load', on_done = { target = 'ready', actions = assign { n = function(_, e) return e.output + 1 end } } } },
+        ready = {},
+      },
+    }
+    local actor = chart:start() -- no manual scheduler, outside any task
+    assert(actor:matches('idle'))
+    actor:send('LOAD') -- opens the root scope under the host's application scope
+    assert(actor:matches('loading') and #actor:pending_invokes() == 1)
+    -- The runner drains runnable tasks while it settles mounted UI.
+    t:mount(function() return o.text { key = 'n', text = tostring(actor:context().n) } end)
+    assert(actor:matches('ready') and t:node('n').label == '42', t:node('n').label)
+    actor:stop()
+  end,
+
   ['event schemas validate external events and drive accepted()'] = function()
     local chart = machine.create {
       id = 'schema', initial = 'clean',
