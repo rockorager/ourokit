@@ -280,6 +280,13 @@ pub const WindowSet = struct {
         }
     }
 
+    /// The native-transition part of `reconcile`'s validation for one
+    /// declaration, changing nothing: a retained id cannot change its role,
+    /// layer namespace or output, or clear an explicit exclusive edge.
+    pub fn checkTransition(self: *WindowSet, declaration: SurfaceDeclaration) !void {
+        try self.validateTransitions(&.{declaration});
+    }
+
     /// Protocol dispatch calls this state-only method after native teardown is
     /// complete. Scope cancellation is deferred to the next task safe point;
     /// slot reclamation occurs during a later reconciliation phase.

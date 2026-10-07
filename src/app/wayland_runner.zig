@@ -913,16 +913,25 @@ fn runSourceInternal(
         }
 
         if (!disconnect_started and host.failure == null and shutdown_signal == null and active_generation.vm.exit_code == null) {
+            active_generation.window_check = .{ .context = &window_set, .check = checkWindowTransition };
             const rebuilt = active_generation.refreshWindows() catch |err| blk: {
                 std.log.err("window declaration failed: {s}", .{@errorName(err)});
                 // The last valid list stays. A bound surface hears why, once
-                // per distinct failure, since evaluation retries.
+                // per distinct failure, since evaluation retries; otherwise
+                // the declaration's own target, bound by run's `send`, does.
+                const failure = active_application.takeWindowsFailure();
+                defer if (failure) |message| init.gpa.free(message);
                 if (active_application.takeRejection()) |rejection| {
                     defer active_application.releaseRejection(rejection);
-                    if (!rejected_surface.matches(rejection)) {
-                        rejected_surface.remember(rejection);
+                    if (!rejected_surface.matches(rejection.id, @errorName(rejection.err))) {
+                        rejected_surface.remember(rejection.id, @errorName(rejection.err));
                         try sendSurfaceRejection(active_generation, rejection);
                     }
+                } else if (!rejected_surface.matches("", @errorName(err))) {
+                    rejected_surface.remember("", @errorName(err));
+                    try sendSurfaceEvent(active_generation, "", "failed", &.{
+                        .{ .string = "windows" }, .{ .string = failure orelse @errorName(err) },
+                    });
                 }
                 break :blk false;
             };
@@ -1132,8 +1141,9 @@ fn runSourceInternal(
                 if (slot.bound and slot.declared and slot.popup == null) {
                     slot.desired = false;
                     desired_changed = true;
+                    const message = if (err == error.LuaBuildFailed) lua_ui.failureMessage() else null;
                     try sendSurfaceEvent(active_generation, slot.id.?, "failed", &.{
-                        .{ .string = "content" }, .{ .string = @errorName(err) },
+                        .{ .string = "content" }, .{ .string = message orelse @errorName(err) },
                     });
                     continue;
                 }
@@ -2029,9 +2039,14 @@ fn sendSurfaceRejection(generation: *source_generation.SourceGeneration, rejecti
     const reference = try generation.application.surfaceFunction("deliver_to");
     defer lua_c.luaL_unref(generation.vm.state, lua_c.registry_index, reference);
     _ = try generation.vm.spawnReference(generation.vm.scheduler.application_scope, reference, &.{
-        .{ .registry = rejection.send_reference }, .{ .string = rejection.id }, .{ .string = "failed" },
-        .{ .string = "declaration" },                .{ .string = @errorName(rejection.err) },
+        .{ .registry = rejection.send_reference }, .{ .string = rejection.id },              .{ .string = "failed" },
+        .{ .string = rejection.reason },           .{ .string = @errorName(rejection.err) },
     });
+}
+
+fn checkWindowTransition(context: *anyopaque, declaration: platform.window.SurfaceDeclaration) anyerror!void {
+    const window_set: *windows_module.WindowSet = @ptrCast(@alignCast(context));
+    try window_set.checkTransition(declaration);
 }
 
 /// The last rejection reported, so retried evaluation does not repeat it.
@@ -2040,15 +2055,15 @@ const RejectedSurface = struct {
     id_len: usize = 0,
     err: ?[]const u8 = null,
 
-    fn matches(self: *const RejectedSurface, rejection: lua.WindowRejection) bool {
+    fn matches(self: *const RejectedSurface, id: []const u8, err_name: []const u8) bool {
         const err = self.err orelse return false;
-        return std.mem.eql(u8, err, @errorName(rejection.err)) and std.mem.eql(u8, self.id[0..self.id_len], rejection.id[0..@min(rejection.id.len, self.id.len)]);
+        return std.mem.eql(u8, err, err_name) and std.mem.eql(u8, self.id[0..self.id_len], id[0..@min(id.len, self.id.len)]);
     }
 
-    fn remember(self: *RejectedSurface, rejection: lua.WindowRejection) void {
-        self.id_len = @min(rejection.id.len, self.id.len);
-        @memcpy(self.id[0..self.id_len], rejection.id[0..self.id_len]);
-        self.err = @errorName(rejection.err);
+    fn remember(self: *RejectedSurface, id: []const u8, err_name: []const u8) void {
+        self.id_len = @min(id.len, self.id.len);
+        @memcpy(self.id[0..self.id_len], id[0..self.id_len]);
+        self.err = err_name;
     }
 
     fn clear(self: *RejectedSurface) void {

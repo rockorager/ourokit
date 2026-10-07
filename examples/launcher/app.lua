@@ -94,6 +94,8 @@ return ouro.app {
   run = function()
     launcher:start()
     launcher:send("OPEN")
-    return { windows = view.windows(launcher) }
+    -- `send` also binds the declaration as a whole: an error thrown by
+    -- windows() reaches the chart as surface.failed with reason 'windows'.
+    return { windows = view.windows(launcher), send = launcher }
   end,
 }

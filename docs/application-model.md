@@ -546,7 +546,8 @@ the event.
 | `surface.mapped.<id>` | The compositor configured a new native surface. Sent again after a reopen. | `id`, `width`, `height` |
 | `surface.close_requested.<id>` | The compositor asked to close the surface. Nothing closes until the chart leaves the state whose view declares it. | `id` |
 | `surface.closed.<id>` | Native teardown finished. This usually follows the declaration dropping the surface. Not sent during application shutdown. | `id` |
-| `surface.failed.<id>` | The surface could not be shown. `reason` is `declaration` when the declaration was rejected and the last valid list was kept, or `content` when the content function failed on its first build. In the `content` case the surface closes and the application keeps running. | `id`, `reason`, `message` (the error name) |
+| `surface.failed.<id>` | The surface could not be shown, and the last valid list was kept. `reason` is `declaration` when its declaration was rejected while parsing; `transition` when a retained id changed its role, layer namespace or output, or cleared an exclusive edge; or `content` when the content function failed on its first build. In the `content` case the surface closes and the application keeps running. | `id`, `reason`, `message` (the Lua error for `content`, otherwise the error name) |
+| `surface.failed` | `windows()` itself failed, or its list as a whole was invalid, so no surface can be named. This goes to the declaration's own `send` (see below). | `reason = 'windows'`, `message` |
 
 ```lua
 open = { on = {
@@ -555,13 +556,18 @@ open = { on = {
 } },
 ```
 
+`run` may bind the declaration as a whole as well: return
+`{ windows = fn, send = actor }`. That target receives `surface.failed` with
+reason `windows` when `windows()` throws (the message is the Lua error) or
+returns something that cannot be a window list. Without it, those failures are
+only logged.
+
 A bound surface cannot also declare `on_close_request`; doing so is itself a
 rejected declaration. Rejections are reported once per distinct surface and
-error until a declaration succeeds again. Only failures that can be attributed
-to a bound surface are reported: an error thrown by `windows()` itself, or a
-list that exceeds window capacity, names no surface and is only logged. A
-`closed` event reaches the actor that was bound when the declaration dropped the
-surface. Events for surfaces of a replaced source generation are not delivered
+error until a declaration succeeds again. Transition failures are rejected
+before commit for unbound surfaces too: they are logged and the last valid set
+stays, instead of stopping the application. A `closed` event reaches the actor
+that was bound when the declaration dropped the surface. Events for surfaces of a replaced source generation are not delivered
 after reload. See [examples/launcher](../examples/launcher).
 
 ## User-initiated anchored popups

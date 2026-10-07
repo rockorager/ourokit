@@ -199,7 +199,8 @@ pub const Application = struct {
     output_templates: []Window = &.{},
     /// The bound surface a rejected declaration was about, if known.
     rejection: ?Rejection = null,
-    surface_events: c_int = c.no_reference,
+    /// The Lua error message of the last failed `windows()` call.
+    windows_failure: ?[]u8 = null,
 
     /// Evaluate desired windows without changing the last valid declaration.
     /// The caller tracks signal reads and commits only after validation.
@@ -207,9 +208,14 @@ pub const Application = struct {
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
         self.clearRejection();
+        self.clearWindowsFailure();
         _ = c.lua_rawgeti(self.state, c.registry_index, self.windows_reference);
-        if (c.lua_pcallk(self.state, 0, 1, 0, 0, null) != c.ok)
+        if (c.lua_pcallk(self.state, 0, 1, 0, 0, null) != c.ok) {
+            var length: usize = 0;
+            if (c.lua_tolstring(self.state, -1, &length)) |message|
+                self.windows_failure = self.allocator.dupe(u8, message[0..length]) catch null;
             return error.LuaWindowsFailed;
+        }
         if (c.lua_type(self.state, -1) != c.type_table) return error.InvalidWindowsDeclaration;
         if (c.lua_rawlen(self.state, -1) > capacity) return error.WindowCapacityExceeded;
         return parseWindowsTable(self.allocator, self.state, &self.rejection);
@@ -232,15 +238,47 @@ pub const Application = struct {
         if (self.takeRejection()) |value| self.releaseRejection(value);
     }
 
+    /// Records that `window` failed a later check (a native transition) so
+    /// its bound target hears about it. Unbound windows record nothing.
+    pub fn rejectWindow(self: *Application, window: Window, err: anyerror, reason: []const u8) void {
+        self.clearRejection();
+        if (window.send_reference == c.no_reference) return;
+        const id = self.allocator.dupe(u8, window.declaration.id()) catch return;
+        _ = c.lua_rawgeti(self.state, c.registry_index, window.send_reference);
+        self.rejection = .{ .id = id, .send_reference = c.luaL_ref(self.state, c.registry_index), .err = err, .reason = reason };
+    }
+
+    /// The Lua message of the last failed `windows()` call; the caller frees it.
+    pub fn takeWindowsFailure(self: *Application) ?[]u8 {
+        const value = self.windows_failure;
+        self.windows_failure = null;
+        return value;
+    }
+
+    fn clearWindowsFailure(self: *Application) void {
+        if (self.takeWindowsFailure()) |value| self.allocator.free(value);
+    }
+
+    /// Whether run's declaration has `send`, which receives failures of the
+    /// declaration as a whole (`surface.failed` with reason 'windows').
+    pub fn windowsBound(self: *Application) bool {
+        const top = c.lua_gettop(self.state);
+        defer c.lua_settop(self.state, top);
+        pushSurfaceEvents(self.state) catch return false;
+        _ = c.lua_getfield(self.state, -1, "bound");
+        _ = c.lua_pushlstring(self.state, "", 0);
+        if (c.lua_pcallk(self.state, 1, 1, 0, 0, null) != c.ok) return false;
+        return c.lua_toboolean(self.state, -1) != 0;
+    }
+
     /// Records each committed surface's `send` target in Lua, so events
     /// for a surface the declaration has since dropped (`closed`) still
     /// reach the actor that owned it. Non-yielding; call after commit.
     pub fn bindSurfaces(self: *Application) !void {
-        const helper = try self.surfaceEvents();
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
         for (self.windows) |window| {
-            _ = c.lua_rawgeti(self.state, c.registry_index, helper);
+            try pushSurfaceEvents(self.state);
             _ = c.lua_getfield(self.state, -1, "bind");
             const id = window.declaration.id();
             _ = c.lua_pushlstring(self.state, id.ptr, id.len);
@@ -253,24 +291,11 @@ pub const Application = struct {
         }
     }
 
-    /// Registry reference of the surface event helper table: `bind(id,
-    /// target)`, `deliver(id, kind, ...)` for bound targets, and
+    /// A registry reference to one surface event helper function, for
+    /// `Vm.spawnReference`: `deliver(id, kind, ...)` for bound targets and
     /// `deliver_to(target, id, kind, ...)` for a rejected declaration.
-    pub fn surfaceEvents(self: *Application) !c_int {
-        if (self.surface_events != c.no_reference) return self.surface_events;
-        const top = c.lua_gettop(self.state);
-        defer c.lua_settop(self.state, top);
-        if (c.luaL_loadbufferx(self.state, surface_events_source, surface_events_source.len, "=ouro.surface_events", "t") != c.ok or
-            c.lua_pcallk(self.state, 0, 1, 0, 0, null) != c.ok)
-            return error.SurfaceEventsInitializationFailed;
-        self.surface_events = c.luaL_ref(self.state, c.registry_index);
-        return self.surface_events;
-    }
-
-    /// A registry reference to one helper function, for `Vm.spawnReference`.
     pub fn surfaceFunction(self: *Application, name: [:0]const u8) !c_int {
-        const helper = try self.surfaceEvents();
-        _ = c.lua_rawgeti(self.state, c.registry_index, helper);
+        try pushSurfaceEvents(self.state);
         _ = c.lua_getfield(self.state, -1, name.ptr);
         const reference = c.luaL_ref(self.state, c.registry_index);
         c.lua_settop(self.state, -2);
@@ -619,8 +644,7 @@ pub const Application = struct {
         for (self.output_templates) |window| deinitWindow(self.allocator, self.state, window);
         self.allocator.free(self.output_templates);
         self.clearRejection();
-        if (self.surface_events != c.no_reference)
-            c.luaL_unref(self.state, c.registry_index, self.surface_events);
+        self.clearWindowsFailure();
         if (self.run_reference != c.no_reference)
             c.luaL_unref(self.state, c.registry_index, self.run_reference);
         if (self.actions_reference != c.no_reference)
@@ -788,6 +812,7 @@ fn optionalFunction(
 
 fn parseRunWindows(allocator: std.mem.Allocator, state: *c.State, reference: *c_int) ![]Window {
     if (c.lua_type(state, -1) != c.type_table) return error.ApplicationRunDeclarationRequired;
+    try bindRunDeclaration(state);
     const kind = c.lua_getfield(state, -1, "windows");
     if (kind == c.type_function) {
         const windows = try allocator.alloc(Window, 0);
@@ -800,10 +825,44 @@ fn parseRunWindows(allocator: std.mem.Allocator, state: *c.State, reference: *c_
     return parseWindowsTable(allocator, state, null);
 }
 
+/// `run` may return `{ windows = fn, send = actor }`: the declaration as a
+/// whole is bound, under the empty surface id.
+fn bindRunDeclaration(state: *c.State) !void {
+    if (c.lua_type(state, -1) != c.type_table) return;
+    const kind = c.lua_getfield(state, -1, "send");
+    defer c.lua_settop(state, -2);
+    if (kind == c.type_nil) return;
+    if (kind != c.type_table and kind != c.type_userdata and kind != c.type_function) return error.InvalidWindowSendTarget;
+    try pushSurfaceEvents(state);
+    _ = c.lua_getfield(state, -1, "bind");
+    _ = c.lua_pushlstring(state, "", 0);
+    c.lua_pushvalue(state, -4);
+    if (c.lua_pcallk(state, 2, 0, 0, 0, null) != c.ok) return error.SurfaceBindingFailed;
+    c.lua_settop(state, -2);
+}
+
+const surface_events_key = "ouro.surface_events";
+
+/// Pushes this VM's surface event helper table, loading it on first use.
+fn pushSurfaceEvents(state: *c.State) !void {
+    if (c.lua_getfield(state, c.registry_index, surface_events_key) == c.type_table) return;
+    c.lua_settop(state, -2);
+    if (c.luaL_loadbufferx(state, surface_events_source, surface_events_source.len, "=ouro.surface_events", "t") != c.ok or
+        c.lua_pcallk(state, 0, 1, 0, 0, null) != c.ok)
+    {
+        c.lua_settop(state, -2);
+        return error.SurfaceEventsInitializationFailed;
+    }
+    c.lua_pushvalue(state, -1);
+    c.lua_setfield(state, c.registry_index, surface_events_key);
+}
+
 pub const Rejection = struct {
     id: []u8,
     send_reference: c_int,
     err: anyerror,
+    /// 'declaration' while parsing, or 'transition' for a native check.
+    reason: []const u8 = "declaration",
 };
 
 /// Delivers surface lifecycle events (design/statecharts.md). Targets are
@@ -814,7 +873,8 @@ pub const Rejection = struct {
 const surface_events_source =
     \\local targets = {}
     \\local function event(id, kind, a, b)
-    \\  local e = { type = 'surface.' .. kind .. '.' .. id, id = id }
+    \\  -- The empty id is the declaration as a whole: plain surface.failed.
+    \\  local e = id == '' and { type = 'surface.' .. kind } or { type = 'surface.' .. kind .. '.' .. id, id = id }
     \\  if kind == 'failed' then e.reason, e.message = a, b
     \\  elseif kind == 'mapped' then e.width, e.height = a, b end
     \\  return e
@@ -825,6 +885,7 @@ const surface_events_source =
     \\end
     \\local M = {}
     \\function M.bind(id, target) targets[id] = target end
+    \\function M.bound(id) return targets[id] ~= nil end
     \\function M.deliver(id, kind, a, b)
     \\  local target = targets[id]
     \\  if target then send(target, event(id, kind, a, b)) end

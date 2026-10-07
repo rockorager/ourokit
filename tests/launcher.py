@@ -156,8 +156,8 @@ clock.run_tasks(); assert(launcher:matches('open.ready') and launcher:context().
 
 -- The surface reports back through actor:deliver (bound with send =).
 launcher:send('OPEN'); clock.run_tasks()
-assert(launcher:deliver({type='surface.mapped.launcher', id='launcher', width=1280, height=720}, 'surface')==false,
-  'mapped needs no transition')
+assert(launcher:deliver({type='surface.mapped.launcher', id='launcher', width=1280, height=720}, 'surface'),
+  'mapped is handled as a no-op')
 assert(launcher:matches('open.ready'))
 launcher:deliver({type='surface.close_requested.launcher', id='launcher'}, 'surface')
 assert(launcher:matches('hidden'), 'a compositor close request hides the launcher')
@@ -170,8 +170,12 @@ assert(launcher:matches('hidden') and invoked('cancelled').src=='launch', 'a fai
 assert(last().origin=='surface')
 assert(launcher:context().error=='Launcher surface failed (declaration): InvalidThemeColor', launcher:context().error)
 clock.run_tasks(); assert(#launches==before_failure)
-launcher:deliver({type='surface.closed.launcher', id='launcher'}, 'surface')
-assert(last().rejected and launcher:matches('hidden'), 'closed after hiding is ignored')
+assert(launcher:deliver({type='surface.closed.launcher', id='launcher'}, 'surface'))
+assert(not last().rejected and launcher:matches('hidden'), 'closed after hiding is a handled no-op, not a rejection')
+-- A failure of windows() itself arrives without a surface id.
+launcher:send('OPEN')
+launcher:deliver({type='surface.failed', reason='windows', message='view.lua:9: boom'}, 'surface')
+assert(launcher:matches('hidden') and launcher:context().error=='Launcher surface failed (windows): view.lua:9: boom')
 assert(not pcall(launcher.send, launcher, {type='surface.failed.launcher'}), 'surface.* cannot be sent by apps')
 launcher:send('OPEN'); assert(launcher:context().error==nil, 'reopening clears the surface error')
 clock.run_tasks()

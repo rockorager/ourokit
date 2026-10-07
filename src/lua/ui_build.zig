@@ -119,6 +119,9 @@ pub const UiBuild = struct {
     state: *c.State,
     storage: []instance.Descriptor,
     count: usize = 0,
+    /// First line of the last failed build's Lua error, for reporting.
+    failure: [256]u8 = undefined,
+    failure_len: usize = 0,
     root_reference: c_int = c.no_reference,
     components: Components = .{},
     component_namespace: u64 = 0,
@@ -321,12 +324,27 @@ pub const UiBuild = struct {
             }
         }
         if (status != c.ok) {
+            self.recordFailure();
             diagnostic.logLuaStack(self.state);
             if (status == c.yield) return error.LuaBuildYielded;
             return error.LuaBuildFailed;
         }
         if (self.signals) |signals| try signals.finishEvaluation(signal_owner, work.revision);
         return self.storage[0..self.count];
+    }
+
+    fn recordFailure(self: *UiBuild) void {
+        var length: usize = 0;
+        const message = if (c.lua_tolstring(self.state, -1, &length)) |value| value[0..length] else "non-string Lua error";
+        const line = message[0 .. std.mem.indexOfScalar(u8, message, '\n') orelse message.len];
+        self.failure_len = @min(line.len, self.failure.len);
+        @memcpy(self.failure[0..self.failure_len], line[0..self.failure_len]);
+    }
+
+    /// The Lua error of the most recent failed build, if it had one.
+    pub fn failureMessage(self: *const UiBuild) ?[]const u8 {
+        if (self.failure_len == 0) return null;
+        return self.failure[0..self.failure_len];
     }
 
     fn beginLowering(self: *UiBuild) !void {

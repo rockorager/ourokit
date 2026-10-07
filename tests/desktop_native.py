@@ -893,13 +893,22 @@ def launcher_surface_failure_test(root, env):
     """A launcher whose surface cannot be shown returns to hidden with the reason."""
     app_env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'])
     source = (ROOT / 'examples/launcher/view.lua').read_text()
-    breaks = {
+    guard = 'if not launcher:matches("open") then return {} end\n'
+    breaks = [
         # Rejected while the last good (empty) list is kept.
-        'declaration': source.replace('background = "#10141c99"', 'background = "#zz"'),
-        # The content function throws on its first build.
-        'content': source.replace('function M.content(launcher)\n', 'function M.content(launcher)\n    error("broken view")\n'),
-    }
-    for reason, view in breaks.items():
+        ('declaration', source.replace('background = "#10141c99"', 'background = "#zz"'), 'InvalidThemeColor', False),
+        # The content function throws on its first build: the Lua message arrives.
+        ('content', source.replace('function M.content(launcher)\n', 'function M.content(launcher)\n    error("broken view")\n'),
+         'broken view', False),
+        # windows() itself throws; run's `send = launcher` binds the declaration.
+        ('windows', source.replace(guard, guard + '      error("broken windows")\n'), 'broken windows', False),
+        # A retained layer surface may not change its namespace. Typing changes
+        # it here; the last valid surface stays until the chart hides it.
+        ('transition', source.replace('namespace = "ourokit-launcher"',
+                                      'namespace = launcher:context().query == "" and "ourokit-launcher" or "ourokit-other"'),
+         'LayerSurfaceNamespaceChanged', True),
+    ]
+    for reason, view, detail, typed in breaks:
         assert view != source, reason
         directory = root / f'launcher-{reason}'
         directory.mkdir()
@@ -914,15 +923,61 @@ def launcher_surface_failure_test(root, env):
             for attempt in range(2):  # it can be opened again, and fails again
                 if attempt:
                     assert call(endpoint, 'Open')['structuredContent']['open'] is True
+                if typed:
+                    wait_for(lambda: 'launcher' in [w['window'] for w in inspect(app_env, endpoint).get('windows', [])],
+                             'transition launcher never opened')
+                    for _ in range(5):
+                        # The keystroke can retire its own surface before replying.
+                        if 'launcher' not in [w['window'] for w in inspect(app_env, endpoint).get('windows', [])]:
+                            break
+                        tree = inspect(app_env, endpoint, 'launcher')['windows'][0]
+                        if run(str(BINARY), 'dev', 'input', str(endpoint), json.dumps(
+                                {'window': 'launcher', 'token': tree['token'], 'action': 'text', 'text': 'x'}),
+                                env=app_env, ok=None).returncode == 0:
+                            break
                 wait_for(lambda: state()['open'] is False and f'({reason})' in state().get('error', ''),
                          f'{reason} failure never reached the chart')
-                assert inspect(app_env, endpoint).get('windows', []) == [], 'no surface may remain'
+                assert detail in state()['error'], state()
+                wait_for(lambda: inspect(app_env, endpoint).get('windows', []) == [], 'no surface may remain')
             assert app.poll() is None, 'a failed bound surface must not exit the app'
             print(f'PASS launcher surface {reason} failure: hidden with "{state()["error"]}"')
         finally:
             terminate(app)
             errors = app.stderr.read()
             assert 'panic' not in errors and 'leaked' not in errors, errors
+
+
+def unbound_transition_test(root, env):
+    """An unbound surface's illegal transition is logged; the last valid set stays."""
+    source = root / 'unbound-transition.lua'
+    source.write_text('''local o=require('ouro'); local machine=o.machine
+local flip=machine.create{id='flip',initial='window',events={FLIP={}},states={window={on={FLIP='layer'}},layer={}}}
+local actor=flip:actor()
+return o.app{id='dev.ourokit.unbound-transition',
+ actions=machine.actions(actor,{Flip={event='FLIP',description='flip'}}),
+ run=function() actor:start()
+  return {windows=function()
+   local content=function() return o.text{key='t',text='still here'} end
+   if actor:matches('window') then return {o.window{id='main',title='Main',width=240,height=120,content=content}} end
+   return {o.layer_surface{id='main',namespace='flip',layer='top',width=240,height=120,content=content}}
+  end} end}
+''')
+    app_env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'])
+    app = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--software'], env=app_env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app, windows=('main',))
+        call(endpoint, 'Flip')
+        time.sleep(.5)
+        assert app.poll() is None, 'a role change must not crash the app'
+        assert [w['window'] for w in inspect(app_env, endpoint)['windows']] == ['main']
+        assert node(app_env, endpoint, 'main', 't')['label'] == 'still here'
+        print('PASS unbound role change: logged, last valid window kept, app alive')
+    finally:
+        terminate(app)
+        errors = app.stderr.read()
+        assert 'window declaration failed: WindowRoleChanged' in errors, errors
+        assert 'panic' not in errors and 'leaked' not in errors, errors
 
 
 def surface_events_test(root, env):
@@ -978,6 +1033,7 @@ def suite(root, env):
     surface_events_test(root, env)
     launcher_test(root, env)
     launcher_surface_failure_test(root, env)
+    unbound_transition_test(root, env)
     document_test(root, env)
     parent_lifetime_test(root, env)
     drag_test(root, env)

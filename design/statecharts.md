@@ -808,13 +808,17 @@ application-scope task in the task phase. See the
 [application model](../docs/application-model.md#surfaces-bound-to-a-statechart).
 - A close request no longer closes anything. The chart leaves `open`, and
   the declaration drops the surface.
-- A rejected declaration, or content that fails on its first build, sends
-  `failed`. The launcher returns to `hidden` with the reason in context,
-  where its MCP `State` action reports it.
+- A rejected declaration, an illegal transition of a retained surface
+  (`transition`), or content that fails on its first build (with the Lua
+  message), sends `failed`. `run`'s `{ windows = fn, send = actor }` also
+  binds the declaration, so an error thrown by `windows()` arrives as
+  `surface.failed` with reason `windows`. The launcher returns to `hidden`
+  with the reason in context, where its MCP `State` action reports it.
 - Retirement still follows the declaration pass, but `closed` tells the
   chart when teardown has finished.
-- Still unreported: an error thrown by `windows()` itself, which names no
-  surface, and native protocol failures, which stay fatal.
+- The launcher handles `surface.mapped` and `surface.closed` as explicit
+  no-op transitions, so the inspector shows no rejections for them.
+- Still fatal: native protocol failures.
 
 ### Contacts (implemented)
 

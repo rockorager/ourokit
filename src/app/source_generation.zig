@@ -10,6 +10,7 @@ const image_service = @import("../image/service.zig");
 const ImageCache = @import("../image/cache.zig").Cache;
 const native = @import("../native/root.zig");
 const lua_c = @import("../lua/c.zig");
+const platform_window = @import("../platform/window.zig");
 
 pub const Config = struct {
     /// Code and names remain borrowed through destruction of all generations.
@@ -56,11 +57,19 @@ pub const UiServices = struct {
     icon_roots: []const []const u8 = &.{},
 };
 
+/// Checks a candidate declaration against live native surfaces.
+pub const WindowCheck = struct {
+    context: *anyopaque,
+    check: *const fn (*anyopaque, platform_window.SurfaceDeclaration) anyerror!void,
+};
+
 /// All Lua-owned meaning for one application source snapshot. This value and
 /// its VM, Signals, and UiBuild fields must retain a stable address from init
 /// through deinit because installed C closures point into them.
 pub const SourceGeneration = struct {
     allocator: std.mem.Allocator,
+    /// Set by the runner: candidate windows must pass native transitions.
+    window_check: ?WindowCheck = null,
     snapshot: bundle.SourceSnapshot,
     vm: lua.Vm,
     mcp_client: lua.McpClient,
@@ -191,6 +200,7 @@ pub const SourceGeneration = struct {
         module_root: ?std.os.linux.fd_t,
     ) !void {
         self.allocator = allocator;
+        self.window_check = null;
         self.snapshot = snapshot;
         self.module_loader = null;
         self.native_modules = null;
@@ -617,10 +627,10 @@ pub const SourceGeneration = struct {
             self.ui_task = null;
             try self.application.finishUi(&self.vm, handle);
             _ = self.refreshWindows() catch |err| blk: {
-                // A bound surface's own rejection is not fatal: the app starts
-                // with no windows and the runner reports it to the surface's
-                // target when it retries the evaluation.
-                if (self.application.rejection == null) return err;
+                // A bound rejection is not fatal: the app starts with no
+                // windows and the runner reports it to the surface's target,
+                // or the declaration's, when it retries the evaluation.
+                if (self.application.rejection == null and !self.application.windowsBound()) return err;
                 std.log.err("window declaration failed: {s}", .{@errorName(err)});
                 break :blk false;
             };
@@ -799,6 +809,14 @@ pub const SourceGeneration = struct {
         // Keep output-expanded IDs stable, including disconnected outputs.
         for (self.application.windows) |window| if (window.template_id != null) {
             _ = try candidate.expandOutput(window.declaration.layer_surface.output.?, self.config.window_capacity);
+        };
+        // Reject what the native window set would refuse, before commit, so
+        // the last valid list stays and a bound surface hears why.
+        if (self.window_check) |check| for (candidate.windows) |window| {
+            check.check(check.context, window.declaration) catch |err| {
+                self.application.rejectWindow(window, err, "transition");
+                return err;
+            };
         };
         try self.signals.finishEvaluation(owner, work.revision);
         finished = true;
@@ -1367,8 +1385,9 @@ test "bound surfaces report rejected declarations to their send target" {
         \\local function record(e) log[#log + 1] = e.type .. ':' .. tostring(e.reason or e.width) .. ':' .. tostring(e.message or e.height) end
         \\local content = function() end
         \\return ouro.app { id = 'dev.ouro.surfaces', run = function()
-        \\  return { windows = function()
+        \\  return { send = record, windows = function()
         \\    if mode() == 'none' then return {} end
+        \\    if mode() == 'throw' then error('boom') end
         \\    return { ouro.window { id = 'probe', title = 'Probe', send = record, content = content,
         \\      background = mode() == 'color' and '#zz' or nil,
         \\      on_close_request = mode() == 'both' and content or nil } }
@@ -1412,12 +1431,47 @@ test "bound surfaces report rejected declarations to their send target" {
         const deliver_to = try generation.application.surfaceFunction("deliver_to");
         defer lua_c.luaL_unref(generation.vm.state, lua_c.registry_index, deliver_to);
         _ = try generation.vm.spawnReference(scheduler.application_scope, deliver_to, &.{
-            .{ .registry = rejection.send_reference }, .{ .string = rejection.id }, .{ .string = "failed" },
-            .{ .string = "declaration" },                .{ .string = @errorName(rejection.err) },
+            .{ .registry = rejection.send_reference }, .{ .string = rejection.id },              .{ .string = "failed" },
+            .{ .string = "declaration" },              .{ .string = @errorName(rejection.err) },
         });
         while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
     }
-    // Failures outside a bound surface have no target to report to.
+    // A native transition check runs before commit; a bound surface hears
+    // reason 'transition' and the last valid list stays.
+    var refuse = true;
+    generation.window_check = .{ .context = &refuse, .check = struct {
+        fn check(context: *anyopaque, declaration: platform_window.SurfaceDeclaration) anyerror!void {
+            const flag: *bool = @ptrCast(@alignCast(context));
+            if (flag.* and std.mem.eql(u8, declaration.id(), "probe")) return error.WindowRoleChanged;
+        }
+    }.check };
+    _ = try generation.vm.spawnApplication("mode:set('ok')");
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    try std.testing.expectError(error.WindowRoleChanged, generation.refreshWindows());
+    {
+        const rejection = generation.application.takeRejection().?;
+        defer generation.application.releaseRejection(rejection);
+        try std.testing.expectEqualStrings("transition", rejection.reason);
+        try std.testing.expectEqualStrings("probe", rejection.id);
+    }
+    refuse = false;
+    // windows() itself throwing names no surface; run's `send` binds the
+    // declaration, which hears the Lua message under the empty id.
+    try std.testing.expect(generation.application.windowsBound());
+    _ = try generation.vm.spawnApplication("mode:set('throw')");
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    try std.testing.expectError(error.LuaWindowsFailed, generation.refreshWindows());
+    try std.testing.expectEqual(@as(?lua.WindowRejection, null), generation.application.takeRejection());
+    {
+        const message = generation.application.takeWindowsFailure().?;
+        defer allocator.free(message);
+        try std.testing.expect(std.mem.endsWith(u8, message, "boom"));
+        _ = try generation.vm.spawnReference(scheduler.application_scope, deliver, &.{
+            .{ .string = "" }, .{ .string = "failed" }, .{ .string = "windows" }, .{ .string = "boom" },
+        });
+        while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    }
+    // Failures outside a bound surface have no surface target.
     _ = try generation.vm.spawnApplication("mode:set('none')");
     while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
     try std.testing.expect(try generation.refreshWindows());
@@ -1429,6 +1483,7 @@ test "bound surfaces report rejected declarations to their send target" {
         \\assert(table.concat(log, ',') == 'surface.mapped.probe:300:200,' ..
         \\  'surface.failed.probe:declaration:InvalidThemeColor,' ..
         \\  'surface.failed.probe:declaration:ConflictingWindowCloseHandlers,' ..
+        \\  'surface.failed:windows:boom,' ..
         \\  'surface.closed.probe:nil:nil', table.concat(log, ','))
         \\checked = true
     );

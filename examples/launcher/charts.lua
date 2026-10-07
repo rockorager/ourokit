@@ -43,8 +43,9 @@ return function(ouro, model, services)
         return { selected = i, launching = results(c.entries, c.query)[i], error = unset }
       end),
       fail = assign { error = function(_, e) return model.message(e.error) end },
-      -- The surface could not be shown: its declaration was rejected or its
-      -- content failed to build. Hidden keeps the reason for MCP and logs.
+      -- The surface could not be shown: its declaration was rejected, failed
+      -- a native transition, its content failed to build, or windows()
+      -- threw. Hidden keeps the reason for MCP and logs.
       surface_failed = assign { error = function(_, e) return "Launcher surface failed (" .. e.reason .. "): " .. e.message end },
     },
     actors = {
@@ -52,12 +53,19 @@ return function(ouro, model, services)
       launch = function(entry) return services.launch(entry) end,
     },
     states = {
-      hidden = { on = { TOGGLE = "open", OPEN = "open" } },
+      hidden = { on = {
+        TOGGLE = "open", OPEN = "open",
+        -- The surface finished closing after we left `open`: nothing to do.
+        ["surface.closed.launcher"] = {},
+      } },
       open = { initial = "loading", entry = "reset",
         on = {
           TOGGLE = "hidden", CLOSE = "hidden",
+          ["surface.mapped.launcher"] = {},
           ["surface.close_requested.launcher"] = "hidden",
           ["surface.failed.launcher"] = { target = "hidden", actions = "surface_failed" },
+          -- windows() itself failed (run's declaration has send = launcher).
+          ["surface.failed"] = { target = "hidden", actions = "surface_failed" },
           QUERY = { actions = "query" },
           MOVE = { actions = "move" },
           SELECT = { guard = "match", actions = "select" },
