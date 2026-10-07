@@ -186,6 +186,36 @@ return {
     sw:stop()
   end,
 
+  ['an input that arrives after a deadline the host has not woken for lets the timer fire first'] = function()
+    local wall = 5000
+    local clock = machine.logical_clock { wall = function() return wall end }
+    local function scope(parent)
+      local s = { alive = true, children = {} }
+      if type(parent) == 'table' then parent.children[#parent.children + 1] = s end
+      return s
+    end
+    local function close(s) s.alive = false; for _, c in ipairs(s.children) do close(c) end end
+    local scheduler = { open = scope, close = close, alive = function(s) return s.alive end,
+      run = function() end, after = clock.after, clock = clock.now, sync = clock.sync }
+    local lines = {}
+    local recorder = machine.recorder(function(line) lines[#lines + 1] = line end, { scheduler = scheduler })
+    local sw = charts.stopwatch:start { id = 'stopwatch', scheduler = scheduler }
+    sw:send('START')
+    wall = 5130 -- the 100 ms tick is due, but no wake ran
+    sw:send('LAP')
+    sw:stop()
+    recorder.stop()
+    local kinds = {}
+    for i = 2, #lines do
+      local entry = o.json.decode(lines[i])
+      kinds[#kinds + 1] = entry.k .. ':' .. #entry.r .. '@' .. entry.t
+    end
+    assert(table.concat(kinds, ' ') == 'start:1@0 event:1@0 timer:1@100 event:1@130 stop:0@130', table.concat(kinds, ' '))
+    assert(sw:context().laps[1].total == 130)
+    local report = machine.replay(lines)
+    assert(report.ok, machine.replay_text(report))
+  end,
+
   ['machine.advance needs a virtual clock'] = function()
     fails(function() machine.advance(-1) end, 'nonnegative integer')
   end,

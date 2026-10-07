@@ -2332,6 +2332,12 @@ function Actor:_process()
 end
 
 local function enqueue(actor, event, origin)
+  -- An outside input first lets due timers fire, before it joins the queue:
+  -- otherwise a timer fired by the sync would process behind it.
+  if depth == 0 then
+    local sync = actor._scheduler.sync
+    if sync then sync() end
+  end
   local item = {event = event, origin = origin}
   actor._queue[#actor._queue + 1] = item
   if actor._processing then return nil, 'queued' end
