@@ -178,6 +178,35 @@ late:stop(); late:stop()
 o.sleep(50)
 assert(late:status() == 'stopped' and late:matches('busy'))
 
+-- Review H1: a child stopped by its parent mid-effects runs no invoke.
+local ran = false
+local stoppable = machine.create { id = 'stoppable', initial = 'idle',
+  actors = { save = function() o.sleep(20); ran = true end },
+  states = {
+    idle = { on = { CLOSE = { target = 'saving', actions = machine.send_parent('CLOSE_ME') } } },
+    saving = { invoke = { src = 'save' } } } }
+local holder = machine.create { id = 'holder', initial = 'running', states = { running = {
+  entry = machine.spawn(stoppable, { id = 'c' }), on = { CLOSE_ME = { actions = machine.stop('c') } } } } }
+local h1 = holder:start()
+local kid = h1:child('c')
+kid:send('CLOSE')
+assert(kid:status() == 'stopped')
+o.sleep(60)
+assert(not ran, 'the invoke of a stopped actor ran')
+h1:stop()
+
+-- Review L11: wait_for on a created actor ends with WaitEnded when it stops.
+local created = machine.create { id = 'created', initial = 'a', states = { a = { on = { GO = 'b' } }, b = {} } }:actor { lazy = true }
+local outcome
+o.spawn(function()
+  local ok, err = pcall(machine.wait_for, created, function(s) return machine.matches(s, 'b') end)
+  outcome = ok and 'matched' or tostring(err)
+end)
+o.sleep(5)
+created:stop()
+o.sleep(5); o.sleep(1)
+assert(outcome and outcome:find('WaitEnded: created is stopped', 1, true), tostring(outcome))
+
 o.stdout.write('PASS machine native\n')
 o.exit(0)
 '''

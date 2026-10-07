@@ -112,7 +112,7 @@ We use SCXML semantics with an XState-like Lua surface. Supported:
 | `invoke` | `invoke = { src, id?, input?, on_done?, on_error? }` | Work that lives exactly as long as its state. |
 | Spawned children | `machine.spawn(chart \| fn \| 'actor', {id?, input?})`, `machine.stop(id)`, `send_to`, `send_parent` | Keyed child actors, such as one per document or tab, or one-shot tasks (§8). Ids default to `<chart or actor>.<n>`. |
 | Entry/exit | `entry = action(s)`, `exit = action(s)` | Actions run in document order. Named actions in `actions = {...}` may be a list. |
-| `on_done` | on compound/parallel states | Shorthand for `on = { ['done.state.<id>'] = ... }`. |
+| `on_done` | on compound/parallel states | Shorthand for `on = { ['done.state.<id>'] = ... }`. Not on the root: a finished machine is `done` (status, `wait_for`, `done.actor.<id>` to its parent), so `machine.create` rejects a root `on_done`. |
 | Tags | `tags = {'busy'}` | Use `actor:has_tag('busy')` in the view. |
 
 Not supported: **history states**, delayed `send`, `<data>`/`<script>`, and
@@ -151,11 +151,22 @@ Transition targets resolve as follows:
 - `'.child.grandchild'`: a descendant of the source.
 - `'#full.id'`: an absolute ID.
 
-A transition whose targets are all descendants of its source does not exit the
-source unless `reenter = true`. This is the default in SCXML internal
-transitions and XState v5. A transition that targets its own state re-enters
-it, which restarts its timers and invokes. A transition with no `target`
-only runs its actions.
+Transition domains follow XState v5 (`getTransitionDomain`):
+- **Without `reenter`**, a transition whose targets are its source or the
+  source's descendants acts *inside* the source. The source, compound or
+  parallel, is neither exited nor re-entered: its entry and exit actions don't
+  run, and its own timers and invokes keep going. Everything active below it
+  is exited and the target configuration entered. For a parallel source, every
+  region restarts, and untargeted regions go to their initial states.
+- **A plain self-target** (`RESET = 'editing'` on `editing`) therefore does
+  not restart the state. On an atomic state it only runs actions; on a
+  compound state it resets the children to `initial`.
+- **With `reenter = true`**, the source is exited and re-entered, restarting
+  its timers and invokes. Use it for polling loops:
+  `after = { [5000] = { target = 'polling', reenter = true } }`.
+- **Otherwise** the domain is the least common compound ancestor of source and
+  targets.
+- A transition with no `target` only runs its actions.
 
 ### Algorithm
 
@@ -178,13 +189,17 @@ The prototype follows the SCXML algorithm without history:
   microsteps is an error (an eventless livelock).
 - **Atomic commit:** a macrostep is computed on copy-on-write data. If a guard,
   assign or expression throws, the previous snapshot stays and the error
-  reaches the sender.
+  reaches the sender. The error affects only that event: events already
+  queued behind it stay queued and are processed, and the first error is
+  raised once the queue drains.
 - **Effects run after commit:** plain function actions, timers, invokes and
   child messages run after commit. Function actions run in order. Each sees the
   context as it was when it was reached in the macrostep. Timers and invokes
   start at the end of the macrostep, only for states that are still active.
   This matches SCXML's end-of-macrostep `<invoke>`. Their cancellation is
-  recorded when the state exits.
+  recorded when the state exits. `actor:stop()` cuts the remaining effects
+  short: no action, timer, invoke or child message runs for a stopped actor,
+  even one queued by the macrostep that stopped it.
 - **Guards, assigns, expressions and function actions cannot wait.** They
   run as native atomic sections. Inside one, `ouro.sleep`, `ouro.exit`,
   `ouro.spawn`, `ouro.spawn_app` and every Ouro I/O wait (files, D-Bus,
@@ -242,7 +257,9 @@ events = {
 ```
 
 The field types are `string`, `number`, `integer`, `boolean`, `table` and `any`.
-A trailing `?` marks an optional field. Events with a schema reject missing or
+`integer` accepts integral floats (`6.0`, as spinboxes and sliders send) and
+normalizes them to integers, like the MCP numeric rule. A trailing `?` marks an
+optional field. Events with a schema reject missing or
 mistyped fields and undeclared fields (`InvalidEvent`). Declared events without
 a schema accept any payload. `machine.set(field, type)` declares
 `{ value = type }`. That is the payload value widgets send (§7), so
@@ -349,8 +366,15 @@ A snapshot is immutable. A new table is created only when something changed:
 - **Serializable.** `actor:persist()` returns `machine`, `status`, `states`,
   `context`, `output` and children as `{ id, snapshot }`. It deep-copies plain
   data and fails on functions or cycles. The result round-trips through
-  `ouro.json`. Tokens are not persisted. Restoring re-enters states without
+  `ouro.json`. It includes `serial`, so default child ids (`<chart>.<n>`)
+  stay unique after a restore or reload. Spawning also skips any id that is
+  still taken, which covers snapshots persisted before `serial` was. Entry
+  and child tokens are not persisted. Restoring re-enters states without
   running entry actions, then restarts their timers and invokes.
+- **Child tokens.** Each spawn records a token, and a `done.actor.<id>` or
+  `error.actor.<id>` carrying an earlier child's token is rejected as
+  `stale`. A late event from a stopped child cannot remove a re-spawned child
+  with the same id.
 - **Rejected events do not write.** If no transition is taken, the snapshot
   table is unchanged and the signal is not written.
 
@@ -657,7 +681,8 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
   under the **owning state's** scope:
   - the transition's domain, or its source when there is no target;
   - the entered state, for entry actions;
-  - the parent, for exit actions.
+  - for exit actions, the nearest ancestor that stays active after the
+    microstep, or the actor root (never a state that exits in the same step).
   A return delivers `done.actor.<id> { output }`; a throw delivers
   `error.actor.<id> { error }`. `stop(id)` or leaving the owner state removes
   it from `children` and cancels it natively. Use this for work whose result
@@ -820,7 +845,8 @@ local machine = ouro.machine
 local chart = machine.create { id, initial, context, states, on, guards, actions, actors, events, ... }
 chart:graph()                      chart:initial(input)      chart:transition(snapshot, event)
 chart:can(snapshot, event)         chart:restore(persisted, {renames, input})
-local actor = chart:actor { input, scheduler, snapshot, charts, id, renames }   -- create (render-safe)
+local actor = chart:actor { input, scheduler, snapshot, charts, id, renames, lazy, scope }   -- create (render-safe)
+local actor = chart:start { ... }  -- chart:actor(options):start()
 actor:start()  actor:stop()  actor:send(event) -> accepted, reason  actor:deliver(event, origin)
 actor:sender(event)  actor:event(event [, field])
 actor:matches(id)  actor:can(event)  actor:has_tag(tag)  actor:accepted()
@@ -828,7 +854,9 @@ actor:snapshot()  actor:context()  actor:states()  actor:status()  actor:started
 actor:output()  actor:child(id)  actor:children()  actor:persist()  actor:observe(fn)
 machine.assign  machine.set  machine.raise  machine.spawn  machine.stop  machine.send_to  machine.send_parent
 machine.wait_for(actor, pred, {timeout})  machine.selector(fn)  machine.actions(actor, specs, opts)
-machine.component(chart, render)  machine.matches(snapshot, id)  machine.plain(v)  machine.unset
+machine.component(chart, render)  machine.matches(snapshot, id)  machine.plain(v)  machine.raw(view)  machine.unset
+-- machine.matches raises for state ids unknown to the snapshot's chart;
+-- machine.raw(view) returns the table behind a read-only view (identity checks).
 actor:handles(type)  actor:pending_timers()  actor:pending_invokes()
 machine.inspect(fn)  machine.actors()  machine.strict  machine.reserved_prefixes
 machine.persist_roots()  machine.carry(entries)  machine.release()

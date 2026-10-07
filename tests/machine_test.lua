@@ -37,7 +37,7 @@ local function nested(log)
       a = state('a', { initial = 'a1', on = { INNER = '.a2', OUTER = { target = '.a2', reenter = true } },
         states = {
           a1 = state('a1', { initial = 'a11', states = {
-            a11 = state('a11', { on = { GO = '#b.b1', SIB = 'a12', SELF = 'a11' } }),
+            a11 = state('a11', { on = { GO = '#b.b1', SIB = 'a12', SELF = { target = 'a11', reenter = true }, STAY = 'a11' } }),
             a12 = state('a12', {}),
           }}),
           a2 = state('a2', { on = { PAR = '#p' } }),
@@ -183,12 +183,24 @@ return {
     assert(join(actor:states()) == 'zeta,zeta.z1,alpha,alpha.a1', join(actor:states()))
   end,
 
-  ['a transition to its own state re-enters it; deep transitions exit inner first'] = function()
+  ['self-targets re-enter only with reenter = true (XState v5); deep transitions exit inner first'] = function()
     local log = {}
     local actor = nested(log):start { scheduler = machine.manual_scheduler() }
     for i = #log, 1, -1 do log[i] = nil end
+    assert(actor:send('STAY')) -- a plain self-target acts inside the state
+    assert(#log == 0, join(log))
     actor:send('SELF')
     assert(join(log) == 'exit a11,enter a11', join(log))
+    -- On a compound state, a plain self-target resets its children without
+    -- exiting the state itself.
+    local reset = machine.create { id = 'reset', initial = 'outer', states = {
+      outer = { initial = 'one', entry = function() log[#log + 1] = 'enter outer' end, exit = function() log[#log + 1] = 'exit outer' end,
+        on = { RESET = 'outer' }, states = { one = { on = { NEXT = 'two' } }, two = {} } } } }
+    local r = reset:start { scheduler = machine.manual_scheduler() }
+    r:send('NEXT')
+    for i = #log, 1, -1 do log[i] = nil end
+    r:send('RESET')
+    assert(r:matches('outer.one') and #log == 0, join(log))
     for i = #log, 1, -1 do log[i] = nil end
     actor:send('GO')
     assert(join(log) == 'exit a11,exit a1,exit a,enter b,enter b1', join(log))
@@ -369,7 +381,7 @@ return {
       id = 'timer', initial = 'idle',
       states = {
         idle = { on = { ARM = 'armed' } },
-        armed = { after = { [100] = 'fired', [300] = 'late' }, on = { DISARM = 'idle', RESET = 'armed' } },
+        armed = { after = { [100] = 'fired', [300] = 'late' }, on = { DISARM = 'idle', RESET = { target = 'armed', reenter = true } } },
         fired = { on = { ARM = 'armed' } },
         late = {},
       },
@@ -669,7 +681,7 @@ return {
     assert(id:match('^read%.%d+$') and actor:snapshot().children[id].status == 'active', id)
     assert(last(records).children[1].action == 'spawned' and last(records).children[1].src == 'read')
     clock.run_tasks()
-    assert(actor:context().log == 'done:A;' and #actor:snapshot().children == 0, actor:context().log)
+    assert(actor:context().log == "done:A;" and #actor:snapshot().children == 0, actor:context().log)
     assert(last(records).origin == 'child' and last(records).children[1].action == 'done')
     actor:send { type = 'READ', name = 'b', fail = true }
     clock.run_tasks()
@@ -1232,6 +1244,210 @@ return {
     t:mount(function() return o.text { key = 'n', text = tostring(actor:context().n) } end)
     assert(actor:matches('ready') and t:node('n').label == '42', t:node('n').label)
     actor:stop()
+  end,
+
+  -- Review findings (independent review of the branch), adopted as regressions.
+
+  -- XState v5: the parallel source is neither exited nor re-entered, but every
+  -- region below it is, so an untargeted region starts over from its initial
+  -- state (getTransitionDomain/computeExitSet in xstate's stateUtils.ts).
+  ['review M5: a parallel source with a descendant target is not exited (XState v5)'] = function()
+    local log = {}
+    local chart = machine.create {
+      id = 'p', initial = 'open',
+      states = { open = {
+        type = 'parallel', order = { 'io', 'life' },
+        entry = function() log[#log + 1] = 'enter open' end, exit = function() log[#log + 1] = 'exit open' end,
+        on = { GO = '.io.saving', AGAIN = { target = '.io.saving', reenter = true } },
+        states = {
+          io = { initial = 'idle', states = { idle = {}, saving = {} } },
+          life = { initial = 'a', states = { a = { on = { NEXT = 'b' } }, b = {} } },
+        },
+      } },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    actor:send('NEXT')
+    log = {}
+    assert(actor:send('GO') and actor:matches('open.io.saving'))
+    assert(#log == 0, 'the parallel source was exited: ' .. table.concat(log, ','))
+    assert(actor:matches('open.life.a'), 'as in XState v5, the untargeted region restarts: ' .. join(actor:states()))
+    actor:send('NEXT')
+    assert(actor:send('AGAIN') and table.concat(log, ',') == 'exit open,enter open' and actor:matches('open.life.a'))
+  end,
+
+  ['review H4: spawning after restore does not reuse child ids'] = function()
+    local doc = machine.create { id = 'doc', initial = 'open', states = { open = {} } }
+    local notes = machine.create { id = 'notes', initial = 'running',
+      states = { running = { on = { ADD = { actions = machine.spawn(doc) } } } } }
+    local before = notes:start { scheduler = machine.manual_scheduler() }
+    for _ = 1, 4 do assert(before:send('ADD')) end
+    local persisted = o.json.decode(o.json.encode(before:persist()))
+    assert(math.type(persisted.serial) == 'integer', 'the serial is persisted')
+    before:stop()
+    local after = notes:start { scheduler = machine.manual_scheduler(), snapshot = notes:restore(persisted) }
+    assert(#after:children() == 4)
+    for _ = 1, 3 do assert(after:send('ADD')) end
+    assert(#after:children() == 7)
+    -- Snapshots persisted before the serial was: ids still skip taken ones.
+    persisted.serial = nil
+    local legacy = notes:start { scheduler = machine.manual_scheduler(), snapshot = notes:restore(persisted) }
+    for _ = 1, 3 do assert(legacy:send('ADD')) end
+    assert(#legacy:children() == 7)
+  end,
+
+  ['review M6: a throwing action does not drop events already queued'] = function()
+    local chart = machine.create {
+      id = 'q', initial = 'a',
+      states = {
+        a = { on = { GO = { target = 'b', actions = {
+          function(_, _, self) assert(select(2, self:send('NEXT')) == 'queued') end,
+          function() error('boom') end,
+        } } } },
+        b = { on = { NEXT = 'c' } },
+        c = { on = { CHECK = { guard = function() error('bad guard') end } , LAST = 'd' } },
+        d = {},
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    fails(function() actor:send('GO') end, 'boom')
+    assert(actor:matches('c'), 'queued NEXT was dropped: ' .. join(actor:states()))
+    fails(function() actor:send('CHECK') end, 'bad guard') -- a guard error: nothing commits for it
+    assert(actor:matches('c') and actor:send('LAST') and actor:matches('d'))
+  end,
+
+  ['review H1: a stopped actor starts no effects'] = function()
+    local clock = machine.manual_scheduler()
+    local child = machine.create {
+      id = 'child', initial = 'idle', actors = { save = function() return true end },
+      states = {
+        idle = { on = { CLOSE = { target = 'closing', actions = machine.send_parent('CLOSE_ME') } } },
+        closing = { after = { [1000] = 'idle' }, invoke = { src = 'save' } },
+      },
+    }
+    local parent = machine.create { id = 'parent', initial = 'running', states = { running = {
+      entry = machine.spawn(child, { id = 'c' }), on = { CLOSE_ME = { actions = machine.stop('c') } } } } }
+    local actor = parent:start { scheduler = clock }
+    local kid = actor:child('c')
+    kid:send('CLOSE') -- the parent stops it while it runs its own effects
+    assert(kid:status() == 'stopped')
+    assert(#kid:pending_timers() == 0 and #kid:pending_invokes() == 0, 'a stopped child started work')
+    assert(clock.open_scopes == 0 and clock.run_tasks() == 0, 'scopes or tasks left: ' .. clock.open_scopes)
+    -- An actor stopped by its own action skips its remaining effects too.
+    local ran = false
+    local self_stop = machine.create { id = 'selfstop', initial = 'a', states = {
+      a = { on = { GO = { target = 'b', actions = { function(_, _, self) self:stop() end, function() ran = true end } } } },
+      b = { after = { [10] = 'a' } } } }
+    local s2 = self_stop:start { scheduler = clock }
+    s2:send('GO')
+    assert(not ran and #s2:pending_timers() == 0 and s2:status() == 'stopped')
+    actor:stop()
+  end,
+
+  ['review H2: a selector filled by an untracked guard still tracks the view'] = function(t)
+    local results = machine.selector(function(c)
+      local out = {}
+      for _, e in ipairs(c.entries) do if e:find(c.query, 1, true) then out[#out + 1] = e end end
+      return out
+    end)
+    local chart = machine.create {
+      id = 'launcher', initial = 'open', context = { query = '', entries = { 'alpha', 'beta', 'gamma' } },
+      states = {
+        open = { on = { QUERY = machine.set('query', 'string'),
+          ACTIVATE = { target = 'done', guard = function(c) return #results(c) > 0 end } } },
+        done = {},
+      },
+    }
+    local actor = chart:actor { scheduler = machine.manual_scheduler() }
+    actor:observe(function() end) -- valve states evaluate the guard right after each commit
+    actor:start()
+    local Count = o.stateless(function() return o.text { key = 'count', text = tostring(#results(actor:context())) } end)
+    t:mount(function()
+      return o.column { key = 'root',
+        o.button { key = 'a', label = 'a', send = actor:event { type = 'QUERY', value = 'a' } },
+        o.button { key = 'al', label = 'al', send = actor:event { type = 'QUERY', value = 'al' } },
+        Count { key = 'c' },
+      }
+    end)
+    assert(t:node('root/count').label == '3')
+    t:click('root/a'); t:click('root/al')
+    assert(t:node('root/count').label == '1', 'stale selector view: ' .. t:node('root/count').label)
+  end,
+
+  ['review M7: integer fields accept integral floats'] = function()
+    local chart = machine.create { id = 'settings', initial = 'open', context = { laps = 5 },
+      states = { open = { on = { LAPS = machine.set('laps', 'integer') } } } }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    assert(actor:send { type = 'LAPS', value = 6.0 })
+    assert(actor:context().laps == 6 and math.type(actor:context().laps) == 'integer')
+    fails(function() actor:send { type = 'LAPS', value = 6.5 } end, 'must be integer')
+    fails(function() actor:send { type = 'LAPS', value = '7' } end, 'must be integer')
+  end,
+
+  ['review L10: pairs over snapshot.children tracks each child'] = function(t)
+    local doc = machine.create { id = 'doc', initial = 'open', context = { title = 'a' },
+      states = { open = { on = { RENAME = machine.set('title', 'string') } } } }
+    local notes = machine.create { id = 'notes', initial = 'running',
+      states = { running = { entry = machine.spawn(doc, { id = 'd' }) } } }
+    local actor = notes:start { scheduler = machine.manual_scheduler() }
+    local kid = actor:child('d')
+    t:mount(function()
+      local titles = {}
+      for key, child in pairs(actor:snapshot().children) do
+        if type(key) == 'string' then titles[#titles + 1] = child.context.title end
+      end
+      return o.column { key = 'root',
+        o.text { key = 'titles', text = table.concat(titles, ',') },
+        o.button { key = 'rename', label = 'Rename', send = kid:event { type = 'RENAME', value = 'b' } },
+      }
+    end)
+    assert(t:node('root/titles').label == 'a')
+    t:click('root/rename')
+    assert(t:node('root/titles').label == 'b', 'stale render: ' .. t:node('root/titles').label)
+  end,
+
+  -- review L11 (wait_for on a created actor that stops) is in tests/machine_native.py.
+
+  ['review L12: a task spawned by an exit action belongs to a surviving ancestor'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create {
+      id = 'exits', initial = 'outer', context = { log = '' },
+      actors = { note = function(input) return input end },
+      states = {
+        outer = { initial = 'inner', on = { LEAVE = 'gone' }, states = {
+          inner = { exit = machine.spawn('note', { id = 'bye', input = function() return 'bye' end }) } } },
+        gone = { on = { ['done.actor.bye'] = { actions = assign { log = function(c, e) return c.log .. e.output end } } } },
+      },
+    }
+    local actor = chart:start { scheduler = clock }
+    actor:send('LEAVE') -- inner and outer both exit: the root owns the task
+    assert(actor:snapshot().children[1] == 'bye')
+    clock.run_tasks()
+    assert(actor:context().log == 'bye', 'the task was cancelled with an exiting owner')
+  end,
+
+  ['review L13: root on_done is rejected, bindings respect non-strict, child tokens'] = function()
+    fails(function() machine.create { id = 'r', initial = 'a', on_done = 'a', states = { a = { type = 'final' } } } end,
+      'the root cannot declare on_done')
+    local chart = machine.create { id = 'strictness', initial = 'a', states = { a = { on = { GO = {} } } } }
+    local actor = chart:actor { scheduler = machine.manual_scheduler() }
+    fails(function() actor:event('TYPO') end, 'UnknownEvent')
+    machine.strict = false
+    local binding = actor:event('TYPO')
+    machine.strict = true
+    assert(binding.event == 'TYPO')
+    -- A stale done.actor from an earlier child with the same id is rejected.
+    local leaf = machine.create { id = 'leaf', initial = 'open', states = { open = { on = { CLOSE = 'closed' } }, closed = { type = 'final' } } }
+    local parent = machine.create { id = 'parent', initial = 'idle', states = { idle = { on = {
+      ADD = { actions = machine.spawn(leaf, { id = 'x' }) }, DROP = { actions = machine.stop('x') } } } } }
+    local p = parent:start { scheduler = machine.manual_scheduler() }
+    p:send('ADD')
+    local old = p:child('x')
+    p:send('DROP'); p:send('ADD')
+    local snapshot = machine.raw(p:snapshot())
+    local _, _, record = parent:transition(snapshot, { type = 'done.actor.x', id = 'x', token = old._token })
+    assert(record.rejected and record.reason == 'stale', 'a stale token removed the new child')
+    p:child('x'):send('CLOSE')
+    assert(#p:children() == 0, 'the current child still finishes')
   end,
 
   ['event schemas validate external events and drive accepted()'] = function()

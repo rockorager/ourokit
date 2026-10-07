@@ -54,6 +54,8 @@ TESTS = (
     'xdg.py',
     'desktop_install.py',
     'documents.py',
+    'machine_native.py',
+    'contacts.py',
     'chart_reload.py',
     'component_machines.py',
     'launcher.py',

@@ -30,7 +30,7 @@ local ticker = machine.create {
   states = {
     idle = { on = { START = 'running' } },
     running = {
-      after = { [100] = { target = 'running', actions = {
+      after = { [100] = { target = 'running', reenter = true, actions = {
         -- Re-entering 'running' also restarts its invoke, by design.
         machine.assign(function(c) return { ticks = c.ticks + 1 } end),
         function(c) print('tick ' .. c.mount) end,

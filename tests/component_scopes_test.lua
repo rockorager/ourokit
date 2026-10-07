@@ -10,7 +10,7 @@ local ticker = machine.create {
   states = {
     idle = { on = { START = { target = 'running', actions = machine.assign(function(c) return { starts = c.starts + 1 } end) } } },
     running = {
-      after = { [1000] = { target = 'running', actions = machine.assign(function(c) return { ticks = c.ticks + 1 } end) } },
+      after = { [1000] = { target = 'running', reenter = true, actions = machine.assign(function(c) return { ticks = c.ticks + 1 } end) } },
       invoke = { src = function() return 'parked until the clock runs tasks' end },
     },
   },

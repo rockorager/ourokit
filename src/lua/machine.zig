@@ -27,7 +27,9 @@ pub fn install(state: *c.State) !void {
     c.lua_pushcclosure(state, waiterWake, 0);
     c.lua_pushcclosure(state, waiterWaiting, 0);
     c.lua_pushcclosure(state, trackedView, 0);
-    if (c.lua_pcallk(state, 9 + extra, 0, 0, 0, null) != c.ok)
+    // Private release(signal); a no-op for values that aren't ouro signals.
+    @import("signals.zig").Signals.pushRelease(state);
+    if (c.lua_pcallk(state, 10 + extra, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     c.lua_settop(state, api);
 }
@@ -343,6 +345,17 @@ fn step(state: *c.State) callconv(.c) c_int {
     _ = pushTarget(state, 1);
     c.lua_pushvalue(state, 2);
     if (c.lua_next(state, 3) == 0) return 0;
+    // Tracked views yield what their hook returns for each key, so iterating
+    // snapshot.children yields each child's own tracked view.
+    if (c.lua_getiuservalue(state, 1, 2) == c.type_function) { // t, k, v, hook
+        c.lua_rotate(state, -2, 1); // t, k, hook, v
+        c.lua_settop(state, -2); // t, k, hook
+        c.lua_pushvalue(state, 3); // t, k, hook, t
+        c.lua_pushvalue(state, 4); // t, k, hook, t, k
+        if (c.lua_pcallk(state, 2, 1, 0, 0, null) != c.ok) return c.lua_error(state);
+        return 2; // k, hook(t, k)
+    }
+    c.lua_settop(state, -2);
     wrapTop(state);
     return 2;
 }

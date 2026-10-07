@@ -46,9 +46,10 @@ local stopwatch = machine.create {
   states = {
     clock = { initial = 'idle', states = {
       idle = { on = { START = 'running' } },
-      -- Targeting its own state re-enters `running`, which restarts the timer.
+      -- reenter = true exits and re-enters `running`, which restarts the timer.
+      -- A plain self-target would stay in the state and not restart it.
       running = {
-        after = { [TICK] = { target = 'running', actions = 'tick' } },
+        after = { [TICK] = { target = 'running', reenter = true, actions = 'tick' } },
         on = { STOP = 'paused', LAP = { actions = 'lap' } },
       },
       paused = { on = {

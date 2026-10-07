@@ -1,5 +1,7 @@
 local ouro, view, raw, scope_open, scope_spawn, scope_close, scope_alive, atomic_call,
-  waiter_new, waiter_park, waiter_wake, waiter_waiting, tracked_view = ...
+  waiter_new, waiter_park, waiter_wake, waiter_waiting, tracked_view, signal_release = ...
+-- Frees a hidden signal's slot at once (reads keep the final value).
+local release_signal = signal_release or function() end
 -- Guards, assigns, expressions and function actions run as native atomic
 -- sections: waiting, spawning or exiting inside them raises YieldInAction.
 local atomic = atomic_call or function(_, fn, ...) return fn(...) end
@@ -112,8 +114,13 @@ end
 
 -- Whether a snapshot (or snapshot view) has state `id` active; use it on
 -- children snapshots: machine.matches(state.children[id], 'open.io.saving').
+-- Unknown ids raise when the snapshot's chart is known (charts register by
+-- id when created), so typos fail loudly as with actor:matches.
+local charts_by_id = {}
 function M.matches(snapshot, id)
   if snapshot == nil then return false end
+  local chart = charts_by_id[snapshot.machine]
+  if chart and (id == '' or not chart.by_id[id]) then fail('machine %s has no state %q', chart.id, tostring(id)) end
   for _, state in ipairs(snapshot.states or {}) do
     if state == id then return true end
   end
@@ -412,6 +419,9 @@ local function compile(def)
       end
     end
     if sdef.on_done ~= nil then
+      if node == chart.root then
+        fail('the root cannot declare on_done: a finished machine is done (status, wait_for, done.actor to its parent)')
+      end
       if node.type ~= 'compound' and node.type ~= 'parallel' then fail('on_done needs a compound or parallel state (%s)', where(node)) end
       on(node, 'done.state.' .. (node.id == '' and def.id or node.id), sdef.on_done, 'done')
     end
@@ -468,9 +478,14 @@ local function validate_event(chart, event)
     local value = event[name]
     if value == nil then
       if not field.optional then fail('InvalidEvent: %s requires %s', event.type, name) end
+    elseif field.type == 'integer' then
+      -- Like MCP's numeric rule: an integral float (1.0, from a spinbox or
+      -- slider) is an integer.
+      local integer = type(value) == 'number' and math.tointeger(value) or nil
+      if integer == nil then fail('InvalidEvent: %s.%s must be integer', event.type, name) end
+      event[name] = integer
     elseif field.type ~= 'any' then
-      local ok = field.type == 'integer' and math.type(value) == 'integer' or type(value) == field.type
-      if not ok then fail('InvalidEvent: %s.%s must be %s', event.type, name, field.type) end
+      if type(value) ~= field.type then fail('InvalidEvent: %s.%s must be %s', event.type, name, field.type) end
     end
   end
   return true
@@ -608,9 +623,14 @@ local function transition_domain(chart, t)
     -- The root is always active; transitions from it act inside it.
     if not t.reenter then return chart.root end
   end
-  if not t.reenter and t.source.type == 'compound' then
+  -- XState v5: unless reenter, a transition whose targets are the source or
+  -- its descendants acts inside the source (compound or parallel), which is
+  -- neither exited nor re-entered.
+  if not t.reenter then
     local all = true
-    for _, target in ipairs(t.targets) do if not is_descendant(target, t.source) then all = false; break end end
+    for _, target in ipairs(t.targets) do
+      if target ~= t.source and not is_descendant(target, t.source) then all = false; break end
+    end
     if all then return t.source end
   end
   local nodes = {t.source}
@@ -702,14 +722,25 @@ local function evaluate(value, m, label)
 end
 
 -- Children are an array of ids in spawn order plus id -> child snapshot.
-local function remove_child(children, id)
-  for i, existing in ipairs(children) do
+-- Each spawn also records a token under entries['@' .. id], so a late
+-- done.actor/error.actor from an earlier child with the same id is stale.
+local function child_token_key(id) return '@' .. id end
+
+local function remove_child(m, id)
+  for i, existing in ipairs(m.children) do
     if existing == id then
-      table.remove(children, i)
-      children[id] = nil
+      table.remove(m.children, i)
+      m.children[id] = nil
+      m.entries[child_token_key(id)] = nil
       return i
     end
   end
+end
+
+local function has_child(children, id)
+  if children[id] ~= nil then return true end
+  for _, existing in ipairs(children) do if existing == id then return true end end
+  return false
 end
 
 -- `owner` is the state whose scope owns spawned tasks: the transition's
@@ -724,25 +755,33 @@ local function run_actions(m, list, owner)
     elseif a.kind == 'spawn' then
       local id = evaluate(a.id, m, a.label)
       if id == nil then
-        m.serial = m.serial + 1
-        id = (a.chart and a.chart.id or (a.src_name ~= 'function' and a.src_name) or 'task') .. '.' .. m.serial
+        -- The serial persists across restore; skipping taken ids also covers
+        -- snapshots persisted before it did.
+        local prefix = a.chart and a.chart.id or (a.src_name ~= 'function' and a.src_name) or 'task'
+        repeat
+          m.serial = m.serial + 1
+          id = prefix .. '.' .. m.serial
+        until not has_child(m.children, id)
       end
       if type(id) ~= 'string' or id == '' or id:find('/', 1, true) then fail('spawned child id must be a nonempty string without /') end
       for _, existing in ipairs(m.children) do
         if existing == id then fail('child %q already exists in %s', id, m.chart.id) end
       end
       m.children[#m.children + 1] = id
+      m.serial = m.serial + 1
+      local token = m.serial
+      m.entries[child_token_key(id)] = token
       local input = evaluate(a.input, m, a.label)
       if a.chart then
-        m.effects[#m.effects + 1] = {kind = 'spawn', id = id, chart = a.chart, input = input}
+        m.effects[#m.effects + 1] = {kind = 'spawn', id = id, chart = a.chart, input = input, child_token = token}
       else
         m.children[id] = {status = 'active', src = a.src_name, owner = owner.id}
-        m.effects[#m.effects + 1] = {kind = 'spawn_task', id = id, src = a.src, src_name = a.src_name, input = input,
+        m.effects[#m.effects + 1] = {kind = 'spawn_task', id = id, src = a.src, src_name = a.src_name, input = input, child_token = token,
           owner = owner.id, token = m.entries[owner.id]}
       end
     elseif a.kind == 'stop' then
       local id = evaluate(a.id, m, a.label)
-      if remove_child(m.children, id) then m.effects[#m.effects + 1] = {kind = 'stop', id = id} end
+      if remove_child(m, id) then m.effects[#m.effects + 1] = {kind = 'stop', id = id} end
     elseif a.kind == 'send_to' then
       m.effects[#m.effects + 1] = {kind = 'send_to', id = evaluate(a.id, m, a.label), event = normalize_event(evaluate(a.event, m, a.label))}
     elseif a.kind == 'send_parent' then
@@ -776,7 +815,7 @@ local function cancel_started(m, node)
     if type(child) == 'table' and child.owner == node.id and child.machine == nil then owned[#owned + 1] = id end
   end
   for _, id in ipairs(owned) do
-    remove_child(m.children, id)
+    remove_child(m, id)
     m.effects[#m.effects + 1] = {kind = 'stop', id = id}
   end
   if token then m.effects[#m.effects + 1] = {kind = 'scope_close', state = node.id, token = token} end
@@ -869,10 +908,15 @@ local function microstep(m, transitions, event_type)
     end
     step.transitions[i] = {index = t.index, source = t.source.id, event = t.event, targets = targets, guard = t.guard_name}
   end
-  for _, node in ipairs(sorted(exit_set(chart, active, transitions), by_reverse_order)) do
+  local exiting = exit_set(chart, active, transitions)
+  for _, node in ipairs(sorted(exiting, by_reverse_order)) do
     step.exited[#step.exited + 1] = node.id
     m.record.exited[#m.record.exited + 1] = node.id
-    run_actions(m, node.exit, node.parent or chart.root)
+    -- Tasks spawned by exit actions belong to the nearest ancestor that stays
+    -- active after this microstep (or the root), not to an exiting state.
+    local owner = node.parent
+    while owner and exiting[owner] do owner = owner.parent end
+    run_actions(m, node.exit, owner or chart.root)
     cancel_started(m, node)
     active[node] = nil
     m.entries[node.id] = nil
@@ -939,7 +983,7 @@ local function finish(m, snapshot)
     -- SCXML exits the remaining configuration when the machine finishes.
     for _, node in ipairs(sorted(m.active, by_reverse_order)) do
       cancel_started(m, node)
-      run_actions(m, node.exit, node.parent or chart.root)
+      run_actions(m, node.exit, chart.root) -- everything exits; the root owns tasks
     end
     m.effects[#m.effects + 1] = {kind = 'done', output = output}
   end
@@ -1012,7 +1056,8 @@ local function transition(chart, snapshot, event)
   local actor_done = event.type:sub(1, 11) == 'done.actor.'
   if actor_done or event.type:sub(1, 12) == 'error.actor.' then
     local id = event.type:sub(actor_done and 12 or 13)
-    local index = remove_child(m.children, id)
+    local expected = m.entries[child_token_key(id)]
+    local index = (expected == nil or event.token == expected) and remove_child(m, id) or nil
     if not index then
       record.rejected, record.reason = true, 'stale'
       return snapshot, {}, record
@@ -1167,7 +1212,10 @@ function M.selector(fn)
       for i = 1, n do
         if raw((select(i, ...))) ~= last_args[i] then same = false; break end
       end
-      if same then
+      -- An entry computed on plain (untracked) views, e.g. by a guard
+      -- evaluated after commit or outside a render, recorded no reads and
+      -- would replay nothing: recompute it instead.
+      if same and #last_reads > 0 then
         for _, signal in ipairs(last_reads) do M._track(signal) end
         return last_result
       end
@@ -1480,7 +1528,7 @@ local Actor = {}
 local function create_actor(chart, options)
   options = options or {}
   local actor = {chart = chart, id = options.id or chart.id, _observers = {}, _queue = {}, _timers = {}, _invokes = {}, _scopes = {}, _tasks = {},
-    _waiters = {}, _lazy = options.lazy == true, _scope_mode = options.scope,
+    _waiters = {}, _lazy = options.lazy == true, _scope_mode = options.scope, _token = options.token,
     _children = {}, _started = false, _status = 'created', _scheduler = options.scheduler or M.default_scheduler,
     _signal_factory = options.signal or ouro.signal, _parent = options.parent, _charts = options.charts or {}}
   for name, fn in pairs(Actor) do actor[name] = fn end
@@ -1500,7 +1548,7 @@ local function create_actor(chart, options)
       if not node or node == chart.root then fail('snapshot state %q is not in machine %s (use restore)', tostring(id), chart.id) end
     end
     snapshot = {machine = chart.id, status = persisted.status or 'active', states = {}, context = copy(raw(persisted.context or {})),
-      children = {}, entries = {}, serial = 0, output = persisted.output}
+      children = {}, entries = {}, serial = math.tointeger(persisted.serial) or 0, output = persisted.output}
     for i, id in ipairs(persisted.states) do snapshot.states[i] = id end
     table.sort(snapshot.states, function(a, b) return chart.by_id[a].order < chart.by_id[b].order end)
     effects = {}
@@ -1526,9 +1574,12 @@ local function create_actor(chart, options)
       local child_chart = actor._charts[machine_id] or chart.child_charts[machine_id] or (machine_id == chart.id and chart)
       if not child_chart then fail('no chart for restored child machine %s', tostring(machine_id)) end
       snapshot.children[#snapshot.children + 1] = child.id
+      snapshot.serial = snapshot.serial + 1
+      snapshot.entries[child_token_key(child.id)] = snapshot.serial
       -- Children map onto their chart too: renamed or removed states fall
       -- back to the nearest surviving ancestor.
-      effects[#effects + 1] = {kind = 'spawn', id = child.id, chart = child_chart, snapshot = child_chart:restore(child.snapshot)}
+      effects[#effects + 1] = {kind = 'spawn', id = child.id, chart = child_chart, snapshot = child_chart:restore(child.snapshot),
+        child_token = snapshot.serial}
     end
     record = new_record({type = 'ouro.restore'})
     record.handled = true
@@ -1589,7 +1640,8 @@ local function context_view(actor)
     actor._context_for = context
     actor._context_view = tracked_view(context, function(t, key)
       if key == nil then track(actor._store); return nil end -- # and pairs: every key
-      track(key_signal(actor, key))
+      -- A stopped actor's signals are released; reads keep working untracked.
+      if actor._status ~= 'stopped' then track(key_signal(actor, key)) end
       return view(t[key])
     end)
   end
@@ -1752,7 +1804,7 @@ function Actor:persist()
   local states = {}
   for i, id in ipairs(snapshot.states) do states[i] = id end
   local out = {machine = snapshot.machine, status = snapshot.status, states = states, context = plain(snapshot.context),
-    output = plain(snapshot.output), children = {}}
+    output = plain(snapshot.output), serial = snapshot.serial, children = {}}
   for _, id in ipairs(snapshot.children) do
     local child = self._children[id]
     if child then out.children[#out.children + 1] = {id = id, snapshot = child:persist()} end
@@ -1837,6 +1889,7 @@ end
 -- (scope = 'task') hang under the instance scope of the callback that first
 -- needed one, so their work ends when the instance unmounts.
 local function root_scope(actor)
+  if actor._status == 'stopped' then fail('machine %s is stopped', actor.path) end
   if not actor._root_scope then
     local parent = actor._parent and root_scope(actor._parent)
       or (actor._scope_mode ~= 'task' and 'application' or nil)
@@ -1857,6 +1910,9 @@ end
 local function run_effects(actor, effects, record)
   local first_error
   for _, effect in ipairs(effects) do
+    -- A stopped actor starts nothing, even mid-list (stopped by a parent or
+    -- by one of its own effects).
+    if actor._status == 'stopped' then break end
     local ok, err = pcall(function()
       local kind = effect.kind
       if kind == 'action' then
@@ -1916,7 +1972,7 @@ local function run_effects(actor, effects, record)
         end
       elseif kind == 'spawn' then
         local child = create_actor(effect.chart, {id = effect.id, input = effect.input, parent = actor, snapshot = effect.snapshot,
-          scheduler = actor._scheduler, signal = actor._signal_factory, charts = actor._charts})
+          scheduler = actor._scheduler, signal = actor._signal_factory, charts = actor._charts, token = effect.child_token})
         actor._children[effect.id] = child
         record.children[#record.children + 1] = {action = 'spawned', id = effect.id, machine = effect.chart.id}
         propagate(child)
@@ -1934,9 +1990,9 @@ local function run_effects(actor, effects, record)
           if actor._tasks[effect.id] ~= live then return end
           actor._tasks[effect.id] = nil
           if ok then
-            actor:_deliver({type = 'done.actor.' .. effect.id, id = effect.id, output = result}, 'child')
+            actor:_deliver({type = 'done.actor.' .. effect.id, id = effect.id, output = result, token = effect.child_token}, 'child')
           else
-            actor:_deliver({type = 'error.actor.' .. effect.id, id = effect.id, error = result}, 'child')
+            actor:_deliver({type = 'error.actor.' .. effect.id, id = effect.id, error = result, token = effect.child_token}, 'child')
           end
           actor._scheduler.close(scope)
         end)
@@ -1962,7 +2018,7 @@ local function run_effects(actor, effects, record)
         -- A finished actor runs nothing else; its state scopes are closed.
         if actor._root_scope then actor._scheduler.close(actor._root_scope) end
         if actor._parent then
-          actor._parent:_deliver({type = 'done.actor.' .. actor.id, id = actor.id, output = effect.output}, 'child')
+          actor._parent:_deliver({type = 'done.actor.' .. actor.id, id = actor.id, output = effect.output, token = actor._token}, 'child')
         end
       end
     end)
@@ -2045,9 +2101,13 @@ end
 function Actor:_process()
   if self._processing then return end
   self._processing = true
-  local ok, err = pcall(function()
-    while #self._queue > 0 do
-      local item = table.remove(self._queue, 1)
+  -- An error (guard, assign, action) affects only the event that raised it:
+  -- events already queued keep processing, and the first error reaches the
+  -- sender afterwards.
+  local first_error
+  while #self._queue > 0 do
+    local item = table.remove(self._queue, 1)
+    local ok, err = pcall(function()
       local snapshot, effects, record = transition(self.chart, self._snapshot, item.event)
       item.accepted, item.reason = not record.rejected, record.reason
       commit(self, snapshot)
@@ -2060,13 +2120,11 @@ function Actor:_process()
         emit(self, record)
       end
       if effect_error then error(effect_error, 0) end
-    end
-  end)
-  self._processing = false
-  if not ok then
-    self._queue = {}
-    error(err, 0)
+    end)
+    if not ok and first_error == nil then first_error = err end
   end
+  self._processing = false
+  if first_error ~= nil then error(first_error, 0) end
 end
 
 local function enqueue(actor, event, origin)
@@ -2112,7 +2170,7 @@ end
 function Actor:event(event, field)
   local normalized = normalize_event(event)
   if internal_type(normalized.type) then fail('InvalidEvent: %q is reserved for the machine runtime', normalized.type) end
-  if not self.chart.declared[normalized.type] then
+  if M.strict and not self.chart.declared[normalized.type] then
     fail('UnknownEvent: %s does not accept %q', self.chart.id, normalized.type)
   end
   if field ~= nil and (type(field) ~= 'string' or field == '') then fail('event binding field must be a nonempty string') end
@@ -2182,6 +2240,14 @@ function Actor:stop()
   local snapshot = copy(self._snapshot)
   snapshot.status = 'stopped'
   if was_started then commit(self, snapshot) else self._snapshot = snapshot end
+  -- Waiters end even if the actor never started (no commit notified them).
+  if next(self._waiters) then M._notify_waiters(self, snapshot) end
+  -- The final commit is done: release every hidden signal so a stopped actor
+  -- holds no signal slots. Nothing writes them after this.
+  release_signal(self._store)
+  release_signal(self._config)
+  release_signal(self._members)
+  for _, signal in pairs(self._keys) do release_signal(signal) end
   registry[self.path] = nil
   for i, path in ipairs(registry_order) do
     if path == self.path then table.remove(registry_order, i); break end
@@ -2199,6 +2265,7 @@ end
 
 function M.create(def)
   local chart = compile(def)
+  charts_by_id[chart.id] = chart
   local exported
   function chart:graph()
     exported = exported or graph(self)
@@ -2239,7 +2306,7 @@ function M.create(def)
       if fresh[k] == nil or type(fresh[k]) == type(v) then fresh[k] = v end
     end
     return {machine = self.id, status = 'active', states = complete(self, wanted), context = fresh,
-      children = persisted.children or {}}
+      children = persisted.children or {}, serial = persisted.serial}
   end
   return chart
 end
