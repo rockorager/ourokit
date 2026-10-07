@@ -112,8 +112,8 @@ def main():
             resumed = statecharts(endpoint, after=idle['next'], keep_alive_ms=30000, seed=1)
             assert len(resumed['records']) <= 3, [event(e) for e in resumed['records']]
             assert resumed['seed'] == 2 and resumed['actors'][0]['latest']['origin'] == 'attach', resumed
-            # After reload the root actor stays visible under its path. (The
-            # host does not yet call machine.carry, so its context restarts.)
+            # Reload carries the root actor: same path, context preserved.
+            before = resumed['actors'][0]['latest']['context']['count']
             source.write_text(SOURCE.replace('REVISION', '2'))
             reload = subprocess.run([str(BINARY), 'dev', 'reload', str(endpoint)], env=env,
                                     capture_output=True, timeout=12)
@@ -122,10 +122,11 @@ def main():
             reloaded = statecharts(endpoint, after=resumed['next'], seed=2)
             assert reloaded['seed'] == 3 and [a['actor'] for a in reloaded['actors']] == ['signal'], reloaded
             assert reloaded['actors'][0]['latest']['origin'] == 'attach', reloaded
+            assert reloaded['actors'][0]['latest']['context']['count'] >= before, reloaded
             after_reload, _ = wait_for(endpoint, lambda s: any(event(e) == 'GO' for e in s), reloaded['next'])
             assert all(e['record']['actor'] == 'signal' for e in after_reload)
             print('PASS runtime.statecharts: attach on demand with seeded actors, transition/rejected/timer '
-                  'records, guard valves and clock, cursor and text mode, idle detach, actors kept by path across reload')
+                  'records, guard valves and clock, cursor and text mode, idle detach, actors carried across reload')
         finally:
             process.terminate()
             _, stderr = process.communicate(timeout=10)

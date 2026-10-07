@@ -109,8 +109,8 @@ today.
   guarded transitions whose source is active) and `time_ms` (the scheduler
   clock: virtual on the manual scheduler, host monotonic otherwise). A seeded
   attach snapshot has no guard outcomes, so its valves stay grey until the
-  next record. Running invokes at attach are read from the interpreter's
-  private table; timers come from `actor:pending_timers()`.
+  next record. Running timers and invokes at attach come from
+  `actor:pending_timers()` and `actor:pending_invokes()`.
 - Headless snapshots cannot advance native animations, so stories pin the
   pulse and rotor phases explicitly.
 - A window has fixed budgets of 256 widget instances and 512 scene commands.

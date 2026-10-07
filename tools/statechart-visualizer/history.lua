@@ -45,7 +45,7 @@ function M.append(history, record)
   end
   for _, invoke in ipairs(record.invokes) do
     frame.pumps[invoke.state .. '|' .. invoke.id] = {status=invoke.op == 'started' and 'running' or invoke.op,
-      state=invoke.state, src=invoke.src, error=invoke.error, since=record.time, token=invoke.token}
+      state=invoke.state, src=invoke.src, error=invoke.error, since=invoke.time or record.time, token=invoke.token}
   end
   -- Valves follow the record's post-step guard outcomes. Older feeds only
   -- had accepted events (can), which decide a valve only when its

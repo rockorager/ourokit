@@ -160,7 +160,7 @@ fn monotonicNs() u64 {
 const registry_key = "ouro.statechart_inspector";
 
 // Returns attach(), idempotent per VM. Records already carry time_ms and
-// guard valve states; seeded snapshots add pending timers.
+// guard valve states; seeded snapshots add pending timers and invokes.
 const bridge_source =
     \\local publish, ouro = ...
     \\local machine, json = ouro.machine, ouro.json
@@ -193,10 +193,9 @@ const bridge_source =
     \\    record.timers[#record.timers + 1] = {action = 'started', state = live.state, delay = live.delay,
     \\      event = live.event, token = live.token, time_ms = live.time_ms}
     \\  end
-    \\  -- Running invokes have no public accessor yet; read the private table.
-    \\  for _, live in pairs(type(actor._invokes) == 'table' and actor._invokes or {}) do
+    \\  for _, live in ipairs(actor.pending_invokes and actor:pending_invokes() or {}) do
     \\    record.invokes[#record.invokes + 1] = {action = 'started', state = live.state, id = live.id,
-    \\      src = live.src, token = live.token}
+    \\      src = live.src, token = live.token, time_ms = live.time_ms}
     \\  end
     \\  send('seed_latest', record)
     \\end
@@ -228,8 +227,8 @@ pub fn install(vm: *vm_module.Vm, store: *Store) !void {
 
 /// Called by the development endpoint at a safe point, with no task running:
 /// renews the keep-alive and attaches the active VM's bridge if needed.
-/// Seeding reads actor snapshots, pending timers and graphs; it runs no
-/// application callbacks.
+/// Seeding reads actor snapshots, pending timers and invokes, and graphs;
+/// it runs no application callbacks.
 pub fn attach(vm: *vm_module.Vm, store: *Store) !void {
     store.last_request_ms = store.elapsedMs();
     const state = vm.state;

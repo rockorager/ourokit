@@ -144,7 +144,8 @@ function M.record(raw, t0, fallback)
   end
   for _, v in ipairs(list(raw.invokes)) do
     r.invokes[#r.invokes+1] = {op=v.action, state=v.state, id=v.id, src=v.src, token=v.token,
-      error=v.error ~= M.null and v.error or nil}
+      error=v.error ~= M.null and v.error or nil,
+      time=v.time_ms and v.time_ms ~= M.null and (v.time_ms - (t0 or v.time_ms)) or nil}
   end
   return r
 end
