@@ -1156,6 +1156,74 @@ end
 
 function M.inspect(fn) return subscribe(inspectors, fn) end
 
+-- External input boundaries (design §14). An input enters the system when no
+-- actor is processing: a send from a widget, MCP or app code, a runtime
+-- delivery, a timer firing, an invoke or task result, a root start or stop.
+-- Everything it causes (child sends, send_parent, spawns) is internal and a
+-- function of the charts. Entering a boundary first syncs the scheduler
+-- clock, so due timers fire before the input. M._hooks, when a recorder or
+-- replayer installs it, sees each boundary of a recorded actor tree: a root
+-- that is not a component machine, on the default scheduler (or the one the
+-- replayer passed). depth counts every processing actor; recorded_depth only
+-- recorded ones, so a component machine's effect sending to a root actor is
+-- still an input (origin 'component').
+local depth, recorded_depth, current_scheduler = 0, 0, nil
+M._hooks = nil
+M._origin = nil -- an origin label hosts may set around a synchronous hook (activation)
+
+local function recorded(actor)
+  local hooks = M._hooks
+  if not hooks then return false end
+  local root = actor
+  while root._parent do root = root._parent end
+  return not root._lazy and root._scheduler == (hooks.scheduler or M.default_scheduler)
+end
+
+-- Runs fn(...) as processing of `actor`; at the outermost level it is an
+-- input boundary of kind 'input' (event, origin), 'start', 'stop' or 'release'.
+local function boundary(actor, kind, event, origin, fn, ...)
+  if depth == 0 then
+    local sync = actor._scheduler.sync
+    if sync then sync() end
+  end
+  local hooks = recorded_depth == 0 and recorded(actor) and M._hooks or nil
+  if hooks then
+    if origin == 'external' then origin = depth > 0 and 'component' or M._origin or 'app' end
+    hooks.enter(actor, kind, event, origin)
+  end
+  local counted = recorded(actor)
+  local previous = current_scheduler
+  depth, current_scheduler = depth + 1, actor._scheduler
+  if counted then recorded_depth = recorded_depth + 1 end
+  local ok, a, b = pcall(fn, ...)
+  depth, current_scheduler = depth - 1, previous
+  if counted then recorded_depth = recorded_depth - 1 end
+  if hooks then hooks.leave(actor, kind, ok, not ok and a or nil) end
+  if not ok then error(a, 0) end
+  return a, b
+end
+
+local function step_hook(actor, record, origin)
+  local hooks = M._hooks
+  if hooks and hooks.step and recorded(actor) then hooks.step(actor, record, origin) end
+end
+
+-- Logical time of the scheduler running the current macrostep (design §8):
+-- frozen for the step, virtual under manual_scheduler, replay and
+-- deterministic hosts. Outside a macrostep, the default scheduler's clock.
+function M.now()
+  local scheduler = current_scheduler or M.default_scheduler
+  local clock = scheduler.clock
+  return clock and clock() or nil
+end
+
+-- Deterministic hosts: move the default virtual clock, firing due timers.
+function M.advance(ms)
+  if not M.clock then fail('machine.advance needs the native scheduler') end
+  if not M.virtual_clock then fail('machine.advance needs a virtual clock (a deterministic host)') end
+  M.clock.advance(ms)
+end
+
 -- XState's waitFor: yield the running task until predicate(snapshot) holds
 -- and return that snapshot. Wakes on the actor's commits, never polls.
 -- Raises WaitTimeout after options.timeout ms, WaitEnded when the actor
@@ -1292,7 +1360,7 @@ function M.actions(actor, specs, options)
         if spec.event then
           event = {type = spec.event}
           for key, value in pairs(params or {}) do event[key] = value end
-          local accepted, reason = target:send(event)
+          local accepted, reason = target:_send(event, 'mcp')
           if not accepted then
             local code = spec.errors and spec.errors[reason]
               or (reason == 'no_transition' and 'EventRejected' or 'ActorUnavailable')
@@ -1342,6 +1410,7 @@ end
 function M.carry(entries)
   carried, held = {}, {}
   for i, entry in ipairs(entries or {}) do carried[i] = entry end
+  if M._hooks and M._hooks.carry then M._hooks.carry() end
 end
 
 function M._take_carried(chart, actor, options)
@@ -1385,6 +1454,7 @@ function M.release()
     local err = M._run_released(actor, by_actor[actor])
     first_error = first_error or err
   end
+  if M._hooks and M._hooks.released then M._hooks.released() end
   if first_error then error(first_error, 0) end
 end
 
@@ -1438,15 +1508,108 @@ end
 -- and in-flight invokes unwind. The per-entry token check stays as a second
 -- line of defense and is what the token scheduler relies on.
 M.native_scopes = scope_open ~= nil
+
+-- Logical time (design §8). A scheduler clock reads one logical instant per
+-- external input: it is frozen for the macrostep and its effects, so guards,
+-- assigns, records and machine.now() agree. `after` timers sit in one queue
+-- ordered by (deadline, start order). A firing runs at its deadline, and
+-- every timer due at or before wall time fires before the next external
+-- input is processed. A live clock follows the host's monotonic time between
+-- inputs. A virtual clock (deterministic hosts, replay) moves only through
+-- advance(). Either way the order and the instants are a function of the
+-- inputs and their times, which is what makes a recording replayable.
+--   clock.now()           logical ms
+--   clock.after(scope, delay, fn)
+--   clock.sync()          fire timers due by wall time, then catch up (live only)
+--   clock.advance(ms)     fire timers due within ms, then move to now + ms
+--   clock.advance_to(t)   the same, to an absolute instant
+function M.logical_clock(options)
+  options = options or {}
+  local c = {timers = {}, sequence = 0, firing = false, fired = 0}
+  local alive, wall, wake = options.alive or function(scope) return scope.alive end, options.wall, options.wake
+  local time = options.start
+  local function current()
+    if time == nil then time = wall and wall() or 0 end
+    return time
+  end
+  function c.now() return current() end
+  function c.after(scope, delay, fn)
+    c.sequence = c.sequence + 1
+    local timer = {at = current() + delay, sequence = c.sequence, scope = scope, fn = fn}
+    local list, i = c.timers, #c.timers
+    while i > 0 and (list[i].at > timer.at) do i = i - 1 end
+    table.insert(list, i + 1, timer)
+    if wake and list[1] == timer then wake(timer.at) end
+  end
+  -- The earliest pending deadline, dropping timers whose scope closed.
+  function c.next()
+    while c.timers[1] and not alive(c.timers[1].scope) do table.remove(c.timers, 1) end
+    return c.timers[1] and c.timers[1].at
+  end
+  function c.advance_to(target)
+    if c.firing then return end
+    c.firing = true
+    local ok, err = pcall(function()
+      while c.timers[1] and c.timers[1].at <= target do
+        local timer = table.remove(c.timers, 1)
+        if alive(timer.scope) then
+          if timer.at > current() then time = timer.at end
+          c.fired = c.fired + 1
+          local fired, failure = pcall(timer.fn)
+          if not fired then print('machine timer failed: ' .. tostring(failure)) end
+        end
+      end
+      if target > current() then time = target end
+    end)
+    c.firing = false
+    if not ok then error(err, 0) end
+    if wake and c.next() then wake(c.timers[1].at) end
+  end
+  function c.advance(ms)
+    if math.type(ms) ~= 'integer' or ms < 0 then fail('advance expects nonnegative integer milliseconds') end
+    c.advance_to(current() + ms)
+  end
+  function c.sync()
+    local now = wall and wall()
+    if now then c.advance_to(now) end
+  end
+  return c
+end
+
+-- Deterministic hosts (Storybook playback, `ouroctl test`) disable wall-clock
+-- sleeps; the host sets this so the default clock is virtual and only
+-- machine.advance(ms) moves it.
+M.virtual_clock = false
 if scope_open then
+  local monotonic = ouro._monotonic_ms
+  local function wall() if not M.virtual_clock then return monotonic() end end
+  -- One native wake task sleeps until the earliest deadline; an earlier
+  -- timer closes its scope and arms a new one.
+  local wake_scope, wake_at, clock
+  local function wake(at)
+    if M.virtual_clock then return end
+    if wake_scope and wake_at <= at and scope_alive(wake_scope) then return end
+    if wake_scope then scope_close(wake_scope) end
+    local scope = scope_open('application')
+    wake_scope, wake_at = scope, at
+    scope_spawn(scope, function()
+      local delay = at - monotonic()
+      if delay > 0 then ouro.sleep(delay) end
+      if wake_scope == scope then wake_scope = nil end
+      clock.sync()
+    end)
+  end
+  clock = M.logical_clock {alive = function(scope) return scope_alive(scope) end, wall = wall, wake = wake}
+  M.clock = clock
   M.default_scheduler = {
     kind = 'native',
     open = function(parent) return scope_open(parent) end,
     close = function(scope) scope_close(scope) end,
     alive = function(scope) return scope_alive(scope) end,
     run = function(scope, fn) scope_spawn(scope, fn) end,
-    after = function(scope, delay, fn) scope_spawn(scope, function() ouro.sleep(delay); fn() end) end,
-    clock = ouro._monotonic_ms,
+    after = clock.after,
+    clock = clock.now,
+    sync = clock.sync,
   }
 end
 
@@ -1554,7 +1717,7 @@ local Actor = {}
 local function create_actor(chart, options)
   options = options or {}
   local actor = {chart = chart, id = options.id or chart.id, _observers = {}, _queue = {}, _timers = {}, _invokes = {}, _scopes = {}, _tasks = {},
-    _waiters = {}, _lazy = options.lazy == true, _scope_mode = options.scope, _token = options.token,
+    _waiters = {}, _lazy = options.lazy == true, _scope_mode = options.scope, _token = options.token, _input = options.input,
     _children = {}, _started = false, _status = 'created', _scheduler = options.scheduler or M.default_scheduler,
     _signal_factory = options.signal or ouro.signal, _parent = options.parent, _charts = options.charts or {}}
   for name, fn in pairs(Actor) do actor[name] = fn end
@@ -1805,6 +1968,9 @@ end
 
 -- Running after-timers, for late-attaching inspectors: {state, delay, event,
 -- token, time_ms} with time_ms the scheduler clock when the timer started.
+-- The actor's scheduler clock (logical ms; design §8).
+function Actor:now() local fn = self._scheduler.clock; return fn and fn() or nil end
+
 function Actor:pending_timers()
   local list = {}
   for _, live in pairs(self._timers) do
@@ -1953,7 +2119,8 @@ local function run_effects(actor, effects, record)
         actor._scheduler.after(scope_for(actor, effect.state, effect.token), effect.delay, function()
           if actor._timers[key] ~= live then return end
           actor._timers[key] = nil
-          actor:_deliver({type = effect.event, state = effect.state, token = effect.token}, 'timer')
+          -- Timer events carry their fire time: the deadline, on a logical clock.
+          actor:_deliver({type = effect.event, state = effect.state, token = effect.token, time_ms = clock(actor)}, 'timer')
         end)
       elseif kind == 'timer_cancel' then
         local key = effect.state .. '|' .. effect.delay
@@ -1969,11 +2136,10 @@ local function run_effects(actor, effects, record)
         actor._invokes[key] = live
         record.invokes[#record.invokes + 1] = {action = 'started', state = effect.state, id = effect.id,
           src = effect.src_name, token = effect.token, time_ms = live.time_ms}
-        actor._scheduler.run(scope_for(actor, effect.state, effect.token), function()
-          local function send(event)
-            if actor._invokes[key] == live then actor:send(event) end
-          end
-          local ok, result = pcall(effect.src, effect.input, send)
+        local function send(event)
+          if actor._invokes[key] == live then actor:_send(event, 'invoke') end
+        end
+        local function complete(ok, result)
           if actor._invokes[key] ~= live then return end
           actor._invokes[key] = nil
           if ok then
@@ -1981,7 +2147,13 @@ local function run_effects(actor, effects, record)
           else
             actor:_deliver({type = 'error.invoke.' .. effect.id, state = effect.state, token = effect.token, error = result}, 'invoke')
           end
-        end)
+        end
+        -- info lets a replay scheduler stub the source: it never calls fn and
+        -- completes the invoke from the recording instead.
+        actor._scheduler.run(scope_for(actor, effect.state, effect.token), function()
+          complete(pcall(effect.src, effect.input, send))
+        end, {kind = 'invoke', actor = actor.path, id = effect.id, src = effect.src_name, state = effect.state,
+          token = effect.token, complete = complete, send = send})
       elseif kind == 'invoke_cancel' then
         local key = effect.state .. '|' .. effect.id
         local live = actor._invokes[key]
@@ -2011,8 +2183,7 @@ local function run_effects(actor, effects, record)
         local live = {scope = scope}
         actor._tasks[effect.id] = live
         record.children[#record.children + 1] = {action = 'spawned', id = effect.id, src = effect.src_name}
-        actor._scheduler.run(scope, function()
-          local ok, result = pcall(effect.src, effect.input)
+        local function complete(ok, result)
           if actor._tasks[effect.id] ~= live then return end
           actor._tasks[effect.id] = nil
           if ok then
@@ -2021,7 +2192,10 @@ local function run_effects(actor, effects, record)
             actor:_deliver({type = 'error.actor.' .. effect.id, id = effect.id, error = result, token = effect.child_token}, 'child')
           end
           actor._scheduler.close(scope)
-        end)
+        end
+        actor._scheduler.run(scope, function() complete(pcall(effect.src, effect.input)) end,
+          {kind = 'task', actor = actor.path, id = effect.id, src = effect.src_name, token = effect.child_token,
+            complete = complete})
       elseif kind == 'stop' then
         local child, task = actor._children[effect.id], actor._tasks[effect.id]
         actor._children[effect.id], actor._tasks[effect.id] = nil, nil
@@ -2114,14 +2288,17 @@ local function forget_finished_children(actor)
 end
 
 function M._run_released(actor, effects)
-  local record = new_record({type = 'ouro.release'})
-  record.handled = true
-  local err = run_effects(actor, effects, record)
-  if wants_records(actor) then
-    finalize(actor, record, 'restore')
-    emit(actor, record)
-  end
-  return err
+  return boundary(actor, 'release', nil, 'restore', function()
+    local record = new_record({type = 'ouro.release'})
+    record.handled = true
+    local err = run_effects(actor, effects, record)
+    step_hook(actor, record, 'restore')
+    if wants_records(actor) then
+      finalize(actor, record, 'restore')
+      emit(actor, record)
+    end
+    return err
+  end)
 end
 
 function Actor:_process()
@@ -2141,6 +2318,7 @@ function Actor:_process()
       record.commit = commits
       local effect_error = run_effects(self, effects, record)
       forget_finished_children(self)
+      step_hook(self, record, item.origin)
       if wants_records(self) then
         finalize(self, record, item.origin)
         emit(self, record)
@@ -2156,7 +2334,8 @@ end
 local function enqueue(actor, event, origin)
   local item = {event = event, origin = origin}
   actor._queue[#actor._queue + 1] = item
-  actor:_process()
+  if actor._processing then return nil, 'queued' end
+  boundary(actor, 'input', event, origin, actor._process, actor)
   -- Sent while this actor is mid-macrostep (from one of its own effects): it
   -- is queued behind the current step, so the outcome is not known yet.
   if item.accepted == nil then return nil, 'queued' end
@@ -2177,7 +2356,10 @@ function Actor:deliver(event, origin)
   return self:_deliver(event, origin or 'runtime')
 end
 
-function Actor:send(event)
+function Actor:send(event) return self:_send(event, 'external') end
+
+-- send with an origin label for records ('widget', 'mcp', 'invoke', ...).
+function Actor:_send(event, origin)
   event = normalize_event(event)
   if internal_type(event.type) then fail('InvalidEvent: %q is reserved for the machine runtime', event.type) end
   if not validate_event(self.chart, event) then return false, 'undeclared' end
@@ -2186,7 +2368,7 @@ function Actor:send(event)
     self:start() -- Component machines start on their first event.
   end
   if self._status == 'stopped' then return false, 'stopped' end
-  return enqueue(self, event, 'external')
+  return enqueue(self, event, origin or 'external')
 end
 
 -- A plain event binding for widgets: exactly { actor, event, field }.
@@ -2206,11 +2388,16 @@ end
 -- Returns a function that sends the event; use for on_press and commands.
 function Actor:sender(event)
   normalize_event(event)
-  return function() self:send(event) end
+  return function() self:_send(event, 'callback') end
 end
 
 function Actor:start()
   if self._status ~= 'created' then return self end
+  boundary(self, 'start', nil, nil, self._start, self)
+  return self
+end
+
+function Actor:_start()
   self._status = 'running'
   bump(self._config) -- status() changes from 'created'
   registry[self.path] = self
@@ -2226,6 +2413,7 @@ function Actor:start()
   self._processing = true
   local ok, err = pcall(function()
     local effect_error = run_effects(self, pending.effects, pending.record)
+    step_hook(self, pending.record, pending.record.event.type == 'ouro.restore' and 'restore' or 'init')
     if wants_records(self) then
       finalize(self, pending.record, pending.record.event.type == 'ouro.restore' and 'restore' or 'init')
       emit(self, pending.record)
@@ -2235,11 +2423,14 @@ function Actor:start()
   self._processing = false
   if not ok then error(err, 0) end
   self:_process()
-  return self
 end
 
 function Actor:stop()
   if self._status == 'stopped' then return end
+  boundary(self, 'stop', nil, 'stop', self._stop, self)
+end
+
+function Actor:_stop()
   local was_started = self._status ~= 'created'
   self._status = 'stopped'
   bump(self._config)

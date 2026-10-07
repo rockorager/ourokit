@@ -13,3 +13,10 @@ function t:key(key, modifiers)
     control = modifiers.control, alt = modifiers.alt, logo = modifiers.logo,
   }
 end
+-- Move the virtual statechart clock (design/statecharts.md §8): due `after`
+-- timers fire at their deadlines, then the UI settles if one is mounted.
+function t:advance(ms)
+  require('ouro').machine.advance(ms)
+  local ok, err = pcall(self.settle, self)
+  if not ok and not tostring(err):find('TestNotMounted', 1, true) then error(err, 0) end
+end

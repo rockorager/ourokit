@@ -29,8 +29,8 @@ local function field_of(v, value_hook) return v.field or (value_hook and 'value'
 local function handler(v, value_hook)
   if not bound(v) then return v end
   local actor, event, field = v.actor, v.event, field_of(v, value_hook)
-  if not field then return function() actor:send(event) end end
-  return function(value) actor:send(carrying(event, field, value)) end
+  if not field then return function() actor:_send(event, 'widget') end end
+  return function(value) actor:_send(carrying(event, field, value), 'widget') end
 end
 local function accepts(v, value_hook)
   if not bound(v) then return true end

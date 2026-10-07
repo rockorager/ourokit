@@ -31,6 +31,14 @@ pub fn install(state: *c.State) !void {
     @import("signals.zig").Signals.pushRelease(state);
     if (c.lua_pcallk(state, 10 + extra, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
+    // Recording and replay (design/statecharts.md §14) extend ouro.machine.
+    const replay = @embedFile("machine_replay.lua");
+    if (c.luaL_loadbufferx(state, replay, replay.len, "=ouro.machine.replay", "t") != c.ok)
+        return error.MachineInitializationFailed;
+    c.lua_pushvalue(state, api);
+    _ = c.lua_getfield(state, api, "machine");
+    if (c.lua_pcallk(state, 2, 0, 0, 0, null) != c.ok)
+        return error.MachineInitializationFailed;
     c.lua_settop(state, api);
 }
 

@@ -252,6 +252,14 @@ pub const Vm = struct {
     /// an io_uring operation that would make snapshot completion time-based.
     pub fn disableSleep(self: *Vm) void {
         self.sleep_enabled = false;
+        // Statechart timers follow a virtual clock that only
+        // machine.advance moves (design/statecharts.md §8).
+        const top = c.lua_gettop(self.state);
+        defer c.lua_settop(self.state, top);
+        self.pushApi(self.state);
+        if (c.lua_getfield(self.state, -1, "machine") != c.type_table) return;
+        c.lua_pushboolean(self.state, 1);
+        c.lua_setfield(self.state, -2, "virtual_clock");
     }
 
     /// Opens a child task scope owned by this VM (source generation). Tasks
