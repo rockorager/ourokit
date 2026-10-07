@@ -30,11 +30,11 @@ Test names are from `tests/machine_test.lua` unless a file is given.
 | **G3** Charts hold all application state; the UI is a pure view of snapshots; plain functions compute | §6, §5, §7 | documents, contacts, launcher and stopwatch keep no app signals: `documents.py`, `contacts.py`, `launcher.py`, `stopwatch_test.lua` | met |
 | **G4** Easy to reason about, for humans and agents, over fewer lines; an app can be written from this doc alone | §0, §4 Callback signatures, §11 | `examples/stopwatch`, first written from this doc alone by the review; `tests/stopwatch_test.lua` | met |
 | **G5** One event model for widgets, shortcuts, commands, palette, MCP, activation and surfaces, with request/response | §2 (send results, `wait_for`, `deliver`, `machine.actions`), §7 | `bindings_test.lua`; 'send reports whether the event was taken…'; 'wait_for…'; 'actions derive MCP input schemas…'; `contacts.py` (MCP as chart events); `desktop_native.py` 'launcher: single instance toggles on activation', 'surface events: … close_requested decided by the chart' | met (a palette is bound buttons or options; there is no stock palette widget) |
-| **G6** Agent-first dev loop: inspect states and records, live visualizer, deterministic record/replay, generated tests, reload that keeps state | §10 (records, Dev tools), §9 | `statechart_inspection.py`; `tools/statechart-visualizer/storybook.lua`; 'records carry the scheduler clock and post-step guard valves'; `chart_reload.py`; 'reload hooks persist roots…' | partly: deterministic record/replay, logical clocks and generated tests (guard-aware paths to every reachable state, emitted as `ouroctl test` files or stories) are open, owned by the replay thread |
+| **G6** Agent-first dev loop: inspect states and records, live visualizer, deterministic record/replay, generated tests, reload that keeps state | §10 (records, Dev tools), §9, §8 Logical time, §14 | `statechart_inspection.py`; `tools/statechart-visualizer/storybook.lua` (`recording/*` stories draw a real session); 'records carry the scheduler clock and post-step guard valves'; `chart_reload.py`; 'reload hooks persist roots…'; `chart_replay.py` (real stopwatch, contacts, documents and launcher sessions replay identically; a changed chart diverges at its first step; generated tests fail on it); `replay_test.lua`; `examples/*/tests/*_paths_test.jsonl` (`ouroctl test examples`) | met: recordings under `--dev`/`--record`, `ouroctl replay` with divergence reports, logical clocks, generated paths (guard-aware, seeded by recordings) as `ouroctl test` files, visualizer scrubbing (§14). Generated paths are not emitted as Storybook stories |
 | **G7** Performance at the real boundaries: few Lua–Zig crossings, per-field rebuild locality, cached views, unchanged text work; the interpreter stays in Lua and snapshots stay Lua tables | §6 Rebuild locality, Status | 'rebuild locality: typing in one document re-renders only its readers'; 'rebuild locality: fields, configuration and selectors'; 'views are cached per table…' | met: render counts and allocation are proven by tests; Lua–Zig crossings and text work by call-path analysis, not measured (performance is not measured yet, by decision) |
 | **G8** No fixed limits on runtime objects; actors and components release native resources on stop and unmount | §8 Resources and capacities | `statechart_capacity.py`; `component_scopes_test.lua` (70 rows, 40 rows remounted 20×, 3000 cycles) | partly: signals grow and release; per-window and protocol budgets are still fixed (§8) |
 | **G9** Failures reach charts instead of crashing: `surface.failed`, atomic commits, `YieldInAction`, rejected events with reasons | §1 Algorithm, §2 Sending, Runtime events | 'guard errors leave the previous snapshot in place'; 'an eventless livelock fails without committing…'; 'guards, assigns and actions cannot wait, spawn or exit'; 'review M6…'; `desktop_native.py` 'launcher surface … failure', 'unbound role change: logged, last valid window kept' | met |
-| **G10** Headless testability: `manual_scheduler`, `ouroctl test` settling, chart tests with fake services | §8 Tests, §0 Tests | `documents.py`, `contacts.py`, `launcher.py` (fake services); `stopwatch_test.lua`; `component_scopes_test.lua` 't:settle shows state changed from the test body' | met (logical timers for native-scheduler tests are open, §8) |
+| **G10** Headless testability: `manual_scheduler`, `ouroctl test` settling, chart tests with fake services | §8 Tests, §0 Tests | `documents.py`, `contacts.py`, `launcher.py` (fake services); `stopwatch_test.lua`; `component_scopes_test.lua` 't:settle shows state changed from the test body' | met: native-scheduler tests run on a virtual logical clock (`t:advance`, §8); `replay_test.lua` |
 
 ## 0. Writing an app
 
@@ -1289,6 +1289,15 @@ book = machine.create {
   to misread.
 - **Input provenance.** Drag and other press-provenance calls cannot move into
   invokes, because spawned tasks lose provenance.
+- **Logical timer queue in Lua.** The clock and the timer queue (§8) are Lua
+  over one native wake task, not Zig. Timers need one crossing per armed
+  deadline. Move the queue native if profiling shows it.
+- **Recording origins.** `activation` and hand-written MCP handlers record as
+  `app`. Only `machine.actions` handlers know they are `mcp`. A host-set
+  `machine._origin` around a yielding hook could mislabel another task's
+  sends.
+- **Component machines are not recorded** (§14), so replay misses UI state
+  that lives only in them.
 
 ## 14. Record, replay and generated tests
 
