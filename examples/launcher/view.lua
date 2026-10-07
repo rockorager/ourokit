@@ -1,6 +1,7 @@
 -- The launcher's UI as a function of the chart snapshot. Shared by app.lua
 -- and stories.lua; it reads the actor and sends it events, nothing else.
-return function(ouro, model)
+-- `filter` is the chart's memoized results selector (charts.lua).
+return function(ouro, model, filter)
   local M = {}
 
   local Caption = ouro.stateless(function(p, _, theme)
@@ -43,7 +44,7 @@ return function(ouro, model)
 
   function M.content(launcher)
     local c = launcher:context()
-    local results = model.results(c.entries, c.query)
+    local results = filter(c.entries, c.query)
     local close = launcher:sender("CLOSE")
     local list
     if #results > 0 then
@@ -66,7 +67,7 @@ return function(ouro, model)
           ouro.text_input {
             key = "search", text = c.query, label = "Search applications",
             placeholder = "Search applications…", autofocus = true,
-            on_change = function(text) launcher:send { type = "QUERY", text = text } end,
+            on_change = function(text) launcher:send { type = "QUERY", value = text } end,
             on_command = function(command)
               if command == "next" then launcher:send { type = "MOVE", delta = 1 }
               elseif command == "previous" then launcher:send { type = "MOVE", delta = -1 }
@@ -82,8 +83,10 @@ return function(ouro, model)
   end
 
   -- The reactive window declaration: the surface exists exactly while the
-  -- chart is open. Keep `content` stable so a retained surface is not rebuilt
-  -- just because the declaration reran.
+  -- chart is open, and `send = launcher` makes it report back: mapped,
+  -- close_requested, failed and closed arrive as surface.*.launcher events.
+  -- Keep `content` stable so a retained surface is not rebuilt just because
+  -- the declaration reran.
   function M.windows(launcher)
     local function content() return M.content(launcher) end
     return function()
@@ -92,8 +95,7 @@ return function(ouro, model)
         id = "launcher", namespace = "ourokit-launcher", layer = "overlay",
         width = 0, height = 0, anchors = { "top", "bottom", "left", "right" },
         keyboard_interactivity = "exclusive", background = "#10141c99",
-        on_close_request = launcher:sender("CLOSE"),
-        content = content,
+        send = launcher, content = content,
       } }
     end
   end

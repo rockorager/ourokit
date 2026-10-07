@@ -2,13 +2,16 @@
 -- fake them:
 --   scan() -> entries        (ouro.xdg.applications.list in the app)
 --   launch(entry) -> true    (prepare_launch + start; throws on failure)
--- The chart knows nothing about surfaces. The view maps `open` to a layer
--- surface; everything `open` invokes is cancelled when it exits.
+-- All launcher state lives here, including the query and the selection.
+-- The view declares the layer surface while the chart is `open` and binds
+-- it with `send = launcher`, so the surface reports back as surface.*
+-- events; everything `open` invokes is cancelled when it exits.
 return function(ouro, model, services)
   local machine = ouro.machine
   local assign, unset = machine.assign, machine.unset
 
-  local function results(c) return model.results(c.entries, c.query) end
+  -- One filter per (entries, query), shared by guards, can() and the view.
+  local results = machine.selector(model.results)
   local function index(c, e) return e.index or c.selected end
 
   local launcher = machine.create {
@@ -16,30 +19,33 @@ return function(ouro, model, services)
     context = { query = "", entries = {}, selected = 1 },
     events = {
       TOGGLE = {}, OPEN = {}, CLOSE = {},
-      QUERY = { text = "string" },
+      QUERY = { value = "string" },
       MOVE = { delta = "integer" },
       SELECT = { index = "integer" },
       ACTIVATE = { index = "integer?" },
       RETRY = {},
     },
     guards = {
-      match = function(c, e) local i = index(c, e); return i >= 1 and i <= #results(c) end,
+      match = function(c, e) local i = index(c, e); return i >= 1 and i <= #results(c.entries, c.query) end,
     },
     actions = {
       -- Each opening starts from an empty query. Entries from the previous
       -- scan stay so the list is not empty while the new scan runs.
       reset = assign { query = "", selected = 1, error = unset, launching = unset },
-      query = assign(function(_, e) return { query = e.text, selected = 1, error = unset } end),
-      move = assign { selected = function(c, e) return model.move(c.selected, e.delta, #results(c)) end },
+      query = assign(function(_, e) return { query = e.value, selected = 1, error = unset } end),
+      move = assign { selected = function(c, e) return model.move(c.selected, e.delta, #results(c.entries, c.query)) end },
       select = assign { selected = function(_, e) return e.index end },
       scanned = assign(function(c, e)
-        return { entries = e.output, error = unset, selected = model.clamp(c.selected, #model.results(e.output, c.query)) }
+        return { entries = e.output, error = unset, selected = model.clamp(c.selected, #results(e.output, c.query)) }
       end),
       pick = assign(function(c, e)
         local i = index(c, e)
-        return { selected = i, launching = results(c)[i], error = unset }
+        return { selected = i, launching = results(c.entries, c.query)[i], error = unset }
       end),
       fail = assign { error = function(_, e) return model.message(e.error) end },
+      -- The surface could not be shown: its declaration was rejected or its
+      -- content failed to build. Hidden keeps the reason for MCP and logs.
+      surface_failed = assign { error = function(_, e) return "Launcher surface failed (" .. e.reason .. "): " .. e.message end },
     },
     actors = {
       scan = function() return model.catalog(services.scan()) end,
@@ -50,6 +56,8 @@ return function(ouro, model, services)
       open = { initial = "loading", entry = "reset",
         on = {
           TOGGLE = "hidden", CLOSE = "hidden",
+          ["surface.close_requested.launcher"] = "hidden",
+          ["surface.failed.launcher"] = { target = "hidden", actions = "surface_failed" },
           QUERY = { actions = "query" },
           MOVE = { actions = "move" },
           SELECT = { guard = "match", actions = "select" },
@@ -69,5 +77,5 @@ return function(ouro, model, services)
     },
   }
 
-  return { launcher = launcher }
+  return { launcher = launcher, results = results }
 end

@@ -776,6 +776,22 @@ Where the reactive `windows` declaration fits and where it fights:
   unless an entry action resets it. Two lifetimes have to agree by
   convention.
 
+**Resolved by surface events.** A declaration with `send = actor` makes the
+surface report back. The runtime delivers `surface.mapped.<id>`,
+`surface.close_requested.<id>`, `surface.closed.<id>` and
+`surface.failed.<id> { reason, message }` with `actor:deliver`, from an
+application-scope task in the task phase. See the
+[application model](../docs/application-model.md#surfaces-bound-to-a-statechart).
+- A close request no longer closes anything. The chart leaves `open`, and
+  the declaration drops the surface.
+- A rejected declaration, or content that fails on its first build, sends
+  `failed`. The launcher returns to `hidden` with the reason in context,
+  where its MCP `State` action reports it.
+- Retirement still follows the declaration pass, but `closed` tells the
+  chart when teardown has finished.
+- Still unreported: an error thrown by `windows()` itself, which names no
+  surface, and native protocol failures, which stay fatal.
+
 ### Contacts (implemented)
 
 [`examples/contacts`](../examples/contacts) loads its address book from an

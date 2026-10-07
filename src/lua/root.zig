@@ -17,6 +17,7 @@ pub const Application = @import("application.zig").Application;
 pub const ApplicationDefinition = @import("application.zig").Definition;
 pub const ApplicationBootstrap = @import("application.zig").Bootstrap;
 pub const ApplicationWindow = @import("application.zig").Window;
+pub const WindowRejection = @import("application.zig").Rejection;
 pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
 pub const DiagnosticPhase = @import("diagnostic.zig").Phase;
 pub const recordDiagnosticError = @import("diagnostic.zig").recordError;

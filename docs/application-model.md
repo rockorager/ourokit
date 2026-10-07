@@ -487,6 +487,38 @@ size, layer, anchors, exclusive zone and edge, margins, keyboard interactivity,
 background, background effect, and input region update transactionally, including
 on source reload. Invalid color/effect/region values reject the new declaration.
 
+### Surfaces bound to a statechart
+
+Set `send = actor` on a `window` or `layer_surface` to bind it to an
+`ouro.machine` actor. The surface then reports its lifecycle to that actor as
+reserved runtime events, delivered with `actor:deliver(event, 'surface')`. Each
+event is delivered from an application-scope task in the task phase, through
+the actor's normal queue. `send` may also be a function, which is called with
+the event.
+
+| Event | When | Payload |
+| --- | --- | --- |
+| `surface.mapped.<id>` | The compositor configured a new native surface. Sent again after a reopen. | `id`, `width`, `height` |
+| `surface.close_requested.<id>` | The compositor asked to close the surface. Nothing closes until the chart leaves the state whose view declares it. | `id` |
+| `surface.closed.<id>` | Native teardown finished. This usually follows the declaration dropping the surface. Not sent during application shutdown. | `id` |
+| `surface.failed.<id>` | The surface could not be shown. `reason` is `declaration` when the declaration was rejected and the last valid list was kept, or `content` when the content function failed on its first build. In the `content` case the surface closes and the application keeps running. | `id`, `reason`, `message` (the error name) |
+
+```lua
+open = { on = {
+  ["surface.close_requested.launcher"] = "hidden",
+  ["surface.failed.launcher"] = { target = "hidden", actions = "remember_error" },
+} },
+```
+
+A bound surface cannot also declare `on_close_request`; doing so is itself a
+rejected declaration. Rejections are reported once per distinct surface and
+error until a declaration succeeds again. Only failures that can be attributed
+to a bound surface are reported: an error thrown by `windows()` itself, or a
+list that exceeds window capacity, names no surface and is only logged. A
+`closed` event reaches the actor that was bound when the declaration dropped the
+surface. Events for surfaces of a replaced source generation are not delivered
+after reload. See [examples/launcher](../examples/launcher).
+
 ## User-initiated anchored popups
 
 Call `ouro.popup` synchronously in a button's `on_press`, before yielding. It

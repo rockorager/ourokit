@@ -82,7 +82,7 @@ launcher:send('TOGGLE')
 assert(launcher:matches('open.loading') and launcher:has_tag('busy'))
 assert(invoked('started').src=='scan' and clock.open_scopes==2 and scans==0)
 assert(not launcher:can('ACTIVATE'), 'cannot launch before the scan finishes')
-launcher:send{type='QUERY', text='fi'}                           -- typing during a scan is kept
+launcher:send{type='QUERY', value='fi'}                           -- typing during a scan is kept
 assert(launcher:context().query=='fi')
 clock.run_tasks()
 assert(scans==1 and launcher:matches('open.ready') and not launcher:has_tag('busy'))
@@ -95,19 +95,19 @@ assert(launcher:context().selected==1)
 launcher:send{type='MOVE', delta=1}; assert(launcher:context().selected==2)
 launcher:send{type='MOVE', delta=1}; assert(launcher:context().selected==1)
 launcher:send{type='MOVE', delta=-1}; assert(launcher:context().selected==2)
-launcher:send{type='QUERY', text=''}; assert(launcher:context().selected==1, 'a new query resets selection')
+launcher:send{type='QUERY', value=''}; assert(launcher:context().selected==1, 'a new query resets selection')
 launcher:send{type='SELECT', index=4}; assert(launcher:context().selected==4)
 launcher:send{type='SELECT', index=99}; assert(last().rejected and launcher:context().selected==4)
 assert(not pcall(launcher.send, launcher, {type='MOVE', delta=0.5}), 'schema requires an integer delta')
 assert(not pcall(launcher.send, launcher, {type='LAUNCH'}), 'undeclared events are rejected')
 
 -- No match, no launch.
-launcher:send{type='QUERY', text='nothing'}
+launcher:send{type='QUERY', value='nothing'}
 assert(not launcher:can('ACTIVATE'))
 launcher:send('ACTIVATE'); assert(last().rejected and launcher:matches('open.ready'))
 
 -- Enter launches the selection, then the launcher closes.
-launcher:send{type='QUERY', text='term'}
+launcher:send{type='QUERY', value='term'}
 launcher:send('ACTIVATE')
 assert(launcher:matches('open.launching') and launcher:context().launching.name=='Terminal')
 assert(invoked('started').src=='launch' and #launches==0)
@@ -129,7 +129,7 @@ assert(launcher:context().launching.name=='Firefox' and launcher:context().selec
 launch_error={name='NoExec', message='entry has no Exec'}
 clock.run_tasks()
 assert(launcher:matches('open.ready') and launcher:context().error=='entry has no Exec', 'launch failure keeps the launcher open')
-launcher:send{type='QUERY', text='c'}; assert(launcher:context().error==nil, 'typing clears the error')
+launcher:send{type='QUERY', value='c'}; assert(launcher:context().error==nil, 'typing clears the error')
 launch_error=nil
 
 -- Escape (CLOSE) while launching cancels the launch: it never runs.
@@ -154,6 +154,28 @@ scan_error=nil
 launcher:send('ACTIVATE'); assert(launcher:matches('open.loading'))
 clock.run_tasks(); assert(launcher:matches('open.ready') and launcher:context().error==nil, 'a successful scan clears the error')
 
+-- The surface reports back through actor:deliver (bound with send =).
+launcher:send('OPEN'); clock.run_tasks()
+assert(launcher:deliver({type='surface.mapped.launcher', id='launcher', width=1280, height=720}, 'surface')==false,
+  'mapped needs no transition')
+assert(launcher:matches('open.ready'))
+launcher:deliver({type='surface.close_requested.launcher', id='launcher'}, 'surface')
+assert(launcher:matches('hidden'), 'a compositor close request hides the launcher')
+launcher:send('OPEN'); clock.run_tasks()
+launcher:send{type='QUERY', value='term'}; launcher:send('ACTIVATE')
+assert(launcher:matches('open.launching'))
+local before_failure=#launches
+launcher:deliver({type='surface.failed.launcher', id='launcher', reason='declaration', message='InvalidThemeColor'}, 'surface')
+assert(launcher:matches('hidden') and invoked('cancelled').src=='launch', 'a failed surface cancels the launch')
+assert(last().origin=='surface')
+assert(launcher:context().error=='Launcher surface failed (declaration): InvalidThemeColor', launcher:context().error)
+clock.run_tasks(); assert(#launches==before_failure)
+launcher:deliver({type='surface.closed.launcher', id='launcher'}, 'surface')
+assert(last().rejected and launcher:matches('hidden'), 'closed after hiding is ignored')
+assert(not pcall(launcher.send, launcher, {type='surface.failed.launcher'}), 'surface.* cannot be sent by apps')
+launcher:send('OPEN'); assert(launcher:context().error==nil, 'reopening clears the surface error')
+clock.run_tasks()
+
 -- What the palette or MCP would see right now.
 local accepted={}
 for _,t in ipairs(launcher:accepted()) do accepted[#accepted+1]=t end
@@ -168,6 +190,17 @@ assert(table.concat(accepted,',')=='OPEN,TOGGLE', table.concat(accepted,','))
 -- Inspection data is plain, and persist keeps platform values (ouro.json.null).
 assert(o.json.decode(o.json.encode(charts.launcher:graph())).id=='launcher')
 assert(o.json.encode(launcher:persist()), 'persist keeps entries with ouro.json.null')
+
+-- Query and selection are chart state, so they survive persist and restore
+-- (source reload), and so do the raw entries prepare_launch needs.
+launcher:send('OPEN'); clock.run_tasks()
+launcher:send{type='QUERY', value='fi'}; launcher:send{type='MOVE', delta=1}
+local saved=o.json.decode(o.json.encode(launcher:persist()))
+local copy=charts.launcher:actor{snapshot=saved, scheduler=machine.manual_scheduler()}
+local cc=copy:context()
+assert(copy:matches('open.ready') and cc.query=='fi' and cc.selected==2, 'query and selection restore')
+assert(cc.entries[1].name=='Calculator' and cc.entries[1].icon==null and cc.entries[1].comment=='Perform calculations')
+launcher:send('CLOSE')
 
 launcher:stop(); assert(clock.open_scopes==0)
 o.stdout.write('PASS launcher charts\n')

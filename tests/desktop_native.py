@@ -845,7 +845,7 @@ def launcher_test(root, env):
         wait_for(lambda: label(status).startswith('Could not launch: '), 'launch failure not shown')
         assert windows() == ['launcher']
         capture(app_env, endpoint, 'launcher', 'launcher-launch-error.png')
-        assert call(endpoint, 'Close')['structuredContent'] == {'open': False}
+        assert call(endpoint, 'Close')['structuredContent']['open'] is False
         closed()
         print('PASS launcher: layer surface follows the chart; search, keyboard selection, launch, Escape and launch failure')
     finally:
@@ -889,10 +889,95 @@ def launcher_test(root, env):
         assert 'panic' not in errors and 'leaked' not in errors, errors
 
 
+def launcher_surface_failure_test(root, env):
+    """A launcher whose surface cannot be shown returns to hidden with the reason."""
+    app_env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'])
+    source = (ROOT / 'examples/launcher/view.lua').read_text()
+    breaks = {
+        # Rejected while the last good (empty) list is kept.
+        'declaration': source.replace('background = "#10141c99"', 'background = "#zz"'),
+        # The content function throws on its first build.
+        'content': source.replace('function M.content(launcher)\n', 'function M.content(launcher)\n    error("broken view")\n'),
+    }
+    for reason, view in breaks.items():
+        assert view != source, reason
+        directory = root / f'launcher-{reason}'
+        directory.mkdir()
+        for name in ('app.lua', 'charts.lua', 'model.lua', 'ouro.json'):
+            shutil.copy(ROOT / 'examples/launcher' / name, directory / name)
+        (directory / 'view.lua').write_text(view)
+        app = subprocess.Popen([str(BINARY), 'run', str(directory / 'ouro.json'), '--dev', '--software'], env=app_env,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app)
+            state = lambda: call(endpoint, 'State')['structuredContent']
+            for attempt in range(2):  # it can be opened again, and fails again
+                if attempt:
+                    assert call(endpoint, 'Open')['structuredContent']['open'] is True
+                wait_for(lambda: state()['open'] is False and f'({reason})' in state().get('error', ''),
+                         f'{reason} failure never reached the chart')
+                assert inspect(app_env, endpoint).get('windows', []) == [], 'no surface may remain'
+            assert app.poll() is None, 'a failed bound surface must not exit the app'
+            print(f'PASS launcher surface {reason} failure: hidden with "{state()["error"]}"')
+        finally:
+            terminate(app)
+            errors = app.stderr.read()
+            assert 'panic' not in errors and 'leaked' not in errors, errors
+
+
+def surface_events_test(root, env):
+    """A window bound with send = actor reports mapped, close_requested and closed."""
+    source = root / 'surface-probe.lua'
+    source.write_text('''local o=require('ouro'); local machine=o.machine; local assign=machine.assign
+local probe=machine.create{id='probe',initial='closed',context={log={}},events={OPEN={},CLOSE={}},
+ actions={log=assign{log=function(c,e)
+  local l={} for i,v in ipairs(c.log) do l[i]=v end
+  l[#l+1]=e.type..(e.width and (':'..e.width..'x'..e.height) or '') return l end}},
+ on={['surface.*']={actions='log'}},
+ states={closed={on={OPEN='open'}},
+  open={on={CLOSE='closed',['surface.close_requested.probe']={target='closed',actions='log'}}}}}
+local actor=probe:actor()
+return o.app{id='dev.ourokit.surface-probe',
+ actions=machine.actions(actor,{
+  Open={event='OPEN',description='open'},
+  Log={description='log',output=function(s) return {log=machine.plain(s.context.log),open=machine.matches(s,'open')} end,
+   output_schema={type='object',properties={log={type='array',items={type='string'}},open={type='boolean'}}}}}),
+ run=function() actor:start(); actor:send('OPEN')
+  return {windows=function()
+   if not actor:matches('open') then return {} end
+   return {o.window{id='probe',title='Probe',width=320,height=200,send=actor,content=function() return o.text{key='t',text='probe'} end}}
+  end} end}
+''')
+    app_env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'])
+    app = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--software'], env=app_env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app)
+        log = lambda: call(endpoint, 'Log')['structuredContent']
+        mapped = wait_for(lambda: [e for e in log()['log'] if e.startswith('surface.mapped.probe:')], 'mapped never arrived')
+        assert mapped == ['surface.mapped.probe:320x200'], mapped
+        # The compositor's close request goes to the chart, which closes.
+        sway(app_env, '[app_id="dev.ourokit.surface-probe"]', 'kill')
+        wait_for(lambda: log()['open'] is False, 'close request did not reach the chart')
+        wait_for(lambda: log()['log'][-1] == 'surface.closed.probe', 'closed never arrived after teardown')
+        assert inspect(app_env, endpoint).get('windows', []) == []
+        call(endpoint, 'Open')
+        wait_for(lambda: log()['log'].count('surface.mapped.probe:320x200') == 2, 'reopened surface did not map')
+        assert log()['log'] == ['surface.mapped.probe:320x200', 'surface.close_requested.probe', 'surface.closed.probe',
+                                'surface.mapped.probe:320x200'], log()
+        print('PASS surface events: mapped with size, close_requested decided by the chart, closed after teardown, reopen')
+    finally:
+        terminate(app)
+        errors = app.stderr.read()
+        assert 'panic' not in errors and 'leaked' not in errors, errors
+
+
 def suite(root, env):
     assert BINARY.is_file(), f"missing {BINARY}; wait for /tmp/ouro-desktop-build.log then build"
     focus_test(root, env)
+    surface_events_test(root, env)
     launcher_test(root, env)
+    launcher_surface_failure_test(root, env)
     document_test(root, env)
     parent_lifetime_test(root, env)
     drag_test(root, env)

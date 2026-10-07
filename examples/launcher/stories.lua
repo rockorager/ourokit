@@ -4,7 +4,7 @@
 --   ouroctl storybook snapshot examples/launcher/stories.lua --output frames
 local ouro = require("ouro")
 local model = require("model")
-local view = require("view")(ouro, model)
+local view = require("view")(ouro, model, ouro.machine.selector(model.results))
 local null = ouro.json.null
 
 local function entry(id, name, icon, comment, generic)
@@ -55,13 +55,13 @@ end
 local stories = {
   story("loading", "Scanning (first open)", drive { scanned = false }),
   story("ready", "Ready, second row selected", drive({}, { { type = "MOVE", delta = 1 } })),
-  story("filtered", "Filtered by “te”", drive({}, { { type = "QUERY", text = "te" }, { type = "MOVE", delta = 1 } })),
-  story("launching", "Launching", drive({}, { { type = "QUERY", text = "fire" }, "ACTIVATE" })),
+  story("filtered", "Filtered by “te”", drive({}, { { type = "QUERY", value = "te" }, { type = "MOVE", delta = 1 } })),
+  story("launching", "Launching", drive({}, { { type = "QUERY", value = "fire" }, "ACTIVATE" })),
   story("launch-error", "Launch failed", drive({ launch_error = { name = "NoExec", message = "Vim has no Exec line" } },
-    { { type = "QUERY", text = "vim" }, "ACTIVATE", "run" })),
+    { { type = "QUERY", value = "vim" }, "ACTIVATE", "run" })),
   story("discovery-error", "Discovery failed",
     drive { scan_error = { name = "ApplicationDiscoveryUnavailable", message = "ApplicationDiscoveryUnavailable" } }),
-  story("no-match", "No matches", drive({}, { { type = "QUERY", text = "zzz" } })),
+  story("no-match", "No matches", drive({}, { { type = "QUERY", value = "zzz" } })),
 }
 
 return ouro.storybook { stories = stories }

@@ -602,7 +602,14 @@ pub const SourceGeneration = struct {
             const handle = self.ui_task.?;
             self.ui_task = null;
             try self.application.finishUi(&self.vm, handle);
-            _ = try self.refreshWindows();
+            _ = self.refreshWindows() catch |err| blk: {
+                // A bound surface's own rejection is not fatal: the app starts
+                // with no windows and the runner reports it to the surface's
+                // target when it retries the evaluation.
+                if (self.application.rejection == null) return err;
+                std.log.err("window declaration failed: {s}", .{@errorName(err)});
+                break :blk false;
+            };
             for (self.prepared_builds) |*prepared| prepared.deinit();
             self.allocator.free(self.prepared_builds);
             self.prepared_builds = &.{};
@@ -793,6 +800,9 @@ pub const SourceGeneration = struct {
         self.application.windows = candidate.windows;
         self.application.output_templates = candidate.output_templates;
         try owners.complete(work);
+        // Committed: remember each surface's `send` target for its events.
+        self.application.bindSurfaces() catch |err|
+            std.log.err("surface event binding failed: {s}", .{@errorName(err)});
         return true;
     }
 
@@ -1326,4 +1336,82 @@ test "reactive windows track signals, retain output identities, and roll back in
     while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
     try std.testing.expect(try generation.refreshWindows());
     try std.testing.expectEqualStrings("launcher", generation.application.windows[0].declaration.id());
+}
+
+test "bound surfaces report rejected declarations to their send target" {
+    const allocator = std.testing.allocator;
+    const snapshot = try bundle.SourceSnapshot.initApplication(allocator, "surfaces.lua",
+        \\local ouro = require('ouro')
+        \\mode = ouro.signal('ok')
+        \\log = {}
+        \\local function record(e) log[#log + 1] = e.type .. ':' .. tostring(e.reason or e.width) .. ':' .. tostring(e.message or e.height) end
+        \\local content = function() end
+        \\return ouro.app { id = 'dev.ouro.surfaces', run = function()
+        \\  return { windows = function()
+        \\    if mode() == 'none' then return {} end
+        \\    return { ouro.window { id = 'probe', title = 'Probe', send = record, content = content,
+        \\      background = mode() == 'color' and '#zz' or nil,
+        \\      on_close_request = mode() == 'both' and content or nil } }
+        \\  end }
+        \\end }
+    , "dev.ouro.surfaces");
+    var loop: io_loop.Loop = undefined;
+    try loop.init(allocator, 32, 16);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(allocator, 8, 4, 8);
+    defer scheduler.deinit();
+    const generation = try SourceGeneration.create(allocator, &scheduler, &loop, snapshot, null, .{}, null);
+    defer generation.destroy();
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    try std.testing.expect(!(try generation.refreshWindows())); // run already evaluated it
+    try std.testing.expectEqual(@as(usize, 1), generation.application.windows.len);
+    try std.testing.expect(generation.application.windows[0].send_reference != lua_c.no_reference);
+
+    // Committed surfaces are bound: deliver() reaches the target by id.
+    const deliver = try generation.application.surfaceFunction("deliver");
+    defer lua_c.luaL_unref(generation.vm.state, lua_c.registry_index, deliver);
+    _ = try generation.vm.spawnReference(scheduler.application_scope, deliver, &.{
+        .{ .string = "probe" }, .{ .string = "mapped" }, .{ .integer = 300 }, .{ .integer = 200 },
+    });
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+
+    // A rejected declaration keeps the last list and names the bound surface.
+    for ([_][]const u8{ "color", "both" }, [_]anyerror{ error.InvalidThemeColor, error.ConflictingWindowCloseHandlers }) |mode, expected| {
+        const source = try std.fmt.allocPrint(allocator, "mode:set('{s}')", .{mode});
+        defer allocator.free(source);
+        _ = try generation.vm.spawnApplication(source);
+        while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+        const retained = generation.application.windows.ptr;
+        try std.testing.expectError(expected, generation.refreshWindows());
+        try std.testing.expectEqual(retained, generation.application.windows.ptr);
+        const rejection = generation.application.takeRejection().?;
+        defer generation.application.releaseRejection(rejection);
+        try std.testing.expectEqualStrings("probe", rejection.id);
+        try std.testing.expectEqual(expected, rejection.err);
+        const deliver_to = try generation.application.surfaceFunction("deliver_to");
+        defer lua_c.luaL_unref(generation.vm.state, lua_c.registry_index, deliver_to);
+        _ = try generation.vm.spawnReference(scheduler.application_scope, deliver_to, &.{
+            .{ .registry = rejection.send_reference }, .{ .string = rejection.id }, .{ .string = "failed" },
+            .{ .string = "declaration" },                .{ .string = @errorName(rejection.err) },
+        });
+        while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    }
+    // Failures outside a bound surface have no target to report to.
+    _ = try generation.vm.spawnApplication("mode:set('none')");
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    try std.testing.expect(try generation.refreshWindows());
+    try std.testing.expectEqual(@as(?lua.WindowRejection, null), generation.application.takeRejection());
+    // A dropped surface stays bound, so its closed event still arrives.
+    _ = try generation.vm.spawnReference(scheduler.application_scope, deliver, &.{ .{ .string = "probe" }, .{ .string = "closed" } });
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    _ = try generation.vm.spawnApplication(
+        \\assert(table.concat(log, ',') == 'surface.mapped.probe:300:200,' ..
+        \\  'surface.failed.probe:declaration:InvalidThemeColor,' ..
+        \\  'surface.failed.probe:declaration:ConflictingWindowCloseHandlers,' ..
+        \\  'surface.closed.probe:nil:nil', table.concat(log, ','))
+        \\checked = true
+    );
+    while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
+    try std.testing.expect(generation.vm.globalBoolean("checked"));
 }

@@ -13,6 +13,7 @@ pub const type_number = 3;
 pub const type_string = 4;
 pub const type_table = 5;
 pub const type_function = 6;
+pub const type_userdata = 7;
 pub const registry_index = -(std.math.maxInt(c_int) / 2 + 1000);
 pub const no_reference = -2;
 

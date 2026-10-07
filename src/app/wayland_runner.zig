@@ -73,6 +73,11 @@ const RuntimeSlot = struct {
     content_reference: c_int = lua_c.no_reference,
     content_changed: bool = false,
     desired: bool = false,
+    /// Declared with `send = target`: lifecycle events go to the target.
+    /// Kept after the declaration drops the surface, for `closed`.
+    bound: bool = false,
+    /// The native surface `surface.mapped` was sent for, until `closed`.
+    mapped_handle: ?core.Handle = null,
     configured_size: ?core.SizeU = null,
     frames_seen: usize = 0,
     runtime: WindowRuntime = .{},
@@ -631,6 +636,7 @@ fn runSourceInternal(
     const development_windows = try init.gpa.alloc(development_control.Window, if (options.development) options.application_window_capacity else 0);
     defer init.gpa.free(development_windows);
     try syncRuntimeSlots(init.gpa, runtime_slots, application.windows);
+    try application.bindSurfaces();
     var popups: PopupHost = .{ .allocator = init.gpa, .windows = &window_set, .host = &host, .callbacks = &callbacks, .slots = runtime_slots };
     callbacks.popup_provider = .{ .context = &popups, .open = PopupHost.open, .close = PopupHost.close, .resize = PopupHost.resize };
     var drag_host: DragHost = .{ .host = &host };
@@ -673,6 +679,7 @@ fn runSourceInternal(
     var queued_reload_sequence: ?u64 = null;
     var animation_timer: @import("animation_timer.zig").Timer = .{};
     defer animation_timer.stop(&loop) catch unreachable;
+    var rejected_surface: RejectedSurface = .{};
 
     while (true) {
         const shutdown_signal = try loop.receivedSignal();
@@ -717,6 +724,11 @@ fn runSourceInternal(
                     if (slotForNativeHandle(&window_set, runtime_slots, handle)) |slot| {
                         if (slot.desired) {
                             if (applicationWindowForId(active_application.windows, slot.id.?)) |window| {
+                                // A bound surface's chart decides; nothing closes here.
+                                if (window.send_reference != lua_c.no_reference) {
+                                    try sendSurfaceEvent(active_generation, slot.id.?, "close_requested", &.{});
+                                    continue;
+                                }
                                 if (window.on_close_request >= 0) {
                                     _ = try active_generation.vm.spawnReference(try window_set.scope(handle), window.on_close_request, &.{});
                                     continue;
@@ -733,6 +745,17 @@ fn runSourceInternal(
                             .width = configured.width,
                             .height = configured.height,
                         };
+                        const mapped = if (slot.mapped_handle) |handle| sameHandle(handle, configured.window) else false;
+                        if (slot.bound and slot.declared and !mapped) {
+                            // A reopen can replace the surface before the old
+                            // one's closed was seen in the slot loop.
+                            if (slot.mapped_handle != null)
+                                try sendSurfaceEvent(active_generation, slot.id.?, "closed", &.{});
+                            slot.mapped_handle = configured.window;
+                            try sendSurfaceEvent(active_generation, slot.id.?, "mapped", &.{
+                                .{ .integer = configured.width }, .{ .integer = configured.height },
+                            });
+                        }
                         if (slot.runtime.registered) _ = try dirty.markDirty(configured.window);
                     }
                 },
@@ -892,8 +915,18 @@ fn runSourceInternal(
         if (!disconnect_started and host.failure == null and shutdown_signal == null and active_generation.vm.exit_code == null) {
             const rebuilt = active_generation.refreshWindows() catch |err| blk: {
                 std.log.err("window declaration failed: {s}", .{@errorName(err)});
+                // The last valid list stays. A bound surface hears why, once
+                // per distinct failure, since evaluation retries.
+                if (active_application.takeRejection()) |rejection| {
+                    defer active_application.releaseRejection(rejection);
+                    if (!rejected_surface.matches(rejection)) {
+                        rejected_surface.remember(rejection);
+                        try sendSurfaceRejection(active_generation, rejection);
+                    }
+                }
                 break :blk false;
             };
+            if (rebuilt) rejected_surface.clear();
             if (rebuilt) {
                 for (host.outputs) |output| if (output.name) |name| {
                     _ = try active_application.expandOutput(name, runtime_slots.len);
@@ -999,6 +1032,15 @@ fn runSourceInternal(
                 slot.text_input_generation = null;
                 slot.text_input_surface_focused = false;
                 slot.text_input_revision = null;
+                if (slot.mapped_handle) |mapped| {
+                    const current = window_set.handleForId(slot.id.?);
+                    // Teardown finished, or a reopen replaced the surface.
+                    if (current == null or !sameHandle(current.?, mapped)) {
+                        slot.mapped_handle = null;
+                        if (!disconnect_started and active_generation.vm.exit_code == null)
+                            try sendSurfaceEvent(active_generation, slot.id.?, "closed", &.{});
+                    }
+                }
                 if (window_set.handleForId(slot.id.?) == null) {
                     slot.runtime.deinit();
                     slot.runtime = .{};
@@ -1086,6 +1128,15 @@ fn runSourceInternal(
                 // a mounted runtime while unwinding this stack.
                 std.log.err("initial window build failed ({s}): {s}", .{ active_generation.snapshot.entry_name, @errorName(err) });
                 try dirty.complete(work);
+                // A bound surface closes and tells its chart instead.
+                if (slot.bound and slot.declared and slot.popup == null) {
+                    slot.desired = false;
+                    desired_changed = true;
+                    try sendSurfaceEvent(active_generation, slot.id.?, "failed", &.{
+                        .{ .string = "content" }, .{ .string = @errorName(err) },
+                    });
+                    continue;
+                }
                 active_generation.vm.exit_code = 1;
                 desired_changed = true;
                 break;
@@ -1957,6 +2008,54 @@ fn shutdownControl(
     control.deinit();
 }
 
+/// Spawns `surface.<kind>.<id>` delivery as an application-scope task, so
+/// the chart receives it in the task phase through its normal queue.
+fn sendSurfaceEvent(
+    generation: *source_generation.SourceGeneration,
+    id: []const u8,
+    kind: []const u8,
+    extra: []const lua.TaskArgument,
+) !void {
+    var arguments: [4]lua.TaskArgument = undefined;
+    arguments[0] = .{ .string = id };
+    arguments[1] = .{ .string = kind };
+    for (extra, 2..) |argument, index| arguments[index] = argument;
+    const reference = try generation.application.surfaceFunction("deliver");
+    defer lua_c.luaL_unref(generation.vm.state, lua_c.registry_index, reference);
+    _ = try generation.vm.spawnReference(generation.vm.scheduler.application_scope, reference, arguments[0 .. 2 + extra.len]);
+}
+
+fn sendSurfaceRejection(generation: *source_generation.SourceGeneration, rejection: lua.WindowRejection) !void {
+    const reference = try generation.application.surfaceFunction("deliver_to");
+    defer lua_c.luaL_unref(generation.vm.state, lua_c.registry_index, reference);
+    _ = try generation.vm.spawnReference(generation.vm.scheduler.application_scope, reference, &.{
+        .{ .registry = rejection.send_reference }, .{ .string = rejection.id }, .{ .string = "failed" },
+        .{ .string = "declaration" },                .{ .string = @errorName(rejection.err) },
+    });
+}
+
+/// The last rejection reported, so retried evaluation does not repeat it.
+const RejectedSurface = struct {
+    id: [64]u8 = undefined,
+    id_len: usize = 0,
+    err: ?[]const u8 = null,
+
+    fn matches(self: *const RejectedSurface, rejection: lua.WindowRejection) bool {
+        const err = self.err orelse return false;
+        return std.mem.eql(u8, err, @errorName(rejection.err)) and std.mem.eql(u8, self.id[0..self.id_len], rejection.id[0..@min(rejection.id.len, self.id.len)]);
+    }
+
+    fn remember(self: *RejectedSurface, rejection: lua.WindowRejection) void {
+        self.id_len = @min(rejection.id.len, self.id.len);
+        @memcpy(self.id[0..self.id_len], rejection.id[0..self.id_len]);
+        self.err = @errorName(rejection.err);
+    }
+
+    fn clear(self: *RejectedSurface) void {
+        self.* = .{};
+    }
+};
+
 fn syncRuntimeSlots(
     allocator: std.mem.Allocator,
     slots: []RuntimeSlot,
@@ -1978,6 +2077,7 @@ fn syncRuntimeSlots(
         target.content_changed = target.declared and
             target.content_reference != declaration.content_reference;
         target.content_reference = declaration.content_reference;
+        target.bound = declaration.send_reference != lua_c.no_reference;
         if (!target.declared) {
             target.desired = true;
             target.frames_seen = 0;

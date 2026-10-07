@@ -4,7 +4,6 @@
 -- charts.lua holds the behavior, view.lua the UI, model.lua search.
 local ouro = require("ouro")
 local model = require("model")
-local view = require("view")(ouro, model)
 
 -- Start a prepared command as a transient systemd user service, the way
 -- desktop shells do. Lua has no process spawning; `prepare_launch` only
@@ -47,25 +46,36 @@ local charts = require("charts")(ouro, model, {
   end,
 })
 
+local view = require("view")(ouro, model, charts.results)
+
 -- Created at load, started by `run`. Activation is delivered before `run` on
--- the first launch, so events before start are dropped: `run` opens.
+-- the first launch; until the actor has started those events are dropped,
+-- and `run` opens.
 local launcher = charts.launcher:actor()
-local started = false
 local function send(type)
-  if started then launcher:send(type) end
+  if launcher:started() then launcher:send(type) end
 end
 
-local function event(type)
-  return {
-    description = "Send " .. type .. " to the launcher chart.",
-    inputSchema = { type = "object", additionalProperties = false },
-    outputSchema = { type = "object", properties = { open = { type = "boolean" } }, required = { "open" } },
-    handler = function()
-      send(type)
-      return { open = launcher:matches("open") }
-    end,
-  }
+local function state(snapshot)
+  return { open = ouro.machine.matches(snapshot, "open"), error = snapshot.context.error }
 end
+local output_schema = {
+  type = "object", additionalProperties = false, required = { "open" },
+  properties = { open = { type = "boolean" }, error = { type = "string" } },
+}
+local function action(event, description)
+  return { event = event, description = description, output = state, output_schema = output_schema }
+end
+local mcp = ouro.machine.actions(launcher, {
+  Toggle = action("TOGGLE", "Show the launcher if hidden, hide it if open."),
+  Open = action("OPEN", "Show the launcher."),
+  Close = action("CLOSE", "Hide the launcher."),
+  State = { description = "Whether the launcher is open, and the last error.", output = state, output_schema = output_schema },
+}, {
+  before = function(actor)
+    if not actor:started() then return ouro.action_error("NotRunning", {}) end
+  end,
+})
 
 local actions = { toggle = "TOGGLE", open = "OPEN", close = "CLOSE" }
 
@@ -80,10 +90,9 @@ return ouro.app {
     end
     send(actions[name])
   end,
-  actions = { Toggle = event("TOGGLE"), Open = event("OPEN"), Close = event("CLOSE") },
+  actions = mcp,
   run = function()
     launcher:start()
-    started = true
     launcher:send("OPEN")
     return { windows = view.windows(launcher) }
   end,
