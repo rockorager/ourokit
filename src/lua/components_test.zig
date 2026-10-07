@@ -771,3 +771,69 @@ test "signal dirty scans track live extent through holes rollback and retirement
     try std.testing.expect(!f.signals.readerDirty(null));
     try f.signals.abortEvaluation(first, 3);
 }
+
+test "stateful unmount hooks run once when an instance leaves, never for survivors" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\left = {}
+        \\local function tracked(kind)
+        \\  return ouro.stateful(function(props)
+        \\    return function() return ouro.box {key='value', width=1} end,
+        \\      function() left[#left + 1] = kind .. ':' .. props.label end
+        \\  end)
+        \\end
+        \\A, B = tracked('a'), tracked('b')
+        \\show, swap, extra, bad = ouro.signal(true), ouro.signal(false), ouro.signal(false), ouro.signal(false)
+        \\function build()
+        \\  return ouro.row {key='root', A {key='kept', label='kept'},
+        \\    show() and (swap() and B or A) {key='item', label='item'} or nil,
+        \\    extra() and A {key='extra', label='extra'} or nil,
+        \\    bad() and ouro.box {key='dup'} or nil, bad() and ouro.box {key='dup'} or nil}
+        \\end
+        \\function seen() local out = '' for i = 1, #left do out = out .. (i > 1 and ',' or '') .. left[i] end return out end
+    );
+    try f.build();
+    try f.expect("seen() == ''");
+    try f.exec("show:set(false)");
+    try f.build();
+    try f.expect("seen() == 'a:item'");
+    // Remounting creates a new instance; nothing else leaves.
+    try f.exec("show:set(true)");
+    try f.build();
+    try f.expect("seen() == 'a:item'");
+    // Reusing the key with another definition replaces the instance.
+    try f.exec("swap:set(true)");
+    try f.build();
+    try f.expect("seen() == 'a:item,a:item'");
+    // An instance first initialized by a failed build never mounted: its hook
+    // runs on rollback, and the committed instances are untouched.
+    try f.exec("extra:set(true); bad:set(true)");
+    try std.testing.expectError(error.DuplicateInstanceId, f.build());
+    try f.expect("seen() == 'a:item,a:item,a:extra'");
+    try f.exec("extra:set(false); bad:set(false)");
+    try f.build();
+    try f.expect("seen() == 'a:item,a:item,a:extra'");
+    // Disposing the owner (window teardown) unmounts what is left, once.
+    f.ui.disposeOwner(&f.owners, f.owner);
+    try f.expect("seen() == 'a:item,a:item,a:extra,a:kept,b:item' or seen() == 'a:item,a:item,a:extra,b:item,a:kept'");
+    f.ui.disposeOwner(&f.owners, f.owner);
+    try f.expect("#left == 5");
+}
+
+test "a failing unmount hook is reported and does not break the commit" {
+    const f = try Fixture.create();
+    defer f.destroy();
+    try f.exec(
+        \\show = ouro.signal(true)
+        \\local Broken = ouro.stateful(function()
+        \\  return function() return ouro.box {key='value'} end, function() error('cleanup failed') end
+        \\end)
+        \\function build() return ouro.row {key='root', show() and Broken {key='broken'} or nil} end
+    );
+    try f.build();
+    try f.exec("show:set(false)");
+    try f.build();
+    try f.exec("show:set(true)");
+    try f.build();
+}

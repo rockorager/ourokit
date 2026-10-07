@@ -195,6 +195,19 @@ identity remains stable. Initialization is provisional until the build commits;
 a failed build can discard it and retry. Initializers must also avoid external
 side effects, signal writes, and yielding operations.
 
+An initializer may return a second function, `return render, on_unmount`. The
+runtime calls it exactly once when that instance leaves:
+- it is unmounted;
+- its key is reused by a different component;
+- its window or owner is disposed;
+- or the build that first initialized it is rolled back.
+
+It runs after the reconciliation transaction, so it may write signals, but it
+must not yield. Errors are reported on stderr; they do not undo the unmount.
+`ouro.machine.component` uses it to stop the instance's actor, which cancels
+the actor's timers and invokes. A remounted instance starts over with fresh
+state.
+
 Props are read through the stable, read-only `props` userdata captured by the
 initializer. Read changing props inside the rebuild function or event handler;
 copying a scalar such as `local title = props.title` during initialization

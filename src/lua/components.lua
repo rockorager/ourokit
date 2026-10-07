@@ -1,8 +1,19 @@
 -- Private retained-description runtime. All records belong to this Lua VM;
 -- preparing a generation never mounts native owners or changes live scopes.
-local select_reader, dirty, next, assert, make_props, is_function, build_list, geometry, restart_reader = ...
+local select_reader, dirty, next, assert, make_props, is_function, build_list, geometry, restart_reader, call_unmount = ...
 local windows, serial, transaction = {}, 0, nil
 local M = {}
+
+-- An initializer may return a second function: it runs once, after the
+-- transaction, when that committed instance leaves (unmounted, its key reused
+-- by another definition, or its owner disposed). call_unmount reports errors
+-- instead of propagating them: unmounting has already happened.
+local function unmount(record)
+    local hook = record.unmount
+    if not hook then return end
+    record.unmount = nil
+    call_unmount(hook)
+end
 
 local function equal(a, b)
     if a == b then return true end
@@ -99,8 +110,10 @@ function M.render(definition, props, children, parent, visual_parent)
         update.retained = false
         restart_reader(record.token)
         if not old then
-            record.render = definition[1](record.proxy)
+            record.render, record.unmount = definition[1](record.proxy)
             assert(is_function(record.render), "component initializer must return a render function")
+            assert(record.unmount == nil or is_function(record.unmount),
+                "component initializer's second result must be an unmount function")
         end
         update.output = { value = record.render() }
     end
@@ -250,26 +263,44 @@ function M.commit()
         update.record.output = update.output
         update.record.props = update.props
     end
+    -- Committed instances that did not survive, plus new ones that were
+    -- initialized and then dropped within this transaction.
+    local left = {}
+    for _, records in next, { t.old.mounts, t.staged_mounts } do
+        for identity, record in next, records do
+            if t.next.mounts[identity] ~= record then left[record] = true end
+        end
+    end
     t.group[t.owner] = t.next
     t.old, t.updates, t.group = nil, nil, nil
     t.proposals, t.staged_mounts, t.staged_lists, t.staged_builders = nil, nil, nil, nil
     transaction = nil
+    for record in next, left do unmount(record) end
 end
 
 function M.rollback()
     if not transaction then return end
-    for index = 1, #transaction.updates do
-        local update = transaction.updates[index]
+    local t = transaction
+    for index = 1, #t.updates do
+        local update = t.updates[index]
         update.record.values = update.previous
     end
     transaction = nil
+    -- Instances first initialized by the failed build never mounted.
+    for identity, record in next, t.staged_mounts do
+        if t.old.mounts[identity] ~= record then unmount(record) end
+    end
 end
 
 function M.dispose(registry, owner)
     local group = windows[registry]
     if group then
+        local mounted = group[owner]
         group[owner] = nil
         if not next(group) then windows[registry] = nil end
+        if mounted then
+            for _, record in next, mounted.mounts do unmount(record) end
+        end
     end
 end
 

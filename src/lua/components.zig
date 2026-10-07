@@ -40,7 +40,8 @@ pub const Components = struct {
         c.lua_pushcclosure(state, geometry, 1);
         c.lua_pushlightuserdata(state, self);
         c.lua_pushcclosure(state, restartReader, 1);
-        if (c.lua_pcallk(state, 9, 1, 0, 0, null) != c.ok) return error.ComponentRuntimeLoadFailed;
+        c.lua_pushcclosure(state, callUnmount, 0);
+        if (c.lua_pcallk(state, 10, 1, 0, 0, null) != c.ok) return error.ComponentRuntimeLoadFailed;
         self.reference = c.luaL_ref(state, c.registry_index);
     }
 
@@ -82,6 +83,18 @@ pub const Components = struct {
 
     // Private primitives let the runtime use ordinary Lua without installing
     // global standard libraries or broadening the application's capabilities.
+    /// Runs one unmount hook protected. Unmounting has already happened, so a
+    /// failure is reported on stderr and never reaches the commit.
+    fn callUnmount(state: *c.State) callconv(.c) c_int {
+        c.lua_settop(state, 1);
+        if (c.lua_pcallk(state, 0, 0, 0, 0, null) != c.ok) {
+            var length: usize = 0;
+            const message = c.lua_tolstring(state, -1, &length) orelse "non-string Lua error";
+            @import("std").debug.print("Lua: component unmount failed: {s}\n", .{message[0..length]});
+        }
+        return 0;
+    }
+
     fn next(state: *c.State) callconv(.c) c_int {
         c.lua_settop(state, 2);
         if (c.lua_next(state, 1) != 0) return 2;
