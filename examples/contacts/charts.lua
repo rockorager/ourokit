@@ -13,7 +13,7 @@ return function(ouro, model, services)
     id = "contacts", initial = "loading",
     context = { contacts = {}, pending = {}, draft = "" },
     events = {
-      SELECT = { id = "string" }, EDIT = { value = "string" }, RENAME = { id = "string", name = "string" },
+      SELECT = { id = "string" }, RENAME = { id = "string", name = "string" },
       RETRY = {}, QUIT = {},
     },
     guards = {
@@ -33,7 +33,6 @@ return function(ouro, model, services)
           selected = first and first.id or unset, draft = first and first.name or "" }
       end),
       select = assign(function(c, e) return { selected = e.id, draft = model.find(c.contacts, e.id).name } end),
-      edit = assign { draft = function(_, e) return e.value end },
       rename = assign(function(c, e)
         return { contacts = model.replaced(c.contacts, model.renamed(model.find(c.contacts, e.id), e.name)),
           pending = model.with(c.pending, e.id), draft = c.selected == e.id and e.name or c.draft }
@@ -68,7 +67,7 @@ return function(ouro, model, services)
       ready = { type = "parallel", order = { "sync", "lifecycle" },
         on = {
           SELECT = { guard = "known", actions = "select" },
-          EDIT = { actions = "edit" },
+          EDIT = machine.set("draft", "string"),
           RENAME = { guard = "renames", actions = "rename" },
         },
         states = {
@@ -93,8 +92,8 @@ return function(ouro, model, services)
 
   -- Presentation only: which visual style the window uses.
   local appearance = machine.create {
-    id = "appearance", initial = "light", events = { TOGGLE = {} },
-    states = { light = { on = { TOGGLE = "terminal" } }, terminal = { on = { TOGGLE = "light" } } },
+    id = "appearance", initial = "shown", context = { style = "light" },
+    states = { shown = { on = { STYLE = machine.set("style", "string") } } },
   }
 
   return { book = book, appearance = appearance }

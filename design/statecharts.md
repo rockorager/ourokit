@@ -413,26 +413,50 @@ Collapsible { key = 'details', title = 'Details', ... }
 
 ## 7. Widgets send events
 
-`actor:event(event [, field])` returns a plain binding,
-`{ actor, event, field }`, validated at render like `can()`. Widgets accept it
-wherever they accept a callback; the widget work is the send= widgets thread's.
-- **Activation widgets** (button, menu item, command, shortcut) send the event
-  as is, and `enabled` defaults to `actor:can(event)`.
-- **Value widgets** (text input, switch, select, listbox, tabs, split view,
-  ...) send a copy with `[field or 'value'] = <new value>`, matching
-  `machine.set`. Their `enabled` defaults to `can()` of the event carrying the
-  current value.
+`actor:event(event [, field])` returns a plain binding, `{ actor, event,
+field }`, validated at render like `can()`. Widgets take one in `send`, their
+main trigger. Every `on_*` hook also accepts one, and so do `commands`
+entries and a text input's `on_command` map. The binding is lowered in
+`src/lua/controls.lua`, which wraps the native `box`, `row`, `column`,
+`split` and `text_editor` constructors. Recipes such as button, tabs and
+select pass bindings through to them.
 
 ```lua
 ouro.button { key = 'save', label = 'Save', send = doc:event('SAVE') }
-ouro.text_input { key = 'query', text = launcher:context().query, send = launcher:event('QUERY') }
+ouro.text_input { key = 'query', text = c.query, send = launcher:event('QUERY') }
+ouro.split_view { key = 'split', position = c.split, send = notes:event('RESIZE', 'position'), ... }
+ouro.tabs { key = 'tabs', selected = c.selected, send = notes:event('SELECT'), on_close = notes:event('CLOSE_TAB'), tabs = ... }
+ouro.box { key = 'scrim', commands = { close = launcher:event('CLOSE') }, shortcuts = { Escape = 'close' }, ... }
+ouro.text_input { ..., on_command = { submit = launcher:event('ACTIVATE'), cancel = launcher:event('CLOSE') } }
+ouro.menu_button { key = 'more', label = 'More', items = {
+  { key = 'save', label = 'Save', send = doc:event('SAVE') },
+} }
 ```
 
-`actor:sender(event)` still returns a function, for windows and direct calls.
+- **Activations** (`on_press`, button and menu item `send`, `on_cancel`,
+  `commands`) send the event as is. Unless `enabled` is set, the widget is
+  enabled while `actor:can(event)` holds. A refused command is left out with
+  its shortcuts, so the key falls through to outer scopes as if unbound. A
+  refused dialog `on_cancel` leaves Escape unhandled.
+- **Value hooks** (`on_change`, `on_select`, `on_activate`, drops; `send` on
+  text input, switch, checkbox, slider, select, spinbox, listbox, tabs, split
+  view, collapsible) send a copy of the event with the new value in
+  `field`, which defaults to `value`, matching `machine.set`. The view reads
+  the value back from the actor's context: `text = c.query`. Value widgets
+  stay enabled unless `enabled` says otherwise. Their payload is unknown at
+  render, and checking can() with the current value fails for guards such as
+  documents' "the edit changes something", which would lock the input.
+- **Tracking.** `can()` reads the actor's snapshot signal. Recipes lower at
+  composition time, and a direct primitive lowers where it is declared, so
+  either way the enclosing build tracks the read and enablement follows the
+  chart.
+- `send` and the classic hook on one widget are an error. Functions remain an
+  escape hatch for imperative calls, not a way to hold state.
+- `actor:sender(event)` still returns a function, for windows and direct calls.
 
-Registry-anchored callback closures go away. The enabled state and the action
-have one source of truth. A disabled button and a rejected MCP call fail for
-the same reason, and the inspector shows that reason.
+The enabled state and the action have one source of truth. A disabled button
+and a rejected MCP call fail for the same reason, and the inspector shows that
+reason.
 
 Some imperative calls must stay in callbacks for now: `ouro.start_drag`, and
 anything else that needs real press provenance. They report failures as events
@@ -796,19 +820,20 @@ application-scope task in the task phase. See the
 
 [`examples/contacts`](../examples/contacts) loads its address book from an
 optional HTTP server (`server.json` in its config directory) or the built-in
-sample, and saves renames with `PUT`. `contacts` is the domain chart and
-`appearance` (`light` / `terminal`) the only UI chart.
+sample, and saves renames with `PUT`. `contacts` is the domain chart.
+`appearance` holds the window style in context
+(`STYLE = machine.set('style', 'string')`).
 
 ```lua
 book = machine.create {
   id = 'contacts', initial = 'loading', context = { contacts = {}, pending = {}, draft = '' },
-  events = { SELECT = {id='string'}, EDIT = {value='string'}, RENAME = {id='string', name='string'}, RETRY = {}, QUIT = {} },
+  events = { SELECT = {id='string'}, RENAME = {id='string', name='string'}, RETRY = {}, QUIT = {} },
   states = {
     loading = { invoke = { src='load', on_done={target='ready', actions='loaded'}, on_error={target='failed', actions='fail'} },
                 on = { QUIT = 'exiting' } },
     failed  = { on = { RETRY = 'loading', QUIT = 'exiting' } },
     ready = { type = 'parallel', order = { 'sync', 'lifecycle' },
-      on = { SELECT = {guard='known', actions='select'}, EDIT = {actions='edit'}, RENAME = {guard='renames', actions='rename'} },
+      on = { SELECT = {guard='known', actions='select'}, EDIT = machine.set('draft', 'string'), RENAME = {guard='renames', actions='rename'} },
       states = {
         sync = { initial = 'idle', states = {
           idle     = { always = { target='saving', guard='pending' } },
@@ -834,18 +859,21 @@ book = machine.create {
 - `quitting.settled` reads the other region: nothing pending, or
   `ready.sync.retrying`. Quitting cancels an in-flight `PUT` only at the
   deadline or on a second Quit.
-- The MCP actions send events to this actor. `SelectContact` checks
-  `book:can(event)` first and maps a rejection to `ContactNotFound`.
-  `RenameContact` checks the id and `model.check_name` itself, because the
-  `renames` guard also rejects unchanged names, which MCP treats as a no-op.
-  `GetContacts` reads `machine.plain(context.contacts)`. Each handler first
-  waits for `loading` to end, by polling `ouro.sleep(10)`, because nothing
-  else can wait for a snapshot.
-- The rename draft is context (`EDIT`), not native text-input state. It resets
-  on selection and when the selected contact is renamed elsewhere, so it is
-  behavior and not just a field.
-- Apply name is enabled from `book:can{type='RENAME', id, name=draft}`, so the
-  button and MCP refuse empty names for the same reason.
+- The MCP actions send events to this actor. `GetContacts` and
+  `SelectContact` come from `machine.actions`: the input schema is the
+  `SELECT` declaration, and a `no_transition` rejection maps to
+  `ContactNotFound`. Their `before` hook waits with `machine.wait_for` until
+  `loading` ends. `RenameContact` stays hand-written. The chart refuses a
+  `RENAME` for an unknown id, an invalid name or an unchanged name, and
+  `send()` reports all three as `no_transition`, but MCP answers each one
+  differently: `ContactNotFound`, `InvalidName`, or the unchanged record.
+- The rename draft is context (`EDIT`, a `machine.set`), not native
+  text-input state. It resets on selection and when the selected contact is
+  renamed elsewhere.
+- The view is all `send =` bindings (§7). Apply name is
+  `send = book:event { type = 'RENAME', id = person.id, name = c.draft }`.
+  Its enabled state is `can()` of that event, so the button and MCP refuse
+  empty names for the same reason.
 
 ## 13. Open questions
 

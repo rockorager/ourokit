@@ -8,10 +8,11 @@ not need native plugins or shell APIs.
   address book, tracks selection and the rename draft, applies renames at once,
   and saves them in the background, one at a time, retrying after a failure.
   Quit waits up to five seconds for queued saves. The `appearance` chart holds
-  the only presentation mode, light or terminal style.
+  the window style, light or terminal, in its context.
 - `app.lua` is the view over the two snapshots, the services (HTTP, the
   built-in sample, exit), and the MCP actions, which send events to the same
-  chart the window uses.
+  chart the window uses. Every control sends an event binding
+  (`send = book:event(...)`) and reads its value back from the chart.
 - `model.lua` holds plain functions: the sample records, lookups,
   copy-on-write updates, name validation, and server body decoding.
 
@@ -144,8 +145,9 @@ background and the call returns the local record. The first call starts the
 chart and waits for the address book to load; a failed load returns
 `LoadFailed` with the message. Empty or multi-line names return `InvalidName`,
 the same rule that disables Apply name. Missing IDs return an `isError: true` tool result with
-`structuredContent.error.code = "ContactNotFound"` and the ID in
-`structuredContent.error.parameters.id`. The native runtime validates arguments
+`structuredContent.error.code = "ContactNotFound"`. For `RenameContact` the ID
+is in `structuredContent.error.parameters.id`. For `SelectContact`, which
+`machine.actions` builds, the parameters are the rejected event and the reason. The native runtime validates arguments
 and successful output against each action's JSON Schemas. `GetContacts` returns
 every record (500 for the sample). Runtime status/reload exist only on an explicitly enabled
 development endpoint, never in the production catalog. No `initialize`

@@ -13,7 +13,7 @@ return function(ouro, model, filter)
     return ouro.button {
       key = "row", label = model.text(entry.name) or entry.id, height = "auto",
       variant = selected and "soft" or "ghost", tone = selected and "accent" or "neutral",
-      on_press = launcher:sender { type = "ACTIVATE", index = i },
+      send = launcher:event { type = "ACTIVATE", index = i },
       children = {
         ouro.row { key = "content", gap = 12, cross_alignment = "center", padding = 6,
           icon and ouro.xdg.icon { key = "icon", name = icon, theme = "Adwaita", width = 32, height = 32, alt = "" }
@@ -45,7 +45,7 @@ return function(ouro, model, filter)
   function M.content(launcher)
     local c = launcher:context()
     local results = filter(c.entries, c.query)
-    local close = launcher:sender("CLOSE")
+    local close = launcher:event("CLOSE")
     local list
     if #results > 0 then
       list = ouro.virtual_list {
@@ -67,13 +67,13 @@ return function(ouro, model, filter)
           ouro.text_input {
             key = "search", text = c.query, label = "Search applications",
             placeholder = "Search applications…", autofocus = true,
-            on_change = function(text) launcher:send { type = "QUERY", value = text } end,
-            on_command = function(command)
-              if command == "next" then launcher:send { type = "MOVE", delta = 1 }
-              elseif command == "previous" then launcher:send { type = "MOVE", delta = -1 }
-              elseif command == "submit" then launcher:send("ACTIVATE")
-              elseif command == "cancel" then close() end
-            end,
+            send = launcher:event("QUERY"),
+            on_command = {
+              next = launcher:event { type = "MOVE", delta = 1 },
+              previous = launcher:event { type = "MOVE", delta = -1 },
+              submit = launcher:event("ACTIVATE"),
+              cancel = close,
+            },
           },
           list,
           Caption { key = "status", text = status(launcher, c, #results) },

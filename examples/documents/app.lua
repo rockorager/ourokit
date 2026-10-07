@@ -43,16 +43,16 @@ local function activate(uris) notes:send { type = "OPEN_URIS", uris = uris or {}
 local function content(doc)
   local d = doc:context()
   local function report(err) doc:send { type = "REPORT", message = model.message(err) } end
-  local function edit(field) return function(value) doc:send { type = "EDIT", field = field, value = value } end end
+  local function edit(field) return doc:event { type = "EDIT", field = field } end
   local children = {
       ouro.row {key="actions", gap=8,
-        ouro.button {key="new", label="New", on_press=notes:sender("NEW")},
-        ouro.button {key="open", label="Open…", on_press=notes:sender("OPEN")},
-        ouro.button {key="save", label="Save", enabled=doc:can("SAVE"), on_press=doc:sender("SAVE")},
-        ouro.button {key="save-as", label="Save as…", enabled=doc:can("SAVE_AS"), on_press=doc:sender("SAVE_AS")},
+        ouro.button {key="new", label="New", send=notes:event("NEW")},
+        ouro.button {key="open", label="Open…", send=notes:event("OPEN")},
+        ouro.button {key="save", label="Save", send=doc:event("SAVE")},
+        ouro.button {key="save-as", label="Save as…", send=doc:event("SAVE_AS")},
       },
-      ouro.text_input {key="title", label="Title", text=d.title, on_change=edit("title")},
-      ouro.text_input {key="text", label="Text", text=d.text, multiline=true, flex=1, on_change=edit("text")},
+      ouro.text_input {key="title", label="Title", text=d.title, send=edit("title")},
+      ouro.text_input {key="text", label="Text", text=d.text, multiline=true, flex=1, send=edit("text")},
       ouro.text {key="path", text=model.dirty(d) and ("Unsaved — "..(d.path or "no file")) or (d.path and ("Saved — "..d.path) or "New document — no file")},
       d.error and ouro.text {key="error", text=d.error} or ouro.box {key="no-error"},
       ouro.row {key="external", gap=8,
@@ -71,13 +71,13 @@ local function content(doc)
   }
   local dialog
   if doc:matches("open.lifecycle.confirming") then
-    dialog = ouro.dialog {key="close-confirm", label="Unsaved changes", width=430, on_cancel=doc:sender("CANCEL"),
+    dialog = ouro.dialog {key="close-confirm", label="Unsaved changes", width=430, on_cancel=doc:event("CANCEL"),
       ouro.column {key="body", gap=16,
         ouro.text {key="prompt",text="Save changes to “"..d.title.."” before closing?"},
         ouro.row {key="actions",gap=8,
-          ouro.button {key="cancel",label="Cancel",on_press=doc:sender("CANCEL")},
-          ouro.button {key="close-save",label="Save",enabled=doc:can("SAVE"),on_press=doc:sender("SAVE")},
-          ouro.button {key="discard",label="Discard",enabled=doc:can("DISCARD"),on_press=doc:sender("DISCARD")},
+          ouro.button {key="cancel",label="Cancel",send=doc:event("CANCEL")},
+          ouro.button {key="close-save",label="Save",send=doc:event("SAVE")},
+          ouro.button {key="discard",label="Discard",send=doc:event("DISCARD")},
         },
       },
     }
@@ -101,17 +101,16 @@ local function main_content()
     options[#options+1] = ouro.option {key=d.id, value=d.tab_value, label=(dirty and "• " or "")..d.title}
     tabs[#tabs+1] = {value=d.tab_value, label=(dirty and "* " or "")..d.title, closable=true, content=content(doc)}
   end
-  local function select(value) notes:send {type="SELECT", value=value} end
   return ouro.split_view {key="documents", axis="horizontal", position=app.split, min_first=160, min_second=560,
-    on_change=function(fraction) notes:send {type="RESIZE", position=fraction} end,
+    send=notes:event("RESIZE", "position"),
     ouro.box {key="sidebar", padding=10, surface="sidebar",
       ouro.column {key="body", gap=8, cross_alignment="stretch",
         ouro.text {key="heading", text="Documents"},
-        ouro.listbox {key="list", selected=app.selected, on_select=select, children=options},
+        ouro.listbox {key="list", selected=app.selected, send=notes:event("SELECT"), children=options},
       },
     },
-    ouro.tabs {key="tabs", label="Open documents", selected=app.selected, on_select=select,
-      on_close=function(value) notes:send {type="CLOSE_TAB", value=value} end,
+    ouro.tabs {key="tabs", label="Open documents", selected=app.selected, send=notes:event("SELECT"),
+      on_close=notes:event("CLOSE_TAB"),
       tabs=tabs,
     },
   }

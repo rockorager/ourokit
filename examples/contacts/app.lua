@@ -43,9 +43,10 @@ local charts = require("charts")(ouro, model, {
 -- MCP calls and the window share one address book. A root actor lives in
 -- application scope, so whichever starts it first, it outlives the call.
 local book = charts.book:actor()
+-- MCP calls wait for the address book to load; a failed load is an error.
 local function loaded()
   book:start()
-  while book:matches("loading") do ouro.sleep(10) end
+  machine.wait_for(book, function(s) return not machine.matches(s, "loading") end)
   if book:matches("failed") then return ouro.action_error("LoadFailed", { message = book:context().error }) end
 end
 local appearance -- Presentation chart, started by run.
@@ -70,7 +71,6 @@ local function summary(c)
 end
 
 local function details(c, person, index)
-  local rename = { type = "RENAME", id = person.id, name = c.draft }
   return ouro.column { key = "details", gap = 16, flex = 1, cross_alignment = "stretch",
     avatar(person, 80),
     ouro.text { key = "name", text = person.name, size = 24 },
@@ -79,12 +79,13 @@ local function details(c, person, index)
       ouro.text { key = "address", text = person.email },
     },
     ouro.text { key = "note", text = model.note(index) },
-    ouro.text_input { key = "rename", text = c.draft, on_change = function(value) book:send { type = "EDIT", value = value } end },
-    ouro.button { key = "save", label = "Apply name", enabled = book:can(rename), on_press = book:sender(rename) },
+    ouro.text_input { key = "rename", text = c.draft, send = book:event("EDIT") },
+    -- Enabled while the chart would take the rename: a changed, valid name.
+    ouro.button { key = "save", label = "Apply name", send = book:event { type = "RENAME", id = person.id, name = c.draft } },
     ouro.text { key = "hint", text = "Selection and names survive scrolling. MCP edits update this same state." },
     ouro.row { key = "exit", gap = 10, cross_alignment = "center",
       ouro.icon { key = "icon", src = "assets/log-out.svg", width = 20, height = 20 },
-      ouro.button { key = "quit", label = "Quit", on_press = book:sender("QUIT") },
+      ouro.button { key = "quit", label = "Quit", send = book:event("QUIT") },
     },
   }
 end
@@ -103,7 +104,7 @@ local function panels(c)
             avatar(contact, 40),
             ouro.column { key = "text", gap = 6, flex = 1, cross_alignment = "stretch",
               ouro.button { key = "select", label = (contact.id == c.selected and "• " or "") .. contact.name,
-                on_press = book:sender { type = "SELECT", id = contact.id } },
+                send = book:event { type = "SELECT", id = contact.id } },
               ouro.text { key = "email", text = contact.email },
               ouro.text { key = "note", text = model.note(i) },
             },
@@ -119,12 +120,12 @@ local function unavailable(c)
   local loading = book:matches("loading")
   return ouro.column { key = "unavailable", gap = 16,
     ouro.text { key = "status", text = loading and "Loading contacts…" or ("Could not load contacts: " .. c.error) },
-    ouro.button { key = "retry", label = "Retry", enabled = book:can("RETRY"), on_press = book:sender("RETRY") },
+    ouro.button { key = "retry", label = "Retry", send = book:event("RETRY") },
   }
 end
 
 local function content()
-  local c, dark = book:context(), appearance:matches("terminal")
+  local c, dark = book:context(), appearance:context().style == "terminal"
   local ready = book:matches("ready")
   return ouro.theme {
     key = "app", color_scheme = dark and "dark" or "light",
@@ -136,8 +137,9 @@ local function content()
       ouro.column { key = "body", gap = 16, cross_alignment = "stretch",
         ouro.row { key = "heading", gap = 16, cross_alignment = "center",
           ouro.text { key = "title", text = "Contacts", size = 30, flex = 1 },
-          book:can("RETRY") and ready and ouro.button { key = "retry", label = "Retry now", on_press = book:sender("RETRY") } or ouro.box { key = "no-retry" },
-          ouro.button { key = "theme", label = dark and "Light style" or "Terminal style", on_press = appearance:sender("TOGGLE") },
+          book:matches("ready.sync.retrying") and ouro.button { key = "retry", label = "Retry now", send = book:event("RETRY") } or ouro.box { key = "no-retry" },
+          ouro.button { key = "theme", label = dark and "Light style" or "Terminal style",
+            send = appearance:event { type = "STYLE", value = dark and "light" or "terminal" } },
         },
         ouro.text { key = "subtitle", text = ready and summary(c) or "One shared MCP address book." },
         ready and panels(c) or unavailable(c),
@@ -151,48 +153,40 @@ local contact_schema = {
   properties = { id = { type = "string" }, name = { type = "string" }, email = { type = "string" } },
   required = { "id", "name", "email" }, additionalProperties = false,
 }
-local empty_schema = { type = "object", additionalProperties = false }
+-- Actions are external events sent to the chart the window uses. Their
+-- input schemas come from the chart's event declarations.
+local actions = machine.actions(book, {
+  GetContacts = {
+    description = "Read the address book without opening a window.",
+    output = function(s) return { contacts = machine.plain(s.context.contacts) } end,
+    output_schema = { type = "object", properties = { contacts = { type = "array", items = contact_schema } }, required = { "contacts" }, additionalProperties = false },
+  },
+  SelectContact = {
+    event = "SELECT", description = "Select a contact, updating the UI if it is active.",
+    errors = { no_transition = "ContactNotFound" },
+  },
+}, { before = loaded })
+-- The chart refuses a RENAME for an unknown id, an invalid name or an
+-- unchanged name, and each needs a different answer, so this one checks the
+-- model before sending.
+actions.RenameContact = {
+  description = "Rename a contact in the shared address book; the UI updates at once and the change is saved in the background.",
+  inputSchema = { type = "object", properties = { id = { type = "string" }, name = { type = "string" } }, required = { "id", "name" }, additionalProperties = false },
+  outputSchema = { type = "object", properties = { contact = contact_schema }, required = { "contact" }, additionalProperties = false },
+  handler = function(params)
+    local err = loaded(); if err then return err end
+    if not model.find(book:context().contacts, params.id) then return ouro.action_error("ContactNotFound", { id = params.id }) end
+    local invalid = model.check_name(params.name)
+    if invalid then return ouro.action_error("InvalidName", { name = params.name, message = invalid }) end
+    book:send { type = "RENAME", id = params.id, name = params.name } -- Ignored when the name is unchanged.
+    return { contact = machine.plain((model.find(book:context().contacts, params.id))) }
+  end,
+}
 
--- Actions are external events: SELECT and RENAME go to the same chart the
--- window uses, and its guards decide what is accepted.
 return ouro.app {
   id = "dev.ourokit.contacts",
   single_instance = true,
-  actions = {
-    GetContacts = {
-      description = "Read the address book without opening a window.",
-      inputSchema = empty_schema,
-      outputSchema = { type = "object", properties = { contacts = { type = "array", items = contact_schema } }, required = { "contacts" }, additionalProperties = false },
-      handler = function()
-        local err = loaded(); if err then return err end
-        return { contacts = machine.plain(book:context().contacts) }
-      end,
-    },
-    SelectContact = {
-      description = "Select a contact, updating the UI if it is active.",
-      inputSchema = { type = "object", properties = { id = { type = "string" } }, required = { "id" }, additionalProperties = false },
-      outputSchema = empty_schema,
-      handler = function(params)
-        local err = loaded(); if err then return err end
-        local event = { type = "SELECT", id = params.id }
-        if not book:can(event) then return ouro.action_error("ContactNotFound", { id = params.id }) end
-        book:send(event)
-      end,
-    },
-    RenameContact = {
-      description = "Rename a contact in the shared address book; the UI updates at once and the change is saved in the background.",
-      inputSchema = { type = "object", properties = { id = { type = "string" }, name = { type = "string" } }, required = { "id", "name" }, additionalProperties = false },
-      outputSchema = { type = "object", properties = { contact = contact_schema }, required = { "contact" }, additionalProperties = false },
-      handler = function(params)
-        local err = loaded(); if err then return err end
-        if not model.find(book:context().contacts, params.id) then return ouro.action_error("ContactNotFound", { id = params.id }) end
-        local invalid = model.check_name(params.name)
-        if invalid then return ouro.action_error("InvalidName", { name = params.name, message = invalid }) end
-        book:send { type = "RENAME", id = params.id, name = params.name } -- Ignored when the name is unchanged.
-        return { contact = machine.plain((model.find(book:context().contacts, params.id))) }
-      end,
-    },
-  },
+  actions = actions,
   run = function()
     book:start()
     appearance = charts.appearance:start()

@@ -154,7 +154,8 @@ book:stop(); assert(clock.open_scopes==0)
 
 -- Presentation chart.
 local look=charts.appearance:start{scheduler=clock}
-assert(look:matches('light')); look:send('TOGGLE'); assert(look:matches('terminal')); look:send('TOGGLE'); assert(look:matches('light'))
+assert(look:context().style=='light'); look:send{type='STYLE', value='terminal'}; assert(look:context().style=='terminal')
+assert(not pcall(look.send, look, {type='STYLE', value=1}), 'STYLE carries a string')
 
 -- Inspection data is plain.
 assert(o.json.decode(o.json.encode(charts.book:graph())).id=='contacts')
