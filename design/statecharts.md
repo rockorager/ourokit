@@ -18,6 +18,24 @@ including presentation state such as query text, selection and appearance.
 Signals are not an application state mechanism (§6). Charts do not replace
 plain functions, the view, or the native editor's per-keystroke state (§5).
 
+## Goals
+
+Status per goal: **met**, **partly** (what is missing is named), or **open**.
+Test names are from `tests/machine_test.lua` unless a file is given.
+
+| Goal | Met by | Proven by | Status |
+| --- | --- | --- | --- |
+| **G1** XState semantics and surface: map form, required `initial`, v5 internal and `reenter` rules, parallel `order` | §1 | 'order on a parallel state…'; 'self-targets re-enter only with reenter = true (XState v5)…'; 'review M5…'; 'parallel regions take the same event in one microstep…'; 'exit and entry order follow the least common compound ancestor' | met (no history states or delayed `send`, §1) |
+| **G2** Active states own lifetimes: tasks, timers, I/O, windows and surfaces; leaving a state cancels them | §8, §0 Windows, §2 Runtime events | `machine_native.py` (exit and stop cancel sleeping work); 'after timers… are cancelled on exit'; 'invokes… exiting cancels them'; 'spawned tasks… are canceled with their owner state'; `http_native.py` (reload cancels requests); `desktop_native.py` 'launcher: layer surface follows the chart' | met |
+| **G3** Charts hold all application state; the UI is a pure view of snapshots; plain functions compute | §6, §5, §7 | documents, contacts, launcher and stopwatch keep no app signals: `documents.py`, `contacts.py`, `launcher.py`, `stopwatch_test.lua` | met |
+| **G4** Easy to reason about, for humans and agents, over fewer lines; an app can be written from this doc alone | §0, §4 Callback signatures, §11 | `examples/stopwatch`, first written from this doc alone by the review; `tests/stopwatch_test.lua` | met |
+| **G5** One event model for widgets, shortcuts, commands, palette, MCP, activation and surfaces, with request/response | §2 (send results, `wait_for`, `deliver`, `machine.actions`), §7 | `bindings_test.lua`; 'send reports whether the event was taken…'; 'wait_for…'; 'actions derive MCP input schemas…'; `contacts.py` (MCP as chart events); `desktop_native.py` 'launcher: single instance toggles on activation', 'surface events: … close_requested decided by the chart' | met (a palette is bound buttons or options; there is no stock palette widget) |
+| **G6** Agent-first dev loop: inspect states and records, live visualizer, deterministic record/replay, generated tests, reload that keeps state | §10 (records, Dev tools), §9 | `statechart_inspection.py`; `tools/statechart-visualizer/storybook.lua`; 'records carry the scheduler clock and post-step guard valves'; `chart_reload.py`; 'reload hooks persist roots…' | partly: deterministic record/replay and logical clocks are open (replay thread, §8); generated tests are open |
+| **G7** Performance at the real boundaries: few Lua–Zig crossings, per-field rebuild locality, cached views, unchanged text work; the interpreter stays in Lua and snapshots stay Lua tables | §6 Rebuild locality, Status | 'rebuild locality: typing in one document re-renders only its readers'; 'rebuild locality: fields, configuration and selectors'; 'views are cached per table…' | partly: render counts and allocation are proven; Lua–Zig crossing counts and text work are not measured yet |
+| **G8** No fixed limits on runtime objects; actors and components release native resources on stop and unmount | §8 Resources and capacities | `statechart_capacity.py`; `component_scopes_test.lua` (70 rows, 40 rows remounted 20×, 3000 cycles) | partly: signals grow and release; per-window and protocol budgets are still fixed (§8) |
+| **G9** Failures reach charts instead of crashing: `surface.failed`, atomic commits, `YieldInAction`, rejected events with reasons | §1 Algorithm, §2 Sending, Runtime events | 'guard errors leave the previous snapshot in place'; 'an eventless livelock fails without committing…'; 'guards, assigns and actions cannot wait, spawn or exit'; 'review M6…'; `desktop_native.py` 'launcher surface … failure', 'unbound role change: logged, last valid window kept' | met |
+| **G10** Headless testability: `manual_scheduler`, `ouroctl test` settling, chart tests with fake services | §8 Tests, §0 Tests | `documents.py`, `contacts.py`, `launcher.py` (fake services); `stopwatch_test.lua`; `component_scopes_test.lua` 't:settle shows state changed from the test body' | met (logical timers for native-scheduler tests are open, §8) |
+
 ## 0. Writing an app
 
 [`examples/stopwatch`](../examples/stopwatch) is the smallest complete app,
@@ -692,8 +710,8 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
   port found this, and `tests/machine_native.py` now covers it. Where
   application spawns are unavailable (Storybook, reload candidates), the root
   falls back to the running task's scope. Generation reload retires every
-  scope. Capacity is fixed (1024 in the Wayland runner). Never-started work is
-  discarded on close, so rapid toggling reuses slots.
+  scope. Never-started work is discarded on close, so rapid toggling reuses
+  slots. Capacities are covered under Resources and capacities below.
 - **One-shot tasks.** These are XState's `spawnChild(fromPromise)`.
   `machine.spawn(fn_or_actor_name, {id?, input?})` lists the task under
   `snapshot.children` and runs `fn(input)` in its own scope. That scope sits
@@ -736,6 +754,66 @@ An invoke `src` is `function(input, send) ... return output end`. It runs as an
 Ouro task and may yield on Ouro I/O. `send` delivers events to the machine
 while the state is still active, for callback-style sources. A throw becomes
 `error.invoke.<id>` with the error value.
+
+### Resources and capacities
+
+Goal G8: the number of live actors, components, signals, scopes and tasks is
+not capped, and stopping or unmounting gives their native resources back at
+once, not when the garbage collector runs.
+
+**What `actor:stop()` releases:**
+- It makes a final commit, then releases the actor's hidden signals (the
+  snapshot, configuration, membership and every per-key signal) through the
+  runtime's private `release(signal)`. No new key signals are created
+  afterwards. A released signal reads its last value untracked and raises
+  "signal was released" on write.
+- It closes the actor's root scope, which opens lazily, only once an `after`
+  or `invoke` needs one. Closing cancels every state scope below it: suspended
+  coroutines unwind, logical timers are removed, in-flight kernel operations
+  are cancelled, and their slots drain before reuse.
+- Stopping a never-started actor only sets `status = 'stopped'`. `stop()` is
+  idempotent and safe after the scope is already gone.
+
+**What a component unmount releases:** `machine.component` returns
+`render, function() actor:stop() end`, and the instance tree calls the second
+function exactly once when the keyed instance leaves (application model,
+`ouro.stateful`). Everything above then happens deterministically. Cancelling
+the instance scope also retires any Lua-opened child scopes beneath it rather
+than panicking, and so does ending an MCP action. A remount starts fresh.
+
+**Capacities:**
+
+| Object | Behavior | Status |
+| --- | --- | --- |
+| Signal graph: signals, subscription edges, readers, pending reads | Configured sizes are initial sizes; grows on demand. Growth happens while a commit is validated, so commit cannot fail | landed (7d20b81) |
+| Actor hidden signals | Released on `stop()` and component unmount | landed (247bcd0) |
+| Scheduler scopes, resources and tasks | Grow on demand; scopes are reserved while a build or reload is prepared, so commit cannot fail. `scope_capacity` becomes an initial size | in flight (scopes thread) |
+| Lua task slots, logical timers | Grow (chunked slots, timer heap) | landed earlier |
+| io_uring operation slots, file reader, module loader, MCP calls, stdio | Grow in fixed-size chunks that never move, because the kernel or a Lua continuation holds slot pointers | in flight (scopes thread) |
+| Per-window node budget (256: instances, render objects, semantics, bindings, controls, animations), scene commands (512) | Fixed | open |
+| HTTP jobs (16), D-Bus (8 buses, 64 subscriptions, 128 requests, 64 names), audio jobs (8), window slots (16) | Fixed | open |
+
+**Fixed by design.** These limits guard against hostile input, protocol
+abuse or pathological depth. They do not count live objects:
+- HTTP and D-Bus message and header byte limits (`max_bytes`, `max_header_bytes`);
+- module file size and file read `max_bytes`;
+- the MCP receive buffer (64 KiB per call) and JSON value depth and count;
+- Lua nesting and stack depth;
+- the io_uring submission ring, which applies backpressure (callers retry on
+  `SubmissionQueueFull`);
+- the platform input-event queue;
+- Wayland outputs and workspaces, which mirror the compositor;
+- damage regions, which merge beyond 8 rectangles.
+
+**Proof:**
+- `tests/component_scopes_test.lua`: 70 rows, 40 rows remounted 20 times, and
+  3000 create/stop cycles. Before 7d20b81, 4 of its 6 tests failed with
+  "signal capacity exceeded".
+- `tests/statechart_capacity.py`: 3000 kept actors in a headless app. It used
+  to fail at cycle 65.
+- Still to come from the scopes thread: scope-growth unit tests, and stress
+  tests (1000 rows × 50 remounts, 10k cycles) that check memory returns to
+  baseline.
 
 ## 9. Reload keeps state
 
@@ -857,6 +935,56 @@ machine, time_ms }`.
 Records are built only while an observer is attached. They answer questions
 like "why is this app waking up when idle?" through timers that are still
 started, and "why is Save disabled?" through rejected events and guards.
+
+### Dev tools: `runtime.statecharts` and the plant visualizer
+
+**`runtime.statecharts`** is a tool on the `--dev` endpoint, called through
+MCP `tools/call`. Production instances install nothing
+([application model](../docs/application-model.md)).
+
+```json
+{"name": "runtime.statecharts", "arguments": {"after": 0, "limit": 20}}
+```
+
+- **On-demand attach.** Nothing is observed until the first call. It attaches
+  a `machine.inspect` observer at a safe point and seeds `actors`. For every
+  live actor it gives the started record, including its graph, plus a
+  synthetic `origin = 'attach'` record of the current snapshot. Running timers
+  and invokes come from `pending_timers()` and `pending_invokes()`.
+- **`keep_alive_ms`** (default 30,000). Each call renews the observer. The
+  first record after that long without a call detaches it, so an idle
+  instance builds no records.
+- **Seeds.** A reload or re-attach reseeds `actors` and increments `seed`. Pass
+  the last `seed` you saw to get `actors` back exactly when it changed. Root
+  actors stay visible across reload.
+- **Records.** They are JSON-encoded in the VM, stamped with host monotonic
+  `time_ms`, and kept in a 1,024-record ring. A call returns `{next, first,
+  dropped, time_ms, seed, records = [{sequence, time_ms, record}], actors}`
+  after the `after` cursor. Records include `guards` (valve outcomes),
+  `time_ms` and `accepted` (the declared events the actor would take).
+  `text = true` returns records as JSON strings, for clients such as
+  `ouro.mcp` that convert at most 4,096 values per reply.
+
+**The plant visualizer** ([`tools/statechart-visualizer`](../tools/statechart-visualizer/README.md))
+draws actors as a process-plant diagram:
+- states are tanks and vessels, and transitions are pipes;
+- guards are valves, `after` timers are gauges, and invokes are pumps;
+- context fields are tag faceplates;
+- a history timeline can be scrubbed.
+
+It reads only the graph and records described above.
+
+```sh
+zig build -Dvulkan=false -Doptimize=ReleaseSafe   # Debug software rendering runs at ~1 fps
+zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua                        # in-process demo charts
+zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- unix:$DEV_SOCKET   # attach to any --dev app
+zig-out/bin/ouroctl storybook snapshot tools/statechart-visualizer/storybook.lua --output out
+```
+
+When attached, it polls `runtime.statecharts`: every 200 ms while idle, and
+again immediately whenever it receives a full page. Open: push delivery
+through a resource subscription instead of polling, and deterministic
+record/replay (replay thread).
 
 ## 11. API summary (prototype)
 
