@@ -11,6 +11,8 @@ pub const Result = struct {
     /// Owned by the caller's allocator (init.gpa).
     text: []u8,
     ok: bool,
+    /// An optional third string result (replay's inspection records).
+    extra: ?[]u8 = null,
 };
 
 /// Evaluates `entry_path` with its directory as the module root, then calls
@@ -81,12 +83,19 @@ const Job = struct {
         if (c.lua_getfield(state, -1, self.tool.ptr) != c.type_function) return error.StatechartToolUnavailable;
         _ = c.lua_pushlstring(state, self.argument.ptr, self.argument.len);
         _ = c.lua_pushlstring(state, self.options.ptr, self.options.len);
-        if (diagnostic.pcall(state, 2, 2) != c.ok) {
+        if (diagnostic.pcall(state, 2, 3) != c.ok) {
             diagnostic.logLuaStack(state);
             return error.StatechartToolFailed;
         }
         var length: usize = 0;
-        const text = c.lua_tolstring(state, -2, &length) orelse return error.StatechartToolFailed;
-        return .{ .text = try env.init.gpa.dupe(u8, text[0..length]), .ok = c.lua_toboolean(state, -1) != 0 };
+        const text = c.lua_tolstring(state, -3, &length) orelse return error.StatechartToolFailed;
+        const owned = try env.init.gpa.dupe(u8, text[0..length]);
+        errdefer env.init.gpa.free(owned);
+        var extra: ?[]u8 = null;
+        if (c.lua_type(state, -1) == c.type_string) {
+            const bytes = c.lua_tolstring(state, -1, &length).?;
+            extra = try env.init.gpa.dupe(u8, bytes[0..length]);
+        }
+        return .{ .text = owned, .ok = c.lua_toboolean(state, -2) != 0, .extra = extra };
     }
 };

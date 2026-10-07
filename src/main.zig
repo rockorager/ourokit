@@ -39,8 +39,11 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
             const log = try readSource(init, options.log_path);
             defer init.gpa.free(log);
             const entry = try applicationEntry(init, options.application);
-            const result = try ourokit.app.chart_tools.call(init, entry, "replay_tool", log, if (options.json) "{\"json\":true}" else "");
+            const tool_options = if (options.json and options.records_path != null) "{\"json\":true,\"records\":true}" else if (options.json) "{\"json\":true}" else if (options.records_path != null) "{\"records\":true}" else "";
+            const result = try ourokit.app.chart_tools.call(init, entry, "replay_tool", log, tool_options);
             defer init.gpa.free(result.text);
+            defer if (result.extra) |bytes| init.gpa.free(bytes);
+            if (options.records_path) |records| try writeAtomic(init, records, result.extra orelse "");
             try writeStdout(init, result.text);
             return if (result.ok) 0 else 1;
         },
@@ -444,6 +447,7 @@ fn replayWorker(init: std.process.Init, path: []const u8, name: ?[]const u8) !vo
     defer init.gpa.free(log);
     const result = try ourokit.app.chart_tools.call(init, entry, "replay_tool", log, "");
     defer init.gpa.free(result.text);
+    defer if (result.extra) |bytes| init.gpa.free(bytes);
     if (!result.ok) {
         try std.Io.File.stderr().writeStreamingAll(init.io, result.text);
         return error.ReplayDiverged;
@@ -465,6 +469,7 @@ fn generateTests(init: std.process.Init, options: cli.Test) !u8 {
     try std.json.Stringify.value(.{ .depth = options.depth, .app = std.fs.path.stem(std.fs.path.dirname(entry) orelse entry) }, .{ .emit_null_optional_fields = false }, &options_json.writer);
     const result = try ourokit.app.chart_tools.call(init, entry, "generate_tool", recordings.items, options_json.written());
     defer init.gpa.free(result.text);
+    defer if (result.extra) |bytes| init.gpa.free(bytes);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, result.text, .{});
     const output = options.output orelse try std.fs.path.join(a, &.{ std.fs.path.dirname(entry) orelse ".", "tests" });
     try std.Io.Dir.cwd().createDirPath(init.io, output);

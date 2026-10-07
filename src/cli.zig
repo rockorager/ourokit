@@ -19,6 +19,8 @@ pub const Replay = struct {
     /// application.lua, ouro.json or a directory holding ouro.json.
     application: []const u8 = ".",
     json: bool = false,
+    /// `--records <file>`: the replay's §10 inspection records as JSON lines.
+    records_path: ?[]const u8 = null,
 };
 
 pub const Test = struct {
@@ -107,7 +109,7 @@ pub const usage =
     \\  ouroctl test [file|directory] [--filter <substring>] [--list] [--json]
     \\              [--timeout-ms <milliseconds>]  (default: tests, 10000 ms per worker)
     \\  ouroctl test --generate <application> [--output <dir>] [--from <log.jsonl>]... [--depth <n>]
-    \\  ouroctl replay <log.jsonl> [application.lua|ouro.json|directory] [--json]
+    \\  ouroctl replay <log.jsonl> [application.lua|ouro.json|directory] [--json] [--records <file>]
     \\  ouroctl help
     \\  ouroctl version
     \\
@@ -200,10 +202,17 @@ fn parseReplay(args: []const []const u8) !Replay {
     var log: ?[]const u8 = null;
     var application: ?[]const u8 = null;
     var json = false;
-    for (args) |argument| {
+    var records: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const argument = args[index];
         if (std.mem.eql(u8, argument, "--json")) {
             if (json) return error.DuplicateOption;
             json = true;
+        } else if (try optionValue(args, &index, argument, "--records")) |value| {
+            if (records != null) return error.DuplicateOption;
+            if (value.len == 0 or std.mem.startsWith(u8, value, "--")) return error.ExpectedOptionValue;
+            records = value;
         } else if (std.mem.startsWith(u8, argument, "--")) {
             return error.UnknownOption;
         } else if (argument.len == 0) {
@@ -214,7 +223,7 @@ fn parseReplay(args: []const []const u8) !Replay {
             application = argument;
         } else return error.UnexpectedArgument;
     }
-    return .{ .log_path = log orelse return error.ExpectedReplayLog, .application = application orelse ".", .json = json };
+    return .{ .log_path = log orelse return error.ExpectedReplayLog, .application = application orelse ".", .json = json, .records_path = records };
 }
 
 fn parseExport(args: []const []const u8) !Export {

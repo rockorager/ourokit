@@ -6,12 +6,16 @@
 --   ouroctl run tools/statechart-visualizer/app.lua -- unix:$SOCKET
 --       Attaches to a `--dev` instance's development socket and polls
 --       runtime.statecharts (see README.md).
+--   ouroctl run tools/statechart-visualizer/app.lua -- session.records.jsonl
+--       Loads a replayed recording (`ouroctl replay log app --records
+--       file`) and opens it at its first step for scrubbing.
 local o = require('ouro')
 local contract = require('contract')
 local history = require('history')
 local layout = require('plant.layout')
 local view = require('plant.view')
 local scenario = require('scenario')
+local recording = require('recording')
 local fixtures = {require('fixtures.document'), require('fixtures.connection')}
 
 contract.null = o.json.null
@@ -23,7 +27,7 @@ local selected = o.signal(nil)
 local cursor = o.signal(nil)
 local source = o.signal('in-process demo · ouro.machine.inspect')
 local status = o.signal('starting')
-local address
+local address, records_path
 
 local function bump() revision:set(revision() + 1) end
 
@@ -113,13 +117,27 @@ local function attach()
   end
 end
 
+-- A replayed recording: ingest it all, then start at each actor's first step.
+local function load_records()
+  source:set('recording · ' .. records_path)
+  local text, err = o.files.read(records_path, {max_bytes = 64 * 1024 * 1024})
+  if not text then status:set('CANNOT READ ' .. tostring(err and err.message or err)); bump(); return end
+  local records, problem = recording.parse(text, o.json)
+  if not records then status:set(problem); bump(); return end
+  for _, record in ipairs(records) do ingest(record, nil) end
+  status:set('RECORDING · ' .. #records .. ' records')
+  cursor:set(1)
+  bump()
+end
+
 local function content()
   revision()
   local path = selected()
   local entry = path and actors[path]
   if not entry then
     return o.box {key = 'empty', width = 'fill', height = 'fill', alignment = 'center', background = '#161b21',
-      o.text {key = 't', text = address and ('Waiting for statechart records from ' .. address) or 'Waiting for actors…',
+      o.text {key = 't', text = address and ('Waiting for statechart records from ' .. address)
+        or (records_path and (records_path .. ': ' .. status())) or 'Waiting for actors…',
         foreground = '#7d8a97'}}
   end
   local n = #entry.history.frames
@@ -127,7 +145,7 @@ local function content()
   local tabs = {}
   for i, p in ipairs(order) do
     tabs[i] = {label = p .. (actors[p].stopped and ' ■' or ''), selected = p == path,
-      on_press = function() selected:set(p); cursor:set(nil) end}
+      on_press = function() selected:set(p); cursor:set(records_path and 1 or nil) end}
   end
   -- Inspected data is arbitrary: show a failure instead of losing the window.
   local ok, screen = pcall(view.screen, {
@@ -152,10 +170,11 @@ return o.app {
   id = 'dev.ourokit.statechart-visualizer',
   open = function(uris)
     local uri = uris[1]
-    if uri then address = uri:find('^unix:') and uri or ('unix:' .. uri:gsub('^file://', '')) end
+    if uri and uri:find('%.jsonl$') then records_path = uri:gsub('^file://', '')
+    elseif uri then address = uri:find('^unix:') and uri or ('unix:' .. uri:gsub('^file://', '')) end
   end,
   run = function()
-    if address then o.spawn(attach) else demo() end
+    if records_path then o.spawn(load_records) elseif address then o.spawn(attach) else demo() end
     return {windows = {o.window {id = 'main', title = 'Statechart plant', width = W, height = H,
       padding = 0, background = '#0d1115', content = content}}}
   end,

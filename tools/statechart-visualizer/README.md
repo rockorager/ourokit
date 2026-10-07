@@ -31,7 +31,19 @@ zig-out/bin/ouroctl run tools/statechart-visualizer/feed.lua --dev   # or any ap
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- unix:$DEVELOPMENT_SOCKET
 # Headless frames of real recorded streams (manual scheduler)
 zig-out/bin/ouroctl storybook snapshot tools/statechart-visualizer/storybook.lua --output out
+# A recorded session (design/statecharts.md §14): expand it, then scrub it
+zig-out/bin/ouroctl run examples/stopwatch/ouro.json --dev      # records ~/.local/state/ourokit/recordings/dev.ourokit.stopwatch.jsonl
+zig-out/bin/ouroctl replay ~/.local/state/ourokit/recordings/dev.ourokit.stopwatch.jsonl examples/stopwatch --records /tmp/stopwatch.records.jsonl
+zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- /tmp/stopwatch.records.jsonl
 ```
+
+A recording holds inputs only. `ouroctl replay --records` replays it against
+the app's charts and writes the §10 records it produced, graphs included,
+which is what this tool draws. A file argument ending in `.jsonl` opens that
+session at its first step: the timeline, step buttons and slider scrub it
+and every actor is a tab. [`recording.lua`](recording.lua) parses the
+file, and `storybook.lua`'s `recording/*` stories draw a real stopwatch
+session (`fixtures/stopwatch_recording.lua`).
 
 ## Where the data comes from
 

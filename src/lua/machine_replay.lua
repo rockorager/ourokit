@@ -375,6 +375,14 @@ function M.replay(source, options)
   local scheduler, recorder, roots, released
   local saved_hooks = M._hooks
   local report = {format = 'ouro.machine.replay', ok = true, entries = #entries, compared = 0}
+  -- options.records(record): the §10 inspection stream of the replayed
+  -- actors (graphs, microsteps, timers, invokes), e.g. for the visualizer.
+  local unsubscribe = options.records and M.inspect(function(record)
+    local root = record.actor and record.actor:match('^[^/]+')
+    for _, actor in ipairs(roots or {}) do
+      if actor.path == root and actor._scheduler == scheduler then return options.records(record) end
+    end
+  end)
 
   local function generation(start)
     if recorder then
@@ -390,9 +398,19 @@ function M.replay(source, options)
     end, {scheduler = scheduler, t0 = t0, header = false})
   end
 
+  -- The replay's own roots and their children, newest first: finished
+  -- actors leave machine.actors() but may still get a stop.
   local function actor_at(path)
-    for _, actor in ipairs(M.actors()) do
-      if actor.path == path and actor._scheduler == scheduler then return actor end
+    local root_id, rest = path:match('^([^/]+)/?(.*)$')
+    for i = #(roots or {}), 1, -1 do
+      local actor = roots[i]
+      if actor.path == root_id and actor._status ~= 'stopped' then
+        for id in rest:gmatch('[^/]+') do
+          actor = actor._children[id]
+          if not actor then return nil end
+        end
+        return actor
+      end
     end
   end
 
@@ -534,6 +552,7 @@ function M.replay(source, options)
     end
   end)
   if recorder then recorder.stop() end
+  if unsubscribe then unsubscribe() end
   for _, actor in ipairs(roots or {}) do pcall(actor.stop, actor) end
   M._hooks = saved_hooks
   if not ok then
@@ -572,10 +591,16 @@ M._canonical_safe = safe
 -- `ouroctl replay`: replay_tool(log, options_json) -> text, ok
 function M.replay_tool(log, options_json)
   local options = options_json ~= '' and json.decode(options_json) or {}
-  local report = M.replay(log, {keep_lines = options.json})
+  local records
+  if options.records then
+    records = {}
+    options.records = function(record) records[#records + 1] = encode(record) end
+  end
+  local report = M.replay(log, {keep_lines = options.json, records = options.records})
+  local extra = records and (table.concat(records, '\n') .. '\n') or nil
   if options.json then
     report.states = nil
-    return json.encode(safe(report)), report.ok
+    return json.encode(safe(report)), report.ok, extra
   end
-  return M.replay_text(report) .. '\n', report.ok
+  return M.replay_text(report) .. '\n', report.ok, extra
 end
