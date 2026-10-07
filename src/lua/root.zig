@@ -28,6 +28,7 @@ pub const StatechartInspector = @import("statechart_inspector.zig").Store;
 pub const StatechartEntry = @import("statechart_inspector.zig").Entry;
 pub const installStatechartInspector = @import("statechart_inspector.zig").install;
 pub const setStatechartStrict = @import("machine.zig").setStrict;
+pub const attachStatechartInspector = @import("statechart_inspector.zig").attach;
 pub const Dbus = @import("dbus.zig").Binding;
 pub const Stdio = @import("stdio.zig").Stdio;
 pub const ShellWorkspaces = @import("shell_workspaces.zig").Binding;

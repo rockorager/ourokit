@@ -219,6 +219,10 @@ fn integer(value: u64) mcp.Value {
 /// were encoded by ouro.json in the application VM; no Lua runs here.
 fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mcp.Value {
     const store = reload.config.statecharts orelse return error.StatechartInspectionUnavailable;
+    // The observer exists only while clients keep calling; each call renews
+    // it and (re)attaches the active generation, seeding current actors.
+    store.keep_alive_ms = @min(try unsignedField(args, "keep_alive_ms", 30_000), 600_000);
+    try lua.attachStatechartInspector(&reload.active().vm, store);
     const after = try unsignedField(args, "after", 0);
     const limit = @min(try unsignedField(args, "limit", 256), 1024);
     // Lua MCP clients convert at most 4096 values per reply; text mode keeps
@@ -254,9 +258,12 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
         .{ "first", integer(first) },
         .{ "dropped", mcp.Value{ .bool = after + 1 < first and store.next_sequence > 1 } },
         .{ "time_ms", integer(store.elapsedMs()) },
+        .{ "seed", integer(store.seed) },
         .{ "records", mcp.Value{ .array = collect.list } },
     });
-    const include_actors = if (mcp.get(args, "actors")) |value| value == .bool and value.bool else after == 0;
+    // A client passing the seed it last saw gets actors whenever it changed.
+    const stale_seed = if (mcp.get(args, "seed") != null) try unsignedField(args, "seed", 0) != store.seed else false;
+    const include_actors = stale_seed or if (mcp.get(args, "actors")) |value| value == .bool and value.bool else after == 0;
     if (include_actors) {
         var actors: std.array_list.Managed(mcp.Value) = .init(a);
         const Decode = struct {

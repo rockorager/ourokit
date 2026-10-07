@@ -953,20 +953,28 @@ tasks, animation completion or compositor presentation. Cancellation/disconnect
 releases an in-flight press through routing but cannot undo callbacks already
 run. Inspection and diagnostics do not evaluate Lua or expose arbitrary mutation.
 
-`runtime.statecharts {after, limit, actors, text}` is experimental and follows
-the `ouro.machine` prototype ([design](../design/statecharts.md#10-inspection-hooks)).
-A development instance registers an `ouro.machine.inspect` observer before the
-application runs. The observer publishes every actor lifecycle and transition
-record, JSON-encoded and stamped with host monotonic `time_ms`, into a bounded
-1,024-record ring. The tool returns `{sequence, time_ms, record}` entries after
-the `after` cursor, `next`, and `dropped` when eviction skipped records.
-`actors`, which defaults to on for `after = 0`, adds each live actor's started
-record (including its graph) and latest record for late attach. `text = true`
-returns records as JSON strings for clients such as `ouro.mcp`, which converts
-at most 4,096 values per reply. Records also carry `accepted`, the declared
-events the actor would take at that moment. Production instances register no
-observer. See the [statechart plant](../tools/statechart-visualizer/README.md)
-visualizer.
+`runtime.statecharts {after, limit, actors, seed, text, keep_alive_ms}` is
+experimental and follows the `ouro.machine` prototype
+([design](../design/statecharts.md#10-inspection-hooks)). Nothing is observed
+until the first call. That call attaches an `ouro.machine.inspect` observer to
+the active source generation and seeds `actors`: every live actor's started
+record, with its graph, and a synthetic `origin = "attach"` record of its
+current snapshot. Every later call renews the observer. The next record after
+`keep_alive_ms` (default 30,000) without a call detaches it, so an idle
+instance builds no records. Actors are keyed by path. A reload or a re-attach
+reseeds them and increments `seed`. Pass the last `seed` you saw to receive
+`actors` again exactly when it changed.
+
+Records are JSON-encoded in the VM and stamped with host monotonic `time_ms`
+in a bounded 1,024-record ring. The tool returns `{sequence, time_ms, record}`
+entries after the `after` cursor, plus `next`, and `dropped` when eviction
+skipped records. `text = true` returns records as JSON strings for clients such
+as `ouro.mcp`, which converts at most 4,096 values per reply. Records also
+carry `accepted`, the declared events the actor would take at that moment.
+Attaching runs host Lua in the application VM at a safe point. That Lua reads
+snapshots and graphs and evaluates guards through `actor:accepted()`.
+Production instances install nothing. See the
+[statechart plant](../tools/statechart-visualizer/README.md) visualizer.
 
 Capture returns `{window, token, kind, path, width, height, bytes}`. Its kind is
 `software_scene_replay`, never presented GPU readback. The endpoint retains four
