@@ -72,7 +72,7 @@ local function last() return records[#records] end
 local function invoked(action) for _,i in ipairs(last().invokes) do if i.action==action then return i end end end
 
 -- Hidden: nothing runs, only opening is possible.
-assert(launcher:matches('hidden') and clock.open_scopes==1)
+assert(launcher:matches('hidden') and clock.open_scopes==0) -- the root scope opens with the first work
 assert(not launcher:can('ACTIVATE') and launcher:can('TOGGLE') and launcher:can('OPEN'))
 launcher:send('CLOSE'); assert(last().rejected and last().reason=='no_transition')
 
@@ -164,9 +164,9 @@ for _,t in ipairs(launcher:accepted()) do accepted[#accepted+1]=t end
 table.sort(accepted)
 assert(table.concat(accepted,',')=='OPEN,TOGGLE', table.concat(accepted,','))
 
--- Inspection data is plain. The context is not: entries hold ouro.json.null.
+-- Inspection data is plain, and persist keeps platform values (ouro.json.null).
 assert(o.json.decode(o.json.encode(charts.launcher:graph())).id=='launcher')
-assert(not pcall(launcher.persist, launcher), 'platform nulls are not plain data')
+assert(o.json.encode(launcher:persist()), 'persist keeps entries with ouro.json.null')
 
 launcher:stop(); assert(clock.open_scopes==0)
 o.stdout.write('PASS launcher charts\n')

@@ -226,7 +226,8 @@ return {
       },
     }
     local actor = chart:start { scheduler = machine.manual_scheduler() }
-    assert(actor:can { type = 'GO', amount = 50 } and actor:can('BUMP') and not actor:can('NOPE'))
+    assert(actor:can { type = 'GO', amount = 50 } and actor:can('BUMP'))
+    fails(function() actor:can('NOPE') end, 'UnknownEvent: g does not accept "NOPE"')
     actor:send { type = 'GO', amount = 0 } -- both child guards fail; parent handles it.
     assert(actor:matches('fallback'))
     local second = chart:start { scheduler = machine.manual_scheduler() }
@@ -515,7 +516,7 @@ return {
   ['prefix descriptors, the state argument and done.actor positions'] = function()
     local leaf = machine.create { id = 'leaf', initial = 'open', states = { open = { on = { CLOSE = 'closed' } }, closed = { type = 'final' } } }
     local chart = machine.create {
-      id = 'tabs', initial = 'idle', context = { removed = '' },
+      id = 'tabs', initial = 'idle', context = { removed = '' }, events = { ANYTHING = {} },
       states = {
         idle = { on = {
           ADD = { actions = machine.spawn(leaf, { id = function(_, e) return e.id end }) },
@@ -835,6 +836,93 @@ return {
     -- Rejections become ouro.action_error; see tests/machine_native.py for the MCP round trip.
   end,
 
+  ['machine.set assigns e.value and declares the event'] = function()
+    local chart = machine.create {
+      id = 'search', initial = 'idle', context = { query = '', selected = 1 },
+      states = { idle = { on = {
+        QUERY = machine.set('query', 'string'),
+        ['search.select'] = machine.set('selected', 'integer'),
+        ['search.clear'] = { actions = assign { query = '' } },
+      } } },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    assert(actor:send { type = 'QUERY', value = 'fire' } and actor:context().query == 'fire')
+    fails(function() actor:send { type = 'QUERY', value = 3 } end, 'InvalidEvent: QUERY.value must be string')
+    fails(function() actor:send('QUERY') end, 'InvalidEvent: QUERY requires value')
+    assert(actor:send { type = 'search.select', value = 4 } and actor:context().selected == 4)
+    actor:send('search.clear') -- dotted user names group events
+    assert(actor:context().query == '')
+    local events = {}
+    for _, e in ipairs(chart:graph().events) do events[e.type] = e end
+    assert(events.QUERY.fields.value == 'string' and events['search.select'].fields.value == 'integer')
+    assert(events['search.clear'].schema == false)
+    local transition
+    for _, t in ipairs(chart:graph().transitions) do if t.event == 'QUERY' then transition = t end end
+    assert(transition.actions[1] == 'set query')
+    fails(function() machine.set('') end, 'context field name')
+    fails(function() machine.set('x', 'date') end, 'machine.set type')
+  end,
+
+  ['runtime prefixes are reserved and undeclared events fail in strict mode'] = function()
+    for _, name in ipairs({ 'surface.closed.main', 'done.x', 'error.x', 'after.x', 'ouro.x' }) do
+      fails(function() machine.create { id = 'm', initial = 'a', events = { [name] = {} }, states = { a = {} } } end, 'invalid external event name')
+    end
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { on = { ['surface.x'] = machine.set('x') } } } } end, 'plain event name')
+    local chart = machine.create {
+      id = 'win', initial = 'shown', context = {},
+      states = {
+        shown = { on = { HIDE = 'hidden', ['surface.close_requested.main'] = 'hidden', ['surface.*'] = { actions = assign { seen = true } } } },
+        hidden = { on = { SHOW = 'shown' } },
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local records = recorder(actor)
+    fails(function() actor:send('surface.close_requested.main') end, 'reserved')
+    fails(function() actor:send('HIDDEN') end, 'UnknownEvent: win does not accept "HIDDEN"')
+    -- The runtime delivers reserved events: no schema or declaration check.
+    assert(actor:deliver({ type = 'surface.mapped.main' }, 'surface') == true and actor:context().seen)
+    assert(last(records).origin == 'surface' and last(records).event.type == 'surface.mapped.main')
+    assert(actor:deliver('surface.close_requested.main', 'surface') and actor:matches('hidden'))
+    local ok, reason = actor:deliver('surface.closed.main')
+    assert(ok == false and reason == 'no_transition' and last(records).origin == 'runtime')
+    machine.strict = false
+    ok, reason = actor:send('HIDDEN')
+    assert(ok == false and reason == 'undeclared' and actor:can('HIDDEN') == false)
+    machine.strict = true
+    assert(join(actor:accepted()) == 'SHOW')
+  end,
+
+  ['components keep per-instance machine state and start on their first event'] = function(t)
+    local chart = machine.create {
+      id = 'collapsible', initial = 'closed',
+      context = function(props) return { title = props.title } end,
+      states = { closed = { on = { TOGGLE = 'open' } }, open = { on = { TOGGLE = 'closed' } } },
+    }
+    local actors = {}
+    local Collapsible = machine.component(chart, function(self, props)
+      actors[props.title] = self
+      local open = self:matches('open')
+      return o.column { key = 'box',
+        o.button { key = 'toggle', label = (open and 'Hide ' or 'Show ') .. self:context().title, on_press = self:sender('TOGGLE') },
+        open and o.text { key = 'body', text = 'Body of ' .. props.title } or nil,
+      }
+    end)
+    t:mount(function()
+      return o.column { key = 'root',
+        Collapsible { key = 'first', title = 'First' },
+        Collapsible { key = 'second', title = 'Second' },
+      }
+    end)
+    assert(actors.First:status() == 'created' and actors.Second:status() == 'created')
+    assert(t:node('root/first/box/toggle').label == 'Show First')
+    t:click('root/first/box/toggle')
+    assert(t:node('root/first/box/toggle').label == 'Hide First' and t:node('root/first/box/body').label == 'Body of First')
+    assert(t:node('root/second/box/toggle').label == 'Show Second' and actors.Second:status() == 'created')
+    assert(actors.First:status() == 'active')
+    t:click('root/first/box/toggle')
+    assert(t:node('root/first/box/toggle').label == 'Show First')
+  end,
+
   ['event schemas validate external events and drive accepted()'] = function()
     local chart = machine.create {
       id = 'schema', initial = 'clean',
@@ -859,12 +947,12 @@ return {
   ['observer records carry steps, rejections and plain context'] = function()
     local chart = machine.create {
       id = 'obs', initial = 'a', context = { n = 0 },
-      states = { a = { on = { GO = { target = 'b', guard = 'ok', actions = assign { n = 1 } } } }, b = {} },
+      states = { a = { on = { GO = { target = 'b', guard = 'ok', actions = assign { n = 1 } } } }, b = { on = { BACK = 'a' } } },
       guards = { ok = function() return true end },
     }
     local actor = chart:start { scheduler = machine.manual_scheduler() }
     local records = recorder(actor)
-    actor:send('NOPE')
+    actor:send('BACK') -- declared (b handles it) but not accepted in a
     local rejected = records[1]
     assert(rejected.rejected and rejected.reason == 'no_transition' and rejected.actor == 'obs' and rejected.origin == 'external')
     actor:send { type = 'GO', note = 'hi' }
@@ -878,10 +966,10 @@ return {
   end,
 
   ['rejected events keep the same snapshot, so the signal is not written'] = function()
-    local chart = machine.create { id = 'w', initial = 'a', states = { a = { on = { GO = 'b' } }, b = {} } }
+    local chart = machine.create { id = 'w', initial = 'a', states = { a = { on = { GO = 'b' } }, b = { on = { BACK = 'a' } } } }
     local actor = chart:start { scheduler = machine.manual_scheduler() }
     local before = machine.raw(actor:snapshot())
-    actor:send('NOPE')
+    assert(actor:send('BACK') == false)
     assert(machine.raw(actor:snapshot()) == before)
     actor:send('GO')
     assert(machine.raw(actor:snapshot()) ~= before and actor:matches('b'))

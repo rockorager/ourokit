@@ -123,6 +123,18 @@ function M.stop(id) return action('stop', {id = id}) end
 function M.send_to(id, event) return action('send_to', {id = id, event = event}) end
 function M.send_parent(event) return action('send_parent', {event = event}) end
 
+local FIELD_TYPES = {string=true, number=true, integer=true, boolean=true, table=true, any=true}
+
+-- Field setter: `on = { QUERY = machine.set('query', 'string') }` assigns
+-- e.value to context.query and declares QUERY = { value = 'string' }, the
+-- payload value widgets send.
+function M.set(field, kind)
+  if type(field) ~= 'string' or field == '' then fail('machine.set expects a context field name') end
+  kind = kind or 'any'
+  if not FIELD_TYPES[kind] then fail('machine.set type must be one of string, number, integer, boolean, table, any') end
+  return {__set = field, kind = kind}
+end
+
 local function normalize_event(event)
   if type(event) == 'string' then return {type = event} end
   if type(event) ~= 'table' or type(event.type) ~= 'string' or event.type == '' then
@@ -131,9 +143,21 @@ local function normalize_event(event)
   return copy(event)
 end
 
+-- Runtime events use reserved lowercase dotted prefixes. Charts may handle
+-- them in `on` (e.g. ['surface.closed.main'], ['done.actor.*']) but never
+-- declare or send them; the runtime delivers them with actor:deliver.
+M.reserved_prefixes = {'after.', 'done.', 'error.', 'ouro.', 'surface.'}
 local function internal_type(name)
-  return name:sub(1, 6) == 'after.' or name:sub(1, 5) == 'done.' or name:sub(1, 6) == 'error.' or name:sub(1, 5) == 'ouro.'
+  for _, prefix in ipairs(M.reserved_prefixes) do
+    if name:sub(1, #prefix) == prefix then return true end
+  end
+  return false
 end
+
+-- Strict mode raises on undeclared events (typos fail loudly); otherwise
+-- send returns false, 'undeclared'. The host is expected to relax it
+-- outside development.
+M.strict = true
 
 ---------------------------------------------------------------------------
 -- Compilation
@@ -144,8 +168,6 @@ local STATE_KEYS = {type=true, initial=true, order=true, states=true, on=true, a
 local ROOT_KEYS = {id=true, context=true, guards=true, actions=true, actors=true, events=true}
 local TRANSITION_KEYS = {target=true, guard=true, actions=true, reenter=true, description=true}
 local INVOKE_KEYS = {id=true, src=true, input=true, on_done=true, on_error=true}
-local FIELD_TYPES = {string=true, number=true, integer=true, boolean=true, table=true, any=true}
-
 local function is_descendant(a, b)
   local p = a.parent
   while p do
@@ -262,7 +284,7 @@ local function compile(def)
         list[#list + 1] = {kind = 'fn', fn = item, name = name or 'function',
           label = "action '" .. (name or 'function') .. "' (" .. context .. ')'}
       elseif type(item) == 'table' and item.__action then
-        local a = copy(item); a.kind = item.__action; a.name = name or item.__action
+        local a = copy(item); a.kind = item.__action; a.name = name or item.name or item.__action
         a.label = a.kind .. " '" .. a.name .. "' (" .. context .. ')'
         if a.kind == 'spawn' and a.src ~= nil then
           if type(a.src) == 'string' then
@@ -290,10 +312,21 @@ local function compile(def)
     return guard, 'function'
   end
 
+  local setters = {}
   local function add_transitions(node, event, spec, kind, into)
     if spec == nil then return end
     local list
-    if type(spec) == 'string' then list = {{target = spec}}
+    if type(spec) == 'table' and spec.__set then
+      if not event or internal_type(event) or event:find('*', 1, true) then
+        fail('machine.set needs a plain event name (%s)', where(node))
+      end
+      if setters[event] and setters[event] ~= spec.kind then fail('event %s is set with two value types', event) end
+      setters[event] = spec.kind
+      local field = spec.__set
+      local setter = M.assign {[field] = function(_, e) return e.value end}
+      setter.name = 'set ' .. field
+      list = {{actions = setter}}
+    elseif type(spec) == 'string' then list = {{target = spec}}
     elseif type(spec) == 'table' and is_array(spec) then list = spec
     elseif type(spec) == 'table' then list = {spec}
     else fail('invalid transition for %s in %s', tostring(event), where(node)) end
@@ -399,13 +432,31 @@ local function compile(def)
       chart.events[name] = fields
     end
   end
+  for name, kind in pairs(setters) do
+    chart.events = chart.events or {}
+    if not chart.events[name] then chart.events[name] = {value = {type = kind, optional = false}} end
+  end
+  -- Declared events: explicit schemas, setters, and every plain event name a
+  -- state handles. Anything else is a typo (or another actor's event).
+  chart.declared = {}
+  for name in pairs(chart.events or {}) do chart.declared[name] = true end
+  for _, node in ipairs(chart.nodes) do
+    for name in pairs(node.on) do
+      if not internal_type(name) and not name:find('*', 1, true) then chart.declared[name] = true end
+    end
+  end
   return chart
 end
 
+-- True when the event may be sent; false (non-strict) for undeclared ones.
 local function validate_event(chart, event)
-  if not chart.events or internal_type(event.type) then return end
-  local fields = chart.events[event.type]
-  if not fields then fail('UnknownEvent: %s does not accept %q', chart.id, event.type) end
+  if internal_type(event.type) then return true end
+  if not chart.declared[event.type] then
+    if M.strict then fail('UnknownEvent: %s does not accept %q', chart.id, event.type) end
+    return false
+  end
+  local fields = chart.events and chart.events[event.type]
+  if not fields then return true end
   for name, value in pairs(event) do
     if name ~= 'type' then
       local field = fields[name]
@@ -421,6 +472,7 @@ local function validate_event(chart, event)
       if not ok then fail('InvalidEvent: %s.%s must be %s', event.type, name, field.type) end
     end
   end
+  return true
 end
 
 ---------------------------------------------------------------------------
@@ -458,15 +510,13 @@ local function graph(chart)
       guard = t.guard_name, guarded = t.guard ~= nil, actions = action_names(t.actions), reenter = t.reenter,
       description = t.description}
   end
-  if chart.events then
-    local names = {}
-    for name in pairs(chart.events) do names[#names + 1] = name end
-    table.sort(names)
-    for i, name in ipairs(names) do
-      local fields = {}
-      for field, spec in pairs(chart.events[name]) do fields[field] = spec.type .. (spec.optional and '?' or '') end
-      g.events[i] = {type = name, fields = fields}
-    end
+  local names = {}
+  for name in pairs(chart.declared) do names[#names + 1] = name end
+  table.sort(names)
+  for i, name in ipairs(names) do
+    local fields = {}
+    for field, spec in pairs(chart.events and chart.events[name] or {}) do fields[field] = spec.type .. (spec.optional and '?' or '') end
+    g.events[i] = {type = name, fields = fields, schema = chart.events ~= nil and chart.events[name] ~= nil}
   end
   return g
 end
@@ -985,8 +1035,9 @@ end
 local function can(chart, snapshot, event)
   if snapshot.status ~= 'active' then return false end
   event = normalize_event(event)
-  if chart.events and not internal_type(event.type) and not chart.events[event.type] then
-    fail('UnknownEvent: %s does not accept %q', chart.id, event.type)
+  if not internal_type(event.type) and not chart.declared[event.type] then
+    if M.strict then fail('UnknownEvent: %s does not accept %q', chart.id, event.type) end
+    return false
   end
   local active = active_set(chart, snapshot)
   local cv, ev = view(snapshot.context), view(event)
@@ -1207,11 +1258,35 @@ function M.actions(actor, specs, options)
 end
 
 function M.actors()
-  local list = {}
+  local list, live = {}, {}
   for _, path in ipairs(registry_order) do
-    if registry[path] then list[#list + 1] = registry[path] end
+    local actor = registry[path]
+    -- Component actors die with their instance scope; drop them here.
+    if actor and actor._root_scope and actor._scheduler.alive and not actor._scheduler.alive(actor._root_scope) then
+      registry[path] = nil
+      actor = nil
+    end
+    if actor then list[#list + 1] = actor; live[#live + 1] = path end
   end
+  registry_order = live
   return list
+end
+
+-- Local UI state as a one-state (or more) machine per mounted instance,
+-- replacing ouro.stateful + signals:
+--   local Collapsible = machine.component(chart, function(self, props) ... end)
+--   Collapsible { key = 'details', title = 'Details' }
+-- The actor is created when the instance mounts (input = props, so context
+-- may read initial props) and starts on its first event, in the callback's
+-- instance scope: its timers and invokes end when the instance unmounts.
+-- render(self, props) reads self:context()/matches()/can() and returns UI.
+function M.component(chart, render)
+  if type(chart) ~= 'table' or not chart.__chart then fail('component expects a chart') end
+  if type(render) ~= 'function' then fail('component expects a render function') end
+  return ouro.stateful(function(props)
+    local actor = chart:actor {input = props, lazy = true, scope = 'task'}
+    return function() return render(actor, props) end
+  end)
 end
 
 local function spawn_task(fn)
@@ -1316,7 +1391,7 @@ local Actor = {}
 local function create_actor(chart, options)
   options = options or {}
   local actor = {chart = chart, id = options.id or chart.id, _observers = {}, _queue = {}, _timers = {}, _invokes = {}, _scopes = {}, _tasks = {},
-    _waiters = {},
+    _waiters = {}, _lazy = options.lazy == true, _scope_mode = options.scope,
     _children = {}, _started = false, _status = 'created', _scheduler = options.scheduler or M.default_scheduler,
     _signal_factory = options.signal or ouro.signal, _parent = options.parent, _charts = options.charts or {}}
   for name, fn in pairs(Actor) do actor[name] = fn end
@@ -1409,9 +1484,8 @@ end
 -- shortcuts and MCP tools. Requires declared events.
 function Actor:accepted()
   local list = {}
-  if not self.chart.events then return list end
   local names = {}
-  for name in pairs(self.chart.events) do names[#names + 1] = name end
+  for name in pairs(self.chart.declared) do names[#names + 1] = name end
   table.sort(names)
   for _, name in ipairs(names) do
     if self:can(name) then list[#list + 1] = name end
@@ -1474,11 +1548,27 @@ local function propagate(child)
   commit(parent, next_snapshot)
 end
 
+-- The actor's root scope, opened on first need (a timer, invoke or task), so
+-- actors that never schedule work never touch the scheduler. Child actors
+-- nest under their parent's root. A root actor lives in application scope,
+-- like spawn_app: it outlives the task that started it (a widget callback,
+-- an MCP action) until stop(), done or source reload. Component actors
+-- (scope = 'task') hang under the instance scope of the callback that first
+-- needed one, so their work ends when the instance unmounts.
+local function root_scope(actor)
+  if not actor._root_scope then
+    local parent = actor._parent and root_scope(actor._parent)
+      or (actor._scope_mode ~= 'task' and 'application' or nil)
+    actor._root_scope = actor._scheduler.open(parent)
+  end
+  return actor._root_scope
+end
+
 local function scope_for(actor, state, token)
   local entry = actor._scopes[state]
   if entry and entry.token == token then return entry.scope end
   if entry then actor._scheduler.close(entry.scope) end
-  entry = {token = token, scope = actor._scheduler.open(actor._root_scope)}
+  entry = {token = token, scope = actor._scheduler.open(root_scope(actor))}
   actor._scopes[state] = entry
   return entry.scope
 end
@@ -1552,7 +1642,7 @@ local function run_effects(actor, effects, record)
       elseif kind == 'spawn_task' then
         -- A one-shot task gets its own scope under its owner state's scope,
         -- so stop(id) and leaving the owner both cancel it.
-        local owner = effect.owner == '' and actor._root_scope or scope_for(actor, effect.owner, effect.token)
+        local owner = effect.owner == '' and root_scope(actor) or scope_for(actor, effect.owner, effect.token)
         local scope = actor._scheduler.open(owner)
         local live = {scope = scope}
         actor._tasks[effect.id] = live
@@ -1664,25 +1754,40 @@ function Actor:_process()
   end
 end
 
-function Actor:_deliver(event, origin)
-  if self._status ~= 'running' and self._status ~= 'done' then return end
-  self._queue[#self._queue + 1] = {event = event, origin = origin}
-  self:_process()
-end
-
-function Actor:send(event)
-  if self._status == 'created' then fail('machine %s was sent an event before start', self.path) end
-  event = normalize_event(event)
-  if internal_type(event.type) then fail('InvalidEvent: %q is reserved for the machine runtime', event.type) end
-  validate_event(self.chart, event)
-  if self._status == 'stopped' then return false, 'stopped' end
-  local item = {event = event, origin = 'external'}
-  self._queue[#self._queue + 1] = item
-  self:_process()
+local function enqueue(actor, event, origin)
+  local item = {event = event, origin = origin}
+  actor._queue[#actor._queue + 1] = item
+  actor:_process()
   -- Sent while this actor is mid-macrostep (from one of its own effects): it
   -- is queued behind the current step, so the outcome is not known yet.
   if item.accepted == nil then return nil, 'queued' end
   return item.accepted, item.reason
+end
+
+function Actor:_deliver(event, origin)
+  if self._status ~= 'running' and self._status ~= 'done' then return false, self._status end
+  return enqueue(self, event, origin)
+end
+
+-- Runtime delivery (surfaces, timers, children): reserved event types are
+-- allowed, no schema or declaration check, same queue and macrostep as
+-- send. `origin` labels inspection records (default 'runtime').
+function Actor:deliver(event, origin)
+  event = normalize_event(event)
+  if self._status == 'created' and self._lazy then self:start() end
+  return self:_deliver(event, origin or 'runtime')
+end
+
+function Actor:send(event)
+  event = normalize_event(event)
+  if internal_type(event.type) then fail('InvalidEvent: %q is reserved for the machine runtime', event.type) end
+  if not validate_event(self.chart, event) then return false, 'undeclared' end
+  if self._status == 'created' then
+    if not self._lazy then fail('machine %s was sent an event before start', self.path) end
+    self:start() -- Component machines start on their first event.
+  end
+  if self._status == 'stopped' then return false, 'stopped' end
+  return enqueue(self, event, 'external')
 end
 
 -- A plain event binding for widgets: exactly { actor, event, field }.
@@ -1692,7 +1797,7 @@ end
 function Actor:event(event, field)
   local normalized = normalize_event(event)
   if internal_type(normalized.type) then fail('InvalidEvent: %q is reserved for the machine runtime', normalized.type) end
-  if self.chart.events and not self.chart.events[normalized.type] then
+  if not self.chart.declared[normalized.type] then
     fail('UnknownEvent: %s does not accept %q', self.chart.id, normalized.type)
   end
   if field ~= nil and (type(field) ~= 'string' or field == '') then fail('event binding field must be a nonempty string') end
@@ -1708,10 +1813,6 @@ end
 function Actor:start()
   if self._status ~= 'created' then return self end
   self._status = 'running'
-  -- Child actors nest under their parent's scope. A root actor lives in
-  -- application scope, like spawn_app: it outlives the task that started it
-  -- (a widget callback, an MCP action) until stop() or source reload.
-  self._root_scope = self._scheduler.open(self._parent and self._parent._root_scope or 'application')
   registry[self.path] = self
   registry_order[#registry_order + 1] = self.path
   if #inspectors > 0 or #self._observers > 0 then
