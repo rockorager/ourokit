@@ -22,5 +22,12 @@ if ! command -v "$cargo" >/dev/null 2>&1; then
     echo 'Cargo is required for bundled resvg (Rust >=1.85). Add it to PATH or set CARGO; alternatively use -Dresvg-system=true.' >&2
     exit 1
 fi
-"$cargo" build --locked --release --manifest-path "$manifest" --target "$rust_target" --target-dir "$output/cargo"
+# Cargo reports progress ("Compiling", "Finished") on stderr, and the Zig build
+# runner prints any step stderr under a "failed command:" heading even when the
+# step succeeds. Keep the log and show it only when the build really fails.
+log="$output/cargo.log"
+if ! "$cargo" build --locked --release --manifest-path "$manifest" --target "$rust_target" --target-dir "$output/cargo" >"$log" 2>&1; then
+    cat "$log" >&2
+    exit 1
+fi
 cp "$output/cargo/$rust_target/release/libourokit_resvg.a" "$output/libourokit_resvg.a"
