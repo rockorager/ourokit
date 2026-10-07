@@ -425,7 +425,19 @@ function M.replay(source, options)
       end
       if recorded.lossy then replayed.r, recorded.r = nil, nil end
       if not equal(recorded, replayed) then
-        diverge(j, 'replay produced ' .. describe(replayed) .. ' where the recording has ' .. describe(recorded))
+        local what = describe(recorded)
+        local message
+        if describe(replayed) ~= what or recorded.t ~= replayed.t then
+          message = 'replay produced ' .. describe(replayed) .. ' at t=' .. tostring(replayed.t) ..
+            ' where the recording has ' .. what
+        elseif not equal(recorded.r, replayed.r) then
+          message = what .. ' took different transitions'
+        elseif recorded.err ~= replayed.err then
+          message = what .. (replayed.err and ' raised an error' or ' no longer raises')
+        else
+          message = what .. ' led to a different snapshot'
+        end
+        diverge(j, message)
         return false
       end
       apply(recorded_states, recorded.s)
@@ -549,4 +561,15 @@ function M.replay_text(report)
     end
   end
   return table.concat(out, '\n')
+end
+
+-- `ouroctl replay`: replay_tool(log, options_json) -> text, ok
+function M.replay_tool(log, options_json)
+  local options = options_json ~= '' and json.decode(options_json) or {}
+  local report = M.replay(log)
+  if options.json then
+    report.states = nil
+    return json.encode(safe(report)), report.ok
+  end
+  return M.replay_text(report) .. '\n', report.ok
 end

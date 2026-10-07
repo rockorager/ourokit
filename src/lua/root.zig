@@ -28,6 +28,7 @@ pub const StatechartInspector = @import("statechart_inspector.zig").Store;
 pub const StatechartEntry = @import("statechart_inspector.zig").Entry;
 pub const installStatechartInspector = @import("statechart_inspector.zig").install;
 pub const setStatechartStrict = @import("machine.zig").setStrict;
+pub const chart_recording = @import("chart_recording.zig");
 pub const attachStatechartInspector = @import("statechart_inspector.zig").attach;
 pub const Dbus = @import("dbus.zig").Binding;
 pub const Stdio = @import("stdio.zig").Stdio;
@@ -50,6 +51,7 @@ test {
     _ = @import("chart_carry.zig");
     _ = @import("components_test.zig");
     _ = @import("machine.zig");
+    _ = @import("chart_recording.zig");
     _ = @import("statechart_inspector.zig");
     _ = @import("diagnostic.zig");
     _ = @import("images_test.zig");

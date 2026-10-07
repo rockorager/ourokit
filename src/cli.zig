@@ -11,6 +11,14 @@ pub const Command = union(enum) {
     storybook: Storybook,
     mcp_export: Export,
     @"test": Test,
+    replay: Replay,
+};
+
+pub const Replay = struct {
+    log_path: []const u8,
+    /// application.lua, ouro.json or a directory holding ouro.json.
+    application: []const u8 = ".",
+    json: bool = false,
 };
 
 pub const Test = struct {
@@ -47,6 +55,8 @@ pub const Run = struct {
     dbus_activated: bool = false,
     action: ?[]const u8 = null,
     uris: []const []const u8 = &.{},
+    /// Statechart input log path (`--record`); `--dev` records by default.
+    record_path: ?[]const u8 = null,
 };
 
 pub const Storybook = union(enum) {
@@ -76,7 +86,8 @@ pub const Snapshot = struct {
 pub const usage =
     \\Usage:
     \\  ouroctl run [application.lua|ouro.json] [--dev|--mcp] [--headless] [--dbus-activated]
-    \\              [--vulkan|--software] [--exit-after-first-frame] [--action <name>] [-- <URI>...]
+    \\              [--vulkan|--software] [--exit-after-first-frame] [--action <name>]
+    \\              [--record <log.jsonl>] [-- <URI>...]
     \\  ouroctl activate <application-id> [--action <name>] [-- <URI>...]
     \\  ouroctl dev reload <development-socket>
     \\  ouroctl dev status <development-socket>
@@ -88,6 +99,7 @@ pub const usage =
     \\  ouroctl storybook snapshot <stories.lua> [--story <id>] [--output <dir>] [--json]
     \\  ouroctl test [file|directory] [--filter <substring>] [--list] [--json]
     \\              [--timeout-ms <milliseconds>]  (default: tests, 10000 ms per worker)
+    \\  ouroctl replay <log.jsonl> [application.lua|ouro.json|directory] [--json]
     \\  ouroctl help
     \\  ouroctl version
     \\
@@ -104,7 +116,7 @@ pub fn parse(args: []const []const u8) !Command {
     if (std.mem.eql(u8, command, "activate")) {
         const options = try parseRun(args[2..]);
         if (options.path == null) return error.ExpectedApplicationId;
-        if (options.development or options.mcp or options.headless or options.dbus_activated or options.vulkan != null or options.exit_after_first_frame) return error.UnknownOption;
+        if (options.development or options.mcp or options.headless or options.dbus_activated or options.vulkan != null or options.exit_after_first_frame or options.record_path != null) return error.UnknownOption;
         return .{ .activate = options };
     }
     if (std.mem.eql(u8, command, "dev")) {
@@ -117,6 +129,7 @@ pub fn parse(args: []const []const u8) !Command {
     }
     if (std.mem.eql(u8, command, "run")) return .{ .run = try parseRun(args[2..]) };
     if (std.mem.eql(u8, command, "test")) return .{ .@"test" = try parseTest(args[2..]) };
+    if (std.mem.eql(u8, command, "replay")) return .{ .replay = try parseReplay(args[2..]) };
     if (std.mem.eql(u8, command, "storybook"))
         return .{ .storybook = try parseStorybook(args[2..]) };
     if (std.mem.eql(u8, command, "mcp")) {
@@ -156,6 +169,27 @@ fn parseTest(args: []const []const u8) !Test {
         } else return error.UnexpectedArgument;
     }
     return result;
+}
+
+fn parseReplay(args: []const []const u8) !Replay {
+    var log: ?[]const u8 = null;
+    var application: ?[]const u8 = null;
+    var json = false;
+    for (args) |argument| {
+        if (std.mem.eql(u8, argument, "--json")) {
+            if (json) return error.DuplicateOption;
+            json = true;
+        } else if (std.mem.startsWith(u8, argument, "--")) {
+            return error.UnknownOption;
+        } else if (argument.len == 0) {
+            return error.ExpectedReplayLog;
+        } else if (log == null) {
+            log = argument;
+        } else if (application == null) {
+            application = argument;
+        } else return error.UnexpectedArgument;
+    }
+    return .{ .log_path = log orelse return error.ExpectedReplayLog, .application = application orelse ".", .json = json };
 }
 
 fn parseExport(args: []const []const u8) !Export {
@@ -240,6 +274,10 @@ fn parseRun(args: []const []const u8) !Run {
         } else if (try optionValue(args, &index, argument, "--action")) |value| {
             if (result.action != null) return error.DuplicateOption;
             result.action = value;
+        } else if (try optionValue(args, &index, argument, "--record")) |value| {
+            if (result.record_path != null) return error.DuplicateOption;
+            if (value.len == 0 or std.mem.startsWith(u8, value, "--")) return error.ExpectedOptionValue;
+            result.record_path = value;
         } else if (std.mem.eql(u8, argument, "--")) {
             result.uris = args[index + 1 ..];
             break;

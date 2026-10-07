@@ -35,6 +35,15 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
             ourokit.runtime.version, ourokit.runtime.api_level, ourokit.runtime.revision,
         })),
         .@"test" => |options| return @import("test_command.zig").run(init, options),
+        .replay => |options| {
+            const log = try readSource(init, options.log_path);
+            defer init.gpa.free(log);
+            const entry = try applicationEntry(init, options.application);
+            const result = try ourokit.app.chart_tools.call(init, entry, "replay_tool", log, if (options.json) "{\"json\":true}" else "");
+            defer init.gpa.free(result.text);
+            try writeStdout(init, result.text);
+            return if (result.ok) 0 else 1;
+        },
         .activate => |target| {
             try ourokit.app.desktop.validateId(target.path.?);
             const source = try std.fmt.allocPrint(init.gpa, "return {{id='{s}'}}", .{target.path.?});
@@ -88,7 +97,15 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
             var libraries = try openNativeModules(init.gpa, manifest);
             defer libraries.deinit();
             var exit_code: u8 = 0;
+            // Statechart inputs are recorded under --dev, or anywhere with --record.
+            const record_app = if (manifest) |value| value.id else std.fs.path.stem(path);
+            const record_path = options.record_path orelse if (options.development)
+                try defaultRecordingPath(init, record_app)
+            else
+                null;
             var run_options: ourokit.app.WaylandRunOptions = .{
+                .record_path = record_path,
+                .record_app = record_app,
                 .development = options.development,
                 .mcp = options.mcp,
                 .headless = options.headless,
@@ -379,6 +396,34 @@ fn testWorker(init: std.process.Init, path: []const u8, name: ?[]const u8) !void
     const result = try ourokit.app.component_tests.execute(init, source, path, name);
     defer init.gpa.free(result);
     try writeStdout(init, result);
+}
+
+/// `$XDG_STATE_HOME/ourokit/recordings/<application>.jsonl`: the last
+/// development run of each application.
+fn defaultRecordingPath(init: std.process.Init, application: []const u8) ![]const u8 {
+    const a = init.arena.allocator();
+    const environ = init.minimal.environ;
+    const state = std.process.Environ.getPosix(environ, "XDG_STATE_HOME") orelse state: {
+        const home = std.process.Environ.getPosix(environ, "HOME") orelse return error.HomeDirectoryUnavailable;
+        break :state try std.fs.path.join(a, &.{ home, ".local", "state" });
+    };
+    const name = try std.fmt.allocPrint(a, "{s}.jsonl", .{application});
+    return std.fs.path.join(a, &.{ state, "ourokit", "recordings", name });
+}
+
+/// The entry module of `application.lua`, `ouro.json`, or a directory that
+/// holds `ouro.json`.
+fn applicationEntry(init: std.process.Init, path: []const u8) ![]const u8 {
+    const a = init.arena.allocator();
+    const manifest_path = if (std.mem.endsWith(u8, path, ".lua"))
+        return path
+    else if (std.mem.eql(u8, std.fs.path.basename(path), ourokit.bundle.manifest_file_name))
+        path
+    else
+        try std.fs.path.join(a, &.{ path, ourokit.bundle.manifest_file_name });
+    var manifest = try ourokit.bundle.Manifest.load(init.io, init.gpa, manifest_path);
+    defer manifest.deinit();
+    return a.dupe(u8, manifest.entry_path);
 }
 
 fn readSource(init: std.process.Init, path: []const u8) ![]u8 {

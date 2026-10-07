@@ -23,6 +23,7 @@ pub const exportCatalogWithModules = @import("wayland_runner.zig").exportCatalog
 pub const WaylandRunOptions = @import("wayland_runner.zig").Options;
 pub const storybook = @import("storybook_runner.zig");
 pub const component_tests = @import("component_tests.zig");
+pub const chart_tools = @import("chart_tools.zig");
 pub const runStorybook = @import("storybook_browser.zig").run;
 
 test {

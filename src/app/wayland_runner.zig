@@ -27,6 +27,10 @@ const ui = @import("../ui/root.zig");
 
 pub const Options = struct {
     development: bool = false,
+    /// Statechart input log (design/statecharts.md §14): `--dev` records by
+    /// default, `--record <path>` anywhere.
+    record_path: ?[]const u8 = null,
+    record_app: []const u8 = "",
     mcp: bool = false,
     headless: bool = false,
     desktop: desktop.Options = .{},
@@ -414,8 +418,18 @@ fn runSourceInternal(
     var statecharts: ?@import("../lua/root.zig").StatechartInspector =
         if (options.development) try .init(init.gpa, 1024) else null;
     defer if (statecharts) |*store| store.deinit();
+    var recording: ?lua.chart_recording.Sink = if (options.record_path) |path|
+        lua.chart_recording.Sink.open(path, options.record_app) catch |err| blk: {
+            std.log.warn("cannot record statecharts to {s}: {s}", .{ path, @errorName(err) });
+            break :blk null;
+        }
+    else
+        null;
+    defer if (recording) |*sink| sink.close();
+    if (recording != null) std.log.info("recording statechart inputs to {s}", .{options.record_path.?});
     const generation_config: source_generation.Config = .{
         .statecharts = if (statecharts != null) &statecharts.? else null,
+        .recording = if (recording != null) &recording.? else null,
         // Production rejects undeclared events instead of raising.
         .statechart_strict = options.development,
         .native_modules = options.native_modules,
