@@ -90,15 +90,102 @@ local expected = table.concat({
 local first = {}
 for i = 1, 8 do first[i] = log[i] end
 assert(table.concat(first, '|') == expected, table.concat(log, '|'))
+-- Waiting inside a function action is rejected before it touches the task,
+-- even when the action swallows the operation's own failure.
+local strict = machine.create { id = 'strict', initial = 'a', states = { a = { on = {
+  READ = { actions = function() local _ = o.files.read('/nonexistent') end },
+  NAP = { actions = function() pcall(o.sleep, 5) end },
+} } } }
+local s = strict:start()
+local ok, err = pcall(s.send, s, 'READ')
+assert(not ok and err:find("YieldInAction: action 'function' (strict.a on READ) called Ouro I/O", 1, true), tostring(err))
+ok, err = pcall(s.send, s, 'NAP')
+assert(not ok and err:find('called ouro.sleep', 1, true), tostring(err))
+o.sleep(1) -- this task is still healthy
+assert(o.files.write('/tmp/ourokit-machine-native-probe', 'ok'))
+
+-- A one-shot spawned task reads in its owner's scope; leaving the owner cancels it.
+local reader = machine.create { id = 'reader', initial = 'idle', context = {},
+  actors = { read = function(input) o.sleep(input.ms); after_sleep[#after_sleep + 1] = 'read ' .. input.ms
+    return o.files.read('/tmp/ourokit-machine-native-probe') end },
+  states = {
+    idle = { on = { GO = 'reading' } },
+    reading = {
+      entry = machine.spawn('read', { id = 'r', input = function() return { ms = 10 } end }),
+      on = { ['done.actor.r'] = { target = 'idle', actions = machine.assign { text = function(_, e) return e.output end } },
+             SLOW = { actions = machine.spawn('read', { id = 'slow', input = function() return { ms = 80 } end }) },
+             LEAVE = 'idle' } },
+  } }
+local r = reader:start()
+r:send('GO'); o.sleep(50)
+assert(r:matches('idle') and r:context().text == 'ok', 'spawned read did not report')
+r:send('GO'); r:send('SLOW'); o.sleep(20)
+assert(r:matches('idle') and r:snapshot().children[1] == nil)
+r:send('GO'); r:send('SLOW'); o.sleep(30); r:send('LEAVE'); o.sleep(100)
+assert(table.concat(after_sleep, ',') == '20,60,read 10,read 10,read 10', 'canceled task ran on: ' .. table.concat(after_sleep, ','))
+
 o.stdout.write('PASS machine native\n')
 o.exit(0)
 '''
 
+# An actor started inside an MCP action handler outlives the call: its root
+# scope is application scope, not the per-call action scope (which used to
+# be left non-empty, panicking when the call returned).
+mcp_source = r'''
+local o = require('ouro')
+local machine = o.machine
+local chart = machine.create { id = 'book', initial = 'loading', context = { loaded = false },
+  actors = { load = function() o.sleep(30); return true end },
+  states = {
+    loading = { invoke = { src = 'load', on_done = { target = 'ready', actions = machine.assign { loaded = true } } } },
+    ready = {},
+  } }
+local book
+local empty = { type = 'object', additionalProperties = false }
+local state = { type = 'object', properties = { ready = { type = 'boolean' } }, required = { 'ready' }, additionalProperties = false }
+return o.app { id = 'dev.ourokit.machinetest', actions = {
+  Start = { description = 'Start the actor', inputSchema = empty, outputSchema = state,
+    handler = function() book = book or chart:start(); return { ready = book:matches('ready') } end },
+  Read = { description = 'Read the actor', inputSchema = empty, outputSchema = state,
+    handler = function() return { ready = book ~= nil and book:matches('ready') and book:context().loaded } end },
+}, run = function() error('headless MCP must not run the UI') end }
+'''
+
+
+def mcp_check():
+    import sys, time
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from application_services import call
+    with tempfile.TemporaryDirectory(prefix="ourokit-machine-mcp-") as temporary:
+        app = Path(temporary) / "app.lua"
+        app.write_text(mcp_source)
+        env = dict(os.environ, XDG_RUNTIME_DIR=temporary)
+        process = subprocess.Popen([str(BINARY), "run", str(app), "--mcp", "--headless"], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            address = Path(temporary) / "ourokit/apps/dev.ourokit.machinetest"
+            deadline = time.monotonic() + 8
+            while not address.exists():
+                assert process.poll() is None and time.monotonic() < deadline, process.stderr.read() if process.poll() is not None else "no socket"
+                time.sleep(.02)
+            first = call(address, "Start")
+            assert first["structuredContent"] == {"ready": False}, first
+            time.sleep(.2)
+            assert process.poll() is None, process.stderr.read()
+            second = call(address, "Read")
+            assert second["structuredContent"] == {"ready": True}, second
+        finally:
+            process.terminate()
+            _, errors = process.communicate(timeout=8)
+            assert "panic" not in errors, errors
+
+
 assert BINARY.exists(), "run zig build first"
+mcp_check()
 with tempfile.TemporaryDirectory() as temporary:
     app = Path(temporary) / "machine.lua"
     app.write_text(source)
     process = subprocess.run([str(BINARY), "run", str(app), "--headless"], capture_output=True, text=True, timeout=10)
     assert process.returncode == 0, process.stderr
     assert "PASS machine native" in process.stdout, (process.stdout, process.stderr)
-print("PASS statechart after/invoke on native scopes: exit and stop cancel sleeping work; token fallback drops stale results")
+print("PASS statechart after/invoke and spawned tasks on native scopes: exit and stop cancel sleeping work; actions cannot wait; token fallback drops stale results")

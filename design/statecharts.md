@@ -25,7 +25,7 @@ We use SCXML semantics with an XState-like Lua surface. Supported:
 | `always` | `always = transition(s)` | Eventless transitions, checked after every microstep. |
 | `after` | `after = { [ms] = transition }` | Integer milliseconds. Started on entry, cancelled on exit. |
 | `invoke` | `invoke = { src, id?, input?, on_done?, on_error? }` | Work that lives exactly as long as its state. |
-| Spawned children | `machine.spawn(chart, {id, input})`, `machine.stop(id)`, `send_to`, `send_parent` | Keyed child actors, such as one per document or tab. |
+| Spawned children | `machine.spawn(chart \| fn \| 'actor', {id?, input?})`, `machine.stop(id)`, `send_to`, `send_parent` | Keyed child actors, such as one per document or tab, or one-shot tasks (§8). Ids default to `<chart or actor>.<n>`. |
 | Entry/exit | `entry = action(s)`, `exit = action(s)` | Actions run in document order. Named actions in `actions = {...}` may be a list. |
 | `on_done` | on compound/parallel states | Shorthand for `on = { ['done.state.<id>'] = ... }`. |
 | Tags | `tags = {'busy'}` | Use `actor:has_tag('busy')` in the view. |
@@ -96,14 +96,25 @@ The prototype follows the SCXML algorithm without history:
   reaches the sender.
 - **Effects run after commit:** plain function actions, timers, invokes and
   child messages run after commit. Function actions run in order. Each sees the
-  context as it was when it was reached in the macrostep. **Function actions
-  must not yield.** They run in the sender's task, such as a button callback,
-  and the commit they follow can unmount that button and cancel its task. Any
-  work that waits on I/O is an `invoke`. The documents port hit this exactly:
-  saving the session in an exit action was cancelled by the closing dialog. Timers and invokes
+  context as it was when it was reached in the macrostep. Timers and invokes
   start at the end of the macrostep, only for states that are still active.
   This matches SCXML's end-of-macrostep `<invoke>`. Their cancellation is
   recorded when the state exits.
+- **Guards, assigns, expressions and function actions cannot wait.** They
+  run as native atomic sections. Inside one, `ouro.sleep`, `ouro.exit`,
+  `ouro.spawn`, `ouro.spawn_app` and every Ouro I/O wait (files, D-Bus,
+  HTTP, portals, notifications) fail before they touch the task. When the
+  section ends, it raises `YieldInAction: action 'report' (document.open on
+  EDIT) called Ouro I/O, which waits or spawns; move async work into an invoke
+  or a spawned actor`. It raises even if the function swallowed the
+  operation's own error. A failing guard or assign aborts the macrostep with
+  nothing committed. Function actions and entry actions run after commit, so
+  the transition stands. Waiting work belongs in an `invoke` or a spawned task.
+  Function actions run in the sender's task, such as a button callback, and the
+  commit can unmount that button and cancel the task mid-wait. The documents
+  port hit this before the rule existed: the session save ran in an exit action
+  and was cancelled by the closing dialog. Its notifications also waited on
+  D-Bus from inside actions.
 
 ## 2. Events
 
@@ -134,7 +145,11 @@ types are reserved and cannot be sent:
 | `after.<ms>.<state>` | A timer fires. Carries `state` and the entry `token`. |
 | `done.invoke.<id>` / `error.invoke.<id>` | Invoked work returns or throws. Carries `output` or `error`, plus `state` and `token`. |
 | `done.state.<id>` | A compound or parallel state completes. Carries `output`. |
-| `done.actor.<child>` | A spawned child finishes. Carries `id`, `output` and the child's former `index`. |
+| `done.actor.<child>` | A spawned child finishes: a chart reaches its final state, or a task returns. Carries `id`, `output` and the child's former `index`. |
+| `error.actor.<child>` | A spawned task throws. Carries `id`, `error` and `index`. |
+
+`done.actor.*` and `error.actor.*` events for a child that is no longer listed,
+because it was stopped or cancelled with its owner, are rejected as `stale`.
 
 A timer or invoke event whose token does not match the current entry of its
 state is rejected as `stale`.
@@ -155,7 +170,11 @@ A snapshot is immutable. A new table is created only when something changed:
   status   = 'active',            -- 'active' | 'done' | 'stopped'
   states   = { 'open', 'open.io', 'open.io.idle', 'open.lifecycle', 'open.lifecycle.active' },
   context  = { title = 'Untitled', text = '', revision = 0, saved_revision = 0 },
-  children = { 'document-1', 'document-2' },  -- spawned children, in spawn order
+  children = {                    -- spawned children
+    'document.1', 'document.2',    -- array part: ids in spawn order
+    ['document.1'] = { machine = 'document', states = {...}, context = {...}, ... },  -- child snapshots
+    ['notify.7'] = { status = 'active', src = 'notify', owner = 'open' },            -- a running task
+  },
   output   = nil,                 -- set when status == 'done'
   -- runtime bookkeeping, not part of the persisted form:
   entries  = { ['open.io.saving'] = 7 }, serial = 7,
@@ -168,6 +187,16 @@ A snapshot is immutable. A new table is created only when something changed:
   `matches(id)` rejects unknown IDs, so typos fail loudly.
 - **Active configuration.** `states` lists every active state except the root,
   including compound ancestors and every parallel region, in document order.
+- **Parents read children, as in XState v5.** `snapshot.children[id]` is the
+  child's current snapshot as a read-only view. It is readable from the view
+  (`actor:snapshot().children`), from guards, assigns and expressions (the
+  third `state` argument's `state.children`), and from the pure
+  `chart:transition`. `ipairs` and `#` still give ids in spawn order.
+  `machine.matches(child, 'open.io.saving')` tests a child's configuration.
+  When a child commits, its new snapshot replaces its entry in the parent,
+  which writes the parent's signal. A view that reads only the parent
+  therefore rebuilds when a child changes, and parent guards see children as
+  of the start of their macrostep.
 - **Serializable.** `actor:persist()` returns `machine`, `status`, `states`,
   `context`, `output` and children as `{ id, snapshot }`. It deep-copies plain
   data and fails on functions or cycles. The result round-trips through
@@ -287,12 +316,28 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
   reject any `after.*` or `done.invoke.*` event from an older entry. With
   native scopes nothing stale should arrive; the check also guards forged
   events.
-- **Where the root scope hangs.** With no parent, `open` uses the running
-  task's scope. Start long-lived actors from application-level tasks (`run`,
-  `app_command`). An actor started inside a widget callback dies with that
-  widget, just like `ouro.spawn`. Generation reload retires every scope.
-  Capacity is fixed (1024 in the Wayland runner). Never-started work is
+- **Where the root scope hangs.** A root actor's scope is application scope,
+  like `spawn_app`, through the binding's `open('application')`. An actor
+  started from a widget callback or an MCP action handler outlives that task
+  until `stop()`, its final state, or source reload. Earlier, parenting the
+  root under the calling task left a Lua-opened scope under the per-call MCP
+  action scope, and the process panicked when the call returned; the contacts
+  port found this, and `tests/machine_native.py` now covers it. Where
+  application spawns are unavailable (Storybook, reload candidates), the root
+  falls back to the running task's scope. Generation reload retires every
+  scope. Capacity is fixed (1024 in the Wayland runner). Never-started work is
   discarded on close, so rapid toggling reuses slots.
+- **One-shot tasks.** These are XState's `spawnChild(fromPromise)`.
+  `machine.spawn(fn_or_actor_name, {id?, input?})` lists the task under
+  `snapshot.children` and runs `fn(input)` in its own scope. That scope sits
+  under the **owning state's** scope:
+  - the transition's domain, or its source when there is no target;
+  - the entered state, for entry actions;
+  - the parent, for exit actions.
+  A return delivers `done.actor.<id> { output }`; a throw delivers
+  `error.actor.<id> { error }`. `stop(id)` or leaving the owner state removes
+  it from `children` and cancels it natively. Use this for work whose result
+  is just an event, such as Open… (a chooser and reads) or a notification.
 - **Token fallback (`machine.token_scheduler`).** Used where a Lua state has
   no `Vm`, so the binding is nil. Work runs in application scope (`spawn_app`,
   else `spawn`), and closing only drops delivery. A cancelled request still
@@ -303,7 +348,7 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
   forbids wall-clock sleeps, and the sandbox has no `coroutine` library, so
   invokes run to completion when they run.
 - **Effects run in the sender's task, not in a state scope.** That is why
-  function actions must not yield (§1).
+  function actions are atomic (§1).
 - **Still open: logical timers.** `after` still uses wall-clock `ouro.sleep`.
   Replay on a virtual clock needs the scope's timers to follow a host clock.
 
@@ -369,7 +414,7 @@ There is one record per processed event, including rejected ones:
 
 ```lua
 {
-  kind = 'transition', actor = 'notes/document-2', machine = 'document', sequence = 14, commit = 203,
+  kind = 'transition', actor = 'notes/document.2', machine = 'document', sequence = 14, commit = 203,
   -- sequence counts this actor's records; commit is the global order in which
   -- snapshots committed. Records are emitted after their effects, so a child's
   -- record can arrive before the parent record that caused it: sort by commit.
@@ -385,8 +430,8 @@ There is one record per processed event, including rejected ones:
   -- timer action: started | fired | cancelled
   invokes = { { action = 'started', state = 'open.io.saving.choosing', id = 'choose', src = 'choose', token = 10 } },
   -- invoke action: started | done | error (+ error) | cancelled
-  children = { { action = 'spawned', id = 'document-3', machine = 'document' } },
-  -- child action: spawned | stopped | done
+  children = { { action = 'spawned', id = 'document.3', machine = 'document' } },
+  -- child action: spawned | stopped | done | error (+ error); tasks carry src instead of machine
   actions = { 'snapshot_save' },   -- action names in execution order
   states = { ... },                -- configuration after the step
   status = 'active',
@@ -412,7 +457,7 @@ actor:start()  actor:stop()  actor:send(event)  actor:sender(event)
 actor:matches(id)  actor:can(event)  actor:has_tag(tag)  actor:accepted()
 actor:snapshot()  actor:context()  actor:states()  actor:status()  actor:output()
 actor:child(id)  actor:children()  actor:persist()  actor:observe(fn)
-machine.inspect(fn)  machine.actors()  machine.plain(v)  machine.unset
+machine.inspect(fn)  machine.actors()  machine.plain(v)  machine.unset  machine.matches(snapshot, id)
 machine.assign  machine.raise  machine.spawn  machine.stop  machine.send_to  machine.send_parent
 machine.default_scheduler  machine.token_scheduler  machine.manual_scheduler()  machine.native_scopes
 ```
@@ -474,16 +519,21 @@ document = machine.create {
   parallel regions take it. While a save is running, `can('SAVE')` is false.
   That replaces `begin_save`'s "Save already in progress" error and the
   `enabled = not d.saving` checks.
-- `notes` holds `running.open` and `running.closing.walking`. `CLOSE_WINDOW`
-  captures the open tabs, then walks: it selects the first unsafe child and
-  sends it `CLOSE`. `done.actor.*` re-enters `walking` but not `closing`, so the
-  captured list survives. That needs the default transition, not
-  `reenter = true`; the first version of the port got this wrong. A child's
-  `CANCEL` sends `CLOSE_CANCELED`, which returns to `open`. When no unsafe
-  children are left, or the last tab closes, `notes` enters `quitting`, which
-  invokes the session save, then `exited`, whose entry exits the process.
-- The parent keeps each child's saved path (`SAVED { id, path }`) for the
-  session, because parent guards and expressions cannot read child snapshots.
+- `CLOSE_WINDOW` moves `notes` into `running.closing`. Its entry captures the
+  session (each child's path and the selected path) from
+  `state.children`. Then `walking` decides with pure `always` transitions: with
+  no dirty or saving child it goes to `quitting`. Otherwise it goes to
+  `prompting`, selecting the first unsafe child and sending it `CLOSE`.
+  `done.actor.document.*` re-enters `walking` but not `closing`, so the
+  capture survives. That needs the default transition, not `reenter = true`;
+  the first version of the port got this wrong. A child's `CANCEL` sends
+  `CLOSE_CANCELED`, which returns to `open`. `quitting` invokes the session
+  save, which then exits.
+- Notifications and Open… are spawned tasks. `report` assigns the error and
+  spawns `notify`. `OPEN` spawns `open` (the chooser, which needs only
+  `parent`, not press provenance, plus the reads), and its `done.actor.open.*`
+  sends one `ADD` per note. Drops and activation URIs use `OPEN_URIS` and the
+  `read` task.
 - The view maps `doc:matches('open.lifecycle.confirming')` to the dialog and
   `doc:matches('open.io.saving')` to disabled Save buttons. The compositor
   close request is just `notes:sender('CLOSE_WINDOW')`.
@@ -555,22 +605,15 @@ through the shared schema and MCP surface, and through inspection.
 
 - **Do signals survive?** The prototype keeps exactly one signal per actor.
   The lean is to keep only derived read-only selectors.
-- **Fire-and-forget I/O.** Reading a file in response to "Open…" has no state
-  of its own. Options: a spawned one-shot child, an invoke on a short-lived
-  state, or leaving it in the callback. The documents port leaves the chooser
-  and reads in the callback and sends `ADD`.
-- **Duplicated facts across actors.** The parent tracks each child's file path
-  for the session (`SAVED { id, path }`) while the child owns it for display.
-  Parent guards cannot read child snapshots. Should they, or should a child
-  publish selected fields into the parent snapshot?
+- ~~Fire-and-forget I/O~~ **Resolved:** one-shot spawned tasks (§8).
+- ~~Duplicated facts across actors~~ **Resolved:** `snapshot.children[id]`
+  exposes child snapshots, as in XState v5.
 - **Copy-on-write by convention.** Nested values in context are not frozen;
   views protect reads, but an action can still mutate a table it created
   before assigning it.
 - ~~Document order from sorted keys~~ **Resolved:** keep XState's map form and
   required `initial`. Parallel states may declare `order`; without it, keys sort.
-- **Yielding in function actions** cannot be detected without a coroutine
-  library in the sandbox. Phase 2 could run effects outside the sender's
-  scope, or reject yields natively.
+- ~~Yielding in function actions~~ **Resolved:** rejected natively (§1).
 - **Effects see stale context.** Function actions run after commit, with the
   context of their point in the macrostep. This is SCXML-consistent but easy
   to misread.

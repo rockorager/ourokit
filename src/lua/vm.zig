@@ -84,6 +84,11 @@ pub const Vm = struct {
     running: ?TaskHandle = null,
     sleep_enabled: bool = true,
     app_spawn_allowed: bool = true,
+    /// Nesting depth of non-yielding statechart sections (machine.zig): guards,
+    /// assigns and actions must not wait or spawn. Operations that would fail
+    /// fast, before touching task state, and record what was attempted.
+    atomic_depth: u32 = 0,
+    atomic_violation: ?[*:0]const u8 = null,
     activation_provider: ?platform_activation.Provider = null,
     popup_provider: ?@import("popup.zig").Provider = null,
     drag_provider: ?@import("drag.zig").Provider = null,
@@ -282,6 +287,14 @@ pub const Vm = struct {
         _ = c.lua_getfield(state, c.registry_index, registry_key);
         defer c.lua_settop(state, -2);
         return @ptrCast(@alignCast(c.lua_touserdata(state, -1) orelse return null));
+    }
+
+    /// True (and recorded) when a waiting or spawning operation is attempted
+    /// inside a statechart atomic section.
+    pub fn rejectInAtomic(self: *Vm, operation: [*:0]const u8) bool {
+        if (self.atomic_depth == 0) return false;
+        if (self.atomic_violation == null) self.atomic_violation = operation;
+        return true;
     }
 
     pub fn spawnApplication(self: *Vm, source: []const u8) !TaskHandle {
@@ -697,6 +710,7 @@ pub const Vm = struct {
         context: *anyopaque,
         lifecycle: *const task.ResourceLifecycle,
     ) !TaskHandle {
+        if (self.rejectInAtomic("Ouro I/O")) return error.YieldInAtomicSection;
         const handle = self.running orelse return error.LuaTaskNotRunning;
         const slot = try self.activeSlot(handle);
         if (slot.thread != state) return error.WrongLuaTask;
@@ -928,6 +942,7 @@ pub const Vm = struct {
 
     fn requestExit(state: *c.State) callconv(.c) c_int {
         const self: *Vm = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
+        if (self.rejectInAtomic("ouro.exit")) return luaError(state, "YieldInAtomicSection: ouro.exit");
         const handle = self.running orelse return luaError(state, "exit called outside a task");
         const slot = self.activeSlot(handle) catch return luaError(state, "stale Ouro task");
         if (slot.thread != state) return luaError(state, "wrong Ouro task");
@@ -996,6 +1011,7 @@ pub const Vm = struct {
         const pointer = c.lua_touserdata(state, c.upvalueIndex(1)) orelse
             return luaError(state, "missing Ouro VM");
         const self: *Vm = @ptrCast(@alignCast(pointer));
+        if (self.rejectInAtomic("ouro.sleep")) return luaError(state, "YieldInAtomicSection: ouro.sleep");
         if (!self.sleep_enabled) return luaError(state, "sleep is unavailable in deterministic playback");
         const handle = self.running orelse return luaError(state, "sleep called outside a task");
         const slot = self.activeSlot(handle) catch return luaError(state, "stale Ouro task");
@@ -1017,6 +1033,7 @@ pub const Vm = struct {
 
     fn spawnApp(state: *c.State) callconv(.c) c_int {
         const self: *Vm = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
+        if (self.rejectInAtomic("ouro.spawn_app")) return luaError(state, "YieldInAtomicSection: ouro.spawn_app");
         if (!self.app_spawn_allowed) return luaError(state, "ApplicationSpawnUnavailable");
         if (self.running == null or c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_function)
             return luaError(state, "spawn_app expects one function in a running task");
@@ -1034,6 +1051,7 @@ pub const Vm = struct {
         const pointer = c.lua_touserdata(state, c.upvalueIndex(1)) orelse
             return luaError(state, "missing Ouro VM");
         const self: *Vm = @ptrCast(@alignCast(pointer));
+        if (self.rejectInAtomic("ouro.spawn")) return luaError(state, "YieldInAtomicSection: ouro.spawn");
         if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_function)
             return luaError(state, "ouro.spawn expects exactly one function");
         const parent = self.running orelse return luaError(state, "ouro.spawn called outside a task");

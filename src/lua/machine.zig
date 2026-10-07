@@ -5,6 +5,7 @@
 //! value is the underlying table.
 const std = @import("std");
 const c = @import("c.zig");
+const Vm = @import("vm.zig").Vm;
 
 const view_metatable = "ouro.machine.view";
 
@@ -18,9 +19,49 @@ pub fn install(state: *c.State) !void {
     c.lua_pushcclosure(state, raw, 0);
     // Native task scopes (open, spawn, close, alive), or four nils without a Vm.
     const extra = @import("scopes.zig").pushChunkArguments(state);
-    if (c.lua_pcallk(state, 3 + extra, 0, 0, 0, null) != c.ok)
+    c.lua_pushcclosure(state, atomic, 0);
+    if (c.lua_pcallk(state, 4 + extra, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     c.lua_settop(state, api);
+}
+
+/// atomic(label, fn, ...) calls fn(...) as a non-yielding section and returns
+/// its results. Guards, assigns, expressions and function actions run this
+/// way: the Vm makes sleep, exit, spawn and every Ouro I/O wait fail before
+/// they touch task state, and the call itself is not yieldable, so nothing can
+/// suspend the sender's task halfway through a macrostep's effects. A
+/// violation raises "YieldInAction: <label> called <operation> ..." even if
+/// the function swallowed the operation's own error.
+fn atomic(state: *c.State) callconv(.c) c_int {
+    const vm = Vm.fromState(state);
+    const arguments = c.lua_gettop(state) - 2;
+    if (arguments < 0 or c.lua_type(state, 2) != c.type_function) {
+        _ = c.lua_pushstring(state, "atomic expects a label and a function");
+        return c.lua_error(state);
+    }
+    const owner = vm orelse {
+        if (c.lua_pcallk(state, arguments, -1, 0, 0, null) != c.ok) return c.lua_error(state);
+        return c.lua_gettop(state) - 1;
+    };
+    const before = owner.atomic_violation;
+    owner.atomic_depth += 1;
+    const status = c.lua_pcallk(state, arguments, -1, 0, 0, null);
+    owner.atomic_depth -= 1;
+    const violation = owner.atomic_violation;
+    owner.atomic_violation = before;
+    if (violation != null and violation != before) {
+        c.lua_settop(state, 1);
+        var label_length: usize = 0;
+        const label = c.lua_tolstring(state, 1, &label_length) orelse "machine function";
+        var buffer: [512]u8 = undefined;
+        const fallback = "YieldInAction: a machine function waited or spawned; move async work into an invoke or a spawned actor";
+        const message = std.fmt.bufPrint(&buffer, "YieldInAction: {s} called {s}, which waits or spawns; " ++
+            "move async work into an invoke or a spawned actor", .{ label[0..label_length], std.mem.span(violation.?) }) catch fallback;
+        _ = c.lua_pushlstring(state, message.ptr, message.len);
+        return c.lua_error(state);
+    }
+    if (status != c.ok) return c.lua_error(state);
+    return c.lua_gettop(state) - 1;
 }
 
 /// Replace the value at the top of the stack with a view when it is a table.

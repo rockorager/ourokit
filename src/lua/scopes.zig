@@ -4,7 +4,8 @@
 //! open, spawn into, or close scopes.
 //!
 //!     local open, spawn, close, alive = ...
-//!     local scope = open(parent?)      -- parent defaults to the running task's scope
+//!     local scope = open(parent?)      -- parent defaults to the running task's scope;
+//!                                      -- 'application' parents it like spawn_app
 //!     spawn(scope, fn, ...)            -- queue fn(...) as a task in scope; no handle
 //!     close(scope)                     -- cancel the subtree; idempotent
 //!     alive(scope)                     -- false once closed, canceled, or stale
@@ -51,9 +52,19 @@ fn open(state: *c.State) callconv(.c) c_int {
     const parent: task.ScopeHandle = if (top == 0 or c.lua_type(state, 1) == c.type_nil)
         vm.currentScope(state) catch
             return raise(state, "NoParentScope: open needs a parent scope outside a running task")
-    else
-        (scopeArgument(state, 1) orelse
-            return raise(state, "InvalidArguments: open expects an optional parent scope")).handle;
+    else if (c.lua_type(state, 1) == c.type_string) application: {
+        // "application": like spawn_app, outlive the calling task (an MCP
+        // action, a widget callback) but not generation retirement. Where
+        // application spawns are unavailable, fall back to the task's scope.
+        var length: usize = 0;
+        const name = c.lua_tolstring(state, 1, &length).?;
+        if (!std.mem.eql(u8, name[0..length], "application"))
+            return raise(state, "InvalidArguments: open expects an optional parent scope");
+        if (vm.app_spawn_allowed) break :application vm.scheduler.application_scope;
+        break :application vm.currentScope(state) catch
+            return raise(state, "NoParentScope: open needs a parent scope outside a running task");
+    } else (scopeArgument(state, 1) orelse
+        return raise(state, "InvalidArguments: open expects an optional parent scope")).handle;
     // Allocate the userdata first so a Lua memory error cannot strand a scope.
     const userdata: *Userdata = @ptrCast(@alignCast(c.lua_newuserdatauv(state, @sizeOf(Userdata), 0).?));
     userdata.* = .{ .handle = .invalid };

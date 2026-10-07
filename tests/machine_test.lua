@@ -544,6 +544,151 @@ return {
     assert(actor:matches('idle'))
   end,
 
+  ['parents read child snapshots from snapshot.children in the view, guards and assign'] = function(t)
+    local item = machine.create {
+      id = 'item', initial = 'clean', context = function(input) return { label = input.label } end,
+      states = { clean = { on = { EDIT = 'dirty' } }, dirty = { on = { SAVE = 'clean' } } },
+    }
+    local function dirty_ids(state)
+      local out = {}
+      for _, id in ipairs(state.children) do
+        if machine.matches(state.children[id], 'dirty') then out[#out + 1] = id end
+      end
+      return out
+    end
+    local list = machine.create {
+      id = 'list', initial = 'idle', context = {},
+      states = {
+        idle = { on = {
+          ADD = { actions = machine.spawn(item, { id = function(_, e) return e.id end, input = function(_, e) return { label = e.label } end }) },
+          QUIT = { target = 'done', guard = function(_, _, state) return #dirty_ids(state) == 0 end },
+          SUMMARY = { actions = assign { summary = function(_, _, state) return join(dirty_ids(state)) end } },
+        } },
+        done = {},
+      },
+    }
+    local actor = list:start { scheduler = machine.manual_scheduler() }
+    actor:send { type = 'ADD', id = 'a', label = 'A' }
+    actor:send { type = 'ADD', id = 'b', label = 'B' }
+    local snapshot = actor:snapshot()
+    assert(#snapshot.children == 2 and snapshot.children[1] == 'a' and snapshot.children[2] == 'b')
+    assert(snapshot.children.a.context.label == 'A' and machine.matches(snapshot.children.b, 'clean'))
+    assert(snapshot.children.a.machine == 'item' and not machine.matches(snapshot.children.b, 'dirty'))
+    fails(function() snapshot.children.a.context.label = 'x' end, 'read-only')
+    local before = machine.raw(actor:snapshot())
+    actor:child('b'):send('EDIT') -- a child commit replaces the parent's snapshot
+    assert(machine.raw(actor:snapshot()) ~= before and machine.matches(actor:snapshot().children.b, 'dirty'))
+    assert(not actor:can('QUIT'))
+    actor:send('SUMMARY')
+    assert(actor:context().summary == 'b')
+    assert(not list:can(machine.raw(actor:snapshot()), 'QUIT')) -- the pure functions see children too
+    actor:child('b'):send('SAVE')
+    assert(actor:can('QUIT'))
+    -- A view reading only the parent rebuilds when a child changes.
+    t:mount(function()
+      local children = actor:snapshot().children
+      local labels = {}
+      for _, id in ipairs(children) do
+        labels[#labels + 1] = children[id].context.label .. (machine.matches(children[id], 'dirty') and '*' or '')
+      end
+      return o.column { key = 'root',
+        o.text { key = 'labels', text = table.concat(labels, ',') },
+        o.button { key = 'edit', label = 'Edit A', on_press = function() actor:child('a'):send('EDIT') end },
+      }
+    end)
+    assert(t:node('root/labels').label == 'A,B')
+    t:click('root/edit')
+    assert(t:node('root/labels').label == 'A*,B')
+  end,
+
+  ['guards, assigns and actions cannot wait, spawn or exit'] = function()
+    local chart = machine.create {
+      id = 'atomic', initial = 'a', context = { n = 0 },
+      actions = {
+        nap = function() o.sleep(1) end,
+        fork = function() o.spawn(function() end) end,
+        leave = function() o.exit(0) end,
+        swallow = function() pcall(o.sleep, 1) end,
+      },
+      states = {
+        a = { on = {
+          NAP = { actions = 'nap' }, FORK = { actions = 'fork' },
+          LEAVE = { actions = 'leave' }, SWALLOW = { actions = 'swallow' },
+          GUARD = { target = 'b', guard = function() o.sleep(1); return true end },
+          ASSIGN = { target = 'b', actions = assign { n = function() o.sleep(1); return 1 end } },
+          ENTER = 'b',
+        } },
+        b = { entry = function() o.sleep(1) end },
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    fails(function() actor:send('NAP') end, "YieldInAction: action 'nap' (atomic.a on NAP) called ouro.sleep")
+    -- Ouro I/O (files, D-Bus, HTTP...) is covered by tests/machine_native.py.
+    fails(function() actor:send('FORK') end, "action 'fork' (atomic.a on FORK) called ouro.spawn")
+    fails(function() actor:send('LEAVE') end, "action 'leave' (atomic.a on LEAVE) called ouro.exit")
+    fails(function() actor:send('SWALLOW') end, "action 'swallow' (atomic.a on SWALLOW) called ouro.sleep")
+    -- Guards and assigns fail inside the pure step: nothing commits.
+    fails(function() actor:send('GUARD') end, "guard 'function' (atomic.a on GUARD) called ouro.sleep")
+    fails(function() actor:send('ASSIGN') end, "assign 'assign' (atomic.a on ASSIGN) called ouro.sleep")
+    assert(actor:matches('a') and actor:context().n == 0)
+    -- Entry actions run after commit, so the transition stands.
+    fails(function() actor:send('ENTER') end, "action 'function' (atomic.b entry) called ouro.sleep")
+    assert(actor:matches('b'))
+  end,
+
+  ['spawned tasks report done or error and are canceled with their owner state'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create {
+      id = 'tasks', initial = 'idle', context = { log = '' },
+      actors = { read = function(input) if input.fail then error('unreadable', 0) end return input.name:upper() end },
+      actions = { note = assign { log = function(c, e)
+        return c.log .. e.type:match('^(%a+)%.actor') .. ':' .. tostring(e.output or e.error) .. ';' end } },
+      states = {
+        idle = { on = {
+          READ = { actions = machine.spawn('read', { input = function(_, e) return { name = e.name, fail = e.fail } end }) },
+          STOP = { actions = machine.stop(function(_, e) return e.id end) },
+          ENTER = 'busy',
+          ['done.actor.read.*'] = { actions = 'note' }, ['error.actor.*'] = { actions = 'note' },
+        } },
+        busy = {
+          entry = machine.spawn(function(input) return input end, { id = 'inner', input = function() return 'inner' end }),
+          on = { LEAVE = 'idle', ['done.actor.inner'] = { actions = 'note' } },
+        },
+      },
+    }
+    local actor = chart:start { scheduler = clock }
+    local records = recorder(actor)
+    actor:send { type = 'READ', name = 'a' }
+    local id = actor:snapshot().children[1]
+    assert(id:match('^read%.%d+$') and actor:snapshot().children[id].status == 'active', id)
+    assert(last(records).children[1].action == 'spawned' and last(records).children[1].src == 'read')
+    clock.run_tasks()
+    assert(actor:context().log == 'done:A;' and #actor:snapshot().children == 0, actor:context().log)
+    assert(last(records).origin == 'child' and last(records).children[1].action == 'done')
+    actor:send { type = 'READ', name = 'b', fail = true }
+    clock.run_tasks()
+    assert(actor:context().log == 'done:A;error:unreadable;', actor:context().log)
+    assert(last(records).children[1].action == 'error' and last(records).children[1].error == 'unreadable')
+    -- stop(id) cancels a task before it reports.
+    actor:send { type = 'READ', name = 'c' }
+    actor:send { type = 'STOP', id = actor:snapshot().children[1] }
+    assert(#actor:snapshot().children == 0 and last(records).children[1].action == 'stopped')
+    clock.run_tasks()
+    assert(actor:context().log == 'done:A;error:unreadable;')
+    -- Leaving the owner state drops and cancels its task.
+    actor:send('ENTER')
+    assert(actor:snapshot().children[1] == 'inner' and clock.open_scopes == 3) -- root, busy, inner
+    actor:send('LEAVE')
+    assert(#actor:snapshot().children == 0 and clock.open_scopes == 1)
+    clock.run_tasks()
+    assert(actor:context().log == 'done:A;error:unreadable;')
+    -- Results for unknown children are stale.
+    local _, _, record = chart:transition(machine.raw(actor:snapshot()), { type = 'done.actor.read.99', output = 1 })
+    assert(record.rejected and record.reason == 'stale')
+    actor:send('ENTER'); clock.run_tasks()
+    assert(actor:context().log == 'done:A;error:unreadable;done:inner;')
+  end,
+
   ['event schemas validate external events and drive accepted()'] = function()
     local chart = machine.create {
       id = 'schema', initial = 'clean',
@@ -642,7 +787,10 @@ return {
     local s1b = chart:transition(s0, 'GO')
     assert(ran == 0 and s0.states[1] == 'a' and s0.context.n == 0)
     assert(s1.states[1] == 'b' and s1.context.n == 1 and s1b.context.n == 1 and s1 ~= s1b)
-    assert(effects[1].kind == 'action' and effects[2].kind == 'timer_start' and effects[2].delay == 10)
+    local kinds = {}
+    for i, effect in ipairs(effects) do kinds[i] = effect.kind end
+    -- Exiting a closes its entry scope, then the action, then b's timer.
+    assert(join(kinds) == 'scope_close,action,timer_start' and effects[3].delay == 10, join(kinds))
     assert(chart:can(s0, 'GO') and not chart:can(s1, 'GO'))
   end,
 
