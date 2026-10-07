@@ -23,7 +23,7 @@ Timers and invokes are also listed in the side panel.
 ## Run it
 
 ```sh
-zig build -Dvulkan=false -Doptimize=ReleaseSafe   # the Debug software renderer is slow
+zig build -Dvulkan=false -Doptimize=ReleaseSafe   # use ReleaseSafe: Debug software rendering runs at ~1 fps
 # In-process demo: runs fixtures/*.lua charts in real time, observes with ouro.machine.inspect
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua
 # Attach to another app's development instance
@@ -52,10 +52,8 @@ All shapes are the inspection hooks in design/statecharts.md §10.
 Three sources feed the same `ingest` function in [`app.lua`](app.lua):
 
 1. **Headless frames:** [`scenario.lua`](scenario.lua) runs a fixture chart on
-   `machine.manual_scheduler()` and stamps each record with the virtual clock.
-2. **In-process:** `ouro.machine.inspect` in the visualizer's own VM. Lua has no
-   millisecond clock, so the demo stamps records with `ouro.time()` seconds,
-   refined by a 50 ms ticker.
+   `machine.manual_scheduler()`, whose virtual clock fills `time_ms`.
+2. **In-process:** `ouro.machine.inspect` in the visualizer's own VM.
 3. **Live attach:** see below.
 
 ## Live attachment
@@ -65,29 +63,33 @@ Three sources feed the same `ingest` function in [`app.lua`](app.lua):
 ```diagram
 ┌─────────────── app (--dev) ───────────────┐        ┌──────── visualizer ────────┐
 │ ouro.machine actors                       │        │                            │
-│   │ machine.inspect(fn), installed by the │        │ ouro.mcp.call(socket,      │
-│   ▼ host before app code runs             │        │   'runtime.statecharts',   │
-│ ouro.json.encode(record) ──► host ring    │◄───────│   {after=cursor,text=true})│
+│   │ machine.inspect(fn), attached by the  │        │ ouro.mcp.call(socket,      │
+│   ▼ first call, dropped when idle         │        │   'runtime.statecharts',   │
+│ ouro.json.encode(record) ──► host ring    │◄───────│   {after=cursor,seed=…})   │
 │   (1024 records, monotonic time_ms,       │  MCP   │ json.decode → ingest       │
 │    per-actor started + latest record)     │        │ poll: 200 ms when idle,    │
-│ runtime.statecharts reads the ring at a   │        │ immediately while a full   │
-│ safe point and never evaluates Lua        │        │ page is returned           │
+│ runtime.statecharts attaches/seeds at a   │        │ immediately while a full   │
+│ safe point, then reads the ring           │        │ page is returned           │
 └───────────────────────────────────────────┘        └────────────────────────────┘
 ```
 
-- `src/lua/statechart_inspector.zig` holds the bounded ring and registers the
-  `ouro.machine.inspect` observer in every source generation of a `--dev`
-  instance. Production instances register nothing, so their records are never
-  built.
-- `runtime.statecharts {after, limit, actors, text}` returns
-  `{next, first, dropped, time_ms, records = [{sequence, time_ms, record}], actors}`.
-  `actors`, which defaults to on when `after == 0`, holds each live actor's
-  `started` record (with its graph) and latest transition record, so a late
-  attach can build every plant even after the ring has evicted the start.
-  `text = true` returns records as JSON strings, because `ouro.mcp` converts
+- `src/lua/statechart_inspector.zig` installs an inactive bridge in every
+  source generation of a `--dev` instance. The first `runtime.statecharts`
+  call attaches it to the active VM. It seeds every live actor from
+  `machine.actors()`, `actor:snapshot()` and `actor.chart:graph()`, then
+  subscribes `ouro.machine.inspect`. Each call renews the subscription. The
+  next record after `keep_alive_ms` (default 30 s) without a call
+  unsubscribes, so idle instances build no records. Production instances
+  install nothing.
+- `runtime.statecharts {after, limit, actors, seed, text, keep_alive_ms}`
+  returns `{next, first, dropped, time_ms, seed, records = [{sequence, time_ms, record}], actors}`.
+  `actors` holds each live actor's started record (with its graph) and its
+  latest record, keyed by actor path. Root actors therefore stay visible
+  across reload. Reattaching or reloading reseeds `actors` and bumps `seed`.
+  The visualizer passes the last `seed` it saw and gets `actors` back only
+  when that changed; a reseed of the same chart keeps its history.
+- `text = true` returns records as JSON strings, because `ouro.mcp` converts
   at most 4096 values per reply.
-- Each VM gets a new epoch, so after a reload the old VM's actors are retired
-  without a `stopped` record.
 
 Try it with any agent or the CLI through MCP `tools/call`:
 
@@ -103,11 +105,12 @@ today.
 
 ## Known limits
 
-- Records carry no guard results or clock. The observers add `accepted`
-  (`actor:accepted()`), which opens or closes a valve only when its transition
-  is the only handler of that event in its source state. Valves on `always`
-  and `after` transitions, and on events with several guarded branches, stay
-  grey. Attached records use the host's publish time.
+- Valves and times come from the records: `guards` (post-step outcomes for
+  guarded transitions whose source is active) and `time_ms` (the scheduler
+  clock: virtual on the manual scheduler, host monotonic otherwise). A seeded
+  attach snapshot has no guard outcomes, so its valves stay grey until the
+  next record. Running invokes at attach are read from the interpreter's
+  private table; timers come from `actor:pending_timers()`.
 - Headless snapshots cannot advance native animations, so stories pin the
   pulse and rotor phases explicitly.
 - A window has fixed budgets of 256 widget instances and 512 scene commands.

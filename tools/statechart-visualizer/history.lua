@@ -37,7 +37,7 @@ function M.append(history, record)
   for _, timer in ipairs(record.timers) do
     local key = timer.state .. '@' .. tostring(timer.delay)
     if timer.op == 'started' then
-      frame.timers[key] = {state=timer.state, delay=timer.delay, started=record.time, token=timer.token}
+      frame.timers[key] = {state=timer.state, delay=timer.delay, started=timer.time or record.time, token=timer.token}
     else
       frame.timers[key] = nil
       if timer.op == 'fired' then frame.fired = frame.fired or {}; frame.fired[key] = true end
@@ -47,14 +47,14 @@ function M.append(history, record)
     frame.pumps[invoke.state .. '|' .. invoke.id] = {status=invoke.op == 'started' and 'running' or invoke.op,
       state=invoke.state, src=invoke.src, error=invoke.error, since=record.time, token=invoke.token}
   end
-  -- Valves follow per-transition guard results when a record has them.
-  -- Otherwise accepted events (can) decide a valve only when its transition
-  -- is the sole handler of that event in the source state.
+  -- Valves follow the record's post-step guard outcomes. Older feeds only
+  -- had accepted events (can), which decide a valve only when its
+  -- transition is the sole handler of that event in the source state.
   for _, t in ipairs(graph.transitions) do
     if t.guard and frame.active[t.source] then
       local value
       if record.guards then value = record.guards[t.id] end
-      if value == nil and record.can and t.kind == 'event' and t.event then
+      if value == nil and not record.guards and record.can and t.kind == 'event' and t.event then
         local handlers = 0
         for _, u in ipairs(graph.transitions) do
           if u.source == t.source and u.event == t.event then handlers = handlers + 1 end

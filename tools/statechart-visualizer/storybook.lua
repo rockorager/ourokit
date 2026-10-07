@@ -19,7 +19,8 @@ local function load(name)
   local run = runs[name]
   local graph = contract.graph(run.graph)
   local hist = history.new(graph)
-  for _, raw in ipairs(run.records) do history.append(hist, contract.record(raw)) end
+  local t0 = run.lifecycle[1] and run.lifecycle[1].time_ms
+  for _, raw in ipairs(run.records) do history.append(hist, contract.record(raw, t0)) end
   return graph, hist
 end
 

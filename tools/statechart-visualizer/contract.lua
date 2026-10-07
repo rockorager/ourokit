@@ -98,20 +98,30 @@ local function event_of(raw)
   return raw
 end
 
--- Normalizes one transition record. `time` (ms, machine clock) is used when
--- the record lacks one; records from the prototype carry no timestamp.
-function M.record(raw, time)
+-- Normalizes one transition record. Times are ms relative to `t0` (the
+-- actor's start on the scheduler clock). `time_ms` is the interpreter's
+-- scheduler clock; `fallback` (receive time) applies to clockless records.
+function M.record(raw, t0, fallback)
+  local time = raw.time_ms and raw.time_ms ~= M.null and (raw.time_ms - (t0 or raw.time_ms)) or fallback
   local r = {
     seq=raw.sequence or raw.seq, actor=raw.actor, machine=raw.machine,
-    time=raw.time or time, timed=(raw.time or time) ~= nil,
+    time=time, timed=time ~= nil,
     event=event_of(raw.event), origin=raw.origin or 'external',
     rejected=raw.rejected == true, reason=raw.reason ~= M.null and raw.reason or nil,
     microsteps={}, exited=list(raw.exited), entered=list(raw.entered), taken={},
     timers={}, invokes={}, children=list(raw.children), actions=list(raw.actions),
     context=raw.context ~= M.null and raw.context or {}, status=raw.status, can=raw.can,
   }
-  -- Added by the visualizer's observers (actor:accepted()); not in §10.
-  if raw.accepted and raw.accepted ~= M.null then
+  -- Post-step guard outcomes: an array of {index, passed[, error]}. JSON
+  -- turns an empty array into an object, which still iterates as empty.
+  if raw.guards and raw.guards ~= M.null then
+    r.guards = {}
+    for _, v in pairs(raw.guards) do
+      if type(v) == 'table' and v.index then r.guards[v.index] = v.passed == true end
+    end
+  end
+  -- Older feeds sent accepted events instead of guard outcomes.
+  if not r.guards and raw.accepted and raw.accepted ~= M.null then
     r.can = r.can or {}
     for _, event in ipairs(raw.accepted) do r.can[event] = true end
     r.accepted = true
@@ -129,7 +139,8 @@ function M.record(raw, time)
     r.microsteps[#r.microsteps+1] = m
   end
   for _, t in ipairs(list(raw.timers)) do
-    r.timers[#r.timers+1] = {op=t.action, state=t.state, delay=t.delay, token=t.token, event=t.event}
+    local started = t.time_ms and t.time_ms ~= M.null and (t.time_ms - (t0 or t.time_ms)) or nil
+    r.timers[#r.timers+1] = {op=t.action, state=t.state, delay=t.delay, token=t.token, event=t.event, time=started}
   end
   for _, v in ipairs(list(raw.invokes)) do
     r.invokes[#r.invokes+1] = {op=v.action, state=v.state, id=v.id, src=v.src, token=v.token,

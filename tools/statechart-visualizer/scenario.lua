@@ -1,6 +1,6 @@
 -- Runs a fixture chart on ouro.machine's manual scheduler and records the
--- real inspection stream, stamped with virtual time (the prototype's records
--- carry no clock). Deterministic, so it also feeds headless snapshots.
+-- real inspection stream (time_ms is the virtual clock). Deterministic, so
+-- it also feeds headless snapshots.
 local o = require('ouro')
 local machine = o.machine
 
@@ -22,8 +22,6 @@ function M.run(fixture)
   local records, lifecycle = {}, {}
   actor:observe(function(record)
     if record.kind == 'transition' then
-      record.time = clock.now
-      if record.status == 'active' then record.accepted = actor:accepted() end
       records[#records + 1] = record
     else
       lifecycle[#lifecycle + 1] = record
