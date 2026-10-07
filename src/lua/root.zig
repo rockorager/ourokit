@@ -53,6 +53,7 @@ test {
     _ = @import("dbus.zig");
     _ = @import("dbus_values.zig");
     _ = @import("files_test.zig");
+    _ = @import("http.zig");
     _ = @import("stdio.zig");
     _ = @import("storybook.zig");
     _ = @import("theme_integration_test.zig");

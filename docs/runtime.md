@@ -151,10 +151,17 @@ Retirement guarantees, at the next safe point unless noted:
   variables run;
 - logical timers leave the heap, and the shared kernel alarm is updated or
   removed on the next submit;
-- external resources receive `request_cancel`. A task with an in-flight kernel
-  operation stays parked until its adapter has seen both the operation's and
-  the cancellation's terminal CQEs. Only then do its scope and the ring slot
-  become reusable;
+- external resources receive `request_cancel`. A canceled wait is published
+  only once no in-flight kernel operation references storage that is released
+  with the task. Stdio and MCP wait for both terminal CQEs. Some adapters
+  publish earlier, because their in-flight operations target client-owned
+  storage:
+  - HTTP: poll watches on duplicated fds;
+  - D-Bus: the bus connection's read and write buffers;
+  - auth: the worker-pipe read.
+
+  That storage, and the scope resource that holds it, is freed only after its
+  CQEs drain. Ring slots are reused only after both terminal CQEs;
 - stale scope, task, timer, and operation handles fail generation checks.
 
 A task that retires its own scope keeps running until its next suspension

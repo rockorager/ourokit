@@ -1421,3 +1421,47 @@ fn drainTestApp(app: *@import("../app/app.zig").App) !void {
     try std.testing.expectEqual(@as(usize, 0), app.lua_vm.activeTaskCount());
     try std.testing.expect(app.dbus.canDeinit());
 }
+
+test "D-Bus connection owned by a retired state scope drains its socket before the scope is freed" {
+    const App = @import("../app/app.zig").App;
+    var app: App = undefined;
+    try app.init(std.testing.allocator);
+    defer app.deinit();
+    defer drainTestApp(&app) catch {};
+    // A peer that accepts the connection in its backlog and never answers.
+    var name_buffer: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buffer, "ouro-dbus-scope-{d}", .{linux.getpid()});
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    @memcpy(address.path[1..][0..name.len], name);
+    const address_length: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + 1 + name.len);
+    const opened = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+    const listener: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(listener);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(listener, @ptrCast(&address), address_length)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(listener, 1)));
+
+    var source_buffer: [192]u8 = undefined;
+    const source = try std.fmt.bufPrint(&source_buffer, "bus = require('ouro').dbus.connect('unix:abstract={s}'); connected_after = true", .{name});
+    const outer = try app.lua_vm.openScope(app.scheduler.application_scope);
+    const inner = try app.lua_vm.openScope(outer);
+    _ = try app.lua_vm.spawn(inner, source);
+    try app.runReadyTurn();
+    try std.testing.expect(app.dbus.buses[0].active);
+    try std.testing.expect(app.loop.hasPendingOperations());
+
+    try app.scheduler.retireScope(outer);
+    while (app.scheduler.scopeAlive(inner) or app.scheduler.scopeAlive(outer)) {
+        // The bus resource, which occupies the state scope, is destroyed only
+        // after its kernel operations are terminal.
+        try std.testing.expect(app.dbus.buses[0].active);
+        try app.runReadyTurn();
+        if (!app.scheduler.scopeAlive(inner) or app.scheduler.hasPendingWork()) continue;
+        if (!app.loop.hasPendingOperations() and !app.loop.hasPendingTimerKernelWork()) continue;
+        try app.reapOne();
+    }
+    try std.testing.expect(!app.dbus.buses[0].active);
+    try std.testing.expect(!app.loop.hasPendingOperations());
+    try std.testing.expect(!app.lua_vm.globalBoolean("connected_after"));
+    try std.testing.expectEqual(@as(usize, 0), app.lua_vm.activeTaskCount());
+}

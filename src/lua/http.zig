@@ -235,3 +235,73 @@ fn luaError(L: *c.State, message: [*:0]const u8) c_int {
     _ = c.lua_pushstring(L, message);
     return c.lua_error(L);
 }
+
+fn testStep(loop: *io.Loop, binding: *Binding) !void {
+    try binding.collectCanceled();
+    _ = try loop.submit();
+    switch (loop.dispatch(try loop.wait())) {
+        .socket => |completion| _ = try binding.dispatch(completion),
+        .file => |completion| _ = binding.dispatchFile(completion),
+        .timer_wakeup, .timer_control => while (try loop.takeExpired()) |timer| {
+            _ = try binding.dispatchTimer(timer.operation);
+        },
+        .operation_cancel => {},
+        else => return error.UnexpectedCompletion,
+    }
+}
+
+fn testAwaitingResponse(binding: *const Binding) bool {
+    for (binding.client.watches.items) |watch| {
+        if (watch.active and watch.events == std.os.linux.POLL.IN and watch.operation != null) return true;
+    }
+    return false;
+}
+
+test "HTTP request owned by a retired state scope is released while curl's socket watch drains" {
+    const linux = std.os.linux;
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 4, 4);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 16, 8);
+    defer loop.deinit();
+    var vm: vm_module.Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    var binding: Binding = undefined;
+    binding.init(&vm, &loop);
+    // A loopback peer that accepts in its backlog and never answers.
+    const opened = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+    const listener: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(listener);
+    var address: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var address_length: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(listener, @ptrCast(&address), address_length)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(listener, 1)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockname(listener, @ptrCast(&address), &address_length)));
+
+    var source_buffer: [128]u8 = undefined;
+    const source = try std.fmt.bufPrint(&source_buffer, "response = require('ouro').http.get('http://127.0.0.1:{d}/'); resumed = true", .{std.mem.bigToNative(u16, address.port)});
+    const state = try vm.openScope(scheduler.application_scope);
+    const inner = try vm.openScope(state);
+    _ = try vm.spawn(inner, source);
+    try std.testing.expectEqual(vm_module.ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    while (!testAwaitingResponse(&binding)) try testStep(&loop, &binding);
+
+    try scheduler.retireScope(state);
+    try scheduler.applyQueuedCancellations();
+    try binding.collectCanceled();
+    try std.testing.expectEqual(vm_module.ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(!vm.globalBoolean("resumed"));
+    for (binding.jobs) |job| try std.testing.expect(job == null);
+    try std.testing.expect(!scheduler.scopeAlive(state) and !scheduler.scopeAlive(inner));
+    // The request is gone, but curl's client-owned watch (on a duplicated fd,
+    // with no request storage) is still draining its poll cancellation.
+    try std.testing.expect(loop.hasPendingOperations());
+
+    try binding.stop();
+    while (!binding.canDeinit() or loop.hasPendingOperations() or loop.hasPendingTimerKernelWork())
+        try testStep(&loop, &binding);
+    binding.deinit();
+}
