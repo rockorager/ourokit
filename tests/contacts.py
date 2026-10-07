@@ -270,7 +270,9 @@ def remote():
             # The first call starts the book in application scope and waits for the GET.
             people = call(address, "GetContacts")["structuredContent"]["contacts"]
             assert [p["id"] for p in people] == ["ada", "grace", "alan"], people
-            assert error_code(call(address, "SelectContact", {"id": "nobody"})) == "ContactNotFound"
+            missing = call(address, "SelectContact", {"id": "nobody"})
+            assert error_code(missing) == "ContactNotFound"
+            assert missing["structuredContent"]["error"]["parameters"] == {"id": "nobody", "event": "SELECT", "reason": "no_transition"}, missing
             assert call(address, "SelectContact", {"id": "grace"})["structuredContent"] == {}
             renamed = call(address, "RenameContact", {"id": "grace", "name": "Rear Admiral Grace Hopper"})
             assert renamed["structuredContent"]["contact"]["name"] == "Rear Admiral Grace Hopper", renamed

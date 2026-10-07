@@ -441,9 +441,14 @@ return {
 
     local cancelled = chart:start { scheduler = clock }
     local cancelled_records = recorder(cancelled)
+    clock.advance(5)
     cancelled:send('LOAD')
+    local running = cancelled:pending_invokes()
+    assert(#running == 1 and running[1].state == 'loading' and running[1].id == 'load' and running[1].src == 'load' and running[1].time_ms == 5)
+    assert(last(cancelled_records).invokes[1].time_ms == 5)
     cancelled:send('CANCEL')
     assert(last(cancelled_records).invokes[1].action == 'cancelled')
+    assert(#cancelled:pending_invokes() == 0)
     clock.run_tasks() -- the stale task runs to completion; its result is dropped.
     assert(cancelled:matches('idle') and last(cancelled_records).event.type == 'CANCEL')
 
@@ -1022,6 +1027,7 @@ return {
     -- BIG reads e.amount: a bare {type = 'BIG'} makes it throw, so it is closed with the error.
     assert(valve(r, 'BIG').passed == false and valve(r, 'BIG').error:find('attempt to compare', 1, true), valve(r, 'BIG').error)
     assert(#r.guards == 3)
+    assert(#actor:pending_invokes() == 0)
     local timers = actor:pending_timers()
     assert(#timers == 1 and timers[1].state == 'filling' and timers[1].delay == 100 and timers[1].time_ms == 0)
     clock.advance(10)
@@ -1057,6 +1063,36 @@ return {
     assert(running:status() == 'stopped' and clock.open_scopes == 0)
     clock.advance(200)
     assert(running:matches('busy'), 'no timer fires after stop')
+  end,
+
+  ['handles ignores guards and value widgets enable on it'] = function(t)
+    local chart = machine.create {
+      id = 'editor', initial = 'closed', context = { title = 'a' },
+      states = {
+        closed = { on = { OPEN = 'open' } },
+        open = { on = {
+          TITLE = { guard = function(c, e) return e.value ~= c.title end, actions = assign { title = function(_, e) return e.value end } },
+          CLOSE = 'closed' } },
+      },
+    }
+    local actor = chart:actor { scheduler = machine.manual_scheduler() }
+    assert(not actor:handles('TITLE') and actor:handles('OPEN'))
+    fails(function() actor:handles('TYPO') end, 'UnknownEvent')
+    local started = o.signal(false)
+    t:mount(function()
+      return o.column { key = 'root',
+        o.text_input { key = 'title', text = actor:context().title, send = actor:event('TITLE') },
+        o.button { key = 'open', label = 'Open', enabled = not started() or nil, send = actor:event('OPEN'),
+          on_press = nil },
+        o.button { key = 'start', label = 'Start', on_press = function() started:set(true); actor:start(); actor:send('OPEN') end },
+      }
+    end)
+    fails(function() t:click('root/title') end, 'DevelopmentTargetDisabled') -- closed: no TITLE transition at all
+    t:click('root/start')
+    assert(actor:matches('open') and actor:handles('TITLE'))
+    assert(not actor:can { type = 'TITLE', value = 'a' }, 'the guard refuses the current value...')
+    t:click('root/title') -- ...but the input is enabled: handles ignores guards
+    assert(t:node('root/title').focused)
   end,
 
   ['event schemas validate external events and drive accepted()'] = function()

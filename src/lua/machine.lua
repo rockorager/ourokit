@@ -1241,7 +1241,11 @@ function M.actions(actor, specs, options)
           if not accepted then
             local code = spec.errors and spec.errors[reason]
               or (reason == 'no_transition' and 'EventRejected' or 'ActorUnavailable')
-            return ouro.action_error(code, {event = spec.event, reason = reason})
+            -- The payload fields plus {event, reason}, e.g. {id, event, reason}.
+            local parameters = {}
+            for key, value in pairs(params or {}) do parameters[key] = value end
+            parameters.event, parameters.reason = spec.event, reason
+            return ouro.action_error(code, parameters)
           end
         end
         if spec.wait then
@@ -1574,6 +1578,28 @@ function Actor:can(event)
   return can(self.chart, self:_read(), event)
 end
 
+-- True when some active state has a transition for this event type,
+-- ignoring guards: value widgets enable on it, so an input disables when the
+-- state takes no such edits at all, without guards locking it out.
+function Actor:handles(event_type)
+  local snapshot = self:_read()
+  if self._status == 'stopped' or snapshot.status ~= 'active' then return false end
+  if type(event_type) ~= 'string' or event_type == '' then fail('handles expects an event type') end
+  local chart = self.chart
+  if not internal_type(event_type) and not chart.declared[event_type] then
+    if M.strict then fail('UnknownEvent: %s does not accept %q', chart.id, event_type) end
+    return false
+  end
+  local names = descriptors(event_type)
+  for node in pairs(active_set(chart, snapshot)) do
+    for _, name in ipairs(names) do
+      local list = node.on[name]
+      if list and #list > 0 then return true end
+    end
+  end
+  return false
+end
+
 -- External events the current configuration would accept, for palettes,
 -- shortcuts and MCP tools. Requires declared events.
 function Actor:accepted()
@@ -1588,6 +1614,17 @@ function Actor:accepted()
 end
 
 function Actor:child(id) return self._children[id] end
+
+-- Running invokes, for late-attaching inspectors: {state, id, src, token,
+-- time_ms} with time_ms the scheduler clock when the invoke started.
+function Actor:pending_invokes()
+  local list = {}
+  for _, live in pairs(self._invokes) do
+    list[#list + 1] = {state = live.state, id = live.id, src = live.src, token = live.token, time_ms = live.time_ms}
+  end
+  table.sort(list, function(a, b) return a.state < b.state or (a.state == b.state and a.id < b.id) end)
+  return list
+end
 
 -- Running after-timers, for late-attaching inspectors: {state, delay, event,
 -- token, time_ms} with time_ms the scheduler clock when the timer started.
@@ -1743,10 +1780,10 @@ local function run_effects(actor, effects, record)
         end
       elseif kind == 'invoke_start' then
         local key = effect.state .. '|' .. effect.id
-        local live = {token = effect.token, state = effect.state, id = effect.id, src = effect.src_name}
+        local live = {token = effect.token, state = effect.state, id = effect.id, src = effect.src_name, time_ms = clock(actor)}
         actor._invokes[key] = live
         record.invokes[#record.invokes + 1] = {action = 'started', state = effect.state, id = effect.id,
-          src = effect.src_name, token = effect.token}
+          src = effect.src_name, token = effect.token, time_ms = live.time_ms}
         actor._scheduler.run(scope_for(actor, effect.state, effect.token), function()
           local function send(event)
             if actor._invokes[key] == live then actor:send(event) end

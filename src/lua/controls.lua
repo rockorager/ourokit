@@ -11,9 +11,10 @@ local transparent = '#00000000'
 -- Unless `enabled` is set, an activation is enabled while its actor would
 -- accept the event. can() reads the actor's snapshot signal, so the build or
 -- composition that lowers the widget tracks it and enablement follows the
--- chart. Value widgets stay enabled: their payload is unknown until the user
--- changes it, and a guard such as "the value changed" would refuse the
--- current value and lock the widget.
+-- chart. Value widgets are enabled while some active state handles the event
+-- type at all (actor:handles, guards ignored): their payload is unknown until
+-- the user changes it, and a guard such as "the value changed" would refuse
+-- the current value and lock the widget.
 local valued = {on_change=true, on_select=true, on_activate=true, on_drop_text=true, on_drop_uris=true}
 local function bound(v) return kind(v) == 'table' and v.actor ~= nil and v.event ~= nil end
 local function callable(v) return v == nil or kind(v) == 'function' or bound(v) end
@@ -31,7 +32,11 @@ local function handler(v, value_hook)
   return function(value) actor:send(carrying(event, field, value)) end
 end
 local function accepts(v, value_hook)
-  if not bound(v) or field_of(v, value_hook) then return true end
+  if not bound(v) then return true end
+  if field_of(v, value_hook) then
+    local event = v.event
+    return v.actor:handles(kind(event) == 'string' and event or event.type)
+  end
   return v.actor:can(v.event)
 end
 
@@ -267,7 +272,7 @@ ouro.accordion = ouro.stateless(function(p, children)
   check(p.expanded == nil or kind(p.expanded) == 'string', 'accordion expanded must be an item key or nil')
   local send = trigger(p, 'on_change')
   check(send ~= nil, 'accordion send or on_change required')
-  local active, change = enabled(p), handler(send, true)
+  local active, change = enabled(p, send, true), handler(send, true)
   motion(p)
   local rows, seen, found = {}, {}, p.expanded == nil
   for _, item in ipairs(p.items) do
@@ -488,9 +493,12 @@ end)
 
 ouro.split_view = ouro.stateless(function(p, children, theme)
   check(#children == 2, 'split_view requires exactly two children')
+  -- The native split has no disabled state: when the binding is not handled
+  -- (or enabled = false), position changes are simply not reported.
+  local change = trigger(p, 'on_change')
   return ouro.split {key=p.key, axis=p.axis, position=p.position,
     min_first=p.min_first, min_second=p.min_second, divider_size=8,
-    on_change=trigger(p, 'on_change'), focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
+    on_change=enabled(p, change, true) and change or nil, focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
     children[1], children[2],
     ouro.box {key='chrome', semantic=false, width='fill', height='fill', background=transparent,
       states={hover=theme.colors.accent, pressed=theme.colors.accent_selected, focus=theme.colors.ring}}}

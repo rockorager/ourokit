@@ -145,9 +145,10 @@ background and the call returns the local record. The first call starts the
 chart and waits for the address book to load; a failed load returns
 `LoadFailed` with the message. Empty or multi-line names return `InvalidName`,
 the same rule that disables Apply name. Missing IDs return an `isError: true` tool result with
-`structuredContent.error.code = "ContactNotFound"`. For `RenameContact` the ID
-is in `structuredContent.error.parameters.id`. For `SelectContact`, which
-`machine.actions` builds, the parameters are the rejected event and the reason. The native runtime validates arguments
+`structuredContent.error.code = "ContactNotFound"`, and the ID is in
+`structuredContent.error.parameters.id`. For `SelectContact`, which
+`machine.actions` builds, the parameters also carry the rejected `event` and
+the `reason`: `{id, event = "SELECT", reason = "no_transition"}`. The native runtime validates arguments
 and successful output against each action's JSON Schemas. `GetContacts` returns
 every record (500 for the sample). Runtime status/reload exist only on an explicitly enabled
 development endpoint, never in the production catalog. No `initialize`
