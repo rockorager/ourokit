@@ -260,15 +260,28 @@ pub const Scheduler = struct {
 
     /// The app coordinator calls this at the beginning of the task safe point.
     /// Resource hooks may request kernel cancellation but must not enter Lua.
+    ///
+    /// A canceled scope's language-owned descendants (non-null owner, for
+    /// example statechart scopes a VM opened under a widget instance) are also
+    /// retired: nothing else would ever free them, and the native owner of the
+    /// canceled ancestor waits for its scope to empty. Natively owned
+    /// descendants still wait for their owner's `destroyScope`.
     pub fn applyQueuedCancellations(self: *Scheduler) !void {
         for (self.scopes, 0..) |scope, scope_index| {
             if (!scope.active or !scope.cancellation_queued) continue;
             const root: u32 = @intCast(scope_index);
             var node: ?u32 = root;
-            while (node) |index| : (node = self.nextInSubtree(index, root))
-                self.scopes[index].cancellation_requested = true;
+            while (node) |index| : (node = self.nextInSubtree(index, root)) {
+                const slot = &self.scopes[index];
+                slot.cancellation_requested = true;
+                if (slot.owner != null) slot.retire_when_empty = true;
+            }
         }
         for (self.scopes) |*scope| scope.cancellation_queued = false;
+        // Free retired scopes that are already empty; reaping cascades upward.
+        for (self.scopes, 0..) |scope, index| {
+            if (scope.active and scope.retire_when_empty and isEmpty(&scope)) self.reapUpward(@intCast(index));
+        }
 
         for (self.tasks) |*task| {
             if (task.state == .free or !(try self.scopeSlot(task.scope)).cancellation_requested) continue;
@@ -739,5 +752,37 @@ test "retiring a wide and deep owned tree frees every empty scope in one sweep" 
     try std.testing.expectEqual(occupied, scheduler.takeRunnable().?);
     try scheduler.complete(occupied);
     try std.testing.expect(!scheduler.scopeAlive(root));
+    try std.testing.expectEqual(initial_capacity, scheduler.availableScopeCapacity());
+}
+
+test "canceling a native scope retires the language-owned scopes beneath it" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 2, 1);
+    defer scheduler.deinit();
+    const initial_capacity = scheduler.availableScopeCapacity();
+    const vm: u8 = 0;
+    // A widget instance scope with a statechart actor's scopes opened inside.
+    const instance = try scheduler.createScope(scheduler.application_scope);
+    const actor_root = try scheduler.createOwnedScope(instance, &vm);
+    const state = try scheduler.createOwnedScope(actor_root, &vm);
+    const idle = try scheduler.createOwnedScope(instance, &vm);
+    const native_child = try scheduler.createScope(actor_root);
+    const timer = try scheduler.createTask(state);
+    try std.testing.expectEqual(timer, scheduler.takeRunnable().?);
+    try scheduler.wait(timer);
+
+    try scheduler.queueScopeCancellation(instance);
+    try scheduler.applyQueuedCancellations();
+    // An empty owned scope is freed at once; the others drain first.
+    try std.testing.expect(!scheduler.scopeAlive(idle));
+    try std.testing.expectError(error.ScopeNotEmpty, scheduler.destroyScope(instance));
+    try std.testing.expectEqual(timer, scheduler.takeRunnable().?);
+    try scheduler.complete(timer);
+    try std.testing.expect(!scheduler.scopeAlive(state));
+    // A natively owned descendant still belongs to its owner.
+    try std.testing.expect(scheduler.scopeAlive(actor_root));
+    try scheduler.destroyScope(native_child);
+    try std.testing.expect(!scheduler.scopeAlive(actor_root));
+    try scheduler.destroyScope(instance);
     try std.testing.expectEqual(initial_capacity, scheduler.availableScopeCapacity());
 }
