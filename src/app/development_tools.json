@@ -25,7 +25,7 @@
   },
   {
     "name": "runtime.diagnostics",
-    "description": "Read the active source name, source generation and latest structured reload diagnostic. Does not evaluate Lua or change application state.",
+    "description": "Read the active source name, source generation and latest structured reload diagnostic, plus the statechart recording {path, inputs, failed} when this instance records (design/statecharts.md section 14; replay it with ouroctl replay <path> <app>). Does not evaluate Lua or change application state.",
     "inputSchema": {"type":"object","properties":{},"additionalProperties":false},
     "outputSchema": {"type":"object"}
   },

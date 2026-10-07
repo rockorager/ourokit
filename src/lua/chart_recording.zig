@@ -14,6 +14,12 @@ pub const Sink = struct {
     t0: i64,
     lines: u64 = 0,
     failed: bool = false,
+    path_buffer: [std.fs.max_path_bytes]u8 = undefined,
+    path_length: usize = 0,
+
+    pub fn location(self: *const Sink) []const u8 {
+        return self.path_buffer[0..self.path_length];
+    }
 
     /// Creates (truncates) `path`, creating missing parent directories.
     pub fn open(path: []const u8, application: []const u8) !Sink {
@@ -30,6 +36,8 @@ pub const Sink = struct {
         }, 0o600);
         if (linux.errno(result) != .SUCCESS) return error.RecordingOpenFailed;
         var sink: Sink = .{ .fd = @intCast(result), .t0 = monotonicMs() };
+        @memcpy(sink.path_buffer[0..path.len], path);
+        sink.path_length = path.len;
         var header: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&header, "{{\"format\":\"ouro.machine.log\",\"version\":1,\"t0\":{d},\"app\":{f}}}", .{
             sink.t0, std.json.fmt(application, .{}),
@@ -129,5 +137,6 @@ test "recording sink writes a header and one line per append" {
     var sink = try Sink.open(path, "dev.test");
     sink.append("{\"k\":\"start\"}");
     try std.testing.expectEqual(@as(u64, 2), sink.lines);
+    try std.testing.expectEqualStrings(path, sink.location());
     sink.close();
 }

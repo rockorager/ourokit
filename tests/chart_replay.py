@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import time
 
-from application_services import development_path
+from application_services import call, development_path
 from desktop_native import BINARY, inspect, run, terminate, wait_for
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -191,6 +191,9 @@ def contacts(env, root):
 def documents(env, root):
     # No --record: development instances record to the state directory.
     app = Instance(env, root, "documents", record=False)
+    default = Path(env["XDG_STATE_HOME"]) / "ourokit" / "recordings" / "dev.ourokit.documents.jsonl"
+    diagnostics = call(app.endpoint, "runtime.diagnostics")["structuredContent"]
+    assert diagnostics["recording"]["path"] == str(default) and not diagnostics["recording"]["failed"], diagnostics
     body = "documents/tabs/control/panels/%d/drop/layers/body/"
     app.type("main", body % 1 + "title", " draft")
     app.type("main", body % 1 + "text", "hello")
@@ -201,7 +204,6 @@ def documents(env, root):
     app.click("main", "documents/tabs/control/panels/2/drop/layers/close-confirm/body/actions/discard")
     wait_for(lambda: app.label("main", "documents/tabs/control/strip/bar/2") is None, "discard did not close the tab")
     app.stop()
-    default = Path(env["XDG_STATE_HOME"]) / "ourokit" / "recordings" / "dev.ourokit.documents.jsonl"
     log = entries(default)
     assert any(e["k"] == "start" and e["a"] == "notes" for e in log)
     assert any(e["a"] == "notes/document.2" and e["k"] == "event" for e in log), "child events are recorded"
