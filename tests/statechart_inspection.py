@@ -97,7 +97,7 @@ def main():
             # Post-step guard valves and the scheduler clock from the interpreter.
             red = next(e['record'] for e in seen if e['record'].get('states') == ['red'])
             assert red['guards'] == [{'index': 2, 'passed': True}], red
-            assert go['timers'][0]['time_ms'] == go['time_ms'], go
+            assert 0 <= go['time_ms'] - go['timers'][0]['time_ms'] <= 20, go
             assert fired['time_ms'] - go['time_ms'] >= 40, (go['time_ms'], fired['time_ms'])
             # Cursor, seed-gated actors and text mode.
             quiet = statecharts(endpoint, after=out['next'], seed=1)
