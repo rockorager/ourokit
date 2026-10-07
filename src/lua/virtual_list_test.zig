@@ -41,7 +41,7 @@ const Fixture = struct {
         });
         self.sources = text.ParagraphSourceCache.init(std.testing.allocator, &self.fonts);
         self.paragraphs = text.ParagraphCache.init(std.testing.allocator, &self.fonts);
-        try self.ui.init(self.state, &self.descriptors);
+        try self.ui.init(std.testing.allocator, self.state, &self.descriptors);
         self.ui.attachSignals(&self.signals);
         try self.ui.attachSemantics(&self.semantic_storage);
         try self.ui.attachText(&self.sources, &self.font, 1);
@@ -64,6 +64,7 @@ const Fixture = struct {
         self.sources.deinit();
         self.fonts.release(self.font[0]) catch unreachable;
         self.fonts.deinit();
+        self.ui.deinit();
         std.testing.allocator.destroy(self);
     }
 

@@ -65,6 +65,9 @@ const Job = struct {
         c.lua_pushlightuserdata(state, &context);
         c.lua_pushcclosure(state, Context.settleTest, 1);
         c.lua_setfield(state, -2, "settle");
+        c.lua_pushlightuserdata(state, &context);
+        c.lua_pushcclosure(state, Context.resources, 1);
+        c.lua_setfield(state, -2, "resources");
         const api = @embedFile("component_test_api.lua");
         if (c.luaL_loadbufferx(state, api, api.len, "@ouro-test-api", null) != c.ok) return error.TestApiLoadFailed;
         c.lua_pushvalue(state, -2);
@@ -163,6 +166,36 @@ const Context = struct {
         self.busy = true;
         defer self.busy = false;
         try self.settle();
+    }
+
+    /// t:resources(): live native objects and Lua heap after a full
+    /// collection, for tests that check memory returns to a baseline.
+    fn resources(state: *c.State) callconv(.c) c_int {
+        const self = get(state);
+        const runtime = self.runtime;
+        // Twice: objects with finalizers (such as signals) are freed by the
+        // cycle after the one that runs their finalizer.
+        _ = c.lua_gc(state, 2); // LUA_GCCOLLECT
+        _ = c.lua_gc(state, 2);
+        const lua_kb = c.lua_gc(state, 3); // LUA_GCCOUNT
+        var signals: usize = 0;
+        for (self.env.signals.slots) |slot| {
+            if (slot.active) signals += 1;
+        }
+        const counts = [_]struct { [:0]const u8, usize }{
+            .{ "instances", runtime.instances.occupied_count },
+            .{ "render_objects", runtime.tree.slots.len - runtime.tree.availableCapacity() },
+            .{ "scopes", self.env.scheduler.scopeCapacity() - self.env.scheduler.availableScopeCapacity() },
+            .{ "signals", signals },
+            .{ "callbacks", self.env.callbacks.countForVm(self.env.vm) },
+            .{ "lua_kb", @intCast(lua_kb) },
+        };
+        c.lua_createtable(state, 0, counts.len);
+        for (counts) |entry| {
+            c.lua_pushinteger(state, @intCast(entry[1]));
+            c.lua_setfield(state, -2, entry[0]);
+        }
+        return 1;
     }
 
     fn node(state: *c.State) callconv(.c) c_int {

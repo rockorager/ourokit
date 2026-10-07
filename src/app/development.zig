@@ -52,9 +52,11 @@ pub fn requireSettled(runtime: *WindowRuntime) !void {
         return error.DevelopmentRuntimeNotSettled;
 }
 
+/// Optional bounds a caller may put on one snapshot. By default a snapshot
+/// covers the whole semantic tree, however large.
 pub const Limits = struct {
-    nodes: usize = 1024,
-    text_bytes: usize = 64 * 1024,
+    nodes: ?usize = null,
+    text_bytes: ?usize = null,
 };
 
 pub const Node = struct {
@@ -87,32 +89,82 @@ pub const Node = struct {
     multiline: bool,
 };
 
-/// Fully owned, bounded copy. It survives rebuild/reload; its token does not.
-/// Capacity failures are explicit, never silently truncated semantic trees.
+/// Fully owned copy. It survives rebuild/reload; its token does not.
+/// Exceeding caller limits fails explicitly, never truncating the tree.
 pub const Snapshot = struct {
     allocator: std.mem.Allocator,
     token: Token,
     nodes: []Node,
-    text: []u8,
+    /// Owns every string the nodes borrow.
+    text: std.heap.ArenaAllocator,
     metrics: runtime_module.Metrics,
 
     pub fn deinit(self: *Snapshot) void {
         self.allocator.free(self.nodes);
-        self.allocator.free(self.text);
+        self.text.deinit();
         self.* = undefined;
+    }
+};
+
+const SiblingKey = struct { parent: ?u64, key: []const u8 };
+
+const SiblingContext = struct {
+    pub fn hash(_: SiblingContext, value: SiblingKey) u64 {
+        var hasher = std.hash.Wyhash.init(value.parent orelse 0);
+        hasher.update(&.{@intFromBool(value.parent != null)});
+        hasher.update(value.key);
+        return hasher.final();
+    }
+
+    pub fn eql(_: SiblingContext, a: SiblingKey, b: SiblingKey) bool {
+        return std.meta.eql(a.parent, b.parent) and std.mem.eql(u8, a.key, b.key);
+    }
+};
+
+const TextStorage = struct {
+    arena: std.mem.Allocator,
+    used: usize = 0,
+    limit: ?usize,
+
+    fn copy(self: *TextStorage, parts: []const []const u8) ![]const u8 {
+        var len: usize = 0;
+        for (parts) |part| len += part.len;
+        if (self.limit) |limit| if (len > limit - self.used) return error.DevelopmentSnapshotCapacityExceeded;
+        const result = try self.arena.alloc(u8, len);
+        var offset: usize = 0;
+        for (parts) |part| {
+            @memcpy(result[offset..][0..part.len], part);
+            offset += part.len;
+        }
+        self.used += len;
+        return result;
     }
 };
 
 pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Limits) !Snapshot {
     try requireSettled(runtime);
     const count = runtime.semantics.count();
-    if (count > limits.nodes or limits.nodes > 4096 or limits.text_bytes > 1024 * 1024)
-        return error.DevelopmentSnapshotCapacityExceeded;
+    if (limits.nodes) |max| if (count > max) return error.DevelopmentSnapshotCapacityExceeded;
     const nodes = try allocator.alloc(Node, count);
     errdefer allocator.free(nodes);
-    const storage = try allocator.alloc(u8, limits.text_bytes);
-    errdefer allocator.free(storage);
-    var used: usize = 0;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    var text: TextStorage = .{ .arena = arena.allocator(), .limit = limits.text_bytes };
+    // A key path addresses a node when every step is the only sibling with
+    // its key. Counting (parent, key) pairs keeps this linear, so large
+    // trees inspect quickly.
+    var siblings: std.HashMapUnmanaged(SiblingKey, u32, SiblingContext, 80) = .empty;
+    defer siblings.deinit(allocator);
+    var indices: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    defer indices.deinit(allocator);
+    try siblings.ensureTotalCapacity(allocator, @intCast(count));
+    try indices.ensureTotalCapacity(allocator, @intCast(count));
+    for (0..count) |index| {
+        const semantic = try runtime.semantics.node(index);
+        indices.putAssumeCapacity(semantic.id, index);
+        const entry = siblings.getOrPutAssumeCapacity(.{ .parent = semantic.parent, .key = semantic.key });
+        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+    }
     for (nodes, 0..) |*node, index| {
         const semantic = try runtime.semantics.node(index);
         // Component groups have semantic identity but no layout instance.
@@ -120,24 +172,18 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
         const target = try runtime.semanticNodeTarget(semantic.id);
         var path: ?[]const u8 = null;
         if (semantic.key.len != 0 and std.mem.indexOfScalar(u8, semantic.key, '/') == null) {
-            var prefix: ?[]const u8 = if (semantic.parent == null) "" else null;
-            if (semantic.parent) |parent| for (nodes[0..index]) |ancestor| {
-                if (ancestor.id == parent) {
-                    prefix = ancestor.path;
-                    break;
-                }
+            // Parents precede children, so a parent's path is already known.
+            const prefix: ?[]const u8 = if (semantic.parent) |parent|
+                if (indices.get(parent)) |parent_index| (if (parent_index < index) nodes[parent_index].path else null) else null
+            else
+                "";
+            const unique = siblings.get(.{ .parent = semantic.parent, .key = semantic.key }).? == 1;
+            if (prefix) |parent_path| if (unique) {
+                path = if (parent_path.len != 0)
+                    try text.copy(&.{ parent_path, "/", semantic.key })
+                else
+                    try text.copy(&.{semantic.key});
             };
-            if (prefix) |parent_path| {
-                const start = used;
-                if (parent_path.len != 0) {
-                    _ = try copyText(storage, &used, parent_path);
-                    _ = try copyText(storage, &used, "/");
-                }
-                _ = try copyText(storage, &used, semantic.key);
-                const candidate = storage[start..used];
-                const resolved = runtime.semantics.findPath(candidate) catch null;
-                if (resolved != null and resolved.?.id == semantic.id) path = candidate;
-            }
         }
         var value: ?[]const u8 = null;
         var selection: ?ui.text_input.Selection = null;
@@ -150,7 +196,7 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             const session = try runtime.text_inputs.session(handle);
             // Masked fields expose neither their value nor its structure.
             if (!session.model.isSecret()) {
-                value = try copyText(storage, &used, session.model.text());
+                value = try text.copy(&.{session.model.text()});
                 selection = session.model.selection;
                 const render = try runtime.instances.renderObject(try runtime.text_inputs.content(handle));
                 text_scroll = .{
@@ -172,7 +218,7 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             .parent = semantic.parent,
             .path = path,
             .role = semantic.role,
-            .label = try copyText(storage, &used, semantic.label),
+            .label = try text.copy(&.{semantic.label}),
             .value = value,
             .bounds = target.bounds,
             .enabled = target.enabled,
@@ -199,15 +245,7 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             .caret_bounds = caret_bounds,
         };
     }
-    return .{ .allocator = allocator, .token = Token.current(runtime), .nodes = nodes, .text = storage, .metrics = runtime.metrics };
-}
-
-fn copyText(storage: []u8, used: *usize, bytes: []const u8) ![]const u8 {
-    if (bytes.len > storage.len - used.*) return error.DevelopmentSnapshotCapacityExceeded;
-    const result = storage[used.*..][0..bytes.len];
-    @memcpy(result, bytes);
-    used.* += bytes.len;
-    return result;
+    return .{ .allocator = allocator, .token = Token.current(runtime), .nodes = nodes, .text = arena, .metrics = runtime.metrics };
 }
 
 pub const Action = union(enum) {

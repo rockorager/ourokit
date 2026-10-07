@@ -284,7 +284,8 @@ test "native drawing signal rebuilds a canvas and retained paint outlives Lua an
         var descriptors: [8]ouro.ui.instance.Descriptor = undefined;
         var semantics: [8]ouro.ui.semantics.Descriptor = undefined;
         var build: ouro.lua.UiBuild = undefined;
-        try build.initWithApi(host.vm.state, &descriptors, host.vm.apiReference());
+        try build.initWithApi(allocator, host.vm.state, &descriptors, host.vm.apiReference());
+        defer build.deinit();
         build.enableDeclarativeWidgets(.light);
         build.attachSignals(&host.signals);
         try build.attachSemantics(&semantics);

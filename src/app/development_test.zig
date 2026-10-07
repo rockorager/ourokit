@@ -38,7 +38,7 @@ const Fixture = struct {
         self.font[0] = try self.fonts.acquire(.{ .key = .{ .file = "/fixtures/Inter-Regular.ttf", .index = 0 }, .bytes = @embedFile("ourokit_test_font_static") });
         self.sources = text.ParagraphSourceCache.init(std.testing.allocator, &self.fonts);
         self.paragraphs = text.ParagraphCache.init(std.testing.allocator, &self.fonts);
-        try self.builder.init(self.vm.state, &self.descriptors);
+        try self.builder.init(std.testing.allocator, self.vm.state, &self.descriptors);
         self.builder.attachCallbacks(&self.callbacks, &self.vm);
         self.builder.attachSignals(&self.signals);
         try self.builder.attachSemantics(&self.semantics);
@@ -68,6 +68,7 @@ const Fixture = struct {
         self.sources.deinit();
         self.fonts.release(self.font[0]) catch unreachable;
         self.fonts.deinit();
+        self.builder.deinit();
         std.testing.allocator.destroy(self);
     }
 

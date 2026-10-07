@@ -46,6 +46,8 @@ pub const Signals = struct {
     allocator: std.mem.Allocator,
     state: *c.State,
     slots: []SignalSlot,
+    /// Every slot below this index is active.
+    free_hint: usize = 0,
     edges: []Edge,
     // One past the last active edge; holes remain reusable without moving edges.
     edge_extent: usize = 0,
@@ -301,7 +303,7 @@ pub const Signals = struct {
     }
 
     fn allocateSignal(self: *Signals) !SignalHandle {
-        const index = for (self.slots, 0..) |slot, index| {
+        const index = for (self.slots[self.free_hint..], self.free_hint..) |slot, index| {
             if (!slot.active) break index;
         } else blk: {
             const old_len = self.slots.len;
@@ -312,6 +314,7 @@ pub const Signals = struct {
         var generation = slot.generation +% 1;
         if (generation == 0) generation = 1;
         slot.* = .{ .generation = generation, .active = true };
+        self.free_hint = index + 1;
         return .{ .slot = @intCast(index), .generation = generation };
     }
 
@@ -328,12 +331,13 @@ pub const Signals = struct {
 
     fn releaseSignal(self: *Signals, signal: SignalHandle) void {
         const slot = self.signalSlot(signal) catch return;
-        for (self.edges) |*edge| {
+        for (self.edges[0..self.edge_extent]) |*edge| {
             if (edge.active and sameHandle(edge.signal, signal)) edge.* = .{};
         }
         self.trimEdges();
         const generation = slot.generation;
         slot.* = .{ .generation = generation };
+        self.free_hint = @min(self.free_hint, signal.slot);
     }
 
     fn recordRead(self: *Signals, signal: SignalHandle) !void {

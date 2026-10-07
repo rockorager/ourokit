@@ -304,7 +304,7 @@ its intrinsic result inside the resolved padded box; widget policy resolves
 direction-sensitive start/end before this render-object layer. Flex performs
 bounded passes and rejects flex children on an unbounded main axis.
 
-The render tree uses fixed-capacity generation-checked slots and intrusive
+The render tree uses growable generation-checked slots and intrusive
 ordered child links. Layout performs no allocation. Constraint results are
 cached per node; layout-affecting changes propagate dirtiness to ancestors,
 while paint-only changes do not trigger layout. Scene painting preserves child
@@ -364,9 +364,9 @@ currently rejected because its hierarchical ownership scope is immutable.
 
 Every instance owns a child scope. Omission detaches its render object and
 queues scope cancellation, but leaves a generation tombstone until the task
-safe point drains resources and child scopes. Capacity therefore explicitly
-accounts for retiring instances instead of freeing identity while completions
-can still arrive.
+safe point drains resources and child scopes. Storage therefore keeps
+retiring instances instead of freeing identity while completions can still
+arrive; preparation grows it so commit never runs out.
 
 Pointer translation remains state-only. During platform-event translation, a
 per-window router hit-tests the last completed layout, maps render identity to
@@ -656,7 +656,7 @@ See [runtime.md](docs/runtime.md) for the exact available functions.
 The UI bridge installs description constructors into that module. These
 functions may run outside a build and cannot touch native UI. Build callbacks
 and subsequent description lowering execute under protected, non-yielding
-calls. Typed descriptor storage is bounded and borrowed until the next build;
+calls. Typed descriptor storage grows during lowering and is borrowed until the next build;
 the returned Lua tree stays anchored for that lifetime. Prepared reload builds
 retain their own description reference across later window builds. Applications
 use stable string keys and constructor tables; numeric descriptor IDs, parent

@@ -35,6 +35,14 @@ pub const Buttons = struct {
         self.* = undefined;
     }
 
+    /// Grows storage by at least `additional` entries. Call while
+    /// preparing a build so that `set` cannot fail during commit.
+    pub fn grow(self: *Buttons, additional: usize) !void {
+        const old_len = self.entries.len;
+        self.entries = try self.allocator.realloc(self.entries, @max(old_len + additional, old_len * 2));
+        @memset(self.entries[old_len..], .{});
+    }
+
     pub fn availableForOwner(self: *const Buttons, owner: BuildOwnerHandle) usize {
         var count: usize = self.entries.len - self.entry_limit;
         for (self.entries[0..self.entry_limit]) |entry| if (!entry.active or same(entry.owner, owner)) {

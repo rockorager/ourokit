@@ -138,7 +138,9 @@ return {
 
   -- Capacity cases from the statecharts review. Each actor holds several
   -- hidden signals; these used to exhaust a fixed signal capacity of 256.
-  ['capacity: a list of 70 component machines mounts'] = function(t)
+  -- 300 rows also pass the old per-window budget of 256 nodes: build storage,
+  -- instances, render objects, semantics and bindings grow while preparing.
+  ['capacity: a list of 300 component machines mounts'] = function(t)
     local Row = machine.component(machine.create {
       id = 'row', initial = 'closed', context = function(p) return { title = p.title } end,
       states = { closed = { on = { TOGGLE = 'open' } }, open = { on = { TOGGLE = 'closed' } } },
@@ -147,10 +149,11 @@ return {
     end)
     t:mount(function()
       local rows = {}
-      for i = 1, 70 do rows[i] = Row { key = 'r' .. i, title = 'Row ' .. i } end
+      for i = 1, 300 do rows[i] = Row { key = 'r' .. i, title = 'Row ' .. i } end
       return o.scroll { key = 's', o.column { key = 'c', children = rows } }
     end, { width = 300, height = 300 })
-    assert(t:node('s/c/r70/b').label == 'Row 70')
+    assert(t:node('s/c/r300/b').label == 'Row 300')
+    assert(t:resources().instances > 300)
   end,
 
   ['capacity: 40 component machine rows remount repeatedly'] = function(t)

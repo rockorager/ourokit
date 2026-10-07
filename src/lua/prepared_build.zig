@@ -53,7 +53,7 @@ pub const PreparedBuild = struct {
     description_reference: c_int = c.no_reference,
     virtual_lists: @import("../ui/widget/virtual_list.zig").Snapshot = .{},
     layout_builders: @import("../ui/widget/layout_builder.zig").Snapshot = .{},
-    animations: [256]@import("../ui/animation.zig").Descriptor = undefined,
+    animations: []@import("../ui/animation.zig").Descriptor = &.{},
     animation_count: usize = 0,
     shapes: ?*text.ParagraphSourceCache,
     images: ?*@import("../image/cache.zig").Cache = null,
@@ -119,8 +119,41 @@ pub const PreparedBuild = struct {
         };
     }
 
+    pub const Counts = struct {
+        descriptors: usize,
+        semantics: usize,
+        semantic_text: usize,
+        handlers: usize,
+        buttons: usize,
+        text_inputs: usize,
+        listboxes: usize,
+        options: usize,
+        animations: usize,
+    };
+
+    /// Grows storage to hold one captured build. Call after reset: grown
+    /// semantic text moves, so no stored descriptor may borrow it.
+    pub fn reserve(self: *PreparedBuild, counts: Counts) !void {
+        std.debug.assert(self.descriptor_count == 0 and self.semantic_count == 0);
+        try ensureLen(self.allocator, instance.Descriptor, &self.descriptor_storage, counts.descriptors);
+        try ensureLen(self.allocator, semantics.Descriptor, &self.semantic_storage, counts.semantics);
+        try ensureLen(self.allocator, u8, &self.semantic_text, counts.semantic_text);
+        try ensureLen(self.allocator, Handler, &self.handlers, counts.handlers);
+        try ensureLen(self.allocator, Button, &self.prepared_buttons, counts.buttons);
+        try ensureLen(self.allocator, TextInput, &self.text_inputs, counts.text_inputs);
+        try ensureLen(self.allocator, ListBox, &self.prepared_listboxes, counts.listboxes);
+        try ensureLen(self.allocator, Option, &self.prepared_options, counts.options);
+        try ensureLen(self.allocator, @import("../ui/animation.zig").Descriptor, &self.animations, counts.animations);
+    }
+
+    fn ensureLen(allocator: std.mem.Allocator, comptime T: type, buffer: *[]T, len: usize) !void {
+        if (len <= buffer.len) return;
+        buffer.* = try allocator.realloc(buffer.*, @max(len, buffer.len * 2));
+    }
+
     pub fn deinit(self: *PreparedBuild) void {
         self.reset();
+        self.allocator.free(self.animations);
         self.allocator.free(self.text_inputs);
         self.allocator.free(self.prepared_options);
         self.allocator.free(self.prepared_listboxes);

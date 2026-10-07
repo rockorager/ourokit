@@ -54,6 +54,23 @@ pub const ListBoxes = struct {
         self.* = undefined;
     }
 
+    /// Ensures `lists` and `options` new entries fit, so commit cannot fail.
+    pub fn reserve(self: *ListBoxes, lists: usize, options: usize) !void {
+        try reserveEntries(ListBox, self.allocator, &self.lists, lists);
+        try reserveEntries(Option, self.allocator, &self.options, options);
+    }
+
+    fn reserveEntries(comptime T: type, allocator: std.mem.Allocator, entries: *[]T, needed: usize) !void {
+        var free: usize = 0;
+        for (entries.*) |entry| if (!entry.active) {
+            free += 1;
+        };
+        if (needed <= free) return;
+        const old_len = entries.len;
+        entries.* = try allocator.realloc(entries.*, @max(old_len + needed - free, old_len * 2));
+        @memset(entries.*[old_len..], .{});
+    }
+
     pub fn clear(self: *ListBoxes) void {
         @memset(self.lists[0..self.list_limit], .{});
         @memset(self.options[0..self.option_limit], .{});

@@ -132,6 +132,12 @@ pub const Tracker = struct {
         };
     }
 
+    /// Grows both draw buffers to `capacity`, keeping the previous frame.
+    pub fn reserve(self: *Tracker, capacity: usize) !void {
+        if (capacity > self.previous.len) self.previous = try self.allocator.realloc(self.previous, capacity);
+        if (capacity > self.candidate.len) self.candidate = try self.allocator.realloc(self.candidate, capacity);
+    }
+
     pub fn deinit(self: *Tracker) void {
         self.allocator.free(self.previous);
         self.allocator.free(self.candidate);

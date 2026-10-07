@@ -86,7 +86,8 @@ pub fn describeAt(init: std.process.Init, source: []const u8, module_root: ?std.
     signals_initialized = true;
     var descriptor_storage: [2]ui.instance.Descriptor = undefined;
     var lua_ui: lua.UiBuild = undefined;
-    try lua_ui.initWithApi(vm.state, &descriptor_storage, vm.apiReference());
+    try lua_ui.initWithApi(init.gpa, vm.state, &descriptor_storage, vm.apiReference());
+    defer lua_ui.deinit();
     lua_ui.attachSignals(&signals);
 
     var loader: ?lua.ModuleLoader = null;
@@ -218,7 +219,8 @@ pub fn withEnvironment(init: std.process.Init, asset_root: ?std.os.linux.fd_t, j
     const semantic_storage = try init.gpa.alloc(ui.semantics.Descriptor, config.node_capacity);
     defer init.gpa.free(semantic_storage);
     var lua_ui: lua.UiBuild = undefined;
-    try lua_ui.initWithApi(vm.state, descriptor_storage, vm.apiReference());
+    try lua_ui.initWithApi(init.gpa, vm.state, descriptor_storage, vm.apiReference());
+    defer lua_ui.deinit();
     lua_ui.theme_fonts = &theme_fonts;
     lua_ui.images = &assets;
     lua_ui.attachSignals(&signals);

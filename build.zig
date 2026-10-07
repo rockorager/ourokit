@@ -341,6 +341,12 @@ pub fn build(b: *std.Build) void {
     component_step.dependOn(&component_tests.step);
     component_step.dependOn(&run_component_contracts.step);
 
+    const stress_tests = b.addRunArtifact(host);
+    stress_tests.addArgs(&.{ "test", "tests/capacity_stress.lua", "--timeout-ms=600000" });
+    stress_tests.setCwd(b.path("."));
+    stress_tests.has_side_effects = true;
+    b.step("test-stress", "Mount and remount 1000 component rows and cycle 10000 actors, checking capacities grow and memory returns to baseline").dependOn(&stress_tests.step);
+
     const development = b.addSystemCommand(&.{"python3"});
     development.addFileArg(b.path("tests/verify_development.py"));
     development.addArtifactArg(host);

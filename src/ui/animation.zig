@@ -125,7 +125,7 @@ const Track = struct {
 
 /// Keyed duration and spring timelines. The caller owns time and schedules wakeups
 /// using delay(); this registry owns no callbacks, UI instances, or resources.
-/// Storage is fixed at init. Reconciliation and lookup are quadratic and linear
+/// Storage grows in validate, never in reconcile. Reconciliation and lookup are quadratic and linear
 /// respectively; advancing and finding the next delay are linear in track count.
 pub const Registry = struct {
     allocator: std.mem.Allocator,
@@ -158,8 +158,12 @@ pub const Registry = struct {
     }
 
     /// Checks the complete declaration without changing clock or track state.
-    pub fn validate(self: *const Registry, descriptors: []const Descriptor) !void {
-        if (descriptors.len > self.tracks.len) return error.AnimationCapacityExceeded;
+    pub fn validate(self: *Registry, descriptors: []const Descriptor) !void {
+        if (descriptors.len > self.tracks.len) {
+            const len = @max(descriptors.len, self.tracks.len * 2);
+            self.tracks = try self.allocator.realloc(self.tracks, len);
+            self.scratch = try self.allocator.realloc(self.scratch, len);
+        }
         for (descriptors, 0..) |descriptor, i| {
             try descriptor.validate();
             if (descriptor.config.spring != null and @abs(self.preview(descriptor).from) > 1e12)
@@ -464,7 +468,9 @@ test "validation and failed reconciliation leave tracks and clock unchanged" {
     _ = registry.advance(100);
     _ = registry.advance(150);
     try registry.validate(&.{changed});
-    try std.testing.expectError(error.AnimationCapacityExceeded, registry.reconcile(&.{ a, b, changed }));
+    // Validation grows storage but leaves tracks and clock alone.
+    try registry.validate(&.{ a, b, .{ .id = 4, .config = .{ .duration_ns = 1 } } });
+    try std.testing.expect(registry.tracks.len >= 3);
     try std.testing.expectError(error.InvalidAnimationConfig, registry.reconcile(&.{ changed, invalid }));
     try std.testing.expectError(error.DuplicateAnimationId, registry.reconcile(&.{ changed, a }));
     try std.testing.expectEqual(@as(usize, 2), registry.count());
@@ -691,7 +697,8 @@ test "empty capacity is valid and initialization cleans up partial allocation fa
     try registry.reconcile(&.{});
     try std.testing.expectEqual(null, registry.delay());
     try std.testing.expect(!registry.advance(100));
-    try std.testing.expectError(error.AnimationCapacityExceeded, registry.reconcile(&.{.{ .id = 1, .config = .{ .duration_ns = 1 } }}));
+    try registry.reconcile(&.{.{ .id = 1, .config = .{ .duration_ns = 1 } }});
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn check(allocator: std.mem.Allocator) !void {
             var allocated = try Registry.init(allocator, 2);

@@ -116,8 +116,15 @@ const Boundary = struct {
 /// Constructor evaluation has no UI side effects. Contextual layout, theme, and
 /// widget policy remain here, not in the description constructors.
 pub const UiBuild = struct {
+    /// Build storage grows while Lua lowers a description; validation,
+    /// reconciliation and commit only read it. Buffers keep their capacity
+    /// across builds, so a steady-state rebuild allocates nothing here.
+    allocator: std.mem.Allocator,
     state: *c.State,
+    /// Starts as the caller's buffer and is replaced by an owned one when a
+    /// build outgrows it.
     storage: []instance.Descriptor,
+    owns_storage: bool = false,
     count: usize = 0,
     /// First line of the last failed build's Lua error, for reporting.
     failure: [256]u8 = undefined,
@@ -140,9 +147,10 @@ pub const UiBuild = struct {
         measure: *const fn (*anyopaque, []instance.Descriptor, *layout_builder.Snapshot) anyerror!bool,
     } = null,
     animations: ?*const animation.Registry = null,
-    pending_animations: [256]animation.Descriptor = undefined,
+    pending_animations: []animation.Descriptor = &.{},
     pending_animation_count: usize = 0,
     semantic_storage: []SemanticDescriptor = &.{},
+    owns_semantic_storage: bool = false,
     semantic_count: usize = 0,
     active_owner: ?ActiveBuildOwner = null,
     signals: ?*Signals = null,
@@ -167,42 +175,76 @@ pub const UiBuild = struct {
     parent_stack: [32]BuildParent = undefined,
     parent_count: usize = 0,
     sources_staged: bool = false,
-    pending_handlers: [256]PendingHandler = undefined,
+    pending_handlers: []PendingHandler = &.{},
     pending_handler_count: usize = 0,
-    pending_buttons: [256]PendingButton = undefined,
+    pending_buttons: []PendingButton = &.{},
     pending_button_count: usize = 0,
-    pending_text_inputs: [256]PendingTextInput = undefined,
+    pending_text_inputs: []PendingTextInput = &.{},
     pending_text_input_count: usize = 0,
-    pending_listboxes: [256]PendingListBox = undefined,
+    pending_listboxes: []PendingListBox = &.{},
     pending_listbox_count: usize = 0,
-    pending_options: [256]PendingOption = undefined,
+    pending_options: []PendingOption = &.{},
     pending_option_count: usize = 0,
 
     pub fn init(
         self: *UiBuild,
+        allocator: std.mem.Allocator,
         state: *c.State,
         storage: []instance.Descriptor,
     ) !void {
-        return self.initWithApiReference(state, storage, null);
+        return self.initWithApiReference(allocator, state, storage, null);
     }
 
     pub fn initWithApi(
         self: *UiBuild,
+        allocator: std.mem.Allocator,
         state: *c.State,
         storage: []instance.Descriptor,
         api_reference: c_int,
     ) !void {
-        return self.initWithApiReference(state, storage, api_reference);
+        return self.initWithApiReference(allocator, state, storage, api_reference);
+    }
+
+    /// Frees build storage. Staged references must already be committed or
+    /// rolled back.
+    pub fn deinit(self: *UiBuild) void {
+        if (self.owns_storage) self.allocator.free(self.storage);
+        if (self.owns_semantic_storage) self.allocator.free(self.semantic_storage);
+        self.allocator.free(self.pending_animations);
+        self.allocator.free(self.pending_handlers);
+        self.allocator.free(self.pending_buttons);
+        self.allocator.free(self.pending_text_inputs);
+        self.allocator.free(self.pending_listboxes);
+        self.allocator.free(self.pending_options);
+        self.* = undefined;
+    }
+
+    /// Makes room for entry `count` of a build-owned buffer.
+    fn reserveEntry(self: *UiBuild, comptime T: type, buffer: *[]T, count: usize) !void {
+        if (count < buffer.len) return;
+        buffer.* = try self.allocator.realloc(buffer.*, @max(16, buffer.len * 2));
+    }
+
+    /// Makes room for entry `count` of a buffer that may still be the
+    /// caller's; the caller's buffer is copied, never freed.
+    fn reserveBorrowedEntry(self: *UiBuild, comptime T: type, buffer: *[]T, owned: *bool, count: usize) !void {
+        if (count < buffer.len) return;
+        const grown = try self.allocator.alloc(T, @max(16, buffer.len * 2));
+        @memcpy(grown[0..count], buffer.*[0..count]);
+        if (owned.*) self.allocator.free(buffer.*);
+        buffer.* = grown;
+        owned.* = true;
     }
 
     fn initWithApiReference(
         self: *UiBuild,
+        allocator: std.mem.Allocator,
         state: *c.State,
         storage: []instance.Descriptor,
         api_reference: ?c_int,
     ) !void {
         if (storage.len == 0) return error.InvalidDescriptorCapacity;
-        self.* = .{ .state = state, .storage = storage };
+        self.* = .{ .allocator = allocator, .state = state, .storage = storage };
 
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
@@ -395,13 +437,17 @@ pub const UiBuild = struct {
             null
         else
             return error.CallbackServiceUnavailable;
-        if (self.pending_handler_count != 0 and
-            self.pending_handler_count > bindings.availableAfterReconcile(tree, owner))
-            return error.PointerBindingCapacityExceeded;
-        if (self.pending_button_count != 0 and self.pending_button_count > buttons.availableForOwnerRetaining(owner, tree))
-            return error.ButtonCapacityExceeded;
-        if (self.pending_text_input_count != 0 and self.pending_text_input_count > text_inputs.availableForOwnerRetaining(owner, tree))
-            return error.TextInputCapacityExceeded;
+        // Registries grow here, before the native tree changes, so commit
+        // never runs out of entries.
+        const bindings_available = bindings.availableAfterReconcile(tree, owner);
+        if (self.pending_handler_count > bindings_available)
+            try bindings.grow(self.pending_handler_count - bindings_available);
+        const buttons_available = buttons.availableForOwnerRetaining(owner, tree);
+        if (self.pending_button_count > buttons_available)
+            try buttons.grow(self.pending_button_count - buttons_available);
+        const text_inputs_available = text_inputs.availableForOwnerRetaining(owner, tree);
+        if (self.pending_text_input_count > text_inputs_available)
+            try text_inputs.grow(self.pending_text_input_count - text_inputs_available);
         if (self.pending_handler_count != 0) {
             const reclaimable = bindings.reclaimableForOwner(tree, owner);
             if (self.pending_handler_count > reclaimable)
@@ -422,6 +468,7 @@ pub const UiBuild = struct {
         owner: build_owner.BuildOwnerHandle,
     ) !void {
         try self.validateBindings(bindings, buttons, text_inputs, tree, owner);
+        try listboxes.reserve(self.pending_listbox_count, self.pending_option_count);
         const callbacks = self.callbacks;
         for (self.pending_handlers[0..self.pending_handler_count]) |pending|
             if (tree.handleForId(pending.id) == null) return error.PointerHandlerInstanceMissing;
@@ -522,27 +569,22 @@ pub const UiBuild = struct {
             descriptors.ptr != self.storage.ptr) return error.InvalidPreparedBuildSource;
         for (descriptors) |descriptor| if (descriptor.retain_subtree)
             return error.RetainedPreparedBuild;
-        if (descriptors.len > prepared.descriptor_storage.len or
-            self.semantic_count > prepared.semantic_storage.len or
-            self.pending_handler_count > prepared.handlers.len or
-            self.pending_button_count > prepared.prepared_buttons.len or
-            self.pending_text_input_count > prepared.text_inputs.len)
-            return error.PreparedBuildCapacityExceeded;
-        if (self.pending_listbox_count > prepared.prepared_listboxes.len or
-            self.pending_option_count > prepared.prepared_options.len)
-            return error.PreparedBuildCapacityExceeded;
         var semantic_text_count: usize = 0;
-        for (self.semantic_storage[0..self.semantic_count]) |descriptor| {
-            semantic_text_count = std.math.add(
-                usize,
-                semantic_text_count,
-                descriptor.label.len,
-            ) catch return error.PreparedSemanticTextCapacityExceeded;
-            if (semantic_text_count > prepared.semantic_text.len)
-                return error.PreparedSemanticTextCapacityExceeded;
-        }
+        for (self.semantic_storage[0..self.semantic_count]) |descriptor|
+            semantic_text_count += descriptor.label.len;
 
         prepared.reset();
+        try prepared.reserve(.{
+            .descriptors = descriptors.len,
+            .semantics = self.semantic_count,
+            .semantic_text = semantic_text_count,
+            .handlers = self.pending_handler_count,
+            .buttons = self.pending_button_count,
+            .text_inputs = self.pending_text_input_count,
+            .listboxes = self.pending_listbox_count,
+            .options = self.pending_option_count,
+            .animations = self.pending_animation_count,
+        });
         _ = c.lua_rawgeti(self.state, c.registry_index, self.root_reference);
         prepared.description_reference = c.luaL_ref(self.state, c.registry_index);
         @memcpy(prepared.descriptor_storage[0..descriptors.len], descriptors);
@@ -831,7 +873,7 @@ pub const UiBuild = struct {
             c.lua_settop(state, -2);
         }
         descriptor.validate() catch return luaError(state, "invalid animation or transition configuration");
-        if (self.pending_animation_count == self.pending_animations.len) return luaError(state, "animation capacity exceeded");
+        self.reserveEntry(animation.Descriptor, &self.pending_animations, self.pending_animation_count) catch return luaError(state, "out of memory");
         for (self.animationDescriptors()) |existing| if (existing.id == descriptor.id) return luaError(state, "duplicate animation key");
         self.pending_animations[self.pending_animation_count] = descriptor;
         self.pending_animation_count += 1;
@@ -1172,15 +1214,15 @@ pub const UiBuild = struct {
 
     fn append(self: *UiBuild, descriptor: instance.Descriptor) !void {
         if (self.active_owner == null) return error.ConstructorOutsideBuild;
-        if (self.count == self.storage.len) return error.DescriptorCapacityExceeded;
+        try self.reserveBorrowedEntry(instance.Descriptor, &self.storage, &self.owns_storage, self.count);
         self.storage[self.count] = descriptor;
         self.storage[self.count].interactive = descriptor.interactive and self.interactive;
         self.count += 1;
     }
 
     fn appendSemantic(self: *UiBuild, descriptor: SemanticDescriptor) !void {
-        if (self.semantic_count == self.semantic_storage.len)
-            return error.SemanticDescriptorCapacityExceeded;
+        if (self.semantic_storage.len == 0) return error.SemanticDescriptorCapacityExceeded;
+        try self.reserveBorrowedEntry(SemanticDescriptor, &self.semantic_storage, &self.owns_semantic_storage, self.semantic_count);
         self.semantic_storage[self.semantic_count] = descriptor;
         self.semantic_storage[self.semantic_count].enabled = descriptor.enabled and self.interactive;
         self.semantic_count += 1;
@@ -1433,8 +1475,8 @@ pub const UiBuild = struct {
         const content_id = semanticId(key, 0x636f6e74656e74 ^ target_id);
         const border_width = visual.border_width orelse 0;
         const sources = self.text_sources orelse return luaError(state, "text service unavailable");
-        if (self.pending_text_input_count == self.pending_text_inputs.len)
-            return luaError(state, "text_input capacity exceeded");
+        self.reserveEntry(PendingTextInput, &self.pending_text_inputs, self.pending_text_input_count) catch
+            return luaError(state, "out of memory");
         const controller = @import("editor.zig").fromTable(state, 1) catch |err| return luaError(state, @errorName(err));
         // Stage ownership before any Lua error can longjmp past Zig cleanup.
         self.pending_text_inputs[self.pending_text_input_count] = .{
@@ -1545,8 +1587,7 @@ pub const UiBuild = struct {
             defer c.lua_settop(state, -2);
             if (callback_type == c.type_nil) continue;
             if (callback_type != c.type_function) return luaError(state, "text_input callback must be a function");
-            if (self.pending_handler_count == self.pending_handlers.len)
-                return luaError(state, "input handler capacity exceeded");
+            self.reserveEntry(PendingHandler, &self.pending_handlers, self.pending_handler_count) catch return luaError(state, "out of memory");
             c.lua_pushvalue(state, -1);
             self.pending_handlers[self.pending_handler_count] = .{
                 .id = target_id,
@@ -1597,7 +1638,7 @@ pub const UiBuild = struct {
         // The resize slot owns input and semantics, but no visual recipe.
         // Its child inherits native interaction state for declarative paint.
         self.append(.{ .id = divider, .parent = id, .focusable = true, .focus_request = tableFocusRequest(state, 1) catch |err| return luaError(state, @errorName(err)), .object = .{ .box = .{} } }) catch return luaError(state, "cannot append split divider");
-        if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "button capacity exceeded");
+        self.reserveEntry(PendingButton, &self.pending_buttons, self.pending_button_count) catch return luaError(state, "out of memory");
         self.pending_buttons[self.pending_button_count] = .{ .id = divider, .enabled = true };
         self.pending_button_count += 1;
         self.appendSemantic(.{ .id = divider, .parent = id, .role = .separator, .key = "divider" }) catch return luaError(state, "cannot append split divider semantics");
@@ -1738,7 +1779,7 @@ pub const UiBuild = struct {
                 const key = tableString(state, span, "key") orelse return error.LinkKeyRequired;
                 const enabled = tableOptionalBoolean(state, span, "enabled", true) orelse return error.InvalidLinkEnabled;
                 const id = semanticId(key, 0x6c696e6b ^ parent ^ self.component_namespace);
-                if (self.pending_button_count == self.pending_buttons.len) return error.InputHandlerCapacityExceeded;
+                try self.reserveEntry(PendingButton, &self.pending_buttons, self.pending_button_count);
                 self.pending_buttons[self.pending_button_count] = .{ .id = id, .enabled = enabled };
                 self.pending_button_count += 1;
                 try self.stageCallbackAt(state, span, id, "on_press", .button);
@@ -2076,7 +2117,7 @@ pub const UiBuild = struct {
             for (self.pending_options[0..self.pending_option_count]) |option| {
                 if (option.listbox_id == parent.id and option.value == value) return luaError(state, "selection values must be unique");
             }
-            if (self.pending_option_count == self.pending_options.len) return luaError(state, "listbox option capacity exceeded");
+            self.reserveEntry(PendingOption, &self.pending_options, self.pending_option_count) catch return luaError(state, "out of memory");
             self.pending_options[self.pending_option_count] = .{ .id = id, .listbox_id = parent.id, .value = value };
             self.pending_option_count += 1;
             selected = group.selected == value;
@@ -2088,7 +2129,7 @@ pub const UiBuild = struct {
         const paint = readInteractionPaint(state, owner, visual.background orelse surface.value, visual.border orelse theme.border, true) catch |err|
             return luaError(state, @errorName(err));
         if (activate or range != null) {
-            if (self.pending_button_count == self.pending_buttons.len) return luaError(state, "activation capacity exceeded");
+            self.reserveEntry(PendingButton, &self.pending_buttons, self.pending_button_count) catch return luaError(state, "out of memory");
             const press_type = c.lua_getfield(state, 1, "on_press");
             const change_type = c.lua_getfield(state, 1, "on_change");
             c.lua_settop(state, -3);
@@ -2238,7 +2279,7 @@ pub const UiBuild = struct {
                 c.lua_settop(state, -2);
                 const filter = try @import("key_bindings.zig").listenerFilter(state, index, keyboard);
                 if (c.lua_getfield(state, index, "handler") != c.type_function) return error.CallbackMustBeFunction;
-                if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+                try self.reserveEntry(PendingHandler, &self.pending_handlers, self.pending_handler_count);
                 self.pending_handlers[self.pending_handler_count] = .{
                     .id = id,
                     .reference = c.luaL_ref(state, c.registry_index),
@@ -2259,7 +2300,7 @@ pub const UiBuild = struct {
                 const name = string(state, -2) orelse return error.InvalidCommands;
                 if (name.len == 0 or c.lua_type(state, -1) != c.type_function) return error.InvalidCommands;
                 const command = try @import("../ui/input/command.zig").Name.init(name);
-                if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+                try self.reserveEntry(PendingHandler, &self.pending_handlers, self.pending_handler_count);
                 c.lua_pushvalue(state, -1);
                 self.pending_handlers[self.pending_handler_count] = .{
                     .id = id,
@@ -2285,7 +2326,7 @@ pub const UiBuild = struct {
                 if (sequence.overlaps(previous.sequence)) return error.AmbiguousShortcut;
             c.lua_pushvalue(state, -1);
             if (c.lua_rawget(state, commands) != c.type_function) return error.UnknownCommand;
-            if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+            try self.reserveEntry(PendingHandler, &self.pending_handlers, self.pending_handler_count);
             self.pending_handlers[self.pending_handler_count] = .{
                 .id = id,
                 .reference = c.luaL_ref(state, c.registry_index),
@@ -2306,7 +2347,7 @@ pub const UiBuild = struct {
         defer c.lua_settop(state, -2);
         if (callback_type == c.type_nil) return;
         if (callback_type != c.type_function) return error.CallbackMustBeFunction;
-        if (self.pending_handler_count == self.pending_handlers.len) return error.InputHandlerCapacityExceeded;
+        try self.reserveEntry(PendingHandler, &self.pending_handlers, self.pending_handler_count);
         var open_override: ?bool = null;
         var include_capture = false;
         if (kind == .popup_anchor) {
@@ -2563,7 +2604,7 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
     if (selection != null) {
         const selected = tableRequiredInteger(state, 1, "selected") orelse return luaError(state, "selection selected must be an integer");
         const appearance = tableOptionalListBoxAppearance(state, 1) orelse return luaError(state, "selection appearance must be default or sidebar");
-        if (self.pending_listbox_count == self.pending_listboxes.len) return luaError(state, "listbox capacity exceeded");
+        self.reserveEntry(PendingListBox, &self.pending_listboxes, self.pending_listbox_count) catch return luaError(state, "out of memory");
         self.pending_listboxes[self.pending_listbox_count] = .{ .id = id, .selected = selected, .enabled = enabled, .appearance = appearance };
         self.pending_listbox_count += 1;
         const callback_type = c.lua_getfield(state, 1, "on_select");
@@ -3192,7 +3233,8 @@ fn luaError(state: *c.State, message: [*:0]const u8) c_int {
 test "contextual input validates filters commands and shortcut ambiguity transactionally" {
     const state = c.luaL_newstate() orelse return error.OutOfMemory;
     defer c.lua_close(state);
-    var ui: UiBuild = .{ .state = state, .storage = &.{} };
+    var ui: UiBuild = .{ .allocator = std.testing.allocator, .state = state, .storage = &.{} };
+    defer ui.deinit();
     defer ui.rollbackHandlers();
     const cases = [_]struct { source: []const u8, failure: ?anyerror, count: usize = 2 }{
         .{ .source = "{on_key={handler=function() end}}", .failure = error.InputPropagationRequired },
@@ -3294,7 +3336,8 @@ test "Lua UI exposes only declarative constructors without standard libraries" {
 
     var storage: [1]instance.Descriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
 
     try std.testing.expectEqual(c.type_table, c.lua_getglobal(state, "ouro"));
     inline for (.{
@@ -3335,7 +3378,8 @@ test "declarative text input separates focus identity from editable render conte
     var storage: [5]instance.Descriptor = undefined;
     var semantic_storage: [2]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachText(&sources, &.{font}, 1);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(.light);
@@ -3451,7 +3495,8 @@ test "declarative sidebar listbox uses paired active visuals" {
     var storage: [7]instance.Descriptor = undefined;
     var semantic_storage: [3]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachText(&sources, &.{font}, 1);
     try ui.attachMediumText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
@@ -3528,7 +3573,8 @@ test "declarative flex is contextual child data and containers expose cross alig
     var storage: [5]instance.Descriptor = undefined;
     var semantic_storage: [3]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(.light);
     try execute(state,
@@ -3566,7 +3612,8 @@ test "declarative flex rejects invalid factors and non-flex parents" {
     c.lua_pushinteger(state, 1);
     c.lua_setfield(state, -2, "flex");
     var storage: [1]instance.Descriptor = undefined;
-    var ui: UiBuild = .{ .state = state, .storage = &storage };
+    var ui: UiBuild = .{ .allocator = std.testing.allocator, .state = state, .storage = &storage };
+    defer ui.deinit();
     ui.parent_stack[0] = .{ .id = 1, .kind = .box };
     ui.parent_count = 1;
     try std.testing.expectError(
@@ -3604,7 +3651,8 @@ test "declarative grid and wrap validate declarations and retain keyed children 
     var storage: [8]instance.Descriptor = undefined;
     var semantics: [6]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachSemantics(&semantics);
     ui.enableDeclarativeWidgets(.light);
     try execute(state,
@@ -3782,7 +3830,8 @@ test "declarative Lua text flows through layout scene and software glyph cache" 
     var storage: [4]instance.Descriptor = undefined;
     var semantic_storage: [2]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachText(&sources, &.{ font, arabic }, 1);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(.light);
@@ -3872,7 +3921,8 @@ test "box maxima and edge padding preserve strict validation and defaults" {
     const owner = try owners.mount(null, 1);
     var storage: [3]instance.Descriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     ui.enableDeclarativeWidgets(.light);
     try execute(state, "function build() return ouro.box(props) end");
 
@@ -3939,7 +3989,8 @@ test "nested declarative widgets include constrained boxes and scoped themes" {
     var storage: [9]instance.Descriptor = undefined;
     var semantic_storage: [6]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachText(&sources, &.{font}, 1);
     try ui.attachMediumText(&.{medium_font});
     try ui.attachSemantics(&semantic_storage);
@@ -4069,7 +4120,8 @@ test "buttons retain semantics and input bindings with intrinsic or fixed custom
     var storage: [4]instance.Descriptor = undefined;
     var semantics: [2]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachSemantics(&semantics);
     ui.enableDeclarativeWidgets(.dark);
     try execute(state,
@@ -4124,7 +4176,8 @@ test "Lua constructors are pure and reject callback children" {
     c.lua_setglobal(state, "ouro");
     var storage: [1]instance.Descriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try execute(state, "description = ouro.column { key = 'content', ouro.box { key = 'child' } }");
     try std.testing.expectEqual(@as(usize, 0), ui.count);
     try std.testing.expectEqual(@as(usize, 0), ui.pending_handler_count);
@@ -4169,7 +4222,8 @@ test "returned descriptions snapshot props forward children and preserve keyed i
     var storage: [8]instance.Descriptor = undefined;
     var semantics: [6]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachSemantics(&semantics);
     ui.enableDeclarativeWidgets(.light);
     try execute(state,
@@ -4265,7 +4319,8 @@ test "prepared descriptions stay alive across builds and release on reset" {
     var storage: [3]instance.Descriptor = undefined;
     var semantics: [1]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     try ui.attachSemantics(&semantics);
     ui.enableDeclarativeWidgets(.light);
     try execute(state,
@@ -4355,7 +4410,8 @@ test "signals dirty only dependent mounted builds and replace dependencies trans
     var storage: [5]instance.Descriptor = undefined;
     var semantic_storage: [3]SemanticDescriptor = undefined;
     var ui: UiBuild = undefined;
-    try ui.init(state, &storage);
+    try ui.init(std.testing.allocator, state, &storage);
+    defer ui.deinit();
     ui.attachSignals(&signals);
     try ui.attachSemantics(&semantic_storage);
     ui.enableDeclarativeWidgets(.light);

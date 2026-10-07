@@ -230,6 +230,7 @@ pub const SourceGeneration = struct {
         var shell_workspaces_initialized = false;
         var descriptor_storage: ?[]ui.instance.Descriptor = null;
         var semantic_storage: ?[]ui.semantics.Descriptor = null;
+        var ui_build_initialized = false;
         var application_initialized = false;
         var prepared_build_storage: ?[]lua.PreparedBuild = null;
         var prepared_build_count: usize = 0;
@@ -257,6 +258,7 @@ pub const SourceGeneration = struct {
             if (self.native_modules) |*modules| modules.deinit();
             if (shell_workspaces_initialized) self.shell_workspaces.?.deinit();
             if (signals_initialized) self.signals.deinit();
+            if (ui_build_initialized) self.ui_build.deinit();
             if (semantic_storage) |storage| allocator.free(storage);
             if (descriptor_storage) |storage| allocator.free(storage);
             self.snapshot.deinit();
@@ -394,6 +396,7 @@ pub const SourceGeneration = struct {
         };
         semantic_storage = self.semantic_storage;
         self.ui_build.initWithApi(
+            allocator,
             self.vm.state,
             self.descriptor_storage,
             self.vm.apiReference(),
@@ -407,6 +410,7 @@ pub const SourceGeneration = struct {
             );
             return err;
         };
+        ui_build_initialized = true;
         // ouro.machine is installed with the UI build API; observe it before
         // application code can start actors.
         if (config.statecharts) |store| try lua.installStatechartInspector(&self.vm, store);
@@ -1009,6 +1013,7 @@ pub const SourceGeneration = struct {
         if (self.native_modules) |*modules| modules.deinit();
         if (self.shell_workspaces) |*binding| binding.deinit();
         self.signals.deinit();
+        self.ui_build.deinit();
         self.allocator.free(self.semantic_storage);
         self.allocator.free(self.descriptor_storage);
         self.snapshot.deinit();

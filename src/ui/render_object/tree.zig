@@ -82,7 +82,7 @@ const Slot = struct {
     scroll_extent: f32 = 0,
 };
 
-/// Fixed-capacity storage for the closed typed render-object set. Unchanged
+/// Growable storage for the closed typed render-object set. Unchanged
 /// layout is allocation-free; dirty Text objects may populate the paragraph cache.
 /// This is deliberately not the widget/instance tree.
 pub const Tree = struct {
@@ -96,6 +96,8 @@ pub const Tree = struct {
 
     allocator: std.mem.Allocator,
     slots: []Slot,
+    /// Every slot below this index is active.
+    free_hint: usize = 0,
     paragraph_sources: ?*text.ParagraphSourceCache = null,
     paragraphs: ?*text.ParagraphCache = null,
     images: ?*ImageCache = null,
@@ -140,11 +142,12 @@ pub const Tree = struct {
         try validateObject(object);
         try self.retainObject(object);
         errdefer self.releaseObject(object);
-        for (self.slots, 0..) |*candidate, index| {
+        for (self.slots[self.free_hint..], self.free_hint..) |*candidate, index| {
             if (candidate.active) continue;
             var generation = candidate.generation +% 1;
             if (generation == 0) generation = 1;
             candidate.* = .{ .generation = generation, .active = true, .object = object };
+            self.free_hint = index + 1;
             return .{ .slot = @intCast(index), .generation = generation };
         }
         return error.RenderObjectCapacityExceeded;
@@ -158,10 +161,23 @@ pub const Tree = struct {
         self.releaseParagraphLayout(target);
         self.releaseObject(target.object);
         self.slots[handle.slot] = .{ .generation = generation };
+        self.free_hint = @min(self.free_hint, handle.slot);
     }
 
     pub fn detachChild(self: *Tree, handle: NodeHandle) !void {
         try self.detach(handle);
+    }
+
+    /// Grows storage so `additional` creates cannot fail. Handles stay
+    /// valid; slot pointers do not, so callers reserve while preparing,
+    /// before layout or reconciliation borrows a slot.
+    pub fn reserve(self: *Tree, additional: usize) !void {
+        const available = self.availableCapacity();
+        if (additional <= available) return;
+        const old_len = self.slots.len;
+        const new_len = @max(old_len + additional - available, old_len * 2);
+        self.slots = try self.allocator.realloc(self.slots, new_len);
+        @memset(self.slots[old_len..], .{});
     }
 
     pub fn availableCapacity(self: *const Tree) usize {

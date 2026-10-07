@@ -37,7 +37,7 @@ const Fixture = struct {
         try self.renders.init(std.testing.allocator, 64);
         try self.instances.init(std.testing.allocator, &self.scheduler, &self.renders, self.scope, 64);
         try self.snapshot.init(std.testing.allocator, 64, 4096);
-        try self.ui.init(self.state, &self.descriptors);
+        try self.ui.init(std.testing.allocator, self.state, &self.descriptors);
         self.ui.attachSignals(&self.signals);
         self.ui.components.instances = &self.instances;
         self.ui.enableDeclarativeWidgets(.light);
@@ -61,6 +61,7 @@ const Fixture = struct {
         self.scheduler.deinit();
         c.lua_close(self.state);
         self.signals.deinit();
+        self.ui.deinit();
         std.testing.allocator.destroy(self);
     }
 

@@ -52,8 +52,9 @@ pub const Node = struct {
     range: ?Range,
 };
 
-/// Double-buffered, allocation-free-after-init semantic snapshot suitable for
-/// headless assertions and future accessibility protocol translation.
+/// Double-buffered semantic snapshot suitable for headless assertions and
+/// future accessibility protocol translation. Storage grows only in
+/// `validate`; staging and commit never allocate.
 pub const Snapshot = struct {
     allocator: std.mem.Allocator,
     nodes: [2][]StoredNode,
@@ -115,8 +116,22 @@ pub const Snapshot = struct {
     }
 
     pub fn validate(self: *Snapshot, descriptors: []const Descriptor) !void {
-        @memset(self.validation_index, 0);
         self.buildActiveIndex();
+        var needed_nodes: usize = 0;
+        var needed_text: usize = 0;
+        for (descriptors) |descriptor| {
+            needed_nodes += 1;
+            needed_text += descriptor.key.len + descriptor.label.len;
+            if (descriptor.retain_subtree) if (lookup(self.active_index, descriptor.id)) |old_index| {
+                var child = self.nodes[self.active][old_index].first_child;
+                while (child) |index| {
+                    self.countRetained(index, &needed_nodes, &needed_text);
+                    child = self.nodes[self.active][index].next_sibling;
+                }
+            };
+        }
+        try self.grow(needed_nodes, needed_text);
+        @memset(self.validation_index, 0);
         var node_count: usize = 0;
         var text_count: usize = 0;
         var dialog_seen = false;
@@ -159,6 +174,36 @@ pub const Snapshot = struct {
         self.staged_node_count = node_count;
         self.staged_text_count = text_count;
         self.has_staged = true;
+    }
+
+    fn countRetained(self: *const Snapshot, old_index: usize, nodes: *usize, text: *usize) void {
+        const old = self.nodes[self.active][old_index];
+        nodes.* += 1;
+        text.* += old.key_len + old.label_len;
+        var child = old.first_child;
+        while (child) |index| {
+            self.countRetained(index, nodes, text);
+            child = self.nodes[self.active][index].next_sibling;
+        }
+    }
+
+    /// Both buffers grow alike: another commit may flip the active buffer
+    /// between this validation and the matching stage. Stored nodes refer
+    /// to text by offset, so moving the buffers is safe here.
+    fn grow(self: *Snapshot, nodes: usize, text: usize) !void {
+        if (text > self.text[0].len) {
+            const len = @max(text, self.text[0].len * 2);
+            for (&self.text) |*buffer| buffer.* = try self.allocator.realloc(buffer.*, len);
+        }
+        if (nodes <= self.nodes[0].len) return;
+        const len = @max(nodes, self.nodes[0].len * 2);
+        const index_len = try indexCapacity(len);
+        for (&self.nodes) |*buffer| buffer.* = try self.allocator.realloc(buffer.*, len);
+        self.last_child = try self.allocator.realloc(self.last_child, len);
+        self.validation_index = try self.allocator.realloc(self.validation_index, index_len);
+        self.output_index = try self.allocator.realloc(self.output_index, index_len);
+        self.active_index = try self.allocator.realloc(self.active_index, index_len);
+        self.buildActiveIndex();
     }
 
     fn buildActiveIndex(self: *Snapshot) void {
@@ -458,7 +503,7 @@ test "expanded state distinguishes false true and absent across retained transac
     try std.testing.expectEqual(@as(?bool, null), snapshot.findId(5).?.expanded);
 }
 
-test "retained semantic subtree rejects conflicts and capacity overflow" {
+test "retained semantic subtree rejects conflicts and grows past its capacity" {
     var snapshot: Snapshot = undefined;
     try snapshot.init(std.testing.allocator, 4, 32);
     defer snapshot.deinit();
@@ -485,7 +530,17 @@ test "retained semantic subtree rejects conflicts and capacity overflow" {
     try snapshot.validate(&.{
         .{ .id = 1, .parent = null, .role = .group, .retain_subtree = true }, .{ .id = 4, .parent = 1, .role = .group },
     });
-    try std.testing.expectError(error.SemanticNodeCapacityExceeded, snapshot.validate(&.{
-        .{ .id = 1, .parent = null, .role = .group, .retain_subtree = true }, .{ .id = 4, .parent = 1, .role = .group }, .{ .id = 5, .parent = 1, .role = .group },
-    }));
+    // Past the initial four nodes and 32 bytes, validation grows both
+    // buffers; staging and commit then fit without allocating.
+    const grown = [_]Descriptor{
+        .{ .id = 1, .parent = null, .role = .group, .retain_subtree = true },
+        .{ .id = 4, .parent = 1, .role = .group },
+        .{ .id = 5, .parent = 1, .role = .text, .label = "a label longer than the initial text buffer" },
+    };
+    try snapshot.validate(&grown);
+    snapshot.stage(&grown);
+    snapshot.commitStaged();
+    try std.testing.expectEqual(@as(usize, 5), snapshot.count());
+    try std.testing.expectEqualStrings("child", snapshot.findId(3).?.label);
+    try std.testing.expectEqualStrings("a label longer than the initial text buffer", snapshot.findId(5).?.label);
 }

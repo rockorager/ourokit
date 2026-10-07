@@ -179,6 +179,20 @@ pub const PointerBindings = struct {
         return error.PointerBindingCapacityExceeded;
     }
 
+    /// Grows storage by at least `additional` entries. Call while
+    /// preparing a build so that `set` cannot fail during commit.
+    pub fn grow(self: *PointerBindings, additional: usize) !void {
+        const old_len = self.entries.len;
+        const new_len = @max(old_len + additional, old_len * 2);
+        // There are never more interaction or scroll targets than entries.
+        self.entries = try self.allocator.realloc(self.entries, new_len);
+        @memset(self.entries[old_len..], .{});
+        self.interactions = try self.allocator.realloc(self.interactions, new_len);
+        @memset(self.interactions[old_len..], .{});
+        self.scrolls = try self.allocator.realloc(self.scrolls, new_len);
+        @memset(self.scrolls[old_len..], .{});
+    }
+
     pub fn availableAfterReconcile(
         self: *const PointerBindings,
         tree: *instance.Tree,

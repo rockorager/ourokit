@@ -145,6 +145,7 @@ pub const Tree = struct {
     instance_entries: []IndexEntry,
     render_entries: []IndexEntry,
     indices_dirty: bool = false,
+    free_hint: usize = 0,
     box_has_child: []bool,
     revision: u64 = 0,
     preparation: u64 = 0,
@@ -220,6 +221,8 @@ pub const Tree = struct {
         descriptors: []const Descriptor,
     ) !ReconcilePlan {
         self.preparation +%= 1;
+        // Storage grows during preparation so applyReconcile cannot fail.
+        try self.growTo(descriptors.len);
         if (self.indices_dirty) try self.rebuildIndices();
         for (self.occupiedSlots()) |index| self.slots[index].retained = false;
         errdefer for (self.occupiedSlots()) |index| {
@@ -276,11 +279,11 @@ pub const Tree = struct {
                 omitted_count += 1;
         }
         if (create_count != 0) {
-            if (create_count > self.freeCount()) return error.InstanceCapacityExceeded;
-            // Reserve during preparation so applyReconcile cannot fail.
+            try self.growTo(self.occupied_count + create_count);
             try self.scheduler.reserveScopes(create_count);
-            if (create_count > self.render_tree.availableCapacity() + omitted_count)
-                return error.RenderObjectCapacityExceeded;
+            // Omitted objects are destroyed before new ones are created.
+            if (create_count > omitted_count)
+                try self.render_tree.reserve(create_count - omitted_count);
         }
 
         var topology_changed = create_count != 0 or omitted_count != 0;
@@ -483,28 +486,32 @@ pub const Tree = struct {
         var changed = false;
         while (progress) {
             progress = false;
-            var index: usize = 0;
-            while (index < self.occupied_count) {
-                const slot = &self.slots[self.occupied[index]];
-                if (slot.state != .retiring) {
-                    index += 1;
+            // Compact in one pass, so freeing many instances stays linear.
+            var kept: usize = 0;
+            for (0..self.occupied_count) |index| {
+                const slot_index = self.occupied[index];
+                const slot = &self.slots[slot_index];
+                if (slot.state == .retiring) free: {
+                    self.scheduler.destroyScope(slot.scope) catch |err| switch (err) {
+                        error.ScopeNotEmpty => break :free,
+                        else => {
+                            std.mem.copyForwards(usize, self.occupied[kept..], self.occupied[index..self.occupied_count]);
+                            self.occupied_count = kept + self.occupied_count - index;
+                            return err;
+                        },
+                    };
+                    const generation = slot.generation;
+                    slot.* = .{ .generation = generation };
+                    self.free_hint = @min(self.free_hint, slot_index);
+                    self.indices_dirty = true;
+                    progress = true;
+                    changed = true;
                     continue;
                 }
-                self.scheduler.destroyScope(slot.scope) catch |err| switch (err) {
-                    error.ScopeNotEmpty => {
-                        index += 1;
-                        continue;
-                    },
-                    else => return err,
-                };
-                const generation = slot.generation;
-                slot.* = .{ .generation = generation };
-                self.indices_dirty = true;
-                self.occupied_count -= 1;
-                std.mem.copyForwards(usize, self.occupied[index..self.occupied_count], self.occupied[index + 1 .. self.occupied_count + 1]);
-                progress = true;
-                changed = true;
+                self.occupied[kept] = slot_index;
+                kept += 1;
             }
+            self.occupied_count = kept;
         }
         if (changed) self.revision +%= 1;
     }
@@ -527,9 +534,11 @@ pub const Tree = struct {
         return handleFor(slot, index);
     }
 
-    pub fn paintAt(self: *const Tree, index: usize) ?struct { render: render_object.NodeHandle, paint: InteractionPaint } {
+    pub const PaintBinding = struct { render: render_object.NodeHandle, paint: InteractionPaint };
+
+    pub fn paintAt(self: *const Tree, index: usize) ?PaintBinding {
         if (index >= self.slots.len) return null;
-        const slot = self.slots[index];
+        const slot = &self.slots[index];
         if (slot.state != .active) return null;
         return .{ .render = slot.render.?, .paint = slot.interaction_paint orelse return null };
     }
@@ -826,9 +835,55 @@ pub const Tree = struct {
         return if (slot.state == .active) slot else null;
     }
 
+    /// Every slot below `free_hint` is occupied, so repeated creation
+    /// does not rescan the occupied prefix.
     fn freeIndex(self: *Tree) ?usize {
-        for (self.slots, 0..) |slot, index| if (slot.state == .free) return index;
+        for (self.slots[self.free_hint..], self.free_hint..) |*slot, index| if (slot.state == .free) {
+            self.free_hint = index;
+            return index;
+        };
         return null;
+    }
+
+    /// Grows slot storage to at least `len` slots. Handles and occupied
+    /// indices stay valid; slot pointers do not, so this runs only while
+    /// preparing a reconcile.
+    fn growTo(self: *Tree, len: usize) !void {
+        if (len <= self.slots.len) return;
+        const old_len = self.slots.len;
+        const new_len = @max(len, old_len * 2);
+        const index_len = try indexCapacity(new_len);
+        const descriptor_entries = try self.allocator.alloc(IndexEntry, index_len);
+        errdefer self.allocator.free(descriptor_entries);
+        const instance_entries = try self.allocator.alloc(IndexEntry, index_len);
+        errdefer self.allocator.free(instance_entries);
+        const render_entries = try self.allocator.alloc(IndexEntry, index_len);
+        errdefer self.allocator.free(render_entries);
+        // Each realloc keeps its contents, so a later failure leaves the
+        // tree consistent, merely larger in some arrays.
+        self.slots = try self.allocator.realloc(self.slots, new_len);
+        @memset(self.slots[old_len..], .{});
+        self.occupied = try self.allocator.realloc(self.occupied, new_len);
+        self.box_has_child = try self.allocator.realloc(self.box_has_child, new_len);
+        // Rehash rather than rebuild: the descriptor index of the
+        // reconcile being prepared must survive.
+        rehash(descriptor_entries, self.descriptor_entries);
+        rehash(instance_entries, self.instance_entries);
+        rehash(render_entries, self.render_entries);
+        self.allocator.free(self.descriptor_entries);
+        self.allocator.free(self.instance_entries);
+        self.allocator.free(self.render_entries);
+        self.descriptor_entries = descriptor_entries;
+        self.instance_entries = instance_entries;
+        self.render_entries = render_entries;
+    }
+
+    fn rehash(into: []IndexEntry, from: []const IndexEntry) void {
+        @memset(into, .{});
+        const index = IdIndex{ .entries = into };
+        for (from) |entry| if (entry.key != 0) {
+            _ = index.put(entry.key, entry.slot) catch unreachable;
+        };
     }
 
     fn freeCount(self: *const Tree) usize {
@@ -1241,6 +1296,40 @@ test "invalid snapshots are transactional and retirement waits for scope drain" 
     try scheduler.applyQueuedCancellations();
     try instances.collectRetired();
     try scheduler.destroyScope(window_scope);
+}
+
+test "reconcile grows instance and render storage during preparation" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 2, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(std.testing.allocator, 2);
+    defer renders.deinit();
+    var tree: Tree = undefined;
+    try tree.init(std.testing.allocator, &scheduler, &renders, scope, 2);
+    defer tree.deinit();
+    var descriptors: [300]Descriptor = undefined;
+    descriptors[0] = .{ .id = 1, .parent = null, .object = .{ .stack = .{} } };
+    for (descriptors[1..], 2..) |*descriptor, id|
+        descriptor.* = .{ .id = id, .parent = 1, .object = .{ .box = .{ .width = 1 } } };
+    try tree.reconcile(descriptors[0..2]);
+    const root = tree.handleForId(1).?;
+    const first = tree.handleForId(2).?;
+    // A plan prepared after growth still applies: growth rehashes the
+    // descriptor index rather than discarding it.
+    const plan = try tree.prepareReconcile(&descriptors);
+    try tree.applyReconcile(plan);
+    try std.testing.expect(tree.slots.len >= 300 and renders.slots.len >= 300);
+    try std.testing.expectEqual(root, tree.handleForId(1).?);
+    try std.testing.expectEqual(first, tree.handleForId(2).?);
+    try std.testing.expect(tree.handleForId(300) != null);
+    try std.testing.expectEqual(@as(usize, 299), renders.childCount(try tree.renderObject(root)));
+
+    try tree.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try tree.collectRetired();
+    try scheduler.destroyScope(scope);
 }
 
 test "reconcile plans distinguish property updates removals and creations at capacity" {

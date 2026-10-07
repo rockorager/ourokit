@@ -540,6 +540,10 @@ The test context provides:
   it, the next `t:node` or `t:click` fails with `DevelopmentRuntimeNotSettled`.
   Examples are sending a chart event or advancing a `machine.manual_scheduler()`
   clock.
+- `t:resources()`: counts of live native objects (`instances`,
+  `render_objects`, `scopes`, `signals`, `callbacks`) and the Lua heap in KiB
+  after a full collection (`lua_kb`). Compare them before and after a workload
+  to check that unmounted components and stopped actors free what they held.
 
 Mount and input drain runnable callbacks, reconciliation, layout, and scene
 preparation before returning. `t:node` and input first settle changes made

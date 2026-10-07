@@ -132,7 +132,7 @@ same mechanism rather than type-specific application arrays.
 
 Scopes form a tree with intrusive child links and per-scope task, resource, and
 child counts, so subtree walks and emptiness checks never scan unrelated slots
-or allocate. Capacity stays fixed at scheduler creation. Natively owned scopes
+or allocate. Natively owned scopes
 (windows, instances) are freed explicitly with `destroyScope` once drained.
 Child scopes, which statechart states will use, can also be
 **retired**: `retireScope` queues cancellation for the whole subtree and frees
@@ -175,13 +175,39 @@ scopes alone.
 canceled subtree that has never started. Such a task has no Lua frames, timers,
 or I/O. Started tasks unwind at the next safe point, as before.
 
-Scope capacity is fixed when the scheduler is created (`scope_capacity`,
-1024 by default in the Wayland runner). It does not grow, because native
-reconcilers prevalidate against `availableScopeCapacity` and rely on infallible
-scope creation at commit. Because never-started work is discarded on close,
-rapid state toggling reuses the same slots, even 10,000 times in one turn.
-Only scopes whose tasks have actually started can wait for drain. Exhaustion
-raises `ScopeCapacityExceeded`, with a message that names the capacity.
+`scope_capacity` (1024 by default in the Wayland runner) is only the initial
+size: scopes, resources and tasks grow on demand, so exhaustion means real
+out-of-memory. Scope handles are indexes, never pointers, so growing moves the
+slab safely. Native reconcilers whose commit must not fail call
+`reserveScopes(count)` while preparing, which grows the slab ahead of time;
+commit then creates scopes without allocating. Because never-started work is
+discarded on close, rapid state toggling reuses the same slots, even 10,000
+times in one turn.
+
+### Capacities grow; input bounds stay
+
+Every count of live runtime objects grows on demand: scopes, tasks, resources,
+signals and their dependency edges, per-window instances, render objects,
+semantic nodes and text, pointer bindings, buttons, text inputs, list boxes,
+animations, scene commands, build storage, io_uring operation slots, whole-file
+reads, modules, MCP calls, stdio operations and HTTP requests. Growth happens on
+creation or while preparing a build or reload, never on the resume and
+completion paths, and commit stays infallible because preparation reserved what
+it needs. Pools whose slots the kernel or a Lua continuation points into
+(operation slots, file reads, modules, MCP calls, stdio) grow in chunks that
+never move (`core.StableSlots`); index-addressed pools reallocate. When a turn
+prepares more SQEs than the ring holds, the loop hands the queued ones to the
+kernel early instead of failing.
+
+Limits that protect against input, protocols or pathological depth are not
+capacities and stay bounded: message, header, file and module byte limits, MCP
+receive buffers and JSON depth, widget nesting depth, build stabilization passes,
+the platform input queue, compositor-mirrored outputs and workspaces, inbound
+D-Bus method calls, and damage regions (merged when exceeded).
+
+`zig build test-stress` mounts and remounts 1000 component rows 50 times and
+cycles 10,000 actors, checking with `t:resources()` that native objects and the
+Lua heap return to their baseline.
 
 ### Private scope binding
 
@@ -207,7 +233,7 @@ alive(scope)                 -- false once closed, canceled, or freed
 Lua state without a VM (bare test states), they are nils. The VM is found
 through the registry, so loaders that only have a `lua_State` (such as
 `UiBuild`) can call it. Errors are strings that start with the error name:
-`ScopeCanceled`, `StaleScope`, `ScopeCapacityExceeded`, `NoParentScope`, or
+`ScopeCanceled`, `StaleScope`, `NoParentScope`, or
 `InvalidArguments`. Scopes opened this way belong to the source generation's
 VM.
 
@@ -317,7 +343,7 @@ descriptor reconciliation succeeds.
 
 `ouro.signal(initial)` creates full userdata whose Lua user value stores the
 application value. Calling a signal reads it; `signal:set(value)` writes it.
-Only reads made during a mounted UI build are tracked. The fixed-capacity native
+Only reads made during a mounted UI build are tracked. The growable native
 graph stores generation-checked signal handles and stable build-owner
 references. Dependencies are provisional until descriptor reconciliation
 succeeds, so Lua errors, forbidden build-time writes, and native transaction

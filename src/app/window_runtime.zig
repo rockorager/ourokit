@@ -447,10 +447,14 @@ pub const WindowRuntime = struct {
         try lua_ui.capturePrepared(prepared, descriptors);
         var captured = true;
         errdefer if (captured) prepared.reset();
-        if (prepared.button_count != 0 and prepared.button_count > self.buttons.availableForOwner(self.root_owner))
-            return error.ButtonCapacityExceeded;
-        if (prepared.text_input_count != 0 and prepared.text_input_count > self.text_inputs.availableForOwner(self.root_owner))
-            return error.TextInputCapacityExceeded;
+        // Registries grow while preparing so commitPreparedSource cannot fail.
+        const buttons_available = self.buttons.availableForOwner(self.root_owner);
+        if (prepared.button_count > buttons_available)
+            try self.buttons.grow(prepared.button_count - buttons_available);
+        const text_inputs_available = self.text_inputs.availableForOwner(self.root_owner);
+        if (prepared.text_input_count > text_inputs_available)
+            try self.text_inputs.grow(prepared.text_input_count - text_inputs_available);
+        try self.listboxes.reserve(prepared.listbox_count, prepared.option_count);
         for (prepared.handlers[0..prepared.handler_count]) |handler|
             if (!containsDescriptorId(prepared.descriptors(), handler.id))
                 return error.PointerHandlerInstanceMissing;
@@ -463,10 +467,9 @@ pub const WindowRuntime = struct {
         }
         try self.retainTextInputPresentation(prepared.descriptor_storage[0..prepared.descriptor_count], prepared.text_inputs[0..prepared.text_input_count]);
         const plan = try self.instances.prepareReconcile(prepared.descriptors());
-        if (prepared.handler_count != 0 and prepared.handler_count > self.pointer_bindings.availableAfterReconcile(
-            &self.instances,
-            self.root_owner,
-        )) return error.PointerBindingCapacityExceeded;
+        const bindings_available = self.pointer_bindings.availableAfterReconcile(&self.instances, self.root_owner);
+        if (prepared.handler_count > bindings_available)
+            try self.pointer_bindings.grow(prepared.handler_count - bindings_available);
         try self.animations.validate(prepared.animations[0..prepared.animation_count]);
         _ = try self.validatePreparedFrame(prepared.descriptors(), size, lua_ui.root_background != null, null);
         try lua_ui.commitDependencies(&self.build_owners, work);
@@ -790,8 +793,7 @@ pub const WindowRuntime = struct {
                 try self.applyFocusVisual(previous, self.focus.current());
             }
             try self.applyFocusRequests();
-            for (0..self.buttons.slotCount()) |index|
-                if (self.buttons.targetAt(index)) |target| try self.applyButtonUpdate(target);
+            try self.refreshButtonVisuals();
             try self.refreshListBoxVisuals();
             // Refresh paint without inventing a focus transition on every
             // controlled echo; real focus changes alone delimit typing groups.
@@ -864,42 +866,60 @@ pub const WindowRuntime = struct {
         if (try self.tree.paintDirty(root) or self.frame_state.needsScene()) {
             const started = self.phaseStart();
             self.frame_state.invalidatePaint();
-            var builder = try ui.render_object.Builder.init(self.commands, self.output_scale);
-            // The root paints the tint once. Reset reused buffers so a
-            // translucent root never blends with the previous frame.
-            if (self.background != null) try builder.clear(core.Color.rgba(0, 0, 0, 0));
-            try self.tree.buildScene(root, &builder);
-            if (self.drag_session) |drag| if (drag.active) {
-                try builder.pushClip(.{ .x = 0, .y = 0, .width = width, .height = height });
-                if (drag.target) |target| try builder.decoratedRectangle(
-                    try self.tree.paintBounds(try self.instances.renderObject(target)),
-                    null,
-                    self.focus_color,
-                    2,
-                    0,
-                );
-                const source = try self.instances.renderObject(drag.source);
-                const offset: core.PointF = .{
-                    .x = drag.position.x - drag.start.x + 12,
-                    .y = drag.position.y - drag.start.y + 24,
-                };
-                var bounds = try self.tree.paintBounds(source);
-                bounds.x += offset.x;
-                bounds.y += offset.y;
-                // Transparent sources (e.g. tab labels) need an opaque plate
-                // so destination text cannot show through the moving glyphs.
-                var plate = self.surface_color;
-                plate.a = 255;
-                try builder.decoratedRectangle(bounds, plate, self.border_color, 1, 4);
-                try builder.pushOpacity(0.75);
-                try self.tree.buildPreview(source, &builder, offset);
-                try builder.popOpacity();
-                try builder.popClip();
+            // The command buffer grows until the scene fits; frames copy
+            // their commands, so no submitted frame borrows it.
+            self.command_count = while (true) {
+                var builder = try ui.render_object.Builder.init(self.commands, self.output_scale);
+                if (self.paintScene(&builder, root, width, height)) |_| {
+                    break builder.displayList().commands.len;
+                } else |err| switch (err) {
+                    error.SceneCapacityExceeded => try self.growCommands(),
+                    else => return err,
+                }
             };
-            self.command_count = builder.displayList().commands.len;
             _ = try self.frame_state.sceneBuilt();
             self.metrics.paints.finish(started);
         }
+    }
+
+    fn growCommands(self: *WindowRuntime) !void {
+        const len = self.commands.len * 2;
+        self.commands = try self.allocator.realloc(self.commands, len);
+        try self.damage_tracker.reserve(len);
+    }
+
+    fn paintScene(self: *WindowRuntime, builder: *ui.render_object.Builder, root: ui.render_object.NodeHandle, width: f32, height: f32) !void {
+        // The root paints the tint once. Reset reused buffers so a
+        // translucent root never blends with the previous frame.
+        if (self.background != null) try builder.clear(core.Color.rgba(0, 0, 0, 0));
+        try self.tree.buildScene(root, builder);
+        if (self.drag_session) |drag| if (drag.active) {
+            try builder.pushClip(.{ .x = 0, .y = 0, .width = width, .height = height });
+            if (drag.target) |target| try builder.decoratedRectangle(
+                try self.tree.paintBounds(try self.instances.renderObject(target)),
+                null,
+                self.focus_color,
+                2,
+                0,
+            );
+            const source = try self.instances.renderObject(drag.source);
+            const offset: core.PointF = .{
+                .x = drag.position.x - drag.start.x + 12,
+                .y = drag.position.y - drag.start.y + 24,
+            };
+            var bounds = try self.tree.paintBounds(source);
+            bounds.x += offset.x;
+            bounds.y += offset.y;
+            // Transparent sources (e.g. tab labels) need an opaque plate
+            // so destination text cannot show through the moving glyphs.
+            var plate = self.surface_color;
+            plate.a = 255;
+            try builder.decoratedRectangle(bounds, plate, self.border_color, 1, 4);
+            try builder.pushOpacity(0.75);
+            try self.tree.buildPreview(source, builder, offset);
+            try builder.popOpacity();
+            try builder.popClip();
+        };
     }
 
     fn queueNativeBuild(self: *WindowRuntime) !void {
@@ -3117,10 +3137,35 @@ pub const WindowRuntime = struct {
 
     fn applyInteractionPaint(self: *WindowRuntime, target: ui.instance.InstanceHandle, focused: bool) !void {
         const id = try self.instances.semanticId(target);
-        const selection = self.listboxes.option(target) != null;
         for (self.instances.occupiedSlots()) |index| {
             const binding = self.instances.paintAt(index) orelse continue;
-            if (binding.paint.source != id) continue;
+            if (binding.paint.source == id) try self.applyPaintBinding(target, binding, focused);
+        }
+    }
+
+    /// Repaints every button in one pass over the instances, rather than one
+    /// pass per button, so rebuilding a large list stays linear.
+    fn refreshButtonVisuals(self: *WindowRuntime) !void {
+        var sources: std.AutoHashMapUnmanaged(u64, ui.instance.InstanceHandle) = .empty;
+        defer sources.deinit(self.allocator);
+        for (0..self.buttons.slotCount()) |index| if (self.buttons.targetAt(index)) |target|
+            try sources.put(self.allocator, try self.instances.semanticId(target), target);
+        for (self.instances.occupiedSlots()) |index| {
+            const binding = self.instances.paintAt(index) orelse continue;
+            const target = sources.get(binding.paint.source) orelse continue;
+            try self.applyPaintBinding(target, binding, self.keyboard_focus_visible and
+                if (self.focus.current()) |focused| sameHandle(focused, target) else false);
+        }
+    }
+
+    fn applyPaintBinding(
+        self: *WindowRuntime,
+        target: ui.instance.InstanceHandle,
+        binding: ui.instance.Tree.PaintBinding,
+        focused: bool,
+    ) !void {
+        const selection = self.listboxes.option(target) != null;
+        {
             var object = try self.tree.objectAt(binding.render);
             const previous = object;
             const color = if (selection) self.listboxes.paintColor(target, binding.paint) else self.buttons.paintColor(target, binding.paint);
@@ -3137,7 +3182,7 @@ pub const WindowRuntime = struct {
                     object.box.outline_inset = true;
                 } else object.box.border_color = if (focused) focus_color else binding.paint.border;
             }
-            if (std.meta.eql(previous, object)) continue;
+            if (std.meta.eql(previous, object)) return;
             try self.tree.update(binding.render, object);
             self.frame_state.invalidatePaint();
         }
@@ -3231,8 +3276,31 @@ pub const WindowRuntime = struct {
             },
             else => return err,
         };
-        const commands = try self.allocator.alloc(scene.Command, self.commands.len);
+        // Validation draws into a scratch buffer that grows like the live one.
+        var commands = try self.allocator.alloc(scene.Command, self.commands.len);
         defer self.allocator.free(commands);
+        while (true) {
+            if (self.drawPreparedScene(&tree, descriptors, handles, root_index, commands, transparent_clear, width, height)) |_| {
+                break;
+            } else |err| switch (err) {
+                error.SceneCapacityExceeded => commands = try self.allocator.realloc(commands, commands.len * 2),
+                else => return err,
+            }
+        }
+        return true;
+    }
+
+    fn drawPreparedScene(
+        self: *WindowRuntime,
+        tree: *ui.render_object.Tree,
+        descriptors: []const ui.instance.Descriptor,
+        handles: []const ui.render_object.NodeHandle,
+        root_index: usize,
+        commands: []scene.Command,
+        transparent_clear: bool,
+        width: f32,
+        height: f32,
+    ) !void {
         var builder = try ui.render_object.Builder.init(commands, self.output_scale);
         if (transparent_clear) try builder.clear(core.Color.rgba(0, 0, 0, 0));
         try tree.buildScene(handles[root_index], &builder);
@@ -3247,7 +3315,6 @@ pub const WindowRuntime = struct {
             try builder.popOpacity();
             try builder.popClip();
         };
-        return true;
     }
 
     fn applyFocusVisual(
