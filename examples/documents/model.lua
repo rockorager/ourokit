@@ -41,6 +41,6 @@ return function(json)
   end
   function M.label(d) return d.title ~= "" and d.title or "Untitled" end
   function M.tab_value(id) return tonumber(id:match("(%d+)$")) end
-  function M.child_id(value) return "document-" .. value end
+  function M.child_id(value) return "document." .. value end
   return M
 end

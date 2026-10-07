@@ -8,10 +8,21 @@ local function notify(options)
   if client then local notifications <close> = client; notifications:send(options) end
 end
 
+-- Reading a note file; also used directly by run when restoring the session.
+local function read_note(uri)
+  local bytes, err = ouro.files.read(uri, { max_bytes = 1024 * 1024 })
+  if not bytes then return nil, err end
+  local value, invalid = model.decode(bytes)
+  if not value then return nil, invalid end
+  return value
+end
+
 local charts = require("charts")(ouro, model, {
   choose = function(name)
     return ouro.desktop.choose_save_file { parent = "main", current_name = name, filters = filters }
   end,
+  choose_files = function() return ouro.desktop.choose_file { parent = "main", multiple = true, filters = filters } end,
+  read = read_note,
   write = function(path, bytes) return ouro.files.write(path, bytes) end,
   notify = notify,
   persist = function(split, paths, selected)
@@ -26,26 +37,8 @@ local charts = require("charts")(ouro, model, {
 local notes -- The application actor, started by run.
 local pending_uris = {}
 
--- Reading files has no state of its own; results arrive as ADD events.
-local function read_note(uri)
-  local bytes, err = ouro.files.read(uri, { max_bytes = 1024 * 1024 })
-  if not bytes then return nil, err end
-  local value, invalid = model.decode(bytes)
-  if not value then return nil, invalid end
-  return value
-end
-local function activate(uris)
-  for _, uri in ipairs(uris or {}) do
-    local value, err = read_note(uri)
-    if value then
-      notes:send { type = "ADD", title = value.title, text = value.text, path = uri }
-    else
-      local message = "Could not open " .. tostring(uri) .. ": " .. model.message(err)
-      notify { app_name = "Ourokit Notes", title = "Ourokit Notes", body = message }
-      notes:send { type = "ADD", error = message }
-    end
-  end
-end
+-- Opening files is a spawned task in the notes chart; results arrive as ADD.
+local function activate(uris) notes:send { type = "OPEN_URIS", uris = uris or {} } end
 
 local function content(doc)
   local d = doc:context()
@@ -54,10 +47,7 @@ local function content(doc)
   local children = {
       ouro.row {key="actions", gap=8,
         ouro.button {key="new", label="New", on_press=notes:sender("NEW")},
-        ouro.button {key="open", label="Open…", on_press=function()
-          local uris, err=ouro.desktop.choose_file {parent="main",multiple=true,filters=filters}
-          if uris then activate(uris) elseif err and err.name~="Canceled" then report(err) end
-        end},
+        ouro.button {key="open", label="Open…", on_press=notes:sender("OPEN")},
         ouro.button {key="save", label="Save", enabled=doc:can("SAVE"), on_press=doc:sender("SAVE")},
         ouro.button {key="save-as", label="Save as…", enabled=doc:can("SAVE_AS"), on_press=doc:sender("SAVE_AS")},
       },
@@ -149,7 +139,18 @@ return ouro.app {
       end
       if selected_value then notes:send { type = "SELECT", value = selected_value } end
     end
-    if #pending_uris>0 then local p=pending_uris; pending_uris={}; activate(p) end
+    -- Launch URIs open before the window shows (run is a task, so it may
+    -- wait), so the empty-session check below sees them.
+    for _,uri in ipairs(pending_uris) do
+      local value, err = read_note(uri)
+      if value then notes:send { type = "ADD", title = value.title, text = value.text, path = uri }
+      else
+        local message = "Could not open " .. tostring(uri) .. ": " .. model.message(err)
+        notify { app_name = "Ourokit Notes", title = "Ourokit Notes", body = message }
+        notes:send { type = "ADD", error = message }
+      end
+    end
+    pending_uris = {}
     if #notes:children()==0 then notes:send("NEW") end
     return {windows=function()
       return {ouro.window {id="main",title="Ourokit Notes",width=1000,height=720,
