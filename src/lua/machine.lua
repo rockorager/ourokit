@@ -1,4 +1,4 @@
-local ouro, view, raw = ...
+local ouro, view, raw, scope_open, scope_spawn, scope_close, scope_alive = ...
 
 -- Statechart prototype (design/statecharts.md). A chart is compiled once into
 -- nodes with stable dotted IDs. `transition` is a pure macrostep: it returns
@@ -984,29 +984,64 @@ local function spawn_task(fn)
   ouro.spawn(fn)
 end
 
--- The scheduler seam. Each active state entry with after/invoke work opens
--- one scope; timers and invokes run inside it; exiting closes it. Phase 2
--- replaces this with native child task scopes that cancel the work. Today
--- spawned work has no handle, so tasks run in application scope and a closed
--- scope only drops their delivery (and the per-entry token rejects
--- anything that slips through).
-M.default_scheduler = {
-  open = function() return {alive = true} end,
-  close = function(scope) scope.alive = false end,
+-- The scheduler seam. Each actor opens a root scope when it starts (a child
+-- of its parent actor's root); each active state entry with after/invoke work
+-- opens one scope under it; timers and invokes run inside; exiting the state
+-- closes it, and stopping the actor closes the root.
+--
+-- With the native binding, closing a scope cancels its tasks: sleeping timers
+-- and in-flight invokes unwind. The per-entry token check stays as a second
+-- line of defense and is what the token scheduler relies on.
+M.native_scopes = scope_open ~= nil
+if scope_open then
+  M.default_scheduler = {
+    kind = 'native',
+    open = function(parent) return scope_open(parent) end,
+    close = function(scope) scope_close(scope) end,
+    alive = function(scope) return scope_alive(scope) end,
+    run = function(scope, fn) scope_spawn(scope, fn) end,
+    after = function(scope, delay, fn) scope_spawn(scope, function() ouro.sleep(delay); fn() end) end,
+  }
+end
+
+-- Fallback where no native binding exists (a Lua state without a Vm), and for
+-- comparison: spawned work has no handle, so it runs in application scope and
+-- a closed scope only drops its delivery.
+local function token_scope(parent)
+  local scope = {alive = true, children = {}}
+  if parent then parent.children[#parent.children + 1] = scope end
+  return scope
+end
+local function close_token_scope(scope)
+  scope.alive = false
+  for _, child in ipairs(scope.children) do close_token_scope(child) end
+end
+M.token_scheduler = {
+  kind = 'token',
+  open = token_scope,
+  close = close_token_scope,
+  alive = function(scope) return scope.alive end,
   run = function(scope, fn) spawn_task(function() if scope.alive then fn() end end) end,
   after = function(scope, delay, fn)
     spawn_task(function() ouro.sleep(delay); if scope.alive then fn() end end)
   end,
 }
+M.default_scheduler = M.default_scheduler or M.token_scheduler
 
 -- Deterministic scheduler for tests: virtual time and explicit task runs.
 function M.manual_scheduler()
-  local s = {now = 0, timers = {}, tasks = {}, sequence = 0, open_scopes = 0}
-  function s.open() s.open_scopes = s.open_scopes + 1; return {alive = true} end
-  function s.close(scope)
+  local s = {kind = 'manual', now = 0, timers = {}, tasks = {}, sequence = 0, open_scopes = 0}
+  function s.open(parent)
+    s.open_scopes = s.open_scopes + 1
+    return token_scope(parent)
+  end
+  local function close(scope)
     if scope.alive then s.open_scopes = s.open_scopes - 1 end
     scope.alive = false
+    for _, child in ipairs(scope.children) do close(child) end
   end
+  s.close = close
+  function s.alive(scope) return scope.alive end
   function s.after(scope, delay, fn)
     s.sequence = s.sequence + 1
     s.timers[#s.timers + 1] = {at = s.now + delay, sequence = s.sequence, fn = function() if scope.alive then fn() end end}
@@ -1182,7 +1217,7 @@ local function scope_for(actor, state, token)
   local entry = actor._scopes[state]
   if entry and entry.token == token then return entry.scope end
   if entry then actor._scheduler.close(entry.scope) end
-  entry = {token = token, scope = actor._scheduler.open()}
+  entry = {token = token, scope = actor._scheduler.open(actor._root_scope)}
   actor._scopes[state] = entry
   return entry.scope
 end
@@ -1268,6 +1303,8 @@ local function run_effects(actor, effects, record)
         actor._parent:send(effect.event)
       elseif kind == 'done' then
         actor._status = 'done'
+        -- A finished actor runs nothing else; its state scopes are closed.
+        if actor._root_scope then actor._scheduler.close(actor._root_scope) end
         if actor._parent then
           actor._parent:_deliver({type = 'done.actor.' .. actor.id, id = actor.id, output = effect.output}, 'child')
         end
@@ -1344,6 +1381,10 @@ end
 function Actor:start()
   if self._status ~= 'created' then return self end
   self._status = 'running'
+  -- Child actors nest under their parent's scope; a root actor's scope is a
+  -- child of the task that starts it, so start long-lived actors from
+  -- application-level tasks (run, app_command), not widget callbacks.
+  self._root_scope = self._scheduler.open(self._parent and self._parent._root_scope)
   registry[self.path] = self
   registry_order[#registry_order + 1] = self.path
   if #inspectors > 0 or #self._observers > 0 then
@@ -1387,6 +1428,7 @@ function Actor:stop()
   self._timers, self._invokes = {}, {}
   for _, entry in pairs(self._scopes) do self._scheduler.close(entry.scope) end
   self._scopes = {}
+  if self._root_scope then self._scheduler.close(self._root_scope) end
   for _, id in ipairs(self._snapshot.children) do
     local child = self._children[id]
     if child then child:stop() end

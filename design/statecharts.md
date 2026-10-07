@@ -263,31 +263,49 @@ anything else that needs real press provenance. They report failures as events
 
 ## 8. Active states own task scopes
 
-Each state entry with `after` or `invoke` work opens one scope. Timers and
-invokes run inside it, and exiting the state closes it. The prototype uses a
-small scheduler seam:
+Each actor opens a root scope when it starts. A spawned child's root scope is a
+child of its parent's root scope. Each state entry with `after` or `invoke`
+work opens one scope under the actor's root. Timers and invokes run inside it,
+and exiting the state closes it. A finished or stopped actor closes its root,
+and with it everything below. The interpreter goes through a small scheduler
+seam:
 
 ```lua
-scheduler.open()                 -- on entry: a scope for this state entry
-scheduler.run(scope, fn)         -- invoke: run fn in the scope
-scheduler.after(scope, ms, fn)   -- after: call fn in the scope after ms
-scheduler.close(scope)           -- on exit: cancel everything in it
+scheduler.open(parent)           -- actor start: parent actor's root (or nil); state entry: the actor's root
+scheduler.run(scope, fn)         -- invoke: run fn as a task in the scope
+scheduler.after(scope, ms, fn)   -- after: spawn sleep(ms) then fn in the scope
+scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtree
 ```
 
-- **Today (`machine.default_scheduler`).** `ouro.spawn` has no handle, so work
-  runs in application scope (`spawn_app`, falling back to `spawn`). A closed
-  scope only drops delivery. Each state entry also gets a token: `snapshot.entries[state]`.
-  Timer and invoke results carry it, and a mismatched token is rejected as
-  `stale`. A cancelled HTTP request therefore still runs to completion; only
-  its result is ignored.
-- **Phase 2.** A private native binding of open, spawn, close and alive
-  (native cancellable child scopes, on `origin/statecharts`) replaces the four
-  functions. Closing a scope cancels sleeping and in-flight work. Logical
-  timers can then follow a virtual clock for replay.
+- **Native (`machine.default_scheduler`, `kind = 'native'`).** These are the
+  private open, spawn, close and alive closures from `src/lua/scopes.zig`.
+  They are passed to the embedded chunk and never installed on `ouro`.
+  Closing a scope cancels its tasks. Sleeping timers and in-flight invokes
+  unwind at the next safe point, so code after the `sleep` never runs and
+  to-be-closed values close. `tests/machine_native.py` checks this for state
+  exit and for `actor:stop()` with a nested child. Per-entry tokens still
+  reject any `after.*` or `done.invoke.*` event from an older entry. With
+  native scopes nothing stale should arrive; the check also guards forged
+  events.
+- **Where the root scope hangs.** With no parent, `open` uses the running
+  task's scope. Start long-lived actors from application-level tasks (`run`,
+  `app_command`). An actor started inside a widget callback dies with that
+  widget, just like `ouro.spawn`. Generation reload retires every scope.
+  Capacity is fixed (1024 in the Wayland runner). Never-started work is
+  discarded on close, so rapid toggling reuses slots.
+- **Token fallback (`machine.token_scheduler`).** Used where a Lua state has
+  no `Vm`, so the binding is nil. Work runs in application scope (`spawn_app`,
+  else `spawn`), and closing only drops delivery. A cancelled request still
+  runs to completion; only its result is ignored.
 - **Tests (`machine.manual_scheduler()`).** Virtual time comes from
-  `advance(ms)`. Queued invokes run when `run_tasks()` is called. `open_scopes`
-  counts live scopes. `ouroctl test` forbids wall-clock sleeps, and the sandbox
-  has no `coroutine` library, so invokes run to completion when they run.
+  `advance(ms)`. Queued invokes run when `run_tasks()` is called.
+  `open_scopes` counts live scopes, including actor roots. `ouroctl test`
+  forbids wall-clock sleeps, and the sandbox has no `coroutine` library, so
+  invokes run to completion when they run.
+- **Effects run in the sender's task, not in a state scope.** That is why
+  function actions must not yield (§1).
+- **Still open: logical timers.** `after` still uses wall-clock `ouro.sleep`.
+  Replay on a virtual clock needs the scope's timers to follow a host clock.
 
 An invoke `src` is `function(input, send) ... return output end`. It runs as an
 Ouro task and may yield on Ouro I/O. `send` delivers events to the machine
@@ -396,7 +414,7 @@ actor:snapshot()  actor:context()  actor:states()  actor:status()  actor:output(
 actor:child(id)  actor:children()  actor:persist()  actor:observe(fn)
 machine.inspect(fn)  machine.actors()  machine.plain(v)  machine.unset
 machine.assign  machine.raise  machine.spawn  machine.stop  machine.send_to  machine.send_parent
-machine.default_scheduler  machine.manual_scheduler()
+machine.default_scheduler  machine.token_scheduler  machine.manual_scheduler()  machine.native_scopes
 ```
 
 `chart:actor` computes the initial snapshot, which may include initial

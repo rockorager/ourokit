@@ -1,5 +1,6 @@
 //! Installs the pure-Lua statechart prototype (`ouro.machine`, see
-//! design/statecharts.md) with a native read-only view primitive. The
+//! design/statecharts.md) with a native read-only view primitive and the
+//! private task-scope binding from scopes.zig. The
 //! application sandbox has no setmetatable, so views are userdata whose user
 //! value is the underlying table.
 const std = @import("std");
@@ -15,7 +16,9 @@ pub fn install(state: *c.State) !void {
     c.lua_pushvalue(state, api);
     c.lua_pushcclosure(state, view, 0);
     c.lua_pushcclosure(state, raw, 0);
-    if (c.lua_pcallk(state, 3, 0, 0, 0, null) != c.ok)
+    // Native task scopes (open, spawn, close, alive), or four nils without a Vm.
+    const extra = @import("scopes.zig").pushChunkArguments(state);
+    if (c.lua_pcallk(state, 3 + extra, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     c.lua_settop(state, api);
 }

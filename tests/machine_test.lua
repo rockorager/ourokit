@@ -378,12 +378,12 @@ return {
     actor:send('ARM')
     local started = last(records).timers
     assert(#started == 2 and started[1].action == 'started' and started[1].delay == 100 and started[2].delay == 300)
-    assert(clock.open_scopes == 1) -- one scope per state entry holds both timers
+    assert(clock.open_scopes == 2) -- the actor's root, plus one scope for this entry holding both timers
     clock.advance(50)
     actor:send('DISARM')
     local cancelled = last(records).timers
     assert(#cancelled == 2 and cancelled[1].action == 'cancelled' and cancelled[2].action == 'cancelled')
-    assert(clock.open_scopes == 0)
+    assert(clock.open_scopes == 1)
     clock.advance(500) -- stale spawned sleeps finish but deliver nothing.
     assert(actor:matches('idle') and last(records).event.type == 'DISARM')
     actor:send('ARM')
@@ -487,7 +487,10 @@ return {
     assert(actor:context().closed == 'A' and join(actor:snapshot().children) == 'b' and actor:child('a') == nil)
     local b = actor:child('b')
     actor:send { type = 'REMOVE', id = 'b' }
-    assert(#actor:children() == 0 and b:status() == 'stopped' and clock.open_scopes == 0)
+    -- Only the parent's root scope is left: a finished, and b stopped.
+    assert(#actor:children() == 0 and b:status() == 'stopped' and clock.open_scopes == 1)
+    actor:stop()
+    assert(clock.open_scopes == 0)
     clock.advance(2000) -- the stopped child's timer is dropped.
     assert(b:matches('open'))
     stop_inspecting()
@@ -496,7 +499,7 @@ return {
       if record.kind == 'actor' then lifecycle[#lifecycle + 1] = record.action .. ' ' .. record.actor end
       if record.kind == 'transition' and record.actor == 'list/b' then child_records = child_records + 1 end
     end
-    assert(join(lifecycle) == 'started list,started list/a,started list/b,stopped list/b', join(lifecycle))
+    assert(join(lifecycle) == 'started list,started list/a,started list/b,stopped list/b,stopped list', join(lifecycle))
     assert(child_records >= 2)
     assert(seen[1].graph.id == 'list')
     -- Records are emitted after their effects, so a child's record can precede
