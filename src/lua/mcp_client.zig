@@ -582,6 +582,16 @@ fn luaTableToJson(
             value_count,
         ));
     }
+    // Lua's table order differs between VMs (randomized string hashes), so
+    // objects encode with sorted keys: equal tables give equal JSON, and
+    // replayed statecharts that store encoded text match their recordings.
+    const Order = struct {
+        keys: []const []const u8,
+        pub fn lessThan(self: @This(), a: usize, b: usize) bool {
+            return std.mem.lessThan(u8, self.keys[a], self.keys[b]);
+        }
+    };
+    object.sort(Order{ .keys = object.keys() });
     return .{ .object = object };
 }
 
