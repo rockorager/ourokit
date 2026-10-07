@@ -52,6 +52,7 @@ TESTS = (
     'xdg.py',
     'desktop_install.py',
     'documents.py',
+    'launcher.py',
     'desktop_native.py',
 )
 

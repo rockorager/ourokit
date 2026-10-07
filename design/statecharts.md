@@ -574,6 +574,28 @@ because they belong to `open`. Ranking results is a plain function of
 `query` and `entries`. The keyboard binding `Super` sends `TOGGLE` as an
 external event, and so can MCP.
 
+[`examples/launcher`](../examples/launcher) implements this without the
+auto-hide timer. Differences from the sketch:
+- `failed` retries on `RETRY` or Enter (`ACTIVATE`), not on `QUERY`.
+- `QUERY` and `MOVE` live on `open`, so typing during a scan is kept.
+- `launch` starts a transient systemd user unit over D-Bus, because Lua
+  cannot spawn processes.
+- The compositor binding runs `ouroctl activate dev.ourokit.launcher`. The
+  first launch opens it, and `activate` toggles it after that.
+
+Where the reactive `windows` declaration fits and where it fights:
+- **Fits:** `windows()` is a pure read of `matches('open')`.
+  `on_close_request`, Escape and click-outside all become one `CLOSE` event.
+  The commit that cancels the scan or launch also invalidates the
+  declaration, so the surface retires with them.
+- **Fights:** retirement happens on the next declaration pass. Nothing ties
+  it to the state's scope, and the chart never learns whether the surface
+  mapped. A surface the compositor rejects, or an invalid declaration that
+  keeps the last good list, leaves `open` with no surface. Widget-local state
+  (focus, scroll, caret) resets on every reopen, while context survives
+  unless an entry action resets it. Two lifetimes have to agree by
+  convention.
+
 ### Contacts (implemented)
 
 [`examples/contacts`](../examples/contacts) loads its address book from an

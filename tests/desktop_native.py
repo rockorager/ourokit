@@ -26,7 +26,7 @@ def run(*args, env, ok=True, timeout=10):
     if len(args) >= 4 and args[0] == str(BINARY) and args[1] == 'dev':
         env = dict(env, XDG_RUNTIME_DIR=str(Path(args[3]).parents[2]))
     result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=timeout)
-    assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
+    assert ok is None or (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
     return result
 
 
@@ -709,9 +709,190 @@ return ouro.app {id='dev.ourokit.focus-test', run=function() return {windows={
         assert 'panic' not in errors and 'leaked' not in errors, errors
 
 
+def systemd_source(log):
+    """A private-bus stand-in for systemd's StartTransientUnit; records, never runs."""
+    return f'''local o=require('ouro'); local b=assert(o.dbus.connect('session')); local count=0
+local x <close> = assert(b:export{{path='/org/freedesktop/systemd1',interface='org.freedesktop.systemd1.Manager',methods={{
+ StartTransientUnit={{input='ssa(sv)a(sa(sv))',output='o',handler=function(r)
+  local unit={{name=r.args[1],mode=r.args[2]}}
+  for _,p in ipairs(r.args[3]) do
+   if p[1]=='ExecStart' then local e=p[2].value[1]; unit.path=e[1]; unit.argv=e[2]
+   else unit[p[1]]=p[2].value end
+  end
+  count=count+1
+  assert(o.files.write({json.dumps(log.as_uri())}..'.'..count,o.json.encode(unit)))
+  return {{'/org/freedesktop/systemd1/job/'..count}}
+ end}}}},signals={{}}}})
+local n <close> = assert(b:own_name('org.freedesktop.systemd1'))
+while true do o.sleep(1000) end
+'''
+
+
+def launcher_test(root, env):
+    """The overlay surface exists only while the launcher chart is open."""
+    data, share = root / 'launcher-data', root / 'launcher-share'
+    (data / 'applications').mkdir(parents=True)
+    share.mkdir()
+    (share / 'icons').symlink_to('/usr/share/icons')
+    entries = {
+        'alpha.desktop': 'Name=Alpha Editor\nComment=Edit alpha files\nIcon=accessories-text-editor\nExec=alpha-editor --new-window %F\n',
+        'beta.desktop': 'Name=Beta Terminal\nIcon=utilities-terminal\nKeywords=shell;\nExec=beta-term\n',
+        'gamma.desktop': 'Name=Gamma Viewer\nIcon=image-x-generic\nExec=gamma\nPath=/tmp\n',
+        'hidden.desktop': 'Name=Hidden Helper\nExec=hidden\nNoDisplay=true\n',
+    }
+    for name, body in entries.items():
+        (data / 'applications' / name).write_text('[Desktop Entry]\nType=Application\n' + body)
+    log = root / 'systemd.log'
+    fake = root / 'systemd.lua'
+    fake.write_text(systemd_source(log))
+    units = lambda: sorted(root.glob('systemd.log.*'), key=lambda p: int(p.suffix[1:]))
+
+    def start_systemd():
+        process = subprocess.Popen([str(BINARY), 'run', str(fake), '--headless'], env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        def owned():
+            assert process.poll() is None, process.stderr.read()
+            # NameHasOwner, unlike introspection, never bus-activates a real systemd.
+            reply = subprocess.run(['gdbus', 'call', '--session', '--dest', 'org.freedesktop.DBus',
+                                    '--object-path', '/org/freedesktop/DBus', '--method',
+                                    'org.freedesktop.DBus.NameHasOwner', 'org.freedesktop.systemd1'],
+                                   env=env, capture_output=True, text=True)
+            return reply.stdout.strip() == '(true,)'
+        wait_for(owned, 'fake systemd did not own its name')
+        return process
+
+    app_env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'],
+                   XDG_DATA_HOME=str(data), XDG_DATA_DIRS=str(share))
+    manifest = str(ROOT / 'examples/launcher/ouro.json')
+    systemd = start_systemd()
+    app = subprocess.Popen([str(BINARY), 'run', manifest, '--dev', '--software'], env=app_env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    status = 'scrim/panel/body/status'
+    search = 'scrim/panel/body/search'
+
+    def windows():
+        return [w['window'] for w in inspect(app_env, endpoint).get('windows', [])]
+
+    def label(path):
+        return node(app_env, endpoint, 'launcher', path)['label']
+
+    def send(**action):
+        # Icons finish loading asynchronously and refresh the token; retry when stale.
+        for _ in range(5):
+            tree = inspect(app_env, endpoint, 'launcher')['windows'][0]
+            result = run(str(BINARY), 'dev', 'input', str(endpoint), json.dumps(
+                dict(window='launcher', token=tree['token'], **action)), env=app_env, ok=None)
+            if result.returncode == 0:
+                return
+            assert 'StaleDevelopmentTarget' in result.stdout, result.stdout
+            # Input that retires its own surface (Escape) also reports stale.
+            if 'launcher' not in windows():
+                return
+        raise AssertionError('launcher input stayed stale')
+
+    key = lambda name: send(action='key', key=name)
+    type_text = lambda text: send(action='text', text=text)
+
+    def opened(expected='3 applications'):
+        wait_for(lambda: 'launcher' in windows(), 'launcher surface did not appear')
+        wait_for(lambda: label(status) == expected, f'launcher never showed {expected!r}')
+
+    def closed():
+        wait_for(lambda: windows() == [], 'launcher surface was not retired: ' + (label(status) if windows() else ''))
+
+    try:
+        endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app)
+        # The first launch opens: activation arrives before run, run sends OPEN.
+        opened()
+        assert node(app_env, endpoint, 'launcher', search)['focused']
+        capture(app_env, endpoint, 'launcher', 'launcher-open.png')
+
+        # Search, then Enter launches through prepare_launch and closes.
+        type_text('ga')
+        wait_for(lambda: label(status) == '1 application', 'query did not filter')
+        key('enter')
+        closed()
+        unit = json.loads(wait_for(units, 'no unit started')[0].read_text())
+        assert unit['name'].startswith('app-ourokit-gamma-') and unit['name'].endswith('.service'), unit
+        assert unit['path'] == '/usr/bin/env' and unit['argv'] == ['env', '--', 'gamma'], unit
+        assert unit['WorkingDirectory'] == '/tmp' and unit['mode'] == 'fail' and unit['Type'] == 'exec', unit
+
+        # A declared action toggles it back; the query starts empty again.
+        assert call(endpoint, 'Toggle')['structuredContent'] == {'open': True}
+        opened()
+        assert node(app_env, endpoint, 'launcher', search)['value'] == ''
+        # Up wraps to the last row, Down twice lands on the second.
+        for name in ('arrow_up', 'arrow_down', 'arrow_down'):
+            key(name)
+        key('enter')
+        closed()
+        assert json.loads(wait_for(lambda: units()[1:], 'second unit missing')[0].read_text())['argv'] == ['env', '--', 'beta-term']
+
+        # Escape closes without launching.
+        call(endpoint, 'Open')
+        opened()
+        key('escape')
+        closed()
+        assert len(units()) == 2
+
+        # Without systemd the launch fails; the launcher stays open and says so.
+        terminate(systemd)
+        call(endpoint, 'Toggle')
+        opened()
+        type_text('alpha')
+        wait_for(lambda: label(status) == '1 application', 'alpha query did not filter')
+        key('enter')
+        wait_for(lambda: label(status).startswith('Could not launch: '), 'launch failure not shown')
+        assert windows() == ['launcher']
+        capture(app_env, endpoint, 'launcher', 'launcher-launch-error.png')
+        assert call(endpoint, 'Close')['structuredContent'] == {'open': False}
+        closed()
+        print('PASS launcher: layer surface follows the chart; search, keyboard selection, launch, Escape and launch failure')
+    finally:
+        terminate(app)
+        terminate(systemd)
+        errors = app.stderr.read()
+        assert 'panic' not in errors and 'leaked' not in errors, errors
+
+    # Production: single instance, toggled by activation like a compositor key binding.
+    def pixel(x=640, y=360):
+        shot = root / 'launcher-screen.png'
+        run('grim', '-t', 'png', '-l', '0', str(shot), env=app_env)
+        return tuple(subprocess.check_output(['magick', str(shot), '-crop', f'1x1+{x}+{y}', '-depth', '8', 'rgb:-']))
+    center = lambda: sum(pixel()) / 3
+    # The selected first row is tinted with the accent: the scan finished.
+    selected_row = lambda: (lambda r, g, b: b > r + 4 and r > 200)(*pixel(640, 213))
+
+    app = subprocess.Popen([str(BINARY), 'run', manifest, '--software'], env=app_env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        wait_for(lambda: center() > 200, 'launcher panel never covered the output')
+        wait_for(selected_row, 'production launcher never listed applications')
+        destination = os.environ.get('OUROKIT_TEST_CAPTURE')
+        if destination:
+            directory = Path(destination).resolve()
+            directory = (directory.parent / 'desktop') if directory.suffix else directory
+            directory.mkdir(parents=True, exist_ok=True)
+            shutil.copy(root / 'launcher-screen.png', directory / 'launcher-sway-output.png')
+        run(str(BINARY), 'activate', 'dev.ourokit.launcher', env=app_env)
+        wait_for(lambda: center() < 100, 'activation did not hide the launcher')
+        run(str(BINARY), 'activate', 'dev.ourokit.launcher', env=app_env)
+        wait_for(lambda: center() > 200, 'activation did not show the launcher again')
+        # A second `run` forwards to the owner and exits; that toggles too.
+        run(str(BINARY), 'run', manifest, '--software', env=app_env)
+        wait_for(lambda: center() < 100, 'forwarded launch did not hide the launcher')
+        assert app.poll() is None, 'hidden launcher must keep running'
+        print('PASS launcher: single instance toggles on activation; hidden keeps the process alive')
+    finally:
+        terminate(app)
+        errors = app.stderr.read()
+        assert 'panic' not in errors and 'leaked' not in errors, errors
+
+
 def suite(root, env):
     assert BINARY.is_file(), f"missing {BINARY}; wait for /tmp/ouro-desktop-build.log then build"
     focus_test(root, env)
+    launcher_test(root, env)
     document_test(root, env)
     parent_lifetime_test(root, env)
     drag_test(root, env)
