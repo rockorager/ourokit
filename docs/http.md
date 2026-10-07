@@ -60,7 +60,7 @@ Curl's standard proxy environment variables apply; `.curlrc` is not loaded.
 Invalid arguments and transport failures raise Lua errors and can be handled
 with `pcall`. Named failures include `HttpTimeout`, `NameResolutionFailed`,
 `ConnectionFailed`, `CertificateVerificationFailed`, `ResponseTooLarge`,
-`HeadersTooLarge`, and `HttpBusy`. Other transfer failures use
+and `HeadersTooLarge`. The number of concurrent requests is not limited. Other transfer failures use
 `HttpTransferFailed`. Failed transfers do not return partial bodies.
 
 This first API buffers responses. Streaming, explicit redirect policies,

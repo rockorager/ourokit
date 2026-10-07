@@ -19,7 +19,8 @@ const Kind = enum { request, get, post };
 pub const Binding = struct {
     vm: *vm_module.Vm,
     client: http.Client,
-    jobs: [http.capacity]?*Job = @splat(null),
+    /// Grows when every entry is busy; completion only clears entries.
+    jobs: std.ArrayList(?*Job) = .empty,
 
     pub fn init(self: *Binding, vm: *vm_module.Vm, loop: *io.Loop) void {
         self.* = .{ .vm = vm, .client = http.Client.init(vm.allocator, loop) };
@@ -54,7 +55,7 @@ pub const Binding = struct {
     }
 
     pub fn collectCanceled(self: *Binding) !void {
-        for (&self.jobs) |*slot| if (slot.*) |job| {
+        for (self.jobs.items) |*slot| if (slot.*) |job| {
             const canceled = job.canceled or self.vm.taskCancellationRequested(job.task_handle);
             if (canceled) self.client.cancel(&job.request);
             if (job.request.ready) {
@@ -69,7 +70,7 @@ pub const Binding = struct {
     }
 
     pub fn stop(self: *Binding) !void {
-        for (self.jobs) |slot| if (slot) |job| {
+        for (self.jobs.items) |slot| if (slot) |job| {
             job.canceled = true;
         };
         try self.client.stop();
@@ -77,13 +78,14 @@ pub const Binding = struct {
     }
 
     pub fn canDeinit(self: *const Binding) bool {
-        for (self.jobs) |slot| if (slot != null) return false;
+        for (self.jobs.items) |slot| if (slot != null) return false;
         return self.client.canDeinit();
     }
 
     pub fn deinit(self: *Binding) void {
         std.debug.assert(self.canDeinit());
         self.client.deinit();
+        self.jobs.deinit(self.vm.allocator);
         self.* = undefined;
     }
 
@@ -144,9 +146,12 @@ pub const Binding = struct {
         }
         if (kind == .post and options.body == null) options.body = "";
         options.headers = headers.items;
-        const slot = for (&self.jobs) |*slot| {
+        const slot = for (self.jobs.items) |*slot| {
             if (slot.* == null) break slot;
-        } else return error.HttpBusy;
+        } else grown: {
+            try self.jobs.append(self.vm.allocator, null);
+            break :grown &self.jobs.items[self.jobs.items.len - 1];
+        };
         try self.client.ensureInitialized();
         const job = try self.vm.allocator.create(Job);
         errdefer self.vm.allocator.destroy(job);
@@ -162,7 +167,7 @@ pub const Binding = struct {
 
     fn continuation(L: *c.State, _: c_int, context: c.KContext) callconv(.c) c_int {
         const job: *Job = @ptrFromInt(@as(usize, @bitCast(context)));
-        const slot = for (&job.owner.jobs) |*slot| {
+        const slot = for (job.owner.jobs.items) |*slot| {
             if (slot.* == job) break slot;
         } else unreachable;
         const failure = job.request.failure;
@@ -257,7 +262,7 @@ fn testAwaitingResponse(binding: *const Binding) bool {
     return false;
 }
 
-test "HTTP request owned by a retired state scope is released while curl's socket watch drains" {
+test "HTTP requests owned by a retired state scope are released while curl's socket watches drain" {
     const linux = std.os.linux;
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 4, 4, 4);
@@ -285,16 +290,23 @@ test "HTTP request owned by a retired state scope is released while curl's socke
     const source = try std.fmt.bufPrint(&source_buffer, "response = require('ouro').http.get('http://127.0.0.1:{d}/'); resumed = true", .{std.mem.bigToNative(u16, address.port)});
     const state = try vm.openScope(scheduler.application_scope);
     const inner = try vm.openScope(state);
-    _ = try vm.spawn(inner, source);
-    try std.testing.expectEqual(vm_module.ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    // More requests than the former fixed limit of 16; the job list grows.
+    const request_count = 20;
+    for (0..request_count) |_| {
+        _ = try vm.spawn(inner, source);
+        try std.testing.expectEqual(vm_module.ResumeResult.waiting, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    }
+    try std.testing.expectEqual(@as(usize, request_count), binding.jobs.items.len);
     while (!testAwaitingResponse(&binding)) try testStep(&loop, &binding);
 
     try scheduler.retireScope(state);
     try scheduler.applyQueuedCancellations();
     try binding.collectCanceled();
-    try std.testing.expectEqual(vm_module.ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    for (0..request_count) |_|
+        try std.testing.expectEqual(vm_module.ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(scheduler.takeRunnable() == null);
     try std.testing.expect(!vm.globalBoolean("resumed"));
-    for (binding.jobs) |job| try std.testing.expect(job == null);
+    for (binding.jobs.items) |job| try std.testing.expect(job == null);
     try std.testing.expect(!scheduler.scopeAlive(state) and !scheduler.scopeAlive(inner));
     // The request is gone, but curl's client-owned watch (on a duplicated fd,
     // with no request storage) is still draining its poll cancellation.

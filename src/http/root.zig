@@ -10,7 +10,6 @@ const c = @cImport({
 pub const default_max_bytes = 16 * 1024 * 1024;
 pub const absolute_max_bytes = 64 * 1024 * 1024;
 pub const max_header_bytes = 64 * 1024;
-pub const capacity = 16;
 
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Options = struct {
@@ -144,7 +143,8 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     loop: *io.Loop,
     multi: ?*c.CURLM = null,
-    requests: [capacity]?*Request = @splat(null),
+    /// Grows on start; completion and cancellation only clear entries.
+    requests: std.ArrayList(?*Request) = .empty,
     watches: std.ArrayList(*Watch) = .empty,
     timer: ?io.OperationHandle = null,
     next_timeout_ms: ?c_long = null,
@@ -188,9 +188,12 @@ pub const Client = struct {
 
     pub fn start(self: *Client, request: *Request) !void {
         try self.ensureInitialized();
-        const slot = for (&self.requests) |*slot| {
+        const slot = for (self.requests.items) |*slot| {
             if (slot.* == null) break slot;
-        } else return error.HttpBusy;
+        } else grown: {
+            try self.requests.append(self.allocator, null);
+            break :grown &self.requests.items[self.requests.items.len - 1];
+        };
         if (c.curl_multi_add_handle(self.multi, request.easy) != c.CURLM_OK) return error.CurlStartFailed;
         slot.* = request;
         // add_handle schedules a zero timer; it must not drive curl recursively
@@ -198,7 +201,7 @@ pub const Client = struct {
     }
 
     pub fn cancel(self: *Client, request: *Request) void {
-        for (&self.requests) |*slot| if (slot.* == request) {
+        for (self.requests.items) |*slot| if (slot.* == request) {
             request.failure = error.Canceled;
             self.finish(slot);
             return;
@@ -220,7 +223,7 @@ pub const Client = struct {
         const result = c.curl_multi_socket_action(self.multi, fd, events, &running);
         if (result != c.CURLM_OK or self.callback_failure != null) {
             const failure = self.callback_failure orelse error.CurlTransferFailed;
-            for (&self.requests) |*slot| if (slot.*) |request| {
+            for (self.requests.items) |*slot| if (slot.*) |request| {
                 request.failure = failure;
                 self.finish(slot);
             };
@@ -232,7 +235,7 @@ pub const Client = struct {
             const message = c.curl_multi_info_read(self.multi, &remaining);
             if (message == null) break;
             if (message.*.msg != c.CURLMSG_DONE) continue;
-            for (&self.requests) |*slot| if (slot.*) |request| {
+            for (self.requests.items) |*slot| if (slot.*) |request| {
                 if (request.easy != message.*.easy_handle) continue;
                 if (request.failure == null) request.failure = switch (message.*.data.result) {
                     c.CURLE_OK => null,
@@ -323,6 +326,7 @@ pub const Client = struct {
                 }
                 watch.operation = self.loop.preparePoll(watch.owned_fd, watch.events) catch |err| switch (err) {
                     error.SubmissionQueueFull, error.OperationCapacityExceeded, error.OutOfMemory => null,
+                    else => return err,
                 };
                 watch.armed_events = watch.events;
             }
@@ -333,12 +337,13 @@ pub const Client = struct {
             self.cleanup_operation = self.loop.prepareRead(self.cleanup_pipe.?[0], &self.cleanup_signal, std.math.maxInt(u64)) catch |err| switch (err) {
                 error.SubmissionQueueFull, error.OperationCapacityExceeded, error.OutOfMemory => return,
                 error.EmptyReadBuffer => unreachable,
+                else => return err,
             };
     }
 
     pub fn stop(self: *Client) !void {
         self.stopping = true;
-        for (&self.requests) |*slot| if (slot.*) |request| {
+        for (self.requests.items) |*slot| if (slot.*) |request| {
             request.failure = error.Canceled;
             self.finish(slot);
         };
@@ -354,6 +359,8 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         std.debug.assert(self.canDeinit());
+        for (self.requests.items) |request| std.debug.assert(request == null);
+        self.requests.deinit(self.allocator);
         self.watches.deinit(self.allocator);
         self.* = undefined;
     }

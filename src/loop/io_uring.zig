@@ -227,6 +227,7 @@ pub const Loop = struct {
         }
         const slot = try self.activeSlot(handle);
         if (slot.cancel_pending) return error.CancellationAlreadyPending;
+        try self.ensureSqe();
         slot.cancel_pending = true;
         _ = self.ring.cancel(
             encodeFile(.operation_cancel, handle),
@@ -458,6 +459,7 @@ pub const Loop = struct {
         try self.synchronizeAlarm();
         if (self.signal_fd) |fd| {
             if (!self.signal_poll_active and !self.signal_poll_failed and self.received_signal == null) {
+                try self.ensureSqe();
                 _ = try self.ring.poll_add(encode(.signal_poll, 0), fd, linux.POLL.IN);
                 self.signal_poll_active = true;
             }
@@ -636,9 +638,18 @@ pub const Loop = struct {
         return slot;
     }
 
+    /// Operation pools grow, so one turn may prepare more SQEs than the
+    /// ring holds. Hand the queued ones to the kernel early instead of
+    /// failing; this only starts them sooner and never reaps completions.
+    fn ensureSqe(self: *Loop) !void {
+        if (self.ring.sq_ready() < self.ring.sq.sqes.len) return;
+        _ = try self.submitRing();
+    }
+
     fn synchronizeAlarm(self: *Loop) !void {
         if (self.control != .none) return;
         if (self.retired_alarm_generation != null) return;
+        try self.ensureSqe();
         const desired = self.timers.nextDeadline();
         if (!self.alarm_active) {
             const deadline = desired orelse return;
@@ -685,6 +696,7 @@ pub const Loop = struct {
     };
 
     fn reserve(self: *Loop, operation: Operation) !Reservation {
+        try self.ensureSqe();
         // Preparation may allocate; completion lookup never does. The slot
         // index must fit the 24 bits encodeFile reserves for it.
         const index = self.availableSlot() orelse grown: {
@@ -1001,7 +1013,7 @@ test "write operation reports stable identity and writes a pipe" {
     try std.testing.expectEqualStrings(bytes, &output);
 }
 
-test "operation slots grow past their initial capacity without moving" {
+test "operation slots grow past their initial capacity and a full ring is flushed early" {
     var pipe: [2]linux.fd_t = undefined;
     switch (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true }))) {
         .SUCCESS => {},
@@ -1011,7 +1023,8 @@ test "operation slots grow past their initial capacity without moving" {
     defer _ = linux.close(pipe[1]);
 
     var loop: Loop = undefined;
-    try loop.init(std.testing.allocator, 16, 2);
+    // Eight writes outgrow both two slots and a four-entry ring.
+    try loop.init(std.testing.allocator, 4, 2);
     defer loop.deinit();
     const first = try loop.prepareWrite(pipe[1], "a", std.math.maxInt(u64));
     const first_slot = loop.slots.at(first.slot);
