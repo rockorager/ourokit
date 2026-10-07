@@ -1,5 +1,5 @@
 local ouro, view, raw, scope_open, scope_spawn, scope_close, scope_alive, atomic_call,
-  waiter_new, waiter_park, waiter_wake, waiter_waiting = ...
+  waiter_new, waiter_park, waiter_wake, waiter_waiting, tracked_view = ...
 -- Guards, assigns, expressions and function actions run as native atomic
 -- sections: waiting, spawning or exiting inside them raises YieldInAction.
 local atomic = atomic_call or function(_, fn, ...) return fn(...) end
@@ -1033,7 +1033,7 @@ local function transition(chart, snapshot, event)
   return finish(m, snapshot)
 end
 
-local function can(chart, snapshot, event)
+local function can(chart, snapshot, event, context_view, children_view)
   if snapshot.status ~= 'active' then return false end
   event = normalize_event(event)
   if not internal_type(event.type) and not chart.declared[event.type] then
@@ -1041,8 +1041,8 @@ local function can(chart, snapshot, event)
     return false
   end
   local active = active_set(chart, snapshot)
-  local cv, ev = view(snapshot.context), view(event)
-  local meta = {children = view(snapshot.children), matches = function(id)
+  local cv, ev = context_view or view(snapshot.context), view(event)
+  local meta = {children = children_view or view(snapshot.children), matches = function(id)
     local node = chart.by_id[id]
     if not node or id == '' then fail('machine %s has no state %q', chart.id, tostring(id)) end
     return active[node] == true
@@ -1155,9 +1155,11 @@ end
 -- last result per raw first argument (a context or snapshot, or their views)
 -- plus raw-equal extra arguments, so a guard, can()/accepted() and the view
 -- share one computation per snapshot. Treat the result as read-only.
+-- A cache hit replays the signal reads the computation made, so a render
+-- that only hits the cache still depends on the fields behind the result.
 function M.selector(fn)
   if type(fn) ~= 'function' then fail('selector expects a function') end
-  local last_key, last_args, last_result, has_result = nil, nil, nil, false
+  local last_key, last_args, last_result, last_reads, has_result = nil, nil, nil, nil, false
   return function(data, ...)
     local key, n = raw(data), select('#', ...)
     if has_result and key == last_key and n == last_args.n then
@@ -1165,11 +1167,16 @@ function M.selector(fn)
       for i = 1, n do
         if raw((select(i, ...))) ~= last_args[i] then same = false; break end
       end
-      if same then return last_result end
+      if same then
+        for _, signal in ipairs(last_reads) do M._track(signal) end
+        return last_result
+      end
     end
     local args = {n = n}
     for i = 1, n do args[i] = raw((select(i, ...))) end
-    last_result = fn(data, ...)
+    local reads, ok, result = M._recording(fn, data, ...)
+    if not ok then error(result, 0) end
+    last_result, last_reads = result, reads
     last_key, last_args, has_result = key, args, true
     return last_result
   end
@@ -1532,57 +1539,149 @@ local function create_actor(chart, options)
   actor._snapshot = snapshot
   actor._pending = {effects = effects, record = record}
   actor._store = actor._signal_factory(snapshot)
+  actor._config = actor._signal_factory(0)
+  actor._members = actor._signal_factory(0)
+  actor._keys = {}
   return actor
 end
 
-function Actor:_read()
-  return self._store()
+---------------------------------------------------------------------------
+-- Rebuild locality. Besides the snapshot, each actor keeps hidden signals:
+--   one per top-level context key, created when a render first reads it;
+--   configuration (states, status, output), bumped only when they change;
+--   membership (the children ids), bumped only when they change;
+--   all (_store), set on every own commit: the coarse fallback for pairs()
+--   and for snapshot fields without a finer signal.
+-- context(), snapshot() and snapshot.children are tracked views whose field
+-- reads read those signals, so the dependency graph records exactly what a
+-- render (or a guard evaluated by can()) looked at. A child's commit updates
+-- its parent's snapshot for guards and pure transitions but writes no parent
+-- signal: snapshot.children[id] reads go to the child's own signals.
+---------------------------------------------------------------------------
+
+local recorder -- signals read while a selector computes
+function M._track(signal)
+  if recorder then recorder[#recorder + 1] = signal end
+  signal()
 end
+function M._recording(fn, ...)
+  local outer, reads = recorder, {}
+  recorder = reads
+  local ok, result = pcall(fn, ...)
+  recorder = outer
+  if outer then for _, signal in ipairs(reads) do outer[#outer + 1] = signal end end
+  return reads, ok, result
+end
+local track = M._track
+
+local function key_signal(actor, key)
+  local signal = actor._keys[key]
+  if not signal then
+    signal = actor._signal_factory(actor._snapshot.context[key])
+    actor._keys[key] = signal
+  end
+  return signal
+end
+
+local function context_view(actor)
+  local context = actor._snapshot.context
+  if actor._context_for ~= context then
+    actor._context_for = context
+    actor._context_view = tracked_view(context, function(t, key)
+      if key == nil then track(actor._store); return nil end -- # and pairs: every key
+      track(key_signal(actor, key))
+      return view(t[key])
+    end)
+  end
+  return actor._context_view
+end
+
+local snapshot_view
+local function children_view(actor)
+  local children = actor._snapshot.children
+  if actor._children_for ~= children then
+    actor._children_for = children
+    actor._children_view = tracked_view(children, function(t, key)
+      if key == nil or math.type(key) == 'integer' then
+        track(actor._members)
+        return key and t[key] or nil
+      end
+      local child = actor._children[key]
+      if child and t[key] ~= nil then return snapshot_view(child) end
+      track(actor._members)
+      return view(t[key]) -- a task child's entry
+    end)
+  end
+  return actor._children_view
+end
+
+snapshot_view = function(actor)
+  local snapshot = actor._snapshot
+  if actor._snapshot_for ~= snapshot then
+    actor._snapshot_for = snapshot
+    actor._snapshot_view = tracked_view(snapshot, function(t, key)
+      if key == 'context' then return context_view(actor) end
+      if key == 'children' then return children_view(actor) end
+      if key == 'states' or key == 'status' or key == 'output' or key == 'machine' then track(actor._config)
+      else track(actor._store) end
+      return view(t[key])
+    end)
+  end
+  return actor._snapshot_view
+end
+
+local function bump(signal) signal:set(signal() + 1) end
 
 -- True when this actor was created from a persisted snapshot (including
 -- state carried across a source reload); apps skip one-time setup then.
 function Actor:restored() return self._restored end
 
-function Actor:snapshot() return view(self:_read()) end
-function Actor:context() return view(self:_read().context) end
+-- Whole-snapshot read: fields are tracked as they are read (§6).
+function Actor:snapshot() return snapshot_view(self) end
+function Actor:context() return context_view(self) end
 -- 'created' until start(), 'stopped' after stop() (even if it never started),
 -- otherwise the snapshot status (active | done).
 function Actor:status()
-  local status = self:_read().status
+  track(self._config)
   if self._status == 'created' or self._status == 'stopped' then return self._status end
-  return status
+  return self._snapshot.status
 end
-function Actor:started() return self._status ~= 'created' end
-function Actor:states() return view(self:_read().states) end
-function Actor:output() return view(self:_read().output) end
+function Actor:started() track(self._config); return self._status ~= 'created' end
+function Actor:states() track(self._config); return view(self._snapshot.states) end
+function Actor:output() track(self._config); return view(self._snapshot.output) end
 
 function Actor:matches(id)
-  local snapshot = self:_read()
+  track(self._config)
+  local snapshot = self._snapshot
   if not self.chart.by_id[id] or id == '' then fail('machine %s has no state %q', self.chart.id, tostring(id)) end
-  if self._set_for ~= snapshot then
+  if self._set_for ~= snapshot.states then
     local set = {}
     for _, state in ipairs(snapshot.states) do set[state] = true end
-    self._set_for, self._set = snapshot, set
+    self._set_for, self._set = snapshot.states, set
   end
   return self._set[id] == true
 end
 
 function Actor:has_tag(tag)
-  for _, id in ipairs(self:_read().states) do
+  track(self._config)
+  for _, id in ipairs(self._snapshot.states) do
     if self.chart.by_id[id].tags[tag] then return true end
   end
   return false
 end
 
+-- Guards run on the tracked views, so their context reads are dependencies.
 function Actor:can(event)
-  return can(self.chart, self:_read(), event)
+  track(self._config)
+  return can(self.chart, self._snapshot, event, context_view(self), children_view(self))
 end
 
 -- True when some active state has a transition for this event type,
 -- ignoring guards: value widgets enable on it, so an input disables when the
 -- state takes no such edits at all, without guards locking it out.
 function Actor:handles(event_type)
-  local snapshot = self:_read()
+  track(self._config)
+  local snapshot = self._snapshot
   if self._status == 'stopped' or snapshot.status ~= 'active' then return false end
   if type(event_type) ~= 'string' or event_type == '' then fail('handles expects an event type') end
   local chart = self.chart
@@ -1638,8 +1737,9 @@ function Actor:pending_timers()
 end
 
 function Actor:children()
+  track(self._members)
   local list = {}
-  for _, id in ipairs(self:_read().children) do
+  for _, id in ipairs(self._snapshot.children) do
     if self._children[id] then list[#list + 1] = self._children[id] end
   end
   return list
@@ -1723,7 +1823,10 @@ local function propagate(child)
   children[child.id] = child._snapshot
   local next_snapshot = copy(current)
   next_snapshot.children = children
-  commit(parent, next_snapshot)
+  -- For guards and pure transitions only: views read the child's own signals.
+  parent._snapshot = next_snapshot
+  propagate(parent)
+  if next(parent._waiters) then M._notify_waiters(parent, next_snapshot) end
 end
 
 -- The actor's root scope, opened on first need (a timer, invoke or task), so
@@ -1889,10 +1992,32 @@ local function notify_waiters(actor, snapshot)
   end
 end
 
+M._notify_waiters = notify_waiters
+
+local function same_configuration(a, b)
+  if a.status ~= b.status or a.output ~= b.output or #a.states ~= #b.states then return false end
+  for i, id in ipairs(a.states) do if b.states[i] ~= id then return false end end
+  return true
+end
+
+local function same_members(a, b)
+  if #a ~= #b then return false end
+  for i, id in ipairs(a) do if b[i] ~= id then return false end end
+  return true
+end
+
+-- Write only what changed: copy-on-write shares unchanged context values, so
+-- a key signal set to a raw-equal value invalidates nothing.
 commit = function(actor, snapshot)
   if snapshot ~= actor._snapshot then
+    local old = actor._snapshot
     actor._snapshot = snapshot
     actor._store:set(snapshot)
+    if old.context ~= snapshot.context then
+      for key, signal in pairs(actor._keys) do signal:set(snapshot.context[key]) end
+    end
+    if not same_configuration(old, snapshot) then bump(actor._config) end
+    if not same_members(old.children, snapshot.children) then bump(actor._members) end
     propagate(actor)
     if next(actor._waiters) then notify_waiters(actor, snapshot) end
   end
@@ -2003,6 +2128,7 @@ end
 function Actor:start()
   if self._status ~= 'created' then return self end
   self._status = 'running'
+  bump(self._config) -- status() changes from 'created'
   registry[self.path] = self
   registry_order[#registry_order + 1] = self.path
   if #inspectors > 0 or #self._observers > 0 then
@@ -2032,6 +2158,7 @@ function Actor:stop()
   if self._status == 'stopped' then return end
   local was_started = self._status ~= 'created'
   self._status = 'stopped'
+  bump(self._config)
   self._queue = {}
   local record = new_record({type = 'ouro.stop'})
   record.handled = true

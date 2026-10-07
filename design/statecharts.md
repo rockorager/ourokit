@@ -262,10 +262,10 @@ A snapshot is immutable. A new table is created only when something changed:
   third `state` argument's `state.children`), and from the pure
   `chart:transition`. `ipairs` and `#` still give ids in spawn order.
   `machine.matches(child, 'open.io.saving')` tests a child's configuration.
-  When a child commits, its new snapshot replaces its entry in the parent,
-  which writes the parent's signal. A view that reads only the parent
-  therefore rebuilds when a child changes, and parent guards see children as
-  of the start of their macrostep.
+  When a child commits, its new snapshot replaces its entry in the parent's
+  snapshot, so parent guards and pure transitions see children as of the
+  start of their macrostep. No parent signal is written: a render that reads
+  `snapshot.children[id]` depends on that child's own signals (§6).
 - **Serializable.** `actor:persist()` returns `machine`, `status`, `states`,
   `context`, `output` and children as `{ id, snapshot }`. It deep-copies plain
   data and fails on functions or cycles. The result round-trips through
@@ -310,9 +310,9 @@ are internal, compiled in Zig and allocation-free. They are not app charts.
 **Decision.** Every piece of application state lives in a chart's context or
 configuration. That includes presentation state such as query text,
 selection, the open tab, appearance, and a collapsible's open flag. Signals
-are not an app-facing state mechanism. The only signal left is the internal
-one each actor keeps for its snapshot, so views rebuild; it may go away in the
-native interpreter. This reverses an interim decision to keep signals for
+are not an app-facing state mechanism. The only signals left are the hidden
+per-field ones each actor keeps so views rebuild precisely (§6). They may go
+away in the native interpreter. This reverses an interim decision to keep signals for
 presentation state. The reasons:
 - one model to learn and reason about;
 - replay, reload, the inspector and MCP only see what is in charts;
@@ -380,6 +380,44 @@ Rule of thumb: if you would have reached for a signal, add a context field
 happen next depends on what happened before, make it a state. If it is a
 calculation on current data, make it a (memoized) function.
 
+### Rebuild locality: per-field tracking
+
+A render, or a guard that `can()` evaluates during one, depends on exactly
+the snapshot fields it reads. Retained subtree skipping therefore keeps
+working: a keystroke in one document re-renders that document's editor, not
+the tab bar or anything that reads `notes`. Each actor keeps hidden signals,
+with no new public API:
+
+| Signal | Read by | Written |
+| --- | --- | --- |
+| one per top-level context key, created on first read | `ctx.key` through `actor:context()` or `snapshot().context` | when that key's value changes; copy-on-write shares unchanged values, so a raw-equal write invalidates nothing; added and removed keys included |
+| configuration | `matches`, `has_tag`, `states`, `status`, `started`, `output`, `can`, `handles`, `accepted`, `snapshot().states/status/output` | when the active configuration, status or output changes, and on start/stop |
+| membership | `actor:children()`, `#`/`ipairs` of `snapshot().children` | when the children ids change |
+| all (the snapshot signal) | `pairs`/`#` over a context, other snapshot fields | on every own commit: the coarse fallback |
+
+- **Children.** `snapshot().children[id]` returns the child's own tracked
+  snapshot view, so `children[id].context.title` depends on that child's
+  `title` signal alone. A child commit updates the parent's snapshot for
+  guards and pure transitions but writes no parent signal.
+- **Guards.** `can()` runs guards on the tracked views, so a Save button
+  depends on configuration plus exactly the fields its guard reads.
+- **Selectors.** `machine.selector` records the signals a computation read and
+  replays them on a cache hit, so every caller depends on the inputs.
+- **Granularity** is the top-level context key: `ctx.doc.title` depends on
+  `doc`. Keep independently changing data in separate keys.
+- **Coarse fallback.** Iterating a context (`pairs`, `#`) depends on
+  everything. `actor:snapshot()` itself costs nothing; its fields are tracked
+  as they are read. `wait_for` and records do not use signals.
+- **Cached views.** One read-only view per raw table, held in a native
+  weak-keyed table, so repeated reads and iterating a 200-row list don't
+  allocate. The semantics are the same in development and production.
+- **Native port constraint.** Snapshots stay plain Lua tables (copy-on-write,
+  identity-comparable values). The native interpreter has to keep them that
+  way, or replace the per-key identity diff with an equivalent.
+
+`tests/machine_test.lua` counts renders in the 'rebuild locality' tests, and
+both fail on the previous one-signal-per-actor design.
+
 ### Components: per-instance machines instead of ouro.stateful
 
 ```lua
@@ -442,11 +480,16 @@ ouro.menu_button { key = 'more', label = 'More', items = {
   text input, switch, checkbox, slider, select, spinbox, listbox, tabs, split
   view, collapsible) send a copy of the event with the new value in
   `field`, which defaults to `value`, matching `machine.set`. The view reads
-  the value back from the actor's context: `text = c.query`. Value widgets
-  stay enabled unless `enabled` says otherwise. Their payload is unknown at
-  render, and checking can() with the current value fails for guards such as
-  documents' "the edit changes something", which would lock the input.
-- **Tracking.** `can()` reads the actor's snapshot signal. Recipes lower at
+  the value back from the actor's context: `text = c.query`. Unless `enabled`
+  is set, value widgets (accordion included) are enabled while
+  `actor:handles(type)` holds, that is while some active state has a
+  transition for the event at all, guards ignored. An input disables while
+  its state takes no edits, for example while closed. Checking can() with the
+  current value would fail for guards such as documents' "the edit changes
+  something" and lock the input. `split_view` has no native disabled state;
+  it simply stops reporting position changes.
+- **Tracking.** `can()` and `handles()` read the actor's configuration signal,
+  and `can()`'s guards read field signals (§6). Recipes lower at
   composition time, and a direct primitive lowers where it is declared, so
   either way the enclosing build tracks the read and enablement follows the
   chart.
@@ -662,17 +705,19 @@ actor:output()  actor:child(id)  actor:children()  actor:persist()  actor:observ
 machine.assign  machine.set  machine.raise  machine.spawn  machine.stop  machine.send_to  machine.send_parent
 machine.wait_for(actor, pred, {timeout})  machine.selector(fn)  machine.actions(actor, specs, opts)
 machine.component(chart, render)  machine.matches(snapshot, id)  machine.plain(v)  machine.unset
+actor:handles(type)  actor:pending_timers()  actor:pending_invokes()
 machine.inspect(fn)  machine.actors()  machine.strict  machine.reserved_prefixes
 machine.persist_roots()  machine.carry(entries)  machine.release()
 machine.default_scheduler  machine.token_scheduler  machine.manual_scheduler()  machine.native_scopes
 ```
 
 `chart:actor` computes the initial snapshot, which may include initial
-`assign`s, and stores it in the actor's internal snapshot signal. It is safe in
+`assign`s, and keeps it with the actor's hidden signals (§6). It is safe in
 a component initializer. `start()` runs the deferred effects and must run in
-the task phase, like any signal write. `status()` is `'created'` until then. Reads (`matches`, `can`, `context`, `snapshot`) go
-through the signal, so a mounted build that reads them rebuilds when the
-snapshot changes.
+the task phase, like any signal write. `status()` is `'created'` until then.
+Reads (`matches`, `can`, `context`, `snapshot`) go through the actor's hidden
+per-field signals, so a mounted build rebuilds when the fields it read change
+(§6).
 
 ## 12. Sketches
 
@@ -882,8 +927,8 @@ book = machine.create {
 ## 13. Open questions
 
 - ~~Do signals survive?~~ **Resolved:** charts hold all application state,
-  presentation state included. Signals survive only as each actor's internal
-  snapshot signal (§6). Derived data uses `machine.selector`.
+  presentation state included. Signals survive only as each actor's hidden
+  per-field signals (§6). Derived data uses `machine.selector`.
 - ~~Fire-and-forget I/O~~ **Resolved:** one-shot spawned tasks (§8).
 - ~~Duplicated facts across actors~~ **Resolved:** `snapshot.children[id]`
   exposes child snapshots, as in XState v5.

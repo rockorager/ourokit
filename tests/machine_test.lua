@@ -1049,10 +1049,10 @@ return {
     local chart = machine.create { id = 'lazy', initial = 'idle', states = {
       idle = { on = { GO = 'busy' } }, busy = { after = { [100] = 'idle' } } } }
     local never = chart:actor { scheduler = clock, lazy = true, scope = 'task' }
-    local before = machine.raw(never:snapshot())
+    local before = never._store()
     never:stop()
     assert(never:status() == 'stopped' and clock.open_scopes == 0)
-    assert(machine.raw(never:snapshot()) == before, 'no signal write for an actor that never committed')
+    assert(never._store() == before, 'no snapshot signal write for an actor that never committed')
     assert(select(2, never:send('GO')) == 'stopped')
     never:stop() -- idempotent
     local running = chart:actor { scheduler = clock, lazy = true, scope = 'task' }
@@ -1093,6 +1093,124 @@ return {
     assert(not actor:can { type = 'TITLE', value = 'a' }, 'the guard refuses the current value...')
     t:click('root/title') -- ...but the input is enabled: handles ignores guards
     assert(t:node('root/title').focused)
+  end,
+
+  ['rebuild locality: typing in one document re-renders only its readers'] = function(t)
+    local doc = machine.create {
+      id = 'doc', initial = 'open', context = function(input) return { title = input.title, text = '' } end,
+      states = { open = { on = { TEXT = machine.set('text', 'string'), TITLE = machine.set('title', 'string') } } },
+    }
+    local notes = machine.create {
+      id = 'notes', initial = 'running', context = { split = 0.25 },
+      states = { running = { on = {
+        ADD = { actions = machine.spawn(doc, { id = function(_, e) return e.id end, input = function(_, e) return { title = e.id } end }) },
+        RESIZE = machine.set('split', 'number'),
+      } } },
+    }
+    local actor = notes:start { scheduler = machine.manual_scheduler() }
+    actor:send { type = 'ADD', id = 'a' }; actor:send { type = 'ADD', id = 'b' }
+    local renders = {}
+    local function counted(name, body)
+      return o.stateful(function(props)
+        return function() renders[name .. (props.id or '')] = (renders[name .. (props.id or '')] or 0) + 1; return body(props) end
+      end)
+    end
+    -- The tab bar reads every child's title through snapshot.children.
+    local TabBar = counted('tabs', function()
+      local children, labels = actor:snapshot().children, {}
+      for _, id in ipairs(children) do labels[#labels + 1] = children[id].context.title end
+      return o.text { key = 'labels', text = table.concat(labels, ',') }
+    end)
+    local Editor = counted('editor', function(props) return o.text { key = 'text', text = actor:child(props.id):context().text } end)
+    local Split = counted('split', function() return o.text { key = 'split', text = tostring(actor:context().split) } end)
+    local Count = counted('count', function() return o.text { key = 'count', text = tostring(#actor:children()) } end)
+    t:mount(function()
+      return o.column { key = 'root',
+        TabBar { key = 'tabs' }, Editor { key = 'ea', id = 'a' }, Editor { key = 'eb', id = 'b' }, Split { key = 'split' }, Count { key = 'count' },
+        o.button { key = 'type', label = 'Type', on_press = function() actor:child('a'):send { type = 'TEXT', value = 'hello' } end },
+        o.button { key = 'rename', label = 'Rename', on_press = function() actor:child('b'):send { type = 'TITLE', value = 'B' } end },
+        o.button { key = 'resize', label = 'Resize', on_press = function() actor:send { type = 'RESIZE', value = 0.5 } end },
+        o.button { key = 'add', label = 'Add', on_press = function() actor:send { type = 'ADD', id = 'c' } end },
+      }
+    end)
+    local function counts() return string.format('tabs=%d ea=%d eb=%d split=%d count=%d',
+      renders.tabs, renders.editora, renders.editorb, renders.split, renders.count) end
+    assert(counts() == 'tabs=1 ea=1 eb=1 split=1 count=1', counts())
+    t:click('root/type') -- a keystroke in document a
+    assert(counts() == 'tabs=1 ea=2 eb=1 split=1 count=1', counts())
+    assert(t:node('root/ea/text').label == 'hello')
+    t:click('root/rename') -- b's title: the tab bar reads it
+    assert(counts() == 'tabs=2 ea=2 eb=1 split=1 count=1', counts())
+    assert(t:node('root/tabs/labels').label == 'a,B')
+    t:click('root/resize') -- a notes-level field
+    assert(counts() == 'tabs=2 ea=2 eb=1 split=2 count=1', counts())
+    t:click('root/add') -- membership changes: children readers re-render
+    assert(counts() == 'tabs=3 ea=2 eb=1 split=2 count=2', counts())
+    assert(t:node('root/tabs/labels').label == 'a,B,c')
+  end,
+
+  ['rebuild locality: fields, configuration and selectors'] = function(t)
+    local results = machine.selector(function(c)
+      local out = {}
+      for _, entry in ipairs(c.entries) do if entry:find(c.query, 1, true) then out[#out + 1] = entry end end
+      return out
+    end)
+    local launcher = machine.create {
+      id = 'launcher', initial = 'hidden', context = { query = '', error = 'none', entries = { 'files', 'firefox', 'terminal' } },
+      states = {
+        hidden = { on = { TOGGLE = 'open' } },
+        open = { on = { TOGGLE = 'hidden', QUERY = machine.set('query', 'string'), FAIL = machine.set('error', 'string'),
+          SUBMIT = { guard = function(c) return c.query ~= '' end } } },
+      },
+    }
+    local actor = launcher:start { scheduler = machine.manual_scheduler() }
+    local renders = {}
+    local function counted(name, body)
+      return o.stateful(function() return function() renders[name] = (renders[name] or 0) + 1; return body() end end)
+    end
+    local Query = counted('query', function() return o.text { key = 'q', text = actor:context().query } end)
+    local Error = counted('error', function() return o.text { key = 'e', text = actor:context().error } end)
+    local Mode = counted('mode', function() return o.text { key = 'm', text = actor:matches('open') and 'open' or 'hidden' } end)
+    local List = counted('list', function() return o.text { key = 'l', text = tostring(#results(actor:context())) } end)
+    local Again = counted('again', function() return o.text { key = 'l', text = tostring(#results(actor:context())) } end)
+    local Can = counted('can', function() return o.text { key = 'c', text = tostring(actor:can('SUBMIT')) } end)
+    t:mount(function()
+      return o.column { key = 'root',
+        Query { key = 'query' }, Error { key = 'error' }, Mode { key = 'mode' }, List { key = 'list' }, Again { key = 'again' }, Can { key = 'can' },
+        o.button { key = 'toggle', label = 'Toggle', on_press = function() actor:send('TOGGLE') end },
+        o.button { key = 'type', label = 'Type', on_press = function() actor:send { type = 'QUERY', value = 'fi' } end },
+        o.button { key = 'fail', label = 'Fail', on_press = function() actor:send { type = 'FAIL', value = 'boom' } end },
+      }
+    end)
+    local function counts() return string.format('query=%d error=%d mode=%d list=%d again=%d can=%d',
+      renders.query, renders.error, renders.mode, renders.list, renders.again, renders.can) end
+    assert(counts() == 'query=1 error=1 mode=1 list=1 again=1 can=1', counts())
+    t:click('root/toggle') -- a state change: only configuration readers (matches, can)
+    assert(counts() == 'query=1 error=1 mode=2 list=1 again=1 can=2', counts())
+    t:click('root/type') -- QUERY: not the error reader; both selector users (one via cache-hit replay);
+    -- can() too, because its guard read query
+    assert(counts() == 'query=2 error=1 mode=2 list=2 again=2 can=3', counts())
+    assert(t:node('root/list/l').label == '2' and t:node('root/again/l').label == '2' and t:node('root/can/c').label == 'true')
+    t:click('root/fail') -- error only
+    assert(counts() == 'query=2 error=2 mode=2 list=2 again=2 can=3', counts())
+  end,
+
+  ['views are cached per table, so repeated reads and iteration do not allocate'] = function()
+    local rows = {}
+    for i = 1, 200 do rows[i] = { id = i } end
+    local chart = machine.create { id = 'rows', initial = 'a', context = { rows = rows, meta = { n = 1 } }, states = { a = { on = { BUMP = machine.set('meta') } } } }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local seen, count = {}, 0
+    for _, row in ipairs(actor:context().rows) do seen[row] = true end
+    for _, row in ipairs(actor:context().rows) do if seen[row] then count = count + 1 end end
+    assert(count == 200, 'the same view userdata comes back for each row')
+    local ctx = actor:context()
+    local first = ctx.meta
+    seen[first] = 'meta'
+    assert(seen[ctx.meta] == 'meta' and seen[actor:context().meta] == 'meta')
+    actor:send { type = 'BUMP', value = { n = 2 } }
+    assert(seen[actor:context().meta] == nil and actor:context().meta.n == 2, 'a replaced table gets its own view')
+    assert(seen[actor:context().rows[1]] == true, 'unchanged tables keep theirs')
   end,
 
   ['event schemas validate external events and drive accepted()'] = function()

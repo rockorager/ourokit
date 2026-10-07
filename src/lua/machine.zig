@@ -26,7 +26,8 @@ pub fn install(state: *c.State) !void {
     c.lua_pushcclosure(state, waiterPark, 0);
     c.lua_pushcclosure(state, waiterWake, 0);
     c.lua_pushcclosure(state, waiterWaiting, 0);
-    if (c.lua_pcallk(state, 8 + extra, 0, 0, 0, null) != c.ok)
+    c.lua_pushcclosure(state, trackedView, 0);
+    if (c.lua_pcallk(state, 9 + extra, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     c.lua_settop(state, api);
 }
@@ -193,12 +194,9 @@ fn waiterWaiting(state: *c.State) callconv(.c) c_int {
     return 1;
 }
 
-/// Replace the value at the top of the stack with a view when it is a table.
-fn wrapTop(state: *c.State) void {
-    if (c.lua_type(state, -1) != c.type_table) return;
-    _ = c.lua_newuserdatauv(state, 0, 1);
-    c.lua_rotate(state, -2, 1);
-    _ = c.lua_setiuservalue(state, -2, 1);
+const view_cache = "ouro.machine.view_cache";
+
+fn pushMetatable(state: *c.State) void {
     if (c.luaL_newmetatable(state, view_metatable) != 0) {
         c.lua_pushcclosure(state, index, 0);
         c.lua_setfield(state, -2, "__index");
@@ -215,7 +213,77 @@ fn wrapTop(state: *c.State) void {
         c.lua_pushboolean(state, 0);
         c.lua_setfield(state, -2, "__metatable");
     }
+}
+
+/// Push the weak-keyed table -> plain view cache (an ephemeron table: a view
+/// references its table, and both go once nothing else holds the table).
+fn pushCache(state: *c.State) void {
+    if (c.lua_getfield(state, c.registry_index, view_cache) == c.type_table) return;
+    c.lua_settop(state, -2);
+    c.lua_createtable(state, 0, 0);
+    c.lua_createtable(state, 0, 1);
+    _ = c.lua_pushstring(state, "k");
+    c.lua_setfield(state, -2, "__mode");
     _ = c.lua_setmetatable(state, -2);
+    c.lua_pushvalue(state, -1);
+    c.lua_setfield(state, c.registry_index, view_cache);
+}
+
+/// Replace the value at the top of the stack with its view when it is a
+/// table. Plain views are cached per table, so repeated reads and iteration
+/// do not allocate.
+fn wrapTop(state: *c.State) void {
+    if (c.lua_type(state, -1) != c.type_table) return;
+    pushCache(state); // t, cache
+    c.lua_pushvalue(state, -2);
+    if (c.lua_rawget(state, -2) != c.type_nil) { // t, cache, view
+        c.lua_rotate(state, -3, 1); // view, t, cache
+        c.lua_settop(state, -3);
+        return;
+    }
+    c.lua_settop(state, -2); // t, cache
+    _ = c.lua_newuserdatauv(state, 0, 2); // t, cache, ud
+    c.lua_pushvalue(state, -3);
+    _ = c.lua_setiuservalue(state, -2, 1);
+    pushMetatable(state);
+    _ = c.lua_setmetatable(state, -2);
+    c.lua_pushvalue(state, -3); // t, cache, ud, t
+    c.lua_pushvalue(state, -2); // t, cache, ud, t, ud
+    c.lua_rawset(state, -4); // t, cache, ud
+    c.lua_rotate(state, -3, 1); // ud, t, cache
+    c.lua_settop(state, -3);
+}
+
+/// tracked_view(t, hook) -> a read-only view whose field reads return
+/// hook(t, key), and whose # and pairs first call hook(t, nil). Actors use it
+/// to read the per-key signals behind a context or snapshot. Not cached.
+fn trackedView(state: *c.State) callconv(.c) c_int {
+    c.lua_settop(state, 2);
+    if (c.lua_type(state, 1) != c.type_table or c.lua_type(state, 2) != c.type_function) {
+        _ = c.lua_pushstring(state, "tracked_view expects a table and a hook");
+        return c.lua_error(state);
+    }
+    _ = c.lua_newuserdatauv(state, 0, 2);
+    c.lua_pushvalue(state, 1);
+    _ = c.lua_setiuservalue(state, -2, 1);
+    c.lua_pushvalue(state, 2);
+    _ = c.lua_setiuservalue(state, -2, 2);
+    pushMetatable(state);
+    _ = c.lua_setmetatable(state, -2);
+    return 1;
+}
+
+/// Calls the tracked view's hook with (t, key) and leaves one result, or
+/// returns false for plain views (nothing pushed).
+fn callHook(state: *c.State, key: c_int) bool {
+    if (c.lua_getiuservalue(state, 1, 2) != c.type_function) {
+        c.lua_settop(state, -2);
+        return false;
+    }
+    _ = c.lua_getiuservalue(state, 1, 1);
+    if (key == 0) c.lua_pushnil(state) else c.lua_pushvalue(state, key);
+    if (c.lua_pcallk(state, 2, 1, 0, 0, null) != c.ok) _ = c.lua_error(state);
+    return true;
 }
 
 /// Push the table behind a view, or return false when the value is not one.
@@ -239,6 +307,8 @@ fn raw(state: *c.State) callconv(.c) c_int {
 }
 
 fn index(state: *c.State) callconv(.c) c_int {
+    c.lua_settop(state, 2);
+    if (callHook(state, 2)) return 1;
     _ = pushTarget(state, 1);
     c.lua_pushvalue(state, 2);
     _ = c.lua_rawget(state, -2);
@@ -252,12 +322,16 @@ fn newIndex(state: *c.State) callconv(.c) c_int {
 }
 
 fn length(state: *c.State) callconv(.c) c_int {
+    c.lua_settop(state, 1);
+    if (callHook(state, 0)) c.lua_settop(state, 1);
     _ = pushTarget(state, 1);
     c.lua_pushinteger(state, @intCast(c.lua_rawlen(state, -1)));
     return 1;
 }
 
 fn pairs(state: *c.State) callconv(.c) c_int {
+    c.lua_settop(state, 1);
+    if (callHook(state, 0)) c.lua_settop(state, 1); // Iteration depends on every key.
     c.lua_pushcclosure(state, step, 0);
     c.lua_pushvalue(state, 1);
     c.lua_pushnil(state);
