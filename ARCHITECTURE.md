@@ -125,9 +125,12 @@ Wayring shutdown. Neither coordinator contains protocol, renderer, task, or UI
 implementations.
 
 Tasks and heterogeneous resources register under application, window, or
-widget scopes. Child scopes now have generation-checked parent links and
-recursive cancellation; canceled scopes reject new tasks, resources, and child
-scopes. The common registry stores generation-checked handles,
+widget scopes. Child scopes have generation-checked parent links, intrusive
+child lists, and occupancy counts. Cancellation is recursive, and canceled scopes
+reject new tasks, resources, and child scopes. Natively owned scopes are destroyed explicitly. Retired child
+scopes, intended for statechart states, free themselves once drained, so
+nested lifetimes can be opened and canceled independently. See
+[docs/runtime.md](docs/runtime.md#tasks-and-resources). The common registry stores generation-checked handles,
 resource kind, owner scope, and cancel/destroy lifecycle hooks. This avoids an
 application object with one array and teardown loop per subsystem. Context
 pointers may live inside that private registry but are never kernel identities.

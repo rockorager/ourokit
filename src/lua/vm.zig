@@ -242,6 +242,15 @@ pub const Vm = struct {
         self.sleep_enabled = false;
     }
 
+    /// Opens a child task scope owned by this VM (source generation). Tasks
+    /// spawned into it, their timers and their external I/O are canceled when
+    /// the scope is retired (`Scheduler.retireScope`), when an enclosing scope
+    /// is canceled, or when this generation retires (`requestCancellation`).
+    /// The scope frees itself once drained; stale handles are rejected.
+    pub fn openScope(self: *Vm, parent: task.ScopeHandle) !task.ScopeHandle {
+        return self.scheduler.createOwnedScope(parent, self);
+    }
+
     pub fn spawnApplication(self: *Vm, source: []const u8) !TaskHandle {
         return self.spawn(self.scheduler.application_scope, source);
     }
@@ -529,7 +538,7 @@ pub const Vm = struct {
         self.running = handle;
         defer self.running = null;
 
-        if (try self.scheduler.cancellationRequested(scheduler_handle)) {
+        if (try self.scheduler.cancellationQueuedOrRequested(scheduler_handle)) {
             if (slot.pending_timeout != null or slot.external_pending) {
                 try self.scheduler.wait(scheduler_handle);
                 return .waiting;
@@ -576,6 +585,13 @@ pub const Vm = struct {
                         return error.UnsupportedYield;
                     },
                     .sleep => {
+                        // The task canceled its own (or an enclosing) scope
+                        // before yielding: unwind instead of arming a timer.
+                        if (try self.scheduler.cancellationQueuedOrRequested(scheduler_handle)) {
+                            try self.scheduler.complete(scheduler_handle);
+                            if (self.closeTask(handle) != c.ok) return error.LuaThreadCloseFailed;
+                            return .canceled;
+                        }
                         slot.timer_resource_handle = self.scheduler.registerResource(
                             slot.scope,
                             .timer,
@@ -758,10 +774,12 @@ pub const Vm = struct {
         return same(pending, operation);
     }
 
-    /// Cancels only tasks and resources created by this VM. Their retained
-    /// native scopes remain usable by a replacement source generation.
+    /// Cancels only tasks and resources created by this VM, and retires the
+    /// child scopes it opened. Retained native scopes remain usable by a
+    /// replacement source generation.
     pub fn requestCancellation(self: *Vm) !void {
         self.app_spawn_allowed = false;
+        try self.scheduler.retireOwnedScopes(self);
         for (self.chunks) |chunk| for (chunk) |*slot| if (slot.active) {
             if (slot.timer_resource_handle) |resource|
                 try self.scheduler.requestResourceCancellation(resource);
@@ -1807,4 +1825,378 @@ test "Lua exit validates codes, defaults to zero, and never continues callbacks"
             try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(runnable));
         try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
     }
+}
+
+/// Gives a Lua state a `closer` value with a `__close` metamethod that counts
+/// unwinds in the global `closed`. Applications cannot attach metatables, so
+/// the host builds it to observe `lua_closethread` unwinding to-be-closed
+/// variables of canceled coroutines.
+fn installTestCloser(vm: *Vm) void {
+    c.lua_createtable(vm.state, 0, 0);
+    c.lua_createtable(vm.state, 0, 1);
+    c.lua_pushcclosure(vm.state, countTestClose, 0);
+    c.lua_setfield(vm.state, -2, "__close");
+    _ = c.lua_setmetatable(vm.state, -2);
+    c.lua_setglobal(vm.state, "closer");
+    c.lua_pushinteger(vm.state, 0);
+    c.lua_setglobal(vm.state, "closed");
+}
+
+fn countTestClose(state: *c.State) callconv(.c) c_int {
+    _ = c.lua_getglobal(state, "closed");
+    var valid: c_int = 0;
+    const count = c.lua_tointegerx(state, -1, &valid);
+    c.lua_pushinteger(state, count + 1);
+    c.lua_setglobal(state, "closed");
+    return 0;
+}
+
+fn testClosedCount(vm: *Vm) c.Integer {
+    _ = c.lua_getglobal(vm.state, "closed");
+    defer c.lua_settop(vm.state, -2);
+    var valid: c_int = 0;
+    return c.lua_tointegerx(vm.state, -1, &valid);
+}
+
+/// A real in-flight kernel operation: POLLIN on a socket that never becomes
+/// readable. Cancellation submits IORING_OP_ASYNC_CANCEL; the task is published
+/// back to the VM only after both terminal CQEs, as production adapters do.
+const TestKernelWait = struct {
+    vm: *Vm,
+    fd: std.os.linux.fd_t,
+    handle: TaskHandle = .invalid,
+    operation: ?io.OperationHandle = null,
+    submitted: ?io.OperationHandle = null,
+    operation_terminal: bool = false,
+    result: i32 = 0,
+    cancel_count: usize = 0,
+    destroyed: bool = false,
+
+    fn install(self: *TestKernelWait, name: [*:0]const u8) void {
+        c.lua_pushlightuserdata(self.vm.state, self);
+        c.lua_pushcclosure(self.vm.state, wait, 1);
+        c.lua_setglobal(self.vm.state, name);
+    }
+
+    fn wait(state: *c.State) callconv(.c) c_int {
+        const self: *TestKernelWait = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
+        self.handle = self.vm.beginExternalWait(state, .operation, self, &test_kernel_lifecycle) catch
+            return luaError(state, "could not begin kernel wait");
+        self.operation = self.vm.loop.preparePoll(self.fd, std.os.linux.POLL.IN) catch {
+            self.vm.abortExternalWait(state, self.handle) catch unreachable;
+            return luaError(state, "could not prepare kernel wait");
+        };
+        self.submitted = self.operation;
+        return c.lua_yieldk(state, 0, 0, continuation);
+    }
+
+    fn continuation(_: *c.State, _: c_int, _: c.KContext) callconv(.c) c_int {
+        return 0;
+    }
+
+    /// Completion phase only: records CQEs and never enters Lua.
+    fn observe(self: *TestKernelWait, dispatch: io.Dispatch) !bool {
+        const operation = self.operation orelse return false;
+        switch (dispatch) {
+            .socket => |completion| {
+                if (!same(completion.operation, operation)) return false;
+                self.operation_terminal = true;
+                self.result = completion.result;
+            },
+            .operation_cancel => |completion| if (!same(completion.operation, operation)) return false,
+            else => return false,
+        }
+        if (self.operation_terminal and !self.vm.loop.operationPending(operation)) {
+            self.operation = null;
+            try self.vm.markExternalCompleted(self.handle);
+        }
+        return true;
+    }
+
+    fn requestCancel(pointer: *anyopaque) !void {
+        const self: *TestKernelWait = @ptrCast(@alignCast(pointer));
+        self.cancel_count += 1;
+        try self.vm.loop.prepareCancel(self.operation.?);
+    }
+
+    fn destroy(pointer: *anyopaque) void {
+        const self: *TestKernelWait = @ptrCast(@alignCast(pointer));
+        self.destroyed = true;
+    }
+};
+
+const test_kernel_lifecycle: task.ResourceLifecycle = .{
+    .request_cancel = TestKernelWait.requestCancel,
+    .destroy = TestKernelWait.destroy,
+};
+
+test "nested state scopes cancel sleeping coroutines, unwind them, and remove their timers" {
+    // Every Zig allocation after setup fails: cancellation, unwinding, scope
+    // reaping and stale-handle rejection must not allocate.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(allocator, 8, 8, 8);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(allocator, 8, 8);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(allocator, &scheduler, &loop);
+    defer vm.deinit();
+    installTestCloser(&vm);
+
+    const window = try scheduler.createScope(scheduler.application_scope);
+    const outer = try vm.openScope(window);
+    const inner = try vm.openScope(outer);
+    const sleeper = "local guard <close> = closer; require('ouro').sleep(60000); error('resumed after cancellation')";
+    const outer_task = try vm.spawn(outer, sleeper);
+    _ = try vm.spawn(inner, sleeper);
+    _ = try vm.spawn(inner, "require('ouro').sleep(0); error('resumed after its state exited')");
+    _ = try vm.spawn(window, "local guard <close> = closer; require('ouro').sleep(60000); retained_resumed = true");
+    while (scheduler.takeRunnable()) |runnable|
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(runnable));
+    try std.testing.expectEqual(@as(usize, 4), loop.timers.count());
+    const outer_timer = (try vm.activeSlot(outer_task)).pending_timeout.?;
+    failing.fail_index = failing.alloc_index;
+
+    // The zero-delay timer fires first, so that task is already runnable when
+    // its enclosing state exits in the same turn.
+    try vm.markTimeoutCompleted((try loop.takeExpired()).?.operation);
+    try scheduler.retireScope(outer);
+    const raced = scheduler.takeRunnable().?;
+    try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(raced));
+    try std.testing.expectError(error.StaleTask, vm.resumeRunnable(raced));
+
+    // Logical timers leave the heap when the safe point applies cancellation.
+    try std.testing.expectEqual(@as(usize, 3), loop.timers.count());
+    try scheduler.applyQueuedCancellations();
+    try std.testing.expectEqual(@as(usize, 1), loop.timers.count());
+    try std.testing.expectError(error.StaleOperation, vm.markTimeoutCompleted(outer_timer));
+    var canceled: usize = 0;
+    while (scheduler.takeRunnable()) |runnable| {
+        try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(runnable));
+        canceled += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), canceled);
+    try std.testing.expectEqual(@as(c.Integer, 2), testClosedCount(&vm));
+    try std.testing.expectEqual(@as(usize, 1), vm.activeTaskCount());
+    try std.testing.expect(!scheduler.scopeAlive(outer) and !scheduler.scopeAlive(inner));
+    try std.testing.expect(scheduler.scopeAlive(window));
+    try std.testing.expectError(error.StaleScope, vm.spawn(inner, "error('spawned into a stale scope')"));
+    const reopened = try vm.openScope(window);
+    try std.testing.expect(!same(reopened, outer) and !same(reopened, inner));
+    try scheduler.retireScope(reopened);
+    try std.testing.expect(!scheduler.scopeAlive(reopened));
+    try std.testing.expect(!failing.has_induced_failure);
+
+    try scheduler.queueScopeCancellation(window);
+    try scheduler.applyQueuedCancellations();
+    while (scheduler.takeRunnable()) |runnable|
+        try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(runnable));
+    try std.testing.expect(!vm.globalBoolean("retained_resumed"));
+    try std.testing.expectEqual(@as(c.Integer, 3), testClosedCount(&vm));
+    try scheduler.destroyScope(window);
+}
+
+test "nested state scopes drain in-flight kernel operations before reusing their slots" {
+    const linux = std.os.linux;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(allocator, 8, 4, 4);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(allocator, 8, 2);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(allocator, &scheduler, &loop);
+    defer vm.deinit();
+    installTestCloser(&vm);
+    var sockets: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets)));
+    defer for (sockets) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var outer_wait: TestKernelWait = .{ .vm = &vm, .fd = sockets[0] };
+    var inner_wait: TestKernelWait = .{ .vm = &vm, .fd = sockets[0] };
+    outer_wait.install("poll_outer");
+    inner_wait.install("poll_inner");
+    const window = try scheduler.createScope(scheduler.application_scope);
+    const outer = try vm.openScope(window);
+    const inner = try vm.openScope(outer);
+    _ = try vm.spawn(outer, "local guard <close> = closer; poll_outer(); error('resumed after cancellation')");
+    _ = try vm.spawn(inner, "local guard <close> = closer; poll_inner(); error('resumed after cancellation')");
+    while (scheduler.takeRunnable()) |runnable|
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(runnable));
+    _ = try loop.submit();
+    const first_operation = outer_wait.submitted.?;
+    failing.fail_index = failing.alloc_index;
+
+    try scheduler.retireScope(outer);
+    try scheduler.applyQueuedCancellations();
+    try std.testing.expectEqual(@as(usize, 1), outer_wait.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), inner_wait.cancel_count);
+    // Cancellation alone never unwinds a task whose kernel operation can
+    // still write into its storage.
+    while (scheduler.takeRunnable()) |runnable|
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(runnable));
+    try std.testing.expect(scheduler.scopeAlive(outer) and scheduler.scopeAlive(inner));
+    try std.testing.expectEqual(@as(c.Integer, 0), testClosedCount(&vm));
+    try std.testing.expect(loop.operationPending(first_operation));
+    try std.testing.expectError(error.OperationCapacityExceeded, loop.preparePoll(sockets[1], linux.POLL.OUT));
+
+    _ = try loop.submit();
+    while (outer_wait.operation != null or inner_wait.operation != null) {
+        const dispatch = loop.dispatch(try loop.wait());
+        if (!(try outer_wait.observe(dispatch)) and !(try inner_wait.observe(dispatch)))
+            return error.UnexpectedCompletion;
+    }
+    try std.testing.expect(!loop.hasPendingOperations());
+    for ([_]*TestKernelWait{ &outer_wait, &inner_wait }) |wait| {
+        try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), wait.result);
+        try std.testing.expect(wait.destroyed);
+    }
+    var canceled: usize = 0;
+    while (scheduler.takeRunnable()) |runnable| {
+        try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(runnable));
+        canceled += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), canceled);
+    try std.testing.expectEqual(@as(c.Integer, 2), testClosedCount(&vm));
+    try std.testing.expect(!scheduler.scopeAlive(outer) and !scheduler.scopeAlive(inner));
+    try std.testing.expectError(error.StaleLuaTask, vm.markExternalCompleted(outer_wait.handle));
+    try std.testing.expect(!failing.has_induced_failure);
+
+    // The drained slot is reusable, under a new generation.
+    const reused = try loop.preparePoll(sockets[1], linux.POLL.OUT);
+    try std.testing.expectEqual(first_operation.slot, reused.slot);
+    try std.testing.expect(!same(first_operation, reused));
+    _ = try loop.submit();
+    switch (loop.dispatch(try loop.wait())) {
+        .socket => |completion| try std.testing.expect(same(completion.operation, reused)),
+        else => return error.UnexpectedCompletion,
+    }
+    try scheduler.destroyScope(window);
+}
+
+test "source-generation retirement retires its nested scopes while retained scopes and the replacement survive" {
+    const linux = std.os.linux;
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 8, 8, 8);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var retiring: Vm = undefined;
+    try retiring.init(std.testing.allocator, &scheduler, &loop);
+    defer retiring.deinit();
+    var replacement: Vm = undefined;
+    try replacement.init(std.testing.allocator, &scheduler, &loop);
+    defer replacement.deinit();
+    installTestCloser(&retiring);
+    var sockets: [2]linux.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sockets)));
+    defer for (sockets) |fd| {
+        _ = linux.close(fd);
+    };
+    var kernel_wait: TestKernelWait = .{ .vm = &retiring, .fd = sockets[0] };
+    kernel_wait.install("poll_kernel");
+    var replacement_wait: TestExternalWait = .{ .vm = &replacement };
+    replacement_wait.install();
+
+    // The window scope is retained across reload; generation-owned state
+    // scopes nest beneath it.
+    const window = try scheduler.createScope(scheduler.application_scope);
+    const state = try retiring.openScope(window);
+    const substate = try retiring.openScope(state);
+    _ = try retiring.spawn(state, "local guard <close> = closer; require('ouro').sleep(60000); error('resumed')");
+    _ = try retiring.spawn(substate, "local guard <close> = closer; poll_kernel(); error('resumed')");
+    _ = try retiring.spawn(window, "local guard <close> = closer; require('ouro').sleep(60000); error('resumed')");
+    const replacement_state = try replacement.openScope(window);
+    const replacement_task = try replacement.spawn(replacement_state, "wait_external(); replacement_resumed = true");
+    while (scheduler.takeRunnable()) |runnable| {
+        const vm = if (retiring.ownsSchedulerTask(runnable)) &retiring else &replacement;
+        try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(runnable));
+    }
+    _ = try loop.submit();
+    try std.testing.expectEqual(@as(usize, 2), loop.timers.count());
+
+    try retiring.requestCancellation();
+    try std.testing.expectEqual(@as(usize, 0), loop.timers.count());
+    try std.testing.expectEqual(@as(usize, 1), kernel_wait.cancel_count);
+    try std.testing.expect(!retiring.app_spawn_allowed and replacement.app_spawn_allowed);
+    try std.testing.expectError(error.ScopeCanceled, retiring.openScope(state));
+    // Applying the queued scope retirement does not re-request cancellation.
+    try scheduler.applyQueuedCancellations();
+    try std.testing.expectEqual(@as(usize, 1), kernel_wait.cancel_count);
+    try std.testing.expect(!replacement_wait.canceled);
+    try std.testing.expect(!(try scheduler.cancellationQueuedOrRequested(try replacement.schedulerHandle(replacement_task))));
+
+    while (scheduler.takeRunnable()) |runnable| {
+        try std.testing.expect(retiring.ownsSchedulerTask(runnable));
+        _ = try retiring.resumeRunnable(runnable);
+    }
+    try std.testing.expectEqual(@as(usize, 1), retiring.activeTaskCount());
+    try std.testing.expect(scheduler.scopeAlive(substate));
+    while (kernel_wait.operation != null or loop.hasPendingTimerKernelWork()) {
+        _ = try loop.submit();
+        const dispatch = loop.dispatch(try loop.wait());
+        switch (dispatch) {
+            .timer_wakeup, .timer_control => try std.testing.expect((try loop.takeExpired()) == null),
+            else => if (!(try kernel_wait.observe(dispatch))) return error.UnexpectedCompletion,
+        }
+    }
+    try std.testing.expectEqual(ResumeResult.canceled, try retiring.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expectEqual(@as(usize, 0), retiring.activeTaskCount());
+    try std.testing.expectEqual(@as(c.Integer, 3), testClosedCount(&retiring));
+    try std.testing.expect(!scheduler.scopeAlive(state) and !scheduler.scopeAlive(substate));
+    try std.testing.expect(scheduler.scopeAlive(window) and scheduler.scopeAlive(replacement_state));
+
+    // The replacement generation keeps working, then retires the same way.
+    try replacement.markExternalCompleted(replacement_wait.handle);
+    try std.testing.expectEqual(ResumeResult.completed, try replacement.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(replacement.globalBoolean("replacement_resumed"));
+    try replacement.requestCancellation();
+    try std.testing.expect(!scheduler.scopeAlive(replacement_state));
+    try scheduler.destroyScope(window);
+}
+
+fn retireOwnScopeForTest(state: *c.State) callconv(.c) c_int {
+    const self: *Vm = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
+    const scope = self.currentScope(state) catch return luaError(state, "no running task");
+    self.scheduler.retireScope(scope) catch return luaError(state, "could not retire scope");
+    return 0;
+}
+
+test "a task that exits its own state scope unwinds at its next suspension" {
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 2, 2);
+    defer scheduler.deinit();
+    var loop: io.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 2);
+    defer loop.deinit();
+    var vm: Vm = undefined;
+    try vm.init(std.testing.allocator, &scheduler, &loop);
+    defer vm.deinit();
+    installTestCloser(&vm);
+    c.lua_pushlightuserdata(vm.state, &vm);
+    c.lua_pushcclosure(vm.state, retireOwnScopeForTest, 1);
+    c.lua_setglobal(vm.state, "exit_own_state");
+
+    const state = try vm.openScope(scheduler.application_scope);
+    _ = try vm.spawn(state,
+        \\local ouro = require('ouro')
+        \\local guard <close> = closer
+        \\exit_own_state()
+        \\ran_until_suspension = not pcall(ouro.spawn, function() end)
+        \\ouro.sleep(10)
+        \\error('resumed after its own state exited')
+    );
+    try std.testing.expectEqual(ResumeResult.canceled, try vm.resumeRunnable(scheduler.takeRunnable().?));
+    try std.testing.expect(vm.globalBoolean("ran_until_suspension"));
+    try std.testing.expectEqual(@as(c.Integer, 1), testClosedCount(&vm));
+    try std.testing.expectEqual(@as(usize, 0), loop.timers.count());
+    try std.testing.expect(!scheduler.scopeAlive(state));
 }

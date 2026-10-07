@@ -130,6 +130,40 @@ handles make stale copies inert. Scope cancellation is first queued, then
 applied at the task safe point. Future application/window/widget scopes use the
 same mechanism rather than type-specific application arrays.
 
+Scopes form a tree with intrusive child links and per-scope task, resource, and
+child counts, so subtree walks and emptiness checks never scan unrelated slots
+or allocate. Capacity stays fixed at scheduler creation. Natively owned scopes
+(windows, instances) are freed explicitly with `destroyScope` once drained.
+Child scopes, which statechart states will use, can also be
+**retired**: `retireScope` queues cancellation for the whole subtree and frees
+the scope as soon as it holds no tasks, resources, or children. Freeing happens
+on whichever completion path removes the last occupant, so the caller never
+polls. Descendants opened by the same owner are retired with it. Descendants
+with another owner are canceled but stay until that owner destroys them.
+`retireOwnedScopes(owner)` retires every scope one owner opened.
+
+Retirement guarantees, at the next safe point unless noted:
+
+- every task in the subtree is marked canceled. A task made runnable earlier in
+  the same turn is unwound instead of resumed, effective immediately
+  (`cancellationQueuedOrRequested`);
+- suspended Lua coroutines unwind through `lua_closethread`, so to-be-closed
+  variables run;
+- logical timers leave the heap, and the shared kernel alarm is updated or
+  removed on the next submit;
+- external resources receive `request_cancel`. A task with an in-flight kernel
+  operation stays parked until its adapter has seen both the operation's and
+  the cancellation's terminal CQEs. Only then do its scope and the ring slot
+  become reusable;
+- stale scope, task, timer, and operation handles fail generation checks.
+
+A task that retires its own scope keeps running until its next suspension
+point. `sleep` then unwinds it instead of arming a timer; spawning and external
+waits raise errors. `lua.Vm.openScope(parent)` opens a scope owned by
+that VM. Retiring the source generation (`requestCancellation`) retires those
+scopes and leaves retained window scopes and the replacement generation's
+scopes alone. No Lua API exposes scopes yet.
+
 ## Embedded Lua
 
 Exact release: **Lua 5.5.1** (official source archive dated 2026-07-24).
