@@ -405,7 +405,12 @@ fn runSourceInternal(
 
     var applications = try @import("../xdg/applications.zig").Config.init(init.gpa, init.minimal.environ);
     defer applications.deinit();
+    // Outlives every source generation; read by runtime.statecharts.
+    var statecharts: ?@import("../lua/root.zig").StatechartInspector =
+        if (options.development) try .init(init.gpa, 1024) else null;
+    defer if (statecharts) |*store| store.deinit();
     const generation_config: source_generation.Config = .{
+        .statecharts = if (statecharts != null) &statecharts.? else null,
         .native_modules = options.native_modules,
         .node_capacity = options.window.node_capacity,
         .window_capacity = options.application_window_capacity,

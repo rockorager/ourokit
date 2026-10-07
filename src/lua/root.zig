@@ -22,6 +22,9 @@ pub const DiagnosticPhase = @import("diagnostic.zig").Phase;
 pub const recordDiagnosticError = @import("diagnostic.zig").recordError;
 pub const ModuleLoader = @import("module_loader.zig").ModuleLoader;
 pub const McpClient = @import("mcp_client.zig").McpClient;
+pub const StatechartInspector = @import("statechart_inspector.zig").Store;
+pub const StatechartEntry = @import("statechart_inspector.zig").Entry;
+pub const installStatechartInspector = @import("statechart_inspector.zig").install;
 pub const Dbus = @import("dbus.zig").Binding;
 pub const Stdio = @import("stdio.zig").Stdio;
 pub const ShellWorkspaces = @import("shell_workspaces.zig").Binding;
@@ -42,6 +45,7 @@ test {
     _ = @import("callbacks.zig");
     _ = @import("components_test.zig");
     _ = @import("machine.zig");
+    _ = @import("statechart_inspector.zig");
     _ = @import("diagnostic.zig");
     _ = @import("images_test.zig");
     _ = @import("prepared_build.zig");

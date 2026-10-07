@@ -8,6 +8,7 @@ const control = @import("control_server.zig");
 const SourceReload = @import("source_reload.zig").SourceReload;
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const PathIdentity = @import("control_endpoint.zig").PathIdentity;
+const lua = @import("../lua/root.zig");
 
 pub const tools = @embedFile("development_tools.json");
 pub const Window = struct { id: []const u8, runtime: *WindowRuntime };
@@ -159,6 +160,7 @@ pub const Service = struct {
             if (requested != null and list.items.len == 0) return error.DevelopmentWindowNotFound;
             return try mcp.object(a, .{.{ "windows", mcp.Value{ .array = list } }});
         }
+        if (std.mem.eql(u8, name, "runtime.statecharts")) return try statecharts(a, reload, args);
         if (server.reloading) return error.DevelopmentReloadInProgress;
         const id = try stringField(args, "window");
         const runtime = for (windows) |window| {
@@ -197,6 +199,82 @@ pub const Service = struct {
         _ = try server.completeDevelopment(self.pending.?.token, result, true);
     }
 };
+
+const statechart_response_bytes = 2 * 1024 * 1024;
+
+fn unsignedField(args: mcp.Value, name: []const u8, default: u64) !u64 {
+    const value = mcp.get(args, name) orelse return default;
+    return switch (value) {
+        .integer => |n| if (n < 0) error.InvalidDevelopmentArgument else @intCast(n),
+        .number_string => |text| std.fmt.parseUnsigned(u64, text, 10) catch error.InvalidDevelopmentArgument,
+        else => error.InvalidDevelopmentArgument,
+    };
+}
+
+fn integer(value: u64) mcp.Value {
+    return .{ .integer = @intCast(@min(value, std.math.maxInt(i64))) };
+}
+
+/// Copies published statechart records out of the host ring. Record bytes
+/// were encoded by ouro.json in the application VM; no Lua runs here.
+fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mcp.Value {
+    const store = reload.config.statecharts orelse return error.StatechartInspectionUnavailable;
+    const after = try unsignedField(args, "after", 0);
+    const limit = @min(try unsignedField(args, "limit", 256), 1024);
+    // Lua MCP clients convert at most 4096 values per reply; text mode keeps
+    // each record as one JSON string for ouro.json.decode.
+    const text = if (mcp.get(args, "text")) |value| value == .bool and value.bool else false;
+    const Collect = struct {
+        a: std.mem.Allocator,
+        text: bool,
+        list: std.array_list.Managed(mcp.Value),
+        bytes: usize = 0,
+        last: ?u64 = null,
+        fn visit(self: *@This(), entry: lua.StatechartEntry) anyerror!bool {
+            if (self.list.items.len != 0 and self.bytes + entry.bytes.len > statechart_response_bytes) return false;
+            self.bytes += entry.bytes.len;
+            const record: mcp.Value = if (self.text)
+                mcp.string(try self.a.dupe(u8, entry.bytes))
+            else
+                try std.json.parseFromSliceLeaky(mcp.Value, self.a, entry.bytes, .{ .allocate = .alloc_always });
+            try self.list.append(try mcp.object(self.a, .{
+                .{ "sequence", integer(entry.sequence) },
+                .{ "time_ms", integer(entry.time_ms) },
+                .{ "record", record },
+            }));
+            self.last = entry.sequence;
+            return true;
+        }
+    };
+    var collect: Collect = .{ .a = a, .text = text, .list = .init(a) };
+    _ = try store.each(after, @intCast(limit), &collect, Collect.visit);
+    const first = store.firstSequence();
+    var result = try mcp.object(a, .{
+        .{ "next", integer(collect.last orelse @max(after, first -| 1)) },
+        .{ "first", integer(first) },
+        .{ "dropped", mcp.Value{ .bool = after + 1 < first and store.next_sequence > 1 } },
+        .{ "time_ms", integer(store.elapsedMs()) },
+        .{ "records", mcp.Value{ .array = collect.list } },
+    });
+    const include_actors = if (mcp.get(args, "actors")) |value| value == .bool and value.bool else after == 0;
+    if (include_actors) {
+        var actors: std.array_list.Managed(mcp.Value) = .init(a);
+        const Decode = struct {
+            fn value(allocator: std.mem.Allocator, bytes: ?[]u8, as_text: bool) !mcp.Value {
+                const owned = bytes orelse return .null;
+                if (as_text) return mcp.string(try allocator.dupe(u8, owned));
+                return std.json.parseFromSliceLeaky(mcp.Value, allocator, owned, .{ .allocate = .alloc_always });
+            }
+        };
+        for (store.actors.keys(), store.actors.values()) |path, actor| {
+            const started = try Decode.value(a, actor.started, text);
+            const latest = try Decode.value(a, actor.latest, text);
+            try actors.append(try mcp.object(a, .{ .{ "actor", mcp.string(path) }, .{ "started", started }, .{ "latest", latest } }));
+        }
+        try result.object.put(a, "actors", .{ .array = actors });
+    }
+    return result;
+}
 
 fn arguments(request: *const control.DevelopmentRequest) mcp.Value {
     return mcp.get(request.parameters.value, "arguments") orelse .{ .object = .empty };

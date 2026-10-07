@@ -1,5 +1,11 @@
 [
   {
+    "name": "runtime.statecharts",
+    "description": "Read ouro.machine inspection records (design/statecharts.md section 10) from this development instance: actor started/stopped lifecycle records and one transition record per processed event, including rejected ones. Returns entries {sequence, time_ms, record} oldest first with sequence greater than after; time_ms is host monotonic time since launch, because records carry no clock. actors (always included when after is 0) holds each live actor's started record (with its graph) and latest transition record, for late attach. dropped is true when the bounded ring evicted records after the cursor. Poll again with after set to next. text returns each record (and actor record) as a JSON string, for clients with per-reply value limits such as ouro.mcp. Does not evaluate Lua.",
+    "inputSchema": {"type":"object","properties":{"after":{"type":"integer"},"limit":{"type":"integer"},"actors":{"type":"boolean"},"text":{"type":"boolean"}},"additionalProperties":false},
+    "outputSchema": {"type":"object"}
+  },
+  {
     "name": "runtime.inspect",
     "description": "Inspect live windows, or a window's bounded semantic tree. Use its opaque token with runtime.input or runtime.capture; inspect again after StaleDevelopmentTarget. Bounds and editor caret_bounds use logical window coordinates before clipping. Editor text_scroll reports both x and y offsets in local logical pixels. Caret geometry is reported even when hidden; masked fields omit both editor geometry properties.",
     "inputSchema": {"type":"object","properties":{"window":{"type":"string"}},"additionalProperties":false},

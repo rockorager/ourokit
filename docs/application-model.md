@@ -826,8 +826,9 @@ declared action sets may change on reload. Production never exposes reload.
 `ouroctl run app.lua --dev` logs `development socket: <path>`. Pass that exact
 instance path to each command; development never discovers a production app ID.
 The private, same-UID endpoint also accepts MCP `tools/call` with the corresponding
-`runtime.inspect`, `runtime.input`, `runtime.capture`, `runtime.diagnostics`, and
-`runtime.metrics` names. These tools are absent from `--mcp` production endpoints.
+`runtime.inspect`, `runtime.input`, `runtime.capture`, `runtime.diagnostics`,
+`runtime.metrics`, and `runtime.statecharts` names. These tools are absent from
+`--mcp` production endpoints.
 
 ```sh
 ouroctl dev inspect "$socket"
@@ -869,6 +870,21 @@ submission before returning a fresh token and
 tasks, animation completion or compositor presentation. Cancellation/disconnect
 releases an in-flight press through routing but cannot undo callbacks already
 run. Inspection and diagnostics do not evaluate Lua or expose arbitrary mutation.
+
+`runtime.statecharts {after, limit, actors, text}` is experimental and follows
+the `ouro.machine` prototype ([design](../design/statecharts.md#10-inspection-hooks)).
+A development instance registers an `ouro.machine.inspect` observer before the
+application runs. The observer publishes every actor lifecycle and transition
+record, JSON-encoded and stamped with host monotonic `time_ms`, into a bounded
+1,024-record ring. The tool returns `{sequence, time_ms, record}` entries after
+the `after` cursor, `next`, and `dropped` when eviction skipped records.
+`actors`, which defaults to on for `after = 0`, adds each live actor's started
+record (including its graph) and latest record for late attach. `text = true`
+returns records as JSON strings for clients such as `ouro.mcp`, which converts
+at most 4,096 values per reply. Records also carry `accepted`, the declared
+events the actor would take at that moment. Production instances register no
+observer. See the [statechart plant](../tools/statechart-visualizer/README.md)
+visualizer.
 
 Capture returns `{window, token, kind, path, width, height, bytes}`. Its kind is
 `software_scene_replay`, never presented GPU readback. The endpoint retains four

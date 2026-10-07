@@ -279,7 +279,7 @@ return o.app {id='dev.test.catalog', actions={
                 # Production automation never grants development or activation.
                 for method in ('runtime.reload', 'runtime.status', 'runtime.activate',
                                'runtime.inspect', 'runtime.input', 'runtime.capture',
-                               'runtime.metrics', 'runtime.diagnostics'):
+                               'runtime.metrics', 'runtime.diagnostics', 'runtime.statecharts'):
                     assert call(endpoint, method)['rpcError']['code'] == -32602
                 assert call(endpoint, 'Probe')['isError'] is False
                 if mode == "trailing":
@@ -490,7 +490,7 @@ return o.app {
                 tools = request(path, "tools/list")["result"]
                 assert {t["name"] for t in tools["tools"]} == {
                     "runtime.status", "runtime.reload", "runtime.inspect", "runtime.input",
-                    "runtime.capture", "runtime.metrics", "runtime.diagnostics",
+                    "runtime.capture", "runtime.metrics", "runtime.diagnostics", "runtime.statecharts",
                     "Get", "Set", "Delayed", "Invalid", "Fail"}
                 assert call(path, "runtime.inspect")["structuredContent"] == {"windows": []}
                 assert call(path, "runtime.metrics")["structuredContent"] == {"windows": []}
