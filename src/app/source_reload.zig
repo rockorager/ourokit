@@ -147,6 +147,17 @@ pub const SourceReload = struct {
         };
         var candidate_config = self.config;
         candidate_config.session_candidate = true;
+        // Read-only: a failed candidate leaves the live actors untouched.
+        // State changes the live generation makes while the candidate
+        // prepares are not carried.
+        const carried = lua.chart_carry.persist(&self.active_generation.vm) catch |err| {
+            lua.recordDiagnosticError(&self.diagnostic, self.allocator, .setup, self.provider.entryName(), err);
+            var owned_snapshot = snapshot;
+            owned_snapshot.deinit();
+            return err;
+        };
+        defer if (carried) |persisted| persisted.deinit();
+        candidate_config.carried_actors = carried;
         const candidate = if (self.module_root) |root|
             SourceGeneration.createBootstrap(
                 self.allocator,
@@ -345,6 +356,7 @@ pub const SourceReload = struct {
         retirement_slot.* = .{ .generation = retired };
         self.generation += 1;
         self.clearDiagnostic();
+        candidate.releaseRestoredActors();
         return .{ .generation = self.generation, .retired = retired };
     }
 
@@ -1278,4 +1290,108 @@ test "a later window build failure leaves every retained window on the active ge
     for (scopes) |scope| try scheduler.destroyScope(scope);
     reload.deinit();
     callbacks.deinit();
+}
+
+fn carrySource(comptime waiting: []const u8, comptime extra_states: []const u8) []const u8 {
+    return
+    \\local ouro = require("ouro")
+    \\local m = ouro.machine
+    \\local chart = m.create { id = "counter", initial = "idle", context = { count = 0, label = "kept" },
+    \\  events = { BUMP = {}, WAIT = {} },
+    \\  states = {
+    \\    idle = { on = { BUMP = { actions = m.assign(function(c) return { count = c.count + 1 } end) }, WAIT = "
+    ++ waiting ++ "\" } },\n    " ++ waiting ++
+        \\ = { after = { [60000] = "idle" } },
+        \\
+    ++ extra_states ++
+        \\  } }
+        \\counter = chart:start()
+        \\restored = counter:restored()
+        \\return ouro.app { id = "dev.ouro.reload-test",
+        \\  run = function() return { windows = { ouro.window { id = "main", title = "Carry", content = function() end } } } end }
+    ;
+}
+
+fn evaluate(generation: *SourceGeneration, scheduler: *task.Scheduler, expression: []const u8) !bool {
+    var buffer: [256]u8 = undefined;
+    const source = try std.fmt.bufPrint(&buffer, "carry_check = {s}", .{expression});
+    _ = try generation.vm.spawnApplication(source);
+    try std.testing.expectEqual(lua.ResumeResult.completed, try generation.vm.resumeRunnable(scheduler.takeRunnable().?));
+    return generation.vm.globalBoolean("carry_check");
+}
+
+test "chart actors keep their state across reload and failed candidates leave them live" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = carrySource("waiting", "") });
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &temporary.sub_path, "app.lua" });
+    defer std.testing.allocator.free(path);
+    var provider = try bundle.SourceProvider.initDisk(std.testing.allocator, path);
+    defer provider.deinit();
+    var loop: io_loop.Loop = undefined;
+    try loop.init(std.testing.allocator, 8, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 16, 4, 8);
+    defer scheduler.deinit();
+    const initial = try SourceGeneration.create(std.testing.allocator, &scheduler, &loop, try provider.snapshot(std.testing.io, std.testing.allocator), null, .{ .node_capacity = 8 }, null);
+    var reload: SourceReload = undefined;
+    reload.init(std.testing.allocator, std.testing.io, &provider, &scheduler, &loop, null, .{ .node_capacity = 8 }, initial);
+    defer reload.deinit();
+    const active = reload.active();
+
+    try std.testing.expect(!active.vm.globalBoolean("restored"));
+    try std.testing.expect(try evaluate(active, &scheduler, "(function() counter:send('BUMP'); counter:send('BUMP'); counter:send('WAIT'); return counter:matches('waiting') end)()"));
+    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
+    try std.testing.expectEqual(@as(usize, 1), loop.timers.count());
+
+    // A candidate that fails to evaluate never touches the live actor.
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = "return ouro.app {" });
+    try std.testing.expectError(error.LuaLoadFailed, reload.prepare());
+    try std.testing.expect(try evaluate(active, &scheduler, "counter:context().count == 2 and counter:matches('waiting')"));
+    try std.testing.expectEqual(@as(usize, 1), loop.timers.count());
+
+    // An edited chart restores in the candidate. Its restored timer is held
+    // until commit, and a discarded candidate never starts it.
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = carrySource("waiting", "    extra = {},\n") });
+    try reload.prepare();
+    const discarded = reload.candidate.?;
+    try std.testing.expect(discarded.vm.globalBoolean("restored"));
+    try std.testing.expect(try evaluate(discarded, &scheduler, "counter:context().count == 2 and counter:context().label == 'kept' and counter:matches('waiting')"));
+    try std.testing.expectEqual(@as(usize, 1), loop.timers.count());
+    reload.discard();
+    try reload.beginRetirement();
+    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+    try std.testing.expect(try evaluate(active, &scheduler, "counter:matches('waiting')"));
+
+    // Commit: the new generation owns the actor and restarts its timer; the
+    // old generation's timer is canceled with its scopes.
+    try std.testing.expect(try evaluate(active, &scheduler, "(function() counter:send('BUMP'); return true end)()"));
+    try reload.prepare();
+    const committed = reload.commit();
+    const next = reload.active();
+    try std.testing.expect(next != active and next.vm.globalBoolean("restored"));
+    try reload.beginRetirement();
+    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
+    try scheduler.applyQueuedCancellations();
+    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
+    try std.testing.expectEqual(@as(usize, 1), loop.timers.count());
+    try std.testing.expect(try evaluate(next, &scheduler, "counter:context().count == 2 and counter:matches('waiting')"));
+    try std.testing.expectEqual(@as(usize, 0), active.vm.activeTaskCount());
+    reload.markRetiringNativeStateDetached(committed.retired);
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
+
+    // Renaming the active state falls back to its nearest surviving ancestor.
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "app.lua", .data = carrySource("paused", "") });
+    try reload.prepare();
+    const fallback = reload.commit();
+    try std.testing.expect(try evaluate(reload.active(), &scheduler, "counter:context().count == 2 and counter:matches('idle')"));
+    try reload.beginRetirement();
+    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
+    try scheduler.applyQueuedCancellations();
+    while (scheduler.takeRunnable()) |handle| _ = try reload.resumeRunnable(handle);
+    try std.testing.expectEqual(@as(usize, 0), loop.timers.count());
+    reload.markRetiringNativeStateDetached(fallback.retired);
+    try std.testing.expectEqual(@as(usize, 1), reload.collectRetired());
 }

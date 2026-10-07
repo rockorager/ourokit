@@ -1,4 +1,5 @@
 pub const Vm = @import("vm.zig").Vm;
+pub const chart_carry = @import("chart_carry.zig");
 pub const TaskHandle = @import("vm.zig").TaskHandle;
 pub const ResumeResult = @import("vm.zig").ResumeResult;
 pub const TaskArgument = @import("vm.zig").Argument;
@@ -45,6 +46,7 @@ test {
     _ = @import("auth.zig");
     _ = @import("image_import.zig");
     _ = @import("callbacks.zig");
+    _ = @import("chart_carry.zig");
     _ = @import("components_test.zig");
     _ = @import("machine.zig");
     _ = @import("statechart_inspector.zig");

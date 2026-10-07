@@ -488,6 +488,12 @@ fn pushEvent(state: *c.State, event: mcp.ClientEvent) !void {
 
 /// Converts a Lua value into arena-owned JSON, including strings and keys.
 /// The caller restores the Lua stack on failure and releases the arena.
+/// `ouro.json.null` is one process-wide light userdata, identical in every VM.
+pub fn isJsonNull(state: *c.State, index: c_int) bool {
+    return c.lua_type(state, index) == c.type_light_userdata and
+        c.lua_touserdata(state, index) == @as(*anyopaque, @ptrCast(&json_null));
+}
+
 pub fn luaToJson(
     state: *c.State,
     index: c_int,

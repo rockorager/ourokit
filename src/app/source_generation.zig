@@ -35,6 +35,9 @@ pub const Config = struct {
     /// `ouro.machine.strict`: undeclared events raise when true (development
     /// and tests) and are rejected as 'undeclared' when false (production).
     statechart_strict: bool = true,
+    /// Statechart actors persisted by the live generation. Borrowed for
+    /// initialization only: they are restored before this source runs.
+    carried_actors: ?lua.chart_carry.Persisted = null,
 };
 
 pub const UiServices = struct {
@@ -398,6 +401,17 @@ pub const SourceGeneration = struct {
         // application code can start actors.
         if (config.statecharts) |store| try lua.installStatechartInspector(&self.vm, store);
         lua.setStatechartStrict(&self.vm, config.statechart_strict);
+        // After the statechart module is installed, before any source runs.
+        if (config.carried_actors) |persisted| lua.chart_carry.adopt(&self.vm, persisted) catch |err| {
+            lua.recordDiagnosticError(
+                diagnostic,
+                allocator,
+                .setup,
+                self.snapshot.entry_name,
+                err,
+            );
+            return err;
+        };
         self.vm.setRuntimeDirectory(config.runtime_dir);
         try @import("../lua/xdg.zig").install(&self.vm, config.environ);
         self.applications.init(&self.vm, loop, config.applications);
@@ -673,6 +687,12 @@ pub const SourceGeneration = struct {
     /// Candidate preparation queues descriptions but never starts workers.
     pub fn pumpImages(self: *SourceGeneration) !void {
         if (self.images) |*images| try images.pump();
+    }
+
+    /// Starts the timers and invokes of actors restored from the previous
+    /// generation. Called once this generation has been committed.
+    pub fn releaseRestoredActors(self: *SourceGeneration) void {
+        lua.chart_carry.release(&self.vm);
     }
 
     pub fn shutdownImages(self: *SourceGeneration) void {

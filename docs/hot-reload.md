@@ -80,8 +80,36 @@ a candidate rather than discarding still-live resources.
 - Compatible keyed widgets preserve retained native state, including focus,
   text editing, selection, and scrolling where the widget owns that state.
 - Renderer, font, glyph, and paragraph caches belong to the surviving host.
-- Lua locals, globals, module values, and `ouro.signal` values reset with the VM.
-  Native retention is not general application-state persistence.
+- Statechart actors keep their state (see below). Lua locals, globals, module
+  values, and `ouro.signal` values reset with the VM.
+
+## Statechart actors carry across reload
+
+Application state lives in charts, so reload carries it over:
+
+1. When preparation starts, the runner persists every running root actor of the
+   live generation with `actor:persist()`. This only reads the live actors.
+   Actors whose context is not plain data are reported on stderr and start
+   fresh.
+2. The plain snapshots are copied directly into the candidate's Lua state,
+   without serialization, so integers, floats, and integer keys are unchanged.
+   This happens before the candidate's source runs.
+3. In the candidate, a root actor created with the same id and chart id is
+   restored with `chart:restore(persisted, {renames = ...})`. Its child actors
+   are restored too. `actor:restored()` is true, so `run()` can skip one-time
+   setup, such as reopening files.
+   - A state that no longer exists falls back to its nearest surviving ancestor
+     and that ancestor's initial states.
+   - A context field is kept when the new chart's initial context leaves it
+     nil or gives it the same type.
+4. The restored state is visible immediately, so the candidate's windows build
+   from it. The restored actors' timers and invokes start only when the
+   candidate commits; they restart from zero.
+   The old generation's scopes are canceled as before.
+
+A rejected or discarded candidate starts nothing and never touches the live
+actors. Events that the live generation handles while the candidate is
+preparing are not carried; preparation normally takes milliseconds.
 
 The application ID cannot change during reload. Such a candidate fails with
 `ApplicationIdChanged` and requires a new process. Development enablement and
@@ -167,7 +195,7 @@ survival, and ownership across generation retirement. Native tests additionally
 exercise window creation/removal, visible replacement content, stale targets,
 and input on newly added windows.
 
-Versioned application-state migration, source-defined component family tokens,
+Versioned application-state migration beyond chart restore, source-defined component family tokens,
 post-commit application lifecycle hooks, multi-file dependency revalidation, and
 file watching are not implemented contracts. Applications should not depend on
 proposed APIs for those features.

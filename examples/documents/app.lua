@@ -127,7 +127,9 @@ return ouro.app {
   run=function()
     local split,restored,selected=storage.load()
     notes = charts.notes:start { input = { split = split } }
-    if #pending_uris==0 then
+    -- After a source reload, notes is restored with its open documents,
+    -- including unsaved edits; reopening saved files would duplicate them.
+    if #pending_uris==0 and not notes:restored() then
       -- Reopen saved files only. Never resurrect discarded edits or overwrite files.
       local selected_value
       for _,uri in ipairs(restored) do
