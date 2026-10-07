@@ -1,0 +1,617 @@
+-- Statechart prototype semantics (design/statecharts.md). Runs under
+-- `ouroctl test`; timers and invokes use the deterministic manual scheduler.
+local o = require('ouro')
+local machine = o.machine
+local assign, raise = machine.assign, machine.raise
+
+local function join(list)
+  local out = {}
+  for i = 1, #list do out[i] = list[i] end
+  return table.concat(out, ',')
+end
+
+local function fails(fn, pattern)
+  local ok, err = pcall(fn)
+  assert(not ok, 'expected failure: ' .. pattern)
+  assert(tostring(err):find(pattern, 1, true), tostring(err))
+end
+
+local function recorder(actor)
+  local records = {}
+  actor:observe(function(record) records[#records + 1] = record end)
+  return records
+end
+
+local function last(list) return list[#list] end
+
+-- a(a1(a11, a12), a2), b(b1), with a parallel p(r1(x, y), r2(u, v)) and out.
+local function nested(log)
+  local function note(text) return function() log[#log + 1] = text end end
+  local function state(name, def)
+    def.entry, def.exit = note('enter ' .. name), note('exit ' .. name)
+    return def
+  end
+  return machine.create {
+    id = 'nested', initial = 'a',
+    states = {
+      a = state('a', { initial = 'a1', on = { INNER = '.a2', OUTER = { target = '.a2', reenter = true } },
+        states = {
+          a1 = state('a1', { initial = 'a11', states = {
+            a11 = state('a11', { on = { GO = '#b.b1', SIB = 'a12', SELF = 'a11' } }),
+            a12 = state('a12', {}),
+          }}),
+          a2 = state('a2', { on = { PAR = '#p' } }),
+        }}),
+      b = state('b', { initial = 'b1', states = { b1 = state('b1', {}) } }),
+      p = state('p', { type = 'parallel', states = {
+        r1 = state('r1', { initial = 'x', states = { x = state('x', { on = { E = 'y', F = 'y' } }), y = state('y', {}) } }),
+        r2 = state('r2', { initial = 'u', states = { u = state('u', { on = { E = 'v', F = '#out' } }), v = state('v', {}) } }),
+      }}),
+      out = state('out', {}),
+    },
+  }
+end
+
+return {
+  ['compile rejects malformed charts with precise messages'] = function()
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { bogus = 1 } } } end, 'unknown field "bogus"')
+    fails(function() machine.create { id = 'm', states = { a = {} } } end, 'needs initial')
+    fails(function() machine.create { id = 'm', initial = 'z', states = { a = {} } } end, 'initial "z"')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { on = { X = 'nope' } } } } end, 'unknown target "nope"')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { on = { X = { guard = 'g' } } } } } end, 'unknown guard "g"')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { entry = 'act' } } } end, 'unknown action "act"')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { invoke = { src = 'load' } } } } end, 'unknown actor "load"')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { type = 'final', on = { X = 'a' } } } } end, 'cannot declare on')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { after = { [1.5] = 'a' } } } } end, 'nonnegative integers')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { ['a.b'] = {} } } end, 'must be an identifier')
+    fails(function() machine.create { id = 'm', initial = 'a', events = { ['done.x'] = {} }, states = { a = {} } } end, 'invalid external event')
+  end,
+
+  ['graph export describes states, transitions, timers and invokes as plain data'] = function()
+    local chart = machine.create {
+      id = 'doc', initial = 'loading',
+      guards = { valid = function() return true end },
+      actors = { load = function() return 1 end },
+      events = { SAVE = {}, RENAME = { title = 'string', force = 'boolean?' } },
+      states = {
+        loading = { invoke = { src = 'load', on_done = 'ready', on_error = 'failed' } },
+        failed = { type = 'final' },
+        ready = { type = 'parallel', on_done = 'loading', states = {
+          edit = { initial = 'clean', states = {
+            clean = { on = { RENAME = { target = 'dirty', guard = 'valid' } } },
+            dirty = { after = { [500] = 'clean' }, on = { SAVE = 'clean' }, tags = { 'unsaved' } },
+          }},
+          view = { initial = 'plain', states = { plain = { always = { target = 'fancy', guard = function() return false end } }, fancy = {} } },
+        }},
+      },
+    }
+    local g = chart:graph()
+    assert(g.format == 'ouro.machine.graph' and g.version == 1 and g.id == 'doc' and g.root == '')
+    local states = {}
+    for _, s in ipairs(g.states) do states[s.id] = s end
+    assert(states[''].type == 'compound' and states[''].initial == 'loading')
+    assert(states['ready'].type == 'parallel' and join(states['ready'].children) == 'ready.edit,ready.view')
+    assert(states['ready.edit'].initial == 'ready.edit.clean' and states['ready.edit'].parent == 'ready')
+    assert(states['failed'].final and states['failed'].type == 'final')
+    assert(states['ready.edit.dirty'].after[1].delay == 500 and states['ready.edit.dirty'].after[1].event == 'after.500.ready.edit.dirty')
+    assert(states['loading'].invoke[1].src == 'load' and states['loading'].invoke[1].id == 'load')
+    assert(states['ready.edit.dirty'].tags[1] == 'unsaved')
+    -- Document order is depth-first with lexically sorted keys.
+    local order = {}
+    for i, s in ipairs(g.states) do order[i] = s.id end
+    assert(join(order) == ',failed,loading,ready,ready.edit,ready.edit.clean,ready.edit.dirty,ready.view,ready.view.fancy,ready.view.plain', join(order))
+    local by = {}
+    for _, t in ipairs(g.transitions) do by[t.source .. ' ' .. (t.event or 'always')] = t end
+    local rename = by['ready.edit.clean RENAME']
+    assert(rename.guarded and rename.guard == 'valid' and rename.targets[1] == 'ready.edit.dirty' and rename.kind == 'event')
+    assert(by['ready.view.plain always'].guarded and by['ready.view.plain always'].guard == 'function')
+    assert(by['ready.edit.dirty after.500.ready.edit.dirty'].kind == 'after')
+    assert(by['loading done.invoke.load'].kind == 'invoke.done' and by['loading error.invoke.load'].targets[1] == 'failed')
+    assert(by['ready done.state.ready'].kind == 'done' and not by['ready.edit.dirty SAVE'].guarded)
+    assert(g.events[1].type == 'RENAME' and g.events[1].fields.title == 'string' and g.events[1].fields.force == 'boolean?')
+    assert(g.events[2].type == 'SAVE')
+    -- Plain data all the way down.
+    assert(o.json.decode(o.json.encode(g)).states[1].id == '')
+    assert(chart:graph() == g)
+  end,
+
+  ['exit and entry order follow the least common compound ancestor'] = function()
+    local log = {}
+    local actor = nested(log):start { scheduler = machine.manual_scheduler() }
+    assert(join(log) == 'enter a,enter a1,enter a11', join(log))
+    assert(join(actor:states()) == 'a,a.a1,a.a1.a11')
+    local records = recorder(actor)
+    actor:send('SIB')
+    assert(join(last(records).exited) == 'a.a1.a11' and join(last(records).entered) == 'a.a1.a12')
+    actor:send('INNER') -- '.a2' from a: a is the domain and is not exited.
+    assert(join(last(records).exited) == 'a.a1.a12,a.a1' and join(last(records).entered) == 'a.a2')
+    actor:send('OUTER') -- reenter = true exits and re-enters a itself.
+    assert(join(last(records).exited) == 'a.a2,a' and join(last(records).entered) == 'a,a.a2')
+    for i = #log, 1, -1 do log[i] = nil end
+    actor:send('PAR')
+    assert(join(log) == 'exit a2,exit a,enter p,enter r1,enter x,enter r2,enter u', join(log))
+    assert(join(actor:states()) == 'p,p.r1,p.r1.x,p.r2,p.r2.u')
+  end,
+
+  ['a transition to its own state re-enters it; deep transitions exit inner first'] = function()
+    local log = {}
+    local actor = nested(log):start { scheduler = machine.manual_scheduler() }
+    for i = #log, 1, -1 do log[i] = nil end
+    actor:send('SELF')
+    assert(join(log) == 'exit a11,enter a11', join(log))
+    for i = #log, 1, -1 do log[i] = nil end
+    actor:send('GO')
+    assert(join(log) == 'exit a11,exit a1,exit a,enter b,enter b1', join(log))
+  end,
+
+  ['parallel regions take the same event in one microstep and resolve conflicts in document order'] = function()
+    local log = {}
+    local actor = nested(log):start { scheduler = machine.manual_scheduler() }
+    actor:send('INNER'); actor:send('PAR')
+    local records = recorder(actor)
+    actor:send('E')
+    local step = last(records).microsteps[1]
+    assert(#last(records).microsteps == 1 and #step.transitions == 2)
+    assert(join(step.exited) == 'p.r2.u,p.r1.x' and join(step.entered) == 'p.r1.y,p.r2.v', join(step.exited) .. ' / ' .. join(step.entered))
+    actor:send('OUTER') -- no handler in p
+    assert(last(records).rejected and last(records).reason == 'no_transition')
+    -- F: r1 (earlier) wants y, r2 wants to leave p. Their exit sets overlap and
+    -- r2's source is not a descendant of r1's, so r2's transition is preempted.
+    local fresh = nested({}):start { scheduler = machine.manual_scheduler() }
+    fresh:send('INNER'); fresh:send('PAR')
+    fresh:send('F')
+    assert(fresh:matches('p.r1.y') and fresh:matches('p.r2.u') and not fresh:matches('out'))
+  end,
+
+  ['guards are tried in order, child handlers win, and can() evaluates guards'] = function()
+    local chart = machine.create {
+      id = 'g', initial = 'parent', context = { n = 0 },
+      states = {
+        parent = { initial = 'child', on = { GO = 'fallback', BUMP = { actions = assign { n = function(c) return c.n + 1 end } } },
+          states = { child = { on = { GO = {
+            { target = '#big', guard = function(c, e) return e.amount > 10 end },
+            { target = '#small', guard = function(c, e) return e.amount > 0 end },
+          } } } } },
+        fallback = {}, big = {}, small = {},
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    assert(actor:can { type = 'GO', amount = 50 } and actor:can('BUMP') and not actor:can('NOPE'))
+    actor:send { type = 'GO', amount = 0 } -- both child guards fail; parent handles it.
+    assert(actor:matches('fallback'))
+    local second = chart:start { scheduler = machine.manual_scheduler() }
+    second:send { type = 'GO', amount = 5 }
+    assert(second:matches('small'))
+    local third = chart:start { scheduler = machine.manual_scheduler() }
+    third:send('BUMP'); third:send('BUMP') -- targetless: no exit or entry.
+    assert(third:matches('parent.child') and third:context().n == 2)
+  end,
+
+  ['assign is the only way to change context and snapshots are immutable'] = function()
+    local chart = machine.create {
+      id = 'ctx', initial = 'idle', context = function(input) return { items = { 'a' }, title = input.title, extra = true } end,
+      states = { idle = { on = {
+        ADD = { actions = assign(function(c, e)
+          local items = {}
+          for i, item in ipairs(c.items) do items[i] = item end
+          items[#items + 1] = e.item
+          return { items = items }
+        end) },
+        CLEAR = { actions = assign { extra = machine.unset, title = function(_, e) return e.title end } },
+        MUTATE = { actions = function(c) c.title = 'mutated' end },
+      } } },
+    }
+    local actor = chart:start { input = { title = 'T' }, scheduler = machine.manual_scheduler() }
+    local before = machine.raw(actor:snapshot())
+    actor:send { type = 'ADD', item = 'b' }
+    local after = machine.raw(actor:snapshot())
+    assert(before ~= after and #before.context.items == 1 and #after.context.items == 2)
+    assert(actor:context().items[2] == 'b' and actor:context().title == 'T')
+    fails(function() actor:context().title = 'x' end, 'read-only')
+    fails(function() actor:send('MUTATE') end, 'read-only')
+    assert(actor:context().title == 'T')
+    actor:send { type = 'CLEAR', title = 'U' }
+    assert(actor:context().extra == nil and actor:context().title == 'U')
+  end,
+
+  ['always transitions and raised events run to completion in one macrostep'] = function()
+    local chart = machine.create {
+      id = 'rtc', initial = 'idle', context = { n = 0, trail = '' },
+      actions = { mark = assign { trail = function(c, e) return c.trail .. e.type .. ';' end } },
+      states = {
+        idle = { on = { START = { target = 'counting', actions = raise('PING') } } },
+        counting = {
+          always = { target = 'done', guard = function(c) return c.n >= 3 end },
+          on = { PING = { target = 'counting', reenter = true, actions = { 'mark', assign { n = function(c) return c.n + 1 end }, raise('PING') } } },
+        },
+        done = { entry = 'mark' },
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local records = recorder(actor)
+    actor:send('START')
+    assert(#records == 1 and actor:matches('done') and actor:context().n == 3, tostring(actor:context().n))
+    local r = records[1]
+    -- START, PING, PING, PING (each then checks always), then the always step.
+    assert(#r.microsteps == 5, tostring(#r.microsteps))
+    assert(r.microsteps[2].event == 'PING' and r.microsteps[5].event == nil)
+    -- Eventless steps keep the last processed event, as SCXML's _event does.
+    assert(actor:context().trail == 'PING;PING;PING;PING;', actor:context().trail)
+  end,
+
+  ['an eventless livelock fails without committing a partial snapshot'] = function()
+    local chart = machine.create {
+      id = 'loop', initial = 'a',
+      states = { a = { on = { GO = 'b' } }, b = { always = 'c' }, c = { always = 'b' } },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    fails(function() actor:send('GO') end, 'exceeded 1000 microsteps')
+    assert(actor:matches('a'))
+  end,
+
+  ['guard errors leave the previous snapshot in place'] = function()
+    local chart = machine.create {
+      id = 'err', initial = 'a', context = { n = 1 },
+      states = { a = { on = { GO = { target = 'b', actions = assign { n = 2 }, guard = function(c, e)
+        if e.explode then error('boom') end
+        return true
+      end } } }, b = {} },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    fails(function() actor:send { type = 'GO', explode = true } end, 'boom')
+    assert(actor:matches('a') and actor:context().n == 1)
+    actor:send('GO')
+    assert(actor:matches('b') and actor:context().n == 2)
+  end,
+
+  ['events sent by effects queue behind the current macrostep'] = function()
+    local order = {}
+    local chart = machine.create {
+      id = 'queue', initial = 'a',
+      states = {
+        a = { on = { GO = { target = 'b', actions = function(_, _, self) order[#order + 1] = 'effect'; self:send('NEXT') end } } },
+        b = { entry = function() order[#order + 1] = 'enter b' end, on = { NEXT = 'c' } },
+        c = {},
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local records = recorder(actor)
+    actor:send('GO')
+    assert(actor:matches('c') and #records == 2 and records[1].event.type == 'GO' and records[2].event.type == 'NEXT')
+    assert(join(order) == 'effect,enter b', join(order))
+    assert(records[2].sequence == records[1].sequence + 1)
+  end,
+
+  ['final states raise done events for compound and parallel parents'] = function()
+    local chart = machine.create {
+      id = 'fin', initial = 'work',
+      states = {
+        work = { type = 'parallel', on_done = 'finished', states = {
+          one = { initial = 'busy', on_done = { actions = assign { one = true } }, states = { busy = { on = { A = 'ok' } }, ok = { type = 'final' } } },
+          two = { initial = 'busy', states = { busy = { on = { B = 'ok' } }, ok = { type = 'final' } } },
+        }},
+        finished = { on = { END = 'over' } },
+        over = { type = 'final', output = function(c) return { one = c.one } end },
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local records = recorder(actor)
+    actor:send('A')
+    assert(actor:matches('work.one.ok') and actor:context().one)
+    actor:send('B')
+    assert(actor:matches('finished'), join(actor:states()))
+    local events = {}
+    for i, step in ipairs(last(records).microsteps) do events[i] = step.event end
+    -- done.state.work.two has no handler, so it takes no microstep.
+    assert(join(events) == 'B,done.state.work', join(events))
+    actor:send('END')
+    assert(actor:status() == 'done' and actor:output().one == true)
+    actor:send('END')
+    assert(last(records).rejected and last(records).reason == 'done')
+    assert(not actor:can('END'))
+  end,
+
+  ['after timers start on entry, fire once, and are cancelled on exit'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create {
+      id = 'timer', initial = 'idle',
+      states = {
+        idle = { on = { ARM = 'armed' } },
+        armed = { after = { [100] = 'fired', [300] = 'late' }, on = { DISARM = 'idle', RESET = 'armed' } },
+        fired = { on = { ARM = 'armed' } },
+        late = {},
+      },
+    }
+    local actor = chart:start { scheduler = clock }
+    local records = recorder(actor)
+    actor:send('ARM')
+    local started = last(records).timers
+    assert(#started == 2 and started[1].action == 'started' and started[1].delay == 100 and started[2].delay == 300)
+    assert(clock.open_scopes == 1) -- one scope per state entry holds both timers
+    clock.advance(50)
+    actor:send('DISARM')
+    local cancelled = last(records).timers
+    assert(#cancelled == 2 and cancelled[1].action == 'cancelled' and cancelled[2].action == 'cancelled')
+    assert(clock.open_scopes == 0)
+    clock.advance(500) -- stale spawned sleeps finish but deliver nothing.
+    assert(actor:matches('idle') and last(records).event.type == 'DISARM')
+    actor:send('ARM')
+    clock.advance(60)
+    actor:send('RESET') -- re-entry restarts both timers with a new token.
+    local reset = last(records).timers
+    assert(reset[1].action == 'cancelled' and reset[3].action == 'started' and reset[3].token ~= reset[1].token)
+    clock.advance(60) -- the first entry's 100ms timer would fire now.
+    assert(actor:matches('armed'))
+    clock.advance(40)
+    assert(actor:matches('fired'))
+    local fired = last(records)
+    assert(fired.origin == 'timer' and fired.timers[1].action == 'fired' and fired.timers[1].delay == 100)
+    assert(fired.timers[2].action == 'cancelled' and fired.timers[2].delay == 300 and #fired.timers == 2)
+    -- A forged or stale timer event is rejected by token.
+    local snapshot = chart:initial()
+    local _, _, record = chart:transition(snapshot, { type = 'after.100.armed', state = 'armed', token = 99 })
+    assert(record.rejected and record.reason == 'stale')
+    fails(function() actor:send('after.100.armed') end, 'reserved')
+  end,
+
+  ['invokes deliver results, errors and callback events; exiting cancels them'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create {
+      id = 'inv', initial = 'idle', context = { name = 'n' },
+      actors = {
+        load = function(input) if input.fail then error('no such file', 0) end return input.name .. '!' end,
+        watch = function(input, send) send { type = 'TICK', n = 1 }; send { type = 'TICK', n = 2 }; return 'watched' end,
+      },
+      states = {
+        idle = { on = { LOAD = 'loading', FAIL = 'failing', WATCH = 'watching' } },
+        loading = { invoke = { src = 'load', input = function(c) return { name = c.name } end,
+          on_done = { target = 'ready', actions = assign { result = function(_, e) return e.output end } },
+          on_error = 'failed' }, on = { CANCEL = 'idle' } },
+        failing = { invoke = { src = 'load', input = function() return { fail = true } end, on_error = {
+          target = 'failed', actions = assign { error = function(_, e) return e.error end } } } },
+        watching = { invoke = { id = 'watcher', src = 'watch', on_done = 'idle' },
+          on = { TICK = { actions = assign { ticks = function(c, e) return (c.ticks or 0) + e.n end } } } },
+        ready = {}, failed = {},
+      },
+    }
+    local actor = chart:start { scheduler = clock }
+    local records = recorder(actor)
+    actor:send('LOAD')
+    assert(last(records).invokes[1].action == 'started' and last(records).invokes[1].src == 'load')
+    assert(clock.run_tasks() == 1 and actor:matches('ready') and actor:context().result == 'n!')
+    assert(last(records).invokes[1].action == 'done' and last(records).origin == 'invoke')
+
+    local failing = chart:start { scheduler = clock }
+    local failing_records = recorder(failing)
+    failing:send('FAIL'); clock.run_tasks()
+    assert(failing:matches('failed') and failing:context().error == 'no such file')
+    assert(last(failing_records).invokes[1].action == 'error' and last(failing_records).invokes[1].error == 'no such file')
+
+    local cancelled = chart:start { scheduler = clock }
+    local cancelled_records = recorder(cancelled)
+    cancelled:send('LOAD')
+    cancelled:send('CANCEL')
+    assert(last(cancelled_records).invokes[1].action == 'cancelled')
+    clock.run_tasks() -- the stale task runs to completion; its result is dropped.
+    assert(cancelled:matches('idle') and last(cancelled_records).event.type == 'CANCEL')
+
+    local watching = chart:start { scheduler = clock }
+    watching:send('WATCH'); clock.run_tasks()
+    assert(watching:matches('idle') and watching:context().ticks == 3)
+  end,
+
+  ['spawned child actors talk to their parent and finish into done events'] = function()
+    local clock = machine.manual_scheduler()
+    local child = machine.create {
+      id = 'item', initial = 'open', context = function(input) return { label = input.label } end,
+      states = {
+        open = { after = { [1000] = 'expired' }, on = {
+          PING = { actions = machine.send_parent(function(c) return { type = 'PONG', label = c.label } end) },
+          CLOSE = 'closed' } },
+        expired = {},
+        closed = { type = 'final', output = function(c) return c.label end },
+      },
+    }
+    local parent = machine.create {
+      id = 'list', initial = 'running', context = { pongs = '' },
+      states = { running = { on = {
+        ADD = { actions = machine.spawn(child, { id = function(_, e) return e.id end, input = function(_, e) return { label = e.label } end }) },
+        PING = { actions = machine.send_to(function(_, e) return e.id end, 'PING') },
+        PONG = { actions = assign { pongs = function(c, e) return c.pongs .. e.label end } },
+        REMOVE = { actions = machine.stop(function(_, e) return e.id end) },
+        ['done.actor.a'] = { actions = assign { closed = function(_, e) return e.output end } },
+      } } },
+    }
+    local seen = {}
+    local stop_inspecting = machine.inspect(function(record) seen[#seen + 1] = record end)
+    local actor = parent:start { scheduler = clock }
+    actor:send { type = 'ADD', id = 'a', label = 'A' }
+    actor:send { type = 'ADD', id = 'b', label = 'B' }
+    assert(join(actor:snapshot().children) == 'a,b' and actor:child('a'):matches('open'))
+    assert(actor:child('b').path == 'list/b' and #actor:children() == 2)
+    fails(function() actor:send { type = 'ADD', id = 'a', label = 'again' } end, 'already exists')
+    actor:send { type = 'PING', id = 'b' }
+    assert(actor:context().pongs == 'B')
+    actor:child('a'):send('CLOSE')
+    assert(actor:context().closed == 'A' and join(actor:snapshot().children) == 'b' and actor:child('a') == nil)
+    local b = actor:child('b')
+    actor:send { type = 'REMOVE', id = 'b' }
+    assert(#actor:children() == 0 and b:status() == 'stopped' and clock.open_scopes == 0)
+    clock.advance(2000) -- the stopped child's timer is dropped.
+    assert(b:matches('open'))
+    stop_inspecting()
+    local lifecycle, child_records = {}, 0
+    for _, record in ipairs(seen) do
+      if record.kind == 'actor' then lifecycle[#lifecycle + 1] = record.action .. ' ' .. record.actor end
+      if record.kind == 'transition' and record.actor == 'list/b' then child_records = child_records + 1 end
+    end
+    assert(join(lifecycle) == 'started list,started list/a,started list/b,stopped list/b', join(lifecycle))
+    assert(child_records >= 2)
+    assert(seen[1].graph.id == 'list')
+  end,
+
+  ['prefix descriptors, the state argument and done.actor positions'] = function()
+    local leaf = machine.create { id = 'leaf', initial = 'open', states = { open = { on = { CLOSE = 'closed' } }, closed = { type = 'final' } } }
+    local chart = machine.create {
+      id = 'tabs', initial = 'idle', context = { removed = '' },
+      states = {
+        idle = { on = {
+          ADD = { actions = machine.spawn(leaf, { id = function(_, e) return e.id end }) },
+          GO = { target = 'busy', guard = function(_, _, state) return #state.children >= 2 and state.matches('idle') end },
+          ['done.actor.*'] = { actions = assign { removed = function(c, e, state)
+            return c.removed .. e.id .. '@' .. e.index .. '/' .. #state.children .. ';' end } },
+        } },
+        busy = { on = { ['done.*'] = 'idle', ['*'] = { actions = assign { other = true } } } },
+      },
+    }
+    fails(function() machine.create { id = 'x', initial = 'a', states = { a = { on = { ['a*b'] = 'a' } } } } end, 'invalid event descriptor')
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    actor:send { type = 'ADD', id = 'a' }
+    assert(not actor:can('GO'))
+    actor:send { type = 'ADD', id = 'b' }
+    actor:send { type = 'ADD', id = 'c' }
+    assert(actor:can('GO'))
+    actor:child('b'):send('CLOSE')
+    actor:child('a'):send('CLOSE')
+    assert(actor:context().removed == 'b@2/2;a@1/1;', actor:context().removed)
+    actor:send { type = 'ADD', id = 'd' }
+    actor:send('GO')
+    actor:send('ANYTHING')
+    assert(actor:matches('busy') and actor:context().other)
+    actor:child('d'):send('CLOSE') -- done.actor.d matches 'done.*' before '*'.
+    assert(actor:matches('idle'))
+  end,
+
+  ['event schemas validate external events and drive accepted()'] = function()
+    local chart = machine.create {
+      id = 'schema', initial = 'clean',
+      events = { EDIT = { text = 'string' }, SAVE = {}, RESIZE = { width = 'integer', animate = 'boolean?' } },
+      states = {
+        clean = { on = { EDIT = 'dirty', RESIZE = {} } },
+        dirty = { on = { SAVE = 'clean', EDIT = {} } },
+      },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    fails(function() actor:send('UNKNOWN') end, 'UnknownEvent')
+    fails(function() actor:can('UNKNOWN') end, 'UnknownEvent')
+    fails(function() actor:send('EDIT') end, 'requires text')
+    fails(function() actor:send { type = 'EDIT', text = 1 } end, 'must be string')
+    fails(function() actor:send { type = 'EDIT', text = 'x', other = 1 } end, 'not declared')
+    fails(function() actor:send { type = 'RESIZE', width = 1.5 } end, 'must be integer')
+    assert(join(actor:accepted()) == 'EDIT,RESIZE')
+    actor:send { type = 'EDIT', text = 'x' }
+    assert(join(actor:accepted()) == 'EDIT,SAVE')
+  end,
+
+  ['observer records carry steps, rejections and plain context'] = function()
+    local chart = machine.create {
+      id = 'obs', initial = 'a', context = { n = 0 },
+      states = { a = { on = { GO = { target = 'b', guard = 'ok', actions = assign { n = 1 } } } }, b = {} },
+      guards = { ok = function() return true end },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local records = recorder(actor)
+    actor:send('NOPE')
+    local rejected = records[1]
+    assert(rejected.rejected and rejected.reason == 'no_transition' and rejected.actor == 'obs' and rejected.origin == 'external')
+    actor:send { type = 'GO', note = 'hi' }
+    local r = records[2]
+    assert(r.kind == 'transition' and r.handled and not r.rejected and r.event.note == 'hi')
+    assert(r.microsteps[1].transitions[1].guard == 'ok' and r.microsteps[1].transitions[1].source == 'a')
+    assert(r.microsteps[1].transitions[1].index == chart:graph().transitions[1].index)
+    assert(join(r.exited) == 'a' and join(r.entered) == 'b' and join(r.states) == 'b')
+    assert(type(r.context) == 'table' and r.context.n == 1)
+    assert(o.json.decode(o.json.encode(r)).context.n == 1)
+  end,
+
+  ['rejected events keep the same snapshot, so the signal is not written'] = function()
+    local chart = machine.create { id = 'w', initial = 'a', states = { a = { on = { GO = 'b' } }, b = {} } }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local before = machine.raw(actor:snapshot())
+    actor:send('NOPE')
+    assert(machine.raw(actor:snapshot()) == before)
+    actor:send('GO')
+    assert(machine.raw(actor:snapshot()) ~= before and actor:matches('b'))
+  end,
+
+  ['persist and restore map old state IDs onto a new chart'] = function()
+    local clock = machine.manual_scheduler()
+    local v1 = machine.create {
+      id = 'editor', initial = 'editing', context = { text = '', count = 1 },
+      states = {
+        editing = { initial = 'clean', states = { clean = { on = { TYPE = 'dirty' } }, dirty = { after = { [100] = 'autosaved' } }, autosaved = {} } },
+        closed = {},
+      },
+    }
+    local actor = v1:start { scheduler = clock }
+    actor:send('TYPE')
+    local saved = actor:persist()
+    assert(o.json.decode(o.json.encode(saved)).states[2] == 'editing.dirty')
+    -- Same chart: exact restore, timers restart.
+    local same = v1:start { scheduler = clock, snapshot = saved }
+    assert(same:matches('editing.dirty'))
+    clock.advance(100)
+    assert(same:matches('editing.autosaved'))
+    -- New chart renames dirty to modified, drops autosaved, and changes count's type.
+    local v2 = machine.create {
+      id = 'editor', initial = 'editing', context = { text = 'default', count = 'one', mode = 'insert' },
+      states = { editing = { initial = 'clean', states = { clean = {}, modified = { initial = 'typing', states = { typing = {}, paused = {} } } } } },
+    }
+    local mapped = v2:restore(saved, { renames = { ['editing.dirty'] = 'editing.modified' } })
+    assert(join(mapped.states) == 'editing,editing.modified,editing.modified.typing', join(mapped.states))
+    assert(mapped.context.text == '' and mapped.context.count == 'one' and mapped.context.mode == 'insert')
+    local restored = v2:start { scheduler = clock, snapshot = mapped }
+    assert(restored:matches('editing.modified.typing'))
+    -- Unknown states fall back to the nearest surviving ancestor.
+    local fallback = v2:restore({ machine = 'editor', states = { 'editing', 'editing.autosaved' }, context = {} })
+    assert(join(fallback.states) == 'editing,editing.clean')
+    fails(function() v2:start { snapshot = saved } end, 'use restore')
+  end,
+
+  ['the pure transition function is deterministic and side-effect free'] = function()
+    local ran = 0
+    local chart = machine.create {
+      id = 'pure', initial = 'a', context = { n = 0 },
+      states = { a = { on = { GO = { target = 'b', actions = { assign { n = 1 }, function() ran = ran + 1 end } } } },
+        b = { after = { [10] = 'a' } } },
+    }
+    local s0 = chart:initial()
+    local s1, effects = chart:transition(s0, 'GO')
+    local s1b = chart:transition(s0, 'GO')
+    assert(ran == 0 and s0.states[1] == 'a' and s0.context.n == 0)
+    assert(s1.states[1] == 'b' and s1.context.n == 1 and s1b.context.n == 1 and s1 ~= s1b)
+    assert(effects[1].kind == 'action' and effects[2].kind == 'timer_start' and effects[2].delay == 10)
+    assert(chart:can(s0, 'GO') and not chart:can(s1, 'GO'))
+  end,
+
+  ['the snapshot lives in one signal that drives the view'] = function(t)
+    local chart = machine.create {
+      id = 'counter', initial = 'idle', context = { n = 0 },
+      states = {
+        idle = { on = { INC = { actions = assign { n = function(c) return c.n + 1 end } }, LOCK = 'locked' } },
+        locked = { on = { UNLOCK = 'idle' } },
+      },
+    }
+    local actor = chart:actor { scheduler = machine.manual_scheduler() }
+    local started = o.signal(false)
+    t:mount(function()
+      return o.column { key = 'root',
+        o.text { key = 'count', text = tostring(actor:context().n) },
+        o.text { key = 'mode', text = actor:matches('locked') and 'locked' or 'idle' },
+        o.button { key = 'start', label = 'Start', enabled = not started(), on_press = function() started:set(true); actor:start() end },
+        o.button { key = 'inc', label = 'Increment', enabled = started() and actor:can('INC'), on_press = actor:sender('INC') },
+        o.button { key = 'lock', label = 'Lock', enabled = started() and actor:can('LOCK'), on_press = actor:sender('LOCK') },
+        o.button { key = 'unlock', label = 'Unlock', enabled = started() and actor:can('UNLOCK'), on_press = actor:sender('UNLOCK') },
+      }
+    end)
+    t:click('root/start')
+    t:click('root/inc'); t:click('root/inc')
+    assert(t:node('root/count').label == '2')
+    t:click('root/lock')
+    assert(t:node('root/mode').label == 'locked')
+    fails(function() t:click('root/inc') end, 'DevelopmentTargetDisabled')
+    t:click('root/unlock')
+    t:click('root/inc')
+    assert(t:node('root/count').label == '3' and t:node('root/mode').label == 'idle')
+  end,
+}

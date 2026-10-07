@@ -213,6 +213,7 @@ pub const UiBuild = struct {
         c.lua_pushcclosure(state, measureText, 1);
         c.lua_setfield(state, -2, "measure_text");
         try @import("forms.zig").install(state);
+        try @import("machine.zig").install(state);
         try self.components.init(state);
     }
 

@@ -1,0 +1,518 @@
+# Statecharts as the application model
+
+Status: Phase 0 (semantics) and Phase 1 (pure-Lua prototype). The prototype
+lives in [`src/lua/machine.lua`](../src/lua/machine.lua) as `ouro.machine`;
+tests are in [`tests/machine_test.lua`](../tests/machine_test.lua) and
+[`tests/machine_native.py`](../tests/machine_native.py).
+[`examples/documents`](../examples/documents) is ported to it.
+
+The core idea: **active states own lifetimes, effects and windows, and the UI is
+a function of the state snapshot.** Statecharts own behavior over time. They
+do not replace plain functions, the view, or the native editor.
+
+## 1. Supported subset
+
+We use SCXML semantics with an XState-like Lua surface. Supported:
+
+| Feature | Surface | Notes |
+| --- | --- | --- |
+| Hierarchy | `states = {...}`, `initial = 'key'` | `initial` is required. Lua tables have no order, so it cannot default to the first child. |
+| Parallel | `type = 'parallel'` | Every region is active at once. |
+| Final | `type = 'final'`, optional `output = fn` | Raises `done.state.<parent>`. A top-level final finishes the machine. |
+| Guards | `guard = 'name' \| fn` | Pure: `(context, event, state) -> boolean`. |
+| `assign` | `machine.assign(fn \| {field = value \| fn})` | The only way to change context. |
+| `raise` | `machine.raise(event \| fn)` | Adds an internal event to the current macrostep. |
+| `always` | `always = transition(s)` | Eventless transitions, checked after every microstep. |
+| `after` | `after = { [ms] = transition }` | Integer milliseconds. Started on entry, cancelled on exit. |
+| `invoke` | `invoke = { src, id?, input?, on_done?, on_error? }` | Work that lives exactly as long as its state. |
+| Spawned children | `machine.spawn(chart, {id, input})`, `machine.stop(id)`, `send_to`, `send_parent` | Keyed child actors, such as one per document or tab. |
+| Entry/exit | `entry = action(s)`, `exit = action(s)` | Actions run in document order. |
+| `on_done` | on compound/parallel states | Shorthand for `on = { ['done.state.<id>'] = ... }`. |
+| Tags | `tags = {'busy'}` | Use `actor:has_tag('busy')` in the view. |
+
+Not supported: **history states**, delayed `send`, `<data>`/`<script>`, and
+deep or shallow history targets. The `in` guard is spelled `state.matches(id)`
+inside a guard. Transition order within one state follows the event
+descriptor: the exact type first, then dotted prefixes (`done.actor.*`), then
+`*`. Child state keys sort lexically to give document order. That order fixes
+parallel entry order and conflict resolution.
+
+Transition targets resolve as follows:
+- `'sibling'`: a sibling of the source.
+- `'.child.grandchild'`: a descendant of the source.
+- `'#full.id'`: an absolute ID.
+
+A transition whose targets are all descendants of its source does not exit the
+source unless `reenter = true`. This is the default in SCXML internal
+transitions and XState v5. A transition that targets its own state re-enters
+it, which restarts its timers and invokes. A transition with no `target`
+only runs its actions.
+
+### Algorithm
+
+The prototype follows the SCXML algorithm without history:
+
+- **Microstep:** compute the exit set from each transition's domain, which is
+  the source, or the LCCA of source and targets when the transition re-enters.
+  Exit those states in reverse document order and run their `exit` actions.
+  Run the transitions' actions. Enter the entry set in document order. This
+  includes the default initial states of compound targets and every region of
+  any parallel state entered.
+- **Selection:** for each atomic state in document order, walk outward and take
+  the first enabled transition. Remove conflicts: when two exit sets intersect,
+  the transition whose source is a descendant wins. Otherwise the earlier
+  transition in document order wins.
+- **Macrostep (run to completion):** take one external event, then repeat:
+  take `always` transitions while enabled, and when none are, take the next
+  raised internal event. External events sent while a macrostep is running,
+  including events sent by effects, queue behind it. More than 1000
+  microsteps is an error (an eventless livelock).
+- **Atomic commit:** a macrostep is computed on copy-on-write data. If a guard,
+  assign or expression throws, the previous snapshot stays and the error
+  reaches the sender.
+- **Effects run after commit:** plain function actions, timers, invokes and
+  child messages run after commit. Function actions run in order. Each sees the
+  context as it was when it was reached in the macrostep. Timers and invokes
+  start at the end of the macrostep, only for states that are still active.
+  This matches SCXML's end-of-macrostep `<invoke>`. Their cancellation is
+  recorded when the state exits.
+
+## 2. Events
+
+An event is a table with a string `type` and flat payload fields:
+`{ type = 'RENAME', title = 'Draft' }`. `send('SAVE')` is shorthand for
+`{ type = 'SAVE' }`. Payloads are copied on send, and guards and actions get a
+read-only view.
+
+External events can be declared with schemas:
+
+```lua
+events = {
+  SAVE = {},
+  EDIT = { field = 'string', value = 'string' },
+  RESIZE = { position = 'number', animate = 'boolean?' },
+}
+```
+
+The field types are `string`, `number`, `integer`, `boolean`, `table` and `any`.
+A trailing `?` marks an optional field. When `events` is present, `send`
+rejects undeclared types (`UnknownEvent`), missing or mistyped fields and
+undeclared fields (`InvalidEvent`). `can` rejects undeclared types. Internal
+types are reserved and cannot be sent:
+
+| Type | Raised when |
+| --- | --- |
+| `ouro.init`, `ouro.restore` | The actor starts, from scratch or from a snapshot. |
+| `after.<ms>.<state>` | A timer fires. Carries `state` and the entry `token`. |
+| `done.invoke.<id>` / `error.invoke.<id>` | Invoked work returns or throws. Carries `output` or `error`, plus `state` and `token`. |
+| `done.state.<id>` | A compound or parallel state completes. Carries `output`. |
+| `done.actor.<child>` | A spawned child finishes. Carries `id`, `output` and the child's former `index`. |
+
+A timer or invoke event whose token does not match the current entry of its
+state is rejected as `stale`.
+
+**Actions, commands, shortcuts, palette entries and MCP calls are all external
+events with schemas.** One declaration serves validation, documentation and
+discovery. `actor:accepted()` lists the declared events the current
+configuration would take, guards included, so the palette and MCP `tools/list`
+can show exactly what is possible now.
+
+## 3. Snapshots
+
+A snapshot is immutable. A new table is created only when something changed:
+
+```lua
+{
+  machine  = 'document',          -- chart id
+  status   = 'active',            -- 'active' | 'done' | 'stopped'
+  states   = { 'open', 'open.io', 'open.io.idle', 'open.lifecycle', 'open.lifecycle.active' },
+  context  = { title = 'Untitled', text = '', revision = 0, saved_revision = 0 },
+  children = { 'document-1', 'document-2' },  -- spawned children, in spawn order
+  output   = nil,                 -- set when status == 'done'
+  -- runtime bookkeeping, not part of the persisted form:
+  entries  = { ['open.io.saving'] = 7 }, serial = 7,
+}
+```
+
+- **Stable state IDs.** An ID is the dotted path of keys from the root, such as
+  `open.io.saving`. The root is `''`. IDs do not depend on declaration order.
+  `matches(id)` rejects unknown IDs, so typos fail loudly.
+- **Active configuration.** `states` lists every active state except the root,
+  including compound ancestors and every parallel region, in document order.
+- **Serializable.** `actor:persist()` returns `machine`, `status`, `states`,
+  `context`, `output` and children as `{ id, snapshot }`. It deep-copies plain
+  data and fails on functions or cycles. The result round-trips through
+  `ouro.json`. Tokens are not persisted. Restoring re-enters states without
+  running entry actions, then restarts their timers and invokes.
+- **Rejected events do not write.** If no transition is taken, the snapshot
+  table is unchanged and the signal is not written.
+
+## 4. Context
+
+Context changes only through `assign`. Everything else reads it through
+**read-only views**: guards, expressions, function actions, `actor:context()`
+and the view. A view is native userdata over the underlying table. Indexing,
+`#`, `pairs` and `ipairs` work and recurse into nested tables. Any write raises
+`machine context is read-only`. Two views of the same table compare equal.
+
+Views are userdata because the app sandbox has no `setmetatable` and Lua 5.5
+`<const>` is binding-only. As a result, `type(view) == 'userdata'` and
+`next(view)` does not work. Use `machine.plain(view)` for a deep, serializable
+copy.
+
+`assign` produces a new shallow copy with the updates applied.
+`machine.unset` deletes a field. Updates that return views are unwrapped.
+Nested tables are replaced, never mutated in place: copy-on-write, by
+convention.
+
+## 5. Continuous values stay native
+
+Pointer position, hover, drag deltas, scroll offsets, animation progress, caret
+and selection, IME preedit and per-keystroke editing stay native. They are not
+states and not context. A chart sees committed facts:
+- `EDIT { field, value }` from `on_change`;
+- `RESIZE { position }` when a split moves;
+- `SELECTED { id }` when a list selection changes.
+
+Phase 5 native widget charts (button hover/pressed, focus, menus, modal editing)
+are internal, compiled in Zig and allocation-free. They are not app charts.
+
+## 6. Layering
+
+```diagram
+┌──────────────────────────────┐
+│ Domain charts (headless)     │  document: io.idle/io.saving, lifecycle.confirming
+│ testable and drivable by MCP │  no widgets, no windows
+└──────────────┬───────────────┘
+               │ snapshot (signal)
+┌──────────────▼───────────────┐
+│ UI charts (presentation only)│  palette open, selected tab, wizard step
+└──────────────┬───────────────┘
+               │
+┌──────────────▼───────────────┐      ┌───────────────────────────┐
+│ view(snapshot) → windows,    │─────▶│ plain functions           │
+│ dialogs, widgets             │      │ validate, encode, sort,   │
+└──────────────┬───────────────┘      │ format, derive (`dirty`)  │
+               │ events               └───────────────────────────┘
+               ▼
+          actor:send
+```
+
+- **Domain charts are headless.** The document chart knows `io.saving` and
+  `lifecycle.confirming`. It does not know that a dialog exists.
+- **UI charts hold presentation modes only.** Examples: palette open, which tab
+  is selected, which wizard step is showing.
+- **The view does the mapping.** `doc:matches('open.lifecycle.confirming')`
+  mounts the confirm dialog. A layer surface exists because
+  `launcher:matches('open')`.
+- **Computation stays in plain functions.** For example, `dirty` is
+  `revision ~= saved_revision`: a calculation, not a state. Rule of thumb: if
+  what can happen next depends on what happened before, use a chart. If it is
+  a calculation on current data, use a function.
+
+## 7. Widgets send events
+
+```lua
+-- Phase 3 target
+ouro.button { key = 'save', label = 'Save', send = 'SAVE' }
+-- enabled defaults to doc:can('SAVE'); on_press sends to the nearest actor
+```
+
+The prototype runs on today's widgets, so it spells this out:
+
+```lua
+ouro.button { key = 'save', label = 'Save', enabled = doc:can('SAVE'), on_press = doc:sender('SAVE') }
+```
+
+Registry-anchored callback closures go away. The enabled state and the action
+have one source of truth. A disabled button and a rejected MCP call fail for
+the same reason, and the inspector shows that reason.
+
+Some imperative calls must stay in callbacks for now: `ouro.start_drag`, and
+anything else that needs real press provenance. They report failures as events
+(`REPORT { message }`).
+
+## 8. Active states own task scopes
+
+Each state entry with `after` or `invoke` work opens one scope. Timers and
+invokes run inside it, and exiting the state closes it. The prototype uses a
+small scheduler seam:
+
+```lua
+scheduler.open()                 -- on entry: a scope for this state entry
+scheduler.run(scope, fn)         -- invoke: run fn in the scope
+scheduler.after(scope, ms, fn)   -- after: call fn in the scope after ms
+scheduler.close(scope)           -- on exit: cancel everything in it
+```
+
+- **Today (`machine.default_scheduler`).** `ouro.spawn` has no handle, so work
+  runs in application scope (`spawn_app`, falling back to `spawn`). A closed
+  scope only drops delivery. Each state entry also gets a token: `snapshot.entries[state]`.
+  Timer and invoke results carry it, and a mismatched token is rejected as
+  `stale`. A cancelled HTTP request therefore still runs to completion; only
+  its result is ignored.
+- **Phase 2.** A private native binding of open, spawn, close and alive
+  (native cancellable child scopes, on `origin/statecharts`) replaces the four
+  functions. Closing a scope cancels sleeping and in-flight work. Logical
+  timers can then follow a virtual clock for replay.
+- **Tests (`machine.manual_scheduler()`).** Virtual time comes from
+  `advance(ms)`. Queued invokes run when `run_tasks()` is called. `open_scopes`
+  counts live scopes. `ouroctl test` forbids wall-clock sleeps, and the sandbox
+  has no `coroutine` library, so invokes run to completion when they run.
+
+An invoke `src` is `function(input, send) ... return output end`. It runs as an
+Ouro task and may yield on Ouro I/O. `send` delivers events to the machine
+while the state is still active, for callback-style sources. A throw becomes
+`error.invoke.<id>` with the error value.
+
+## 9. Reload keeps state
+
+`chart:restore(persisted, { renames = { ['old.id'] = 'new.id' } })` maps a
+snapshot from an older chart onto the new one:
+
+1. Rename each old ID, then fall back to the nearest surviving ancestor.
+2. Build a legal configuration. In each compound state, choose the child that
+   contains a wanted state, otherwise its `initial`. Parallel states keep every
+   region.
+3. Carry context over field by field, keeping old values whose type still
+   matches the new initial context (or that the new context lacks).
+4. `chart:actor { snapshot = mapped }` re-enters without entry actions and
+   restarts timers and invokes.
+
+Today's hot reload discards the VM, including signals. The host has to keep
+`actor:persist()` across generations before reload can actually preserve
+state. That is Phase 3 work. The mapping itself is implemented and tested.
+
+## 10. Inspection hooks
+
+### Static graph: `chart:graph()`
+
+Plain, JSON-encodable data, computed once per chart:
+
+```lua
+{
+  format = 'ouro.machine.graph', version = 1, id = 'document', root = '',
+  states = {   -- document order; the root is first with id ''
+    { id = 'open.io.saving', key = 'saving', type = 'compound',  -- atomic|compound|parallel|final
+      parent = 'open.io', depth = 3, children = { 'open.io.saving.choosing', 'open.io.saving.writing' },
+      initial = 'open.io.saving.choosing', final = false,
+      after = { { delay = 500, event = 'after.500.open.io.saving' } },
+      invoke = { { id = 'write', src = 'write' } },    -- src is the actor name, or 'function'
+      entry = { 'snapshot_save' }, exit = {}, tags = { 'busy' }, description = nil },
+  },
+  transitions = {  -- document order; index is stable for the chart
+    { index = 12, source = 'open.io.idle', event = 'SAVE', kind = 'event',
+      -- kind: event | always | after | done | invoke.done | invoke.error
+      targets = { 'open.io.saving' },    -- nil for transitions that only run actions
+      guard = 'can_save', guarded = true, actions = { 'snapshot_save' }, reenter = false },
+  },
+  events = { { type = 'EDIT', fields = { field = 'string', value = 'string' } } },
+}
+```
+
+### Live records: `actor:observe(fn)` and `machine.inspect(fn)`
+
+`actor:observe(fn)` sees one actor. `machine.inspect(fn)` sees every actor,
+including spawned children. Both return an unsubscribe function, and observer
+errors are logged without breaking the machine. `machine.actors()` lists live
+actors, so a late-attaching tool can call `actor:snapshot()` and
+`actor.chart:graph()`.
+
+There is one record per processed event, including rejected ones:
+
+```lua
+{
+  kind = 'transition', actor = 'notes/document-2', machine = 'document', sequence = 14,
+  origin = 'external',       -- external | timer | invoke | child | init | restore | stop
+  event = { type = 'SAVE' },
+  handled = true, rejected = false, reason = nil,  -- reason: no_transition | stale | done | stopped
+  microsteps = {
+    { event = 'SAVE', transitions = { { index = 12, source = 'open.io.idle', targets = { 'open.io.saving' }, event = 'SAVE', guard = nil } },
+      exited = { 'open.io.idle' }, entered = { 'open.io.saving', 'open.io.saving.choosing' } },
+  },
+  exited = { 'open.io.idle' }, entered = { 'open.io.saving', 'open.io.saving.choosing' },
+  timers  = { { action = 'started', state = 'open.io.saving', delay = 500, event = 'after.500.open.io.saving', token = 9 } },
+  -- timer action: started | fired | cancelled
+  invokes = { { action = 'started', state = 'open.io.saving.choosing', id = 'choose', src = 'choose', token = 10 } },
+  -- invoke action: started | done | error (+ error) | cancelled
+  children = { { action = 'spawned', id = 'document-3', machine = 'document' } },
+  -- child action: spawned | stopped | done
+  actions = { 'snapshot_save' },   -- action names in execution order
+  states = { ... },                -- configuration after the step
+  status = 'active',
+  context = { ... },               -- plain deep copy of the context after the step
+}
+```
+
+Lifecycle records are `{ kind = 'actor', action = 'started', actor, machine,
+parent, graph }` and `{ kind = 'actor', action = 'stopped', actor, machine }`.
+Records are built only while an observer is attached. They answer questions
+like "why is this app waking up when idle?" through timers that are still
+started, and "why is Save disabled?" through rejected events and guards.
+
+## 11. API summary (prototype)
+
+```lua
+local machine = ouro.machine
+local chart = machine.create { id, initial, context, states, on, guards, actions, actors, events, ... }
+chart:graph()                      chart:initial(input)      chart:transition(snapshot, event)
+chart:can(snapshot, event)         chart:restore(persisted, {renames})
+local actor = chart:actor { input, scheduler, snapshot, charts, id }   -- create (render-safe)
+actor:start()  actor:stop()  actor:send(event)  actor:sender(event)
+actor:matches(id)  actor:can(event)  actor:has_tag(tag)  actor:accepted()
+actor:snapshot()  actor:context()  actor:states()  actor:status()  actor:output()
+actor:child(id)  actor:children()  actor:persist()  actor:observe(fn)
+machine.inspect(fn)  machine.actors()  machine.plain(v)  machine.unset
+machine.assign  machine.raise  machine.spawn  machine.stop  machine.send_to  machine.send_parent
+machine.default_scheduler  machine.manual_scheduler()
+```
+
+`chart:actor` computes the initial snapshot, which may include initial
+`assign`s, and stores it in one `ouro.signal`. It is safe in an `ouro.stateful`
+initializer. `start()` runs the deferred effects and must run in the task phase,
+like any signal write. Reads (`matches`, `can`, `context`, `snapshot`) go
+through the signal, so a mounted build that reads them rebuilds when the
+snapshot changes.
+
+## 12. Sketches
+
+### Documents (implemented)
+
+There are two charts. `notes` is the application: open documents, selection,
+the split, and the close-window walk. `document` is spawned once per open note.
+
+```lua
+document = machine.create {
+  id = 'document', initial = 'open',
+  events = { EDIT = {field='string', value='string'}, SAVE = {}, SAVE_AS = {}, CLOSE = {},
+             CANCEL = {}, DISCARD = {}, REPORT = {message='string'} },
+  states = {
+    open = { type = 'parallel', states = {
+      io = { initial = 'idle', states = {
+        idle   = { on = { SAVE = 'saving', SAVE_AS = {target='saving', actions=assign{save_as=true}} } },
+        saving = { initial = 'choosing', entry = 'snapshot_save', states = {     -- bytes + revision at save start
+          choosing = { always = {target='writing', guard='has_path'},
+                       invoke = { src='choose', on_done={target='writing', actions='set_target'},
+                                  on_error={target='#open.io.idle', actions='report_unless_canceled'} } },
+          writing  = { invoke = { src='write', on_done={target='#open.io.idle', actions='saved'},
+                                  on_error={target='#open.io.idle', actions='report'} } },
+        }},
+      }},
+      lifecycle = { initial = 'active', states = {
+        active     = { on = { CLOSE = { {target='confirming', guard='unsafe'}, {target='#closed'} } } },
+        confirming = { initial = 'prompt', on = { CANCEL = {target='active', actions=send_parent('CLOSE_CANCELED')} },
+          states = {
+            prompt   = { on = { SAVE = 'awaiting', DISCARD = {target='#closed', guard='idle'} } },
+            awaiting = { always = { {target='#closed', guard='saved_clean'}, {target='prompt', guard='save_finished'} } },
+          }},
+      }},
+    }},
+    closed = { type = 'final' },
+  },
+}
+```
+
+- `dirty(c)` is a plain function: `c.revision ~= c.saved_revision`. A save that
+  finishes after newer edits records `saved_revision` from its snapshot, so the
+  document stays dirty. There are no serial numbers or `save_active` identity
+  checks.
+- The dialog's Save is the same `SAVE` event. `io.idle` starts saving and
+  `lifecycle.prompt` moves to `awaiting` in one microstep, because both
+  parallel regions take it. While a save is running, `can('SAVE')` is false.
+  That replaces `begin_save`'s "Save already in progress" error and the
+  `enabled = not d.saving` checks.
+- `notes` holds `running.open` and `running.closing.walking`. `CLOSE_WINDOW`
+  captures the open tabs, then walks: it selects the first unsafe child and
+  sends it `CLOSE`. `done.actor.*` re-enters `walking`. A child's `CANCEL`
+  sends `CLOSE_CANCELED`, which returns to `open`. No unsafe children left, or
+  closing the last tab, leads to the `quitting` final state, whose entry
+  persists the session and exits.
+- The view maps `doc:matches('open.lifecycle.confirming')` to the dialog and
+  `doc:matches('open.io.saving')` to disabled Save buttons. The compositor
+  close request is just `notes:sender('CLOSE_WINDOW')`.
+
+### Layer-shell launcher
+
+```lua
+launcher = machine.create {
+  id = 'launcher', initial = 'hidden', context = { query = '', entries = {}, index = 1 },
+  events = { TOGGLE = {}, QUERY = {text='string'}, MOVE = {delta='integer'}, ACTIVATE = {}, CLOSE = {} },
+  actors = { scan = function() return ouro.xdg.applications.list() end,
+             launch = function(entry) return ouro.xdg.applications.prepare_launch(entry) --[[ + spawn ]] end },
+  states = {
+    hidden = { on = { TOGGLE = 'open' } },
+    open = { initial = 'loading', on = { TOGGLE = 'hidden', CLOSE = 'hidden' },   -- CLOSE = Escape or compositor close
+      after = { [60000] = 'hidden' },                                            -- idle auto-hide, cancelled on exit
+      states = {
+        loading  = { invoke = { src='scan', on_done={target='ready', actions=assign{entries=output}},
+                                on_error='failed' } },
+        ready    = { on = { QUERY = {actions=assign{query=..., index=1}}, MOVE = {actions=assign{index=...}},
+                            ACTIVATE = {target='launching', guard='has_match'} } },
+        launching = { invoke = { src='launch', input=selected_entry, on_done='#hidden', on_error='ready' } },
+        failed   = { on = { QUERY = 'loading' } },
+      }},
+  },
+}
+-- view(snapshot): the surface exists only while open.
+windows = function()
+  if not launcher:matches('open') then return {} end
+  return { ouro.layer_surface { id='launcher', layer='overlay', keyboard_interactivity='exclusive',
+    on_close_request = launcher:sender('CLOSE'), content = function() return results(launcher) end } }
+end
+```
+
+Closing the surface (`hidden`) cancels the scan and the auto-hide timer,
+because they belong to `open`. Ranking results is a plain function of
+`query` and `entries`. The keyboard binding `Super` sends `TOGGLE` as an
+external event, and so can MCP.
+
+### Contacts
+
+Contacts is in-memory today. It has no chart-worthy behavior except
+selection, renaming and the presentation style:
+
+```lua
+book = machine.create {
+  id = 'contacts', initial = 'browsing', context = { contacts = seed, selected = 'ada', style = 'light' },
+  events = { SELECT = {id='string'}, RENAME = {id='string', name='string'}, TOGGLE_STYLE = {}, QUIT = {} },
+  guards = { known = function(c, e) return index_of(c.contacts, e.id) ~= nil end },
+  states = {
+    browsing = { on = {
+      SELECT = { guard='known', actions=assign{selected=function(_, e) return e.id end} },
+      RENAME = { guard='known', actions=assign{contacts=function(c, e) return renamed(c.contacts, e.id, e.name) end} },
+      TOGGLE_STYLE = { actions=assign{style=function(c) return c.style=='light' and 'terminal' or 'light' end} },
+      QUIT = 'quit' } },
+    quit = { type = 'final', entry = function() ouro.exit(0) end },
+  },
+}
+```
+
+The three MCP actions (`GetContacts`, `SelectContact`, `RenameContact`) become
+the declared `SELECT`/`RENAME` events. `ContactNotFound` is a rejected event
+(the guard fails), and `GetContacts` is a snapshot read. The rename draft
+stays native text-input state until "Apply name" sends `RENAME`. A one-state
+chart here is ceremony compared with three signals. It earns its keep only
+through the shared schema and MCP surface, and through inspection.
+
+## 13. Open questions
+
+- **Do signals survive?** The prototype keeps exactly one signal per actor.
+  The lean is to keep only derived read-only selectors.
+- **Fire-and-forget I/O.** Reading a file in response to "Open…" has no state
+  of its own. Options: a spawned one-shot child, an invoke on a short-lived
+  state, or leaving it in the callback. The documents port leaves the chooser
+  and reads in the callback and sends `ADD`.
+- **Duplicated facts across actors.** The parent tracks each child's file path
+  for the session (`SAVED { id, path }`) while the child owns it for display.
+  Parent guards cannot read child snapshots. Should they, or should a child
+  publish selected fields into the parent snapshot?
+- **Copy-on-write by convention.** Nested values in context are not frozen;
+  views protect reads, but an action can still mutate a table it created
+  before assigning it.
+- **Document order from sorted keys** surprises people writing parallel regions
+  whose order matters. Should parallel regions be ordered with an array syntax?
+- **Effects see stale context.** Function actions run after commit, with the
+  context of their point in the macrostep. This is SCXML-consistent but easy
+  to misread.
+- **Input provenance.** Drag and other press-provenance calls cannot move into
+  invokes, because spawned tasks lose provenance.

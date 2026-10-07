@@ -40,6 +40,7 @@ test {
     _ = @import("image_import.zig");
     _ = @import("callbacks.zig");
     _ = @import("components_test.zig");
+    _ = @import("machine.zig");
     _ = @import("diagnostic.zig");
     _ = @import("images_test.zig");
     _ = @import("prepared_build.zig");
