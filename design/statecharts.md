@@ -4,7 +4,8 @@ Status: Phase 0 (semantics) and Phase 1 (pure-Lua prototype). The prototype
 lives in [`src/lua/machine.lua`](../src/lua/machine.lua) as `ouro.machine`;
 tests are in [`tests/machine_test.lua`](../tests/machine_test.lua) and
 [`tests/machine_native.py`](../tests/machine_native.py).
-[`examples/documents`](../examples/documents) is ported to it.
+[`examples/documents`](../examples/documents) and [`examples/contacts`](../examples/contacts)
+are ported to it.
 
 The core idea: **active states own lifetimes, effects and windows, and the UI is
 a function of the state snapshot.** Statecharts own behavior over time. They
@@ -573,33 +574,60 @@ because they belong to `open`. Ranking results is a plain function of
 `query` and `entries`. The keyboard binding `Super` sends `TOGGLE` as an
 external event, and so can MCP.
 
-### Contacts
+### Contacts (implemented)
 
-Contacts is in-memory today. It has no chart-worthy behavior except
-selection, renaming and the presentation style:
+[`examples/contacts`](../examples/contacts) loads its address book from an
+optional HTTP server (`server.json` in its config directory) or the built-in
+sample, and saves renames with `PUT`. `contacts` is the domain chart and
+`appearance` (`light` / `terminal`) the only UI chart.
 
 ```lua
 book = machine.create {
-  id = 'contacts', initial = 'browsing', context = { contacts = seed, selected = 'ada', style = 'light' },
-  events = { SELECT = {id='string'}, RENAME = {id='string', name='string'}, TOGGLE_STYLE = {}, QUIT = {} },
-  guards = { known = function(c, e) return index_of(c.contacts, e.id) ~= nil end },
+  id = 'contacts', initial = 'loading', context = { contacts = {}, pending = {}, draft = '' },
+  events = { SELECT = {id='string'}, EDIT = {value='string'}, RENAME = {id='string', name='string'}, RETRY = {}, QUIT = {} },
   states = {
-    browsing = { on = {
-      SELECT = { guard='known', actions=assign{selected=function(_, e) return e.id end} },
-      RENAME = { guard='known', actions=assign{contacts=function(c, e) return renamed(c.contacts, e.id, e.name) end} },
-      TOGGLE_STYLE = { actions=assign{style=function(c) return c.style=='light' and 'terminal' or 'light' end} },
-      QUIT = 'quit' } },
-    quit = { type = 'final', entry = function() ouro.exit(0) end },
+    loading = { invoke = { src='load', on_done={target='ready', actions='loaded'}, on_error={target='failed', actions='fail'} },
+                on = { QUIT = 'exiting' } },
+    failed  = { on = { RETRY = 'loading', QUIT = 'exiting' } },
+    ready = { type = 'parallel', order = { 'sync', 'lifecycle' },
+      on = { SELECT = {guard='known', actions='select'}, EDIT = {actions='edit'}, RENAME = {guard='renames', actions='rename'} },
+      states = {
+        sync = { initial = 'idle', states = {
+          idle     = { always = { target='saving', guard='pending' } },
+          saving   = { entry = 'begin_save',          -- the record as it was when the save started
+                       invoke = { src='save', on_done={target='idle', actions='saved'}, on_error={target='retrying', actions='fail'} } },
+          retrying = { after = { [5000] = 'saving' }, on = { RETRY = 'saving' } },
+        }},
+        lifecycle = { initial = 'running', states = {
+          running  = { on = { QUIT = 'quitting' } },
+          quitting = { always = {target='#exiting', guard='settled'}, after = { [5000] = '#exiting' }, on = { QUIT = '#exiting' } },
+        }},
+      }},
+    exiting = { invoke = { src='exit', on_done='exited', on_error='exited' } },   -- actions cannot exit
+    exited  = { type = 'final' },
   },
 }
 ```
 
-The three MCP actions (`GetContacts`, `SelectContact`, `RenameContact`) become
-the declared `SELECT`/`RENAME` events. `ContactNotFound` is a rejected event
-(the guard fails), and `GetContacts` is a snapshot read. The rename draft
-stays native text-input state until "Apply name" sends `RENAME`. A one-state
-chart here is ceremony compared with three signals. It earns its keep only
-through the shared schema and MCP surface, and through inspection.
+- `RENAME` applies locally at once and appends the id to `pending`, an
+  ordered set. `sync` writes one record at a time. A reply replaces the local
+  record only if the name still matches what was sent; otherwise the id stays
+  pending and the newer name is written next. There are no serials.
+- `quitting.settled` reads the other region: nothing pending, or
+  `ready.sync.retrying`. Quitting cancels an in-flight `PUT` only at the
+  deadline or on a second Quit.
+- The MCP actions send events to this actor. `SelectContact` checks
+  `book:can(event)` first and maps a rejection to `ContactNotFound`.
+  `RenameContact` checks the id and `model.check_name` itself, because the
+  `renames` guard also rejects unchanged names, which MCP treats as a no-op.
+  `GetContacts` reads `machine.plain(context.contacts)`. Each handler first
+  waits for `loading` to end, by polling `ouro.sleep(10)`, because nothing
+  else can wait for a snapshot.
+- The rename draft is context (`EDIT`), not native text-input state. It resets
+  on selection and when the selected contact is renamed elsewhere, so it is
+  behavior and not just a field.
+- Apply name is enabled from `book:can{type='RENAME', id, name=draft}`, so the
+  button and MCP refuse empty names for the same reason.
 
 ## 13. Open questions
 
@@ -614,6 +642,14 @@ through the shared schema and MCP surface, and through inspection.
 - ~~Document order from sorted keys~~ **Resolved:** keep XState's map form and
   required `initial`. Parallel states may declare `order`; without it, keys sort.
 - ~~Yielding in function actions~~ **Resolved:** rejected natively (§1).
+- **Request/response over events.** An MCP handler sends an event, but cannot
+  learn whether it was taken (`send` returns nothing) or wait for a later
+  snapshot. Contacts duplicates guard checks with `can` and polls with
+  `ouro.sleep` while loading. Candidates: `send` returns the handled/rejected
+  record, and a native `actor:wait_for(predicate, timeout)` (XState's
+  `waitFor`) built on signal change notification.
+- **Two schemas per command.** Chart `events` and MCP `inputSchema` describe
+  the same payload in two languages. Phase 3 should derive one from the other.
 - **Effects see stale context.** Function actions run after commit, with the
   context of their point in the macrostep. This is SCXML-consistent but easy
   to misread.

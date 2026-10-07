@@ -1,10 +1,36 @@
 # Contacts
 
-A desktop application with optional schema-validated MCP tools. Its UI uses
-`ouro.app`, `run`, windows, widgets, signals, and ordinary Lua functions; it does
-not need native plugins or shell APIs. The sample address book and selection are
-in memory; they reset after exit or source reload. No real address-book storage
-or portal integration is implied.
+A desktop application with optional schema-validated MCP tools, written as
+statecharts (see [design/statecharts.md](../../design/statecharts.md)). It does
+not need native plugins or shell APIs.
+
+- `charts.lua` holds the behavior. The headless `contacts` chart loads the
+  address book, tracks selection and the rename draft, applies renames at once,
+  and saves them in the background, one at a time, retrying after a failure.
+  Quit waits up to five seconds for queued saves. The `appearance` chart holds
+  the only presentation mode, light or terminal style.
+- `app.lua` is the view over the two snapshots, the services (HTTP, the
+  built-in sample, exit), and the MCP actions, which send events to the same
+  chart the window uses.
+- `model.lua` holds plain functions: the sample records, lookups,
+  copy-on-write updates, name validation, and server body decoding.
+
+By default the address book is the built-in sample, kept in memory; it resets
+after exit or source reload. No real address-book storage or portal integration
+is implied. To use a server instead, write
+`$XDG_CONFIG_HOME/dev.ourokit.contacts/server.json`:
+
+```json
+{"version": 1, "url": "http://127.0.0.1:8080/contacts"}
+```
+
+Contacts then loads `GET <url>`, which must return
+`{"contacts": [{"id", "name", "email"}, ...]}`, and saves each rename with
+`PUT <url>/<id>` and the body `{"name": "..."}`. The server replies
+`{"contact": {...}}`, and its copy replaces the local record unless the name
+changed again meanwhile. Any status other than 200 is a failure: a failed load
+shows Retry, and a failed save keeps the local name, shows the error and Retry
+now, and tries again after five seconds.
 
 The list contains 500 synthetic contacts with three different note lengths.
 `ouro.virtual_list` measures row heights and mounts only the visible range plus
@@ -13,8 +39,10 @@ no avatar metadata use seeded initials. This is not an image-load-error fallback
 The source SVGs are included; regenerate PNGs with `magick -background none
 assets/ada.svg assets/ada.png` (and the equivalent Grace command).
 
-Select a contact, edit its name, and click Apply name. Selection and edits live
-outside row lifetimes, so scrolling rows out of view does not discard them.
+Select a contact, edit its name, and click Apply name. Apply name is enabled
+exactly when the chart would accept the rename: a known contact and a changed,
+nonempty, single-line name. Selection and edits live in the chart, outside row
+lifetimes, so scrolling rows out of view does not discard them.
 Terminal style toggles font, colors, and control geometry around the same tree.
 The generic viewport handles wheel/Up/Down/Home/End/Page Up/Page Down scrolling;
 Tab and Enter operate the row buttons. Unlike the original three-item listbox,
@@ -22,6 +50,10 @@ arrow keys scroll rather than change the selected contact.
 
 `mail.svg` and `log-out.svg` are Lucide 0.468.0 icons, distributed with
 `assets/LUCIDE-LICENSE`. Avatar artwork follows this repository's license.
+
+`python3 tests/contacts.py` drives the charts headless with fake services, then
+runs the app with `--mcp --headless` against a loopback HTTP server.
+`tests/demo_apps.py` checks the window on a Weston X11 display.
 
 ## Direct development run
 
@@ -106,12 +138,16 @@ ouro.exit(0)
 ```
 
 The calls return data/change selection without altering desktop lifecycle.
-Renaming updates the live UI through
-the same shared signal. Missing IDs return an `isError: true` tool result with
+Each call sends an event to the same address book chart the window uses, so
+renaming updates the live UI at once; with a server, the PUT follows in the
+background and the call returns the local record. The first call starts the
+chart and waits for the address book to load; a failed load returns
+`LoadFailed` with the message. Empty or multi-line names return `InvalidName`,
+the same rule that disables Apply name. Missing IDs return an `isError: true` tool result with
 `structuredContent.error.code = "ContactNotFound"` and the ID in
 `structuredContent.error.parameters.id`. The native runtime validates arguments
 and successful output against each action's JSON Schemas. `GetContacts` returns
-all 500 records. Runtime status/reload exist only on an explicitly enabled
+every record (500 for the sample). Runtime status/reload exist only on an explicitly enabled
 development endpoint, never in the production catalog. No `initialize`
 handshake or legacy endpoint is supported. Closing the last window drains
 pending calls/output and exits; Quit explicitly requests exit. A deliberately
