@@ -738,17 +738,48 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
   invokes run to completion when they run.
 - **Effects run in the sender's task, not in a state scope.** That is why
   function actions are atomic (§1).
-- **Still open: logical timers.** `after` still uses wall-clock `ouro.sleep`.
-  Replay on a virtual clock needs the scope's timers to follow a host clock.
+- **Logical time.** Every scheduler has a clock (`scheduler.clock()`, in
+  ms). The default scheduler's is a **logical clock** (`machine.clock`,
+  built by `machine.logical_clock`):
+  - It reads one instant per external input (§14): entering an input syncs
+    it, and it stays frozen for the macrostep and its effects. Guards,
+    assigns, records, `pending_timers()` and `machine.now()` agree.
+  - `after` timers sit in one queue ordered by deadline, then start order.
+    `deadline = clock when started + delay`. A firing runs *at its
+    deadline*: the clock reads the deadline while it is processed, even if
+    the host woke late. Every timer due by wall time fires before the next
+    external input is processed. A timer started while one fires counts from
+    that deadline, so periodic ticks never drift.
+  - One native wake task (a scope from `scopes.zig` and one `ouro.sleep`)
+    sleeps until the earliest deadline; an earlier timer replaces it. Closing
+    a state's scope drops its timers. Per-entry tokens still guard delivery.
+  - **Live** (the Wayland host, `ouroctl run`, including `--headless`), the
+    clock follows the host's monotonic time between inputs.
+  - **Virtual** in deterministic hosts (Storybook playback and `ouroctl
+    test`, where wall-clock sleeps are disabled): the host sets
+    `machine.virtual_clock` and only `machine.advance(ms)` moves time.
+    `t:advance(ms)` in `ouroctl test` advances and settles the mounted UI.
+    `manual_scheduler()` keeps its own virtual clock, and replay uses one
+    per generation (§14).
+
+  The order of firings and their instants is a function of the inputs and
+  their times, so a recording replays exactly. The queue and the clock are
+  Lua over the native wake task: one crossing per armed deadline, not per
+  timer. Porting the queue to Zig is possible if profiling asks for it.
 - **`after` delays are constants.** They are the integer keys of the `after`
   table, fixed when the chart is created; a delay computed from context is
   not supported. Use a fixed tick that re-enters its state
   (`{ target = 'running', reenter = true }`) and count, or one state per delay.
-- **Missing: a millisecond clock for apps.** Lua's `os.time()` has one-second
-  resolution, and the runtime's monotonic clock is private. So a stopwatch
-  counts `after` ticks, and its elapsed time falls behind wall time by the
-  timer latency of each tick. The proposed fix is a scheduler-backed clock
-  readable from assigns, virtual under `manual_scheduler`.
+- **A millisecond clock for apps.** `machine.now()` returns the logical time
+  of the scheduler running the current macrostep, and `actor:now()` the
+  actor's scheduler clock. Both work in guards, assigns, expressions and
+  actions. Outside a macrostep `machine.now()` reads the default clock.
+  Timer events carry `time_ms`, their fire time (the deadline). The clock is
+  virtual under `manual_scheduler`, in `ouroctl test` and in replay, so tests
+  and recordings stay deterministic. The stopwatch computes
+  `elapsed = banked + (now - started_at)` instead of counting ticks
+  (`tests/stopwatch_test.lua`, `tests/replay_test.lua` 'a live logical clock
+  fires late wakes at their deadlines…').
 
 An invoke `src` is `function(input, send) ... return output end`. It runs as an
 Ouro task and may yield on Ouro I/O. `send` delivers events to the machine
@@ -982,9 +1013,9 @@ zig-out/bin/ouroctl storybook snapshot tools/statechart-visualizer/storybook.lua
 ```
 
 When attached, it polls `runtime.statecharts`: every 200 ms while idle, and
-again immediately whenever it receives a full page. Open: push delivery
-through a resource subscription instead of polling, and deterministic
-record/replay (replay thread).
+again immediately whenever it receives a full page. It also loads a recorded
+log (§14) and scrubs it step by step. Open: push delivery through a resource
+subscription instead of polling.
 
 ## 11. API summary (prototype)
 
@@ -1009,6 +1040,9 @@ actor:handles(type)  actor:pending_timers()  actor:pending_invokes()
 machine.inspect(fn)  machine.actors()  machine.strict  machine.reserved_prefixes
 machine.persist_roots()  machine.carry(entries)  machine.release()
 machine.default_scheduler  machine.token_scheduler  machine.manual_scheduler()  machine.native_scopes
+machine.now()  actor:now()  machine.advance(ms)  machine.clock  machine.virtual_clock  machine.logical_clock(opts)
+machine.recorder(write, opts)  machine.replay(log, opts) -> report  machine.replay_text(report)
+machine.paths(chart, opts)  machine.paths_log(chart, result)  machine.charts()
 ```
 
 `chart:actor` computes the initial snapshot, which may include initial
@@ -1255,3 +1289,175 @@ book = machine.create {
   to misread.
 - **Input provenance.** Drag and other press-provenance calls cannot move into
   invokes, because spawned tasks lose provenance.
+
+## 14. Record, replay and generated tests
+
+Charts hold all application state (§6). So the inputs that cross into the
+root actors fully determine app behavior, and a log of them replays.
+
+### Inputs and boundaries
+
+An input enters the system when no actor is processing:
+- a send from a widget, MCP, app code or a component machine;
+- a runtime delivery, such as a surface event;
+- a timer firing;
+- an invoke or spawned-task result, or an invoke's `send` callback;
+- a root actor's start, stop or held work release.
+
+Everything an input causes is internal and a function of the charts:
+child sends, `send_parent`, spawns, `always` chains and function actions.
+`machine.lua` marks each input as a *boundary*. Entering one syncs the
+scheduler clock (§8), so due timers fire first. An installed recorder or
+replayer (`M._hooks`) sees every boundary of a **recorded tree**. That is a
+root actor on the default scheduler, or the replayer's, plus its children.
+Component machines (§6) are not recorded: they are per-instance UI state,
+recreated by rendering and not carried by reload either. A component's
+effect that sends to a root actor is an input with origin `component`.
+
+### Recording
+
+`ouroctl run --dev` records by default to
+`$XDG_STATE_HOME/ourokit/recordings/<application id>.jsonl`, the last
+development run of each app. `ouroctl run --record <log.jsonl>` records
+anywhere, including production, `--mcp` and `--headless`. The host opens one
+file per process. Every source generation installs `machine.recorder`
+before app code runs, so reloads continue the same log. The recorder writes
+each line synchronously; a failed write stops recording, not the app.
+
+**Format: JSON lines, `ouro.machine.log` version 1.** The first line is the
+header. Each later line is one input with what it caused:
+
+```json
+{"format":"ouro.machine.log","version":1,"t0":1782223,"app":"dev.ourokit.stopwatch"}
+{"k":"start","t":0,"a":"stopwatch","m":"stopwatch","input":{},"r":[{"a":"stopwatch","e":"ouro.init","tr":[]}],"s":{"stopwatch":{"states":["clock","clock.idle","settings","settings.closed"],"status":"active","children":[],"context":{"elapsed":0,"laps":[]}}}}
+{"k":"event","t":20713,"a":"stopwatch","o":"widget","e":{"type":"START"},"r":[{"a":"stopwatch","e":"START","tr":[1]}],"s":{"stopwatch":{"states":["clock","clock.running","settings","settings.closed"],"context":{"started_at":1802936}}}}
+{"k":"timer","t":20813,"a":"stopwatch","o":"timer","e":{"type":"after.100.clock.running","state":"clock.running","token":6,"time_ms":1803036},"r":[{"a":"stopwatch","e":"after.100.clock.running","tr":[2]}],"s":{"stopwatch":{"context":{"elapsed":100}}}}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `t0` (header) | Logical ms of `t = 0`: host monotonic time when the log opened. Contexts may hold absolute `machine.now()` values, so replay runs its clock at `t0 + t`. |
+| `k` | `start`, `event`, `timer`, `invoke`, `task`, `stop`, `release`, `reload` or `released` |
+| `t` | Logical ms since `t0`: the input's instant, or a timer's deadline |
+| `a` | Actor path, such as `notes/document.2` |
+| `o` | Origin: `widget`, `callback` (`actor:sender`), `mcp` (`machine.actions`), `invoke` (a result or an invoke's `send`), `child` (a task result), `timer`, `surface`, `runtime`, `component`, `app` (any other app code; hosts may set `machine._origin`, e.g. `activation`, around a synchronous hook) |
+| `e` | The event as delivered, payload included. Invoke and task results carry `output` or `error`. |
+| `m`, `input` / `snapshot` | On `start`: the chart id and the actor's `input`. A restored or carried actor gets its persisted snapshot instead (§3). An input that is not plain data (injected services) falls back to the initial snapshot and marks the step `lossy`. |
+| `r` | Compact records for every actor step the input caused: actor, event type, transition indices (`chart:graph()`), and rejection reason `x` |
+| `s` | Snapshot deltas of the recorded actors that changed: `states`, `status`, `children` ids, `output`, changed top-level `context` keys, and `unset` keys. Copy-on-write makes the comparison an identity check per key. |
+| `err` | The error the input raised, if any |
+
+Reload writes `reload` first. The candidate's lines are held until its
+commit (`machine.release()`): carried actors' `start` lines with snapshots,
+the events `run` sent, then `release` per actor and `released`. A failed
+candidate leaves nothing behind.
+
+### Replay
+
+```sh
+ouroctl replay <log.jsonl> [application.lua|ouro.json|directory] [--json]
+```
+
+Replay loads the application's modules in the deterministic test host
+without calling `run`, so the charts get created. `machine.charts()`
+remembers every chart by id. Then `machine.replay(log)` runs the inputs
+against those charts:
+- **Clock.** Each generation gets a virtual replay scheduler, a logical
+  clock at `t0 + t`. Before each input the replayer advances to the input's
+  `t`, so timers fire on their own at their deadlines, exactly as live. A
+  `timer` line is therefore a check, not an input.
+- **Stubs.** Invokes and spawned tasks never run. The scheduler keeps their
+  `complete`/`send` handles (`scheduler.run(scope, fn, info)`), and a
+  recorded result completes the matching one. With no running invoke to
+  complete, replay reports the divergence.
+- **Events.** Events are delivered as recorded. Live sends were validated,
+  and an invalid send never reaches the log.
+- **Reload.** A `reload` line starts a new generation: the old actors stop,
+  `machine.carry({})` holds restored work, and the first `release` or
+  `released` line calls `machine.release()`.
+
+Replay records what it observes with the same recorder, then compares it
+line by line with the log: kinds, times, events, compact records and
+snapshot deltas. **The first line that differs is the divergence.** The
+report names the input, and lists field differences against the full
+snapshots rebuilt from deltas. Here a chart's `after` delay changed from 40
+to 30 ms:
+
+```text
+DIVERGED at step 5 (log line 6, t=437 ms): replay produced timer after.30.green on signal at t=427 where the recording has timer after.40.green on signal
+  matched 4 of 19 entries before it
+  e                                        recorded {"type":"after.40.green","time_ms":1697811,"token":5,"state":"green"}
+                                           replayed {"type":"after.30.green","state":"green","token":5,"time_ms":1697801}
+  t                                        recorded 437
+                                           replayed 427
+```
+
+The exit status is 0 for identical replays, 1 for a divergence. `--json`
+returns the report with the replayed lines. In Lua, `machine.replay(text or
+lines, {charts = {id = chart}})` returns `{ok, compared, divergence =
+{step, line, t, message, recorded, replayed, differences}}`, and
+`machine.replay_text(report)` formats it.
+
+**Limits.** Replay reproduces chart behavior, not the world:
+- function actions run again, so their side effects (prints, signals they
+  write outside charts) repeat;
+- charts must be created when the app module loads, not inside `run`;
+- context values that are not JSON (functions, userdata) are recorded as
+  markers and cannot be reproduced;
+- component machines are not recorded.
+
+### Generated tests
+
+```sh
+ouroctl test --generate <application> [--output <dir>] [--from <log.jsonl>]... [--depth <n>]
+ouroctl test examples/stopwatch          # runs examples/stopwatch/tests/*_test.jsonl
+```
+
+`machine.paths(chart, options)` searches for event paths that reach every
+state of the chart's graph and take every transition. It works breadth
+first, expanding first the paths that reached something new.
+- **Real runs.** A search node is a path of inputs, re-run on a fresh actor
+  with a replay scheduler. Guards, assigns, timers and stubbed invokes
+  behave as in replay, and `always` chains count the states they pass
+  through.
+- **Inputs at a node.** Every declared event the actor or a live child
+  `handles()`, the earliest pending timer, and a result (output or error)
+  for each running invoke or task.
+- **Guard-aware payloads.** Candidates come from the event schema, filled
+  with the values found in the node's context (ids, names, integers and
+  their successors). Recordings passed with `--from` add their payloads and
+  their real invoke and task results, which unlocks states behind a `load`.
+- **Dedupe and budget.** Nodes dedupe on configuration, context, children,
+  pending timers and stubs. The depth limit is 8 and the run limit 1500.
+
+Each chart the app module created gets one `<chart>_paths_test.jsonl`. It
+replays the selected paths as start, inputs and stop. The header's
+`generated` field lists each path's steps, the targets it covers, and
+coverage with anything left unreached. `ouroctl test` treats every
+`*_test.jsonl` as one test, `replay`, against the application found by
+walking up to `ouro.json`. A chart change that alters a covered behavior
+fails with the divergence report. After an intended change, regenerate.
+Real recordings saved as `*_test.jsonl` work the same way.
+
+Results on the examples (`zig build test-components` runs the committed
+files):
+
+| App | Chart | States | Transitions | Seeded by `tests/seed.jsonl` |
+| --- | --- | --- | --- | --- |
+| stopwatch | `stopwatch` | 7/7 | 11/11 | not needed |
+| documents | `notes` | 7/7 | 19/20 | Open… and drop results |
+| documents | `document` | 12/12 | 15/18 | chooser results, including `Canceled` |
+| contacts | `contacts` | 12/12 | 19/19 | a two-person `load`, a failed `save` |
+| contacts | `appearance` | 1/1 | 1/1 | not needed |
+| launcher | `launcher` | 6/6 | 19/19 | a two-entry `scan`, a `launch` |
+
+The seeds are hand-written logs: small fake results instead of a real
+desktop's application list or the 500-row contacts sample. The search
+cannot reach some transitions:
+- a standalone `document` has no parent, so `CANCEL`'s `send_parent` raises;
+- `notes` reaches the close walk's done-while-closing transition only
+  through a deeper child interaction than the default budget allows.
+
+Without seeds, contacts reaches 4/12 states and the launcher 5/6. Their
+invokes then return only `null` or `{}`, which their `on_done` actions
+reject.
