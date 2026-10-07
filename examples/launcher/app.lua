@@ -42,9 +42,8 @@ end
 local charts = require("charts")(ouro, model, {
   scan = function() return ouro.xdg.applications.list() end,
   launch = function(entry)
-    local prepare = ouro.xdg.applications.prepare_launch
-    local launch = entry.terminal and prepare(entry, { terminal_argv = { "xdg-terminal-exec" } }) or prepare(entry)
-    return start_unit(entry, launch)
+    local options = entry.terminal and { terminal_argv = { "xdg-terminal-exec" } } or nil
+    return start_unit(entry, ouro.xdg.applications.prepare_launch(entry, options))
   end,
 })
 

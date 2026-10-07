@@ -145,7 +145,8 @@ fn prepareValue(state: *c.State, count: c_int) !void {
     var values: usize = 0;
     const entry_json = try json.luaToJson(state, 1, a, 0, &values);
     const entry = try std.json.parseFromValueLeaky(native.Entry, a, entry_json, .{});
-    const options = if (count == 2) try std.json.parseFromValueLeaky(native.LaunchOptions, a, try json.luaToJson(state, 2, a, 0, &values), .{}) else native.LaunchOptions{};
+    // An explicit nil, as from `prepare_launch(entry, cond and opts or nil)`, means no options.
+    const options = if (count == 2 and c.lua_type(state, 2) != c.type_nil) try std.json.parseFromValueLeaky(native.LaunchOptions, a, try json.luaToJson(state, 2, a, 0, &values), .{}) else native.LaunchOptions{};
     var launch = try native.prepareLaunch(a, &entry, options);
     defer launch.deinit();
     try pushValue(state, .{ .argv = launch.argv, .cwd = launch.cwd });
@@ -241,6 +242,9 @@ test "Lua applications list yields fresh snapshots and prepares exact argv witho
         \\assert(#launch.argv == 3 and launch.argv[1] == 'editor')
         \\assert(launch.argv[2] == '--title' and launch.argv[3] == 'An Editor')
         \\assert(launch.cwd == o.json.null)
+        \\local explicit = o.xdg.applications.prepare_launch(entries[1], nil)
+        \\assert(#explicit.argv == 3 and explicit.argv[3] == 'An Editor')
+        \\assert(not pcall(o.xdg.applications.prepare_launch, entries[1], false))
         \\prepared = true
     ));
     try std.testing.expectEqual(vm_module.ResumeResult.completed, try runtime.start(

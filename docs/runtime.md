@@ -373,7 +373,7 @@ returning an indistinguishable partial snapshot. Limits are 1 MiB per desktop
 file, 64 MiB of file contents, 65,536 directory entries, and 32 nested directories.
 
 `prepare_launch(entry[, {action = id, terminal_argv = {"terminal", "-e"}}])`
-prepares Exec as literal argv without a shell. It expands `%c`, `%k`, `%i`, and
+(a `nil` options argument is the same as omitting it) prepares Exec as literal argv without a shell. It expands `%c`, `%k`, `%i`, and
 `%%`, removes file/URL placeholders because no documents are supplied, and
 rejects invalid field codes. Terminal entries require an explicit argument
 prefix. D-Bus-only entries/actions without Exec raise `NoExec`; this is not a
