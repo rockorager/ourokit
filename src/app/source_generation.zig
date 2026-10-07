@@ -1490,3 +1490,30 @@ test "bound surfaces report rejected declarations to their send target" {
     while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
     try std.testing.expect(generation.vm.globalBoolean("checked"));
 }
+
+test "stopped statechart actors release their hidden signals at once" {
+    const allocator = std.testing.allocator;
+    const snapshot = try bundle.SourceSnapshot.initApplication(allocator, "release.lua",
+        \\local o = require('ouro')
+        \\local chart = o.machine.create { id = 'tiny', initial = 'idle', context = { n = 0 },
+        \\  states = { idle = { on = { X = 'idle' } } } }
+        \\for _ = 1, 500 do
+        \\  local actor = chart:start()
+        \\  assert(actor:context().n == 0)
+        \\  actor:stop()
+        \\  assert(actor:status() == 'stopped' and actor:context().n == 0)
+        \\end
+        \\return o.app { id = 'dev.ouro.release', run = function() return { windows = {} } end }
+    , "dev.ouro.release");
+    var loop: io_loop.Loop = undefined;
+    try loop.init(allocator, 8, 4);
+    defer loop.deinit();
+    var scheduler: task.Scheduler = undefined;
+    try scheduler.init(allocator, 8, 4, 8);
+    defer scheduler.deinit();
+    const generation = try SourceGeneration.create(allocator, &scheduler, &loop, snapshot, null, .{ .node_capacity = 8, .signal_capacity = 8 }, null);
+    defer generation.destroy();
+    // 500 actors with several hidden signals each, but each actor's signals
+    // were freed by stop(), not left for the garbage collector.
+    try std.testing.expect(generation.signals.slots.len <= 16);
+}
