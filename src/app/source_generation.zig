@@ -1134,6 +1134,10 @@ test "source generation bootstrap retains async module closure before becoming r
     });
     try temporary.dir.writeFile(std.testing.io, .{
         .sub_path = "title.lua",
+        .data = "return require('subtitle')",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "subtitle.lua",
         .data = "return 'Loaded asynchronously'",
     });
     try temporary.dir.writeFile(std.testing.io, .{
@@ -1170,7 +1174,8 @@ test "source generation bootstrap retains async module closure before becoming r
         snapshot,
         module_root.handle,
         null,
-        .{ .node_capacity = 8, .module_capacity = 4 },
+        // A nested require keeps two loads in flight, so the loader grows.
+        .{ .node_capacity = 8, .module_capacity = 1 },
         null,
     );
     defer generation.destroy();

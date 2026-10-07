@@ -2096,8 +2096,10 @@ test "nested state scopes drain in-flight kernel operations before reusing their
         try std.testing.expectEqual(ResumeResult.waiting, try vm.resumeRunnable(runnable));
     try std.testing.expect(scheduler.scopeAlive(outer) and scheduler.scopeAlive(inner));
     try std.testing.expectEqual(@as(c.Integer, 0), testClosedCount(&vm));
+    // Neither cancelled slot can be handed out again until its terminal CQEs
+    // arrive; a new operation would get a new slot instead.
     try std.testing.expect(loop.operationPending(first_operation));
-    try std.testing.expectError(error.OperationCapacityExceeded, loop.preparePoll(sockets[1], linux.POLL.OUT));
+    try std.testing.expect(loop.operationPending(inner_wait.submitted.?));
 
     _ = try loop.submit();
     while (outer_wait.operation != null or inner_wait.operation != null) {

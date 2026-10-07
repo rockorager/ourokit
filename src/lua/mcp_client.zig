@@ -1,5 +1,6 @@
 const std = @import("std");
 const linux = std.os.linux;
+const core = @import("../core/root.zig");
 const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
 const mcp = @import("../mcp/root.zig");
@@ -44,7 +45,9 @@ pub const McpClient = struct {
     allocator: std.mem.Allocator,
     vm: *vm_module.Vm,
     loop: *io.Loop,
-    slots: []Slot,
+    /// The kernel writes into `receive_buffer` and Lua guards point at
+    /// slots, so slots grow in chunks that never move.
+    slots: core.StableSlots(Slot),
 
     pub fn init(
         self: *McpClient,
@@ -54,10 +57,11 @@ pub const McpClient = struct {
         capacity: usize,
     ) !void {
         if (capacity == 0) return error.InvalidCapacity;
-        const slots = try allocator.alloc(Slot, capacity);
-        @memset(slots, .{});
+        var slots = core.StableSlots(Slot).init(capacity);
+        errdefer slots.deinit(allocator);
+        _ = try slots.grow(allocator);
         self.* = .{ .allocator = allocator, .vm = vm, .loop = loop, .slots = slots };
-        for (self.slots) |*slot| slot.owner = self;
+        for (0..self.slots.len()) |index| self.slots.at(index).owner = self;
 
         vm.pushApi(vm.state);
         c.lua_createtable(vm.state, 0, 2);
@@ -77,15 +81,16 @@ pub const McpClient = struct {
     }
 
     pub fn deinit(self: *McpClient) void {
-        for (self.slots) |slot| std.debug.assert(slot.state == .free);
-        self.allocator.free(self.slots);
+        for (0..self.slots.len()) |index| std.debug.assert(self.slots.at(index).state == .free);
+        self.slots.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// Routes one socket CQE without entering Lua. Completion only publishes
     /// the reply or failure and marks the owning task runnable.
     pub fn dispatch(self: *McpClient, completion: io.SocketCompletion) !bool {
-        for (self.slots) |*slot| {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
             const operation = slot.operation orelse continue;
             if (!same(operation, completion.operation)) continue;
             slot.operation_terminal = true;
@@ -147,8 +152,10 @@ pub const McpClient = struct {
     /// point. Storage is released only once both original and cancel CQEs are
     /// terminal, so the kernel never retains pointers into a reused slot.
     pub fn collectCanceled(self: *McpClient) !void {
-        for (self.slots) |*slot| if (slot.cancellation_requested)
-            try self.collectCanceledSlot(slot);
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
+            if (slot.cancellation_requested) try self.collectCanceledSlot(slot);
+        }
     }
 
     fn collectCanceledSlot(self: *McpClient, slot: *Slot) !void {
@@ -207,9 +214,14 @@ pub const McpClient = struct {
         return false;
     }
 
-    fn available(self: *McpClient) ?*Slot {
-        for (self.slots) |*slot| if (slot.state == .free) return slot;
-        return null;
+    fn available(self: *McpClient) !*Slot {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
+            if (slot.state == .free) return slot;
+        }
+        const first = try self.slots.grow(self.allocator);
+        for (first..self.slots.len()) |index| self.slots.at(index).owner = self;
+        return self.slots.at(first);
     }
 
     fn release(self: *McpClient, slot: *Slot) void {
@@ -275,7 +287,7 @@ pub const McpClient = struct {
 
         var method_length: usize = 0;
         const method_pointer = c.lua_tolstring(state, 2, &method_length).?;
-        const slot = self.available() orelse return luaError(state, "MCP call capacity exceeded");
+        const slot = self.available() catch return luaError(state, "out of memory starting MCP call");
         slot.streaming = streaming;
         slot.guard = guard;
         guard.* = slot;
@@ -1028,7 +1040,7 @@ fn testSubscription(replies: []const u8, body: []const u8, cancel: enum { none, 
             }
         }
     }
-    try std.testing.expect(client.available() != null);
+    for (0..client.slots.len()) |index| try std.testing.expectEqual(State.free, client.slots.at(index).state);
     try std.testing.expect(!loop.hasPendingOperations());
     while (loop.hasPendingTimerKernelWork()) {
         _ = try loop.submit();

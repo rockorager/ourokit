@@ -322,7 +322,7 @@ pub const Client = struct {
                     continue;
                 }
                 watch.operation = self.loop.preparePoll(watch.owned_fd, watch.events) catch |err| switch (err) {
-                    error.SubmissionQueueFull, error.OperationCapacityExceeded => null,
+                    error.SubmissionQueueFull, error.OperationCapacityExceeded, error.OutOfMemory => null,
                 };
                 watch.armed_events = watch.events;
             }
@@ -331,7 +331,7 @@ pub const Client = struct {
         if (self.stopping and self.multi != null and self.watches.items.len == 0) try self.beginCleanup();
         if (self.cleanup_thread != null and self.cleanup_operation == null)
             self.cleanup_operation = self.loop.prepareRead(self.cleanup_pipe.?[0], &self.cleanup_signal, std.math.maxInt(u64)) catch |err| switch (err) {
-                error.SubmissionQueueFull, error.OperationCapacityExceeded => return,
+                error.SubmissionQueueFull, error.OperationCapacityExceeded, error.OutOfMemory => return,
                 error.EmptyReadBuffer => unreachable,
             };
     }

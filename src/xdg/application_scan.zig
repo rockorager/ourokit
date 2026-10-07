@@ -323,12 +323,12 @@ test "XDG applications cancellation closes descriptors at every scan and reader 
     for (stages) |stage| for ([_]bool{ false, true }) |submitted| {
         try scan.start();
         while (true) {
-            const current = if (scan.state == .reading) @tagName(scan.reader.slots[0].state) else @tagName(scan.state);
+            const current = if (scan.state == .reading) @tagName(scan.reader.slots.at(0).state) else @tagName(scan.state);
             if (std.mem.eql(u8, stage, current)) break;
             try std.testing.expect(!scan.finished());
             try testStep(&scan);
         }
-        const fd = if (scan.state == .reading) scan.reader.slots[0].fd else scan.fd;
+        const fd = if (scan.state == .reading) scan.reader.slots.at(0).fd else scan.fd;
         if (submitted) _ = try loop.submit();
         try scan.cancel();
         while (loop.hasPendingOperations()) try testStep(&scan);

@@ -8,3 +8,4 @@ pub const RectI = @import("geometry.zig").RectI;
 pub const SizeF = @import("geometry.zig").SizeF;
 pub const SizeU = @import("geometry.zig").SizeU;
 pub const Handle = @import("handle.zig").Handle;
+pub const StableSlots = @import("stable_slots.zig").StableSlots;

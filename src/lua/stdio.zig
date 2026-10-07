@@ -1,5 +1,6 @@
 const std = @import("std");
 const linux = std.os.linux;
+const core = @import("../core/root.zig");
 const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
 const c = @import("c.zig");
@@ -38,7 +39,7 @@ pub const Stdio = struct {
     vm: *vm_module.Vm,
     loop: *io.Loop,
     files: Files,
-    slots: []Slot,
+    slots: core.StableSlots(Slot),
 
     pub fn init(self: *Stdio, allocator: std.mem.Allocator, vm: *vm_module.Vm, loop: *io.Loop, capacity: usize) !void {
         try self.initWithFiles(allocator, vm, loop, capacity, .{});
@@ -46,10 +47,11 @@ pub const Stdio = struct {
 
     pub fn initWithFiles(self: *Stdio, allocator: std.mem.Allocator, vm: *vm_module.Vm, loop: *io.Loop, capacity: usize, files: Files) !void {
         if (capacity == 0) return error.InvalidCapacity;
-        const slots = try allocator.alloc(Slot, capacity);
-        @memset(slots, .{});
+        var slots = core.StableSlots(Slot).init(capacity);
+        errdefer slots.deinit(allocator);
+        _ = try slots.grow(allocator);
         self.* = .{ .allocator = allocator, .vm = vm, .loop = loop, .files = files, .slots = slots };
-        for (slots) |*slot| slot.owner = self;
+        for (0..self.slots.len()) |index| self.slots.at(index).owner = self;
         vm.pushApi(vm.state);
         inline for (.{ Stream.stdin, Stream.stdout, Stream.stderr }) |stream| {
             c.lua_createtable(vm.state, 0, 1);
@@ -62,16 +64,29 @@ pub const Stdio = struct {
         c.lua_settop(vm.state, -2);
     }
 
+    /// Slots hold the kernel's buffer bookkeeping and wait lifecycles, so
+    /// they grow in chunks that never move.
+    fn available(self: *Stdio) !*Slot {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
+            if (slot.state == .free) return slot;
+        }
+        const first = try self.slots.grow(self.allocator);
+        for (first..self.slots.len()) |index| self.slots.at(index).owner = self;
+        return self.slots.at(first);
+    }
+
     pub fn deinit(self: *Stdio) void {
-        for (self.slots) |slot| std.debug.assert(slot.state == .free);
-        self.allocator.free(self.slots);
+        for (0..self.slots.len()) |index| std.debug.assert(self.slots.at(index).state == .free);
+        self.slots.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// Output has drained when the kernel has accepted every byte, even if
     /// the Lua continuation is suspended by an explicit exit request.
     pub fn hasPendingOutput(self: *const Stdio) bool {
-        for (self.slots) |slot| {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
             if (slot.state == .pending and slot.stream != .stdin) return true;
         }
         return false;
@@ -80,7 +95,8 @@ pub const Stdio = struct {
     /// Completion phase only; never enters Lua. A write resumes its task only
     /// after every suffix has been accepted, or a terminal error occurs.
     pub fn dispatch(self: *Stdio, completion: io.FileCompletion) !bool {
-        for (self.slots) |*slot| {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
             const operation = slot.operation orelse continue;
             if (!same(operation, completion.operation)) continue;
             if (completion.kind != (if (slot.stream == .stdin) io.OperationKind.read else .write))
@@ -116,7 +132,8 @@ pub const Stdio = struct {
     /// BOTH the original operation and its cancellation have terminated.
     /// Also discard ready results canceled before their Lua continuation.
     pub fn collectCanceled(self: *Stdio) !void {
-        for (self.slots) |*slot| {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
             if (slot.cancellation_requested) {
                 try self.collectCanceledSlot(slot);
             } else if (slot.state == .ready and self.vm.taskCancellationRequested(slot.task_handle)) {
@@ -173,9 +190,7 @@ pub const Stdio = struct {
             bytes = c.lua_tolstring(state, 1, &length).?;
             if (length == 0) return 0;
         }
-        const slot = for (self.slots) |*candidate| {
-            if (candidate.state == .free) break candidate;
-        } else return luaError(state, "stdio operation capacity exceeded");
+        const slot = self.available() catch return luaError(state, "out of memory starting stdio operation");
         slot.buffer = self.allocator.alloc(u8, length) catch return luaError(state, "could not allocate stdio buffer");
         if (bytes) |source| @memcpy(slot.buffer, source[0..length]);
         slot.stream = stream;
@@ -413,7 +428,7 @@ test "stdio cancellation drains blocked reads and writes and discards ready resu
             _ = try runtime.loop.submit();
             try runtime.cancel();
             try std.testing.expect(!runtime.vm.globalBoolean("continued"));
-            for (runtime.stdio.slots) |slot| try std.testing.expectEqual(State.free, slot.state);
+            for (0..runtime.stdio.slots.len()) |index| try std.testing.expectEqual(State.free, runtime.stdio.slots.at(index).state);
         }
     }
     const pipe = try testPipe(false);
@@ -425,10 +440,10 @@ test "stdio cancellation drains blocked reads and writes and discards ready resu
     try std.testing.expectEqual(@as(usize, 1), linux.write(pipe[1], "r", 1));
     _ = try runtime.start("require('ouro').stdin.read(1); continued = true");
     try runtime.completeOne();
-    try std.testing.expectEqual(State.ready, runtime.stdio.slots[0].state);
+    try std.testing.expectEqual(State.ready, runtime.stdio.slots.at(0).state);
     try runtime.cancel();
     try std.testing.expect(!runtime.vm.globalBoolean("continued"));
-    try std.testing.expectEqual(State.free, runtime.stdio.slots[0].state);
+    try std.testing.expectEqual(State.free, runtime.stdio.slots.at(0).state);
 }
 
 test "stdio errors release storage and empty writes are no-ops" {
@@ -440,7 +455,7 @@ test "stdio errors release storage and empty writes are no-ops" {
         try runtime.completeOne();
         try std.testing.expectError(error.LuaRuntimeError, runtime.vm.resumeRunnable(runtime.scheduler.takeRunnable().?));
         try std.testing.expect(!runtime.vm.globalBoolean("continued"));
-        for (runtime.stdio.slots) |slot| try std.testing.expectEqual(State.free, slot.state);
+        for (0..runtime.stdio.slots.len()) |index| try std.testing.expectEqual(State.free, runtime.stdio.slots.at(index).state);
     }
     inline for (.{ "stdin.read(0)", "stdin.read(-1)", "stdin.read(1.5)", "stdout.write(1)", "stderr.write(nil)" }) |operation| {
         try std.testing.expectError(error.LuaRuntimeError, runtime.start("require('ouro')." ++ operation));

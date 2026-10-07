@@ -1,5 +1,6 @@
 const std = @import("std");
 const bundle = @import("../bundle/root.zig");
+const core = @import("../core/root.zig");
 const fs = @import("../fs/root.zig");
 const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
@@ -39,7 +40,9 @@ pub const ModuleLoader = struct {
     vm: *vm_module.Vm,
     directory: std.os.linux.fd_t,
     reader: fs.Reader,
-    slots: []Slot,
+    /// Wait lifecycles and Lua continuations keep slot addresses, so slots
+    /// grow in chunks that never move.
+    slots: core.StableSlots(Slot),
     frozen: bool = false,
 
     pub fn init(
@@ -51,9 +54,9 @@ pub const ModuleLoader = struct {
         capacity: usize,
     ) !void {
         if (capacity == 0) return error.InvalidCapacity;
-        const slots = try allocator.alloc(Slot, capacity);
-        errdefer allocator.free(slots);
-        @memset(slots, .{});
+        var slots = core.StableSlots(Slot).init(capacity);
+        errdefer slots.deinit(allocator);
+        _ = try slots.grow(allocator);
         self.* = .{
             .allocator = allocator,
             .vm = vm,
@@ -62,7 +65,7 @@ pub const ModuleLoader = struct {
             .slots = slots,
         };
         try self.reader.init(allocator, loop, capacity);
-        for (self.slots) |*slot| slot.loader = self;
+        for (0..self.slots.len()) |index| self.slots.at(index).loader = self;
 
         c.lua_pushlightuserdata(vm.state, self);
         c.lua_pushcclosure(vm.state, require, 1);
@@ -70,7 +73,8 @@ pub const ModuleLoader = struct {
     }
 
     pub fn deinit(self: *ModuleLoader) void {
-        for (self.slots) |*slot| {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
             // Closing a canceled coroutine may leave an outer module waiting
             // on a nested require. All I/O must be drained before destruction.
             std.debug.assert(slot.state == .free or slot.state == .loaded or
@@ -78,7 +82,7 @@ pub const ModuleLoader = struct {
             self.release(slot);
         }
         self.reader.deinit();
-        self.allocator.free(self.slots);
+        self.slots.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -93,7 +97,8 @@ pub const ModuleLoader = struct {
     /// Lua. The caller owns submission at the end of the current turn.
     pub fn dispatch(self: *ModuleLoader, completion: io.FileCompletion) !bool {
         if (!(try self.reader.dispatch(completion))) return false;
-        for (self.slots) |*slot| {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
             if (slot.state != .reading_file and slot.state != .reading_init) continue;
             if (!(try self.reader.finished(slot.read))) continue;
             const contents = self.reader.take(slot.read) catch |err| {
@@ -144,7 +149,8 @@ pub const ModuleLoader = struct {
         // available after freeze without opening mutable code from disk.
         if (self.vm.pushNativeModule(state, name)) return 1;
 
-        for (self.slots) |*slot| {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
             if (slot.state == .free or !std.mem.eql(u8, slot.paths.?.canonical, name)) continue;
             if (slot.state == .loaded) {
                 _ = c.lua_rawgeti(state, c.registry_index, slot.cache_reference);
@@ -155,8 +161,8 @@ pub const ModuleLoader = struct {
         if (self.frozen)
             return luaError(state, "module was not loaded during application bootstrap");
 
-        const slot = self.available() orelse
-            return luaError(state, "module capacity exceeded");
+        const slot = self.available() catch
+            return luaError(state, "out of memory loading module");
         slot.paths = bundle.module_name.paths(self.allocator, name) catch
             return luaError(state, "invalid module name");
         slot.state = .reading_file;
@@ -243,9 +249,14 @@ pub const ModuleLoader = struct {
         return 1;
     }
 
-    fn available(self: *ModuleLoader) ?*Slot {
-        for (self.slots) |*slot| if (slot.state == .free) return slot;
-        return null;
+    fn available(self: *ModuleLoader) !*Slot {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
+            if (slot.state == .free) return slot;
+        }
+        const first = try self.slots.grow(self.allocator);
+        for (first..self.slots.len()) |index| self.slots.at(index).loader = self;
+        return self.slots.at(first);
     }
 
     fn release(self: *ModuleLoader, slot: *Slot) void {

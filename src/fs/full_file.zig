@@ -65,13 +65,15 @@ const Slot = struct {
     cancellation_requested: bool = false,
 };
 
-/// Fixed-capacity owner for asynchronous whole-file reads. It enters no
+/// Growable owner for asynchronous whole-file reads. It enters no
 /// language runtime and submits nothing itself: callers batch the prepared
 /// SQEs through the application-owned loop and route file completions here.
 pub const Reader = struct {
     allocator: std.mem.Allocator,
     loop: *io.Loop,
-    slots: []Slot,
+    /// statx writes into `before`/`after` after submission, so slots grow in
+    /// chunks that never move.
+    slots: core.StableSlots(Slot),
 
     pub fn init(
         self: *Reader,
@@ -80,14 +82,15 @@ pub const Reader = struct {
         capacity: usize,
     ) !void {
         if (capacity == 0) return error.InvalidCapacity;
-        const slots = try allocator.alloc(Slot, capacity);
-        @memset(slots, .{});
+        var slots = core.StableSlots(Slot).init(capacity);
+        errdefer slots.deinit(allocator);
+        _ = try slots.grow(allocator);
         self.* = .{ .allocator = allocator, .loop = loop, .slots = slots };
     }
 
     pub fn deinit(self: *Reader) void {
-        for (self.slots) |slot| std.debug.assert(slot.state == .free);
-        self.allocator.free(self.slots);
+        for (0..self.slots.len()) |index| std.debug.assert(self.slots.at(index).state == .free);
+        self.slots.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -98,11 +101,11 @@ pub const Reader = struct {
         options: Options,
     ) !ReadHandle {
         if (path.len == 0 or options.max_bytes == 0) return error.InvalidReadRequest;
-        const index = self.availableSlot() orelse return error.ReadCapacityExceeded;
+        const index = self.availableSlot() orelse try self.slots.grow(self.allocator);
         const owned_path = try self.allocator.allocSentinel(u8, path.len, 0);
         errdefer self.allocator.free(owned_path);
         @memcpy(owned_path, path);
-        const slot = &self.slots[index];
+        const slot = self.slots.at(index);
         var generation = slot.generation +% 1;
         if (generation == 0) generation = 1;
         slot.* = .{
@@ -268,21 +271,23 @@ pub const Reader = struct {
     }
 
     fn availableSlot(self: *Reader) ?usize {
-        for (self.slots, 0..) |slot, index| if (slot.state == .free) return index;
+        for (0..self.slots.len()) |index| if (self.slots.at(index).state == .free) return index;
         return null;
     }
 
     fn activeSlot(self: *Reader, handle: ReadHandle) !*Slot {
-        if (handle.slot >= self.slots.len) return error.StaleRead;
-        const slot = &self.slots[handle.slot];
+        const slot = self.slots.get(handle.slot) orelse return error.StaleRead;
         if (slot.state == .free or slot.generation != handle.generation)
             return error.StaleRead;
         return slot;
     }
 
     fn slotForOperation(self: *Reader, operation: io.OperationHandle) ?*Slot {
-        for (self.slots) |*slot| if (slot.state != .free and slot.state != .complete and
-            same(slot.operation, operation)) return slot;
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
+            if (slot.state != .free and slot.state != .complete and
+                same(slot.operation, operation)) return slot;
+        }
         return null;
     }
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const timer_heap = @import("timer_heap.zig");
+const StableSlots = @import("../core/stable_slots.zig").StableSlots;
 
 pub const OperationHandle = timer_heap.TimerHandle;
 
@@ -110,7 +111,9 @@ pub const Loop = struct {
     allocator: std.mem.Allocator,
     ring: linux.IoUring,
     timers: timer_heap.TimerHeap,
-    slots: []Slot,
+    /// The kernel reads `open_how` and `connect_address` from a slot after
+    /// submission, so slots grow in chunks that never move.
+    slots: StableSlots(Slot),
     operation_capacity_hint: usize,
 
     alarm_generation: u32 = 0,
@@ -136,9 +139,9 @@ pub const Loop = struct {
     ) !void {
         if (operation_capacity == 0 or operation_capacity > 0x00ff_ffff)
             return error.InvalidCapacity;
-        const slots = try allocator.alloc(Slot, operation_capacity);
-        errdefer allocator.free(slots);
-        @memset(slots, .{});
+        var slots = StableSlots(Slot).init(operation_capacity);
+        errdefer slots.deinit(allocator);
+        _ = try slots.grow(allocator);
         self.* = .{
             .allocator = allocator,
             .ring = try linux.IoUring.init(
@@ -165,8 +168,11 @@ pub const Loop = struct {
             _ = linux.close(fd);
             _ = linux.sigprocmask(linux.SIG.SETMASK, &self.previous_signal_mask, null);
         }
-        for (self.slots) |slot| std.debug.assert(!slot.active and !slot.cancel_pending);
-        self.allocator.free(self.slots);
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
+            std.debug.assert(!slot.active and !slot.cancel_pending);
+        }
+        self.slots.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -234,8 +240,7 @@ pub const Loop = struct {
 
     pub fn operationPending(self: *const Loop, handle: OperationHandle) bool {
         if (handle.generation & timer_generation_bit != 0) return false;
-        if (handle.slot >= self.slots.len) return false;
-        const slot = &self.slots[handle.slot];
+        const slot = self.slots.get(handle.slot) orelse return false;
         return slot.generation == handle.generation and (slot.active or slot.cancel_pending);
     }
 
@@ -488,7 +493,10 @@ pub const Loop = struct {
     }
 
     pub fn hasPendingOperations(self: *const Loop) bool {
-        for (self.slots) |slot| if (slot.active or slot.cancel_pending) return true;
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
+            if (slot.active or slot.cancel_pending) return true;
+        }
         return false;
     }
 
@@ -565,8 +573,7 @@ pub const Loop = struct {
             },
             .operation_cancel => {
                 const handle = decoded.handle orelse return .stale;
-                if (handle.slot >= self.slots.len) return .stale;
-                const slot = &self.slots[handle.slot];
+                const slot = self.slots.get(handle.slot) orelse return .stale;
                 if (slot.generation != handle.generation) return .stale;
                 if (!slot.cancel_pending) return .stale;
                 slot.cancel_pending = false;
@@ -574,8 +581,7 @@ pub const Loop = struct {
             },
             .openat2, .statx, .read, .write, .close => |operation| {
                 const handle = decoded.handle orelse return .stale;
-                if (handle.slot >= self.slots.len) return .stale;
-                const slot = &self.slots[handle.slot];
+                const slot = self.slots.get(handle.slot) orelse return .stale;
                 if (slot.generation != handle.generation) return .stale;
                 if (!slot.active or slot.operation != operation) return .stale;
                 slot.active = false;
@@ -594,8 +600,7 @@ pub const Loop = struct {
             },
             .accept, .recv, .send, .connect, .recvmsg, .sendmsg, .poll => |operation| {
                 const handle = decoded.handle orelse return .stale;
-                if (handle.slot >= self.slots.len) return .stale;
-                const slot = &self.slots[handle.slot];
+                const slot = self.slots.get(handle.slot) orelse return .stale;
                 if (slot.generation != handle.generation) return .stale;
                 if (!slot.active or slot.operation != operation) return .stale;
                 slot.active = false;
@@ -618,15 +623,15 @@ pub const Loop = struct {
     }
 
     fn availableSlot(self: *Loop) ?usize {
-        for (self.slots, 0..) |slot, index| {
+        for (0..self.slots.len()) |index| {
+            const slot = self.slots.at(index);
             if (!slot.active and !slot.cancel_pending) return index;
         }
         return null;
     }
 
     fn activeSlot(self: *Loop, handle: OperationHandle) !*Slot {
-        if (handle.slot >= self.slots.len) return error.StaleOperation;
-        const slot = &self.slots[handle.slot];
+        const slot = self.slots.get(handle.slot) orelse return error.StaleOperation;
         if (!slot.active or slot.generation != handle.generation) return error.StaleOperation;
         return slot;
     }
@@ -680,8 +685,14 @@ pub const Loop = struct {
     };
 
     fn reserve(self: *Loop, operation: Operation) !Reservation {
-        const index = self.availableSlot() orelse return error.OperationCapacityExceeded;
-        const slot = &self.slots[index];
+        // Preparation may allocate; completion lookup never does. The slot
+        // index must fit the 24 bits encodeFile reserves for it.
+        const index = self.availableSlot() orelse grown: {
+            if (self.slots.len() + self.slots.chunk_len > 0x0100_0000)
+                return error.OperationCapacityExceeded;
+            break :grown try self.slots.grow(self.allocator);
+        };
+        const slot = self.slots.at(index);
         slot.generation +%= 1;
         if (slot.generation == 0) slot.generation = 1;
         slot.active = true;
@@ -988,6 +999,34 @@ test "write operation reports stable identity and writes a pipe" {
     var output: [bytes.len]u8 = undefined;
     try std.testing.expectEqual(bytes.len, try std.posix.read(pipe[0], &output));
     try std.testing.expectEqualStrings(bytes, &output);
+}
+
+test "operation slots grow past their initial capacity without moving" {
+    var pipe: [2]linux.fd_t = undefined;
+    switch (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true }))) {
+        .SUCCESS => {},
+        else => return error.PipeCreationFailed,
+    }
+    defer _ = linux.close(pipe[0]);
+    defer _ = linux.close(pipe[1]);
+
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, 16, 2);
+    defer loop.deinit();
+    const first = try loop.prepareWrite(pipe[1], "a", std.math.maxInt(u64));
+    const first_slot = loop.slots.at(first.slot);
+    var operations: [7]OperationHandle = undefined;
+    for (&operations) |*operation| operation.* = try loop.prepareWrite(pipe[1], "b", std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(usize, 8), loop.slots.len());
+    try std.testing.expectEqual(first_slot, loop.slots.at(first.slot));
+    _ = try loop.submit();
+    for (0..8) |_| try std.testing.expectEqual(@as(i32, 1), loop.dispatch(try loop.wait()).file.result);
+    try std.testing.expect(!loop.hasPendingOperations());
+    // Drained slots are reused before the storage grows again.
+    _ = try loop.prepareWrite(pipe[1], "c", std.math.maxInt(u64));
+    _ = try loop.submit();
+    _ = loop.dispatch(try loop.wait());
+    try std.testing.expectEqual(@as(usize, 8), loop.slots.len());
 }
 
 test "signal watch wakes the ring and retains the first signal through shutdown" {
