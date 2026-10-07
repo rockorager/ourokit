@@ -176,28 +176,36 @@ o.exit(0)
 mcp_source = r'''
 local o = require('ouro')
 local machine = o.machine
-local chart = machine.create { id = 'book', initial = 'loading', context = { loaded = false },
+local chart = machine.create { id = 'book', initial = 'loading', context = { loaded = false, names = { ada = 'Ada' } },
   actors = { load = function() o.sleep(30); return true end },
+  events = { RENAME = { id = 'string', name = 'string' } },
   states = {
     loading = { invoke = { src = 'load', on_done = { target = 'ready', actions = machine.assign { loaded = true } } } },
-    ready = {},
+    ready = { on = { RENAME = { guard = function(c, e) return c.names[e.id] ~= nil end,
+      actions = machine.assign { names = function(c, e) local n = {}; for k, v in pairs(c.names) do n[k] = v end; n[e.id] = e.name; return n end } } } },
   } }
 local book
 local empty = { type = 'object', additionalProperties = false }
 local state = { type = 'object', properties = { ready = { type = 'boolean' } }, required = { 'ready' }, additionalProperties = false }
-return o.app { id = 'dev.ourokit.machinetest', actions = {
-  Start = { description = 'Start the actor', inputSchema = empty, outputSchema = state,
-    handler = function() book = book or chart:start(); return { ready = book:matches('ready') } end },
-  Read = { description = 'Read the actor', inputSchema = empty, outputSchema = state,
-    handler = function() return { ready = book ~= nil and book:matches('ready') and book:context().loaded } end },
-}, run = function() error('headless MCP must not run the UI') end }
+local actions = machine.actions(function() return book end, {
+  Rename = { event = 'RENAME', description = 'Rename once loaded', errors = { no_transition = 'NotFoundOrLoading' },
+    output = function(s, e) return { name = s.context.names[e.id] } end,
+    output_schema = { type = 'object', properties = { name = { type = 'string' } }, required = { 'name' }, additionalProperties = false } },
+  WaitReady = { description = 'Wait until loaded', wait = function(s) return machine.matches(s, 'ready') end, timeout = 1000,
+    output = function(s) return { ready = s.context.loaded } end, output_schema = state },
+}, { chart = chart, before = function(actor) if not actor then return o.action_error('NotStarted', {}) end end })
+actions.Start = { description = 'Start the actor', inputSchema = empty, outputSchema = state,
+  handler = function() book = book or chart:start(); return { ready = book:matches('ready') } end }
+actions.Read = { description = 'Read the actor', inputSchema = empty, outputSchema = state,
+  handler = function() return { ready = book ~= nil and book:matches('ready') and book:context().loaded } end }
+return o.app { id = 'dev.ourokit.machinetest', actions = actions, run = function() error('headless MCP must not run the UI') end }
 '''
 
 
 def mcp_check():
     import sys, time
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from application_services import call
+    from application_services import call, request
     with tempfile.TemporaryDirectory(prefix="ourokit-machine-mcp-") as temporary:
         app = Path(temporary) / "app.lua"
         app.write_text(mcp_source)
@@ -210,12 +218,26 @@ def mcp_check():
             while not address.exists():
                 assert process.poll() is None and time.monotonic() < deadline, process.stderr.read() if process.poll() is not None else "no socket"
                 time.sleep(.02)
+            early = call(address, "Rename", {"id": "ada", "name": "Lovelace"})
+            assert early["structuredContent"]["error"]["code"] == "NotStarted", early
             first = call(address, "Start")
             assert first["structuredContent"] == {"ready": False}, first
-            time.sleep(.2)
+            # The chart rejects RENAME while loading: an action error with the reason.
+            loading = call(address, "Rename", {"id": "ada", "name": "Lovelace"})
+            error = loading["structuredContent"]["error"]
+            assert loading["isError"] and error["code"] == "NotFoundOrLoading" and error["parameters"]["reason"] == "no_transition", loading
+            ready = call(address, "WaitReady")  # wait_for inside an MCP handler, woken by the invoke's commit
+            assert ready["structuredContent"] == {"ready": True}, ready
+            time.sleep(.05)
             assert process.poll() is None, process.stderr.read()
             second = call(address, "Read")
             assert second["structuredContent"] == {"ready": True}, second
+            renamed = call(address, "Rename", {"id": "ada", "name": "Lovelace"})
+            assert renamed["structuredContent"] == {"name": "Lovelace"}, renamed
+            missing = call(address, "Rename", {"id": "nobody", "name": "x"})
+            assert missing["structuredContent"]["error"]["code"] == "NotFoundOrLoading", missing
+            invalid = request(address, "tools/call", {"name": "Rename", "arguments": {"id": "ada"}})
+            assert "error" in invalid, invalid  # inputSchema comes from the chart's RENAME schema
         finally:
             process.terminate()
             _, errors = process.communicate(timeout=8)

@@ -1,6 +1,7 @@
 # Statecharts as the application model
 
-Status: Phase 0 (semantics) and Phase 1 (pure-Lua prototype). The prototype
+Status: Phases 0–1 done (GO). Phase 3, the app-model integration in Lua,
+is in progress. The prototype
 lives in [`src/lua/machine.lua`](../src/lua/machine.lua) as `ouro.machine`;
 tests are in [`tests/machine_test.lua`](../tests/machine_test.lua) and
 [`tests/machine_native.py`](../tests/machine_native.py).
@@ -8,8 +9,10 @@ tests are in [`tests/machine_test.lua`](../tests/machine_test.lua) and
 are ported to it.
 
 The core idea: **active states own lifetimes, effects and windows, and the UI is
-a function of the state snapshot.** Statecharts own behavior over time. They
-do not replace plain functions, the view, or the native editor.
+a function of the state snapshot.** Charts hold *all* application state,
+including presentation state such as query text, selection and appearance.
+Signals are not an application state mechanism (§6). Charts do not replace
+plain functions, the view, or the native editor's per-keystroke state (§5).
 
 ## 1. Supported subset
 
@@ -21,6 +24,7 @@ We use SCXML semantics with an XState-like Lua surface. Supported:
 | Parallel | `type = 'parallel'`, optional `order = {'io', 'lifecycle'}` | Every region is active at once. `order` sets region document order. |
 | Final | `type = 'final'`, optional `output = fn` | Raises `done.state.<parent>`. A top-level final finishes the machine. |
 | Guards | `guard = 'name' \| fn` | Pure: `(context, event, state) -> boolean`. |
+| Field setters | `on = { QUERY = machine.set('query', 'string') }` | Assigns `e.value` to the field and declares `QUERY = { value = 'string' }`. |
 | `assign` | `machine.assign(fn \| {field = value \| fn})` | The only way to change context. |
 | `raise` | `machine.raise(event \| fn)` | Adds an internal event to the current macrostep. |
 | `always` | `always = transition(s)` | Eventless transitions, checked after every microstep. |
@@ -124,7 +128,28 @@ An event is a table with a string `type` and flat payload fields:
 `{ type = 'SAVE' }`. Payloads are copied on send, and guards and actions get a
 read-only view.
 
-External events can be declared with schemas:
+### Naming
+
+- **Event names are scoped per actor.** `send` always targets an actor. There
+  is no global bus and no global namespace, so two charts may both have
+  `SELECT`.
+- **Runtime events use reserved lowercase dotted prefixes**
+  (`machine.reserved_prefixes`): `after.`, `done.`, `error.`, `ouro.` and
+  `surface.`. Charts may *handle* them in `on`, for example
+  `['surface.closed.main']`, `['done.actor.*']` or `['surface.*']`. A chart
+  that declares one in `events` or `machine.set` fails at `machine.create`.
+  `send` refuses them, because only the runtime delivers them.
+- **Dotted user names group events**, for example `search.query` and
+  `search.clear`. Prefix descriptors such as `['search.*']` match them.
+- **Charts declare their events.** The declared set is the union of three
+  sources: the explicit `events` schemas, `machine.set` setters, and every
+  plain event name some state handles. With `machine.strict = true`, the
+  default and the intended development setting, `send`, `can` and
+  `actor:event` raise `UnknownEvent` for anything else, so typos fail loudly.
+  Non-strict, `send` returns `false, 'undeclared'`. The host is expected to
+  relax strictness outside development; that wiring is not done yet.
+
+### Schemas
 
 ```lua
 events = {
@@ -135,10 +160,33 @@ events = {
 ```
 
 The field types are `string`, `number`, `integer`, `boolean`, `table` and `any`.
-A trailing `?` marks an optional field. When `events` is present, `send`
-rejects undeclared types (`UnknownEvent`), missing or mistyped fields and
-undeclared fields (`InvalidEvent`). `can` rejects undeclared types. Internal
-types are reserved and cannot be sent:
+A trailing `?` marks an optional field. Events with a schema reject missing or
+mistyped fields and undeclared fields (`InvalidEvent`). Declared events without
+a schema accept any payload. `machine.set(field, type)` declares
+`{ value = type }`. That is the payload value widgets send (§7), so
+`on = { QUERY = machine.set('query', 'string') }` needs no other glue.
+
+### Sending and delivering
+
+- `actor:send(event)` returns `accepted, reason`, synchronously, because the
+  macrostep runs to completion inside the call. `reason` uses the record
+  vocabulary: `no_transition`, `stale`, `done`, `stopped` (or `undeclared`
+  when non-strict). An event sent while the same actor is mid-macrostep, for
+  example from its own effect, is queued and returns `nil, 'queued'`. Guard
+  and assign errors raise.
+- `actor:deliver(event [, origin])` is the runtime's entry point: surface
+  lifecycle events, timers, children. Reserved types are allowed and there is
+  no schema or declaration check. It uses the same queue and macrostep, and
+  `origin` labels the inspection records (`'surface'`, default `'runtime'`).
+- `machine.wait_for(actor, predicate, {timeout = ms})` is XState's `waitFor`.
+  It parks the running task until `predicate(snapshot)` holds and returns that
+  snapshot, waking on the actor's commits, never by polling. It raises
+  `WaitTimeout`, or `WaitEnded` when the actor stops or finishes without
+  matching. Only tasks may wait: MCP handlers, callbacks, invokes and spawned
+  tasks. Inside actions it raises `YieldInAction`. Cancelling the waiting task
+  drops its subscription and timer.
+
+### Runtime events
 
 | Type | Raised when |
 | --- | --- |
@@ -148,18 +196,36 @@ types are reserved and cannot be sent:
 | `done.state.<id>` | A compound or parallel state completes. Carries `output`. |
 | `done.actor.<child>` | A spawned child finishes: a chart reaches its final state, or a task returns. Carries `id`, `output` and the child's former `index`. |
 | `error.actor.<child>` | A spawned task throws. Carries `id`, `error` and `index`. |
+| `surface.<kind>.<window>` | A window or layer surface declared with `send = actor` is mapped, has a close requested, is closed, or fails (`reason`, `message`). Delivered with origin `surface`. |
 
 `done.actor.*` and `error.actor.*` events for a child that is no longer listed,
 because it was stopped or cancelled with its owner, are rejected as `stale`.
-
 A timer or invoke event whose token does not match the current entry of its
 state is rejected as `stale`.
 
-**Actions, commands, shortcuts, palette entries and MCP calls are all external
-events with schemas.** One declaration serves validation, documentation and
-discovery. `actor:accepted()` lists the declared events the current
-configuration would take, guards included, so the palette and MCP `tools/list`
-can show exactly what is possible now.
+### Commands, shortcuts and MCP are events
+
+Actions, commands, shortcuts, palette entries and MCP calls are all external
+events with schemas. `actor:accepted()` lists the declared events the current
+configuration would take, guards included. `machine.actions` derives MCP tools
+from the same declarations:
+
+```lua
+actions = machine.actions(book, {
+  RenameContact = { event = 'RENAME', description = 'Rename a contact',
+    errors = { no_transition = 'ContactNotFound' },          -- rejection reason -> error code
+    output = function(snapshot, e) return { contact = ... } end, output_schema = {...} },
+  GetContacts = { description = 'Read the address book',     -- no event: a read
+    wait = function(s) return not machine.matches(s, 'loading') end, timeout = 5000,
+    output = function(snapshot) return { contacts = ... } end, output_schema = {...} },
+}, { before = function(actor) ... end })                      -- may return ouro.action_error
+```
+
+`inputSchema` comes from the chart's event schema. The handler sends the
+event and turns a rejection into `ouro.action_error(code, {event, reason})`.
+It can optionally `wait_for`, then returns `output(snapshot, event)`. The
+actor may be a function, which is resolved per call; it then needs
+`options.chart`.
 
 ## 3. Snapshots
 
@@ -227,61 +293,141 @@ convention.
 ## 5. Continuous values stay native
 
 Pointer position, hover, drag deltas, scroll offsets, animation progress, caret
-and selection, IME preedit and per-keystroke editing stay native. They are not
-states and not context. A chart sees committed facts:
-- `EDIT { field, value }` from `on_change`;
+and selection, IME preedit and the editor's per-keystroke buffer stay native.
+They are not states and not context. A chart sees committed values, and owns
+them from then on:
+- `QUERY { value }` from a text field's change;
 - `RESIZE { position }` when a split moves;
-- `SELECTED { id }` when a list selection changes.
+- `SELECT { value }` when a list or tab selection changes.
 
 Phase 5 native widget charts (button hover/pressed, focus, menus, modal editing)
 are internal, compiled in Zig and allocation-free. They are not app charts.
 
-## 6. Layering
+## 6. Layering: charts hold all application state
+
+**Decision.** Every piece of application state lives in a chart's context or
+configuration. That includes presentation state such as query text,
+selection, the open tab, appearance, and a collapsible's open flag. Signals
+are not an app-facing state mechanism. The only signal left is the internal
+one each actor keeps for its snapshot, so views rebuild; it may go away in the
+native interpreter. This reverses an interim decision to keep signals for
+presentation state. The reasons:
+- one model to learn and reason about;
+- replay, reload, the inspector and MCP only see what is in charts;
+- "presentation" state leaks into behavior anyway: the launcher's `ACTIVATE`
+  guard depends on the query.
+Code that is easy to reason about matters more than fewer lines. The ceremony
+is handled with setters, value widgets and component machines.
 
 ```diagram
 ┌──────────────────────────────┐
-│ Domain charts (headless)     │  document: io.idle/io.saving, lifecycle.confirming
-│ testable and drivable by MCP │  no widgets, no windows
+│ Domain charts (headless)     │  document: io.saving, lifecycle.confirming
+│ drivable by tests and MCP    │  contacts: loading, sync, lifecycle
 └──────────────┬───────────────┘
-               │ snapshot (signal)
+               │ snapshot.children / send_to
 ┌──────────────▼───────────────┐
-│ UI charts (presentation only)│  palette open, selected tab, wizard step
+│ UI charts                    │  notes: tabs, selection, split, close walk
+│ (app-level presentation)     │  launcher: query, selected, open/hidden
 └──────────────┬───────────────┘
                │
 ┌──────────────▼───────────────┐      ┌───────────────────────────┐
-│ view(snapshot) → windows,    │─────▶│ plain functions           │
-│ dialogs, widgets             │      │ validate, encode, sort,   │
-└──────────────┬───────────────┘      │ format, derive (`dirty`)  │
-               │ events               └───────────────────────────┘
+│ Component machines           │      │ plain functions +         │
+│ (per mounted instance)       │      │ machine.selector          │
+│ collapsible open, hover menu │      │ validate, encode, rank,   │
+└──────────────┬───────────────┘      │ derive (`dirty`, results) │
+               │ snapshots            └─────────────▲─────────────┘
+┌──────────────▼───────────────┐                    │
+│ view(snapshots) → windows,   │────────────────────┘
+│ dialogs, widgets             │
+└──────────────┬───────────────┘
+               │ events: actor:event bindings, send =, senders
                ▼
           actor:send
 ```
 
 - **Domain charts are headless.** The document chart knows `io.saving` and
   `lifecycle.confirming`. It does not know that a dialog exists.
-- **UI charts hold presentation modes only.** Examples: palette open, which tab
-  is selected, which wizard step is showing.
+- **UI charts hold presentation state and modes.** Examples:
+  - the launcher's `query` and `selected` (`QUERY = machine.set('query', 'string')`);
+  - notes' selected tab and split position;
+  - contacts' appearance (`light` / `terminal`).
+  App-wide presentation state lives here, not in signals.
+- **Component machines hold per-instance UI state** (below).
 - **The view does the mapping.** `doc:matches('open.lifecycle.confirming')`
   mounts the confirm dialog. A layer surface exists because
-  `launcher:matches('open')`.
-- **Computation stays in plain functions.** For example, `dirty` is
-  `revision ~= saved_revision`: a calculation, not a state. Rule of thumb: if
-  what can happen next depends on what happened before, use a chart. If it is
-  a calculation on current data, use a function.
+  `launcher:matches('open')`. Windows report back with `surface.*` events.
+- **Computation stays in plain functions,** memoized with `machine.selector`
+  when a guard and the view share it. `dirty` is `revision ~= saved_revision`;
+  the launcher's results are `results(c)`, computed once per context for both
+  the `ACTIVATE` guard and the list.
+
+Where state goes:
+
+| State | Where | Why |
+| --- | --- | --- |
+| Note text, path, save progress | domain chart (`document`) | lifecycle, async I/O, rules |
+| Which tab is selected, split position | UI chart (`notes`) | app-wide, persisted with the session |
+| Launcher query and highlighted row | UI chart (`launcher`), `machine.set` | the `ACTIVATE` guard depends on it |
+| Light / terminal appearance | UI chart (contacts' `appearance`) | one source of truth for the theme and MCP |
+| A collapsible's open flag, a menu's hover row | component machine | local to one mounted instance |
+| Caret, selection, IME preedit, scroll offset | native widget | continuous values (§5) |
+| Search results, `dirty`, labels | `machine.selector` / plain function | derived, never stored |
+
+Rule of thumb: if you would have reached for a signal, add a context field
+(`machine.set` for the common "store the widget's value" case). If what can
+happen next depends on what happened before, make it a state. If it is a
+calculation on current data, make it a (memoized) function.
+
+### Components: per-instance machines instead of ouro.stateful
+
+```lua
+local Collapsible = machine.component(machine.create {
+  id = 'collapsible', initial = 'closed',
+  context = function(props) return { title = props.title } end,  -- input = props
+  states = { closed = { on = { TOGGLE = 'open' } }, open = { on = { TOGGLE = 'closed' } } },
+}, function(self, props)
+  return ouro.column { key = 'box',
+    ouro.button { key = 'toggle', label = self:context().title, send = self:event('TOGGLE') },
+    self:matches('open') and props.children or nil,
+  }
+end)
+
+Collapsible { key = 'details', title = 'Details', ... }
+```
+
+- One actor exists per mounted keyed instance. It is created when the
+  instance mounts, with `input = props`, so the context can read initial
+  props. Keys preserve it across reorders, and unmounting forgets it.
+- It **starts on its first event**, in the callback's task, because
+  initializers and renders may not write signals or schedule work. Entry
+  effects of the initial state therefore run at that first event.
+- Its root scope hangs under the instance scope of the callback that first
+  needed one, so its timers and invokes end when the instance unmounts. Root
+  scopes open lazily, so a component without `after`/`invoke` never opens one.
+  Known gap: a component *with* timers makes component-test teardown panic
+  until instance teardown retires VM-owned child scopes. The scopes thread
+  has the report.
+- Component actors are not carried across reload (`persist_roots` skips
+  them), and `machine.actors()` drops them once their scope is gone.
 
 ## 7. Widgets send events
 
+`actor:event(event [, field])` returns a plain binding,
+`{ actor, event, field }`, validated at render like `can()`. Widgets accept it
+wherever they accept a callback; the widget work is the send= widgets thread's.
+- **Activation widgets** (button, menu item, command, shortcut) send the event
+  as is, and `enabled` defaults to `actor:can(event)`.
+- **Value widgets** (text input, switch, select, listbox, tabs, split view,
+  ...) send a copy with `[field or 'value'] = <new value>`, matching
+  `machine.set`. Their `enabled` defaults to `can()` of the event carrying the
+  current value.
+
 ```lua
--- Phase 3 target
-ouro.button { key = 'save', label = 'Save', send = 'SAVE' }
--- enabled defaults to doc:can('SAVE'); on_press sends to the nearest actor
+ouro.button { key = 'save', label = 'Save', send = doc:event('SAVE') }
+ouro.text_input { key = 'query', text = launcher:context().query, send = launcher:event('QUERY') }
 ```
 
-The prototype runs on today's widgets, so it spells this out:
-
-```lua
-ouro.button { key = 'save', label = 'Save', enabled = doc:can('SAVE'), on_press = doc:sender('SAVE') }
-```
+`actor:sender(event)` still returns a function, for windows and direct calls.
 
 Registry-anchored callback closures go away. The enabled state and the action
 have one source of truth. A disabled button and a rejected MCP call fail for
@@ -293,8 +439,8 @@ anything else that needs real press provenance. They report failures as events
 
 ## 8. Active states own task scopes
 
-Each actor opens a root scope when it starts. A spawned child's root scope is a
-child of its parent's root scope. Each state entry with `after` or `invoke`
+Each actor opens a root scope on first need, at its first timer, invoke or
+task. A spawned child's root scope is a child of its parent's root scope. Each state entry with `after` or `invoke`
 work opens one scope under the actor's root. Timers and invokes run inside it,
 and exiting the state closes it. A finished or stopped actor closes its root,
 and with it everything below. The interpreter goes through a small scheduler
@@ -372,9 +518,25 @@ snapshot from an older chart onto the new one:
 4. `chart:actor { snapshot = mapped }` re-enters without entry actions and
    restarts timers and invokes.
 
-Today's hot reload discards the VM, including signals. The host has to keep
-`actor:persist()` across generations before reload can actually preserve
-state. That is Phase 3 work. The mapping itself is implemented and tested.
+The host keeps root actors across source reload with three hooks, and the
+host side belongs to the scopes thread:
+
+1. In the live VM, `machine.persist_roots()` returns `entries, skipped`. The
+   entries are `{id, machine, snapshot}` for every started, active root actor
+   except component actors. `skipped` lists `"id: error"` for actors whose
+   context cannot be persisted; those start fresh.
+2. In the candidate VM, `machine.carry(entries)` runs before the source.
+   Creating a root actor whose `id` and chart id match an entry restores it
+   through `chart:restore`, using the actor option `renames`. Children go
+   through their own chart's `restore`; a child whose fresh context needs
+   input keeps its old context.
+3. After the candidate commits, `machine.release()` starts the held work.
+
+Restored state is visible immediately, so the candidate's UI builds from it.
+Restored timers and invokes start when the candidate commits, skipping states
+exited since then. A failed candidate starts nothing. `actor:restored()` tells
+app code to skip one-time setup, for example documents not re-opening its
+saved session.
 
 ## 10. Inspection hooks
 
@@ -452,21 +614,25 @@ started, and "why is Save disabled?" through rejected events and guards.
 local machine = ouro.machine
 local chart = machine.create { id, initial, context, states, on, guards, actions, actors, events, ... }
 chart:graph()                      chart:initial(input)      chart:transition(snapshot, event)
-chart:can(snapshot, event)         chart:restore(persisted, {renames})
-local actor = chart:actor { input, scheduler, snapshot, charts, id }   -- create (render-safe)
-actor:start()  actor:stop()  actor:send(event)  actor:sender(event)
+chart:can(snapshot, event)         chart:restore(persisted, {renames, input})
+local actor = chart:actor { input, scheduler, snapshot, charts, id, renames }   -- create (render-safe)
+actor:start()  actor:stop()  actor:send(event) -> accepted, reason  actor:deliver(event, origin)
+actor:sender(event)  actor:event(event [, field])
 actor:matches(id)  actor:can(event)  actor:has_tag(tag)  actor:accepted()
-actor:snapshot()  actor:context()  actor:states()  actor:status()  actor:output()
-actor:child(id)  actor:children()  actor:persist()  actor:observe(fn)
-machine.inspect(fn)  machine.actors()  machine.plain(v)  machine.unset  machine.matches(snapshot, id)
-machine.assign  machine.raise  machine.spawn  machine.stop  machine.send_to  machine.send_parent
+actor:snapshot()  actor:context()  actor:states()  actor:status()  actor:started()  actor:restored()
+actor:output()  actor:child(id)  actor:children()  actor:persist()  actor:observe(fn)
+machine.assign  machine.set  machine.raise  machine.spawn  machine.stop  machine.send_to  machine.send_parent
+machine.wait_for(actor, pred, {timeout})  machine.selector(fn)  machine.actions(actor, specs, opts)
+machine.component(chart, render)  machine.matches(snapshot, id)  machine.plain(v)  machine.unset
+machine.inspect(fn)  machine.actors()  machine.strict  machine.reserved_prefixes
+machine.persist_roots()  machine.carry(entries)  machine.release()
 machine.default_scheduler  machine.token_scheduler  machine.manual_scheduler()  machine.native_scopes
 ```
 
 `chart:actor` computes the initial snapshot, which may include initial
-`assign`s, and stores it in one `ouro.signal`. It is safe in an `ouro.stateful`
-initializer. `start()` runs the deferred effects and must run in the task phase,
-like any signal write. Reads (`matches`, `can`, `context`, `snapshot`) go
+`assign`s, and stores it in the actor's internal snapshot signal. It is safe in
+a component initializer. `start()` runs the deferred effects and must run in
+the task phase, like any signal write. `status()` is `'created'` until then. Reads (`matches`, `can`, `context`, `snapshot`) go
 through the signal, so a mounted build that reads them rebuilds when the
 snapshot changes.
 
@@ -653,8 +819,9 @@ book = machine.create {
 
 ## 13. Open questions
 
-- **Do signals survive?** The prototype keeps exactly one signal per actor.
-  The lean is to keep only derived read-only selectors.
+- ~~Do signals survive?~~ **Resolved:** charts hold all application state,
+  presentation state included. Signals survive only as each actor's internal
+  snapshot signal (§6). Derived data uses `machine.selector`.
 - ~~Fire-and-forget I/O~~ **Resolved:** one-shot spawned tasks (§8).
 - ~~Duplicated facts across actors~~ **Resolved:** `snapshot.children[id]`
   exposes child snapshots, as in XState v5.
@@ -664,14 +831,18 @@ book = machine.create {
 - ~~Document order from sorted keys~~ **Resolved:** keep XState's map form and
   required `initial`. Parallel states may declare `order`; without it, keys sort.
 - ~~Yielding in function actions~~ **Resolved:** rejected natively (§1).
-- **Request/response over events.** An MCP handler sends an event, but cannot
-  learn whether it was taken (`send` returns nothing) or wait for a later
-  snapshot. Contacts duplicates guard checks with `can` and polls with
-  `ouro.sleep` while loading. Candidates: `send` returns the handled/rejected
-  record, and a native `actor:wait_for(predicate, timeout)` (XState's
-  `waitFor`) built on signal change notification.
-- **Two schemas per command.** Chart `events` and MCP `inputSchema` describe
-  the same payload in two languages. Phase 3 should derive one from the other.
+- ~~Request/response over events~~ **Resolved:** `send` returns
+  `accepted, reason`, and `machine.wait_for` wakes on commits (§2).
+- ~~Two schemas per command~~ **Resolved:** `machine.actions` derives MCP
+  `inputSchema` from the chart's event schema (§2). Output schemas are still
+  written by hand.
+- **Strict mode wiring.** `machine.strict` should follow `--dev`; the host
+  does not set it yet.
+- **Instance-scope teardown** with VM-owned child scopes (component machines
+  with timers) panics in component tests (§6). This is with the scopes thread.
+- **Selector caching** keeps one entry per selector. A selector called with
+  alternating contexts, for example per child, recomputes. Per-key caches
+  may be needed.
 - **Effects see stale context.** Function actions run after commit, with the
   context of their point in the macrostep. This is SCXML-consistent but easy
   to misread.
