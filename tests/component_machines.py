@@ -5,7 +5,8 @@ Runs on the private compositor that verify_development.py provides. A keyed
 component machine runs a 100 ms timer and a parked invoke. Hiding it must stop
 both (no further ticks from that instance), and showing it again must create a
 new actor with initial state. Each mount has a number, so stderr shows which
-instance ticked.
+instance ticked. Clicks pin the inspected node (runtime.input `node`) because
+the ticking UI rebuilds faster than inspect -> input completes on slow hosts.
 """
 import json
 import os
@@ -91,17 +92,24 @@ def main():
                 wait_for(lambda: inspect(env, endpoint).get("windows"), "window did not appear")
 
                 def click(target):
-                    # Every tick rebuilds the UI, so a token can go stale before
-                    # the click lands; retry with a fresh one.
-                    for _ in range(20):
-                        tree = inspect(env, endpoint, WINDOW)["windows"][0]
-                        result = run(str(BINARY), "dev", "input", str(endpoint), json.dumps({
-                            "window": WINDOW, "token": tree["token"], "action": "click", "target": target}),
-                            env=env, ok=None)
-                        if result.returncode == 0:
-                            return
-                        assert "StaleDevelopmentTarget" in result.stdout, result.stdout
-                    raise AssertionError(f"click on {target} stayed stale")
+                    # Every tick rebuilds the UI, so the token can be stale by the
+                    # time input arrives on a slow host. Pin the input to the
+                    # inspected node instead: it is accepted while the path still
+                    # resolves to that same node.
+                    tree = inspect(env, endpoint, WINDOW)["windows"][0]
+                    target_id = next(n["id"] for n in tree["nodes"] if n["path"] == target)
+                    time.sleep(0.35)  # a slow host: several ticks rebuild the UI first
+                    run(str(BINARY), "dev", "input", str(endpoint), json.dumps({
+                        "window": WINDOW, "token": tree["token"], "action": "click",
+                        "target": target, "node": target_id}), env=env)
+
+                def unpinned_click_is_stale(target):
+                    tree = inspect(env, endpoint, WINDOW)["windows"][0]
+                    time.sleep(0.35)
+                    result = run(str(BINARY), "dev", "input", str(endpoint), json.dumps({
+                        "window": WINDOW, "token": tree["token"], "action": "click", "target": target}),
+                        env=env, ok=False)
+                    return "StaleDevelopmentTarget" in result.stdout
 
                 def lines():
                     error_file.flush()
@@ -118,6 +126,10 @@ def main():
                 wait_for(lambda: lines().count("tick 1") >= 3, "mount 1 did not tick")
                 assert "invoke started 1" in lines()
                 wait_for(lambda: label() not in (None, "mount 1 ticks 0"), "ticks did not reach the UI")
+
+                # While it ticks, an ordinary click with that old token is stale.
+                assert unpinned_click_is_stale("root/hide")
+                assert label() is not None, "the stale click must not have run"
 
                 # Unmount: the actor is stopped. No further ticks from mount 1,
                 # and its invoke never resumes.

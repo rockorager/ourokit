@@ -27,6 +27,14 @@ pub const Token = struct {
         if (!std.meta.eql(self, current(runtime))) return error.StaleDevelopmentTarget;
         try requireSettled(runtime);
     }
+
+    /// Same window and source generation; build and scene revisions may have
+    /// moved on. Only for input pinned to a retained node (`Playback.initPinned`).
+    fn validateIdentity(self: Token, runtime: *WindowRuntime) !void {
+        if (!std.meta.eql(self.window, runtime.window) or self.generation != runtime.development_generation)
+            return error.StaleDevelopmentTarget;
+        try requireSettled(runtime);
+    }
 };
 
 /// Does not wait for timers, animation completion, or arbitrary asynchronous
@@ -231,11 +239,33 @@ pub const Playback = struct {
     token: Token,
     action: Action,
     target: ?ui.instance.InstanceHandle,
+    /// Semantic ID the targeted path must still resolve to (`initPinned`).
+    node: ?u64 = null,
     step: usize = 0,
     text_offset: usize = 0,
 
+    /// Requires a token from the current build and scene.
     pub fn init(runtime: *WindowRuntime, token: Token, action: Action) !Playback {
-        try token.validate(runtime);
+        return initChecked(runtime, token, action, null);
+    }
+
+    /// Targeted input pinned to the inspected node's semantic ID. The token
+    /// may predate later rebuilds (a UI that rebuilds on a timer) as long as
+    /// window and source generation match and the path still resolves to that
+    /// same retained instance. A remount gets a new ID and is rejected.
+    pub fn initPinned(runtime: *WindowRuntime, token: Token, action: Action, node: u64) !Playback {
+        if (action.path() == null) return error.DevelopmentNodeRequiresTarget;
+        return initChecked(runtime, token, action, node);
+    }
+
+    fn validateStart(token: Token, runtime: *WindowRuntime, action: Action, node: ?u64) !void {
+        const id = node orelse return token.validate(runtime);
+        try token.validateIdentity(runtime);
+        if ((try runtime.semantics.findPath(action.path().?)).id != id) return error.StaleDevelopmentTarget;
+    }
+
+    fn initChecked(runtime: *WindowRuntime, token: Token, action: Action, node: ?u64) !Playback {
+        try validateStart(token, runtime, action, node);
         if (runtime.text_inputs.hasSecret()) return error.SecureInputProtected;
         var target: ?ui.instance.InstanceHandle = null;
         if (action.path()) |path| {
@@ -279,7 +309,7 @@ pub const Playback = struct {
             if ((try runtime.text_inputs.session(focused)).preedit() != null) return error.DevelopmentCompositionActive;
             target = focused;
         }
-        return .{ .token = token, .action = action, .target = target };
+        return .{ .token = token, .action = action, .target = target, .node = node };
     }
 
     pub fn advance(self: *Playback, runtime: *WindowRuntime) !enum { routed, complete } {
@@ -287,7 +317,7 @@ pub const Playback = struct {
             return error.StaleDevelopmentTarget;
         if (runtime.text_inputs.hasSecret()) return error.SecureInputProtected;
         try requireSettled(runtime);
-        if (self.step == 0) try self.token.validate(runtime);
+        if (self.step == 0) try validateStart(self.token, runtime, self.action, self.node);
         const steps: usize = switch (self.action) {
             .hover, .pointer_move, .pointer_up => 1,
             .text => if (self.text_offset == self.action.text.len) 0 else std.math.maxInt(usize),

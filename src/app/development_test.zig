@@ -2963,3 +2963,55 @@ test "animated component declarations reject invalid motion disclosure and facto
         try std.testing.expectError(error.LuaBuildFailed, Fixture.create(source));
     }
 }
+
+fn runLua(f: *Fixture, source: []const u8) !void {
+    try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(f.vm.state, source.ptr, source.len, "@pinned-input", "t"));
+    try std.testing.expectEqual(c.ok, c.lua_pcallk(f.vm.state, 0, 0, 0, 0, null));
+    try f.settle();
+}
+
+test "development input pinned to a retained node survives rebuilds but not a remount" {
+    const f = try Fixture.create(
+        \\count, shown, pressed = ouro.signal(0), ouro.signal(true), 0
+        \\local Go = ouro.stateful(function()
+        \\  return function() return ouro.button {key='button', label='Go', on_press=function() pressed = pressed + 1 end} end
+        \\end)
+        \\function build()
+        \\  return ouro.column {key='root',
+        \\    ouro.text {key='count', text=tostring(count())},
+        \\    shown() and Go {key='go'} or nil}
+        \\end
+    );
+    defer f.destroy();
+    var before = try f.snapshot();
+    defer before.deinit();
+    const go = try node(before, "root/go/button");
+    const click: dev.Action = .{ .click = "root/go/button" };
+
+    // A rebuild (the count changes, as on a timer) makes the token stale for
+    // ordinary input, but the button is the same retained instance.
+    try runLua(f, "count:set(1)");
+    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.init(&f.runtime, before.token, click));
+    var playback = try dev.Playback.initPinned(&f.runtime, before.token, click, go.id);
+    while (try playback.advance(&f.runtime) == .routed) {
+        try f.settle();
+        try runLua(f, "count:set(count() + 1)"); // keeps rebuilding between phases
+    }
+    try runLua(f, "assert(pressed == 1)");
+
+    // The pin must match, the action needs a target, and identity still matters.
+    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, before.token, click, go.id +% 1));
+    try std.testing.expectError(error.DevelopmentNodeRequiresTarget, dev.Playback.initPinned(&f.runtime, before.token, .{ .text = "x" }, go.id));
+    var other_window = before.token;
+    other_window.window.generation += 1;
+    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, other_window, click, go.id));
+
+    // A remounted component instance at the same path is a different node.
+    try runLua(f, "shown:set(false)");
+    try runLua(f, "shown:set(true)");
+    var remounted = try f.snapshot();
+    defer remounted.deinit();
+    try std.testing.expect((try node(remounted, "root/go/button")).id != go.id);
+    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, before.token, click, go.id));
+    try runLua(f, "assert(pressed == 1)");
+}

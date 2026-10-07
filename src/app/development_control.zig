@@ -168,7 +168,12 @@ pub const Service = struct {
         } else return error.DevelopmentWindowNotFound;
         const token = try decodeToken(try stringField(args, "token"));
         if (std.mem.eql(u8, name, "runtime.input")) {
-            self.playback = try dev.Playback.init(runtime, token, try parseAction(args));
+            const action = try parseAction(args);
+            self.playback = if (mcp.get(args, "node")) |node| blk: {
+                if (node != .string) return error.InvalidDevelopmentArgument;
+                const pinned = std.fmt.parseInt(u64, node.string, 16) catch return error.InvalidDevelopmentArgument;
+                break :blk try dev.Playback.initPinned(runtime, token, action, pinned);
+            } else try dev.Playback.init(runtime, token, action);
             self.runtime = runtime;
             return null;
         }
