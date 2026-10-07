@@ -709,7 +709,8 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
   Replay on a virtual clock needs the scope's timers to follow a host clock.
 - **`after` delays are constants.** They are the integer keys of the `after`
   table, fixed when the chart is created; a delay computed from context is
-  not supported. Use a fixed tick and count, or one state per delay.
+  not supported. Use a fixed tick that re-enters its state
+  (`{ target = 'running', reenter = true }`) and count, or one state per delay.
 - **Missing: a millisecond clock for apps.** Lua's `os.time()` has one-second
   resolution, and the runtime's monotonic clock is private. So a stopwatch
   counts `after` ticks, and its elapsed time falls behind wall time by the
