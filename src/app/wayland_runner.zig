@@ -2608,7 +2608,8 @@ test "structural reload validates later additions and capacity before retaining 
     try std.testing.expectEqualDeep(commands, keep.runtime.commands[0..keep.runtime.command_count]);
     try std.testing.expectEqual(button, keep.runtime.focus.current().?);
 
-    // Each tree fits independently, but the application-wide sum does not.
+    // Fewer free scopes than the application-wide sum no longer rejects the
+    // candidate: validation reserves the scopes its commit will create.
     try Source.write(temporary.dir, "window('new-first','New'), window('keep','Changed'), window('new-late','Later')");
     try reload.prepare();
     {
@@ -2621,7 +2622,9 @@ test "structural reload validates later additions and capacity before retaining 
         while (scheduler.availableScopeCapacity() > per_window) : (held_count += 1)
             held[held_count] = try scheduler.createScope(scheduler.application_scope);
         defer for (held[0..held_count]) |held_scope| scheduler.destroyScope(held_scope) catch unreachable;
-        try std.testing.expectError(error.ScopeCapacityExceeded, reload.commitApplication(targets[0..prepared.target_count], &callbacks));
+        try std.testing.expect(scheduler.availableScopeCapacity() <= per_window);
+        try reload.validateApplicationCommit(targets[0..prepared.target_count], &callbacks);
+        try std.testing.expect(scheduler.availableScopeCapacity() >= per_window * 2);
         try std.testing.expect(reload.active() == active);
         try std.testing.expectEqual(old_callbacks, callbacks.countForVm(&active.vm));
         try std.testing.expectEqualDeep(commands, keep.runtime.commands[0..keep.runtime.command_count]);

@@ -277,8 +277,8 @@ pub const Tree = struct {
         }
         if (create_count != 0) {
             if (create_count > self.freeCount()) return error.InstanceCapacityExceeded;
-            if (create_count > self.scheduler.availableScopeCapacity())
-                return error.ScopeCapacityExceeded;
+            // Reserve during preparation so applyReconcile cannot fail.
+            try self.scheduler.reserveScopes(create_count);
             if (create_count > self.render_tree.availableCapacity() + omitted_count)
                 return error.RenderObjectCapacityExceeded;
         }
@@ -1274,8 +1274,10 @@ test "reconcile plans distinguish property updates removals and creations at cap
 
     var replacement = child;
     replacement.id = 3;
-    // Replacement still needs a new scope before the retiring scope drains.
-    try std.testing.expectError(error.ScopeCapacityExceeded, tree.prepareReconcile(&.{ root, replacement }));
+    // Replacement needs a new scope before the retiring scope drains;
+    // preparation reserves it instead of failing.
+    _ = try tree.prepareReconcile(&.{ root, replacement });
+    try std.testing.expect(scheduler.availableScopeCapacity() >= 1);
     const removal = try tree.prepareReconcile(&.{root});
     try std.testing.expect(removal.removes_instances and !removal.creates_instances);
     try tree.applyReconcile(removal);

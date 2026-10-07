@@ -128,14 +128,9 @@ fn scopeArgument(state: *c.State, index: c_int) ?*Userdata {
     return @ptrCast(@alignCast(c.luaL_testudata(state, index, metatable) orelse return null));
 }
 
-fn raiseScopeError(state: *c.State, vm: *Vm, err: anyerror) c_int {
+fn raiseScopeError(state: *c.State, _: *Vm, err: anyerror) c_int {
     var buffer: [192]u8 = undefined;
     const message = switch (err) {
-        error.ScopeCapacityExceeded => std.fmt.bufPrintZ(
-            &buffer,
-            "ScopeCapacityExceeded: all {d} task scopes are in use; closed scopes are reused once their started tasks and I/O drain",
-            .{vm.scheduler.scopeCapacity()},
-        ),
         error.ScopeCanceled => std.fmt.bufPrintZ(&buffer, "ScopeCanceled: the scope or an enclosing scope is closed", .{}),
         error.StaleScope => std.fmt.bufPrintZ(&buffer, "StaleScope: the scope no longer exists", .{}),
         else => std.fmt.bufPrintZ(&buffer, "{s}", .{@errorName(err)}),
@@ -258,7 +253,7 @@ test "private scope closures open, spawn into, and close nested state scopes fro
     try std.testing.expectEqual(@as(usize, 0), loop.timers.count());
 }
 
-test "rapid state toggling reuses scopes immediately and capacity errors are diagnosable" {
+test "rapid state toggling reuses scopes immediately and scopes grow past the initial capacity" {
     var scheduler: task.Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 4, 4, 4);
     defer scheduler.deinit();
@@ -282,16 +277,18 @@ test "rapid state toggling reuses scopes immediately and capacity errors are dia
         \\  spawn(state, function() ouro.sleep(1000) end)
         \\  close(state)
         \\end
-        \\local held = {open(machine), open(machine)}
-        \\local ok, err = pcall(open, machine)
-        \\assert(not ok and err:find('^ScopeCapacityExceeded: all 4 task scopes are in use'), err)
+        \\local held = {}
+        \\for i = 1, 20 do held[i] = open(machine) end -- past the initial four
         \\close(machine)
         \\toggled = true
     );
     try runAll(&vm, &scheduler);
     try std.testing.expect(vm.globalBoolean("toggled"));
     try std.testing.expectEqual(@as(usize, 0), vm.activeTaskCount());
-    try std.testing.expectEqual(@as(usize, 3), scheduler.availableScopeCapacity());
+    // Toggling reused slots; only the 20 held scopes grew the slab (4 to 32),
+    // and every scope but the application's is free again.
+    try std.testing.expectEqual(@as(usize, 32), scheduler.scopeCapacity());
+    try std.testing.expectEqual(scheduler.scopeCapacity() - 1, scheduler.availableScopeCapacity());
     try std.testing.expectEqual(@as(usize, 0), loop.timers.count());
 }
 

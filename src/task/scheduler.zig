@@ -67,6 +67,11 @@ pub const Scheduler = struct {
     tasks: []TaskSlot,
     resources: []ResourceSlot,
     application_scope: ScopeHandle,
+    /// Every slot below a hint is in use, so searches start there. Freeing a
+    /// slot lowers its hint; the lowest free slot is still reused first.
+    scope_hint: usize = 0,
+    task_hint: usize = 0,
+    resource_hint: usize = 0,
 
     pub fn init(
         self: *Scheduler,
@@ -108,14 +113,13 @@ pub const Scheduler = struct {
 
     pub fn createTask(self: *Scheduler, scope: ScopeHandle) !TaskHandle {
         if (!(try self.scopeAcceptsNew(scope))) return error.ScopeCanceled;
-        for (self.tasks, 0..) |*slot, index| if (slot.state == .free) {
+        for (self.tasks[self.task_hint..], self.task_hint..) |*slot, index| if (slot.state == .free) {
+            self.task_hint = index + 1;
             return self.activateTask(slot, index, scope);
         };
         const old_len = self.tasks.len;
-        const new_len = std.math.mul(usize, old_len, 2) catch return error.TaskCapacityExceeded;
-        if (new_len > std.math.maxInt(u32)) return error.TaskCapacityExceeded;
-        self.tasks = try self.allocator.realloc(self.tasks, new_len);
-        @memset(self.tasks[old_len..], .{});
+        try grow(TaskSlot, self.allocator, &self.tasks, old_len + 1);
+        self.task_hint = old_len + 1;
         return self.activateTask(&self.tasks[old_len], old_len, scope);
     }
 
@@ -192,23 +196,43 @@ pub const Scheduler = struct {
         owner: ?*const anyopaque,
     ) !ScopeHandle {
         if (!(try self.scopeAcceptsNew(parent))) return error.ScopeCanceled;
-        for (self.scopes, 0..) |*slot, index| if (!slot.active) {
-            const parent_slot = &self.scopes[parent.slot];
-            var generation = slot.generation +% 1;
-            if (generation == 0) generation = 1;
-            slot.* = .{
-                .generation = generation,
-                .active = true,
-                .parent = parent,
-                .next_sibling = parent_slot.first_child,
-                .owner = owner,
-            };
-            if (parent_slot.first_child != no_scope)
-                self.scopes[parent_slot.first_child].previous_sibling = @intCast(index);
-            parent_slot.first_child = @intCast(index);
-            return .{ .slot = @intCast(index), .generation = slot.generation };
+        // Grow before taking slot pointers: growth may move the slice.
+        const index = self.firstFreeScope() orelse blk: {
+            const old_len = self.scopes.len;
+            try grow(ScopeSlot, self.allocator, &self.scopes, old_len + 1);
+            break :blk old_len;
         };
-        return error.ScopeCapacityExceeded;
+        self.scope_hint = index + 1;
+        const slot = &self.scopes[index];
+        const parent_slot = &self.scopes[parent.slot];
+        var generation = slot.generation +% 1;
+        if (generation == 0) generation = 1;
+        slot.* = .{
+            .generation = generation,
+            .active = true,
+            .parent = parent,
+            .next_sibling = parent_slot.first_child,
+            .owner = owner,
+        };
+        if (parent_slot.first_child != no_scope)
+            self.scopes[parent_slot.first_child].previous_sibling = @intCast(index);
+        parent_slot.first_child = @intCast(index);
+        return .{ .slot = @intCast(index), .generation = slot.generation };
+    }
+
+    /// Grows the scope slab until `count` scopes can be created without
+    /// allocating. Preparation calls this so a later commit cannot fail.
+    pub fn reserveScopes(self: *Scheduler, count: usize) !void {
+        const available = self.availableScopeCapacity();
+        if (available >= count) return;
+        try grow(ScopeSlot, self.allocator, &self.scopes, self.scopes.len + count - available);
+    }
+
+    fn firstFreeScope(self: *const Scheduler) ?usize {
+        for (self.scopes[self.scope_hint..], self.scope_hint..) |slot, index| {
+            if (!slot.active) return index;
+        }
+        return null;
     }
 
     /// Removes an empty scope after its resources and child scopes have been
@@ -288,7 +312,10 @@ pub const Scheduler = struct {
             task.cancellation_requested = true;
             if (task.state == .waiting) task.state = .runnable;
         }
-        for (self.resources) |*resource| {
+        // By index: a hook may register resources, which can move the slab.
+        var index: usize = 0;
+        while (index < self.resources.len) : (index += 1) {
+            const resource = &self.resources[index];
             if (!resource.active or resource.cancellation_requested or
                 !(try self.scopeSlot(resource.owner)).cancellation_requested) continue;
             resource.cancellation_requested = true;
@@ -320,7 +347,16 @@ pub const Scheduler = struct {
         lifecycle: *const ResourceLifecycle,
     ) !ResourceHandle {
         if (!(try self.scopeAcceptsNew(owner))) return error.ScopeCanceled;
-        for (self.resources, 0..) |*slot, index| if (!slot.active) {
+        const index = for (self.resources[self.resource_hint..], self.resource_hint..) |slot, index| {
+            if (!slot.active) break index;
+        } else blk: {
+            const old_len = self.resources.len;
+            try grow(ResourceSlot, self.allocator, &self.resources, old_len + 1);
+            break :blk old_len;
+        };
+        self.resource_hint = index + 1;
+        {
+            const slot = &self.resources[index];
             slot.generation +%= 1;
             if (slot.generation == 0) slot.generation = 1;
             slot.active = true;
@@ -331,8 +367,7 @@ pub const Scheduler = struct {
             slot.lifecycle = lifecycle;
             self.scopes[owner.slot].resource_count += 1;
             return .{ .slot = @intCast(index), .generation = slot.generation };
-        };
-        return error.ResourceCapacityExceeded;
+        }
     }
 
     pub fn destroyResource(self: *Scheduler, handle: ResourceHandle) !void {
@@ -346,6 +381,7 @@ pub const Scheduler = struct {
         slot.context = null;
         slot.lifecycle = null;
         slot.owner = .invalid;
+        self.resource_hint = @min(self.resource_hint, handle.slot);
         self.scopes[owner].resource_count -= 1;
         lifecycle.destroy(context);
         self.reapUpward(owner);
@@ -363,7 +399,8 @@ pub const Scheduler = struct {
         if (slot.cancellation_requested) return;
         slot.cancellation_requested = true;
         slot.lifecycle.?.request_cancel(slot.context.?) catch |err| {
-            slot.cancellation_requested = false;
+            // Re-fetch: the hook may have grown (moved) the slab.
+            self.resources[handle.slot].cancellation_requested = false;
             return err;
         };
     }
@@ -429,6 +466,8 @@ pub const Scheduler = struct {
     }
 
     fn releaseTask(self: *Scheduler, slot: *TaskSlot) void {
+        const index = (@intFromPtr(slot) - @intFromPtr(self.tasks.ptr)) / @sizeOf(TaskSlot);
+        self.task_hint = @min(self.task_hint, index);
         const scope = slot.scope.slot;
         slot.state = .free;
         slot.scope = .invalid;
@@ -496,8 +535,21 @@ pub const Scheduler = struct {
         if (slot.next_sibling != no_scope)
             self.scopes[slot.next_sibling].previous_sibling = slot.previous_sibling;
         slot.* = .{ .generation = slot.generation };
+        self.scope_hint = @min(self.scope_hint, index);
     }
 };
+
+/// Doubles a slot slab until it holds `minimum` entries. Slots are reached by
+/// index through generation-checked handles, never retained pointers, so the
+/// slab may move. Only creation and reservation paths grow.
+fn grow(comptime T: type, allocator: std.mem.Allocator, slots: *[]T, minimum: usize) !void {
+    var length = @max(slots.len, 1);
+    while (length < minimum) length = std.math.mul(usize, length, 2) catch return error.OutOfMemory;
+    if (length >= no_scope) return error.OutOfMemory;
+    const old_len = slots.len;
+    slots.* = try allocator.realloc(slots.*, length);
+    @memset(slots.*[old_len..], .{});
+}
 
 fn isEmpty(slot: *const ScopeSlot) bool {
     return slot.task_count == 0 and slot.resource_count == 0 and slot.first_child == no_scope;

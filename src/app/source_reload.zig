@@ -288,7 +288,9 @@ pub const SourceReload = struct {
                 prepared.handler_count,
             ) catch return error.CallbackCapacityExceeded;
         }
-        if (scope_count > self.scheduler.availableScopeCapacity()) return error.ScopeCapacityExceeded;
+        // Reserve now, during validation, so creating instance scopes at
+        // commit cannot fail.
+        try self.scheduler.reserveScopes(scope_count);
         try callbacks.ensureAvailable(callback_count);
         // A coordinator must account for every old live runtime before the VM
         // can be marked detached. Empty trees validate retirement without any
