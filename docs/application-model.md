@@ -126,7 +126,39 @@ return ouro.column {
 
 Build dynamic child lists in a local table, append descriptions in order, and
 pass that table as `children`. Keep explicit stable keys on each widget.
-Event handlers such as `on_press` and `on_select` remain callbacks.
+
+**Widgets send events to statecharts.** Application state lives in
+[statecharts](../design/statecharts.md). A widget that triggers behavior takes
+an event binding from `actor:event(event [, field])` in `send`, its main
+trigger, instead of a callback:
+
+```lua
+local c = doc:context()
+ouro.button { key = "save", label = "Save", send = doc:event("SAVE") }
+ouro.text_input { key = "title", text = c.title, send = doc:event { type = "EDIT", field = "title" } }
+ouro.listbox { key = "list", selected = c.selected, send = notes:event("SELECT"), children = options }
+ouro.split_view { key = "split", position = c.split, send = notes:event("RESIZE", "position"), left, right }
+```
+
+- Buttons, menu items, commands and dialog cancels send the event as is.
+  Unless `enabled` is set, they are enabled while `actor:can(event)` holds.
+  The read is tracked, so enablement follows the chart.
+- Value widgets (text input, switch, checkbox, slider, select, spinbox,
+  listbox, radio group, tab bar, tabs, split view, collapsible, accordion)
+  send a copy of the event with the new value in `field`, `value` by default:
+  `{ type = "EDIT", field = "title", value = "Draft" }`. Read the value back
+  from the actor's context. They stay enabled unless `enabled` says otherwise.
+- Every `on_*` hook also accepts a binding: `on_close = notes:event("CLOSE_TAB")`,
+  `on_cancel = doc:event("CANCEL")`, `on_drop_text = doc:event { type = "EDIT", field = "text" }`.
+  A text input's `on_command` may be a map:
+  `on_command = { submit = launcher:event("ACTIVATE"), cancel = launcher:event("CLOSE") }`.
+- `commands` entries may be bindings. A command whose event the actor would
+  refuse is left out, together with its shortcuts, so the key falls through to
+  enclosing scopes. A dialog's refused `on_cancel` leaves Escape unhandled.
+- Setting both `send` and the classic hook (`on_press`, `on_change`,
+  `on_select`) is an error. Functions still work wherever bindings do. Keep
+  them for imperative calls such as `ouro.start_drag` or opening a URI, not for
+  holding state.
 
 **Choose stateless by default; use stateful for per-instance state.**
 
@@ -603,7 +635,12 @@ ouro.menu_button {
 ```
 
 `content(close)` is a render callback; invoke `close` from an item action, not
-while constructing the content. `popup_width`/`popup_height` default to 240×200
+while constructing the content. Alternatively, `items` declares the menu:
+`items = { { key = "save", label = "Save", send = doc:event("SAVE") }, ... }`.
+Each item is a ghost button with an optional `tone` and `enabled`; activating
+it sends its event (or runs `on_press`) and closes the menu. An item with a
+binding is disabled while its actor would refuse the event. Pass `content` or
+`items`, not both. `popup_width`/`popup_height` default to 240×200
 integer logical pixels. Button options include `label`, `variant`, `tone`,
 `width`, `height`, `flex`, `enabled`, `focus_request`, and custom children.
 Optional `on_error(error)` handles opening failures. Disabling or removing the

@@ -2,9 +2,116 @@ local ouro, check, kind, validate_appearance, normalize = ...
 local f = ouro.tokens.foundation
 local transparent = '#00000000'
 
-local function enabled(p)
+-- Event bindings. `actor:event(event [, field])` returns the plain table
+-- {actor=, event=, field=}. Widgets take one in `send`, their main trigger,
+-- and every on_* hook also accepts one; functions remain an escape hatch.
+--   Activations (on_press, on_cancel, commands) send the event as is.
+--   Value hooks (on_change, on_select, ...) send a copy with the widget's new
+--   value in `field`, default 'value': {type='QUERY', value='text'}.
+-- Unless `enabled` is set, an activation is enabled while its actor would
+-- accept the event. can() reads the actor's snapshot signal, so the build or
+-- composition that lowers the widget tracks it and enablement follows the
+-- chart. Value widgets stay enabled: their payload is unknown until the user
+-- changes it, and a guard such as "the value changed" would refuse the
+-- current value and lock the widget.
+local valued = {on_change=true, on_select=true, on_activate=true, on_drop_text=true, on_drop_uris=true}
+local function bound(v) return kind(v) == 'table' and v.actor ~= nil and v.event ~= nil end
+local function callable(v) return v == nil or kind(v) == 'function' or bound(v) end
+local function carrying(event, field, value)
+  local e = {}
+  if kind(event) == 'string' then e.type = event else for k, x in pairs(event) do e[k] = x end end
+  e[field] = value
+  return e
+end
+local function field_of(v, value_hook) return v.field or (value_hook and 'value') or nil end
+local function handler(v, value_hook)
+  if not bound(v) then return v end
+  local actor, event, field = v.actor, v.event, field_of(v, value_hook)
+  if not field then return function() actor:send(event) end end
+  return function(value) actor:send(carrying(event, field, value)) end
+end
+local function accepts(v, value_hook)
+  if not bound(v) or field_of(v, value_hook) then return true end
+  return v.actor:can(v.event)
+end
+
+-- A widget's main trigger: `send`, or its classic hook, not both.
+local function trigger(p, hook)
+  check(p.send == nil or p[hook] == nil, 'use send or '..hook..', not both')
+  local v = p.send
+  if v == nil then v = p[hook] end
+  check(callable(v), hook..' must be a function or event binding')
+  return v
+end
+
+-- An explicit `enabled` wins; otherwise the trigger's binding decides.
+local function enabled(p, v, value_hook)
   check(p.enabled == nil or kind(p.enabled) == 'boolean', 'enabled must be boolean')
-  return p.enabled ~= false
+  if p.enabled ~= nil then return p.enabled end
+  return accepts(v, value_hook)
+end
+
+-- Lower bindings on the native primitives, so recipes and applications can
+-- pass them through. Commands whose event the actor would refuse are left
+-- out, together with their shortcuts, so the keys fall through as if unbound.
+-- A refused on_cancel is left out too. The props table is copied, never
+-- changed, when anything is lowered.
+-- Bare embedding states may have no base library; they get no lowering.
+local pairs, next = pairs, next
+local function lower(p)
+  if not pairs or kind(p) ~= 'table' then return p end
+  local out, refused
+  local function set(k, v)
+    if not out then out = {}; for key, value in pairs(p) do out[key] = value end end
+    out[k] = v
+  end
+  for k, v in pairs(p) do
+    if kind(k) == 'string' and kind(v) == 'table' then
+      if bound(v) then
+        set(k, (k ~= 'on_cancel' or accepts(v)) and handler(v, valued[k]) or nil)
+      elseif k == 'commands' then
+        local commands, changed = {}, false
+        for name, command in pairs(v) do
+          if bound(command) then
+            changed = true
+            if accepts(command) then commands[name] = handler(command)
+            else refused = refused or {}; refused[name] = true end
+          else commands[name] = command end
+        end
+        if changed then set(k, next(commands) and commands or nil) end
+      elseif k == 'on_command' then
+        -- An editor command map: {submit = binding | function, ...}.
+        local commands = {}
+        for name, command in pairs(v) do
+          check(callable(command), 'on_command entries must be functions or event bindings')
+          commands[name] = handler(command)
+        end
+        set(k, function(command)
+          local run = commands[command]
+          if run then run(command) end
+        end)
+      elseif bound(v.handler) then
+        local hook = {}
+        for key, value in pairs(v) do hook[key] = value end
+        hook.handler = handler(v.handler)
+        set(k, hook)
+      end
+    end
+  end
+  if refused and kind(p.shortcuts) == 'table' then
+    local shortcuts = {}
+    for chord, name in pairs(p.shortcuts) do
+      if not refused[name] then shortcuts[chord] = name end
+    end
+    set('shortcuts', next(shortcuts) and shortcuts or nil)
+  end
+  if p.activate and p.enabled == nil and bound(p.on_press) then set('enabled', accepts(p.on_press)) end
+  return out or p
+end
+local primitives = {'box', 'row', 'column', 'split', 'text_editor'}
+for i = 1, #primitives do
+  local construct = ouro[primitives[i]]
+  ouro[primitives[i]] = function(p, ...) return construct(lower(p), ...) end
 end
 
 local function motion(p)
@@ -28,7 +135,8 @@ ouro.button = ouro.stateless(function(p, children, theme)
   check(tone == 'accent' or tone == 'neutral' or tone == 'destructive', 'invalid button tone')
   check(kind(p.key) == 'string' and kind(p.label) == 'string', 'button key and label required')
   check(#children <= 1, 'button accepts one content child')
-  local active = enabled(p)
+  local press = trigger(p, 'on_press')
+  local active = enabled(p, press)
   local soft, hover, selected, text, border, solid, solid_hover, solid_text
   if tone == 'accent' then
     soft, hover, selected, text, border = c.accent, c.accent_hover, c.accent_selected, c.accent_text, c.accent_border
@@ -64,7 +172,7 @@ ouro.button = ouro.stateless(function(p, children, theme)
   local content = children[1] or ouro.text {key=p.key, text=p.label, size=size,
     foreground=fg, weight='medium', alignment='center', max_lines=1, overflow='ellipsis', semantic=false}
   return ouro.box {key=p.key, role='button', label=p.label, activate=true, enabled=active,
-    on_press=p.on_press, on_cancel=p.on_cancel, on_interaction_change=p.on_interaction_change,
+    on_press=press, on_cancel=p.on_cancel, on_interaction_change=p.on_interaction_change,
     focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y, width=p.width, height=height ~= 'auto' and height or nil,
     padding_x=metric('padding_x', f.spacing_3), alignment='center',
     radius=metric('radius', theme.controls.radius or f.radius_2),
@@ -81,7 +189,8 @@ local function toggle(p, children, theme, checkbox)
   check(#children == 0, 'toggle does not accept children')
   check(kind(p.key) == 'string' and #p.key > 0 and kind(p.label) == 'string' and #p.label > 0, 'toggle key and label required')
   check(kind(p.checked) == 'boolean', 'checked must be boolean')
-  local active, c = enabled(p), theme.colors
+  local change = trigger(p, 'on_change')
+  local active, c = enabled(p, change, true), theme.colors
   local h, inset, ring = f.spacing_5 * 5 / 6, f.border_width_default, f.border_width_strong
   local radius = theme.controls.radius or h / 2
   local background = not active and c.disabled or (p.checked and c.primary or c.switch_track)
@@ -102,7 +211,7 @@ local function toggle(p, children, theme, checkbox)
         border_width=inset, border=c.switch_border}
     end}
   return ouro.box {key=p.key, role=checkbox and 'checkbox' or 'switch', label=p.label,
-    checked=p.checked, activate=true, enabled=active, on_change=p.on_change, flex=p.flex, x=p.x, y=p.y,
+    checked=p.checked, activate=true, enabled=active, on_change=change, flex=p.flex, x=p.x, y=p.y,
     focus_request=p.focus_request, width=(checkbox and h or h*1.75)+ring*4, height=h+ring*4,
     padding=ring, alignment='center', border_width=ring, border=transparent,
     radius=checkbox and f.radius_2 or radius+ring*2, states={focus=c.ring},
@@ -118,13 +227,15 @@ ouro.checkbox = ouro.stateless(function(p, children, theme) return toggle(p, chi
 ouro.collapsible = ouro.stateless(function(p, children, theme)
   check(kind(p.key) == 'string' and #p.key > 0 and kind(p.label) == 'string' and #p.label > 0, 'collapsible key and label required')
   check(kind(p.expanded) == 'boolean', 'collapsible expanded must be boolean')
-  check(kind(p.on_change) == 'function', 'collapsible on_change required')
+  local send = trigger(p, 'on_change')
+  check(send ~= nil, 'collapsible send or on_change required')
   check(#children == 1, 'collapsible requires one content child')
-  local active, duration, c = enabled(p), motion(p), theme.colors
+  local active, duration, c = enabled(p, send, true), motion(p), theme.colors
+  local change = handler(send, true)
   return ouro.column {key=p.key, flex=p.flex, x=p.x, y=p.y, gap=0, cross_alignment='stretch',
     ouro.box {key='trigger', role='button', label=p.label, expanded=p.expanded,
       activate=true, enabled=active, focus_request=p.focus_request,
-      on_press=function() p.on_change(not p.expanded) end,
+      on_press=function() change(not p.expanded) end,
       padding_x=f.spacing_3, padding_y=f.spacing_3, border_width=f.border_width_strong,
       border=transparent, radius=f.radius_2, background=transparent,
       states={hover=c.accent, pressed=c.accent_selected, focus=c.ring},
@@ -154,8 +265,9 @@ ouro.accordion = ouro.stateless(function(p, children)
   check(#children == 0 and kind(p.items) == 'table' and #p.items > 0, 'accordion requires nonempty items and no children')
   check(kind(p.key) == 'string' and #p.key > 0, 'accordion key required')
   check(p.expanded == nil or kind(p.expanded) == 'string', 'accordion expanded must be an item key or nil')
-  check(kind(p.on_change) == 'function', 'accordion on_change required')
-  local active = enabled(p)
+  local send = trigger(p, 'on_change')
+  check(send ~= nil, 'accordion send or on_change required')
+  local active, change = enabled(p), handler(send, true)
   motion(p)
   local rows, seen, found = {}, {}, p.expanded == nil
   for _, item in ipairs(p.items) do
@@ -168,7 +280,7 @@ ouro.accordion = ouro.stateless(function(p, children)
     rows[#rows+1] = ouro.collapsible {key='item-'..item.key, label=item.label,
       expanded=p.expanded == item.key, enabled=active and item_enabled,
       duration=p.duration, motion=p.motion,
-      on_change=function(open) p.on_change(open and item.key or nil) end,
+      on_change=function(open) change(open and item.key or nil) end,
       item.content}
   end
   check(found, 'accordion expanded key must exist')
@@ -267,7 +379,7 @@ ouro.popover = ouro.stateful(function(p)
     local active = trigger_active or popup_active
     if reported ~= active then
       reported = active
-      if p.on_interaction_change then p.on_interaction_change(active) end
+      if p.on_interaction_change then handler(p.on_interaction_change)(active) end
     end
   end
   local function observe_trigger(active) trigger_active=active; report() end
@@ -286,7 +398,7 @@ ouro.popover = ouro.stateful(function(p)
       on_close=function()
         if request ~= generation then return end
         popup=nil; popup_active=false; report()
-        if p.on_close then p.on_close() end
+        if p.on_close then handler(p.on_close)() end
       end,
       content=function()
         local colors = {}
@@ -314,9 +426,10 @@ ouro.popover = ouro.stateful(function(p)
     local gap = p.gap or 6
     check(kind(gap) == 'number' and gap % 1 == 0 and gap >= 0 and gap <= 1024, 'invalid popover gap')
     check(p.side == nil or p.side == 'top' or p.side == 'bottom' or p.side == 'left' or p.side == 'right', 'invalid popover side')
-    for _, field in ipairs({'on_interaction_change', 'on_close', 'on_error'}) do
-      check(p[field] == nil or kind(p[field]) == 'function', 'invalid popover '..field)
+    for _, field in ipairs({'on_interaction_change', 'on_close'}) do
+      check(callable(p[field]), 'invalid popover '..field)
     end
+    check(p.on_error == nil or kind(p.on_error) == 'function', 'invalid popover on_error')
     return PopoverTrigger {key='trigger', flex=p.flex, x=p.x, y=p.y, open=p.open and active,
       prepare=function(style) theme=style end, anchor=anchor, observe=observe_trigger, children=p.children}
   end
@@ -352,13 +465,14 @@ ouro.slider = ouro.stateless(function(p, children, theme)
   check(#children == 0, 'slider does not accept children')
   check(kind(p.key) == 'string' and kind(p.label) == 'string', 'slider key and label required')
   local value = normalize(p) -- Validate and convert to native floating-point range values.
-  local active, width = enabled(p), p.width
+  local change = trigger(p, 'on_change')
+  local active, width = enabled(p, change, true), p.width
   if width == nil then width = 200 end
   check(kind(width) == 'number' and width >= 32, 'slider width must be at least 32')
   local before = math.floor((value-p.min)/(p.max*1.0-p.min)*65535 + 0.5)
   return ouro.box {key=p.key, label=p.label, enabled=active,
     range={value=p.value, min=p.min, max=p.max, step=p.step, inset=14},
-    on_change=p.on_change, focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
+    on_change=change, focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
     width=width, height=28, padding=4, border_width=2, border=transparent,
     radius=4, alignment='center', states={focus=theme.colors.ring},
     ouro.stack {key='layers', semantic=false,
@@ -376,7 +490,7 @@ ouro.split_view = ouro.stateless(function(p, children, theme)
   check(#children == 2, 'split_view requires exactly two children')
   return ouro.split {key=p.key, axis=p.axis, position=p.position,
     min_first=p.min_first, min_second=p.min_second, divider_size=8,
-    on_change=p.on_change, focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
+    on_change=trigger(p, 'on_change'), focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
     children[1], children[2],
     ouro.box {key='chrome', semantic=false, width='fill', height='fill', background=transparent,
       states={hover=theme.colors.accent, pressed=theme.colors.accent_selected, focus=theme.colors.ring}}}
@@ -385,7 +499,8 @@ end)
 ouro.text_input = ouro.stateless(function(p, children, theme)
   check(#children == 0, 'text_input does not accept children')
   validate_appearance(p)
-  local active, c, d = enabled(p), theme.colors, theme.widgets.text_input
+  local change = trigger(p, 'on_change')
+  local active, c, d = enabled(p, change, true), theme.colors, theme.widgets.text_input
   local function appearance(name, fallback)
     if p[name] ~= nil then return p[name] end
     if d[name] ~= nil then return d[name] end
@@ -400,7 +515,7 @@ ouro.text_input = ouro.stateless(function(p, children, theme)
     label=p.label, placeholder=p.placeholder, multiline=p.multiline,
     enabled=active, read_only=p.read_only, text_entry=p.text_entry, autofocus=p.autofocus,
     caret_shape=p.caret_shape, caret_blink=p.caret_blink, controller=p.controller,
-    key_bindings=p.key_bindings, on_change=p.on_change, on_command=p.on_command,
+    key_bindings=p.key_bindings, on_change=change, on_command=p.on_command,
     focus_request=p.focus_request, flex=p.flex, x=p.x, y=p.y,
     width=p.width, height=height, alignment=alignment,
     padding_x=appearance('padding_x', f.spacing_2), padding_y=p.multiline and f.spacing_2 or 0,
@@ -417,8 +532,9 @@ local function selection_group(p, children, policy)
   local gap = p.gap
   if gap == nil then gap = policy == 'tab_list' and 0 or f.spacing_1 end
   local layout = policy == 'tab_list' and ouro.row or ouro.column
-  return layout {key=p.key, selection=policy, selected=p.selected, enabled=p.enabled,
-    label=p.label, appearance=p.appearance, on_select=p.on_select,
+  local select = trigger(p, 'on_select')
+  return layout {key=p.key, selection=policy, selected=p.selected, enabled=enabled(p, select, true),
+    label=p.label, appearance=p.appearance, on_select=select,
     on_activate=p.on_activate, on_cancel=p.on_cancel, focus_request=p.focus_request,
     flex=p.flex, x=p.x, y=p.y, main_axis_size='max', cross_alignment='stretch',
     gap=gap, children=children}
@@ -502,18 +618,37 @@ local function openMenu(p, theme, content, on_close)
     end}
 end
 
+-- Declarative items: {key, label, send | on_press, enabled?, tone?}. Activating one
+-- runs its handler or sends its event, then closes the menu. A fixed binding
+-- disables the item while its actor would refuse the event.
+local function menuItems(items, close)
+  local rows = {}
+  for i, item in ipairs(items) do
+    check(kind(item) == 'table' and kind(item.key) == 'string' and kind(item.label) == 'string', 'menu item key and label required')
+    local send = trigger(item, 'on_press')
+    check(send ~= nil, 'menu item send or on_press required')
+    local press = handler(send)
+    rows[i] = ouro.button {key=item.key, label=item.label, variant='ghost', tone=item.tone,
+      enabled=enabled(item, send), on_press=function() press(); close() end}
+  end
+  return ouro.column {key='items', cross_alignment='stretch', children=rows}
+end
+
 ouro.menu_button = ouro.stateful(function(p)
   local popup
   local function close() if popup then popup:close(); popup=nil end end
   local function open(theme)
-    local handle, err = openMenu(p, theme, function() return p.content(close) end,
+    local handle, err = openMenu(p, theme, function()
+        if p.items then return menuItems(p.items, close) end
+        return p.content(close)
+      end,
       function() popup=nil end)
     if handle then popup=handle
     elseif p.on_error then p.on_error(err) else error(err.message) end
   end
   return function()
     motion(p)
-    check(kind(p.content) == 'function', 'menu_button content required')
+    check((kind(p.content) == 'function') ~= (kind(p.items) == 'table'), 'menu_button requires content or items')
     for _, name in ipairs({'popup_width','popup_height'}) do
       check(p[name] == nil or (kind(p[name]) == 'number' and p[name] % 1 == 0 and p[name] >= 1 and p[name] <= 16384), 'invalid '..name)
     end
@@ -541,7 +676,7 @@ local TimedToast = ouro.stateful(function(p)
   local function dismiss(reason)
     if dismissed then return end
     dismissed=true; deadline=nil
-    p.on_dismiss(reason)
+    handler(p.on_dismiss)(reason)
   end
   local function observe(active)
     if deadline then remaining=math.max(0,deadline-ouro._monotonic_ms()); deadline=nil end
@@ -567,7 +702,7 @@ ouro.toast = ouro.stateless(function(p, children)
   check(#children == 0, 'toast does not accept children')
   check(kind(p.present) == 'boolean', 'toast present must be boolean')
   check(kind(p.message) == 'string' and #p.message > 0, 'toast message required')
-  check(kind(p.on_dismiss) == 'function', 'toast on_dismiss required')
+  check(p.on_dismiss ~= nil and callable(p.on_dismiss), 'toast on_dismiss required')
   local timeout=p.timeout
   if timeout == nil then timeout=5000 end
   check(kind(timeout) == 'number' and timeout % 1 == 0 and timeout >= 0 and timeout <= 86400000, 'invalid toast timeout')
@@ -581,4 +716,4 @@ ouro.toast = ouro.stateless(function(p, children)
     end}
 end)
 
-return {open=openMenu, trigger=MenuTrigger, validate=motion}
+return {open=openMenu, trigger=MenuTrigger, validate=motion, handler=handler, callable=callable, main_trigger=trigger, enabled=enabled}

@@ -16,13 +16,14 @@ ouro.spinbox = ouro.stateful(function(props)
   local function request(candidate)
     local value = normalize(props, candidate)
     reset()
-    if props.on_change and value ~= props.value then props.on_change(value) end
+    local change = menus.main_trigger(props, 'on_change')
+    if change and value ~= props.value then menus.handler(change, true)(value) end
   end
   return function()
     normalize(props) -- Validate even when disabled or untouched.
     local editing = draft()
     local text = editing.base == props.value and editing.text or tostring(props.value)
-    local enabled = props.enabled ~= false
+    local enabled = menus.enabled(props, menus.main_trigger(props, 'on_change'), true)
     return ouro.row { key='control', gap=4, flex=props.flex,
       ouro.text_input { key='value', label=props.label, text=text, width=props.width or 100,
         enabled=enabled, focus_request=props.focus_request, key_bindings={Up='previous', Down='next'},
@@ -49,7 +50,8 @@ ouro.select = ouro.stateful(function(props)
   local popup
   local function choose(value)
     if popup then popup:close(); popup=nil end
-    if props.on_select then props.on_select(value) end
+    local select = menus.main_trigger(props, 'on_select')
+    if select then menus.handler(select, true)(value) end
   end
   local function open(theme)
     selected:set(props.selected)
@@ -81,12 +83,13 @@ ouro.select = ouro.stateful(function(props)
       if item.value==props.selected then label=item.label end
     end
     assert(label, 'select selected value must exist')
-    if props.enabled == false and popup then popup:close(); popup=nil end
+    local enabled = menus.enabled(props, menus.main_trigger(props, 'on_select'), true)
+    if not enabled and popup then popup:close(); popup=nil end
     -- Radix Themes surface Select trigger: the field label stays semantic;
     -- the trigger shows only the value and a trailing chevron.
     return menus.trigger {key='trigger', variant='surface', tone='neutral',
       label=(props.label and props.label .. ': ' or '') .. label,
-      width=props.width or (props.flex == nil and 240 or nil), enabled=props.enabled, open=open, flex=props.flex,
+      width=props.width or (props.flex == nil and 240 or nil), enabled=enabled, open=open, flex=props.flex,
       focus_request=props.focus_request,
       ouro.row {key='content', gap=space.spacing_2, cross_alignment='center',
         ouro.text {key='value', text=label, flex=1, max_lines=1, overflow='ellipsis'},
@@ -110,10 +113,11 @@ ouro.tabs = ouro.stateful(function(props)
       local key=tostring(item.value)
       local children={}
       if item.closable then
-        assert(type(props.on_close)=='function', 'closable tabs require on_close')
+        assert(props.on_close ~= nil and menus.callable(props.on_close), 'closable tabs require on_close')
+        local close = menus.handler(props.on_close, true)
         children[1]=ouro.button {key='close', label='Close', variant='ghost', tone='neutral',
           width=space.spacing_5, height=space.spacing_5, padding_x=0, radius=space.radius_1,
-          on_press=function() props.on_close(item.value) end,
+          on_press=function() close(item.value) end,
           ouro.icon {key='icon', bytes=cross, width=14, height=14}}
       end
       headers[#headers+1]=ouro.tab {key=key, value=item.value, label=item.label, children=children,
@@ -121,10 +125,11 @@ ouro.tabs = ouro.stateful(function(props)
       panels[#panels+1]=ouro.box {key=key, width='fill', height='fill', hidden=item.value~=props.selected, item.content}
     end
     assert(selected, 'tabs selected value must exist')
-    assert(type(props.on_select)=='function', 'tabs on_select must be a function')
+    local select = menus.main_trigger(props, 'on_select')
+    assert(select ~= nil, 'tabs requires send or on_select')
     return ouro.column {key='control', flex=props.flex, gap=0, cross_alignment='stretch',
       ouro.scroll {key='strip', axis='horizontal',
-        ouro.tab_bar {key='bar', label=props.label, selected=props.selected, on_select=props.on_select, children=headers, focus_request=props.focus_request}},
+        ouro.tab_bar {key='bar', label=props.label, selected=props.selected, on_select=select, children=headers, focus_request=props.focus_request}},
       ouro.separator {key='rule'},
       ouro.stack {key='panels', flex=1, children=panels},
     }

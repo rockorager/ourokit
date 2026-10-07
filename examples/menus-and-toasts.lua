@@ -44,15 +44,10 @@ return o.app {id='dev.ourokit.menus-and-toasts',actions={
             o.column {key='controls',width=260,gap=14,cross_alignment='stretch',
               o.text {key='menu-title',text='Native popups',size=17,weight='medium'},
               o.menu_button {key='menu',label='Workspace actions',popup_width=260,popup_height=112,
-                duration=slow() and 1200 or 120,content=function(close)
-                  return o.column {key='actions',cross_alignment='stretch',
-                    o.button {key='save',label='Save workspace',variant='ghost',
-                      on_press=function() close(); menu_hits=menu_hits+1; shown[1]:set(true) end},
-                    o.button {key='build',label='Build project',variant='ghost',
-                      on_press=function() close(); menu_hits=menu_hits+1; shown[2]:set(true) end},
-                    o.button {key='settings',label='Apply settings',variant='ghost',
-                      on_press=function() close(); menu_hits=menu_hits+1; shown[3]:set(true) end}}
-                end},
+                duration=slow() and 1200 or 120,items={
+                  {key='save',label='Save workspace',on_press=function() menu_hits=menu_hits+1; shown[1]:set(true) end},
+                  {key='build',label='Build project',on_press=function() menu_hits=menu_hits+1; shown[2]:set(true) end},
+                  {key='settings',label='Apply settings',on_press=function() menu_hits=menu_hits+1; shown[3]:set(true) end}}},
               o.select {key='select',label='Audio output',width=260,selected=selected(),
                 duration=slow() and 1200 or 120,on_select=function(v) selected:set(v) end,
                 options={{value=1,label='Speakers'},{value=2,label='Headphones'},{value=3,label='HDMI'}}},
