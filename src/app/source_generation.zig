@@ -32,6 +32,9 @@ pub const Config = struct {
     session_candidate: bool = false,
     /// Development only: every generation publishes ouro.machine records here.
     statecharts: ?*lua.StatechartInspector = null,
+    /// `ouro.machine.strict`: undeclared events raise when true (development
+    /// and tests) and are rejected as 'undeclared' when false (production).
+    statechart_strict: bool = true,
 };
 
 pub const UiServices = struct {
@@ -394,6 +397,7 @@ pub const SourceGeneration = struct {
         // ouro.machine is installed with the UI build API; observe it before
         // application code can start actors.
         if (config.statecharts) |store| try lua.installStatechartInspector(&self.vm, store);
+        lua.setStatechartStrict(&self.vm, config.statechart_strict);
         self.vm.setRuntimeDirectory(config.runtime_dir);
         try @import("../lua/xdg.zig").install(&self.vm, config.environ);
         self.applications.init(&self.vm, loop, config.applications);

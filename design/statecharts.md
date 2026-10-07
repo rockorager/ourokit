@@ -144,10 +144,12 @@ read-only view.
 - **Charts declare their events.** The declared set is the union of three
   sources: the explicit `events` schemas, `machine.set` setters, and every
   plain event name some state handles. With `machine.strict = true`, the
-  default and the intended development setting, `send`, `can` and
-  `actor:event` raise `UnknownEvent` for anything else, so typos fail loudly.
-  Non-strict, `send` returns `false, 'undeclared'`. The host is expected to
-  relax strictness outside development; that wiring is not done yet.
+  default, `send`, `can` and `actor:event` raise `UnknownEvent` for anything
+  else, so typos fail loudly. Non-strict, `send` returns `false,
+  'undeclared'`. The host sets it: strict under `--dev`, in `ouroctl test`
+  and in Storybook; non-strict for production `ouroctl run`, with or without
+  `--mcp` or `--headless`. Headless test scripts opt in with
+  `machine.strict = true`.
 
 ### Schemas
 
@@ -404,9 +406,8 @@ Collapsible { key = 'details', title = 'Details', ... }
 - Its root scope hangs under the instance scope of the callback that first
   needed one, so its timers and invokes end when the instance unmounts. Root
   scopes open lazily, so a component without `after`/`invoke` never opens one.
-  Known gap: a component *with* timers makes component-test teardown panic
-  until instance teardown retires VM-owned child scopes. The scopes thread
-  has the report.
+  (Instance teardown retires VM-owned child scopes, so components with
+  timers tear down cleanly.)
 - Component actors are not carried across reload (`persist_roots` skips
   them), and `machine.actors()` drops them once their scope is gone.
 
@@ -570,14 +571,17 @@ Plain, JSON-encodable data, computed once per chart:
 `actor:observe(fn)` sees one actor. `machine.inspect(fn)` sees every actor,
 including spawned children. Both return an unsubscribe function, and observer
 errors are logged without breaking the machine. `machine.actors()` lists live
-actors, so a late-attaching tool can call `actor:snapshot()` and
-`actor.chart:graph()`.
+actors, so a late-attaching tool can call `actor:snapshot()`,
+`actor.chart:graph()` and `actor:pending_timers()`. The last returns
+`{state, delay, event, token, time_ms}` per running `after` timer, so gauges
+can resume counting down.
 
 There is one record per processed event, including rejected ones:
 
 ```lua
 {
   kind = 'transition', actor = 'notes/document.2', machine = 'document', sequence = 14, commit = 203,
+  time_ms = 81234,           -- scheduler clock: virtual for manual_scheduler, host monotonic otherwise
   -- sequence counts this actor's records; commit is the global order in which
   -- snapshots committed. Records are emitted after their effects, so a child's
   -- record can arrive before the parent record that caused it: sort by commit.
@@ -589,8 +593,8 @@ There is one record per processed event, including rejected ones:
       exited = { 'open.io.idle' }, entered = { 'open.io.saving', 'open.io.saving.choosing' } },
   },
   exited = { 'open.io.idle' }, entered = { 'open.io.saving', 'open.io.saving.choosing' },
-  timers  = { { action = 'started', state = 'open.io.saving', delay = 500, event = 'after.500.open.io.saving', token = 9 } },
-  -- timer action: started | fired | cancelled
+  timers  = { { action = 'started', state = 'open.io.saving', delay = 500, event = 'after.500.open.io.saving', token = 9, time_ms = 81234 } },
+  -- timer action: started (+ time_ms) | fired | cancelled
   invokes = { { action = 'started', state = 'open.io.saving.choosing', id = 'choose', src = 'choose', token = 10 } },
   -- invoke action: started | done | error (+ error) | cancelled
   children = { { action = 'spawned', id = 'document.3', machine = 'document' } },
@@ -599,11 +603,21 @@ There is one record per processed event, including rejected ones:
   states = { ... },                -- configuration after the step
   status = 'active',
   context = { ... },               -- plain deep copy of the context after the step
+  guards = { { index = 12, passed = true }, { index = 14, passed = false, error = '...' } },
 }
 ```
 
+`guards` are valve states for the visualizer. They cover every guarded
+transition whose source is active after the step, evaluated against the
+committed snapshot. Event transitions see a bare `{type = event}`, `after`
+transitions their timer event, and `always` transitions `{type = 'ouro.always'}`.
+A guard that throws, for example because it reads a payload field, is
+`passed = false` with its `error`. `index` maps to
+`chart:graph().transitions[].index`.
+
 Lifecycle records are `{ kind = 'actor', action = 'started', actor, machine,
-parent, graph }` and `{ kind = 'actor', action = 'stopped', actor, machine }`.
+parent, graph, time_ms }` and `{ kind = 'actor', action = 'stopped', actor,
+machine, time_ms }`.
 Records are built only while an observer is attached. They answer questions
 like "why is this app waking up when idle?" through timers that are still
 started, and "why is Save disabled?" through rejected events and guards.
@@ -836,10 +850,10 @@ book = machine.create {
 - ~~Two schemas per command~~ **Resolved:** `machine.actions` derives MCP
   `inputSchema` from the chart's event schema (§2). Output schemas are still
   written by hand.
-- **Strict mode wiring.** `machine.strict` should follow `--dev`; the host
-  does not set it yet.
-- **Instance-scope teardown** with VM-owned child scopes (component machines
-  with timers) panics in component tests (§6). This is with the scopes thread.
+- ~~Strict mode wiring~~ **Resolved:** the host sets `machine.strict` from
+  `--dev` (§2).
+- ~~Instance-scope teardown~~ **Resolved by the scopes thread:** cancelling a
+  scope now retires the VM-owned scopes beneath it.
 - **Selector caching** keeps one entry per selector. A selector called with
   alternating contexts, for example per child, recomputes. Per-key caches
   may be needed.

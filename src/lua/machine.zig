@@ -70,6 +70,19 @@ fn atomic(state: *c.State) callconv(.c) c_int {
     return c.lua_gettop(state) - 1;
 }
 
+/// Sets `ouro.machine.strict`: hosts make it follow development mode, so
+/// undeclared events raise under --dev and in tests and are rejected in
+/// production.
+pub fn setStrict(vm: *Vm, strict: bool) void {
+    const state = vm.state;
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    vm.pushApi(state);
+    if (c.lua_getfield(state, -1, "machine") != c.type_table) return;
+    c.lua_pushboolean(state, @intFromBool(strict));
+    c.lua_setfield(state, -2, "strict");
+}
+
 /// A parked task for machine.wait_for. The Lua userdata owns this memory; the
 /// parked coroutine keeps it alive (it is on that task's stack), and the
 /// scheduler only holds it as a resource context while the task waits.

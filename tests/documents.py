@@ -16,6 +16,7 @@ BINARY = Path(os.environ.get("OUROKIT_TEST_BINARY", ROOT / "zig-out/bin/ouroctl"
 source = r'''
 local o=require('ouro')
 local machine=o.machine
+machine.strict=true -- production runs are non-strict; this test wants typos to fail
 local m=require('model')(o.json)
 
 -- Plain functions.

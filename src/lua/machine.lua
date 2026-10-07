@@ -1384,6 +1384,7 @@ if scope_open then
     alive = function(scope) return scope_alive(scope) end,
     run = function(scope, fn) scope_spawn(scope, fn) end,
     after = function(scope, delay, fn) scope_spawn(scope, function() ouro.sleep(delay); fn() end) end,
+    clock = ouro._monotonic_ms,
   }
 end
 
@@ -1401,6 +1402,7 @@ local function close_token_scope(scope)
 end
 M.token_scheduler = {
   kind = 'token',
+  clock = ouro._monotonic_ms,
   open = token_scope,
   close = close_token_scope,
   alive = function(scope) return scope.alive end,
@@ -1414,6 +1416,7 @@ M.default_scheduler = M.default_scheduler or M.token_scheduler
 -- Deterministic scheduler for tests: virtual time and explicit task runs.
 function M.manual_scheduler()
   local s = {kind = 'manual', now = 0, timers = {}, tasks = {}, sequence = 0, open_scopes = 0}
+  function s.clock() return s.now end -- virtual time for records
   function s.open(parent)
     s.open_scopes = s.open_scopes + 1
     return token_scope(parent)
@@ -1582,6 +1585,17 @@ end
 
 function Actor:child(id) return self._children[id] end
 
+-- Running after-timers, for late-attaching inspectors: {state, delay, event,
+-- token, time_ms} with time_ms the scheduler clock when the timer started.
+function Actor:pending_timers()
+  local list = {}
+  for _, live in pairs(self._timers) do
+    list[#list + 1] = {state = live.state, delay = live.delay, event = live.event, token = live.token, time_ms = live.time_ms}
+  end
+  table.sort(list, function(a, b) return a.state < b.state or (a.state == b.state and a.delay < b.delay) end)
+  return list
+end
+
 function Actor:children()
   local list = {}
   for _, id in ipairs(self:_read().children) do
@@ -1605,8 +1619,44 @@ function Actor:persist()
   return out
 end
 
+-- Scheduler clock in ms (virtual for the manual scheduler, host monotonic
+-- otherwise); records use differences only.
+local function clock(actor)
+  local fn = actor._scheduler.clock
+  return fn and fn() or nil
+end
+
+-- Valve states for the visualizer: every guarded transition whose source is
+-- active, evaluated against the committed snapshot. Event transitions see a
+-- bare {type = event}; after transitions their timer event; always ones
+-- {type = 'ouro.always'}. A throwing guard is closed, with its error.
+local function valve_states(actor)
+  local chart, snapshot = actor.chart, actor._snapshot
+  local out = {}
+  if snapshot.status ~= 'active' then return out end
+  local active = active_set(chart, snapshot)
+  local context = view(snapshot.context)
+  local meta = {children = view(snapshot.children), matches = function(id)
+    local node = chart.by_id[id]
+    if not node or id == '' then fail('machine %s has no state %q', chart.id, tostring(id)) end
+    return active[node] == true
+  end}
+  for _, t in ipairs(chart.transitions) do
+    if t.guard and active[t.source] then
+      local event = {type = t.event or 'ouro.always'}
+      if t.kind == 'after' then event.state, event.token = t.source.id, snapshot.entries[t.source.id] end
+      local ok, result = pcall(atomic, t.guard_label, t.guard, context, view(event), meta)
+      if ok then out[#out + 1] = {index = t.index, passed = result and true or false}
+      else out[#out + 1] = {index = t.index, passed = false, error = tostring(result)} end
+    end
+  end
+  return out
+end
+
 local function finalize(actor, record, origin)
   actor._sequence = (actor._sequence or 0) + 1
+  record.time_ms = clock(actor)
+  record.guards = valve_states(actor)
   record.actor, record.machine, record.sequence, record.origin = actor.path, actor.chart.id, actor._sequence, origin
   local snapshot = actor._snapshot
   local states = {}
@@ -1669,10 +1719,11 @@ local function run_effects(actor, effects, record)
         atomic(effect.label, effect.fn, view(effect.context), view(effect.event), actor)
       elseif kind == 'timer_start' then
         local key = effect.state .. '|' .. effect.delay
-        local live = {token = effect.token, state = effect.state, delay = effect.delay, event = effect.event}
+        local live = {token = effect.token, state = effect.state, delay = effect.delay, event = effect.event,
+          time_ms = clock(actor)}
         actor._timers[key] = live
         record.timers[#record.timers + 1] = {action = 'started', state = effect.state, delay = effect.delay,
-          event = effect.event, token = effect.token}
+          event = effect.event, token = effect.token, time_ms = live.time_ms}
         actor._scheduler.after(scope_for(actor, effect.state, effect.token), effect.delay, function()
           if actor._timers[key] ~= live then return end
           actor._timers[key] = nil
@@ -1914,7 +1965,7 @@ function Actor:start()
   registry[self.path] = self
   registry_order[#registry_order + 1] = self.path
   if #inspectors > 0 or #self._observers > 0 then
-    emit(self, {kind = 'actor', action = 'started', actor = self.path, machine = self.chart.id,
+    emit(self, {kind = 'actor', action = 'started', actor = self.path, machine = self.chart.id, time_ms = clock(self),
       parent = self._parent and self._parent.path, graph = self.chart:graph()})
   end
   local pending = self._pending
@@ -1970,7 +2021,7 @@ function Actor:stop()
   if was_started and wants_records(self) then
     finalize(self, record, 'stop')
     emit(self, record)
-    emit(self, {kind = 'actor', action = 'stopped', actor = self.path, machine = self.chart.id})
+    emit(self, {kind = 'actor', action = 'stopped', actor = self.path, machine = self.chart.id, time_ms = clock(self)})
   end
 end
 

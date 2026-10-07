@@ -864,6 +864,7 @@ return {
   end,
 
   ['runtime prefixes are reserved and undeclared events fail in strict mode'] = function()
+    assert(machine.strict == true, 'ouroctl test is strict')
     for _, name in ipairs({ 'surface.closed.main', 'done.x', 'error.x', 'after.x', 'ouro.x' }) do
       fails(function() machine.create { id = 'm', initial = 'a', events = { [name] = {} }, states = { a = {} } } end, 'invalid external event name')
     end
@@ -988,6 +989,53 @@ return {
     held:send('BACK') -- transitions after restore behave normally
     machine.release()
     assert(held:matches('running.idle') and #again.timers == 0)
+  end,
+
+  ['records carry the scheduler clock and post-step guard valves'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create {
+      id = 'valves', initial = 'filling', context = { level = 0 },
+      states = {
+        filling = {
+          always = { target = 'full', guard = function(c) return c.level >= 3 end },
+          after = { [100] = { target = 'drained', guard = function(c) return c.level == 0 end } },
+          on = {
+            POUR = { actions = assign { level = function(c) return c.level + 1 end } },
+            BIG = { target = 'full', guard = function(_, e) return e.amount > 10 end },
+          },
+        },
+        full = {}, drained = {},
+      },
+    }
+    local actor = chart:start { scheduler = clock }
+    local records = recorder(actor)
+    local index = {}
+    for _, t in ipairs(chart:graph().transitions) do index[(t.event or 'always'):match('^[%w]+')] = t.index end
+    local function valve(record, key)
+      for _, v in ipairs(record.guards) do if v.index == index[key] then return v end end
+    end
+    clock.advance(40)
+    actor:send('POUR')
+    local r = last(records)
+    assert(r.time_ms == 40 and r.timers[1] == nil)
+    assert(valve(r, 'always').passed == false and valve(r, 'after').passed == false)
+    -- BIG reads e.amount: a bare {type = 'BIG'} makes it throw, so it is closed with the error.
+    assert(valve(r, 'BIG').passed == false and valve(r, 'BIG').error:find('attempt to compare', 1, true), valve(r, 'BIG').error)
+    assert(#r.guards == 3)
+    local timers = actor:pending_timers()
+    assert(#timers == 1 and timers[1].state == 'filling' and timers[1].delay == 100 and timers[1].time_ms == 0)
+    clock.advance(10)
+    actor:send('POUR')
+    actor:send('POUR') -- level 3: the always valve opens and fires in the same step
+    r = last(records)
+    assert(r.time_ms == 50 and actor:matches('full') and #r.guards == 0, 'no guarded transitions are active in full')
+    assert(o.json.decode(o.json.encode(r)).time_ms == 50)
+    local fresh = machine.manual_scheduler()
+    fresh.advance(7)
+    local other = chart:start { scheduler = fresh }
+    local other_records = recorder(other)
+    other:send('POUR')
+    assert(last(other_records).timers[1] == nil and other:pending_timers()[1].time_ms == 7)
   end,
 
   ['event schemas validate external events and drive accepted()'] = function()

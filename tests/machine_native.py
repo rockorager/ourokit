@@ -18,6 +18,8 @@ BINARY = Path(os.environ.get("OUROKIT_TEST_BINARY", ROOT / "zig-out/bin/ouroctl"
 source = r'''
 local o = require('ouro')
 local machine = o.machine
+assert(machine.strict == false, 'production runs reject undeclared events instead of raising')
+machine.strict = true -- this test wants typos to fail loudly
 assert(machine.native_scopes and machine.default_scheduler.kind == 'native', 'native scope binding missing')
 local log = {}
 local after_sleep = {}
@@ -244,7 +246,19 @@ def mcp_check():
             assert "panic" not in errors, errors
 
 
+def strict_check():
+    """machine.strict follows the host: strict under --dev, rejecting otherwise."""
+    with tempfile.TemporaryDirectory(prefix="ourokit-machine-strict-") as temporary:
+        app = Path(temporary) / "strict.lua"
+        app.write_text("local o = require('ouro'); o.stdout.write('strict=' .. tostring(o.machine.strict) .. '\\n'); o.exit(0)\n")
+        env = dict(os.environ, XDG_RUNTIME_DIR=temporary)
+        for flags, expected in ((["--headless"], "strict=false"), (["--dev", "--headless"], "strict=true")):
+            result = subprocess.run([str(BINARY), "run", str(app), *flags], env=env, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0 and expected in result.stdout, (flags, result.stdout, result.stderr)
+
+
 assert BINARY.exists(), "run zig build first"
+strict_check()
 mcp_check()
 with tempfile.TemporaryDirectory() as temporary:
     app = Path(temporary) / "machine.lua"

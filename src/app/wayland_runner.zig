@@ -411,6 +411,8 @@ fn runSourceInternal(
     defer if (statecharts) |*store| store.deinit();
     const generation_config: source_generation.Config = .{
         .statecharts = if (statecharts != null) &statecharts.? else null,
+        // Production rejects undeclared events instead of raising.
+        .statechart_strict = options.development,
         .native_modules = options.native_modules,
         .node_capacity = options.window.node_capacity,
         .window_capacity = options.application_window_capacity,
