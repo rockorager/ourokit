@@ -54,6 +54,7 @@ TESTS = (
     'desktop_install.py',
     'documents.py',
     'chart_reload.py',
+    'component_machines.py',
     'launcher.py',
     'desktop_native.py',
 )
