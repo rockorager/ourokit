@@ -1,12 +1,16 @@
 # Statecharts as the application model
 
-Status: Phases 0–1 done (GO). Phase 3, the app-model integration in Lua,
-is in progress. The prototype
+Status: Phases 0–1 done (GO). Phase 2 is shrunk: there is no native
+interpreter. The interpreter stays in Lua and snapshots stay Lua tables.
+Only three parts are native: chart validation at load, logical timers, and
+the existing waiters and task scopes. Phase 3, the app-model integration in
+Lua, is in progress. The implementation
 lives in [`src/lua/machine.lua`](../src/lua/machine.lua) as `ouro.machine`;
 tests are in [`tests/machine_test.lua`](../tests/machine_test.lua) and
 [`tests/machine_native.py`](../tests/machine_native.py).
-[`examples/documents`](../examples/documents) and [`examples/contacts`](../examples/contacts)
-are ported to it.
+[`examples/documents`](../examples/documents), [`examples/contacts`](../examples/contacts),
+[`examples/launcher`](../examples/launcher) and [`examples/stopwatch`](../examples/stopwatch)
+are built on it.
 
 The core idea: **active states own lifetimes, effects and windows, and the UI is
 a function of the state snapshot.** Charts hold *all* application state,
@@ -28,7 +32,7 @@ local stopwatch = machine.create {
   states = {
     clock = { initial = 'idle', states = {
       idle = { on = { START = 'running' } },
-      running = { after = { [100] = { target = 'running', actions = 'tick' } }, on = { STOP = 'paused' } },
+      running = { after = { [100] = { target = 'running', reenter = true, actions = 'tick' } }, on = { STOP = 'paused' } },
       paused = { on = { START = 'running' } },
     } },
     settings = { initial = 'closed', states = { ... MAX_LAPS = machine.set('draft_max_laps', 'integer') ... } },
@@ -444,8 +448,7 @@ are internal, compiled in Zig and allocation-free. They are not app charts.
 configuration. That includes presentation state such as query text,
 selection, the open tab, appearance, and a collapsible's open flag. Signals
 are not an app-facing state mechanism. The only signals left are the hidden
-per-field ones each actor keeps so views rebuild precisely (§6). They may go
-away in the native interpreter. This reverses an interim decision to keep signals for
+per-field ones each actor keeps so views rebuild precisely (§6). This reverses an interim decision to keep signals for
 presentation state. The reasons:
 - one model to learn and reason about;
 - replay, reload, the inspector and MCP only see what is in charts;
@@ -544,9 +547,10 @@ with no new public API:
 - **Cached views.** One read-only view per raw table, held in a native
   weak-keyed table, so repeated reads and iterating a 200-row list don't
   allocate. The semantics are the same in development and production.
-- **Native port constraint.** Snapshots stay plain Lua tables (copy-on-write,
-  identity-comparable values). The native interpreter has to keep them that
-  way, or replace the per-key identity diff with an equivalent.
+- **Snapshots stay Lua tables.** The interpreter stays in Lua (see Status),
+  so snapshots stay plain tables with copy-on-write, identity-comparable
+  values. Native pieces (chart validation, logical timers) must not change
+  that, because the per-key identity diff depends on it.
 
 `tests/machine_test.lua` counts renders in the 'rebuild locality' tests, and
 both fail on the previous one-signal-per-actor design.
