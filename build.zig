@@ -701,6 +701,23 @@ fn addWaylandExample(
         }),
     });
     b.installArtifact(host);
+    // The native test peers (tests/session_native.py, the virtual pointer in
+    // desktop_native.py and others) speak these protocols from their XML.
+    // Installing them next to ouroctl lets downstream projects run those
+    // tests against a prebuilt binary, which comes without zig-pkg.
+    inline for (.{
+        .{ "wayland", "protocol/wayland.xml" },
+        .{ "wayland_protocols", "staging/ext-idle-notify/ext-idle-notify-v1.xml" },
+        .{ "wayland_protocols", "staging/ext-session-lock/ext-session-lock-v1.xml" },
+        .{ "wlr_protocols", "unstable/wlr-output-power-management-unstable-v1.xml" },
+        .{ "wlr_protocols", "unstable/wlr-virtual-pointer-unstable-v1.xml" },
+    }) |protocol| {
+        const install = b.addInstallFile(
+            b.dependency(protocol[0], .{}).path(protocol[1]),
+            "share/ourokit/protocols/" ++ comptime std.fs.path.basename(protocol[1]),
+        );
+        b.getInstallStep().dependOn(&install.step);
+    }
     const run_host = b.addRunArtifact(host);
     run_host.addArg("run");
     if (b.args) |args| run_host.addArgs(args);

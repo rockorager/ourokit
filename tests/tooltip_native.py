@@ -17,7 +17,7 @@ import tempfile
 import time
 
 from application_services import BINARY, ROOT, call, development_path
-from desktop_native import sway, terminate, wait_for
+from desktop_native import protocol_xml, sway, terminate, wait_for
 import verify_development as verify
 
 
@@ -49,7 +49,7 @@ on_press=function() hits=hits+1 end}}} end}}} end}
 ''')
         logs, processes, endpoints = [], [], []
         try:
-            protocol = next((ROOT / 'zig-pkg').glob('*/unstable/wlr-virtual-pointer-unstable-v1.xml'))
+            protocol = protocol_xml('wlr-virtual-pointer-unstable-v1.xml', BINARY)
             subprocess.run(['wayland-scanner', 'client-header', str(protocol), str(root / 'virtual-pointer.h')], check=True)
             subprocess.run(['wayland-scanner', 'private-code', str(protocol), str(root / 'virtual-pointer.c')], check=True)
             flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'wayland-client'], text=True))

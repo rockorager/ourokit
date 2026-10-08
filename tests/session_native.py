@@ -16,6 +16,8 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 
+from desktop_native import protocol_xml
+
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get('OUROKIT_TEST_BINARY', ROOT / 'zig-out/bin/ouroctl')).resolve()
 
@@ -101,7 +103,7 @@ class Peer:
         wanted = {'wayland.xml', 'ext-idle-notify-v1.xml', 'ext-session-lock-v1.xml',
                   'wlr-output-power-management-unstable-v1.xml'}
         supplied = os.environ.get('OUROKIT_TEST_PROTOCOL_XMLS')
-        paths = map(Path, supplied.split(os.pathsep)) if supplied else (ROOT / 'zig-pkg').rglob('*.xml')
+        paths = map(Path, supplied.split(os.pathsep)) if supplied else (protocol_xml(name, BINARY) for name in wanted)
         for path in paths:
             if path.name in wanted:
                 for interface in ET.parse(path).getroot().findall('interface'):

@@ -112,9 +112,12 @@ jobs:
       - name: Package
         run: |
           root="dist/${ASSET}"
-          mkdir -p "$root/bin" "$root/include" "$root/share/licenses/ourokit"
+          mkdir -p "$root/bin" "$root/include" "$root/share/licenses/ourokit" "$root/share/ourokit"
           cp out/bin/ouroctl "$root/bin/"
           cp -r out/include/ourokit "$root/include/"
+          # Protocol XMLs for the native test peers (tests/session_native.py).
+          cp -r out/share/ourokit/protocols "$root/share/ourokit/"
+          test -f "$root/share/ourokit/protocols/ext-session-lock-v1.xml"
           cp out/share/licenses/ourokit/* docs/licenses/* "$root/share/licenses/ourokit/"
           cp LICENSE "$root/share/licenses/ourokit/LICENSE"
           "$root/bin/ouroctl" --help > /dev/null

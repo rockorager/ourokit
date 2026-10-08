@@ -299,7 +299,11 @@ check protocol ordering, configured SHM pixels, independent outputs, input,
 hotplug, denial/relock, reload rejection, exit without unlock, asynchronous
 prompts, native editing, success/denial, stale submissions, buffer bounds,
 crashes and cancellation. `Peer(root, remove_managers=False)` remains the entry
-point. Fixture services require `fixture-user`: `fixture` expects `alice` then
+point. The peer parses the Wayland protocol XMLs installed with ouroctl in
+`share/ourokit/protocols`, so downstream projects can run it against a prebuilt
+`ouroctl` (`python3 tests/session_native.py <ouroctl>`); a source checkout falls
+back to `zig-pkg`, and `OUROKIT_TEST_PROTOCOL_XMLS` overrides both. Fixture
+services require `fixture-user`: `fixture` expects `alice` then
 `test-only-response`; `deny-account` accepts those but rejects account;
 `blocked` ignores TERM forever; `crash` raises SIGSEGV; `edited` checks Unicode;
 `end-failed` fails PAM cleanup; and `limit` checks exactly 512 `x` bytes. No real

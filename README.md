@@ -78,12 +78,14 @@ x86_64 Linux `ouroctl` as GitHub release assets:
 - running the workflow manually with a commit SHA backfills `commit-<sha>`.
 
 Each release has `ouroctl-x86_64-linux-gnu.tar.gz` (`bin/ouroctl`, the plugin
-header and licenses) and its `.sha256`, and a GitHub build-provenance
-attestation. The binary is built on Debian 12 with `-Dcpu=baseline`, so it
-needs glibc 2.36 or newer and any x86_64 CPU. At runtime it needs Fontconfig,
-FreeType, xkbcommon, libcurl and PipeWire (Debian: `libfontconfig1 libfreetype6
-libxkbcommon0 libcurl4 libpipewire-0.3-0`). System audio observation and controls
-live under [`ouro.audio`](docs/audio.md), using PipeWire directly.
+header, licenses, and under `share/ourokit/protocols` the Wayland protocol XMLs
+that native tests such as `tests/session_native.py` find next to the binary)
+and its `.sha256`, and a GitHub build-provenance attestation. The binary is
+built on Debian 12 with `-Dcpu=baseline`, so it needs glibc 2.36 or newer and
+any x86_64 CPU. At runtime it needs Fontconfig, FreeType, xkbcommon, libcurl and
+PipeWire (Debian: `libfontconfig1 libfreetype6 libxkbcommon0 libcurl4
+libpipewire-0.3-0`). System audio observation and controls live under
+[`ouro.audio`](docs/audio.md), using PipeWire directly.
 
 Install it with [mise](https://mise.jdx.dev), pinning a commit:
 
