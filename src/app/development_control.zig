@@ -381,8 +381,7 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
         for (store.actors.keys(), store.actors.values()) |path, actor| {
             const started = try Decode.value(a, actor.started, text);
             const latest = try Decode.value(a, actor.latest, text);
-            try actors.append(try mcp.object(a, .{ .{ "actor", mcp.string(path) }, .{ "started", started }, .{ "latest", latest },
-                .{ "latest_sequence", integer(actor.latest_sequence) } }));
+            try actors.append(try mcp.object(a, .{ .{ "actor", mcp.string(path) }, .{ "started", started }, .{ "latest", latest }, .{ "latest_sequence", integer(actor.latest_sequence) } }));
         }
         try result.object.put(a, "actors", .{ .array = actors });
     }
