@@ -15,7 +15,7 @@ local M = {}
 function M.new(null, thresholds)
   contract.null = null
   return {actors = {}, order = {}, plants = {}, null = null, thresholds = thresholds or default_thresholds,
-    alarms = {}, alarm_keys = {}, endpoints = {}, endpoint_order = {}, traffic = {}, traffic_order = {}}
+    alarms = {}, alarm_keys = {}, endpoints = {}, endpoint_order = {}, traffic = {}, traffic_order = {}, inbox = {}}
 end
 
 local function shape(g) return g.id .. ':' .. #g.states .. ':' .. #g.transitions end
@@ -72,6 +72,20 @@ function M.check(store, now)
   store.now = math.max(store.now or now, now)
   store.deadline = overview.check(store, store.now)
   return store.deadline
+end
+
+-- Services only stage what they receive; the visualizer chart's `ingest`
+-- action drains the inbox (design §6: this store is a cache written from
+-- chart actions only). `now` also runs the stuck-state check.
+function M.stage(store, record, time)
+  store.inbox[#store.inbox + 1] = {record = record, time = time}
+end
+
+function M.drain(store, now)
+  local inbox = store.inbox
+  store.inbox = {}
+  for _, item in ipairs(inbox) do M.ingest(store, item.record, item.time) end
+  if now then M.check(store, now) end
 end
 
 -- Frame counts per actor, for the chart's cursor arithmetic.

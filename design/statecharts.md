@@ -553,6 +553,20 @@ Where state goes:
 | Caret, selection, IME preedit, scroll offset | native widget | continuous values (§5) |
 | Search results, `dirty`, labels | `machine.selector` / plain function | derived, never stored |
 
+**Sanctioned exception: large external caches.** A tool may keep a large,
+derived cache outside chart context when copying it through context on
+every event would be wasteful and it is not the source of truth for any
+behavior. The statechart visualizer's `model.lua` is the example: thousands
+of history frames, layouts and alarms folded from another app's records,
+rebuildable from that app at any time. The rules:
+- the cache is written only from chart actions. Services (invokes) stage
+  what they receive in an inbox and send an event; the event's assign drains
+  the inbox into the cache while it computes the new context;
+- every write is announced by a context change (`revision`), so views that
+  read the cache rebuild through normal tracking;
+- guards and transitions never read it. The chart keeps what decides
+  behavior (selection, cursor, acknowledgements, connection state) in context.
+
 Rule of thumb: if you would have reached for a signal, add a context field
 (`machine.set` for the common "store the widget's value" case). If what can
 happen next depends on what happened before, make it a state. If it is a
@@ -1089,6 +1103,11 @@ MCP `tools/call`. Production instances install nothing
   outcomes), `time_ms` and `accepted` (the declared events the actor would
   take). `text = true` returns records as JSON strings, for clients such as
   `ouro.mcp` that convert at most 4,096 values per reply. `reads` counts calls.
+  `more` says the page was cut (limit, or the 2 MiB response budget), so call
+  again. `epoch` identifies the running instance; a client seeing a new one
+  starts over from `after = 0`. Each `actors` entry has `latest_sequence`,
+  the ring sequence of its latest record (0 for a synthetic attach record),
+  so a client whose cursor already passed it does not ingest it twice.
 - **One actor, complete.** `actor = path` adds `actor = {actor, machine,
   parent, graph, snapshot}`, read now. The snapshot record has the
   configuration (`states`), `status`, the full `context`, `children`,
@@ -1129,7 +1148,11 @@ chart as well as inspect it:
   that changed and `changes` their new values.
 - With `wait`, it then calls `machine.wait_for` until one of `wait.states`
   matches (or the next commit when `states` is omitted) or `timeout_ms`
-  (default 5,000) passes, and adds `wait = {matched, error}`.
+  (default 5,000, at most 60,000; larger is an `InvalidWaitTimeout` error)
+  passes, and adds `wait = {matched, error}`. A waiting send does not hold up
+  other clients' development requests, and cancelling it
+  (`notifications/cancelled` or disconnect) retires its task scope, ending
+  the wait and its observer.
 - The input is labeled origin `dev` in records and in the statechart
   recording, so `ouroctl replay` reproduces sessions driven this way
   (`statechart_inspection.py` drives START/LAP/STOP into the stopwatch and

@@ -77,7 +77,7 @@ zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua --dev -- self
 # Headless frames (manual scheduler, recorded streams)
 zig-out/bin/ouroctl storybook snapshot tools/statechart-visualizer/storybook.lua --output out
 # The visualizer's own chart, on a manual clock with fake services
-(cd tools/statechart-visualizer && ../../zig-out/bin/ouroctl test charts_test.lua && ../../zig-out/bin/ouroctl test overview_test.lua)
+(cd tools/statechart-visualizer && for t in charts overview client; do ../../zig-out/bin/ouroctl test ${t}_test.lua; done)
 # A recorded session (design/statecharts.md §14): expand it, then scrub or play it
 zig-out/bin/ouroctl replay ~/.local/state/ourokit/recordings/dev.ourokit.stopwatch.jsonl examples/stopwatch --records /tmp/stopwatch.records.jsonl
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- /tmp/stopwatch.records.jsonl
@@ -102,8 +102,10 @@ All shapes are the inspection hooks in design/statecharts.md §10.
   with its changed keys.
 
 [`model.lua`](model.lua) holds that inspected data (append-only, rebuilt from
-the app at any time). Everything about the session is in the `visualizer`
-chart ([`charts.lua`](charts.lua)), one parallel chart with three regions:
+the app at any time). It is the sanctioned large-cache exception of design
+§6: services only stage records in its inbox, and the chart's `RECORDS`
+assign drains them. Everything about the session is in the `visualizer`
+chart ([`charts.lua`](charts.lua)), one parallel chart:
 
 ```diagram
 connection: starting ─┬─► in_process            (machine.inspect in this VM)
@@ -137,7 +139,10 @@ functions of the chart and the model; there is no `o.signal` or
 ```
 
 - Notify-then-fetch: the endpoint sends `notifications/resources/updated`
-  when records arrive, at most once until the client next reads. Nothing is
+  when records arrive, at most once until the client next reads.
+  [`client.lua`](client.lua) fetches until `more` is false, skips an
+  actor's `latest` once the cursor passed it (`latest_sequence`), and
+  starts over when `epoch` changes (the app restarted behind the address). Nothing is
   sent, and neither process wakes, while the app is idle.
 - Leaving `connected` cancels the invoke; scope cancellation closes the
   subscription socket. The subscription keeps the app's observer attached;

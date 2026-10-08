@@ -38,14 +38,14 @@ return function(services)
     context = function(input)
       return {
         mode = input.mode, address = input.address or false, path = input.path or false,
-        revision = 0, actors = {}, counts = {}, after = 0, seed = false, gaps = 0,
+        revision = 0, actors = {}, counts = {}, after = 0, seed = false, epoch = false, gaps = 0,
         acked = {}, wait = false, alarm = false,
         selected = false, cursor = false, message = false, editor = false,
       }
     end,
     events = {
-      RECORDS = {revision = 'integer', actors = 'table', counts = 'table', after = 'integer?', seed = 'integer?', gaps = 'integer?',
-        wait = 'number?'},
+      RECORDS = {revision = 'integer', actors = 'table?', counts = 'table?', after = 'integer?', seed = 'integer?', gaps = 'integer?',
+        wait = 'number?', epoch = 'integer?'},
       ATTACHED = {},
       SELECT = {value = 'string'},
       SCRUB = {value = 'number'},
@@ -68,16 +68,25 @@ return function(services)
       wait_event = function(_, e) return e.wait ~= nil end,
     },
     actions = {
+      -- The inspected-data cache (model.lua) is written in these assigns
+      -- and nowhere else: services stage what they receive, and the assign
+      -- drains it while computing the new context (plain-function actions
+      -- would run after the commit, too late for the counts).
       records = assign(function(c, e)
+        if services.drain then services.drain() end
+        local s = services.summary and services.summary() or e
         local selected = c.selected
-        if not selected or not e.counts[selected] then selected = e.actors[1] or false end
-        return {revision = e.revision, actors = e.actors, counts = e.counts, selected = selected,
-          after = e.after or c.after, seed = e.seed or c.seed, gaps = e.gaps or c.gaps, wait = e.wait or false}
+        if not selected or not s.counts[selected] then selected = s.actors[1] or false end
+        return {revision = e.revision, actors = s.actors, counts = s.counts, selected = selected,
+          after = e.after or c.after, seed = e.seed or c.seed, epoch = e.epoch or c.epoch, gaps = e.gaps or c.gaps,
+          wait = s.wait or false}
       end),
       -- The stuck-state check ran (watch service): new alarms and deadline.
       checked = assign(function(_, e)
         local o = e.output
-        return {revision = o.revision, actors = o.actors, counts = o.counts, wait = o.wait or false}
+        if services.drain then services.drain(o.now) end
+        local s = services.summary and services.summary() or o
+        return {revision = o.revision, actors = s.actors, counts = s.counts, wait = s.wait or false}
       end),
       open_alarm = assign(function(c, e)
         local n = c.counts[e.actor] or 0
@@ -97,7 +106,9 @@ return function(services)
       end},
       loaded = assign(function(_, e)
         local o = e.output
-        return {revision = o.revision, actors = o.actors, counts = o.counts, selected = o.actors[1] or false,
+        if services.drain then services.drain() end
+        local s = services.summary and services.summary() or o
+        return {revision = o.revision, actors = s.actors, counts = s.counts, selected = s.actors[1] or false,
           cursor = 1, message = false}
       end),
       report = assign {message = function(_, e) return tostring(e.error) end},
@@ -147,14 +158,14 @@ return function(services)
         -- each notification. An endpoint without the resource falls back to
         -- polling; a broken connection detaches and retries.
         connected = {initial = 'attaching',
-          invoke = {src = 'follow', input = function(c) return {address = c.address, after = c.after} end,
+          invoke = {src = 'follow', input = function(c) return {address = c.address, after = c.after, epoch = c.epoch or nil} end,
             on_error = {{target = 'polling', guard = 'no_push'}, {target = 'detached', actions = 'report'}}},
           states = {
             attaching = {on = {ATTACHED = {target = 'live', actions = 'clear_message'}}},
             live = {},
           }},
         polling = {
-          invoke = {src = 'poll', input = function(c) return {address = c.address, after = c.after, seed = c.seed} end,
+          invoke = {src = 'poll', input = function(c) return {address = c.address, after = c.after, seed = c.seed, epoch = c.epoch or nil} end,
             on_error = {target = 'detached', actions = 'report'}},
           after = {[200] = {target = 'polling', reenter = true}}},
         detached = {after = {[1000] = 'connected'}},

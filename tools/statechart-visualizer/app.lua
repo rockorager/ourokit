@@ -23,6 +23,7 @@ local charts = require('charts')
 local view = require('diagram.view')
 local scenario = require('scenario')
 local recording = require('recording')
+local client = require('client')
 local fixtures = {require('fixtures.document'), require('fixtures.connection')}
 
 local W, H = 1600, 1000
@@ -37,12 +38,10 @@ local function wait()
   return store.deadline and store.now and math.max(20, store.deadline - store.now) or nil
 end
 
+-- A RECORDS event: staged data is waiting in the inbox for the chart.
 local function batch(extra)
   revision = revision + 1
-  local actors = {}
-  for i, path in ipairs(store.order) do actors[i] = path end
-  local event = {type = 'RECORDS', revision = revision, actors = actors, counts = model.counts(store), gaps = gaps,
-    wait = wait()}
+  local event = {type = 'RECORDS', revision = revision, gaps = gaps}
   for k, v in pairs(extra or {}) do event[k] = v end
   return event
 end
@@ -51,7 +50,7 @@ end
 local function seed(actor)
   local clock = actor._scheduler and actor._scheduler.clock
   local now = clock and clock() or nil
-  model.ingest(store, {kind = 'actor', action = 'started', actor = actor.path, machine = actor.chart.id,
+  model.stage(store, {kind = 'actor', action = 'started', actor = actor.path, machine = actor.chart.id,
     graph = actor.chart:graph(), seeded = true, time_ms = now})
   local snapshot = machine.plain(actor:snapshot())
   local record = {kind = 'transition', actor = actor.path, machine = actor.chart.id, origin = 'attach', seeded = true,
@@ -63,7 +62,7 @@ local function seed(actor)
   for _, live in ipairs(actor:pending_invokes()) do
     record.invokes[#record.invokes + 1] = {action = 'started', state = live.state, id = live.id, src = live.src, token = live.token, time_ms = live.time_ms}
   end
-  model.ingest(store, record)
+  model.stage(store, record)
 end
 
 -- Feedback from our own bookkeeping events must not trigger another batch
@@ -72,35 +71,13 @@ local function own(record)
   return record.machine == 'visualizer' and record.event and (record.event.type == 'RECORDS' or record.event.type == 'ATTACHED')
 end
 
--- One fetch of runtime.statecharts, paging until caught up. Returns the
--- cursor and seed to keep, and whether anything other than our own
--- feedback arrived. A gap (dropped) asks for the late-attach actors again.
-local function fetch(address, after, seed_seen)
-  local changed = false
-  while true do
-    local reply = o.mcp.call(address, 'runtime.statecharts',
-      {after = after, limit = LIMIT, text = true, seed = seed_seen, actors = seed_seen == nil})
-    if reply.error then error('FetchFailed: ' .. tostring(reply.error.message), 0) end
-    local out = reply.result.structuredContent
-    if reply.result.isError then error('FetchFailed: ' .. o.json.encode(out), 0) end
-    for _, entry in ipairs(out.records) do
-      local record = o.json.decode(entry.record)
-      model.ingest(store, record, entry.time_ms)
-      if not own(record) then changed = true end
-    end
-    -- The ring evicted records past the cursor: reseed from current state
-    -- (the next page asks for actors).
-    if out.dropped and seed_seen ~= nil then seed_seen, gaps, changed = nil, gaps + 1, true end
-    if out.actors and #out.records < LIMIT then
-      for _, actor in ipairs(out.actors) do
-        if actor.started ~= o.json.null then model.ingest(store, o.json.decode(actor.started), out.time_ms) end
-        if actor.latest ~= o.json.null then model.ingest(store, o.json.decode(actor.latest), out.time_ms) end
-      end
-      seed_seen, changed = out.seed, true
-    end
-    after = out.next
-    if #out.records < LIMIT and seed_seen ~= nil then return after, seed_seen, changed end
-  end
+-- One fetch of runtime.statecharts until caught up (client.lua).
+local function fetch(address, after, seed_seen, epoch_seen)
+  local cursor = {after = after, seed = seed_seen, epoch = epoch_seen, gaps = gaps}
+  local changed = client.fetch(function(arguments) return o.mcp.call(address, 'runtime.statecharts', arguments) end,
+    cursor, function(record, time) model.stage(store, record, time) end, own, o.json, LIMIT)
+  gaps = cursor.gaps
+  return cursor.after, cursor.seed, changed, cursor.epoch
 end
 
 local services = {}
@@ -109,7 +86,7 @@ local services = {}
 function services.observe(_, send)
   for _, actor in ipairs(machine.actors()) do pcall(seed, actor) end
   machine.inspect(function(record)
-    model.ingest(store, record)
+    model.stage(store, record)
     if not own(record) then send(batch()) end
   end)
   send(batch())
@@ -119,12 +96,12 @@ end
 -- Push: subscribe, then fetch after the acknowledgment and after every
 -- notification. Raises NoPush when the endpoint lacks the resource.
 function services.follow(input, send)
-  local after, seed_seen = input.after or 0, nil
+  local after, seed_seen, epoch = input.after or 0, nil, input.epoch
   local refused
   local function pull()
     local changed
-    after, seed_seen, changed = fetch(input.address, after, seed_seen)
-    if changed then send(batch({after = after, seed = seed_seen})) end
+    after, seed_seen, changed, epoch = fetch(input.address, after, seed_seen, epoch)
+    if changed then send(batch({after = after, seed = seed_seen, epoch = epoch})) end
   end
   o.mcp.subscribe(input.address, URI, function(message)
     if message.method == 'notifications/subscriptions/acknowledged' then
@@ -142,8 +119,8 @@ end
 
 -- Fallback: one fetch per polling state entry.
 function services.poll(input, send)
-  local after, seed_seen, changed = fetch(input.address, input.after or 0, input.seed or nil)
-  if changed then send(batch({after = after, seed = seed_seen})) end
+  local after, seed_seen, changed, epoch = fetch(input.address, input.after or 0, input.seed or nil, input.epoch)
+  if changed then send(batch({after = after, seed = seed_seen, epoch = epoch})) end
 end
 
 -- A replayed recording (§14 --records), all at once.
@@ -152,9 +129,8 @@ function services.load(input)
   if not text then error('CannotRead: ' .. tostring(err and err.message or err), 0) end
   local records, problem = recording.parse(text, o.json)
   if not records then error(problem, 0) end
-  for _, record in ipairs(records) do model.ingest(store, record) end
-  local event = batch()
-  return {revision = event.revision, actors = event.actors, counts = event.counts}
+  for _, record in ipairs(records) do model.stage(store, record) end
+  return {revision = batch().revision}
 end
 
 -- Stuck states: sleep until the earliest deadline, then check. Records
@@ -163,9 +139,15 @@ end
 function services.watch(input)
   local from = store.now
   o.sleep(math.ceil(input.wait))
-  model.check(store, from + input.wait)
-  local event = batch()
-  return {revision = event.revision, actors = event.actors, counts = event.counts, wait = event.wait}
+  return {revision = batch().revision, now = from + input.wait}
+end
+
+-- For the chart's actions: drain staged data into the cache, and read it.
+function services.drain(now) model.drain(store, now) end
+function services.summary()
+  local actors = {}
+  for i, path in ipairs(store.order) do actors[i] = path end
+  return {actors = actors, counts = model.counts(store), wait = wait()}
 end
 
 -- Event pills: runtime.send on an endpoint, actor:_send in-process.
