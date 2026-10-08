@@ -1180,7 +1180,9 @@ replay = function(source, options)
         diverge(index, 'the recording could not capture how ' .. entry.a .. ' started: ' .. entry.unrecordable)
         return false
       end
-      local actor = chart:actor {id = entry.a, input = entry.input, snapshot = entry.snapshot, scheduler = scheduler}
+      -- Generated logs ran their roots with a stand-in parent (machine_paths).
+      local actor = chart:actor {id = entry.a, input = entry.input, snapshot = entry.snapshot, scheduler = scheduler,
+        parent_stand_in = header.generated and function() end or nil}
       if entry.component then actor._component, actor._recorded_input = true, entry.input end
       roots[#roots + 1] = actor
       if entry.checkpoint then

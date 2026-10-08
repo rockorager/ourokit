@@ -241,13 +241,15 @@ local function run(chart, setup, path, covered)
               tostring(event), tostring(sent.system or sent.to))}
         end
       end
-      if covered and actor._parent == nil then
-        -- States entered in passing (an always chain) count too.
+      if covered then
+        -- States entered in passing (an always chain) count too. A spawned
+        -- child's count under its chart id ('c<chart>|s<state>').
+        local prefix = actor._parent and ('c' .. actor.chart.id .. '|') or ''
         for _, micro in ipairs(record.microsteps or {}) do
-          for _, t in ipairs(micro.transitions or {}) do covered['t' .. t.index] = true end
-          for _, id in ipairs(micro.entered or {}) do covered['s' .. id] = true end
+          for _, t in ipairs(micro.transitions or {}) do covered[prefix .. 't' .. t.index] = true end
+          for _, id in ipairs(micro.entered or {}) do covered[prefix .. 's' .. id] = true end
         end
-        for _, id in ipairs(actor._snapshot.states) do covered['s' .. id] = true end
+        for _, id in ipairs(actor._snapshot.states) do covered[prefix .. 's' .. id] = true end
       end
     end}
   local previous_sink = effect_sink
@@ -255,7 +257,13 @@ local function run(chart, setup, path, covered)
     problems[#problems + 1] = {at = step_index, kind = 'effect', message = name .. '()'}
   end
   local ok, actor, applied = pcall(function()
-    local actor = chart:actor {id = chart.id, input = setup.input, scheduler = scheduler}
+    -- A chart that is normally a child sends to a stand-in parent, which
+    -- reports what it received as an observation, not an error.
+    local actor = chart:actor {id = chart.id, input = setup.input, scheduler = scheduler,
+      parent_stand_in = function(event)
+        problems[#problems + 1] = {at = step_index, kind = 'observed',
+          message = string.format('%s sent %s to its parent', chart.id, tostring(event.type))}
+      end}
     actor:start()
     for i, input in ipairs(path) do
       step_index = i
@@ -414,6 +422,28 @@ local function search(chart, options)
   local targets = {}
   for _, state in ipairs(graph.states) do if state.id ~= '' then targets[#targets + 1] = 's' .. state.id end end
   for _, t in ipairs(graph.transitions) do targets[#targets + 1] = 't' .. t.index end
+  -- Charts it spawns are explored through it (their events are inputs once
+  -- they run), so their states and transitions are targets too.
+  local children, child_order = {}, {}
+  local function add_children(of)
+    local ids = {}
+    for id in pairs(of.child_charts or {}) do ids[#ids + 1] = id end
+    table.sort(ids)
+    for _, id in ipairs(ids) do
+      if id ~= chart.id and not children[id] then
+        local child = of.child_charts[id]
+        children[id] = {states = 0, transitions = 0}
+        child_order[#child_order + 1] = id
+        local child_graph = child:graph()
+        for _, state in ipairs(child_graph.states) do
+          if state.id ~= '' then targets[#targets + 1] = 'c' .. id .. '|s' .. state.id end
+        end
+        for _, t in ipairs(child_graph.transitions) do targets[#targets + 1] = 'c' .. id .. '|t' .. t.index end
+        add_children(child)
+      end
+    end
+  end
+  add_children(chart)
   local setup = {input = options.input}
   -- Find an input that builds the initial context.
   if not run(chart, setup, {}) then
@@ -508,13 +538,29 @@ local function search(chart, options)
   local unreached = {}
   for _, t in ipairs(targets) do if not first[t] then unreached[#unreached + 1] = t end end
   M.strict, M._origin = saved_strict, saved_origin
-  local states, transitions = 0, 0
-  for _, t in ipairs(targets) do
-    if t:sub(1, 1) == 's' then states = states + 1 else transitions = transitions + 1 end
+  -- Counts per chart: the chart's own, and each spawned chart's apart.
+  local function count(t, field, reached)
+    local id, rest = t:match('^c([^|]*)|(.*)$')
+    local counts = id and children[id] or nil
+    local kind = (rest or t):sub(1, 1) == 's' and 'states' or 'transitions'
+    if counts then
+      local key = reached and ('reached_' .. kind) or kind
+      counts[key] = (counts[key] or 0) + 1
+    else field[kind] = field[kind] + 1 end
   end
-  local reached_states, reached_transitions = 0, 0
-  for t in pairs(first) do
-    if t:sub(1, 1) == 's' then reached_states = reached_states + 1 else reached_transitions = reached_transitions + 1 end
+  local totals, reached_counts = {states = 0, transitions = 0}, {states = 0, transitions = 0}
+  for _, t in ipairs(targets) do
+    count(t, totals, false)
+    if first[t] then count(t, reached_counts, true) end
+  end
+  local states, transitions = totals.states, totals.transitions
+  local reached_states, reached_transitions = reached_counts.states, reached_counts.transitions
+  local child_coverage = nil
+  for _, id in ipairs(child_order) do
+    local c = children[id]
+    child_coverage = child_coverage or {}
+    child_coverage[id] = {states = {reached = c.reached_states or 0, total = c.states},
+      transitions = {reached = c.reached_transitions or 0, total = c.transitions}}
   end
   -- The first path that reached each state, for the state stories.
   local reach = {}
@@ -522,7 +568,7 @@ local function search(chart, options)
     if t:sub(1, 1) == 's' and first[t] then reach[#reach + 1] = {state = t:sub(2), inputs = first[t]} end
   end
   return {chart = chart.id, setup = setup, paths = selected, unreached = unreached, nodes = visited, reach = reach,
-    issues = issue_order,
+    issues = issue_order, children = child_coverage,
     states = {reached = reached_states, total = states}, transitions = {reached = reached_transitions, total = transitions}}
 end
 
@@ -541,7 +587,8 @@ local function render(chart, result, options)
   local recorder = M.recorder(function(line) lines[#lines + 1] = line end, {scheduler = scheduler, t0 = 0, header = false})
   local ok, err = pcall(function()
     for _, path in ipairs(result.paths) do
-      local actor = chart:actor {id = chart.id, input = result.setup.input, scheduler = scheduler}
+      local actor = chart:actor {id = chart.id, input = result.setup.input, scheduler = scheduler,
+        parent_stand_in = function() end}
       actor:start()
       for _, input in ipairs(path.inputs) do
         if not apply(scheduler, actor, input) then error('a generated path no longer applies: ' .. describe_input(input), 0) end
@@ -572,18 +619,28 @@ local function summary_line(result)
   local text = string.format('%s: %d paths reach %d/%d states and %d/%d transitions (%d runs)', result.chart,
     #result.paths, result.states.reached, result.states.total, result.transitions.reached, result.transitions.total,
     result.nodes)
+  local child_ids = {}
+  for id in pairs(result.children or {}) do child_ids[#child_ids + 1] = id end
+  table.sort(child_ids)
+  for _, id in ipairs(child_ids) do
+    local c = result.children[id]
+    text = text .. string.format('\n  spawned %s: %d/%d states and %d/%d transitions', id, c.states.reached,
+      c.states.total, c.transitions.reached, c.transitions.total)
+  end
   if #result.unreached > 0 then
     local names = {}
     for i, t in ipairs(result.unreached) do
-      names[i] = (t:sub(1, 1) == 's' and 'state ' or 'transition #') .. t:sub(2)
+      local id, rest = t:match('^c([^|]*)|(.*)$')
+      rest = rest or t
+      names[i] = (id and (id .. ' ') or '') .. (rest:sub(1, 1) == 's' and 'state ' or 'transition #') .. rest:sub(2)
     end
     text = text .. '\n  not reached: ' .. table.concat(names, ', ')
   end
   -- Gap 9: what the search ran into, so nothing is pruned silently. Real
   -- errors first; skipped effects (gap 4) are listed apart, as notes.
   local labels = {error = 'an input raised', not_started = 'a send was refused',
-    isolated = 'skipped: isolated effect', effect = 'skipped effect (isolated)'}
-  for _, kind in ipairs({'error', 'not_started', 'isolated', 'effect'}) do
+    isolated = 'skipped: isolated effect', effect = 'skipped effect (isolated)', observed = 'observed (stand-in parent)'}
+  for _, kind in ipairs({'error', 'not_started', 'isolated', 'effect', 'observed'}) do
     for _, issue in ipairs(result.issues or {}) do
       if issue.kind == kind then
         local path = #issue.steps > 0 and table.concat(issue.steps, ' → ') or '(start)'

@@ -1894,6 +1894,18 @@ first, expanding first the paths that reached something new.
   The delivery is reported once as *skipped: isolated effect*, with the
   handler's error, after the real errors and never counted as one. A
   handler that ignores the output proceeds as before.
+- **Children have a parent; parents explore their children.** A chart
+  that is normally spawned (documents' `document`) is generated as a root
+  with a stand-in parent (`chart:actor{parent_stand_in = fn}`). Its
+  `send_parent` goes to the stand-in instead of raising "has no parent",
+  and each event type it receives is reported as *observed (stand-in
+  parent)*, not as an error. A generated log is replayed with the same
+  stand-in (its header has `generated`); real recordings never get one.
+  From the parent's generation, spawned children's events are already
+  inputs once they run. The states and transitions of every chart it
+  spawns (`spawn(chart)`, transitively) are targets too, reported per
+  chart (`spawned document: 12/12 states ...`, `result.children`), apart
+  from the parent's own counts.
 - **Refused sends name their event (gap 3).** A send refused because its
   target has not started reports the resolved event type, even when a
   function computes the event.

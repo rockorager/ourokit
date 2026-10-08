@@ -2119,7 +2119,10 @@ local function create_actor(chart, options)
   local actor = {chart = chart, id = options.id or chart.id, _observers = {}, _queue = {}, _timers = {}, _invokes = {}, _scopes = {}, _tasks = {},
     _waiters = {}, _lazy = options.lazy == true, _scope_mode = options.scope, _token = options.token, _input = options.input,
     _children = {}, _started = false, _status = 'created', _scheduler = options.scheduler or M.default_scheduler,
-    _signal_factory = options.signal or ouro.signal, _parent = options.parent, _charts = options.charts or {}}
+    _signal_factory = options.signal or ouro.signal, _parent = options.parent, _charts = options.charts or {},
+    -- Generation and replays of generated logs: a root that is normally a
+    -- child sends to this function instead of failing in send_parent.
+    _parent_stand_in = options.parent_stand_in}
   for name, fn in pairs(Actor) do actor[name] = fn end
   actor.path = options.parent and (options.parent.path .. '/' .. actor.id) or actor.id
   if options.system_id ~= nil then
@@ -2771,6 +2774,13 @@ local function run_effects(actor, effects, record)
           if not target then fail('machine %s has no child or invoke %q', actor.chart.id, tostring(effect.id)) end
         else
           target = actor._parent
+          if not target and actor._parent_stand_in then
+            local event = copy(effect.event)
+            record.sent[#record.sent + 1] = {kind = kind, to = '(parent stand-in)', event = event.type, accepted = true,
+              stand_in = true}
+            actor._parent_stand_in(event)
+            return
+          end
           if not target then fail('machine %s has no parent', actor.chart.id) end
         end
         -- Inter-actor traffic is visible on both records: `sent` on the

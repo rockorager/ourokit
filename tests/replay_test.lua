@@ -764,6 +764,64 @@ return {
     assert(report.ok, machine.replay_text(report))
   end,
 
+  -- A chart that is normally a child (documents' `document`) generated on
+  -- its own: send_parent used to raise "has no parent". The generated root
+  -- now has a stand-in parent that takes the event, and generation reports
+  -- what it received as an observation. From the parent's generation, the
+  -- spawned child's states and transitions are targets too.
+  ['generation: a child chart gets a stand-in parent, and the parent generation covers it'] = function()
+    local item = machine.create {
+      id = 'gen_item', initial = 'viewing',
+      context = function(input) return { label = input and input.label or '' } end,
+      states = {
+        viewing = { on = { EDIT = 'editing', CLOSE = { actions = machine.send_parent { type = 'ITEM_CLOSED' } } } },
+        editing = { on = { SAVE = 'saved', CANCEL = { target = 'viewing', actions = machine.send_parent('EDIT_CANCELED') } } },
+        saved = { type = 'final' },
+      },
+    }
+    local list = machine.create {
+      id = 'gen_list', initial = 'idle', context = { closed = 0 },
+      states = { idle = { on = {
+        ADD = { actions = machine.spawn(item, { id = 'item', input = function() return { label = 'one' } end }) },
+        ITEM_CLOSED = { actions = machine.assign { closed = function(c) return c.closed + 1 end } },
+        EDIT_CANCELED = {},
+      } } },
+    }
+    local result = machine.paths(item)
+    local observed = {}
+    for _, issue in ipairs(result.issues) do
+      assert(issue.kind ~= 'error', 'no false errors: ' .. issue.message)
+      if issue.kind == 'observed' then observed[#observed + 1] = issue.message end
+    end
+    table.sort(observed)
+    assert(table.concat(observed, '|') == 'gen_item sent EDIT_CANCELED to its parent|gen_item sent ITEM_CLOSED to its parent',
+      table.concat(observed, '|'))
+    assert(result.states.reached == result.states.total)
+    local summary = machine._paths_summary(result)
+    assert(summary:find('observed (stand-in parent)', 1, true), summary)
+    -- The generated log replays with the same stand-in.
+    local report = machine.replay(machine.paths_log(item, result), { charts = { gen_item = item } })
+    assert(report.ok, machine.replay_text(report))
+    -- From the parent: the child is spawned, explored and counted.
+    result = machine.paths(list)
+    local child = result.children and result.children.gen_item
+    assert(child, 'the parent reports its children\'s coverage')
+    assert(child.states.reached == child.states.total and child.transitions.reached == child.transitions.total,
+      machine._paths_summary(result))
+    assert(result.states.total == 1, 'the parent\'s own counts are unchanged')
+    report = machine.replay(machine.paths_log(list, result), { charts = { gen_list = list, gen_item = item } })
+    assert(report.ok, machine.replay_text(report))
+    -- A real recording still raises: no stand-in outside generated logs.
+    local lines = record(function()
+      local a = item:start { id = 'gen_item', input = { label = 'x' } }
+      local ok = pcall(a.send, a, 'CLOSE')
+      assert(not ok, 'a root without a parent still raises live')
+      a:stop()
+    end)
+    report = machine.replay(lines, { charts = { gen_item = item } })
+    assert(report.ok, machine.replay_text(report))
+  end,
+
   ['machine.advance needs a virtual clock'] = function()
     fails(function() machine.advance(-1) end, 'nonnegative integer')
   end,
