@@ -206,7 +206,7 @@ end
 
 local function pill_width(p)
   -- After pills leave room for their running countdown (" · 99.9s").
-  local extra = (p.transition and p.transition.after) and ' · 99.9s' or ''
+  local extra = (p.transition and p.transition.after_event) and ' · 99.9s' or ''
   return text_width(p.event .. extra .. (p.guard and (' ' .. p.guard) or ''), M.LABEL_SIZE) + 14
 end
 M.pill_width = pill_width

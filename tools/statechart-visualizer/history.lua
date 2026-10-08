@@ -35,9 +35,10 @@ function M.append(history, record)
   for _, id in ipairs(record.entered) do frame.entered[id] = true end
   for _, id in ipairs(record.exited) do frame.exited[id] = true end
   for _, timer in ipairs(record.timers) do
-    local key = timer.state .. '@' .. tostring(timer.delay)
+    local key = timer.key or (timer.state .. '@' .. tostring(timer.delay))
     if timer.op == 'started' then
-      frame.timers[key] = {state=timer.state, delay=timer.delay, started=timer.time or record.time, token=timer.token}
+      frame.timers[key] = {state=timer.state, delay=timer.delay, name=timer.name, started=timer.time or record.time,
+        token=timer.token, event=timer.event}
     else
       frame.timers[key] = nil
       if timer.op == 'fired' then frame.fired = frame.fired or {}; frame.fired[key] = true end
@@ -74,6 +75,7 @@ end
 
 -- Remaining milliseconds for a running timer at `now` (machine time).
 function M.remaining(timer, now)
+  if not timer.delay then return nil end
   return math.max(0, timer.delay - (now - timer.started))
 end
 

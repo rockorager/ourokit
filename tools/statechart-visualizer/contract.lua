@@ -18,13 +18,24 @@ function M.is_internal(event)
   return event:find('^done%.') or event:find('^error%.') or event:find('^after%.') or event:find('^ouro%.')
 end
 
+-- An after transition's delay from its event 'after.<delay>.<state>': a
+-- number of ms, or a delay name.
 local function delay_of(t)
-  return t.delay or (t.event and tonumber(t.event:match('^after%.(%d+)%.')))
+  if type(t.delay) == 'number' then return t.delay end
+  local raw = t.event and t.event:match('^after%.([^%.]+)%.')
+  return tonumber(raw) or raw
+end
+
+-- Opaque native handles in context arrive as {"$h": "<type>"}.
+function M.handle(value)
+  return type(value) == 'table' and type(value['$h']) == 'string' and value['$h'] or nil
 end
 
 -- Short pipe label for a transition.
 function M.event_label(t)
   if t.kind == 'after' then
+    -- Named delays (`after = {slow = ...}`) keep their name.
+    if t.delay_name then return 'after ' .. t.delay_name end
     local d = t.after or 0
     return d % 1000 == 0 and ('after ' .. (d // 1000) .. 's') or ('after ' .. d .. 'ms')
   end
@@ -52,7 +63,13 @@ function M.graph(raw)
     }
     for _, name in ipairs(list(s.entry)) do state.entry[#state.entry+1] = tostring(name) end
     for _, name in ipairs(list(s.exit)) do state.exit[#state.exit+1] = tostring(name) end
-    for _, a in ipairs(list(s.after)) do state.after[#state.after+1] = {delay=a.delay, event=a.event} end
+    -- ms is the computed duration (nil for a function delay); delay may be
+    -- a name. Timers are keyed by their event.
+    for _, a in ipairs(list(s.after)) do
+      local ms = a.ms ~= M.null and a.ms or nil
+      if ms == nil and type(a.delay) == 'number' then ms = a.delay end
+      state.after[#state.after+1] = {delay=ms, name=type(a.delay) == 'string' and a.delay or nil, event=a.event}
+    end
     for _, v in ipairs(list(s.invoke)) do state.invoke[#state.invoke+1] = {id=v.id, src=v.src or v.id} end
     for _, child in ipairs(list(s.children)) do state.children[#state.children+1] = child end
     g.states[index], g.by_id[s.id] = state, state
@@ -69,7 +86,15 @@ function M.graph(raw)
       guard=t.guarded and (t.guard ~= M.null and t.guard or true) or nil,
       internal=#targets == 0,
     }
-    if transition.kind == 'after' then transition.after = delay_of(t) end
+    if transition.kind == 'after' then
+      local delay = delay_of(t)
+      transition.after_event = t.event
+      if type(delay) == 'string' then transition.delay_name = delay else transition.after = delay end
+      local state = g.by_id[t.source]
+      for _, a in ipairs(state and state.after or {}) do
+        if a.event == t.event and a.delay then transition.after = a.delay end
+      end
+    end
     if transition.kind == 'always' then transition.always = true end
     transition.label = M.event_label(transition)
     g.transitions[#g.transitions+1] = transition
@@ -92,11 +117,11 @@ function M.graph(raw)
     end
     if not seen[name] then seen[name] = true; g.events[#g.events+1] = name end
   end
-  -- Attach each after-transition to its source state's gauge.
+  -- Attach each after-transition to its source state's timer.
   for _, t in ipairs(g.transitions) do
-    if t.after then
+    if t.after_event then
       local state = g.by_id[t.source]
-      for _, a in ipairs(state.after) do if a.delay == t.after then a.transition = t.id end end
+      for _, a in ipairs(state.after) do if a.event == t.after_event then a.transition = t.id end end
     end
   end
   return g
@@ -150,7 +175,13 @@ function M.record(raw, t0, fallback)
   end
   for _, t in ipairs(list(raw.timers)) do
     local started = t.time_ms and t.time_ms ~= M.null and (t.time_ms - (t0 or t.time_ms)) or nil
-    r.timers[#r.timers+1] = {op=t.action, state=t.state, delay=t.delay, token=t.token, event=t.event, time=started}
+    -- delay may be a name; ms is the duration (named and function delays).
+    local ms = t.ms ~= nil and t.ms ~= M.null and t.ms or (type(t.delay) == 'number' and t.delay or nil)
+    local name = type(t.delay) == 'string' and t.delay or nil
+    local raw = type(t.event) == 'string' and t.event:match('^after%.([^%.]+)%.') or nil
+    if not name and raw and not tonumber(raw) then name = raw end
+    r.timers[#r.timers+1] = {op=t.action, state=t.state, delay=ms, name=name, token=t.token, event=t.event, time=started,
+      key=t.event or (tostring(t.state) .. '@' .. tostring(t.delay))}
   end
   for _, v in ipairs(list(raw.invokes)) do
     r.invokes[#r.invokes+1] = {op=v.action, state=v.state, id=v.id, src=v.src, token=v.token,

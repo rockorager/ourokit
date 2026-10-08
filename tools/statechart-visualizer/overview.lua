@@ -130,10 +130,26 @@ function M.observe(store, entry, raw, frame)
     local child = event:match('^done%.actor%.(.+)$') or event:match('^error%.actor%.(.+)$')
     if child and store.actors[parent_path .. '/' .. child] then link(store, parent_path .. '/' .. child, parent_path, event) end
   end
+  -- sent: to another actor (send_to, send_parent, or by system id), or to
+  -- one of this actor's invokes (invoke = true, to = '<actor>/<invoke id>').
+  -- A system-id send to a target that has not started links nothing.
   local sent = raw.sent
   if type(sent) == 'table' then
     for _, s in ipairs(sent) do
-      if type(s) == 'table' and s.to then link(store, entry.path, s.to, s.event) end
+      if type(s) == 'table' and s.to and s.to ~= entry.null then
+        if s.invoke == true then
+          local id = tostring(s.to):match('/([^/]+)$')
+          for _, state in ipairs(entry.graph.states) do
+            for _, v in ipairs(state.invoke) do
+              if v.id == id and store.endpoints[v.src] then
+                store.endpoints[v.src].received = (store.endpoints[v.src].received or 0) + 1
+              end
+            end
+          end
+        elseif store.actors[s.to] then
+          link(store, entry.path, s.to, s.event)
+        end
+      end
     end
   end
   for _, c in ipairs(record.children) do

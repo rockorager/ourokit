@@ -273,7 +273,8 @@ function M.topology(viz, c, store, P, now, opts)
   end
   for k, ep in ipairs(L.endpoints) do
     layers[#layers + 1] = label('e' .. k, ep.x + 14, ep.y + 8, ep.w - 20,
-      {{text = ep.src, foreground = P.text}, {text = ep.kind == 'task' and '  task' or '  I/O', foreground = P.muted}}, 11)
+      {{text = ep.src, foreground = P.text}, {text = (ep.kind == 'task' and '  task' or '  I/O')
+        .. ((store.endpoints[ep.src].received or 0) > 0 and ('  ←' .. store.endpoints[ep.src].received) or ''), foreground = P.muted}}, 11)
   end
   local stack = o.stack {key = 'layers', children = layers}
   return o.layout_builder {key = 'fit', render = function(cons)
