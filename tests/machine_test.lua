@@ -941,6 +941,45 @@ return {
     assert(t:node('root/first/box/toggle').label == 'Show First')
   end,
 
+  ['component machines are listed and sendable from mount, before their first event'] = function(t)
+    local chart = machine.create {
+      id = 'panel', initial = 'closed', events = { TOGGLE = {} },
+      context = function(props) return { title = props.title } end,
+      states = { closed = { after = { [1000] = 'open' }, on = { TOGGLE = 'open' } }, open = { on = { TOGGLE = 'closed' } } },
+    }
+    local Panel = machine.component(chart, function(self)
+      return o.text { key = 'label', text = self:context().title .. (self:matches('open') and ' open' or ' closed') }
+    end)
+    local page = machine.create { id = 'page', initial = 'shown', events = { HIDE = {} },
+      states = { shown = { on = { HIDE = 'hidden' } }, hidden = {} } }:start { scheduler = machine.manual_scheduler() }
+    local function panels()
+      local found = {}
+      for _, actor in ipairs(machine.actors()) do
+        if actor.chart == chart then found[actor:context().title] = actor end
+      end
+      return found
+    end
+    local timers = #machine.clock.timers
+    t:mount(function()
+      return o.column { key = 'root', page:matches('shown') and o.column { key = 'list',
+        Panel { key = 'a', title = 'A' }, Panel { key = 'b', title = 'B' } } or nil }
+    end)
+    local found = panels()
+    assert(found.A and found.B and found.A.path ~= found.B.path, 'both instances are registered at mount')
+    assert(found.A:status() == 'created' and found.A:matches('closed') and found.A:snapshot().context.title == 'A')
+    -- Effects stay lazy: no root scope, no timer, until the first event.
+    assert(found.A._root_scope == nil and #found.A:pending_timers() == 0 and #machine.clock.timers == timers)
+    assert(found.B:_send('TOGGLE', 'dev') == true)
+    t:settle()
+    assert(t:node('root/list/b/label').label == 'B open' and t:node('root/list/a/label').label == 'A closed')
+    assert(found.B:status() == 'active' and found.A:status() == 'created')
+    page:send('HIDE')
+    t:settle()
+    found = panels()
+    assert(not found.A and not found.B, 'unmount unregisters both instances')
+    page:stop()
+  end,
+
   ['reload hooks persist roots, carry them into new charts and hold their work until release'] = function()
     local clock = machine.manual_scheduler()
     local doc_v1 = machine.create {

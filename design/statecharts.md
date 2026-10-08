@@ -617,16 +617,18 @@ Collapsible { key = 'details', title = 'Details', ... }
 - One actor exists per mounted keyed instance. It is created when the
   instance mounts, with `input = props`, so the context can read initial
   props. Keys preserve it across reorders, and unmounting forgets it.
-- It **starts on its first event**, in the callback's task, because
-  initializers and renders may not write signals or schedule work. Entry
-  effects of the initial state therefore run at that first event.
-- Its root scope hangs under the instance scope of the callback that first
-  needed one, so its timers and invokes end when the instance unmounts. Root
-  scopes open lazily, so a component without `after`/`invoke` never opens one.
-  (Instance teardown retires VM-owned child scopes, so components with
-  timers tear down cleanly.)
+- It is **registered at mount**: `machine.actors()` lists it with its
+  initial snapshot (status `created`), so the inspector shows it and
+  `runtime.send` can target it before anything has happened.
+- It **starts on its first event**, from whichever task sends it (a widget
+  callback, `runtime.send`, a test body), because initializers and renders
+  may not write signals or schedule work. Entry effects of the initial state
+  therefore run at that first event.
+- Its root scope is application scope, like any root actor, and opens
+  lazily, so a component without `after`/`invoke` never opens one. The
+  unmount hook's `stop()` closes it, ending its timers and invokes.
 - Component actors are not carried across reload (`persist_roots` skips
-  them), and `machine.actors()` drops them once their scope is gone.
+  them). Unmount unregisters them.
 - A component actor's id is `<chart id>@<instance path>`, so recordings
   (§14) tell instances apart.
 

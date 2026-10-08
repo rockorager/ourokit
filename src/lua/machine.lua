@@ -1139,6 +1139,21 @@ local commits = 0 -- Global commit order across actors, for records.
 local registry = {}
 local registry_order = {}
 
+-- machine.actors() lists registered actors by path. A path belongs to its
+-- latest actor: a remounted component registers before the old instance's
+-- unmount stops it, and that stop must not unregister the new one.
+local function register(actor)
+  if registry[actor.path] == nil then registry_order[#registry_order + 1] = actor.path end
+  registry[actor.path] = actor
+end
+local function unregister(actor)
+  if registry[actor.path] ~= actor then return end
+  registry[actor.path] = nil
+  for i, path in ipairs(registry_order) do
+    if path == actor.path then table.remove(registry_order, i); break end
+  end
+end
+
 local function emit(actor, record)
   local list = {}
   for _, fn in ipairs(actor._observers) do list[#list + 1] = fn end
@@ -1474,7 +1489,7 @@ function M.actors()
   local list, live = {}, {}
   for _, path in ipairs(registry_order) do
     local actor = registry[path]
-    -- Component actors die with their instance scope; drop them here.
+    -- A scope = 'task' actor dies with its task's scope; drop it here.
     if actor and actor._root_scope and actor._scheduler.alive and not actor._scheduler.alive(actor._root_scope) then
       registry[path] = nil
       actor = nil
@@ -1490,8 +1505,10 @@ end
 --   local Collapsible = machine.component(chart, function(self, props) ... end)
 --   Collapsible { key = 'details', title = 'Details' }
 -- The actor is created when the instance mounts (input = props, so context
--- may read initial props) and starts on its first event, in the callback's
--- instance scope: its timers and invokes end when the instance unmounts.
+-- may read initial props) and is registered then, so machine.actors() lists it
+-- and runtime.send can reach it. It starts on its first event, from any task
+-- (a widget callback, a dev tool, a test body); its root scope is application
+-- scope, and the unmount hook's stop() ends its timers and invokes.
 -- render(self, props) reads self:context()/matches()/can() and returns UI.
 -- When the instance leaves (unmount, key reuse, owner disposal, or a build
 -- that rolled back), the runtime's on_unmount hook stops the actor: its
@@ -1506,7 +1523,7 @@ function M.component(chart, render)
     local id = chart.id .. '@' .. tostring(path or props.key)
     local base, n = id, 1
     while component_ids[id] and component_ids[id]._status ~= 'stopped' do n = n + 1; id = base .. '#' .. n end
-    local actor = chart:actor {id = id, input = props, lazy = true, scope = 'task'}
+    local actor = chart:actor {id = id, input = props, lazy = true}
     actor._component = true
     -- A recorder logs the plain part of the initial props (§14).
     if M._hooks and M._hooks.component_input then actor._recorded_input = M._hooks.component_input(values) end
@@ -1860,6 +1877,9 @@ local function create_actor(chart, options)
   actor._config = actor._signal_factory(0)
   actor._members = actor._signal_factory(0)
   actor._keys = {}
+  -- A lazy (component) actor is inspectable and sendable from creation, with
+  -- its initial snapshot; its root scope and effects still wait for start.
+  if actor._lazy and not actor._parent then register(actor) end
   return actor
 end
 
@@ -2155,9 +2175,9 @@ end
 -- actors that never schedule work never touch the scheduler. Child actors
 -- nest under their parent's root. A root actor lives in application scope,
 -- like spawn_app: it outlives the task that started it (a widget callback,
--- an MCP action) until stop(), done or source reload. Component actors
--- (scope = 'task') hang under the instance scope of the callback that first
--- needed one, so their work ends when the instance unmounts.
+-- an MCP action) until stop(), done or source reload. Component actors do
+-- too; their instance's unmount hook stops them. scope = 'task' instead
+-- hangs the root under the current task's scope.
 local function root_scope(actor)
   if actor._status == 'stopped' then fail('machine %s is stopped', actor.path) end
   if not actor._root_scope then
@@ -2507,8 +2527,7 @@ end
 function Actor:_start()
   self._status = 'running'
   bump(self._config) -- status() changes from 'created'
-  registry[self.path] = self
-  registry_order[#registry_order + 1] = self.path
+  register(self)
   if #inspectors > 0 or #self._observers > 0 then
     emit(self, {kind = 'actor', action = 'started', actor = self.path, machine = self.chart.id, time_ms = clock(self),
       parent = self._parent and self._parent.path, graph = self.chart:graph()})
@@ -2572,10 +2591,7 @@ function Actor:_stop()
   release_signal(self._config)
   release_signal(self._members)
   for _, signal in pairs(self._keys) do release_signal(signal) end
-  registry[self.path] = nil
-  for i, path in ipairs(registry_order) do
-    if path == self.path then table.remove(registry_order, i); break end
-  end
+  unregister(self)
   if was_started and wants_records(self) then
     finalize(self, record, 'stop')
     emit(self, record)
