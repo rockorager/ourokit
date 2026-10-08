@@ -155,7 +155,11 @@ local function apply(scheduler, root, input)
     local ok, accepted
     if input.o == 'surface' then ok, accepted = pcall(target._deliver, target, copy(input.e), 'surface')
     else ok, accepted = pcall(target._send, target, copy(input.e), 'external') end
-    return ok and accepted ~= false
+    -- A raising action still committed its transition (actions run after
+    -- commit): keep the path and report the error (gap 9). A raising guard
+    -- or assign leaves the snapshot unchanged, which dedupes away.
+    if not ok then return true, tostring(accepted) end
+    return accepted ~= false
   elseif input.k == 'timer' then
     local at = scheduler.logical.next()
     if not at then return false end
@@ -164,16 +168,29 @@ local function apply(scheduler, root, input)
   end
   local info = scheduler.find(input.a, input.k, input.id, true)
   if not info then return false end
-  return (pcall(info.complete, input.ok, input.value))
+  local ok, err = pcall(info.complete, input.ok, input.value)
+  if not ok then return true, tostring(err) end
+  return true
 end
 
 -- Runs a path from a fresh actor. Returns the actor and scheduler (or nil if
 -- an input did not apply) and the coverage it reached.
+-- Returns the actor and scheduler (nil when an input did not apply) and
+-- the problems the path hit: inputs whose actions raised, and sends that a
+-- target refused because it had not started (record.sent).
 local function run(chart, setup, path, covered)
   local scheduler = M._replay_scheduler(0)
   local saved = M._hooks
+  local problems, step_index = {}, 0
   M._hooks = {scheduler = scheduler, enter = function() end, leave = function() end,
     step = function(actor, record)
+      for _, sent in ipairs(record.sent or {}) do
+        if sent.accepted == false and sent.reason == 'not_started' then
+          problems[#problems + 1] = {at = step_index, kind = 'not_started',
+            message = string.format('%s sent %s to %s, which has not started', actor.path,
+              tostring(sent.event and sent.event.type or sent.type), tostring(sent.to or sent.target or sent.id))}
+        end
+      end
       if covered and actor._parent == nil then
         -- States entered in passing (an always chain) count too.
         for _, micro in ipairs(record.microsteps or {}) do
@@ -186,15 +203,18 @@ local function run(chart, setup, path, covered)
   local ok, actor, applied = pcall(function()
     local actor = chart:actor {id = chart.id, input = setup.input, scheduler = scheduler}
     actor:start()
-    for _, input in ipairs(path) do
-      if not apply(scheduler, actor, input) then return actor, false end
+    for i, input in ipairs(path) do
+      step_index = i
+      local applies, err = apply(scheduler, actor, input)
+      if err then problems[#problems + 1] = {at = i, kind = 'error', message = err} end
+      if not applies then return actor, false end
     end
     return actor, true
   end)
   M._hooks = saved
-  if not ok then return nil end
-  if not applied then actor:stop(); return nil end
-  return actor, scheduler
+  if not ok then return nil, nil, {{at = step_index, kind = 'error', message = tostring(actor)}} end
+  if not applied then actor:stop(); return nil, nil, problems end
+  return actor, scheduler, problems
 end
 
 local function node_key(actor, scheduler)
@@ -323,8 +343,25 @@ function M.paths(chart, options)
     for target in pairs(covered) do if not first[target] then first[target] = path; new = true end end
     return new
   end
+  -- Problems the search ran into, each reported once with its first path.
+  local issues, issue_order = {}, {}
+  local function note(problems, path)
+    for _, problem in ipairs(problems or {}) do
+      local key = problem.kind .. '|' .. problem.message
+      local issue = issues[key]
+      if not issue then
+        local steps = {}
+        for i = 1, problem.at do if path[i] then steps[#steps + 1] = describe_input(path[i]) end end
+        issue = {kind = problem.kind, message = problem.message, count = 0, steps = json.array(steps)}
+        issues[key] = issue
+        issue_order[#issue_order + 1] = issue
+      end
+      issue.count = issue.count + 1
+    end
+  end
   local covered = {}
-  local root, scheduler = run(chart, setup, {}, covered)
+  local root, scheduler, root_problems = run(chart, setup, {}, covered)
+  note(root_problems, {})
   cover({}, covered)
   local seen = {[node_key(root, scheduler)] = true}
   root:stop()
@@ -348,7 +385,8 @@ function M.paths(chart, options)
           for i, x in ipairs(path) do next_path[i] = x end
           next_path[#next_path + 1] = input
           local reached = {}
-          local child, child_scheduler = run(chart, setup, next_path, reached)
+          local child, child_scheduler, problems = run(chart, setup, next_path, reached)
+          note(problems, next_path)
           visited = visited + 1
           if child then
             local new = cover(next_path, reached)
@@ -398,6 +436,7 @@ function M.paths(chart, options)
     if t:sub(1, 1) == 's' and first[t] then reach[#reach + 1] = {state = t:sub(2), inputs = first[t]} end
   end
   return {chart = chart.id, setup = setup, paths = selected, unreached = unreached, nodes = visited, reach = reach,
+    issues = issue_order,
     states = {reached = reached_states, total = states}, transitions = {reached = reached_transitions, total = transitions}}
 end
 
@@ -412,7 +451,7 @@ function M.paths_log(chart, result, options)
   for i, path in ipairs(result.paths) do described[i] = {steps = json.array(path.steps), targets = json.array(path.targets)} end
   lines[1] = M._json_encode({format = 'ouro.machine.log', version = 2, t0 = 0, app = options.app,
     generated = {chart = chart.id, states = result.states, transitions = result.transitions,
-      unreached = json.array(result.unreached), paths = described}})
+      unreached = json.array(result.unreached), paths = described, issues = json.array(result.issues or {})}})
   local recorder = M.recorder(function(line) lines[#lines + 1] = line end, {scheduler = scheduler, t0 = 0, header = false})
   local ok, err = pcall(function()
     for _, path in ipairs(result.paths) do
@@ -440,6 +479,13 @@ local function summary_line(result)
       names[i] = (t:sub(1, 1) == 's' and 'state ' or 'transition #') .. t:sub(2)
     end
     text = text .. '\n  not reached: ' .. table.concat(names, ', ')
+  end
+  -- Gap 9: what the search ran into, so nothing is pruned silently.
+  for _, issue in ipairs(result.issues or {}) do
+    local label = issue.kind == 'error' and 'an input raised' or 'a send was refused'
+    local path = #issue.steps > 0 and table.concat(issue.steps, ' → ') or '(start)'
+    text = text .. string.format('\n  %s (%d run%s): %s\n    first after: %s', label, issue.count,
+      issue.count == 1 and '' or 's', issue.message, path)
   end
   return text
 end
