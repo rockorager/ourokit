@@ -466,7 +466,11 @@ fn generateTests(init: std.process.Init, options: cli.Test) !u8 {
         try recordings.appendSlice(a, "\n\x1e\n");
     }
     var options_json: std.Io.Writer.Allocating = .init(a);
-    try std.json.Stringify.value(.{ .depth = options.depth, .app = std.fs.path.stem(std.fs.path.dirname(entry) orelse entry) }, .{ .emit_null_optional_fields = false }, &options_json.writer);
+    try std.json.Stringify.value(.{
+        .depth = options.depth,
+        .app = std.fs.path.stem(std.fs.path.dirname(entry) orelse entry),
+        .entry = std.fs.path.stem(entry),
+    }, .{ .emit_null_optional_fields = false }, &options_json.writer);
     const result = try ourokit.app.chart_tools.call(init, entry, "generate_tool", recordings.items, options_json.written());
     defer init.gpa.free(result.text);
     defer if (result.extra) |bytes| init.gpa.free(bytes);
@@ -476,7 +480,10 @@ fn generateTests(init: std.process.Init, options: cli.Test) !u8 {
     var files = parsed.value.object.get("files").?.object.iterator();
     var written: std.Io.Writer.Allocating = .init(a);
     while (files.next()) |file| {
-        const target = try std.fs.path.join(a, &.{ output, file.key_ptr.* });
+        // Stories require the app's modules, so they live next to the entry.
+        const stories = std.mem.endsWith(u8, file.key_ptr.*, ".stories.lua");
+        const directory = if (stories and options.output == null) std.fs.path.dirname(entry) orelse "." else output;
+        const target = try std.fs.path.join(a, &.{ directory, file.key_ptr.* });
         try writeAtomic(init, target, file.value_ptr.string);
         try written.writer.print("wrote {s}\n", .{target});
     }

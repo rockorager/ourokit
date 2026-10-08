@@ -236,15 +236,64 @@ def launcher(env, root):
     return len(log)
 
 
+def mcp(root):
+    """MCP calls, generated (machine.actions) and hand-written, record as 'mcp'."""
+    log = root / "contacts-mcp.jsonl"
+    env = dict(os.environ, XDG_RUNTIME_DIR=str(root / "mcp"), XDG_CONFIG_HOME=str(root / "mcp-config"))
+    (root / "mcp").mkdir(mode=0o700)
+    for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
+        env.pop(key, None)
+    process = subprocess.Popen(["dbus-run-session", "--", str(BINARY), "run", str(EXAMPLES / "contacts" / "ouro.json"),
+                                "--mcp", "--headless", "--record", str(log)],
+                               env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        address = root / "mcp" / "ourokit/apps/dev.ourokit.contacts"
+        wait_for(lambda: address.is_socket(), "contacts did not publish its MCP socket")
+        assert call(address, "SelectContact", {"id": "grace"})["structuredContent"] == {}
+        renamed = call(address, "RenameContact", {"id": "grace", "name": "Grace B."})
+        assert renamed["structuredContent"]["contact"]["name"] == "Grace B.", renamed
+        time.sleep(0.3)
+    finally:
+        terminate(process)
+    events = [(e["e"]["type"], e["o"]) for e in entries(log) if e["k"] == "event"]
+    assert ("SELECT", "mcp") in events and ("RENAME", "mcp") in events, events
+    out = replay(log, EXAMPLES / "contacts")
+    assert out.startswith("replay matched"), out
+    return len(entries(log))
+
+
+def stories(env, root):
+    """Generated state stories: one snapshot per reached state."""
+    counts = {}
+    for name, seed in (("stopwatch", None), ("launcher", "launcher"), ("contacts", "contacts"), ("documents", "documents")):
+        app = root / f"{name}-stories"
+        shutil.copytree(EXAMPLES / name, app, ignore=shutil.ignore_patterns("states.stories.lua"))
+        args = [str(BINARY), "test", "--generate", str(app)]
+        if seed:
+            args += ["--from", str(app / "tests" / "seed.jsonl")]
+        out = run(*args, env=env, timeout=600).stdout
+        reached = sum(int(line.split(" reach ")[1].split("/")[0]) for line in out.splitlines() if " reach " in line)
+        assert f"states.stories.lua: {reached} stories" in out, out
+        snapshot = run(str(BINARY), "storybook", "snapshot", str(app / "states.stories.lua"), "--output",
+                       str(root / f"{name}-frames"), "--json", env=env, timeout=600).stdout
+        frames = list((root / f"{name}-frames").rglob("*.png"))
+        assert len(frames) == reached, (name, reached, len(frames), snapshot)
+        counts[name] = reached
+    return counts
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="ouro-chart-replay-") as directory:
         root = Path(directory)
         env = dict(os.environ, WAYLAND_DISPLAY=os.environ["OUROKIT_TEST_WAYLAND_DISPLAY"])
         counts = {name: fn(env, root) for name, fn in
                   (("stopwatch", stopwatch), ("contacts", contacts), ("documents", documents), ("launcher", launcher))}
-        print("PASS chart replay: real stopwatch, contacts, documents and launcher sessions replay to identical "
-              "records and snapshots " + json.dumps(counts) + "; a changed chart reports its first divergent step; "
-              "generated tests cover the stopwatch and fail on the change; seeded generation covers contacts")
+        counts["contacts over MCP"] = mcp(root)
+        frames = stories(env, root)
+        print("PASS chart replay: real stopwatch, contacts, documents and launcher sessions and an MCP session replay "
+              "to identical records and snapshots " + json.dumps(counts) + "; a changed chart reports its first "
+              "divergent step; generated tests cover the stopwatch and fail on the change; seeded generation covers "
+              "contacts; state stories snapshot every reached state " + json.dumps(frames))
 
 
 if __name__ == "__main__":
