@@ -1,20 +1,34 @@
--- Lays a normalized statechart graph out as a process plant: atomic states
--- are tanks, compound states are vessels containing their children, parallel
--- regions are side-by-side compartments. Siblings are layered left to right by
--- breadth-first distance from the initial child so flow mostly runs east.
-local route = require('plant.route')
+-- Lays a normalized statechart graph out in Harel/SCXML notation: atomic
+-- states are rounded boxes sized to their content (key, entry/exit actions,
+-- invokes), compound states contain their children under a title, parallel
+-- states hold regions separated by dashed lines. Siblings are layered by
+-- breadth-first distance from the initial child, east or south, whichever
+-- fits the drawing's aspect ratio. Transitions are routed by diagram.route.
+local route = require('diagram.route')
 
 local M = {}
 
-M.TANK_W, M.TANK_H = 108, 70
-M.PAD, M.HEADER, M.REGION_HEADER = 26, 28, 24
-M.GAP_X, M.GAP_Y = 124, 60
+M.MIN_W, M.MIN_H = 112, 44
+M.PAD, M.HEADER, M.REGION_HEADER = 26, 30, 24
+M.GAP_X, M.GAP_Y = 168, 100
 M.MARGIN = 24
+M.TITLE_SIZE, M.LINE_SIZE, M.LINE_H = 13, 11, 15
 
 -- Monospace label metrics (DejaVu Sans Mono advance is 0.602 em).
-M.LABEL_SIZE = 10
+M.LABEL_SIZE = 11
 local function text_width(text, size) return utf8.len(text) * size * 0.602 end
 M.text_width = text_width
+
+-- The lines drawn inside an atomic or final state, Stately style.
+function M.state_lines(state)
+  local lines = {}
+  for _, name in ipairs(state.entry or {}) do lines[#lines+1] = {kind='entry', text='entry / ' .. name} end
+  for _, name in ipairs(state.exit or {}) do lines[#lines+1] = {kind='exit', text='exit / ' .. name} end
+  for _, v in ipairs(state.invoke) do
+    lines[#lines+1] = {kind='invoke', text='invoke: ' .. v.src, invoke=v, key=state.id .. '|' .. v.id}
+  end
+  return lines
+end
 
 local function child_of(graph, ancestor, id)
   local state = graph.by_id[id]
@@ -55,7 +69,7 @@ local measure
 
 -- Target aspect ratio of the plant area; each vessel picks the layer
 -- direction (east or south) that brings it closest.
-M.ASPECT = 1.9
+M.ASPECT = 1.5
 
 local function measure_compound(graph, state, sizes, header)
   local layer_ids = layers(graph, state)
@@ -91,8 +105,16 @@ end
 
 function measure(graph, state, sizes)
   if state.kind == 'atomic' or state.kind == 'final' then
-    sizes[state.id] = {w=M.TANK_W, h=M.TANK_H}
-    return M.TANK_W, M.TANK_H
+    local lines = M.state_lines(state)
+    local w = math.max(M.MIN_W, text_width(state.label, M.TITLE_SIZE) + 32)
+    -- Invoke lines carry a status chip of up to "cancelled".
+    for _, line in ipairs(lines) do
+      w = math.max(w, text_width(line.text, M.LINE_SIZE) + (line.invoke and 84 or 24))
+    end
+    local h = math.max(M.MIN_H, 30 + #lines * M.LINE_H + (#lines > 0 and 8 or 0))
+    w, h = math.ceil(w / route.CELL) * route.CELL, math.ceil(h / route.CELL) * route.CELL
+    sizes[state.id] = {w=w, h=h, lines=lines}
+    return w, h
   end
   local parent = state.parent and graph.by_id[state.parent]
   local header = (parent and parent.kind == 'parallel') and M.REGION_HEADER or M.HEADER
@@ -105,7 +127,7 @@ function measure(graph, state, sizes)
     rw, rh, mw, mh = rw + cw, math.max(rh, ch), math.max(mw, cw), mh + ch
   end
   local function misfit(w, h) return math.abs(math.log(w / h / M.ASPECT)) end
-  local stacked = misfit(mw, mh + header) + 0.35 < misfit(rw, rh + header)
+  local stacked = misfit(mw, mh + header) + 0.1 < misfit(rw, rh + header)
   for _, id in ipairs(state.children) do
     if stacked then sizes[id].w = mw else sizes[id].h = rh end
   end
@@ -148,68 +170,47 @@ end
 
 local function snap(v) return math.floor(v / route.CELL + 0.5) * route.CELL end
 
--- Returns {width, height, boxes, pipes, manifold}. Coordinates are logical
--- pixels in the plant drawing.
+-- Returns {width, height, boxes, pipes, initials}. Coordinates are logical
+-- pixels in the drawing.
 function M.layout(graph)
   local sizes, boxes = {}, {}
   local root = graph.by_id[graph.root]
   local w, h = measure(graph, root, sizes)
-  local widest = 0
-  for _, event in ipairs(graph.events) do widest = math.max(widest, text_width(event, 11)) end
-  local ox, oy = snap(M.MARGIN + widest + 64 + 56), snap(M.MARGIN + 8)
+  local ox, oy = snap(M.MARGIN), snap(M.MARGIN)
   place(graph, root, sizes, boxes, ox, oy)
-  -- Grid-align every box so routed pipes sit on cell centers symmetrically.
-  for _, box in pairs(boxes) do box.x, box.y = snap(box.x), snap(box.y) end
-  local plant = {graph=graph, boxes=boxes, width=snap(ox + w + M.MARGIN + 48), height=snap(oy + h + M.MARGIN + 24)}
-  -- Instruments sit on tank corners: gauges top-right, pumps bottom-left.
-  plant.gauges, plant.pumps = {}, {}
+  -- Grid-align every box so routed arrows sit on cell centers symmetrically.
+  for id, box in pairs(boxes) do
+    box.x, box.y = snap(box.x), snap(box.y)
+    box.lines = sizes[id].lines
+  end
+  local plant = {graph=graph, boxes=boxes, width=snap(ox + w + M.MARGIN + 48), height=snap(oy + h + M.MARGIN + 24),
+    gauges={}, pumps={}}
+  -- Initial pseudostates: a dot above the initial child of every compound.
+  plant.initials = {}
   for _, state in ipairs(graph.states) do
-    local box = boxes[state.id]
-    for i, a in ipairs(state.after) do
-      plant.gauges[#plant.gauges+1] = {state=state.id, delay=a.delay, transition=a.transition,
-        x=box.x + box.w - 6 - (i - 1) * 34, y=box.y + 2, r=15}
-    end
-    for i, v in ipairs(state.invoke) do
-      plant.pumps[#plant.pumps+1] = {state=state.id, id=v.id, src=v.src, key=state.id .. '|' .. v.id,
-        x=box.x + 4 + (i - 1) * 40, y=box.y + box.h - 2, r=15}
+    if state.kind == 'compound' and state.initial and boxes[state.initial] then
+      local child = boxes[state.initial]
+      plant.initials[#plant.initials+1] = {state=state.id, target=state.initial,
+        x=child.x + 18, y=child.y - 18, to={child.x + 18, child.y}}
     end
   end
-  -- Inlet manifold: a vertical header left of the root vessel, one nozzle
-  -- per external event, feeding the root through a single pipe.
-  local root_box = boxes[graph.root]
-  local events = graph.events
-  local spacing = 34
-  local widest = 0
-  for _, event in ipairs(events) do widest = math.max(widest, text_width(event, 11)) end
-  local mx = snap(M.MARGIN + widest + 64)
-  local top = snap(root_box.y + 40)
-  plant.manifold = {x=mx, top=top, bottom=top + math.max(1, #events - 1) * spacing, nozzles={}}
-  for i, event in ipairs(events) do
-    plant.manifold.nozzles[i] = {event=event, x=mx - 52, y=top + (i - 1) * spacing}
-  end
-  local feed_y = snap((plant.manifold.top + plant.manifold.bottom) / 2)
-  plant.manifold.feed = {{mx, feed_y}, {root_box.x, feed_y}}
-  plant.height = math.max(plant.height, snap(plant.manifold.bottom + 60))
   plant.pipes = route.route_all(plant)
   M.place_labels(plant)
   return plant
 end
 
-
--- Guarded labels wrap the guard onto a second line to stay narrow.
-function M.pipe_text(t)
-  if not t.guard then return t.label end
-  local guard = '[' .. (t.guard == true and 'guard' or t.guard) .. ']'
-  if utf8.len(t.label) + utf8.len(guard) > 14 then return t.label .. '\n' .. guard end
-  return t.label .. ' ' .. guard
+-- Pill text: the event label and, separately, the guard (colored by outcome).
+function M.pill(t)
+  return {event=t.label, guard=t.guard and ('[' .. (t.guard == true and 'guard' or t.guard) .. ']') or nil, transition=t}
 end
 
--- Valve body plus actuator: the stem points up on horizontal pipes and
--- left on vertical ones.
-function M.valve_box(x, y, horizontal)
-  if horizontal then return {x=x - 12, y=y - 24, w=24, h=36} end
-  return {x=x - 24, y=y - 12, w=36, h=24}
+local function pill_width(p)
+  -- After pills leave room for their running countdown (" · 99.9s").
+  local extra = (p.transition and p.transition.after) and ' · 99.9s' or ''
+  return text_width(p.event .. extra .. (p.guard and (' ' .. p.guard) or ''), M.LABEL_SIZE) + 14
 end
+M.pill_width = pill_width
+M.PILL_H = 18
 
 local function overlap(a, b)
   local w = math.min(a.x + a.w, b.x + b.w) - math.max(a.x, b.x)
@@ -217,36 +218,26 @@ local function overlap(a, b)
   return (w > 0 and h > 0) and w * h or 0
 end
 
--- Greedy collision-avoiding placement of pipe labels and valves: candidates
--- sit beside every segment; boxes, headers, instruments, pipes and earlier
--- labels are penalized. Valves go on the segment the label chose.
+-- Greedy collision-avoiding placement of transition pills: candidates sit
+-- beside every segment; boxes, titles, arrows and earlier pills are
+-- penalized. A recirculation loop lists one pill per transition.
 function M.place_labels(plant)
   local hard, soft = {}, {}
   for id, b in pairs(plant.boxes) do
     if b.kind == 'atomic' or b.kind == 'final' then hard[#hard+1] = {x=b.x - 2, y=b.y - 2, w=b.w + 4, h=b.h + 4}
     elseif id ~= plant.graph.root then hard[#hard+1] = {x=b.x, y=b.y, w=b.w, h=b.header} end
   end
-  for _, g in ipairs(plant.gauges) do hard[#hard+1] = {x=g.x - g.r - 22, y=g.y - g.r - 16, w=2 * g.r + 44, h=2 * g.r + 16} end
-  for _, p in ipairs(plant.pumps) do
-    local w = text_width(p.src .. ' · cancelled', 10)
-    hard[#hard+1] = {x=p.x - p.r, y=p.y - p.r, w=2 * p.r + 8 + w, h=2 * p.r + 4}
-  end
+  for _, i in ipairs(plant.initials) do hard[#hard+1] = {x=i.x - 8, y=i.y - 8, w=16, h=26} end
+  -- Small self loops are as hard to read through as boxes.
   for _, pipe in ipairs(plant.pipes) do
     for k = 1, #pipe.points - 1 do
       local a, b = pipe.points[k], pipe.points[k + 1]
-      soft[#soft+1] = {x=math.min(a[1], b[1]) - 4, y=math.min(a[2], b[2]) - 4,
+      local list = pipe.top and hard or soft
+      list[#list+1] = {x=math.min(a[1], b[1]) - 4, y=math.min(a[2], b[2]) - 4,
         w=math.abs(a[1] - b[1]) + 8, h=math.abs(a[2] - b[2]) + 8}
     end
   end
   local placed = {}
-  local order = {}
-  for _, pipe in ipairs(plant.pipes) do if pipe.first then order[#order+1] = pipe end end
-  -- Valved pipes have the fewest good spots; place them first.
-  table.sort(order, function(a, b)
-    local ga, gb = a.transition.guard and 0 or 1, b.transition.guard and 0 or 1
-    if ga ~= gb then return ga < gb end
-    return a.transition.index < b.transition.index
-  end)
   local function score_box(c)
     local score = 0
     for _, r in ipairs(hard) do score = score + overlap(c, r) * 200 end
@@ -255,65 +246,86 @@ function M.place_labels(plant)
     if c.x < 0 or c.y < 0 or c.x + c.w > plant.width or c.y + c.h > plant.height then score = score + 1e6 end
     return score
   end
+  -- Loops have the fewest good spots; place their pills first.
+  local order = {}
+  for _, pipe in ipairs(plant.pipes) do if pipe.first then order[#order+1] = pipe end end
+  table.sort(order, function(a, b)
+    if (a.loop and 0 or 1) ~= (b.loop and 0 or 1) then return a.loop ~= nil end
+    return a.transition.index < b.transition.index
+  end)
+  -- The lowest compound (or parallel region) holding both ends: a pill that
+  -- leaves it reads as belonging to a neighbouring region.
+  local graph = plant.graph
+  local function container(t, target)
+    local ancestors = {}
+    local s = graph.by_id[t.source]
+    while s do ancestors[s.id] = true; s = s.parent and graph.by_id[s.parent] end
+    local e = graph.by_id[target]
+    if target == t.source then e = e.parent and graph.by_id[e.parent] end
+    while e and not ancestors[e.id] do e = e.parent and graph.by_id[e.parent] end
+    if e and target ~= t.source and e.id == t.source then e = e.parent and graph.by_id[e.parent] end
+    return e and plant.boxes[e.id]
+  end
   for _, pipe in ipairs(order) do
-    local t = pipe.transition
-    local text = M.pipe_text(t)
-    if pipe.loop and #pipe.group > 1 then
-      local names = {}
-      for i, member in ipairs(pipe.group) do
-        if i > 6 then names[#names+1] = '+' .. (#pipe.group - 6) .. ' more'; break end
-        names[#names+1] = M.pipe_text(member):gsub('\n', ' ')
+    do
+      local box = container(pipe.transition, pipe.target)
+      local function outside(c)
+        if not box then return 0 end
+        return c.w * c.h - overlap(c, {x=box.x + 2, y=box.y + 2, w=box.w - 4, h=box.h - 4})
       end
-      text = table.concat(names, '\n')
-    end
-    local w, lines = 0, 0
-    for line in text:gmatch('[^\n]+') do w, lines = math.max(w, text_width(line, M.LABEL_SIZE) + 4), lines + 1 end
-    local h = 14 * lines
-    local valve = t.guard and not pipe.loop
-    local best, best_score, best_valve
-    local total = route.length(pipe.points)
-    local walked = 0
-    for k = 1, #pipe.points - 1 do
-      local a, b = pipe.points[k], pipe.points[k + 1]
-      local len = math.abs(a[1] - b[1]) + math.abs(a[2] - b[2])
-      local horizontal = a[2] == b[2]
-      for _, f in ipairs(valve and {0.5, 0.3, 0.7} or {0.5}) do
-        local mx, my = a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f
-        local vbox = valve and M.valve_box(mx, my, horizontal)
-        local base = math.abs(walked + len * f - total / 2) * 0.4 + (len < 40 and 400 or 0)
-        if valve then
-          base = base + score_box(vbox) * 2 + (len < 48 and 3000 or 0)
-        end
+      local pills = {}
+      for i, member in ipairs(pipe.group) do
+        if i > 6 then pills[#pills+1] = {event='+' .. (#pipe.group - 6) .. ' more'}; break end
+        pills[#pills+1] = M.pill(member)
+      end
+      local w = 0
+      for _, p in ipairs(pills) do w = math.max(w, pill_width(p)) end
+      local h = #pills * (M.PILL_H + 3) - 3
+      local best, best_score
+      local total = route.length(pipe.points)
+      local walked = 0
+      for k = 1, #pipe.points - 1 do
+        local a, b = pipe.points[k], pipe.points[k + 1]
+        local len = math.abs(a[1] - b[1]) + math.abs(a[2] - b[2])
+        local horizontal = a[2] == b[2]
+        local mx, my = (a[1] + b[1]) / 2, (a[2] + b[2]) / 2
+        local base = math.abs(walked + len / 2 - total / 2) * 0.4 + (len < 40 and 400 or 0)
         local candidates = {}
-        if pipe.loop then
-          candidates[1] = {x=math.max(a[1], b[1]) + 4, y=my - h / 2}
+        if pipe.loop and pipe.top then
+          candidates[1] = {x=pipe.points[1][1] - 4, y=pipe.points[2][2] - h - 3}
+          candidates[2] = {x=pipe.points[4][1] + 6, y=pipe.points[2][2] - h / 2}
+          candidates[3] = {x=pipe.points[4][1] + 4 - w, y=pipe.points[2][2] - h - 3}
+          candidates[4] = {x=(pipe.points[1][1] + pipe.points[4][1] - w) / 2, y=pipe.points[2][2] - h - 3}
+        elseif pipe.loop then
+          candidates[1] = {x=math.max(a[1], b[1]) + 6, y=my - h / 2}
         elseif horizontal then
-          local off = valve and 16 or 0
-          for _, dx in ipairs({0, -w / 2 - off, w / 2 + off}) do
-            candidates[#candidates+1] = {x=mx - w / 2 + dx, y=my - h - 5}
-            candidates[#candidates+1] = {x=mx - w / 2 + dx, y=my + 6}
+          for _, dx in ipairs({0, -w / 2 - 8, w / 2 + 8}) do
+            candidates[#candidates+1] = {x=mx - w / 2 + dx, y=my - h - 4}
+            candidates[#candidates+1] = {x=mx - w / 2 + dx, y=my + 4}
+            candidates[#candidates+1] = {x=mx - w / 2 + dx, y=my - h / 2}
           end
         else
           for _, dy in ipairs({0, -h - 8, h + 8}) do
-            candidates[#candidates+1] = {x=mx + 8, y=my - h / 2 + dy}
-            candidates[#candidates+1] = {x=mx - w - (valve and 26 or 8), y=my - h / 2 + dy}
+            candidates[#candidates+1] = {x=mx + 6, y=my - h / 2 + dy}
+            candidates[#candidates+1] = {x=mx - w - 6, y=my - h / 2 + dy}
+            candidates[#candidates+1] = {x=mx - w / 2, y=my - h / 2 + dy}
           end
         end
         for _, c in ipairs(candidates) do
           c.w, c.h = w, h
-          local score = base + score_box(c) + (vbox and overlap(c, vbox) * 60 or 0)
-          if not best_score or score < best_score then
-            best, best_score = c, score
-            best_valve = {anchor={mx, my}, horizontal=horizontal, box=vbox}
-          end
+          local score = base + score_box(c) + outside(c) * 150
+          if not best_score or score < best_score then best, best_score = c, score end
         end
+        walked = walked + len
       end
-      walked = walked + len
+      pipe.label_box, pipe.pills = best, pills
+      placed[#placed+1] = best
     end
-    pipe.label_box, pipe.label_text = best, text
-    pipe.anchor, pipe.horizontal = best_valve.anchor, best_valve.horizontal
-    placed[#placed+1] = best
-    if valve then placed[#placed+1] = best_valve.box end
+  end
+  -- Root loops have no in-bounds spot; grow the canvas to keep them whole.
+  for _, r in ipairs(placed) do
+    plant.width = math.max(plant.width, math.ceil(r.x + r.w + 4))
+    plant.height = math.max(plant.height, math.ceil(r.y + r.h + 4))
   end
 end
 

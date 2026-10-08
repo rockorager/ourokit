@@ -1,4 +1,4 @@
--- Orthogonal pipe routing on an 8 px grid. Each transition is routed with A*
+-- Orthogonal transition routing on an 8 px grid. Each transition is routed with A*
 -- over (node, heading) states: tanks and instruments block, vessel walls and
 -- headers are expensive to cross, bends cost extra, and every routed pipe
 -- raises the cost of its cells so later pipes run beside it instead of on it.
@@ -88,7 +88,7 @@ local function build_grid(plant)
       for j = j0 + 1, j0 + b.header // C do for i = i0 + 1, i1 - 1 do add(i, j, HEADER) end end
     end
   end
-  for _, list in ipairs({plant.gauges, plant.pumps}) do
+  for _, list in ipairs({plant.gauges or {}, plant.pumps or {}}) do
     for _, g in ipairs(list) do
       local r = g.r + 6
       for j = (g.y - r) // C, (g.y + r) // C + 1 do for i = (g.x - r) // C, (g.x + r) // C + 1 do
@@ -101,8 +101,8 @@ local function build_grid(plant)
   local function soft_rect(x0, y0, x1, y1)
     for j = y0 // C, y1 // C + 1 do for i = x0 // C, x1 // C + 1 do add(i, j, LABEL) end end
   end
-  for _, g in ipairs(plant.gauges) do soft_rect(g.x - 22, g.y - g.r - 16, g.x + 22, g.y - g.r) end
-  for _, p in ipairs(plant.pumps) do soft_rect(p.x + p.r + 6, p.y - 2, p.x + p.r + 6 + 6 * (#p.src + 12), p.y + 12) end
+  for _, g in ipairs(plant.gauges or {}) do soft_rect(g.x - 22, g.y - g.r - 16, g.x + 22, g.y - g.r) end
+  for _, p in ipairs(plant.pumps or {}) do soft_rect(p.x + p.r + 6, p.y - 2, p.x + p.r + 6 + 6 * (#p.src + 12), p.y + 12) end
   return {cost=cost, cols=cols, rows=rows}
 end
 
@@ -279,10 +279,17 @@ function M.route_all(plant)
           table.insert(loop.group, t)
         else
           local b = boxes[t.source]
-          local x0, x1 = b.x + b.w, b.x + b.w + 16
-          local points = {{x0, b.y + 24}, {x1, b.y + 24}, {x1, b.y + b.h - 24}, {x0, b.y + b.h - 24}}
+          local points, top
+          if b.kind == 'atomic' or b.kind == 'final' then
+            -- A small loop over the box's top-right corner.
+            local x0, x1, y = b.x + b.w - 40, b.x + b.w - 16, b.y - 18
+            points, top = {{x0, b.y}, {x0, y}, {x1, y}, {x1, b.y}}, true
+          else
+            local x0, x1 = b.x + b.w, b.x + b.w + 16
+            points = {{x0, b.y + 24}, {x1, b.y + 24}, {x1, b.y + b.h - 24}, {x0, b.y + b.h - 24}}
+          end
           occupy(grid, points)
-          loop = {transition=t, group={t}, target=target, first=true, loop=true, points=points}
+          loop = {transition=t, group={t}, target=target, first=true, loop=true, top=top, points=points}
           loops[t.source] = loop
           pipes[#pipes+1] = loop
         end

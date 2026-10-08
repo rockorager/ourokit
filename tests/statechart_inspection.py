@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""runtime.statecharts on a real headless development instance.
+"""runtime.statecharts, runtime.send and the ouro://statecharts push feed
+on real development instances.
 
-Covers on-demand attachment with seeded late-attach state, the record
-stream, idle detachment, and actors carried across a development reload.
+Headless: on-demand attachment with seeded late-attach state, the record
+stream, idle detachment, actors carried across a development reload; then
+runtime.send (accepted, rejected, wait, errors), the actor filter, push
+notifications (none while idle, coalesced until read, the subscription keeps
+the observer attached) and a ring overflow that the client reseeds from.
+With OUROKIT_TEST_WAYLAND_DISPLAY also: the stopwatch driven over the
+endpoint and replayed identically, the statechart visualizer attached by push
+without periodic requests, and the visualizer attached to itself.
 Run after zig build: python3 tests/statechart_inspection.py
-Needs XDG_RUNTIME_DIR-style private directories only; no compositor.
 """
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import tempfile
 import time
 
-from application_services import BINARY, call, development_path
+from application_services import BINARY, RpcStream, call, development_path, record, request
 
 SOURCE = '''local o = require('ouro')
 local m = o.machine
@@ -61,6 +68,150 @@ def wait_for(endpoint, predicate, after, **arguments):
 
 def event(entry):
     return entry['record'].get('event', {}).get('type')
+
+
+# A quiet app: nothing happens unless the endpoint sends an event. BURST
+# makes `count` ticker records in one turn, faster than any client reads.
+QUIET = '''local o = require('ouro')
+local m = o.machine
+local ticker = m.create {
+  id = 'ticker', initial = 'on', context = {ticks = 0}, events = {TICK = {}},
+  states = {on = {on = {TICK = {actions = m.assign {ticks = function(c) return c.ticks + 1 end}}}}},
+}:actor {id = 'ticker'}
+ticker:start()
+local counter = m.create {
+  id = 'counter', initial = 'idle', context = {n = 0},
+  events = {SET = {n = 'integer'}, ARM = {}, DISARM = {}, BURST = {count = 'integer'}},
+  actions = {
+    set = m.assign {n = function(_, e) return e.n end},
+    burst = function(_, e) for _ = 1, e.count do ticker:send('TICK') end end,
+  },
+  states = {
+    idle = {on = {SET = {actions = 'set'}, ARM = 'armed', BURST = {actions = 'burst'}}},
+    armed = {after = {[60000] = 'idle'}, on = {DISARM = 'idle'}},
+  },
+}:actor {id = 'counter'}
+counter:start()
+return o.app {id = 'dev.ourokit.statechart-send', run = function() return {windows = {}} end}
+'''
+
+
+def send(endpoint, actor, event, **extra):
+    result = call(endpoint, 'runtime.send', dict(actor=actor, event=event, **extra))
+    return result['structuredContent'], result['isError']
+
+
+def updates(stream, timeout):
+    """Messages that arrive on a subscription within timeout seconds."""
+    out, deadline = [], time.monotonic() + timeout
+    while True:
+        while b"\n" in stream.buffer:
+            out.append(stream.read())
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([stream.socket], [], [], left)[0]:
+            return out
+        chunk = stream.socket.recv(65536)
+        assert chunk, 'subscription closed'
+        stream.buffer.extend(chunk)
+
+
+def updated(messages):
+    assert all(m.get('method') == 'notifications/resources/updated' and m['params']['uri'] == 'ouro://statecharts'
+               for m in messages), messages
+    return len(messages)
+
+
+def send_and_push():
+    with tempfile.TemporaryDirectory(prefix='ourokit-statechart-send-') as directory:
+        root = Path(directory)
+        source = root / 'app.lua'
+        source.write_text(QUIET)
+        env = dict(os.environ, XDG_RUNTIME_DIR=str(root), XDG_STATE_HOME=str(root / 'state'))
+        process = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--headless'],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            endpoint = development_path(root, process)
+            time.sleep(.3)
+            # runtime.send: the actor's normal send path, with a summary.
+            out, failed = send(endpoint, 'counter', {'type': 'SET', 'n': 7})
+            assert not failed and out['accepted'] and out['states'] == ['idle'], out
+            assert out['changed'] == ['n'] and out['changes'] == {'n': 7} and isinstance(out['commit'], int), out
+            out, failed = send(endpoint, 'counter', {'type': 'DISARM'})
+            assert not failed and not out['accepted'] and out['reason'] == 'no_transition' and out['changed'] == [], out
+            for actor, bad, code in (('nobody', {'type': 'SET', 'n': 1}, 'UnknownActor'),
+                                     ('counter', {'type': 'NOPE'}, 'UnknownEvent'),
+                                     ('counter', {'type': 'SET', 'n': 'x'}, 'InvalidEvent'),
+                                     ('counter', {'type': 'ouro.x'}, 'InvalidEvent')):
+                out, failed = send(endpoint, actor, bad)
+                assert failed and out['error']['code'] == code, (bad, out)
+            out, failed = send(endpoint, 'counter', {'type': 'ARM'}, wait={'states': ['armed'], 'timeout_ms': 2000})
+            assert not failed and out['wait'] == {'matched': True} and out['states'] == ['armed'], out
+            # The actor filter: one actor's complete current state.
+            full = statecharts(endpoint, after=0, limit=0, actors=False, actor='counter')['actor']
+            assert full['graph']['format'] == 'ouro.machine.graph' and full['machine'] == 'counter', full
+            snap = full['snapshot']
+            assert snap['states'] == ['armed'] and snap['context'] == {'n': 7}, snap
+            assert [(t['state'], t['delay']) for t in snap['timers']] == [('armed', 60000)], snap
+            assert 'DISARM' in snap['accepted'] and 'SET' not in snap['accepted'], snap
+            failed = call(endpoint, 'runtime.statecharts', {'actor': 'nobody'})
+            assert failed['isError'], failed
+
+            # Push: discover advertises it, nothing arrives while idle, one
+            # notification per read, and the subscription keeps the observer.
+            info = request(endpoint, 'server/discover')['result']
+            assert info['capabilities']['resources'] == {'subscribe': True}, info
+            stream = RpcStream(endpoint)
+            stream.socket.sendall(record('subscriptions/listen', {'notifications': {
+                'resourceSubscriptions': ['ouro://statecharts']}}, 'feed'))
+            ack = stream.read()
+            assert ack['method'] == 'notifications/subscriptions/acknowledged', ack
+            assert ack['params']['notifications'] == {'resourceSubscriptions': ['ouro://statecharts']}, ack
+            cursor = statecharts(endpoint, after=0, limit=1024, keep_alive_ms=100)
+            assert updated(updates(stream, 1.0)) == 0, 'no notifications while idle'
+            send(endpoint, 'counter', {'type': 'DISARM'})
+            assert updated(updates(stream, 1.0)) == 1
+            send(endpoint, 'counter', {'type': 'SET', 'n': 8})
+            assert updated(updates(stream, .5)) == 0, 'coalesced until the next read'
+            page = statecharts(endpoint, after=cursor['next'], seed=cursor['seed'], keep_alive_ms=100)
+            assert [event(e) for e in page['records']] == ['DISARM', 'SET'], page
+            assert updated(updates(stream, 1.0)) == 1, 'the read re-arms a notification for newer records'
+            page = statecharts(endpoint, after=page['next'], seed=page['seed'], keep_alive_ms=100)
+            assert updated(updates(stream, 1.0)) == 0, 'caught up: idle again'
+            # keep_alive_ms is 100 ms, but the subscriber keeps the observer.
+            send(endpoint, 'counter', {'type': 'SET', 'n': 9})
+            assert updated(updates(stream, 1.0)) == 1
+            page = statecharts(endpoint, after=page['next'], seed=page['seed'], keep_alive_ms=100)
+            assert [event(e) for e in page['records']] == ['SET'] and page['seed'] == cursor['seed'], page
+
+            # Overflow: two bursts evict past the cursor in single turns; the
+            # read reports dropped and the client reseeds from actors.
+            cursor = page
+            for _ in range(2):
+                out, failed = send(endpoint, 'counter', {'type': 'BURST', 'count': 600})
+                assert not failed and out['accepted'], out
+            assert updated(updates(stream, 1.0)) == 1, 'one notification for the whole burst'
+            gap = statecharts(endpoint, after=cursor['next'], seed=cursor['seed'], limit=1)
+            assert gap['dropped'] and gap['first'] > cursor['next'] + 1 and 'actors' not in gap, gap
+            reseed = statecharts(endpoint, after=gap['next'], actors=True, limit=0)
+            ticker = next(a for a in reseed['actors'] if a['actor'] == 'ticker')
+            assert ticker['latest']['context'] == {'ticks': 1200} and ticker['started']['graph']['id'] == 'ticker', ticker
+
+            # Closing the subscription lets the observer detach after keep_alive.
+            stream.close()
+            statecharts(endpoint, after=reseed['next'], keep_alive_ms=100)
+            time.sleep(.4)
+            send(endpoint, 'counter', {'type': 'SET', 'n': 10})  # detaches on this record
+            send(endpoint, 'counter', {'type': 'SET', 'n': 11})
+            after = statecharts(endpoint, after=reseed['next'], seed=reseed['seed'])
+            assert after['seed'] == reseed['seed'] + 1, after
+            assert 11 not in [e['record'].get('event', {}).get('n') for e in after['records']], after
+            print('PASS runtime.send: accepted, rejected, wait and error codes; actor filter; '
+                  'push without idle notifications, coalesced per read, subscription keeps the observer; '
+                  'ring overflow reported as dropped and reseeded')
+        finally:
+            process.terminate()
+            _, stderr = process.communicate(timeout=10)
+            assert b'panic' not in stderr and b'leaked' not in stderr, stderr
 
 
 def main():
@@ -133,5 +284,123 @@ def main():
             assert b'panic' not in stderr and b'leaked' not in stderr, stderr
 
 
+ROOT = Path(__file__).resolve().parents[1]
+VISUALIZER = ROOT / 'tools/statechart-visualizer/app.lua'
+
+
+def snapshot(endpoint, actor):
+    return statecharts(endpoint, after=0, limit=0, actors=False, actor=actor)['actor']['snapshot']
+
+
+def poll(predicate, message, timeout=20):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            value = predicate()
+        except (AssertionError, KeyError, StopIteration, ConnectionError, OSError):
+            value = None
+        if value:
+            return value
+        assert time.monotonic() < deadline, message
+        time.sleep(.1)
+
+
+def native():
+    """The stopwatch driven over the endpoint, watched by the visualizer."""
+    with tempfile.TemporaryDirectory(prefix='ourokit-statechart-native-') as directory:
+        root = Path(directory)
+        env = dict(os.environ, XDG_RUNTIME_DIR=str(root), XDG_STATE_HOME=str(root / 'state'),
+                   WAYLAND_DISPLAY=os.environ['OUROKIT_TEST_WAYLAND_DISPLAY'])
+        processes, endpoints = [], []
+
+        def launch(name, *args):
+            with (root / f'{name}.stderr').open('w') as errors:
+                process = subprocess.Popen([str(BINARY), 'run', *map(str, args)], env=env,
+                                           stdout=subprocess.DEVNULL, stderr=errors)
+            processes.append((name, process))
+            endpoint = development_path(root, process, exclude=endpoints)
+            endpoints.append(endpoint)
+            return process, endpoint
+
+        def reads(endpoint):
+            return statecharts(endpoint, after=0, limit=0, actors=False)['reads']
+
+        def live(endpoint):
+            return 'connection.connected.live' in snapshot(endpoint, 'visualizer')['states']
+
+        try:
+            log = root / 'stopwatch.jsonl'
+            stopwatch, sw = launch('stopwatch', ROOT / 'examples/stopwatch/ouro.json', '--dev', '--software',
+                                   '--record', log)
+            poll(lambda: snapshot(sw, 'stopwatch'), 'the stopwatch actor never started')
+            _, viz = launch('visualizer', VISUALIZER, '--dev', '--software', '--', f'unix:{sw}')
+            poll(lambda: live(viz), 'the visualizer never attached by push', timeout=60)
+            time.sleep(1)
+            # Idle: the attached visualizer makes no requests (only ours count).
+            before = reads(sw)
+            time.sleep(2)
+            assert reads(sw) - before == 1, 'the visualizer polled while idle'
+
+            # Drive the chart over the endpoint, no widget clicks.
+            out, failed = send(sw, 'stopwatch', {'type': 'START'}, wait={'states': ['clock.running']})
+            assert not failed and out['accepted'] and out['wait'] == {'matched': True}, out
+            time.sleep(.35)
+            out, failed = send(sw, 'stopwatch', {'type': 'LAP'})
+            assert not failed and out['accepted'] and 'laps' in out['changed'] and len(out['changes']['laps']) == 1, out
+            time.sleep(.2)
+            out, failed = send(sw, 'stopwatch', {'type': 'STOP'}, wait={'states': ['clock.paused']})
+            assert not failed and 'clock.paused' in out['states'] and {'banked', 'elapsed'} <= set(out['changed']), out
+            state = snapshot(sw, 'stopwatch')
+            context = state['context']
+            assert 'clock.paused' in state['states'] and 'settings.closed' in state['states'], state
+            assert context['elapsed'] == context['banked'] >= 500 and len(context['laps']) == 1, context
+            assert 300 <= context['laps'][0]['total'] < context['elapsed'], context
+
+            # The records reached the visualizer by push: it holds a frame per
+            # stopwatch record, then goes quiet again.
+            records = statecharts(sw, after=0, actors=False)['next']
+            poll(lambda: snapshot(viz, 'visualizer')['context']['counts']['stopwatch'] >= records,
+                 'the visualizer missed records', timeout=60)
+            time.sleep(1)
+            before = reads(sw)
+            time.sleep(1.5)
+            assert reads(sw) - before == 1, 'the visualizer kept requesting after STOP'
+
+            # Replay reproduces the session driven through runtime.send.
+            stopwatch.terminate()
+            stopwatch.wait(timeout=10)
+            endpoints.remove(sw)
+            lines = [json.loads(line) for line in log.read_text().splitlines()[1:]]
+            sent = [e['e']['type'] for e in lines if e.get('o') == 'dev']
+            assert sent == ['START', 'LAP', 'STOP'], lines
+            replay = subprocess.run([str(BINARY), 'replay', str(log), str(ROOT / 'examples/stopwatch')],
+                                    capture_output=True, text=True, timeout=60, env=env)
+            assert replay.returncode == 0 and replay.stdout.startswith(f'replay matched: {len(lines)} entries'), replay
+
+            # The visualizer attached to itself, driven over its own endpoint.
+            _, me = launch('self', VISUALIZER, '--dev', '--software', '--', 'self')
+            poll(lambda: live(me), 'the visualizer never attached to itself', timeout=60)
+            poll(lambda: snapshot(me, 'visualizer')['context']['counts']['visualizer'] >= 1,
+                 'the visualizer never saw its own chart', timeout=60)
+            out, failed = send(me, 'visualizer', {'type': 'SCRUB', 'value': 1})
+            assert not failed and out['accepted'] and 'view.scrubbing' in out['states'] and out['changes']['cursor'] == 1, out
+            out, failed = send(me, 'visualizer', {'type': 'LIVE'})
+            assert not failed and 'view.following' in out['states'], out
+            out, failed = send(me, 'visualizer', {'type': 'ATTACHED'})
+            assert not failed and not out['accepted'] and out['reason'] == 'no_transition', out
+            print('PASS statecharts native: stopwatch driven by runtime.send and replayed identically; '
+                  'visualizer attached by push with no idle requests; visualizer attached to itself')
+        finally:
+            for name, process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+                text = (root / f'{name}.stderr').read_text()
+                assert 'panic' not in text and 'leaked' not in text, (name, text)
+
+
 if __name__ == '__main__':
     main()
+    send_and_push()
+    if os.environ.get('OUROKIT_TEST_WAYLAND_DISPLAY'):
+        native()

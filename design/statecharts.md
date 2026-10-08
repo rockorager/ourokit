@@ -1039,7 +1039,7 @@ Records are built only while an observer is attached. They answer questions
 like "why is this app waking up when idle?" through timers that are still
 started, and "why is Save disabled?" through rejected events and guards.
 
-### Dev tools: `runtime.statecharts` and the plant visualizer
+### Dev tools: `runtime.statecharts`, `runtime.send` and the visualizer
 
 **`runtime.statecharts`** is a tool on the `--dev` endpoint, called through
 MCP `tools/call`. Production instances install nothing
@@ -1049,45 +1049,101 @@ MCP `tools/call`. Production instances install nothing
 {"name": "runtime.statecharts", "arguments": {"after": 0, "limit": 20}}
 ```
 
-- **On-demand attach.** Nothing is observed until the first call. It attaches
-  a `machine.inspect` observer at a safe point and seeds `actors`. For every
-  live actor it gives the started record, including its graph, plus a
-  synthetic `origin = 'attach'` record of the current snapshot. Running timers
-  and invokes come from `pending_timers()` and `pending_invokes()`.
-- **`keep_alive_ms`** (default 30,000). Each call renews the observer. The
-  first record after that long without a call detaches it, so an idle
-  instance builds no records.
+- **On-demand attach.** Nothing is observed until the first call or
+  subscription. It attaches a `machine.inspect` observer at a safe point and
+  seeds `actors`. For every live actor it gives the started record, including
+  its graph, plus a synthetic `origin = 'attach'` record of the current
+  snapshot. Running timers and invokes come from `pending_timers()` and
+  `pending_invokes()`.
+- **`keep_alive_ms`** (default 30,000). Each call renews the observer, and a
+  live `ouro://statecharts` subscription holds it. The first record after
+  that long without either detaches it, so an idle instance builds no records.
 - **Seeds.** A reload or re-attach reseeds `actors` and increments `seed`. Pass
   the last `seed` you saw to get `actors` back exactly when it changed. Root
   actors stay visible across reload.
 - **Records.** They are JSON-encoded in the VM, stamped with host monotonic
   `time_ms`, and kept in a 1,024-record ring. A call returns `{next, first,
-  dropped, time_ms, seed, records = [{sequence, time_ms, record}], actors}`
-  after the `after` cursor. Records include `guards` (valve outcomes),
-  `time_ms` and `accepted` (the declared events the actor would take).
-  `text = true` returns records as JSON strings, for clients such as
-  `ouro.mcp` that convert at most 4,096 values per reply.
+  dropped, time_ms, seed, reads, records = [{sequence, time_ms, record}],
+  actors}` after the `after` cursor. Records include `guards` (guard
+  outcomes), `time_ms` and `accepted` (the declared events the actor would
+  take). `text = true` returns records as JSON strings, for clients such as
+  `ouro.mcp` that convert at most 4,096 values per reply. `reads` counts calls.
+- **One actor, complete.** `actor = path` adds `actor = {actor, machine,
+  parent, graph, snapshot}`, read now. The snapshot record has the
+  configuration (`states`), `status`, the full `context`, `children`,
+  `output`, pending `timers` and `invokes` with their start times, and
+  `accepted`. Together with `actors` this is a complete late-attach read: an
+  agent never needs history to know where a chart is.
 
-**The plant visualizer** ([`tools/statechart-visualizer`](../tools/statechart-visualizer/README.md))
-draws actors as a process-plant diagram:
-- states are tanks and vessels, and transitions are pipes;
-- guards are valves, `after` timers are gauges, and invokes are pumps;
-- context fields are tag faceplates;
-- a history timeline can be scrubbed.
+**Push, not polling.** The endpoint offers the resource `ouro://statecharts`
+(`server/discover` advertises `capabilities.resources.subscribe`). A client
+subscribes with `subscriptions/listen {notifications: {resourceSubscriptions:
+["ouro://statecharts"]}}` and then works notify-then-fetch:
 
-It reads only the graph and records described above.
+- the server sends `notifications/resources/updated` when records were
+  appended or the source reloaded since the last notification;
+- at most one notification is outstanding per subscriber until some
+  `runtime.statecharts` call (`reads` grows), so a burst costs one wakeup;
+- nothing is sent, and neither process wakes, while no record arrives;
+- if the ring evicted records past the client's cursor, the fetch reports
+  `dropped` and the client reseeds from `actors` (the late-attach read).
+
+`ouro.mcp.subscribe` implements the client side. Polling remains only as the
+fallback for endpoints that do not offer the resource.
+
+**`runtime.send`** injects one event into a live actor, so agents can drive a
+chart as well as inspect it:
+
+```json
+{"name": "runtime.send", "arguments": {"actor": "stopwatch", "event": {"type": "START"},
+  "wait": {"states": ["clock.running"], "timeout_ms": 2000}}}
+```
+
+- It runs as a task in the application VM and delivers through the actor's
+  normal send path. Event schema validation, strict mode and reserved-prefix
+  rejection apply. Failures are tool errors with codes such as `UnknownActor`,
+  `UnknownEvent` and `InvalidEvent`.
+- It returns `{actor, accepted, reason, states, status, changed, changes,
+  sequence, commit, time_ms, guards}`, where `changed` lists the context keys
+  that changed and `changes` their new values.
+- With `wait`, it then calls `machine.wait_for` until one of `wait.states`
+  matches (or the next commit when `states` is omitted) or `timeout_ms`
+  (default 5,000) passes, and adds `wait = {matched, error}`.
+- The input is labeled origin `dev` in records and in the statechart
+  recording, so `ouroctl replay` reproduces sessions driven this way
+  (`statechart_inspection.py` drives START/LAP/STOP into the stopwatch and
+  replays the log identically).
+- Component machines are addressed by instance path (`chart@<instance path>`)
+  once the interpreter registers them that way.
+- It is absent outside `--dev`. Production automation uses `machine.actions`.
+
+`ouro.development_endpoint()` returns `"unix:<path>"` of the instance's own
+endpoint under `--dev`, which lets a tool attach to itself.
+
+**The statechart visualizer** ([`tools/statechart-visualizer`](../tools/statechart-visualizer/README.md))
+draws actors in Harel / SCXML / Stately notation: rounded states with
+`entry`/`exit`/`invoke` lines, compound containers, dashed parallel regions,
+initial dots, double-bordered finals, and arrows with event pills (`EVENT
+[guard]`, `after 100ms` with a live countdown, `always`, `done.*`). A taken
+transition is highlighted and a pulse runs along it. Guard text is green or red
+from `record.guards`, and grey when not evaluated. Side panels list event
+pills (enabled when accepted, clicking one calls `runtime.send`, with a
+payload editor for events with fields), the context tree with changed keys
+highlighted, timers and invokes. A scrubbable timeline and record log sit
+below. Light and dark follow the app theme.
+
+The visualizer's own state lives in one parallel chart (connection, view,
+editor; no `o.signal`). It reads only the graph and records described above.
 
 ```sh
 zig build -Dvulkan=false -Doptimize=ReleaseSafe   # Debug software rendering runs at ~1 fps
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua                        # in-process demo charts
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- unix:$DEV_SOCKET   # attach to any --dev app
+zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua --dev -- self         # attach to itself
 zig-out/bin/ouroctl storybook snapshot tools/statechart-visualizer/storybook.lua --output out
 ```
 
-When attached, it polls `runtime.statecharts`: every 200 ms while idle, and
-again immediately whenever it receives a full page. It also loads a recorded
-log (§14) and scrubs it step by step. Open: push delivery through a resource
-subscription instead of polling.
+It also loads a recorded log (§14) and scrubs or plays it step by step.
 
 ## 11. API summary (prototype)
 

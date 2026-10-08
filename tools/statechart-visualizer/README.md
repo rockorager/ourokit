@@ -1,24 +1,26 @@
-# Statechart plant
+# Statechart visualizer
 
-A development visualizer for [`ouro.machine`](../../design/statecharts.md) actors,
-drawn as a process-plant HMI / P&ID. It is an ordinary Ourokit application built
-on `ouro.drawing` paths, `ouro.canvas`, `ouro.stack`, `ouro.layout_builder`, Box
-transforms and native `ouro.animation`. It uses no plugins or web views.
+A development visualizer for [`ouro.machine`](../../design/statecharts.md)
+actors, drawn in Harel / SCXML / Stately notation. It is an ordinary Ourokit
+application built on `ouro.drawing` paths, `ouro.canvas`, `ouro.stack`,
+`ouro.layout_builder`, Box transforms and native `ouro.animation`. It uses no
+plugins or web views.
 
-| Chart concept | Plant symbol |
+| Chart concept | Drawn as |
 | --- | --- |
-| Atomic state | Tank. It fills with liquid while active. A final state is a double-walled tank and fills green. |
-| Compound state | Vessel containing its children, with a header band. It is lit while active. |
-| Parallel state | Compartments separated by a double bulkhead, side by side or stacked to fit the window |
-| Transition | Orthogonally routed pipe with a flange at the source and a flow arrow at the target. The pipe is energized while its source is active. A taken transition turns amber and sends a pulse from source to target, one microstep after another. A state's targetless and self transitions share one recirculation loop that lists their events. |
-| Guarded transition | Valve: green when open, red when closed, grey when the guard was not evaluated |
-| `after` | Gauge in the tank's corner. It counts down while the timer runs and flashes when it fires. |
-| `invoke` | Pump. The rotor spins while running. The casing turns red on error, green when done, and the pump stops with an × when cancelled. |
-| External events | Inlet manifold with one nozzle per declared or handled event. A rejected event bursts red at the inlet. |
-| Context | Tag faceplates. A tag gets an amber border when the last step changed it. |
-| History | Event-log timeline: ticks coloured by origin, a scrub slider, step buttons and **Go live** |
+| Atomic state | Rounded rectangle labeled with its key, with `entry / action`, `exit / action` and `invoke: src` lines. Active states get an accent outline and a light fill. |
+| Compound state | Rounded container with a title; children nest inside |
+| Parallel state | Regions separated by dashed lines, each labeled |
+| Initial / final | A filled dot with an arrow to the initial child; a double border for final states |
+| Transition | Orthogonal arrow with an event pill: `EVENT [guard]`, `after 100ms`, `always`, `done.*`. Self and targetless transitions share a small loop. A taken transition turns orange and a pulse runs along it, one microstep after another. |
+| Guard | The `[guard]` text: green when it passed, red when it failed, grey when not evaluated (`record.guards`) |
+| `after` | Its pill counts down while the timer runs |
+| `invoke` | A status chip on the `invoke:` line: running, done, error or cancelled |
+| Events | Left panel: one pill per declared event, highlighted when accepted. A rejected event flashes. Clicking a pill sends it (`runtime.send`, or the actor itself in-process); events with fields open a payload editor. |
+| Context | Right panel: a tree with changed keys highlighted, plus running timers and invokes |
+| History | Timeline below: ticks colored by origin, a scrub slider, step buttons, Play for recordings and **Live** |
 
-Timers and invokes are also listed in the side panel.
+Light and dark palettes follow the app theme (`color_scheme`).
 
 ## Run it
 
@@ -26,108 +28,100 @@ Timers and invokes are also listed in the side panel.
 zig build -Dvulkan=false -Doptimize=ReleaseSafe   # use ReleaseSafe: Debug software rendering runs at ~1 fps
 # In-process demo: runs fixtures/*.lua charts in real time, observes with ouro.machine.inspect
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua
-# Attach to another app's development instance
-zig-out/bin/ouroctl run tools/statechart-visualizer/feed.lua --dev   # or any app using ouro.machine
+# Attach to any --dev app (its log prints "development socket: <path>")
+zig-out/bin/ouroctl run examples/stopwatch/ouro.json --dev
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- unix:$DEVELOPMENT_SOCKET
-# Headless frames of real recorded streams (manual scheduler)
+# Attach to itself (it inspects its own visualizer chart)
+zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua --dev -- self
+# Headless frames (manual scheduler, recorded streams)
 zig-out/bin/ouroctl storybook snapshot tools/statechart-visualizer/storybook.lua --output out
-# A recorded session (design/statecharts.md §14): expand it, then scrub it
-zig-out/bin/ouroctl run examples/stopwatch/ouro.json --dev      # records ~/.local/state/ourokit/recordings/dev.ourokit.stopwatch.jsonl
+# The visualizer's own chart, on a manual clock with fake services
+(cd tools/statechart-visualizer && ../../zig-out/bin/ouroctl test charts_test.lua)
+# A recorded session (design/statecharts.md §14): expand it, then scrub or play it
 zig-out/bin/ouroctl replay ~/.local/state/ourokit/recordings/dev.ourokit.stopwatch.jsonl examples/stopwatch --records /tmp/stopwatch.records.jsonl
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- /tmp/stopwatch.records.jsonl
 ```
 
 A recording holds inputs only. `ouroctl replay --records` replays it against
 the app's charts and writes the §10 records it produced, graphs included,
-which is what this tool draws. A file argument ending in `.jsonl` opens that
-session at its first step: the timeline, step buttons and slider scrub it
-and every actor is a tab. [`recording.lua`](recording.lua) parses the
-file, and `storybook.lua`'s `recording/*` stories draw a real stopwatch
-session (`fixtures/stopwatch_recording.lua`).
+which is what this tool draws. [`recording.lua`](recording.lua) parses the
+file.
 
 ## Where the data comes from
 
 All shapes are the inspection hooks in design/statecharts.md §10.
 [`contract.lua`](contract.lua) is the only file that knows them:
 
-- **Graph:** `chart:graph()`, format `ouro.machine.graph` v1. It supplies the
-  states (type, parent, children, initial, `after`, `invoke`), the transitions
-  (index, kind, targets, `guarded`) and the events. The actor `started` record
-  carries it.
+- **Graph:** `chart:graph()`, format `ouro.machine.graph` v1, carried by the
+  actor `started` record.
 - **Records:** one `transition` record per processed event, rejected ones
   included, plus actor `started`/`stopped` records.
-  [`history.lua`](history.lua) folds them into frames: the active configuration
-  (`states` plus the root), the taken transition indices from `microsteps`,
-  timers keyed by state and delay, pumps keyed by state and invoke ID, and the
-  context and which fields it changed.
+  [`history.lua`](history.lua) folds them into frames: the configuration,
+  taken transitions from `microsteps`, timers, invokes, guards, and the context
+  with its changed keys.
 
-Three sources feed the same `ingest` function in [`app.lua`](app.lua):
-
-1. **Headless frames:** [`scenario.lua`](scenario.lua) runs a fixture chart on
-   `machine.manual_scheduler()`, whose virtual clock fills `time_ms`.
-2. **In-process:** `ouro.machine.inspect` in the visualizer's own VM.
-3. **Live attach:** see below.
-
-## Live attachment
-
-`--dev` instances now publish statechart records to the development endpoint:
+[`model.lua`](model.lua) holds that inspected data (append-only, rebuilt from
+the app at any time). Everything about the session is in the `visualizer`
+chart ([`charts.lua`](charts.lua)), one parallel chart with three regions:
 
 ```diagram
-┌─────────────── app (--dev) ───────────────┐        ┌──────── visualizer ────────┐
-│ ouro.machine actors                       │        │                            │
-│   │ machine.inspect(fn), attached by the  │        │ ouro.mcp.call(socket,      │
-│   ▼ first call, dropped when idle         │        │   'runtime.statecharts',   │
-│ ouro.json.encode(record) ──► host ring    │◄───────│   {after=cursor,seed=…})   │
-│   (1024 records, monotonic time_ms,       │  MCP   │ json.decode → ingest       │
-│    per-actor started + latest record)     │        │ poll: 200 ms when idle,    │
-│ runtime.statecharts attaches/seeds at a   │        │ immediately while a full   │
-│ safe point, then reads the ring           │        │ page is returned           │
-└───────────────────────────────────────────┘        └────────────────────────────┘
+connection: starting ─┬─► in_process            (machine.inspect in this VM)
+                      ├─► loading ─► loaded | failed   (a records file)
+                      └─► connected{attaching ─ATTACHED─► live}
+                              │ error NoPush ─► polling (re-enters every 200 ms)
+                              └ other error ─► detached ─after 1s─► connected
+view:       following ⇄ scrubbing ⇄ playing (after 500ms steps, stops at the end)
+editor:     closed ⇄ open   (payload drafts; INJECT / SEND_PAYLOAD spawn 'inject')
 ```
 
-- `src/lua/statechart_inspector.zig` installs an inactive bridge in every
-  source generation of a `--dev` instance. The first `runtime.statecharts`
-  call attaches it to the active VM. It seeds every live actor from
-  `machine.actors()`, `actor:snapshot()` and `actor.chart:graph()`, then
-  subscribes `ouro.machine.inspect`. Each call renews the subscription. The
-  next record after `keep_alive_ms` (default 30 s) without a call
-  unsubscribes, so idle instances build no records. Production instances
-  install nothing.
-- `runtime.statecharts {after, limit, actors, seed, text, keep_alive_ms}`
-  returns `{next, first, dropped, time_ms, seed, records = [{sequence, time_ms, record}], actors}`.
-  `actors` holds each live actor's started record (with its graph) and its
-  latest record, keyed by actor path. Root actors therefore stay visible
-  across reload. Reattaching or reloading reseeds `actors` and bumps `seed`.
-  The visualizer passes the last `seed` it saw and gets `actors` back only
-  when that changed; a reseed of the same chart keeps its history.
-- `text = true` returns records as JSON strings, because `ouro.mcp` converts
-  at most 4096 values per reply.
+Effects are injected services (`observe`, `follow`, `poll`, `load`,
+`inject`), so `charts_test.lua` runs the chart without sockets. Views are pure
+functions of the chart and the model; there is no `o.signal` or
+`ouro.stateful`. Each ingest batch is a `RECORDS` event that bumps `revision`.
 
-Try it with any agent or the CLI through MCP `tools/call`:
+## Live attachment: push
 
-```json
-{"name": "runtime.statecharts", "arguments": {"after": 0, "limit": 20}}
+```diagram
+┌──────────── app (--dev) ────────────┐            ┌──────── visualizer ─────────┐
+│ actors ─► machine.inspect observer  │            │ connected (invoke follow):  │
+│   (attached on demand) ─► ring      │ subscribe  │   ouro.mcp.subscribe(       │
+│   1024 records, seed, reads         │◄───────────│     'ouro://statecharts')   │
+│                                     │ updated    │   on ack / each update:     │
+│ control server: one notification    │───────────►│   runtime.statecharts       │
+│ per subscriber until the next read  │            │     {after, seed, text}     │
+│                                     │◄───────────│   send RECORDS batch        │
+└─────────────────────────────────────┘   fetch    └─────────────────────────────┘
 ```
 
-The next step would be push instead of polling: a `resourceSubscriptions` URI
-such as `ourokit-dev://statecharts` on the control server. That would let
-`ouro.mcp.subscribe` follow the documented subscribe → acknowledge → read →
-dirty-read discipline. The control server only supports `toolsListChanged`
-today.
+- Notify-then-fetch: the endpoint sends `notifications/resources/updated`
+  when records arrive, at most once until the client next reads. Nothing is
+  sent, and neither process wakes, while the app is idle.
+- Leaving `connected` cancels the invoke; scope cancellation closes the
+  subscription socket. The subscription keeps the app's observer attached;
+  closing it lets the observer detach after `keep_alive_ms`.
+- A ring overflow past the cursor comes back as `dropped`. The client then
+  reseeds from `actors` (the late-attach read) and the header counts the gap.
+- Endpoints without the resource fall back to polling.
+- Event pills call `runtime.send {actor, event}`. The input is labeled origin
+  `dev`, so `ouroctl replay` reproduces sessions driven from here.
+- The visualizer filters its own RECORDS/ATTACHED records when it inspects
+  itself, so self-attach does not feed back.
+
+`tests/statechart_inspection.py` checks this on real instances: the stopwatch
+driven over the endpoint and replayed identically, no requests from an
+attached visualizer while idle, records arriving without polling, a ring
+overflow reseed, and self-attach.
 
 ## Known limits
 
-- Valves and times come from the records: `guards` (post-step outcomes for
-  guarded transitions whose source is active) and `time_ms` (the scheduler
-  clock: virtual on the manual scheduler, host monotonic otherwise). A seeded
-  attach snapshot has no guard outcomes, so its valves stay grey until the
-  next record. Running timers and invokes at attach come from
-  `actor:pending_timers()` and `actor:pending_invokes()`.
+- A seeded attach snapshot has no guard outcomes, so guard text stays grey
+  until the next record.
 - Headless snapshots cannot advance native animations, so stories pin the
-  pulse and rotor phases explicitly.
+  pulse phase explicitly.
 - A window has fixed budgets of 256 widget instances and 512 scene commands.
-  Paint commands of the same style are merged into local groups
-  (`draw.compact`), labels are bare positioned text, and moving parts are small
-  sprites. The real Notes chart uses about 100 instances and 250 commands.
+  Paint commands of the same style are merged (`draw.compact`) and pills are
+  bare positioned text. Very large charts can exceed the scene budget.
+- Layout is a layered placement with greedy pill placement; dense regions
+  (many transitions between few states) can still crowd their pills.
 - Software rendering needs an optimized build. A Debug `ouroctl` renders this
-  window at about 1 fps; ReleaseSafe renders it at about 45 fps.
+  window at about 1 fps; ReleaseSafe at about 45 fps.

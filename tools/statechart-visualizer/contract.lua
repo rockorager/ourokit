@@ -48,7 +48,10 @@ function M.graph(raw)
       initial=s.initial ~= M.null and s.initial or nil,
       label=(s.id == g.root) and g.id or (s.key or s.id:match('([^%.]+)$')),
       kind=s.type or s.kind or 'atomic', children={}, after={}, invoke={}, tags=list(s.tags),
+      entry={}, exit={},
     }
+    for _, name in ipairs(list(s.entry)) do state.entry[#state.entry+1] = tostring(name) end
+    for _, name in ipairs(list(s.exit)) do state.exit[#state.exit+1] = tostring(name) end
     for _, a in ipairs(list(s.after)) do state.after[#state.after+1] = {delay=a.delay, event=a.event} end
     for _, v in ipairs(list(s.invoke)) do state.invoke[#state.invoke+1] = {id=v.id, src=v.src or v.id} end
     for _, child in ipairs(list(s.children)) do state.children[#state.children+1] = child end
@@ -77,9 +80,16 @@ function M.graph(raw)
       g.events[#g.events+1] = transition.event
     end
   end
-  -- Declared external events, even ones no transition handles yet.
+  -- Declared external events, even ones no transition handles yet, with
+  -- their payload fields ({name = 'string' | 'integer?' ...}).
+  g.fields = {}
   for _, e in ipairs(list(raw.events)) do
     local name = type(e) == 'table' and e.type or e
+    if type(e) == 'table' and type(e.fields) == 'table' then
+      local fields = {}
+      for field, kind in pairs(e.fields) do fields[field] = tostring(kind) end
+      g.fields[name] = fields
+    end
     if not seen[name] then seen[name] = true; g.events[#g.events+1] = name end
   end
   -- Attach each after-transition to its source state's gauge.
