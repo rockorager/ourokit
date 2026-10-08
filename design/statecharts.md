@@ -1508,11 +1508,26 @@ A second live instance on the same path gets a `#2` suffix.
 
 `ouroctl run --dev` records by default to
 `$XDG_STATE_HOME/ourokit/recordings/<application id>.jsonl`, the last
-development run of each app. `ouroctl run --record <log.jsonl>` records
-anywhere, including production, `--mcp` and `--headless`. The host opens one
-file per process. Every source generation installs `machine.recorder`
-before app code runs, so reloads continue the same log. The recorder writes
-each line synchronously; a failed write stops recording, not the app.
+development run of each app.
+- **Naming.** The id is the one the app declares (`ouro.app { id = ... }`,
+  required), so two apps both started from an `app.lua` get different
+  files. The host learns the id once the entry has loaded. Lines recorded
+  before that, from actors started while the module loads, are buffered and
+  written after the header. An app the host cannot identify records to
+  `<entry stem>-<hash>.jsonl`, where the hash is 8 hex digits of the
+  absolute entry path's hash.
+- **Opt-in.** `ouroctl run --record <log.jsonl>` records anywhere, including
+  production, `--mcp` and `--headless`.
+- **Lifetime.** The host opens one file per process. Every source generation
+  installs `machine.recorder` before app code runs, so reloads continue the
+  same log. The recorder writes each line synchronously.
+- **Never throws into the app.** One input may cause more than the native
+  JSON encoder's 4096 values, for example an action that sends 1000
+  events. Such lines go through a Lua encoder, and replay reads them with a
+  Lua decoder; the format is the same. An entry that still cannot be
+  written, a failing recorder hook, or a failed file write stops recording
+  and leaves the app running. `runtime.diagnostics` then reports
+  `recording = {path, inputs, failed = true, reason}`.
 
 **Format: JSON lines, `ouro.machine.log` version 1.** The first line is the
 header. Each later line is one input with what it caused:

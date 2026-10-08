@@ -30,6 +30,10 @@ pub const Options = struct {
     /// Statechart input log (design/statecharts.md §14): `--dev` records by
     /// default, `--record <path>` anywhere.
     record_path: ?[]const u8 = null,
+    /// Without record_path: record into this directory, named after the
+    /// application id (record_fallback when there is none).
+    record_directory: ?[]const u8 = null,
+    record_fallback: []const u8 = "app",
     record_app: []const u8 = "",
     mcp: bool = false,
     headless: bool = false,
@@ -463,14 +467,16 @@ fn runSourceInternal(
         if (options.development) try .init(init.gpa, 1024) else null;
     defer if (statecharts) |*store| store.deinit();
     var recording: ?lua.chart_recording.Sink = if (options.record_path) |path|
-        lua.chart_recording.Sink.open(path, options.record_app) catch |err| blk: {
+        lua.chart_recording.Sink.open(init.gpa, path, options.record_app) catch |err| blk: {
             std.log.warn("cannot record statecharts to {s}: {s}", .{ path, @errorName(err) });
             break :blk null;
         }
+    else if (options.record_directory != null)
+        lua.chart_recording.Sink.deferred(init.gpa)
     else
         null;
     defer if (recording) |*sink| sink.close();
-    if (recording != null) std.log.info("recording statechart inputs to {s}", .{options.record_path.?});
+    if (options.record_path) |path| if (recording != null) std.log.info("recording statechart inputs to {s}", .{path});
     const generation_config: source_generation.Config = .{
         .statecharts = if (statecharts != null) &statecharts.? else null,
         .recording = if (recording != null) &recording.? else null,
@@ -553,6 +559,20 @@ fn runSourceInternal(
         initial_generation,
     );
     source_reload.appearance = &appearance_client;
+    // The entry has loaded: name a development recording after its id.
+    if (recording) |*sink| if (sink.fd == null) {
+        const id = source_reload.active().application.id;
+        const name = if (id.len != 0) id else options.record_fallback;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&buffer, "{s}/{s}.jsonl", .{ options.record_directory.?, name })) |path| {
+            if (sink.assign(path, id)) {
+                std.log.info("recording statechart inputs to {s}", .{path});
+            } else |err| {
+                std.log.warn("cannot record statecharts to {s}: {s}", .{ path, @errorName(err) });
+                sink.fail(@errorName(err));
+            }
+        } else |_| sink.fail("recording path too long");
+    };
     if (module_root_fd) |root| source_reload.attachModuleRoot(root);
     initial_generation_owned = false;
     var sources_destroyed = false;

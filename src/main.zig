@@ -101,13 +101,18 @@ fn execute(init: std.process.Init, command: cli.Command) !u8 {
             defer libraries.deinit();
             var exit_code: u8 = 0;
             // Statechart inputs are recorded under --dev, or anywhere with --record.
+            // Development recordings are named after the declared application
+            // id once the entry loads; recordingFallback names the rare app
+            // the host cannot identify.
             const record_app = if (manifest) |value| value.id else std.fs.path.stem(path);
-            const record_path = options.record_path orelse if (options.development)
-                try defaultRecordingPath(init, record_app)
+            const record_directory = if (options.record_path == null and options.development)
+                try recordingDirectory(init)
             else
                 null;
             var run_options: ourokit.app.WaylandRunOptions = .{
-                .record_path = record_path,
+                .record_path = options.record_path,
+                .record_directory = record_directory,
+                .record_fallback = try recordingFallback(init, path),
                 .record_app = record_app,
                 .development = options.development,
                 .mcp = options.mcp,
@@ -402,17 +407,25 @@ fn testWorker(init: std.process.Init, path: []const u8, name: ?[]const u8) !void
     try writeStdout(init, result);
 }
 
-/// `$XDG_STATE_HOME/ourokit/recordings/<application>.jsonl`: the last
-/// development run of each application.
-fn defaultRecordingPath(init: std.process.Init, application: []const u8) ![]const u8 {
+/// `$XDG_STATE_HOME/ourokit/recordings`: development runs record to
+/// `<application id>.jsonl` there, the last run of each application.
+fn recordingDirectory(init: std.process.Init) ![]const u8 {
     const a = init.arena.allocator();
     const environ = init.minimal.environ;
     const state = std.process.Environ.getPosix(environ, "XDG_STATE_HOME") orelse state: {
         const home = std.process.Environ.getPosix(environ, "HOME") orelse return error.HomeDirectoryUnavailable;
         break :state try std.fs.path.join(a, &.{ home, ".local", "state" });
     };
-    const name = try std.fmt.allocPrint(a, "{s}.jsonl", .{application});
-    return std.fs.path.join(a, &.{ state, "ourokit", "recordings", name });
+    return std.fs.path.join(a, &.{ state, "ourokit", "recordings" });
+}
+
+/// `<entry stem>-<8 hex digits of the absolute entry path's hash>`: stable
+/// per entry file, distinct for two `app.lua` files.
+fn recordingFallback(init: std.process.Init, path: []const u8) ![]const u8 {
+    const a = init.arena.allocator();
+    const absolute = std.Io.Dir.cwd().realPathFileAlloc(init.io, path, a) catch path;
+    const hash: u32 = @truncate(std.hash.Wyhash.hash(0, absolute));
+    return std.fmt.allocPrint(a, "{s}-{x:0>8}", .{ std.fs.path.stem(path), hash });
 }
 
 /// The entry module of `application.lua`, `ouro.json`, or a directory that

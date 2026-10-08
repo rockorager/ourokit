@@ -262,6 +262,58 @@ def mcp(root):
     return len(entries(log))
 
 
+BURST = """local o = require('ouro')
+local m = o.machine
+local burst = m.create { id = 'burst', initial = 'idle', context = { n = 0 },
+  events = { BURST = {}, TICK = {} },
+  actions = { burst = function(_, _, self) for _ = 1, 1000 do self:send('TICK') end end },
+  states = { idle = { on = { BURST = { actions = 'burst' },
+    TICK = { actions = m.assign { n = function(c) return c.n + 1 end } } } } } }
+burst:start { id = 'burst' }
+return o.app { id = 'dev.ourokit.burst', run = function() return { windows = {} } end }
+"""
+
+
+def burst(root):
+    """One input whose effects exceed the JSON value limit (an action sending
+    1000 events through runtime.send) records, keeps the app running, and
+    replays. Two apps that share a file name record to different files."""
+    directory = root / "burst"
+    directory.mkdir()
+    (directory / "app.lua").write_text(BURST)
+    other = root / "other"
+    other.mkdir()
+    (other / "app.lua").write_text(BURST.replace("dev.ourokit.burst", "dev.ourokit.other-burst"))
+    env = dict(os.environ, XDG_RUNTIME_DIR=str(root / "burst-runtime"), XDG_STATE_HOME=str(root / "burst-state"))
+    (root / "burst-runtime").mkdir(mode=0o700)
+    for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
+        env.pop(key, None)
+    recordings = root / "burst-state" / "ourokit" / "recordings"
+    for app, name in ((directory, "dev.ourokit.burst"), (other, "dev.ourokit.other-burst")):
+        sockets = Path(env["XDG_RUNTIME_DIR"]) / "ourokit/dev"
+        before = set(sockets.glob("*")) if sockets.is_dir() else set()
+        process = subprocess.Popen([str(BINARY), "run", str(app / "app.lua"), "--dev", "--headless"],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            endpoint = development_path(Path(env["XDG_RUNTIME_DIR"]), process, exclude=before)
+            sent = call(endpoint, "runtime.send", {"actor": "burst", "event": {"type": "BURST"}})
+            assert not sent.get("isError") and sent["structuredContent"]["accepted"], sent
+            diagnostics = call(endpoint, "runtime.diagnostics")["structuredContent"]["recording"]
+            assert diagnostics["path"] == str(recordings / f"{name}.jsonl"), diagnostics
+            assert not diagnostics["failed"] and diagnostics.get("reason") is None and diagnostics["inputs"] == 2, diagnostics
+            assert process.poll() is None
+        finally:
+            terminate(process)
+    log = recordings / "dev.ourokit.burst.jsonl"
+    lines = log.read_text().splitlines()
+    big = json.loads(lines[2])
+    assert big["o"] == "dev" and len(big["r"]) == 1001, (big["o"], len(big["r"]))
+    assert (recordings / "dev.ourokit.other-burst.jsonl").is_file()
+    out = replay(log, directory / "app.lua")
+    assert out.startswith("replay matched: 2 entries"), out
+    return len(big["r"])
+
+
 def stories(env, root):
     """Generated state stories: one snapshot per reached state."""
     counts = {}
@@ -289,6 +341,7 @@ def main():
         counts = {name: fn(env, root) for name, fn in
                   (("stopwatch", stopwatch), ("contacts", contacts), ("documents", documents), ("launcher", launcher))}
         counts["contacts over MCP"] = mcp(root)
+        counts["records in one runtime.send input"] = burst(root)
         frames = stories(env, root)
         print("PASS chart replay: real stopwatch, contacts, documents and launcher sessions and an MCP session replay "
               "to identical records and snapshots " + json.dumps(counts) + "; a changed chart reports its first "
