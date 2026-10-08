@@ -59,8 +59,33 @@ pub const Limits = struct {
     text_bytes: ?usize = null,
 };
 
+/// Identity of one mounted node, for input pinned across rebuilds. The
+/// semantic id is a hash of the key path, so a node removed and mounted again
+/// under the same keys has the same id; its instance handle differs.
+pub const Pin = struct {
+    id: u64,
+    instance: ui.instance.InstanceHandle,
+
+    /// The text form inspection reports as a node's `pin`.
+    pub fn format(self: Pin, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(allocator, "{x}:{d}:{d}", .{ self.id, self.instance.slot, self.instance.generation });
+    }
+
+    pub fn parse(text: []const u8) !Pin {
+        var parts = std.mem.splitScalar(u8, text, ':');
+        const id = std.fmt.parseInt(u64, parts.next().?, 16) catch return error.InvalidDevelopmentPin;
+        const slot = std.fmt.parseInt(u32, parts.next() orelse return error.InvalidDevelopmentPin, 10) catch return error.InvalidDevelopmentPin;
+        const generation = std.fmt.parseInt(u32, parts.next() orelse return error.InvalidDevelopmentPin, 10) catch return error.InvalidDevelopmentPin;
+        if (parts.next() != null) return error.InvalidDevelopmentPin;
+        return .{ .id = id, .instance = .{ .slot = slot, .generation = generation } };
+    }
+};
+
 pub const Node = struct {
     id: u64,
+    /// Pass as runtime.input `pin` to target this mounted node after later
+    /// rebuilds. Null for nodes without a layout instance.
+    pin: ?[]const u8 = null,
     parent: ?u64,
     /// Null means unkeyed, ambiguous, or not addressable by slash-key paths.
     path: ?[]const u8,
@@ -215,6 +240,10 @@ pub fn inspect(allocator: std.mem.Allocator, runtime: *WindowRuntime, limits: Li
             semantic.selected;
         node.* = .{
             .id = semantic.id,
+            .pin = if (runtime.instances.isActive(handle))
+                try (Pin{ .id = semantic.id, .instance = handle }).format(text.arena)
+            else
+                null,
             .parent = semantic.parent,
             .path = path,
             .role = semantic.role,
@@ -277,8 +306,8 @@ pub const Playback = struct {
     token: Token,
     action: Action,
     target: ?ui.instance.InstanceHandle,
-    /// Semantic ID the targeted path must still resolve to (`initPinned`).
-    node: ?u64 = null,
+    /// Node the targeted path must still resolve to (`initPinned`).
+    pin: ?Pin = null,
     step: usize = 0,
     text_offset: usize = 0,
 
@@ -287,23 +316,26 @@ pub const Playback = struct {
         return initChecked(runtime, token, action, null);
     }
 
-    /// Targeted input pinned to the inspected node's semantic ID. The token
-    /// may predate later rebuilds (a UI that rebuilds on a timer) as long as
-    /// window and source generation match and the path still resolves to that
-    /// same retained instance. A remount gets a new ID and is rejected.
-    pub fn initPinned(runtime: *WindowRuntime, token: Token, action: Action, node: u64) !Playback {
+    /// Targeted input pinned to the inspected node. The token may predate
+    /// later rebuilds (a UI that rebuilds on a timer) as long as window and
+    /// source generation match and the path still resolves to the same
+    /// mounted instance. A node removed and mounted again is rejected, even
+    /// when its keys, and so its semantic id, are the same.
+    pub fn initPinned(runtime: *WindowRuntime, token: Token, action: Action, pin: Pin) !Playback {
         if (action.path() == null) return error.DevelopmentNodeRequiresTarget;
-        return initChecked(runtime, token, action, node);
+        return initChecked(runtime, token, action, pin);
     }
 
-    fn validateStart(token: Token, runtime: *WindowRuntime, action: Action, node: ?u64) !void {
-        const id = node orelse return token.validate(runtime);
+    fn validateStart(token: Token, runtime: *WindowRuntime, action: Action, pin: ?Pin) !void {
+        const expected = pin orelse return token.validate(runtime);
         try token.validateIdentity(runtime);
-        if ((try runtime.semantics.findPath(action.path().?)).id != id) return error.StaleDevelopmentTarget;
+        const id = (try runtime.semantics.findPath(action.path().?)).id;
+        const instance = runtime.instances.handleForId(id) orelse return error.StaleDevelopmentTarget;
+        if (id != expected.id or !std.meta.eql(instance, expected.instance)) return error.StaleDevelopmentTarget;
     }
 
-    fn initChecked(runtime: *WindowRuntime, token: Token, action: Action, node: ?u64) !Playback {
-        try validateStart(token, runtime, action, node);
+    fn initChecked(runtime: *WindowRuntime, token: Token, action: Action, pin: ?Pin) !Playback {
+        try validateStart(token, runtime, action, pin);
         if (runtime.text_inputs.hasSecret()) return error.SecureInputProtected;
         var target: ?ui.instance.InstanceHandle = null;
         if (action.path()) |path| {
@@ -347,7 +379,7 @@ pub const Playback = struct {
             if ((try runtime.text_inputs.session(focused)).preedit() != null) return error.DevelopmentCompositionActive;
             target = focused;
         }
-        return .{ .token = token, .action = action, .target = target, .node = node };
+        return .{ .token = token, .action = action, .target = target, .pin = pin };
     }
 
     pub fn advance(self: *Playback, runtime: *WindowRuntime) !enum { routed, complete } {
@@ -355,7 +387,7 @@ pub const Playback = struct {
             return error.StaleDevelopmentTarget;
         if (runtime.text_inputs.hasSecret()) return error.SecureInputProtected;
         try requireSettled(runtime);
-        if (self.step == 0) try validateStart(self.token, runtime, self.action, self.node);
+        if (self.step == 0) try validateStart(self.token, runtime, self.action, self.pin);
         const steps: usize = switch (self.action) {
             .hover, .pointer_move, .pointer_up => 1,
             .text => if (self.text_offset == self.action.text.len) 0 else std.math.maxInt(usize),

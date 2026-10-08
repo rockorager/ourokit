@@ -198,10 +198,9 @@ pub const Service = struct {
         const token = try decodeToken(try stringField(args, "token"));
         if (std.mem.eql(u8, name, "runtime.input")) {
             const action = try parseAction(args);
-            self.playback = if (mcp.get(args, "node")) |node| blk: {
-                if (node != .string) return error.InvalidDevelopmentArgument;
-                const pinned = std.fmt.parseInt(u64, node.string, 16) catch return error.InvalidDevelopmentArgument;
-                break :blk try dev.Playback.initPinned(runtime, token, action, pinned);
+            self.playback = if (mcp.get(args, "pin")) |pin| blk: {
+                if (pin != .string) return error.InvalidDevelopmentArgument;
+                break :blk try dev.Playback.initPinned(runtime, token, action, try dev.Pin.parse(pin.string));
             } else try dev.Playback.init(runtime, token, action);
             self.runtime = runtime;
             return null;

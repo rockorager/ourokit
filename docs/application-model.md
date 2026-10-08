@@ -967,17 +967,20 @@ ouroctl dev reload "$socket"
 Inspection without `window` lists live windows, handles, sizes and opaque tokens.
 With `window`, it returns `windows: [{window, token, nodes}]`: semantic paths,
 roles, labels, values, logical bounds, enabled/checked/selected/focused state,
-text selection and scroll offsets. Semantic IDs are strings. Paths can be null
-for unkeyed or ambiguous nodes; bounds may extend beyond clips. Snapshots fail
-explicitly above 1,024 nodes or 64 KiB of text instead of silently truncating.
+text selection, scroll offsets and a `pin` for targeted input. Semantic IDs are
+strings. Paths can be null for unkeyed or ambiguous nodes; bounds may extend
+beyond clips. Snapshots cover the whole tree, however large; nothing is
+truncated.
 
 Input and capture require a fresh token from inspection. Reinspect after
 `StaleDevelopmentTarget`; tokens cover window identity, source generation and
 runtime/scene revisions, not just the path. A UI that rebuilds on a timer can
-outrun that: pass the target's inspected `id` as `node` with a targeted action.
+outrun that: pass the target's inspected `pin` as `pin` with a targeted action.
 The token may then predate later rebuilds, as long as the window and source
-generation are unchanged and the path still resolves to that same semantic
-node. A remounted component instance gets a new id and is rejected. Hit
+generation are unchanged and the path still resolves to that same mounted
+node. The pin names the node's instance as well as its id: an id is a hash of
+the key path, so a node removed and mounted again under the same keys keeps
+its id, but gets a new pin and is rejected. Hit
 testing, enabled state and settling are still checked when the input plays. Input accepts `click`, `hover`,
 `pointer_down`, or `pointer_move` with `target`, `pointer_up` without a target,
 `scroll` with `target` and signed `delta`, `key` with a logical

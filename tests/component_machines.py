@@ -5,7 +5,7 @@ Runs on the private compositor that verify_development.py provides. A keyed
 component machine runs a 100 ms timer and a parked invoke. Hiding it must stop
 both (no further ticks from that instance), and showing it again must create a
 new actor with initial state. Each mount has a number, so stderr shows which
-instance ticked. Clicks pin the inspected node (runtime.input `node`) because
+instance ticked. Clicks pin the inspected node (runtime.input `pin`) because
 the ticking UI rebuilds faster than inspect -> input completes on slow hosts.
 """
 import json
@@ -97,11 +97,11 @@ def main():
                     # inspected node instead: it is accepted while the path still
                     # resolves to that same node.
                     tree = inspect(env, endpoint, WINDOW)["windows"][0]
-                    target_id = next(n["id"] for n in tree["nodes"] if n["path"] == target)
+                    pin = next(n["pin"] for n in tree["nodes"] if n["path"] == target)
                     time.sleep(0.35)  # a slow host: several ticks rebuild the UI first
                     run(str(BINARY), "dev", "input", str(endpoint), json.dumps({
                         "window": WINDOW, "token": tree["token"], "action": "click",
-                        "target": target, "node": target_id}), env=env)
+                        "target": target, "pin": pin}), env=env)
 
                 def unpinned_click_is_stale(target):
                     tree = inspect(env, endpoint, WINDOW)["windows"][0]

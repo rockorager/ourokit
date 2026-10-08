@@ -419,7 +419,7 @@ def native():
             tree = poll(lambda: inspect(env, comp, 'main')['windows'][0], 'no component window')
             node = next(n for n in tree['nodes'] if n.get('path') == 'panel/details/b')
             subprocess.run([str(BINARY), 'dev', 'input', str(comp), json.dumps(dict(
-                window='main', token=tree['token'], node=node['id'], action='click', target='panel/details/b'))],
+                window='main', token=tree['token'], pin=node['pin'], action='click', target='panel/details/b'))],
                 env=env, check=True, capture_output=True, timeout=10)
             poll(lambda: snapshot(comp, 'collapsible@details')['states'] == ['closed'], 'the click did not reach the same actor')
             out, failed = send(comp, 'collapsible@details', {'type': 'TOGGLE'}, wait={'states': ['open']})
@@ -461,7 +461,7 @@ def native():
             assert not any(n.get('label') == 'Open alarm 2' for n in tree['nodes']), 'one alarm only'
             assert 'screen.overview' in snapshot(ov, 'visualizer')['states']
             subprocess.run([str(BINARY), 'dev', 'input', str(ov), json.dumps(dict(
-                window='main', token=tree['token'], node=row['id'], action='click', target=row['path']))],
+                window='main', token=tree['token'], pin=row['pin'], action='click', target=row['path']))],
                 env=env, check=True, capture_output=True, timeout=10)
             state = poll(lambda: (lambda s: 'screen.unit' in s['states'] and s)(snapshot(ov, 'visualizer')),
                          'the alarm did not drill down', timeout=30)

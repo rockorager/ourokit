@@ -2987,13 +2987,14 @@ test "development input pinned to a retained node survives rebuilds but not a re
     var before = try f.snapshot();
     defer before.deinit();
     const go = try node(before, "root/go/button");
+    const pin = try dev.Pin.parse(go.pin.?);
     const click: dev.Action = .{ .click = "root/go/button" };
 
     // A rebuild (the count changes, as on a timer) makes the token stale for
     // ordinary input, but the button is the same retained instance.
     try runLua(f, "count:set(1)");
     try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.init(&f.runtime, before.token, click));
-    var playback = try dev.Playback.initPinned(&f.runtime, before.token, click, go.id);
+    var playback = try dev.Playback.initPinned(&f.runtime, before.token, click, pin);
     while (try playback.advance(&f.runtime) == .routed) {
         try f.settle();
         try runLua(f, "count:set(count() + 1)"); // keeps rebuilding between phases
@@ -3001,11 +3002,11 @@ test "development input pinned to a retained node survives rebuilds but not a re
     try runLua(f, "assert(pressed == 1)");
 
     // The pin must match, the action needs a target, and identity still matters.
-    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, before.token, click, go.id +% 1));
-    try std.testing.expectError(error.DevelopmentNodeRequiresTarget, dev.Playback.initPinned(&f.runtime, before.token, .{ .text = "x" }, go.id));
+    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, before.token, click, .{ .id = pin.id +% 1, .instance = pin.instance }));
+    try std.testing.expectError(error.DevelopmentNodeRequiresTarget, dev.Playback.initPinned(&f.runtime, before.token, .{ .text = "x" }, pin));
     var other_window = before.token;
     other_window.window.generation += 1;
-    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, other_window, click, go.id));
+    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, other_window, click, pin));
 
     // A remounted component instance at the same path is a different node.
     try runLua(f, "shown:set(false)");
@@ -3013,6 +3014,39 @@ test "development input pinned to a retained node survives rebuilds but not a re
     var remounted = try f.snapshot();
     defer remounted.deinit();
     try std.testing.expect((try node(remounted, "root/go/button")).id != go.id);
-    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, before.token, click, go.id));
+    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, before.token, click, pin));
+    try runLua(f, "assert(pressed == 1)");
+}
+
+test "development input pinned to a plain node rejects a remount under the same keys" {
+    // No component boundary: the semantic id is a hash of the key path, so
+    // the remounted button has the same id. The pin also names the instance.
+    const f = try Fixture.create(
+        \\count, shown, pressed = ouro.signal(0), ouro.signal(true), 0
+        \\function build()
+        \\  return ouro.column {key='root',
+        \\    ouro.text {key='count', text=tostring(count())},
+        \\    shown() and ouro.button {key='item', label='Delete', on_press=function() pressed = pressed + 1 end} or nil}
+        \\end
+    );
+    defer f.destroy();
+    var before = try f.snapshot();
+    defer before.deinit();
+    const item = try node(before, "root/item");
+    const pin = try dev.Pin.parse(item.pin.?);
+    const click: dev.Action = .{ .click = "root/item" };
+    try runLua(f, "shown:set(false)");
+    try runLua(f, "shown:set(true)");
+    var remounted = try f.snapshot();
+    defer remounted.deinit();
+    try std.testing.expectEqual(item.id, (try node(remounted, "root/item")).id);
+    try std.testing.expect(!std.mem.eql(u8, item.pin.?, (try node(remounted, "root/item")).pin.?));
+    try std.testing.expectError(error.StaleDevelopmentTarget, dev.Playback.initPinned(&f.runtime, before.token, click, pin));
+    try runLua(f, "assert(pressed == 0)");
+    // Rebuilds alone keep the pin valid.
+    const fresh = try dev.Pin.parse((try node(remounted, "root/item")).pin.?);
+    try runLua(f, "count:set(5)");
+    var playback = try dev.Playback.initPinned(&f.runtime, remounted.token, click, fresh);
+    while (try playback.advance(&f.runtime) == .routed) try f.settle();
     try runLua(f, "assert(pressed == 1)");
 }

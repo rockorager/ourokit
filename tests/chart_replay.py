@@ -53,8 +53,8 @@ class Instance:
                 return  # The stale-looking input closed its window after all.
             node = next((n for n in tree["nodes"] if n.get("path") == body.get("target")), None)
             request = dict(body, window=window, token=tree["token"])
-            if node:
-                request["node"] = node["id"]
+            if node and node.get("pin"):
+                request["pin"] = node["pin"]
             result = run(str(BINARY), "dev", "input", str(self.endpoint), json.dumps(request), env=self.env, ok=None)
             if result.returncode == 0:
                 return
