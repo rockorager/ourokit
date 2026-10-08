@@ -1612,14 +1612,16 @@ return {
       idle = { on = { ENTER = 'waiting' } },
       waiting = { after = { [3600000] = 'expired' }, on = { LEAVE = 'idle' } },
       expired = {} } }
+    -- The queue is checked on every cycle, so a few thousand cycles prove the
+    -- same as more; test-stress covers volume. Kept small for the 10 s worker.
     local live = chart:start()
-    for _ = 1, 10000 do
+    for _ = 1, 2000 do
       live:send('ENTER')
       assert(#queue == base + 1)
       live:send('LEAVE')
     end
     assert(#queue == base, 'exited states leave timers queued: ' .. #queue - base)
-    for _ = 1, 2000 do
+    for _ = 1, 500 do
       local actor = chart:start()
       actor:send('ENTER')
       actor:stop()
