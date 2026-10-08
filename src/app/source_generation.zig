@@ -821,7 +821,8 @@ pub const SourceGeneration = struct {
         // the last valid list stays and a bound surface hears why.
         if (self.window_check) |check| for (candidate.windows) |window| {
             check.check(check.context, window.declaration) catch |err| {
-                self.application.rejectWindow(window, err, "transition");
+                const reason = if (platform_window.isUnsupported(err)) "unsupported" else "transition";
+                self.application.rejectWindow(window, err, reason);
                 return err;
             };
         };

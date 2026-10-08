@@ -451,7 +451,16 @@ pub const NativeHost = struct {
         update_minimum_size: *const fn (*anyopaque, WindowHandle, u32, u32) anyerror!void,
         update_layer_surface: *const fn (*anyopaque, WindowHandle, LayerSurfaceDeclaration) anyerror!void,
         begin_close: *const fn (*anyopaque, WindowHandle) anyerror!void,
+        /// Optional: fails when the host cannot create or apply `declaration`
+        /// at all, e.g. a lock surface without ext-session-lock. Hosts
+        /// without it accept every declaration here.
+        check: ?*const fn (*anyopaque, SurfaceDeclaration) anyerror!void = null,
     };
+
+    /// See `VTable.check`. Errors satisfy `isUnsupported`.
+    pub fn check(self: NativeHost, declaration: SurfaceDeclaration) !void {
+        if (self.vtable.check) |function| try function(self.context, declaration);
+    }
 
     pub fn create(
         self: NativeHost,
@@ -487,6 +496,14 @@ pub const NativeHost = struct {
         try self.vtable.begin_close(self.context, handle);
     }
 };
+
+/// Whether `err` means the host lacks a protocol (or protocol version) a
+/// surface declaration needs. These reject the surface, not the application.
+pub fn isUnsupported(err: anyerror) bool {
+    return err == error.XdgShellUnavailable or err == error.LayerShellUnavailable or
+        err == error.SessionLockUnavailable or err == error.LockOutputRequired or
+        err == error.LayerShellVersionTooOld;
+}
 
 /// State-only sink used by protocol dispatch and platform maintenance. The
 /// implementation may queue data and cancellation, but must never execute an

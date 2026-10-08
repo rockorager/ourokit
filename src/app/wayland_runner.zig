@@ -766,7 +766,11 @@ fn runSourceInternal(
             for (host.outputs) |output| if (output.name) |name| {
                 if (try active_application.expandOutput(name)) desired_changed = true;
             };
-            if (desired_changed) try syncRuntimeSlots(init.gpa, &runtime_slots, active_application.windows);
+            if (desired_changed) {
+                try syncRuntimeSlots(init.gpa, &runtime_slots, active_application.windows);
+                // Per-output copies of a bound template are bound too.
+                try active_application.bindSurfaces();
+            }
         }
         clipboard.setPlatformAvailable(host.clipboardAvailable());
         while (host.takeClipboardCompletion()) |completion| {
@@ -1006,6 +1010,7 @@ fn runSourceInternal(
                     _ = try active_application.expandOutput(name);
                 };
                 try syncRuntimeSlots(init.gpa, &runtime_slots, active_application.windows);
+                try active_application.bindSurfaces();
                 for (runtime_slots.all()) |slot| if (slot.runtime.ready and slot.desired) {
                     if (slot.content_changed)
                         _ = try slot.runtime.build_owners.markDirty(slot.runtime.root_owner);
@@ -1091,6 +1096,20 @@ fn runSourceInternal(
             disconnect_started = true;
         }
         try window_set.reconcile(current_storage.items);
+        // Surfaces the compositor cannot provide (no ext-session-lock, no
+        // layer shell, too old a version) close instead of stopping the app.
+        while (window_set.takeUnsupported()) |item| {
+            defer window_set.releaseUnsupported(item);
+            std.log.err("surface {s} unsupported: {s}", .{ item.id, @errorName(item.err) });
+            const slot = runtimeSlotForId(runtime_slots.all(), item.id) orelse continue;
+            if (!slot.desired) continue;
+            slot.desired = false;
+            desired_changed = true;
+            if (slot.bound and slot.declared and !disconnect_started and active_generation.vm.exit_code == null)
+                try sendSurfaceEvent(active_generation, item.id, "failed", &.{
+                    .{ .string = "unsupported" }, .{ .string = @errorName(item.err) },
+                });
+        }
 
         for (runtime_slots.all()) |slot| {
             const window = if (slot.popup) |*popup| &popup.window else applicationWindowForId(active_application.windows, slot.id orelse continue);

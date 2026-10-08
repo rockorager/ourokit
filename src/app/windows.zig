@@ -67,6 +67,11 @@ pub const WindowSet = struct {
     event_head: usize = 0,
     event_count: usize = 0,
     change_serial: u64 = 0,
+    /// Declarations `reconcile` could not create or update because the host
+    /// lacks a protocol they need. Taken by the runner after each reconcile.
+    unsupported: std.ArrayList(Unsupported) = .empty,
+
+    pub const Unsupported = struct { id: []u8, err: anyerror };
 
     pub fn init(
         self: *WindowSet,
@@ -93,6 +98,8 @@ pub const WindowSet = struct {
     pub fn deinit(self: *WindowSet) void {
         for (self.slots) |slot| std.debug.assert(slot.state == .free);
         std.debug.assert(self.event_count == 0);
+        for (self.unsupported.items) |item| self.allocator.free(item.id);
+        self.unsupported.deinit(self.allocator);
         self.allocator.free(self.events);
         self.allocator.free(self.slots);
         self.* = undefined;
@@ -104,6 +111,9 @@ pub const WindowSet = struct {
     pub fn prepare(self: *WindowSet, declarations: []const SurfaceDeclaration) !Prepared {
         try validateDeclarations(declarations);
         try self.validateTransitions(declarations);
+        // Reload commits cannot undo native effects: reject unsupported
+        // surfaces while the candidate can still be refused.
+        for (declarations) |declaration| try self.host.check(declaration);
         try self.ensureCreateCapacity(declarations);
         const additions = try self.allocator.alloc(Slot, self.slots.len);
         @memset(additions, .{});
@@ -267,7 +277,12 @@ pub const WindowSet = struct {
                     }
                 },
                 .layer_surface => |layer_surface| if (!layerStateEqual(slot, layer_surface)) {
-                    try self.host.updateLayerSurface(handleFor(slot, index), layer_surface);
+                    // An unsupported update keeps the native surface as it
+                    // was; the runner closes it and reports the failure.
+                    self.host.updateLayerSurface(handleFor(slot, index), layer_surface) catch |err| {
+                        try self.skipUnsupported(slot.id.?, err);
+                        continue;
+                    };
                     setLayerState(slot, layer_surface);
                 },
                 .popup => {},
@@ -276,7 +291,7 @@ pub const WindowSet = struct {
 
         for (declarations) |declaration| {
             if (self.findById(declaration.id()) != null) continue;
-            try self.create(declaration);
+            self.create(declaration) catch |err| try self.skipUnsupported(declaration.id(), err);
         }
     }
 
@@ -285,6 +300,26 @@ pub const WindowSet = struct {
     /// layer namespace or output, or clear an explicit exclusive edge.
     pub fn checkTransition(self: *WindowSet, declaration: SurfaceDeclaration) !void {
         try self.validateTransitions(&.{declaration});
+        try self.host.check(declaration);
+    }
+
+    /// The next declaration `reconcile` skipped as unsupported; the caller
+    /// frees `id` with `releaseUnsupported`.
+    pub fn takeUnsupported(self: *WindowSet) ?Unsupported {
+        if (self.unsupported.items.len == 0) return null;
+        return self.unsupported.orderedRemove(0);
+    }
+
+    pub fn releaseUnsupported(self: *WindowSet, item: Unsupported) void {
+        self.allocator.free(item.id);
+    }
+
+    fn skipUnsupported(self: *WindowSet, id: []const u8, err: anyerror) !void {
+        if (!platform_window.isUnsupported(err)) return err;
+        for (self.unsupported.items) |item| if (std.mem.eql(u8, item.id, id)) return;
+        const owned = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(owned);
+        try self.unsupported.append(self.allocator, .{ .id = owned, .err = err });
     }
 
     /// Protocol dispatch calls this state-only method after native teardown is
@@ -743,6 +778,8 @@ const FakeHost = struct {
 
     actions: [128]Action = undefined,
     count: usize = 0,
+    /// Behaves like a compositor without ext-session-lock.
+    refuse_lock: bool = false,
 
     fn interface(self: *FakeHost) NativeHost {
         return .{ .context = self, .vtable = &vtable };
@@ -757,10 +794,17 @@ const FakeHost = struct {
         context: *anyopaque,
         handle: WindowHandle,
         scope_handle: ScopeHandle,
-        _: SurfaceDeclaration,
+        declaration: SurfaceDeclaration,
     ) !void {
         const self: *FakeHost = @ptrCast(@alignCast(context));
+        try check(context, declaration);
         self.append(.{ .create = .{ .handle = handle, .scope = scope_handle } });
+    }
+
+    fn check(context: *anyopaque, declaration: SurfaceDeclaration) !void {
+        const self: *FakeHost = @ptrCast(@alignCast(context));
+        if (self.refuse_lock and declaration == .layer_surface and declaration.layer_surface.session_lock)
+            return error.SessionLockUnavailable;
     }
 
     fn updateTitle(context: *anyopaque, handle: WindowHandle, _: []const u8) !void {
@@ -802,8 +846,46 @@ const FakeHost = struct {
         .update_minimum_size = updateMinimumSize,
         .update_layer_surface = updateLayerSurface,
         .begin_close = beginClose,
+        .check = check,
     };
 };
+
+test "surfaces the host cannot provide are skipped and reported, not fatal" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    var host: FakeHost = .{ .refuse_lock = true };
+    var windows: WindowSet = undefined;
+    try windows.init(std.testing.allocator, &scheduler, host.interface(), 2, 4);
+    defer windows.deinit();
+
+    const lock: SurfaceDeclaration = .{ .layer_surface = .{
+        .id = "lock",
+        .namespace = "session-lock",
+        .session_lock = true,
+        .output = "HEADLESS-1",
+        .width = 0,
+        .height = 0,
+        .layer = .overlay,
+        .anchors = .{ .top = true, .bottom = true, .left = true, .right = true },
+    } };
+    const declarations = [_]SurfaceDeclaration{ .{ .toplevel = .{ .id = "main", .title = "Main" } }, lock };
+    try windows.reconcile(&declarations);
+    try std.testing.expectEqual(@as(usize, 1), windows.activeCount());
+    const skipped = windows.takeUnsupported().?;
+    defer windows.releaseUnsupported(skipped);
+    try std.testing.expectEqualStrings("lock", skipped.id);
+    try std.testing.expectEqual(@as(anyerror, error.SessionLockUnavailable), skipped.err);
+    try std.testing.expectEqual(@as(?WindowSet.Unsupported, null), windows.takeUnsupported());
+    // Checks before commit reject it too: reactive refreshes and reloads.
+    try std.testing.expectError(error.SessionLockUnavailable, windows.checkTransition(lock));
+    try std.testing.expectError(error.SessionLockUnavailable, windows.prepare(&declarations));
+
+    try windows.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try windows.markClosed(host.actions[0].create.handle);
+    try windows.reconcile(&.{});
+}
 
 test "window declarations reconcile into stable scoped native identities" {
     var scheduler: Scheduler = undefined;

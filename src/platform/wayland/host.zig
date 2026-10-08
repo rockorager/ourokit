@@ -1969,9 +1969,10 @@ pub const Host = struct {
         declaration: platform_window.SurfaceDeclaration,
     ) !void {
         const self: *Host = @ptrCast(@alignCast(context));
+        try nativeCheck(context, declaration);
         const window = try self.freeWindow();
         switch (declaration) {
-            .toplevel => if (self.wm_base == null) return error.XdgShellUnavailable,
+            .toplevel, .layer_surface => {},
             .popup => |popup| {
                 try popup.validate();
                 if (self.wm_base == null) return error.XdgShellUnavailable;
@@ -1992,16 +1993,6 @@ pub const Host = struct {
                     @as(u64, @intCast(anchor.y)) + anchor.height > parent.height)
                     return error.InvalidPopupAnchor;
                 if (popup.input != null and parent.layer_state != null and parent.layer_state.?.keyboard_interactivity == .none and self.layer_shell_version < 4)
-                    return error.LayerShellVersionTooOld;
-            },
-            .layer_surface => |value| {
-                if (value.session_lock) {
-                    if (self.session.manager == null and self.session.lock == null) return error.SessionLockUnavailable;
-                    if (value.output == null) return error.LockOutputRequired;
-                } else if (self.layer_shell == null) return error.LayerShellUnavailable;
-                if (value.keyboard_interactivity == .on_demand and self.layer_shell_version < 4)
-                    return error.LayerShellVersionTooOld;
-                if (value.exclusive_edge != null and self.layer_shell_version < 5)
                     return error.LayerShellVersionTooOld;
             },
         }
@@ -2334,6 +2325,29 @@ pub const Host = struct {
         _ = try self.driver.schedule();
     }
 
+    /// The optional-protocol requirements of a declaration, checked before
+    /// any native state changes. Errors satisfy `platform_window.isUnsupported`,
+    /// so the application rejects the surface instead of failing.
+    fn nativeCheck(context: *anyopaque, declaration: platform_window.SurfaceDeclaration) !void {
+        const self: *Host = @ptrCast(@alignCast(context));
+        switch (declaration) {
+            .toplevel => if (self.wm_base == null) return error.XdgShellUnavailable,
+            .popup => if (self.wm_base == null) return error.XdgShellUnavailable,
+            .layer_surface => |value| {
+                if (value.session_lock) {
+                    if (self.session.manager == null and self.session.lock == null) return error.SessionLockUnavailable;
+                    if (value.output == null) return error.LockOutputRequired;
+                    return;
+                }
+                if (self.layer_shell == null) return error.LayerShellUnavailable;
+                if (value.keyboard_interactivity == .on_demand and self.layer_shell_version < 4)
+                    return error.LayerShellVersionTooOld;
+                if (value.exclusive_edge != null and self.layer_shell_version < 5)
+                    return error.LayerShellVersionTooOld;
+            },
+        }
+    }
+
     fn nativeUpdateLayerSurface(
         context: *anyopaque,
         handle: WindowHandle,
@@ -2407,6 +2421,7 @@ pub const Host = struct {
         .update_title = nativeUpdateTitle,
         .update_minimum_size = nativeUpdateMinimumSize,
         .update_layer_surface = nativeUpdateLayerSurface,
+        .check = nativeCheck,
         .begin_close = nativeBeginClose,
     };
 

@@ -1129,9 +1129,85 @@ return o.app{id='dev.ourokit.workspace-bar',
         proxy.close()
 
 
+def unsupported_surfaces_test(root, env):
+    """Surfaces the compositor cannot provide fail; the application keeps running.
+
+    Sway 1.7 has no ext-session-lock and only layer-shell version 4, so a lock
+    surface and a layer surface with an exclusive edge are both unsupported.
+    """
+    app_env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'])
+    chart = '''local o=require('ouro'); local machine=o.machine; local assign=machine.assign
+local lock=machine.create{id='lock',initial='unlocked',context={},events={LOCK={}},
+ actions={failed=assign{error=function(_,e) return e.reason..': '..e.message end}},
+ on={['surface.failed.*']={target='#unlocked',actions='failed'}},
+ states={unlocked={on={LOCK='locked'}},locked={}}}
+local actor=lock:actor()
+local function state(s) return {locked=machine.matches(s,'locked'),error=s.context.error} end
+local schema={type='object',properties={locked={type='boolean'},error={type='string'}}}
+local actions=machine.actions(actor,{Lock={event='LOCK',description='lock'},
+ State={description='state',output=state,output_schema=schema}})
+local main=o.window{id='main',title='Shell',width=240,height=120,content=function() return o.text{key='t',text='alive'} end}
+'''
+    cases = {
+        # A reactive declaration: rejected before commit, reported to the chart.
+        'reactive': chart + '''return o.app{id='dev.ourokit.lock-reactive',actions=actions,run=function() actor:start()
+ return {windows=function()
+  if not actor:matches('locked') then return {main} end
+  return {main,o.lock_surface{id='lock',outputs='all',send=actor,content=function() return o.text{key='t',text='locked'} end}}
+ end} end}
+''',
+        # Static declarations from run: skipped at creation instead of stopping
+        # the app; the bound one reports, the unbound ones are logged.
+        'static': chart + '''return o.app{id='dev.ourokit.lock-static',actions=actions,run=function() actor:start(); actor:send('LOCK')
+ return {windows={main,
+  o.lock_surface{id='lock',output='HEADLESS-1',send=actor,content=function() return o.text{key='t',text='locked'} end},
+  o.layer_surface{id='edge',namespace='edge',layer='top',width=0,height=30,anchors={'top','left','right'},
+   exclusive_zone=30,exclusive_edge='top',content=function() return o.text{key='t',text='edge'} end}}} end}
+''',
+        # Unbound: logged, the last valid set stays, nothing reaches the chart.
+        'unbound': chart + '''return o.app{id='dev.ourokit.lock-unbound',actions=actions,run=function() actor:start()
+ return {windows=function()
+  if not actor:matches('locked') then return {main} end
+  return {main,o.lock_surface{id='quiet-lock',output='HEADLESS-1',content=function() return o.text{key='t',text='locked'} end}}
+ end} end}
+''',
+    }
+    for name, source in cases.items():
+        path = root / f'lock-{name}.lua'
+        path.write_text(source)
+        app = subprocess.Popen([str(BINARY), 'run', str(path), '--dev', '--software'], env=app_env,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app, windows=('main',))
+            state = lambda: call(endpoint, 'State')['structuredContent']
+            if name != 'static':
+                assert call(endpoint, 'Lock')['structuredContent'] == {}
+            if name == 'unbound':
+                time.sleep(.5)
+                assert state() == {'locked': True}, state()
+            else:
+                wait_for(lambda: state().get('error') == 'unsupported: SessionLockUnavailable' and not state()['locked'],
+                         f'{name}: the bound lock surface never reported its failure')
+            time.sleep(.3)
+            assert app.poll() is None, f'{name}: an unsupported surface must not stop the app'
+            assert [w['window'] for w in inspect(app_env, endpoint)['windows']] == ['main']
+            assert node(app_env, endpoint, 'main', 't')['label'] == 'alive'
+        finally:
+            terminate(app)
+            errors = app.stderr.read()
+            assert 'panic' not in errors and 'leaked' not in errors, errors
+        assert 'SessionLockUnavailable' in errors, errors
+        if name == 'static':
+            assert 'surface edge unsupported: LayerShellVersionTooOld' in errors, errors
+        if name == 'unbound':
+            assert 'window declaration failed: SessionLockUnavailable' in errors, errors
+        print(f'PASS unsupported surfaces ({name}): ' + ('logged, last valid set kept' if name == 'unbound' else 'bound lock surface reports failed') + ', app alive')
+
+
 def suite(root, env):
     assert BINARY.is_file(), f"missing {BINARY}; wait for /tmp/ouro-desktop-build.log then build"
     focus_test(root, env)
+    unsupported_surfaces_test(root, env)
     workspaces_test(root, env)
     surface_events_test(root, env)
     launcher_test(root, env)
