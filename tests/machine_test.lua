@@ -1603,4 +1603,34 @@ return {
     clock.advance(1000)
     assert(live:matches('done'))
   end,
+
+  ['the default logical clock removes a cancelled timer when its state exits or its actor stops'] = function()
+    assert(machine.virtual_clock and machine.clock, 'ouroctl test runs the native scheduler on a virtual clock')
+    local queue = machine.clock.timers
+    local base = #queue
+    local chart = machine.create { id = 'hourly', initial = 'idle', events = { ENTER = {}, LEAVE = {} }, states = {
+      idle = { on = { ENTER = 'waiting' } },
+      waiting = { after = { [3600000] = 'expired' }, on = { LEAVE = 'idle' } },
+      expired = {} } }
+    local live = chart:start()
+    for _ = 1, 10000 do
+      live:send('ENTER')
+      assert(#queue == base + 1)
+      live:send('LEAVE')
+    end
+    assert(#queue == base, 'exited states leave timers queued: ' .. #queue - base)
+    for _ = 1, 2000 do
+      local actor = chart:start()
+      actor:send('ENTER')
+      actor:stop()
+    end
+    assert(#queue == base, 'stopped actors leave timers queued: ' .. #queue - base)
+    -- Firing order and deadlines are unchanged by removal.
+    live:send('ENTER')
+    machine.advance(3599999)
+    assert(live:matches('waiting'))
+    machine.advance(1)
+    assert(live:matches('expired') and #queue == base)
+    live:stop()
+  end,
 }

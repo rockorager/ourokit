@@ -761,7 +761,9 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
     that deadline, so periodic ticks never drift.
   - One native wake task (a scope from `scopes.zig` and one `ouro.sleep`)
     sleeps until the earliest deadline; an earlier timer replaces it. Closing
-    a state's scope drops its timers. Per-entry tokens still guard delivery.
+    a state's scope (exit or stop) removes its timers from the queue then,
+    not at their deadline: they are tombstoned and swept once tombstones are
+    half the queue, keeping order. Per-entry tokens still guard delivery.
   - **Live** (the Wayland host, `ouroctl run`, including `--headless`), the
     clock follows the host's monotonic time between inputs.
   - **Virtual** in deterministic hosts (Storybook playback and `ouroctl

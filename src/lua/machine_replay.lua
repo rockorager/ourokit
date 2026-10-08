@@ -258,7 +258,9 @@ local function replay_scheduler(start)
   end
   local function close(scope)
     scope.alive = false
+    clock.cancel(scope)
     for _, child in ipairs(scope.children) do close(child) end
+    scope.children = {}
   end
   s.close = close
   function s.alive(scope) return scope.alive end

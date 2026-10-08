@@ -1509,6 +1509,19 @@ end
 -- line of defense and is what the token scheduler relies on.
 M.native_scopes = scope_open ~= nil
 
+-- Drop dead entries once a list doubles since its last compaction, so a
+-- long-lived owner (a root scope, a manual clock) stays bounded.
+local function compact(list, keep)
+  if #list < (list.compact_at or 32) then return end
+  local j = 0
+  for i = 1, #list do
+    local item = list[i]
+    list[i] = nil
+    if keep(item) then j = j + 1; list[j] = item end
+  end
+  list.compact_at = math.max(32, 2 * j)
+end
+
 -- Logical time (design §8). A scheduler clock reads one logical instant per
 -- external input: it is frozen for the macrostep and its effects, so guards,
 -- assigns, records and machine.now() agree. `after` timers sit in one queue
@@ -1525,7 +1538,9 @@ M.native_scopes = scope_open ~= nil
 --   clock.advance_to(t)   the same, to an absolute instant
 function M.logical_clock(options)
   options = options or {}
-  local c = {timers = {}, sequence = 0, firing = false, fired = 0}
+  -- by_scope finds the queued timers of a scope when it closes (it holds only
+  -- scopes with queued timers); dead counts cancelled timers still queued.
+  local c = {timers = {}, sequence = 0, firing = false, fired = 0, dead = 0, compact_at = 32, by_scope = {}}
   local alive, wall, wake = options.alive or function(scope) return scope.alive end, options.wall, options.wake
   local time = options.start
   local function current()
@@ -1533,17 +1548,67 @@ function M.logical_clock(options)
     return time
   end
   function c.now() return current() end
+  local function live(timer) return not timer.dead and alive(timer.scope) end
+  local function link(timer)
+    local mine = c.by_scope[timer.scope]
+    if not mine then mine = {}; c.by_scope[timer.scope] = mine end
+    mine[#mine + 1] = timer
+  end
+  -- Remove every timer that can no longer fire. Order is kept, so firing order
+  -- and replay are unaffected.
+  local function sweep()
+    local list, j = c.timers, 0
+    c.by_scope = {}
+    for i = 1, #list do
+      local timer = list[i]
+      list[i] = nil
+      if live(timer) then j = j + 1; list[j] = timer; link(timer) end
+    end
+    c.dead = 0
+  end
+  local function pop()
+    local timer = table.remove(c.timers, 1)
+    if timer.dead then c.dead = c.dead - 1 end
+    local mine = c.by_scope[timer.scope]
+    if mine then
+      for i, other in ipairs(mine) do
+        if other == timer then table.remove(mine, i); break end
+      end
+      if not mine[1] then c.by_scope[timer.scope] = nil end
+    end
+    return timer
+  end
   function c.after(scope, delay, fn)
     c.sequence = c.sequence + 1
+    -- Scopes closed without cancel() (a parent's close cascading natively)
+    -- are caught here, once the queue has doubled since the last pass.
+    if #c.timers >= c.compact_at then
+      sweep()
+      c.compact_at = math.max(32, 2 * #c.timers)
+    end
     local timer = {at = current() + delay, sequence = c.sequence, scope = scope, fn = fn}
     local list, i = c.timers, #c.timers
     while i > 0 and (list[i].at > timer.at) do i = i - 1 end
     table.insert(list, i + 1, timer)
+    link(timer)
     if wake and list[1] == timer then wake(timer.at) end
+  end
+  -- A scope closed: its timers will never fire. Tombstone them and sweep once
+  -- tombstones are at least half the queue, so a cancelled timer leaves the
+  -- queue when its state exits, not when its deadline passes. Without this a
+  -- virtual clock (moved only by advance()) or a 1 h delay keeps every one.
+  function c.cancel(scope)
+    local mine = c.by_scope[scope]
+    if not mine then return end
+    c.by_scope[scope] = nil
+    for _, timer in ipairs(mine) do
+      if not timer.dead then timer.dead = true; c.dead = c.dead + 1 end
+    end
+    if c.dead > 0 and c.dead * 2 >= #c.timers then sweep() end
   end
   -- The earliest pending deadline, dropping timers whose scope closed.
   function c.next()
-    while c.timers[1] and not alive(c.timers[1].scope) do table.remove(c.timers, 1) end
+    while c.timers[1] and not live(c.timers[1]) do pop() end
     return c.timers[1] and c.timers[1].at
   end
   function c.advance_to(target)
@@ -1551,8 +1616,8 @@ function M.logical_clock(options)
     c.firing = true
     local ok, err = pcall(function()
       while c.timers[1] and c.timers[1].at <= target do
-        local timer = table.remove(c.timers, 1)
-        if alive(timer.scope) then
+        local timer = pop()
+        if live(timer) then
           if timer.at > current() then time = timer.at end
           c.fired = c.fired + 1
           local fired, failure = pcall(timer.fn)
@@ -1604,7 +1669,7 @@ if scope_open then
   M.default_scheduler = {
     kind = 'native',
     open = function(parent) return scope_open(parent) end,
-    close = function(scope) scope_close(scope) end,
+    close = function(scope) scope_close(scope); clock.cancel(scope) end,
     alive = function(scope) return scope_alive(scope) end,
     run = function(scope, fn) scope_spawn(scope, fn) end,
     after = clock.after,
@@ -1616,18 +1681,6 @@ end
 -- Fallback where no native binding exists (a Lua state without a Vm), and for
 -- comparison: spawned work has no handle, so it runs in application scope and
 -- a closed scope only drops its delivery.
--- Drop dead entries once a list doubles since its last compaction, so a
--- long-lived owner (a root scope, a shared manual clock) stays bounded.
-local function compact(list, keep)
-  if #list < (list.compact_at or 32) then return end
-  local j = 0
-  for i = 1, #list do
-    local item = list[i]
-    list[i] = nil
-    if keep(item) then j = j + 1; list[j] = item end
-  end
-  list.compact_at = math.max(32, 2 * j)
-end
 local function is_alive(scope) return scope.alive end
 local function token_scope(parent)
   local scope = {alive = true, children = {}}
