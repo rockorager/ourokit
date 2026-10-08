@@ -708,6 +708,32 @@ local function select_transitions(chart, active, event_type, guard_args)
   return enabled
 end
 
+-- Probing guards without a payload (the inspector's valves, accepted()):
+-- the event is a tracked view that notes reads of fields a real event must
+-- carry: a required schema field, or any field of an event without a schema
+-- (its payload is unknown). A guard that reads one cannot be decided by the
+-- probe: it is payload-dependent, not failed, whatever it returned or raised.
+-- Optional fields read as nil, as in a real event that omits them.
+local function needs_payload(chart, event_type, key)
+  if internal_type(event_type) then return false end
+  local fields = chart.events and chart.events[event_type]
+  if fields == nil then return key == nil or key ~= 'type' end
+  if key == nil then return next(fields) ~= nil end
+  local field = fields[key]
+  return field ~= nil and not field.optional
+end
+local function probe_guard(chart, t, context, event, meta)
+  local read = false
+  local probe = tracked_view and tracked_view(event, function(e, key)
+    if needs_payload(chart, e.type, key) then read = true end
+    if key ~= nil then return view(e[key]) end
+  end) or view(event)
+  local ok, result = pcall(atomic, t.guard_label, t.guard, context, probe, meta)
+  if read then return 'payload' end
+  if not ok then return 'error', tostring(result) end
+  return result and 'passed' or 'failed'
+end
+
 local function lcca(chart, nodes)
   local first = nodes[1]
   local anc = first.parent
@@ -2329,15 +2355,50 @@ end
 
 -- External events the current configuration would accept, for palettes,
 -- shortcuts and MCP tools. Requires declared events.
+-- accepted() -> accepted, guarded: the declared events an active transition
+-- takes now without a payload (no guard, or a guard that passed without
+-- reading payload fields), and those an active transition handles but whose
+-- guard reads the payload, so only a real event can decide them. Both sorted
+-- and disjoint. Guards are probed: one that raises without reading the
+-- payload just doesn't count; nothing is raised or recorded as an error.
 function Actor:accepted()
-  local list = {}
+  track(self._config)
+  local chart, snapshot = self.chart, self._snapshot
+  local accepted, guarded = {}, {}
+  if self._status == 'stopped' or snapshot.status ~= 'active' then return accepted, guarded end
+  local active = active_set(chart, snapshot)
+  local context, children = context_view(self), children_view(self)
+  local meta = {children = children, matches = function(id)
+    local node = chart.by_id[id]
+    if not node or id == '' then fail('machine %s has no state %q', chart.id, tostring(id)) end
+    return active[node] == true
+  end}
   local names = {}
-  for name in pairs(self.chart.declared) do names[#names + 1] = name end
+  for name in pairs(chart.declared) do names[#names + 1] = name end
   table.sort(names)
   for _, name in ipairs(names) do
-    if self:can(name) then list[#list + 1] = name end
+    local takes, pending = false, false
+    local patterns = descriptors(name)
+    for _, state in ipairs(sorted(active)) do
+      if takes then break end
+      if is_atomic(state) then
+        local node = state
+        while node and not takes do
+          for _, pattern in ipairs(patterns) do
+            for _, t in ipairs(node.on[pattern] or {}) do
+              local outcome = t.guard == nil and 'passed' or probe_guard(chart, t, context, {type = name}, meta)
+              if outcome == 'passed' then takes = true; break end
+              if outcome == 'payload' then pending = true end
+            end
+            if takes then break end
+          end
+          node = node.parent
+        end
+      end
+    end
+    if takes then accepted[#accepted + 1] = name elseif pending then guarded[#guarded + 1] = name end
   end
-  return list
+  return accepted, guarded
 end
 
 function Actor:child(id) return self._children[id] end
@@ -2438,9 +2499,10 @@ local function valve_states(actor)
     if t.guard and active[t.source] then
       local event = {type = t.event or 'ouro.always'}
       if t.kind == 'after' then event.state, event.token = t.source.id, snapshot.entries[t.source.id] end
-      local ok, result = pcall(atomic, t.guard_label, t.guard, context, view(event), meta)
-      if ok then out[#out + 1] = {index = t.index, passed = result and true or false}
-      else out[#out + 1] = {index = t.index, passed = false, error = tostring(result)} end
+      local outcome, err = probe_guard(chart, t, context, event, meta)
+      if outcome == 'payload' then out[#out + 1] = {index = t.index, passed = false, payload = true}
+      elseif outcome == 'error' then out[#out + 1] = {index = t.index, passed = false, error = err}
+      else out[#out + 1] = {index = t.index, passed = outcome == 'passed'} end
     end
   end
   return out

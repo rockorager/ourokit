@@ -375,9 +375,22 @@ state is rejected as `stale`.
 ### Commands, shortcuts and MCP are events
 
 Actions, commands, shortcuts, palette entries and MCP calls are all external
-events with schemas. `actor:accepted()` lists the declared events the current
-configuration would take, guards included. `machine.actions` derives MCP tools
-from the same declarations:
+events with schemas. `actor:accepted()` returns `accepted, guarded`, both
+sorted and disjoint:
+- `accepted`: the declared events an active transition takes now without a
+  payload: it has no guard, or its guard passed.
+- `guarded`: events an active transition handles, but whose guard reads a
+  field a real event must carry, so only a real event can decide them
+  ("available with a payload"). That is a required schema field, or any
+  field of an event that has no schema (its payload is unknown).
+
+The probe hands guards a bare `{type = name}` as a tracked view that notes
+those reads. Optional fields read as `nil`, as in a real event that omits
+them, so a guard over optional fields is decided normally. A guard that
+reads a required field is payload-dependent whatever it returns or raises;
+a guard that raises without reading one simply does not count. The probe never raises and records no errors. `actor:can(event)`
+is unchanged: it evaluates guards with the event you pass. `machine.actions`
+derives MCP tools from the same declarations:
 
 ```lua
 actions = machine.actions(book, {
@@ -1136,7 +1149,7 @@ There is one record per processed event, including rejected ones:
   states = { ... },                -- configuration after the step
   status = 'active',
   context = { ... },               -- plain deep copy of the context after the step
-  guards = { { index = 12, passed = true }, { index = 14, passed = false, error = '...' } },
+  guards = { { index = 12, passed = true }, { index = 13, passed = false, payload = true }, { index = 14, passed = false, error = '...' } },
 }
 ```
 
@@ -1151,7 +1164,9 @@ Either way the error also reaches the sender. `code` is the message's
 transition whose source is active after the step, evaluated against the
 committed snapshot. Event transitions see a bare `{type = event}`, `after`
 transitions their timer event, and `always` transitions `{type = 'ouro.always'}`.
-A guard that throws, for example because it reads a payload field, is
+The guards are probed like `accepted()` (§2): one that reads a required
+payload field cannot be decided and is `{ index, passed = false, payload = true }`, with no
+error. A guard that throws without reading the payload (a real bug) is
 `passed = false` with its `error`. `index` maps to
 `chart:graph().transitions[].index`.
 
@@ -1188,8 +1203,9 @@ MCP `tools/call`. Production instances install nothing
   `time_ms`, and kept in a 1,024-record ring. A call returns `{next, first,
   dropped, time_ms, seed, reads, records = [{sequence, time_ms, record}],
   actors}` after the `after` cursor. Records include `guards` (guard
-  outcomes), `time_ms` and `accepted` (the declared events the actor would
-  take). `text = true` returns records as JSON strings, for clients such as
+  outcomes), `time_ms`, and on attach records `accepted` and `guarded`
+  (the declared events the actor takes now, and those only a payload can
+  decide; §2). `text = true` returns records as JSON strings, for clients such as
   `ouro.mcp` that convert at most 4,096 values per reply. `reads` counts calls.
   `more` says the page was cut (limit, or the 2 MiB response budget), so call
   again. `epoch` identifies the running instance; a client seeing a new one

@@ -101,8 +101,10 @@ local function current(actor)
     record.invokes[#record.invokes + 1] = {action = 'started', state = live.state, id = live.id,
       src = live.src, token = live.token, time_ms = live.time_ms}
   end
-  local ok, accepted = pcall(actor.accepted, actor)
-  if ok then record.accepted = accepted end
+  -- accepted: taken now without a payload; guarded: handled, but a guard
+  -- reads the payload, so only a real event decides (design §2).
+  local ok, accepted, guarded = pcall(actor.accepted, actor)
+  if ok then record.accepted, record.guarded = json.array(accepted), json.array(guarded) end
   return started, record
 end
 

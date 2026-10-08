@@ -1274,8 +1274,9 @@ return {
     local r = last(records)
     assert(r.time_ms == 40 and r.timers[1] == nil)
     assert(valve(r, 'always').passed == false and valve(r, 'after').passed == false)
-    -- BIG reads e.amount: a bare {type = 'BIG'} makes it throw, so it is closed with the error.
-    assert(valve(r, 'BIG').passed == false and valve(r, 'BIG').error:find('attempt to compare', 1, true), valve(r, 'BIG').error)
+    -- BIG reads e.amount: the probe cannot decide it without a payload, so it is
+    -- closed and payload-dependent, not an error.
+    assert(valve(r, 'BIG').passed == false and valve(r, 'BIG').payload == true and valve(r, 'BIG').error == nil)
     assert(#r.guards == 3)
     assert(#actor:pending_invokes() == 0)
     local timers = actor:pending_timers()
@@ -1707,6 +1708,48 @@ return {
     assert(join(actor:accepted()) == 'EDIT,RESIZE')
     actor:send { type = 'EDIT', text = 'x' }
     assert(join(actor:accepted()) == 'EDIT,SAVE')
+  end,
+
+  ['payload guards are probed, not failed: accepted, guarded and valve payload flags'] = function()
+    local chart = machine.create {
+      id = 'notify', initial = 'online', context = { timers = 0, limit = 2, quiet = false },
+      events = { NOTIFY = { delay = 'integer' }, QUIET = {}, CLEAR = {}, BROKEN = {}, PICK = { index = 'integer?' } },
+      guards = {
+        timed = function(c, e) return e.delay > 0 and c.timers < c.limit end, -- raises on a bare event
+        roomy = function(c, e) return e.delay == nil or c.timers < c.limit end, -- returns without raising
+        loud = function(c) return not c.quiet end,
+        broken = function(c) return c.missing.field end, -- a real bug, payload or not
+        picked = function(_, e) return e.index == nil or e.index > 0 end, -- optional: nil is a real event too
+      },
+      states = { online = { on = {
+        NOTIFY = { { guard = 'timed', actions = machine.assign { timers = function(c) return c.timers + 1 end } }, { guard = 'roomy' } },
+        QUIET = { guard = 'loud', actions = machine.assign { quiet = true } },
+        CLEAR = {},
+        BROKEN = { guard = 'broken' },
+        PICK = { guard = 'picked' },
+      } } },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local records = recorder(actor)
+    local accepted, guarded = actor:accepted()
+    assert(join(accepted) == 'CLEAR,PICK,QUIET' and join(guarded) == 'NOTIFY', join(accepted) .. ' | ' .. join(guarded))
+    actor:send('QUIET')
+    local valves = {}
+    for _, g in ipairs(last(records).guards) do valves[g.index] = g end
+    local graph = chart:graph()
+    local by_guard = {}
+    for _, t in ipairs(graph.transitions) do if t.guard then by_guard[t.guard] = valves[t.index] end end
+    assert(by_guard.timed.payload and by_guard.timed.error == nil and by_guard.timed.passed == false,
+      'a guard that reads the payload is payload-dependent, not an error')
+    assert(by_guard.roomy.payload and by_guard.roomy.error == nil)
+    assert(by_guard.loud.passed == false and not by_guard.loud.payload)
+    assert(by_guard.broken.error and not by_guard.broken.payload, 'other failures keep their error')
+    assert(by_guard.picked.passed == true and not by_guard.picked.payload, 'reading an optional field decides with nil')
+    accepted, guarded = actor:accepted()
+    assert(join(accepted) == 'CLEAR,PICK' and join(guarded) == 'NOTIFY')
+    -- The real event still decides.
+    assert(actor:send { type = 'NOTIFY', delay = 5 } and actor:context().timers == 1)
+    actor:stop()
   end,
 
   ['observer records carry steps, rejections and plain context'] = function()

@@ -186,11 +186,11 @@ assert(not pcall(launcher.send, launcher, {type='surface.failed.launcher'}), 'su
 launcher:send('OPEN'); assert(launcher:context().error==nil, 'reopening clears the surface error')
 clock.run_tasks()
 
--- What the palette or MCP would see right now.
-local accepted={}
-for _,t in ipairs(launcher:accepted()) do accepted[#accepted+1]=t end
-table.sort(accepted)
-assert(table.concat(accepted,',')=='ACTIVATE,CLOSE,MOVE,QUERY,SELECT,TOGGLE', table.concat(accepted,','))
+-- What the palette or MCP would see right now. SELECT's guard reads its
+-- required index, so only a real event decides it: guarded, not accepted.
+local accepted, guarded = launcher:accepted()
+assert(table.concat(accepted,',')=='ACTIVATE,CLOSE,MOVE,QUERY,TOGGLE', table.concat(accepted,','))
+assert(table.concat(guarded,',')=='SELECT', table.concat(guarded,','))
 launcher:send('CLOSE')
 accepted={}
 for _,t in ipairs(launcher:accepted()) do accepted[#accepted+1]=t end

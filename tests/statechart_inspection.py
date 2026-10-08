@@ -307,8 +307,9 @@ local m = o.machine
 local link = m.create {
   id = 'link', initial = 'up', transient = {'bus'},
   context = function() return {bus = o.signal(0), other = o.signal(1), pings = 0} end,
-  events = {PING = {}},
-  states = {up = {on = {PING = {actions = m.assign {pings = function(c) return c.pings + 1 end}}}}},
+  events = {PING = {}, NOTIFY = {delay = 'integer'}},
+  states = {up = {on = {PING = {actions = m.assign {pings = function(c) return c.pings + 1 end}},
+    NOTIFY = {guard = function(_, e) return e.delay > 0 end}}}},
 }:actor {id = 'link'}
 link:start()
 return o.app {id = 'dev.ourokit.statechart-handles', run = function() return {windows = {}} end}
@@ -330,15 +331,20 @@ def native_handles():
             time.sleep(.3)
             out, failed = send(endpoint, 'link', {'type': 'PING'})
             assert not failed and out['accepted'] is True and out['changed'] == ['pings'], out
-            context = statecharts(endpoint, after=0, limit=0, actors=False, actor='link')['actor']['snapshot']['context']
+            # Gap 2: NOTIFY's guard reads e.delay; the probe flags it, no error.
+            assert out['guards'] == [{'index': out['guards'][0]['index'], 'passed': False, 'payload': True}], out['guards']
+            snapshot = statecharts(endpoint, after=0, limit=0, actors=False, actor='link')['actor']['snapshot']
+            context = snapshot['context']
             assert set(context['bus']) == {'$h'} and set(context['other']) == {'$h'} and context['pings'] == 1, context
+            assert snapshot['accepted'] == ['PING'] and snapshot['guarded'] == ['NOTIFY'], snapshot
             rows = statecharts(endpoint, after=0, limit=0, actors=False, rollup=True)['rollup']['actors']
             assert any(r['actor'] == 'link' for r in rows), rows
             assert process.poll() is None
         finally:
             process.terminate()
             process.communicate(timeout=10)
-    print('PASS native handles: runtime.send, runtime.statecharts and the rollup show handles as {"$h": type}')
+    print('PASS native handles and payload guards: handles show as {"$h": type}; payload-reading guards are '
+          'flagged payload, never errors, and listed as guarded')
 
 
 def send_robustness():
