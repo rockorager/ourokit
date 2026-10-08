@@ -104,7 +104,7 @@ def session(root):
             assert path.stat().st_mode & 0o777 == 0o600
             assert {t['name'] for t in request(path, 'tools/list')['result']['tools']} == {
                 'runtime.status', 'runtime.reload', 'runtime.inspect', 'runtime.input',
-                'runtime.capture', 'runtime.metrics', 'runtime.diagnostics', 'runtime.statecharts'}
+                'runtime.capture', 'runtime.metrics', 'runtime.diagnostics', 'runtime.statecharts', 'runtime.send'}
             command(env, 'dev', 'status', str(path))
         # No actions at all, and action enablement can change on reload.
         app.write_text(source().replace("  run=function()", "  actions={}, run=function()"))

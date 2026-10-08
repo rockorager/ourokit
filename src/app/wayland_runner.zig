@@ -568,6 +568,10 @@ fn runSourceInternal(
     if (options.mcp and !source_reload.active().application.hasActions()) return error.ApplicationActionsDisabled;
     if (control) |server| {
         try server.init(init.gpa, &loop, init.minimal.environ, source_reload.active().application.id, source_reload.generation, reload_requests, options.development);
+        if (statecharts != null) {
+            server.statecharts = &statecharts.?;
+            statecharts.?.endpoint = try init.gpa.dupe(u8, server.socketPath());
+        }
         std.log.info("{s} socket: {s}", .{ if (options.development) "development" else "application", server.socketPath() });
     }
     var development_service: development_control.Service = .{ .allocator = init.gpa, .io = init.io };

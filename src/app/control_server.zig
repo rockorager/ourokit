@@ -21,6 +21,22 @@ const Subscription = struct {
     call: mcp.CallHandle,
     id: std.json.Parsed(mcp.Value),
     dirty: bool = false,
+    /// A development resource subscription to statechart_uri instead of the
+    /// tool catalog.
+    statecharts: ?StatechartWatch = null,
+};
+
+pub const statechart_uri = "ouro://statecharts";
+
+/// Notify-then-fetch state for one statechart subscriber: at most one
+/// notification is outstanding until some client reads runtime.statecharts.
+const StatechartWatch = struct {
+    /// Ring position and generation covered by the last notification.
+    sequence: u64,
+    generation: u64,
+    /// store.reads when notified; a later read clears `pending`.
+    read_mark: u64 = 0,
+    pending: bool = false,
 };
 
 const Waiter = struct {
@@ -139,6 +155,8 @@ pub const ControlServer = struct {
     listener_terminal: bool = false,
     clients: [client_capacity]?Client = [_]?Client{null} ** client_capacity,
     generation: u64,
+    /// Development only: the statechart record ring behind statechart_uri.
+    statecharts: ?*lua.StatechartInspector = null,
     reloading: bool = false,
     failure: ?Failure = null,
     shutting_down: bool = false,
@@ -457,6 +475,16 @@ pub const ControlServer = struct {
 
     pub fn serviceRequests(self: *ControlServer) !void {
         if (self.shutting_down) return;
+        // Statechart subscribers keep the on-demand observer attached.
+        if (self.statecharts) |store| {
+            var subscribers: usize = 0;
+            for (self.clients) |entry| if (entry) |client| {
+                for (client.subscriptions) |slot| if (slot) |subscription| {
+                    if (subscription.statecharts != null) subscribers += 1;
+                };
+            };
+            store.subscribers = subscribers;
+        }
         if (self.publication_dirty) {
             self.publication_dirty = false;
             // Retry on the next catalog change, not every event-loop turn.
@@ -666,12 +694,35 @@ pub const ControlServer = struct {
         // dirty invalidations bounds slow listeners without losing the
         // subscribe-then-list race: later commits dirty them again.
         for (&client.subscriptions) |*entry| if (entry.*) |*subscription| {
-            if (!subscription.dirty or client.protocol.transmits.items.len == client.protocol.config.max_transmits) continue;
+            if (client.protocol.transmits.items.len == client.protocol.config.max_transmits) continue;
+            if (subscription.statecharts) |*watch| {
+                try self.notifyStatecharts(client, subscription, watch);
+                continue;
+            }
+            if (!subscription.dirty) continue;
             var arena: std.heap.ArenaAllocator = .init(self.allocator);
             defer arena.deinit();
             try client.protocol.sendNotification("notifications/tools/list_changed", try subscriptionParams(arena.allocator(), subscription.id.value));
             subscription.dirty = false;
         };
+    }
+
+    /// Push for statechart_uri: notify when the ring grew or the source
+    /// generation changed since the last notification, coalesced to one
+    /// outstanding notification until a runtime.statecharts read. Nothing is
+    /// sent, and nothing wakes, while no record arrives.
+    fn notifyStatecharts(self: *ControlServer, client: *Client, subscription: *Subscription, watch: *StatechartWatch) !void {
+        const store = self.statecharts orelse return;
+        if (watch.pending and store.reads > watch.read_mark) watch.pending = false;
+        if (watch.pending) return;
+        if (store.next_sequence == watch.sequence and self.generation == watch.generation) return;
+        var arena: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var params = try subscriptionParams(a, subscription.id.value);
+        try params.object.put(a, "uri", mcp.string(statechart_uri));
+        try client.protocol.sendNotification("notifications/resources/updated", params);
+        watch.* = .{ .sequence = store.next_sequence, .generation = self.generation, .read_mark = store.reads, .pending = true };
     }
 
     fn handleCall(
@@ -709,14 +760,31 @@ pub const ControlServer = struct {
                 \\{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"ourokit","version":"0.1.0"}},"ttlMs":60000,"cacheScope":"private"}
             , .{});
             defer doc.deinit();
+            // Development endpoints with statecharts also offer statechart_uri.
+            if (self.statecharts != null) {
+                var arena: std.heap.ArenaAllocator = .init(self.allocator);
+                defer arena.deinit();
+                const capabilities = doc.value.object.getPtr("capabilities").?;
+                try capabilities.object.put(arena.allocator(), "resources", try mcp.object(arena.allocator(), .{.{ "subscribe", mcp.Value{ .bool = true } }}));
+                return client.protocol.sendResult(call, doc.value);
+            }
             return client.protocol.sendResult(call, doc.value);
         }
         if (std.mem.eql(u8, request.method, "tools/list")) return self.sendTools(client, call);
         if (std.mem.eql(u8, request.method, "subscriptions/listen")) {
             const notifications = mcp.get(request.params orelse return client.protocol.sendError(call, -32602, "Missing subscription filter", null), "notifications") orelse
                 return client.protocol.sendError(call, -32602, "Missing subscription filter", null);
-            const changed = mcp.get(notifications, "toolsListChanged") orelse return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
-            if (changed != .bool or !changed.bool) return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
+            // Either the tool catalog, or (development) the statechart feed.
+            var watch: ?StatechartWatch = null;
+            if (mcp.get(notifications, "resourceSubscriptions")) |uris| {
+                const store = self.statecharts orelse return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
+                if (uris != .array or uris.array.items.len != 1 or !mcp.isString(uris.array.items[0], statechart_uri))
+                    return client.protocol.sendError(call, -32602, "Unknown resource", null);
+                watch = .{ .sequence = store.next_sequence, .generation = self.generation, .read_mark = store.reads };
+            } else {
+                const changed = mcp.get(notifications, "toolsListChanged") orelse return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
+                if (changed != .bool or !changed.bool) return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
+            }
             const slot = for (&client.subscriptions) |*entry| {
                 if (entry.* == null) break entry;
             } else return client.protocol.sendError(call, -32000, "Subscription capacity exceeded", null);
@@ -728,9 +796,15 @@ pub const ControlServer = struct {
             defer arena.deinit();
             const a = arena.allocator();
             var params = try subscriptionParams(a, id.value);
-            try params.object.put(a, "notifications", try mcp.object(a, .{.{ "toolsListChanged", mcp.Value{ .bool = true } }}));
+            if (watch != null) {
+                var uris = std.json.Array.init(a);
+                try uris.append(mcp.string(statechart_uri));
+                try params.object.put(a, "notifications", try mcp.object(a, .{.{ "resourceSubscriptions", mcp.Value{ .array = uris } }}));
+            } else {
+                try params.object.put(a, "notifications", try mcp.object(a, .{.{ "toolsListChanged", mcp.Value{ .bool = true } }}));
+            }
             try client.protocol.sendNotification("notifications/subscriptions/acknowledged", params);
-            slot.* = .{ .call = call, .id = id };
+            slot.* = .{ .call = call, .id = id, .statecharts = watch };
             return;
         }
         if (!std.mem.eql(u8, request.method, "tools/call")) return client.protocol.sendError(call, -32601, "Method not found", null);

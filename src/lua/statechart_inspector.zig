@@ -40,6 +40,15 @@ pub const Store = struct {
     keep_alive_ms: u64 = 30_000,
     max_record_bytes: usize = 256 * 1024,
     actors: std.StringArrayHashMapUnmanaged(Actor) = .empty,
+    /// runtime.statecharts calls so far, and live statechart_uri subscribers
+    /// (the control server counts them): both keep the observer attached.
+    reads: u64 = 0,
+    subscribers: usize = 0,
+    /// runtime.send deliveries in flight: null until the task completes.
+    results: std.AutoHashMapUnmanaged(u64, ?[]u8) = .empty,
+    next_token: u64 = 1,
+    /// This instance's development socket path, set once the server exists.
+    endpoint: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Store {
         if (capacity == 0) return error.InvalidCapacity;
@@ -53,6 +62,10 @@ pub const Store = struct {
         self.allocator.free(self.ring);
         self.clearActors();
         self.actors.deinit(self.allocator);
+        var results = self.results.valueIterator();
+        while (results.next()) |value| if (value.*) |bytes| self.allocator.free(bytes);
+        self.results.deinit(self.allocator);
+        if (self.endpoint) |path| self.allocator.free(path);
         self.* = undefined;
     }
 
@@ -62,7 +75,7 @@ pub const Store = struct {
 
     /// False once no client has asked for records within keep_alive_ms.
     pub fn wanted(self: *const Store) bool {
-        return self.elapsedMs() -| self.last_request_ms <= self.keep_alive_ms;
+        return self.subscribers > 0 or self.elapsedMs() -| self.last_request_ms <= self.keep_alive_ms;
     }
 
     fn freeActor(self: *Store, actor: *Actor) void {
@@ -130,6 +143,19 @@ pub const Store = struct {
         self.next_sequence += 1;
     }
 
+    /// The finished delivery's JSON (caller frees), or null while running.
+    pub fn takeResult(self: *Store, token: u64) ?[]u8 {
+        const entry = self.results.getEntry(token) orelse return null;
+        const bytes = entry.value_ptr.* orelse return null;
+        _ = self.results.remove(token);
+        return bytes;
+    }
+
+    /// Forget an abandoned delivery; a later completion is discarded.
+    pub fn dropResult(self: *Store, token: u64) void {
+        if (self.results.fetchRemove(token)) |entry| if (entry.value) |bytes| self.allocator.free(bytes);
+    }
+
     /// Oldest retained sequence, or next_sequence when the ring is empty.
     pub fn firstSequence(self: *const Store) u64 {
         const oldest = self.ring[self.head] orelse (self.ring[0] orelse return self.next_sequence);
@@ -158,57 +184,7 @@ fn monotonicNs() u64 {
 }
 
 const registry_key = "ouro.statechart_inspector";
-
-// Returns attach(), idempotent per VM. Records already carry time_ms and
-// guard valve states; seeded snapshots add pending timers and invokes.
-const bridge_source =
-    \\local publish, ouro = ...
-    \\local machine, json = ouro.machine, ouro.json
-    \\if not machine then return nil end
-    \\local unsubscribe
-    \\local function send(kind, record)
-    \\  local ok, bytes = pcall(json.encode, record)
-    \\  if not ok then
-    \\    kind, bytes = 'other', json.encode({kind = 'encode_error', actor = record.actor,
-    \\      machine = record.machine, message = tostring(bytes)})
-    \\  end
-    \\  return publish(kind, record.actor or '', bytes)
-    \\end
-    \\local function observe(record)
-    \\  local kind = record.kind == 'actor' and record.action or record.kind
-    \\  if not send(kind, record) and unsubscribe then unsubscribe(); unsubscribe = nil end
-    \\end
-    \\-- Current state of one actor as a synthetic started + transition pair.
-    \\local function seed(actor)
-    \\  local clock = actor._scheduler and actor._scheduler.clock
-    \\  local now = clock and clock() or nil
-    \\  send('seed_started', {kind = 'actor', action = 'started', actor = actor.path, machine = actor.chart.id,
-    \\    parent = actor._parent and actor._parent.path, graph = actor.chart:graph(), seeded = true, time_ms = now})
-    \\  local snapshot = machine.plain(actor:snapshot())
-    \\  local record = {kind = 'transition', actor = actor.path, machine = actor.chart.id, origin = 'attach',
-    \\    seeded = true, event = {type = 'ouro.attach'}, handled = true, rejected = false, time_ms = now,
-    \\    microsteps = {}, exited = {}, entered = {}, timers = {}, invokes = {}, children = {}, actions = {},
-    \\    states = snapshot.states, status = snapshot.status, context = snapshot.context}
-    \\  for _, live in ipairs(actor.pending_timers and actor:pending_timers() or {}) do
-    \\    record.timers[#record.timers + 1] = {action = 'started', state = live.state, delay = live.delay,
-    \\      event = live.event, token = live.token, time_ms = live.time_ms}
-    \\  end
-    \\  for _, live in ipairs(actor.pending_invokes and actor:pending_invokes() or {}) do
-    \\    record.invokes[#record.invokes + 1] = {action = 'started', state = live.state, id = live.id,
-    \\      src = live.src, token = live.token, time_ms = live.time_ms}
-    \\  end
-    \\  send('seed_latest', record)
-    \\end
-    \\return function()
-    \\  if unsubscribe then return end
-    \\  unsubscribe = machine.inspect(observe)
-    \\  publish('seed_reset', '', '{}')
-    \\  for _, actor in ipairs(machine.actors()) do
-    \\    local ok, err = pcall(seed, actor)
-    \\    if not ok then print('statechart inspector cannot seed ' .. tostring(actor.path) .. ': ' .. tostring(err)) end
-    \\  end
-    \\end
-;
+const bridge_source = @embedFile("statechart_inspector.lua");
 
 /// Installs the inactive bridge in a VM whose `ouro.machine` is installed.
 pub fn install(vm: *vm_module.Vm, store: *Store) !void {
@@ -219,23 +195,86 @@ pub fn install(vm: *vm_module.Vm, store: *Store) !void {
         return error.StatechartInspectorInitializationFailed;
     c.lua_pushlightuserdata(state, store);
     c.lua_pushcclosure(state, publish, 1);
+    c.lua_pushlightuserdata(state, store);
+    c.lua_pushcclosure(state, complete, 1);
     vm.pushApi(state);
-    if (c.lua_pcallk(state, 2, 1, 0, 0, null) != c.ok)
+    if (c.lua_pcallk(state, 3, 1, 0, 0, null) != c.ok)
         return error.StatechartInspectorInitializationFailed;
     c.lua_setfield(state, c.registry_index, registry_key);
+    // ouro.development_endpoint() -> 'unix:<path>' of this --dev instance.
+    vm.pushApi(state);
+    c.lua_pushlightuserdata(state, store);
+    c.lua_pushcclosure(state, endpoint, 1);
+    c.lua_setfield(state, -2, "development_endpoint");
+}
+
+fn endpoint(state: *c.State) callconv(.c) c_int {
+    const store: *Store = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)) orelse return 0));
+    const path = store.endpoint orelse return 0;
+    _ = c.lua_pushstring(state, "unix:");
+    _ = c.lua_pushlstring(state, path.ptr, path.len);
+    c.lua_concat(state, 2);
+    return 1;
+}
+
+/// Pushes bridge[name] and returns true, or pushes nothing when the VM has
+/// no bridge (no ouro.machine).
+fn pushBridge(state: *c.State, name: [*:0]const u8) bool {
+    if (c.lua_getfield(state, c.registry_index, registry_key) != c.type_table) {
+        c.lua_settop(state, -2);
+        return false;
+    }
+    _ = c.lua_getfield(state, -1, name);
+    c.lua_rotate(state, -2, 1);
+    c.lua_settop(state, -2);
+    return true;
 }
 
 /// Called by the development endpoint at a safe point, with no task running:
 /// renews the keep-alive and attaches the active VM's bridge if needed.
-/// Seeding reads actor snapshots, pending timers and invokes, and graphs;
-/// it runs no application callbacks.
+/// Seeding reads actor snapshots, pending timers and invokes, graphs and
+/// accepted events; it runs no application callbacks besides guards.
 pub fn attach(vm: *vm_module.Vm, store: *Store) !void {
     store.last_request_ms = store.elapsedMs();
+    store.reads += 1;
     const state = vm.state;
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    if (c.lua_getfield(state, c.registry_index, registry_key) != c.type_function) return;
+    if (!pushBridge(state, "attach")) return;
     if (c.lua_pcallk(state, 0, 0, 0, 0, null) != c.ok) return error.StatechartInspectorAttachFailed;
+}
+
+/// One actor's complete current state as owned JSON, or null when no live
+/// actor has that path. Same safe-point rules as attach.
+pub fn inspect(allocator: std.mem.Allocator, vm: *vm_module.Vm, path: []const u8) !?[]u8 {
+    const state = vm.state;
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    if (!pushBridge(state, "inspect")) return null;
+    _ = c.lua_pushlstring(state, path.ptr, path.len);
+    if (c.lua_pcallk(state, 1, 1, 0, 0, null) != c.ok) return error.StatechartInspectFailed;
+    const bytes = argument(state, -1) orelse return null;
+    return try allocator.dupe(u8, bytes);
+}
+
+/// Spawns runtime.send's delivery as a task in the active VM's application
+/// scope; its JSON result arrives through takeResult(token).
+pub fn send(vm: *vm_module.Vm, store: *Store, request_json: []const u8) !u64 {
+    const state = vm.state;
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    if (!pushBridge(state, "send")) return error.StatechartInspectionUnavailable;
+    const reference = c.luaL_ref(state, c.registry_index);
+    defer c.luaL_unref(state, c.registry_index, reference);
+    const token = store.next_token;
+    store.next_token += 1;
+    try store.results.put(store.allocator, token, null);
+    errdefer _ = store.results.remove(token);
+    _ = try vm.spawnReference(vm.scheduler.application_scope, reference, &.{
+        .{ .integer = @intCast(token) },
+        .{ .string = request_json },
+    });
+    return token;
 }
 
 fn argument(state: *c.State, index: c_int) ?[]const u8 {
@@ -255,6 +294,19 @@ fn publish(state: *c.State) callconv(.c) c_int {
     store.publish(kind, actor, bytes) catch |err| return fail(state, @errorName(err));
     c.lua_pushboolean(state, @intFromBool(store.wanted()));
     return 1;
+}
+
+/// complete(token, json): a runtime.send task's result.
+fn complete(state: *c.State) callconv(.c) c_int {
+    const store: *Store = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)) orelse return 0));
+    var is_number: c_int = 0;
+    const token = c.lua_tointegerx(state, 1, &is_number);
+    const bytes = argument(state, 2) orelse return fail(state, "statechart complete expects JSON bytes");
+    if (is_number == 0 or token < 0) return fail(state, "statechart complete expects a token");
+    const entry = store.results.getPtr(@intCast(token)) orelse return 0;
+    if (entry.* != null) return 0;
+    entry.* = store.allocator.dupe(u8, bytes) catch |err| return fail(state, @errorName(err));
+    return 0;
 }
 
 fn fail(state: *c.State, message: [*:0]const u8) c_int {

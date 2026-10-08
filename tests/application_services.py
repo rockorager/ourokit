@@ -279,7 +279,7 @@ return o.app {id='dev.test.catalog', actions={
                 # Production automation never grants development or activation.
                 for method in ('runtime.reload', 'runtime.status', 'runtime.activate',
                                'runtime.inspect', 'runtime.input', 'runtime.capture',
-                               'runtime.metrics', 'runtime.diagnostics', 'runtime.statecharts'):
+                               'runtime.metrics', 'runtime.diagnostics', 'runtime.statecharts', 'runtime.send'):
                     assert call(endpoint, method)['rpcError']['code'] == -32602
                 assert call(endpoint, 'Probe')['isError'] is False
                 if mode == "trailing":
@@ -485,12 +485,12 @@ return o.app {
                 status = call(path, "runtime.status")["structuredContent"]
                 assert status["uiActive"] is False
                 info = request(path, "server/discover")["result"]
-                assert info["supportedVersions"] == ["2026-07-28"] and info["capabilities"] == {"tools": {"listChanged": True}}
+                assert info["supportedVersions"] == ["2026-07-28"] and info["capabilities"] == {"tools": {"listChanged": True}, "resources": {"subscribe": True}}
                 assert info["ttlMs"] == 60000 and info["cacheScope"] == "private"
                 tools = request(path, "tools/list")["result"]
                 assert {t["name"] for t in tools["tools"]} == {
                     "runtime.status", "runtime.reload", "runtime.inspect", "runtime.input",
-                    "runtime.capture", "runtime.metrics", "runtime.diagnostics", "runtime.statecharts",
+                    "runtime.capture", "runtime.metrics", "runtime.diagnostics", "runtime.statecharts", "runtime.send",
                     "Get", "Set", "Delayed", "Invalid", "Fail"}
                 assert call(path, "runtime.inspect")["structuredContent"] == {"windows": []}
                 assert call(path, "runtime.metrics")["structuredContent"] == {"windows": []}

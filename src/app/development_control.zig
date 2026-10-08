@@ -18,6 +18,9 @@ pub const Service = struct {
     io: std.Io,
     pending: ?control.DevelopmentRequest = null,
     playback: ?dev.Playback = null,
+    /// runtime.send delivery running as a task in the application VM.
+    statechart_send: ?u64 = null,
+    statecharts: ?*lua.StatechartInspector = null,
     runtime: ?*WindowRuntime = null,
     failure: ?anyerror = null,
     captures: [4]?struct { path: [:0]u8, identity: PathIdentity } = @splat(null),
@@ -37,6 +40,8 @@ pub const Service = struct {
     }
 
     fn finish(self: *Service) void {
+        if (self.statechart_send) |token| self.statecharts.?.dropResult(token);
+        self.statechart_send = null;
         self.pending.?.deinit();
         self.pending = null;
         self.playback = null;
@@ -58,6 +63,16 @@ pub const Service = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
+        if (self.statechart_send) |token| {
+            const store = self.statecharts.?;
+            const bytes = store.takeResult(token) orelse return false;
+            defer self.allocator.free(bytes);
+            self.statechart_send = null;
+            const value = try std.json.parseFromSliceLeaky(mcp.Value, a, bytes, .{ .allocate = .alloc_always });
+            _ = try server.completeDevelopment(request.token, value, mcp.get(value, "error") != null);
+            self.finish();
+            return true;
+        }
         if (self.playback) |*playback| {
             const runtime = self.runtime.?;
             // Avoid touching a deinitialized/reused slot after native close.
@@ -166,6 +181,15 @@ pub const Service = struct {
             return try mcp.object(a, .{.{ "windows", mcp.Value{ .array = list } }});
         }
         if (std.mem.eql(u8, name, "runtime.statecharts")) return try statecharts(a, reload, args);
+        if (std.mem.eql(u8, name, "runtime.send")) {
+            // Delivered by a task in the application VM: send needs the task
+            // phase for effects and wait_for. poll completes the request.
+            const store = reload.config.statecharts orelse return error.StatechartInspectionUnavailable;
+            const bytes = try std.json.Stringify.valueAlloc(a, args, .{});
+            self.statechart_send = try lua.sendStatechartEvent(&reload.active().vm, store, bytes);
+            self.statecharts = store;
+            return null;
+        }
         if (server.reloading) return error.DevelopmentReloadInProgress;
         const id = try stringField(args, "window");
         const runtime = for (windows) |window| {
@@ -233,6 +257,12 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
     // it and (re)attaches the active generation, seeding current actors.
     store.keep_alive_ms = @min(try unsignedField(args, "keep_alive_ms", 30_000), 600_000);
     try lua.attachStatechartInspector(&reload.active().vm, store);
+    // actor: one live actor's complete current state, read now.
+    const snapshot: ?mcp.Value = if (mcp.get(args, "actor") != null) blk: {
+        const path = try stringField(args, "actor");
+        const bytes = try lua.inspectStatechart(a, &reload.active().vm, path) orelse return error.StatechartActorNotFound;
+        break :blk try std.json.parseFromSliceLeaky(mcp.Value, a, bytes, .{ .allocate = .alloc_always });
+    } else null;
     const after = try unsignedField(args, "after", 0);
     const limit = @min(try unsignedField(args, "limit", 256), 1024);
     // Lua MCP clients convert at most 4096 values per reply; text mode keeps
@@ -269,6 +299,7 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
         .{ "dropped", mcp.Value{ .bool = after + 1 < first and store.next_sequence > 1 } },
         .{ "time_ms", integer(store.elapsedMs()) },
         .{ "seed", integer(store.seed) },
+        .{ "reads", integer(store.reads) },
         .{ "records", mcp.Value{ .array = collect.list } },
     });
     // A client passing the seed it last saw gets actors whenever it changed.
@@ -290,6 +321,7 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
         }
         try result.object.put(a, "actors", .{ .array = actors });
     }
+    if (snapshot) |value| try result.object.put(a, "actor", value);
     return result;
 }
 

@@ -951,7 +951,7 @@ declared action sets may change on reload. Production never exposes reload.
 instance path to each command; development never discovers a production app ID.
 The private, same-UID endpoint also accepts MCP `tools/call` with the corresponding
 `runtime.inspect`, `runtime.input`, `runtime.capture`, `runtime.diagnostics`,
-`runtime.metrics`, and `runtime.statecharts` names. These tools are absent from
+`runtime.metrics`, `runtime.statecharts` and `runtime.send` names. These tools are absent from
 `--mcp` production endpoints.
 
 ```sh
@@ -1000,7 +1000,7 @@ tasks, animation completion or compositor presentation. Cancellation/disconnect
 releases an in-flight press through routing but cannot undo callbacks already
 run. Inspection and diagnostics do not evaluate Lua or expose arbitrary mutation.
 
-`runtime.statecharts {after, limit, actors, seed, text, keep_alive_ms}` is
+`runtime.statecharts {after, limit, actors, seed, text, keep_alive_ms, actor}` is
 experimental and follows the `ouro.machine` prototype
 ([design](../design/statecharts.md#10-inspection-hooks)). Nothing is observed
 until the first call. That call attaches an `ouro.machine.inspect` observer to
@@ -1020,8 +1020,22 @@ as `ouro.mcp`, which converts at most 4,096 values per reply. Records also
 carry `accepted`, the declared events the actor would take at that moment.
 Attaching runs host Lua in the application VM at a safe point. That Lua reads
 snapshots and graphs and evaluates guards through `actor:accepted()`.
-Production instances install nothing. See the
-[statechart plant](../tools/statechart-visualizer/README.md) visualizer.
+Production instances install nothing. `actor = path` adds that actor's
+complete current state (configuration, full context, children, pending timers
+and invokes, accepted events and graph), read at the call.
+
+Instead of polling, a client can subscribe to the resource
+`ouro://statecharts` with `subscriptions/listen` and fetch on each
+`notifications/resources/updated`. The endpoint notifies at most once per
+`runtime.statecharts` call and never while no records arrive. A live
+subscription keeps the observer attached.
+
+`runtime.send {actor, event, wait?}` delivers one event to a live actor
+through its normal send path, as a task, labeled origin `dev` in records and
+recordings. It returns `{accepted, reason, states, changed, changes, sequence,
+commit}`, and with `wait = {states?, timeout_ms?}` waits through
+`machine.wait_for`. Unknown actors and invalid events are tool errors. See the
+[statechart visualizer](../tools/statechart-visualizer/README.md).
 
 Capture returns `{window, token, kind, path, width, height, bytes}`. Its kind is
 `software_scene_replay`, never presented GPU readback. The endpoint retains four
