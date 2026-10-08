@@ -17,6 +17,7 @@ local chart = machine.create {
     transform = { x = 3, y = 4, origin = { x = 0, y = 0 } },
     shadow = { color = '#000000', blur = 2 },
     spans = { { text = 'from ' }, { text = 'context', weight = 'medium' } },
+    choices = { { value = 1, label = 'One' }, { value = 2, label = 'Two' } },
     count = 0,
   },
   events = { BUMP = {} },
@@ -51,6 +52,7 @@ return {
       return o.column { key = 'root',
         o.box { key = 'moved', width = 10, height = 10, transform = c.transform, shadow = c.shadow },
         o.text { key = 'rich', spans = c.spans },
+        o.select { key = 'choice', label = 'Choice', options = c.choices, selected = 2, on_select = function() end },
         -- Encoding the whole context reads every key, so this text follows it.
         o.text { key = 'json', text = tostring(o.json.decode(o.json.encode(c)).count) },
       }
@@ -58,6 +60,7 @@ return {
     assert(t:node('root/moved'))
     assert(t:node('root/rich').label == 'from context', t:node('root/rich').label)
     assert(t:node('root/json').label == '0')
+    assert(t:node('root/choice/trigger').label == 'Choice: Two', t:node('root/choice/trigger').label)
     actor:send('BUMP')
     assert(t:node('root/json').label == '1', t:node('root/json').label)
   end,

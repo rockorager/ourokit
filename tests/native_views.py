@@ -35,6 +35,8 @@ local chart = machine.create {
     request = { method = 'POST', headers = { ['x-view'] = 'yes' }, body = 'from context' },
     write = { permissions = 'private' },
     read = { max_bytes = 64 },
+    notification = { title = 'Saved', body = 'from context', actions = { { id = 'open', label = 'Open' } } },
+    chooser = { title = 'Pick', filters = { { name = 'Text', patterns = { '*.txt' } } } },
   },
   events = { FOUND = { entry = 'table' } },
   states = { idle = { on = { FOUND = { actions = machine.assign { entry = function(_, e) return e.entry end } } } } },
@@ -90,6 +92,24 @@ section('prepare_launch', function()
   actor:send { type = 'FOUND', entry = entries[1] }
   local launch = o.xdg.applications.prepare_launch(actor:context().entry)
   assert(launch.argv[1] == 'viewer' and launch.argv[2] == '--flag', table.concat(launch.argv, ' '))
+end)
+
+section('desktop', function()
+  -- A notification spec from context reaches a notification server.
+  local service <close> = check('connect', o.dbus.connect('session'))
+  local received
+  local export <close> = check('export', service:export { path = '/org/freedesktop/Notifications',
+    interface = 'org.freedesktop.Notifications', signals = {}, methods = {
+      Notify = { input = 'susssasa{sv}i', output = 'u', handler = function(r) received = r.args; return { 1 } end },
+      CloseNotification = { input = 'u', output = '', handler = function() return {} end },
+    } })
+  local name <close> = check('own_name', service:own_name('org.freedesktop.Notifications'))
+  local client <close> = check('notifications', o.desktop.notifications())
+  check('send', client:send(c.notification))
+  assert(received[4] == 'Saved' and received[6][1] == 'open' and received[6][2] == 'Open', 'notification arguments')
+  -- Portal options pass validation; this bus has no portal to answer.
+  local _, err = o.desktop.choose_file(c.chooser)
+  assert(err and err.name ~= 'InvalidOptions', err and err.message)
 end)
 
 if #failures > 0 then
@@ -179,4 +199,4 @@ for check in (script_check, mcp_check):
     except AssertionError as error:
         failed.append(f"{check.__name__}: {error}")
 assert not failed, "\n".join(failed)
-print("PASS native APIs accept context views: D-Bus call/emit, HTTP, files, prepare_launch and MCP output")
+print("PASS native APIs accept context views: D-Bus call/emit, HTTP, files, prepare_launch, desktop and MCP output")

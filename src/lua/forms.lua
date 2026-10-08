@@ -77,7 +77,8 @@ ouro.select = ouro.stateful(function(props)
   end
   return function()
     menus.validate(props)
-    assert(type(props.options)=='table' and #props.options>0, 'select requires options')
+    -- Options from statechart context are views (userdata), read as tables.
+    assert(type(ouro.machine.raw(props.options))=='table' and #props.options>0, 'select requires options')
     local label
     local seen={}
     for _, item in ipairs(props.options) do
@@ -104,7 +105,7 @@ end)
 ouro.tabs = ouro.stateful(function(props)
   return function()
     assert(type(props.key)=='string' and type(props.label)=='string', 'tabs requires key and label')
-    assert(type(props.tabs)=='table' and #props.tabs>0, 'tabs requires nonempty tabs')
+    assert(type(ouro.machine.raw(props.tabs))=='table' and #props.tabs>0, 'tabs requires nonempty tabs')
     assert(math.type(props.selected)=='integer', 'tabs selected must be an integer')
     local seen, selected={}, false
     local headers, panels={}, {}

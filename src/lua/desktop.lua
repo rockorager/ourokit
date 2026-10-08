@@ -5,7 +5,11 @@ local request_iface = 'org.freedesktop.portal.Request'
 local serial = 0
 
 local function failure(name, message) return nil, {kind='desktop', name=name, message=message} end
+-- Options often come from statechart context, whose tables are read-only
+-- views (userdata); read them as the tables behind them.
+local function raw(value) return ouro.machine and ouro.machine.raw(value) or value end
 local function table_options(value)
+  value = raw(value)
   if value == nil then return {} end
   if type(value) ~= 'table' then return nil, {kind='desktop',name='InvalidOptions',message='options must be a table'} end
   return value
@@ -88,16 +92,19 @@ local function dict(result,key,signature)
   end
 end
 local function filters(value)
+  value = raw(value)
   if value == nil then return nil end
   if type(value) ~= 'table' then return nil, 'filters must be a table' end
   local out={}
   for i,filter in ipairs(value) do
+    filter = raw(filter)
     if type(filter)~='table' or type(filter.name)~='string' then return nil,'filter #'..i..' needs a name' end
     local rules={}
-    if filter.patterns ~= nil and type(filter.patterns)~='table' then return nil,'filter patterns must be a table' end
-    if filter.mime_types ~= nil and type(filter.mime_types)~='table' then return nil,'filter MIME types must be a table' end
-    for _,pattern in ipairs(filter.patterns or {}) do if type(pattern)~='string' then return nil,'filter pattern must be a string' end; rules[#rules+1]={0,pattern} end
-    for _,mime in ipairs(filter.mime_types or {}) do if type(mime)~='string' then return nil,'filter MIME type must be a string' end; rules[#rules+1]={1,mime} end
+    local patterns, mime_types = raw(filter.patterns), raw(filter.mime_types)
+    if patterns ~= nil and type(patterns)~='table' then return nil,'filter patterns must be a table' end
+    if mime_types ~= nil and type(mime_types)~='table' then return nil,'filter MIME types must be a table' end
+    for _,pattern in ipairs(patterns or {}) do if type(pattern)~='string' then return nil,'filter pattern must be a string' end; rules[#rules+1]={0,pattern} end
+    for _,mime in ipairs(mime_types or {}) do if type(mime)~='string' then return nil,'filter MIME type must be a string' end; rules[#rules+1]={1,mime} end
     if #rules==0 then return nil,'filter #'..i..' has no patterns or MIME types' end
     out[#out+1]={filter.name,rules}
   end
@@ -174,14 +181,16 @@ end
 local notify_name,notify_path='org.freedesktop.Notifications','/org/freedesktop/Notifications'
 local notifications={}; notifications.__index=notifications
 local function notification_args(spec,replaces)
+  spec = raw(spec)
   if type(spec)~='table' then return nil,'notification must be a table' end
   for _,item in ipairs{{'app_name','string'},{'icon','string'},{'title','string'},{'body','string'},{'timeout','number'}} do
     if spec[item[1]]~=nil and type(spec[item[1]])~=item[2] then return nil,item[1]..' must be a '..item[2] end
   end
   if spec.timeout~=nil and (spec.timeout%1~=0 or spec.timeout < -1 or spec.timeout>2147483647) then return nil,'timeout must be an integer from -1 to 2147483647' end
   local actions={}
-  if spec.actions~=nil and type(spec.actions)~='table' then return nil,'actions must be a table' end
-  for i,a in ipairs(spec.actions or {}) do if type(a)~='table' or type(a.id)~='string' or type(a.label)~='string' then return nil,'invalid action #'..i end; actions[#actions+1]=a.id; actions[#actions+1]=a.label end
+  local spec_actions = raw(spec.actions)
+  if spec_actions~=nil and type(spec_actions)~='table' then return nil,'actions must be a table' end
+  for i,a in ipairs(spec_actions or {}) do a=raw(a); if type(a)~='table' or type(a.id)~='string' or type(a.label)~='string' then return nil,'invalid action #'..i end; actions[#actions+1]=a.id; actions[#actions+1]=a.label end
   local hints={}; if spec.hints~=nil and type(spec.hints)~='table' then return nil,'hints must be a table' end
   for k,v in pairs(spec.hints or {}) do if type(k)~='string' or type(v)~='userdata' then return nil,'hints must map strings to D-Bus variants' end; hints[#hints+1]={k,v} end
   return {spec.app_name or '',replaces or 0,spec.icon or '',spec.title or '',spec.body or '',actions,hints,spec.timeout or -1}
