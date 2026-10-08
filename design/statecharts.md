@@ -32,7 +32,7 @@ Test names are from `tests/machine_test.lua` unless a file is given.
 | **G5** One event model for widgets, shortcuts, commands, palette, MCP, activation and surfaces, with request/response | §2 (send results, `wait_for`, `deliver`, `machine.actions`), §7 | `bindings_test.lua`; 'send reports whether the event was taken…'; 'wait_for…'; 'actions derive MCP input schemas…'; `contacts.py` (MCP as chart events); `desktop_native.py` 'launcher: single instance toggles on activation', 'surface events: … close_requested decided by the chart' | met (a palette is bound buttons or options; there is no stock palette widget) |
 | **G6** Agent-first dev loop: inspect states and records, live visualizer, deterministic record/replay, generated tests, reload that keeps state | §10 (records, Dev tools), §9, §8 Logical time, §14 | `statechart_inspection.py`; `tools/statechart-visualizer/storybook.lua` (`recording/*` stories draw a real session); 'records carry the scheduler clock and post-step guard valves'; `chart_reload.py`; 'reload hooks persist roots…'; `chart_replay.py` (real stopwatch, contacts, documents and launcher sessions replay identically; a changed chart diverges at its first step; generated tests fail on it); `replay_test.lua`; `examples/*/tests/*_paths_test.jsonl` (`ouroctl test examples`) | met: recordings under `--dev`/`--record`, `ouroctl replay` with divergence reports, logical clocks, generated paths (guard-aware, seeded by recordings) as `ouroctl test` files, visualizer scrubbing (§14). Generated paths are not emitted as Storybook stories |
 | **G7** Performance at the real boundaries: few Lua–Zig crossings, per-field rebuild locality, cached views, unchanged text work; the interpreter stays in Lua and snapshots stay Lua tables | §6 Rebuild locality, Status | 'rebuild locality: typing in one document re-renders only its readers'; 'rebuild locality: fields, configuration and selectors'; 'views are cached per table…' | met: render counts and allocation are proven by tests; Lua–Zig crossings and text work by call-path analysis, not measured (performance is not measured yet, by decision) |
-| **G8** No fixed limits on runtime objects; actors and components release native resources on stop and unmount | §8 Resources and capacities | `zig build test-stress` (1000 rows × 50 remounts, 10k actors, back to baseline); `component_scopes_test.lua` (300 rows); `statechart_capacity.py`; growth unit tests (§8) | partly: application windows (16), virtual-list and layout-builder snapshots, and clipboard requests are still fixed; test-stress currently fails on retained cancelled timers (§8) |
+| **G8** No fixed limits on runtime objects; actors and components release native resources on stop and unmount | §8 Resources and capacities | `zig build test-stress` (1000 rows × 50 remounts, 10k actors, back to baseline); `component_scopes_test.lua` (300 rows); `statechart_capacity.py`; `many_windows.py` (40 windows); growth unit tests (§8) | partly: virtual-list and layout-builder snapshots and clipboard requests are still fixed; windows grow on a wayring branch not yet merged; test-stress currently fails on retained cancelled timers (§8) |
 | **G9** Failures reach charts instead of crashing: `surface.failed`, atomic commits, `YieldInAction`, rejected events with reasons | §1 Algorithm, §2 Sending, Runtime events | 'guard errors leave the previous snapshot in place'; 'an eventless livelock fails without committing…'; 'guards, assigns and actions cannot wait, spawn or exit'; 'review M6…'; `desktop_native.py` 'launcher surface … failure', 'unbound role change: logged, last valid window kept' | met |
 | **G10** Headless testability: `manual_scheduler`, `ouroctl test` settling, chart tests with fake services | §8 Tests, §0 Tests | `documents.py`, `contacts.py`, `launcher.py` (fake services); `stopwatch_test.lua`; `component_scopes_test.lua` 't:settle shows state changed from the test body' | met: native-scheduler tests run on a virtual logical clock (`t:advance`, §8); `replay_test.lua` |
 
@@ -839,10 +839,9 @@ never move (`core.StableSlots`).
 | HTTP requests (was 16) | stable chunks | 2c7c299 |
 | Per-window budgets: instances, render objects, semantic nodes and text, pointer bindings, buttons, text inputs, list boxes, animations, scene commands (was 256 nodes, 512 commands), UI build storage, prepared reload builds | while a build is prepared; large trees have linear repaint, allocation, retirement and inspection paths | be20adb |
 | D-Bus connections (8), calls (128), subscriptions (64), owned names (64); audio watchers (8) | stable chunks | a93ad61 |
+| Application windows (was 16): host windows, runtime slots, the window set, the reconcile queue, `windows()` evaluation and per-output expansion | host windows in stable chunks, runtime slots one allocation each; `application_window_capacity` is an initial size. Wayring's client object and ID tables grow (`ObjectConfig.growable`; wayring fa6f1bc on branch `growable-objects`, not yet on wayring main) | b56ae75 |
 
 **Still fixed, not by design (open):**
-- application windows (16): wayring sizes its object tables from it when it
-  connects;
 - per-build virtual list snapshots (32 lists, 256 materialized rows) and
   layout-builder snapshots (128), which are copied by value;
 - clipboard requests (16).
@@ -856,7 +855,11 @@ abuse or pathological depth. They do not count live objects:
 - inbound D-Bus method calls from peers (128);
 - the platform input-event queue;
 - compositor-mirrored outputs and workspaces, and mirrored PipeWire objects;
-- damage regions, which merge beyond 8 rectangles.
+- damage regions, which merge beyond 8 rectangles;
+- buffer creation waits while a Wayland connection already queues 28 file
+  descriptors, libwayland's per-message limit (`MAX_FDS_OUT`). Sending more
+  made sway drop the client when 40 windows mapped at once;
+- wayring's server-side per-client quotas.
 
 **Proof:**
 - `zig build test-stress` (`tests/capacity_stress.lua`) has two tests:
@@ -875,6 +878,8 @@ abuse or pathological depth. They do not count live objects:
   Before 7d20b81, it failed with "signal capacity exceeded".
 - `tests/statechart_capacity.py` keeps 3000 actors in a headless app. It used
   to fail at cycle 65.
+- `tests/many_windows.py`, part of `verify_development`, opens 40 windows and
+  closes back to 1, twice.
 - Unit tests:
   - the scope-growth test in `src/lua/scopes.zig`;
   - 'reconcile plans … at capacity' and 'reconcile grows instance and render
@@ -884,7 +889,17 @@ abuse or pathological depth. They do not count live objects:
   - the module loader loading nested modules with `module_capacity` 1;
   - 'HTTP requests owned by a retired state scope …', now with 20 requests;
   - 'stopped statechart actors release their hidden signals at once'
-    (`src/app/source_generation.zig`).
+    (`src/app/source_generation.zig`);
+  - 'forty windows open past the initial capacity and close back to baseline'
+    (`src/app/windows.zig`), 'runtime slots grow past their initial count and
+    keep addresses' (`wayland_runner.zig`) and 'registering a higher owner slot
+    grows the queue and keeps queued order' (`reconcile_queue.zig`);
+  - wayring: 'growable tables double when full and keep handles and
+    generations', 'growable client IDs extend the dense range and keep the
+    delete_id protocol', 'growable client objects create far more locals and
+    peers than their initial size' (`src/objects.zig`), and 'growable client
+    objects keep generated constructors working past their initial size'
+    (`test/client-core.zig`).
 
 ## 9. Reload keeps state
 
