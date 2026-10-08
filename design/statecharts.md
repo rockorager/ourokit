@@ -991,9 +991,10 @@ There is one record per processed event, including rejected ones:
   -- sequence counts this actor's records; commit is the global order in which
   -- snapshots committed. Records are emitted after their effects, so a child's
   -- record can arrive before the parent record that caused it: sort by commit.
-  origin = 'external',       -- external | timer | invoke | child | init | restore | stop
+  origin = 'external',       -- external | widget | callback | mcp | actor | timer | invoke | child | surface | runtime | init | restore | stop
+  from = nil,                -- origin 'actor': the sending actor's path (send_to / send_parent)
   event = { type = 'SAVE' },
-  handled = true, rejected = false, reason = nil,  -- reason: no_transition | stale | done | stopped
+  handled = true, rejected = false, reason = nil,  -- reason: no_transition | stale | done | stopped | error
   microsteps = {
     { event = 'SAVE', transitions = { { index = 12, source = 'open.io.idle', targets = { 'open.io.saving' }, event = 'SAVE', guard = nil } },
       exited = { 'open.io.idle' }, entered = { 'open.io.saving', 'open.io.saving.choosing' } },
@@ -1006,12 +1007,22 @@ There is one record per processed event, including rejected ones:
   children = { { action = 'spawned', id = 'document.3', machine = 'document' } },
   -- child action: spawned | stopped | done | error (+ error); tasks carry src instead of machine
   actions = { 'snapshot_save' },   -- action names in execution order
+  sent = { { kind = 'send_to', to = 'notes/document.2/dialog', event = 'OPEN', accepted = true } },
+  -- send_to / send_parent effects of this step (accepted, reason as send returns them)
+  error = nil,                     -- { code = 'YieldInAction', message = '...' } when the step raised
   states = { ... },                -- configuration after the step
   status = 'active',
   context = { ... },               -- plain deep copy of the context after the step
   guards = { { index = 12, passed = true }, { index = 14, passed = false, error = '...' } },
 }
 ```
+
+`error` marks a step that raised. When an action or another effect raises,
+the step stands and its record carries the first error. When a guard, assign
+or expression raises, nothing commits, but a record is still emitted with
+`rejected = true`, `reason = 'error'`, the error, and the unchanged states.
+Either way the error also reaches the sender. `code` is the message's
+`Name:` prefix (`YieldInAction`, `InvalidEvent`, ...) or `'Error'`.
 
 `guards` are valve states for the visualizer. They cover every guarded
 transition whose source is active after the step, evaluated against the

@@ -692,7 +692,16 @@ end
 
 local function new_record(event)
   return {kind = 'transition', event = event, handled = false, rejected = false, microsteps = {},
-    exited = {}, entered = {}, timers = {}, invokes = {}, children = {}, actions = {}}
+    exited = {}, entered = {}, timers = {}, invokes = {}, children = {}, actions = {}, sent = {}}
+end
+
+-- record.error: {code, message}. The code is the message's `Name:` prefix
+-- (YieldInAction, InvalidEvent, ...), after any `chunk:line: ` position, or
+-- 'Error'.
+local function error_info(err)
+  local message = tostring(err)
+  local code = message:match('^(%u%w+):') or message:match('^[^%s:]+:%d+: (%u%w+):')
+  return {code = code or 'Error', message = message}
 end
 
 local function apply_assign(m, a)
@@ -1189,7 +1198,7 @@ local function boundary(actor, kind, event, origin, fn, ...)
   end
   local hooks = recorded_depth == 0 and recorded(actor) and M._hooks or nil
   if hooks then
-    if origin == 'external' then
+    if origin == 'external' or origin == 'actor' then
       origin = depth > 0 and 'component' or (M._current_origin and M._current_origin()) or M._origin or 'app'
     end
     hooks.enter(actor, kind, event, origin)
@@ -2275,13 +2284,20 @@ local function run_effects(actor, effects, record)
           record.children[#record.children + 1] = {action = 'stopped', id = effect.id}
           actor._scheduler.close(task.scope)
         end
-      elseif kind == 'send_to' then
-        local child = actor._children[effect.id]
-        if not child then fail('machine %s has no child %q', actor.chart.id, tostring(effect.id)) end
-        child:send(effect.event)
-      elseif kind == 'send_parent' then
-        if not actor._parent then fail('machine %s has no parent', actor.chart.id) end
-        actor._parent:send(effect.event)
+      elseif kind == 'send_to' or kind == 'send_parent' then
+        local target
+        if kind == 'send_to' then
+          target = actor._children[effect.id]
+          if not target then fail('machine %s has no child %q', actor.chart.id, tostring(effect.id)) end
+        else
+          target = actor._parent
+          if not target then fail('machine %s has no parent', actor.chart.id) end
+        end
+        -- Inter-actor traffic is visible on both records: `sent` on the
+        -- sender's, origin 'actor' and `from` on the receiver's.
+        local sent = {kind = kind, to = target.path, event = effect.event.type}
+        record.sent[#record.sent + 1] = sent
+        sent.accepted, sent.reason = target:_send(effect.event, 'actor', actor.path)
       elseif kind == 'done' then
         actor._status = 'done'
         -- A finished actor runs nothing else; its state scopes are closed.
@@ -2380,7 +2396,20 @@ function Actor:_process()
   while #self._queue > 0 do
     local item = table.remove(self._queue, 1)
     local ok, err = pcall(function()
-      local snapshot, effects, record = transition(self.chart, self._snapshot, item.event)
+      local stepped, snapshot, effects, record = pcall(transition, self.chart, self._snapshot, item.event)
+      if not stepped then
+        -- A guard, assign or expression raised: nothing commits, but observers
+        -- still see the event, rejected with reason 'error'.
+        item.accepted, item.reason = false, 'error'
+        if wants_records(self) then
+          record = new_record(item.event)
+          record.rejected, record.reason, record.error = true, 'error', error_info(snapshot)
+          finalize(self, record, item.origin)
+          record.from = item.from
+          emit(self, record)
+        end
+        error(snapshot, 0)
+      end
       item.accepted, item.reason = not record.rejected, record.reason
       commit(self, snapshot)
       commits = commits + 1
@@ -2390,6 +2419,8 @@ function Actor:_process()
       step_hook(self, record, item.origin)
       if wants_records(self) then
         finalize(self, record, item.origin)
+        record.from = item.from
+        if effect_error ~= nil then record.error = error_info(effect_error) end
         emit(self, record)
       end
       if effect_error then error(effect_error, 0) end
@@ -2400,14 +2431,14 @@ function Actor:_process()
   if first_error ~= nil then error(first_error, 0) end
 end
 
-local function enqueue(actor, event, origin)
+local function enqueue(actor, event, origin, from)
   -- An outside input first lets due timers fire, before it joins the queue:
   -- otherwise a timer fired by the sync would process behind it.
   if depth == 0 then
     local sync = actor._scheduler.sync
     if sync then sync() end
   end
-  local item = {event = event, origin = origin}
+  local item = {event = event, origin = origin, from = from}
   actor._queue[#actor._queue + 1] = item
   if actor._processing then return nil, 'queued' end
   boundary(actor, 'input', event, origin, actor._process, actor)
@@ -2434,7 +2465,8 @@ end
 function Actor:send(event) return self:_send(event, 'external') end
 
 -- send with an origin label for records ('widget', 'mcp', 'invoke', ...).
-function Actor:_send(event, origin)
+-- `from` is the sending actor's path for send_to/send_parent (record.from).
+function Actor:_send(event, origin, from)
   event = normalize_event(event)
   if internal_type(event.type) then fail('InvalidEvent: %q is reserved for the machine runtime', event.type) end
   if not validate_event(self.chart, event) then return false, 'undeclared' end
@@ -2443,7 +2475,7 @@ function Actor:_send(event, origin)
     self:start() -- Component machines start on their first event.
   end
   if self._status == 'stopped' then return false, 'stopped' end
-  return enqueue(self, event, origin or 'external')
+  return enqueue(self, event, origin or 'external', from)
 end
 
 -- A plain event binding for widgets: exactly { actor, event, field }.

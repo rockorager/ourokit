@@ -1586,6 +1586,52 @@ return {
     assert(t:node('root/count').label == '3' and t:node('root/mode').label == 'idle')
   end,
 
+  ['records show inter-actor sends and errors'] = function()
+    local clock = machine.manual_scheduler()
+    local item = machine.create { id = 'item', initial = 'idle', events = { PING = {} }, states = {
+      idle = { on = { PING = { actions = machine.send_parent({ type = 'PONG' }) } } } } }
+    local list = machine.create { id = 'list', initial = 'ready', context = { n = 0 },
+      events = { ADD = {}, PING = {}, PONG = {}, BAD = {}, BOOM = {} },
+      states = { ready = { on = {
+        ADD = { actions = machine.spawn(item, { id = 'one' }) },
+        PING = { actions = machine.send_to('one', 'PING') },
+        PONG = { actions = assign { n = function(c) return c.n + 1 end } },
+        BAD = { guard = function() error('guard broke') end, target = 'ready' },
+        BOOM = { actions = function() error('InvalidThing: action broke') end },
+      } } } }
+    local records = {}
+    local stop = machine.inspect(function(r) if r.kind == 'transition' then records[#records + 1] = r end end)
+    local actor = list:start { scheduler = clock }
+    actor:send('ADD')
+    actor:send('PING')
+    stop()
+    local by = {}
+    for _, r in ipairs(records) do by[r.actor .. ':' .. r.event.type] = r end
+    local ping = by['list:PING']
+    assert(#ping.sent == 1 and ping.sent[1].kind == 'send_to' and ping.sent[1].to == 'list/one'
+      and ping.sent[1].event == 'PING', 'send_to is on the sender record')
+    local child = by['list/one:PING']
+    assert(child.origin == 'actor' and child.from == 'list', 'the receiver record names its sender')
+    assert(child.sent[1].kind == 'send_parent' and child.sent[1].to == 'list' and child.sent[1].event == 'PONG')
+    local pong = by['list:PONG']
+    assert(pong.origin == 'actor' and pong.from == 'list/one' and actor:context().n == 1)
+    assert(#by['list:ADD'].sent == 0 and by['list:ADD'].error == nil)
+
+    local seen = recorder(actor)
+    local ok, err = pcall(actor.send, actor, 'BAD')
+    assert(not ok and tostring(err):find('guard broke'))
+    local bad = last(seen)
+    assert(bad.event.type == 'BAD' and bad.rejected and bad.reason == 'error' and bad.error.code == 'Error'
+      and bad.error.message:find('guard broke') and join(bad.states) == 'ready' and bad.commit == nil,
+      'a transition error still emits a rejected record')
+    ok, err = pcall(actor.send, actor, 'BOOM')
+    assert(not ok and tostring(err):find('action broke'))
+    local boom = last(seen)
+    assert(boom.event.type == 'BOOM' and not boom.rejected and boom.error.code == 'InvalidThing'
+      and boom.error.message:find('action broke'), 'an effect error marks its record')
+    actor:stop()
+  end,
+
   ['a shared manual clock drops the timers and scopes of stopped and exited states'] = function()
     local clock = machine.manual_scheduler()
     local chart = machine.create { id = 'timed', initial = 'waiting', events = { FLIP = {} }, states = {
