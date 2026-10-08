@@ -1,6 +1,7 @@
 //! Generic, scoped D-Bus access. CQEs publish data; only continuations touch Lua.
 const std = @import("std");
 const linux = std.os.linux;
+const core = @import("../core/root.zig");
 const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
 const dbus = @import("../dbus/root.zig");
@@ -95,22 +96,26 @@ pub const Binding = struct {
     allocator: std.mem.Allocator,
     vm: *vm_module.Vm,
     loop: *io.Loop,
-    buses: []Bus,
-    subscriptions: []Subscription,
-    waits: []Wait,
+    /// Lua guards and other entries point into these pools, so they grow in
+    /// chunks that never move. Inbound requests stay bounded: peers send them.
+    buses: core.StableSlots(Bus),
+    subscriptions: core.StableSlots(Subscription),
+    waits: core.StableSlots(Wait),
     requests: [128]Request = @splat(.{}),
-    names: [64]Name = @splat(.{}),
+    names: core.StableSlots(Name),
     session_address: ?[]u8 = null,
     system_address: []u8,
     stopping: bool = false,
 
     pub fn init(self: *Binding, allocator: std.mem.Allocator, vm: *vm_module.Vm, loop: *io.Loop, environ: std.process.Environ) !void {
-        const buses = try allocator.alloc(Bus, 8);
-        errdefer allocator.free(buses);
-        const subscriptions = try allocator.alloc(Subscription, 64);
-        errdefer allocator.free(subscriptions);
-        const waits = try allocator.alloc(Wait, 128);
-        errdefer allocator.free(waits);
+        var buses = core.StableSlots(Bus).init(8);
+        errdefer buses.deinit(allocator);
+        var subscriptions = core.StableSlots(Subscription).init(64);
+        errdefer subscriptions.deinit(allocator);
+        var waits = core.StableSlots(Wait).init(128);
+        errdefer waits.deinit(allocator);
+        var names = core.StableSlots(Name).init(64);
+        errdefer names.deinit(allocator);
         const session = if (environ.getPosix("DBUS_SESSION_BUS_ADDRESS")) |address|
             try allocator.dupe(u8, address)
         else if (environ.getPosix("XDG_RUNTIME_DIR")) |directory|
@@ -120,10 +125,7 @@ pub const Binding = struct {
         errdefer if (session) |address| allocator.free(address);
         const system = try allocator.dupe(u8, environ.getPosix("DBUS_SYSTEM_BUS_ADDRESS") orelse "unix:path=/run/dbus/system_bus_socket");
         errdefer allocator.free(system);
-        self.* = .{ .allocator = allocator, .vm = vm, .loop = loop, .buses = buses, .subscriptions = subscriptions, .waits = waits, .session_address = session, .system_address = system };
-        for (buses) |*bus| bus.* = .{ .binding = self };
-        for (subscriptions) |*sub| sub.* = .{ .binding = self };
-        for (waits) |*wait| wait.* = .{ .binding = self };
+        self.* = .{ .allocator = allocator, .vm = vm, .loop = loop, .buses = buses, .subscriptions = subscriptions, .waits = waits, .names = names, .session_address = session, .system_address = system };
         const L = vm.state;
         const top = c.lua_gettop(L);
         defer c.lua_settop(L, top);
@@ -169,31 +171,37 @@ pub const Binding = struct {
     /// native scopes shared with its replacement. Pump until canDeinit().
     pub fn shutdown(self: *Binding) void {
         self.stopping = true;
-        for (self.buses) |*bus| if (bus.active) {
+        for (self.buses.chunks.items) |buses_chunk| for (buses_chunk) |*bus| if (bus.active) {
             bus.closing = true;
         };
     }
 
     pub fn canDeinit(self: *const Binding) bool {
-        for (self.buses) |bus| if (bus.active) return false;
-        for (self.waits) |wait| if (wait.active) return false;
-        for (self.subscriptions) |sub| if (sub.active and sub.scope != null) return false;
+        for (self.buses.chunks.items) |buses_chunk| for (buses_chunk) |bus| if (bus.active) return false;
+        for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |wait| if (wait.active) return false;
+        for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |sub| if (sub.active and sub.scope != null) return false;
         return true;
+    }
+
+    fn freeEntry(self: *Binding, comptime T: type, pool: *core.StableSlots(T)) !*T {
+        for (pool.chunks.items) |chunk| for (chunk) |*entry| if (!entry.active) return entry;
+        return pool.at(try pool.grow(self.allocator));
     }
 
     pub fn deinit(self: *Binding) void {
         std.debug.assert(self.canDeinit());
-        for (self.subscriptions) |*sub| if (sub.active) self.releaseSub(sub);
-        self.allocator.free(self.buses);
-        self.allocator.free(self.subscriptions);
-        self.allocator.free(self.waits);
+        for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |*sub| if (sub.active) self.releaseSub(sub);
+        self.buses.deinit(self.allocator);
+        self.subscriptions.deinit(self.allocator);
+        self.waits.deinit(self.allocator);
+        self.names.deinit(self.allocator);
         if (self.session_address) |address| self.allocator.free(address);
         self.allocator.free(self.system_address);
         self.* = undefined;
     }
 
     pub fn dispatch(self: *Binding, completion: io.SocketCompletion) !bool {
-        for (self.buses) |*bus| if (bus.active) {
+        for (self.buses.chunks.items) |buses_chunk| for (buses_chunk) |*bus| if (bus.active) {
             if (try bus.client.dispatch(completion)) {
                 try self.collectCanceled();
                 return true;
@@ -203,11 +211,11 @@ pub const Binding = struct {
     }
 
     pub fn dispatchTimer(self: *Binding, operation: io.OperationHandle) !bool {
-        for (self.buses) |*bus| if (bus.active and try bus.client.dispatchTimer(operation)) {
+        for (self.buses.chunks.items) |buses_chunk| for (buses_chunk) |*bus| if (bus.active and try bus.client.dispatchTimer(operation)) {
             try self.collectCanceled();
             return true;
         };
-        for (self.waits) |*wait| if (wait.active) {
+        for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |*wait| if (wait.active) {
             if (wait.timer) |timer| if (same(timer, operation)) {
                 wait.timer = null;
                 if (wait.kind == .connect) wait.bus.closing = true;
@@ -222,7 +230,7 @@ pub const Binding = struct {
 
     /// Host safe-point pump, also called for terminal cancellation CQEs.
     pub fn collectCanceled(self: *Binding) !void {
-        for (self.waits) |*wait| if (wait.active and wait.canceled and !wait.completed) {
+        for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |*wait| if (wait.active and wait.canceled and !wait.completed) {
             if (wait.kind == .connect) wait.bus.closing = true;
             if (wait.kind == .subscribe) wait.sub.?.phase = .closing;
             if (wait.kind == .own_name) wait.name.?.closing = true;
@@ -231,7 +239,7 @@ pub const Binding = struct {
             // run its __close guards (including protocol-level cancellation).
             if (wait.guard == null) self.releaseWait(wait);
         };
-        for (self.buses) |*bus| if (bus.active) {
+        for (self.buses.chunks.items) |buses_chunk| for (buses_chunk) |*bus| if (bus.active) {
             // A non-yielding send may have been queued by a Lua __close guard.
             // Flush it before retiring the transport.
             if (bus.closing and !self.busHasWait(bus) and bus.client.outgoing.items.len == 0 and bus.client.write_operation == null) try bus.client.close();
@@ -250,12 +258,12 @@ pub const Binding = struct {
                 };
             }
             if (bus.client.failure != null) bus.closing = true;
-            for (self.waits) |*wait| if (wait.active and !wait.completed and wait.bus == bus) {
+            for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |*wait| if (wait.active and !wait.completed and wait.bus == bus) {
                 if (bus.closing) {
                     try self.finish(wait, bus.client.failure orelse error.ConnectionClosed);
                 } else if (wait.kind == .connect and bus.ready) try self.finish(wait, null);
             };
-            for (self.subscriptions) |*sub| if (sub.active and sub.bus == bus) {
+            for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |*sub| if (sub.active and sub.bus == bus) {
                 if (bus.closing) {
                     sub.failure = bus.client.failure orelse error.ConnectionClosed;
                     sub.phase = .closing;
@@ -281,7 +289,7 @@ pub const Binding = struct {
                         };
                         sub.added = false;
                     }
-                    for (self.waits) |*wait| if (wait.active and !wait.completed and wait.sub == sub)
+                    for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |*wait| if (wait.active and !wait.completed and wait.sub == sub)
                         try self.finish(wait, sub.failure orelse error.SubscriptionClosed);
                     // Keep an error-bearing handle until Lua observes/ closes it.
                     self.clearSubQueue(sub);
@@ -299,7 +307,7 @@ pub const Binding = struct {
                     if (sub.guard == null and !self.subHasWait(sub)) self.releaseSub(sub);
                 }
             };
-            for (&self.names) |*name| if (name.active and name.bus == bus and (name.closing or bus.closing)) {
+            for (self.names.chunks.items) |names_chunk| for (names_chunk) |*name| if (name.active and name.bus == bus and (name.closing or bus.closing)) {
                 if (name.requested and !bus.closing) {
                     _ = daemonCall(bus, "ReleaseName", name.value) catch |err| {
                         if (err == error.QueueFull) continue;
@@ -309,7 +317,7 @@ pub const Binding = struct {
                     name.requested = false;
                 }
                 var waiting = false;
-                for (self.waits) |wait| if (wait.active and wait.name == name) {
+                for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |wait| if (wait.active and wait.name == name) {
                     waiting = true;
                 };
                 if (!waiting) self.releaseName(name);
@@ -320,11 +328,11 @@ pub const Binding = struct {
                 try bus.client.close();
                 if (bus.client.canDeinit() and !self.busHasWait(bus)) {
                     var serving = false;
-                    for (self.subscriptions) |sub| if (sub.active and sub.bus == bus and sub.scope != null) {
+                    for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |sub| if (sub.active and sub.bus == bus and sub.scope != null) {
                         serving = true;
                     };
                     if (serving) continue;
-                    for (self.subscriptions) |*sub| if (sub.active and sub.bus == bus) self.releaseSub(sub);
+                    for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |*sub| if (sub.active and sub.bus == bus) self.releaseSub(sub);
                     if (bus.guard) |guard| guard.* = null;
                     if (bus.resource) |resource| try self.vm.scheduler.destroyResource(resource);
                     if (bus.unique_name) |name| self.allocator.free(name);
@@ -343,7 +351,7 @@ pub const Binding = struct {
                 const name = try decoder.string();
                 _ = try decoder.string();
                 const owner = try decoder.string();
-                for (self.subscriptions) |*sub| if (sub.active and sub.bus == bus and optionalEqual(sub.sender, name)) {
+                for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |*sub| if (sub.active and sub.bus == bus and optionalEqual(sub.sender, name)) {
                     if (sub.close_on_owner_change) if (sub.sender_owner) |old| {
                         if (old.len != 0 and !std.mem.eql(u8, old, owner)) {
                             sub.failure = error.ServiceDisappeared;
@@ -355,7 +363,7 @@ pub const Binding = struct {
                     sub.sender_owner = copy;
                 };
             }
-            for (self.subscriptions) |*sub| if (sub.active and sub.scope == null and sub.bus == bus and sub.phase != .closing and matches(sub, message)) {
+            for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |*sub| if (sub.active and sub.scope == null and sub.bus == bus and sub.phase != .closing and matches(sub, message)) {
                 if (sub.queue.items.len >= 64 or message.data.len > 1024 * 1024 -| sub.queued_bytes) {
                     sub.failure = error.SignalQueueOverflow;
                     sub.phase = .closing;
@@ -367,10 +375,10 @@ pub const Binding = struct {
                     return err;
                 };
                 sub.queued_bytes += copy.data.len;
-                for (self.waits) |*wait| if (wait.active and !wait.completed and wait.kind == .next and wait.sub == sub) {
+                waits: for (self.waits.chunks.items) |chunk| for (chunk) |*wait| if (wait.active and !wait.completed and wait.kind == .next and wait.sub == sub) {
                     wait.result = self.popSignal(sub);
                     try self.finish(wait, null);
-                    break;
+                    break :waits;
                 };
             };
             return;
@@ -387,7 +395,7 @@ pub const Binding = struct {
             bus.ready = true;
             return;
         }
-        for (self.subscriptions) |*sub| if (sub.active and sub.bus == bus and sub.serial == serial and sub.phase != .closing) {
+        for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |*sub| if (sub.active and sub.bus == bus and sub.serial == serial and sub.phase != .closing) {
             if (sub.phase == .resolving) {
                 if (message.header.message_type == .method_return) {
                     if (!std.mem.eql(u8, message.header.signature, "s")) return error.InvalidReply;
@@ -405,14 +413,14 @@ pub const Binding = struct {
                 sub.phase = .adding;
             } else if (sub.phase == .adding) {
                 sub.phase = if (message.header.message_type == .method_return) .ready else .closing;
-                for (self.waits) |*wait| if (wait.active and !wait.completed and wait.kind == .subscribe and wait.sub == sub) {
+                for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |*wait| if (wait.active and !wait.completed and wait.kind == .subscribe and wait.sub == sub) {
                     if (message.header.message_type == .error_reply) wait.result = try cloneMessage(self.allocator, message);
                     try self.finish(wait, null);
                 };
             }
             return;
         };
-        for (self.waits) |*wait| if (wait.active and !wait.completed and (wait.kind == .call or wait.kind == .own_name) and wait.bus == bus and wait.serial == serial) {
+        for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |*wait| if (wait.active and !wait.completed and (wait.kind == .call or wait.kind == .own_name) and wait.bus == bus and wait.serial == serial) {
             wait.result = try cloneMessage(self.allocator, message);
             try self.finish(wait, null);
             return;
@@ -431,9 +439,7 @@ pub const Binding = struct {
     }
 
     fn beginWait(self: *Binding, L: *c.State, bus: *Bus, sub: ?*Subscription, kind: @FieldType(Wait, "kind"), timeout_ms: ?u32) !*Wait {
-        const wait = for (self.waits) |*entry| {
-            if (!entry.active) break entry;
-        } else return error.CallCapacityExceeded;
+        const wait = try self.freeEntry(Wait, &self.waits);
         wait.* = .{ .binding = self, .active = true, .bus = bus, .sub = sub, .kind = kind };
         errdefer self.releaseWait(wait);
         wait.guard = try pushHandle(Wait, L, wait, wait_mt);
@@ -461,11 +467,11 @@ pub const Binding = struct {
         wait.* = .{ .binding = self };
     }
     fn busHasWait(self: *Binding, bus: *Bus) bool {
-        for (self.waits) |wait| if (wait.active and wait.bus == bus) return true;
+        for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |wait| if (wait.active and wait.bus == bus) return true;
         return false;
     }
     fn subHasWait(self: *Binding, sub: *Subscription) bool {
-        for (self.waits) |wait| if (wait.active and wait.sub == sub) return true;
+        for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |wait| if (wait.active and wait.sub == sub) return true;
         return false;
     }
     fn popSignal(_: *Binding, sub: *Subscription) wire.Message {
@@ -540,7 +546,7 @@ pub const Binding = struct {
         if (header.sender == null) return error.ProtocolError;
         var target: ?*Subscription = null;
         var known_path = false;
-        for (self.subscriptions) |*sub| if (sub.active and sub.bus == bus and sub.scope != null and sub.phase == .ready and optionalEqual(header.path, sub.path.?)) {
+        for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |*sub| if (sub.active and sub.bus == bus and sub.scope != null and sub.phase == .ready and optionalEqual(header.path, sub.path.?)) {
             known_path = true;
             if (header.interface) |interface| {
                 if (!std.mem.eql(u8, interface, sub.interface.?)) continue;
@@ -556,7 +562,7 @@ pub const Binding = struct {
         const method = findMethod(sub, header.member.?) orelse return sendError(bus, message, "org.freedesktop.DBus.Error.UnknownMethod", "No exported method");
         if (!std.mem.eql(u8, header.signature, method.input)) return sendError(bus, message, "org.freedesktop.DBus.Error.InvalidArgs", "Signature does not match method");
         var pending: usize = 0;
-        for (self.subscriptions) |entry| if (entry.active and entry.scope != null) {
+        for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |entry| if (entry.active and entry.scope != null) {
             pending += entry.queue.items.len + entry.requests;
         };
         var sub_pending = sub.queue.items.len + sub.requests;
@@ -564,7 +570,7 @@ pub const Binding = struct {
         for (self.requests) |request| if (request.active and request.sub == sub) {
             sub_bytes += request.message.data.len;
         };
-        for (self.waits) |wait| if (wait.active and wait.result != null and wait.result.?.header.message_type == .method_call) {
+        for (self.waits.chunks.items) |waits_chunk| for (waits_chunk) |wait| if (wait.active and wait.result != null and wait.result.?.header.message_type == .method_call) {
             pending += 1;
             if (wait.sub == sub) {
                 sub_pending += 1;
@@ -579,10 +585,10 @@ pub const Binding = struct {
             return err;
         };
         sub.queued_bytes += copy.data.len;
-        for (self.waits) |*wait| if (wait.active and !wait.completed and wait.kind == .next and wait.sub == sub) {
+        waits: for (self.waits.chunks.items) |chunk| for (chunk) |*wait| if (wait.active and !wait.completed and wait.kind == .next and wait.sub == sub) {
             wait.result = self.popSignal(sub);
             try self.finish(wait, null);
-            break;
+            break :waits;
         };
     }
 
@@ -591,7 +597,7 @@ pub const Binding = struct {
         defer xml.deinit();
         const writer = &xml.writer;
         try writer.writeAll("<node><interface name=\"org.freedesktop.DBus.Introspectable\"><method name=\"Introspect\"><arg type=\"s\" direction=\"out\"/></method></interface>");
-        for (self.subscriptions) |sub| if (sub.active and sub.bus == bus and sub.scope != null and sub.phase == .ready and optionalEqual(message.header.path, sub.path.?)) {
+        for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |sub| if (sub.active and sub.bus == bus and sub.scope != null and sub.phase == .ready and optionalEqual(message.header.path, sub.path.?)) {
             try writer.print("<interface name=\"{s}\">", .{sub.interface.?});
             for (sub.methods.items) |method| {
                 try writer.print("<method name=\"{s}\">", .{method.name});
@@ -675,10 +681,8 @@ fn exportImpl(L: *c.State) !void {
     const interface = try stringField(L, 2, "interface");
     if (!wire.validObjectPath(path) or !validMatchValue("interface", interface)) return error.InvalidExport;
     if (std.mem.eql(u8, interface, "org.freedesktop.DBus.Introspectable")) return error.ReservedInterface;
-    for (self.subscriptions) |sub| if (sub.active and sub.bus == bus and sub.scope != null and sub.phase != .closing and optionalEqual(sub.path, path) and optionalEqual(sub.interface, interface)) return error.AlreadyExported;
-    const sub = for (self.subscriptions) |*entry| {
-        if (!entry.active) break entry;
-    } else return error.SubscriptionCapacityExceeded;
+    for (self.subscriptions.chunks.items) |subscriptions_chunk| for (subscriptions_chunk) |sub| if (sub.active and sub.bus == bus and sub.scope != null and sub.phase != .closing and optionalEqual(sub.path, path) and optionalEqual(sub.interface, interface)) return error.AlreadyExported;
+    const sub = try self.freeEntry(Subscription, &self.subscriptions);
     sub.* = .{ .binding = self, .bus = bus, .active = true, .phase = .ready };
     errdefer self.releaseSub(sub);
     sub.path = try self.allocator.dupe(u8, path);
@@ -790,10 +794,8 @@ fn ownNameImpl(L: *c.State) !*Wait {
     const scope = try self.vm.currentScope(L);
     const value = try string(L, 2);
     if (!validMatchValue("sender", value) or value[0] == ':' or std.mem.eql(u8, value, daemon)) return error.InvalidBusName;
-    for (self.names) |name| if (name.active and name.bus == bus and std.mem.eql(u8, name.value, value)) return error.NameAlreadyRequested;
-    const name = for (&self.names) |*entry| {
-        if (!entry.active) break entry;
-    } else return error.NameCapacityExceeded;
+    for (self.names.chunks.items) |names_chunk| for (names_chunk) |name| if (name.active and name.bus == bus and std.mem.eql(u8, name.value, value)) return error.NameAlreadyRequested;
+    const name = try self.freeEntry(Name, &self.names);
     name.* = .{ .active = true, .bus = bus };
     errdefer self.releaseName(name);
     name.value = try self.allocator.dupe(u8, value);
@@ -838,9 +840,7 @@ fn connectImpl(self: *Binding, L: *c.State) !*Wait {
     const scope = try self.vm.currentScope(L);
     const target = try string(L, 1);
     const address = if (std.mem.eql(u8, target, "session")) self.session_address orelse return error.AddressUnavailable else if (std.mem.eql(u8, target, "system")) self.system_address else target;
-    const bus = for (self.buses) |*entry| {
-        if (!entry.active) break entry;
-    } else return error.ConnectionCapacityExceeded;
+    const bus = try self.freeEntry(Bus, &self.buses);
     bus.* = .{ .binding = self };
     bus.guard = try pushHandle(Bus, L, bus, bus_mt);
     errdefer {
@@ -932,9 +932,7 @@ fn subscribeImpl(L: *c.State) !*Wait {
     const self = bus.binding;
     const scope = try self.vm.currentScope(L);
     if (c.lua_type(L, 2) != c.type_table) return error.InvalidMatch;
-    const sub = for (self.subscriptions) |*entry| {
-        if (!entry.active) break entry;
-    } else return error.SubscriptionCapacityExceeded;
+    const sub = try self.freeEntry(Subscription, &self.subscriptions);
     sub.* = .{ .binding = self, .bus = bus, .active = true };
     errdefer self.releaseSub(sub);
     _ = c.lua_getfield(L, 2, "close_on_owner_change");
@@ -1343,12 +1341,22 @@ test "D-Bus service routing bounds pending calls and honors no-reply headers" {
         bus.client.phase = .closed;
         bus.client.deinit();
     }
-    const sub = &binding.subscriptions[0];
+    const sub = try binding.freeEntry(Subscription, &binding.subscriptions);
     sub.* = .{ .binding = binding, .active = true, .bus = &bus, .phase = .ready, .scope = app.scheduler.application_scope };
     defer {
         sub.scope = null;
         binding.releaseSub(sub);
     }
+    // Pools grow past their first chunk (64 subscriptions) without moving
+    // entries that guards and waits point at.
+    var extra: [80]*Subscription = undefined;
+    for (&extra) |*entry| {
+        entry.* = try binding.freeEntry(Subscription, &binding.subscriptions);
+        entry.*.active = true;
+    }
+    try std.testing.expectEqual(sub, binding.subscriptions.at(0));
+    try std.testing.expect(binding.subscriptions.len() >= 81);
+    for (extra) |entry| entry.active = false;
     sub.path = try a.dupe(u8, "/test");
     sub.interface = try a.dupe(u8, "dev.ourokit.Test");
     try sub.methods.append(a, .{ .name = try a.dupe(u8, "Empty"), .input = try a.dupe(u8, ""), .output = try a.dupe(u8, "") });
@@ -1447,20 +1455,20 @@ test "D-Bus connection owned by a retired state scope drains its socket before t
     const inner = try app.lua_vm.openScope(outer);
     _ = try app.lua_vm.spawn(inner, source);
     try app.runReadyTurn();
-    try std.testing.expect(app.dbus.buses[0].active);
+    try std.testing.expect(app.dbus.buses.at(0).active);
     try std.testing.expect(app.loop.hasPendingOperations());
 
     try app.scheduler.retireScope(outer);
     while (app.scheduler.scopeAlive(inner) or app.scheduler.scopeAlive(outer)) {
         // The bus resource, which occupies the state scope, is destroyed only
         // after its kernel operations are terminal.
-        try std.testing.expect(app.dbus.buses[0].active);
+        try std.testing.expect(app.dbus.buses.at(0).active);
         try app.runReadyTurn();
         if (!app.scheduler.scopeAlive(inner) or app.scheduler.hasPendingWork()) continue;
         if (!app.loop.hasPendingOperations() and !app.loop.hasPendingTimerKernelWork()) continue;
         try app.reapOne();
     }
-    try std.testing.expect(!app.dbus.buses[0].active);
+    try std.testing.expect(!app.dbus.buses.at(0).active);
     try std.testing.expect(!app.loop.hasPendingOperations());
     try std.testing.expect(!app.lua_vm.globalBoolean("connected_after"));
     try std.testing.expectEqual(@as(usize, 0), app.lua_vm.activeTaskCount());

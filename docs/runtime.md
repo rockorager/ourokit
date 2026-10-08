@@ -190,11 +190,12 @@ Every count of live runtime objects grows on demand: scopes, tasks, resources,
 signals and their dependency edges, per-window instances, render objects,
 semantic nodes and text, pointer bindings, buttons, text inputs, list boxes,
 animations, scene commands, build storage, io_uring operation slots, whole-file
-reads, modules, MCP calls, stdio operations and HTTP requests. Growth happens on
+reads, modules, MCP calls, stdio operations, HTTP requests, D-Bus connections,
+calls, subscriptions and owned names, and audio watchers. Growth happens on
 creation or while preparing a build or reload, never on the resume and
 completion paths, and commit stays infallible because preparation reserved what
 it needs. Pools whose slots the kernel or a Lua continuation points into
-(operation slots, file reads, modules, MCP calls, stdio) grow in chunks that
+(operation slots, file reads, modules, MCP calls, stdio, D-Bus) grow in chunks that
 never move (`core.StableSlots`); index-addressed pools reallocate. When a turn
 prepares more SQEs than the ring holds, the loop hands the queued ones to the
 kernel early instead of failing.
@@ -203,7 +204,13 @@ Limits that protect against input, protocols or pathological depth are not
 capacities and stay bounded: message, header, file and module byte limits, MCP
 receive buffers and JSON depth, widget nesting depth, build stabilization passes,
 the platform input queue, compositor-mirrored outputs and workspaces, inbound
-D-Bus method calls, and damage regions (merged when exceeded).
+D-Bus method calls, mirrored PipeWire objects, and damage regions (merged
+when exceeded).
+
+Still fixed, though they count live objects: application windows (16; the
+Wayland client sizes its object tables from this when it connects), and the
+per-build virtual list (32 lists, 256 materialized rows) and layout builder
+(128) snapshots, which are copied by value between builds.
 
 `zig build test-stress` mounts and remounts 1000 component rows 50 times and
 cycles 10,000 actors, checking with `t:resources()` that native objects and the

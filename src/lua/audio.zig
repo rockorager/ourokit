@@ -31,7 +31,8 @@ const Job = struct {
 pub const Binding = struct {
     vm: *Vm,
     signals: *signals_module.Signals,
-    jobs: [8]?*Job = @splat(null),
+    /// Grows when every entry is busy; completion only clears entries.
+    jobs: std.ArrayList(?*Job) = .empty,
     stopping: bool = false,
     candidate: bool = false,
 
@@ -56,7 +57,7 @@ pub const Binding = struct {
     }
 
     pub fn dispatch(self: *Binding, completion: io.FileCompletion) !bool {
-        for (self.jobs) |slot| if (slot) |job| {
+        for (self.jobs.items) |slot| if (slot) |job| {
             if (job.operation) |op| if (std.meta.eql(op, completion.operation)) {
                 job.operation = null;
                 native.ouro_audio_snapshot(job.native, &job.snapshot);
@@ -78,7 +79,7 @@ pub const Binding = struct {
     }
 
     pub fn collectCanceled(self: *Binding) !void {
-        for (&self.jobs) |*slot| if (slot.*) |job| {
+        for (self.jobs.items) |*slot| if (slot.*) |job| {
             if ((job.waiting or job.resumed) and self.vm.taskCancellationRequested(job.waiter)) {
                 stopJob(job);
                 if (job.waiting) {
@@ -98,14 +99,15 @@ pub const Binding = struct {
     }
     pub fn stop(self: *Binding) void {
         self.stopping = true;
-        for (self.jobs) |slot| if (slot) |job| stopJob(job);
+        for (self.jobs.items) |slot| if (slot) |job| stopJob(job);
     }
     pub fn canDeinit(self: *const Binding) bool {
-        for (self.jobs) |slot| if (slot != null) return false;
+        for (self.jobs.items) |slot| if (slot != null) return false;
         return true;
     }
     pub fn deinit(self: *Binding) void {
         std.debug.assert(self.canDeinit());
+        self.jobs.deinit(self.vm.allocator);
     }
 };
 
@@ -114,7 +116,12 @@ fn defaultOutput(L: *c.State) callconv(.c) c_int {
     if (c.lua_gettop(L) != 0) return failure(L, "InvalidArguments");
     if (self.stopping) return failure(L, "AudioStopped");
     const scope = self.vm.currentScope(L) catch return failure(L, "TaskRequired");
-    const slot = for (&self.jobs) |*slot| if (slot.* == null) break slot else continue else return failure(L, "AudioCapacityExceeded");
+    const slot = for (self.jobs.items) |*slot| {
+        if (slot.* == null) break slot;
+    } else grown: {
+        self.jobs.append(self.vm.allocator, null) catch return failure(L, "OutOfMemory");
+        break :grown &self.jobs.items[self.jobs.items.len - 1];
+    };
     const ud: *Userdata = @ptrCast(@alignCast(c.lua_newuserdatauv(L, @sizeOf(Userdata), 0).?));
     ud.* = .{};
     _ = c.luaL_newmetatable(L, metatable);
