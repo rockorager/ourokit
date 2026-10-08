@@ -1204,6 +1204,18 @@ local function recorded(actor)
   return root._scheduler == (hooks.scheduler or M.default_scheduler)
 end
 
+-- A recorder never throws into the app: a failing hook uninstalls the
+-- recorder, which reports why (hooks.failed), and processing goes on.
+local function call_hook(hooks, name, ...)
+  local fn = hooks[name]
+  if not fn then return nil end
+  local ok, result = pcall(fn, ...)
+  if ok then return result end
+  if M._hooks == hooks then M._hooks = nil end
+  if hooks.failed then pcall(hooks.failed, 'recorder ' .. name .. ' failed: ' .. tostring(result)) end
+  return nil
+end
+
 -- Runs fn(...) as processing of `actor`; at the outermost level it is an
 -- input boundary of kind 'input' (event, origin), 'start', 'stop' or 'release'.
 local function boundary(actor, kind, event, origin, fn, ...)
@@ -1216,7 +1228,7 @@ local function boundary(actor, kind, event, origin, fn, ...)
     if origin == 'external' or origin == 'actor' then
       origin = depth > 0 and 'component' or (M._current_origin and M._current_origin()) or M._origin or 'app'
     end
-    hooks.enter(actor, kind, event, origin)
+    call_hook(hooks, 'enter', actor, kind, event, origin)
   end
   local counted = recorded(actor)
   local previous = current_scheduler
@@ -1225,14 +1237,14 @@ local function boundary(actor, kind, event, origin, fn, ...)
   local ok, a, b = pcall(fn, ...)
   depth, current_scheduler = depth - 1, previous
   if counted then recorded_depth = recorded_depth - 1 end
-  if hooks then hooks.leave(actor, kind, ok, not ok and a or nil) end
+  if hooks then call_hook(hooks, 'leave', actor, kind, ok, not ok and a or nil) end
   if not ok then error(a, 0) end
   return a, b
 end
 
 local function step_hook(actor, record, origin)
   local hooks = M._hooks
-  if hooks and hooks.step and recorded(actor) then hooks.step(actor, record, origin) end
+  if hooks and hooks.step and recorded(actor) then call_hook(hooks, 'step', actor, record, origin) end
 end
 
 -- Logical time of the scheduler running the current macrostep (design §8):
@@ -1437,7 +1449,7 @@ end
 function M.carry(entries)
   carried, held = {}, {}
   for i, entry in ipairs(entries or {}) do carried[i] = entry end
-  if M._hooks and M._hooks.carry then M._hooks.carry() end
+  if M._hooks then call_hook(M._hooks, 'carry') end
 end
 
 function M._take_carried(chart, actor, options)
@@ -1481,7 +1493,7 @@ function M.release()
     local err = M._run_released(actor, by_actor[actor])
     first_error = first_error or err
   end
-  if M._hooks and M._hooks.released then M._hooks.released() end
+  if M._hooks then call_hook(M._hooks, 'released') end
   if first_error then error(first_error, 0) end
 end
 
@@ -1526,7 +1538,7 @@ function M.component(chart, render)
     local actor = chart:actor {id = id, input = props, lazy = true}
     actor._component = true
     -- A recorder logs the plain part of the initial props (§14).
-    if M._hooks and M._hooks.component_input then actor._recorded_input = M._hooks.component_input(values) end
+    if M._hooks then actor._recorded_input = call_hook(M._hooks, 'component_input', values) end
     component_ids[id] = actor
     return function() return render(actor, props) end, function()
       actor:stop()

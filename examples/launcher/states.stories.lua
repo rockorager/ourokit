@@ -15,7 +15,7 @@ ouro.xdg.paths = ouro.xdg.paths or function(id)
 end
 require("app")
 local has_views, views = pcall(require, 'story_views')
-local decode = ouro.json.decode
+local decode = ouro.machine._json_decode
 local values = {}
 values[1] = decode([=[{"value":"generated error"}]=]).value
 values[2] = decode([=[{"value":[{"actions":[],"comment":null,"dbus_activatable":false,"exec":"org.gnome.Terminal","generic_name":"Terminal emulator","hidden":false,"icon":null,"id":"org.gnome.Terminal.desktop","keywords":["shell"],"name":"Terminal","no_display":false,"path":"/apps/org.gnome.Terminal.desktop","terminal":false,"visible":true,"working_directory":null},{"actions":[],"comment":"Browse the web","dbus_activatable":false,"exec":"firefox","generic_name":null,"hidden":false,"icon":null,"id":"firefox.desktop","keywords":[],"name":"Firefox","no_display":false,"path":"/apps/firefox.desktop","terminal":false,"visible":true,"working_directory":null}]}]=]).value

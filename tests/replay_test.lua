@@ -287,6 +287,52 @@ return {
     assert(table.concat(origins, ',') == 'activation,app', table.concat(origins, ','))
   end,
 
+  ['an input whose effects exceed the JSON value limit still records and replays'] = function()
+    local chart = machine.create { id = 'burst', initial = 'idle', context = { n = 0 },
+      events = { BURST = {}, TICK = {} },
+      actions = { burst = function(_, _, self) for _ = 1, 1000 do self:send('TICK') end end },
+      states = { idle = { on = {
+        BURST = { actions = 'burst' },
+        TICK = { actions = machine.assign { n = function(c) return c.n + 1 end } },
+      } } } }
+    local lines = {}
+    local failure
+    local recorder = machine.recorder(function(line) lines[#lines + 1] = line end,
+      { app = 'test', fail = function(reason) failure = reason end })
+    local actor = chart:start { id = 'burst' }
+    assert(actor:send('BURST'))
+    recorder.stop()
+    actor:stop()
+    assert(actor:context().n == 1000)
+    assert(failure == nil, failure)
+    assert(#lines == 3, #lines) -- header, start, BURST
+    local ok = pcall(o.json.decode, lines[3])
+    assert(not ok, 'the BURST line is beyond the native decoder, so it exercises the Lua fallback')
+    local entry = machine._json_decode(lines[3])
+    assert(entry.k == 'event' and #entry.r == 1001, #entry.r)
+    local report = machine.replay(lines)
+    assert(report.ok, machine.replay_text(report))
+  end,
+
+  ['a recorder that cannot write stops and reports why, and the app keeps running'] = function()
+    local chart = machine.create { id = 'counter', initial = 'idle', context = { n = 0 },
+      states = { idle = { on = { INC = { actions = machine.assign { n = function(c) return c.n + 1 end } } } } } }
+    local reason
+    local writes = 0
+    local recorder = machine.recorder(function()
+      writes = writes + 1
+      if writes > 2 then error('disk full') end
+    end, { fail = function(text) reason = text end })
+    local actor = chart:start { id = 'counter' }
+    assert(actor:send('INC')) -- the third write raises inside the recorder
+    assert(actor:send('INC'))
+    assert(actor:context().n == 2, 'processing went on')
+    assert(reason and reason:find('disk full', 1, true), tostring(reason))
+    assert(machine._hooks == nil, 'the failed recorder uninstalled itself')
+    recorder.stop()
+    actor:stop()
+  end,
+
   ['machine.advance needs a virtual clock'] = function()
     fails(function() machine.advance(-1) end, 'nonnegative integer')
   end,

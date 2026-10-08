@@ -530,7 +530,7 @@ function M.state_stories_source(entry, plan)
     'end',
     string.format('require(%q)', entry),
     "local has_views, views = pcall(require, 'story_views')",
-    'local decode = ouro.json.decode',
+    'local decode = ouro.machine._json_decode',
     'local values = {}',
   }
   local refs, count = {}, 0
@@ -539,7 +539,7 @@ function M.state_stories_source(entry, plan)
     if not refs[key] then
       count = count + 1
       refs[key] = count
-      out[#out + 1] = 'values[' .. count .. '] = decode(' .. long_string(json.encode(safe({value = value}))) .. ').value'
+      out[#out + 1] = 'values[' .. count .. '] = decode(' .. long_string(M._json_encode({value = value})) .. ').value'
     end
     return refs[key]
   end
@@ -555,10 +555,10 @@ function M.state_stories_source(entry, plan)
         inputs[i] = copy_of
       end
       states[#states + 1] = string.format('    {state = %q, steps = decode(%s), inputs = decode(%s)},', item.state,
-        long_string(json.encode(safe(item.steps or json.array({})))), long_string(json.encode(safe(json.array(inputs)))))
+        long_string(M._json_encode(item.steps or json.array({}))), long_string(M._json_encode(json.array(inputs))))
     end
     charts[#charts + 1] = string.format('  {chart = %q, input = decode(%s).input, states = {\n%s\n  }},', chart.chart,
-      long_string(json.encode(safe({input = chart.input}))), table.concat(states, '\n'))
+      long_string(M._json_encode({input = chart.input})), table.concat(states, '\n'))
   end
   out[#out + 1] = 'local plan = {values = values, charts = {'
   out[#out + 1] = table.concat(charts, '\n')

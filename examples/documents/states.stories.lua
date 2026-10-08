@@ -15,7 +15,7 @@ ouro.xdg.paths = ouro.xdg.paths or function(id)
 end
 require("app")
 local has_views, views = pcall(require, 'story_views')
-local decode = ouro.json.decode
+local decode = ouro.machine._json_decode
 local values = {}
 values[1] = decode([=[{"value":"file:///tmp/note.ournote"}]=]).value
 values[2] = decode([=[{"value":null}]=]).value

@@ -9,20 +9,46 @@ const vm_module = @import("vm.zig");
 const linux = std.os.linux;
 
 pub const Sink = struct {
-    fd: i32,
+    allocator: std.mem.Allocator,
+    /// Null until the path is known: a development recording is named after
+    /// the application id, which the host learns once the entry has loaded.
+    fd: ?i32 = null,
     /// Host monotonic ms at the start of the log; entries carry t - t0.
     t0: i64,
     lines: u64 = 0,
     failed: bool = false,
+    reason_buffer: [256]u8 = undefined,
+    reason_length: usize = 0,
     path_buffer: [std.fs.max_path_bytes]u8 = undefined,
     path_length: usize = 0,
+    /// Lines recorded before the path was assigned.
+    pending: std.ArrayList(u8) = .empty,
+    const max_pending = 16 * 1024 * 1024;
 
     pub fn location(self: *const Sink) []const u8 {
         return self.path_buffer[0..self.path_length];
     }
 
-    /// Creates (truncates) `path`, creating missing parent directories.
-    pub fn open(path: []const u8, application: []const u8) !Sink {
+    pub fn reason(self: *const Sink) ?[]const u8 {
+        return if (self.reason_length == 0) null else self.reason_buffer[0..self.reason_length];
+    }
+
+    /// A sink that buffers until `assign` names its file.
+    pub fn deferred(allocator: std.mem.Allocator) Sink {
+        return .{ .allocator = allocator, .t0 = monotonicMs() };
+    }
+
+    /// Creates (truncates) `path` now.
+    pub fn open(allocator: std.mem.Allocator, path: []const u8, application: []const u8) !Sink {
+        var sink = deferred(allocator);
+        try sink.assign(path, application);
+        return sink;
+    }
+
+    /// Creates (truncates) `path`, creating missing parent directories, and
+    /// writes the header and any buffered lines.
+    pub fn assign(self: *Sink, path: []const u8, application: []const u8) !void {
+        std.debug.assert(self.fd == null);
         if (std.fs.path.dirname(path)) |parent| try makePath(parent);
         var buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
         if (path.len >= buffer.len) return error.NameTooLong;
@@ -35,40 +61,52 @@ pub const Sink = struct {
             .CLOEXEC = true,
         }, 0o600);
         if (linux.errno(result) != .SUCCESS) return error.RecordingOpenFailed;
-        var sink: Sink = .{ .fd = @intCast(result), .t0 = monotonicMs() };
-        @memcpy(sink.path_buffer[0..path.len], path);
-        sink.path_length = path.len;
+        self.fd = @intCast(result);
+        @memcpy(self.path_buffer[0..path.len], path);
+        self.path_length = path.len;
         var header: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&header, "{{\"format\":\"ouro.machine.log\",\"version\":1,\"t0\":{d},\"app\":{f}}}", .{
-            sink.t0, std.json.fmt(application, .{}),
+            self.t0, std.json.fmt(application, .{}),
         }) catch return error.NameTooLong;
-        sink.append(line);
-        return sink;
+        self.append(line);
+        if (!self.failed) self.writeAll(self.pending.items) catch self.fail("cannot write the recording file");
+        self.pending.clearAndFree(self.allocator);
     }
 
     pub fn close(self: *Sink) void {
-        _ = linux.close(self.fd);
+        if (self.fd) |fd| _ = linux.close(fd);
+        self.pending.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Stops recording; the app keeps running. The first reason is kept.
+    pub fn fail(self: *Sink, text: []const u8) void {
+        if (self.failed) return;
+        self.failed = true;
+        const length = @min(text.len, self.reason_buffer.len);
+        @memcpy(self.reason_buffer[0..length], text[0..length]);
+        self.reason_length = length;
     }
 
     /// Appends one line. A failed write stops recording rather than the app.
     pub fn append(self: *Sink, line: []const u8) void {
         if (self.failed) return;
-        self.writeAll(line) catch {
-            self.failed = true;
+        if (self.fd == null) {
+            if (self.pending.items.len + line.len + 1 > max_pending) return self.fail("too many inputs before the recording file was named");
+            self.pending.appendSlice(self.allocator, line) catch return self.fail("out of memory");
+            self.pending.append(self.allocator, '\n') catch return self.fail("out of memory");
+            self.lines += 1;
             return;
-        };
-        self.writeAll("\n") catch {
-            self.failed = true;
-            return;
-        };
+        }
+        self.writeAll(line) catch return self.fail("cannot write the recording file");
+        self.writeAll("\n") catch return self.fail("cannot write the recording file");
         self.lines += 1;
     }
 
     fn writeAll(self: *Sink, bytes: []const u8) !void {
         var offset: usize = 0;
         while (offset < bytes.len) {
-            const result = linux.write(self.fd, bytes[offset..].ptr, bytes.len - offset);
+            const result = linux.write(self.fd.?, bytes[offset..].ptr, bytes.len - offset);
             switch (linux.errno(result)) {
                 .SUCCESS => offset += result,
                 .INTR => {},
@@ -101,9 +139,9 @@ fn monotonicMs() i64 {
 }
 
 const bridge_source =
-    \\local write, t0, ouro = ...
+    \\local write, t0, fail, ouro = ...
     \\local machine = ouro.machine
-    \\if machine and machine.recorder then machine.recorder(write, {t0 = t0, header = false}) end
+    \\if machine and machine.recorder then machine.recorder(write, {t0 = t0, header = false, fail = fail}) end
 ;
 
 /// Installs the recorder in a VM whose `ouro.machine` is installed, before
@@ -117,9 +155,19 @@ pub fn install(vm: *vm_module.Vm, sink: *Sink) !void {
     c.lua_pushlightuserdata(state, sink);
     c.lua_pushcclosure(state, write, 1);
     c.lua_pushinteger(state, sink.t0);
+    c.lua_pushlightuserdata(state, sink);
+    c.lua_pushcclosure(state, failRecording, 1);
     vm.pushApi(state);
-    if (c.lua_pcallk(state, 3, 0, 0, 0, null) != c.ok)
+    if (c.lua_pcallk(state, 4, 0, 0, 0, null) != c.ok)
         return error.StatechartRecorderInitializationFailed;
+}
+
+fn failRecording(state: *c.State) callconv(.c) c_int {
+    const sink: *Sink = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)) orelse return 0));
+    var length: usize = 0;
+    const text = c.lua_tolstring(state, 1, &length) orelse "recording failed";
+    sink.fail(text[0..length]);
+    return 0;
 }
 
 fn write(state: *c.State) callconv(.c) c_int {
@@ -134,9 +182,21 @@ fn write(state: *c.State) callconv(.c) c_int {
 test "recording sink writes a header and one line per append" {
     var path_buffer: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, "/tmp/ourokit-recording-test-{d}/nested/log.jsonl", .{linux.getpid()});
-    var sink = try Sink.open(path, "dev.test");
+    var sink = try Sink.open(std.testing.allocator, path, "dev.test");
     sink.append("{\"k\":\"start\"}");
     try std.testing.expectEqual(@as(u64, 2), sink.lines);
     try std.testing.expectEqualStrings(path, sink.location());
+    sink.fail("first");
+    sink.fail("second");
+    sink.append("{}");
+    try std.testing.expectEqualStrings("first", sink.reason().?);
+    try std.testing.expectEqual(@as(u64, 2), sink.lines);
     sink.close();
+    // Deferred: lines wait for the name.
+    var later = Sink.deferred(std.testing.allocator);
+    later.append("{\"k\":\"start\"}");
+    const named = try std.fmt.bufPrint(&path_buffer, "/tmp/ourokit-recording-test-{d}/later.jsonl", .{linux.getpid()});
+    try later.assign(named, "dev.test");
+    try std.testing.expectEqual(@as(u64, 2), later.lines);
+    later.close();
 }

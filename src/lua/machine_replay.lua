@@ -81,11 +81,149 @@ local function safe(value, seen)
   return out
 end
 
+-- The native encoder and decoder stop at 4096 values per call. One input can
+-- cause more (an action that sends 1000 events), so big lines fall back to
+-- these Lua versions, with the same output: sorted keys, `[]` for marked
+-- empty arrays. A recording line is never refused for its size.
+local function is_empty_array(t)
+  local ok, text = pcall(json.encode, t)
+  return ok and text == '[]'
+end
+
+local function lua_encode(value, out)
+  local kind = type(value)
+  if value == nil or value == json.null then out[#out + 1] = 'null'
+  elseif kind == 'boolean' or kind == 'number' or kind == 'string' then out[#out + 1] = json.encode(value)
+  elseif kind == 'table' then
+    local n = #value
+    local count = 0
+    for _ in pairs(value) do count = count + 1 end
+    if (n > 0 and count == n) or (count == 0 and is_empty_array(value)) then
+      out[#out + 1] = '['
+      for i = 1, n do
+        if i > 1 then out[#out + 1] = ',' end
+        lua_encode(value[i], out)
+      end
+      out[#out + 1] = ']'
+    else
+      local keys = {}
+      for k in pairs(value) do keys[#keys + 1] = tostring(k) end
+      table.sort(keys)
+      out[#out + 1] = '{'
+      for i, k in ipairs(keys) do
+        if i > 1 then out[#out + 1] = ',' end
+        local v = value[k]
+        if v == nil then v = value[math.tointeger(tonumber(k)) or k] end
+        out[#out + 1] = json.encode(k)
+        out[#out + 1] = ':'
+        lua_encode(v, out)
+      end
+      out[#out + 1] = '}'
+    end
+  else out[#out + 1] = json.encode('<' .. kind .. '>') end
+  return out
+end
+
 local function encode(entry)
   local ok, text = pcall(json.encode, entry)
   if ok then return text end
-  return json.encode(safe(entry))
+  local value = safe(entry)
+  ok, text = pcall(json.encode, value)
+  if ok then return text end
+  return table.concat(lua_encode(value, {}))
 end
+
+local escapes = {['"'] = '"', ['\\'] = '\\', ['/'] = '/', b = '\b', f = '\f', n = '\n', r = '\r', t = '\t'}
+local function lua_decode(text)
+  local pos = 1
+  local function fail_at(what) error(string.format('invalid JSON at byte %d: %s', pos, what), 0) end
+  local function space() pos = text:find('[^ \t\r\n]', pos) or #text + 1 end
+  local value
+  local function str()
+    local out = {}
+    pos = pos + 1
+    while true do
+      local stop = text:find('["\\]', pos)
+      if not stop then fail_at('unterminated string') end
+      out[#out + 1] = text:sub(pos, stop - 1)
+      if text:sub(stop, stop) == '"' then pos = stop + 1; break end
+      local c = text:sub(stop + 1, stop + 1)
+      if c == 'u' then
+        local code = tonumber(text:sub(stop + 2, stop + 5), 16) or fail_at('bad escape')
+        pos = stop + 6
+        if code >= 0xD800 and code < 0xDC00 and text:sub(pos, pos + 1) == '\\u' then
+          local low = tonumber(text:sub(pos + 2, pos + 5), 16)
+          if low and low >= 0xDC00 and low < 0xE000 then
+            code = 0x10000 + (code - 0xD800) * 0x400 + (low - 0xDC00)
+            pos = pos + 6
+          end
+        end
+        out[#out + 1] = utf8.char(code)
+      else
+        out[#out + 1] = escapes[c] or fail_at('bad escape')
+        pos = stop + 2
+      end
+    end
+    return table.concat(out)
+  end
+  function value()
+    space()
+    local c = text:sub(pos, pos)
+    if c == '{' then
+      local out = {}
+      pos = pos + 1
+      space()
+      if text:sub(pos, pos) == '}' then pos = pos + 1; return out end
+      while true do
+        space()
+        if text:sub(pos, pos) ~= '"' then fail_at('object key') end
+        local key = str()
+        space()
+        if text:sub(pos, pos) ~= ':' then fail_at('colon') end
+        pos = pos + 1
+        out[key] = value()
+        space()
+        local sep = text:sub(pos, pos)
+        pos = pos + 1
+        if sep == '}' then return out end
+        if sep ~= ',' then fail_at('comma') end
+      end
+    elseif c == '[' then
+      local out = {}
+      pos = pos + 1
+      space()
+      if text:sub(pos, pos) == ']' then pos = pos + 1; return json.array(out) end
+      while true do
+        out[#out + 1] = value()
+        space()
+        local sep = text:sub(pos, pos)
+        pos = pos + 1
+        if sep == ']' then return out end
+        if sep ~= ',' then fail_at('comma') end
+      end
+    elseif c == '"' then return str()
+    elseif text:sub(pos, pos + 3) == 'true' then pos = pos + 4; return true
+    elseif text:sub(pos, pos + 4) == 'false' then pos = pos + 5; return false
+    elseif text:sub(pos, pos + 3) == 'null' then pos = pos + 4; return json.null
+    else
+      local number = text:match('^-?%d+%.?%d*[eE]?[-+]?%d*', pos)
+      if not number or number == '' then fail_at('value') end
+      pos = pos + #number
+      return math.tointeger(tonumber(number)) or tonumber(number)
+    end
+  end
+  local result = value()
+  space()
+  if pos <= #text then fail_at('trailing data') end
+  return result
+end
+
+local function decode(text)
+  local ok, value = pcall(json.decode, text)
+  if ok then return value end
+  return lua_decode(text)
+end
+M._json_decode, M._json_encode = decode, encode
 
 ---------------------------------------------------------------------------
 -- Recorder. recorder(write, options) installs M._hooks and calls write(line)
@@ -154,9 +292,19 @@ function M.recorder(write, options)
   local r = {count = 0, t0 = options.t0, tracked = {}, last = {}, current = nil, buffer = nil}
   if r.t0 == nil then r.t0 = now() end
 
+  -- A recording never throws into the app: an entry that cannot be written
+  -- stops recording, and the host reports the reason (runtime.diagnostics).
+  function r.fail(reason)
+    if r.failed then return end
+    r.failed = tostring(reason)
+    r.stop()
+    if options.fail then pcall(options.fail, r.failed) end
+  end
   local function emit(entry)
+    if r.failed then return end
     r.count = r.count + 1
-    local line = encode(entry)
+    local ok, line = pcall(encode, entry)
+    if not ok then return r.fail('cannot encode recording entry ' .. r.count .. ': ' .. tostring(line)) end
     if r.buffer then r.buffer[#r.buffer + 1] = line else write(line) end
   end
   if options.header ~= false then
@@ -171,6 +319,7 @@ function M.recorder(write, options)
   end
 
   local hooks = {scheduler = options.scheduler}
+  function hooks.failed(reason) r.fail(reason) end
   -- Component props hold descriptions and callbacks: keep the plain data.
   -- Replay re-runs the context function on it; a context that read a
   -- dropped prop diverges at the start step.
@@ -326,7 +475,7 @@ local function decode_lines(source)
   else fail('replay expects log text or a list of lines') end
   local entries = {}
   for i, line in ipairs(lines) do
-    local ok, value = pcall(json.decode, line)
+    local ok, value = pcall(decode, line)
     if not ok or type(value) ~= 'table' then fail('replay: line %d is not a JSON object', i) end
     entries[i] = value
   end
@@ -429,7 +578,7 @@ function M.replay(source, options)
     scheduler, roots, released = replay_scheduler(start), {}, false
     recorder = M.recorder(function(line)
       observed_lines[#observed_lines + 1] = line
-      observed[#observed + 1] = json.decode(line)
+      observed[#observed + 1] = decode(line)
     end, {scheduler = scheduler, t0 = t0, header = false})
   end
 

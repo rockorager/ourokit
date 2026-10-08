@@ -126,9 +126,9 @@ pub const Service = struct {
                 .{ .phase = @tagName(d.phase), .source = d.source_name, .message = d.message }
             else
                 null;
-            const Recording = struct { path: []const u8, inputs: u64, failed: bool };
+            const Recording = struct { path: []const u8, inputs: u64, failed: bool, reason: ?[]const u8 };
             const recording: ?Recording = if (reload.config.recording) |sink|
-                .{ .path = sink.location(), .inputs = sink.lines -| 1, .failed = sink.failed }
+                .{ .path = sink.location(), .inputs = sink.lines -| 1, .failed = sink.failed, .reason = sink.reason() }
             else
                 null;
             return try jsonValue(a, .{ .generation = reload.generation, .source = reload.active().snapshot.entry_name, .diagnostic = diagnostic, .recording = recording });
