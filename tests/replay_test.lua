@@ -637,6 +637,75 @@ return {
     assert(pending > 0, 'checkpoints carried running popup timers')
   end,
 
+  -- A spawned task and an invoke started before a rotation finish after it:
+  -- the checkpoint lists them, replay stubs them, and their recorded results
+  -- apply. A child spawned after the checkpoint gets the live auto id.
+  ['rotation: a task and an invoke in flight across a checkpoint complete in the next segment'] = function()
+    local chart = machine.create {
+      id = 'straddle', initial = 'ready', context = { got = {}, watched = 0 },
+      actors = {
+        fetch = function(input) return input end,
+        watch = function() return 7 end,
+      },
+      states = { ready = {
+        invoke = { id = 'watch', src = 'watch', on_done = { actions = machine.assign {
+          watched = function(_, e) return e.output end } } },
+        on = {
+          FETCH = { actions = machine.spawn('fetch', { id = 'fetch', input = function() return 'first' end }) },
+          MORE = { actions = machine.spawn('fetch', { input = function() return 'auto' end }) },
+          PING = {},
+          ['done.actor.*'] = { actions = machine.assign { got = function(c, e)
+            local got = { table.unpack(c.got) }
+            got[#got + 1] = e.id .. '=' .. e.output
+            return got
+          end } },
+        },
+      } },
+    }
+    local clock = machine.manual_scheduler()
+    local segments, rotate_now = { {} }, false
+    local recorder = machine.recorder(function(line)
+      local segment = segments[#segments]
+      segment[#segment + 1] = line
+      return rotate_now
+    end, { scheduler = clock, app = 'test', rotate = function()
+      rotate_now = false
+      segments[#segments + 1] = { o.json.encode { format = 'ouro.machine.log', version = 3, t0 = 0, app = 'test', segment = #segments + 1 } }
+      return true
+    end })
+    local ok, err = pcall(function()
+      local actor = chart:start { id = 'straddle', scheduler = clock }
+      clock.advance(10)
+      actor:send('FETCH')
+      clock.advance(10)
+      rotate_now = true
+      actor:send('PING') -- written to segment 1; the checkpoint opens segment 2
+      clock.advance(10)
+      assert(#segments == 2, 'rotated once')
+      clock.resolve('fetch', 'late')
+      clock.resolve('watch', 7)
+      actor:send('MORE')
+      clock.run_tasks()
+      local got = actor:context().got
+      assert(#got == 2 and got[1] == 'fetch=late' and got[2]:find('=auto$'), table.concat(got, ','))
+      assert(actor:context().watched == 7)
+      actor:stop()
+    end)
+    recorder.stop()
+    assert(ok, err)
+    local checkpoint
+    for _, line in ipairs(segments[2]) do
+      local entry = o.json.decode(line)
+      if entry.checkpoint then checkpoint = entry end
+    end
+    for n, segment in ipairs(segments) do
+      local report = machine.replay(segment)
+      assert(report.ok, 'segment ' .. n .. ': ' .. machine.replay_text(report))
+    end
+    assert(checkpoint.tasks.straddle[1].id == 'fetch' and checkpoint.tasks.straddle[1].owner == 'ready', segments[2][3])
+    assert(checkpoint.invokes.straddle[1].id == 'watch', segments[2][3])
+  end,
+
   ['machine.advance needs a virtual clock'] = function()
     fails(function() machine.advance(-1) end, 'nonnegative integer')
   end,

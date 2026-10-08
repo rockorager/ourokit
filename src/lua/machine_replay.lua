@@ -681,6 +681,44 @@ function M.recorder(write, options)
     end
     return into
   end
+  -- Work in flight at a checkpoint: spawned tasks ({id, src, owner, index},
+  -- index being its place among the actor's children) and active invokes
+  -- ({state, id, src, at}), per actor path. Replay stubs them, so results
+  -- that arrive after the checkpoint apply as they did live.
+  local function tasks_of(actor)
+    local list, children = {}, actor._snapshot.children
+    for index, id in ipairs(children) do
+      local meta = children[id]
+      if actor._tasks[id] and type(meta) == 'table' then
+        list[#list + 1] = {id = id, src = meta.src, owner = meta.owner, index = index}
+      end
+    end
+    return list
+  end
+  local function work_of(actor, tasks, invokes)
+    local own = tasks_of(actor)
+    if own[1] then tasks[actor.path] = own end
+    local active = {}
+    for _, live in pairs(actor._invokes) do
+      if live.mailbox and live.time_ms then
+        active[#active + 1] = {state = live.state, id = live.id, src = live.src, at = live.time_ms - r.t0}
+      end
+    end
+    table.sort(active, function(a, b) return a.state < b.state or (a.state == b.state and a.id < b.id) end)
+    if active[1] then invokes[actor.path] = active end
+    for _, id in ipairs(actor._snapshot.children) do
+      local child = actor._children[id]
+      if type(child) == 'table' and child.chart then work_of(child, tasks, invokes) end
+    end
+  end
+  -- Restore numbers one serial per state, chart child and (replay) adopted
+  -- task. Lower the persisted serial by that count, so the replayed actor
+  -- ends at the live serial: auto-generated child ids stay the same.
+  local function align(persisted, actor)
+    if not actor or type(persisted) ~= 'table' or math.type(persisted.serial) ~= 'integer' then return end
+    persisted.serial = persisted.serial - #persisted.states - #persisted.children - #tasks_of(actor)
+    for _, child in ipairs(persisted.children) do align(child.snapshot, actor._children[child.id]) end
+  end
   function r.checkpoint()
     r.full = false
     if r.buffer or not options.rotate then return end
@@ -692,9 +730,13 @@ function M.recorder(write, options)
     for _, actor in ipairs(r.tracked) do
       if not actor._parent and actor._status ~= 'stopped' then
         local entry = {k = 'start', a = actor.path, m = actor.chart.id, t = t, checkpoint = true, r = json.array({}),
-          component = actor._component or nil, timers = timers_of(actor, {}), s = {}}
+          component = actor._component or nil, timers = timers_of(actor, {}), tasks = {}, invokes = {}, s = {}}
+        work_of(actor, entry.tasks, entry.invokes)
         local persisted, snapshot = pcall(actor.persist, actor)
-        if persisted then entry.snapshot = snapshot else entry.unrecordable = tostring(snapshot) end
+        if persisted then
+          align(snapshot, actor)
+          entry.snapshot = snapshot
+        else entry.unrecordable = tostring(snapshot) end
         for _, tracked in ipairs(r.tracked) do
           if root_of(tracked) == actor then entry.s[tracked.path] = delta(nil, tracked._snapshot) end
         end
@@ -943,6 +985,7 @@ replay = function(source, options)
     for k, v in pairs(entry) do out[k] = v end
     if recorded.checkpoint then
       out.snapshot, out.timers, out.r, out.s, out.checkpoint, out.component, out.input = nil, nil, nil, nil, nil, nil, nil
+      out.tasks, out.invokes = nil, nil
     end
     if type(out.e) == 'table' and out.e.token ~= nil then
       local e = {}
@@ -1044,6 +1087,53 @@ replay = function(source, options)
       if live then live.time_ms = timer.at - timer.ms end
     end
     if not ok then error(err, 0) end
+    -- Restore starts the active states' invokes again (as stubs here); check
+    -- each one the checkpoint lists and give it its live start time.
+    for path, list in pairs(entry.invokes or {}) do
+      local a = actor_at(path)
+      for _, invoke in ipairs(list) do
+        local live = a and a._invokes[invoke.state .. '|' .. invoke.id]
+        if not live or not scheduler.find(path, 'invoke', invoke.id, false) then
+          return string.format('the checkpoint has invoke %s (%s) running on %s, but restoring it did not start one',
+            tostring(invoke.id), tostring(invoke.state), path)
+        end
+        live.time_ms = t0 + invoke.at
+      end
+    end
+    -- Spawned tasks are not part of a persisted snapshot: adopt each one in
+    -- flight as a stub, in its place among the children, with a fresh child
+    -- token. This mirrors the interpreter's spawn_task effect: the result
+    -- arrives as done.actor.<id> / error.actor.<id> from origin 'child'.
+    local paths = {}
+    for path in pairs(entry.tasks or {}) do paths[#paths + 1] = path end
+    table.sort(paths)
+    for _, path in ipairs(paths) do
+      local a = actor_at(path)
+      if not a then return 'the checkpoint has tasks on ' .. path .. ', which restoring did not create' end
+      local snapshot = a._snapshot
+      for _, task in ipairs(entry.tasks[path]) do
+        local children = snapshot.children
+        table.insert(children, math.min(task.index, #children + 1), task.id)
+        children[task.id] = {status = 'active', src = task.src, owner = task.owner}
+        snapshot.serial = snapshot.serial + 1
+        local token = snapshot.serial
+        snapshot.entries['@' .. task.id] = token -- the interpreter's child_token_key
+        local scope = scheduler.open(a._root_scope)
+        local live = {scope = scope}
+        a._tasks[task.id] = live
+        local function complete(done, result)
+          if a._tasks[task.id] ~= live then return end
+          a._tasks[task.id] = nil
+          local event = done and {type = 'done.actor.' .. task.id, id = task.id, output = result, token = token}
+            or {type = 'error.actor.' .. task.id, id = task.id, error = result, token = token}
+          local delivered, failure = pcall(a._deliver, a, event, 'child')
+          if not delivered then print(('machine %s: handling %s failed: %s'):format(a.path, event.type, tostring(failure))) end
+          scheduler.close(scope)
+        end
+        scheduler.pending[#scheduler.pending + 1] = {scope = scope,
+          info = {kind = 'task', actor = a.path, id = task.id, src = task.src, token = token, complete = complete}}
+      end
+    end
   end
 
   local function deliver_stub(entry, kind, prefix)
@@ -1094,7 +1184,8 @@ replay = function(source, options)
       if entry.component then actor._component, actor._recorded_input = true, entry.input end
       roots[#roots + 1] = actor
       if entry.checkpoint then
-        restore_checkpoint(actor, entry)
+        local problem = restore_checkpoint(actor, entry)
+        if problem then diverge(index, problem); return false end
       else
         actor:start()
       end

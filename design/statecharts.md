@@ -1758,8 +1758,17 @@ replay exact for what is kept.
   segment opens with a **checkpoint**: a `{"k":"checkpoint","t":...}` line,
   then a `start` line with `checkpoint = true` for each running root. Each
   such line has the persisted snapshot (children included), full deltas in
-  `s`, and `timers`, the pending timers of the root and its children with
-  their deadlines (`{path: [{state, delay, ms, at}]}`).
+  `s`, and the work in flight in the root and its children, per actor
+  path:
+  - `timers`: pending timers with their deadlines, `{path: [{state, delay, ms, at}]}`;
+  - `tasks`: spawned tasks still running, `{path: [{id, src, owner, index}]}`,
+    where `owner` is the owner state and `index` the task's place among the
+    children;
+  - `invokes`: active invokes, `{path: [{state, id, src, at}]}`.
+
+  Restore numbers one serial per state, chart child and task. The persisted
+  `serial` is lowered by that count, so the restored actor ends at the live
+  serial and auto-generated child ids stay the same.
 
 Measured by `tests/replay_test.lua` ("recording size: 50 notifications
 ..."): 50 notifications, each with its own 16 KB image and a shared 4 KB
@@ -1799,15 +1808,15 @@ against those charts:
 - **Checkpoints.** A `checkpoint` line also starts a new generation, without
   holding work. Each checkpoint `start` restores its root from the snapshot,
   and restored timers are armed at their recorded deadlines, not a full
-  delay later. Restored invokes are stubs that the recorded results
-  complete. Each rotated segment therefore replays on its own from its
-  checkpoint. A checkpoint `start` compares its kind, actor, chart and
+  delay later. Restoring starts the listed invokes again as stubs, and
+  replay checks each one. Listed tasks, which a persisted snapshot does not
+  hold, are adopted as stubs in their place among the children. Recorded
+  results after the checkpoint complete both kinds as they did live. Each
+  rotated segment therefore replays on its own from its checkpoint. A checkpoint `start` compares its kind, actor, chart and
   time, and its deltas are the state both sides continue from. After a
   checkpoint, event `token`s are not compared, because restore numbers
   state entries afresh.
-  - Limits: a spawned task still running at the checkpoint has no stub, so
-    its result diverges ("no running task"). Transient context fields reset
-    as on reload (§6).
+  - Limit: transient context fields reset, as on reload (§6).
 
 Replay records what it observes with the same recorder, then compares it
 line by line with the log: kinds, times, events, compact records and
