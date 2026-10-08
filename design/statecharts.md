@@ -46,16 +46,24 @@ first written from this document alone. Its shape:
 local machine = require('ouro').machine
 local stopwatch = machine.create {
   id = 'stopwatch', type = 'parallel', order = { 'clock', 'settings' },  -- a parallel root
-  context = { elapsed = 0, laps = {}, max_laps = 5, draft_max_laps = 5 },
+  context = { elapsed = 0, banked = 0, started_at = 0, laps = {}, max_laps = 5, draft_max_laps = 5 },
   states = {
     clock = { initial = 'idle', states = {
-      idle = { on = { START = 'running' } },
-      running = { after = { [100] = { target = 'running', reenter = true, actions = 'tick' } }, on = { STOP = 'paused' } },
-      paused = { on = { START = 'running' } },
+      idle = { on = { START = { target = 'running', actions = 'start' } } },
+      running = { after = { [100] = { target = 'running', reenter = true, actions = 'tick' } },
+                  on = { STOP = { target = 'paused', actions = 'stop' } } },
+      paused = { on = { START = { target = 'running', actions = 'start' } } },
     } },
     settings = { initial = 'closed', states = { ... MAX_LAPS = machine.set('draft_max_laps', 'integer') ... } },
   },
-  actions = { tick = machine.assign { elapsed = function(c) return c.elapsed + 100 end } },
+  actions = {   -- machine.now() is the scheduler's logical clock (§8)
+    start = machine.assign { started_at = function() return machine.now() end },
+    tick = machine.assign { elapsed = function(c, e) return c.banked + (e.time_ms - c.started_at) end },
+    stop = machine.assign(function(c)
+      local elapsed = c.banked + (machine.now() - c.started_at)
+      return { elapsed = elapsed, banked = elapsed }
+    end),
+  },
 }
 
 -- view.lua: a function of the snapshot that hands widgets event bindings (§7).
@@ -456,8 +464,9 @@ unknown ids, and `state.children` maps child ids to child snapshots (§3).
 | `machine.selector(fn)` returns `sel` | `sel(data, ...)` calls `fn(data, ...)` | `fn`'s result, memoized while `data` and the arguments are raw-equal |
 | `machine.actions` specs | `before(actor)`; `output(snapshot, event)` | `nil` or an `ouro.action_error`; the output table |
 
-Guards, assigns, expressions and function actions are atomic: they cannot
-wait, spawn or exit (§1). Function actions get the actor for reading and for
+`machine.now()` (the logical clock, §8) is readable in all of the
+callbacks above that run inside a macrostep. Guards, assigns, expressions and
+function actions are atomic: they cannot wait, spawn or exit (§1). Function actions get the actor for reading and for
 sending; a send from an action queues behind the current macrostep and
 returns `nil, 'queued'`. Each sees the context as it was when it was reached
 in the macrostep, not the final context.
@@ -769,7 +778,8 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
 - **`after` delays are constants.** They are the integer keys of the `after`
   table, fixed when the chart is created; a delay computed from context is
   not supported. Use a fixed tick that re-enters its state
-  (`{ target = 'running', reenter = true }`) and count, or one state per delay.
+  (`{ target = 'running', reenter = true }`) and compute from the clock
+  below, or one state per delay.
 - **A millisecond clock for apps.** `machine.now()` returns the logical time
   of the scheduler running the current macrostep, and `actor:now()` the
   actor's scheduler clock. Both work in guards, assigns, expressions and
