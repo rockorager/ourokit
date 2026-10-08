@@ -12,7 +12,17 @@ return function(ouro, model, services)
 
   -- One filter per (entries, query), shared by guards, can() and the view.
   local results = machine.selector(model.results)
-  local function index(c, e) return e.index or c.selected end
+  -- ACTIVATE names an entry by id (a row click, or Enter's payload resolved
+  -- from the current snapshot), by index, or by nothing: the selection.
+  local function index(c, e)
+    if e.id then
+      for i, entry in ipairs(results(c.entries, c.query)) do
+        if entry.id == e.id then return i end
+      end
+      return 0
+    end
+    return e.index or c.selected
+  end
 
   local launcher = machine.create {
     id = "launcher", initial = "hidden",
@@ -22,7 +32,7 @@ return function(ouro, model, services)
       QUERY = { value = "string" },
       MOVE = { delta = "integer" },
       SELECT = { index = "integer" },
-      ACTIVATE = { index = "integer?" },
+      ACTIVATE = { id = "string?", index = "integer?" },
       RETRY = {},
     },
     guards = {

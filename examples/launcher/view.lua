@@ -13,7 +13,8 @@ return function(ouro, model, filter)
     return ouro.button {
       key = "row", label = model.text(entry.name) or entry.id, height = "auto",
       variant = selected and "soft" or "ghost", tone = selected and "accent" or "neutral",
-      send = launcher:event { type = "ACTIVATE", index = i },
+      -- A click activates the entry the user saw, by id.
+      send = launcher:event { type = "ACTIVATE", id = entry.id },
       children = {
         ouro.row { key = "content", gap = 12, cross_alignment = "center", padding = 6,
           icon and ouro.xdg.icon { key = "icon", name = icon, theme = "Adwaita", width = 32, height = 32, alt = "" }
@@ -42,10 +43,25 @@ return function(ouro, model, filter)
     return count == 1 and "1 application" or (count .. " applications")
   end
 
+  -- Enter names the selected entry as of dispatch, not as of this render:
+  -- a lazy payload resolves from the current snapshot, so Enter typed right
+  -- after a character that has not rebuilt the view yet still launches the
+  -- current top match. It resolves to nothing when nothing matches; in
+  -- `open.failed` it retries the scan.
+  function M.submit(launcher)
+    return launcher:event(function(s)
+      if ouro.machine.matches(s, "open.failed") then return { type = "ACTIVATE" } end
+      local c = s.context
+      local entry = filter(c.entries, c.query)[c.selected]
+      return entry and { type = "ACTIVATE", id = entry.id }
+    end)
+  end
+
   function M.content(launcher)
     local c = launcher:context()
     local results = filter(c.entries, c.query)
     local close = launcher:event("CLOSE")
+    local submit = M.submit(launcher)
     local list
     if #results > 0 then
       list = ouro.virtual_list {
@@ -71,7 +87,7 @@ return function(ouro, model, filter)
             on_command = {
               next = launcher:event { type = "MOVE", delta = 1 },
               previous = launcher:event { type = "MOVE", delta = -1 },
-              submit = launcher:event("ACTIVATE"),
+              submit = submit,
               cancel = close,
             },
           },

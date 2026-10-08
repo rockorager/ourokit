@@ -123,6 +123,12 @@ local c=launcher:context()
 assert(launcher:matches('open.loading') and c.query=='' and c.selected==1 and c.launching==nil and #c.entries==5)
 clock.run_tasks(); assert(scans==2)
 
+-- An activation by id must name a current result.
+launcher:send{type='QUERY', value='term'}
+assert(not launcher:can{type='ACTIVATE', id='firefox.desktop'}, 'Firefox is not a result for "term"')
+launcher:send{type='QUERY', value=''}
+assert(launcher:can{type='ACTIVATE', id='firefox.desktop'})
+
 -- A pointer activation names its row.
 launcher:send{type='ACTIVATE', index=3}
 assert(launcher:context().launching.name=='Firefox' and launcher:context().selected==3)
