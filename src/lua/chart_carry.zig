@@ -100,7 +100,9 @@ fn reportError(state: *c.State, context: []const u8) void {
 
 /// Pushes onto `to` a deep copy of the plain value at absolute `index` in
 /// `from`: nil, booleans, numbers, strings, `ouro.json.null`, and tables with
-/// string or integer keys. Tables are read raw. On error the caller restores both stack tops.
+/// string or integer keys. Tables are read raw and keep their `ouro.json.array`
+/// mark, the only metatable plain data carries. On error the caller restores
+/// both stack tops.
 fn copyPlain(from: *c.State, index: c_int, to: *c.State, depth: usize) !void {
     if (depth > max_depth) return error.CarriedStateTooDeep;
     if (c.lua_checkstack(from, 2) == 0 or c.lua_checkstack(to, 3) == 0) return error.LuaStackExhausted;
@@ -133,6 +135,9 @@ fn copyPlain(from: *c.State, index: c_int, to: *c.State, depth: usize) !void {
                 c.lua_settable(to, -3);
                 c.lua_settop(from, -2);
             }
+            // The array mark is what makes an empty table encode as [] and
+            // decode back into native lists (prepare_launch's entry fields).
+            if (json.isJsonArray(from, index)) try json.markJsonArray(to, -1);
         },
         // The same pointer in every VM, so it crosses unchanged.
         c.type_light_userdata => {
@@ -196,4 +201,37 @@ test "plain values cross Lua states unchanged and non-plain values are rejected"
     try std.testing.expectEqual(c.ok, c.luaL_loadbufferx(from, deep, deep.len, "=deep", "t"));
     try std.testing.expectEqual(c.ok, c.lua_pcallk(from, 0, 1, 0, 0, null));
     try std.testing.expectError(error.CarriedStateTooDeep, copyPlain(from, 1, to, 0));
+}
+
+test "carried tables keep their JSON array marks" {
+    const from = c.luaL_newstate().?;
+    defer c.lua_close(from);
+    const to = c.luaL_newstate().?;
+    defer c.lua_close(to);
+    // A desktop entry as ouro.xdg.applications returns it: empty arrays are
+    // marked, and absent optional fields are ouro.json.null.
+    c.lua_createtable(from, 0, 3);
+    c.lua_createtable(from, 0, 0);
+    try json.markJsonArray(from, -1);
+    c.lua_setfield(from, -2, "categories");
+    c.lua_createtable(from, 0, 1);
+    c.lua_createtable(from, 0, 0);
+    try json.markJsonArray(from, -1);
+    c.lua_setfield(from, -2, "keywords");
+    c.lua_setfield(from, -2, "nested");
+    try json.pushJson(from, .null);
+    c.lua_setfield(from, -2, "icon");
+    try copyPlain(from, 1, to, 0);
+
+    _ = c.lua_getfield(to, 1, "categories");
+    try std.testing.expect(json.isJsonArray(to, -1));
+    c.lua_settop(to, 1);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var count: usize = 0;
+    const value = try json.luaToJson(to, 1, arena.allocator(), 0, &count);
+    const text = try std.json.Stringify.valueAlloc(arena.allocator(), value, .{});
+    try std.testing.expectEqualStrings(
+        \\{"categories":[],"icon":null,"nested":{"keywords":[]}}
+    , text);
 }

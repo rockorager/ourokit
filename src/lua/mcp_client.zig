@@ -607,7 +607,7 @@ pub fn markJsonArray(state: *c.State, index: c_int) !void {
     _ = c.lua_setmetatable(state, absolute_index);
 }
 
-fn isJsonArray(state: *c.State, index: c_int) bool {
+pub fn isJsonArray(state: *c.State, index: c_int) bool {
     if (c.lua_getmetatable(state, index) == 0) return false;
     _ = c.luaL_newmetatable(state, array_metatable);
     const matches = c.lua_rawequal(state, -1, -2) != 0;

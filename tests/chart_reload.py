@@ -156,6 +156,21 @@ def launcher():
                 assert label(status) == "1 application", f"launcher query did not survive reload: {label(status)}"
                 assert node(env, endpoint, "launcher", search)["value"] == "ga"
                 print("PASS chart reload: the launcher query and its results survive a reload")
+
+                # The carried entry came from ouro.xdg.applications: its empty
+                # lists are marked JSON arrays, which prepare_launch needs to
+                # decode it. Launching then reaches systemd over D-Bus, which
+                # this private session bus does not have.
+                for _ in range(5):
+                    tree = inspect(env, endpoint, "launcher")["windows"][0]
+                    row = next(n["path"] for n in tree["nodes"] if n.get("role") == "button" and n.get("label") == "Gamma Viewer")
+                    result = run(str(BINARY), "dev", "input", str(endpoint), json.dumps({
+                        "window": "launcher", "token": tree["token"], "action": "click", "target": row}), env=env, ok=None)
+                    if result.returncode == 0:
+                        break
+                wait_for(lambda: (label(status) or "").startswith("Could not launch"), "activating did not try to launch")
+                assert "systemd1" in label(status), f"the carried entry did not reach D-Bus: {label(status)}"
+                print("PASS chart reload: a carried desktop entry still prepares a launch")
             except BaseException:
                 error_file.flush()
                 print(errors.read_text())
