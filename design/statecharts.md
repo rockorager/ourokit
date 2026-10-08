@@ -32,7 +32,7 @@ Test names are from `tests/machine_test.lua` unless a file is given.
 | **G5** One event model for widgets, shortcuts, commands, palette, MCP, activation and surfaces, with request/response | §2 (send results, `wait_for`, `deliver`, `machine.actions`), §7 | `bindings_test.lua`; 'send reports whether the event was taken…'; 'wait_for…'; 'actions derive MCP input schemas…'; `contacts.py` (MCP as chart events); `desktop_native.py` 'launcher: single instance toggles on activation', 'surface events: … close_requested decided by the chart' | met (a palette is bound buttons or options; there is no stock palette widget) |
 | **G6** Agent-first dev loop: inspect states and records, live visualizer, deterministic record/replay, generated tests, reload that keeps state | §10 (records, Dev tools), §9, §8 Logical time, §14 | `statechart_inspection.py`; `tools/statechart-visualizer/storybook.lua` (`recording/*` stories draw a real session); 'records carry the scheduler clock and post-step guard valves'; `chart_reload.py`; 'reload hooks persist roots…'; `chart_replay.py` (real stopwatch, contacts, documents and launcher sessions replay identically; a changed chart diverges at its first step; generated tests fail on it); `replay_test.lua`; `examples/*/tests/*_paths_test.jsonl` (`ouroctl test examples`) | met: recordings under `--dev`/`--record`, `ouroctl replay` with divergence reports, logical clocks, generated paths (guard-aware, seeded by recordings) as `ouroctl test` files, visualizer scrubbing (§14). Generated paths are not emitted as Storybook stories |
 | **G7** Performance at the real boundaries: few Lua–Zig crossings, per-field rebuild locality, cached views, unchanged text work; the interpreter stays in Lua and snapshots stay Lua tables | §6 Rebuild locality, Status | 'rebuild locality: typing in one document re-renders only its readers'; 'rebuild locality: fields, configuration and selectors'; 'views are cached per table…' | met: render counts and allocation are proven by tests; Lua–Zig crossings and text work by call-path analysis, not measured (performance is not measured yet, by decision) |
-| **G8** No fixed limits on runtime objects; actors and components release native resources on stop and unmount | §8 Resources and capacities | `statechart_capacity.py`; `component_scopes_test.lua` (70 rows, 40 rows remounted 20×, 3000 cycles) | partly: signals grow and release; per-window and protocol budgets are still fixed (§8) |
+| **G8** No fixed limits on runtime objects; actors and components release native resources on stop and unmount | §8 Resources and capacities | `zig build test-stress` (1000 rows × 50 remounts, 10k actors, back to baseline); `component_scopes_test.lua` (300 rows); `statechart_capacity.py`; growth unit tests (§8) | partly: application windows (16), virtual-list and layout-builder snapshots, and clipboard requests are still fixed; test-stress currently fails on retained cancelled timers (§8) |
 | **G9** Failures reach charts instead of crashing: `surface.failed`, atomic commits, `YieldInAction`, rejected events with reasons | §1 Algorithm, §2 Sending, Runtime events | 'guard errors leave the previous snapshot in place'; 'an eventless livelock fails without committing…'; 'guards, assigns and actions cannot wait, spawn or exit'; 'review M6…'; `desktop_native.py` 'launcher surface … failure', 'unbound role change: logged, last valid window kept' | met |
 | **G10** Headless testability: `manual_scheduler`, `ouroctl test` settling, chart tests with fake services | §8 Tests, §0 Tests | `documents.py`, `contacts.py`, `launcher.py` (fake services); `stopwatch_test.lua`; `component_scopes_test.lua` 't:settle shows state changed from the test body' | met: native-scheduler tests run on a virtual logical clock (`t:advance`, §8); `replay_test.lua` |
 
@@ -822,39 +822,67 @@ function exactly once when the keyed instance leaves (application model,
 the instance scope also retires any Lua-opened child scopes beneath it rather
 than panicking, and so does ending an MCP action. A remount starts fresh.
 
-**Capacities:**
+**Capacities.** Configured sizes are initial sizes. Growth happens while a
+commit, build or reload is *prepared*, so commit itself never fails. Slots
+that the kernel or a suspended Lua continuation points at grow in chunks that
+never move (`core.StableSlots`).
 
-| Object | Behavior | Status |
+| Object | Grows | Landed in |
 | --- | --- | --- |
-| Signal graph: signals, subscription edges, readers, pending reads | Configured sizes are initial sizes; grows on demand. Growth happens while a commit is validated, so commit cannot fail | landed (7d20b81) |
-| Actor hidden signals | Released on `stop()` and component unmount | landed (247bcd0) |
-| Scheduler scopes, resources and tasks | Grow on demand; scopes are reserved while a build or reload is prepared, so commit cannot fail. `scope_capacity` becomes an initial size | in flight (scopes thread) |
-| Lua task slots, logical timers | Grow (chunked slots, timer heap) | landed earlier |
-| io_uring operation slots, file reader, module loader, MCP calls, stdio | Grow in fixed-size chunks that never move, because the kernel or a Lua continuation holds slot pointers | in flight (scopes thread) |
-| Per-window node budget (256: instances, render objects, semantics, bindings, controls, animations), scene commands (512) | Fixed | open |
-| HTTP jobs (16), D-Bus (8 buses, 64 subscriptions, 128 requests, 64 names), audio jobs (8), window slots (16) | Fixed | open |
+| Signal graph: signals, subscription edges, readers, pending reads | on demand, while a commit is validated | 7d20b81 |
+| Actor hidden signals | released on `stop()` and component unmount | 247bcd0, ff9d0e4 |
+| Scheduler scopes, resources and tasks | on demand; reconcile and reload reserve scopes while preparing | de18a08 |
+| Lua task slots, logical timers | chunked slots, timer heap | earlier |
+| io_uring operation slots, whole-file reads, module loader, MCP calls, stdio | stable chunks; a full submission ring is flushed early, not an error | 19073d0 |
+| HTTP requests (was 16) | stable chunks | 2c7c299 |
+| Per-window budgets: instances, render objects, semantic nodes and text, pointer bindings, buttons, text inputs, list boxes, animations, scene commands (was 256 nodes, 512 commands), UI build storage, prepared reload builds | while a build is prepared; large trees have linear repaint, allocation, retirement and inspection paths | be20adb |
+| D-Bus connections (8), calls (128), subscriptions (64), owned names (64); audio watchers (8) | stable chunks | a93ad61 |
+
+**Still fixed, not by design (open):**
+- application windows (16): wayring sizes its object tables from it when it
+  connects;
+- per-build virtual list snapshots (32 lists, 256 materialized rows) and
+  layout-builder snapshots (128), which are copied by value;
+- clipboard requests (16).
 
 **Fixed by design.** These limits guard against hostile input, protocol
 abuse or pathological depth. They do not count live objects:
-- HTTP and D-Bus message and header byte limits (`max_bytes`, `max_header_bytes`);
-- module file size and file read `max_bytes`;
-- the MCP receive buffer (64 KiB per call) and JSON value depth and count;
-- Lua nesting and stack depth;
-- the io_uring submission ring, which applies backpressure (callers retry on
-  `SubmissionQueueFull`);
+- HTTP, D-Bus, file and module byte limits (`max_bytes`, `max_header_bytes`,
+  module size);
+- MCP receive buffers (64 KiB per call) and JSON value depth and count;
+- widget nesting (32), build stabilization passes, Lua nesting and stack depth;
+- inbound D-Bus method calls from peers (128);
 - the platform input-event queue;
-- Wayland outputs and workspaces, which mirror the compositor;
+- compositor-mirrored outputs and workspaces, and mirrored PipeWire objects;
 - damage regions, which merge beyond 8 rectangles.
 
 **Proof:**
-- `tests/component_scopes_test.lua`: 70 rows, 40 rows remounted 20 times, and
-  3000 create/stop cycles. Before 7d20b81, 4 of its 6 tests failed with
-  "signal capacity exceeded".
-- `tests/statechart_capacity.py`: 3000 kept actors in a headless app. It used
+- `zig build test-stress` (`tests/capacity_stress.lua`) has two tests:
+  '1000 component rows mount and remount 50 times' and '10000 actors created
+  and stopped'. Both check that instances, render objects, scopes, signals,
+  callbacks and the Lua heap return to baseline, including while the stopped
+  actors are still referenced. It takes about 50 s in Debug, using the
+  `t:resources()` test API. Known regression: it currently fails, because
+  the logical clock (abbcdcd) keeps cancelled timers; the interpreter thread
+  has the report.
+- `tests/component_scopes_test.lua` has these tests:
+  - 'capacity: a list of 300 component machines mounts' (about 80 rows used
+    to fail with "cannot append box descriptor");
+  - 40 rows remounted 20 times;
+  - 3000 create/stop cycles.
+  Before 7d20b81, it failed with "signal capacity exceeded".
+- `tests/statechart_capacity.py` keeps 3000 actors in a headless app. It used
   to fail at cycle 65.
-- Still to come from the scopes thread: scope-growth unit tests, and stress
-  tests (1000 rows × 50 remounts, 10k cycles) that check memory returns to
-  baseline.
+- Unit tests:
+  - the scope-growth test in `src/lua/scopes.zig`;
+  - 'reconcile plans … at capacity' and 'reconcile grows instance and render
+    storage during preparation' (`src/ui/instance/tree.zig`);
+  - 'operation slots grow past their initial capacity and a full ring is
+    flushed early' (`io_uring.zig`);
+  - the module loader loading nested modules with `module_capacity` 1;
+  - 'HTTP requests owned by a retired state scope …', now with 20 requests;
+  - 'stopped statechart actors release their hidden signals at once'
+    (`src/app/source_generation.zig`).
 
 ## 9. Reload keeps state
 
