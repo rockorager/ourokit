@@ -21,6 +21,7 @@ import tempfile
 import time
 
 from application_services import BINARY, RpcStream, call, development_path, record, request
+from desktop_native import inspect
 
 SOURCE = '''local o = require('ouro')
 local m = o.machine
@@ -284,6 +285,21 @@ def main():
             assert b'panic' not in stderr and b'leaked' not in stderr, stderr
 
 
+COMPONENT = '''local o = require('ouro')
+local m = o.machine
+local chart = m.create {
+  id = 'collapsible', initial = 'closed', events = {TOGGLE = {}},
+  states = {closed = {on = {TOGGLE = 'open'}}, open = {on = {TOGGLE = 'closed'}}},
+}
+local Collapsible = m.component(chart, function(self, props)
+  return o.button {key = 'b', label = props.title, send = self:event('TOGGLE')}
+end)
+return o.app {id = 'dev.ourokit.statechart-component', run = function()
+  return {windows = {o.window {id = 'main', title = 'c', width = 300, height = 200, content = function()
+    return o.column {key = 'panel', Collapsible {key = 'details', title = 'Details'}}
+  end}}}
+end}
+'''
 ROOT = Path(__file__).resolve().parents[1]
 VISUALIZER = ROOT / 'tools/statechart-visualizer/app.lua'
 
@@ -388,8 +404,21 @@ def native():
             assert not failed and 'view.following' in out['states'], out
             out, failed = send(me, 'visualizer', {'type': 'ATTACHED'})
             assert not failed and not out['accepted'] and out['reason'] == 'no_transition', out
+
+            # Component machines by exact path, once started (they start lazily).
+            component = root / 'component.lua'
+            component.write_text(COMPONENT)
+            _, comp = launch('component', component, '--dev', '--software')
+            tree = poll(lambda: inspect(env, comp, 'main')['windows'][0], 'no component window')
+            node = next(n for n in tree['nodes'] if n.get('path') == 'panel/details/b')
+            subprocess.run([str(BINARY), 'dev', 'input', str(comp), json.dumps(dict(
+                window='main', token=tree['token'], node=node['id'], action='click', target='panel/details/b'))],
+                env=env, check=True, capture_output=True, timeout=10)
+            out, failed = send(comp, 'collapsible@details', {'type': 'TOGGLE'}, wait={'states': ['closed']})
+            assert not failed and out['accepted'] and out['states'] == ['closed'], out
             print('PASS statecharts native: stopwatch driven by runtime.send and replayed identically; '
-                  'visualizer attached by push with no idle requests; visualizer attached to itself')
+                  'visualizer attached by push with no idle requests; visualizer attached to itself; '
+                  'component machine addressed by instance path')
         finally:
             for name, process in processes:
                 if process.poll() is None:

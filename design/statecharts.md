@@ -1113,8 +1113,12 @@ chart as well as inspect it:
   recording, so `ouroctl replay` reproduces sessions driven this way
   (`statechart_inspection.py` drives START/LAP/STOP into the stopwatch and
   replays the log identically).
-- Component machines are addressed by instance path (`chart@<instance path>`)
-  once the interpreter registers them that way.
+- Actors are matched by exact path: root actors by id, spawned children as
+  `parent/child`, component machines as `<chart id>@<instance path>` (for
+  example `collapsible@panel/details`, with `#2` for a second live instance
+  on the same path). Component inputs are recorded, so they replay too.
+  Component actors start lazily and are listed by `machine.actors()` only
+  after their first event, so until then they cannot be sent to.
 - It is absent outside `--dev`. Production automation uses `machine.actions`.
 
 `ouro.development_endpoint()` returns `"unix:<path>"` of the instance's own
