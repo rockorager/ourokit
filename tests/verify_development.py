@@ -85,6 +85,38 @@ def stop(process):
     process.wait(timeout=5)
 
 
+def survivors(binary, token):
+    """ouroctl processes started by this run: they inherit OUROKIT_TEST_RUN."""
+    found = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if Path(entry, 'exe').resolve() != binary:
+                continue
+            if f'OUROKIT_TEST_RUN={token}'.encode() in Path(entry, 'environ').read_bytes().split(b'\0'):
+                found.append(int(entry.name))
+        except OSError:  # exited, or not ours
+            pass
+    return found
+
+
+def check_survivors(name, binary, token):
+    """No ouroctl may outlive its suite. A test that runs the app in its own
+    session (dbus-run-session with start_new_session) escapes stop(), so a
+    leak would otherwise go unnoticed and accumulate across runs."""
+    deadline = time.monotonic() + 3
+    while (left := survivors(binary, token)) and time.monotonic() < deadline:
+        time.sleep(.05)
+    if left:
+        for pid in left:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        raise RuntimeError(f'{name} left ouroctl running: pids {left}')
+
+
 def environment(root, binary):
     env = os.environ.copy()
     for key in (
@@ -106,6 +138,7 @@ def environment(root, binary):
     env.update(
         XDG_RUNTIME_DIR=str(root),
         OUROKIT_TEST_BINARY=str(binary),
+        OUROKIT_TEST_RUN=root.name,
         WLR_BACKENDS='headless',
         WLR_RENDERER='pixman',
         WLR_LIBINPUT_NO_DEVICES='1',
@@ -160,6 +193,7 @@ def verify(binary):
                             raise RuntimeError(f'{name} failed with exit status {code}')
                     finally:
                         stop(process)
+                    check_survivors(name, binary, env['OUROKIT_TEST_RUN'])
                     if compositor.poll() is not None:
                         raise RuntimeError('Sway exited while tests were running')
                 print(f'PASS development verification: all {len(TESTS)} suites ran on a private headless compositor', flush=True)

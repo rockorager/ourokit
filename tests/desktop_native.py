@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import shlex
+import signal
 import select
 import subprocess
 import sys
@@ -79,12 +80,35 @@ def capture(env, endpoint, window, name):
 
 
 def terminate(process):
-    if process.poll() is None:
-        process.terminate()
+    """Stop a process. One started with start_new_session=True leads its own
+    process group, and the whole group is stopped: a wrapper such as
+    dbus-run-session exits on SIGTERM without stopping the app it started."""
+    def send(sig):
+        try:
+            os.killpg(process.pid, sig)  # no such group unless it leads one
+            return
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            process.send_signal(sig)
+
+    def group_alive():
+        try:
+            os.killpg(process.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    send(signal.SIGTERM)
+    deadline = time.monotonic() + 5
     try:
         process.wait(timeout=5)
+        while group_alive() and time.monotonic() < deadline:
+            time.sleep(.02)
     except subprocess.TimeoutExpired:
-        process.kill()
+        pass
+    if process.poll() is None or group_alive():
+        send(signal.SIGKILL)
         process.wait(timeout=5)
 
 

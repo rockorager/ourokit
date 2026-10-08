@@ -10,6 +10,8 @@ import os
 import subprocess
 import tempfile
 
+from desktop_native import terminate
+
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("OUROKIT_TEST_BINARY", ROOT / "zig-out/bin/ouroctl"))
 
@@ -216,8 +218,13 @@ with tempfile.TemporaryDirectory() as temporary:
     for name in ("model.lua", "storage.lua", "charts.lua"):
         (Path(temporary) / name).write_bytes((ROOT / "examples/documents" / name).read_bytes())
     env=dict(os.environ, XDG_CONFIG_HOME=temporary+'/config', XDG_STATE_HOME=temporary+'/state')
-    process = subprocess.run(["dbus-run-session", "--", str(BINARY), "run", str(app), "--headless"], env=env, capture_output=True, text=True, timeout=10)
-    stdout, stderr = process.stdout, process.stderr
+    # Its own process group: a timeout stops the app, not only dbus-run-session.
+    process = subprocess.Popen(["dbus-run-session", "--", str(BINARY), "run", str(app), "--headless"], env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    finally:
+        terminate(process)
     assert process.returncode == 0, stderr
 assert "LuaRuntimeError" not in stderr, stderr
 assert "PASS documents charts" in stdout, stdout
