@@ -15,6 +15,17 @@ ouro.xdg.paths = ouro.xdg.paths or function(id)
 end
 require("app")
 local has_views, views = pcall(require, 'story_views')
-return ouro.machine.state_stories(ouro.json.decode([=[
-{"charts":[{"chart":"stopwatch","states":[{"inputs":{},"state":"clock","steps":[]},{"inputs":{},"state":"clock.idle","steps":[]},{"inputs":[{"a":"stopwatch","e":{"type":"START"},"k":"event"},{"a":"stopwatch","e":{"type":"STOP"},"k":"event"}],"state":"clock.paused","steps":["START","STOP"]},{"inputs":[{"a":"stopwatch","e":{"type":"START"},"k":"event"}],"state":"clock.running","steps":["START"]},{"inputs":{},"state":"settings","steps":[]},{"inputs":{},"state":"settings.closed","steps":[]},{"inputs":[{"a":"stopwatch","e":{"type":"OPEN_SETTINGS"},"k":"event"}],"state":"settings.open","steps":["OPEN_SETTINGS"]}]}]}
-]=]), has_views and views or nil)
+local decode = ouro.json.decode
+local values = {}
+local plan = {values = values, charts = {
+  {chart = "stopwatch", input = decode([=[{}]=]).input, states = {
+    {state = "clock", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "clock.idle", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "clock.paused", steps = decode([=[["START","STOP"]]=]), inputs = decode([=[[{"a":"stopwatch","e":{"type":"START"},"k":"event"},{"a":"stopwatch","e":{"type":"STOP"},"k":"event"}]]=])},
+    {state = "clock.running", steps = decode([=[["START"]]=]), inputs = decode([=[[{"a":"stopwatch","e":{"type":"START"},"k":"event"}]]=])},
+    {state = "settings", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "settings.closed", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "settings.open", steps = decode([=[["OPEN_SETTINGS"]]=]), inputs = decode([=[[{"a":"stopwatch","e":{"type":"OPEN_SETTINGS"},"k":"event"}]]=])},
+  }},
+}}
+return ouro.machine.state_stories(plan, has_views and views or nil)

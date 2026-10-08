@@ -15,6 +15,29 @@ ouro.xdg.paths = ouro.xdg.paths or function(id)
 end
 require("app")
 local has_views, views = pcall(require, 'story_views')
-return ouro.machine.state_stories(ouro.json.decode([=[
-{"charts":[{"chart":"appearance","states":[{"inputs":{},"state":"shown","steps":[]}]},{"chart":"contacts","states":[{"inputs":[{"a":"contacts","e":{"type":"QUIT"},"k":"event"},{"a":"contacts","id":"exit","k":"invoke","ok":true,"value":null}],"state":"exited","steps":["QUIT","done.invoke.exit"]},{"inputs":[{"a":"contacts","e":{"type":"QUIT"},"k":"event"}],"state":"exiting","steps":["QUIT"]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":false,"value":"generated error"}],"state":"failed","steps":["error.invoke.load"]},{"inputs":{},"state":"loading","steps":[]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":true,"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}}],"state":"ready","steps":["done.invoke.load"]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":true,"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}}],"state":"ready.sync","steps":["done.invoke.load"]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":true,"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}}],"state":"ready.sync.idle","steps":["done.invoke.load"]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":true,"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}},{"a":"contacts","e":{"id":"ada","name":"pending","type":"RENAME"},"k":"event"},{"a":"contacts","id":"save","k":"invoke","ok":false,"value":{"message":"offline"}}],"state":"ready.sync.retrying","steps":["done.invoke.load","RENAME","error.invoke.save"]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":true,"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}},{"a":"contacts","e":{"id":"ada","name":"pending","type":"RENAME"},"k":"event"}],"state":"ready.sync.saving","steps":["done.invoke.load","RENAME"]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":true,"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}}],"state":"ready.lifecycle","steps":["done.invoke.load"]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":true,"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}},{"a":"contacts","e":{"type":"QUIT"},"k":"event"}],"state":"ready.lifecycle.quitting","steps":["done.invoke.load","QUIT"]},{"inputs":[{"a":"contacts","id":"load","k":"invoke","ok":true,"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}}],"state":"ready.lifecycle.running","steps":["done.invoke.load"]}]}]}
-]=]), has_views and views or nil)
+local decode = ouro.json.decode
+local values = {}
+values[1] = decode([=[{"value":null}]=]).value
+values[2] = decode([=[{"value":"generated error"}]=]).value
+values[3] = decode([=[{"value":{"contacts":[{"email":"ada@example.org","id":"ada","name":"Ada Lovelace"},{"email":"grace@example.org","id":"grace","name":"Grace Hopper"}]}}]=]).value
+values[4] = decode([=[{"value":{"message":"offline"}}]=]).value
+local plan = {values = values, charts = {
+  {chart = "appearance", input = decode([=[{}]=]).input, states = {
+    {state = "shown", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+  }},
+  {chart = "contacts", input = decode([=[{}]=]).input, states = {
+    {state = "exited", steps = decode([=[["QUIT","done.invoke.exit"]]=]), inputs = decode([=[[{"a":"contacts","e":{"type":"QUIT"},"k":"event"},{"a":"contacts","id":"exit","k":"invoke","ok":true,"vref":1}]]=])},
+    {state = "exiting", steps = decode([=[["QUIT"]]=]), inputs = decode([=[[{"a":"contacts","e":{"type":"QUIT"},"k":"event"}]]=])},
+    {state = "failed", steps = decode([=[["error.invoke.load"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":false,"vref":2}]]=])},
+    {state = "loading", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "ready", steps = decode([=[["done.invoke.load"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":true,"vref":3}]]=])},
+    {state = "ready.sync", steps = decode([=[["done.invoke.load"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":true,"vref":3}]]=])},
+    {state = "ready.sync.idle", steps = decode([=[["done.invoke.load"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":true,"vref":3}]]=])},
+    {state = "ready.sync.retrying", steps = decode([=[["done.invoke.load","RENAME","error.invoke.save"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":true,"vref":3},{"a":"contacts","e":{"id":"ada","name":"pending","type":"RENAME"},"k":"event"},{"a":"contacts","id":"save","k":"invoke","ok":false,"vref":4}]]=])},
+    {state = "ready.sync.saving", steps = decode([=[["done.invoke.load","RENAME"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":true,"vref":3},{"a":"contacts","e":{"id":"ada","name":"pending","type":"RENAME"},"k":"event"}]]=])},
+    {state = "ready.lifecycle", steps = decode([=[["done.invoke.load"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":true,"vref":3}]]=])},
+    {state = "ready.lifecycle.quitting", steps = decode([=[["done.invoke.load","QUIT"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":true,"vref":3},{"a":"contacts","e":{"type":"QUIT"},"k":"event"}]]=])},
+    {state = "ready.lifecycle.running", steps = decode([=[["done.invoke.load"]]=]), inputs = decode([=[[{"a":"contacts","id":"load","k":"invoke","ok":true,"vref":3}]]=])},
+  }},
+}}
+return ouro.machine.state_stories(plan, has_views and views or nil)

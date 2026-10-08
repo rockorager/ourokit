@@ -15,6 +15,33 @@ ouro.xdg.paths = ouro.xdg.paths or function(id)
 end
 require("app")
 local has_views, views = pcall(require, 'story_views')
-return ouro.machine.state_stories(ouro.json.decode([=[
-{"charts":[{"chart":"document","input":{},"states":[{"inputs":[{"a":"document","e":{"type":"CLOSE"},"k":"event"}],"state":"closed","steps":["CLOSE"]},{"inputs":{},"state":"open","steps":[]},{"inputs":{},"state":"open.io","steps":[]},{"inputs":{},"state":"open.io.idle","steps":[]},{"inputs":[{"a":"document","e":{"type":"SAVE"},"k":"event"}],"state":"open.io.saving","steps":["SAVE"]},{"inputs":[{"a":"document","e":{"type":"SAVE"},"k":"event"}],"state":"open.io.saving.choosing","steps":["SAVE"]},{"inputs":[{"a":"document","e":{"type":"SAVE"},"k":"event"},{"a":"document","id":"choose","k":"invoke","ok":true,"value":"file:///tmp/note.ournote"}],"state":"open.io.saving.writing","steps":["SAVE","done.invoke.choose"]},{"inputs":{},"state":"open.lifecycle","steps":[]},{"inputs":{},"state":"open.lifecycle.active","steps":[]},{"inputs":[{"a":"document","e":{"field":"text","type":"EDIT","value":"title"},"k":"event"},{"a":"document","e":{"type":"CLOSE"},"k":"event"}],"state":"open.lifecycle.confirming","steps":["EDIT","CLOSE"]},{"inputs":[{"a":"document","e":{"field":"text","type":"EDIT","value":"title"},"k":"event"},{"a":"document","e":{"type":"CLOSE"},"k":"event"},{"a":"document","e":{"type":"SAVE"},"k":"event"}],"state":"open.lifecycle.confirming.awaiting","steps":["EDIT","CLOSE","SAVE"]},{"inputs":[{"a":"document","e":{"field":"text","type":"EDIT","value":"title"},"k":"event"},{"a":"document","e":{"type":"CLOSE"},"k":"event"}],"state":"open.lifecycle.confirming.prompt","steps":["EDIT","CLOSE"]}]},{"chart":"notes","states":[{"inputs":[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"},{"a":"notes","id":"quit","k":"invoke","ok":true,"value":null}],"state":"exited","steps":["CLOSE_WINDOW","done.invoke.quit"]},{"inputs":[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}],"state":"quitting","steps":["CLOSE_WINDOW"]},{"inputs":{},"state":"running","steps":[]},{"inputs":[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}],"state":"running.closing","steps":["CLOSE_WINDOW"]},{"inputs":[{"a":"notes","e":{"type":"ADD"},"k":"event"},{"a":"notes/document.1","e":{"field":"title","type":"EDIT","value":"title"},"k":"event"},{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}],"state":"running.closing.prompting","steps":["ADD","EDIT","CLOSE_WINDOW"]},{"inputs":[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}],"state":"running.closing.walking","steps":["CLOSE_WINDOW"]},{"inputs":{},"state":"running.open","steps":[]}]}]}
-]=]), has_views and views or nil)
+local decode = ouro.json.decode
+local values = {}
+values[1] = decode([=[{"value":"file:///tmp/note.ournote"}]=]).value
+values[2] = decode([=[{"value":null}]=]).value
+local plan = {values = values, charts = {
+  {chart = "document", input = decode([=[{"input":{}}]=]).input, states = {
+    {state = "closed", steps = decode([=[["CLOSE"]]=]), inputs = decode([=[[{"a":"document","e":{"type":"CLOSE"},"k":"event"}]]=])},
+    {state = "open", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "open.io", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "open.io.idle", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "open.io.saving", steps = decode([=[["SAVE"]]=]), inputs = decode([=[[{"a":"document","e":{"type":"SAVE"},"k":"event"}]]=])},
+    {state = "open.io.saving.choosing", steps = decode([=[["SAVE"]]=]), inputs = decode([=[[{"a":"document","e":{"type":"SAVE"},"k":"event"}]]=])},
+    {state = "open.io.saving.writing", steps = decode([=[["SAVE","done.invoke.choose"]]=]), inputs = decode([=[[{"a":"document","e":{"type":"SAVE"},"k":"event"},{"a":"document","id":"choose","k":"invoke","ok":true,"vref":1}]]=])},
+    {state = "open.lifecycle", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "open.lifecycle.active", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "open.lifecycle.confirming", steps = decode([=[["EDIT","CLOSE"]]=]), inputs = decode([=[[{"a":"document","e":{"field":"text","type":"EDIT","value":"title"},"k":"event"},{"a":"document","e":{"type":"CLOSE"},"k":"event"}]]=])},
+    {state = "open.lifecycle.confirming.awaiting", steps = decode([=[["EDIT","CLOSE","SAVE"]]=]), inputs = decode([=[[{"a":"document","e":{"field":"text","type":"EDIT","value":"title"},"k":"event"},{"a":"document","e":{"type":"CLOSE"},"k":"event"},{"a":"document","e":{"type":"SAVE"},"k":"event"}]]=])},
+    {state = "open.lifecycle.confirming.prompt", steps = decode([=[["EDIT","CLOSE"]]=]), inputs = decode([=[[{"a":"document","e":{"field":"text","type":"EDIT","value":"title"},"k":"event"},{"a":"document","e":{"type":"CLOSE"},"k":"event"}]]=])},
+  }},
+  {chart = "notes", input = decode([=[{}]=]).input, states = {
+    {state = "exited", steps = decode([=[["CLOSE_WINDOW","done.invoke.quit"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"},{"a":"notes","id":"quit","k":"invoke","ok":true,"vref":2}]]=])},
+    {state = "quitting", steps = decode([=[["CLOSE_WINDOW"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}]]=])},
+    {state = "running", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+    {state = "running.closing", steps = decode([=[["CLOSE_WINDOW"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}]]=])},
+    {state = "running.closing.prompting", steps = decode([=[["ADD","EDIT","CLOSE_WINDOW"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"ADD"},"k":"event"},{"a":"notes/document.1","e":{"field":"title","type":"EDIT","value":"title"},"k":"event"},{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}]]=])},
+    {state = "running.closing.walking", steps = decode([=[["CLOSE_WINDOW"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}]]=])},
+    {state = "running.open", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
+  }},
+}}
+return ouro.machine.state_stories(plan, has_views and views or nil)
