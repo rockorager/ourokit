@@ -18,7 +18,7 @@ local has_views, views = pcall(require, 'story_views')
 local decode = ouro.machine._json_decode
 local values = {}
 values[1] = decode([=[{"value":"file:///tmp/note.ournote"}]=]).value
-values[2] = decode([=[{"value":null}]=]).value
+values[2] = decode([=[{"value":{}}]=]).value
 local plan = {values = values, charts = {
   {chart = "document", input = decode([=[{"input":{}}]=]).input, states = {
     {state = "closed", steps = decode([=[["CLOSE"]]=]), inputs = decode([=[[{"a":"document","e":{"type":"CLOSE"},"k":"event"}]]=])},
@@ -35,7 +35,7 @@ local plan = {values = values, charts = {
     {state = "open.lifecycle.confirming.prompt", steps = decode([=[["EDIT","CLOSE"]]=]), inputs = decode([=[[{"a":"document","e":{"field":"text","type":"EDIT","value":"title"},"k":"event"},{"a":"document","e":{"type":"CLOSE"},"k":"event"}]]=])},
   }},
   {chart = "notes", input = decode([=[{}]=]).input, states = {
-    {state = "exited", steps = decode([=[["CLOSE_WINDOW","done.invoke.quit"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"},{"a":"notes","id":"quit","k":"invoke","ok":true,"vref":2}]]=])},
+    {state = "exited", steps = decode([=[["CLOSE_WINDOW","done.invoke.quit"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"},{"a":"notes","id":"quit","k":"invoke","ok":true,"synthetic":true,"vref":2}]]=])},
     {state = "quitting", steps = decode([=[["CLOSE_WINDOW"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}]]=])},
     {state = "running", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
     {state = "running.closing", steps = decode([=[["CLOSE_WINDOW"]]=]), inputs = decode([=[[{"a":"notes","e":{"type":"CLOSE_WINDOW"},"k":"event"}]]=])},

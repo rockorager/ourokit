@@ -23,7 +23,7 @@ local plan = {values = values, charts = {
   {chart = "launcher", input = decode([=[{}]=]).input, states = {
     {state = "hidden", steps = decode([=[[]]=]), inputs = decode([=[[]]=])},
     {state = "open", steps = decode([=[["OPEN"]]=]), inputs = decode([=[[{"a":"launcher","e":{"type":"OPEN"},"k":"event"}]]=])},
-    {state = "open.failed", steps = decode([=[["OPEN","error.invoke.scan"]]=]), inputs = decode([=[[{"a":"launcher","e":{"type":"OPEN"},"k":"event"},{"a":"launcher","id":"scan","k":"invoke","ok":false,"vref":1}]]=])},
+    {state = "open.failed", steps = decode([=[["OPEN","error.invoke.scan"]]=]), inputs = decode([=[[{"a":"launcher","e":{"type":"OPEN"},"k":"event"},{"a":"launcher","id":"scan","k":"invoke","ok":false,"synthetic":true,"vref":1}]]=])},
     {state = "open.launching", steps = decode([=[["OPEN","done.invoke.scan","ACTIVATE"]]=]), inputs = decode([=[[{"a":"launcher","e":{"type":"OPEN"},"k":"event"},{"a":"launcher","id":"scan","k":"invoke","ok":true,"vref":2},{"a":"launcher","e":{"type":"ACTIVATE"},"k":"event"}]]=])},
     {state = "open.loading", steps = decode([=[["OPEN"]]=]), inputs = decode([=[[{"a":"launcher","e":{"type":"OPEN"},"k":"event"}]]=])},
     {state = "open.ready", steps = decode([=[["OPEN","done.invoke.scan"]]=]), inputs = decode([=[[{"a":"launcher","e":{"type":"OPEN"},"k":"event"},{"a":"launcher","id":"scan","k":"invoke","ok":true,"vref":2}]]=])},

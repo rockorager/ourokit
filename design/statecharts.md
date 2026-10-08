@@ -1884,6 +1884,16 @@ first, expanding first the paths that reached something new.
   `ouro.shell.workspaces.activate()`, listed after the real errors and never
   counted as one. The modules return when generation or replay ends.
   Runtime error prints are collected from the boundaries instead.
+- **Unknown results are not made up into errors.** Invoke and task
+  sources never run here, so a stub's result is either recorded (`--from`),
+  shaped by a declared schema for its done event (`events =
+  {['done.invoke.now'] = {output = 'table'}}`), or an empty table. The last
+  two are *synthetic*. If handling a synthetic result raises, as when
+  ouroshell's clock reads `e.output.text`, generation does not follow that
+  delivery: the invoke stays pending, and other inputs are still explored.
+  The delivery is reported once as *skipped: isolated effect*, with the
+  handler's error, after the real errors and never counted as one. A
+  handler that ignores the output proceeds as before.
 - **Refused sends name their event (gap 3).** A send refused because its
   target has not started reports the resolved event type, even when a
   function computes the event.

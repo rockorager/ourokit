@@ -706,6 +706,64 @@ return {
     assert(checkpoint.invokes.straddle[1].id == 'watch', segments[2][3])
   end,
 
+  -- Generation never runs invoke or task sources; it completes their stubs.
+  -- With no recorded output (--from) it used to fabricate one (json.null,
+  -- {}), and a chart that reads its output, like ouroshell's clock, got
+  -- "attempt to index a userdata (field 'output')" as an issue. Fabricated
+  -- results that the chart cannot handle are now skipped as isolated
+  -- effects, never reported as errors.
+  ['generation: unknown invoke and task outputs are skipped as isolated effects, not errors (ouroshell clock)'] = function()
+    local function charts(id)
+      return machine.create {
+        id = id, initial = 'loading', context = { text = '', zone = '', user = '' },
+        actors = {
+          now = function() return o.desktop.clock() end,
+          whoami = function() return o.session.user() end,
+        },
+        states = {
+          loading = { invoke = { id = 'now', src = 'now',
+            on_done = { target = 'showing', actions = machine.assign {
+              text = function(_, e) return e.output.text end,
+              zone = function(_, e) return e.output.zone:upper() end } },
+            on_error = 'failed' } },
+          showing = {
+            after = { [1000] = 'loading' },
+            on = {
+              LOCK = { target = 'locking', actions = machine.spawn('whoami', { id = 'who' }) },
+            },
+          },
+          locking = { on = { ['done.actor.who'] = { target = 'locked', actions = machine.assign {
+            user = function(_, e) return e.output.name:lower() end } } } },
+          locked = {},
+          failed = {},
+        },
+      }
+    end
+    local chart = charts('clock_isolated')
+    local result = machine.paths(chart)
+    local errors, skipped = {}, {}
+    for _, issue in ipairs(result.issues) do
+      if issue.kind == 'error' then errors[#errors + 1] = issue.message end
+      if issue.kind == 'isolated' then skipped[#skipped + 1] = issue.message end
+    end
+    assert(#errors == 0, 'no false errors: ' .. table.concat(errors, ' | '))
+    assert(#skipped == 1 and skipped[1]:find('done.invoke.now', 1, true), table.concat(skipped, ' | '))
+    assert(machine._paths_summary(result):find('skipped: isolated effect', 1, true), machine._paths_summary(result))
+    local reached = {}
+    for _, target in ipairs(result.unreached) do reached[target] = false end
+    assert(reached.sfailed == nil, 'the error path is still explored')
+    assert(reached.sshowing == false, 'no state is reached on a fabricated output')
+    -- Recorded outputs (--from) are real data: the whole chart is reached,
+    -- through the spawned task too.
+    local seeded = charts('clock_seeded')
+    result = machine.paths(seeded, { outputs = {
+      now = { { text = '12:00', zone = 'utc' } }, whoami = { { name = 'Ada' } } } })
+    for _, issue in ipairs(result.issues) do assert(issue.kind ~= 'error', issue.message) end
+    assert(result.states.reached == result.states.total, machine._paths_summary(result))
+    local report = machine.replay(machine.paths_log(seeded, result), { charts = { clock_seeded = seeded } })
+    assert(report.ok, machine.replay_text(report))
+  end,
+
   ['machine.advance needs a virtual clock'] = function()
     fails(function() machine.advance(-1) end, 'nonnegative integer')
   end,

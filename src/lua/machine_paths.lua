@@ -177,6 +177,12 @@ local function live_actors(root)
   return list
 end
 
+local function describe_input(input)
+  if input.k == 'event' then return input.e.type end
+  if input.k == 'timer' then return 'timer' end
+  return (input.ok and 'done.' or 'error.') .. input.k .. '.' .. input.id
+end
+
 -- Applies one input; false when it does not apply (no timer, no stub, an
 -- invalid payload or a raising step).
 local function apply(scheduler, root, input)
@@ -254,7 +260,26 @@ local function run(chart, setup, path, covered)
     for i, input in ipairs(path) do
       step_index = i
       -- apply's own error report duplicates the boundary's (leave above).
+      local before = #problems
       local applies = apply(scheduler, actor, input)
+      if input.synthetic then
+        -- A made-up result the chart could not handle says nothing about
+        -- the chart: skip the delivery (the invoke stays pending in the
+        -- other paths) and report it apart from errors.
+        local failure
+        for j = before + 1, #problems do
+          if problems[j].kind == 'error' then failure = failure or problems[j].message; problems[j] = false end
+        end
+        if failure then
+          local kept = {}
+          for _, problem in ipairs(problems) do if problem then kept[#kept + 1] = problem end end
+          problems = kept
+          problems[#problems + 1] = {at = i, kind = 'isolated', message = string.format(
+            '%s on %s: no recorded or declared result, so generation does not follow it (the handler raised: %s); '
+            .. 'seed it with --from <recording> or declare the done event\'s fields', describe_input(input), input.a, failure)}
+          return actor, false
+        end
+      end
       if not applies then return actor, false end
     end
     return actor, true
@@ -316,21 +341,33 @@ local function candidates(chart, actor, scheduler, options)
   for _, item in ipairs(scheduler.pending) do
     local info = item.info
     if item.scope.alive then
-      local outputs = options.outputs[info.src or ''] or options.outputs[info.id] or {json.null, {}}
-      for _, value in ipairs(outputs) do
-        list[#list + 1] = {k = info.kind, a = info.actor, id = info.id, ok = true, value = value}
+      -- Sources never run here (their effects are isolated), so a result is
+      -- recorded data (--from), shaped by a declared done event schema, or
+      -- an empty table. The last two are synthetic: run() skips them when
+      -- the chart cannot handle them, rather than report an error.
+      local outputs = options.outputs[info.src or ''] or options.outputs[info.id]
+      local synthetic = outputs == nil or nil
+      if not outputs then
+        local owner
+        for _, a in ipairs(live_actors(actor)) do if a.path == info.actor then owner = a end end
+        local name = (info.kind == 'invoke' and 'done.invoke.' or 'done.actor.') .. info.id
+        if owner and owner.chart.events and owner.chart.events[name] then
+          outputs = {}
+          for _, e in ipairs(payloads(owner.chart, name, owner._snapshot.context, {}, options.payloads)) do
+            if e.output ~= nil then outputs[#outputs + 1] = e.output end
+          end
+        end
+        if not outputs or not outputs[1] then outputs = {{}} end
       end
+      for _, value in ipairs(outputs) do
+        list[#list + 1] = {k = info.kind, a = info.actor, id = info.id, ok = true, value = value, synthetic = synthetic}
+      end
+      local errors = options.errors[info.src or ''] or options.errors[info.id]
       list[#list + 1] = {k = info.kind, a = info.actor, id = info.id, ok = false,
-        value = (options.errors[info.src or ''] or options.errors[info.id] or {'generated error'})[1]}
+        value = (errors or {'generated error'})[1], synthetic = errors == nil or nil}
     end
   end
   return list
-end
-
-local function describe_input(input)
-  if input.k == 'event' then return input.e.type end
-  if input.k == 'timer' then return 'timer' end
-  return (input.ok and 'done.' or 'error.') .. input.k .. '.' .. input.id
 end
 
 -- Harvests event payloads and invoke/task results from recordings.
@@ -544,8 +581,9 @@ local function summary_line(result)
   end
   -- Gap 9: what the search ran into, so nothing is pruned silently. Real
   -- errors first; skipped effects (gap 4) are listed apart, as notes.
-  local labels = {error = 'an input raised', not_started = 'a send was refused', effect = 'skipped effect (isolated)'}
-  for _, kind in ipairs({'error', 'not_started', 'effect'}) do
+  local labels = {error = 'an input raised', not_started = 'a send was refused',
+    isolated = 'skipped: isolated effect', effect = 'skipped effect (isolated)'}
+  for _, kind in ipairs({'error', 'not_started', 'isolated', 'effect'}) do
     for _, issue in ipairs(result.issues or {}) do
       if issue.kind == kind then
         local path = #issue.steps > 0 and table.concat(issue.steps, ' → ') or '(start)'
@@ -556,6 +594,8 @@ local function summary_line(result)
   end
   return text
 end
+
+M._paths_summary = summary_line
 
 -- `ouroctl test --generate`: generate_tool(recordings, options_json) -> json, ok
 -- Generates for every chart the app module created (or options.charts).
