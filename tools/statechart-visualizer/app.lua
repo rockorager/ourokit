@@ -57,7 +57,8 @@ local function seed(actor)
     event = {type = 'ouro.attach'}, time_ms = now, microsteps = {}, exited = {}, entered = {}, timers = {}, invokes = {},
     states = snapshot.states, status = snapshot.status, context = snapshot.context}
   for _, live in ipairs(actor:pending_timers()) do
-    record.timers[#record.timers + 1] = {action = 'started', state = live.state, delay = live.delay, token = live.token, time_ms = live.time_ms}
+    record.timers[#record.timers + 1] = {action = 'started', state = live.state, delay = live.delay, ms = live.ms,
+      event = live.event, token = live.token, time_ms = live.time_ms}
   end
   for _, live in ipairs(actor:pending_invokes()) do
     record.invokes[#record.invokes + 1] = {action = 'started', state = live.state, id = live.id, src = live.src, token = live.token, time_ms = live.time_ms}

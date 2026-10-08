@@ -19,6 +19,8 @@ M.fmt_ms = fmt_ms
 
 local function value_text(v, null)
   if v == nil or v == null then return 'null' end
+  local handle = type(v) == 'table' and type(v['$h']) == 'string' and v['$h']
+  if handle then return '‹' .. handle .. '›' end
   if type(v) == 'string' then return string.format('%q', v) end
   if type(v) == 'table' then
     if type(v.message) == 'string' then return v.message end
@@ -53,9 +55,9 @@ local CHIP_TEXT = {running='running', done='done', error='error', cancelled='can
 -- An after pill shows a countdown while its timer runs. Following live, a
 -- native one-shot animation keyed by the timer token counts it down.
 local function after_text(key, t, frame, now, live, render)
-  local delay = t.after
-  local timer = frame.timers[t.source .. '@' .. tostring(delay)]
-  if not timer then return render(nil) end
+  local timer = frame.timers[t.after_event] or frame.timers[t.source .. '@' .. tostring(t.after)]
+  local delay = timer and (timer.delay or t.after)
+  if not timer or not delay then return render(nil) end
   if live then
     return o.animation {key=key .. ':' .. tostring(timer.token), duration=delay,
       render=function(p) return render(delay * (1 - p)) end}
@@ -102,7 +104,7 @@ local function texts(plant, frame, now, P, live)
         local color = taken and P.taken or ((t and frame.active[t.source]) and P.text or P.muted)
         local key = 'p:' .. i .. ':' .. j
         local function pill(left)
-          local spans = {{text=p.event .. ((t and t.after and left) and (' · ' .. fmt_ms(left)) or ''), foreground=color}}
+          local spans = {{text=p.event .. ((t and t.after_event and left) and (' · ' .. fmt_ms(left)) or ''), foreground=color}}
           if p.guard then
             local outcome = t and frame.guards[t.id]
             spans[#spans+1] = {text=' ' .. p.guard,
@@ -110,7 +112,7 @@ local function texts(plant, frame, now, P, live)
           end
           return o.text {key=key, positioned={left=r.x + 7, top=r.y + 2}, size=layout.LABEL_SIZE, spans=spans, max_lines=1}
         end
-        children[#children+1] = (t and t.after) and after_text(key, t, frame, now, live, pill) or pill(nil)
+        children[#children+1] = (t and t.after_event) and after_text(key, t, frame, now, live, pill) or pill(nil)
       end
     end
   end
@@ -213,7 +215,8 @@ end
 local function tree(rows, key, value, depth, changed, P, null)
   if #rows > 80 then return end
   local indent = string.rep('  ', depth)
-  if type(value) == 'table' and value ~= null and depth < 3 then
+  -- Opaque native handles ({"$h": type}) are leaves.
+  if type(value) == 'table' and value ~= null and type(value['$h']) ~= 'string' and depth < 3 then
     local keys = {}
     for k in pairs(value) do keys[#keys+1] = k end
     table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
@@ -244,10 +247,12 @@ function M.side(plant, frame, now, P, null, live)
   for i, timer in ipairs(timers) do
     any = true
     local function row(left)
-      return o.text {key='tm' .. i, size=12, spans={{text='after ' .. fmt_ms(timer.delay) .. ' ', foreground=P.text},
+      local what = timer.name and (timer.name .. (timer.delay and (' (' .. fmt_ms(timer.delay) .. ')') or ''))
+        or (timer.delay and fmt_ms(timer.delay) or '?')
+      return o.text {key='tm' .. i, size=12, spans={{text='after ' .. what .. ' ', foreground=P.text},
         {text=timer.state .. (left and ('  ' .. fmt_ms(left) .. ' left') or ''), foreground=P.muted}}}
     end
-    if live then
+    if live and timer.delay then
       rows[#rows+1] = o.animation {key='tma' .. tostring(timer.token), duration=timer.delay,
         render=function(p) return row(timer.delay * (1 - p)) end}
     else
@@ -414,7 +419,10 @@ local function record_detail(store, entry, frame, P)
     end
     add('microstep ' .. i, table.concat(ts, '; ') .. '  exit ' .. table.concat(m.exited, ',') .. '  enter ' .. table.concat(m.entered, ','))
   end
-  for _, t in ipairs(r.timers) do add('timer', t.op .. ' ' .. tostring(t.state) .. ' after ' .. tostring(t.delay) .. 'ms') end
+  for _, t in ipairs(r.timers) do
+    add('timer', t.op .. ' ' .. tostring(t.state) .. ' after ' .. (t.name and (t.name .. ' ') or '')
+      .. (t.delay and (t.delay .. 'ms') or ''))
+  end
   for _, v in ipairs(r.invokes) do
     add('invoke', v.op .. ' ' .. tostring(v.id) .. ((v.src and v.src ~= v.id) and (' (' .. tostring(v.src) .. ')') or '') .. (v.error and (': ' .. value_text(v.error, store.null)) or ''),
       v.op == 'error' and P.high or nil)
