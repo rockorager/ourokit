@@ -44,8 +44,9 @@ const presentation_feedback_capacity = 8;
 /// message (MAX_FDS_OUT), so this is a protocol bound. Buffer creation waits
 /// for room instead of failing when many windows map at once.
 const transmit_fd_budget = 28;
-/// The most descriptors one buffer pool or dmabuf slot sends.
-const buffer_fd_reserve = 4;
+/// The most descriptors one buffer pool or dmabuf slot sends: a dmabuf slot
+/// sends its syncobj timeline plus one fd per plane.
+const buffer_fd_reserve = 1 + @typeInfo(@FieldType(Vulkan.DmabufTarget, "planes")).array.len;
 const fractional_scale_denominator = 120;
 
 pub const StartupCompletions = struct {
@@ -1244,10 +1245,8 @@ pub const Host = struct {
                 window.dmabuf_buffers.direct != window.direct_presentation) return null;
             const index = try window.dmabuf_buffers.acquireSlot(self.vulkan.?) orelse return null;
             const slot = &window.dmabuf_buffers.slots[index];
-            if (slot.target == null) {
-                if (try self.transmitDescriptorsFull()) return null;
-                try self.createDmabufSlot(window, index, pixel_width, pixel_height);
-            }
+            if (slot.target == null and !try self.createDmabufSlot(window, index, pixel_width, pixel_height))
+                return null;
             slot.acquired = true;
             return .{
                 .target = .{ .vulkan = &slot.target.? },
@@ -1752,13 +1751,19 @@ pub const Host = struct {
                 try window.dmabuf_buffers.destroy(renderer, objects, transmit);
             }
         }
+        // Like the shm pool: wait for queued descriptors to drain first.
+        if (try self.transmitDescriptorsFull()) return;
         window.next_pool_generation +%= 1;
         if (window.next_pool_generation == 0) window.next_pool_generation = 1;
-        try self.createDmabufSlot(window, 0, pixel_width, pixel_height);
+        _ = try self.createDmabufSlot(window, 0, pixel_width, pixel_height);
         _ = try self.driver.schedule();
     }
 
-    fn createDmabufSlot(self: *Host, window: *Window, index: usize, width: u32, height: u32) !void {
+    /// Every dmabuf slot goes through here, so none can push the queued
+    /// descriptors past the protocol bound. False means "retry after sends
+    /// drain"; acquireFrame then reports no frame.
+    fn createDmabufSlot(self: *Host, window: *Window, index: usize, width: u32, height: u32) !bool {
+        if (try self.transmitDescriptorsFull()) return false;
         try window.dmabuf_buffers.createSlot(
             self.vulkan.?,
             &self.connection.objects,
@@ -1772,6 +1777,7 @@ pub const Host = struct {
             index,
             window.direct_presentation,
         );
+        return true;
     }
 
     fn usingDmabuf(self: *const Host) bool {
@@ -4088,6 +4094,60 @@ test "layer background teardown retires pending callbacks and destroys effect be
         bytes = bytes[message.header.size..];
     }
     try std.testing.expectEqual(@as(usize, 0), bytes.len);
+}
+
+test "dma-buf slot creation waits for room when many windows map at once" {
+    // A slot sends its syncobj timeline plus one fd per plane.
+    try std.testing.expectEqual(@as(usize, 5), buffer_fd_reserve);
+    const allocator = std.testing.allocator;
+    var reactor: wayring.io_uring.Reactor = undefined;
+    var reactor_config = (Config{ .app_id = "test" }).reactor;
+    reactor_config.descriptor_count = 64;
+    try reactor.initOwned(allocator, .{ .entries = 8 }, reactor_config);
+    defer reactor.deinit(allocator);
+    const socket_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(socket_result) != .SUCCESS) return error.SocketFailed;
+    const peer = try reactor.attach(@intCast(socket_result), .{
+        .received_fd_budget = 0,
+        .transmit_byte_budget = 64 * 1024,
+        .transmit_fd_budget = transmit_fd_budget,
+    });
+    defer reactor.destroyPeer(peer) catch unreachable;
+    var host: Host = undefined;
+    host.connection = .{
+        .reactor = &reactor,
+        .peer = peer,
+        .objects = try wayring.objects.ClientObjects.init(allocator, 16, 16, &protocol.wl_display.info, null),
+    };
+    defer host.connection.objects.deinit(allocator);
+    // No Vulkan device: a slot that would be created is simulated by queueing
+    // the most descriptors it sends. createDmabufSlot must refuse before it
+    // touches Vulkan whenever that could pass the protocol bound.
+    var windows = [_]Window{.{}} ** 40;
+    var created: usize = 0;
+    var deferred: usize = 0;
+    for (&windows) |*window| {
+        const queue = try host.queue();
+        if (try host.transmitDescriptorsFull()) {
+            try std.testing.expect(!try host.createDmabufSlot(window, 0, 8, 8));
+            deferred += 1;
+            continue;
+        }
+        var fds: [buffer_fd_reserve]linux.fd_t = undefined;
+        for (&fds) |*fd| fd.* = @intCast(linux.dup(@intCast(socket_result)));
+        try queue.enqueue("slot", &fds);
+        created += 1;
+        try std.testing.expect(queue.queuedDescriptors() <= transmit_fd_budget);
+    }
+    try std.testing.expect(created > 0 and deferred > 0 and created + deferred == windows.len);
+    // Once the queued send drains, deferred windows get their turn.
+    const queue = try host.queue();
+    var scratch: [transmit_fd_budget]linux.fd_t = undefined;
+    var control: [512]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const snapshot = try queue.snapshot(&scratch, &control);
+    try queue.begin(snapshot);
+    try queue.complete(snapshot.byteCount());
+    try std.testing.expect(!try host.transmitDescriptorsFull());
 }
 
 test "Vulkan dma-buf slots grow on demand and reuse released storage" {
