@@ -1453,14 +1453,31 @@ end
 -- Fallback where no native binding exists (a Lua state without a Vm), and for
 -- comparison: spawned work has no handle, so it runs in application scope and
 -- a closed scope only drops its delivery.
+-- Drop dead entries once a list doubles since its last compaction, so a
+-- long-lived owner (a root scope, a shared manual clock) stays bounded.
+local function compact(list, keep)
+  if #list < (list.compact_at or 32) then return end
+  local j = 0
+  for i = 1, #list do
+    local item = list[i]
+    list[i] = nil
+    if keep(item) then j = j + 1; list[j] = item end
+  end
+  list.compact_at = math.max(32, 2 * j)
+end
+local function is_alive(scope) return scope.alive end
 local function token_scope(parent)
   local scope = {alive = true, children = {}}
-  if type(parent) == 'table' then parent.children[#parent.children + 1] = scope end
+  if type(parent) == 'table' then
+    compact(parent.children, is_alive)
+    parent.children[#parent.children + 1] = scope
+  end
   return scope
 end
 local function close_token_scope(scope)
   scope.alive = false
   for _, child in ipairs(scope.children) do close_token_scope(child) end
+  scope.children = {}
 end
 M.token_scheduler = {
   kind = 'token',
@@ -1487,15 +1504,24 @@ function M.manual_scheduler()
     if scope.alive then s.open_scopes = s.open_scopes - 1 end
     scope.alive = false
     for _, child in ipairs(scope.children) do close(child) end
+    scope.children = {}
   end
   s.close = close
   function s.alive(scope) return scope.alive end
+  local function live_timer(t) return t.scope.alive end
   function s.after(scope, delay, fn)
     s.sequence = s.sequence + 1
-    s.timers[#s.timers + 1] = {at = s.now + delay, sequence = s.sequence, fn = function() if scope.alive then fn() end end}
+    -- Timers of closed scopes never fire; drop them so a shared clock stays bounded.
+    compact(s.timers, live_timer)
+    s.timers[#s.timers + 1] = {at = s.now + delay, sequence = s.sequence, scope = scope,
+      fn = function() if scope.alive then fn() end end}
   end
   function s.run(scope, fn) s.tasks[#s.tasks + 1] = function() if scope.alive then fn() end end end
-  function s.pending() return #s.timers, #s.tasks end
+  function s.pending()
+    local live = 0
+    for _, t in ipairs(s.timers) do if t.scope.alive then live = live + 1 end end
+    return live, #s.tasks
+  end
   function s.run_tasks()
     local count = 0
     while #s.tasks > 0 do

@@ -1585,4 +1585,22 @@ return {
     t:click('root/inc')
     assert(t:node('root/count').label == '3' and t:node('root/mode').label == 'idle')
   end,
+
+  ['a shared manual clock drops the timers and scopes of stopped and exited states'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create { id = 'timed', initial = 'waiting', events = { FLIP = {} }, states = {
+      waiting = { after = { [1000] = 'done' }, on = { FLIP = 'other' } },
+      other = { after = { [1000] = 'done' }, on = { FLIP = 'waiting' } },
+      done = {} } }
+    for _ = 1, 2000 do chart:start { scheduler = clock }:stop() end
+    local live = chart:start { scheduler = clock }
+    for _ = 1, 2000 do live:send('FLIP') end
+    assert(#clock.timers <= 64, 'cancelled timers stay queued: ' .. #clock.timers)
+    assert(clock.pending() == 1)
+    local children = 0
+    for _ in pairs(live._root_scope and live._root_scope.children or {}) do children = children + 1 end
+    assert(children <= 64, 'exited state scopes stay under the root: ' .. children)
+    clock.advance(1000)
+    assert(live:matches('done'))
+  end,
 }
