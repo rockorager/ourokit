@@ -30,7 +30,7 @@ local updated = ouro.http.request {
 `request(options)` requires `url` and defaults `method` to `GET`.
 `get(url[, options])` and `post(url[, options])` select their respective methods;
 POST defaults to an empty body. Options are plain tables, read without invoking
-metamethods:
+metamethods; statechart context views are read as the tables behind them:
 
 | Option | Meaning |
 | --- | --- |

@@ -1,6 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
 const wire = @import("../dbus/wire.zig");
 
 const variant_mt = "ouro.dbus.variant";
@@ -129,7 +130,7 @@ pub fn install(L: *c.State) !void {
 
 fn sequenceLen(L: *c.State, idx0: c_int) !usize {
     const idx = abs(L, idx0);
-    if (c.lua_type(L, idx) != c.type_table) return error.InvalidValue;
+    if (unwrapView(L, idx) != c.type_table) return error.InvalidValue;
     const n = c.lua_rawlen(L, idx);
     if (n > max_values) return error.ValueLimitExceeded;
     c.lua_pushnil(L);

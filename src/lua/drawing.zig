@@ -1,5 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
+const unwrapTop = @import("machine.zig").unwrapTop;
 const Drawing = @import("../ui/render_object/drawing.zig").Drawing;
 const Rectangle = @import("../ui/render_object/drawing.zig").Rectangle;
 const Paint = @import("../ui/render_object/drawing.zig").Command;
@@ -50,7 +52,7 @@ fn release(state: *c.State) callconv(.c) c_int {
 }
 
 fn construct(state: *c.State) callconv(.c) c_int {
-    if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+    if (c.lua_gettop(state) != 1 or unwrapView(state, 1) != c.type_table)
         return fail(state, "ouro.drawing expects one declaration table");
     const allocator: *const std.mem.Allocator = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
     const width = numberField(state, 1, "width", null, true) catch
@@ -58,7 +60,7 @@ fn construct(state: *c.State) callconv(.c) c_int {
     const height = numberField(state, 1, "height", null, true) catch
         return fail(state, "ouro.drawing height must be a finite nonnegative number");
     if (rawField(state, 1, "commands") != c.type_nil) {
-        if (c.lua_type(state, 2) != c.type_table or rawField(state, 1, "rectangles") != c.type_nil)
+        if (unwrapView(state, 2) != c.type_table or rawField(state, 1, "rectangles") != c.type_nil)
             return fail(state, "ouro.drawing requires exactly one commands or rectangles array");
         c.lua_settop(state, 2);
         return constructCommands(state, allocator.*, width, height) catch |err| {
@@ -69,7 +71,7 @@ fn construct(state: *c.State) callconv(.c) c_int {
         };
     }
     c.lua_settop(state, 1);
-    if (rawField(state, 1, "rectangles") != c.type_table)
+    if (unwrapTop(state, rawField(state, 1, "rectangles")) != c.type_table)
         return fail(state, "ouro.drawing rectangles must be a dense array");
     const count = c.lua_rawlen(state, 2);
     if (count > Drawing.max_rectangles)
@@ -90,7 +92,7 @@ fn construct(state: *c.State) callconv(.c) c_int {
     const memory: [*]Rectangle = @ptrCast(@alignCast(c.lua_newuserdatauv(state, count * @sizeOf(Rectangle), 0).?));
     const rectangles = memory[0..count];
     for (rectangles, 1..) |*rectangle, index| {
-        if (c.lua_rawgeti(state, 2, @intCast(index)) != c.type_table)
+        if (unwrapTop(state, c.lua_rawgeti(state, 2, @intCast(index))) != c.type_table)
             return fail(state, "ouro.drawing rectangles must contain tables without holes");
         rectangle.* = readRectangle(state, 5) catch
             return fail(state, "ouro.drawing rectangle requires finite x/y, nonnegative width/height/corner_radius, and a #RRGGBB or #RRGGBBAA color");
@@ -113,7 +115,7 @@ fn constructCommands(state: *c.State, allocator: std.mem.Allocator, width: f32, 
     c.lua_createtable(state, @intCast(count), 0); // 5: temporary path leases.
     var segments: usize = 0;
     for (commands, 1..) |*command, index| {
-        if (c.lua_rawgeti(state, 2, @intCast(index)) != c.type_table) return error.InvalidDrawingCommand;
+        if (unwrapTop(state, c.lua_rawgeti(state, 2, @intCast(index))) != c.type_table) return error.InvalidDrawingCommand;
         const kind = try enumField(enum { rectangle, fill, stroke }, state, 6, "kind", null);
         if (kind == .rectangle) {
             command.* = .{ .rectangle = try readRectangle(state, 6) };
@@ -145,7 +147,7 @@ fn constructCommands(state: *c.State, allocator: std.mem.Allocator, width: f32, 
 }
 
 fn readPath(state: *c.State, allocator: std.mem.Allocator, style: paths.Style, total: *usize) !*paths.Path {
-    if (rawField(state, 6, "path") != c.type_table) return error.InvalidDrawingPath;
+    if (unwrapTop(state, rawField(state, 6, "path")) != c.type_table) return error.InvalidDrawingPath;
     const count = try denseCount(state, 7, 4096);
     if (count > 65536 - total.*) return error.DrawingPathCapacityExceeded;
     total.* += count;
@@ -159,7 +161,7 @@ fn readPath(state: *c.State, allocator: std.mem.Allocator, style: paths.Style, t
     _ = c.lua_setmetatable(state, -2); // 8: staged path owner.
     const memory: [*]paths.Command = @ptrCast(@alignCast(c.lua_newuserdatauv(state, count * @sizeOf(paths.Command), 0).?));
     for (memory[0..count], 1..) |*command, index| {
-        if (c.lua_rawgeti(state, 7, @intCast(index)) != c.type_table) return error.InvalidPathSegment;
+        if (unwrapTop(state, c.lua_rawgeti(state, 7, @intCast(index))) != c.type_table) return error.InvalidPathSegment;
         const fields = try denseCount(state, 10, 7);
         _ = c.lua_rawgeti(state, 10, 1);
         const kind = try readEnum(enum { move, line, quadratic, cubic, close }, state, -1);

@@ -345,6 +345,37 @@ fn pushTarget(state: *c.State, slot: c_int) bool {
     return true;
 }
 
+/// Native bindings read application tables raw, which a machine view (a
+/// userdata) does not support. Each binding calls this where it expects a
+/// table: a view at `at` is replaced in place by the table behind it, so
+/// context data passes to native APIs unchanged. Returns the resulting type.
+///
+/// An actor's context and snapshot are tracked views. Unwrapping one first
+/// reads it whole, as pairs does, so a view or computed that hands it to a
+/// native API still updates when it changes. Nested values are plain views,
+/// whose reads are already tracked by the key that reached them.
+pub fn unwrapView(state: *c.State, at: c_int) c_int {
+    if (c.luaL_testudata(state, at, view_metatable) == null) return c.lua_type(state, at);
+    const slot = c.lua_absindex(state, at);
+    if (c.lua_checkstack(state, 3) == 0) return c.type_userdata;
+    if (c.lua_getiuservalue(state, slot, 2) == c.type_function) {
+        _ = c.lua_getiuservalue(state, slot, 1);
+        c.lua_pushnil(state);
+        // Tracking only; an error here must not unwind native callers.
+        if (c.lua_pcallk(state, 2, 0, 0, 0, null) != c.ok) c.lua_settop(state, -2);
+    } else c.lua_settop(state, -2);
+    _ = c.lua_getiuservalue(state, slot, 1);
+    c.lua_copy(state, -1, slot);
+    c.lua_settop(state, -2);
+    return c.type_table;
+}
+
+/// unwrapView for the value a getter just pushed, as in
+/// `unwrapTop(state, c.lua_getfield(state, 1, "uris"))`. Returns its type.
+pub fn unwrapTop(state: *c.State, pushed: c_int) c_int {
+    return if (pushed == c.type_userdata) unwrapView(state, -1) else pushed;
+}
+
 fn view(state: *c.State) callconv(.c) c_int {
     c.lua_settop(state, 1);
     if (c.luaL_testudata(state, 1, view_metatable) != null) return 1;

@@ -1,5 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
+const unwrapTop = @import("machine.zig").unwrapTop;
 const diagnostic = @import("diagnostic.zig");
 const platform = @import("../platform/window.zig");
 const task = @import("../task/root.zig");
@@ -216,7 +218,7 @@ pub const Application = struct {
                 self.windows_failure = self.allocator.dupe(u8, message[0..length]) catch null;
             return error.LuaWindowsFailed;
         }
-        if (c.lua_type(self.state, -1) != c.type_table) return error.InvalidWindowsDeclaration;
+        if (unwrapView(self.state, -1) != c.type_table) return error.InvalidWindowsDeclaration;
         return parseWindowsTable(self.allocator, self.state, &self.rejection);
     }
 
@@ -617,7 +619,7 @@ pub const Application = struct {
         // still rejects it if required output fields are missing.
         if (c.lua_type(vm.state, -1) == c.type_nil)
             return .{ .output = .{ .object = .empty } };
-        if (c.lua_type(vm.state, -1) != c.type_table) return error.ActionOutputTableRequired;
+        if (unwrapView(vm.state, -1) != c.type_table) return error.ActionOutputTableRequired;
         var count: usize = 0;
         _ = c.lua_getfield(vm.state, -1, "__ouro_action_error");
         const is_error = c.lua_touserdata(vm.state, -1) == @as(?*anyopaque, &action_error_tag);
@@ -814,7 +816,7 @@ fn optionalFunction(
 fn parseRunWindows(allocator: std.mem.Allocator, state: *c.State, reference: *c_int) ![]Window {
     if (c.lua_type(state, -1) != c.type_table) return error.ApplicationRunDeclarationRequired;
     try bindRunDeclaration(state);
-    const kind = c.lua_getfield(state, -1, "windows");
+    const kind = unwrapTop(state, c.lua_getfield(state, -1, "windows"));
     if (kind == c.type_function) {
         const windows = try allocator.alloc(Window, 0);
         reference.* = c.luaL_ref(state, c.registry_index);
@@ -902,7 +904,7 @@ fn parseWindowsTable(allocator: std.mem.Allocator, state: *c.State, rejection: ?
     var initialized: usize = 0;
     errdefer for (windows[0..initialized]) |window| deinitWindow(allocator, state, window);
     for (windows, 1..) |*window, index| {
-        if (c.lua_rawgeti(state, -1, @intCast(index)) != c.type_table)
+        if (unwrapTop(state, c.lua_rawgeti(state, -1, @intCast(index))) != c.type_table)
             return error.InvalidWindowDeclaration;
         const window_id = try requiredString(allocator, state, -1, "id");
         errdefer allocator.free(window_id);
@@ -1063,7 +1065,7 @@ fn installConstructors(state: *c.State, api_reference: ?c_int) !void {
 var action_error_tag: u8 = 0;
 
 fn actionError(state: *c.State) callconv(.c) c_int {
-    if (c.lua_gettop(state) != 2 or c.lua_type(state, 1) != c.type_string or c.lua_type(state, 2) != c.type_table)
+    if (c.lua_gettop(state) != 2 or c.lua_type(state, 1) != c.type_string or unwrapView(state, 2) != c.type_table)
         return luaError(state, "action_error expects an error name and parameters table");
     c.lua_createtable(state, 0, 3);
     c.lua_pushlightuserdata(state, &action_error_tag);
@@ -1172,7 +1174,7 @@ fn optionalBackground(state: *c.State, table: c_int) !?@import("../core/color.zi
 }
 
 fn optionalInputRegion(state: *c.State, table: c_int) !?@import("../core/geometry.zig").RectI {
-    const value_type = c.lua_getfield(state, table, "input_region");
+    const value_type = unwrapTop(state, c.lua_getfield(state, table, "input_region"));
     defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return null;
     if (value_type != c.type_table) return error.InvalidLayerSurfaceInputRegion;
@@ -1185,7 +1187,7 @@ fn optionalInputRegion(state: *c.State, table: c_int) !?@import("../core/geometr
 }
 
 fn optionalAnchors(state: *c.State, table: c_int) !platform.Anchors {
-    const value_type = c.lua_getfield(state, table, "anchors");
+    const value_type = unwrapTop(state, c.lua_getfield(state, table, "anchors"));
     defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return .{};
     if (value_type != c.type_table) return error.InvalidLayerSurfaceAnchors;
@@ -1214,7 +1216,7 @@ fn optionalAnchors(state: *c.State, table: c_int) !platform.Anchors {
 }
 
 fn optionalMargins(state: *c.State, table: c_int) !platform.Margins {
-    const value_type = c.lua_getfield(state, table, "margins");
+    const value_type = unwrapTop(state, c.lua_getfield(state, table, "margins"));
     defer c.lua_settop(state, -2);
     if (value_type == c.type_nil) return .{};
     if (value_type != c.type_table) return error.InvalidLayerSurfaceMargins;

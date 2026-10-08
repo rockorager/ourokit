@@ -1,5 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
+const unwrapTop = @import("machine.zig").unwrapTop;
 const paint = @import("../paint/root.zig");
 const PointF = @import("../core/geometry.zig").PointF;
 const metatable = "ouro.linear-gradient.v1";
@@ -34,10 +36,10 @@ fn construct(state: *c.State) callconv(.c) c_int {
 }
 
 fn read(state: *c.State) !paint.LinearGradient {
-    if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table) return error.InvalidGradient;
+    if (c.lua_gettop(state) != 1 or unwrapView(state, 1) != c.type_table) return error.InvalidGradient;
     const start = try point(state, "from");
     const end = try point(state, "to");
-    if (rawField(state, 1, "stops") != c.type_table) return error.InvalidGradientStops;
+    if (unwrapTop(state, rawField(state, 1, "stops")) != c.type_table) return error.InvalidGradientStops;
     const count = c.lua_rawlen(state, 2);
     if (count < 2 or count > 8) return error.InvalidGradientStops;
     c.lua_pushnil(state);
@@ -50,7 +52,7 @@ fn read(state: *c.State) !paint.LinearGradient {
     }
     var stops: [8]paint.Stop = undefined;
     for (stops[0..count], 1..) |*stop, index| {
-        if (c.lua_rawgeti(state, 2, @intCast(index)) != c.type_table) return error.InvalidGradientStop;
+        if (unwrapTop(state, c.lua_rawgeti(state, 2, @intCast(index))) != c.type_table) return error.InvalidGradientStop;
         _ = rawField(state, 3, "offset");
         const offset = try number(state, -1);
         c.lua_settop(state, 3);
@@ -63,7 +65,7 @@ fn read(state: *c.State) !paint.LinearGradient {
 
 fn point(state: *c.State, name: [*:0]const u8) !PointF {
     defer c.lua_settop(state, 1);
-    if (rawField(state, 1, name) != c.type_table) return error.InvalidGradientPoint;
+    if (unwrapTop(state, rawField(state, 1, name)) != c.type_table) return error.InvalidGradientPoint;
     _ = rawField(state, 2, "x");
     const x = try number(state, -1);
     c.lua_settop(state, 2);

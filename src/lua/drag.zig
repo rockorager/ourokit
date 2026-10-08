@@ -1,4 +1,6 @@
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
+const unwrapTop = @import("machine.zig").unwrapTop;
 const Vm = @import("vm.zig").Vm;
 
 pub const Mime = enum { text, uri_list };
@@ -9,7 +11,7 @@ pub const Provider = struct {
 
 pub fn start(state: *c.State) callconv(.c) c_int {
     const vm: *Vm = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)).?));
-    if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+    if (c.lua_gettop(state) != 1 or unwrapView(state, 1) != c.type_table)
         return fail(state, "InvalidDragPayload");
     const input = vm.takePointerInput(state) catch |err| return fail(state, @errorName(err));
     const provider = vm.drag_provider orelse return fail(state, "DragUnavailable");
@@ -24,7 +26,7 @@ pub fn start(state: *c.State) callconv(.c) c_int {
     } else {
         if (c.lua_type(state, -1) != c.type_nil) return fail(state, "InvalidDragPayload");
         c.lua_settop(state, -2);
-        if (c.lua_getfield(state, 1, "uris") != c.type_table) return fail(state, "InvalidDragPayload");
+        if (unwrapTop(state, c.lua_getfield(state, 1, "uris")) != c.type_table) return fail(state, "InvalidDragPayload");
         const count = c.lua_rawlen(state, -1);
         if (count == 0) return fail(state, "InvalidDragPayload");
         _ = c.lua_pushstring(state, "");

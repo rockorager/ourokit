@@ -7,6 +7,7 @@ const task = @import("../task/root.zig");
 const dbus = @import("../dbus/root.zig");
 const wire = dbus.wire;
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
 const vm_module = @import("vm.zig");
 const values = @import("dbus_values.zig");
 
@@ -765,7 +766,7 @@ fn emitLua(L: *c.State) callconv(.c) c_int {
     return 1;
 }
 fn emitImpl(L: *c.State) !void {
-    if (c.lua_gettop(L) != 2 or c.lua_type(L, 2) != c.type_table) return error.InvalidSignal;
+    if (c.lua_gettop(L) != 2 or unwrapView(L, 2) != c.type_table) return error.InvalidSignal;
     const bus = try getHandle(Bus, L, 1, bus_mt);
     if (!bus.ready or bus.closing) return error.ConnectionClosed;
     _ = try bus.binding.vm.currentScope(L);
@@ -870,7 +871,7 @@ fn callImpl(L: *c.State) !*Wait {
     if (!bus.ready or bus.closing) return error.ConnectionClosed;
     const self = bus.binding;
     _ = try self.vm.currentScope(L);
-    if (c.lua_type(L, 2) != c.type_table) return error.InvalidCall;
+    if (unwrapView(L, 2) != c.type_table) return error.InvalidCall;
     const metadata: wire.Metadata = .{ .message_type = .method_call, .destination = try stringField(L, 2, "destination"), .path = try stringField(L, 2, "path"), .interface = try stringField(L, 2, "interface"), .member = try stringField(L, 2, "member"), .signature = try stringField(L, 2, "signature") };
     try validateMetadata(metadata);
     const timeout = try timeoutField(L, 2);
@@ -907,7 +908,7 @@ fn sendImpl(L: *c.State) !void {
     // before the connection's transport is drained and closed.
     if (!bus.ready or !bus.client.isReady()) return error.ConnectionClosed;
     _ = try bus.binding.vm.currentScope(L);
-    if (c.lua_type(L, 2) != c.type_table) return error.InvalidCall;
+    if (unwrapView(L, 2) != c.type_table) return error.InvalidCall;
     const metadata: wire.Metadata = .{ .message_type = .method_call, .destination = try stringField(L, 2, "destination"), .path = try stringField(L, 2, "path"), .interface = try stringField(L, 2, "interface"), .member = try stringField(L, 2, "member"), .signature = try stringField(L, 2, "signature") };
     try validateMetadata(metadata);
     _ = c.lua_getfield(L, 2, "args");
@@ -931,7 +932,7 @@ fn subscribeImpl(L: *c.State) !*Wait {
     if (!bus.ready or bus.closing) return error.ConnectionClosed;
     const self = bus.binding;
     const scope = try self.vm.currentScope(L);
-    if (c.lua_type(L, 2) != c.type_table) return error.InvalidMatch;
+    if (unwrapView(L, 2) != c.type_table) return error.InvalidMatch;
     const sub = try self.freeEntry(Subscription, &self.subscriptions);
     sub.* = .{ .binding = self, .bus = bus, .active = true };
     errdefer self.releaseSub(sub);

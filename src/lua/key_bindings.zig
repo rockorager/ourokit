@@ -1,5 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
+const unwrapTop = @import("machine.zig").unwrapTop;
 const keymap = @import("../ui/text_input/keymap.zig");
 pub const Keymap = keymap.Keymap;
 
@@ -9,7 +11,7 @@ pub fn field(state: *c.State, index: c_int, name: [*:0]const u8, base: Keymap) !
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
     if (c.lua_checkstack(state, 4) == 0) return error.OutOfMemory;
-    const kind = c.lua_getfield(state, index, name);
+    const kind = unwrapTop(state, c.lua_getfield(state, index, name));
     if (kind == c.type_nil) return base;
     if (kind != c.type_table) return error.InvalidKeyBindings;
     const table = c.lua_gettop(state);
@@ -31,7 +33,7 @@ pub fn field(state: *c.State, index: c_int, name: [*:0]const u8, base: Keymap) !
             if (binding.sequence.len == sequence.len and binding.sequence.overlaps(sequence)) return error.DuplicateKeyBinding;
         try seen.setSequence(sequence, .{});
         var actions: keymap.Actions = .{};
-        if (c.lua_type(state, -1) == c.type_table) {
+        if (unwrapView(state, -1) == c.type_table) {
             const array = c.lua_gettop(state);
             if (c.lua_getfield(state, array, "command") != c.type_nil)
                 actions.command = try @import("../ui/input/command.zig").Name.init(try string(state, -1));
@@ -116,7 +118,7 @@ fn denseArray(state: *c.State, index: c_int) !usize {
 }
 
 fn denseArrayExcept(state: *c.State, index: c_int, allowed: []const u8) !usize {
-    if (c.lua_type(state, index) != c.type_table) return error.InvalidInputFilter;
+    if (unwrapView(state, index) != c.type_table) return error.InvalidInputFilter;
     const count = c.lua_rawlen(state, index);
     c.lua_pushnil(state);
     while (c.lua_next(state, index) != 0) {

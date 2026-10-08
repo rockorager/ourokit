@@ -7,6 +7,7 @@ const codec = @import("../image/codec.zig");
 const Bitmap = @import("../image/pixels.zig").Bitmap;
 const png = @import("../renderer/png.zig");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
 const vm_module = @import("vm.zig");
 
 const max_encoded = 4 * 1024 * 1024;
@@ -96,7 +97,7 @@ pub const Binding = struct {
 
     fn load(L: *c.State) callconv(.c) c_int {
         const self: *Binding = @ptrCast(@alignCast(c.lua_touserdata(L, c.upvalueIndex(1)).?));
-        if (c.lua_gettop(L) != 1 or c.lua_type(L, 1) != c.type_table) return pushFailure(L, "InvalidOptions");
+        if (c.lua_gettop(L) != 1 or unwrapView(L, 1) != c.type_table) return pushFailure(L, "InvalidOptions");
         const slot = for (&self.jobs) |*candidate| if (candidate.* == null) break candidate else continue else {
             return pushFailure(L, "ImageImportBusy");
         };

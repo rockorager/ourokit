@@ -36,6 +36,8 @@ pub extern fn lua_newthread(state: *State) ?*State;
 pub extern fn lua_closethread(state: *State, from: ?*State) c_int;
 pub extern fn luaL_loadbufferx(state: *State, buffer: [*]const u8, size: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int;
 pub extern fn lua_gettop(state: *State) c_int;
+pub extern fn lua_absindex(state: *State, index: c_int) c_int;
+pub extern fn lua_copy(state: *State, from: c_int, to: c_int) void;
 pub extern fn lua_checkstack(state: *State, extra: c_int) c_int;
 pub extern fn lua_xmove(from: *State, to: *State, count: c_int) void;
 pub extern fn lua_type(state: *State, index: c_int) c_int;

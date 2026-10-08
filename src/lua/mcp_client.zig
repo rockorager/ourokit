@@ -6,6 +6,7 @@ const task = @import("../task/root.zig");
 const mcp = @import("../mcp/root.zig");
 const c = @import("c.zig");
 const vm_module = @import("vm.zig");
+const unwrapView = @import("machine.zig").unwrapView;
 
 const receive_capacity = 64 * 1024;
 const max_value_depth = 32;
@@ -256,7 +257,7 @@ pub const McpClient = struct {
             return luaError(state, "ouro.mcp.subscribe expects address, resource URI, and callback");
         if ((!streaming and argument_count != 2 and argument_count != 3) or
             c.lua_type(state, 1) != c.type_string or c.lua_type(state, 2) != c.type_string or
-            (!streaming and argument_count >= 3 and c.lua_type(state, 3) != c.type_table))
+            (!streaming and argument_count >= 3 and unwrapView(state, 3) != c.type_table))
             return luaError(state, "MCP expects address, name, and a parameters table");
 
         // A C-stack to-be-closed guard covers errors, exit, and cancellation
@@ -498,14 +499,16 @@ fn pushEvent(state: *c.State, event: mcp.ClientEvent) !void {
     }
 }
 
-/// Converts a Lua value into arena-owned JSON, including strings and keys.
-/// The caller restores the Lua stack on failure and releases the arena.
 /// `ouro.json.null` is one process-wide light userdata, identical in every VM.
 pub fn isJsonNull(state: *c.State, index: c_int) bool {
     return c.lua_type(state, index) == c.type_light_userdata and
         c.lua_touserdata(state, index) == @as(*anyopaque, @ptrCast(&json_null));
 }
 
+/// Converts a Lua value into arena-owned JSON, including strings and keys.
+/// Machine context views are read as the tables behind them, so json.encode,
+/// MCP calls and outputs, and prepare_launch accept context data directly.
+/// The caller restores the Lua stack on failure and releases the arena.
 pub fn luaToJson(
     state: *c.State,
     index: c_int,
@@ -517,7 +520,7 @@ pub fn luaToJson(
         return error.ValueLimitExceeded;
     if (c.lua_checkstack(state, 4) == 0) return error.LuaStackCapacityExceeded;
     value_count.* += 1;
-    return switch (c.lua_type(state, index)) {
+    return switch (unwrapView(state, index)) {
         c.type_nil => .null,
         c.type_boolean => .{ .bool = c.lua_toboolean(state, index) != 0 },
         c.type_light_userdata => if (c.lua_touserdata(state, index) ==

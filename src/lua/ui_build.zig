@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig");
+const unwrapTop = @import("machine.zig").unwrapTop;
 const diagnostic = @import("diagnostic.zig");
 const Description = @import("description.zig").Description;
 const Components = @import("components.zig").Components;
@@ -1766,7 +1767,7 @@ pub const UiBuild = struct {
     fn emitTextLinks(self: *UiBuild, state: *c.State, parent: u64, source: text.ParagraphSourceHandle, semantic: bool) !void {
         const top = c.lua_gettop(state);
         defer c.lua_settop(state, top);
-        if (c.lua_getfield(state, 1, "spans") == c.type_nil) return;
+        if (unwrapTop(state, c.lua_getfield(state, 1, "spans")) == c.type_nil) return;
         const spans = c.lua_gettop(state);
         const retained = try self.text_sources.?.get(source);
         const theme = self.currentTheme().?;
@@ -1803,7 +1804,7 @@ pub const UiBuild = struct {
         defer c.lua_settop(state, top);
         const sources = self.text_sources.?;
         const candidates = try self.themedFonts(weight == .medium);
-        const spans_type = c.lua_getfield(state, 1, "spans");
+        const spans_type = unwrapTop(state, c.lua_getfield(state, 1, "spans"));
         if (spans_type == c.type_nil) return sources.acquire(.{
             .utf8 = tableString(state, 1, "text") orelse return error.TextContentRequired,
             .language = "und",
@@ -1834,7 +1835,7 @@ pub const UiBuild = struct {
         var fonts: std.ArrayList(text.FontHandle) = .empty;
         defer fonts.deinit(allocator);
         for (0..count) |i| {
-            if (c.lua_rawgeti(state, spans, @intCast(i + 1)) != c.type_table) return error.InvalidTextSpans;
+            if (unwrapTop(state, c.lua_rawgeti(state, spans, @intCast(i + 1))) != c.type_table) return error.InvalidTextSpans;
             const span = c.lua_gettop(state);
             const content = tableString(state, span, "text") orelse return error.TextContentRequired;
             if (content.len == 0) return error.EmptyTextSpan;
@@ -2085,7 +2086,7 @@ pub const UiBuild = struct {
             return luaError(state, "expanded requires an activating semantic button");
         var range: ?@import("../ui/widget/range.zig").Range = null;
         var range_inset: f32 = 0;
-        const range_type = c.lua_getfield(state, 1, "range");
+        const range_type = unwrapTop(state, c.lua_getfield(state, 1, "range"));
         if (range_type != c.type_nil) {
             if (range_type != c.type_table) return luaError(state, "range must be a table");
             range = @import("forms.zig").readRange(state, -1) catch |err| return luaError(state, @errorName(err));
@@ -2228,7 +2229,7 @@ pub const UiBuild = struct {
         defer c.lua_settop(state, top);
         var result: drag.Options = .{};
         inline for (.{ "drag", "drop" }) |field| {
-            const kind = c.lua_getfield(state, 1, field);
+            const kind = unwrapTop(state, c.lua_getfield(state, 1, field));
             if (kind != c.type_nil) {
                 if (kind != c.type_table) return error.InvalidDragDeclaration;
                 const table = c.lua_gettop(state);
@@ -2312,7 +2313,7 @@ pub const UiBuild = struct {
                 c.lua_settop(state, -2);
             }
         }
-        const shortcuts_type = c.lua_getfield(state, 1, "shortcuts");
+        const shortcuts_type = unwrapTop(state, c.lua_getfield(state, 1, "shortcuts"));
         if (shortcuts_type == c.type_nil) return;
         if (shortcuts_type != c.type_table or commands_type != c.type_table) return error.InvalidShortcuts;
         const shortcuts = c.lua_gettop(state);
@@ -2624,7 +2625,7 @@ fn emitFlexContainer(state: *c.State, axis: render_types.Axis) c_int {
 fn readInteractionPaint(state: *c.State, owner: ?InteractionOwner, idle: ?@import("../core/color.zig").Color, border: ?@import("../core/color.zig").Color, box: bool) !?instance.InteractionPaint {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    const kind = c.lua_getfield(state, 1, "states");
+    const kind = unwrapTop(state, c.lua_getfield(state, 1, "states"));
     if (kind == c.type_nil) return null;
     if (kind != c.type_table) return error.StatesMustBeTable;
     const source = owner orelse return error.StatesRequireInteractionAncestor;
@@ -2800,7 +2801,7 @@ const OptionalSurface = struct { value: ?@TypeOf(design.tokens.light.background)
 fn tableOptionalTransform(state: *c.State, table: c_int) !@import("../core/geometry.zig").Transform {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    const kind = c.lua_getfield(state, table, "transform");
+    const kind = unwrapTop(state, c.lua_getfield(state, table, "transform"));
     if (kind == c.type_nil) return .{};
     if (kind != c.type_table) return error.InvalidTransform;
     const index = c.lua_gettop(state);
@@ -2814,7 +2815,7 @@ fn tableOptionalTransform(state: *c.State, table: c_int) !@import("../core/geome
         }
         c.lua_settop(state, index);
     }
-    const origin_kind = c.lua_getfield(state, index, "origin");
+    const origin_kind = unwrapTop(state, c.lua_getfield(state, index, "origin"));
     if (origin_kind != c.type_nil) {
         if (origin_kind != c.type_table) return error.InvalidTransform;
         const origin_index = c.lua_gettop(state);
@@ -2834,7 +2835,7 @@ fn tableOptionalTransform(state: *c.State, table: c_int) !@import("../core/geome
 fn tableOptionalShadow(state: *c.State, table: c_int) !?@import("../shadow/root.zig").Style {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    const kind = c.lua_getfield(state, table, "shadow");
+    const kind = unwrapTop(state, c.lua_getfield(state, table, "shadow"));
     if (kind == c.type_nil) return null;
     if (kind != c.type_table) return error.InvalidShadow;
     const index = c.lua_gettop(state);
@@ -2898,7 +2899,7 @@ fn tableOptionalParagraphOverflow(
 fn tableOptionalSpring(state: *c.State, table: c_int) !?animation.Spring {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    const kind = c.lua_getfield(state, table, "spring");
+    const kind = unwrapTop(state, c.lua_getfield(state, table, "spring"));
     if (kind == c.type_nil) return null;
     if (kind != c.type_table) return error.InvalidSpringConfig;
     const index = c.lua_gettop(state);
@@ -3009,7 +3010,7 @@ fn tableOptionalPositiveInteger(
 fn tableGridTracks(state: *c.State, table: c_int, field: [*:0]const u8) ?render_types.GridTracks {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    if (c.lua_getfield(state, table, field) != c.type_table) return null;
+    if (unwrapTop(state, c.lua_getfield(state, table, field)) != c.type_table) return null;
     const index = top + 1;
     const count = c.lua_rawlen(state, index);
     if (count == 0 or count > render_types.GridTracks.capacity) return null;
@@ -3094,7 +3095,7 @@ fn tableScroll(state: *c.State, table: c_int, theme: design.tokens.Theme) !rende
 fn tableScrollRequest(state: *c.State, table: c_int) !?@import("../ui/render_object/scroll.zig").Request {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    const kind = c.lua_getfield(state, table, "scroll_to");
+    const kind = unwrapTop(state, c.lua_getfield(state, table, "scroll_to"));
     if (kind == c.type_nil) return null;
     if (kind != c.type_table) return error.InvalidScrollRequest;
     const index = c.lua_gettop(state);
@@ -3117,7 +3118,7 @@ fn tableScrollRequest(state: *c.State, table: c_int) !?@import("../ui/render_obj
 fn tableOptionalPositioned(state: *c.State, table: c_int) !?render_types.Positioned {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    const kind = c.lua_getfield(state, table, "positioned");
+    const kind = unwrapTop(state, c.lua_getfield(state, table, "positioned"));
     if (kind == c.type_nil) return null;
     if (kind != c.type_table) return error.InvalidPositioned;
     const index = c.lua_gettop(state);
@@ -3143,7 +3144,7 @@ fn tableOptionalPositioned(state: *c.State, table: c_int) !?render_types.Positio
 fn tableOptionalFlex(state: *c.State, table: c_int) !?@FieldType(render_types.ParentData, "flex") {
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
-    const value_type = c.lua_getfield(state, table, "flex");
+    const value_type = unwrapTop(state, c.lua_getfield(state, table, "flex"));
     if (value_type == c.type_nil) return null;
     var fit: render_types.FlexFit = .tight;
     if (value_type == c.type_table) {

@@ -5,6 +5,7 @@ const http = @import("../http/root.zig");
 const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
 const vm_module = @import("vm.zig");
 
 const Job = struct {
@@ -110,8 +111,8 @@ pub const Binding = struct {
         const count = c.lua_gettop(L);
         const index: c_int = if (kind == .request) 1 else 2;
         if (kind == .request) {
-            if (count != 1 or c.lua_type(L, 1) != c.type_table) return error.ExpectedRequestTable;
-        } else if (count < 1 or count > 2 or (count == 2 and c.lua_type(L, 2) != c.type_table)) return error.InvalidHttpArguments;
+            if (count != 1 or unwrapView(L, 1) != c.type_table) return error.ExpectedRequestTable;
+        } else if (count < 1 or count > 2 or (count == 2 and unwrapView(L, 2) != c.type_table)) return error.InvalidHttpArguments;
         const has_options = count >= index;
         var options: http.Options = .{ .url = undefined };
         options.url = if (kind == .request) (try stringField(L, index, "url")) orelse return error.ExpectedUrl else try string(L, 1);
@@ -130,7 +131,7 @@ pub const Binding = struct {
             _ = c.lua_rawget(L, index);
             defer c.lua_settop(L, count);
             if (c.lua_type(L, -1) != c.type_nil) {
-                if (c.lua_type(L, -1) != c.type_table) return error.ExpectedHeadersTable;
+                if (unwrapView(L, -1) != c.type_table) return error.ExpectedHeadersTable;
                 c.lua_pushnil(L);
                 var bytes: usize = 0;
                 while (c.lua_next(L, -2) != 0) {

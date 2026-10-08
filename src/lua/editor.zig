@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
 const Vm = @import("vm.zig").Vm;
 const Controller = @import("../ui/text_input/controller.zig").Controller;
 const Selection = @import("../ui/text_input/model.zig").Selection;
@@ -107,7 +108,7 @@ fn offset(state: *c.State, index: c_int) !usize {
 }
 
 fn selectionValue(state: *c.State) !Selection {
-    if (c.lua_type(state, 3) != c.type_table) return error.InvalidEditorSelection;
+    if (unwrapView(state, 3) != c.type_table) return error.InvalidEditorSelection;
     var value: Selection = .collapsed(0);
     inline for (.{ "anchor", "extent" }) |name| {
         _ = c.lua_getfield(state, 3, name);
@@ -125,7 +126,7 @@ fn selectionValue(state: *c.State) !Selection {
     }
     inline for (.{ "line_caret", "character_caret" }) |field| {
         if (c.lua_getfield(state, 3, field) != c.type_nil) {
-            if (c.lua_type(state, -1) != c.type_table) return error.InvalidEditorSelection;
+            if (unwrapView(state, -1) != c.type_table) return error.InvalidEditorSelection;
             var caret: Selection.LineCaret = .{ .anchor = 0, .extent = 0, .column = 0 };
             inline for (.{ "anchor", "extent", "column" }) |name| {
                 _ = c.lua_getfield(state, -1, name);

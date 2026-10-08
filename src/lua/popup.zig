@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
 const Vm = @import("vm.zig").Vm;
 const Handle = @import("../core/handle.zig").Handle;
 const platform = @import("../platform/window.zig");
@@ -65,7 +66,7 @@ pub fn open(state: *c.State) callconv(.c) c_int {
 }
 
 fn parse(vm: *Vm, state: *c.State) !Options {
-    if (c.lua_gettop(state) != 1 or c.lua_type(state, 1) != c.type_table)
+    if (c.lua_gettop(state) != 1 or unwrapView(state, 1) != c.type_table)
         return error.InvalidPopupArguments;
     const anchor_kind = c.lua_getfield(state, 1, "anchor");
     const input = if (anchor_kind == c.type_nil) try vm.takeActivationInput(state) else null;
@@ -140,7 +141,7 @@ fn close(state: *c.State) callconv(.c) c_int {
 
 fn resize(state: *c.State) callconv(.c) c_int {
     const raw = c.luaL_testudata(state, 1, metatable) orelse return failure(state, error.InvalidPopupHandle);
-    if (c.lua_gettop(state) != 2 or c.lua_type(state, 2) != c.type_table)
+    if (c.lua_gettop(state) != 2 or unwrapView(state, 2) != c.type_table)
         return failure(state, error.InvalidPopupArguments);
     const value: *Userdata = @ptrCast(@alignCast(raw));
     const width = dimension(state, 2, "width") catch |err| return failure(state, err);

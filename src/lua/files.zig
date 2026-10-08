@@ -5,6 +5,7 @@ const linux = std.os.linux;
 const io = @import("../loop/root.zig");
 const task = @import("../task/root.zig");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
 const vm_module = @import("vm.zig");
 const dbus_values = @import("dbus_values.zig");
 
@@ -142,7 +143,7 @@ pub const Binding = struct {
         var write_options: WriteOptions = .{};
         var payload: []u8 = &.{};
         if (kind == .read and argc == 2) {
-            if (c.lua_type(L, 2) != c.type_table) {
+            if (unwrapView(L, 2) != c.type_table) {
                 self.allocator.free(path);
                 return pushFailure(L, "InvalidOptions");
             }
@@ -159,7 +160,7 @@ pub const Binding = struct {
             }
             c.lua_settop(L, -2);
         } else if (kind == .open and argc == 2) {
-            if (c.lua_type(L, 2) != c.type_table) {
+            if (unwrapView(L, 2) != c.type_table) {
                 self.allocator.free(path);
                 return pushFailure(L, "InvalidOptions");
             }
@@ -269,7 +270,7 @@ fn continuation(L: *c.State, _: c_int, context: c.KContext) callconv(.c) c_int {
 }
 
 fn parseWriteOptions(L: *c.State) !WriteOptions {
-    if (c.lua_type(L, 3) != c.type_table) return error.InvalidOptions;
+    if (unwrapView(L, 3) != c.type_table) return error.InvalidOptions;
     const top = c.lua_gettop(L);
     defer c.lua_settop(L, top);
     var options: WriteOptions = .{};

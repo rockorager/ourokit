@@ -1,5 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
+const unwrapView = @import("machine.zig").unwrapView;
+const unwrapTop = @import("machine.zig").unwrapTop;
 const core = @import("../core/root.zig");
 const tokens = @import("../design/root.zig").tokens;
 
@@ -35,7 +37,7 @@ pub fn inheritedColors(state: *c.State, index: c_int) ColorFields {
     if (c.lua_getfield(state, table, "color_scheme") != c.type_nil) return .initEmpty();
     c.lua_settop(state, top);
     var inherited = ColorFields.initFull();
-    if (c.lua_getfield(state, table, "colors") == c.type_table) {
+    if (unwrapTop(state, c.lua_getfield(state, table, "colors")) == c.type_table) {
         inline for (std.meta.fields(tokens.Theme), 0..) |field, i| {
             if (c.lua_getfield(state, -1, field.name) != c.type_nil)
                 inherited.remove(@enumFromInt(i));
@@ -123,7 +125,7 @@ pub fn widgetOverrides(state: *c.State, inherited: Overrides, comptime omit_heig
 }
 
 fn merge(comptime T: type, state: *c.State, index: c_int, base: T, comptime owner: []const u8) !T {
-    if (c.lua_type(state, index) != c.type_table) return error.InvalidThemeType;
+    if (unwrapView(state, index) != c.type_table) return error.InvalidThemeType;
     const table = if (index < 0 and index > c.registry_index) c.lua_gettop(state) + index + 1 else index;
     var result = base;
     if (T == Theme) {
