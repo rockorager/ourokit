@@ -40,7 +40,15 @@ pub fn install(state: *c.State) !void {
     _ = c.lua_getfield(state, api, "machine");
     c.lua_pushcclosure(state, taskOrigin, 0);
     _ = c.ouro_push_private_coroutine(state);
-    if (c.lua_pcallk(state, 4, 0, 0, 0, null) != c.ok)
+    // Recording codec: content hashes for blobs, base64 for raw bytes.
+    c.lua_createtable(state, 0, 3);
+    c.lua_pushcclosure(state, codecHash, 0);
+    c.lua_setfield(state, -2, "hash");
+    c.lua_pushcclosure(state, codecBase64, 0);
+    c.lua_setfield(state, -2, "base64");
+    c.lua_pushcclosure(state, codecUnbase64, 0);
+    c.lua_setfield(state, -2, "unbase64");
+    if (c.lua_pcallk(state, 5, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     // Generated tests: guard-aware paths to every reachable state.
     const paths = @embedFile("machine_paths.lua");
@@ -246,6 +254,50 @@ fn waiterArgument(state: *c.State) *Waiter {
         _ = c.lua_error(state);
         unreachable;
     }));
+}
+
+fn checkBytes(state: *c.State) ?[]const u8 {
+    if (c.lua_type(state, 1) != c.type_string) return null;
+    var size: usize = 0;
+    const bytes = c.lua_tolstring(state, 1, &size) orelse return null;
+    return bytes[0..size];
+}
+
+/// hash(text) -> 16 hex digits: a recording blob's content address.
+fn codecHash(state: *c.State) callconv(.c) c_int {
+    const bytes = checkBytes(state) orelse return raiseText(state, "hash expects a string");
+    var buffer: [16]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{x:0>16}", .{std.hash.Wyhash.hash(0, bytes)}) catch unreachable;
+    _ = c.lua_pushlstring(state, text.ptr, text.len);
+    return 1;
+}
+
+/// base64(bytes) -> standard base64 text.
+fn codecBase64(state: *c.State) callconv(.c) c_int {
+    const bytes = checkBytes(state) orelse return raiseText(state, "base64 expects a string");
+    const encoder = std.base64.standard.Encoder;
+    const out = std.heap.smp_allocator.alloc(u8, encoder.calcSize(bytes.len)) catch return raiseText(state, "out of memory");
+    defer std.heap.smp_allocator.free(out);
+    _ = c.lua_pushlstring(state, encoder.encode(out, bytes).ptr, out.len);
+    return 1;
+}
+
+/// unbase64(text) -> bytes, or nil and a message for invalid text.
+fn codecUnbase64(state: *c.State) callconv(.c) c_int {
+    const text = checkBytes(state) orelse return raiseText(state, "unbase64 expects a string");
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(text) catch return invalidBase64(state);
+    const out = std.heap.smp_allocator.alloc(u8, size) catch return raiseText(state, "out of memory");
+    defer std.heap.smp_allocator.free(out);
+    decoder.decode(out, text) catch return invalidBase64(state);
+    _ = c.lua_pushlstring(state, out.ptr, out.len);
+    return 1;
+}
+
+fn invalidBase64(state: *c.State) c_int {
+    c.lua_pushnil(state);
+    _ = c.lua_pushstring(state, "invalid base64");
+    return 2;
 }
 
 fn raiseText(state: *c.State, text: []const u8) c_int {

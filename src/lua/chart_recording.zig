@@ -16,6 +16,15 @@ pub const Sink = struct {
     /// Host monotonic ms at the start of the log; entries carry t - t0.
     t0: i64,
     lines: u64 = 0,
+    /// Entry lines written over all segments (not headers or blob lines).
+    inputs: u64 = 0,
+    /// Size policy: 0 for none. Once the current segment holds `limit`
+    /// bytes, `write` tells the recorder, which calls `rotate` at the next
+    /// entry boundary: the segment is kept as `<stem>.1.jsonl` (replacing an
+    /// older one) and a new one starts with a checkpoint.
+    limit: u64 = 0,
+    bytes: u64 = 0,
+    segment: u32 = 1,
     failed: bool = false,
     reason_buffer: [256]u8 = undefined,
     reason_length: usize = 0,
@@ -23,7 +32,12 @@ pub const Sink = struct {
     path_length: usize = 0,
     /// Lines recorded before the path was assigned.
     pending: std.ArrayList(u8) = .empty,
+    application_buffer: [256]u8 = undefined,
+    application_length: usize = 0,
     const max_pending = 16 * 1024 * 1024;
+    /// The development recording's segment size: at most two segments
+    /// (this size each) stay on disk per running app.
+    pub const development_limit = 32 * 1024 * 1024;
 
     pub fn location(self: *const Sink) []const u8 {
         return self.path_buffer[0..self.path_length];
@@ -64,13 +78,64 @@ pub const Sink = struct {
         self.fd = fd;
         @memcpy(self.path_buffer[0..chosen.len], chosen);
         self.path_length = chosen.len;
-        var header: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&header, "{{\"format\":\"ouro.machine.log\",\"version\":2,\"t0\":{d},\"app\":{f}}}", .{
-            self.t0, std.json.fmt(application, .{}),
-        }) catch return error.NameTooLong;
-        self.append(line);
+        if (application.len > self.application_buffer.len) return error.NameTooLong;
+        @memcpy(self.application_buffer[0..application.len], application);
+        self.application_length = application.len;
+        try self.writeHeader();
         if (!self.failed) self.writeAll(self.pending.items) catch self.fail("cannot write the recording file");
+        self.bytes += self.pending.items.len;
         self.pending.clearAndFree(self.allocator);
+    }
+
+    fn writeHeader(self: *Sink) !void {
+        var header: [512]u8 = undefined;
+        const application = self.application_buffer[0..self.application_length];
+        const line = if (self.segment == 1)
+            std.fmt.bufPrint(&header, "{{\"app\":{f},\"format\":\"ouro.machine.log\",\"t0\":{d},\"version\":3}}", .{
+                std.json.fmt(application, .{}), self.t0,
+            }) catch return error.NameTooLong
+        else
+            std.fmt.bufPrint(&header, "{{\"app\":{f},\"format\":\"ouro.machine.log\",\"segment\":{d},\"t0\":{d},\"version\":3}}", .{
+                std.json.fmt(application, .{}), self.segment, self.t0,
+            }) catch return error.NameTooLong;
+        self.append(line);
+    }
+
+    /// True once the current segment has reached the size limit.
+    pub fn full(self: *const Sink) bool {
+        return self.limit != 0 and self.fd != null and self.bytes >= self.limit;
+    }
+
+    /// Keeps the current segment as `<stem>.1.jsonl` and starts a new one
+    /// at location(), header first. False (and recording stops) on failure.
+    pub fn rotate(self: *Sink) bool {
+        if (self.failed or self.fd == null) return false;
+        const path = self.location();
+        const stem = if (std.mem.endsWith(u8, path, ".jsonl")) path[0 .. path.len - ".jsonl".len] else path;
+        var from: [std.fs.max_path_bytes + 1]u8 = undefined;
+        var to: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const kept = std.fmt.bufPrintZ(&to, "{s}.1.jsonl", .{stem}) catch {
+            self.fail("recording path too long to rotate");
+            return false;
+        };
+        const current = std.fmt.bufPrintZ(&from, "{s}", .{path}) catch unreachable;
+        if (linux.errno(linux.renameat(linux.AT.FDCWD, current, linux.AT.FDCWD, kept)) != .SUCCESS) {
+            self.fail("cannot rotate the recording file");
+            return false;
+        }
+        const fd = (openLocked(path) catch null) orelse {
+            self.fail("cannot open a new recording segment");
+            return false;
+        };
+        _ = linux.close(self.fd.?);
+        self.fd = fd;
+        self.bytes = 0;
+        self.segment += 1;
+        self.writeHeader() catch {
+            self.fail("cannot write the recording header");
+            return false;
+        };
+        return !self.failed;
     }
 
     pub fn close(self: *Sink) void {
@@ -97,6 +162,7 @@ pub const Sink = struct {
             self.pending.appendSlice(self.allocator, line) catch return self.fail("out of memory");
             self.pending.append(self.allocator, '\n') catch return self.fail("out of memory");
             self.lines += 1;
+            if (isEntry(line)) self.inputs += 1;
             return;
         }
         const whole = self.allocator.alloc(u8, line.len + 1) catch return self.fail("out of memory");
@@ -105,6 +171,8 @@ pub const Sink = struct {
         whole[line.len] = '\n';
         self.writeAll(whole) catch return self.fail("cannot write the recording file");
         self.lines += 1;
+        self.bytes += whole.len;
+        if (isEntry(line)) self.inputs += 1;
     }
 
     fn writeAll(self: *Sink, bytes: []const u8) !void {
@@ -119,6 +187,11 @@ pub const Sink = struct {
         }
     }
 };
+
+/// Entry lines, not the header or a blob line (`{"id":...,"k":"blob"}`).
+fn isEntry(line: []const u8) bool {
+    return !std.mem.startsWith(u8, line, "{\"id\":") and !std.mem.startsWith(u8, line, "{\"app\":");
+}
 
 /// An append-only descriptor on `path` holding its exclusive lock, truncated;
 /// null when another process holds the lock.
@@ -178,9 +251,9 @@ fn monotonicMs() i64 {
 }
 
 const bridge_source =
-    \\local write, t0, fail, ouro = ...
+    \\local write, t0, fail, rotate, ouro = ...
     \\local machine = ouro.machine
-    \\if machine and machine.recorder then machine.recorder(write, {t0 = t0, header = false, fail = fail}) end
+    \\if machine and machine.recorder then machine.recorder(write, {t0 = t0, header = false, fail = fail, rotate = rotate}) end
 ;
 
 /// Installs the recorder in a VM whose `ouro.machine` is installed, before
@@ -196,8 +269,10 @@ pub fn install(vm: *vm_module.Vm, sink: *Sink) !void {
     c.lua_pushinteger(state, sink.t0);
     c.lua_pushlightuserdata(state, sink);
     c.lua_pushcclosure(state, failRecording, 1);
+    c.lua_pushlightuserdata(state, sink);
+    c.lua_pushcclosure(state, rotateRecording, 1);
     vm.pushApi(state);
-    if (c.lua_pcallk(state, 4, 0, 0, 0, null) != c.ok)
+    if (c.lua_pcallk(state, 5, 0, 0, 0, null) != c.ok)
         return error.StatechartRecorderInitializationFailed;
 }
 
@@ -209,13 +284,22 @@ fn failRecording(state: *c.State) callconv(.c) c_int {
     return 0;
 }
 
+/// write(line) -> true once the segment is over its size limit.
 fn write(state: *c.State) callconv(.c) c_int {
     const sink: *Sink = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)) orelse return 0));
     if (c.lua_type(state, 1) != c.type_string) return 0;
     var length: usize = 0;
     const bytes = c.lua_tolstring(state, 1, &length) orelse return 0;
     sink.append(bytes[0..length]);
-    return 0;
+    c.lua_pushboolean(state, @intFromBool(sink.full()));
+    return 1;
+}
+
+/// rotate() -> true when a new segment was started.
+fn rotateRecording(state: *c.State) callconv(.c) c_int {
+    const sink: *Sink = @ptrCast(@alignCast(c.lua_touserdata(state, c.upvalueIndex(1)) orelse return 0));
+    c.lua_pushboolean(state, @intFromBool(sink.full() and sink.rotate()));
+    return 1;
 }
 
 test "recording sink writes a header and one line per append" {
@@ -247,4 +331,41 @@ test "recording sink writes a header and one line per append" {
     defer second.close();
     try std.testing.expect(!std.mem.eql(u8, first.location(), second.location()));
     try std.testing.expect(std.mem.endsWith(u8, second.location(), ".jsonl"));
+}
+
+fn readForTest(path: []const u8, buffer: []u8) ![]const u8 {
+    var name: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const fd_result = linux.openat(linux.AT.FDCWD, try std.fmt.bufPrintZ(&name, "{s}", .{path}), .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd_result) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(fd_result);
+    defer _ = linux.close(fd);
+    const count = linux.read(fd, buffer.ptr, buffer.len);
+    if (linux.errno(count) != .SUCCESS) return error.ReadFailed;
+    return buffer[0..count];
+}
+
+test "recording sink rotates at its limit and keeps one previous segment" {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/tmp/ourokit-recording-test-{d}/rotate.jsonl", .{linux.getpid()});
+    var sink = try Sink.open(std.testing.allocator, path, "dev.test");
+    defer sink.close();
+    sink.limit = 128;
+    try std.testing.expect(!sink.full());
+    sink.append("{\"id\":\"00\",\"k\":\"blob\",\"v\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}");
+    sink.append("{\"k\":\"event\"}");
+    try std.testing.expect(sink.full());
+    try std.testing.expectEqual(@as(u64, 1), sink.inputs);
+    try std.testing.expect(sink.rotate());
+    try std.testing.expect(!sink.full());
+    sink.append("{\"k\":\"checkpoint\"}");
+    try std.testing.expectEqual(@as(u64, 2), sink.inputs);
+    var kept_buffer: [160]u8 = undefined;
+    const kept_path = try std.fmt.bufPrint(&kept_buffer, "/tmp/ourokit-recording-test-{d}/rotate.1.jsonl", .{linux.getpid()});
+    var read_buffer: [4096]u8 = undefined;
+    const current = try readForTest(path, &read_buffer);
+    try std.testing.expect(std.mem.indexOf(u8, current, "\"segment\":") != null);
+    try std.testing.expect(std.mem.endsWith(u8, current, "{\"k\":\"checkpoint\"}\n"));
+    var kept_read: [4096]u8 = undefined;
+    const kept = try readForTest(kept_path, &kept_read);
+    try std.testing.expect(std.mem.endsWith(u8, kept, "{\"k\":\"event\"}\n"));
 }

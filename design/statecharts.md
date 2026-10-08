@@ -1675,13 +1675,14 @@ development run of each app.
   Lua decoder; the format is the same. An entry that still cannot be
   written, a failing recorder hook, or a failed file write stops recording
   and leaves the app running. `runtime.diagnostics` then reports
-  `recording = {path, inputs, failed = true, reason}`.
+  `recording = {path, inputs, segment, bytes, limit, failed = true, reason}`.
+- **Size.** Development logs stay bounded; see *Size* below.
 
-**Format: JSON lines, `ouro.machine.log` version 2.** The first line is the
-header. Each later line is one input with what it caused:
+**Format: JSON lines, `ouro.machine.log` version 3.** The first line is the
+header. Each later line is one input with what it caused, or a blob (*Size*):
 
 ```json
-{"format":"ouro.machine.log","version":2,"t0":1782223,"app":"dev.ourokit.stopwatch"}
+{"app":"dev.ourokit.stopwatch","format":"ouro.machine.log","t0":1782223,"version":3}
 {"k":"start","t":0,"a":"stopwatch","m":"stopwatch","input":{},"r":[{"a":"stopwatch","e":"ouro.init","tr":[]}],"s":{"stopwatch":{"states":["clock","clock.idle","settings","settings.closed"],"status":"active","children":[],"context":{"elapsed":0,"laps":[]}}}}
 {"k":"event","t":20713,"a":"stopwatch","o":"widget","e":{"type":"START"},"r":[{"a":"stopwatch","e":"START","tr":[1]}],"s":{"stopwatch":{"states":["clock","clock.running","settings","settings.closed"],"context":{"started_at":1802936}}}}
 {"k":"timer","t":20813,"a":"stopwatch","o":"timer","e":{"type":"after.100.clock.running","state":"clock.running","token":6,"time_ms":1803036},"r":[{"a":"stopwatch","e":"after.100.clock.running","tr":[2]}],"s":{"stopwatch":{"context":{"elapsed":100}}}}
@@ -1690,7 +1691,7 @@ header. Each later line is one input with what it caused:
 | Field | Meaning |
 | --- | --- |
 | `t0` (header) | Logical ms of `t = 0`: host monotonic time when the log opened. Contexts may hold absolute `machine.now()` values, so replay runs its clock at `t0 + t`. |
-| `k` | `start`, `event`, `timer`, `invoke`, `task`, `stop`, `release`, `reload` or `released` |
+| `k` | `start`, `event`, `timer`, `invoke`, `task`, `stop`, `release`, `reload`, `released` or `checkpoint`; `blob` lines are not inputs |
 | `t` | Logical ms since `t0`: the input's instant, or a timer's deadline |
 | `a` | Actor path, such as `notes/document.2` |
 | `o` | Origin: `widget`, `callback` (`actor:sender`), `mcp` (an MCP action call: the host tags the handler's task, so `machine.actions` and hand-written handlers both record it), `activation` (a desktop `activate`/`open`/action hook, run under `machine._with_origin`), `invoke` (a result or an invoke's `send`), `child` (a task result), `timer`, `surface`, `runtime`, `component` (a component's effect that sends to an actor outside the recorded trees), `app` (any other app code). Task tags are per task and are not inherited by tasks they spawn. |
@@ -1702,8 +1703,8 @@ header. Each later line is one input with what it caused:
 
 **Values keep their Lua types.** Plain JSON would turn `3.0` into `3`,
 string the keys of `{[10] = 'ten'}`, and lose NaN and infinities. Replay
-would then diverge with no chart change (second review, M-5). Version 2
-writes plain JSON wherever it is exact, plus three small tags:
+would then diverge with no chart change (second review, M-5). Versions 2
+and 3 write plain JSON wherever it is exact, plus small tags:
 
 | Value | Written as |
 | --- | --- |
@@ -1711,11 +1712,13 @@ writes plain JSON wherever it is exact, plus three small tags:
 | NaN, `math.huge`, `-math.huge` | `{"$f": "nan"}`, `{"$f": "inf"}`, `{"$f": "-inf"}` |
 | a table with non-string keys that is not a dense array (sparse, mixed, boolean or float keys) | `{"$t": [[10, "ten"], [20, "twenty"]]}`, pairs sorted by key |
 | a native handle: userdata, function, thread (gap 7) | `{"$h": "<type>"}`: the metatable `__name` when known (`machine.inspectable`), else the Lua type. Replay passes the marker table in its place and reports how many it substituted. |
-| a string that is not valid UTF-8 | `{"$x": "<hex bytes>"}` |
+| a string that is not valid UTF-8 | `{"$x": "<hex bytes>"}` under 48 bytes, else `{"$64": "<base64>"}` (version 3) |
+| a value whose JSON is 1 KB or more (version 3) | `{"$b": "<id>"}`, see *Size* |
 | an object whose only key is a tag | `{"$o": {...}}` (escaped) |
 
 Replay compares number subtypes strictly (`3` is not `3.0`), and NaN equals
-NaN. Version 1 logs have no tags and still replay.
+NaN. Version 1 logs have no tags, version 2 logs no blobs; both still
+replay.
 
 **Concurrent runs and several recorders.** Each process locks its log file
 (`flock`), writes it append-only, and writes each line with one `write`. A
@@ -1725,6 +1728,45 @@ reports the path actually used. Recorders can coexist: the development
 recorder keeps recording while a public `machine.recorder`, `paths_log` or
 replay records too. Each recorder watches its own scheduler, and stopping
 one leaves the others installed.
+
+### Size
+
+A shell runs for days under `--dev`, and its inputs carry images. Live
+ouroshell wrote 190–270 KB per notification popup: each image went out with
+its event, again in every snapshot delta of the list that held it, and
+again for the popup it was passed to. Three rules keep a log small, and
+replay exact for what is kept.
+
+- **Blobs, stored once.** A value whose JSON is at least 1 KB is written as
+  `{"$b": "<id>"}`. The id is a 64-bit hash (16 hex digits) of that JSON.
+  Its content goes on its own line, `{"id":"<id>","k":"blob","v":<value>}`,
+  once per log segment and before the first line that uses it. Inside a
+  value of 1 KB or more, parts of 128 bytes or more become blobs too, so a
+  list that gains an item costs one blob of references, not its items
+  again. An event keeps its `type` and fields inline, and a delta its keys.
+  Only payload values become references. Replay resolves each reference
+  to a fresh copy.
+- **Bytes as base64.** A non-UTF-8 string of 48 bytes or more is
+  `{"$64": ...}`, a third larger than the raw bytes rather than double.
+- **Minimal deltas.** `s` holds only the context keys whose value changed,
+  by identity. With blobs, a changed list re-sends references.
+- **Rotation (`--dev`).** A development log is a series of 32 MiB segments.
+  Once one is full, the next entry boundary renames it to
+  `<name>.1.jsonl` (replacing an older one) and starts a new `<name>.jsonl`.
+  The new header has `"segment": n`, so at most two segments (64 MiB) per
+  running app stay on disk. `ouroctl run --record` does not rotate. A new
+  segment opens with a **checkpoint**: a `{"k":"checkpoint","t":...}` line,
+  then a `start` line with `checkpoint = true` for each running root. Each
+  such line has the persisted snapshot (children included), full deltas in
+  `s`, and `timers`, the pending timers of the root and its children with
+  their deadlines (`{path: [{state, delay, ms, at}]}`).
+
+Measured by `tests/replay_test.lua` ("recording size: 50 notifications
+..."): 50 notifications, each with its own 16 KB image and a shared 4 KB
+icon, going into a 50-item list and a popup child with a 5 s timer. The log
+went from **1,132,460 bytes per notification** (56.6 MB; recording and
+replay took about 3.5 min) to **24,218** (1.2 MB, about 5 s). Most of that is the
+image itself: 21,848 bytes of base64. The icon is written once.
 
 Reload writes `reload` first. The candidate's lines are held until its
 commit (`machine.release()`): carried actors' `start` lines with snapshots,
@@ -1754,6 +1796,18 @@ against those charts:
 - **Reload.** A `reload` line starts a new generation: the old actors stop,
   `machine.carry({})` holds restored work, and the first `release` or
   `released` line calls `machine.release()`.
+- **Checkpoints.** A `checkpoint` line also starts a new generation, without
+  holding work. Each checkpoint `start` restores its root from the snapshot,
+  and restored timers are armed at their recorded deadlines, not a full
+  delay later. Restored invokes are stubs that the recorded results
+  complete. Each rotated segment therefore replays on its own from its
+  checkpoint. A checkpoint `start` compares its kind, actor, chart and
+  time, and its deltas are the state both sides continue from. After a
+  checkpoint, event `token`s are not compared, because restore numbers
+  state entries afresh.
+  - Limits: a spawned task still running at the checkpoint has no stub, so
+    its result diverges ("no running task"). Transient context fields reset
+    as on reload (§6).
 
 Replay records what it observes with the same recorder, then compares it
 line by line with the log: kinds, times, events, compact records and

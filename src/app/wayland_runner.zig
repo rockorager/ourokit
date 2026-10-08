@@ -471,9 +471,12 @@ fn runSourceInternal(
             std.log.warn("cannot record statecharts to {s}: {s}", .{ path, @errorName(err) });
             break :blk null;
         }
-    else if (options.record_directory != null)
-        lua.chart_recording.Sink.deferred(init.gpa)
-    else
+    else if (options.record_directory != null) dev: {
+        // Development recordings rotate (design/statecharts.md §14).
+        var sink = lua.chart_recording.Sink.deferred(init.gpa);
+        sink.limit = lua.chart_recording.Sink.development_limit;
+        break :dev sink;
+    } else
         null;
     defer if (recording) |*sink| sink.close();
     if (options.record_path) |path| if (recording != null) std.log.info("recording statechart inputs to {s}", .{path});

@@ -1,4 +1,4 @@
-local ouro, M, task_origin, coroutine_library = ...
+local ouro, M, task_origin, coroutine_library, codec = ...
 -- Private to the statechart runtime (applications have no coroutines): the
 -- manual scheduler runs invokes and tasks in coroutines so machine.sleep
 -- can wait for its virtual clock.
@@ -12,7 +12,8 @@ M._coroutine = coroutine_library
 -- it observes the same way, and compares line by line.
 
 local json = ouro.json
-local FORMAT, VERSION = 'ouro.machine.log', 2
+local FORMAT, VERSION = 'ouro.machine.log', 3
+M._log_version = VERSION
 
 -- Input origins per task: hosts tag MCP action calls natively; activation
 -- hooks run under _with_origin. Sub-tasks do not inherit a tag.
@@ -58,14 +59,17 @@ end
 --   {"$h": "<type>"}      a native handle (userdata, function, thread): its
 --                         metatable __name when known, else its Lua type.
 --                         Opaque: replay passes the marker table instead;
---   {"$x": "<hex>"}       a string that is not valid UTF-8 (raw bytes);
+--   {"$x": "<hex>"}       a short string that is not valid UTF-8 (raw bytes),
+--   {"$64": "<base64>"}   and a long one (version 3);
+--   {"$b": "<id>"}        a large value stored once, in an earlier
+--                         {"k":"blob","id":"<id>","v":<value>} line (version 3);
 --   {"$o": {...}}         an object whose only key is itself a tag, escaped.
 -- Everything else is plain JSON, so lines stay readable. revive() undoes the
 -- tags after decoding; version 1 logs have none and decode as before.
 ---------------------------------------------------------------------------
 local install, uninstall -- recorder registry, below
 local raw = M.raw
-local TAGS = {['$f'] = true, ['$t'] = true, ['$o'] = true, ['$h'] = true, ['$x'] = true}
+local TAGS = {['$f'] = true, ['$t'] = true, ['$o'] = true, ['$h'] = true, ['$x'] = true, ['$64'] = true, ['$b'] = true}
 -- The interpreter's machine.inspectable names handles ({"$h": name}); use
 -- it when present.
 local function handle(value, kind)
@@ -89,6 +93,7 @@ local function safe(value, seen)
   if kind == 'nil' or kind == 'boolean' then return value end
   if kind == 'string' then
     if utf8.len(value) then return value end
+    if #value >= 48 and codec then return {['$64'] = codec.base64(value)} end
     return {['$x'] = (value:gsub('.', function(c) return string.format('%02x', c:byte()) end))}
   end
   if kind == 'number' then
@@ -179,11 +184,69 @@ local function lua_encode(value, out)
   return out
 end
 
-local function encode(entry)
-  local value = safe(entry)
+local function to_json(value)
   local ok, text = pcall(json.encode, value)
   if ok then return text end
   return table.concat(lua_encode(value, {}))
+end
+local function encode(entry) return to_json(safe(entry)) end
+
+-- Blobs (version 3). A recording must stay small in a long-running app: a
+-- notification image would otherwise be written with its event, again in
+-- every snapshot delta of the list that holds it, and again by each actor it
+-- is passed to. blobify() replaces values whose JSON is at least BLOB_BYTES
+-- with {"$b": id}, id being a hash of that JSON, and put() writes each id's
+-- {"k":"blob"} line once, before the first line that refers to it. Inside a
+-- large container, parts of at least PART_BYTES become blobs too, so a list
+-- that gains an item costs one line of references, not its items again.
+-- Values are rewritten in place: they are fresh tables from safe().
+local BLOB_BYTES, PART_BYTES = 1024, 128
+local ATOMIC = {['$x'] = true, ['$64'] = true, ['$f'] = true, ['$h'] = true, ['$b'] = true}
+local function blobify(value, put)
+  local kind = type(value)
+  if kind == 'string' then
+    if #value + 2 >= BLOB_BYTES then return put(value), 24 end
+    return value, #value + 2
+  end
+  if kind ~= 'table' or value == json.null then return value, 6 end
+  local only = next(value)
+  if only ~= nil and next(value, only) == nil and ATOMIC[only] then
+    local size = type(value[only]) == 'string' and #value[only] + 10 or 16
+    if size >= BLOB_BYTES then return put(value), 24 end
+    return value, size
+  end
+  local sizes, size = {}, 2
+  for k, v in pairs(value) do
+    local inner, n = blobify(v, put)
+    value[k], sizes[k] = inner, n
+    size = size + n + (type(k) == 'string' and #k + 4 or 1)
+  end
+  if size < BLOB_BYTES then return value, size end
+  for k, n in pairs(sizes) do
+    if n >= PART_BYTES then value[k] = put(value[k]) end
+  end
+  return put(value), 24
+end
+-- The children of a table become blobs, the table itself stays inline (an
+-- event keeps its type readable, a delta its keys).
+local function blobify_inside(value, put)
+  if type(value) ~= 'table' or value == json.null then return value end
+  local only = next(value)
+  if only ~= nil and next(value, only) == nil and TAGS[only] then return (blobify(value, put)) end
+  for k, v in pairs(value) do value[k] = (blobify(v, put)) end
+  return value
+end
+local function encode_entry(entry, put)
+  local value = safe(entry)
+  if not put then return to_json(value) end
+  for _, field in ipairs({'e', 'input', 'snapshot'}) do
+    if value[field] ~= nil then value[field] = blobify_inside(value[field], put) end
+  end
+  for _, d in pairs(type(value.s) == 'table' and value.s or {}) do
+    if d.context then d.context = blobify_inside(d.context, put) end
+    if d.output ~= nil then d.output = (blobify(d.output, put)) end
+  end
+  return to_json(value)
 end
 
 local escapes = {['"'] = '"', ['\\'] = '\\', ['/'] = '/', b = '\b', f = '\f', n = '\n', r = '\r', t = '\t'}
@@ -278,7 +341,15 @@ local function decode_plain(text)
 end
 
 local revived_handles = 0
-local function revive(value)
+local function copy_deep(value)
+  if type(value) ~= 'table' or value == json.null then return value end
+  local out = {}
+  for k, v in pairs(value) do out[k] = copy_deep(v) end
+  if next(value) == nil and is_empty_array(value) then json.array(out) end
+  return out
+end
+-- blobs: id -> revived value, from the log's {"k":"blob"} lines so far.
+local function revive(value, blobs)
   if type(value) ~= 'table' or value == json.null then return value end
   local key, inner = next(value)
   if key ~= nil and next(value, key) == nil and TAGS[key] then
@@ -289,24 +360,41 @@ local function revive(value)
       return inner + 0.0
     elseif key == '$t' then
       local out = {}
-      for _, pair in ipairs(inner) do out[revive(pair[1])] = revive(pair[2]) end
+      for _, pair in ipairs(inner) do out[revive(pair[1], blobs)] = revive(pair[2], blobs) end
       return out
     elseif key == '$h' then
       revived_handles = revived_handles + 1
       return {['$h'] = inner}
     elseif key == '$x' then
       return (tostring(inner):gsub('%x%x', function(h) return string.char(tonumber(h, 16)) end))
+    elseif key == '$64' then
+      local bytes = codec.unbase64(tostring(inner))
+      if not bytes then fail('replay: invalid base64 in a $64 value') end
+      return bytes
+    elseif key == '$b' then
+      local found = blobs and blobs[inner]
+      if found == nil then fail('replay: blob %s is used before its {"k":"blob"} line', tostring(inner)) end
+      -- Each use gets its own tables: a chart may keep or change them.
+      return copy_deep(found)
     else
       local out = {}
-      for k, v in pairs(inner) do out[k] = revive(v) end
+      for k, v in pairs(inner) do out[k] = revive(v, blobs) end
       return out
     end
   end
-  for k, v in pairs(value) do value[k] = revive(v) end
+  for k, v in pairs(value) do value[k] = revive(v, blobs) end
   return value
 end
 
 local function decode(text) return revive(decode_plain(text)) end
+-- One decoded log line: a blob line is kept in blobs and yields nil.
+local function decode_entry(value, blobs)
+  if value.k == 'blob' and value.id ~= nil then
+    blobs[value.id] = revive(value.v, blobs)
+    return nil
+  end
+  return revive(value, blobs)
+end
 M._json_decode, M._json_encode = decode, encode
 
 ---------------------------------------------------------------------------
@@ -427,7 +515,7 @@ function M.recorder(write, options)
   if type(write) ~= 'function' then fail('recorder expects a write function') end
   local scheduler = options.scheduler or M.default_scheduler
   local function now() return scheduler.clock and scheduler.clock() or 0 end
-  local r = {count = 0, t0 = options.t0, tracked = {}, last = {}, current = nil, buffer = nil}
+  local r = {count = 0, t0 = options.t0, tracked = {}, last = {}, current = nil, buffer = nil, blobs = {}}
   if r.t0 == nil then r.t0 = now() end
 
   -- A recording never throws into the app: an entry that cannot be written
@@ -438,13 +526,29 @@ function M.recorder(write, options)
     r.stop()
     if options.fail then pcall(options.fail, r.failed) end
   end
+  -- write(line) returns true once the log is over its size limit
+  -- (options.rotate, below).
+  local function out(line)
+    if r.buffer then r.buffer[#r.buffer + 1] = line
+    elseif write(line) == true then r.full = true end
+  end
+  local function put(value)
+    local text = to_json(value)
+    local id = codec.hash(text)
+    if not r.blobs[id] then
+      r.blobs[id] = true
+      out('{"id":"' .. id .. '","k":"blob","v":' .. text .. '}')
+    end
+    return {['$b'] = id}
+  end
   local function emit(entry)
     if r.failed then return end
     r.count = r.count + 1
-    local ok, line = pcall(encode, entry)
+    local ok, line = pcall(encode_entry, entry, codec and options.blobs ~= false and put or nil)
     if not ok then return r.fail('cannot encode recording entry ' .. r.count .. ': ' .. tostring(line)) end
-    if r.buffer then r.buffer[#r.buffer + 1] = line else write(line) end
+    out(line)
   end
+  r.emit = emit
   if options.header ~= false then
     write(encode({format = FORMAT, version = VERSION, t0 = r.t0, app = options.app}))
   end
@@ -541,6 +645,7 @@ function M.recorder(write, options)
     if any then entry.s = changes end
     if not ok then entry.err = tostring(err) end
     emit(entry)
+    if r.full then r.checkpoint() end
   end
   -- Source reload: a candidate VM's lines wait for release (a failed
   -- candidate leaves nothing behind) and start a new generation.
@@ -552,7 +657,51 @@ function M.recorder(write, options)
     emit({k = 'released', t = now() - r.t0})
     local lines = r.buffer
     r.buffer = nil
-    for _, line in ipairs(lines or {}) do write(line) end
+    for _, line in ipairs(lines or {}) do out(line) end
+    if r.full then r.checkpoint() end
+  end
+  -- Size policy. With options.rotate (the development log), write() reports
+  -- when the log is over its limit; at the next entry boundary rotate()
+  -- starts a new segment (the old one is kept beside it) and the recorder
+  -- opens it with a checkpoint: {"k":"checkpoint"} and, for each running
+  -- root, a start entry with checkpoint = true, its persisted snapshot, its
+  -- and its children's pending timers with their deadlines, and full
+  -- snapshot deltas. Replay starts each segment from its checkpoint.
+  local function timers_of(actor, into)
+    local list = {}
+    for _, timer in ipairs(actor:pending_timers()) do
+      if timer.time_ms then
+        list[#list + 1] = {state = timer.state, delay = timer.delay, ms = timer.ms, at = timer.time_ms + timer.ms - r.t0}
+      end
+    end
+    if list[1] then into[actor.path] = list end
+    for _, id in ipairs(actor._snapshot.children) do
+      local child = actor._children[id]
+      if type(child) == 'table' and child.chart and child.pending_timers then timers_of(child, into) end
+    end
+    return into
+  end
+  function r.checkpoint()
+    r.full = false
+    if r.buffer or not options.rotate then return end
+    local ok, rotated = pcall(options.rotate)
+    if not ok or not rotated then return end
+    r.blobs = {}
+    local t = now() - r.t0
+    emit({k = 'checkpoint', t = t})
+    for _, actor in ipairs(r.tracked) do
+      if not actor._parent and actor._status ~= 'stopped' then
+        local entry = {k = 'start', a = actor.path, m = actor.chart.id, t = t, checkpoint = true, r = json.array({}),
+          component = actor._component or nil, timers = timers_of(actor, {}), s = {}}
+        local persisted, snapshot = pcall(actor.persist, actor)
+        if persisted then entry.snapshot = snapshot else entry.unrecordable = tostring(snapshot) end
+        for _, tracked in ipairs(r.tracked) do
+          if root_of(tracked) == actor then entry.s[tracked.path] = delta(nil, tracked._snapshot) end
+        end
+        emit(entry)
+      end
+    end
+    r.full = false
   end
   r.hooks = hooks
   function r.stop() uninstall(hooks) end
@@ -573,7 +722,15 @@ local function replay_scheduler(start)
   local s = {kind = 'replay', unlisted = true, pending = {}}
   local clock = M.logical_clock {start = start}
   s.logical = clock
-  s.clock, s.after = clock.now, clock.after
+  s.clock = clock.now
+  -- While a checkpoint restores an actor, s.rearm(scope, ms) returns the
+  -- recorded deadline of the timer being started, so it fires when it did
+  -- live rather than a full delay after the checkpoint.
+  function s.after(scope, ms, fn)
+    local at = s.rearm and s.rearm(scope, ms)
+    if at then ms = math.max(0, at - clock.now()) end
+    return clock.after(scope, ms, fn)
+  end
   function s.open(parent)
     local scope = {alive = true, children = {}}
     if type(parent) == 'table' then parent.children[#parent.children + 1] = scope end
@@ -622,15 +779,23 @@ local function decode_lines(source)
   end
   local header = table.remove(entries, 1)
   if not header or header.format ~= FORMAT then fail('replay: the first line is not an %s header', FORMAT) end
-  if header.version ~= 1 and header.version ~= VERSION then
+  if header.version ~= 1 and header.version ~= 2 and header.version ~= VERSION then
     fail('replay: unsupported log version %s', tostring(header.version))
   end
-  -- Version 1 has no type tags.
+  -- Version 1 has no type tags; version 3 adds blob lines, which are not
+  -- entries.
   revived_handles = 0
+  local blobs = {}
   if header.version >= 2 then
-    for i, entry in ipairs(entries) do entries[i] = revive(entry) end
+    local kept, line_of = {}, {}
+    for i, entry in ipairs(entries) do
+      local value = decode_entry(entry, blobs)
+      if value then kept[#kept + 1] = value; line_of[#kept] = i + 1 end
+    end
+    entries, header.line_of = kept, line_of
   end
   header.handles = revived_handles
+  header.blobs = blobs
   return header, entries
 end
 
@@ -722,7 +887,7 @@ replay = function(source, options)
   local chart_for = options.charts or charts
   local t0 = header.t0 or 0
   local observed, observed_lines = {}, {}
-  local scheduler, recorder, roots, released
+  local scheduler, recorder, roots, released, checkpointed, restore_checkpoint, comparable
   local report = {format = 'ouro.machine.replay', ok = true, entries = #entries, compared = 0,
     handles = header.handles}
   -- options.records(record): the §10 inspection stream of the replayed
@@ -744,7 +909,8 @@ replay = function(source, options)
     scheduler, roots, released = replay_scheduler(start), {}, false
     recorder = M.recorder(function(line)
       observed_lines[#observed_lines + 1] = line
-      observed[#observed + 1] = decode(line)
+      local value = decode_entry(decode_plain(line), header.blobs)
+      if value then observed[#observed + 1] = value end
     end, {scheduler = scheduler, t0 = t0, header = false})
   end
 
@@ -767,6 +933,24 @@ replay = function(source, options)
     end
   end
 
+  -- After a checkpoint, event tokens are the restored actors' own (restore
+  -- numbers state entries afresh), so they are not compared; a checkpoint's
+  -- start compares its kind, actor, chart and time, and its deltas set the
+  -- state both sides continue from.
+  function comparable(entry, recorded)
+    if not (recorded.checkpoint or checkpointed) then return entry end
+    local out = {}
+    for k, v in pairs(entry) do out[k] = v end
+    if recorded.checkpoint then
+      out.snapshot, out.timers, out.r, out.s, out.checkpoint, out.component, out.input = nil, nil, nil, nil, nil, nil, nil
+    end
+    if type(out.e) == 'table' and out.e.token ~= nil then
+      local e = {}
+      for k, v in pairs(out.e) do e[k] = v end
+      e.token, out.e = nil, e
+    end
+    return out
+  end
   local recorded_states, replayed_states = {}, {}
   local function diverge(index, message)
     local recorded, replayed = entries[index], observed[index]
@@ -786,7 +970,7 @@ replay = function(source, options)
       end
     end
     report.ok = false
-    report.divergence = {step = index, line = index + 1, t = recorded and recorded.t,
+    report.divergence = {step = index, line = header.line_of and header.line_of[index] or index + 1, t = recorded and recorded.t,
       message = message, recorded = recorded, replayed = replayed, differences = diffs}
   end
 
@@ -798,7 +982,7 @@ replay = function(source, options)
         return false
       end
       if recorded.lossy then replayed.r, recorded.r = nil, nil end
-      if not equal(recorded, replayed) then
+      if not equal(comparable(recorded, recorded), comparable(replayed, recorded)) then
         local what = describe(recorded)
         local message
         if describe(replayed) ~= what or recorded.t ~= replayed.t then
@@ -821,6 +1005,47 @@ replay = function(source, options)
     return true
   end
 
+  -- Starts an actor restored by a checkpoint with its pending timers at their
+  -- recorded deadlines.
+  function restore_checkpoint(actor, entry)
+    local plan = {}
+    for path, list in pairs(entry.timers or {}) do
+      for _, timer in ipairs(list) do
+        plan[#plan + 1] = {path = path, state = timer.state, delay = timer.delay, ms = timer.ms, at = t0 + timer.at}
+      end
+    end
+    local function owner(a, scope)
+      for state, held in pairs(a._scopes or {}) do
+        if held.scope == scope then return a, state end
+      end
+      for _, child in pairs(a._children or {}) do
+        if type(child) == 'table' and child.chart then
+          local found, state = owner(child, scope)
+          if found then return found, state end
+        end
+      end
+    end
+    local used = {}
+    scheduler.rearm = function(scope, ms)
+      local a, state = owner(actor, scope)
+      if not a then return nil end
+      for _, timer in ipairs(plan) do
+        if not used[timer] and timer.path == a.path and timer.state == state and timer.ms == ms then
+          used[timer] = a
+          return timer.at
+        end
+      end
+    end
+    local ok, err = pcall(actor.start, actor)
+    scheduler.rearm = nil
+    -- pending_timers() reports when each timer started, as it did live.
+    for timer, a in pairs(used) do
+      local live = a._timers[timer.state .. '|' .. tostring(timer.delay)]
+      if live then live.time_ms = timer.at - timer.ms end
+    end
+    if not ok then error(err, 0) end
+  end
+
   local function deliver_stub(entry, kind, prefix)
     local id = entry.e.type:match('^done%.' .. prefix .. '%.(.+)$') or entry.e.type:match('^error%.' .. prefix .. '%.(.+)$')
     local info = scheduler.find(entry.a, kind, id, true)
@@ -835,6 +1060,13 @@ replay = function(source, options)
     if kind == 'reload' then
       generation(t0 + entry.t)
       M.carry({})
+      return true
+    elseif kind == 'checkpoint' then
+      -- A new log segment: the previous one's actors are gone, the
+      -- checkpoint's start entries restore them.
+      generation(t0 + entry.t)
+      checkpointed = true
+      recorder.emit({k = 'checkpoint', t = entry.t})
       return true
     elseif kind == 'released' then
       if not released then released = true; M.release() end
@@ -861,7 +1093,11 @@ replay = function(source, options)
       local actor = chart:actor {id = entry.a, input = entry.input, snapshot = entry.snapshot, scheduler = scheduler}
       if entry.component then actor._component, actor._recorded_input = true, entry.input end
       roots[#roots + 1] = actor
-      actor:start()
+      if entry.checkpoint then
+        restore_checkpoint(actor, entry)
+      else
+        actor:start()
+      end
       return true
     end
     local actor = actor_at(entry.a)

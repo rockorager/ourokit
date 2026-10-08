@@ -93,8 +93,9 @@ def replay(log, app, ok=True, *extra):
 def entries(log):
     lines = Path(log).read_text().splitlines()
     header = json.loads(lines[0])
-    assert header["format"] == "ouro.machine.log" and header["version"] == 2, header
-    return [json.loads(line) for line in lines[1:]]
+    assert header["format"] == "ouro.machine.log" and header["version"] == 3, header
+    # Blob lines (version 3) hold large values; they are not inputs.
+    return [entry for entry in map(json.loads, lines[1:]) if entry.get("k") != "blob"]
 
 
 def stopwatch(env, root):

@@ -498,7 +498,7 @@ local function render(chart, result, options)
   M.strict, M._origin = true, 'generated'
   local described = {}
   for i, path in ipairs(result.paths) do described[i] = {steps = json.array(path.steps), targets = json.array(path.targets)} end
-  lines[1] = M._json_encode({format = 'ouro.machine.log', version = 2, t0 = 0, app = options.app,
+  lines[1] = M._json_encode({format = 'ouro.machine.log', version = M._log_version, t0 = 0, app = options.app,
     generated = {chart = chart.id, states = result.states, transitions = result.transitions,
       unreached = json.array(result.unreached), paths = described, issues = json.array(result.issues or {})}})
   local recorder = M.recorder(function(line) lines[#lines + 1] = line end, {scheduler = scheduler, t0 = 0, header = false})

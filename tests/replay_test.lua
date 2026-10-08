@@ -38,6 +38,41 @@ local function session()
   return sw
 end
 
+-- A notification center (as in a shell): each NOTIFY carries an image, goes
+-- to the front of a 50-item list and starts a popup child with a 5 s timer.
+local function bytes_of(seed, count)
+  local out, x = {}, seed * 7919 + 17
+  for i = 1, count do x = (x * 1103515245 + 12345) % 2147483648; out[i] = string.char(x % 256) end
+  return table.concat(out)
+end
+local notification_icon = bytes_of(0, 4096)
+local function notification_center(id)
+  local popup = machine.create {
+    id = id .. '_popup', initial = 'shown',
+    context = function(input) return { n = input.n } end,
+    states = { shown = { after = { [5000] = 'gone' }, on = { DISMISS = 'gone' } }, gone = { type = 'final' } },
+  }
+  return machine.create {
+    id = id, initial = 'running', context = { list = {}, count = 0 },
+    states = { running = { on = { NOTIFY = { actions = {
+      machine.assign {
+        list = function(c, e)
+          local list = { e.n }
+          for i, n in ipairs(c.list) do if i < 50 then list[#list + 1] = n end end
+          return list
+        end,
+        count = function(c) return c.count + 1 end,
+      },
+      machine.spawn(popup, { id = function(_, e) return 'popup' .. e.n.id end, input = function(_, e) return { n = e.n } end }),
+    } } } } },
+  }
+end
+local function notify(actor, i, image_bytes)
+  actor:send { type = 'NOTIFY', n = { id = i, app = 'mail', summary = 'Message ' .. i,
+    body = 'Hello there, this is notification number ' .. i, icon = notification_icon,
+    image = { width = 64, height = 64, rowstride = 256, alpha = true, data = bytes_of(i, image_bytes) } } }
+end
+
 return {
   ['machine.now is the logical clock: frozen per step, virtual here, and timer events carry their fire time'] = function()
     assert(machine.virtual_clock, 'ouroctl test runs a virtual clock')
@@ -75,7 +110,7 @@ return {
     local lines = record(session)
     assert(#lines > 10, #lines)
     local header = o.json.decode(lines[1])
-    assert(header.format == 'ouro.machine.log' and header.version == 2)
+    assert(header.format == 'ouro.machine.log' and header.version == 3)
     local kinds = {}
     for i = 2, #lines do
       local entry = o.json.decode(lines[i])
@@ -530,6 +565,76 @@ return {
     assert(o.shell == nil and o.desktop == nil, 'the real modules are back afterwards')
     local report = machine.replay(machine.paths_log(chart, result), { charts = { workspaces4 = chart } })
     assert(report.ok, machine.replay_text(report))
+  end,
+
+  -- Recording size (§14 "Size"): the development log of a long-running shell
+  -- grew by 190-270 KB per notification popup, because each image was written
+  -- with its event, again in every delta of the list holding it and again by
+  -- the popup it was passed to. Values of 1 KB or more are now blobs, written
+  -- once per log; binary strings are base64.
+  ['recording size: 50 notifications with 16 KB images cost about one image each, and replay'] = function()
+    local center = notification_center('size_center')
+    local lines = record(function()
+      local actor = center:start { id = 'center' }
+      for i = 1, 50 do notify(actor, i, 16384); machine.advance(1000) end
+      machine.advance(6000)
+      actor:stop()
+    end)
+    local bytes, icon_lines = 0, 0
+    for _, line in ipairs(lines) do
+      bytes = bytes + #line + 1
+      if line:find('"k":"blob"', 1, true) and #line > 5000 and #line < 6000 then icon_lines = icon_lines + 1 end
+    end
+    local per = bytes // 50
+    -- One 16 KB image is 21848 bytes of base64.
+    assert(per < 26000, 'bytes per notification: ' .. per)
+    assert(icon_lines == 1, 'the shared 4 KB icon is written once, not ' .. icon_lines .. ' times')
+    local report = machine.replay(lines)
+    assert(report.ok, machine.replay_text(report))
+    assert(report.compared == 102, report.compared)
+  end,
+
+  -- Size policy: the development log rotates into segments; each segment
+  -- after the first opens with a checkpoint, and replays alone from it.
+  ['rotation: every segment replays from its checkpoint, with popup timers at their recorded deadlines'] = function()
+    local center = notification_center('rotate_center')
+    local segments, size, limit = { {} }, 0, 60000
+    local t0 = machine.now()
+    local recorder = machine.recorder(function(line)
+      local segment = segments[#segments]
+      segment[#segment + 1] = line
+      size = size + #line + 1
+      return size >= limit
+    end, { app = 'test', t0 = t0, rotate = function()
+      segments[#segments + 1] = { o.json.encode { format = 'ouro.machine.log', version = 3, t0 = t0, app = 'test', segment = #segments + 1 } }
+      size = 0
+      return true
+    end })
+    local ok, err = pcall(function()
+      local actor = center:start { id = 'center' }
+      for i = 1, 20 do notify(actor, i, 8192); machine.advance(700) end
+      machine.advance(6000)
+      actor:stop()
+    end)
+    recorder.stop()
+    assert(ok, err)
+    assert(#segments >= 3, 'the log rotated: ' .. #segments .. ' segments')
+    local pending = 0
+    for n, segment in ipairs(segments) do
+      if n > 1 then
+        local first = o.json.decode(segment[2])
+        assert(first.k == 'checkpoint', segment[2])
+        for _, line in ipairs(segment) do
+          local entry = o.json.decode(line)
+          if entry.checkpoint then
+            for _, timers in pairs(entry.timers) do pending = pending + #timers end
+          end
+        end
+      end
+      local report = machine.replay(segment)
+      assert(report.ok, 'segment ' .. n .. ': ' .. machine.replay_text(report))
+    end
+    assert(pending > 0, 'checkpoints carried running popup timers')
   end,
 
   ['machine.advance needs a virtual clock'] = function()
