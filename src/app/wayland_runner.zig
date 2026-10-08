@@ -532,7 +532,6 @@ fn runSourceInternal(
         if (options.exit_code) |result| result.* = code;
         return;
     }
-    if (options.development and options.mcp) return error.ConflictingControlModes;
     var desktop_options = options.desktop;
     desktop_options.development = options.development;
     desktop_options.token = init.minimal.environ.getPosix("XDG_ACTIVATION_TOKEN");
@@ -590,12 +589,17 @@ fn runSourceInternal(
     const control: ?*ControlServer = if (options.development or options.mcp) &control_storage else null;
     if (options.mcp and !source_reload.active().application.hasActions()) return error.ApplicationActionsDisabled;
     if (control) |server| {
-        try server.init(init.gpa, &loop, init.minimal.environ, source_reload.active().application.id, source_reload.generation, reload_requests, options.development);
+        // --dev and --mcp each add their own endpoint; one server owns both.
+        try server.init(init.gpa, &loop, init.minimal.environ, source_reload.active().application.id, source_reload.generation, reload_requests, .{
+            .application = options.mcp,
+            .development = options.development,
+        });
         if (statecharts != null) {
             server.statecharts = &statecharts.?;
-            statecharts.?.endpoint = try init.gpa.dupe(u8, server.socketPath());
+            statecharts.?.endpoint = try init.gpa.dupe(u8, server.socketPath(.development).?);
         }
-        std.log.info("{s} socket: {s}", .{ if (options.development) "development" else "application", server.socketPath() });
+        if (server.socketPath(.development)) |path| std.log.info("development socket: {s}", .{path});
+        if (server.socketPath(.application)) |path| std.log.info("application socket: {s}", .{path});
     }
     var development_service: development_control.Service = .{ .allocator = init.gpa, .io = init.io };
     defer development_service.deinit();
@@ -2405,7 +2409,7 @@ test "render failure drains native and application owners before returning origi
     defer environ.block.deinit(allocator);
     var requests: ReloadRequests = .{};
     var control: ControlServer = undefined;
-    try control.init(allocator, &loop, environ, "dev.ouro.drain-test", 1, &requests, true);
+    try control.init(allocator, &loop, environ, "dev.ouro.drain-test", 1, &requests, .{ .development = true });
     defer control.deinit();
     _ = try initial.vm.spawnApplication("require('ouro').sleep(60000); error('canceled task resumed')");
     while (scheduler.takeRunnable()) |runnable| try reload.resumeRunnable(runnable);

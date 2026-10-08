@@ -239,7 +239,8 @@ ouroctl activate dev.example.app
 
 Optional `--mcp` exposes only declared actions at
 `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`. It cannot enable development
-diagnostics or determine desktop lifecycle. `--headless` is a separate explicit
+diagnostics or determine desktop lifecycle. `--dev --mcp` serves both endpoints
+from one instance, each with only its own tools. `--headless` is a separate explicit
 launch option; neither declaring actions nor exporting them starts a service.
 
 Export an installed tool catalog without opening the UI or connecting to a

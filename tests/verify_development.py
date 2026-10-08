@@ -57,6 +57,7 @@ TESTS = (
     'documents.py',
     'machine_native.py',
     'native_views.py',
+    'dev_and_mcp.py',
     'contacts.py',
     'chart_reload.py',
     'component_machines.py',

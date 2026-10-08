@@ -856,9 +856,12 @@ the UI only when requested. Actions and window callbacks share the same Lua VM
 and closures; invoking a method never implicitly initializes Wayland.
 
 Declaring `actions` does not start a server or select single-instance policy.
-`ouroctl run --mcp` explicitly enables an optional production actions endpoint;
-`--dev` instead creates a private development endpoint with live runtime tools,
-even when `actions` is absent. Each action has a description, `inputSchema`, `outputSchema`, and
+`ouroctl run --mcp` explicitly enables an optional production actions endpoint.
+`--dev` creates a private development endpoint with live runtime tools, even
+when `actions` is absent. The two are separate surfaces and can be combined:
+`--dev --mcp` listens on both, each with its own authority. The actions
+endpoint never offers `runtime.*` tools, and the development endpoint keeps its
+private per-instance path and is never published. Each action has a description, `inputSchema`, `outputSchema`, and
 handler. The table key is the exact tool name; `runtime.` names are reserved.
 Use `tools/call` with `{name, arguments}`. There is no `interface` field, IDL,
 qualified-method alias, initialization handshake, or old wire protocol.
@@ -911,7 +914,10 @@ Desktop activation follows the [Desktop Entry Specification](https://specificati
 Declare `single_instance = true` to own the application's session-bus name.
 Subsequent ordinary launches forward to that owner. The default is false:
 each launch is a new process, without a public bus name. Development always
-creates an independent process and neither calls nor owns the production name.
+creates an independent process and neither calls nor owns the production name,
+so `ouroctl activate` does not reach it. With `--mcp` it also takes the
+production actions path, and fails to start (`AddressInUse`) while another
+instance holds it; drive such an instance through its actions instead.
 
 The optional declaration hooks are:
 
@@ -970,7 +976,9 @@ instance path to each command; development never discovers a production app ID.
 The private, same-UID endpoint also accepts MCP `tools/call` with the corresponding
 `runtime.inspect`, `runtime.input`, `runtime.capture`, `runtime.diagnostics`,
 `runtime.metrics`, `runtime.statecharts` and `runtime.send` names. These tools are absent from
-`--mcp` production endpoints.
+`--mcp` production endpoints, including the actions endpoint of a `--dev --mcp`
+instance. Inputs sent with `runtime.send` record with origin `dev`; events an
+action handler sends record with origin `mcp`, whichever endpoint called it.
 
 ```sh
 ouroctl dev inspect "$socket"

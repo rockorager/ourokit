@@ -118,7 +118,10 @@ are available regardless of whether the app enables an inbound server.
 `tools/list` at `$XDG_RUNTIME_DIR/ourokit/apps/<application-id>`.
 Declaring actions alone enables no inbound server. `--dev` creates a separate
 private per-instance endpoint with development status/reload tools, regardless
-of actions. Production catalogs never include runtime tools. Custom actions declare
+of actions. `--dev --mcp` runs both side by side: the actions endpoint at its
+normal path, which also survives reloads and re-publishes its catalog, and the
+private development endpoint. Production catalogs never include runtime tools,
+and calling a `runtime.*` name on the actions endpoint fails with `Unknown tool`. Custom actions declare
 `description`, `inputSchema`, `outputSchema`, and `handler` together. See
 [the application model](application-model.md) and the runnable
 [Contacts service](../examples/contacts/README.md). Installed descriptors and

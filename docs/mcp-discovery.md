@@ -4,6 +4,7 @@ This is Ourokit's version 1 optional action-discovery convention, independent
 of MCP's wire protocol. Neither a registry daemon nor an external bridge is
 required to launch, activate, develop, or test an application. Production MCP
 is explicitly enabled with `--mcp`; ordinary runs and `--dev` publish no catalog.
+`--dev --mcp` publishes the actions endpoint only, never the development one.
 
 ## Installed descriptors
 

@@ -95,8 +95,54 @@ const Failure = struct {
     }
 };
 
+/// The endpoint a peer connected through, which is its authority. The
+/// application endpoint (--mcp) serves the app's declared actions. The
+/// development endpoint (--dev) adds runtime.* tools and the statechart feed.
+/// An instance listens on either or both; neither grants the other's tools.
+pub const Surface = enum { application, development };
+
+pub const Surfaces = struct {
+    application: bool = false,
+    development: bool = false,
+};
+
+const Listener = struct {
+    path: [:0]u8,
+    fd: linux.fd_t,
+    owned_path: ?endpoint.PathIdentity = null,
+    /// The pending accept, armed by serviceRequests and after each accept.
+    operation: ?io_loop.OperationHandle = null,
+    terminal: bool = false,
+
+    fn open(allocator: std.mem.Allocator, environ: std.process.Environ, application_id: []const u8, surface: Surface) !Listener {
+        const path = try endpoint.socketPath(allocator, environ, application_id, surface == .development);
+        errdefer allocator.free(path);
+        try endpoint.makeParentDirectories(allocator, path);
+        const fd = try wayring.unix_socket.listen(path, 16);
+        errdefer {
+            _ = linux.close(fd);
+            wayring.unix_socket.unlink(path) catch {};
+        }
+        if (linux.errno(linux.chmod(path, 0o600)) != .SUCCESS) return error.SocketPermissionsFailed;
+        return .{ .path = path, .fd = fd, .owned_path = try endpoint.PathIdentity.read(path) };
+    }
+
+    fn deinit(self: *Listener, allocator: std.mem.Allocator) void {
+        if (self.fd >= 0) _ = linux.close(self.fd);
+        if (self.owned_path) |identity| identity.unlink(self.path);
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+
+    fn close(self: *Listener) void {
+        if (self.fd >= 0) _ = linux.close(self.fd);
+        self.fd = -1;
+    }
+};
+
 const Client = struct {
     fd: linux.fd_t,
+    surface: Surface,
     protocol: mcp.Server,
     waiters: std.array_list.Managed(Waiter),
     operation: ?io_loop.OperationHandle = null,
@@ -112,11 +158,12 @@ const Client = struct {
     closing: bool = false,
     receive_buffer: [receive_capacity]u8 = undefined,
 
-    fn init(allocator: std.mem.Allocator, fd: linux.fd_t) !Client {
+    fn init(allocator: std.mem.Allocator, fd: linux.fd_t, surface: Surface) !Client {
         var protocol = try mcp.Server.init(allocator, .{});
         errdefer protocol.deinit();
         return .{
             .fd = fd,
+            .surface = surface,
             .protocol = protocol,
             .waiters = try std.array_list.Managed(Waiter).initCapacity(allocator, 32),
         };
@@ -147,12 +194,9 @@ pub const ControlServer = struct {
     loop: *io_loop.Loop,
     requests: *ReloadRequests,
     application_id: []u8,
-    path: [:0]u8,
-    listener: linux.fd_t,
-    owned_path: ?endpoint.PathIdentity = null,
+    listeners: std.EnumArray(Surface, ?Listener) = .initFill(null),
+    /// True when the development endpoint listens.
     development: bool,
-    listener_operation: ?io_loop.OperationHandle = null,
-    listener_terminal: bool = false,
     clients: [client_capacity]?Client = [_]?Client{null} ** client_capacity,
     generation: u64,
     /// Development only: the statechart record ring behind statechart_uri.
@@ -163,7 +207,8 @@ pub const ControlServer = struct {
     application: ?*const lua.Application = null,
     vm: ?*lua.Vm = null,
     ui_active: bool = false,
-    tools_json: []u8,
+    /// Each endpoint's tools/list, kept for both even when one endpoint is off.
+    catalogs: std.EnumArray(Surface, []u8),
     publication: ?Publication = null,
     publication_dirty: bool = false,
     development_tools: ?std.json.Parsed(mcp.Value) = null,
@@ -177,36 +222,33 @@ pub const ControlServer = struct {
         application_id: []const u8,
         generation: u64,
         requests: *ReloadRequests,
-        development: bool,
+        surfaces: Surfaces,
     ) !void {
-        const path = try endpoint.socketPath(allocator, environ, application_id, development);
-        errdefer allocator.free(path);
+        std.debug.assert(surfaces.application or surfaces.development);
         const owned_id = try allocator.dupe(u8, application_id);
         errdefer allocator.free(owned_id);
-        const tools_json = try catalog.tools(allocator, null, development);
-        errdefer allocator.free(tools_json);
-        try endpoint.makeParentDirectories(allocator, path);
-        const listener = try wayring.unix_socket.listen(path, 16);
-        errdefer {
-            _ = linux.close(listener);
-            wayring.unix_socket.unlink(path) catch {};
-        }
-        if (linux.errno(linux.chmod(path, 0o600)) != .SUCCESS) return error.SocketPermissionsFailed;
-        const owned_path = try endpoint.PathIdentity.read(path);
-        const operation = try loop.prepareAccept(listener);
+        const application_tools = try catalog.tools(allocator, null, false);
+        errdefer allocator.free(application_tools);
+        const development_tools = try catalog.tools(allocator, null, true);
+        errdefer allocator.free(development_tools);
+        var listeners: std.EnumArray(Surface, ?Listener) = .initFill(null);
+        errdefer for (&listeners.values) |*entry| if (entry.*) |*listener| listener.deinit(allocator);
+        if (surfaces.application) listeners.set(.application, try Listener.open(allocator, environ, application_id, .application));
+        if (surfaces.development) listeners.set(.development, try Listener.open(allocator, environ, application_id, .development));
         self.* = .{
             .allocator = allocator,
             .loop = loop,
             .requests = requests,
             .application_id = owned_id,
-            .path = path,
-            .listener = listener,
-            .owned_path = owned_path,
-            .listener_operation = operation,
+            .listeners = listeners,
             .generation = generation,
-            .development = development,
-            .tools_json = tools_json,
-            .publication = if (development) null else Publication.init(allocator, environ, application_id, path) catch null,
+            .development = surfaces.development,
+            .catalogs = .init(.{ .application = application_tools, .development = development_tools }),
+            // Discovery advertises the application endpoint only.
+            .publication = if (listeners.get(.application)) |listener|
+                Publication.init(allocator, environ, application_id, listener.path) catch null
+            else
+                null,
         };
     }
 
@@ -214,19 +256,18 @@ pub const ControlServer = struct {
         std.debug.assert(self.shutting_down and self.quiescent());
         self.collectClosed();
         for (&self.clients) |*entry| std.debug.assert(entry.* == null);
-        if (self.listener >= 0) _ = linux.close(self.listener);
-        if (self.owned_path) |identity| identity.unlink(self.path);
+        for (&self.listeners.values) |*entry| if (entry.*) |*listener| listener.deinit(self.allocator);
         if (self.failure) |*failure| failure.deinit(self.allocator);
         if (self.publication) |*publication| publication.deinit();
         if (self.development_tools) |*tools| tools.deinit();
-        self.allocator.free(self.tools_json);
-        self.allocator.free(self.path);
+        for (self.catalogs.values) |tools| self.allocator.free(tools);
         self.allocator.free(self.application_id);
         self.* = undefined;
     }
 
-    pub fn socketPath(self: *const ControlServer) []const u8 {
-        return self.path;
+    /// The endpoint's socket, or null when that endpoint is not listening.
+    pub fn socketPath(self: *const ControlServer, surface: Surface) ?[]const u8 {
+        return if (self.listeners.get(surface)) |listener| listener.path else null;
     }
 
     /// Register a fixed array of runtime.* tool schemas before admitting peers.
@@ -246,8 +287,8 @@ pub const ControlServer = struct {
             try mcp.schema.check(mcp.get(tool, "outputSchema") orelse return error.InvalidDevelopmentTools);
         }
         const tools = try catalog.toolsWithDevelopment(self.allocator, self.application, true, doc.value);
-        self.allocator.free(self.tools_json);
-        self.tools_json = tools;
+        self.allocator.free(self.catalogs.get(.development));
+        self.catalogs.set(.development, tools);
         self.development_tools = doc;
     }
 
@@ -306,11 +347,11 @@ pub const ControlServer = struct {
         application: *const lua.Application,
         vm: *lua.Vm,
         allocator: std.mem.Allocator,
-        tools_json: []u8,
-        changed: bool,
+        catalogs: std.EnumArray(Surface, []u8),
+        changed: std.EnumArray(Surface, bool),
 
         pub fn deinit(self: *PreparedApplication) void {
-            self.allocator.free(self.tools_json);
+            for (self.catalogs.values) |tools| self.allocator.free(tools);
             self.* = undefined;
         }
     };
@@ -320,23 +361,34 @@ pub const ControlServer = struct {
     pub fn prepareApplication(self: *ControlServer, application: *const lua.Application, vm: *lua.Vm) !PreparedApplication {
         if (!std.mem.eql(u8, self.application_id, application.id)) return error.ApplicationIdChanged;
         if (vm.state != application.state) return error.ApplicationVmMismatch;
-        const tools_json = try catalog.toolsWithDevelopment(self.allocator, application, self.development, if (self.development_tools) |tools| tools.value else null);
-        return .{ .application = application, .vm = vm, .allocator = self.allocator, .tools_json = tools_json, .changed = !std.mem.eql(u8, self.tools_json, tools_json) };
+        const application_tools = try catalog.tools(self.allocator, application, false);
+        errdefer self.allocator.free(application_tools);
+        const development_tools = try catalog.toolsWithDevelopment(self.allocator, application, true, if (self.development_tools) |tools| tools.value else null);
+        return .{
+            .application = application,
+            .vm = vm,
+            .allocator = self.allocator,
+            .catalogs = .init(.{ .application = application_tools, .development = development_tools }),
+            .changed = .init(.{
+                .application = !std.mem.eql(u8, self.catalogs.get(.application), application_tools),
+                .development = !std.mem.eql(u8, self.catalogs.get(.development), development_tools),
+            }),
+        };
     }
 
     /// No allocation or failure after the parent's UI generation commit.
     pub fn commitApplication(self: *ControlServer, prepared: *PreparedApplication) void {
-        self.publication_dirty = self.publication_dirty or self.application == null or prepared.changed;
+        self.publication_dirty = self.publication_dirty or self.application == null or prepared.changed.get(.application);
         self.application = prepared.application;
         self.vm = prepared.vm;
-        if (prepared.changed) {
-            std.mem.swap([]u8, &self.tools_json, &prepared.tools_json);
-            for (&self.clients) |*entry| if (entry.*) |*client| {
+        for (std.enums.values(Surface)) |surface| if (prepared.changed.get(surface)) {
+            std.mem.swap([]u8, self.catalogs.getPtr(surface), prepared.catalogs.getPtr(surface));
+            for (&self.clients) |*entry| if (entry.*) |*client| if (client.surface == surface) {
                 for (&client.subscriptions) |*slot| if (slot.*) |*subscription| {
                     subscription.dirty = true;
                 };
             };
-        }
+        };
     }
 
     pub fn setActivated(self: *ControlServer, active: bool) void {
@@ -475,6 +527,10 @@ pub const ControlServer = struct {
 
     pub fn serviceRequests(self: *ControlServer) !void {
         if (self.shutting_down) return;
+        for (&self.listeners.values) |*entry| if (entry.*) |*listener| if (listener.operation == null) {
+            listener.operation = try self.loop.prepareAccept(listener.fd);
+            listener.terminal = false;
+        };
         // Statechart subscribers keep the on-demand observer attached.
         if (self.statecharts) |store| {
             var subscribers: usize = 0;
@@ -489,7 +545,7 @@ pub const ControlServer = struct {
             self.publication_dirty = false;
             // Retry on the next catalog change, not every event-loop turn.
             // A best-effort discovery hint must never roll back a generation.
-            if (self.publication) |*publication| publication.publish(self.application_id, self.tools_json) catch {};
+            if (self.publication) |*publication| publication.publish(self.application_id, self.catalogs.get(.application)) catch {};
         }
         for (&self.clients) |*entry| if (entry.*) |*client| {
             if (!client.closing) if (client.development_call) |pending| if (pending.generation != self.generation) {
@@ -510,26 +566,27 @@ pub const ControlServer = struct {
     }
 
     pub fn dispatch(self: *ControlServer, completion: io_loop.SocketCompletion) !bool {
-        if (self.listener_operation) |operation| if (same(operation, completion.operation)) {
-            self.listener_terminal = true;
+        for (std.enums.values(Surface)) |surface| if (self.listeners.getPtr(surface).*) |*listener| {
+            const operation = listener.operation orelse continue;
+            if (!same(operation, completion.operation)) continue;
+            listener.terminal = true;
             if (completion.kind != .accept) return error.UnexpectedSocketCompletion;
             if (completion.result >= 0) {
                 const fd: linux.fd_t = @intCast(completion.result);
                 if (self.shutting_down) {
                     _ = linux.close(fd);
                 } else {
-                    try self.admit(fd);
+                    try self.admit(fd, surface);
                 }
             } else if (!self.shutting_down) {
                 return error.AcceptFailed;
             }
             if (!self.shutting_down) {
-                self.listener_operation = try self.loop.prepareAccept(self.listener);
-                self.listener_terminal = false;
+                listener.operation = try self.loop.prepareAccept(listener.fd);
+                listener.terminal = false;
             } else if (!self.loop.operationPending(completion.operation)) {
-                self.listener_operation = null;
-                _ = linux.close(self.listener);
-                self.listener = -1;
+                listener.operation = null;
+                listener.close();
             }
             return true;
         };
@@ -584,7 +641,7 @@ pub const ControlServer = struct {
     pub fn beginShutdown(self: *ControlServer) !void {
         if (self.shutting_down) return;
         self.shutting_down = true;
-        if (self.listener_operation) |operation| try self.loop.prepareCancel(operation);
+        for (&self.listeners.values) |*entry| if (entry.*) |*listener| if (listener.operation) |operation| try self.loop.prepareCancel(operation);
         for (&self.clients) |*entry| if (entry.*) |*client| try self.closeClient(client);
         self.collectClosed();
     }
@@ -599,13 +656,10 @@ pub const ControlServer = struct {
     }
 
     pub fn collectClosed(self: *ControlServer) void {
-        if (self.shutting_down) if (self.listener_operation) |operation| {
-            if (self.listener_terminal and !self.loop.operationPending(operation)) {
-                self.listener_operation = null;
-                if (self.listener >= 0) {
-                    _ = linux.close(self.listener);
-                    self.listener = -1;
-                }
+        if (self.shutting_down) for (&self.listeners.values) |*entry| if (entry.*) |*listener| if (listener.operation) |operation| {
+            if (listener.terminal and !self.loop.operationPending(operation)) {
+                listener.operation = null;
+                listener.close();
             }
         };
         for (&self.clients) |*entry| if (entry.*) |*client| {
@@ -626,12 +680,13 @@ pub const ControlServer = struct {
     }
 
     pub fn quiescent(self: *const ControlServer) bool {
-        if (!self.shutting_down or self.listener_operation != null) return false;
+        if (!self.shutting_down) return false;
+        for (self.listeners.values) |entry| if (entry) |listener| if (listener.operation != null) return false;
         for (self.clients) |entry| if (entry != null) return false;
         return true;
     }
 
-    fn admit(self: *ControlServer, fd: linux.fd_t) !void {
+    fn admit(self: *ControlServer, fd: linux.fd_t, surface: Surface) !void {
         errdefer _ = linux.close(fd);
         const credentials = try wayring.unix_socket.peerCredentials(fd);
         if (credentials.uid != linux.getuid()) {
@@ -644,7 +699,7 @@ pub const ControlServer = struct {
             _ = linux.close(fd);
             return;
         };
-        entry.* = try Client.init(self.allocator, fd);
+        entry.* = try Client.init(self.allocator, fd, surface);
     }
 
     fn pumpClient(self: *ControlServer, client: *Client) !void {
@@ -761,7 +816,7 @@ pub const ControlServer = struct {
             , .{});
             defer doc.deinit();
             // Development endpoints with statecharts also offer statechart_uri.
-            if (self.statecharts != null) {
+            if (self.statecharts != null and client.surface == .development) {
                 var arena: std.heap.ArenaAllocator = .init(self.allocator);
                 defer arena.deinit();
                 const capabilities = doc.value.object.getPtr("capabilities").?;
@@ -777,7 +832,8 @@ pub const ControlServer = struct {
             // Either the tool catalog, or (development) the statechart feed.
             var watch: ?StatechartWatch = null;
             if (mcp.get(notifications, "resourceSubscriptions")) |uris| {
-                const store = self.statecharts orelse return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
+                const store = (if (client.surface == .development) self.statecharts else null) orelse
+                    return client.protocol.sendError(call, -32602, "Unsupported subscription filter", null);
                 if (uris != .array or uris.array.items.len != 1 or !mcp.isString(uris.array.items[0], statechart_uri))
                     return client.protocol.sendError(call, -32602, "Unknown resource", null);
                 watch = .{ .sequence = store.next_sequence, .generation = self.generation, .read_mark = store.reads };
@@ -813,7 +869,7 @@ pub const ControlServer = struct {
         if (name_value != .string) return client.protocol.sendError(call, -32602, "Invalid tool name", null);
         const name = name_value.string;
         const arguments = mcp.get(params, "arguments") orelse mcp.Value{ .object = .empty };
-        if (self.development_tools) |tools| for (tools.value.array.items) |tool| {
+        if (client.surface == .development) if (self.development_tools) |tools| for (tools.value.array.items) |tool| {
             if (!mcp.isString(mcp.get(tool, "name"), name)) continue;
             if (!mcp.schema.validate(mcp.get(tool, "inputSchema").?, arguments)) return client.protocol.sendError(call, -32602, "Invalid tool arguments", null);
             if (client.development_call != null) return sendToolError(&client.protocol, call, "Busy", "One development operation per connection", null);
@@ -828,7 +884,7 @@ pub const ControlServer = struct {
         var builtins = try std.json.parseFromSlice(mcp.Value, self.allocator, catalog.builtin_tools, .{});
         defer builtins.deinit();
         const tool = for (builtins.value.array.items) |item| {
-            if (self.development and mcp.isString(mcp.get(item, "name"), name)) break item;
+            if (client.surface == .development and mcp.isString(mcp.get(item, "name"), name)) break item;
         } else (if (self.application) |app| app.actionTool(name) else null) orelse
             return client.protocol.sendError(call, -32602, "Unknown tool", null);
         if (!mcp.schema.validate(mcp.get(tool, "inputSchema").?, arguments))
@@ -896,7 +952,7 @@ pub const ControlServer = struct {
         var arena: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const list = try std.json.parseFromSlice(mcp.Value, a, self.tools_json, .{ .parse_numbers = false });
+        const list = try std.json.parseFromSlice(mcp.Value, a, self.catalogs.get(client.surface), .{ .parse_numbers = false });
         try client.protocol.sendResult(call, try mcp.object(a, .{ .{ "tools", list.value }, .{ "ttlMs", mcp.Value{ .integer = 60000 } }, .{ "cacheScope", mcp.string("private") } }));
     }
 
@@ -1050,7 +1106,7 @@ test "runtime server holds Reload reply until the generation commits" {
         "dev.ourokit.test",
         1,
         &requests,
-        true,
+        .{ .development = true },
     );
     try control.setApplication(&application, &vm);
     try std.testing.expect(!control.hasClients() and !control.hasPendingCalls());
@@ -1059,7 +1115,7 @@ test "runtime server holds Reload reply until the generation commits" {
     // Preparing a catalog is not publishing it. A later candidate UI failure
     // must leave the active app, serialized catalog and publication bit intact.
     {
-        const before = try std.testing.allocator.dupe(u8, control.tools_json);
+        const before = try std.testing.allocator.dupe(u8, control.catalogs.get(.development));
         defer std.testing.allocator.free(before);
         var candidate = try lua.Application.loadNamedWithApi(std.testing.allocator, vm.state,
             \\local o = require('ouro')
@@ -1068,8 +1124,8 @@ test "runtime server holds Reload reply until the generation commits" {
         defer candidate.deinit();
         var prepared = try control.prepareApplication(&candidate, &vm);
         defer prepared.deinit();
-        try std.testing.expect(prepared.changed);
-        try std.testing.expectEqualStrings(before, control.tools_json);
+        try std.testing.expect(prepared.changed.get(.development) and prepared.changed.get(.application));
+        try std.testing.expectEqualStrings(before, control.catalogs.get(.development));
         try std.testing.expect(control.application == &application and !control.publication_dirty);
 
         const exported = try catalog.descriptor(std.testing.allocator, &application);
@@ -1088,7 +1144,7 @@ test "runtime server holds Reload reply until the generation commits" {
     }
 
     _ = try loop.submit();
-    const client = try wayring.unix_socket.connect(control.socketPath());
+    const client = try wayring.unix_socket.connect(control.socketPath(.development).?);
     defer _ = linux.close(client);
     switch (loop.dispatch(try loop.wait())) {
         .socket => |completion| try std.testing.expect(try control.dispatch(completion)),
@@ -1192,7 +1248,7 @@ test "runtime server holds Reload reply until the generation commits" {
 
     // An action can call another connection to the same server without blocking
     // its task phase. This also verifies native Status survives a custom name.
-    const outbound_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"address\":\"unix:{s}\"}}", .{control.socketPath()});
+    const outbound_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"address\":\"unix:{s}\"}}", .{control.socketPath(.development).?});
     defer std.testing.allocator.free(outbound_args);
     const outbound_request = try testRequest("Outbound", outbound_args);
     defer std.testing.allocator.free(outbound_request);
@@ -1251,12 +1307,12 @@ test "runtime server stable listener never replaces an existing owner" {
     defer loop.deinit();
     var requests: ReloadRequests = .{};
     var first: ControlServer = undefined;
-    try first.init(std.testing.allocator, &loop, environ, "dev.test.owner", 1, &requests, false);
-    const path = try std.testing.allocator.dupeZ(u8, first.socketPath());
+    try first.init(std.testing.allocator, &loop, environ, "dev.test.owner", 1, &requests, .{ .application = true });
+    const path = try std.testing.allocator.dupeZ(u8, first.socketPath(.application).?);
     defer std.testing.allocator.free(path);
     const identity = try endpoint.PathIdentity.read(path);
     var second: ControlServer = undefined;
-    try std.testing.expectError(error.AddressInUse, second.init(std.testing.allocator, &loop, environ, "dev.test.owner", 1, &requests, false));
+    try std.testing.expectError(error.AddressInUse, second.init(std.testing.allocator, &loop, environ, "dev.test.owner", 1, &requests, .{ .application = true }));
     try std.testing.expectEqual(identity, try endpoint.PathIdentity.read(path));
     try first.beginShutdown();
     while (!first.quiescent()) {
@@ -1280,11 +1336,9 @@ test "runtime server development requests remain pending across turns and cancel
         .loop = &loop,
         .requests = &requests,
         .application_id = try a.dupe(u8, "dev.test.pending"),
-        .path = try a.dupeZ(u8, "/unused"),
-        .listener = -1,
         .development = false,
         .generation = 1,
-        .tools_json = try catalog.tools(a, null, false),
+        .catalogs = .init(.{ .application = try catalog.tools(a, null, false), .development = try catalog.tools(a, null, true) }),
     };
     defer control.deinit();
     defer control.beginShutdown() catch unreachable;
@@ -1294,7 +1348,26 @@ test "runtime server development requests remain pending across turns and cancel
     try std.testing.expectError(error.DevelopmentDisabled, control.registerDevelopmentTools(tools));
     control.development = true;
     try control.registerDevelopmentTools(tools);
-    control.clients[0] = try Client.init(a, -1);
+    // A peer of the application endpoint cannot reach runtime.* tools, even
+    // when the same instance also has a development endpoint.
+    control.clients[1] = try Client.init(a, -1, .application);
+    const outsider = &control.clients[1].?;
+    {
+        const status = try testRequest(status_method, "{}");
+        defer a.free(status);
+        const registered = try testRequest("runtime.test", "{\"value\":17}");
+        defer a.free(registered);
+        for ([_][]const u8{ status, registered }) |request| {
+            try testFeedDevelopment(&control, outsider, request);
+            try std.testing.expect(control.takeDevelopmentRequest() == null);
+            var refused = outsider.protocol.takeTransmit().?;
+            defer refused.deinit();
+            try std.testing.expect(std.mem.indexOf(u8, refused.remaining(), "Unknown tool") != null);
+        }
+    }
+    try control.closeClient(outsider);
+    control.collectClosed();
+    control.clients[0] = try Client.init(a, -1, .development);
     const client = &control.clients[0].?;
     const wire = try testRequest("runtime.test", "{\"value\":17}");
     defer a.free(wire);
@@ -1334,7 +1407,7 @@ test "runtime server development requests remain pending across turns and cancel
     try std.testing.expect(!try control.completeDevelopment(retired.token, result.value, false));
     try control.closeClient(client);
     control.collectClosed();
-    control.clients[0] = try Client.init(a, -1);
+    control.clients[0] = try Client.init(a, -1, .development);
     try testFeedDevelopment(&control, &control.clients[0].?, wire);
     var replacement = control.takeDevelopmentRequest().?;
     defer replacement.deinit();

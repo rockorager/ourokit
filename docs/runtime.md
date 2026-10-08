@@ -61,7 +61,9 @@ API-level discovery and are part of level 1, not optional later additions.
 These levels describe implemented APIs, not available system services, fonts,
 compositor protocols, optional build backends, or permissions. Continue handling
 operation errors and platform capability checks. MCP clients can use the live
-development endpoint's existing `tools/list` schemas for tool/action discovery;
+development endpoint's existing `tools/list` schemas for tool/action discovery
+(an instance run with `--dev --mcp` lists only actions on its production
+endpoint);
 the Lua level is not a substitute for a compositor capability negotiation.
 
 Binaries are published per commit and can lag `main`. **Do not use `0.1.0` to

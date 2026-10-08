@@ -94,9 +94,11 @@ pub const Snapshot = struct {
 
 pub const usage =
     \\Usage:
-    \\  ouroctl run [application.lua|ouro.json] [--dev|--mcp] [--headless] [--dbus-activated]
+    \\  ouroctl run [application.lua|ouro.json] [--dev] [--mcp] [--headless] [--dbus-activated]
     \\              [--vulkan|--software] [--exit-after-first-frame] [--action <name>]
     \\              [--record <log.jsonl>] [-- <URI>...]
+    \\              --mcp serves the app's actions at $XDG_RUNTIME_DIR/ourokit/apps/<id>;
+    \\              --dev adds a private runtime.* endpoint under ourokit/dev/. Both may be given.
     \\  ouroctl activate <application-id> [--action <name>] [-- <URI>...]
     \\  ouroctl dev reload <development-socket>
     \\  ouroctl dev status <development-socket>
@@ -296,10 +298,10 @@ fn parseRun(args: []const []const u8) !Run {
         } else if (std.mem.eql(u8, argument, "--exit-after-first-frame")) {
             exit_after_first_frame = true;
         } else if (std.mem.eql(u8, argument, "--dev")) {
-            if (result.development or result.mcp) return error.DuplicateOption;
+            if (result.development) return error.DuplicateOption;
             result.development = true;
         } else if (std.mem.eql(u8, argument, "--mcp")) {
-            if (result.development or result.mcp) return error.DuplicateOption;
+            if (result.mcp) return error.DuplicateOption;
             result.mcp = true;
         } else if (std.mem.eql(u8, argument, "--headless")) {
             result.headless = true;
@@ -522,7 +524,9 @@ test "CLI separates development production and standard activation" {
     try std.testing.expectEqualDeep(Command{ .run = .{ .path = "app.lua", .mcp = true } }, try parse(&.{ "ouroctl", "run", "app.lua", "--mcp" }));
     try std.testing.expectEqualDeep(Command{ .activate = .{ .path = "org.example.App", .uris = &.{ "file:///tmp/a%20b", "https://example.test/doc" } } }, try parse(&.{ "ouroctl", "activate", "org.example.App", "--", "file:///tmp/a%20b", "https://example.test/doc" }));
     try std.testing.expectEqualDeep(Command{ .activate = .{ .path = "org.example.App", .action = "NewWindow" } }, try parse(&.{ "ouroctl", "activate", "org.example.App", "--action", "NewWindow" }));
-    try std.testing.expectError(error.DuplicateOption, parse(&.{ "ouroctl", "run", "--mcp", "--dev" }));
+    // Separate endpoints: an instance may serve both.
+    try std.testing.expectEqualDeep(Command{ .run = .{ .path = "app.lua", .development = true, .mcp = true } }, try parse(&.{ "ouroctl", "run", "app.lua", "--mcp", "--dev" }));
+    try std.testing.expectError(error.DuplicateOption, parse(&.{ "ouroctl", "run", "--mcp", "--mcp" }));
     try std.testing.expectError(error.ConflictingActivationArguments, parse(&.{ "ouroctl", "run", "--dev", "--dbus-activated" }));
     try std.testing.expectError(error.ConflictingActivationArguments, parse(&.{ "ouroctl", "activate", "org.example.App", "--action", "New", "--", "file:///tmp/a" }));
     try std.testing.expectError(error.UnknownOption, parse(&.{ "ouroctl", "activate", "org.example.App", "--mcp" }));

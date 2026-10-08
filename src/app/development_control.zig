@@ -215,7 +215,7 @@ pub const Service = struct {
         if (!std.mem.eql(u8, name, "runtime.capture")) return error.UnknownDevelopmentOperation;
         var image = try dev.capture(a, runtime, token);
         defer image.deinit();
-        const path = try std.fmt.allocPrintSentinel(self.allocator, "{s}-{d}.png", .{ server.socketPath(), request.token }, 0);
+        const path = try std.fmt.allocPrintSentinel(self.allocator, "{s}-{d}.png", .{ server.socketPath(.development).?, request.token }, 0);
         errdefer self.allocator.free(path);
         const file = try std.Io.Dir.createFileAbsolute(self.io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
         defer file.close(self.io);
