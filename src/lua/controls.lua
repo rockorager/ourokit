@@ -18,7 +18,16 @@ local transparent = '#00000000'
 local valued = {on_change=true, on_select=true, on_activate=true, on_drop_text=true, on_drop_uris=true,
   on_interaction_change=true, on_scroll=true}
 local function bound(v) return kind(v) == 'table' and v.actor ~= nil and v.event ~= nil end
-local function callable(v) return v == nil or kind(v) == 'function' or bound(v) end
+-- Several targets: a list of bindings (or functions), sent in order.
+local function fanout(v)
+  if kind(v) ~= 'table' or v.actor ~= nil or v[1] == nil then return false end
+  for i = 1, #v do
+    if not (bound(v[i]) or kind(v[i]) == 'function') then return false end
+  end
+  return true
+end
+local function binding(v) return bound(v) or fanout(v) end
+local function callable(v) return v == nil or kind(v) == 'function' or binding(v) end
 local function carrying(event, field, value)
   local e = {}
   if kind(event) == 'string' then e.type = event else for k, x in pairs(event) do e[k] = x end end
@@ -26,19 +35,47 @@ local function carrying(event, field, value)
   return e
 end
 local function field_of(v, value_hook) return v.field or (value_hook and 'value') or nil end
-local function handler(v, value_hook)
-  if not bound(v) then return v end
-  local actor, event, field = v.actor, v.event, field_of(v, value_hook)
-  if not field then return function() actor:_send(event, 'widget') end end
-  return function(value) actor:_send(carrying(event, field, value), 'widget') end
+-- A lazy binding's event is a function of the actor's snapshot. It resolves
+-- at render (for enablement) and again at dispatch, so a key that outruns the
+-- rebuild still sends a payload computed from the current state. nil means
+-- there is nothing to send.
+local function resolve(v)
+  local event = v.event
+  if kind(event) == 'function' then return event(v.actor:snapshot()) end
+  return event
 end
+local function handler(v, value_hook)
+  if fanout(v) then
+    local handlers = {}
+    for i = 1, #v do handlers[i] = handler(v[i], value_hook) end
+    return function(...)
+      for i = 1, #handlers do handlers[i](...) end
+    end
+  end
+  if not bound(v) then return v end
+  local actor, field = v.actor, field_of(v, value_hook)
+  return function(value)
+    local event = resolve(v)
+    if event == nil then return end
+    if field then event = carrying(event, field, value) end
+    actor:_send(event, 'widget')
+  end
+end
+-- Several targets: enabled while any of them would take its event.
 local function accepts(v, value_hook)
+  if fanout(v) then
+    for i = 1, #v do
+      if accepts(v[i], value_hook) then return true end
+    end
+    return false
+  end
   if not bound(v) then return true end
+  local event = resolve(v)
+  if event == nil then return false end
   if field_of(v, value_hook) then
-    local event = v.event
     return v.actor:handles(kind(event) == 'string' and event or event.type)
   end
-  return v.actor:can(v.event)
+  return v.actor:can(event)
 end
 
 -- A widget's main trigger: `send`, or its classic hook, not both.
@@ -73,12 +110,12 @@ local function lower(p)
   end
   for k, v in pairs(p) do
     if kind(k) == 'string' and kind(v) == 'table' then
-      if bound(v) then
+      if binding(v) then
         set(k, (k ~= 'on_cancel' or accepts(v)) and handler(v, valued[k]) or nil)
       elseif k == 'commands' then
         local commands, changed = {}, false
         for name, command in pairs(v) do
-          if bound(command) then
+          if binding(command) then
             changed = true
             if accepts(command) then commands[name] = handler(command)
             else refused = refused or {}; refused[name] = true end
@@ -96,7 +133,7 @@ local function lower(p)
           local run = commands[command]
           if run then run(command) end
         end)
-      elseif bound(v.handler) then
+      elseif binding(v.handler) then
         local hook = {}
         for key, value in pairs(v) do hook[key] = value end
         hook.handler = handler(v.handler)
@@ -111,7 +148,7 @@ local function lower(p)
     end
     set('shortcuts', next(shortcuts) and shortcuts or nil)
   end
-  if p.activate and p.enabled == nil and bound(p.on_press) then set('enabled', accepts(p.on_press)) end
+  if p.activate and p.enabled == nil and binding(p.on_press) then set('enabled', accepts(p.on_press)) end
   return out or p
 end
 local primitives = {'box', 'row', 'column', 'split', 'text_editor'}

@@ -694,6 +694,31 @@ ouro.menu_button { key = 'more', label = 'More', items = {
   composition time, and a direct primitive lowers where it is declared, so
   either way the enclosing build tracks the read and enablement follows the
   chart.
+- **Lazy payloads.** `actor:event(function(snapshot) return event end)`
+  computes the event from the actor's snapshot. It resolves at render, for
+  enablement, and again at dispatch, so a key that outruns the rebuild still
+  sends a payload computed from the current state. A plain table payload is
+  fixed at render: Enter typed right after a character could send the
+  previous query's row. The resolved event is validated by `can()` and
+  `send()`. A resolver that returns `nil` means there is nothing to send: the
+  widget is disabled, and a dispatch sends nothing. Value widgets still add
+  their value in `field`. The launcher's Enter uses one
+  (`examples/launcher/view.lua`, `M.submit`):
+  ```lua
+  submit = launcher:event(function(s)
+    local entry = filter(s.context.entries, s.context.query)[s.context.selected]
+    return entry and { type = 'ACTIVATE', id = entry.id }
+  end)
+  ```
+  Use a fixed payload for what the user saw (a clicked row's id), and a lazy
+  one for what the state says now (the current selection).
+- **Several targets.** `send = { a:event('X'), b:event('Y') }`, or the same
+  list in any `on_*` hook or `commands` entry, sends to each target in order.
+  Each target accepts or refuses on its own. Unless `enabled` is set, the
+  widget is enabled while **any** target would take its event, because
+  fan-out mostly notifies: a popover's `on_close` tells its owner and a
+  presenter, and a hover reaches every actor that tracks it. A list may mix
+  bindings and functions. A command is dropped only when no target accepts.
 - `send` and the classic hook on one widget are an error. Functions remain an
   escape hatch for imperative calls, not a way to hold state.
 - `actor:sender(event)` still returns a function, for windows and direct calls.

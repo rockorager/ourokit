@@ -66,6 +66,40 @@ local function start(t)
   t:mount(view, { width = 420, height = 520 })
 end
 
+-- A launcher-shaped chart: ACTIVATE names the top match for the query.
+local ENTRIES = { 'fir-tree', 'firefox', 'files' }
+local function top(query)
+  for _, id in ipairs(ENTRIES) do
+    if id:sub(1, #query) == query then return id end
+  end
+end
+local search = machine.create {
+  id = 'search', initial = 'open', context = { query = 'fire', activated = '' },
+  states = { open = { on = {
+    QUERY = machine.set('query', 'string'),
+    ACTIVATE = { actions = assign { activated = function(_, e) return e.id end } },
+  } } },
+}
+-- Enter deletes a character and submits in one keystroke, so the submit
+-- command runs before the rebuild that would follow the edit.
+local function search_view(finder, submit)
+  return function()
+    return o.text_input { key = 'query', label = 'Query', text = finder:context().query,
+      send = finder:event('QUERY'), key_bindings = { Enter = { 'delete_backward', 'submit' } },
+      on_command = { submit = submit(finder) } }
+  end
+end
+
+local switches = machine.create {
+  id = 'switch', initial = 'off', context = { presses = 0, hovered = false },
+  states = {
+    off = { on = { PRESS = { target = 'on', actions = assign { presses = function(c) return c.presses + 1 end } } } },
+    on = { on = { PRESS = { target = 'off', actions = assign { presses = function(c) return c.presses + 1 end } } } },
+  },
+  on = { HOVER = machine.set('hovered', 'boolean') },
+}
+local idle = machine.create { id = 'idle', initial = 'resting', events = { PRESS = {} }, states = { resting = {} } }
+
 return {
   ['buttons send their event and follow can()'] = function(t)
     start(t)
@@ -155,5 +189,65 @@ return {
     assert(doc:context().hovered == true)
     t:hover('root/other')
     assert(doc:context().hovered == false)
+  end,
+
+  ['a lazy payload resolves at dispatch when a key outruns the rebuild'] = function(t)
+    local finder = search:start { scheduler = machine.manual_scheduler() }
+    t:mount(search_view(finder, function(f)
+      return f:event(function(snapshot) return { type = 'ACTIVATE', id = top(snapshot.context.query) } end)
+    end))
+    t:click('query')
+    t:key('end')
+    t:key('enter')
+    assert(finder:context().query == 'fir', finder:context().query)
+    assert(finder:context().activated == 'fir-tree', 'lazy: ' .. finder:context().activated)
+  end,
+
+  ['a render-time payload is stale when a key outruns the rebuild'] = function(t)
+    local finder = search:start { scheduler = machine.manual_scheduler() }
+    t:mount(search_view(finder, function(f)
+      return f:event { type = 'ACTIVATE', id = top(f:context().query) }
+    end))
+    t:click('query')
+    t:key('end')
+    t:key('enter')
+    assert(finder:context().query == 'fir')
+    assert(finder:context().activated == 'firefox', 'eager payloads carry the rendered query: ' .. finder:context().activated)
+  end,
+
+  ['a lazy binding that resolves to nothing is disabled and sends nothing'] = function(t)
+    local finder = search:start { scheduler = machine.manual_scheduler() }
+    t:mount(function()
+      return o.button { key = 'go', label = 'Go', send = finder:event(function(snapshot)
+        local id = top(snapshot.context.query)
+        return id and { type = 'ACTIVATE', id = id } end) }
+    end)
+    t:click('go')
+    assert(finder:context().activated == 'firefox')
+    finder:send { type = 'QUERY', value = 'zzz' }
+    assert(not t:node('go').enabled, 'no match: disabled')
+  end,
+
+  ['one widget sends to several actors; enabled while any accepts'] = function(t)
+    local a = switches:start { scheduler = machine.manual_scheduler() }
+    local b = switches:start { scheduler = machine.manual_scheduler() }
+    local still = idle:start { scheduler = machine.manual_scheduler() }
+    t:mount(function()
+      return o.column { key = 'root',
+        o.button { key = 'both', label = 'Both', send = { a:event('PRESS'), b:event('PRESS') },
+          on_interaction_change = { a:event('HOVER'), b:event('HOVER') } },
+        o.button { key = 'mixed', label = 'Mixed', send = { still:event('PRESS'), a:event('PRESS') } },
+        o.button { key = 'none', label = 'None', send = { still:event('PRESS') } },
+      }
+    end)
+    assert(t:node('root/mixed').enabled and not t:node('root/none').enabled)
+    t:hover('root/both')
+    assert(a:context().hovered and b:context().hovered, 'value hooks fan out too')
+    t:hover('root/mixed')
+    assert(not a:context().hovered and not b:context().hovered)
+    t:click('root/both')
+    assert(a:context().presses == 1 and b:context().presses == 1 and a:matches('on') and b:matches('on'))
+    t:click('root/mixed')
+    assert(a:context().presses == 2 and a:matches('off') and b:context().presses == 1, 'a refusing target is skipped')
   end,
 }

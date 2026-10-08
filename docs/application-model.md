@@ -187,6 +187,14 @@ ouro.split_view { key = "split", position = c.split, send = notes:event("RESIZE"
 - `commands` entries may be bindings. A command whose event the actor would
   refuse is left out, together with its shortcuts, so the key falls through to
   enclosing scopes. A dialog's refused `on_cancel` leaves Escape unhandled.
+- A binding's event may be a function of the actor's snapshot:
+  `launcher:event(function(s) return { type = "ACTIVATE", id = ... } end)`.
+  It resolves at render for enablement and again at dispatch, so a key that
+  outruns the rebuild still sends a payload from the current state. A
+  resolver that returns nil disables the widget and sends nothing.
+- A list of bindings sends to several actors in order:
+  `on_close = { volume:event("CLOSE"), bar:event("POPOVER_CLOSED") }`. The
+  widget is enabled while any target would take its event.
 - Setting both `send` and the classic hook (`on_press`, `on_change`,
   `on_select`) is an error. Functions still work wherever bindings do. Keep
   them for imperative calls such as `ouro.start_drag` or opening a URI, not for

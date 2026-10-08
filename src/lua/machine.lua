@@ -2594,6 +2594,11 @@ end
 -- copied nor frozen (send copies payloads). With `field`, the widget sends a
 -- copy of the event with event[field] = its value.
 function Actor:event(event, field)
+  if field ~= nil and (type(field) ~= 'string' or field == '') then fail('event binding field must be a nonempty string') end
+  -- A lazy binding: function(snapshot) -> event or nil, resolved by the widget
+  -- at render and again at dispatch; the resolved event is validated by
+  -- can() and send() then.
+  if type(event) == 'function' then return {actor = self, event = event, field = field} end
   local normalized = normalize_event(event)
   if internal_type(normalized.type) then fail('InvalidEvent: %q is reserved for the machine runtime', normalized.type) end
   if M.strict and not self.chart.declared[normalized.type] then
