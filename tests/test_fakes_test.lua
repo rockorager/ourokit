@@ -96,11 +96,53 @@ return {
     actor:stop()
   end,
 
-  ['send reaches an invoke only through its receive mailbox'] = function()
-    local chart = session()
+  ['machine.sleep in a running invoke finishes only after clock.advance'] = function()
     local clock = machine.manual_scheduler()
-    local actor = chart:start { id = 'session', scheduler = clock }
-    fails(function() clock.send('status', { type = 'X' }) end, 'cannot receive events')
+    local chart = machine.create {
+      id = 'backoff', initial = 'waiting', context = { tries = 0 },
+      actors = { retry = function()
+        machine.sleep(1000)
+        machine.sleep(500)
+        return 'connected'
+      end },
+      states = {
+        waiting = { invoke = { src = 'retry',
+          on_done = { target = 'online', actions = machine.assign { result = function(_, e) return e.output end } } } },
+        online = {},
+      },
+    }
+    local actor = chart:start { scheduler = clock }
+    clock.run_tasks()
+    assert(actor:matches('waiting'))
+    clock.advance(1000)
+    assert(actor:matches('waiting'), 'the second sleep is still pending')
+    clock.advance(499)
+    assert(actor:matches('waiting'))
+    clock.advance(1)
+    assert(actor:matches('online') and actor:context().result == 'connected' and clock.now == 1500)
+    assert(machine._task_sleep == nil, 'the hook is set only while an item runs')
     actor:stop()
+  end,
+
+  ['send reaches a running invoke through its receive mailbox'] = function()
+    local clock = machine.manual_scheduler()
+    local heard = {}
+    local chart = machine.create {
+      id = 'pam2', initial = 'asking', context = {},
+      actors = { converse = function(_, send, receive)
+        receive(function(event) heard[#heard + 1] = event.answer; send { type = 'GOT', answer = event.answer } end)
+        machine.sleep(60000) -- a long conversation
+      end },
+      events = { GOT = { answer = 'string' } },
+      states = { asking = { invoke = { id = 'converse', src = 'converse' },
+        on = { GOT = { actions = machine.assign { answer = function(_, e) return e.answer end } } } } },
+    }
+    local actor = chart:start { scheduler = clock }
+    clock.run_tasks() -- the source runs and registers its handler
+    assert(clock.send('converse', { type = 'ANSWER', answer = 'secret' }))
+    clock.run_tasks() -- the invoke's mailbox drains
+    assert(heard[1] == 'secret' and actor:context().answer == 'secret', tostring(heard[1]))
+    actor:stop()
+    assert(clock.pending_invokes()[1] == nil)
   end,
 }

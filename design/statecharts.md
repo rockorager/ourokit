@@ -140,7 +140,9 @@ return ouro.app {
   task's id. A settled item never runs. `clock.run_tasks()` still runs
   queued sources for real, each in a coroutine. A fake source that calls
   `machine.sleep(ms)` (or `clock.sleep(nil, ms)`) parks until `advance()`
-  reaches its wake time. The coroutines are private to the scheduler;
+  reaches its wake time; the clock sets `machine._task_sleep` only while one
+  of its items runs. `clock.send` posts into a running invoke's receive
+  mailbox (`info.post`); the next `run_tasks()` drains it. The coroutines are private to the scheduler;
   applications still have none. Ouro I/O inside a source that the manual
   scheduler runs is not supported; fake it.
 

@@ -1974,8 +1974,10 @@ function M.manual_scheduler()
   local co = M._coroutine
   local function resume(item, ...)
     if item.done or not item.scope.alive then return end
-    local previous = s.current
+    local previous, previous_sleep = s.current, M._task_sleep
     s.current = item
+    -- machine.sleep(ms) inside this item parks it on the virtual clock.
+    M._task_sleep = function(ms) return s.sleep(nil, ms) end
     local ok, err
     if co then
       item.co = item.co or co.create(item.fn)
@@ -1985,7 +1987,7 @@ function M.manual_scheduler()
       ok, err = pcall(item.fn)
       item.done = true
     end
-    s.current = previous
+    s.current, M._task_sleep = previous, previous_sleep
     if not ok then item.done = true; error(err, 0) end
   end
   function s.run(scope, fn, info)
