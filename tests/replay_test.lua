@@ -333,6 +333,26 @@ return {
     actor:stop()
   end,
 
+  -- Second review, M-5(a): two roots on the default id shared one path, so
+  -- replay sent every event to the newest. Root paths now get a suffix
+  -- (eb2b142), which the recording keeps.
+  ['review2 M-5a: two roots with the default id'] = function()
+    local counter = machine.create {
+      id = 'counter2', initial = 'on', context = { n = 0 },
+      events = { INC = {} },
+      states = { on = { on = { INC = { actions = machine.assign { n = function(c) return c.n + 1 end } } } } },
+    }
+    local lines = record(function()
+      local a = counter:start {}
+      local b = counter:start {}
+      assert(a.path == 'counter2' and b.path == 'counter2#2', b.path)
+      a:send('INC'); a:send('INC'); b:send('INC')
+      a:stop(); b:stop()
+    end)
+    local report = machine.replay(table.concat(lines, '\n'))
+    assert(report.ok, machine.replay_text(report))
+  end,
+
   -- Second review, M-5(b): JSON turned an integral float into an integer.
   ['review2 M-5b: float payloads keep their type'] = function()
     local chart = machine.create {
