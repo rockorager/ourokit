@@ -4,10 +4,44 @@
 --   attach()            observe records and seed every live actor
 --   inspect(path)       one actor's complete current state, as JSON
 --   send(token, json)   runtime.send, run as a task; reports through complete()
+--   rollup()            one summary row per live actor (the overview), as JSON
 local publish, complete, ouro = ...
 local machine, json = ouro.machine, ouro.json
 if not machine then return nil end
 local unsubscribe
+
+-- Per-actor counters while attached, for rollup(): records, rejected events,
+-- errors (failed invokes and children, error.* and surface.failed.* events,
+-- record.error) and the last of each.
+local stats, since_ms = {}, nil
+
+local function error_of(record)
+  if type(record.error) == 'table' then return record.error.code or record.error.message or 'error' end
+  for _, invoke in ipairs(record.invokes or {}) do
+    if invoke.action == 'error' then
+      local err = invoke.error
+      return 'invoke ' .. tostring(invoke.id) .. ' failed: ' .. tostring(type(err) == 'table' and (err.message or err.name) or err)
+    end
+  end
+  local kind = record.event and record.event.type or ''
+  if kind:find('^error%.') or kind:find('^surface%.failed') then
+    local e = record.event
+    local detail = e.message or (type(e.error) == 'table' and (e.error.message or e.error.name)) or e.error or e.reason
+    return kind .. (detail and (': ' .. tostring(detail)) or '')
+  end
+end
+
+local function count(record)
+  if record.kind ~= 'transition' or not record.actor then return end
+  local s = stats[record.actor]
+  if not s then s = {records = 0, rejected = 0, errors = 0}; stats[record.actor] = s end
+  s.records = s.records + 1
+  s.last_event, s.last_time_ms = record.event and record.event.type, record.time_ms
+  if record.rejected then s.rejected = s.rejected + 1 end
+  if record.entered and #record.entered > 0 then s.changed_ms = record.time_ms end
+  local err = error_of(record)
+  if err then s.errors, s.last_error = s.errors + 1, {message = err, time_ms = record.time_ms} end
+end
 
 local function emit(kind, record)
   local ok, bytes = pcall(json.encode, record)
@@ -19,6 +53,7 @@ local function emit(kind, record)
 end
 
 local function observe(record)
+  count(record)
   local kind = record.kind == 'actor' and record.action or record.kind
   if not emit(kind, record) and unsubscribe then unsubscribe(); unsubscribe = nil end
 end
@@ -27,6 +62,19 @@ local function find(path)
   for _, actor in ipairs(machine.actors()) do
     if actor.path == path then return actor end
   end
+end
+
+-- snapshot.children lists child ids and also maps each id to the child's
+-- snapshot, which JSON cannot hold: report one {id, machine, status,
+-- states} per child instead.
+local function children_of(snapshot)
+  local out = {}
+  for _, id in ipairs(snapshot.children or {}) do
+    local child = snapshot.children[id]
+    out[#out + 1] = {id = id, machine = type(child) == 'table' and child.machine or nil,
+      status = type(child) == 'table' and child.status or nil, states = type(child) == 'table' and child.states or nil}
+  end
+  return json.array(out)
 end
 
 -- Complete current state of one actor: a synthetic started record (with the
@@ -42,7 +90,7 @@ local function current(actor)
     seeded = true, event = {type = 'ouro.attach'}, handled = true, rejected = false, time_ms = now,
     microsteps = {}, exited = {}, entered = {}, timers = {}, invokes = {}, actions = {},
     states = snapshot.states, status = snapshot.status, context = snapshot.context,
-    children = snapshot.children, output = snapshot.output}
+    children = children_of(snapshot), output = snapshot.output}
   for _, live in ipairs(actor:pending_timers()) do
     record.timers[#record.timers + 1] = {action = 'started', state = live.state, delay = live.delay,
       event = live.event, token = live.token, time_ms = live.time_ms}
@@ -59,6 +107,7 @@ end
 local function attach()
   if unsubscribe then return end
   unsubscribe = machine.inspect(observe)
+  stats, since_ms = {}, nil
   publish('seed_reset', '', '{}')
   for _, actor in ipairs(machine.actors()) do
     local ok, err = pcall(function()
@@ -76,6 +125,33 @@ local function inspect(path)
   local started, record = current(actor)
   return json.encode({actor = actor.path, machine = actor.chart.id, parent = started.parent,
     graph = started.graph, snapshot = record})
+end
+
+-- The overview: one row per live actor, from live state plus the counters
+-- kept while attached (observed_since_ms says since when).
+local function rollup()
+  local rows = {}
+  for _, actor in ipairs(machine.actors()) do
+    local clock = actor._scheduler and actor._scheduler.clock
+    local now = clock and clock() or nil
+    since_ms = since_ms or now
+    local snapshot = machine.plain(actor:snapshot())
+    local leaves = {}
+    for _, id in ipairs(snapshot.states or {}) do
+      local leaf = true
+      for _, other in ipairs(snapshot.states) do
+        if other:sub(1, #id + 1) == id .. '.' then leaf = false; break end
+      end
+      if leaf then leaves[#leaves + 1] = id end
+    end
+    local s = stats[actor.path] or {records = 0, rejected = 0, errors = 0}
+    rows[#rows + 1] = {actor = actor.path, machine = actor.chart.id, parent = actor._parent and actor._parent.path,
+      status = snapshot.status, states = json.array(leaves), timers = #actor:pending_timers(),
+      invokes = #actor:pending_invokes(), records = s.records, rejected = s.rejected, errors = s.errors,
+      last_error = s.last_error, last_event = s.last_event, last_time_ms = s.last_time_ms,
+      changed_ms = s.changed_ms, time_ms = now}
+  end
+  return json.encode({observed_since_ms = since_ms, actors = json.array(rows)})
 end
 
 local function same(a, b)
@@ -141,4 +217,4 @@ local function send(token, text)
   complete(token, bytes)
 end
 
-return {attach = attach, inspect = inspect, send = send}
+return {attach = attach, inspect = inspect, send = send, rollup = rollup}

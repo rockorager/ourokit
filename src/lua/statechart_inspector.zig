@@ -257,6 +257,17 @@ pub fn inspect(allocator: std.mem.Allocator, vm: *vm_module.Vm, path: []const u8
     return try allocator.dupe(u8, bytes);
 }
 
+/// One summary row per live actor (runtime.statecharts rollup), as JSON.
+pub fn rollup(allocator: std.mem.Allocator, vm: *vm_module.Vm) !?[]u8 {
+    const state = vm.state;
+    const top = c.lua_gettop(state);
+    defer c.lua_settop(state, top);
+    if (!pushBridge(state, "rollup")) return null;
+    if (c.lua_pcallk(state, 0, 1, 0, 0, null) != c.ok) return error.StatechartInspectFailed;
+    const bytes = argument(state, -1) orelse return null;
+    return try allocator.dupe(u8, bytes);
+}
+
 /// Spawns runtime.send's delivery as a task in the active VM's application
 /// scope; its JSON result arrives through takeResult(token).
 pub fn send(vm: *vm_module.Vm, store: *Store, request_json: []const u8) !u64 {

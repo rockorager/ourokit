@@ -31,6 +31,7 @@ pub const setStatechartStrict = @import("machine.zig").setStrict;
 pub const chart_recording = @import("chart_recording.zig");
 pub const attachStatechartInspector = @import("statechart_inspector.zig").attach;
 pub const inspectStatechart = @import("statechart_inspector.zig").inspect;
+pub const rollupStatecharts = @import("statechart_inspector.zig").rollup;
 pub const sendStatechartEvent = @import("statechart_inspector.zig").send;
 pub const Dbus = @import("dbus.zig").Binding;
 pub const Stdio = @import("stdio.zig").Stdio;

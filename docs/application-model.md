@@ -1022,7 +1022,10 @@ Attaching runs host Lua in the application VM at a safe point. That Lua reads
 snapshots and graphs and evaluates guards through `actor:accepted()`.
 Production instances install nothing. `actor = path` adds that actor's
 complete current state (configuration, full context, children, pending timers
-and invokes, accepted events and graph), read at the call.
+and invokes, accepted events and graph), read at the call. `rollup = true`
+adds one summary row per live actor (leaf states, pending timer and invoke
+counts, record, rejection and error counters, last error), the same system
+overview the visualizer shows.
 
 Instead of polling, a client can subscribe to the resource
 `ouro://statecharts` with `subscriptions/listen` and fetch on each

@@ -263,6 +263,11 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
         const bytes = try lua.inspectStatechart(a, &reload.active().vm, path) orelse return error.StatechartActorNotFound;
         break :blk try std.json.parseFromSliceLeaky(mcp.Value, a, bytes, .{ .allocate = .alloc_always });
     } else null;
+    // rollup: one summary row per live actor (the visualizer's overview).
+    const rollup: ?mcp.Value = if (mcp.get(args, "rollup")) |flag| if (flag == .bool and flag.bool) blk: {
+        const bytes = try lua.rollupStatecharts(a, &reload.active().vm) orelse break :blk null;
+        break :blk try std.json.parseFromSliceLeaky(mcp.Value, a, bytes, .{ .allocate = .alloc_always });
+    } else null else null;
     const after = try unsignedField(args, "after", 0);
     const limit = @min(try unsignedField(args, "limit", 256), 1024);
     // Lua MCP clients convert at most 4096 values per reply; text mode keeps
@@ -322,6 +327,7 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
         try result.object.put(a, "actors", .{ .array = actors });
     }
     if (snapshot) |value| try result.object.put(a, "actor", value);
+    if (rollup) |value| try result.object.put(a, "rollup", value);
     return result;
 }
 
