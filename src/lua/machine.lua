@@ -1228,6 +1228,7 @@ local function recorded(actor)
   local root = actor
   while root._parent do root = root._parent end
   -- Component machines record too, keyed by instance path (machine.component).
+  if hooks.watches then return hooks.watches(root) end
   return root._scheduler == (hooks.scheduler or M.default_scheduler)
 end
 

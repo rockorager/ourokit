@@ -8,7 +8,7 @@ local ouro, M, task_origin = ...
 -- it observes the same way, and compares line by line.
 
 local json = ouro.json
-local FORMAT, VERSION = 'ouro.machine.log', 1
+local FORMAT, VERSION = 'ouro.machine.log', 2
 
 -- Input origins per task: hosts tag MCP action calls natively; activation
 -- hooks run under _with_origin. Sub-tasks do not inherit a tag.
@@ -44,17 +44,37 @@ function M.charts()
 end
 
 ---------------------------------------------------------------------------
--- JSON-safe copies. Views are unwrapped; functions, userdata and cycles
--- become marker strings, so a line can always be written. Non-string keys
--- are kept only in pure arrays.
+-- Type-faithful JSON (log format version 2). Views are unwrapped; functions,
+-- userdata and cycles become marker strings, so a line can always be
+-- written. JSON alone loses Lua types, so three compact tags keep them:
+--   {"$f": 3}            a float with an integral value (3.0), and
+--   {"$f": "nan"|"inf"|"-inf"} the non-finite numbers;
+--   {"$t": [[k, v], ...]} a table with non-string keys that is not a dense
+--                         array (sparse or mixed maps, boolean or float keys);
+--   {"$o": {...}}         an object whose only key is itself "$f", "$t" or
+--                         "$o", escaped.
+-- Everything else is plain JSON, so lines stay readable. revive() undoes the
+-- tags after decoding; version 1 logs have none and decode as before.
 ---------------------------------------------------------------------------
+local install, uninstall -- recorder registry, below
 local raw = M.raw
+local TAGS = {['$f'] = true, ['$t'] = true, ['$o'] = true}
+local function key_order(a, b)
+  local ta, tb = type(a[1]), type(b[1])
+  if ta ~= tb then return ta < tb end
+  if ta == 'boolean' then return (a[1] and 1 or 0) < (b[1] and 1 or 0) end
+  if ta == 'number' or ta == 'string' then return a[1] < b[1] end
+  return tostring(a[1]) < tostring(b[1])
+end
 local function safe(value, seen)
   value = raw(value)
   local kind = type(value)
   if kind == 'nil' or kind == 'boolean' or kind == 'string' then return value end
   if kind == 'number' then
-    if value ~= value or value == math.huge or value == -math.huge then return tostring(value) end
+    if value ~= value then return {['$f'] = 'nan'} end
+    if value == math.huge then return {['$f'] = 'inf'} end
+    if value == -math.huge then return {['$f'] = '-inf'} end
+    if math.type(value) == 'float' and value == math.floor(value) then return {['$f'] = value} end
     return value
   end
   if value == json.null then return value end
@@ -68,14 +88,28 @@ local function safe(value, seen)
     if math.type(k) ~= 'integer' or k < 1 then array = false end
   end
   local out = {}
+  local strings = true
+  for k in pairs(value) do if type(raw(k)) ~= 'string' then strings = false; break end end
   if array and count == #value then
     for i = 1, count do out[i] = safe(value[i], seen) end
     if count == 0 then
       local ok, text = pcall(json.encode, value)
       if ok and text == '[]' then json.array(out) end
     end
+  elseif strings then
+    local only
+    for k, v in pairs(value) do out[k] = safe(v, seen); only = k end
+    if count == 1 and TAGS[only] then out = {['$o'] = out} end
   else
-    for k, v in pairs(value) do out[tostring(raw(k))] = safe(v, seen) end
+    local pairs_list = {}
+    for original, v in pairs(value) do
+      local k = raw(original)
+      local key = (type(k) == 'number' or type(k) == 'string' or type(k) == 'boolean') and k or tostring(k)
+      pairs_list[#pairs_list + 1] = {key, v}
+    end
+    table.sort(pairs_list, key_order)
+    for i, pair in ipairs(pairs_list) do pairs_list[i] = json.array({safe(pair[1], seen), safe(pair[2], seen)}) end
+    out = {['$t'] = json.array(pairs_list)}
   end
   seen[value] = nil
   return out
@@ -125,10 +159,8 @@ local function lua_encode(value, out)
 end
 
 local function encode(entry)
-  local ok, text = pcall(json.encode, entry)
-  if ok then return text end
   local value = safe(entry)
-  ok, text = pcall(json.encode, value)
+  local ok, text = pcall(json.encode, value)
   if ok then return text end
   return table.concat(lua_encode(value, {}))
 end
@@ -218,11 +250,36 @@ local function lua_decode(text)
   return result
 end
 
-local function decode(text)
+local function decode_plain(text)
   local ok, value = pcall(json.decode, text)
   if ok then return value end
   return lua_decode(text)
 end
+
+local function revive(value)
+  if type(value) ~= 'table' or value == json.null then return value end
+  local key, inner = next(value)
+  if key ~= nil and next(value, key) == nil and TAGS[key] then
+    if key == '$f' then
+      if inner == 'nan' then return 0.0 / 0.0 end
+      if inner == 'inf' then return math.huge end
+      if inner == '-inf' then return -math.huge end
+      return inner + 0.0
+    elseif key == '$t' then
+      local out = {}
+      for _, pair in ipairs(inner) do out[revive(pair[1])] = revive(pair[2]) end
+      return out
+    else
+      local out = {}
+      for k, v in pairs(inner) do out[k] = revive(v) end
+      return out
+    end
+  end
+  for k, v in pairs(value) do value[k] = revive(v) end
+  return value
+end
+
+local function decode(text) return revive(decode_plain(text)) end
 M._json_decode, M._json_encode = decode, encode
 
 ---------------------------------------------------------------------------
@@ -249,12 +306,12 @@ local function delta(old, new)
   local d, changed = {}, false
   if not old or not same_list(old.states, new.states) then d.states = ids(new.states); changed = true end
   if not old or old.status ~= new.status then d.status = new.status; changed = true end
-  if (old and old.output) ~= new.output then d.output = safe(new.output); changed = true end
+  if (old and old.output) ~= new.output then d.output = new.output; changed = true end
   if not old or old.context ~= new.context then
     local set, unset = nil, nil
     local before = old and old.context or {}
     for k, v in pairs(new.context) do
-      if before[k] ~= v then set = set or {}; set[tostring(k)] = safe(v) end
+      if before[k] ~= v then set = set or {}; set[tostring(k)] = v end
     end
     for k in pairs(before) do
       if new.context[k] == nil then unset = unset or {}; unset[#unset + 1] = tostring(k) end
@@ -282,6 +339,60 @@ local function classify(event, origin)
   if origin == 'invoke' and (kind:find('^done%.invoke%.') or kind:find('^error%.invoke%.')) then return 'invoke' end
   if origin == 'child' then return 'task' end
   return 'event'
+end
+
+-- Several recorders may run at once (the development recorder, a public
+-- machine.recorder, paths_log, replay's own). M._hooks is the only one, or a
+-- composite that hands each boundary to the recorders watching that actor's
+-- scheduler. A failing recorder is dropped alone; stopping one keeps the rest.
+local installed = {}
+local composite = {}
+local function reinstall()
+  if #installed == 0 then M._hooks = nil
+  elseif #installed == 1 then M._hooks = installed[1]
+  else M._hooks = composite end
+end
+install = function(hooks) installed[#installed + 1] = hooks; reinstall() end
+uninstall = function(hooks)
+  for i, h in ipairs(installed) do
+    if h == hooks then table.remove(installed, i); break end
+  end
+  reinstall()
+end
+local function root_of(actor)
+  while actor._parent do actor = actor._parent end
+  return actor
+end
+local function each(name, actor, ...)
+  local list = {}
+  for i, h in ipairs(installed) do list[i] = h end
+  local root = actor and root_of(actor)
+  local result
+  for _, h in ipairs(list) do
+    if h[name] and (not root or h.watches(root)) then
+      local ok, value = pcall(h[name], actor, ...)
+      if not ok then pcall(h.failed, 'recorder ' .. name .. ' failed: ' .. tostring(value))
+      elseif result == nil then result = value end
+    end
+  end
+  return result
+end
+function composite.watches(root)
+  for _, h in ipairs(installed) do if h.watches(root) then return true end end
+  return false
+end
+function composite.enter(actor, ...) each('enter', actor, ...) end
+function composite.leave(actor, ...) each('leave', actor, ...) end
+function composite.step(actor, ...) each('step', actor, ...) end
+function composite.carry() each('carry') end
+function composite.released() each('released') end
+function composite.component_input(values)
+  local result
+  for _, h in ipairs(installed) do
+    local ok, value = pcall(h.component_input, values)
+    if ok and result == nil then result = value end
+  end
+  return result
 end
 
 function M.recorder(write, options)
@@ -320,6 +431,7 @@ function M.recorder(write, options)
 
   local hooks = {scheduler = options.scheduler}
   function hooks.failed(reason) r.fail(reason) end
+  function hooks.watches(root) return root._scheduler == (scheduler or M.default_scheduler) end
   -- Component props hold descriptions and callbacks: keep the plain data.
   -- Replay re-runs the context function on it; a context that read a
   -- dropped prop diverges at the start step.
@@ -337,14 +449,14 @@ function M.recorder(write, options)
     end
     local out = project(values, 0) or {}
     out.children = nil
-    return safe(out)
+    return out
   end
   function hooks.enter(actor, kind, event, origin)
     local entry = {t = now() - r.t0, a = actor.path, r = json.array({})}
     if kind == 'input' then
       entry.k = classify(event, origin)
       entry.o = origin
-      entry.e = safe(event)
+      entry.e = event
     elseif kind == 'start' then
       entry.k, entry.m = 'start', actor.chart.id
       if actor._component then
@@ -416,8 +528,8 @@ function M.recorder(write, options)
     for _, line in ipairs(lines or {}) do write(line) end
   end
   r.hooks = hooks
-  function r.stop() if M._hooks == hooks then M._hooks = nil end end
-  M._hooks = hooks
+  function r.stop() uninstall(hooks) end
+  install(hooks)
   return r
 end
 
@@ -477,17 +589,28 @@ local function decode_lines(source)
   else fail('replay expects log text or a list of lines') end
   local entries = {}
   for i, line in ipairs(lines) do
-    local ok, value = pcall(decode, line)
+    local ok, value = pcall(decode_plain, line)
     if not ok or type(value) ~= 'table' then fail('replay: line %d is not a JSON object', i) end
     entries[i] = value
   end
   local header = table.remove(entries, 1)
   if not header or header.format ~= FORMAT then fail('replay: the first line is not an %s header', FORMAT) end
-  if header.version ~= VERSION then fail('replay: unsupported log version %s', tostring(header.version)) end
+  if header.version ~= 1 and header.version ~= VERSION then
+    fail('replay: unsupported log version %s', tostring(header.version))
+  end
+  -- Version 1 has no type tags.
+  if header.version >= 2 then
+    for i, entry in ipairs(entries) do entries[i] = revive(entry) end
+  end
   return header, entries
 end
 
+-- Strict about number subtypes (3 vs 3.0); NaN equals NaN.
 local function equal(a, b)
+  if type(a) == 'number' and type(b) == 'number' then
+    if a ~= a and b ~= b then return true end
+    return a == b and math.type(a) == math.type(b)
+  end
   if a == b then return true end
   if type(a) ~= 'table' or type(b) ~= 'table' then return false end
   for k, v in pairs(a) do if not equal(v, b[k]) then return false end end
@@ -559,7 +682,6 @@ function M.replay(source, options)
   local t0 = header.t0 or 0
   local observed, observed_lines = {}, {}
   local scheduler, recorder, roots, released
-  local saved_hooks = M._hooks
   local report = {format = 'ouro.machine.replay', ok = true, entries = #entries, compared = 0}
   -- options.records(record): the §10 inspection stream of the replayed
   -- actors (graphs, microsteps, timers, invokes), e.g. for the visualizer.
@@ -744,7 +866,6 @@ function M.replay(source, options)
   if recorder then recorder.stop() end
   if unsubscribe then unsubscribe() end
   for _, actor in ipairs(roots or {}) do pcall(actor.stop, actor) end
-  M._hooks = saved_hooks
   if not ok then
     report.ok = false
     report.error = tostring(err)

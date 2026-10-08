@@ -75,7 +75,7 @@ return {
     local lines = record(session)
     assert(#lines > 10, #lines)
     local header = o.json.decode(lines[1])
-    assert(header.format == 'ouro.machine.log' and header.version == 1)
+    assert(header.format == 'ouro.machine.log' and header.version == 2)
     local kinds = {}
     for i = 2, #lines do
       local entry = o.json.decode(lines[i])
@@ -331,6 +331,72 @@ return {
     assert(machine._hooks == nil, 'the failed recorder uninstalled itself')
     recorder.stop()
     actor:stop()
+  end,
+
+  -- Second review, M-5(b): JSON turned an integral float into an integer.
+  ['review2 M-5b: float payloads keep their type'] = function()
+    local chart = machine.create {
+      id = 'vol', initial = 'on', context = { label = '' },
+      events = { SET = { value = 'number' } },
+      states = { on = { on = { SET = { actions = machine.assign { label = function(_, e) return 'Volume ' .. tostring(e.value) end } } } } },
+    }
+    local lines = record(function()
+      local a = chart:start { id = 'vol' }
+      a:send { type = 'SET', value = 3.0 }
+      assert(a:context().label == 'Volume 3.0')
+      a:stop()
+    end)
+    local report = machine.replay(table.concat(lines, '\n'))
+    assert(report.ok, machine.replay_text(report))
+  end,
+
+  -- Second review, M-5(c): integer keys became strings, NaN and inf strings.
+  ['review2 M-5c: integer-keyed tables and non-finite numbers keep their type'] = function()
+    local chart = machine.create {
+      id = 'sparse', initial = 'on', context = { picked = '' },
+      events = { PICK = { map = 'table', limit = 'number' } },
+      states = { on = { on = { PICK = { actions = machine.assign {
+        picked = function(_, e) return tostring(e.map[10]) .. ' ' .. tostring(e.map.name) .. ' ' .. tostring(e.map[1.5]) end,
+        limit = function(_, e) return e.limit end,
+        weird = function(_, e) return { [true] = 'yes', ['$f'] = 'literal' } end,
+      } } } } },
+    }
+    local lines = record(function()
+      local a = chart:start { id = 'sparse' }
+      a:send { type = 'PICK', map = { [10] = 'ten', [20] = 'twenty', name = 'n', [1.5] = 'half' }, limit = math.huge }
+      assert(a:context().picked == 'ten n half' and a:context().limit == math.huge)
+      a:send { type = 'PICK', map = {}, limit = 0 / 0 }
+      a:stop()
+    end)
+    local report = machine.replay(table.concat(lines, '\n'))
+    assert(report.ok, machine.replay_text(report))
+    -- Version 1 logs (no type tags) stay readable.
+    local old = { '{"format":"ouro.machine.log","version":1,"t0":0}',
+      '{"k":"start","t":0,"a":"vol","m":"vol","input":{},"r":[{"a":"vol","e":"ouro.init","tr":[]}],"s":{"vol":{"states":["on"],"status":"active","children":[],"context":{"label":""}}}}' }
+    local charts = { vol = machine.create { id = 'vol', initial = 'on', context = { label = '' }, states = { on = {} } } }
+    report = machine.replay(old, { charts = charts })
+    assert(report.ok, machine.replay_text(report))
+  end,
+
+  -- Second review, L-3: a second recorder replaced the development recorder,
+  -- and stopping it left none installed.
+  ['review2 L-3: recorders coexist, and stopping one keeps the others'] = function()
+    local chart = machine.create { id = 'tick', initial = 'idle', context = { n = 0 },
+      states = { idle = { on = { INC = { actions = machine.assign { n = function(c) return c.n + 1 end } } } } } }
+    local first, second = {}, {}
+    local dev = machine.recorder(function(line) first[#first + 1] = line end)
+    local actor = chart:start { id = 'tick' }
+    local nested = machine.recorder(function(line) second[#second + 1] = line end)
+    actor:send('INC')
+    nested.stop()
+    actor:send('INC')
+    dev.stop()
+    actor:stop()
+    -- header, start, INC, INC for the first; header and the one INC for the second.
+    assert(#first == 4 and #second == 2, #first .. ' ' .. #second)
+    assert(machine._hooks == nil)
+    local report = machine.replay(first)
+    assert(report.ok, machine.replay_text(report))
   end,
 
   ['machine.advance needs a virtual clock'] = function()

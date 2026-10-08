@@ -1571,11 +1571,11 @@ development run of each app.
   and leaves the app running. `runtime.diagnostics` then reports
   `recording = {path, inputs, failed = true, reason}`.
 
-**Format: JSON lines, `ouro.machine.log` version 1.** The first line is the
+**Format: JSON lines, `ouro.machine.log` version 2.** The first line is the
 header. Each later line is one input with what it caused:
 
 ```json
-{"format":"ouro.machine.log","version":1,"t0":1782223,"app":"dev.ourokit.stopwatch"}
+{"format":"ouro.machine.log","version":2,"t0":1782223,"app":"dev.ourokit.stopwatch"}
 {"k":"start","t":0,"a":"stopwatch","m":"stopwatch","input":{},"r":[{"a":"stopwatch","e":"ouro.init","tr":[]}],"s":{"stopwatch":{"states":["clock","clock.idle","settings","settings.closed"],"status":"active","children":[],"context":{"elapsed":0,"laps":[]}}}}
 {"k":"event","t":20713,"a":"stopwatch","o":"widget","e":{"type":"START"},"r":[{"a":"stopwatch","e":"START","tr":[1]}],"s":{"stopwatch":{"states":["clock","clock.running","settings","settings.closed"],"context":{"started_at":1802936}}}}
 {"k":"timer","t":20813,"a":"stopwatch","o":"timer","e":{"type":"after.100.clock.running","state":"clock.running","token":6,"time_ms":1803036},"r":[{"a":"stopwatch","e":"after.100.clock.running","tr":[2]}],"s":{"stopwatch":{"context":{"elapsed":100}}}}
@@ -1593,6 +1593,30 @@ header. Each later line is one input with what it caused:
 | `r` | Compact records for every actor step the input caused: actor, event type, transition indices (`chart:graph()`), and rejection reason `x` |
 | `s` | Snapshot deltas of the recorded actors that changed: `states`, `status`, `children` ids, `output`, changed top-level `context` keys, and `unset` keys. Copy-on-write makes the comparison an identity check per key. |
 | `err` | The error the input raised, if any |
+
+**Values keep their Lua types.** Plain JSON would turn `3.0` into `3`,
+string the keys of `{[10] = 'ten'}`, and lose NaN and infinities. Replay
+would then diverge with no chart change (second review, M-5). Version 2
+writes plain JSON wherever it is exact, plus three small tags:
+
+| Value | Written as |
+| --- | --- |
+| a float with an integral value, `3.0` | `{"$f": 3}` |
+| NaN, `math.huge`, `-math.huge` | `{"$f": "nan"}`, `{"$f": "inf"}`, `{"$f": "-inf"}` |
+| a table with non-string keys that is not a dense array (sparse, mixed, boolean or float keys) | `{"$t": [[10, "ten"], [20, "twenty"]]}`, pairs sorted by key |
+| an object whose only key is `$f`, `$t` or `$o` | `{"$o": {...}}` (escaped) |
+
+Replay compares number subtypes strictly (`3` is not `3.0`), and NaN equals
+NaN. Version 1 logs have no tags and still replay.
+
+**Concurrent runs and several recorders.** Each process locks its log file
+(`flock`), writes it append-only, and writes each line with one `write`. A
+second running instance of the same app id finds the default name locked
+and records to `<application id>.<pid>.jsonl`. `runtime.diagnostics`
+reports the path actually used. Recorders can coexist: the development
+recorder keeps recording while a public `machine.recorder`, `paths_log` or
+replay records too. Each recorder watches its own scheduler, and stopping
+one leaves the others installed.
 
 Reload writes `reload` first. The candidate's lines are held until its
 commit (`machine.release()`): carried actors' `start` lines with snapshots,
