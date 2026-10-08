@@ -439,6 +439,23 @@ Views are userdata because the app sandbox has no `setmetatable` and Lua 5.5
 `next(view)` does not work. Use `machine.plain(view)` for a deep, serializable
 copy.
 
+**Native APIs take views directly.** Every binding that consumes a table
+reads a view as that table, so a context value can go straight to native
+code without `machine.plain`. This covers:
+- `ouro.json.encode`, MCP parameters and action outputs;
+- `prepare_launch`, D-Bus `call`/`emit`/`send`/`subscribe` arguments, HTTP
+  and file options;
+- popups, drag, the editor, image import, gradients, drawings, themes, key
+  bindings, window declarations and UI fields;
+- `ouro.select` options, and `ouro.desktop` options and notifications.
+
+Two caveats:
+- Reads through a view are tracked. Handing a whole `actor:context()` to a
+  native API inside a view or a selector therefore depends on every key; pass
+  the fields it needs.
+- `ouro.json.array(view)` and the window constructors mutate their argument,
+  so they need a plain table: use `machine.plain(view)` there.
+
 **Native handles** (a D-Bus connection, an audio output, a lock owner) may
 live in context when the chart declares them **transient**:
 `transient = { 'bus', 'output' }`. Transient fields are left out of
@@ -1008,6 +1025,10 @@ host side belongs to the scopes thread:
    through their own chart's `restore`; a child whose fresh context needs
    input keeps its old context.
 3. After the candidate commits, `machine.release()` starts the held work.
+
+Carried snapshots keep `ouro.json.array` marks, so an empty or JSON-shaped
+list in context (for example desktop entries handed to `prepare_launch`)
+behaves the same after reload.
 
 Carry only reaches actors the candidate creates while it runs, that is at
 module load or in `run()`. `machine.release()` drops entries nobody claimed,

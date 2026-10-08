@@ -92,7 +92,8 @@ Application state lives in charts, so reload carries it over:
    Actors whose context is not plain data are reported on stderr and start
    fresh.
 2. The plain snapshots are copied directly into the candidate's Lua state,
-   without serialization, so integers, floats, and integer keys are unchanged.
+   without serialization, so integers, floats, integer keys and `ouro.json.array`
+   marks are unchanged.
    This happens before the candidate's source runs.
 3. In the candidate, a root actor created with the same id and chart id is
    restored with `chart:restore(persisted, {renames = ...})`. Its child actors
