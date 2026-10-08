@@ -93,7 +93,7 @@ def replay(log, app, ok=True, *extra):
 def entries(log):
     lines = Path(log).read_text().splitlines()
     header = json.loads(lines[0])
-    assert header["format"] == "ouro.machine.log" and header["version"] == 1, header
+    assert header["format"] == "ouro.machine.log" and header["version"] == 2, header
     return [json.loads(line) for line in lines[1:]]
 
 
