@@ -125,9 +125,16 @@ local function method(name,uri)
   assert(o.files.write({json.dumps(log.as_uri())},name..' '..r.args[1]))
   local token=assert(val(r.args[3],'handle_token')); local p='/org/freedesktop/portal/desktop/request/'..r.sender:sub(2):gsub('%.','_')..'/'..token
   if r.args[2]=='pending' then
+   -- Return an alternate request path, as older portals do. A client that is
+   -- cancelled before this reply reaches it can only close the predicted path.
+   local function closable(path, label)
+    requests[#requests+1]=assert(b:export{{path=path,interface='org.freedesktop.portal.Request',methods={{Close={{input='',output='',handler=function()
+     assert(o.files.write({json.dumps(log.as_uri())},'closed '..label..' request')); return {{}} end}}}},signals={{}}}})
+   end
+   closable(p, 'predicted')
    p='/org/freedesktop/portal/desktop/request/alternate/'..token
-   requests[#requests+1]=assert(b:export{{path=p,interface='org.freedesktop.portal.Request',methods={{Close={{input='',output='',handler=function()
-    assert(o.files.write({json.dumps(log.as_uri())},'closed alternate request')); return {{}} end}}}},signals={{}}}})
+   closable(p, 'alternate')
+   assert(o.files.write({json.dumps(log.as_uri())},'replying '..p))
    return {{p}}
   end
   assert(b:emit{{destination=r.sender,path=p,interface='org.freedesktop.portal.Request',member='Response',signature='ua{{sv}}',args={{0,{{{{'uris',d.variant('as',{{uri}})}}}}}}}})
@@ -371,9 +378,17 @@ return o.app{id='dev.ourokit.parent-lifetime',run=function() return {windows={
         click(app_env, endpoint, "one", "root/test")
         wait_for(lambda: node(app_env, endpoint, "one", "root/status")["label"] == "closed", "two exports did not complete")
         click(app_env, endpoint, 'one', 'root/pending')
-        wait_for(portal_log.exists, 'pending request never reached portal')
+        # The portal logs the request on arrival and again just before it
+        # replies with the alternate path. Closing the window before the client
+        # has that reply makes it close the predicted path instead, which is
+        # correct but not what this checks, so give the reply time to arrive.
+        wait_for(lambda: portal_log.exists() and portal_log.read_text().startswith('replying '),
+                 'pending request never reached portal')
+        time.sleep(1)
         sway(app_env, '[app_id="dev.ourokit.parent-lifetime" title="one"]', 'kill')
-        wait_for(lambda: portal_log.read_text() == 'closed alternate request', 'closing owner did not send Request.Close to returned path')
+        wait_for(lambda: portal_log.read_text().startswith('closed '), 'closing owner did not send Request.Close')
+        assert portal_log.read_text() == 'closed alternate request', \
+            f'closing owner did not close the returned path: {portal_log.read_text()}'
         print("PASS sequential parent exports; window cancellation closes alternate portal request")
     finally:
         terminate(process)
