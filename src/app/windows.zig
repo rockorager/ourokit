@@ -393,7 +393,11 @@ pub const WindowSet = struct {
             free_index = index;
             break;
         };
-        const index = free_index orelse return error.WindowCapacityExceeded;
+        const index = free_index orelse grown: {
+            const first = self.slots.len;
+            try self.growSlots(1);
+            break :grown first;
+        };
         var prepared = try self.prepareSlot(declaration, self.slots[index].generation);
         errdefer {
             self.scheduler.destroyScope(prepared.scope) catch unreachable;
@@ -494,7 +498,15 @@ pub const WindowSet = struct {
         for (declarations) |declaration| if (self.findById(declaration.id()) == null) {
             create_count += 1;
         };
-        if (create_count > free_count) return error.WindowCapacityExceeded;
+        if (create_count > free_count) try self.growSlots(create_count - free_count);
+    }
+
+    /// Slots are addressed by index (window handles), so growing may move
+    /// them. Only preparation and creation grow; commit never does.
+    fn growSlots(self: *WindowSet, additional: usize) !void {
+        const old_len = self.slots.len;
+        self.slots = try self.allocator.realloc(self.slots, @max(old_len + additional, old_len * 2));
+        @memset(self.slots[old_len..], .{});
     }
 
     fn validateTransitions(self: *WindowSet, declarations: []const SurfaceDeclaration) !void {
@@ -729,7 +741,7 @@ const FakeHost = struct {
         begin_close: WindowHandle,
     };
 
-    actions: [16]Action = undefined,
+    actions: [128]Action = undefined,
     count: usize = 0,
 
     fn interface(self: *FakeHost) NativeHost {
@@ -947,7 +959,9 @@ test "invalid declaration snapshots do not alter native windows" {
         .{ .toplevel = .{ .id = "first", .title = "First" } },
         .{ .toplevel = .{ .id = "second", .title = "Second" } },
     };
-    try std.testing.expectError(error.WindowCapacityExceeded, windows.reconcile(&too_many));
+    var invalid = too_many;
+    invalid[1].toplevel.initial_width = 0;
+    try std.testing.expectError(error.InvalidWindowSize, windows.reconcile(&invalid));
     try std.testing.expectEqual(@as(usize, 1), host.count);
     try std.testing.expectEqual(@as(usize, 1), windows.activeCount());
 
@@ -1002,7 +1016,7 @@ test "prepared window reservations roll back every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, preparedAllocationFailure, .{});
 }
 
-test "prepared window capacity failure does not drop live identities" {
+test "preparing past the initial window capacity grows without dropping live identities" {
     var scheduler: Scheduler = undefined;
     try scheduler.init(std.testing.allocator, 4, 1, 0);
     defer scheduler.deinit();
@@ -1012,7 +1026,13 @@ test "prepared window capacity failure does not drop live identities" {
     defer windows.deinit();
     try windows.reconcile(&.{.{ .toplevel = .{ .id = "old", .title = "Old" } }});
     const handle = windows.activeHandleForId("old").?;
-    try std.testing.expectError(error.WindowCapacityExceeded, windows.prepare(&.{.{ .toplevel = .{ .id = "new", .title = "New" } }}));
+    var prepared = try windows.prepare(&.{
+        .{ .toplevel = .{ .id = "old", .title = "Old" } },
+        .{ .toplevel = .{ .id = "new", .title = "New" } },
+    });
+    try std.testing.expect(windows.slots.len >= 2);
+    try std.testing.expect(prepared.handleForId("new") != null);
+    prepared.deinit();
     try std.testing.expectEqual(handle, windows.activeHandleForId("old").?);
     try std.testing.expect(!windows.slots[handle.slot].dropped);
     try std.testing.expectEqual(@as(usize, 1), host.count);
@@ -1153,4 +1173,30 @@ test "text input batches own protocol strings until safe-point translation" {
     try scheduler.applyQueuedCancellations();
     try windows.markClosed(handle);
     try windows.reconcile(&.{});
+}
+
+test "forty windows open past the initial capacity and close back to baseline" {
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
+    defer scheduler.deinit();
+    var host: FakeHost = .{};
+    var windows: WindowSet = undefined;
+    try windows.init(std.testing.allocator, &scheduler, host.interface(), 16, 2);
+    defer windows.deinit();
+    const baseline = scheduler.scopeCapacity() - scheduler.availableScopeCapacity();
+    var ids: [40][8]u8 = undefined;
+    var declarations: [40]SurfaceDeclaration = undefined;
+    for (&declarations, &ids, 0..) |*declaration, *id, index|
+        declaration.* = .{ .toplevel = .{ .id = try std.fmt.bufPrint(id, "w{d}", .{index}), .title = "Window" } };
+    try windows.reconcile(&declarations);
+    try std.testing.expectEqual(@as(usize, 40), windows.activeCount());
+    try std.testing.expectEqual(@as(usize, 40), host.count);
+    var handles: [40]WindowHandle = undefined;
+    for (&handles, declarations) |*handle, declaration| handle.* = windows.activeHandleForId(declaration.id()).?;
+    try windows.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    for (handles) |handle| try windows.markClosed(handle);
+    try windows.reconcile(&.{});
+    try std.testing.expectEqual(@as(usize, 0), windows.activeCount());
+    try std.testing.expectEqual(baseline, scheduler.scopeCapacity() - scheduler.availableScopeCapacity());
 }

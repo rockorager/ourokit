@@ -16,7 +16,6 @@ pub const Config = struct {
     /// Code and names remain borrowed through destruction of all generations.
     native_modules: []const native.Module = &.{},
     node_capacity: usize = 256,
-    window_capacity: usize = 16,
     semantic_text_capacity: usize = 16 * 1024,
     signal_capacity: usize = 256,
     subscription_capacity: usize = 1024,
@@ -807,7 +806,7 @@ pub const SourceGeneration = struct {
             if (finished) self.signals.rollback(owner, work.revision) catch unreachable else self.signals.abortEvaluation(owner, work.revision) catch unreachable;
         }
         var candidate = self.application;
-        candidate.windows = try self.application.evaluateWindows(self.config.window_capacity);
+        candidate.windows = try self.application.evaluateWindows();
         candidate.output_templates = &.{};
         errdefer {
             candidate.releaseWindows(candidate.windows);
@@ -816,7 +815,7 @@ pub const SourceGeneration = struct {
         try candidate.extractOutputTemplates();
         // Keep output-expanded IDs stable, including disconnected outputs.
         for (self.application.windows) |window| if (window.template_id != null) {
-            _ = try candidate.expandOutput(window.declaration.layer_surface.output.?, self.config.window_capacity);
+            _ = try candidate.expandOutput(window.declaration.layer_surface.output.?);
         };
         // Reject what the native window set would refuse, before commit, so
         // the last valid list stays and a bound surface hears why.
@@ -1344,8 +1343,8 @@ test "reactive windows track signals, retain output identities, and roll back in
     defer generation.destroy();
     while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);
     try std.testing.expectEqual(@as(usize, 1), generation.application.output_templates.len);
-    _ = try generation.application.expandOutput("DP-2", 3);
-    _ = try generation.application.expandOutput("HDMI-A-1", 3);
+    _ = try generation.application.expandOutput("DP-2");
+    _ = try generation.application.expandOutput("HDMI-A-1");
     try std.testing.expect(!(try generation.refreshWindows()));
     _ = try generation.vm.spawnApplication("unused:set(1); visible:set(true)");
     while (scheduler.takeRunnable()) |handle| _ = try generation.resumeRunnable(handle, null);

@@ -21,6 +21,7 @@ TESTS = (
     'development_runtime.py',
     'statechart_inspection.py',
     'statechart_capacity.py',
+    'many_windows.py',
     'storybook_native.py',
     'control_composition.py',
     'window_theme.py',

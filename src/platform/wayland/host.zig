@@ -6,6 +6,7 @@ const OuroLoop = @import("../../loop/io_uring.zig").Loop;
 const LoopFileCompletion = @import("../../loop/io_uring.zig").FileCompletion;
 const platform_window = @import("../window.zig");
 const RectI = @import("../../core/geometry.zig").RectI;
+const core = @import("../../core/root.zig");
 const scene = @import("../../scene/root.zig");
 const Adapter = @import("adapter.zig").Adapter;
 const Repeat = @import("repeat.zig");
@@ -38,6 +39,13 @@ const Roundtrip = wayring.client.Roundtrip(protocol, *Host);
 
 const buffer_count = 3;
 const presentation_feedback_capacity = 8;
+/// Descriptors the connection may queue before a send drains them. One
+/// sendmsg carries them all, and libwayland servers accept at most 28 fds per
+/// message (MAX_FDS_OUT), so this is a protocol bound. Buffer creation waits
+/// for room instead of failing when many windows map at once.
+const transmit_fd_budget = 28;
+/// The most descriptors one buffer pool or dmabuf slot sends.
+const buffer_fd_reserve = 4;
 const fractional_scale_denominator = 120;
 
 pub const StartupCompletions = struct {
@@ -733,7 +741,9 @@ pub const Host = struct {
     keyboard_focus: ?WindowHandle = null,
     keyboard_repeat: Repeat.State = .{},
     xkb: Xkb.Keyboard,
-    windows: []Window,
+    /// Grows in chunks that never move: buffers, frames and callbacks keep
+    /// window pointers.
+    windows: core.StableSlots(Window),
     outputs: []Output,
     disconnect_started: bool = false,
     transport_lost: bool = false,
@@ -752,9 +762,9 @@ pub const Host = struct {
     ) !void {
         if (config.window_capacity == 0 or config.output_capacity == 0 or config.app_id.len == 0)
             return error.InvalidConfig;
-        const windows = try allocator.alloc(Window, config.window_capacity);
-        errdefer allocator.free(windows);
-        @memset(windows, .{});
+        var windows = core.StableSlots(Window).init(config.window_capacity);
+        errdefer windows.deinit(allocator);
+        _ = try windows.grow(allocator);
         const outputs = try allocator.alloc(Output, config.output_capacity);
         errdefer allocator.free(outputs);
         @memset(outputs, .{});
@@ -838,13 +848,15 @@ pub const Host = struct {
             .{
                 .received_fd_budget = 4,
                 .transmit_byte_budget = 128 * 1024,
-                .transmit_fd_budget = 32,
+                .transmit_fd_budget = transmit_fd_budget,
             },
             .{
+                // Starting sizes: both tables grow with the number of windows.
                 .max_objects = 100 + config.output_capacity + config.window_capacity * 18 +
                     (if (config.workspaces != null) config.workspace_capacity * 2 + 1 else 0),
                 .max_client_ids = 80 + config.output_capacity + config.window_capacity * 18 +
                     @as(usize, @intFromBool(config.workspaces != null)),
+                .growable = true,
             },
         );
         self.driver = Driver.init(&self.connection);
@@ -926,10 +938,10 @@ pub const Host = struct {
         };
         self.connection.deinit(self.allocator) catch unreachable;
         self.clipboard.abandonProtocol();
-        for (self.windows) |*window| {
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
             std.debug.assert(window.state == .free or window.state == .shutdown);
             if (window.state == .shutdown) self.releaseWindowLocal(window);
-        }
+        };
         self.releaseDmabufFormatTable();
         self.adapter.deinit(self.allocator);
         self.clipboard.deinit();
@@ -938,7 +950,7 @@ pub const Host = struct {
         self.xkb.deinit();
         for (self.outputs) |*output| if (output.name) |name| self.allocator.free(name);
         self.allocator.free(self.outputs);
-        self.allocator.free(self.windows);
+        self.windows.deinit(self.allocator);
         self.allocator.free(self.app_id);
         self.* = undefined;
     }
@@ -967,13 +979,13 @@ pub const Host = struct {
     pub fn pumpSession(self: *Host) !void {
         if (self.transport_lost or self.disconnect_started) return;
         try self.session.pump(&self.connection.objects, try self.queue(), self.seat, self.outputs);
-        for (self.windows) |*window| {
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
             if (window.state == .open and window.lock_surface != null and !std.meta.eql(window.lock_owner, self.session.lock)) {
                 window.state = .closing;
                 window.recreate = true;
                 window.pending_redraw = false;
             }
-        }
+        };
         try self.maintainWindows();
         try self.resumeWaitingOutputs();
         _ = try self.driver.schedule();
@@ -981,7 +993,7 @@ pub const Host = struct {
 
     pub fn beginDisconnect(self: *Host) !void {
         if (self.disconnect_started) return;
-        for (self.windows) |window| if (window.state != .free) return error.WindowsRemainOpen;
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |window| if (window.state != .free) return error.WindowsRemainOpen;
         try self.releaseInput();
         try self.releaseClipboardManager();
         if ((try self.connection.actor()).lifecycle == .open and
@@ -1003,13 +1015,13 @@ pub const Host = struct {
         if ((try self.connection.actor()).lifecycle == .open and
             try self.connection.prepareClose()) self.submission_pending = true;
         self.disconnect_started = true;
-        for (self.windows) |*window| {
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
             if (window.state == .free) continue;
             const handle = window.handle;
             window.state = .shutdown;
             window.pending_redraw = false;
             try self.sink.closed(handle);
-        }
+        };
         _ = try self.driver.schedule();
     }
 
@@ -1232,7 +1244,10 @@ pub const Host = struct {
                 window.dmabuf_buffers.direct != window.direct_presentation) return null;
             const index = try window.dmabuf_buffers.acquireSlot(self.vulkan.?) orelse return null;
             const slot = &window.dmabuf_buffers.slots[index];
-            if (slot.target == null) try self.createDmabufSlot(window, index, pixel_width, pixel_height);
+            if (slot.target == null) {
+                if (try self.transmitDescriptorsFull()) return null;
+                try self.createDmabufSlot(window, index, pixel_width, pixel_height);
+            }
             slot.acquired = true;
             return .{
                 .target = .{ .vulkan = &slot.target.? },
@@ -1641,20 +1656,25 @@ pub const Host = struct {
         );
     }
 
+    fn freeWindow(self: *Host) !*Window {
+        for (self.windows.chunks.items) |chunk| for (chunk) |*window| if (window.state == .free) return window;
+        return self.windows.at(try self.windows.grow(self.allocator));
+    }
+
     fn windowFor(self: *Host, handle: WindowHandle) !*Window {
-        for (self.windows) |*window|
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window|
             if (window.state != .free and sameWindow(window.handle, handle)) return window;
         return error.StaleWindow;
     }
 
     fn windowForObject(self: *Host, object_id: u32) !*Window {
-        for (self.windows) |*window|
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window|
             if (window.state != .free and window.ownsObject(object_id)) return window;
         return error.UnknownWindowObject;
     }
 
     fn windowForSurface(self: *Host, object_id: u32) !*Window {
-        for (self.windows) |*window|
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window|
             if (window.state != .free and window.surface != null and
                 window.surface.?.id == object_id) return window;
         return error.UnknownWindowSurface;
@@ -1672,6 +1692,10 @@ pub const Host = struct {
         if (window.dmabuf_buffers.generation != frame.pool_generation or frame.slot >= buffer_count)
             return error.StaleFrame;
         return &window.dmabuf_buffers.slots[frame.slot];
+    }
+
+    fn transmitDescriptorsFull(self: *Host) !bool {
+        return (try self.queue()).queuedDescriptors() + buffer_fd_reserve > transmit_fd_budget;
     }
 
     fn prepareBuffers(self: *Host, window: *Window) !void {
@@ -1692,6 +1716,9 @@ pub const Host = struct {
                 try window.buffers.destroy(objects, transmit);
             }
         }
+        // Without room for the pool's descriptor, acquireFrame reports no
+        // frame and the window retries after queued sends drain.
+        if (try self.transmitDescriptorsFull()) return;
         window.next_pool_generation +%= 1;
         if (window.next_pool_generation == 0) window.next_pool_generation = 1;
         try window.buffers.create(
@@ -1761,7 +1788,7 @@ pub const Host = struct {
     }
 
     fn maintainWindows(self: *Host) !void {
-        for (self.windows) |*window| {
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
             if (window.state == .closing) try self.destroySurfaces(window);
             if (window.state != .surfaces_destroyed) continue;
             const objects = &self.connection.objects;
@@ -1799,7 +1826,7 @@ pub const Host = struct {
             if (window.layer_state) |*layer_state| layer_state.deinit(self.allocator);
             window.* = .{ .next_pool_generation = next_pool_generation };
             try self.sink.closed(handle);
-        }
+        };
     }
 
     fn abandonWindows(self: *Host) !void {
@@ -1807,13 +1834,13 @@ pub const Host = struct {
         self.releaseDmabufFormatTable();
         self.text_input_active = null;
         self.text_input_pending.resetObject();
-        for (self.windows) |*window| {
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
             if (window.state == .free) continue;
             const closed_reported = window.state == .shutdown;
             const handle = window.handle;
             self.releaseWindowLocal(window);
             if (!closed_reported) try self.sink.closed(handle);
-        }
+        };
     }
 
     fn releaseWindowLocal(self: *Host, window: *Window) void {
@@ -1836,7 +1863,7 @@ pub const Host = struct {
     fn destroySurfaces(self: *Host, window: *Window) !void {
         // A parent can disappear independently of the Lua declaration. Always
         // retire its popup role first, including output removal/recreation.
-        for (self.windows) |*child| if (child.popup_parent) |parent| {
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*child| if (child.popup_parent) |parent| {
             if (sameWindow(parent, window.handle) and child.surface != null) {
                 try self.sink.closeRequested(child.handle);
                 try self.destroySurfaces(child);
@@ -1936,12 +1963,7 @@ pub const Host = struct {
         declaration: platform_window.SurfaceDeclaration,
     ) !void {
         const self: *Host = @ptrCast(@alignCast(context));
-        var slot: ?*Window = null;
-        for (self.windows) |*candidate| if (candidate.state == .free) {
-            slot = candidate;
-            break;
-        };
-        const window = slot orelse return error.WindowCapacityExceeded;
+        const window = try self.freeWindow();
         switch (declaration) {
             .toplevel => if (self.wm_base == null) return error.XdgShellUnavailable,
             .popup => |popup| {
@@ -1958,7 +1980,7 @@ pub const Host = struct {
                 if (parent.state != .open or !parent.configured or parent.frames_presented == 0)
                     return error.PopupParentNotMapped;
                 if (parent.popup != null) return error.NestedPopupUnsupported;
-                for (self.windows) |other| if (other.popup != null and other.popup_grabbing) return error.PopupAlreadyOpen;
+                for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |other| if (other.popup != null and other.popup_grabbing) return error.PopupAlreadyOpen;
                 const anchor = popup.anchor.rectangle;
                 if (@as(u64, @intCast(anchor.x)) + anchor.width > parent.width or
                     @as(u64, @intCast(anchor.y)) + anchor.height > parent.height)
@@ -1977,7 +1999,7 @@ pub const Host = struct {
                     return error.LayerShellVersionTooOld;
             },
         }
-        if (declaration == .popup) for (self.windows) |*other| {
+        if (declaration == .popup) for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*other| {
             if (other.popup != null and (declaration.popup.input != null or
                 (other.popup_parent != null and sameWindow(other.popup_parent.?, declaration.popup.anchor.window))))
             {
@@ -2328,7 +2350,7 @@ pub const Host = struct {
             var effective = declaration;
             // Preserve user-initiated popup keyboard access across reactive
             // parent updates; retain the declared policy for dismissal.
-            for (self.windows) |*child| if (child.popup_parent) |parent| {
+            for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*child| if (child.popup_parent) |parent| {
                 if (sameWindow(parent, handle) and child.popup != null and child.popup_grabbing and effective.keyboard_interactivity == .none) {
                     effective.keyboard_interactivity = .exclusive;
                     child.popup_keyboard_promoted = true;
@@ -2779,11 +2801,11 @@ pub const Host = struct {
     fn refreshBackgroundEffects(self: *Host) !void {
         const objects = &self.connection.objects;
         const transmit = try self.queue();
-        for (self.windows) |*window| {
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
             if (window.state != .open or window.layer_state == null) continue;
             try setBackgroundEffect(objects, transmit, self.compositor.?, self.background_effect_manager, self.blur_supported, window.surface.?, &window.background_effect, window.layer_state.?.background_effect);
             try wayring.client.sendRequest(protocol.wl_surface, objects, transmit, window.surface.?, .{ .commit = .{} });
-        }
+        };
         _ = try self.driver.schedule();
     }
 
@@ -3000,12 +3022,12 @@ pub const Host = struct {
     fn removeOutput(self: *Host, global_name: u32) !void {
         for (self.outputs) |*output| {
             if (output.handle == null or output.global_name != global_name) continue;
-            for (self.windows) |*window| {
+            for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
                 if (window.state != .open or window.output_global_name != global_name) continue;
                 window.recreate = true;
                 if (window.lock_surface != null) window.state = .closing;
                 window.pending_redraw = false;
-            }
+            };
             if (self.workspaces) |*client| try client.removeOutput(output.handle.?);
             try wayring.client.sendRequest(
                 protocol.wl_output,
@@ -3037,11 +3059,11 @@ pub const Host = struct {
     }
 
     fn resumeWaitingOutputs(self: *Host) !void {
-        for (self.windows) |*window| {
+        for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
             if (window.state != .waiting_output) continue;
             const name = window.layer_state.?.output orelse continue;
             if (self.outputNamed(name) != null) try self.activateLayerSurface(window);
-        }
+        };
     }
 
     fn ensureClipboardDevice(self: *Host) !void {
@@ -3809,6 +3831,11 @@ fn pointerAxisSource(value: protocol.wl_pointer.axis_source) !platform_window.Po
     return error.InvalidPointerAxisSource;
 }
 
+/// Test view of a caller-owned window array as one chunk; never deinit it.
+fn testWindowSlots(chunk: *[]Window) core.StableSlots(Window) {
+    return .{ .chunk_len = chunk.len, .chunks = .{ .items = @as(*[1][]Window, chunk), .capacity = 1 } };
+}
+
 test "Wayland host frame tokens retain generation-checked window identity" {
     try std.testing.expect(@hasDecl(Host, "nativeHost"));
     try std.testing.expect(@hasDecl(Host, "acquireFrame"));
@@ -3823,7 +3850,8 @@ test "Wayland activation validates windows and tolerates missing protocol" {
         .toplevel = .{ .id = 13, .generation = 1 },
     }};
     var host: Host = undefined;
-    host.windows = &windows;
+    var window_chunk: []Window = &windows;
+    host.windows = testWindowSlots(&window_chunk);
     host.activation = null;
     // No connection or driver is needed when the optional global is absent.
     try host.activate(windows[0].handle, "caller-token");
@@ -3894,7 +3922,8 @@ test "Wayland activation binds version one and queues the supplied token and sur
             .toplevel = try objects.createLocal(&protocol.xdg_toplevel.info, 1, null),
         },
     };
-    host.windows = &windows;
+    var window_chunk: []Window = &windows;
+    host.windows = testWindowSlots(&window_chunk);
     var token = "opaque-token-47".*;
     try host.activate(windows[1].handle, &token);
     @memset(&token, 'x');
@@ -4039,7 +4068,8 @@ test "layer background teardown retires pending callbacks and destroys effect be
         .background_effect = effect,
         .frame_callback = callback,
     };
-    host.windows = @as(*[1]Window, @ptrCast(&window));
+    var window_chunk: []Window = (&window)[0..1];
+    host.windows = testWindowSlots(&window_chunk);
     try std.testing.expect(window.addPresentationFeedback(feedback));
     try host.destroySurfaces(&window);
     try std.testing.expectEqual(WindowState.surfaces_destroyed, window.state);
@@ -4134,7 +4164,8 @@ test "Vulkan damage follows shared contents and discarded frames force repair" {
     pool.slots[1].target = try Vulkan.DmabufTarget.initShared(&renderer, &pool.slots[0].target.?);
     pool.slots[1].acquired = true;
     var host: Host = undefined;
-    host.windows = &windows;
+    var window_chunk: []Window = &windows;
+    host.windows = testWindowSlots(&window_chunk);
     host.vulkan = &renderer;
     const patch: RectI = .{ .x = 2, .y = 1, .width = 3, .height = 1 };
     var frame: Frame = .{ .target = .{ .vulkan = &pool.slots[1].target.? }, .width = 7, .height = 3, .window = window.handle, .pool_generation = 2, .slot = 1 };
@@ -4167,7 +4198,8 @@ test "direct Vulkan damage uses slot age and discard invalidates only that slot"
     pool.slots[1].target = std.mem.zeroes(Vulkan.DmabufTarget);
     pool.slots[1].acquired = true;
     var host: Host = undefined;
-    host.windows = &windows;
+    var window_chunk: []Window = &windows;
+    host.windows = testWindowSlots(&window_chunk);
     const full: RectI = .{ .x = 0, .y = 0, .width = 17, .height = 9 };
     const earlier: RectI = .{ .x = 1, .y = 2, .width = 2, .height = 1 };
     const current: RectI = .{ .x = 8, .y = 4, .width = 3, .height = 2 };
@@ -4230,7 +4262,8 @@ test "destroyed surfaces close without dma-buf release events" {
         .handle = .{ .slot = 2, .generation = 7 },
         .next_pool_generation = 17,
     }};
-    host.windows = &windows;
+    var window_chunk: []Window = &windows;
+    host.windows = testWindowSlots(&window_chunk);
     const closed_handle = windows[0].handle;
     const Recorder = struct {
         handle: ?WindowHandle = null,
@@ -4431,6 +4464,7 @@ test "retained scene waits for layer configure after output reconnect" {
     const peer = try reactor.attach(@intCast(socket), .{ .received_fd_budget = 0, .transmit_byte_budget = 65536, .transmit_fd_budget = 16 });
     defer reactor.destroyPeer(peer) catch unreachable;
     var windows = [_]Window{.{}} ** 2;
+    var window_chunk: []Window = &windows;
     var outputs = [_]Output{.{}} ** 2;
     var host: Host = .{
         .allocator = allocator,
@@ -4445,7 +4479,7 @@ test "retained scene waits for layer configure after output reconnect" {
         .text_input_pending = TextInput.Pending.init(allocator),
         .clipboard = undefined,
         .xkb = undefined,
-        .windows = &windows,
+        .windows = testWindowSlots(&window_chunk),
         .outputs = &outputs,
     };
     defer host.connection.objects.deinit(allocator);
@@ -4658,7 +4692,8 @@ test "scene damage repairs alternating buffers but presents only the logical cha
         .handle = .{ .slot = 1, .generation = 1 },
         .surface = try objects.createLocal(&protocol.wl_surface.info, 4, null),
     }};
-    host.windows = &windows;
+    var window_chunk: []Window = &windows;
+    host.windows = testWindowSlots(&window_chunk);
     for (&windows[0].buffers.slots) |*slot|
         slot.handle = try objects.createLocal(&protocol.wl_buffer.info, 1, null);
     var tracker = try scene.DamageTracker.init(allocator, 2);
@@ -4831,7 +4866,8 @@ test "native popup validates input, positions independently and tears down befor
         .frames_presented = 1,
     }, .{}, .{} };
     defer windows[0].layer_state.?.deinit(allocator);
-    host.windows = &windows;
+    var window_chunk: []Window = &windows;
+    host.windows = testWindowSlots(&window_chunk);
     const input: Activation.Input = .{ .window = windows[0].handle, .serial = 347, .anchor = .{ .x = 293, .y = 127, .width = 83, .height = 31 } };
     const declaration: platform_window.SurfaceDeclaration = .{ .popup = .{ .id = "popup", .input = input, .anchor = .{ .window = input.window, .target = input.target, .rectangle = input.anchor.? }, .width = 211, .height = 93 } };
     const popup_window: WindowHandle = .{ .slot = 8, .generation = 2 };

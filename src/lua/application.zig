@@ -204,7 +204,7 @@ pub const Application = struct {
 
     /// Evaluate desired windows without changing the last valid declaration.
     /// The caller tracks signal reads and commits only after validation.
-    pub fn evaluateWindows(self: *Application, capacity: usize) ![]Window {
+    pub fn evaluateWindows(self: *Application) ![]Window {
         const top = c.lua_gettop(self.state);
         defer c.lua_settop(self.state, top);
         self.clearRejection();
@@ -217,7 +217,6 @@ pub const Application = struct {
             return error.LuaWindowsFailed;
         }
         if (c.lua_type(self.state, -1) != c.type_table) return error.InvalidWindowsDeclaration;
-        if (c.lua_rawlen(self.state, -1) > capacity) return error.WindowCapacityExceeded;
         return parseWindowsTable(self.allocator, self.state, &self.rejection);
     }
 
@@ -310,7 +309,7 @@ pub const Application = struct {
     /// Materialize each all-output declaration once per output name. Retain
     /// disconnected names so the native host can recreate their surfaces and
     /// preserve UI identity when they return.
-    pub fn expandOutput(self: *Application, name: []const u8, capacity: usize) !bool {
+    pub fn expandOutput(self: *Application, name: []const u8) !bool {
         try self.extractOutputTemplates();
         var changed = false;
         for (self.output_templates) |template| {
@@ -326,7 +325,6 @@ pub const Application = struct {
                 }
             }
             if (found) continue;
-            if (self.windows.len >= capacity) return error.WindowCapacityExceeded;
             var layer = template.declaration.layer_surface;
             layer.id = try std.fmt.allocPrint(self.allocator, "{s}@{d}:{s}", .{ layer.id, name.len, name });
             errdefer self.allocator.free(layer.id);
@@ -1743,10 +1741,10 @@ test "all-output layers materialize stable independent callbacks and retain disc
     try application.extractOutputTemplates();
     try std.testing.expectEqual(@as(usize, 1), application.windows.len);
     try std.testing.expectEqual(@as(usize, 1), application.output_templates.len);
-    try std.testing.expect(try application.expandOutput("DP-1", 4));
+    try std.testing.expect(try application.expandOutput("DP-1"));
     const first_reference = application.windows[1].content_reference;
-    try std.testing.expect(try application.expandOutput("eDP-1", 4));
-    try std.testing.expect(!(try application.expandOutput("DP-1", 4)));
+    try std.testing.expect(try application.expandOutput("eDP-1"));
+    try std.testing.expect(!(try application.expandOutput("DP-1")));
     try std.testing.expectEqual(first_reference, application.windows[1].content_reference);
     for (application.windows[1..], [_][]const u8{ "DP-1", "eDP-1" }) |window, expected| {
         try std.testing.expectEqualStrings(expected, window.declaration.layer_surface.output.?);
@@ -1758,9 +1756,8 @@ test "all-output layers materialize stable independent callbacks and retain disc
         c.lua_settop(state, -2);
     }
     // Seeing only the remaining output does not discard the disconnected one.
-    try std.testing.expect(!(try application.expandOutput("eDP-1", 4)));
+    try std.testing.expect(!(try application.expandOutput("eDP-1")));
     try std.testing.expectEqual(@as(usize, 3), application.windows.len);
-    try std.testing.expectError(error.WindowCapacityExceeded, application.expandOutput("HDMI-A-1", 3));
-    try std.testing.expect(try application.expandOutput("HDMI-A-1", 4));
+    try std.testing.expect(try application.expandOutput("HDMI-A-1"));
     try std.testing.expectEqualStrings("panel@8:HDMI-A-1", application.windows[3].declaration.id());
 }

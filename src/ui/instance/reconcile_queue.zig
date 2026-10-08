@@ -17,8 +17,9 @@ const Slot = struct {
     in_progress_revision: u64 = 0,
 };
 
-/// Bounded dirty-owner queue between task state and instance reconciliation.
-/// Marking is state-only and allocation-free. Snapshot production belongs to
+/// Dirty-owner queue between task state and instance reconciliation. It grows
+/// when an owner with a higher slot registers; marking is state-only and
+/// allocation-free. Snapshot production belongs to
 /// the consumer of `take`, during the reconciliation phase.
 pub const ReconcileQueue = struct {
     allocator: std.mem.Allocator,
@@ -43,8 +44,25 @@ pub const ReconcileQueue = struct {
         self.* = undefined;
     }
 
+    /// Grows to hold owners in slots below `len`, so a later `register` for
+    /// them cannot fail. The queue keeps its order.
+    pub fn reserve(self: *ReconcileQueue, len: usize) !void {
+        if (len <= self.slots.len) return;
+        const old_len = self.slots.len;
+        const new_len = @max(len, old_len * 2);
+        const queue = try self.allocator.alloc(OwnerHandle, new_len);
+        errdefer self.allocator.free(queue);
+        self.slots = try self.allocator.realloc(self.slots, new_len);
+        @memset(self.slots[old_len..], .{});
+        for (0..self.count) |index| queue[index] = self.queue[(self.head + index) % self.queue.len];
+        self.allocator.free(self.queue);
+        self.queue = queue;
+        self.head = 0;
+    }
+
     pub fn register(self: *ReconcileQueue, owner: OwnerHandle) !void {
-        if (owner.slot >= self.slots.len or owner.generation == 0) return error.InvalidOwner;
+        if (owner.generation == 0) return error.InvalidOwner;
+        try self.reserve(owner.slot + 1);
         const slot = &self.slots[owner.slot];
         if (slot.registered) return error.OwnerAlreadyRegistered;
         slot.* = .{ .registered = true, .generation = owner.generation };
@@ -183,4 +201,28 @@ test "unregister removes queued work and rejects stale generations" {
     try queue.retry(work);
     try queue.complete(queue.take().?);
     try queue.unregister(replacement);
+}
+
+test "registering a higher owner slot grows the queue and keeps queued order" {
+    var queue: ReconcileQueue = undefined;
+    try queue.init(std.testing.allocator, 2);
+    defer queue.deinit();
+    const owners = [_]OwnerHandle{ .{ .slot = 0, .generation = 1 }, .{ .slot = 1, .generation = 1 } };
+    for (owners) |owner| try queue.register(owner);
+    // Wrap the ring before growing so reordering is exercised.
+    _ = try queue.markDirty(owners[0]);
+    try queue.complete(queue.take().?);
+    _ = try queue.markDirty(owners[1]);
+    _ = try queue.markDirty(owners[0]);
+    const late: OwnerHandle = .{ .slot = 39, .generation = 4 };
+    try queue.register(late);
+    _ = try queue.markDirty(late);
+    for ([_]OwnerHandle{ owners[1], owners[0], late }) |expected| {
+        const work = queue.take().?;
+        try std.testing.expectEqual(expected, work.owner);
+        try queue.complete(work);
+    }
+    try std.testing.expect(queue.take() == null);
+    for (owners) |owner| try queue.unregister(owner);
+    try queue.unregister(late);
 }

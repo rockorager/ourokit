@@ -207,10 +207,16 @@ the platform input queue, compositor-mirrored outputs and workspaces, inbound
 D-Bus method calls, mirrored PipeWire objects, and damage regions (merged
 when exceeded).
 
-Still fixed, though they count live objects: application windows (16; the
-Wayland client sizes its object tables from this when it connects), and the
-per-build virtual list (32 lists, 256 materialized rows) and layout builder
-(128) snapshots, which are copied by value between builds.
+Application windows grow too: window slots, per-window runtimes (each in its
+own allocation, since a runtime points into itself), the reconcile queue, and
+the Wayland client's object and ID tables (wayring `ObjectConfig.growable`).
+Buffer creation waits while the connection already queues the 28 descriptors
+libwayland accepts in one message, so many windows mapping at once stay within
+that protocol bound. `tests/many_windows.py` opens and closes 40 windows twice.
+
+Still fixed, though they count live objects: the per-build virtual list (32
+lists, 256 materialized rows) and layout builder (128) snapshots, which are
+copied by value between builds.
 
 `zig build test-stress` mounts and remounts 1000 component rows 50 times and
 cycles 10,000 actors, checking with `t:resources()` that native objects and the
