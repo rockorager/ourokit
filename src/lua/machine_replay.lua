@@ -1,4 +1,4 @@
-local ouro, M = ...
+local ouro, M, task_origin = ...
 -- Statechart recording and replay (design/statecharts.md §14). Charts hold
 -- all application state, so the inputs that cross into the root actors fully
 -- determine behavior. The recorder logs each input as one JSON line together
@@ -9,6 +9,18 @@ local ouro, M = ...
 
 local json = ouro.json
 local FORMAT, VERSION = 'ouro.machine.log', 1
+
+-- Input origins per task: hosts tag MCP action calls natively; activation
+-- hooks run under _with_origin. Sub-tasks do not inherit a tag.
+function M._current_origin() return task_origin and task_origin() or nil end
+function M._with_origin(origin, fn, ...)
+  if not task_origin then return fn(...) end
+  local previous = task_origin(origin)
+  local results = table.pack(pcall(fn, ...))
+  task_origin(previous)
+  if not results[1] then error(results[2], 0) end
+  return table.unpack(results, 2, results.n)
+end
 
 local function fail(message, ...)
   error(select('#', ...) > 0 and string.format(message, ...) or message, 0)
@@ -159,6 +171,25 @@ function M.recorder(write, options)
   end
 
   local hooks = {scheduler = options.scheduler}
+  -- Component props hold descriptions and callbacks: keep the plain data.
+  -- Replay re-runs the context function on it; a context that read a
+  -- dropped prop diverges at the start step.
+  function hooks.component_input(values)
+    local function project(value, depth)
+      value = raw(value)
+      local kind = type(value)
+      if kind == 'string' or kind == 'number' or kind == 'boolean' or value == json.null then return value end
+      if kind ~= 'table' or depth > 8 then return nil end
+      local out = {}
+      for k, v in pairs(value) do
+        if type(k) == 'string' or math.type(k) == 'integer' then out[k] = project(v, depth + 1) end
+      end
+      return out
+    end
+    local out = project(values, 0) or {}
+    out.children = nil
+    return safe(out)
+  end
   function hooks.enter(actor, kind, event, origin)
     local entry = {t = now() - r.t0, a = actor.path, r = json.array({})}
     if kind == 'input' then
@@ -167,7 +198,9 @@ function M.recorder(write, options)
       entry.e = safe(event)
     elseif kind == 'start' then
       entry.k, entry.m = 'start', actor.chart.id
-      if actor._restored then
+      if actor._component then
+        entry.input, entry.component = actor._recorded_input or {}, true
+      elseif actor._restored then
         local ok, snapshot = pcall(actor.persist, actor)
         if ok then entry.snapshot = snapshot else entry.unrecordable = tostring(snapshot) end
       else
@@ -402,16 +435,19 @@ function M.replay(source, options)
 
   -- The replay's own roots and their children, newest first: finished
   -- actors leave machine.actors() but may still get a stop.
+  -- Component ids hold '/' (instance paths), so match roots by prefix.
   local function actor_at(path)
-    local root_id, rest = path:match('^([^/]+)/?(.*)$')
     for i = #(roots or {}), 1, -1 do
       local actor = roots[i]
-      if actor.path == root_id and actor._status ~= 'stopped' then
+      local rest
+      if path == actor.path then rest = ''
+      elseif path:sub(1, #actor.path + 1) == actor.path .. '/' then rest = path:sub(#actor.path + 2) end
+      if rest and actor._status ~= 'stopped' then
         for id in rest:gmatch('[^/]+') do
           actor = actor._children[id]
-          if not actor then return nil end
+          if not actor then break end
         end
-        return actor
+        if actor then return actor end
       end
     end
   end
@@ -508,6 +544,7 @@ function M.replay(source, options)
         return false
       end
       local actor = chart:actor {id = entry.a, input = entry.input, snapshot = entry.snapshot, scheduler = scheduler}
+      if entry.component then actor._component, actor._recorded_input = true, entry.input end
       roots[#roots + 1] = actor
       actor:start()
       return true

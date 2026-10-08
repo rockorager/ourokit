@@ -37,7 +37,8 @@ pub fn install(state: *c.State) !void {
         return error.MachineInitializationFailed;
     c.lua_pushvalue(state, api);
     _ = c.lua_getfield(state, api, "machine");
-    if (c.lua_pcallk(state, 2, 0, 0, 0, null) != c.ok)
+    c.lua_pushcclosure(state, taskOrigin, 0);
+    if (c.lua_pcallk(state, 3, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     // Generated tests: guard-aware paths to every reachable state.
     const paths = @embedFile("machine_paths.lua");
@@ -87,6 +88,30 @@ fn atomic(state: *c.State) callconv(.c) c_int {
     }
     if (status != c.ok) return c.lua_error(state);
     return c.lua_gettop(state) - 1;
+}
+
+/// task_origin([name]) -> previous name or nil: reads, and with an argument
+/// replaces, the running task's input origin ('mcp', 'activation', or nil
+/// for none). Outside a task it returns nil and changes nothing.
+fn taskOrigin(state: *c.State) callconv(.c) c_int {
+    const vm = Vm.fromState(state) orelse return 0;
+    const origin = vm.runningOrigin() orelse return 0;
+    const previous = origin.*;
+    if (c.lua_gettop(state) >= 1) {
+        if (c.lua_type(state, 1) == c.type_nil) {
+            origin.* = .none;
+        } else {
+            var name_length: usize = 0;
+            const name = c.lua_tolstring(state, 1, &name_length) orelse return raiseText(state, "task origin must be a string or nil");
+            origin.* = std.meta.stringToEnum(@import("vm.zig").InputOrigin, name[0..name_length]) orelse
+                return raiseText(state, "unknown task origin");
+            if (origin.* == .none) return raiseText(state, "unknown task origin");
+        }
+    }
+    if (previous == .none) return 0;
+    const text = @tagName(previous);
+    _ = c.lua_pushlstring(state, text.ptr, text.len);
+    return 1;
 }
 
 /// Sets `ouro.machine.strict`: hosts make it follow development mode, so

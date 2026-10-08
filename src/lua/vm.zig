@@ -34,8 +34,13 @@ const YieldRequest = enum {
     exit,
 };
 
+/// Where a task's work came from, for statechart input recording
+/// (design/statecharts.md §14). Hosts tag the tasks they start.
+pub const InputOrigin = enum(u8) { none, mcp, activation };
+
 const Slot = struct {
     generation: u32 = 0,
+    input_origin: InputOrigin = .none,
     active: bool = false,
     next_free: u32 = invalid_slot,
     thread: ?*c.State = null,
@@ -859,6 +864,19 @@ pub const Vm = struct {
         }
         self.releaseSlot(handle);
         return status;
+    }
+
+    /// Tags a task's input origin (an MCP action call, an activation).
+    pub fn setTaskOrigin(self: *Vm, handle: TaskHandle, origin: InputOrigin) !void {
+        (try self.activeSlot(handle)).input_origin = origin;
+    }
+
+    /// The running task's input origin and a pointer to change it, or null
+    /// outside a task.
+    pub fn runningOrigin(self: *Vm) ?*InputOrigin {
+        const handle = self.running orelse return null;
+        const slot = self.activeSlot(handle) catch return null;
+        return &slot.input_origin;
     }
 
     fn activeSlot(self: *Vm, handle: TaskHandle) !*Slot {

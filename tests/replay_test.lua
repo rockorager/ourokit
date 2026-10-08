@@ -216,6 +216,77 @@ return {
     assert(report.ok, machine.replay_text(report))
   end,
 
+  ['component machines record by instance path and replay with their plain props'] = function(t)
+    local chart = machine.create {
+      id = 'collapsible', initial = 'closed',
+      context = function(props) return { title = props.title, opened = 0 } end,
+      states = {
+        closed = { on = { TOGGLE = { target = 'open', actions = machine.assign { opened = function(c) return c.opened + 1 end } } } },
+        open = { on = { TOGGLE = 'closed' }, after = { [500] = 'closed' } },
+      },
+    }
+    local Collapsible = machine.component(chart, function(self, props)
+      return o.column { key = 'box',
+        o.button { key = 'toggle', label = self:context().title, send = self:event('TOGGLE') } }
+    end)
+    local Panel = machine.component(machine.create { id = 'panel', initial = 'shown', states = { shown = {} } },
+      function(self, props)
+        return o.column { key = 'inner', Collapsible { key = 'details', title = 'Details', on_close = function() end } }
+      end)
+    local lines = {}
+    local recorder = machine.recorder(function(line) lines[#lines + 1] = line end)
+    t:mount(function()
+      return o.column { key = 'root',
+        Collapsible { key = 'first', title = 'First' },
+        Collapsible { key = 'second', title = 'Second' },
+        Panel { key = 'panel' },
+      }
+    end)
+    t:click('root/first/box/toggle')
+    t:click('root/second/box/toggle')
+    t:click('root/panel/inner/details/box/toggle')
+    t:advance(500)
+    t:click('root/first/box/toggle')
+    recorder.stop()
+    local actors, inputs = {}, {}
+    for i = 2, #lines do
+      local entry = o.json.decode(lines[i])
+      if entry.k == 'start' then actors[#actors + 1] = entry.a; inputs[entry.a] = entry.input end
+    end
+    assert(table.concat(actors, ',') == 'collapsible@first,collapsible@second,collapsible@panel/details',
+      table.concat(actors, ','))
+    assert(inputs['collapsible@panel/details'].title == 'Details' and inputs['collapsible@panel/details'].on_close == nil,
+      'props keep plain data only')
+    local report = machine.replay(lines)
+    assert(report.ok, machine.replay_text(report))
+    assert(report.compared == #lines - 1)
+  end,
+
+  ['activation hooks and MCP handlers tag their task, so their events record those origins'] = function(t)
+    local chart = machine.create { id = 'toggle', initial = 'off',
+      states = { off = { on = { GO = 'on' } }, on = { on = { GO = 'off' } } } }
+    local lines = {}
+    local recorder = machine.recorder(function(line) lines[#lines + 1] = line end)
+    local actor = chart:start { id = 'toggle' }
+    -- A callback is a task. desktop_application.lua runs activation hooks
+    -- like this; the host tags MCP action tasks natively.
+    t:mount(function()
+      return o.button { key = 'hook', label = 'hook', on_press = function()
+        machine._with_origin('activation', function() actor:send('GO') end)
+        actor:send('GO')
+      end }
+    end)
+    t:click('hook')
+    recorder.stop()
+    actor:stop()
+    local origins = {}
+    for i = 2, #lines do
+      local entry = o.json.decode(lines[i])
+      if entry.k == 'event' then origins[#origins + 1] = entry.o end
+    end
+    assert(table.concat(origins, ',') == 'activation,app', table.concat(origins, ','))
+  end,
+
   ['machine.advance needs a virtual clock'] = function()
     fails(function() machine.advance(-1) end, 'nonnegative integer')
   end,

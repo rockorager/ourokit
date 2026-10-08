@@ -87,7 +87,12 @@ function M.render(definition, props, children, parent, visual_parent)
     local record = old
     if not record then
         serial = serial + 1
-        record = { token = serial, identity = identity, definition = definition, output = {}, values = values }
+        -- The instance path: the keys of the enclosing component instances
+        -- and this one, e.g. 'notes/details'. Initializers receive it, and
+        -- the initial property values for recording.
+        local enclosing = t.current and t.current.record.path
+        record = { token = serial, identity = identity, definition = definition, output = {}, values = values,
+            path = enclosing and (enclosing .. '/' .. props.key) or props.key }
         record.proxy = make_props(record)
     end
     t.mounts[identity], t.staged_mounts[identity] = record, record
@@ -110,7 +115,7 @@ function M.render(definition, props, children, parent, visual_parent)
         update.retained = false
         restart_reader(record.token)
         if not old then
-            record.render, record.unmount = definition[1](record.proxy)
+            record.render, record.unmount = definition[1](record.proxy, record.path, record.values)
             assert(is_function(record.render), "component initializer must return a render function")
             assert(record.unmount == nil or is_function(record.unmount),
                 "component initializer's second result must be an unmount function")

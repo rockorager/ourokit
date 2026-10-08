@@ -31,9 +31,15 @@ local function deliver(member, args)
   end
   if hook then
     local result, err
-    if member == 'Activate' then result, err = hook(data)
-    elseif member == 'Open' then result, err = hook(args[1], data)
-    else result, err = hook(args[1], args[2], data) end
+    -- Statechart events the hook sends record with origin 'activation'.
+    local machine = ouro.machine
+    local function call(fn, ...)
+      if machine and machine._with_origin then return machine._with_origin('activation', fn, ...) end
+      return fn(...)
+    end
+    if member == 'Activate' then result, err = call(hook, data)
+    elseif member == 'Open' then result, err = call(hook, args[1], data)
+    else result, err = call(hook, args[1], args[2], data) end
     if err then return nil, err end
   end
   state.requested = true

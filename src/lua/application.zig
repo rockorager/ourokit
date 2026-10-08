@@ -592,7 +592,10 @@ pub const Application = struct {
         } else c.lua_createtable(self.state, 0, 0);
         const argument = c.luaL_ref(self.state, c.registry_index);
         defer c.luaL_unref(self.state, c.registry_index, argument);
-        return vm.spawnRetainedReference(scope, reference, &.{.{ .registry = argument }});
+        const handle = try vm.spawnRetainedReference(scope, reference, &.{.{ .registry = argument }});
+        // Statechart events the handler sends record with origin 'mcp'.
+        vm.setTaskOrigin(handle, .mcp) catch {};
+        return handle;
     }
 
     /// Converts the first action return value to arena-owned JSON and releases

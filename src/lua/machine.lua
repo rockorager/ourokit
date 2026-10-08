@@ -1176,7 +1176,8 @@ local function recorded(actor)
   if not hooks then return false end
   local root = actor
   while root._parent do root = root._parent end
-  return not root._lazy and root._scheduler == (hooks.scheduler or M.default_scheduler)
+  -- Component machines record too, keyed by instance path (machine.component).
+  return root._scheduler == (hooks.scheduler or M.default_scheduler)
 end
 
 -- Runs fn(...) as processing of `actor`; at the outermost level it is an
@@ -1188,7 +1189,9 @@ local function boundary(actor, kind, event, origin, fn, ...)
   end
   local hooks = recorded_depth == 0 and recorded(actor) and M._hooks or nil
   if hooks then
-    if origin == 'external' then origin = depth > 0 and 'component' or M._origin or 'app' end
+    if origin == 'external' then
+      origin = depth > 0 and 'component' or (M._current_origin and M._current_origin()) or M._origin or 'app'
+    end
     hooks.enter(actor, kind, event, origin)
   end
   local counted = recorded(actor)
@@ -1484,12 +1487,25 @@ end
 -- When the instance leaves (unmount, key reuse, owner disposal, or a build
 -- that rolled back), the runtime's on_unmount hook stops the actor: its
 -- scope retires and its work ends. Remounting creates a fresh actor.
+local component_ids = {} -- live component actors by id; unmount removes them
 function M.component(chart, render)
   if type(chart) ~= 'table' or not chart.__chart then fail('component expects a chart') end
   if type(render) ~= 'function' then fail('component expects a render function') end
-  return ouro.stateful(function(props)
-    local actor = chart:actor {input = props, lazy = true, scope = 'task'}
-    return function() return render(actor, props) end, function() actor:stop() end
+  return ouro.stateful(function(props, path, values)
+    -- Keyed by instance path, so recordings and replay tell instances apart
+    -- (design §14); a second live instance on the same path gets a suffix.
+    local id = chart.id .. '@' .. tostring(path or props.key)
+    local base, n = id, 1
+    while component_ids[id] and component_ids[id]._status ~= 'stopped' do n = n + 1; id = base .. '#' .. n end
+    local actor = chart:actor {id = id, input = props, lazy = true, scope = 'task'}
+    actor._component = true
+    -- A recorder logs the plain part of the initial props (§14).
+    if M._hooks and M._hooks.component_input then actor._recorded_input = M._hooks.component_input(values) end
+    component_ids[id] = actor
+    return function() return render(actor, props) end, function()
+      actor:stop()
+      if component_ids[id] == actor then component_ids[id] = nil end
+    end
   end)
 end
 
