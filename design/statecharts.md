@@ -844,7 +844,9 @@ never move (`core.StableSlots`).
 **Still fixed, not by design (open):**
 - per-build virtual list snapshots (32 lists, 256 materialized rows) and
   layout-builder snapshots (128), which are copied by value;
-- clipboard requests (16).
+- clipboard: at most 16 concurrent copy/paste requests per app
+  (`clipboard_request_capacity`; more raise `ClipboardRequestCapacityExceeded`)
+  and a queue of 128 pending clipboard actions (`src/app/clipboard.zig`).
 
 **Fixed by design.** These limits guard against hostile input, protocol
 abuse or pathological depth. They do not count live objects:
