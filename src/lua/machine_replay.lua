@@ -1,4 +1,8 @@
-local ouro, M, task_origin = ...
+local ouro, M, task_origin, coroutine_library = ...
+-- Private to the statechart runtime (applications have no coroutines): the
+-- manual scheduler runs invokes and tasks in coroutines so machine.sleep
+-- can wait for its virtual clock.
+M._coroutine = coroutine_library
 -- Statechart recording and replay (design/statecharts.md §14). Charts hold
 -- all application state, so the inputs that cross into the root actors fully
 -- determine behavior. The recorder logs each input as one JSON line together
@@ -51,14 +55,27 @@ end
 --   {"$f": "nan"|"inf"|"-inf"} the non-finite numbers;
 --   {"$t": [[k, v], ...]} a table with non-string keys that is not a dense
 --                         array (sparse or mixed maps, boolean or float keys);
---   {"$o": {...}}         an object whose only key is itself "$f", "$t" or
---                         "$o", escaped.
+--   {"$h": "<type>"}      a native handle (userdata, function, thread): its
+--                         metatable __name when known, else its Lua type.
+--                         Opaque: replay passes the marker table instead;
+--   {"$x": "<hex>"}       a string that is not valid UTF-8 (raw bytes);
+--   {"$o": {...}}         an object whose only key is itself a tag, escaped.
 -- Everything else is plain JSON, so lines stay readable. revive() undoes the
 -- tags after decoding; version 1 logs have none and decode as before.
 ---------------------------------------------------------------------------
 local install, uninstall -- recorder registry, below
 local raw = M.raw
-local TAGS = {['$f'] = true, ['$t'] = true, ['$o'] = true}
+local TAGS = {['$f'] = true, ['$t'] = true, ['$o'] = true, ['$h'] = true, ['$x'] = true}
+-- The interpreter's machine.inspectable names handles ({"$h": name}); use
+-- it when present.
+local function handle(value, kind)
+  local inspect = M.inspectable
+  if inspect then
+    local ok, marker = pcall(inspect, value)
+    if ok and type(marker) == 'table' and type(marker['$h']) == 'string' then return {['$h'] = marker['$h']} end
+  end
+  return {['$h'] = kind}
+end
 local function key_order(a, b)
   local ta, tb = type(a[1]), type(b[1])
   if ta ~= tb then return ta < tb end
@@ -69,7 +86,11 @@ end
 local function safe(value, seen)
   value = raw(value)
   local kind = type(value)
-  if kind == 'nil' or kind == 'boolean' or kind == 'string' then return value end
+  if kind == 'nil' or kind == 'boolean' then return value end
+  if kind == 'string' then
+    if utf8.len(value) then return value end
+    return {['$x'] = (value:gsub('.', function(c) return string.format('%02x', c:byte()) end))}
+  end
   if kind == 'number' then
     if value ~= value then return {['$f'] = 'nan'} end
     if value == math.huge then return {['$f'] = 'inf'} end
@@ -78,9 +99,9 @@ local function safe(value, seen)
     return value
   end
   if value == json.null then return value end
-  if kind ~= 'table' then return '<' .. kind .. '>' end
+  if kind ~= 'table' then return handle(value, kind) end
   seen = seen or {}
-  if seen[value] then return '<cycle>' end
+  if seen[value] then return {['$h'] = 'cycle'} end
   seen[value] = true
   local count, array = 0, true
   for k in pairs(value) do
@@ -256,6 +277,7 @@ local function decode_plain(text)
   return lua_decode(text)
 end
 
+local revived_handles = 0
 local function revive(value)
   if type(value) ~= 'table' or value == json.null then return value end
   local key, inner = next(value)
@@ -269,6 +291,11 @@ local function revive(value)
       local out = {}
       for _, pair in ipairs(inner) do out[revive(pair[1])] = revive(pair[2]) end
       return out
+    elseif key == '$h' then
+      revived_handles = revived_handles + 1
+      return {['$h'] = inner}
+    elseif key == '$x' then
+      return (tostring(inner):gsub('%x%x', function(h) return string.char(tonumber(h, 16)) end))
     else
       local out = {}
       for k, v in pairs(inner) do out[k] = revive(v) end
@@ -599,9 +626,11 @@ local function decode_lines(source)
     fail('replay: unsupported log version %s', tostring(header.version))
   end
   -- Version 1 has no type tags.
+  revived_handles = 0
   if header.version >= 2 then
     for i, entry in ipairs(entries) do entries[i] = revive(entry) end
   end
+  header.handles = revived_handles
   return header, entries
 end
 
@@ -682,7 +711,8 @@ function M.replay(source, options)
   local t0 = header.t0 or 0
   local observed, observed_lines = {}, {}
   local scheduler, recorder, roots, released
-  local report = {format = 'ouro.machine.replay', ok = true, entries = #entries, compared = 0}
+  local report = {format = 'ouro.machine.replay', ok = true, entries = #entries, compared = 0,
+    handles = header.handles}
   -- options.records(record): the §10 inspection stream of the replayed
   -- actors (graphs, microsteps, timers, invokes), e.g. for the visualizer.
   local unsubscribe = options.records and M.inspect(function(record)
@@ -892,6 +922,10 @@ function M.replay_text(report)
       out[#out + 1] = string.format('  %-40s recorded %s', diff.path, show(diff.recorded))
       out[#out + 1] = string.format('  %-40s replayed %s', '', show(diff.replayed))
     end
+  end
+  if (report.handles or 0) > 0 then
+    out[#out + 1] = string.format('note: %d recorded values were native handles ({"$h": type}); '
+      .. 'replay passed opaque markers in their place', report.handles)
   end
   return table.concat(out, '\n')
 end

@@ -545,6 +545,14 @@ pub fn luaToJson(
             break :blk .{ .string = try allocator.dupe(u8, string[0..length]) };
         },
         c.type_table => try luaTableToJson(state, index, allocator, depth, value_count),
+        // A statechart's read-only view (an action's event or context)
+        // encodes as the plain data behind it.
+        c.type_userdata => if (c.luaL_testudata(state, index, "ouro.machine.view") != null) blk: {
+            value_count.* -= 1;
+            _ = c.lua_getiuservalue(state, index, 1);
+            defer c.lua_settop(state, -2);
+            break :blk try luaToJson(state, -1, allocator, depth, value_count);
+        } else error.UnsupportedValue,
         else => error.UnsupportedValue,
     };
 }
