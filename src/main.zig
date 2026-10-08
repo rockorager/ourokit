@@ -449,7 +449,10 @@ fn replayWorker(init: std.process.Init, path: []const u8, name: ?[]const u8) !vo
     if (name == null) return writeStdout(init, "[\"replay\"]");
     if (!std.mem.eql(u8, name.?, "replay")) return error.UnknownTest;
     const a = init.arena.allocator();
-    var directory = std.fs.path.dirname(path) orelse ".";
+    // Walk up from the log's absolute directory: a relative path such as
+    // `x_test.jsonl` has no parent component to walk through.
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(init.io, path, a);
+    var directory = std.fs.path.dirname(absolute) orelse return error.ApplicationManifestNotFound;
     const manifest = while (true) {
         const candidate = try std.fs.path.join(a, &.{ directory, ourokit.bundle.manifest_file_name });
         if (std.Io.Dir.cwd().access(init.io, candidate, .{})) |_| break candidate else |_| {}

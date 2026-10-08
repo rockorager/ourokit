@@ -62,6 +62,7 @@ TESTS = (
     'component_machines.py',
     'launcher.py',
     'chart_replay.py',
+    'chart_tools.py',
     'desktop_native.py',
 )
 
