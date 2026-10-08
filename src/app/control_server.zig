@@ -13,7 +13,7 @@ const endpoint = @import("control_endpoint.zig");
 pub const reload_method = "runtime.reload";
 pub const status_method = "runtime.status";
 
-const client_capacity = 8;
+pub const client_capacity = 8;
 const receive_capacity = 64 * 1024;
 const subscription_capacity = 32;
 

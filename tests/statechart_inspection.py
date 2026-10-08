@@ -18,6 +18,7 @@ from pathlib import Path
 import select
 import subprocess
 import tempfile
+import threading
 import time
 
 from application_services import BINARY, RpcStream, call, development_path, record, request
@@ -300,6 +301,88 @@ return o.app {id = 'dev.ourokit.statechart-component', run = function()
   end}}}
 end}
 '''
+def send_robustness():
+    """runtime.send cannot end the app, never holds up other clients, waits
+    for the next commit when states are omitted, and stops when cancelled
+    (second review M-2, M-6, L-4)."""
+    with tempfile.TemporaryDirectory(prefix='ourokit-statechart-send2-') as directory:
+        root = Path(directory)
+        source = root / 'app.lua'
+        source.write_text(QUIET)
+        env = dict(os.environ, XDG_RUNTIME_DIR=str(root), XDG_STATE_HOME=str(root / 'state'))
+        process = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--headless'],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        def counter():
+            rows = statecharts(endpoint, after=0, limit=0, actors=False, rollup=True)['rollup']['actors']
+            return next(r for r in rows if r['actor'] == 'counter')
+
+        def background(arguments):
+            box = {}
+            def run():
+                began = time.monotonic()
+                result = call(endpoint, 'runtime.send', arguments)
+                box.update(result=result, took=time.monotonic() - began)
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            return thread, box
+
+        try:
+            endpoint = development_path(root, process)
+            time.sleep(.3)
+            # M-2: wait.timeout_ms is bounded; nothing a client sends ends the app.
+            for timeout, code in ((20000000000000, 'InvalidWaitTimeout'), (60001, 'InvalidWaitTimeout'),
+                                  (-1, 'InvalidDevelopmentArgument')):
+                out, failed = send(endpoint, 'counter', {'type': 'SET', 'n': 1},
+                                   wait={'states': ['armed'], 'timeout_ms': timeout})
+                assert failed and out['error']['code'] == code, (timeout, out)
+            time.sleep(.5)
+            assert process.poll() is None, 'runtime.send ended the app'
+            out, failed = send(endpoint, 'counter', {'type': 'SET', 'n': 1}, wait={'states': ['idle'], 'timeout_ms': 60000})
+            assert not failed and out['wait'] == {'matched': True}, out
+            # L-4: without states the wait ends at the next commit, not at once.
+            out, failed = send(endpoint, 'counter', {'type': 'SET', 'n': 2}, wait={'timeout_ms': 300})
+            assert not failed and out['wait']['matched'] is False and 'WaitTimeout' in out['wait']['error'], out
+            waiting, box = background({'actor': 'counter', 'event': {'type': 'SET', 'n': 3}, 'wait': {'timeout_ms': 5000}})
+            time.sleep(.4)
+            send(endpoint, 'counter', {'type': 'SET', 'n': 4})
+            waiting.join(5)
+            out = box['result']['structuredContent']
+            assert out['wait'] == {'matched': True} and .3 < box['took'] < 2, (out, box['took'])
+            # M-6: while one client waits, other clients are served at once,
+            # and one of them can make the wait match.
+            waiting, box = background({'actor': 'counter', 'event': {'type': 'SET', 'n': 5},
+                                       'wait': {'states': ['armed'], 'timeout_ms': 8000}})
+            time.sleep(.4)
+            began = time.monotonic()
+            row = counter()
+            assert time.monotonic() - began < 1 and row['waits'] == 1 and row['observers'] == 1, row
+            out, failed = send(endpoint, 'counter', {'type': 'ARM'})
+            assert not failed and out['accepted'], out
+            waiting.join(5)
+            out = box['result']['structuredContent']
+            assert out['wait'] == {'matched': True} and out['states'] == ['armed'] and box['took'] < 2, (out, box['took'])
+            assert counter()['waits'] == 0 and counter()['observers'] == 0
+            # Cancelling a waiting send ends its wait and drops its observer.
+            send(endpoint, 'counter', {'type': 'DISARM'})
+            stream = RpcStream(endpoint)
+            stream.socket.sendall(record('tools/call', {'name': 'runtime.send', 'arguments': {
+                'actor': 'counter', 'event': {'type': 'SET', 'n': 6}, 'wait': {'states': ['armed'], 'timeout_ms': 60000}}}, 'slow'))
+            poll(lambda: counter()['waits'] == 1, 'the send never started waiting', timeout=5)
+            assert counter()['observers'] == 1
+            stream.socket.sendall(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/cancelled',
+                                              'params': {'requestId': 'slow'}}).encode() + b'\n')
+            poll(lambda: (lambda r: r['waits'] == 0 and r['observers'] == 0)(counter()), 'the cancelled wait kept running', timeout=5)
+            stream.close()
+            assert process.poll() is None
+            print('PASS runtime.send robustness: bounded wait timeout keeps the app alive; waits do not block other '
+                  'clients; omitted states wait for the next commit; cancellation ends the wait and its observer')
+        finally:
+            process.terminate()
+            _, stderr = process.communicate(timeout=10)
+            assert b'panic' not in stderr and b'leaked' not in stderr, stderr
+
+
 ROOT = Path(__file__).resolve().parents[1]
 VISUALIZER = ROOT / 'tools/statechart-visualizer/app.lua'
 
@@ -487,5 +570,6 @@ def native():
 if __name__ == '__main__':
     main()
     send_and_push()
+    send_robustness()
     if os.environ.get('OUROKIT_TEST_WAYLAND_DISPLAY'):
         native()

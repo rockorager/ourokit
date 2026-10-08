@@ -9,6 +9,22 @@ const SourceReload = @import("source_reload.zig").SourceReload;
 const WindowRuntime = @import("window_runtime.zig").WindowRuntime;
 const PathIdentity = @import("control_endpoint.zig").PathIdentity;
 const lua = @import("../lua/root.zig");
+const task = @import("../task/root.zig");
+
+/// Upper bound of runtime.send's wait.timeout_ms (the MCP schema subset has
+/// no numeric constraints, so it is enforced here and in the Lua bridge).
+pub const max_wait_ms = 60_000;
+
+/// A runtime.send delivery in flight. It runs as a task in a scope of its own
+/// and does not occupy the single pending slot, so other clients' requests
+/// are served while it waits; cancelling it retires the scope, which ends the
+/// task, its wait_for and its observer.
+const Send = struct {
+    request: control.DevelopmentRequest,
+    token: u64,
+    scope: task.ScopeHandle,
+    generation: u64,
+};
 
 pub const tools = @embedFile("development_tools.json");
 pub const Window = struct { id: []const u8, runtime: *WindowRuntime };
@@ -18,8 +34,8 @@ pub const Service = struct {
     io: std.Io,
     pending: ?control.DevelopmentRequest = null,
     playback: ?dev.Playback = null,
-    /// runtime.send delivery running as a task in the application VM.
-    statechart_send: ?u64 = null,
+    /// runtime.send deliveries in flight (at most one per client).
+    sends: [control.client_capacity]?Send = @splat(null),
     statecharts: ?*lua.StatechartInspector = null,
     runtime: ?*WindowRuntime = null,
     failure: ?anyerror = null,
@@ -28,6 +44,11 @@ pub const Service = struct {
 
     pub fn deinit(self: *Service) void {
         if (self.pending) |*request| request.deinit();
+        for (&self.sends) |*entry| if (entry.*) |*send| {
+            if (self.statecharts) |store| store.dropResult(send.token);
+            send.request.deinit();
+            entry.* = null;
+        };
         for (&self.captures) |*entry| if (entry.*) |capture| {
             capture.identity.unlink(capture.path);
             self.allocator.free(capture.path);
@@ -40,8 +61,6 @@ pub const Service = struct {
     }
 
     fn finish(self: *Service) void {
-        if (self.statechart_send) |token| self.statecharts.?.dropResult(token);
-        self.statechart_send = null;
         self.pending.?.deinit();
         self.pending = null;
         self.playback = null;
@@ -52,7 +71,8 @@ pub const Service = struct {
     /// True means queued input or consumed requests require another turn.
     /// False allows the runner to sleep for normal native/I/O completions.
     pub fn poll(self: *Service, server: *control.ControlServer, reload: *SourceReload, windows: []const Window) !bool {
-        if (self.pending == null) self.pending = server.takeDevelopmentRequest() orelse return false;
+        const sent = try self.pollSends(server, reload);
+        if (self.pending == null) self.pending = server.takeDevelopmentRequest() orelse return sent;
         const request = &self.pending.?;
         if (!server.developmentPending(request.token) or (self.playback != null and server.reloading)) {
             if (self.playback) |*playback| try playback.cancel(self.runtime.?);
@@ -63,16 +83,6 @@ pub const Service = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        if (self.statechart_send) |token| {
-            const store = self.statecharts.?;
-            const bytes = store.takeResult(token) orelse return false;
-            defer self.allocator.free(bytes);
-            self.statechart_send = null;
-            const value = try std.json.parseFromSliceLeaky(mcp.Value, a, bytes, .{ .allocate = .alloc_always });
-            _ = try server.completeDevelopment(request.token, value, mcp.get(value, "error") != null);
-            self.finish();
-            return true;
-        }
         if (self.playback) |*playback| {
             const runtime = self.runtime.?;
             // Avoid touching a deinitialized/reused slot after native close.
@@ -183,11 +193,8 @@ pub const Service = struct {
         if (std.mem.eql(u8, name, "runtime.statecharts")) return try statecharts(a, reload, args);
         if (std.mem.eql(u8, name, "runtime.send")) {
             // Delivered by a task in the application VM: send needs the task
-            // phase for effects and wait_for. poll completes the request.
-            const store = reload.config.statecharts orelse return error.StatechartInspectionUnavailable;
-            const bytes = try std.json.Stringify.valueAlloc(a, args, .{});
-            self.statechart_send = try lua.sendStatechartEvent(&reload.active().vm, store, bytes);
-            self.statecharts = store;
+            // phase for effects and wait_for. pollSends completes it.
+            try self.startSend(a, reload, args);
             return null;
         }
         if (server.reloading) return error.DevelopmentReloadInProgress;
@@ -223,6 +230,53 @@ pub const Service = struct {
         self.captures[self.capture_index] = .{ .path = path, .identity = identity };
         self.capture_index = (self.capture_index + 1) % self.captures.len;
         return result;
+    }
+
+    /// Validates and spawns a runtime.send, then moves the request out of the
+    /// pending slot into `sends`.
+    fn startSend(self: *Service, a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !void {
+        const store = reload.config.statecharts orelse return error.StatechartInspectionUnavailable;
+        if (mcp.get(args, "wait")) |wait| if (wait == .object) {
+            if (try unsignedField(wait, "timeout_ms", 0) > max_wait_ms) return error.InvalidWaitTimeout;
+        };
+        const slot = for (&self.sends) |*entry| {
+            if (entry.* == null) break entry;
+        } else return error.DevelopmentSendCapacityExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(a, args, .{});
+        const vm = &reload.active().vm;
+        const scope = try vm.openScope(vm.scheduler.application_scope);
+        errdefer vm.closeScope(scope) catch {};
+        const token = try lua.sendStatechartEvent(vm, store, scope, bytes);
+        self.statecharts = store;
+        slot.* = .{ .request = self.pending.?, .token = token, .scope = scope, .generation = reload.generation };
+        self.pending = null;
+    }
+
+    /// Completes finished sends and stops cancelled ones (request cancelled,
+    /// client gone, or source reloaded). True when any slot changed.
+    fn pollSends(self: *Service, server: *control.ControlServer, reload: *SourceReload) !bool {
+        var changed = false;
+        for (&self.sends) |*entry| if (entry.*) |*send| {
+            const store = self.statecharts.?;
+            const same_vm = send.generation == reload.generation;
+            if (server.developmentPending(send.request.token)) {
+                const bytes = store.takeResult(send.token) orelse continue;
+                defer self.allocator.free(bytes);
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const value = try std.json.parseFromSliceLeaky(mcp.Value, arena.allocator(), bytes, .{ .allocate = .alloc_always });
+                _ = try server.completeDevelopment(send.request.token, value, mcp.get(value, "error") != null);
+            } else {
+                store.dropResult(send.token);
+            }
+            // A finished task's scope is empty; a cancelled one's task, wait
+            // and observer unwind. A reload already retired the old VM's.
+            if (same_vm) reload.active().vm.closeScope(send.scope) catch {};
+            send.request.deinit();
+            entry.* = null;
+            changed = true;
+        };
+        return changed;
     }
 
     fn sendError(self: *Service, server: *control.ControlServer, err: anyerror) !void {
@@ -297,8 +351,14 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
     var collect: Collect = .{ .a = a, .text = text, .list = .init(a) };
     _ = try store.each(after, @intCast(limit), &collect, Collect.visit);
     const first = store.firstSequence();
+    const next = collect.last orelse @max(after, first -| 1);
     var result = try mcp.object(a, .{
-        .{ "next", integer(collect.last orelse @max(after, first -| 1)) },
+        .{ "next", integer(next) },
+        // Records past `next` exist (limit or the byte budget cut the page).
+        .{ "more", mcp.Value{ .bool = next + 1 < store.next_sequence } },
+        // Changes when the instance restarts on the same socket path; a
+        // client then resets its cursor and seed.
+        .{ "epoch", integer(store.start_ns) },
         .{ "first", integer(first) },
         .{ "dropped", mcp.Value{ .bool = after + 1 < first and store.next_sequence > 1 } },
         .{ "time_ms", integer(store.elapsedMs()) },
@@ -321,7 +381,8 @@ fn statecharts(a: std.mem.Allocator, reload: *SourceReload, args: mcp.Value) !mc
         for (store.actors.keys(), store.actors.values()) |path, actor| {
             const started = try Decode.value(a, actor.started, text);
             const latest = try Decode.value(a, actor.latest, text);
-            try actors.append(try mcp.object(a, .{ .{ "actor", mcp.string(path) }, .{ "started", started }, .{ "latest", latest } }));
+            try actors.append(try mcp.object(a, .{ .{ "actor", mcp.string(path) }, .{ "started", started }, .{ "latest", latest },
+                .{ "latest_sequence", integer(actor.latest_sequence) } }));
         }
         try result.object.put(a, "actors", .{ .array = actors });
     }

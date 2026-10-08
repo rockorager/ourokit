@@ -5,7 +5,7 @@
 --   inspect(path)       one actor's complete current state, as JSON
 --   send(token, json)   runtime.send, run as a task; reports through complete()
 --   rollup()            one summary row per live actor (the overview), as JSON
-local publish, complete, ouro = ...
+local publish, complete, ouro, closing = ...
 local machine, json = ouro.machine, ouro.json
 if not machine then return nil end
 local unsubscribe
@@ -14,6 +14,7 @@ local unsubscribe
 -- errors (failed invokes and children, error.* and surface.failed.* events,
 -- record.error) and the last of each.
 local stats, since_ms = {}, nil
+local MAX_WAIT_MS = 60000 -- runtime.send wait.timeout_ms bound (also checked by the host)
 
 local function error_of(record)
   if type(record.error) == 'table' then return record.error.code or record.error.message or 'error' end
@@ -127,6 +128,12 @@ local function inspect(path)
     graph = started.graph, snapshot = record})
 end
 
+local function count_keys(t)
+  local n = 0
+  for _ in pairs(t or {}) do n = n + 1 end
+  return n
+end
+
 -- The overview: one row per live actor, from live state plus the counters
 -- kept while attached (observed_since_ms says since when).
 local function rollup()
@@ -148,6 +155,9 @@ local function rollup()
     rows[#rows + 1] = {actor = actor.path, machine = actor.chart.id, parent = actor._parent and actor._parent.path,
       status = actor:status(), states = json.array(leaves), timers = #actor:pending_timers(),
       invokes = #actor:pending_invokes(), records = s.records, rejected = s.rejected, errors = s.errors,
+      -- Per-actor observers (actor:observe) and pending wait_for calls: why
+      -- an actor builds records, and whether a cancelled wait let go.
+      observers = #(actor._observers or {}), waits = count_keys(actor._waiters),
       last_error = s.last_error, last_event = s.last_event, last_time_ms = s.last_time_ms,
       changed_ms = s.changed_ms, time_ms = now}
   end
@@ -171,23 +181,50 @@ local function deliver(request)
   if type(request.event) ~= 'table' or type(request.event.type) ~= 'string' then
     error('InvalidEvent: event must be a table with a string type', 0)
   end
+  -- wait is validated before anything is sent: timeout_ms 0..MAX_WAIT_MS
+  -- (ouro.sleep rejects durations past ~584 years, and that error would
+  -- surface in wait_for's timer task), states a list of state ids.
+  local wait_states, timeout
+  if request.wait ~= nil then
+    if type(request.wait) ~= 'table' then error('InvalidArgument: wait must be an object', 0) end
+    wait_states, timeout = request.wait.states, request.wait.timeout_ms
+    if timeout == nil then timeout = 5000 end
+    if math.type(timeout) ~= 'integer' or timeout < 0 or timeout > MAX_WAIT_MS then
+      error('InvalidArgument: wait.timeout_ms must be an integer from 0 to ' .. MAX_WAIT_MS, 0)
+    end
+    if wait_states ~= nil then
+      if type(wait_states) ~= 'table' then error('InvalidArgument: wait.states must be a list of state ids', 0) end
+      for _, id in ipairs(wait_states) do
+        if type(id) ~= 'string' then error('InvalidArgument: wait.states must be a list of state ids', 0) end
+      end
+    end
+  end
   local before = machine.plain(actor:snapshot()).context or {}
   local last
-  local stop = actor:observe(function(record) if record.kind == 'transition' then last = record end end)
+  -- Closed however this task ends, cancellation included (runtime.send's
+  -- request cancelled or its client gone retires the task's scope).
+  local observer <close> = closing(actor:observe(function(record)
+    if record.kind == 'transition' then last = record end
+  end))
   local ok, accepted, reason = pcall(actor._send, actor, request.event, 'dev')
   local wait
   if ok and request.wait then
-    local states, timeout = request.wait.states, request.wait.timeout_ms or 5000
+    -- wait_for checks the predicate once before parking: without states,
+    -- that first check says no, so the wait ends at the next commit.
+    local first = true
     local matched, err = pcall(machine.wait_for, actor, function(snapshot)
-      if not states then return true end
-      for _, id in ipairs(states) do
+      if not wait_states then
+        local now = not first
+        first = false
+        return now
+      end
+      for _, id in ipairs(wait_states) do
         if machine.matches(snapshot, id) then return true end
       end
       return false
-    end, {timeout = math.tointeger(timeout) or 5000})
+    end, {timeout = timeout})
     wait = {matched = matched, error = not matched and tostring(err) or nil}
   end
-  stop()
   if not ok then error(accepted, 0) end
   local snapshot = machine.plain(actor:snapshot())
   local after = snapshot.context or {}

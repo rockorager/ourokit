@@ -10,6 +10,7 @@
 const std = @import("std");
 const c = @import("c.zig");
 const vm_module = @import("vm.zig");
+const task = @import("../task/scheduler.zig");
 
 /// started/stopped/transition/other go to the ring. The seed kinds only
 /// rebuild the per-actor late-attach map.
@@ -26,6 +27,9 @@ pub const Entry = struct {
 pub const Actor = struct {
     started: ?[]u8 = null,
     latest: ?[]u8 = null,
+    /// Ring sequence of `latest`, or 0 for a synthetic attach record: a
+    /// client whose cursor already passed it has ingested it from the ring.
+    latest_sequence: u64 = 0,
 };
 
 pub const Store = struct {
@@ -100,7 +104,7 @@ pub const Store = struct {
         self.allocator.free(key);
     }
 
-    fn setActor(self: *Store, path: []const u8, started: bool, bytes: []const u8) !void {
+    fn setActor(self: *Store, path: []const u8, started: bool, bytes: []const u8, sequence: u64) !void {
         const copy = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(copy);
         const slot = try self.actors.getOrPut(self.allocator, path);
@@ -117,6 +121,7 @@ pub const Store = struct {
         } else {
             if (slot.value_ptr.latest) |old| self.allocator.free(old);
             slot.value_ptr.latest = copy;
+            slot.value_ptr.latest_sequence = sequence;
         }
     }
 
@@ -129,11 +134,11 @@ pub const Store = struct {
                 return;
             },
             .seed_started, .seed_latest => {
-                if (actor_path.len != 0) try self.setActor(actor_path, kind == .seed_started, bytes);
+                if (actor_path.len != 0) try self.setActor(actor_path, kind == .seed_started, bytes, 0);
                 return;
             },
             .stopped => self.removeActor(actor_path),
-            .started, .transition => if (actor_path.len != 0) try self.setActor(actor_path, kind == .started, bytes),
+            .started, .transition => if (actor_path.len != 0) try self.setActor(actor_path, kind == .started, bytes, self.next_sequence),
             .other => {},
         }
         const owned = try self.allocator.dupe(u8, bytes);
@@ -198,7 +203,8 @@ pub fn install(vm: *vm_module.Vm, store: *Store) !void {
     c.lua_pushlightuserdata(state, store);
     c.lua_pushcclosure(state, complete, 1);
     vm.pushApi(state);
-    if (c.lua_pcallk(state, 3, 1, 0, 0, null) != c.ok)
+    c.lua_pushcclosure(state, closing, 0);
+    if (c.lua_pcallk(state, 4, 1, 0, 0, null) != c.ok)
         return error.StatechartInspectorInitializationFailed;
     c.lua_setfield(state, c.registry_index, registry_key);
     // ouro.development_endpoint() -> 'unix:<path>' of this --dev instance.
@@ -206,6 +212,30 @@ pub fn install(vm: *vm_module.Vm, store: *Store) !void {
     c.lua_pushlightuserdata(state, store);
     c.lua_pushcclosure(state, endpoint, 1);
     c.lua_setfield(state, -2, "development_endpoint");
+}
+
+const closer_key = "ouro.statechart_inspector.closer";
+
+/// closing(fn) -> a to-be-closed value that calls fn() when closed (the
+/// bridge has no setmetatable). Errors from fn are swallowed: closing runs
+/// while a task unwinds.
+fn closing(state: *c.State) callconv(.c) c_int {
+    if (c.lua_type(state, 1) != c.type_function) return 0;
+    c.lua_createtable(state, 1, 0);
+    c.lua_pushvalue(state, 1);
+    c.lua_rawseti(state, -2, 1);
+    if (c.luaL_newmetatable(state, closer_key) != 0) {
+        c.lua_pushcclosure(state, close, 0);
+        c.lua_setfield(state, -2, "__close");
+    }
+    _ = c.lua_setmetatable(state, -2);
+    return 1;
+}
+
+fn close(state: *c.State) callconv(.c) c_int {
+    _ = c.lua_rawgeti(state, 1, 1);
+    _ = c.lua_pcallk(state, 0, 0, 0, 0, null);
+    return 0;
 }
 
 fn endpoint(state: *c.State) callconv(.c) c_int {
@@ -268,9 +298,10 @@ pub fn rollup(allocator: std.mem.Allocator, vm: *vm_module.Vm) !?[]u8 {
     return try allocator.dupe(u8, bytes);
 }
 
-/// Spawns runtime.send's delivery as a task in the active VM's application
-/// scope; its JSON result arrives through takeResult(token).
-pub fn send(vm: *vm_module.Vm, store: *Store, request_json: []const u8) !u64 {
+/// Spawns runtime.send's delivery as a task in `scope` (a scope of its own,
+/// so cancelling the request retires the task, its wait and its observer);
+/// its JSON result arrives through takeResult(token).
+pub fn send(vm: *vm_module.Vm, store: *Store, scope: task.ScopeHandle, request_json: []const u8) !u64 {
     const state = vm.state;
     const top = c.lua_gettop(state);
     defer c.lua_settop(state, top);
@@ -281,7 +312,7 @@ pub fn send(vm: *vm_module.Vm, store: *Store, request_json: []const u8) !u64 {
     store.next_token += 1;
     try store.results.put(store.allocator, token, null);
     errdefer _ = store.results.remove(token);
-    _ = try vm.spawnReference(vm.scheduler.application_scope, reference, &.{
+    _ = try vm.spawnReference(scope, reference, &.{
         .{ .integer = @intCast(token) },
         .{ .string = request_json },
     });
