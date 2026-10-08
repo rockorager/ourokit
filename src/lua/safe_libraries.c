@@ -13,6 +13,15 @@
 #define l_randomizePivot(L) (~0u)
 #include "ltablib.c"
 #include "lutf8lib.c"
+#include "lcorolib.c"
+
+/* The coroutine library is not installed for applications. The statechart
+ * test scheduler receives a private copy so a fake invoke can wait
+ * (machine.sleep) until the test advances its virtual clock. */
+int ouro_push_private_coroutine(lua_State *L) {
+    luaL_newlib(L, co_funcs);
+    return 1;
+}
 
 /* Lua 5.5 print semantics, but diagnostics belong on stderr, not stdout.
  * This narrow logging exception is synchronous and can block the Lua thread.

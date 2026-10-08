@@ -123,6 +123,26 @@ return ouro.app {
   drive time with `clock.advance(ms)` (§8). `ouroctl test` can mount the real
   view with `t:mount(view.content(actor))` and click through it
   (`tests/stopwatch_test.lua`).
+- **Fakes need no scheduler wrappers.** The clock controls pending invokes
+  and spawned tasks directly (`tests/test_fakes_test.lua`):
+
+  ```lua
+  local clock = machine.manual_scheduler()
+  local session = charts.session:start { scheduler = clock }
+  clock.pending_invokes()            --> {{id = 'pam', kind = 'invoke', actor = 'session', state = 'locked', started = false}, ...}
+  clock.emit('pam', { type = 'PROGRESS', value = 40 })   -- the invoke's send(): invoke -> chart
+  clock.resolve('pam', { user = 'ada' })                  -- done.invoke.pam, without running the source
+  clock.reject('session:pam', { name = 'AuthFailed' })    -- error.invoke.pam ('actor:id' picks one)
+  clock.send('pam', event)           -- into the invoke's receive mailbox: chart -> invoke
+  ```
+
+  `resolve`, `reject`, `emit` and `send` take an invoke id or a spawned
+  task's id. A settled item never runs. `clock.run_tasks()` still runs
+  queued sources for real, each in a coroutine. A fake source that calls
+  `machine.sleep(ms)` (or `clock.sleep(nil, ms)`) parks until `advance()`
+  reaches its wake time. The coroutines are private to the scheduler;
+  applications still have none. Ouro I/O inside a source that the manual
+  scheduler runs is not supported; fake it.
 
 ## 1. Supported subset
 
@@ -826,9 +846,9 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
   timers in time order on virtual time, `clock.run_tasks()` runs queued invokes
   and spawned tasks, and `clock.pending()` returns the timer and task counts.
   `clock.now` is the virtual time and `clock.open_scopes` counts live scopes,
-  including actor roots. `ouroctl test`
-  forbids wall-clock sleeps, and the sandbox has no `coroutine` library, so
-  invokes run to completion when they run.
+  including actor roots. `ouroctl test` forbids wall-clock sleeps. Pending
+  invokes and tasks can be settled, made to send, or parked on the virtual
+  clock; see §0 Tests.
 - **Effects run in the sender's task, not in a state scope.** That is why
   function actions are atomic (§1).
 - **Logical time.** Every scheduler has a clock (`scheduler.clock()`, in
@@ -1672,7 +1692,9 @@ writes plain JSON wherever it is exact, plus three small tags:
 | a float with an integral value, `3.0` | `{"$f": 3}` |
 | NaN, `math.huge`, `-math.huge` | `{"$f": "nan"}`, `{"$f": "inf"}`, `{"$f": "-inf"}` |
 | a table with non-string keys that is not a dense array (sparse, mixed, boolean or float keys) | `{"$t": [[10, "ten"], [20, "twenty"]]}`, pairs sorted by key |
-| an object whose only key is `$f`, `$t` or `$o` | `{"$o": {...}}` (escaped) |
+| a native handle: userdata, function, thread (gap 7) | `{"$h": "<type>"}`: the metatable `__name` when known (`machine.inspectable`), else the Lua type. Replay passes the marker table in its place and reports how many it substituted. |
+| a string that is not valid UTF-8 | `{"$x": "<hex bytes>"}` |
+| an object whose only key is a tag | `{"$o": {...}}` (escaped) |
 
 Replay compares number subtypes strictly (`3` is not `3.0`), and NaN equals
 NaN. Version 1 logs have no tags and still replay.
@@ -1768,6 +1790,14 @@ first, expanding first the paths that reached something new.
   their real invoke and task results, which unlocks states behind a `load`.
 - **Dedupe and budget.** Nodes dedupe on configuration, context, children,
   pending timers and stubs. The depth limit is 8 and the run limit 1500.
+- **Nothing is pruned silently (gap 9).** When an input's action raises,
+  the transition still committed (actions run after commit), so the path is
+  kept and explored further. The error is reported with how many runs hit
+  it and the first path to it, in the summary and in the log header's
+  `generated.issues`. A send refused because its target had not started
+  (`record.sent` with reason `not_started`) is reported the same way.
+  Rejected events (no transition, guard false) are ordinary search misses
+  and are not reported.
 
 Each chart the app module created gets one `<chart>_paths_test.jsonl`. It
 replays the selected paths as start, inputs and stop. The header's

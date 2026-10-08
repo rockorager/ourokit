@@ -39,7 +39,8 @@ pub fn install(state: *c.State) !void {
     c.lua_pushvalue(state, api);
     _ = c.lua_getfield(state, api, "machine");
     c.lua_pushcclosure(state, taskOrigin, 0);
-    if (c.lua_pcallk(state, 3, 0, 0, 0, null) != c.ok)
+    _ = c.ouro_push_private_coroutine(state);
+    if (c.lua_pcallk(state, 4, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     // Generated tests: guard-aware paths to every reachable state.
     const paths = @embedFile("machine_paths.lua");

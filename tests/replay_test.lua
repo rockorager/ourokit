@@ -419,6 +419,71 @@ return {
     assert(report.ok, machine.replay_text(report))
   end,
 
+  -- Gap 7: an action encoding its invoke output (an ouro.mcp.call reply)
+  -- raised "value cannot be encoded as JSON": the output is a read-only view.
+  ['gap 7: json.encode accepts machine views, so an action can encode an invoke output'] = function()
+    local clock = machine.manual_scheduler()
+    local encoded
+    local chart = machine.create { id = 'mcp', initial = 'calling', context = {},
+      actors = { call = function() return { result = { content = { { type = 'text', text = '{}' } }, structuredContent = {} } } end },
+      states = {
+        calling = { invoke = { src = 'call', on_done = { target = 'done', actions = function(_, e) encoded = o.json.encode(e.output) end } } },
+        done = {},
+      } }
+    local actor = chart:start { scheduler = clock }
+    clock.run_tasks()
+    assert(actor:matches('done'), 'the on_done action did not raise')
+    assert(encoded == '{"result":{"content":[{"text":"{}","type":"text"}],"structuredContent":{}}}', encoded)
+    assert(o.json.encode(actor:context()) == '{}')
+    actor:stop()
+  end,
+
+  -- Gap 7: values JSON cannot hold record as markers; the recorder never throws.
+  ['gap 7: handles and raw bytes in invoke outputs record as markers and replay'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create { id = 'native', initial = 'calling', context = {},
+      actors = { call = function() return { fn = print, bytes = '\255\254', text = 'ok' } end },
+      states = {
+        calling = { invoke = { src = 'call', on_done = { target = 'done',
+          actions = machine.assign { reply = function(_, e) return e.output end } } } },
+        done = {},
+      } }
+    local lines, failure = {}, nil
+    local recorder = machine.recorder(function(line) lines[#lines + 1] = line end,
+      { scheduler = clock, fail = function(reason) failure = reason end })
+    local actor = chart:start { id = 'native', scheduler = clock }
+    clock.run_tasks()
+    recorder.stop()
+    actor:stop()
+    assert(failure == nil, failure)
+    local entry = o.json.decode(lines[3])
+    assert(entry.e.output.fn['$h'] == 'function' and entry.e.output.bytes['$x'] == 'fffe', lines[3])
+    local report = machine.replay(lines)
+    assert(report.ok, machine.replay_text(report))
+    assert(report.handles == 2 and machine.replay_text(report):find('native handles', 1, true), machine.replay_text(report))
+  end,
+
+  -- Gap 9: generation pruned paths silently when an action raised.
+  ['gap 9: generation keeps paths whose actions raise and reports them'] = function()
+    local chart = machine.create {
+      id = 'shellish', initial = 'idle', events = { LOCK = {}, UNLOCK = {} },
+      actions = { tell_session = function() error('session actor has not started') end },
+      states = {
+        idle = { on = { LOCK = { target = 'locked', actions = 'tell_session' } } },
+        locked = { on = { UNLOCK = 'idle' }, initial = 'prompt', states = { prompt = {} } },
+      },
+    }
+    local result = machine.paths(chart)
+    assert(result.states.reached == result.states.total, result.states.reached .. '/' .. result.states.total)
+    assert(#result.issues == 1, #result.issues)
+    local issue = result.issues[1]
+    assert(issue.kind == 'error' and issue.message:find('session actor has not started', 1, true), issue.message)
+    assert(issue.steps[1] == 'LOCK', issue.steps[1])
+    local log = machine.paths_log(chart, result)
+    local report = machine.replay(log, { charts = { shellish = chart } })
+    assert(report.ok, machine.replay_text(report))
+  end,
+
   ['machine.advance needs a virtual clock'] = function()
     fails(function() machine.advance(-1) end, 'nonnegative integer')
   end,

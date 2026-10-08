@@ -1959,7 +1959,47 @@ function M.manual_scheduler()
       pass = delay == 0 and s.firing and s.pass or nil,
       fn = function() if scope.alive then fn() end end}
   end
-  function s.run(scope, fn) s.tasks[#s.tasks + 1] = function() if scope.alive then fn() end end end
+  -- Invokes and spawned tasks. run_tasks() runs queued ones for real, each in
+  -- a coroutine, so one that calls machine.sleep(ms) parks until advance()
+  -- reaches its wake time. A test fake can instead settle a pending one
+  -- without running it (design §0 Tests):
+  --   clock.pending_invokes()      -> {{id, kind, actor, src, state, started}}
+  --   clock.resolve(id, value)     done.invoke.<id> / done.actor.<id>
+  --   clock.reject(id, err)        error.invoke.<id> / error.actor.<id>
+  --   clock.emit(id, event)        the invoke's send(event): invoke -> chart
+  --   clock.send(id, event)        the invoke's receive handler: chart -> invoke
+  -- `id` is the invoke id or the spawned task's id; with two pending items of
+  -- one id, the first started wins. Pass 'actor path:id' to pick one.
+  local items = {}
+  local co = M._coroutine
+  local function resume(item, ...)
+    if item.done or not item.scope.alive then return end
+    local previous = s.current
+    s.current = item
+    local ok, err
+    if co then
+      item.co = item.co or co.create(item.fn)
+      ok, err = co.resume(item.co, ...)
+      if ok and co.status(item.co) == 'dead' then item.done = true end
+    else
+      ok, err = pcall(item.fn)
+      item.done = true
+    end
+    s.current = previous
+    if not ok then item.done = true; error(err, 0) end
+  end
+  function s.run(scope, fn, info)
+    local item = {scope = scope, fn = fn, info = info}
+    s.tasks[#s.tasks + 1] = item
+    if info then items[#items + 1] = item end
+  end
+  -- Parks the running invoke or task until advance() reaches now + ms.
+  function s.sleep(scope, ms)
+    local item = s.current
+    if not item or not co then fail('sleep needs an invoke or task that the manual scheduler runs') end
+    s.after(scope or item.scope, ms, function() resume(item) end)
+    co.yield()
+  end
   function s.pending()
     local live = 0
     for _, t in ipairs(s.timers) do if t.scope.alive then live = live + 1 end end
@@ -1968,11 +2008,54 @@ function M.manual_scheduler()
   function s.run_tasks()
     local count = 0
     while #s.tasks > 0 do
-      local fn = table.remove(s.tasks, 1)
-      fn()
+      local item = table.remove(s.tasks, 1)
+      if not item.co then resume(item) end
       count = count + 1
     end
     return count
+  end
+  local function live_items()
+    local list = {}
+    for _, item in ipairs(items) do
+      if not item.done and not item.settled and item.scope.alive then list[#list + 1] = item end
+    end
+    items = list
+    return list
+  end
+  function s.pending_invokes()
+    local out = {}
+    for _, item in ipairs(live_items()) do
+      local info = item.info
+      out[#out + 1] = {id = info.id, kind = info.kind, actor = info.actor, src = info.src, state = info.state,
+        started = item.co ~= nil}
+    end
+    return out
+  end
+  local function find(id)
+    local actor, local_id = tostring(id):match('^(.*):([^:]+)$')
+    for _, item in ipairs(live_items()) do
+      if item.info.id == (local_id or id) and (not actor or item.info.actor == actor) then return item end
+    end
+    fail('no pending invoke or task %q', tostring(id))
+  end
+  local function settle(id, ok, value)
+    local item = find(id)
+    item.settled, item.done = true, true
+    for i, queued in ipairs(s.tasks) do if queued == item then table.remove(s.tasks, i); break end end
+    item.info.complete(ok, value)
+  end
+  function s.resolve(id, value) settle(id, true, value) end
+  function s.reject(id, err) settle(id, false, err) end
+  function s.emit(id, event)
+    local item = find(id)
+    if not item.info.send then fail('%s is a task; only invokes send events', tostring(id)) end
+    return item.info.send(event)
+  end
+  function s.send(id, event)
+    local item = find(id)
+    local post = item.info.post
+    if not post then fail('%s cannot receive events (invokes receive through receive(fn))', tostring(id)) end
+    return post(event)
   end
   function s.advance(ms)
     local target = s.now + ms
