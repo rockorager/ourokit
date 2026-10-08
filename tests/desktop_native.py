@@ -1138,12 +1138,14 @@ def unsupported_surfaces_test(root, env):
     app_env = dict(env, WAYLAND_DISPLAY=env['OUROKIT_TEST_WAYLAND_DISPLAY'])
     chart = '''local o=require('ouro'); local machine=o.machine; local assign=machine.assign
 local lock=machine.create{id='lock',initial='unlocked',context={},events={LOCK={}},
- actions={failed=assign{error=function(_,e) return e.reason..': '..e.message end}},
+ actions={failed=assign(function(c,e)
+  local log=(c.log or '')..e.id..' '..e.reason..': '..e.message..';'
+  return {error=e.reason..': '..e.message,log=log} end)},
  on={['surface.failed.*']={target='#unlocked',actions='failed'}},
  states={unlocked={on={LOCK='locked'}},locked={}}}
 local actor=lock:actor()
-local function state(s) return {locked=machine.matches(s,'locked'),error=s.context.error} end
-local schema={type='object',properties={locked={type='boolean'},error={type='string'}}}
+local function state(s) return {locked=machine.matches(s,'locked'),error=s.context.error,log=s.context.log} end
+local schema={type='object',properties={locked={type='boolean'},error={type='string'},log={type='string'}}}
 local actions=machine.actions(actor,{Lock={event='LOCK',description='lock'},
  State={description='state',output=state,output_schema=schema}})
 local main=o.window{id='main',title='Shell',width=240,height=120,content=function() return o.text{key='t',text='alive'} end}
@@ -1164,6 +1166,13 @@ local main=o.window{id='main',title='Shell',width=240,height=120,content=functio
   o.layer_surface{id='edge',namespace='edge',layer='top',width=0,height=30,anchors={'top','left','right'},
    exclusive_zone=30,exclusive_edge='top',content=function() return o.text{key='t',text='edge'} end}}} end}
 ''',
+        # Two lock surfaces on one output: only the second is rejected, as an
+        # invalid declaration; the first is still just unsupported here.
+        'duplicate': chart + '''return o.app{id='dev.ourokit.lock-duplicate',actions=actions,run=function() actor:start(); actor:send('LOCK')
+ return {windows={main,
+  o.lock_surface{id='lock',output='HEADLESS-1',content=function() return o.text{key='t',text='locked'} end},
+  o.lock_surface{id='lock-2',output='HEADLESS-1',send=actor,content=function() return o.text{key='t',text='locked'} end}}} end}
+''',
         # Unbound: logged, the last valid set stays, nothing reaches the chart.
         'unbound': chart + '''return o.app{id='dev.ourokit.lock-unbound',actions=actions,run=function() actor:start()
  return {windows=function()
@@ -1180,11 +1189,16 @@ local main=o.window{id='main',title='Shell',width=240,height=120,content=functio
         try:
             endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app, windows=('main',))
             state = lambda: call(endpoint, 'State')['structuredContent']
-            if name != 'static':
+            if name in ('reactive', 'unbound'):
                 assert call(endpoint, 'Lock')['structuredContent'] == {}
             if name == 'unbound':
                 time.sleep(.5)
                 assert state() == {'locked': True}, state()
+            elif name == 'duplicate':
+                # Once the first (unsupported) lock surface closes, the second
+                # is no longer a duplicate, and is itself unsupported.
+                wait_for(lambda: state().get('log') == 'lock-2 declaration: DuplicateLockOutput;'
+                         'lock-2 unsupported: SessionLockUnavailable;', f'duplicate: {state()}')
             else:
                 wait_for(lambda: state().get('error') == 'unsupported: SessionLockUnavailable' and not state()['locked'],
                          f'{name}: the bound lock surface never reported its failure')
@@ -1201,7 +1215,11 @@ local main=o.window{id='main',title='Shell',width=240,height=120,content=functio
             assert 'surface edge unsupported: LayerShellVersionTooOld' in errors, errors
         if name == 'unbound':
             assert 'window declaration failed: SessionLockUnavailable' in errors, errors
-        print(f'PASS unsupported surfaces ({name}): ' + ('logged, last valid set kept' if name == 'unbound' else 'bound lock surface reports failed') + ', app alive')
+        if name == 'duplicate':
+            assert 'surface lock-2 rejected: DuplicateLockOutput' in errors, errors
+            assert 'surface lock unsupported: SessionLockUnavailable' in errors, errors
+        print(f'PASS unsupported surfaces ({name}): ' + ('logged, last valid set kept' if name == 'unbound' else
+              'only the duplicate lock surface is rejected' if name == 'duplicate' else 'bound lock surface reports failed') + ', app alive')
 
 
 def suite(root, env):

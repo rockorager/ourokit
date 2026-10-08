@@ -1096,18 +1096,22 @@ fn runSourceInternal(
             disconnect_started = true;
         }
         try window_set.reconcile(current_storage.items);
-        // Surfaces the compositor cannot provide (no ext-session-lock, no
-        // layer shell, too old a version) close instead of stopping the app.
+        // A surface reconcile rejected on its own never stops the app. One
+        // the compositor cannot provide (no ext-session-lock, no layer shell,
+        // too old a version) closes; an invalid declaration or transition
+        // leaves the surface as it was. Each is reported once.
         while (window_set.takeUnsupported()) |item| {
             defer window_set.releaseUnsupported(item);
-            std.log.err("surface {s} unsupported: {s}", .{ item.id, @errorName(item.err) });
+            std.log.err("surface {s} {s}: {s}", .{ item.id, if (std.mem.eql(u8, item.reason, "unsupported")) "unsupported" else "rejected", @errorName(item.err) });
             const slot = runtimeSlotForId(runtime_slots.all(), item.id) orelse continue;
             if (!slot.desired) continue;
-            slot.desired = false;
-            desired_changed = true;
+            if (std.mem.eql(u8, item.reason, "unsupported")) {
+                slot.desired = false;
+                desired_changed = true;
+            }
             if (slot.bound and slot.declared and !disconnect_started and active_generation.vm.exit_code == null)
                 try sendSurfaceEvent(active_generation, item.id, "failed", &.{
-                    .{ .string = "unsupported" }, .{ .string = @errorName(item.err) },
+                    .{ .string = item.reason }, .{ .string = @errorName(item.err) },
                 });
         }
 

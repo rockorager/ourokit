@@ -67,11 +67,23 @@ pub const WindowSet = struct {
     event_head: usize = 0,
     event_count: usize = 0,
     change_serial: u64 = 0,
-    /// Declarations `reconcile` could not create or update because the host
-    /// lacks a protocol they need. Taken by the runner after each reconcile.
+    /// Surfaces `reconcile` rejected on their own, newly this reconcile:
+    /// invalid declarations, illegal transitions, and declarations the host
+    /// lacks a protocol for. Taken by the runner after each reconcile.
     unsupported: std.ArrayList(Unsupported) = .empty,
+    /// Every rejection of the last reconcile, so one that persists is
+    /// reported once rather than on every pass.
+    reported: std.ArrayList(Unsupported) = .empty,
 
-    pub const Unsupported = struct { id: []u8, err: anyerror };
+    pub const Unsupported = struct {
+        id: []u8,
+        err: anyerror,
+        /// 'declaration', 'transition' or 'unsupported'. Only 'unsupported'
+        /// closes a surface that exists; the others keep its last valid state.
+        reason: []const u8,
+    };
+
+    const Failure = struct { id: []const u8, err: anyerror, reason: []const u8 };
 
     pub fn init(
         self: *WindowSet,
@@ -100,6 +112,8 @@ pub const WindowSet = struct {
         std.debug.assert(self.event_count == 0);
         for (self.unsupported.items) |item| self.allocator.free(item.id);
         self.unsupported.deinit(self.allocator);
+        for (self.reported.items) |item| self.allocator.free(item.id);
+        self.reported.deinit(self.allocator);
         self.allocator.free(self.events);
         self.allocator.free(self.slots);
         self.* = undefined;
@@ -239,10 +253,29 @@ pub const WindowSet = struct {
     /// Applies one complete, already-decoded desired-state snapshot. Validation
     /// finishes before native state changes, so malformed Lua output can never
     /// partially replace the last valid window set.
-    pub fn reconcile(self: *WindowSet, declarations: []const SurfaceDeclaration) !void {
-        try validateDeclarations(declarations);
-        try self.validateTransitions(declarations);
-        for (self.slots) |*slot| if (slot.state != .free and findDeclaration(declarations, slot.id.?) == null) {
+    pub fn reconcile(self: *WindowSet, all: []const SurfaceDeclaration) !void {
+        // Validate each surface on its own. An invalid declaration, or one a
+        // retained surface cannot transition to, is rejected alone: the rest
+        // apply, and a live surface it names keeps its last valid state.
+        var failures: std.ArrayList(Failure) = .empty;
+        defer failures.deinit(self.allocator);
+        var accepted = try std.ArrayList(SurfaceDeclaration).initCapacity(self.allocator, all.len);
+        defer accepted.deinit(self.allocator);
+        for (all) |declaration| {
+            validateDeclaration(declaration, accepted.items) catch |err| {
+                try failures.append(self.allocator, .{ .id = declaration.id(), .err = err, .reason = "declaration" });
+                continue;
+            };
+            self.validateTransitions(&.{declaration}) catch |err| {
+                try failures.append(self.allocator, .{ .id = declaration.id(), .err = err, .reason = "transition" });
+                continue;
+            };
+            accepted.appendAssumeCapacity(declaration);
+        }
+        const declarations = accepted.items;
+        defer self.report(failures.items) catch {};
+
+        for (self.slots) |*slot| if (slot.state != .free and findDeclaration(all, slot.id.?) == null) {
             slot.dropped = true;
         };
         try self.collectClosed();
@@ -251,6 +284,8 @@ pub const WindowSet = struct {
         for (self.slots, 0..) |*slot, index| {
             if (slot.state != .active) continue;
             const declaration = findDeclaration(declarations, slot.id.?) orelse {
+                // Still declared, but rejected: leave it as it was.
+                if (findDeclaration(all, slot.id.?) != null) continue;
                 const handle = handleFor(slot, index);
                 try self.host.beginClose(handle);
                 try self.scheduler.queueScopeCancellation(slot.scope);
@@ -280,7 +315,8 @@ pub const WindowSet = struct {
                     // An unsupported update keeps the native surface as it
                     // was; the runner closes it and reports the failure.
                     self.host.updateLayerSurface(handleFor(slot, index), layer_surface) catch |err| {
-                        try self.skipUnsupported(slot.id.?, err);
+                        if (!platform_window.isUnsupported(err)) return err;
+                        try failures.append(self.allocator, .{ .id = slot.id.?, .err = err, .reason = "unsupported" });
                         continue;
                     };
                     setLayerState(slot, layer_surface);
@@ -291,7 +327,10 @@ pub const WindowSet = struct {
 
         for (declarations) |declaration| {
             if (self.findById(declaration.id()) != null) continue;
-            self.create(declaration) catch |err| try self.skipUnsupported(declaration.id(), err);
+            self.create(declaration) catch |err| {
+                if (!platform_window.isUnsupported(err)) return err;
+                try failures.append(self.allocator, .{ .id = declaration.id(), .err = err, .reason = "unsupported" });
+            };
         }
     }
 
@@ -314,12 +353,25 @@ pub const WindowSet = struct {
         self.allocator.free(item.id);
     }
 
-    fn skipUnsupported(self: *WindowSet, id: []const u8, err: anyerror) !void {
-        if (!platform_window.isUnsupported(err)) return err;
-        for (self.unsupported.items) |item| if (std.mem.eql(u8, item.id, id)) return;
-        const owned = try self.allocator.dupe(u8, id);
-        errdefer self.allocator.free(owned);
-        try self.unsupported.append(self.allocator, .{ .id = owned, .err = err });
+    /// Queues the rejections not already reported by the previous reconcile,
+    /// then remembers exactly this pass's set.
+    fn report(self: *WindowSet, failures: []const Failure) !void {
+        for (failures) |failure| {
+            const known = for (self.reported.items) |item| {
+                if (item.err == failure.err and std.mem.eql(u8, item.id, failure.id)) break true;
+            } else false;
+            if (known) continue;
+            const owned = try self.allocator.dupe(u8, failure.id);
+            errdefer self.allocator.free(owned);
+            try self.unsupported.append(self.allocator, .{ .id = owned, .err = failure.err, .reason = failure.reason });
+        }
+        for (self.reported.items) |item| self.allocator.free(item.id);
+        self.reported.clearRetainingCapacity();
+        for (failures) |failure| {
+            const owned = try self.allocator.dupe(u8, failure.id);
+            errdefer self.allocator.free(owned);
+            try self.reported.append(self.allocator, .{ .id = owned, .err = failure.err, .reason = failure.reason });
+        }
     }
 
     /// Protocol dispatch calls this state-only method after native teardown is
@@ -687,30 +739,33 @@ fn freeTextInput(allocator: std.mem.Allocator, event: TextInputEvent) void {
 }
 
 fn validateDeclarations(declarations: []const SurfaceDeclaration) !void {
-    for (declarations, 0..) |declaration, index| {
-        if (declaration.id().len == 0) return error.EmptyWindowId;
-        switch (declaration) {
-            .toplevel => |toplevel| {
-                if (toplevel.initial_width == 0 or toplevel.initial_height == 0)
-                    return error.InvalidWindowSize;
-                if (toplevel.min_width > toplevel.initial_width or
-                    toplevel.min_height > toplevel.initial_height or
-                    toplevel.min_width > std.math.maxInt(i32) or
-                    toplevel.min_height > std.math.maxInt(i32)) return error.InvalidMinimumWindowSize;
-            },
-            .layer_surface => |layer_surface| {
-                try layer_surface.validate();
-                if (layer_surface.session_lock) for (declarations[0..index]) |earlier| {
-                    if (earlier == .layer_surface and earlier.layer_surface.session_lock and
-                        optionalStringEqual(earlier.layer_surface.output, layer_surface.output))
-                        return error.DuplicateLockOutput;
-                };
-            },
-            .popup => |popup| try popup.validate(),
-        }
-        for (declarations[0..index]) |earlier|
-            if (std.mem.eql(u8, earlier.id(), declaration.id())) return error.DuplicateWindowId;
+    for (declarations, 0..) |declaration, index| try validateDeclaration(declaration, declarations[0..index]);
+}
+
+/// One declaration against those before it in the same snapshot.
+fn validateDeclaration(declaration: SurfaceDeclaration, earlier_declarations: []const SurfaceDeclaration) !void {
+    if (declaration.id().len == 0) return error.EmptyWindowId;
+    switch (declaration) {
+        .toplevel => |toplevel| {
+            if (toplevel.initial_width == 0 or toplevel.initial_height == 0)
+                return error.InvalidWindowSize;
+            if (toplevel.min_width > toplevel.initial_width or
+                toplevel.min_height > toplevel.initial_height or
+                toplevel.min_width > std.math.maxInt(i32) or
+                toplevel.min_height > std.math.maxInt(i32)) return error.InvalidMinimumWindowSize;
+        },
+        .layer_surface => |layer_surface| {
+            try layer_surface.validate();
+            if (layer_surface.session_lock) for (earlier_declarations) |earlier| {
+                if (earlier == .layer_surface and earlier.layer_surface.session_lock and
+                    optionalStringEqual(earlier.layer_surface.output, layer_surface.output))
+                    return error.DuplicateLockOutput;
+            };
+        },
+        .popup => |popup| try popup.validate(),
     }
+    for (earlier_declarations) |earlier|
+        if (std.mem.eql(u8, earlier.id(), declaration.id())) return error.DuplicateWindowId;
 }
 
 fn findDeclaration(
@@ -963,25 +1018,16 @@ test "layer surface declarations retain identity and update role-specific state"
 
     var cleared_edge = updated;
     cleared_edge.layer_surface.exclusive_edge = null;
-    try std.testing.expectError(
-        error.LayerSurfaceExclusiveEdgeCannotBeCleared,
-        windows.reconcile(&.{cleared_edge}),
-    );
+    try expectRejected(&windows, &.{cleared_edge}, error.LayerSurfaceExclusiveEdgeCannotBeCleared, "transition");
 
     var changed_namespace = updated;
     changed_namespace.layer_surface.namespace = "other";
-    try std.testing.expectError(
-        error.LayerSurfaceNamespaceChanged,
-        windows.reconcile(&.{changed_namespace}),
-    );
+    try expectRejected(&windows, &.{changed_namespace}, error.LayerSurfaceNamespaceChanged, "transition");
     try std.testing.expectEqual(@as(usize, 2), host.count);
 
     var changed_output = updated;
     changed_output.layer_surface.output = "HDMI-A-1";
-    try std.testing.expectError(
-        error.LayerSurfaceOutputChanged,
-        windows.reconcile(&.{changed_output}),
-    );
+    try expectRejected(&windows, &.{changed_output}, error.LayerSurfaceOutputChanged, "transition");
     try std.testing.expectEqual(@as(usize, 2), host.count);
 
     updated.layer_surface.background = .rgba(17, 24, 32, 184);
@@ -1007,7 +1053,7 @@ test "layer surface declarations retain identity and update role-specific state"
     try std.testing.expectEqual(handle, host.actions[6].update_layer_surface);
     var invalid_region = updated;
     invalid_region.layer_surface.input_region.?.width = std.math.maxInt(u32);
-    try std.testing.expectError(error.InvalidLayerSurfaceInputRegion, windows.reconcile(&.{invalid_region}));
+    try expectRejected(&windows, &.{invalid_region}, error.InvalidLayerSurfaceInputRegion, "declaration");
     try std.testing.expectEqual(@as(usize, 7), host.count);
     updated.layer_surface.input_region = null;
     try windows.reconcile(&.{updated});
@@ -1019,38 +1065,68 @@ test "layer surface declarations retain identity and update role-specific state"
     try windows.reconcile(&.{});
 }
 
-test "invalid declaration snapshots do not alter native windows" {
+/// Reconciles `declarations`, which must reject exactly one surface.
+fn expectRejected(windows: *WindowSet, declarations: []const SurfaceDeclaration, expected: anyerror, reason: []const u8) !void {
+    try windows.reconcile(declarations);
+    const item = windows.takeUnsupported() orelse return error.TestExpectedRejection;
+    defer windows.releaseUnsupported(item);
+    try std.testing.expectEqual(expected, item.err);
+    try std.testing.expectEqualStrings(reason, item.reason);
+    try std.testing.expectEqual(@as(?WindowSet.Unsupported, null), windows.takeUnsupported());
+}
+
+test "an invalid declaration rejects only its own surface" {
     var scheduler: Scheduler = undefined;
-    try scheduler.init(std.testing.allocator, 3, 1, 0);
+    try scheduler.init(std.testing.allocator, 4, 1, 0);
     defer scheduler.deinit();
     var host: FakeHost = .{};
     var windows: WindowSet = undefined;
     try windows.init(std.testing.allocator, &scheduler, host.interface(), 2, 2);
     defer windows.deinit();
 
-    try windows.reconcile(&.{.{ .toplevel = .{ .id = "main", .title = "Main" } }});
-    const duplicate = [_]SurfaceDeclaration{
-        .{ .toplevel = .{ .id = "same", .title = "One" } },
-        .{ .toplevel = .{ .id = "same", .title = "Two" } },
+    const lock = struct {
+        fn on(id: []const u8) SurfaceDeclaration {
+            return .{ .layer_surface = .{
+                .id = id,
+                .namespace = "session-lock",
+                .session_lock = true,
+                .output = "HEADLESS-1",
+                .width = 0,
+                .height = 0,
+                .layer = .overlay,
+                .anchors = .{ .top = true, .bottom = true, .left = true, .right = true },
+            } };
+        }
+    }.on;
+    // Two lock surfaces on one output: the second is rejected, the first and
+    // the window still apply. A persisting rejection is reported once.
+    const declarations = [_]SurfaceDeclaration{
+        .{ .toplevel = .{ .id = "main", .title = "Main" } }, lock("lock"), lock("second-lock"),
     };
-    try std.testing.expectError(error.DuplicateWindowId, windows.reconcile(&duplicate));
-    try std.testing.expectEqual(@as(usize, 1), host.count);
-    try std.testing.expectEqual(@as(usize, 1), windows.activeCount());
+    try expectRejected(&windows, &declarations, error.DuplicateLockOutput, "declaration");
+    try std.testing.expectEqual(@as(usize, 2), windows.activeCount());
+    try std.testing.expect(windows.activeHandleForId("second-lock") == null);
+    try windows.reconcile(&declarations);
+    try std.testing.expectEqual(@as(?WindowSet.Unsupported, null), windows.takeUnsupported());
 
-    const too_many = [_]SurfaceDeclaration{
-        .{ .toplevel = .{ .id = "first", .title = "First" } },
-        .{ .toplevel = .{ .id = "second", .title = "Second" } },
-    };
-    var invalid = too_many;
-    invalid[1].toplevel.initial_width = 0;
-    try std.testing.expectError(error.InvalidWindowSize, windows.reconcile(&invalid));
-    try std.testing.expectEqual(@as(usize, 1), host.count);
-    try std.testing.expectEqual(@as(usize, 1), windows.activeCount());
+    // An invalid update keeps the live surface as it was; dropping the bad
+    // declaration lets it be reported again later.
+    var invalid = declarations;
+    invalid[0].toplevel.initial_width = 0;
+    invalid[0].toplevel.title = "Invalid";
+    try windows.reconcile(&invalid);
+    const item = windows.takeUnsupported().?;
+    defer windows.releaseUnsupported(item);
+    try std.testing.expectEqualStrings("main", item.id);
+    try std.testing.expectEqual(@as(anyerror, error.InvalidWindowSize), item.err);
+    try std.testing.expectEqual(@as(?WindowSet.Unsupported, null), windows.takeUnsupported()); // second-lock: already reported
+    const main = windows.activeHandleForId("main").?;
+    try std.testing.expectEqualStrings("Main", windows.slots[main.slot].title.?);
 
-    const handle = host.actions[0].create.handle;
+    const handles = [_]WindowHandle{ main, windows.activeHandleForId("lock").? };
     try windows.reconcile(&.{});
     try scheduler.applyQueuedCancellations();
-    try windows.markClosed(handle);
+    for (handles) |handle| try windows.markClosed(handle);
     try windows.reconcile(&.{});
 }
 

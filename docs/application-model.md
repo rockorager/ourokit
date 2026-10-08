@@ -590,7 +590,7 @@ the event.
 | `surface.mapped.<id>` | The compositor configured a new native surface. Sent again after a reopen. | `id`, `width`, `height` |
 | `surface.close_requested.<id>` | The compositor asked to close the surface. Nothing closes until the chart leaves the state whose view declares it. | `id` |
 | `surface.closed.<id>` | Native teardown finished. This usually follows the declaration dropping the surface. Not sent during application shutdown. | `id` |
-| `surface.failed.<id>` | The surface could not be shown, and the last valid list was kept. `reason` is `declaration` when its declaration was rejected while parsing; `transition` when a retained id changed its role, layer namespace or output, or cleared an exclusive edge; `unsupported` when the compositor lacks a protocol the surface needs (a `lock_surface` without ext-session-lock, a layer surface without wlr-layer-shell or with a feature its version lacks, a window without xdg-shell); or `content` when the content function failed on its first build. In the `unsupported` and `content` cases a surface that was already declared closes, and the application keeps running. | `id`, `reason`, `message` (the Lua error for `content`, otherwise the error name) |
+| `surface.failed.<id>` | The surface could not be shown, and the last valid list was kept. `reason` is `declaration` when its declaration was rejected while parsing or is invalid next to the rest of the list (two lock surfaces on one output, a duplicate id from per-output expansion); `transition` when a retained id changed its role, layer namespace or output, or cleared an exclusive edge; `unsupported` when the compositor lacks a protocol the surface needs (a `lock_surface` without ext-session-lock, a layer surface without wlr-layer-shell or with a feature its version lacks, a window without xdg-shell); or `content` when the content function failed on its first build. In the `unsupported` and `content` cases a surface that was already declared closes, and the application keeps running. | `id`, `reason`, `message` (the Lua error for `content`, otherwise the error name) |
 | `surface.failed` | `windows()` itself failed, or its list as a whole was invalid, so no surface can be named. This goes to the declaration's own `send` (see below). | `reason = 'windows'`, `message` |
 
 ```lua
@@ -614,6 +614,9 @@ stays, instead of stopping the application. A `closed` event reaches the actor
 that was bound when the declaration dropped the surface. Events for surfaces of a replaced source generation are not delivered
 after reload. See [examples/launcher](../examples/launcher).
 
+A surface rejected for any of these reasons is rejected alone: the other
+surfaces in the list still apply, and a live surface keeps its last valid
+state (an unsupported one closes). A rejection that persists is reported once.
 Unsupported surfaces never stop the application either. An unbound one is only
 logged: a reactive declaration that adds it is rejected and keeps its last
 valid set, and a surface from `run`'s initial list is skipped
