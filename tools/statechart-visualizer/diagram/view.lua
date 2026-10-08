@@ -177,8 +177,8 @@ end
 
 -- Whether the inspected actor would take `event` now: 'enabled' when an
 -- active transition for it has no guard or one that passed, 'payload' when
--- its guards need the event's payload to decide (record.guarded, or guard
--- entries flagged payload), 'refused' otherwise.
+-- its guard needs the event's payload to decide (record.guarded on attach
+-- records, guards[].payload on transition records), 'refused' otherwise.
 function M.availability(graph, frame, event)
   if frame.record.guarded and frame.record.guarded[event] then return 'payload' end
   local payload = false

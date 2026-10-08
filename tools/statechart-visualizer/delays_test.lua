@@ -13,9 +13,13 @@ local chart = machine.create {
   id = 'clock', initial = 'reading', context = {second = 18, level = 0},
   events = {READ = {}, SET = {level = 'integer'}, IDLE = {}},
   delays = {minute = function(c) return (60 - c.second) * 1000 end, slow = 2000},
-  guards = {louder = function(c, e) return e.level > c.level end},
+  guards = {
+    louder = function(c, e) return e.level > c.level end,
+    broken = function(c) return c.missing > 0 end, -- raises without reading the payload
+  },
   states = {
-    reading = {on = {READ = 'waiting', SET = {guard = 'louder', actions = machine.assign {level = function(_, e) return e.level end}}}},
+    reading = {on = {READ = 'waiting', SET = {guard = 'louder', actions = machine.assign {level = function(_, e) return e.level end}},
+      IDLE = {guard = 'broken'}}},
     waiting = {after = {minute = 'reading', slow = 'stale'}, on = {IDLE = 'reading'}},
     stale = {},
   },
@@ -24,10 +28,12 @@ local chart = machine.create {
 local function run()
   local clock = machine.manual_scheduler()
   local store = model.new(o.json.null)
+  store.actor = nil
   local actor = chart:actor {id = 'clock', scheduler = clock}
   model.ingest(store, {kind = 'actor', action = 'started', actor = 'clock', machine = 'clock', graph = chart:graph(), time_ms = 0})
   actor:observe(function(record) model.ingest(store, record) end)
   actor:start()
+  store.actor = actor
   return store, actor, clock
 end
 
@@ -51,7 +57,7 @@ return {
     assert(history.remaining(timer, frame.time + 1000) == 41000)
     assert(view.after_text_of(minute, frame, frame.time + 1000) == 'after minute · 41.0s')
     assert(view.after_text_of(slow, frame, frame.time + 500) == 'after slow · 1.5s')
-    clock.advance(200); actor:send('IDLE')
+    clock.advance(200); actor:send('IDLE') -- from waiting: unguarded
     frame = frames[#frames]
     assert(next(frame.timers) == nil and view.after_text_of(minute, frame, frame.time) == 'after minute', 'stopped: name only')
   end,
@@ -61,10 +67,14 @@ return {
     local graph = store.actors.clock.graph
     local frames = store.actors.clock.history.frames
     local frame = frames[#frames]
-    -- The interpreter evaluates SET's guard without a payload: it raises.
+    -- SET's guard reads the payload: the interpreter flags it payload = true.
     assert(view.availability(graph, frame, 'SET') == 'payload', tostring(view.availability(graph, frame, 'SET')))
     assert(view.availability(graph, frame, 'READ') == 'enabled')
-    assert(view.availability(graph, frame, 'IDLE') == 'refused', 'no active transition handles IDLE in reading')
+    -- IDLE's guard raises without touching the payload: a real error, refused.
+    assert(view.availability(graph, frame, 'IDLE') == 'refused', tostring(view.availability(graph, frame, 'IDLE')))
+    -- Late attach: the snapshot record's guarded list.
+    local _, guarded = store.actor:accepted()
+    assert(#guarded == 1 and guarded[1] == 'SET', 'accepted() returns guarded second')
     -- The gap-2 shape: guards entries flagged payload = true, and a guarded list.
     local raw = {kind = 'transition', actor = 'clock', machine = 'clock', time_ms = 1, event = {type = 'READ'},
       states = {'reading'}, guards = {{index = 2, passed = false, payload = true}}, accepted = {'READ'}, guarded = {'SET'}}

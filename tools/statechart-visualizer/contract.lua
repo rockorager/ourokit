@@ -152,11 +152,11 @@ function M.record(raw, t0, fallback)
   if raw.guards and raw.guards ~= M.null then
     r.guards = {}
     for _, v in pairs(raw.guards) do
-      -- A guard that needs the event's payload cannot be decided on the
-      -- bare event: `payload = true`, or (older feeds) an error.
+      -- A guard that reads a field a real event must carry cannot be
+      -- decided on the bare event: the interpreter flags it payload = true.
+      -- A guard with an error failed for another reason.
       if type(v) == 'table' and v.index then
-        local undecided = v.payload == true or (v.passed ~= true and v.error ~= nil and v.error ~= M.null)
-        r.guards[v.index] = undecided and 'payload' or v.passed == true
+        r.guards[v.index] = v.payload == true and 'payload' or v.passed == true
       end
     end
   end

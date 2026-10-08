@@ -16,7 +16,7 @@ plugins or web views.
 | Guard | The `[guard]` text: green when it passed, red when it failed, grey when not evaluated (`record.guards`) |
 | `after` | Its pill counts down while the timer runs. Named delays show their name (`after slow`), with the evaluated duration only while the timer runs; durations come from the records' `ms` (and `pending_timers()` on late attach), so function delays count down too. Timers are keyed by their event. |
 | `invoke` | A status chip on the `invoke:` line: running, done, error or cancelled |
-| Events | Left panel: one pill per declared event, highlighted when accepted. An event whose guards need its payload to decide (`record.guarded`, or guard entries flagged `payload` or erroring on the bare event) is available with payload: highlighted, marked `…`, and it opens the payload editor. A rejected event flashes. Clicking a pill sends it (`runtime.send`, or the actor itself in-process); events with fields open a payload editor. |
+| Events | Left panel: one pill per declared event, highlighted when accepted. An event whose guards need its payload to decide (`record.guarded` on attach records, `guards[].payload` on transition records) is available with payload: highlighted, marked `…`, and it opens the payload editor. A rejected event flashes. Clicking a pill sends it (`runtime.send`, or the actor itself in-process); events with fields open a payload editor. |
 | Context | Right panel: a tree with changed keys highlighted, plus running timers and invokes. Native handles (`{"$h": type}`) show as opaque `‹type›` values. |
 | History | Timeline below: ticks colored by origin, a scrub slider, step buttons, Play for recordings and **Live** |
 
