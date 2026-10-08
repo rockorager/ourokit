@@ -1119,8 +1119,8 @@ chart as well as inspect it:
   `parent/child`, component machines as `<chart id>@<instance path>` (for
   example `collapsible@panel/details`, with `#2` for a second live instance
   on the same path). Component inputs are recorded, so they replay too.
-  Component actors start lazily and are listed by `machine.actors()` only
-  after their first event, so until then they cannot be sent to.
+  Component actors are listed from mount with their initial snapshot
+  (status `created`); the first `runtime.send` starts them.
 - It is absent outside `--dev`. Production automation uses `machine.actions`.
 
 `ouro.development_endpoint()` returns `"unix:<path>"` of the instance's own

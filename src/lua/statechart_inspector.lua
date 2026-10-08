@@ -89,7 +89,7 @@ local function current(actor)
   local record = {kind = 'transition', actor = actor.path, machine = actor.chart.id, origin = 'attach',
     seeded = true, event = {type = 'ouro.attach'}, handled = true, rejected = false, time_ms = now,
     microsteps = {}, exited = {}, entered = {}, timers = {}, invokes = {}, actions = {},
-    states = snapshot.states, status = snapshot.status, context = snapshot.context,
+    states = snapshot.states, status = actor:status(), context = snapshot.context,
     children = children_of(snapshot), output = snapshot.output}
   for _, live in ipairs(actor:pending_timers()) do
     record.timers[#record.timers + 1] = {action = 'started', state = live.state, delay = live.delay,
@@ -146,7 +146,7 @@ local function rollup()
     end
     local s = stats[actor.path] or {records = 0, rejected = 0, errors = 0}
     rows[#rows + 1] = {actor = actor.path, machine = actor.chart.id, parent = actor._parent and actor._parent.path,
-      status = snapshot.status, states = json.array(leaves), timers = #actor:pending_timers(),
+      status = actor:status(), states = json.array(leaves), timers = #actor:pending_timers(),
       invokes = #actor:pending_invokes(), records = s.records, rejected = s.rejected, errors = s.errors,
       last_error = s.last_error, last_event = s.last_event, last_time_ms = s.last_time_ms,
       changed_ms = s.changed_ms, time_ms = now}
@@ -201,7 +201,7 @@ local function deliver(request)
   local changes = {}
   for _, k in ipairs(changed) do changes[k] = after[k] == nil and json.null or after[k] end
   return {actor = actor.path, accepted = accepted == true, reason = reason, states = snapshot.states,
-    status = snapshot.status, changed = json.array(changed), changes = changes, wait = wait,
+    status = actor:status(), changed = json.array(changed), changes = changes, wait = wait,
     sequence = last and last.sequence, commit = last and last.commit, time_ms = last and last.time_ms,
     guards = last and last.guards}
 end

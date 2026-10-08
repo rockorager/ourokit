@@ -406,17 +406,24 @@ def native():
             out, failed = send(me, 'visualizer', {'type': 'ATTACHED'})
             assert not failed and not out['accepted'] and out['reason'] == 'no_transition', out
 
-            # Component machines by exact path, once started (they start lazily).
+            # Component machines by exact path, listed from mount: inspect
+            # one before its first event, start it with runtime.send, then
+            # the widget and the endpoint drive the same actor.
             component = root / 'component.lua'
             component.write_text(COMPONENT)
             _, comp = launch('component', component, '--dev', '--software')
+            created = poll(lambda: snapshot(comp, 'collapsible@details'), 'the component was not listed at mount')
+            assert created['status'] == 'created' and created['states'] == ['closed'], created
+            out, failed = send(comp, 'collapsible@details', {'type': 'TOGGLE'}, wait={'states': ['open']})
+            assert not failed and out['accepted'] and out['states'] == ['open'] and out['status'] == 'active', out
             tree = poll(lambda: inspect(env, comp, 'main')['windows'][0], 'no component window')
             node = next(n for n in tree['nodes'] if n.get('path') == 'panel/details/b')
             subprocess.run([str(BINARY), 'dev', 'input', str(comp), json.dumps(dict(
                 window='main', token=tree['token'], node=node['id'], action='click', target='panel/details/b'))],
                 env=env, check=True, capture_output=True, timeout=10)
-            out, failed = send(comp, 'collapsible@details', {'type': 'TOGGLE'}, wait={'states': ['closed']})
-            assert not failed and out['accepted'] and out['states'] == ['closed'], out
+            poll(lambda: snapshot(comp, 'collapsible@details')['states'] == ['closed'], 'the click did not reach the same actor')
+            out, failed = send(comp, 'collapsible@details', {'type': 'TOGGLE'}, wait={'states': ['open']})
+            assert not failed and out['accepted'] and out['states'] == ['open'], out
 
             # The overview on a real Notes session: three notes, one failing
             # write, a red unit and alarm; the alarm drills into its unit.
