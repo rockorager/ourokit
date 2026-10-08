@@ -302,9 +302,11 @@ crashes and cancellation. `Peer(root, remove_managers=False)` remains the entry
 point. The peer parses the Wayland protocol XMLs installed with ouroctl in
 `share/ourokit/protocols`, so downstream projects can run it against a prebuilt
 `ouroctl` (`python3 tests/session_native.py <ouroctl>`); a source checkout falls
-back to `zig-pkg`, and `OUROKIT_TEST_PROTOCOL_XMLS` overrides both. Fixture
-services require `fixture-user`: `fixture` expects `alice` then
-`test-only-response`; `deny-account` accepts those but rejects account;
+back to `zig-pkg`, and `OUROKIT_TEST_PROTOCOL_XMLS` overrides both. The file
+needs only the standard library and no sibling test module, so a downstream
+test can load it by path with `importlib` instead of adding `ourokit/tests` to
+`sys.path`. Fixture services require `fixture-user`: `fixture` expects `alice`
+then `test-only-response`; `deny-account` accepts those but rejects account;
 `blocked` ignores TERM forever; `crash` raises SIGSEGV; `edited` checks Unicode;
 `end-failed` fails PAM cleanup; and `limit` checks exactly 512 `x` bytes. No real
 credentials, system PAM configuration or user's compositor are touched.

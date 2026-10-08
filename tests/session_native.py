@@ -16,8 +16,6 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 
-from desktop_native import protocol_xml
-
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get('OUROKIT_TEST_BINARY', ROOT / 'zig-out/bin/ouroctl')).resolve()
 
@@ -92,6 +90,21 @@ return o.app {id='dev.ourokit.session-fixture', theme={color_scheme='dark'}, run
   end}
 end}
 '''
+
+def protocol_xml(name, binary=BINARY):
+    """Path of a Wayland protocol XML that the native test peers parse.
+
+    ouroctl installs them under share/ourokit/protocols next to bin/, so a
+    prebuilt ouroctl brings its own; a source checkout also has them in zig-pkg.
+    This module uses only the standard library and no sibling test module, so
+    other projects can load it by path (see verify_standalone_import).
+    """
+    installed = Path(binary).resolve().parents[1] / 'share/ourokit/protocols' / name
+    if installed.is_file():
+        return installed
+    found = next((ROOT / 'zig-pkg').rglob(name), None)
+    assert found, f'{name} not found next to {binary} (share/ourokit/protocols) or in zig-pkg'
+    return found
 
 def u32(value):
     return struct.pack('<I', value & 0xffffffff)
@@ -414,7 +427,30 @@ end}
         assert peer.locks == peer.idles == peer.powers == 0, 'must not downgrade or use a different protocol'
         print(result.stdout.strip())
 
+def verify_standalone_import():
+    """Other projects (ouroshell) subclass Peer. Load a lone copy of this file
+    by path, in isolated mode with nothing added to sys.path, and build a Peer:
+    importing must not need sibling test modules or the ourokit checkout."""
+    import shutil
+    with tempfile.TemporaryDirectory(prefix='ourokit-session-import-') as temp:
+        copy = Path(temp) / 'elsewhere' / 'session_native.py'
+        copy.parent.mkdir()
+        shutil.copy(__file__, copy)
+        probe = (
+            'import importlib.util, pathlib, sys\n'
+            f'spec = importlib.util.spec_from_file_location("ourokit_session", {str(copy)!r})\n'
+            'module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)\n'
+            f'peer = module.Peer(pathlib.Path({temp!r}))\n'
+            'peer.listener.close()\n'
+            'print("imported", len(peer.xml))\n')
+        env = dict(os.environ, OUROKIT_TEST_BINARY=str(BINARY))
+        result = subprocess.run([sys.executable, '-I', '-c', probe], env=env, cwd=temp,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0 and 'imported' in result.stdout, result.stderr
+        print('PASS session peer loads by path from outside the checkout')
+
 if __name__ == '__main__':
+    verify_standalone_import()
     verify()
     verify(loss=True)
     verify(loss='killed')

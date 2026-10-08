@@ -17,23 +17,10 @@ import tempfile
 import time
 
 from application_services import call, development_path
+from session_native import protocol_xml
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("OUROKIT_TEST_BINARY", ROOT / "zig-out/bin/ouroctl"))
-
-
-def protocol_xml(name, binary=BINARY):
-    """Path of a Wayland protocol XML that the native test peers parse.
-
-    ouroctl installs them under share/ourokit/protocols next to bin/, so a
-    prebuilt ouroctl brings its own; a source checkout also has them in zig-pkg.
-    """
-    installed = Path(binary).resolve().parents[1] / "share/ourokit/protocols" / name
-    if installed.is_file():
-        return installed
-    found = next((ROOT / "zig-pkg").rglob(name), None)
-    assert found, f"{name} not found next to {binary} (share/ourokit/protocols) or in zig-pkg"
-    return found
 
 
 def run(*args, env, ok=True, timeout=10):
@@ -399,7 +386,7 @@ return o.app{id='dev.ourokit.parent-lifetime',run=function() return {windows={
 
 def drag_test(root, env):
     """Two real Wayland clients, with Sway's private seat providing serials."""
-    xml = os.environ.get('OUROKIT_TEST_POINTER_XML') or protocol_xml('wlr-virtual-pointer-unstable-v1.xml')
+    xml = os.environ.get('OUROKIT_TEST_POINTER_XML') or protocol_xml('wlr-virtual-pointer-unstable-v1.xml', BINARY)
     run('wayland-scanner', 'client-header', str(xml), str(root / 'virtual-pointer.h'), env=env)
     run('wayland-scanner', 'private-code', str(xml), str(root / 'virtual-pointer.c'), env=env)
     flags = shlex.split(run('pkg-config', '--cflags', '--libs', 'wayland-client', env=env).stdout)

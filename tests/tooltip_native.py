@@ -17,7 +17,8 @@ import tempfile
 import time
 
 from application_services import BINARY, ROOT, call, development_path
-from desktop_native import protocol_xml, sway, terminate, wait_for
+from desktop_native import sway, terminate, wait_for
+from session_native import protocol_xml
 import verify_development as verify
 
 
