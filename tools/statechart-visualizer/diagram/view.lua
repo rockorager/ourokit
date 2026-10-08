@@ -7,6 +7,7 @@ local draw = require('diagram.draw')
 local layout = require('diagram.layout')
 local history = require('history')
 local model = require('model')
+local overview_view = require('diagram.overview')
 
 local M = {}
 
@@ -357,13 +358,25 @@ function M.status(viz)
   return 'starting', 'busy'
 end
 
-function M.header(viz, c, P, scheme, store)
-  local row = {o.text {key='brand', text='Statechart inspector', size=14, weight='medium', foreground=P.text}}
-  for i, path in ipairs(store.order) do
-    local entry = store.actors[path]
-    row[#row+1] = o.button {key='tab' .. i, label=path .. (entry and entry.stopped and ' ■' or ''), height=26, padding_x=10,
-      font_size=12, variant=path == c.selected and 'solid' or 'ghost', tone=path == c.selected and 'accent' or 'neutral',
-      send=viz:event({type='SELECT', value=path})}
+-- Breadcrumbs down the display hierarchy: Overview › unit › step › record.
+local function crumb(key, text, event, current, P)
+  if current then return o.text {key=key, text=text, size=13, weight='medium', foreground=P.text} end
+  return o.button {key=key, label=text, height=26, padding_x=8, font_size=13, variant='ghost', tone='neutral', send=event}
+end
+
+function M.header(viz, c, P, scheme, store, cursor)
+  local row = {o.text {key='brand', text='Statechart inspector', size=14, weight='medium', foreground=P.text},
+    o.box {key='gap', width=8}}
+  local level = viz:matches('screen.record') and 4 or viz:matches('screen.unit') and 3 or 1
+  row[#row+1] = crumb('c1', 'Overview', viz:event('OVERVIEW'), level == 1, P)
+  if level > 1 and c.selected then
+    local entry = store.actors[c.selected]
+    row[#row+1] = o.text {key='s1', text='›', size=13, foreground=P.faint}
+    row[#row+1] = crumb('c2', c.selected .. (entry and entry.stopped and ' ■' or ''), viz:event('UNIT'), level == 3, P)
+    if cursor then
+      row[#row+1] = o.text {key='s2', text='›', size=13, foreground=P.faint}
+      row[#row+1] = crumb('c3', 'step ' .. cursor, viz:event('RECORD'), level == 4, P)
+    end
   end
   local source = c.mode == 'file' and ('recording · ' .. tostring(c.path))
     or c.mode == 'socket' and ('attached · ' .. tostring(c.address)) or 'in-process'
@@ -376,11 +389,52 @@ function M.header(viz, c, P, scheme, store)
     background=(tone == 'live' and P.pass or tone == 'error' and P.fail or P.muted) .. '26',
     o.text {key='t', text=status, size=11, foreground=tone == 'live' and P.pass or tone == 'error' and P.fail or P.muted}}
   return o.box {key='header', width='fill', padding_x=14, padding_y=8, background=P.panel,
-    o.row {key='r', gap=10, cross_alignment='center', children=row}}
+    o.row {key='r', gap=6, cross_alignment='center', children=row}}
+end
+
+-- Level 4: everything one record says, plus the alarms it raised.
+local function record_detail(store, entry, frame, P)
+  local r = frame.record
+  local lines = {}
+  local function add(k, v, color) lines[#lines+1] = o.text {key='l' .. #lines, size=12, max_lines=3, overflow='ellipsis',
+    spans={{text=k .. '  ', foreground=P.muted}, {text=v, foreground=color or P.text}}} end
+  add('actor', entry.path .. '  (' .. tostring(entry.machine) .. ')')
+  add('step', string.format('%d  ·  seq %s  ·  t+%.3fs', frame.index, tostring(r.seq), (r.time or 0) / 1000))
+  add('event', (r.event and r.event.type or '—') .. '  ·  origin ' .. tostring(r.origin))
+  if r.event then add('payload', value_text(r.event, store.null)) end
+  add('outcome', r.rejected and ('rejected (' .. tostring(r.reason) .. ')') or 'handled', r.rejected and P.medium or nil)
+  local states = {}
+  for _, id in ipairs(r.configuration) do if id ~= '' then states[#states+1] = id end end
+  add('states', table.concat(states, ', '))
+  for i, m in ipairs(r.microsteps) do
+    local ts = {}
+    for _, id in ipairs(m.transitions) do
+      local t = entry.graph.transition_by_id[id]
+      ts[#ts+1] = t and ('#' .. id .. ' ' .. t.source .. ' → ' .. (t.targets[1] or '⟲') .. ' [' .. t.label .. ']') or ('#' .. id)
+    end
+    add('microstep ' .. i, table.concat(ts, '; ') .. '  exit ' .. table.concat(m.exited, ',') .. '  enter ' .. table.concat(m.entered, ','))
+  end
+  for _, t in ipairs(r.timers) do add('timer', t.op .. ' ' .. tostring(t.state) .. ' after ' .. tostring(t.delay) .. 'ms') end
+  for _, v in ipairs(r.invokes) do
+    add('invoke', v.op .. ' ' .. tostring(v.id) .. ((v.src and v.src ~= v.id) and (' (' .. tostring(v.src) .. ')') or '') .. (v.error and (': ' .. value_text(v.error, store.null)) or ''),
+      v.op == 'error' and P.high or nil)
+  end
+  local keys = {}
+  for k in pairs(frame.changed) do keys[#keys+1] = k end
+  table.sort(keys)
+  for _, k in ipairs(keys) do add('context.' .. k, value_text(frame.context[k], store.null), P.accent) end
+  for _, a in ipairs(store.alarms) do
+    if a.actor == entry.path and a.step == frame.index then
+      add('alarm', (a.severity == 'high' and 'HIGH ' or 'MED ') .. a.message, a.severity == 'high' and P.high or P.medium)
+    end
+  end
+  return o.box {key='record', flex=1, height='fill', padding=20, background=P.canvas,
+    o.scroll {key='scroll', axis='vertical', height='fill', o.column {key='lines', gap=6, children=lines}}}
 end
 
 -- The whole window for the visualizer actor `viz` over `store`.
--- props.motion pins the pulse phase and props.now the clock (storybook).
+-- props.motion pins the pulse phase and props.now the clock (storybook);
+-- props.overview_now pins the overview's clock (scheduler time).
 M.Screen = o.stateless(function(props, _, theme)
   local viz, store = props.viz, props.store
   local scheme = theme and theme.color_scheme or 'light'
@@ -390,33 +444,60 @@ M.Screen = o.stateless(function(props, _, theme)
   -- the screen when an ingest batch lands in the (non-reactive) store.
   local _ = c.revision
   local entry = c.selected and store.actors[c.selected]
-  local body
-  if not entry or #entry.history.frames == 0 then
+  local body, cursor
+  if viz:matches('screen.overview') then
+    local now = props.overview_now or store.now or 0
+    body = o.row {key='overview-body', gap=0, flex=1, cross_alignment='stretch',
+      o.box {key='topology', flex=1, height='fill', background=P.hmi, clip=true, alignment='center', padding=8,
+        #store.order > 0 and overview_view.topology(viz, c, store, P, now, {motion=props.motion})
+          or o.text {key='waiting', foreground=P.muted, text=c.message or 'Waiting for actors…'}},
+      overview_view.alarms(viz, c, store, P),
+    }
+  elseif not entry or #entry.history.frames == 0 then
     body = o.box {key='main', width='fill', flex=1, alignment='center', background=P.canvas,
       o.text {key='waiting', text=c.message or (c.mode == 'socket' and ('Waiting for records from ' .. tostring(c.address)))
         or 'Waiting for actors…', foreground=P.muted}}
   else
     local hist = entry.history
     local n = #hist.frames
-    local cursor = c.cursor and math.min(c.cursor, n) or n
+    cursor = c.cursor and math.min(c.cursor, n) or n
     local frame = hist.frames[cursor]
     local following = not c.cursor
     local now = props.now or frame.time
     local live = following and not props.motion
-    local plant = model.plant(store, entry)
-    body = o.column {key='main', gap=0, flex=1, cross_alignment='stretch',
-      o.row {key='body', gap=0, flex=1, cross_alignment='stretch',
+    local middle
+    if viz:matches('screen.record') then
+      middle = {record_detail(store, entry, frame, P)}
+    else
+      local plant = model.plant(store, entry)
+      middle = {
         M.events(viz, c, entry.graph, frame, P, c.mode ~= 'file' and entry.machine ~= nil and not entry.stopped),
         o.box {key='diagram-frame', flex=1, height='fill', background=P.canvas, clip=true, alignment='center',
           M.diagram(plant, frame, now, P, scheme, {pulse=props.motion, live=live})},
         M.side(plant, frame, now, P, store.null, live),
-      },
-      M.timeline(viz, hist, cursor, following, viz:matches('view.playing'), props.timeline_width or 1300, P, c.mode == 'file'),
-    }
+      }
+    end
+    local column = {}
+    -- The alarm that opened this unit, until acknowledged.
+    local opened = c.alarm and store.alarms[c.alarm]
+    if opened and opened.actor == entry.path and not (c.acked or {})[tostring(opened.id)] then
+      local color = opened.severity == 'high' and P.high or P.medium
+      column[#column+1] = o.box {key='banner', width='fill', padding_x=14, padding_y=6,
+        background=opened.severity == 'high' and P.high_soft or P.medium_soft,
+        o.row {key='r', gap=10, cross_alignment='center',
+          o.text {key='t', size=12, flex=1, max_lines=1, overflow='ellipsis', spans={
+            {text=(opened.severity == 'high' and 'ALARM  ' or 'WARNING  '), foreground=color},
+            {text=opened.message .. '  (step ' .. opened.step .. ')', foreground=P.text}}},
+          o.button {key='ack', label='Acknowledge', height=24, padding_x=8, font_size=11, variant='soft', tone='neutral',
+            send=viz:event({type='ACK', id=opened.id})}}}
+    end
+    column[#column+1] = o.row {key='body', gap=0, flex=1, cross_alignment='stretch', children=middle}
+    column[#column+1] = M.timeline(viz, hist, cursor, following, viz:matches('view.playing'), props.timeline_width or 1300, P, c.mode == 'file')
+    body = o.column {key='main', gap=0, flex=1, cross_alignment='stretch', children=column}
   end
   return o.box {key='root', width='fill', height='fill', background=P.background,
     o.column {key='screen', gap=1, cross_alignment='stretch',
-      M.header(viz, c, P, scheme, store),
+      M.header(viz, c, P, scheme, store, cursor),
       body,
     }}
 end)

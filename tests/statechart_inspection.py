@@ -310,14 +310,15 @@ def snapshot(endpoint, actor):
 
 def poll(predicate, message, timeout=20):
     deadline = time.monotonic() + timeout
+    last = None
     while True:
         try:
             value = predicate()
-        except (AssertionError, KeyError, StopIteration, ConnectionError, OSError):
-            value = None
+        except (AssertionError, KeyError, StopIteration, ConnectionError, OSError) as error:
+            value, last = None, error
         if value:
             return value
-        assert time.monotonic() < deadline, message
+        assert time.monotonic() < deadline, (message, last)
         time.sleep(.1)
 
 
@@ -416,9 +417,57 @@ def native():
                 env=env, check=True, capture_output=True, timeout=10)
             out, failed = send(comp, 'collapsible@details', {'type': 'TOGGLE'}, wait={'states': ['closed']})
             assert not failed and out['accepted'] and out['states'] == ['closed'], out
+
+            # The overview on a real Notes session: three notes, one failing
+            # write, a red unit and alarm; the alarm drills into its unit.
+            for name, process in processes:  # Debug software rendering is slow: keep the CPU free.
+                if name in ('visualizer', 'self') and process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+            _, docs = launch('documents', ROOT / 'examples/documents/ouro.json', '--dev', '--software')
+            notes = poll(lambda: snapshot(docs, 'notes'), 'the notes actor never started', timeout=60)
+            first = notes['context']['next']  # Notes opens with an untitled note.
+            failing = f'notes/document.{first + 1}'
+            _, ov = launch('overview', VISUALIZER, '--dev', '--software', '--', f'unix:{docs}')
+            poll(lambda: live(ov), 'the overview never attached', timeout=60)
+            for title, path in (('Groceries', '/tmp/groceries.ournote'), ('Ideas', str(root / 'missing/ideas.ournote')),
+                                ('Draft', None)):
+                note = {'type': 'ADD', 'title': title, 'text': title.lower()}
+                if path:
+                    note['path'] = path
+                out, failed = send(docs, 'notes', note)
+                assert not failed and out['accepted'], out
+            out, failed = send(docs, failing, {'type': 'SAVE'}, wait={'states': ['open.io.idle']})
+            assert not failed and out['accepted'] and out['wait'] == {'matched': True}, out
+            rollup = {r['actor']: r for r in statecharts(docs, after=0, limit=0, actors=False, rollup=True)['rollup']['actors']}
+            documents = {f'notes/document.{n}' for n in range(first, first + 3)}
+            assert documents <= set(rollup), rollup
+            assert rollup[failing]['errors'] == 1 and 'write' in rollup[failing]['last_error']['message'], rollup
+            assert rollup[failing]['parent'] == 'notes' and rollup[f'notes/document.{first}']['errors'] == 0, rollup
+            assert 'open.io.idle' in rollup[f'notes/document.{first + 2}']['states'], rollup
+
+            def node(label):
+                tree = inspect(env, ov, 'main')['windows'][0]
+                return tree, next(n for n in tree['nodes'] if n.get('label') == label)
+            tree, row = poll(lambda: node('Open alarm 1'), 'no alarm row in the overview', timeout=60)
+            assert any(n.get('label') == 'Open ' + failing for n in tree['nodes']), 'no unit tile'
+            assert not any(n.get('label') == 'Open alarm 2' for n in tree['nodes']), 'one alarm only'
+            assert 'screen.overview' in snapshot(ov, 'visualizer')['states']
+            subprocess.run([str(BINARY), 'dev', 'input', str(ov), json.dumps(dict(
+                window='main', token=tree['token'], node=row['id'], action='click', target=row['path']))],
+                env=env, check=True, capture_output=True, timeout=10)
+            state = poll(lambda: (lambda s: 'screen.unit' in s['states'] and s)(snapshot(ov, 'visualizer')),
+                         'the alarm did not drill down', timeout=30)
+            assert state['context']['selected'] == failing and state['context']['alarm'] == 1, state['context']
+            assert 'view.scrubbing' in state['states'], state
+            out, failed = send(ov, 'visualizer', {'type': 'ACK', 'id': 1})
+            assert not failed and out['changes']['acked'] == {'1': True}, out
+            out, failed = send(ov, 'visualizer', {'type': 'OVERVIEW'})
+            assert not failed and 'screen.overview' in out['states'], out
             print('PASS statecharts native: stopwatch driven by runtime.send and replayed identically; '
                   'visualizer attached by push with no idle requests; visualizer attached to itself; '
-                  'component machine addressed by instance path')
+                  'component machine addressed by instance path; overview alarm on a real Notes write '
+                  'failure, rollup, drill-down and acknowledge')
         finally:
             for name, process in processes:
                 if process.poll() is None:

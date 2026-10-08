@@ -19,7 +19,7 @@ local noop = function() end
 return {
   ['push attaches live, follows batches and polls only without the resource'] = function()
     local follows, polls, failing = 0, 0, false
-    local services = {observe = noop, load = noop, inject = noop}
+    local services = {observe = noop, load = noop, inject = noop, watch = noop}
     function services.follow(input, send)
       follows = follows + 1
       if failing then error(failing, 0) end
@@ -54,7 +54,7 @@ return {
   end,
 
   ['scrubbing, stepping, playing and going live move the cursor'] = function()
-    local services = {follow = noop, poll = noop, load = noop, inject = noop}
+    local services = {follow = noop, poll = noop, load = noop, inject = noop, watch = noop}
     function services.observe(_, send) send(batch(1, 5)) end
     local viz, clock = start(services, {mode = 'in_process'})
     clock.run_tasks()
@@ -74,7 +74,7 @@ return {
 
   ['the payload editor converts drafts and sends through inject'] = function()
     local sent
-    local services = {follow = noop, poll = noop, load = noop}
+    local services = {follow = noop, poll = noop, load = noop, watch = noop}
     function services.observe(_, send) send(batch(1, 1)) end
     function services.inject(input) sent = input; return input.event.type .. ' accepted' end
     local viz, clock = start(services, {mode = 'in_process'})
@@ -90,5 +90,37 @@ return {
     viz:send({type = 'INJECT', name = 'START'})
     clock.run_tasks()
     assert(sent.event.type == 'START' and viz:context().message == 'START accepted')
+  end,
+
+  ['the overview drills into units and alarms, acknowledges, and watches for stuck states'] = function()
+    local watched = {}
+    local services = {follow = noop, poll = noop, load = noop, inject = noop}
+    function services.observe(_, send)
+      local event = batch(1, 6)
+      event.wait = 2500
+      send(event)
+    end
+    function services.watch(input)
+      watched[#watched + 1] = input.wait
+      return {revision = 2, actors = {'stopwatch'}, counts = {stopwatch = 7}}
+    end
+    local viz, clock = start(services, {mode = 'in_process'})
+    clock.run_tasks()
+    assert(viz:matches('screen.overview'), 'the overview is Level 1')
+    assert(watched[1] == 2500 and viz:matches('watch.idle') and viz:context().wait == false, 'one check, no next deadline')
+    assert(viz:context().counts.stopwatch == 7 and viz:context().revision == 2)
+    viz:send({type = 'SELECT', value = 'stopwatch'})
+    assert(viz:matches('screen.unit') and viz:matches('view.following'))
+    viz:send('RECORD')
+    assert(viz:matches('screen.record'))
+    viz:send('UNIT'); viz:send('OVERVIEW')
+    assert(viz:matches('screen.overview'))
+    viz:send({type = 'OPEN_ALARM', id = 3, actor = 'stopwatch', step = 4})
+    assert(viz:matches('screen.unit') and viz:matches('view.scrubbing'))
+    assert(viz:context().cursor == 4 and viz:context().alarm == 3 and viz:context().selected == 'stopwatch')
+    viz:send({type = 'ACK', id = 3})
+    viz:send({type = 'ACK_ALL', ids = {1, 2}})
+    local acked = viz:context().acked
+    assert(acked['1'] and acked['2'] and acked['3'] and not acked['4'])
   end,
 }

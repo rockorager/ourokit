@@ -7,12 +7,15 @@
 local contract = require('contract')
 local history = require('history')
 local layout = require('diagram.layout')
+local overview = require('overview')
+local default_thresholds = require('thresholds')
 
 local M = {}
 
-function M.new(null)
+function M.new(null, thresholds)
   contract.null = null
-  return {actors = {}, order = {}, plants = {}, null = null}
+  return {actors = {}, order = {}, plants = {}, null = null, thresholds = thresholds or default_thresholds,
+    alarms = {}, alarm_keys = {}, endpoints = {}, endpoint_order = {}, traffic = {}, traffic_order = {}}
 end
 
 local function shape(g) return g.id .. ':' .. #g.states .. ':' .. #g.transitions end
@@ -35,8 +38,13 @@ local function started(store, record, time)
   end
   if not existing then store.order[#store.order + 1] = path end
   -- t0 is on the scheduler clock when records carry time_ms, else receive time.
-  store.actors[path] = {path = path, machine = record.machine, graph = graph, history = history.new(graph),
+  local parent = record.parent
+  local entry = {path = path, machine = record.machine, graph = graph, history = history.new(graph),
+    parent = parent ~= store.null and parent or nil, null = store.null,
     t0 = record.time_ms ~= store.null and record.time_ms or nil, received0 = time}
+  overview.new_entry(entry)
+  store.actors[path] = entry
+  overview.declare(store, entry)
 end
 
 -- Ingests one §10 record (`time` is the receive time, for clockless feeds).
@@ -52,8 +60,18 @@ function M.ingest(store, record, time)
     if record.time_ms and record.time_ms ~= store.null then entry.t0 = entry.t0 or record.time_ms end
     entry.received0 = entry.received0 or time
     local fallback = time and (time - entry.received0) or (frames[#frames] and frames[#frames].time or 0)
-    history.append(entry.history, contract.record(record, entry.t0, fallback))
+    local frame = history.append(entry.history, contract.record(record, entry.t0, fallback))
+    overview.observe(store, entry, record, frame)
+    store.deadline = overview.check(store, store.now)
   end
+end
+
+-- Stuck-state check at `now` on the inspected app's clock (no record
+-- needed); returns the next deadline.
+function M.check(store, now)
+  store.now = math.max(store.now or now, now)
+  store.deadline = overview.check(store, store.now)
+  return store.deadline
 end
 
 -- Frame counts per actor, for the chart's cursor arithmetic.

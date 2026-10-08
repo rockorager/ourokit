@@ -5,7 +5,11 @@
 --               polling fallback, detaching and retrying on errors;
 --   view        which actor is shown, and following live vs scrubbing vs
 --               playing a recording;
---   editor      the payload editor for events with fields.
+--   editor      the payload editor for events with fields;
+--   screen      the HMI hierarchy: overview (Level 1/2) -> unit statechart
+--               (Level 3) -> record detail (Level 4);
+--   watch       one timer for the next possible stuck-state alarm.
+-- Alarm acknowledgements are context (`acked`, keyed by alarm id).
 -- Effects are injected `services` (invokes and one-shot tasks), so storybook
 -- and tests can run the chart without sockets. Inspected data itself lives
 -- in model.lua; RECORDS events bump `revision` and carry per-actor counts.
@@ -30,16 +34,18 @@ end
 
 return function(services)
   return machine.create {
-    id = 'visualizer', type = 'parallel', order = {'connection', 'view', 'editor'},
+    id = 'visualizer', type = 'parallel', order = {'connection', 'view', 'editor', 'screen', 'watch'},
     context = function(input)
       return {
         mode = input.mode, address = input.address or false, path = input.path or false,
         revision = 0, actors = {}, counts = {}, after = 0, seed = false, gaps = 0,
+        acked = {}, wait = false, alarm = false,
         selected = false, cursor = false, message = false, editor = false,
       }
     end,
     events = {
-      RECORDS = {revision = 'integer', actors = 'table', counts = 'table', after = 'integer?', seed = 'integer?', gaps = 'integer?'},
+      RECORDS = {revision = 'integer', actors = 'table', counts = 'table', after = 'integer?', seed = 'integer?', gaps = 'integer?',
+        wait = 'number?'},
       ATTACHED = {},
       SELECT = {value = 'string'},
       SCRUB = {value = 'number'},
@@ -49,20 +55,46 @@ return function(services)
       EDIT_PAYLOAD = {name = 'string', fields = 'table'},
       FIELD = {name = 'string', value = 'any'},
       SEND_PAYLOAD = {}, CLOSE_EDITOR = {},
+      OVERVIEW = {}, UNIT = {}, RECORD = {},
+      OPEN_ALARM = {id = 'integer', actor = 'string', step = 'integer'},
+      ACK = {id = 'integer'}, ACK_ALL = {ids = 'table'},
     },
     guards = {
       in_process = function(c) return c.mode == 'in_process' end,
       file = function(c) return c.mode == 'file' end,
       no_push = function(_, e) return tostring(e.error):find('NoPush', 1, true) ~= nil end,
       at_end = function(c) return (c.cursor or 0) >= (c.counts[c.selected] or 0) end,
+      waiting = function(c) return c.wait ~= false end,
+      wait_event = function(_, e) return e.wait ~= nil end,
     },
     actions = {
       records = assign(function(c, e)
         local selected = c.selected
         if not selected or not e.counts[selected] then selected = e.actors[1] or false end
         return {revision = e.revision, actors = e.actors, counts = e.counts, selected = selected,
-          after = e.after or c.after, seed = e.seed or c.seed, gaps = e.gaps or c.gaps}
+          after = e.after or c.after, seed = e.seed or c.seed, gaps = e.gaps or c.gaps, wait = e.wait or false}
       end),
+      -- The stuck-state check ran (watch service): new alarms and deadline.
+      checked = assign(function(_, e)
+        local o = e.output
+        return {revision = o.revision, actors = o.actors, counts = o.counts, wait = o.wait or false}
+      end),
+      open_alarm = assign(function(c, e)
+        local n = c.counts[e.actor] or 0
+        return {selected = e.actor, cursor = math.max(1, math.min(n, e.step)), alarm = e.id}
+      end),
+      ack = assign {acked = function(c, e)
+        local acked = {}
+        for k, v in pairs(c.acked) do acked[k] = v end
+        acked[tostring(e.id)] = true
+        return acked
+      end},
+      ack_all = assign {acked = function(c, e)
+        local acked = {}
+        for k, v in pairs(c.acked) do acked[k] = v end
+        for _, id in ipairs(e.ids) do acked[tostring(id)] = true end
+        return acked
+      end},
       loaded = assign(function(_, e)
         local o = e.output
         return {revision = o.revision, actors = o.actors, counts = o.counts, selected = o.actors[1] or false,
@@ -100,7 +132,7 @@ return function(services)
     },
     actors = {
       observe = services.observe, follow = services.follow, poll = services.poll,
-      load = services.load, inject = services.inject,
+      load = services.load, inject = services.inject, watch = services.watch,
     },
     states = {
       connection = {initial = 'starting', on = {RECORDS = {actions = 'records'}}, states = {
@@ -128,7 +160,11 @@ return function(services)
         detached = {after = {[1000] = 'connected'}},
       }},
       view = {initial = 'following',
-        on = {SELECT = {{target = '.scrubbing', guard = 'file', actions = 'select'}, {target = '.following', actions = 'select'}}},
+        on = {
+          SELECT = {{target = '.scrubbing', guard = 'file', actions = 'select'}, {target = '.following', actions = 'select'}},
+          -- An alarm opens its unit at the step that raised it.
+          OPEN_ALARM = {target = '.scrubbing', actions = 'open_alarm'},
+        },
         states = {
           following = {on = {
             SCRUB = {target = 'scrubbing', actions = 'scrub'},
@@ -163,6 +199,26 @@ return function(services)
             CLOSE_EDITOR = {target = 'closed', actions = 'close_editor'},
           }},
         }},
+      -- ISA-101 display hierarchy; breadcrumbs send OVERVIEW / UNIT.
+      screen = {initial = 'overview',
+        on = {
+          ACK = {actions = 'ack'}, ACK_ALL = {actions = 'ack_all'},
+          OVERVIEW = '.overview', SELECT = '.unit', OPEN_ALARM = '.unit',
+        },
+        states = {
+          overview = {},
+          unit = {on = {RECORD = 'record'}},
+          record = {on = {UNIT = 'unit'}},
+        }},
+      -- Stuck states need time to pass without records: one invoke sleeps
+      -- until the earliest possible alarm, then the check runs.
+      watch = {initial = 'idle', states = {
+        idle = {always = {target = 'waiting', guard = 'waiting'}},
+        waiting = {
+          invoke = {src = 'watch', input = function(c) return {wait = c.wait} end,
+            on_done = {target = 'idle', actions = 'checked'}},
+          on = {RECORDS = {{target = 'waiting', reenter = true, guard = 'wait_event'}, {target = 'idle'}}}},
+      }},
     },
   }
 end

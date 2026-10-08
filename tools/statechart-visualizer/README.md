@@ -22,6 +22,47 @@ plugins or web views.
 
 Light and dark palettes follow the app theme (`color_scheme`).
 
+## System overview (ISA-101)
+
+The window opens on an overview of the whole actor system, following ISA-101
+"high-performance HMI" principles. Views form a hierarchy with breadcrumbs:
+
+| Level | View |
+| --- | --- |
+| 1/2 | **Overview**: unit tiles, topology, alarm list |
+| 3 | **Unit**: one actor's statechart, events, context, timeline (above) |
+| 4 | **Record**: one step in full (event, payload, microsteps, timers, invokes, changed context, alarms) |
+
+- **Units:** one tile per live actor: roots in columns, spawned children
+  below their parent, component machines grouped by instance path. A tile
+  shows path and chart, active leaf states, pending timers, running invokes and
+  a 30-second event-rate sparkline. Placement follows first-seen order, so it
+  is stable as records arrive. Clicking a tile opens its statechart.
+- **Topology:** parent/child elbows; dashed traffic lines from `record.sent`
+  and children reporting back (`done.actor.*`, `error.actor.*`); an I/O bus
+  to external endpoints, which are every invoke `src` in the graphs and every
+  spawned task `src`. A stub darkens while its invoke runs.
+- **Grey by default; colour only when abnormal:**
+  - red: failed invokes and children, `error.*`, `surface.failed.*` and
+    `record.error` (action errors such as `YieldInAction`, guard or assign
+    errors);
+  - amber: a stuck state;
+  - a brief amber flash: a rejected event.
+- **Stuck states:** busy leaf states (with an invoke or `after`) alarm when
+  the current dwell exceeds 10x their median dwell (at least 1 s, after 3
+  samples). [`thresholds.lua`](thresholds.lua) changes this per chart or
+  per state (`{max_ms = n}`, or `false` to stop watching). The `watch`
+  region sleeps until the earliest deadline, so nothing runs periodically.
+- **Alarms:** time, unit, severity and message, newest first. Unacknowledged
+  alarms keep their unit coloured. **Ack** / **Ack all** acknowledge. Clicking
+  an alarm opens its unit at the step that raised it, with a banner.
+
+[`overview.lua`](overview.lua) folds the records into alarms, dwell samples,
+rates and topology at ingest. This is a pure function of the records, so a
+recording shows the same alarms. The display hierarchy and acknowledgements
+are chart state (`screen`, `acked`). Agents get the same overview from the
+app with `runtime.statecharts {rollup = true}`.
+
 ## Run it
 
 ```sh
@@ -36,7 +77,7 @@ zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua --dev -- self
 # Headless frames (manual scheduler, recorded streams)
 zig-out/bin/ouroctl storybook snapshot tools/statechart-visualizer/storybook.lua --output out
 # The visualizer's own chart, on a manual clock with fake services
-(cd tools/statechart-visualizer && ../../zig-out/bin/ouroctl test charts_test.lua)
+(cd tools/statechart-visualizer && ../../zig-out/bin/ouroctl test charts_test.lua && ../../zig-out/bin/ouroctl test overview_test.lua)
 # A recorded session (design/statecharts.md §14): expand it, then scrub or play it
 zig-out/bin/ouroctl replay ~/.local/state/ourokit/recordings/dev.ourokit.stopwatch.jsonl examples/stopwatch --records /tmp/stopwatch.records.jsonl
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- /tmp/stopwatch.records.jsonl
@@ -72,10 +113,12 @@ connection: starting ─┬─► in_process            (machine.inspect in this
                               └ other error ─► detached ─after 1s─► connected
 view:       following ⇄ scrubbing ⇄ playing (after 500ms steps, stops at the end)
 editor:     closed ⇄ open   (payload drafts; INJECT / SEND_PAYLOAD spawn 'inject')
+screen:     overview ─SELECT/OPEN_ALARM─► unit ─RECORD─► record   (OVERVIEW, UNIT go back)
+watch:      idle ⇄ waiting  (invoke 'watch' sleeps until the next stuck deadline)
 ```
 
 Effects are injected services (`observe`, `follow`, `poll`, `load`,
-`inject`), so `charts_test.lua` runs the chart without sockets. Views are pure
+`inject`, `watch`), so `charts_test.lua` runs the chart without sockets. Views are pure
 functions of the chart and the model; there is no `o.signal` or
 `ouro.stateful`. Each ingest batch is a `RECORDS` event that bumps `revision`.
 
@@ -110,7 +153,13 @@ functions of the chart and the model; there is no `o.signal` or
 `tests/statechart_inspection.py` checks this on real instances: the stopwatch
 driven over the endpoint and replayed identically, no requests from an
 attached visualizer while idle, records arriving without polling, a ring
-overflow reseed, and self-attach.
+overflow reseed, self-attach, and a real Notes session whose failed write
+raises an alarm that drills into its unit.
+
+Storybook `overview/*` stories use real Notes records
+([`fixtures/notes_session.lua`](fixtures/notes_session.lua)): input logs
+written by hand, filled in with the replayed expectations, and expanded with
+`ouroctl replay <log> examples/documents --records`.
 
 ## Known limits
 

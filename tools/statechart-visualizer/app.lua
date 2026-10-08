@@ -12,6 +12,8 @@
 --       Attaches to its own development endpoint.
 --   ouroctl run tools/statechart-visualizer/app.lua -- session.records.jsonl
 --       Loads a replayed recording (`ouroctl replay log app --records file`).
+-- It opens on the system overview (every actor, I/O and the alarm list);
+-- clicking a unit drills into its statechart.
 -- All session state is in the `visualizer` chart (charts.lua); the views are
 -- pure functions of it and of the inspected data (model.lua).
 local o = require('ouro')
@@ -30,11 +32,17 @@ local store = model.new(o.json.null)
 local revision = 0
 local gaps = 0 -- ring overflows reseeded from the late-attach snapshot
 
+-- Until the next possible stuck-state alarm, on the inspected app's clock.
+local function wait()
+  return store.deadline and store.now and math.max(20, store.deadline - store.now) or nil
+end
+
 local function batch(extra)
   revision = revision + 1
   local actors = {}
   for i, path in ipairs(store.order) do actors[i] = path end
-  local event = {type = 'RECORDS', revision = revision, actors = actors, counts = model.counts(store), gaps = gaps}
+  local event = {type = 'RECORDS', revision = revision, actors = actors, counts = model.counts(store), gaps = gaps,
+    wait = wait()}
   for k, v in pairs(extra or {}) do event[k] = v end
   return event
 end
@@ -147,6 +155,17 @@ function services.load(input)
   for _, record in ipairs(records) do model.ingest(store, record) end
   local event = batch()
   return {revision = event.revision, actors = event.actors, counts = event.counts}
+end
+
+-- Stuck states: sleep until the earliest deadline, then check. Records
+-- arriving meanwhile re-enter the watch state, cancelling this sleep, so the
+-- app clock advanced by exactly `wait` when it returns.
+function services.watch(input)
+  local from = store.now
+  o.sleep(math.ceil(input.wait))
+  model.check(store, from + input.wait)
+  local event = batch()
+  return {revision = event.revision, actors = event.actors, counts = event.counts, wait = event.wait}
 end
 
 -- Event pills: runtime.send on an endpoint, actor:_send in-process.

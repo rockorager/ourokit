@@ -1136,8 +1136,43 @@ payload editor for events with fields), the context tree with changed keys
 highlighted, timers and invokes. A scrubbable timeline and record log sit
 below. Light and dark follow the app theme.
 
+It opens on a **system overview** in ISA-101 "high-performance HMI" style,
+the top of a display hierarchy: overview (Level 1/2), a unit's statechart
+(Level 3), one record in full (Level 4), with breadcrumbs back up.
+
+- **Units.** One tile per live actor: roots in columns, spawned children
+  below their parent, component machines grouped by instance path. Each tile
+  shows the path and chart, the active leaf states, pending timers, running
+  invokes and a 30-second event-rate sparkline. Layout is by first-seen order,
+  so tiles never move as records arrive.
+- **Topology.** Parent/child elbows, dashed lines for actor traffic
+  (`record.sent`, and `done.actor.*`/`error.actor.*` from children), and an
+  I/O bus to external endpoints: every invoke `src` in the graphs and every
+  spawned task `src`.
+- **Grey unless abnormal.** Colour marks only abnormal conditions: red for
+  failed invokes and children, `error.*` and `surface.failed.*` events and
+  `record.error` (action errors such as `YieldInAction`, and guard or assign
+  errors); amber for a state active far longer than usual; a brief amber
+  flash for a rejected event.
+- **Stuck states.** Busy leaf states (with an invoke or `after`) are watched.
+  One alarms when its dwell exceeds `factor` x the median of its earlier dwells
+  (default 10x, at least 1 s, after 3 samples). `tools/statechart-visualizer/thresholds.lua`
+  overrides this per chart and per state, including fixed limits. A single
+  `watch` invoke sleeps until the earliest deadline, so an idle system still
+  costs no periodic work.
+- **Alarms.** A list with time, unit, severity and message. Unacknowledged
+  alarms keep their unit coloured; Ack and Ack all acknowledge. Clicking an
+  alarm opens its unit at the step that raised it, with a banner.
+
+Alarms are a pure function of the records, so a loaded recording shows the
+same ones. `runtime.statecharts {rollup = true}` gives agents the same
+overview from the app side: one row per live actor with its leaf states,
+pending timer and invoke counts, record, rejection and error counters, and
+the last error.
+
 The visualizer's own state lives in one parallel chart (connection, view,
-editor; no `o.signal`). It reads only the graph and records described above.
+editor, screen, watch; acknowledgements in its context; no `o.signal`). It
+reads only the graph and records described above.
 
 ```sh
 zig build -Dvulkan=false -Doptimize=ReleaseSafe   # Debug software rendering runs at ~1 fps

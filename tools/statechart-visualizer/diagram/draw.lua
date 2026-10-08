@@ -17,6 +17,9 @@ M.palettes = {
     taken='#ea6a0c', taken_soft='#fff1e6', pulse='#ffb27a',
     pill='#eef1f5', pill_edge='#d6dbe2', pass='#13854a', fail='#d23a2f',
     chip_running='#2f6fed', chip_done='#13854a', chip_error='#d23a2f', chip_idle='#8a94a3',
+    -- Overview (ISA-101): greys for normal operation, colour only for alarms.
+    hmi='#dfe1e4', tile='#eeeff1', tile_edge='#a7adb5', badge='#d5d8dc', line='#8e959e', line_live='#4f5660',
+    high='#c8102e', medium='#d97800', high_soft='#f9e1e4', medium_soft='#fcefd9',
   },
   dark = {
     background='#101318', canvas='#13171d', panel='#171b22', panel_edge='#262c36',
@@ -27,6 +30,8 @@ M.palettes = {
     taken='#ff9a4d', taken_soft='#3a2616', pulse='#ffc79a',
     pill='#222833', pill_edge='#343c49', pass='#4fc785', fail='#ff6b60',
     chip_running='#6aa3ff', chip_done='#4fc785', chip_error='#ff6b60', chip_idle='#6c7687',
+    hmi='#1b1e22', tile='#262a30', tile_edge='#4b525c', badge='#343a42', line='#5f6772', line_live='#a3abb6',
+    high='#ff4d5a', medium='#ffa31a', high_soft='#3a1c20', medium_soft='#3a2a12',
   },
 }
 
@@ -77,6 +82,8 @@ local function arrow_path(points, radius)
   return path
 end
 
+M.rounded, M.arrow_path = rounded, arrow_path
+
 local function heading(points)
   local a, b = points[#points - 1], points[#points]
   local dx, dy = b[1] - a[1], b[2] - a[2]
@@ -116,6 +123,8 @@ local function dashed(out, color, x1, y1, x2, y2)
   end
   out[#out+1] = {kind='stroke', color=color, width=1.5, cap='round', path=path}
 end
+
+M.arrowhead, M.dashed = arrowhead, dashed
 
 -- Windows have a fixed scene-command budget, so fills and strokes of the
 -- same style merge into multi-contour paths while their bounding box stays
