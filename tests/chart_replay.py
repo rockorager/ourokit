@@ -304,6 +304,27 @@ def burst(root):
             assert process.poll() is None
         finally:
             terminate(process)
+    # Review2 L-3: two concurrent instances of one app id record to their own
+    # files; the second reports <id>.<pid>.jsonl.
+    processes, paths = [], []
+    try:
+        for _ in range(2):
+            sockets = Path(env["XDG_RUNTIME_DIR"]) / "ourokit/dev"
+            before = set(sockets.glob("*"))
+            process = subprocess.Popen([str(BINARY), "run", str(other / "app.lua"), "--dev", "--headless"],
+                                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            processes.append(process)
+            endpoint = development_path(Path(env["XDG_RUNTIME_DIR"]), process, exclude=before)
+            call(endpoint, "runtime.send", {"actor": "burst", "event": {"type": "BURST"}})
+            paths.append(call(endpoint, "runtime.diagnostics")["structuredContent"]["recording"]["path"])
+    finally:
+        for process in processes:
+            terminate(process)
+    assert paths[0] == str(recordings / "dev.ourokit.other-burst.jsonl"), paths
+    assert paths[1] == str(recordings / f"dev.ourokit.other-burst.{processes[1].pid}.jsonl"), paths
+    for path in paths:
+        out = replay(path, other / "app.lua")
+        assert out.startswith("replay matched: 2 entries"), (path, out)
     log = recordings / "dev.ourokit.burst.jsonl"
     lines = log.read_text().splitlines()
     big = json.loads(lines[2])

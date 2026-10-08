@@ -45,27 +45,27 @@ pub const Sink = struct {
         return sink;
     }
 
-    /// Creates (truncates) `path`, creating missing parent directories, and
-    /// writes the header and any buffered lines.
+    /// Opens `path` for this process alone: an exclusive lock, then
+    /// truncation. When another running instance holds `path` (the same app
+    /// id twice), records to `<path without .jsonl>.<pid>.jsonl` instead, so
+    /// concurrent runs never share a file. location() reports the choice.
+    /// Creates missing parent directories, then writes the header and any
+    /// buffered lines.
     pub fn assign(self: *Sink, path: []const u8, application: []const u8) !void {
         std.debug.assert(self.fd == null);
         if (std.fs.path.dirname(path)) |parent| try makePath(parent);
-        var buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-        if (path.len >= buffer.len) return error.NameTooLong;
-        @memcpy(buffer[0..path.len], path);
-        buffer[path.len] = 0;
-        const result = linux.openat(linux.AT.FDCWD, buffer[0..path.len :0], .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .TRUNC = true,
-            .CLOEXEC = true,
-        }, 0o600);
-        if (linux.errno(result) != .SUCCESS) return error.RecordingOpenFailed;
-        self.fd = @intCast(result);
-        @memcpy(self.path_buffer[0..path.len], path);
-        self.path_length = path.len;
+        var chosen = path;
+        var alternative: [std.fs.max_path_bytes]u8 = undefined;
+        const fd = (try openLocked(path)) orelse fd: {
+            const stem = if (std.mem.endsWith(u8, path, ".jsonl")) path[0 .. path.len - ".jsonl".len] else path;
+            chosen = std.fmt.bufPrint(&alternative, "{s}.{d}.jsonl", .{ stem, linux.getpid() }) catch return error.NameTooLong;
+            break :fd (try openLocked(chosen)) orelse return error.RecordingLocked;
+        };
+        self.fd = fd;
+        @memcpy(self.path_buffer[0..chosen.len], chosen);
+        self.path_length = chosen.len;
         var header: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&header, "{{\"format\":\"ouro.machine.log\",\"version\":1,\"t0\":{d},\"app\":{f}}}", .{
+        const line = std.fmt.bufPrint(&header, "{{\"format\":\"ouro.machine.log\",\"version\":2,\"t0\":{d},\"app\":{f}}}", .{
             self.t0, std.json.fmt(application, .{}),
         }) catch return error.NameTooLong;
         self.append(line);
@@ -88,7 +88,8 @@ pub const Sink = struct {
         self.reason_length = length;
     }
 
-    /// Appends one line. A failed write stops recording rather than the app.
+    /// Appends one line, with its newline in the same write. A failed write
+    /// stops recording rather than the app.
     pub fn append(self: *Sink, line: []const u8) void {
         if (self.failed) return;
         if (self.fd == null) {
@@ -98,8 +99,11 @@ pub const Sink = struct {
             self.lines += 1;
             return;
         }
-        self.writeAll(line) catch return self.fail("cannot write the recording file");
-        self.writeAll("\n") catch return self.fail("cannot write the recording file");
+        const whole = self.allocator.alloc(u8, line.len + 1) catch return self.fail("out of memory");
+        defer self.allocator.free(whole);
+        @memcpy(whole[0..line.len], line);
+        whole[line.len] = '\n';
+        self.writeAll(whole) catch return self.fail("cannot write the recording file");
         self.lines += 1;
     }
 
@@ -115,6 +119,41 @@ pub const Sink = struct {
         }
     }
 };
+
+/// An append-only descriptor on `path` holding its exclusive lock, truncated;
+/// null when another process holds the lock.
+fn openLocked(path: []const u8) !?i32 {
+    var buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buffer.len) return error.NameTooLong;
+    @memcpy(buffer[0..path.len], path);
+    buffer[path.len] = 0;
+    const result = linux.openat(linux.AT.FDCWD, buffer[0..path.len :0], .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    if (linux.errno(result) != .SUCCESS) return error.RecordingOpenFailed;
+    const fd: i32 = @intCast(result);
+    const lock_exclusive = 2;
+    const lock_nonblocking = 4;
+    switch (linux.errno(linux.flock(fd, lock_exclusive | lock_nonblocking))) {
+        .SUCCESS => {},
+        .AGAIN => {
+            _ = linux.close(fd);
+            return null;
+        },
+        else => {
+            _ = linux.close(fd);
+            return error.RecordingOpenFailed;
+        },
+    }
+    if (linux.errno(linux.ftruncate(fd, 0)) != .SUCCESS) {
+        _ = linux.close(fd);
+        return error.RecordingOpenFailed;
+    }
+    return fd;
+}
 
 fn makePath(path: []const u8) !void {
     var buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -199,4 +238,13 @@ test "recording sink writes a header and one line per append" {
     try later.assign(named, "dev.test");
     try std.testing.expectEqual(@as(u64, 2), later.lines);
     later.close();
+    // A second sink on a held path records beside it, under its pid.
+    var first = try Sink.open(std.testing.allocator, named, "dev.test");
+    defer first.close();
+    // flock locks belong to the open file description: a second open in the
+    // same process conflicts like another process would.
+    var second = try Sink.open(std.testing.allocator, named, "dev.test");
+    defer second.close();
+    try std.testing.expect(!std.mem.eql(u8, first.location(), second.location()));
+    try std.testing.expect(std.mem.endsWith(u8, second.location(), ".jsonl"));
 }
