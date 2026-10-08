@@ -60,3 +60,57 @@ workspace manager's `done` boundary. Output discovery, renaming, and removal
 also refresh snapshots; names are copied and no transient Wayland object IDs
 are exposed. The API intentionally omits workspace-group creation and
 assignment.
+
+## Watching workspaces from a chart
+
+A statechart cannot read the reactive session: its state changes come from
+events. `ouro.shell.workspaces.watch()` is the event source. It returns a
+watcher whose `watcher:next()` returns the current snapshot on the first call.
+Each later call parks the calling task until the next `done` batch and then
+returns that snapshot. Run it in an invoke, which owns the task, and send each
+snapshot to the chart:
+
+```lua
+local ouro = require("ouro")
+local machine = ouro.machine
+
+local bar = machine.create {
+  id = "bar", initial = "watching",
+  context = { available = false, workspaces = {} },
+  events = { WORKSPACES = { snapshot = "table" }, ACTIVATE = { handle = "string" } },
+  actions = {
+    store = machine.assign(function(_, e)
+      return { available = e.snapshot.available, workspaces = e.snapshot.workspaces }
+    end),
+    activate = function(_, e) ouro.shell.workspaces.activate(e.handle) end,
+  },
+  actors = {
+    watch = function(_, send)
+      local watcher <close> = ouro.shell.workspaces.watch()
+      while true do send { type = "WORKSPACES", snapshot = watcher:next() } end
+    end,
+  },
+  states = {
+    watching = { invoke = { src = "watch" }, on = { WORKSPACES = { actions = "store" }, ACTIVATE = { actions = "activate" } } },
+  },
+}
+```
+
+The view reads `bar:context().workspaces` and sends
+`{ type = "ACTIVATE", handle = workspace.handle }`.
+
+Watch snapshots have the same `available` and workspace fields as the session,
+except that they are plain data and can be kept in context, persisted, and
+carried across reload. Instead of request closures, each workspace has an
+opaque `handle` string. Pass it to `ouro.shell.workspaces.activate(handle)`,
+`deactivate(handle)` or `remove(handle)`. These queue the same batched
+requests as the session's functions, and they raise an error for a workspace
+that no longer exists. They do not wait, so a chart action may call them.
+
+Watching costs nothing until it is used. The protocol is bound only after the
+first `connect()` or `watch()`, and a watcher holds no native resources while
+its task is not parked in `next`. Closing the watcher stops it. So does its
+scope ending: a `<close>` local in an invoke closes when the state exits. A
+task parked in `next` when its watcher is closed from elsewhere resumes with
+the error `workspace watch canceled`. Several watchers may be open at once, and
+`watch()` can be used with or without `connect()`.

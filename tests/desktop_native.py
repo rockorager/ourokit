@@ -1027,9 +1027,98 @@ return o.app{id='dev.ourokit.surface-probe',
         assert 'panic' not in errors and 'leaked' not in errors, errors
 
 
+def workspaces_test(root, env):
+    """ouro.shell.workspaces.watch() feeds a chart from ext-workspace-v1 done batches."""
+    from workspace_proxy import WorkspaceProxy
+    upstream = env['OUROKIT_TEST_WAYLAND_DISPLAY']
+    proxy = WorkspaceProxy(upstream, str(root / 'wayland-workspaces'))
+    app_env = dict(env, WAYLAND_DISPLAY=proxy.path)
+    source = root / 'workspace-bar.lua'
+    source.write_text('''local o=require('ouro'); local machine=o.machine; local assign=machine.assign
+local bar=machine.create{id='bar',initial='watching',context={available=false,workspaces={},updates=0},
+ events={WORKSPACES={snapshot='table'},ACTIVATE={handle='string'},PAUSE={},RESUME={}},
+ actions={store=assign(function(c,e) return {available=e.snapshot.available,workspaces=e.snapshot.workspaces,updates=c.updates+1} end),
+  activate=function(_,e) o.shell.workspaces.activate(e.handle) end},
+ actors={watch=function(_,send)
+  local watch <close> = o.shell.workspaces.watch()
+  while true do send{type='WORKSPACES',snapshot=watch:next()} end
+ end},
+ states={
+  watching={invoke={src='watch'},on={WORKSPACES={actions='store'},ACTIVATE={actions='activate'},PAUSE='paused'}},
+  paused={on={RESUME='watching',ACTIVATE={actions='activate'}}}}}
+local actor=bar:actor()
+local function state(s)
+ local names={} for i,w in ipairs(s.context.workspaces) do names[i]=w.name..(w.active and '*' or '') end
+ return {available=s.context.available,updates=s.context.updates,names=table.concat(names,' '),watching=machine.matches(s,'watching')}
+end
+local schema={type='object',properties={available={type='boolean'},updates={type='integer'},names={type='string'},watching={type='boolean'}}}
+return o.app{id='dev.ourokit.workspace-bar',
+ actions=machine.actions(actor,{State={description='state',output=state,output_schema=schema},
+  Pause={event='PAUSE',description='pause'},Resume={event='RESUME',description='resume'}}),
+ run=function() actor:start()
+  return {windows={o.layer_surface{id='bar',namespace='bar',layer='top',width=0,height=40,anchors={'top','left','right'},
+   content=function()
+    local c=actor:context(); local children={}
+    for i,w in ipairs(c.workspaces) do
+     children[#children+1]=o.button{key='w'..i,label=w.name..(w.active and ' *' or ''),
+      on_press=function() actor:send{type='ACTIVATE',handle=w.handle} end}
+    end
+    return o.row{key='workspaces',gap=8,children=children}
+   end}}}
+ end}
+''')
+    app = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--software'], env=app_env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app, windows=('bar',))
+        state = lambda: call(endpoint, 'State')['structuredContent']
+        wait_for(lambda: state()['names'] == 'One* Two Three', 'first workspace snapshot never reached the chart')
+        assert state()['available'] and proxy.binds == 1, (state(), proxy.binds)
+        # A click sends ACTIVATE; the request goes out at the safe point, the
+        # compositor answers with a done batch, the watcher wakes the chart.
+        click(app_env, endpoint, 'bar', 'workspaces/w2')
+        wait_for(lambda: state()['names'] == 'One Two* Three', 'activation never came back as a snapshot')
+        assert proxy.activations == ['Two'], proxy.activations
+        wait_for(lambda: node(app_env, endpoint, 'bar', 'workspaces/w2')['label'] == 'Two *', 'bar label not updated')
+        proxy.rename(2, 'Mail')
+        wait_for(lambda: state()['names'] == 'One Two* Mail', 'rename never reached the chart')
+        # Leaving the watching state closes the watcher with its scope.
+        updates = state()['updates']
+        call(endpoint, 'Pause')
+        proxy.rename(0, 'Web')
+        time.sleep(.3)
+        assert state()['updates'] == updates and state()['names'] == 'One Two* Mail', state()
+        # A new watcher starts from the current snapshot.
+        call(endpoint, 'Resume')
+        wait_for(lambda: state()['names'] == 'Web Two* Mail', 'resumed watcher did not see the current snapshot')
+        print('PASS workspaces: watch() streams done batches into a chart; activation round trip; closing with the state stops it')
+    finally:
+        terminate(app)
+        errors = app.stderr.read()
+        assert 'panic' not in errors and 'leaked' not in errors, errors
+
+    # Nobody watches: the manager is never bound.
+    quiet = root / 'no-workspaces.lua'
+    quiet.write_text("local o=require('ouro') return o.app{id='dev.ourokit.no-workspaces',run=function() "
+                     "return {windows={o.window{id='main',title='Quiet',width=200,height=100,"
+                     "content=function() return o.text{key='t',text='quiet'} end}}} end}")
+    binds = proxy.binds
+    app = subprocess.Popen([str(BINARY), 'run', str(quiet), '--dev', '--software'], env=app_env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        endpoint = development_path(Path(env['XDG_RUNTIME_DIR']), app, windows=('main',))
+        time.sleep(.3)
+        assert proxy.binds == binds, 'an app that never watches must not bind ext-workspace'
+        print('PASS workspaces: an app that never watches never binds the protocol')
+    finally:
+        terminate(app)
+        proxy.close()
+
+
 def suite(root, env):
     assert BINARY.is_file(), f"missing {BINARY}; wait for /tmp/ouro-desktop-build.log then build"
     focus_test(root, env)
+    workspaces_test(root, env)
     surface_events_test(root, env)
     launcher_test(root, env)
     launcher_surface_failure_test(root, env)
