@@ -1778,8 +1778,8 @@ lines, {charts = {id = chart}})` returns `{ok, compared, divergence =
 `machine.replay_text(report)` formats it.
 
 **Limits.** Replay reproduces chart behavior, not the world:
-- function actions run again, so their side effects (prints, signals they
-  write outside charts) repeat;
+- function actions run again. Their platform effects are isolated (below),
+  but other side effects, such as signals they write outside charts, repeat;
 - charts must be created when the app module loads, not inside `run`;
 - context values that are not JSON (functions, userdata) are recorded as
   markers and cannot be reproduced;
@@ -1808,6 +1808,22 @@ first, expanding first the paths that reached something new.
   their real invoke and task results, which unlocks states behind a `load`.
 - **Dedupe and budget.** Nodes dedupe on configuration, context, children,
   pending timers and stubs. The depth limit is 8 and the run limit 1500.
+- **Effects are isolated (gap 4).** Generation and replay run guards,
+  assigns and function actions for real, so sends, raises and spawns count.
+  While they run, the platform modules are inert stand-ins: `ouro.shell`,
+  `desktop`, `dbus`, `http`, `files`, `audio`, `session`, `mcp`, `secrets`,
+  `auth`, `clipboard`, `portal`, `applications`, `notifications`,
+  `workspaces`, `xdg`, plus `start_drag`, `activation_token`, `app_command`
+  and `exit`. Any field of a stand-in is another stand-in, and calling one
+  does nothing and returns a stand-in, so `client:send{...}`,
+  `<close>` locals and `'text ' .. result` keep working. Each call is
+  reported as a *skipped effect*, for example
+  `ouro.shell.workspaces.activate()`, listed after the real errors and never
+  counted as one. The modules return when generation or replay ends.
+  Runtime error prints are collected from the boundaries instead.
+- **Refused sends name their event (gap 3).** A send refused because its
+  target has not started reports the resolved event type, even when a
+  function computes the event.
 - **Nothing is pruned silently (gap 9).** When an input's action raises,
   the transition still committed (actions run after commit), so the path is
   kept and explored further. The error is reported with how many runs hit

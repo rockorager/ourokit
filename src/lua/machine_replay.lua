@@ -704,7 +704,19 @@ end
 
 -- replay(log, options) -> report. options.charts maps chart ids to charts
 -- (default: every chart created in this VM, see machine.charts()).
+local replay
+-- Replay runs function actions again, so platform effects are isolated as in
+-- generation (machine_paths.lua): ouro.shell, desktop, dbus, files, ... are
+-- inert while it runs, and a replay never touches the desktop.
 function M.replay(source, options)
+  local restore = M._isolate_effects and M._isolate_effects() or function() end
+  local results = table.pack(pcall(replay, source, options))
+  restore()
+  if not results[1] then error(results[2], 0) end
+  return table.unpack(results, 2, results.n)
+end
+
+replay = function(source, options)
   options = options or {}
   local header, entries = decode_lines(source)
   local chart_for = options.charts or charts

@@ -48,9 +48,107 @@ pub fn install(state: *c.State) !void {
         return error.MachineInitializationFailed;
     c.lua_pushvalue(state, api);
     _ = c.lua_getfield(state, api, "machine");
-    if (c.lua_pcallk(state, 2, 0, 0, 0, null) != c.ok)
+    c.lua_pushcclosure(state, inertNew, 0);
+    if (c.lua_pcallk(state, 3, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     c.lua_settop(state, api);
+}
+
+const inert_metatable = "ouro.machine.inert";
+
+/// inert(name, record) -> a stand-in for a platform module while --generate
+/// explores a chart: any field is another inert value named `name.field`,
+/// calling one calls record(name) and returns an inert `name()`, and it
+/// closes, measures (0) and concatenates harmlessly. Function actions then
+/// run without touching the desktop, D-Bus or files, and the calls they made
+/// are reported as skipped effects. Private to the paths chunk; the sandbox
+/// has no setmetatable to build it in Lua.
+fn inertNew(state: *c.State) callconv(.c) c_int {
+    c.lua_settop(state, 2);
+    _ = c.lua_newuserdatauv(state, 0, 2);
+    c.lua_pushvalue(state, 1);
+    _ = c.lua_setiuservalue(state, -2, 1);
+    c.lua_pushvalue(state, 2);
+    _ = c.lua_setiuservalue(state, -2, 2);
+    if (c.luaL_newmetatable(state, inert_metatable) != 0) {
+        c.lua_pushcclosure(state, inertIndex, 0);
+        c.lua_setfield(state, -2, "__index");
+        c.lua_pushcclosure(state, inertCall, 0);
+        c.lua_setfield(state, -2, "__call");
+        c.lua_pushcclosure(state, inertNothing, 0);
+        c.lua_setfield(state, -2, "__close");
+        c.lua_pushcclosure(state, inertNothing, 0);
+        c.lua_setfield(state, -2, "__newindex");
+        c.lua_pushcclosure(state, inertLength, 0);
+        c.lua_setfield(state, -2, "__len");
+        c.lua_pushcclosure(state, inertConcat, 0);
+        c.lua_setfield(state, -2, "__concat");
+        c.lua_pushcclosure(state, inertName, 0);
+        c.lua_setfield(state, -2, "__tostring");
+        _ = c.lua_pushstring(state, inert_metatable);
+        c.lua_setfield(state, -2, "__name");
+        c.lua_pushboolean(state, 0);
+        c.lua_setfield(state, -2, "__metatable");
+    }
+    _ = c.lua_setmetatable(state, -2);
+    return 1;
+}
+
+/// Pushes a new inert value named `<name of slot 1><prefix><key at key_index>`,
+/// sharing its recorder. Non-string keys show as `?`.
+fn pushInertChild(state: *c.State, key_index: c_int, prefix: [:0]const u8) void {
+    _ = c.lua_getiuservalue(state, 1, 1);
+    const name = c.lua_gettop(state);
+    _ = c.lua_pushlstring(state, prefix.ptr, prefix.len);
+    var parts: c_int = 2;
+    if (key_index != 0) {
+        const kind = c.lua_type(state, key_index);
+        if (kind == c.type_string or kind == c.type_number) c.lua_pushvalue(state, key_index) else _ = c.lua_pushstring(state, "?");
+        parts += 1;
+    }
+    c.lua_concat(state, parts);
+    std.debug.assert(c.lua_gettop(state) == name);
+    c.lua_pushcclosure(state, inertNew, 0);
+    c.lua_pushvalue(state, name);
+    _ = c.lua_getiuservalue(state, 1, 2);
+    _ = c.lua_pcallk(state, 2, 1, 0, 0, null);
+}
+
+fn inertIndex(state: *c.State) callconv(.c) c_int {
+    c.lua_settop(state, 2);
+    pushInertChild(state, 2, ".");
+    return 1;
+}
+
+fn inertCall(state: *c.State) callconv(.c) c_int {
+    c.lua_settop(state, 1);
+    if (c.lua_getiuservalue(state, 1, 2) == c.type_function) {
+        _ = c.lua_getiuservalue(state, 1, 1);
+        if (c.lua_pcallk(state, 1, 0, 0, 0, null) != c.ok) c.lua_settop(state, 1);
+    } else c.lua_settop(state, 1);
+    pushInertChild(state, 0, "()");
+    return 1;
+}
+
+fn inertNothing(_: *c.State) callconv(.c) c_int {
+    return 0;
+}
+
+fn inertLength(state: *c.State) callconv(.c) c_int {
+    c.lua_pushinteger(state, 0);
+    return 1;
+}
+
+fn inertConcat(state: *c.State) callconv(.c) c_int {
+    // Whichever side is not inert is kept: 'Saved ' .. inert == 'Saved '.
+    if (c.luaL_testudata(state, 1, inert_metatable) != null) c.lua_pushvalue(state, 2) else c.lua_pushvalue(state, 1);
+    if (c.lua_type(state, -1) != c.type_string and c.lua_type(state, -1) != c.type_number) _ = c.lua_pushstring(state, "");
+    return 1;
+}
+
+fn inertName(state: *c.State) callconv(.c) c_int {
+    _ = c.lua_getiuservalue(state, 1, 1);
+    return 1;
 }
 
 /// atomic(label, fn, ...) calls fn(...) as a non-yielding section and returns

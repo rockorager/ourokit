@@ -484,6 +484,54 @@ return {
     assert(report.ok, machine.replay_text(report))
   end,
 
+  -- Gap 3: a refused send whose event a function computes was reported as nil.
+  ['gap 3: generation names the computed event of a send refused by an unstarted actor'] = function()
+    local shell = machine.create { id = 'shell3', initial = 'idle', events = { ACTIVATE = { workspace = 'integer' } },
+      states = { idle = { on = { ACTIVATE = {} } } } }
+    local waiting = shell:actor { system_id = 'shell3' } -- created by the app, never started here
+    local chart = machine.create { id = 'workspaces3', initial = 'idle', context = { workspace = 2 }, events = { PICK = {} },
+      states = { idle = { on = { PICK = { actions = machine.send_to({ system = 'shell3' },
+        function(c) return { type = 'ACTIVATE', workspace = c.workspace } end) } } } } }
+    local result = machine.paths(chart)
+    local found
+    for _, issue in ipairs(result.issues) do if issue.kind == 'not_started' then found = issue end end
+    assert(found, 'the refused send is reported')
+    assert(found.message == 'workspaces3 sent ACTIVATE to shell3, which has not started', found.message)
+    waiting:stop()
+  end,
+
+  -- Gap 4: generation ran function actions against the real platform modules,
+  -- so an action using ouro.shell (absent in the tool host) raised.
+  ['gap 4: generation isolates platform effects and reports them apart from errors'] = function()
+    local chart = machine.create { id = 'workspaces4', initial = 'idle', events = { ACTIVATE = {}, DONE = {} },
+      actions = { activate = function(_, _, self)
+        o.shell.workspaces.activate(3)
+        local client <close> = o.desktop.notifications()
+        client:send { title = 'Switched to ' .. o.shell.workspaces.name(3) }
+        self:send('DONE')
+      end },
+      states = {
+        idle = { on = { ACTIVATE = { target = 'switching', actions = 'activate' } } },
+        switching = { on = { DONE = 'switched' } },
+        switched = {},
+      } }
+    assert(o.shell == nil and o.desktop == nil, 'the test host has no shell or desktop modules')
+    local result = machine.paths(chart)
+    assert(result.states.reached == result.states.total, 'the action still sent DONE')
+    local effects, errors = {}, 0
+    for _, issue in ipairs(result.issues) do
+      if issue.kind == 'effect' then effects[#effects + 1] = issue.message
+      elseif issue.kind == 'error' then errors = errors + 1 end
+    end
+    table.sort(effects)
+    assert(errors == 0, 'no real errors')
+    assert(table.concat(effects, ',') == 'ouro.desktop.notifications(),ouro.desktop.notifications().send(),'
+      .. 'ouro.shell.workspaces.activate(),ouro.shell.workspaces.name()', table.concat(effects, ','))
+    assert(o.shell == nil and o.desktop == nil, 'the real modules are back afterwards')
+    local report = machine.replay(machine.paths_log(chart, result), { charts = { workspaces4 = chart } })
+    assert(report.ok, machine.replay_text(report))
+  end,
+
   ['machine.advance needs a virtual clock'] = function()
     fails(function() machine.advance(-1) end, 'nonnegative integer')
   end,

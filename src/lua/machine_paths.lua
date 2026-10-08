@@ -1,4 +1,4 @@
-local ouro, M = ...
+local ouro, M, inert = ...
 -- Generated chart tests (design/statecharts.md §14). A breadth-first search
 -- over real actor runs finds event paths that reach every reachable state
 -- and take every transition it can. Each search node is a path of inputs,
@@ -11,6 +11,41 @@ local ouro, M = ...
 
 local json = ouro.json
 local safe = M._canonical_safe
+
+-- Effects are isolated while generation runs app code (gap 4). Function
+-- actions still run, so their sends and spawns count, but the platform
+-- modules they reach are inert stand-ins: any field is another stand-in and
+-- calling one does nothing. Each call is reported as a skipped effect,
+-- separately from real errors.
+local PLATFORM = {'shell', 'desktop', 'dbus', 'http', 'files', 'audio', 'session', 'mcp', 'secrets', 'auth',
+  'clipboard', 'portal', 'applications', 'notifications', 'workspaces', 'xdg', 'start_drag', 'activation_token',
+  'app_command', 'exit', '_desktop_parent'}
+local effect_sink
+local isolation_depth, isolation_saved = 0, nil
+local function isolate()
+  isolation_depth = isolation_depth + 1
+  if isolation_depth == 1 and inert then
+    isolation_saved = {}
+    for _, name in ipairs(PLATFORM) do
+      isolation_saved[name] = {ouro[name]}
+      ouro[name] = inert('ouro.' .. name, function(path) if effect_sink then effect_sink(path) end end)
+    end
+    -- Errors the runtime reports by printing (a failed timer or invoke
+    -- result) are collected from the records instead.
+    isolation_saved.print = print
+    print = function() end
+  end
+  return function()
+    isolation_depth = isolation_depth - 1
+    if isolation_depth == 0 and isolation_saved then
+      print = isolation_saved.print
+      isolation_saved.print = nil
+      for name, saved in pairs(isolation_saved) do ouro[name] = saved[1] end
+      isolation_saved = nil
+    end
+  end
+end
+M._isolate_effects = isolate
 
 -- Deterministic text for a value: sorted keys, so states dedupe reliably.
 local function canonical(value, depth)
@@ -182,13 +217,22 @@ local function run(chart, setup, path, covered)
   local scheduler = M._replay_scheduler(0)
   local saved = M._hooks
   local problems, step_index = {}, 0
-  M._hooks = {scheduler = scheduler, enter = function() end, leave = function() end,
+  -- Errors are collected where every input ends, at its boundary: a send
+  -- raises to its caller, but the runtime only reports a failed invoke
+  -- result or timer, so the boundary is the one place that sees both.
+  M._hooks = {scheduler = scheduler, enter = function() end,
+    leave = function(_, _, ok, err)
+      if not ok then problems[#problems + 1] = {at = step_index, kind = 'error', message = tostring(err)} end
+    end,
     step = function(actor, record)
       for _, sent in ipairs(record.sent or {}) do
         if sent.accepted == false and sent.reason == 'not_started' then
+          -- record.sent holds the resolved event type (gap 3: a computed
+          -- event was reported as nil).
+          local event = type(sent.event) == 'table' and sent.event.type or sent.event
           problems[#problems + 1] = {at = step_index, kind = 'not_started',
             message = string.format('%s sent %s to %s, which has not started', actor.path,
-              tostring(sent.event and sent.event.type or sent.type), tostring(sent.to or sent.target or sent.id))}
+              tostring(event), tostring(sent.system or sent.to))}
         end
       end
       if covered and actor._parent == nil then
@@ -200,18 +244,23 @@ local function run(chart, setup, path, covered)
         for _, id in ipairs(actor._snapshot.states) do covered['s' .. id] = true end
       end
     end}
+  local previous_sink = effect_sink
+  effect_sink = function(name)
+    problems[#problems + 1] = {at = step_index, kind = 'effect', message = name .. '()'}
+  end
   local ok, actor, applied = pcall(function()
     local actor = chart:actor {id = chart.id, input = setup.input, scheduler = scheduler}
     actor:start()
     for i, input in ipairs(path) do
       step_index = i
-      local applies, err = apply(scheduler, actor, input)
-      if err then problems[#problems + 1] = {at = i, kind = 'error', message = err} end
+      -- apply's own error report duplicates the boundary's (leave above).
+      local applies = apply(scheduler, actor, input)
       if not applies then return actor, false end
     end
     return actor, true
   end)
   M._hooks = saved
+  effect_sink = previous_sink
   if not ok then return nil, nil, {{at = step_index, kind = 'error', message = tostring(actor)}} end
   if not applied then actor:stop(); return nil, nil, problems end
   return actor, scheduler, problems
@@ -318,7 +367,7 @@ end
 -- paths(chart, options) -> {paths = {{inputs, targets}}, reached, unreached, nodes}
 -- options: depth (8), nodes (600), payloads per event (6), input, seeds,
 -- outputs/errors by invoke src or id, logs (recordings to harvest).
-function M.paths(chart, options)
+local function search(chart, options)
   options = options or {}
   seed(options, options.logs)
   options.depth, options.nodes, options.payloads = options.depth or 8, options.nodes or 1500, options.payloads or 6
@@ -441,7 +490,7 @@ function M.paths(chart, options)
 end
 
 -- Renders selected paths as one replay log: start, inputs, stop per path.
-function M.paths_log(chart, result, options)
+local function render(chart, result, options)
   options = options or {}
   local lines = {}
   local scheduler = M._replay_scheduler(0)
@@ -469,6 +518,19 @@ function M.paths_log(chart, result, options)
   return table.concat(lines, '\n') .. '\n'
 end
 
+-- Both run app code (guards, assigns, function actions) with effects isolated.
+local function isolated(fn)
+  return function(...)
+    local restore = isolate()
+    local results = table.pack(pcall(fn, ...))
+    restore()
+    if not results[1] then error(results[2], 0) end
+    return table.unpack(results, 2, results.n)
+  end
+end
+M.paths = isolated(search)
+M.paths_log = isolated(render)
+
 local function summary_line(result)
   local text = string.format('%s: %d paths reach %d/%d states and %d/%d transitions (%d runs)', result.chart,
     #result.paths, result.states.reached, result.states.total, result.transitions.reached, result.transitions.total,
@@ -480,12 +542,17 @@ local function summary_line(result)
     end
     text = text .. '\n  not reached: ' .. table.concat(names, ', ')
   end
-  -- Gap 9: what the search ran into, so nothing is pruned silently.
-  for _, issue in ipairs(result.issues or {}) do
-    local label = issue.kind == 'error' and 'an input raised' or 'a send was refused'
-    local path = #issue.steps > 0 and table.concat(issue.steps, ' → ') or '(start)'
-    text = text .. string.format('\n  %s (%d run%s): %s\n    first after: %s', label, issue.count,
-      issue.count == 1 and '' or 's', issue.message, path)
+  -- Gap 9: what the search ran into, so nothing is pruned silently. Real
+  -- errors first; skipped effects (gap 4) are listed apart, as notes.
+  local labels = {error = 'an input raised', not_started = 'a send was refused', effect = 'skipped effect (isolated)'}
+  for _, kind in ipairs({'error', 'not_started', 'effect'}) do
+    for _, issue in ipairs(result.issues or {}) do
+      if issue.kind == kind then
+        local path = #issue.steps > 0 and table.concat(issue.steps, ' → ') or '(start)'
+        text = text .. string.format('\n  %s (%d run%s): %s\n    first after: %s', labels[kind], issue.count,
+          issue.count == 1 and '' or 's', issue.message, path)
+      end
+    end
   end
   return text
 end
