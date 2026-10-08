@@ -70,12 +70,27 @@ end
 -- as the internal cycle set.
 M.plain = function(value) return plain(value) end
 
--- Like plain, but never fails: records must survive arbitrary payloads.
+-- Native handles (and functions) have no plain form. Inspection, records and
+-- recordings show them as an opaque marker {"$h": "<type>"}: the metatable's
+-- __name when there is one (e.g. "ouro.dbus.connection"), else the Lua type.
+local get_metatable = getmetatable
+local function handle_type(value)
+  local kind = type(value)
+  if kind == 'userdata' and get_metatable then
+    local ok, mt = pcall(get_metatable, value)
+    if ok and type(mt) == 'table' and type(mt.__name) == 'string' then return mt.__name end
+  end
+  return kind
+end
+local function opaque(value) return {['$h'] = handle_type(value)} end
+
+-- Like plain, but never fails: records and dev tools must survive arbitrary
+-- payloads. Handles become opaque markers.
 local function inspectable(value, seen)
   value = raw(value)
   local kind = type(value)
   if kind == 'nil' or kind == 'boolean' or kind == 'number' or kind == 'string' or is_json_null(value) then return value end
-  if kind ~= 'table' then return '<' .. kind .. '>' end
+  if kind ~= 'table' then return opaque(value) end
   seen = seen or {}
   if seen[value] then return '<cycle>' end
   seen[value] = true
@@ -89,6 +104,39 @@ local function inspectable(value, seen)
   return out
 end
 M.raw = raw
+M.inspectable = function(value) return inspectable(value) end
+
+-- Context for inspection: transient fields (native handles a chart declares,
+-- §4) are always opaque, whatever they hold.
+local function inspectable_context(chart, context)
+  local out = inspectable(context)
+  if chart.transient and type(out) == 'table' then
+    for key in pairs(chart.transient) do
+      local value = raw(context)[key]
+      if value ~= nil then out[key] = opaque(raw(value)) end
+    end
+  end
+  return out
+end
+
+-- Context for persist and carry: transient fields are left out (they restore
+-- as nil; re-acquire them when actor:restored()). Anything else must be
+-- plain, and an error names the field.
+local function persist_context(chart, context)
+  context = raw(context)
+  if type(context) ~= 'table' then return plain(context) end
+  local out = {}
+  for key, value in pairs(context) do
+    if not (chart.transient and chart.transient[key]) then
+      local ok, copy = pcall(plain, value)
+      if not ok then
+        fail('context.%s: %s (declare native handles transient)', tostring(key), tostring(copy))
+      end
+      out[raw(key)] = copy
+    end
+  end
+  return keep_array_mark(context, out)
+end
 
 -- Action constructors. Each returns a tagged description; nothing runs here.
 local function action(kind, fields)
@@ -176,7 +224,7 @@ M.strict = true
 
 local STATE_KEYS = {type=true, initial=true, order=true, states=true, on=true, always=true, after=true, invoke=true,
   entry=true, exit=true, on_done=true, tags=true, description=true, output=true}
-local ROOT_KEYS = {id=true, context=true, guards=true, actions=true, actors=true, events=true}
+local ROOT_KEYS = {id=true, context=true, guards=true, actions=true, actors=true, events=true, transient=true, delays=true}
 local TRANSITION_KEYS = {target=true, guard=true, actions=true, reenter=true, description=true}
 local INVOKE_KEYS = {id=true, src=true, input=true, on_done=true, on_error=true}
 local function is_descendant(a, b)
@@ -391,17 +439,31 @@ local function compile(def)
     end
     add_transitions(node, nil, sdef.always, 'always', node.always)
     if sdef.after then
+      -- Keys are integer ms, or names of chart `delays` (XState-style), whose
+      -- value is ms or function(context, event) -> ms, evaluated on entry.
       local delays = {}
       for delay in pairs(sdef.after) do
-        if math.type(delay) ~= 'integer' or delay < 0 or delay > M.max_delay_ms then
-          fail('after delays in %s must be integers from 0 to %d ms', where(node), M.max_delay_ms)
+        if type(delay) == 'string' then
+          local named = def.delays and def.delays[delay]
+          if named == nil then fail('after delay %q in %s is not in the chart\'s delays', delay, where(node)) end
+        elseif math.type(delay) ~= 'integer' or delay < 0 or delay > M.max_delay_ms then
+          fail('after delays in %s must be integers from 0 to %d ms, or delay names', where(node), M.max_delay_ms)
         end
         delays[#delays + 1] = delay
       end
-      table.sort(delays)
+      table.sort(delays, function(a, b)
+        if type(a) ~= type(b) then return type(a) == 'number' end
+        return a < b
+      end)
       for _, delay in ipairs(delays) do
         local event = 'after.' .. delay .. '.' .. (node.id == '' and def.id or node.id)
-        node.after[#node.after + 1] = {delay = delay, event = event}
+        local entry = {delay = delay, event = event}
+        if type(delay) == 'string' then
+          local named = def.delays[delay]
+          if type(named) == 'function' then entry.fn, entry.label = named, 'delay ' .. delay
+          else entry.ms = named end
+        end
+        node.after[#node.after + 1] = entry
         on(node, event, sdef.after[delay], 'after')
       end
     end
@@ -436,6 +498,23 @@ local function compile(def)
     end
   end
 
+  if def.delays ~= nil then
+    if type(def.delays) ~= 'table' then fail('delays must be a table of names') end
+    for name, value in pairs(def.delays) do
+      if type(name) ~= 'string' or not name:match('^[%a_][%w_]*$') then fail('delay names must be identifiers') end
+      if type(value) ~= 'function' and (math.type(value) ~= 'integer' or value < 0 or value > M.max_delay_ms) then
+        fail('delay %q must be integer ms from 0 to %d or a function', name, M.max_delay_ms)
+      end
+    end
+  end
+  if def.transient ~= nil then
+    if type(def.transient) ~= 'table' then fail('transient must be a list of context field names') end
+    chart.transient = {}
+    for _, name in ipairs(def.transient) do
+      if type(name) ~= 'string' or name == '' then fail('transient must be a list of context field names') end
+      chart.transient[name] = true
+    end
+  end
   if def.events ~= nil then
     if type(def.events) ~= 'table' then fail('events must be a table') end
     chart.events = {}
@@ -493,6 +572,11 @@ local function validate_event(chart, event)
       local integer = type(value) == 'number' and math.tointeger(value) or nil
       if integer == nil then fail('InvalidEvent: %s.%s must be integer', event.type, name) end
       event[name] = integer
+    elseif field.type == 'table' then
+      -- Context reads are read-only views; a view of a table is that table.
+      local target = raw(value)
+      if type(target) ~= 'table' then fail('InvalidEvent: %s.%s must be table', event.type, name) end
+      event[name] = target
     elseif field.type ~= 'any' then
       if type(value) ~= field.type then fail('InvalidEvent: %s.%s must be %s', event.type, name, field.type) end
     end
@@ -510,13 +594,25 @@ local function action_names(list)
   return names
 end
 
+-- The ms of an `after` entry: its integer key, a constant named delay, or the
+-- named delay function's result for this entry (validated like a constant).
+local function delay_ms(a, context, event, meta)
+  if a.fn == nil then return a.ms or a.delay end
+  local ms = atomic(a.label, a.fn, context, event, meta)
+  if math.type(ms) == 'float' then ms = math.tointeger(ms) end
+  if math.type(ms) ~= 'integer' or ms < 0 or ms > M.max_delay_ms then
+    fail('%s must return integer ms from 0 to %d, got %s', a.label, M.max_delay_ms, tostring(ms))
+  end
+  return ms
+end
+
 local function graph(chart)
   local g = {format = 'ouro.machine.graph', version = 1, id = chart.id, root = '', states = {}, transitions = {}, events = {}}
   for i, node in ipairs(chart.nodes) do
     local children = {}
     for j, child in ipairs(node.children) do children[j] = child.id end
     local after, invoke, tags = {}, {}, {}
-    for j, a in ipairs(node.after) do after[j] = {delay = a.delay, event = a.event} end
+    for j, a in ipairs(node.after) do after[j] = {delay = a.delay, event = a.event, ms = a.ms or (not a.fn and a.delay or nil)} end
     for j, inv in ipairs(node.invokes) do invoke[j] = {id = inv.id, src = inv.src_name} end
     for tag in pairs(node.tags) do tags[#tags + 1] = tag end
     table.sort(tags)
@@ -1011,7 +1107,8 @@ local function finish(m, snapshot)
     if m.active[node] then
       local token = m.entries[node.id]
       for _, a in ipairs(node.after) do
-        m.effects[#m.effects + 1] = {kind = 'timer_start', state = node.id, delay = a.delay, event = a.event, token = token}
+        m.effects[#m.effects + 1] = {kind = 'timer_start', state = node.id, delay = a.delay, event = a.event, token = token,
+          ms = a.fn and delay_ms(a, m.view(), m.event_view, m.meta()) or a.ms or a.delay}
       end
       for _, inv in ipairs(node.invokes) do
         local input = inv.input and raw(atomic('input of invoke ' .. inv.id, inv.input, m.view(), m.event_view, m.meta()))
@@ -1173,7 +1270,15 @@ local function claim_path(actor)
   actor.id = base .. '#' .. n
   actor.path = actor.id
 end
+-- System ids (XState v5's systemId): chart:actor { system_id = 'shell' }
+-- makes an actor addressable app-wide, as machine.system('shell') and
+-- machine.send_to({ system = 'shell' }, event), from creation until it stops
+-- or finishes. A system id names one live actor at a time.
+local systems = {}
+function M.system(id) return systems[id] end
+
 local function unregister(actor)
+  if actor._system_id and systems[actor._system_id] == actor then systems[actor._system_id] = nil end
   if registry[actor.path] ~= actor then return end
   registry[actor.path] = nil
   for i, path in ipairs(registry_order) do
@@ -1777,6 +1882,27 @@ if scope_open then
   }
 end
 
+-- machine.sleep(ms) for invokes and spawned tasks: waits on the scheduler's
+-- logical clock instead of wall time, so backoff and timeouts stay
+-- deterministic under a virtual clock, manual_scheduler and replay. A
+-- scheduler that runs tasks itself (manual_scheduler) sets machine._task_sleep
+-- while a task runs. The wait is cancelled with the calling task.
+function M.sleep(ms)
+  if math.type(ms) == 'float' then ms = math.tointeger(ms) end
+  if math.type(ms) ~= 'integer' or ms < 0 or ms > M.max_delay_ms then
+    fail('machine.sleep expects integer ms from 0 to %d', M.max_delay_ms)
+  end
+  if M._task_sleep then return M._task_sleep(ms) end
+  if not (waiter_new and scope_open and M.clock) then return ouro.sleep(ms) end
+  local timer = scope_open() -- a child of the running task's scope
+  local waiter <close> = waiter_new(function()
+    scope_close(timer)
+    M.clock.cancel(timer)
+  end)
+  M.clock.after(timer, ms, function() waiter_wake(waiter, WAKE_MATCH) end)
+  waiter_park(waiter)
+end
+
 -- Fallback where no native binding exists (a Lua state without a Vm), and for
 -- comparison: spawned work has no handle, so it runs in application scope and
 -- a closed scope only drops its delivery.
@@ -1885,6 +2011,14 @@ local function create_actor(chart, options)
     _signal_factory = options.signal or ouro.signal, _parent = options.parent, _charts = options.charts or {}}
   for name, fn in pairs(Actor) do actor[name] = fn end
   actor.path = options.parent and (options.parent.path .. '/' .. actor.id) or actor.id
+  if options.system_id ~= nil then
+    if type(options.system_id) ~= 'string' or options.system_id == '' then fail('system_id must be a nonempty string') end
+    local holder = systems[options.system_id]
+    if holder and holder._status ~= 'stopped' and not holder._released then
+      fail('DuplicateSystemId: %q already names %s', options.system_id, holder.path)
+    end
+    actor._system_id = options.system_id
+  end
   local snapshot, effects, record
   local carried_entry = M._take_carried(chart, actor, options)
   if carried_entry then
@@ -1910,7 +2044,8 @@ local function create_actor(chart, options)
       snapshot.entries[id] = snapshot.serial
       if snapshot.status == 'active' then
         for _, a in ipairs(node.after) do
-          effects[#effects + 1] = {kind = 'timer_start', state = id, delay = a.delay, event = a.event, token = snapshot.serial}
+          effects[#effects + 1] = {kind = 'timer_start', state = id, delay = a.delay, event = a.event, token = snapshot.serial,
+            ms = a.fn and delay_ms(a, view(snapshot.context), view({type = 'ouro.restore'})) or a.ms or a.delay}
         end
         for _, inv in ipairs(node.invokes) do
           local input = inv.input and raw(atomic('input of invoke ' .. inv.id, inv.input, view(snapshot.context), view({type = 'ouro.restore'})))
@@ -1948,6 +2083,7 @@ local function create_actor(chart, options)
   -- A lazy (component) actor is inspectable and sendable from creation, with
   -- its initial snapshot; its root scope and effects still wait for start.
   if actor._lazy and not actor._parent then claim_path(actor); register(actor) end
+  if actor._system_id then systems[actor._system_id] = actor end
   return actor
 end
 
@@ -2140,9 +2276,10 @@ function Actor:now() local fn = self._scheduler.clock; return fn and fn() or nil
 function Actor:pending_timers()
   local list = {}
   for _, live in pairs(self._timers) do
-    list[#list + 1] = {state = live.state, delay = live.delay, event = live.event, token = live.token, time_ms = live.time_ms}
+    list[#list + 1] = {state = live.state, delay = live.delay, event = live.event, token = live.token, time_ms = live.time_ms,
+      ms = live.ms}
   end
-  table.sort(list, function(a, b) return a.state < b.state or (a.state == b.state and a.delay < b.delay) end)
+  table.sort(list, function(a, b) return a.state < b.state or (a.state == b.state and a.event < b.event) end)
   return list
 end
 
@@ -2157,11 +2294,31 @@ end
 
 function Actor:observe(fn) return subscribe(self._observers, fn) end
 
+-- The snapshot as plain data for dev tools: never fails; native handles and
+-- transient fields are opaque {"$h": type} markers.
+function Actor:inspectable()
+  local snapshot = self._snapshot
+  local states = {}
+  for i, id in ipairs(snapshot.states) do states[i] = id end
+  local children = {}
+  for _, id in ipairs(snapshot.children) do
+    children[#children + 1] = id
+    local child = snapshot.children[id]
+    if child ~= nil then
+      local actor = self._children[id]
+      children[id] = actor and actor:inspectable() or inspectable(child)
+    end
+  end
+  return {machine = snapshot.machine, status = snapshot.status, states = states,
+    context = inspectable_context(self.chart, snapshot.context), output = inspectable(snapshot.output),
+    children = children}
+end
+
 function Actor:persist()
   local snapshot = self._snapshot
   local states = {}
   for i, id in ipairs(snapshot.states) do states[i] = id end
-  local out = {machine = snapshot.machine, status = snapshot.status, states = states, context = plain(snapshot.context),
+  local out = {machine = snapshot.machine, status = snapshot.status, states = states, context = persist_context(self.chart, snapshot.context),
     output = plain(snapshot.output), serial = snapshot.serial, children = {}}
   for _, id in ipairs(snapshot.children) do
     local child = self._children[id]
@@ -2213,7 +2370,7 @@ local function finalize(actor, record, origin)
   local states = {}
   for i, id in ipairs(snapshot.states) do states[i] = id end
   record.states, record.status = states, snapshot.status
-  record.context = inspectable(snapshot.context)
+  record.context = inspectable_context(actor.chart, snapshot.context)
   record.event = inspectable(record.event)
   for _, entry in ipairs(record.invokes) do entry.error = inspectable(entry.error) end
 end
@@ -2265,6 +2422,32 @@ local function scope_for(actor, state, token)
   return entry.scope
 end
 
+-- Runtime deliveries (timers, invoke and task results) run in runtime tasks.
+-- An error while handling one (a throwing action or guard) is already on the
+-- step's record and was not raised by app code, so report it instead of
+-- ending the task.
+local function deliver_reported(actor, event, origin)
+  local ok, err = pcall(actor._deliver, actor, event, origin)
+  if not ok then print(('machine %s: handling %s failed: %s'):format(actor.path, tostring(event.type), tostring(err))) end
+end
+
+-- A callback invoke's cleanup runs once, protected, when it is cancelled.
+local function cleanup_invoke(live)
+  local cleanup = live.cleanup
+  live.cleanup, live.handler, live.mailbox = nil, nil, {}
+  if cleanup then
+    local ok, err = pcall(cleanup)
+    if not ok then print('machine invoke cleanup failed: ' .. tostring(err)) end
+  end
+end
+
+-- The active invoke with this id, if any (send_to targets it after children).
+local function active_invoke(actor, id)
+  for _, live in pairs(actor._invokes) do
+    if live.id == id and live.mailbox then return live end
+  end
+end
+
 local function run_effects(actor, effects, record)
   local first_error
   for _, effect in ipairs(effects) do
@@ -2277,16 +2460,17 @@ local function run_effects(actor, effects, record)
         atomic(effect.label, effect.fn, view(effect.context), view(effect.event), actor)
       elseif kind == 'timer_start' then
         local key = effect.state .. '|' .. effect.delay
+        local ms = effect.ms or effect.delay
         local live = {token = effect.token, state = effect.state, delay = effect.delay, event = effect.event,
-          time_ms = clock(actor)}
+          time_ms = clock(actor), ms = ms}
         actor._timers[key] = live
         record.timers[#record.timers + 1] = {action = 'started', state = effect.state, delay = effect.delay,
-          event = effect.event, token = effect.token, time_ms = live.time_ms}
-        actor._scheduler.after(scope_for(actor, effect.state, effect.token), effect.delay, function()
+          event = effect.event, token = effect.token, time_ms = live.time_ms, ms = ms}
+        actor._scheduler.after(scope_for(actor, effect.state, effect.token), ms, function()
           if actor._timers[key] ~= live then return end
           actor._timers[key] = nil
           -- Timer events carry their fire time: the deadline, on a logical clock.
-          actor:_deliver({type = effect.event, state = effect.state, token = effect.token, time_ms = clock(actor)}, 'timer')
+          deliver_reported(actor, {type = effect.event, state = effect.state, token = effect.token, time_ms = clock(actor)}, 'timer')
         end)
       elseif kind == 'timer_cancel' then
         local key = effect.state .. '|' .. effect.delay
@@ -2305,21 +2489,56 @@ local function run_effects(actor, effects, record)
         local function send(event)
           if actor._invokes[key] == live then actor:_send(event, 'invoke') end
         end
+        local scope = scope_for(actor, effect.state, effect.token)
+        -- receive(fn): events the chart sends to this invoke (send_to its id)
+        -- queue in a mailbox that one task in the invoke's scope drains in
+        -- order. The last registration wins; the mailbox ends with the state.
+        live.mailbox = {}
+        live.drain = function()
+          if live.draining or not live.handler or not live.mailbox[1] then return end
+          live.draining = true
+          actor._scheduler.run(scope, function()
+            while live.mailbox[1] and live.handler and actor._invokes[key] == live do
+              local ok, err = pcall(live.handler, table.remove(live.mailbox, 1))
+              if not ok then live.complete(false, err) end
+            end
+            live.draining = false
+          end)
+        end
+        local function receive(fn)
+          if type(fn) ~= 'function' then fail('receive expects a function') end
+          live.handler = fn
+          live.drain()
+        end
+        -- Like machine.send_to('<invoke id>', event) from the chart.
+        local function post(event)
+          if actor._invokes[key] ~= live then return false end
+          live.mailbox[#live.mailbox + 1] = normalize_event(event)
+          live.drain()
+          return true
+        end
         local function complete(ok, result)
           if actor._invokes[key] ~= live then return end
+          -- A src that returns a function is a callback invoke: it stays
+          -- active until its state exits, and the function is its cleanup.
+          if ok and type(result) == 'function' and not live.cleanup then
+            live.cleanup = result
+            return
+          end
           actor._invokes[key] = nil
           if ok then
-            actor:_deliver({type = 'done.invoke.' .. effect.id, state = effect.state, token = effect.token, output = result}, 'invoke')
+            deliver_reported(actor, {type = 'done.invoke.' .. effect.id, state = effect.state, token = effect.token, output = result}, 'invoke')
           else
-            actor:_deliver({type = 'error.invoke.' .. effect.id, state = effect.state, token = effect.token, error = result}, 'invoke')
+            deliver_reported(actor, {type = 'error.invoke.' .. effect.id, state = effect.state, token = effect.token, error = result}, 'invoke')
           end
         end
         -- info lets a replay scheduler stub the source: it never calls fn and
         -- completes the invoke from the recording instead.
-        actor._scheduler.run(scope_for(actor, effect.state, effect.token), function()
-          complete(pcall(effect.src, effect.input, send))
+        live.complete = complete
+        actor._scheduler.run(scope, function()
+          complete(pcall(effect.src, effect.input, send, receive))
         end, {kind = 'invoke', actor = actor.path, id = effect.id, src = effect.src_name, state = effect.state,
-          token = effect.token, complete = complete, send = send})
+          token = effect.token, complete = complete, send = send, receive = receive, post = post})
       elseif kind == 'invoke_cancel' then
         local key = effect.state .. '|' .. effect.id
         local live = actor._invokes[key]
@@ -2327,6 +2546,7 @@ local function run_effects(actor, effects, record)
           actor._invokes[key] = nil
           record.invokes[#record.invokes + 1] = {action = 'cancelled', state = effect.state, id = effect.id,
             src = effect.src, token = effect.token}
+          cleanup_invoke(live)
         end
       elseif kind == 'scope_close' then
         local entry = actor._scopes[effect.state]
@@ -2353,9 +2573,9 @@ local function run_effects(actor, effects, record)
           if actor._tasks[effect.id] ~= live then return end
           actor._tasks[effect.id] = nil
           if ok then
-            actor:_deliver({type = 'done.actor.' .. effect.id, id = effect.id, output = result, token = effect.child_token}, 'child')
+            deliver_reported(actor, {type = 'done.actor.' .. effect.id, id = effect.id, output = result, token = effect.child_token}, 'child')
           else
-            actor:_deliver({type = 'error.actor.' .. effect.id, id = effect.id, error = result, token = effect.child_token}, 'child')
+            deliver_reported(actor, {type = 'error.actor.' .. effect.id, id = effect.id, error = result, token = effect.child_token}, 'child')
           end
           actor._scheduler.close(scope)
         end
@@ -2374,9 +2594,34 @@ local function run_effects(actor, effects, record)
         end
       elseif kind == 'send_to' or kind == 'send_parent' then
         local target
-        if kind == 'send_to' then
+        if kind == 'send_to' and type(effect.id) == 'table' then
+          -- { system = id }: an actor anywhere in the app (machine.system).
+          local system = effect.id.system
+          target = type(system) == 'string' and systems[system]
+          if not target then fail('machine %s: no actor has system id %q', actor.chart.id, tostring(system)) end
+          if target._status == 'created' and not target._lazy then
+            -- Created but not started (a sibling the app starts later): rejected, not raised.
+            record.sent[#record.sent + 1] = {kind = kind, to = target.path, system = system, event = effect.event.type,
+              accepted = false, reason = 'not_started'}
+            return
+          end
+          local sent = {kind = kind, to = target.path, system = system, event = effect.event.type}
+          record.sent[#record.sent + 1] = sent
+          sent.accepted, sent.reason = target:_send(effect.event, 'actor', actor.path)
+          return
+        elseif kind == 'send_to' then
           target = actor._children[effect.id]
-          if not target then fail('machine %s has no child %q', actor.chart.id, tostring(effect.id)) end
+          local invoke = not target and active_invoke(actor, effect.id)
+          if invoke then
+            -- An active invoke's mailbox (receive).
+            local event = copy(effect.event)
+            record.sent[#record.sent + 1] = {kind = kind, to = actor.path .. '/' .. effect.id, invoke = true,
+              event = event.type, accepted = true}
+            invoke.mailbox[#invoke.mailbox + 1] = event
+            invoke.drain()
+            return
+          end
+          if not target then fail('machine %s has no child or invoke %q', actor.chart.id, tostring(effect.id)) end
         else
           target = actor._parent
           if not target then fail('machine %s has no parent', actor.chart.id) end
@@ -2469,6 +2714,9 @@ end
 -- closed with its root), and it retires like a stopped one.
 local function retire_if_done(actor)
   if actor._status ~= 'done' or actor._released then return end
+  local invokes = actor._invokes
+  actor._invokes = {}
+  for _, live in pairs(invokes) do cleanup_invoke(live) end
   for _, child in pairs(actor._children) do child:stop() end
   actor._children = {}
   retire(actor)
@@ -2676,7 +2924,9 @@ function Actor:_stop()
     record.invokes[#record.invokes + 1] = {action = 'cancelled', state = live.state, id = live.id,
       src = live.src, token = live.token}
   end
+  local invokes = self._invokes
   self._timers, self._invokes, self._tasks = {}, {}, {}
+  for _, live in pairs(invokes) do cleanup_invoke(live) end
   for _, entry in pairs(self._scopes) do self._scheduler.close(entry.scope) end
   self._scopes = {}
   if self._root_scope then self._scheduler.close(self._root_scope) end

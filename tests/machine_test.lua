@@ -980,6 +980,205 @@ return {
     page:stop()
   end,
 
+  ['gap 1: transient handles stay out of persist and carry, and inspect as opaque markers'] = function()
+    local handle = o.signal(0) -- any native userdata
+    local chart = machine.create {
+      id = 'volume', initial = 'connected', transient = { 'output' },
+      context = { level = 40 },
+      events = { CONNECTED = { output = 'any' }, OTHER = { thing = 'any' } },
+      states = { connected = { on = {
+        CONNECTED = { actions = machine.assign { output = function(_, e) return e.output end } },
+        OTHER = { actions = machine.assign { other = function(_, e) return e.thing end } },
+      } } },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local records = recorder(actor)
+    actor:send { type = 'CONNECTED', output = handle }
+    assert(machine.raw(actor:context().output) == handle)
+    -- Persist and carry leave transient fields out; they restore as nil.
+    local persisted = actor:persist()
+    assert(persisted.context.level == 40 and persisted.context.output == nil)
+    assert(o.json.encode(persisted))
+    local entries, skipped = machine.persist_roots()
+    local carried
+    for _, entry in ipairs(entries) do if entry.id == 'volume' then carried = entry end end
+    assert(carried and #skipped == 0, 'not carried: ' .. table.concat(skipped, '; '))
+    machine.carry(entries)
+    local restored = chart:actor { scheduler = machine.manual_scheduler() }
+    machine.release()
+    assert(restored:restored() and restored:context().level == 40 and restored:context().output == nil)
+    -- Inspection and records show the handle as {"$h": type}, and never fail.
+    local marker = actor:inspectable().context.output
+    assert(type(marker) == 'table' and type(marker['$h']) == 'string', 'opaque marker')
+    assert(last(records).context.output['$h'] == marker['$h'] and last(records).event.output['$h'] == marker['$h'])
+    assert(o.json.encode(actor:inspectable()) and o.json.encode(last(records)))
+    assert(machine.inspectable(handle)['$h'] == marker['$h'] and machine.inspectable(print)['$h'] == 'function')
+    -- An undeclared handle still inspects, but persist names the field.
+    actor:send { type = 'OTHER', thing = handle }
+    assert(actor:inspectable().context.other['$h'] == marker['$h'])
+    fails(function() actor:persist() end, 'context.other')
+    fails(function() machine.create { id = 'bad', initial = 'a', transient = { 1 }, states = { a = {} } } end, 'transient')
+    actor:stop()
+  end,
+
+  ['gap 4: invokes receive events sent to their id while active'] = function()
+    local clock = machine.manual_scheduler()
+    local seen, cleaned = {}, 0
+    local chart = machine.create {
+      id = 'session', initial = 'held', context = { echoes = 0 },
+      events = { UNLOCK = {}, ECHO = { v = 'integer' }, LEAVE = {} },
+      actors = {
+        own = function(input, send, receive)
+          receive(function(event)
+            seen[#seen + 1] = event.type .. ':' .. tostring(event.v)
+            send { type = 'ECHO', v = event.v }
+          end)
+          return function() cleaned = cleaned + 1 end -- a callback invoke: active until the state exits
+        end,
+      },
+      states = {
+        held = {
+          invoke = { id = 'owner', src = 'own' },
+          on = {
+            UNLOCK = { actions = { machine.send_to('owner', { type = 'UNLOCK', v = 1 }), machine.send_to('owner', { type = 'UNLOCK', v = 2 }) } },
+            ECHO = { actions = machine.assign { echoes = function(c, e) return c.echoes + e.v end } },
+            LEAVE = 'free',
+          },
+        },
+        free = { on = { UNLOCK = { actions = machine.send_to('owner', 'UNLOCK') } } },
+      },
+    }
+    local actor = chart:start { scheduler = clock }
+    local records = recorder(actor)
+    clock.run_tasks()
+    assert(#actor:pending_invokes() == 1, 'a callback invoke stays active after its src returns')
+    actor:send('UNLOCK')
+    local sent = last(records).sent
+    assert(#sent == 2 and sent[1].invoke and sent[1].to == 'session/owner' and sent[1].accepted)
+    clock.run_tasks()
+    assert(join(seen) == 'UNLOCK:1,UNLOCK:2', 'delivered in order: ' .. join(seen))
+    assert(actor:context().echoes == 3)
+    actor:send('LEAVE')
+    assert(cleaned == 1 and #actor:pending_invokes() == 0, 'leaving the state cancels the invoke and runs its cleanup')
+    local ok, err = pcall(actor.send, actor, 'UNLOCK')
+    assert(not ok and tostring(err):find('no child or invoke'), tostring(err))
+    actor:stop()
+    -- Schedulers that stub invokes (tests, replay) post to the mailbox through info.post.
+    local infos = {}
+    local stub = machine.manual_scheduler()
+    local run = stub.run
+    stub.run = function(scope, fn, info) if info then infos[info.id] = info end return run(scope, fn, info) end
+    seen = {}
+    local again = chart:start { scheduler = stub }
+    stub.run_tasks()
+    assert(infos.owner.post { type = 'UNLOCK', v = 7 } == true)
+    stub.run_tasks()
+    assert(join(seen) == 'UNLOCK:7' and again:context().echoes == 7)
+    again:send('LEAVE')
+    assert(infos.owner.post('UNLOCK') == false, 'no mailbox once the invoke ended')
+    again:stop()
+  end,
+
+  ['an action error while handling a timer, invoke or task result is reported, not raised into the runtime task'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create { id = 'fragile', initial = 'waiting',
+      actors = { load = function() return 'loaded' end },
+      states = {
+        waiting = { invoke = { src = 'load', on_done = { target = 'ready', actions = function() error('on_done broke') end } } },
+        ready = { after = { [10] = { target = 'later', actions = function() error('timer action broke') end } } },
+        later = {},
+      } }
+    local actor = chart:start { scheduler = clock }
+    local records = recorder(actor)
+    clock.run_tasks() -- would raise without the report
+    assert(actor:matches('ready') and last(records).error.message:find('on_done broke'))
+    clock.advance(10)
+    assert(actor:matches('later') and last(records).error.message:find('timer action broke'))
+    actor:stop()
+  end,
+
+  ['gap 5: named delays are evaluated on entry on the logical clock'] = function()
+    local clock = machine.manual_scheduler()
+    local chart = machine.create {
+      id = 'reconnect', initial = 'offline', context = { backoff = 300 },
+      events = { FAIL = {}, BAD = {} },
+      delays = { retry = function(c) return c.backoff end, grace = 50 },
+      states = {
+        offline = { after = { retry = 'trying' } },
+        trying = { after = { grace = 'idle' }, on = {
+          FAIL = { target = 'offline', actions = machine.assign { backoff = function(c) return math.min(c.backoff * 2, 1000) end } },
+        } },
+        idle = { on = { BAD = { target = 'offline', actions = machine.assign { backoff = function() return -1 end } } } },
+      },
+    }
+    local actor = chart:start { scheduler = clock }
+    local timer = actor:pending_timers()[1]
+    assert(timer.delay == 'retry' and timer.ms == 300 and timer.event == 'after.retry.offline')
+    clock.advance(299); assert(actor:matches('offline'))
+    clock.advance(1); assert(actor:matches('trying'))
+    actor:send('FAIL')
+    assert(actor:pending_timers()[1].ms == 600, 'evaluated again on each entry')
+    clock.advance(600); assert(actor:matches('trying'))
+    clock.advance(50); assert(actor:matches('idle'), 'a constant named delay')
+    local ok, err = pcall(actor.send, actor, 'BAD')
+    assert(not ok and tostring(err):find('delay retry must return integer ms'), tostring(err))
+    assert(actor:matches('idle'), 'an invalid delay aborts the step')
+    actor:stop()
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { after = { slow = 'a' } } } } end, "not in the chart's delays")
+    fails(function() machine.create { id = 'm', initial = 'a', delays = { slow = -5 }, states = { a = {} } } end, 'delay "slow"')
+  end,
+
+  ['siblings address each other by system id'] = function()
+    local clock = machine.manual_scheduler()
+    local shell = machine.create { id = 'shell', initial = 'overlay', events = { DISMISS = {} },
+      states = { overlay = { on = { DISMISS = 'plain' } }, plain = {} } }
+    local session = machine.create { id = 'session', initial = 'open', events = { LOCK = {}, POKE = {} },
+      states = { open = { on = {
+        LOCK = { target = 'locked', actions = machine.send_to({ system = 'shell' }, 'DISMISS') },
+        POKE = { actions = machine.send_to({ system = 'nobody' }, 'DISMISS') },
+      } }, locked = { on = { LOCK = { actions = machine.send_to({ system = 'shell' }, 'DISMISS') } } } } }
+    local s = shell:actor { scheduler = clock, system_id = 'shell' }
+    assert(machine.system('shell') == s, 'registered at creation')
+    local u = session:start { scheduler = clock }
+    local records = recorder(u)
+    u:send('LOCK')
+    local sent = last(records).sent[1]
+    assert(u:matches('locked') and sent.system == 'shell' and sent.accepted == false and sent.reason == 'not_started',
+      'a send to an unstarted sibling is rejected, not raised')
+    s:start()
+    u:send('LOCK')
+    assert(s:matches('plain') and last(records).sent[1].accepted == true and last(records).sent[1].to == 'shell')
+    fails(function() shell:actor { scheduler = clock, system_id = 'shell' } end, 'DuplicateSystemId')
+    local ok, err = pcall(u.send, u, 'LOCK') -- still locked: sends again, shell no longer handles DISMISS
+    assert(ok and last(records).sent[1].reason == 'no_transition', tostring(err))
+    s:stop()
+    assert(machine.system('shell') == nil, 'stopping frees the system id')
+    local again = shell:start { scheduler = clock, system_id = 'shell' }
+    assert(machine.system('shell') == again)
+    again:stop(); u:stop()
+    local v = session:start { scheduler = clock }
+    ok, err = pcall(v.send, v, 'POKE')
+    assert(not ok and tostring(err):find('no actor has system id "nobody"'), tostring(err))
+    v:stop()
+  end,
+
+  ['table event fields accept context views'] = function()
+    local clock = machine.manual_scheduler()
+    local catalog = machine.create { id = 'catalog', initial = 'ready',
+      context = { entries = { { name = 'Files', exec = 'files' }, { name = 'Mail', exec = 'mail' } } },
+      states = { ready = {} } }:start { scheduler = clock }
+    local launched
+    local launcher = machine.create { id = 'launcher', initial = 'open',
+      events = { ACTIVATE = { entry = 'table?' } },
+      states = { open = { on = { ACTIVATE = { actions = function(_, e) launched = e.entry end } } } } }:start { scheduler = clock }
+    local entry = catalog:context().entries[2]
+    assert(machine.raw(entry) ~= entry, 'context reads are views')
+    assert(launcher:send { type = 'ACTIVATE', entry = entry })
+    assert(launched.exec == 'mail')
+    fails(function() launcher:send { type = 'ACTIVATE', entry = 'mail' } end, 'ACTIVATE.entry must be table')
+    catalog:stop(); launcher:stop()
+  end,
+
   ['reload hooks persist roots, carry them into new charts and hold their work until release'] = function()
     local clock = machine.manual_scheduler()
     local doc_v1 = machine.create {
@@ -1006,7 +1205,7 @@ return {
     for _, entry in ipairs(entries) do ids[#ids + 1] = entry.id .. '/' .. entry.machine end
     table.sort(ids)
     assert(join(ids) == 'app/app', join(ids)) -- done, unserializable and child actors are left out
-    assert(#skipped == 1 and skipped[1]:find('^bad: machine value is not serializable'), tostring(skipped[1]))
+    assert(#skipped == 1 and skipped[1]:find('^bad: context%.f: machine value is not serializable'), tostring(skipped[1]))
     local mine
     for _, entry in ipairs(entries) do if entry.id == 'app' then mine = entry end end
 

@@ -86,7 +86,7 @@ local function current(actor)
   local now = clock and clock() or nil
   local started = {kind = 'actor', action = 'started', actor = actor.path, machine = actor.chart.id,
     parent = actor._parent and actor._parent.path, graph = actor.chart:graph(), seeded = true, time_ms = now}
-  local snapshot = machine.plain(actor:snapshot())
+  local snapshot = actor:inspectable()
   local record = {kind = 'transition', actor = actor.path, machine = actor.chart.id, origin = 'attach',
     seeded = true, event = {type = 'ouro.attach'}, handled = true, rejected = false, time_ms = now,
     microsteps = {}, exited = {}, entered = {}, timers = {}, invokes = {}, actions = {},
@@ -142,7 +142,7 @@ local function rollup()
     local clock = actor._scheduler and actor._scheduler.clock
     local now = clock and clock() or nil
     since_ms = since_ms or now
-    local snapshot = machine.plain(actor:snapshot())
+    local snapshot = actor:inspectable()
     local leaves = {}
     for _, id in ipairs(snapshot.states or {}) do
       local leaf = true
@@ -199,7 +199,7 @@ local function deliver(request)
       end
     end
   end
-  local before = machine.plain(actor:snapshot()).context or {}
+  local before = actor:inspectable().context or {}
   local last
   -- Closed however this task ends, cancellation included (runtime.send's
   -- request cancelled or its client gone retires the task's scope).
@@ -226,7 +226,7 @@ local function deliver(request)
     wait = {matched = matched, error = not matched and tostring(err) or nil}
   end
   if not ok then error(accepted, 0) end
-  local snapshot = machine.plain(actor:snapshot())
+  local snapshot = actor:inspectable()
   local after = snapshot.context or {}
   local changed, keys = {}, {}
   for k in pairs(after) do keys[k] = true end

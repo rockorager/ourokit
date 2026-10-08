@@ -301,6 +301,46 @@ return o.app {id = 'dev.ourokit.statechart-component', run = function()
   end}}}
 end}
 '''
+# Native handles in context (gap 1): a transient bus, and an undeclared one.
+HANDLES = '''local o = require('ouro')
+local m = o.machine
+local link = m.create {
+  id = 'link', initial = 'up', transient = {'bus'},
+  context = function() return {bus = o.signal(0), other = o.signal(1), pings = 0} end,
+  events = {PING = {}},
+  states = {up = {on = {PING = {actions = m.assign {pings = function(c) return c.pings + 1 end}}}}},
+}:actor {id = 'link'}
+link:start()
+return o.app {id = 'dev.ourokit.statechart-handles', run = function() return {windows = {}} end}
+'''
+
+
+def native_handles():
+    """runtime.send, runtime.statecharts and the rollup work for an actor
+    whose context holds native handles; they show as {"$h": type}."""
+    with tempfile.TemporaryDirectory(prefix='ourokit-statechart-handles-') as directory:
+        root = Path(directory)
+        source = root / 'app.lua'
+        source.write_text(HANDLES)
+        env = dict(os.environ, XDG_RUNTIME_DIR=str(root), XDG_STATE_HOME=str(root / 'state'))
+        process = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--headless'],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            endpoint = development_path(root, process)
+            time.sleep(.3)
+            out, failed = send(endpoint, 'link', {'type': 'PING'})
+            assert not failed and out['accepted'] is True and out['changed'] == ['pings'], out
+            context = statecharts(endpoint, after=0, limit=0, actors=False, actor='link')['actor']['snapshot']['context']
+            assert set(context['bus']) == {'$h'} and set(context['other']) == {'$h'} and context['pings'] == 1, context
+            rows = statecharts(endpoint, after=0, limit=0, actors=False, rollup=True)['rollup']['actors']
+            assert any(r['actor'] == 'link' for r in rows), rows
+            assert process.poll() is None
+        finally:
+            process.terminate()
+            process.communicate(timeout=10)
+    print('PASS native handles: runtime.send, runtime.statecharts and the rollup show handles as {"$h": type}')
+
+
 def send_robustness():
     """runtime.send cannot end the app, never holds up other clients, waits
     for the next commit when states are omitted, and stops when cancelled
@@ -571,5 +611,6 @@ if __name__ == '__main__':
     main()
     send_and_push()
     send_robustness()
+    native_handles()
     if os.environ.get('OUROKIT_TEST_WAYLAND_DISPLAY'):
         native()

@@ -138,9 +138,10 @@ We use SCXML semantics with an XState-like Lua surface. Supported:
 | `assign` | `machine.assign(fn \| {field = value \| fn})` | The only way to change context. |
 | `raise` | `machine.raise(event \| fn)` | Adds an internal event to the current macrostep. |
 | `always` | `always = transition(s)` | Eventless transitions, checked after every microstep. |
-| `after` | `after = { [ms] = transition }` | Integer milliseconds, 0 to `machine.max_delay_ms` (2^31 − 1, about 24.8 days); `machine.create` rejects others. Started on entry, cancelled on exit. |
-| `invoke` | `invoke = { src, id?, input?, on_done?, on_error? }` | Work that lives exactly as long as its state. |
+| `after` | `after = { [ms] = transition }` or `after = { name = transition }` with chart `delays = { name = ms \| function(context, event) -> ms }` | Integer milliseconds, 0 to `machine.max_delay_ms` (2^31 − 1, about 24.8 days); `machine.create` rejects others. A named delay is evaluated on entry (a bad result aborts the step, like a throwing guard); its event is `after.<name>.<state>`, and records and `pending_timers()` carry `delay = name` plus the computed `ms`. Started on entry, cancelled on exit, on the logical clock. |
+| `invoke` | `invoke = { src, id?, input?, on_done?, on_error? }`, `src = function(input, send, receive)` | Work that lives exactly as long as its state. `receive(fn)` registers a handler for events the chart sends with `machine.send_to('<invoke id>', event)`; they queue in a mailbox drained in order by one task in the invoke's scope. A `src` that returns a function is a callback invoke (XState `fromCallback`): it stays active until its state exits, and the function runs as its cleanup. Use `machine.sleep(ms)` inside invokes and spawned tasks for waits that follow the logical clock. |
 | Spawned children | `machine.spawn(chart \| fn \| 'actor', {id?, input?})`, `machine.stop(id)`, `send_to`, `send_parent` | Keyed child actors, such as one per document or tab, or one-shot tasks (§8). Ids default to `<chart or actor>.<n>`. |
+| System ids | `chart:actor { system_id = 'shell' }`, `machine.system('shell')`, `machine.send_to({ system = 'shell' }, event)` | XState v5's `systemId`: any actor addressable app-wide from creation until it stops or finishes, so sibling roots need no closures. One live actor per id (`DuplicateSystemId`). A send to an actor created but not started is rejected (`record.sent` reason `not_started`), not raised; an unknown id raises. |
 | Entry/exit | `entry = action(s)`, `exit = action(s)` | Actions run in document order. Named actions in `actions = {...}` may be a list. |
 | `on_done` | on compound/parallel states | Shorthand for `on = { ['done.state.<id>'] = ... }`. Not on the root: a finished machine is `done` (status, `wait_for`, `done.actor.<id>` to its parent), so `machine.create` rejects a root `on_done`. |
 | Tags | `tags = {'busy'}` | Use `actor:has_tag('busy')` in the view. |
@@ -304,7 +305,9 @@ events = {
 The field types are `string`, `number`, `integer`, `boolean`, `table` and `any`.
 `integer` accepts integral floats (`6.0`, as spinboxes and sliders send) and
 normalizes them to integers, like the MCP numeric rule. A trailing `?` marks an
-optional field. Events with a schema reject missing or
+optional field. A `table` field also accepts a context view and carries the
+table behind it, so rows read from another actor's context pass through
+without `machine.plain`. Events with a schema reject missing or
 mistyped fields and undeclared fields (`InvalidEvent`). Declared events without
 a schema accept any payload. `machine.set(field, type)` declares
 `{ value = type }`. That is the payload value widgets send (§7), so
@@ -435,6 +438,23 @@ Views are userdata because the app sandbox has no `setmetatable` and Lua 5.5
 `<const>` is binding-only. As a result, `type(view) == 'userdata'` and
 `next(view)` does not work. Use `machine.plain(view)` for a deep, serializable
 copy.
+
+**Native handles** (a D-Bus connection, an audio output, a lock owner) may
+live in context when the chart declares them **transient**:
+`transient = { 'bus', 'output' }`. Transient fields are left out of
+`persist()` and reload carry: a restored actor has them as `nil`, so
+re-acquire them when `actor:restored()`. Inspection, records, recordings and
+the dev tools (`runtime.send`, `runtime.statecharts`, the rollup) show them as
+the opaque marker `{"$h": "<type>"}` (the metatable `__name`, else the Lua
+type). Any other handle or function in context still inspects as such a
+marker and never breaks a dev tool, but `persist()` fails naming the field
+(`context.bus: ... (declare native handles transient)`), so the actor is not
+carried. `machine.inspectable(v)` and `actor:inspectable()` give that
+never-failing plain form.
+
+An action error while the actor handles a timer, an invoke result or a task
+result is on that step's record (`error`) and is printed; it does not end
+the runtime task that delivered the event.
 
 `assign` produces a new shallow copy with the updates applied.
 `machine.unset` deletes a field. Updates that return views are unwrapped.
@@ -1260,7 +1280,7 @@ local machine = ouro.machine
 local chart = machine.create { id, initial, context, states, on, guards, actions, actors, events, ... }
 chart:graph()                      chart:initial(input)      chart:transition(snapshot, event)
 chart:can(snapshot, event)         chart:restore(persisted, {renames, input})
-local actor = chart:actor { input, scheduler, snapshot, charts, id, renames, lazy, scope }   -- create (render-safe)
+local actor = chart:actor { input, scheduler, snapshot, charts, id, renames, lazy, scope, system_id }   -- create (render-safe)
 local actor = chart:start { ... }  -- chart:actor(options):start()
 actor:start()  actor:stop()  actor:send(event) -> accepted, reason  actor:deliver(event, origin)
 actor:sender(event)  actor:event(event [, field])
@@ -1272,7 +1292,9 @@ machine.wait_for(actor, pred, {timeout})  machine.selector(fn)  machine.actions(
 machine.component(chart, render)  machine.matches(snapshot, id)  machine.plain(v)  machine.raw(view)  machine.unset
 -- machine.matches raises for state ids no chart with the snapshot's machine id has;
 -- machine.raw(view) returns the table behind a read-only view (identity checks).
-actor:handles(type)  actor:pending_timers()  actor:pending_invokes()
+actor:handles(type)  actor:pending_timers()  actor:pending_invokes()  actor:inspectable()
+machine.system(id)  machine.sleep(ms)  machine.inspectable(v)  machine.max_delay_ms
+-- create: transient = { field, ... }, delays = { name = ms | fn(context, event) }
 machine.inspect(fn)  machine.actors()  machine.strict  machine.reserved_prefixes
 machine.persist_roots()  machine.carry(entries)  machine.release()
 machine.default_scheduler  machine.token_scheduler  machine.manual_scheduler()  machine.native_scopes

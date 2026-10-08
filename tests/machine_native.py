@@ -207,6 +207,25 @@ created:stop()
 o.sleep(5); o.sleep(1)
 assert(outcome and outcome:find('WaitEnded: created is stopped', 1, true), tostring(outcome))
 
+-- Gap 5: machine.sleep in an invoke waits on the logical clock (it wakes at
+-- its deadline), and leaving the state cancels the wait.
+local slept = {}
+local napper = machine.create { id = 'napper', initial = 'idle',
+  actors = { nap = function(ms) local t0 = machine.now(); machine.sleep(ms); slept[#slept + 1] = machine.now() - t0; return ms end },
+  states = {
+    idle = { on = { NAP = 'napping', LONG = 'long' } },
+    napping = { invoke = { src = 'nap', input = function() return 40 end, on_done = 'idle' } },
+    long = { invoke = { src = 'nap', input = function() return 200 end, on_done = 'idle' }, on = { LEAVE = 'idle' } },
+  } }
+local n = napper:start()
+n:send('NAP'); o.sleep(20)
+assert(n:matches('napping') and #slept == 0, 'woke early')
+o.sleep(60)
+assert(n:matches('idle') and slept[1] >= 40 and slept[1] < 60, 'slept ' .. tostring(slept[1]))
+n:send('LONG'); o.sleep(20); n:send('LEAVE'); o.sleep(250)
+assert(#slept == 1, 'a canceled machine.sleep woke')
+n:stop()
+
 o.stdout.write('PASS machine native\n')
 o.exit(0)
 '''
