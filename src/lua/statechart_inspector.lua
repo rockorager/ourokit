@@ -93,8 +93,9 @@ local function current(actor)
     states = snapshot.states, status = actor:status(), context = snapshot.context,
     children = children_of(snapshot), output = snapshot.output}
   for _, live in ipairs(actor:pending_timers()) do
+    -- delay may be a delay name; ms is the evaluated duration.
     record.timers[#record.timers + 1] = {action = 'started', state = live.state, delay = live.delay,
-      event = live.event, token = live.token, time_ms = live.time_ms}
+      ms = live.ms, event = live.event, token = live.token, time_ms = live.time_ms}
   end
   for _, live in ipairs(actor:pending_invokes()) do
     record.invokes[#record.invokes + 1] = {action = 'started', state = live.state, id = live.id,

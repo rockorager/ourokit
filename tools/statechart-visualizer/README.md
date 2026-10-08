@@ -14,9 +14,9 @@ plugins or web views.
 | Initial / final | A filled dot with an arrow to the initial child; a double border for final states |
 | Transition | Orthogonal arrow with an event pill: `EVENT [guard]`, `after 100ms`, `always`, `done.*`. Self and targetless transitions share a small loop. A taken transition turns orange and a pulse runs along it, one microstep after another. |
 | Guard | The `[guard]` text: green when it passed, red when it failed, grey when not evaluated (`record.guards`) |
-| `after` | Its pill counts down while the timer runs. Named delays show their name (`after slow`); durations come from the records' `ms`, so function delays count down too. Timers are keyed by their event. |
+| `after` | Its pill counts down while the timer runs. Named delays show their name (`after slow`), with the evaluated duration only while the timer runs; durations come from the records' `ms` (and `pending_timers()` on late attach), so function delays count down too. Timers are keyed by their event. |
 | `invoke` | A status chip on the `invoke:` line: running, done, error or cancelled |
-| Events | Left panel: one pill per declared event, highlighted when accepted. A rejected event flashes. Clicking a pill sends it (`runtime.send`, or the actor itself in-process); events with fields open a payload editor. |
+| Events | Left panel: one pill per declared event, highlighted when accepted. An event whose guards need its payload to decide (`record.guarded`, or guard entries flagged `payload` or erroring on the bare event) is available with payload: highlighted, marked `…`, and it opens the payload editor. A rejected event flashes. Clicking a pill sends it (`runtime.send`, or the actor itself in-process); events with fields open a payload editor. |
 | Context | Right panel: a tree with changed keys highlighted, plus running timers and invokes. Native handles (`{"$h": type}`) show as opaque `‹type›` values. |
 | History | Timeline below: ticks colored by origin, a scrub slider, step buttons, Play for recordings and **Live** |
 
@@ -77,7 +77,7 @@ zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua --dev -- self
 # Headless frames (manual scheduler, recorded streams)
 zig-out/bin/ouroctl storybook snapshot tools/statechart-visualizer/storybook.lua --output out
 # The visualizer's own chart, on a manual clock with fake services
-(cd tools/statechart-visualizer && for t in charts overview client contract; do ../../zig-out/bin/ouroctl test ${t}_test.lua; done)
+(cd tools/statechart-visualizer && for t in charts overview client contract delays; do ../../zig-out/bin/ouroctl test ${t}_test.lua; done)
 # A recorded session (design/statecharts.md §14): expand it, then scrub or play it
 zig-out/bin/ouroctl replay ~/.local/state/ourokit/recordings/dev.ourokit.stopwatch.jsonl examples/stopwatch --records /tmp/stopwatch.records.jsonl
 zig-out/bin/ouroctl run tools/statechart-visualizer/app.lua -- /tmp/stopwatch.records.jsonl

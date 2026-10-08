@@ -152,8 +152,18 @@ function M.record(raw, t0, fallback)
   if raw.guards and raw.guards ~= M.null then
     r.guards = {}
     for _, v in pairs(raw.guards) do
-      if type(v) == 'table' and v.index then r.guards[v.index] = v.passed == true end
+      -- A guard that needs the event's payload cannot be decided on the
+      -- bare event: `payload = true`, or (older feeds) an error.
+      if type(v) == 'table' and v.index then
+        local undecided = v.payload == true or (v.passed ~= true and v.error ~= nil and v.error ~= M.null)
+        r.guards[v.index] = undecided and 'payload' or v.passed == true
+      end
     end
+  end
+  -- Events an active transition handles once given a payload.
+  if raw.guarded and raw.guarded ~= M.null then
+    r.guarded = {}
+    for _, event in ipairs(raw.guarded) do r.guarded[event] = true end
   end
   -- Older feeds sent accepted events instead of guard outcomes.
   if not r.guards and raw.accepted and raw.accepted ~= M.null then

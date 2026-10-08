@@ -423,8 +423,60 @@ def send_robustness():
             assert b'panic' not in stderr and b'leaked' not in stderr, stderr
 
 
+NAMED = '''local o = require('ouro')
+local m = o.machine
+local chart = m.create {
+  id = 'clock', initial = 'waiting', context = {second = 18},
+  delays = {minute = function(c) return (60 - c.second) * 1000 end},
+  states = {waiting = {after = {minute = 'reading'}}, reading = {}},
+}
+chart:actor {id = 'clock'}:start()
+return o.app {id = 'dev.ourokit.statechart-named', run = function() return {windows = {}} end}
+'''
+
+
+def named_delays():
+    """Late attach carries a running named timer's evaluated ms (gap 5)."""
+    with tempfile.TemporaryDirectory(prefix='ourokit-statechart-named-') as directory:
+        root = Path(directory)
+        source = root / 'app.lua'
+        source.write_text(NAMED)
+        env = dict(os.environ, XDG_RUNTIME_DIR=str(root), XDG_STATE_HOME=str(root / 'state'))
+        process = subprocess.Popen([str(BINARY), 'run', str(source), '--dev', '--headless'],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            endpoint = development_path(root, process)
+            time.sleep(.3)
+            seeded = statecharts(endpoint, after=0, limit=0, text=False)['actors'][0]['latest']
+            timer = seeded['timers'][0]
+            assert timer['delay'] == 'minute' and timer['ms'] == 42000 and timer['event'] == 'after.minute.waiting', timer
+            full = statecharts(endpoint, after=0, limit=0, actors=False, actor='clock')['actor']['snapshot']
+            assert full['timers'][0]['ms'] == 42000, full['timers']
+            print('PASS named delays: late attach carries the evaluated ms of a running named timer')
+        finally:
+            process.terminate()
+            _, stderr = process.communicate(timeout=10)
+            assert b'panic' not in stderr and b'leaked' not in stderr, stderr
+
+
 ROOT = Path(__file__).resolve().parents[1]
 VISUALIZER = ROOT / 'tools/statechart-visualizer/app.lua'
+
+
+def visualizer():
+    """The visualizer's own suites: its Lua tests and every storybook frame
+    (they run the interpreter's manual scheduler, so scheduler changes show
+    up here)."""
+    directory = VISUALIZER.parent
+    for name in ('charts', 'overview', 'client', 'contract', 'delays'):
+        run = subprocess.run([str(BINARY), 'test', f'{name}_test.lua'], cwd=directory, capture_output=True, text=True, timeout=120)
+        assert run.returncode == 0 and ' 0 failed' in run.stdout, (name, run.stdout[-2000:], run.stderr[-2000:])
+    with tempfile.TemporaryDirectory(prefix='ourokit-visualizer-frames-') as out:
+        run = subprocess.run([str(BINARY), 'storybook', 'snapshot', str(directory / 'storybook.lua'), '--output', out],
+                             capture_output=True, text=True, timeout=300)
+        frames = list(Path(out).rglob('*.png'))
+        assert run.returncode == 0 and len(frames) >= 17, (len(frames), run.stdout[-1000:], run.stderr[-2000:])
+    print(f'PASS statechart visualizer: Lua suites and {len(frames)} storybook frames')
 
 
 def snapshot(endpoint, actor):
@@ -611,6 +663,8 @@ if __name__ == '__main__':
     main()
     send_and_push()
     send_robustness()
+    named_delays()
+    visualizer()
     native_handles()
     if os.environ.get('OUROKIT_TEST_WAYLAND_DISPLAY'):
         native()

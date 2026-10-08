@@ -6,6 +6,26 @@ local machine = o.machine
 
 local M = {}
 
+-- Runs exactly one queued invoke or task on a manual scheduler, through its
+-- run_tasks (queued items are records, not functions, since 653f6fc);
+-- work that item queues stays queued for a later call.
+function M.run_one(clock)
+  local item = table.remove(clock.tasks, 1)
+  if not item then return end
+  if type(item) == 'function' then return item() end
+  local rest, held, run = clock.tasks, {}, clock.run
+  clock.tasks = {item}
+  clock.run = function(...)
+    run(...)
+    held[#held + 1] = table.remove(clock.tasks)
+  end
+  local ok, err = pcall(clock.run_tasks)
+  clock.run = run
+  for _, queued in ipairs(held) do rest[#rest + 1] = queued end
+  clock.tasks = rest
+  if not ok then error(err, 0) end
+end
+
 function M.run(fixture)
   local clock = machine.manual_scheduler()
   local mode = {}
@@ -39,8 +59,7 @@ function M.run(fixture)
   -- Completes exactly one piece of queued invoked work.
   function d.run(t)
     d.advance(t)
-    local task = table.remove(clock.tasks, 1)
-    if task then task() end
+    M.run_one(clock)
   end
   function d.fail(message) mode.fail = message end
   function d.hang() end

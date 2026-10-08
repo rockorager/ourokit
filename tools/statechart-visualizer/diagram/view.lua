@@ -52,11 +52,26 @@ end
 
 local CHIP_TEXT = {running='running', done='done', error='error', cancelled='cancelled', idle='idle'}
 
+-- The running timer of an after transition and its evaluated duration
+-- (the record's ms, so named and function delays count down too).
+local function running_timer(t, frame)
+  local timer = frame.timers[t.after_event] or frame.timers[t.source .. '@' .. tostring(t.after)]
+  return timer, timer and (timer.delay or t.after)
+end
+
+-- An after pill's text: the delay's label (`after slow`, `after 250ms`),
+-- plus the time left only while its timer runs.
+function M.after_text_of(t, frame, now, left)
+  local timer, delay = running_timer(t, frame)
+  if not timer or not delay then return t.label end
+  left = left or (frame.timed and history.remaining(timer, now) or delay)
+  return t.label .. ' · ' .. fmt_ms(left)
+end
+
 -- An after pill shows a countdown while its timer runs. Following live, a
 -- native one-shot animation keyed by the timer token counts it down.
 local function after_text(key, t, frame, now, live, render)
-  local timer = frame.timers[t.after_event] or frame.timers[t.source .. '@' .. tostring(t.after)]
-  local delay = timer and (timer.delay or t.after)
+  local timer, delay = running_timer(t, frame)
   if not timer or not delay then return render(nil) end
   if live then
     return o.animation {key=key .. ':' .. tostring(timer.token), duration=delay,
@@ -104,8 +119,10 @@ local function texts(plant, frame, now, P, live)
         local color = taken and P.taken or ((t and frame.active[t.source]) and P.text or P.muted)
         local key = 'p:' .. i .. ':' .. j
         local function pill(left)
-          local spans = {{text=p.event .. ((t and t.after_event and left) and (' · ' .. fmt_ms(left)) or ''), foreground=color}}
+          local text = (t and t.after_event) and (left and M.after_text_of(t, frame, now, left) or t.label) or p.event
+          local spans = {{text=text, foreground=color}}
           if p.guard then
+            -- Green passed, red failed, grey not evaluated or needing a payload.
             local outcome = t and frame.guards[t.id]
             spans[#spans+1] = {text=' ' .. p.guard,
               foreground=outcome == true and P.pass or outcome == false and P.fail or P.faint}
@@ -158,18 +175,23 @@ local function heading(key, text, P)
   return o.text {key=key, text=text, size=11, weight='medium', foreground=P.muted}
 end
 
--- Whether the inspected actor would take `event` now: some transition for it
--- leaves an active state and its guard is not known to fail.
-local function enabled_now(graph, frame, event)
+-- Whether the inspected actor would take `event` now: 'enabled' when an
+-- active transition for it has no guard or one that passed, 'payload' when
+-- its guards need the event's payload to decide (record.guarded, or guard
+-- entries flagged payload), 'refused' otherwise.
+function M.availability(graph, frame, event)
+  if frame.record.guarded and frame.record.guarded[event] then return 'payload' end
+  local payload = false
   for _, t in ipairs(graph.transitions) do
-    if t.event == event and frame.active[t.source] and frame.guards[t.id] ~= false then return true end
+    if t.event == event and frame.active[t.source] then
+      local outcome = frame.guards[t.id]
+      if outcome == nil or outcome == true then return 'enabled' end
+      if outcome == 'payload' then payload = true end
+    end
   end
-  return false
+  return payload and 'payload' or 'refused'
 end
 
--- Events panel: one pill per event. Pressing one sends it to the inspected
--- actor (runtime.send, or the actor itself in-process); an event with
--- payload fields opens the editor first. A rejected event shows red.
 function M.events(viz, c, graph, frame, P, can_send)
   local rows = {heading('h', 'EVENTS', P)}
   local record = frame.record
@@ -177,10 +199,14 @@ function M.events(viz, c, graph, frame, P, can_send)
     local fields = graph.fields[event]
     local has_fields = fields and next(fields) ~= nil
     local rejected = record.rejected and record.event and record.event.type == event
-    local enabled = enabled_now(graph, frame, event)
-    local binding = has_fields and viz:event({type='EDIT_PAYLOAD', name=event, fields=fields})
+    -- Available with payload: highlighted like enabled, marked '…', and it
+    -- opens the payload editor (even without declared fields).
+    local state = M.availability(graph, frame, event)
+    local enabled = state ~= 'refused'
+    local editor = has_fields or state == 'payload'
+    local binding = editor and viz:event({type='EDIT_PAYLOAD', name=event, fields=fields or {}})
       or viz:event({type='INJECT', name=event})
-    rows[#rows+1] = o.button {key='e' .. i, label=event .. (has_fields and ' …' or ''), height=28, padding_x=10,
+    rows[#rows+1] = o.button {key='e' .. i, label=event .. (editor and ' …' or ''), height=28, padding_x=10,
       font_size=12, variant=enabled and 'soft' or 'surface', tone=rejected and 'destructive' or (enabled and 'accent' or 'neutral'),
       enabled=can_send, send=binding}
   end

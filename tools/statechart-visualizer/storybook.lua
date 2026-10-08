@@ -60,13 +60,13 @@ do
     graph = viz.chart:graph(), time_ms = 0})
   viz:start()
   local function at(t) clock.advance(t - clock.now) end
-  at(30); local task = table.remove(clock.tasks, 1); if task then task() end
+  at(30); scenario.run_one(clock)
   at(60); viz:send {type = 'RECORDS', revision = 1, actors = {'stopwatch'}, counts = {stopwatch = 3}, after = 3, seed = 1}
   at(900); viz:send {type = 'SCRUB', value = 2}
   at(1400); viz:send {type = 'STEP', delta = 1}
   at(2000); viz:send {type = 'LIVE'}
   at(2600); viz:send {type = 'INJECT', name = 'START'}
-  at(2700); task = table.remove(clock.tasks, 1); if task then task() end
+  at(2700); scenario.run_one(clock)
   at(3200); viz:send {type = 'EDIT_PAYLOAD', name = 'MAX_LAPS', fields = {value = 'integer'}}
   at(3600); viz:send {type = 'FIELD', name = 'value', value = '3'}
 end
