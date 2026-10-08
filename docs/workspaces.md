@@ -114,3 +114,13 @@ scope ending: a `<close>` local in an invoke closes when the state exits. A
 task parked in `next` when its watcher is closed from elsewhere resumes with
 the error `workspace watch canceled`. Several watchers may be open at once, and
 `watch()` can be used with or without `connect()`.
+
+### Testing
+
+The Sway used by `tests/desktop_native.py`, and so by
+`tests/verify_development.py`, does not implement ext-workspace-v1. CI
+therefore runs the workspace test through `tests/workspace_proxy.py`. The proxy
+forwards all traffic between the application and Sway, file descriptors
+included, and serves a fake `ext_workspace_manager_v1` with a scripted group
+and workspaces. Behavior against real compositors with ext-workspace-v1 is
+checked manually.
