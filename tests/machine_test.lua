@@ -62,7 +62,7 @@ return {
     fails(function() machine.create { id = 'm', initial = 'a', states = { a = { entry = 'act' } } } end, 'unknown action "act"')
     fails(function() machine.create { id = 'm', initial = 'a', states = { a = { invoke = { src = 'load' } } } } end, 'unknown actor "load"')
     fails(function() machine.create { id = 'm', initial = 'a', states = { a = { type = 'final', on = { X = 'a' } } } } end, 'cannot declare on')
-    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { after = { [1.5] = 'a' } } } } end, 'nonnegative integers')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { after = { [1.5] = 'a' } } } } end, 'integers from 0 to')
     fails(function() machine.create { id = 'm', initial = 'a', states = { ['a.b'] = {} } } end, 'must be an identifier')
     fails(function() machine.create { id = 'm', initial = 'a', events = { ['done.x'] = {} }, states = { a = {} } } end, 'invalid external event')
   end,
@@ -1668,6 +1668,147 @@ return {
     local boom = last(seen)
     assert(boom.event.type == 'BOOM' and not boom.rejected and boom.error.code == 'InvalidThing'
       and boom.error.message:find('action broke'), 'an effect error marks its record')
+    actor:stop()
+  end,
+
+  ['review2 H-1: finished root and child actors leave machine.actors() and release their signals'] = function(t)
+    local once = machine.create {
+      id = 'once', initial = 'run', events = { FINISH = {} },
+      states = { run = { on = { FINISH = 'over' } }, over = { type = 'final' } },
+    }
+    local job = machine.create { id = 'job', initial = 'run', states = { run = { always = 'over' }, over = { type = 'final' } } }
+    local boss = machine.create { id = 'boss', initial = 'on', events = { JOB = {} },
+      states = { on = { on = { JOB = { actions = machine.spawn(job) } } } } }
+    local actor = boss:start { scheduler = machine.manual_scheduler() }
+    local before, listed = t:resources(), #machine.actors()
+    local last
+    for _ = 1, 500 do
+      last = once:start()
+      last:send('FINISH')
+      assert(last:status() == 'done')
+    end
+    for _ = 1, 500 do actor:send('JOB') end
+    local after = t:resources()
+    assert(#machine.actors() == listed, 'finished actors still listed: ' .. #machine.actors() - listed)
+    assert(after.signals - before.signals < 50, 'finished actors hold signals: ' .. after.signals - before.signals)
+    assert(#actor:children() == 0)
+    -- A finished actor stays readable and can still be stopped.
+    assert(last:matches('over') and last:status() == 'done' and last:snapshot().status == 'done')
+    last:stop()
+    assert(last:status() == 'stopped')
+    actor:stop()
+  end,
+
+  ['review2 H-1: stopping a parent reaches every child it holds, finished or not'] = function()
+    local job = machine.create { id = 'job', initial = 'run', events = { END = {} },
+      states = { run = { on = { END = 'over' } }, over = { type = 'final' } } }
+    local boss = machine.create { id = 'boss', initial = 'on', events = { END = {} },
+      states = { on = { entry = { machine.spawn(job, { id = 'j' }), machine.spawn(job, { id = 'k' }) },
+        on = { END = { actions = machine.send_to('j', 'END') } } } } }
+    local actor = boss:start { scheduler = machine.manual_scheduler() }
+    local j, k = actor:child('j'), actor:child('k')
+    actor:send('END')
+    assert(j:status() == 'done' and k:status() == 'active')
+    for _, a in ipairs(machine.actors()) do assert(a ~= j, 'a finished child stays registered') end
+    -- A finished child whose done.actor is still undelivered is held: stop reaches it.
+    actor._children.j = j
+    actor:stop()
+    assert(j:status() == 'stopped' and k:status() == 'stopped' and actor:status() == 'stopped')
+  end,
+
+  ['review2 M-1: zero-delay after loops yield between turns; delays are validated'] = function()
+    local chart = machine.create {
+      id = 'zero', initial = 'a', context = { n = 0 },
+      states = {
+        a = { after = { [0] = { target = 'b', guard = function(c) return c.n < 5000 end,
+          actions = machine.assign { n = function(c) return c.n + 1 end } } } },
+        b = { after = { [0] = 'a' } },
+      },
+    }
+    for _, scheduler in ipairs { false, machine.manual_scheduler() } do
+      local actor = chart:start { scheduler = scheduler or nil }
+      local advance = scheduler and scheduler.advance or machine.advance
+      advance(0)
+      assert(actor:context().n == 1 and actor:matches('b'), 'one turn ran ' .. actor:context().n .. ' round trips')
+      advance(0); advance(0)
+      assert(actor:context().n == 2 and actor:matches('b'), 'each turn runs one zero-delay generation')
+      actor:stop()
+    end
+    -- Ordinary timers still all fire within one advance, at their deadlines.
+    local ticks = {}
+    local tick = machine.create { id = 'tick', initial = 'on', context = { n = 0 },
+      states = { on = { after = { [100] = { target = 'on', reenter = true, actions = function() ticks[#ticks + 1] = machine.now() end } } } } }
+    local ticker = tick:start {}
+    local t0 = machine.now()
+    machine.advance(1000)
+    assert(#ticks == 10 and ticks[10] - t0 == 1000, 'ticks: ' .. #ticks)
+    ticker:stop()
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { after = { [-1] = 'a' } } } } end, 'integers from 0 to')
+    fails(function() machine.create { id = 'm', initial = 'a', states = { a = { after = { [machine.max_delay_ms + 1] = 'a' } } } } end, 'integers from 0 to')
+    machine.create { id = 'm', initial = 'a', states = { a = { after = { [machine.max_delay_ms] = 'a' } } } }
+  end,
+
+  ['review2 M-4: a selector over call-site reads still memoizes'] = function()
+    local runs = 0
+    local results = machine.selector(function(entries, query)
+      runs = runs + 1
+      local out = {}
+      for _, e in ipairs(entries) do if e:find(query, 1, true) then out[#out + 1] = e end end
+      return out
+    end)
+    local chart = machine.create {
+      id = 'memo', initial = 'open', context = { query = 'a', entries = { 'alpha', 'beta', 'gamma' } },
+      states = { open = { on = { GO = { target = 'open', guard = function(c) return #results(c.entries, c.query) > 0 end } } } },
+    }
+    local actor = chart:start { scheduler = machine.manual_scheduler() }
+    local c = actor:context()
+    for _ = 1, 5 do results(c.entries, c.query) end
+    assert(actor:can('GO'))
+    assert(runs == 1, 'same (entries, query) recomputed ' .. runs .. ' times')
+    actor:stop()
+  end,
+
+  ['review2 M-7: an entry error during start does not strand queued events'] = function()
+    local child = machine.create { id = 'm7child', initial = 'idle', states = { idle = { entry = machine.send_parent('PING') } } }
+    local parent = machine.create {
+      id = 'm7parent', initial = 'running',
+      states = {
+        running = { entry = { machine.spawn(child, { id = 'c' }), function() error('entry boom') end }, on = { PING = 'pinged' } },
+        pinged = {},
+      },
+    }
+    local actor = parent:actor { scheduler = machine.manual_scheduler() }
+    local ok, err = pcall(actor.start, actor)
+    assert(not ok and tostring(err):find('entry boom'), 'the entry error reaches the starter')
+    assert(actor:matches('pinged'), 'queued PING stranded; parent is in ' .. join(actor:states()))
+    actor:stop()
+  end,
+
+  ['review2 M-5: live root paths are unique; a taken default id gets a suffix'] = function()
+    local counter = machine.create { id = 'counter2', initial = 'on', states = { on = {} } }
+    local a, b, c = counter:start(), counter:start(), counter:start()
+    assert(a.path == 'counter2' and b.path == 'counter2#2' and c.path == 'counter2#3', b.path .. ' ' .. c.path)
+    local paths = {}
+    for _, actor in ipairs(machine.actors()) do paths[actor.path] = actor end
+    assert(paths.counter2 == a and paths['counter2#2'] == b and paths['counter2#3'] == c)
+    b:stop()
+    local d = counter:start()
+    assert(d.path == 'counter2#2', 'the lowest free suffix is reused: ' .. d.path)
+    local explicit = counter:start { id = 'counter2' }
+    assert(explicit.path == 'counter2#4', 'a taken explicit id gets a suffix too: ' .. explicit.path)
+    a:stop(); c:stop(); d:stop(); explicit:stop()
+    local e = counter:start { id = 'counter2' }
+    assert(e.path == 'counter2')
+    e:stop()
+  end,
+
+  ['review2 L-1: matches accepts the states of every chart sharing an id'] = function()
+    local first = machine.create { id = 'dup', initial = 'red', states = { red = {} } }
+    local actor = first:start { scheduler = machine.manual_scheduler() }
+    machine.create { id = 'dup', initial = 'green', states = { green = {} } }
+    assert(machine.matches(actor:snapshot(), 'red') == true)
+    assert(machine.matches(actor:snapshot(), 'green') == false)
+    fails(function() machine.matches(actor:snapshot(), 'blue') end, 'has no state')
     actor:stop()
   end,
 

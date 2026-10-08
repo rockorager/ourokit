@@ -29,7 +29,8 @@ pub fn install(state: *c.State) !void {
     c.lua_pushcclosure(state, trackedView, 0);
     // Private release(signal); a no-op for values that aren't ouro signals.
     @import("signals.zig").Signals.pushRelease(state);
-    if (c.lua_pcallk(state, 10 + extra, 0, 0, 0, null) != c.ok)
+    c.lua_pushcclosure(state, isTracked, 0);
+    if (c.lua_pcallk(state, 11 + extra, 0, 0, 0, null) != c.ok)
         return error.MachineInitializationFailed;
     // Recording and replay (design/statecharts.md §14) extend ouro.machine.
     const replay = @embedFile("machine_replay.lua");
@@ -313,6 +314,14 @@ fn trackedView(state: *c.State) callconv(.c) c_int {
     _ = c.lua_setiuservalue(state, -2, 2);
     pushMetatable(state);
     _ = c.lua_setmetatable(state, -2);
+    return 1;
+}
+
+/// is_tracked(v) -> true for a tracked view (its reads go to signals).
+fn isTracked(state: *c.State) callconv(.c) c_int {
+    const tracked = c.luaL_testudata(state, 1, view_metatable) != null and
+        c.lua_getiuservalue(state, 1, 2) == c.type_function;
+    c.lua_pushboolean(state, @intFromBool(tracked));
     return 1;
 }
 

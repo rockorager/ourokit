@@ -1,5 +1,6 @@
 local ouro, view, raw, scope_open, scope_spawn, scope_close, scope_alive, atomic_call,
-  waiter_new, waiter_park, waiter_wake, waiter_waiting, tracked_view, signal_release = ...
+  waiter_new, waiter_park, waiter_wake, waiter_waiting, tracked_view, signal_release, is_tracked = ...
+is_tracked = is_tracked or function() return false end
 -- Frees a hidden signal's slot at once (reads keep the final value).
 local release_signal = signal_release or function() end
 -- Guards, assigns, expressions and function actions run as native atomic
@@ -116,11 +117,14 @@ end
 -- children snapshots: machine.matches(state.children[id], 'open.io.saving').
 -- Unknown ids raise when the snapshot's chart is known (charts register by
 -- id when created), so typos fail loudly as with actor:matches.
-local charts_by_id = {}
+-- State ids per machine id, the union over every chart created with that id
+-- (a factory called twice, tests, stories, reload), so matches() never
+-- rejects a state of an older chart that shares the id. Strings only.
+local state_ids_by_machine = {}
 function M.matches(snapshot, id)
   if snapshot == nil then return false end
-  local chart = charts_by_id[snapshot.machine]
-  if chart and (id == '' or not chart.by_id[id]) then fail('machine %s has no state %q', chart.id, tostring(id)) end
+  local known = state_ids_by_machine[snapshot.machine]
+  if known and (id == '' or not known[id]) then fail('machine %s has no state %q', snapshot.machine, tostring(id)) end
   for _, state in ipairs(snapshot.states or {}) do
     if state == id then return true end
   end
@@ -183,6 +187,9 @@ local function is_descendant(a, b)
   end
   return false
 end
+
+-- The longest `after` delay, about 24.8 days (2^31 - 1 ms, as in browsers).
+M.max_delay_ms = 2147483647
 
 local function compile(def)
   if type(def) ~= 'table' then fail('machine.create expects a table') end
@@ -386,7 +393,9 @@ local function compile(def)
     if sdef.after then
       local delays = {}
       for delay in pairs(sdef.after) do
-        if math.type(delay) ~= 'integer' or delay < 0 then fail('after delays in %s must be nonnegative integers', where(node)) end
+        if math.type(delay) ~= 'integer' or delay < 0 or delay > M.max_delay_ms then
+          fail('after delays in %s must be integers from 0 to %d ms', where(node), M.max_delay_ms)
+        end
         delays[#delays + 1] = delay
       end
       table.sort(delays)
@@ -1142,9 +1151,27 @@ local registry_order = {}
 -- machine.actors() lists registered actors by path. A path belongs to its
 -- latest actor: a remounted component registers before the old instance's
 -- unmount stops it, and that stop must not unregister the new one.
+-- Actors on an `unlisted` scheduler (replay's sandbox) stay out of the app's
+-- registry: they neither appear in machine.actors() nor claim app paths.
 local function register(actor)
+  if actor._scheduler.unlisted then return end
   if registry[actor.path] == nil then registry_order[#registry_order + 1] = actor.path end
   registry[actor.path] = actor
+end
+
+-- Root actor paths are unique among live actors, so records, the recorder and
+-- replay tell them apart. A root whose id (default or explicit) is taken by a
+-- live actor gets the next free deterministic suffix: 'counter', 'counter#2',
+-- 'counter#3'. Replay runs on an unlisted scheduler and keeps the recorded
+-- path as is. Children are unique per parent.
+local function claim_path(actor)
+  if actor._parent or actor._scheduler.unlisted then return end
+  local holder = registry[actor.path]
+  if holder == nil or holder == actor then return end
+  local base, n = actor.id, 2
+  while registry[base .. '#' .. n] ~= nil do n = n + 1 end
+  actor.id = base .. '#' .. n
+  actor.path = actor.id
 end
 local function unregister(actor)
   if registry[actor.path] ~= actor then return end
@@ -1311,18 +1338,23 @@ end
 -- that only hits the cache still depends on the fields behind the result.
 function M.selector(fn)
   if type(fn) ~= 'function' then fail('selector expects a function') end
-  local last_key, last_args, last_result, last_reads, has_result = nil, nil, nil, nil, false
+  local last_key, last_args, last_result, last_reads, last_tracked, has_result = nil, nil, nil, nil, false, false
   return function(data, ...)
     local key, n = raw(data), select('#', ...)
+    -- Tracked when any input is a tracked view: its reads go to signals.
+    local tracked = is_tracked(data)
+    for i = 1, n do if not tracked and is_tracked((select(i, ...))) then tracked = true end end
     if has_result and key == last_key and n == last_args.n then
       local same = true
       for i = 1, n do
         if raw((select(i, ...))) ~= last_args[i] then same = false; break end
       end
-      -- An entry computed on plain (untracked) views, e.g. by a guard
-      -- evaluated after commit or outside a render, recorded no reads and
-      -- would replay nothing: recompute it instead.
-      if same and #last_reads > 0 then
+      -- Reuse replays the entry's reads, so a tracked caller depends on what
+      -- the computation read. An entry computed on plain views (a guard after
+      -- commit, can() outside a render) recorded none, so a tracked caller
+      -- recomputes it. Inputs read at the call site (results(c.entries,
+      -- c.query)) were tracked by the caller and stay memoized.
+      if same and (last_tracked or not tracked) then
         for _, signal in ipairs(last_reads) do M._track(signal) end
         return last_result
       end
@@ -1331,7 +1363,7 @@ function M.selector(fn)
     for i = 1, n do args[i] = raw((select(i, ...))) end
     local reads, ok, result = M._recording(fn, data, ...)
     if not ok then error(result, 0) end
-    last_result, last_reads = result, reads
+    last_result, last_reads, last_tracked = result, reads, tracked
     last_key, last_args, has_result = key, args, true
     return last_result
   end
@@ -1594,7 +1626,7 @@ function M.logical_clock(options)
   options = options or {}
   -- by_scope finds the queued timers of a scope when it closes (it holds only
   -- scopes with queued timers); dead counts cancelled timers still queued.
-  local c = {timers = {}, sequence = 0, firing = false, fired = 0, dead = 0, compact_at = 32, by_scope = {}}
+  local c = {timers = {}, sequence = 0, firing = false, fired = 0, dead = 0, compact_at = 32, by_scope = {}, pass = 0}
   local alive, wall, wake = options.alive or function(scope) return scope.alive end, options.wall, options.wake
   local time = options.start
   local function current()
@@ -1641,6 +1673,9 @@ function M.logical_clock(options)
       c.compact_at = math.max(32, 2 * #c.timers)
     end
     local timer = {at = current() + delay, sequence = c.sequence, scope = scope, fn = fn}
+    -- A zero-delay timer started while timers fire belongs to the next turn,
+    -- so an `after 0` loop yields instead of spinning inside one pass.
+    if delay == 0 and c.firing then timer.pass = c.pass end
     local list, i = c.timers, #c.timers
     while i > 0 and (list[i].at > timer.at) do i = i - 1 end
     table.insert(list, i + 1, timer)
@@ -1668,8 +1703,15 @@ function M.logical_clock(options)
   function c.advance_to(target)
     if c.firing then return end
     c.firing = true
+    c.pass = c.pass + 1
+    local pass, deferred = c.pass, false
     local ok, err = pcall(function()
       while c.timers[1] and c.timers[1].at <= target do
+        local head = c.timers[1]
+        -- Started by this pass with zero delay: stop here. The clock stays at
+        -- its deadline (no pending timer is skipped); the live clock's next
+        -- wake or the next advance() continues from it.
+        if head.pass == pass and live(head) then deferred = true; break end
         local timer = pop()
         if live(timer) then
           if timer.at > current() then time = timer.at end
@@ -1678,7 +1720,7 @@ function M.logical_clock(options)
           if not fired then print('machine timer failed: ' .. tostring(failure)) end
         end
       end
-      if target > current() then time = target end
+      if not deferred and target > current() then time = target end
     end)
     c.firing = false
     if not ok then error(err, 0) end
@@ -1712,8 +1754,10 @@ if scope_open then
     local scope = scope_open('application')
     wake_scope, wake_at = scope, at
     scope_spawn(scope, function()
+      -- Always sleep, even for a due timer: sleep(0) goes through the event
+      -- loop, so input is handled between turns of an `after 0` loop.
       local delay = at - monotonic()
-      if delay > 0 then ouro.sleep(delay) end
+      ouro.sleep(delay > 0 and delay or 0)
       if wake_scope == scope then wake_scope = nil end
       clock.sync()
     end)
@@ -1764,7 +1808,7 @@ M.default_scheduler = M.default_scheduler or M.token_scheduler
 
 -- Deterministic scheduler for tests: virtual time and explicit task runs.
 function M.manual_scheduler()
-  local s = {kind = 'manual', now = 0, timers = {}, tasks = {}, sequence = 0, open_scopes = 0}
+  local s = {kind = 'manual', now = 0, timers = {}, tasks = {}, sequence = 0, open_scopes = 0, pass = 0}
   function s.clock() return s.now end -- virtual time for records
   function s.open(parent)
     s.open_scopes = s.open_scopes + 1
@@ -1784,6 +1828,8 @@ function M.manual_scheduler()
     -- Timers of closed scopes never fire; drop them so a shared clock stays bounded.
     compact(s.timers, live_timer)
     s.timers[#s.timers + 1] = {at = s.now + delay, sequence = s.sequence, scope = scope,
+      -- As on the logical clock: zero delay while firing waits for the next advance().
+      pass = delay == 0 and s.firing and s.pass or nil,
       fn = function() if scope.alive then fn() end end}
   end
   function s.run(scope, fn) s.tasks[#s.tasks + 1] = function() if scope.alive then fn() end end end
@@ -1803,17 +1849,26 @@ function M.manual_scheduler()
   end
   function s.advance(ms)
     local target = s.now + ms
-    while true do
-      local best
-      for i, t in ipairs(s.timers) do
-        if t.at <= target and (not best or t.at < s.timers[best].at
-          or (t.at == s.timers[best].at and t.sequence < s.timers[best].sequence)) then best = i end
+    s.pass = s.pass + 1
+    local pass = s.pass
+    local outer = s.firing
+    s.firing = true
+    local ok, err = pcall(function()
+      while true do
+        local best
+        for i, t in ipairs(s.timers) do
+          if t.at <= target and (not best or t.at < s.timers[best].at
+            or (t.at == s.timers[best].at and t.sequence < s.timers[best].sequence)) then best = i end
+        end
+        if not best then break end
+        if s.timers[best].pass == pass and s.timers[best].scope.alive then target = s.now; break end
+        local t = table.remove(s.timers, best)
+        s.now = t.at
+        t.fn()
       end
-      if not best then break end
-      local t = table.remove(s.timers, best)
-      s.now = t.at
-      t.fn()
-    end
+    end)
+    s.firing = outer
+    if not ok then error(err, 0) end
     s.now = target
   end
   return s
@@ -1891,7 +1946,7 @@ local function create_actor(chart, options)
   actor._keys = {}
   -- A lazy (component) actor is inspectable and sendable from creation, with
   -- its initial snapshot; its root scope and effects still wait for start.
-  if actor._lazy and not actor._parent then register(actor) end
+  if actor._lazy and not actor._parent then claim_path(actor); register(actor) end
   return actor
 end
 
@@ -1939,8 +1994,8 @@ local function context_view(actor)
     actor._context_for = context
     actor._context_view = tracked_view(context, function(t, key)
       if key == nil then track(actor._store); return nil end -- # and pairs: every key
-      -- A stopped actor's signals are released; reads keep working untracked.
-      if actor._status ~= 'stopped' then track(key_signal(actor, key)) end
+      -- A stopped or finished actor's signals are released; reads keep working untracked.
+      if not actor._released then track(key_signal(actor, key)) end
       return view(t[key])
     end)
   end
@@ -2396,6 +2451,28 @@ commit = function(actor, snapshot)
   end
 end
 
+-- After the final commit (stop, or reaching a top-level final state): release
+-- every hidden signal so the actor holds no signal slots, and drop it from
+-- machine.actors(). Reads keep returning the final values, untracked.
+local function retire(actor)
+  if actor._released then return end
+  actor._released = true
+  release_signal(actor._store)
+  release_signal(actor._config)
+  release_signal(actor._members)
+  for _, signal in pairs(actor._keys) do release_signal(signal) end
+  unregister(actor)
+end
+
+-- A finished actor is done for good: its children stop (their scopes already
+-- closed with its root), and it retires like a stopped one.
+local function retire_if_done(actor)
+  if actor._status ~= 'done' or actor._released then return end
+  for _, child in pairs(actor._children) do child:stop() end
+  actor._children = {}
+  retire(actor)
+end
+
 local function forget_finished_children(actor)
   local live = {}
   for _, id in ipairs(actor._snapshot.children) do live[id] = true end
@@ -2455,6 +2532,7 @@ function Actor:_process()
         if effect_error ~= nil then record.error = error_info(effect_error) end
         emit(self, record)
       end
+      retire_if_done(self)
       if effect_error then error(effect_error, 0) end
     end)
     if not ok and first_error == nil then first_error = err end
@@ -2532,6 +2610,8 @@ end
 
 function Actor:start()
   if self._status ~= 'created' then return self end
+  -- Before the start boundary, so the recorder logs the final path.
+  claim_path(self)
   boundary(self, 'start', nil, nil, self._start, self)
   return self
 end
@@ -2554,13 +2634,19 @@ function Actor:_start()
     step_hook(self, pending.record, pending.record.event.type == 'ouro.restore' and 'restore' or 'init')
     if wants_records(self) then
       finalize(self, pending.record, pending.record.event.type == 'ouro.restore' and 'restore' or 'init')
+      if effect_error ~= nil then pending.record.error = error_info(effect_error) end
       emit(self, pending.record)
     end
+    retire_if_done(self)
     if effect_error then error(effect_error, 0) end
   end)
   self._processing = false
+  -- Like _process (M6): an entry error does not strand events queued during
+  -- start (a child's send_parent from its entry); they process, then the
+  -- first error reaches the starter.
+  local drained, drain_err = pcall(self._process, self)
   if not ok then error(err, 0) end
-  self:_process()
+  if not drained then error(drain_err, 0) end
 end
 
 function Actor:stop()
@@ -2571,7 +2657,8 @@ end
 function Actor:_stop()
   local was_started = self._status ~= 'created'
   self._status = 'stopped'
-  bump(self._config)
+  -- A finished actor already retired its signals; status() reads _status.
+  if not self._released then bump(self._config) end
   self._queue = {}
   local record = new_record({type = 'ouro.stop'})
   record.handled = true
@@ -2587,23 +2674,16 @@ function Actor:_stop()
   for _, entry in pairs(self._scopes) do self._scheduler.close(entry.scope) end
   self._scopes = {}
   if self._root_scope then self._scheduler.close(self._root_scope) end
-  for _, id in ipairs(self._snapshot.children) do
-    local child = self._children[id]
-    if child then child:stop() end
-  end
+  -- Every child it still holds, listed or finished-but-not-yet-forgotten.
+  for _, child in pairs(self._children) do child:stop() end
   self._children = {}
   local snapshot = copy(self._snapshot)
   snapshot.status = 'stopped'
-  if was_started then commit(self, snapshot) else self._snapshot = snapshot end
+  if was_started and not self._released then commit(self, snapshot) else self._snapshot = snapshot end
   -- Waiters end even if the actor never started (no commit notified them).
   if next(self._waiters) then M._notify_waiters(self, snapshot) end
-  -- The final commit is done: release every hidden signal so a stopped actor
-  -- holds no signal slots. Nothing writes them after this.
-  release_signal(self._store)
-  release_signal(self._config)
-  release_signal(self._members)
-  for _, signal in pairs(self._keys) do release_signal(signal) end
-  unregister(self)
+  -- The final commit is done; nothing writes the hidden signals after this.
+  retire(self)
   if was_started and wants_records(self) then
     finalize(self, record, 'stop')
     emit(self, record)
@@ -2617,7 +2697,9 @@ end
 
 function M.create(def)
   local chart = compile(def)
-  charts_by_id[chart.id] = chart
+  local known = state_ids_by_machine[chart.id]
+  if not known then known = {}; state_ids_by_machine[chart.id] = known end
+  for id in pairs(chart.by_id) do if type(id) == 'string' then known[id] = true end end
   local exported
   function chart:graph()
     exported = exported or graph(self)

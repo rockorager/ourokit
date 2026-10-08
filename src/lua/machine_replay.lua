@@ -429,7 +429,9 @@ end
 -- moves, token scopes, and invokes and tasks that never run. Their
 -- info.complete/info.send are called with the recorded results instead.
 local function replay_scheduler(start)
-  local s = {kind = 'replay', pending = {}}
+  -- unlisted: replayed actors stay out of machine.actors() and never claim
+  -- (or rename around) the live app's paths.
+  local s = {kind = 'replay', unlisted = true, pending = {}}
   local clock = M.logical_clock {start = start}
   s.logical = clock
   s.clock, s.after = clock.now, clock.after

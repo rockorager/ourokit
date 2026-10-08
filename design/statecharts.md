@@ -138,7 +138,7 @@ We use SCXML semantics with an XState-like Lua surface. Supported:
 | `assign` | `machine.assign(fn \| {field = value \| fn})` | The only way to change context. |
 | `raise` | `machine.raise(event \| fn)` | Adds an internal event to the current macrostep. |
 | `always` | `always = transition(s)` | Eventless transitions, checked after every microstep. |
-| `after` | `after = { [ms] = transition }` | Integer milliseconds. Started on entry, cancelled on exit. |
+| `after` | `after = { [ms] = transition }` | Integer milliseconds, 0 to `machine.max_delay_ms` (2^31 − 1, about 24.8 days); `machine.create` rejects others. Started on entry, cancelled on exit. |
 | `invoke` | `invoke = { src, id?, input?, on_done?, on_error? }` | Work that lives exactly as long as its state. |
 | Spawned children | `machine.spawn(chart \| fn \| 'actor', {id?, input?})`, `machine.stop(id)`, `send_to`, `send_parent` | Keyed child actors, such as one per document or tab, or one-shot tasks (§8). Ids default to `<chart or actor>.<n>`. |
 | Entry/exit | `entry = action(s)`, `exit = action(s)` | Actions run in document order. Named actions in `actions = {...}` may be a list. |
@@ -580,7 +580,11 @@ with no new public API:
 - **Guards.** `can()` runs guards on the tracked views, so a Save button
   depends on configuration plus exactly the fields its guard reads.
 - **Selectors.** `machine.selector` records the signals a computation read and
-  replays them on a cache hit, so every caller depends on the inputs.
+  replays them on a cache hit, so every caller depends on the inputs. An
+  entry computed on plain views (a guard evaluated after commit, `can()`
+  outside a render) recorded nothing, so the first call with a tracked view
+  recomputes it once. Inputs read at the call site, as in
+  `results(c.entries, c.query)`, are tracked by the caller and stay memoized.
 - **Granularity** is the top-level context key: `ctx.doc.title` depends on
   `doc`. Keep independently changing data in separate keys.
 - **Coarse fallback.** Iterating a context (`pairs`, `#`) depends on
@@ -763,6 +767,11 @@ scheduler.close(scope)           -- exit, done or stop: cancel the scope's subtr
     the host woke late. Every timer due by wall time fires before the next
     external input is processed. A timer started while one fires counts from
     that deadline, so periodic ticks never drift.
+  - A **zero-delay** timer started while timers fire runs in the *next turn*:
+    the live clock's next wake, which sleeps through the event loop, or the
+    next `advance()` under a virtual clock. The clock stops at its deadline
+    rather than skip it. So an `after = { [0] = ... }` loop yields between
+    turns instead of hanging the app; `advance(0)` runs one generation.
   - One native wake task (a scope from `scopes.zig` and one `ouro.sleep`)
     sleeps until the earliest deadline; an earlier timer replaces it. Closing
     a state's scope (exit or stop) removes its timers from the queue then,
@@ -810,7 +819,11 @@ Goal G8: the number of live actors, components, signals, scopes and tasks is
 not capped, and stopping or unmounting gives their native resources back at
 once, not when the garbage collector runs.
 
-**What `actor:stop()` releases:**
+**What `actor:stop()` releases** (an actor that reaches a top-level final
+state does the same right after its last step: it stops its children, leaves
+`machine.actors()` and releases its signals, while `status()`, `snapshot()`
+and `output()` keep their final values; a later `stop()` only marks it
+`stopped`, and stopping a parent reaches every child it still holds):
 - It makes a final commit, then releases the actor's hidden signals (the
   snapshot, configuration, membership and every per-key signal) through the
   runtime's private `release(signal)`. No new key signals are created
@@ -979,7 +992,13 @@ Plain, JSON-encodable data, computed once per chart:
 `actor:observe(fn)` sees one actor. `machine.inspect(fn)` sees every actor,
 including spawned children. Both return an unsubscribe function, and observer
 errors are logged without breaking the machine. `machine.actors()` lists live
-actors, so a late-attaching tool can call `actor:snapshot()`,
+actors by path. Root paths are unique among live actors: a root started (or
+a component mounted) while its id is taken gets the next free suffix
+(`counter`, `counter#2`, `counter#3`), whether the id is the default chart id
+or explicit, so records and replay tell the two apart. Reload carries a root
+by its id at creation, so give roots that must survive reload distinct
+explicit ids. Replayed actors run on an unlisted scheduler and stay out of
+the list. A late-attaching tool can call `actor:snapshot()`,
 `actor.chart:graph()` and `actor:pending_timers()`. The last returns
 `{state, delay, event, token, time_ms}` per running `after` timer, so gauges
 can resume counting down.
@@ -1203,7 +1222,7 @@ actor:output()  actor:child(id)  actor:children()  actor:persist()  actor:observ
 machine.assign  machine.set  machine.raise  machine.spawn  machine.stop  machine.send_to  machine.send_parent
 machine.wait_for(actor, pred, {timeout})  machine.selector(fn)  machine.actions(actor, specs, opts)
 machine.component(chart, render)  machine.matches(snapshot, id)  machine.plain(v)  machine.raw(view)  machine.unset
--- machine.matches raises for state ids unknown to the snapshot's chart;
+-- machine.matches raises for state ids no chart with the snapshot's machine id has;
 -- machine.raw(view) returns the table behind a read-only view (identity checks).
 actor:handles(type)  actor:pending_timers()  actor:pending_invokes()
 machine.inspect(fn)  machine.actors()  machine.strict  machine.reserved_prefixes
