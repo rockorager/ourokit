@@ -191,18 +191,46 @@ pub const Snapshot = struct {
     /// between this validation and the matching stage. Stored nodes refer
     /// to text by offset, so moving the buffers is safe here.
     fn grow(self: *Snapshot, nodes: usize, text: usize) !void {
+        // Each group is allocated in full before anything is replaced, so a
+        // failed growth leaves the buffers matched and unchanged.
         if (text > self.text[0].len) {
             const len = @max(text, self.text[0].len * 2);
-            for (&self.text) |*buffer| buffer.* = try self.allocator.realloc(buffer.*, len);
+            const text_a = try self.allocator.alloc(u8, len);
+            errdefer self.allocator.free(text_a);
+            const text_b = try self.allocator.alloc(u8, len);
+            for ([_][]u8{ text_a, text_b }, &self.text) |grown, *buffer| {
+                @memcpy(grown[0..buffer.len], buffer.*);
+                self.allocator.free(buffer.*);
+                buffer.* = grown;
+            }
         }
         if (nodes <= self.nodes[0].len) return;
         const len = @max(nodes, self.nodes[0].len * 2);
         const index_len = try indexCapacity(len);
-        for (&self.nodes) |*buffer| buffer.* = try self.allocator.realloc(buffer.*, len);
-        self.last_child = try self.allocator.realloc(self.last_child, len);
-        self.validation_index = try self.allocator.realloc(self.validation_index, index_len);
-        self.output_index = try self.allocator.realloc(self.output_index, index_len);
-        self.active_index = try self.allocator.realloc(self.active_index, index_len);
+        const nodes_a = try self.allocator.alloc(StoredNode, len);
+        errdefer self.allocator.free(nodes_a);
+        const nodes_b = try self.allocator.alloc(StoredNode, len);
+        errdefer self.allocator.free(nodes_b);
+        const last_child = try self.allocator.alloc(?usize, len);
+        errdefer self.allocator.free(last_child);
+        const validation_index = try self.allocator.alloc(u64, index_len);
+        errdefer self.allocator.free(validation_index);
+        const output_index = try self.allocator.alloc(IndexEntry, index_len);
+        errdefer self.allocator.free(output_index);
+        const active_index = try self.allocator.alloc(IndexEntry, index_len);
+        for ([_][]StoredNode{ nodes_a, nodes_b }, &self.nodes) |grown, *buffer| {
+            @memcpy(grown[0..buffer.len], buffer.*);
+            self.allocator.free(buffer.*);
+            buffer.* = grown;
+        }
+        self.allocator.free(self.last_child);
+        self.allocator.free(self.validation_index);
+        self.allocator.free(self.output_index);
+        self.allocator.free(self.active_index);
+        self.last_child = last_child;
+        self.validation_index = validation_index;
+        self.output_index = output_index;
+        self.active_index = active_index;
         self.buildActiveIndex();
     }
 
@@ -543,4 +571,41 @@ test "retained semantic subtree rejects conflicts and grows past its capacity" {
     try std.testing.expectEqual(@as(usize, 5), snapshot.count());
     try std.testing.expectEqualStrings("child", snapshot.findId(3).?.label);
     try std.testing.expectEqualStrings("a label longer than the initial text buffer", snapshot.findId(5).?.label);
+}
+
+test "a growth that runs out of memory leaves both buffers matched" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var snapshot: Snapshot = undefined;
+    try snapshot.init(failing.allocator(), 2, 16);
+    defer snapshot.deinit();
+    const initial = [_]Descriptor{
+        .{ .id = 1, .parent = null, .role = .group, .key = "root" },
+        .{ .id = 2, .parent = 1, .role = .text, .key = "a", .label = "first" },
+    };
+    try snapshot.validate(&initial);
+    snapshot.stage(&initial);
+    snapshot.commitStaged();
+    var grown: [20]Descriptor = undefined;
+    grown[0] = initial[0];
+    for (grown[1..], 2..) |*descriptor, id|
+        descriptor.* = .{ .id = id, .parent = 1, .role = .text, .key = "k", .label = "a longer label than before" };
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        failing.fail_index = failing.alloc_index + attempt;
+        snapshot.validate(&grown) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(snapshot.text[0].len, snapshot.text[1].len);
+            try std.testing.expectEqual(snapshot.nodes[0].len, snapshot.nodes[1].len);
+            try std.testing.expectEqual(snapshot.nodes[0].len, snapshot.last_child.len);
+            try std.testing.expectEqual(snapshot.validation_index.len, snapshot.active_index.len);
+            try std.testing.expectEqual(snapshot.output_index.len, snapshot.active_index.len);
+            try std.testing.expectEqualStrings("first", snapshot.findId(2).?.label);
+            continue;
+        };
+        break;
+    }
+    try std.testing.expect(attempt > 0);
+    snapshot.stage(&grown);
+    snapshot.commitStaged();
+    try std.testing.expectEqual(@as(usize, 20), snapshot.count());
 }

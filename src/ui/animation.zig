@@ -160,9 +160,16 @@ pub const Registry = struct {
     /// Checks the complete declaration without changing clock or track state.
     pub fn validate(self: *Registry, descriptors: []const Descriptor) !void {
         if (descriptors.len > self.tracks.len) {
+            // Both or neither: reconcile indexes scratch by track.
             const len = @max(descriptors.len, self.tracks.len * 2);
-            self.tracks = try self.allocator.realloc(self.tracks, len);
-            self.scratch = try self.allocator.realloc(self.scratch, len);
+            const tracks = try self.allocator.alloc(Track, len);
+            errdefer self.allocator.free(tracks);
+            const scratch = try self.allocator.alloc(Track, len);
+            @memcpy(tracks[0..self.len], self.tracks[0..self.len]);
+            self.allocator.free(self.tracks);
+            self.allocator.free(self.scratch);
+            self.tracks = tracks;
+            self.scratch = scratch;
         }
         for (descriptors, 0..) |descriptor, i| {
             try descriptor.validate();
@@ -807,4 +814,31 @@ test "reduced motion settles springs and loops immediately and full restores onl
     try std.testing.expectEqual(0, registry.sample(loop));
     _ = registry.advance(1024);
     try std.testing.expectEqual(0.25, registry.sample(loop));
+}
+
+test "a growth that runs out of memory keeps tracks and scratch matched" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var registry = try Registry.init(failing.allocator(), 1);
+    defer registry.deinit();
+    const first: Descriptor = .{ .id = 1, .config = .{ .duration_ns = 100 } };
+    try registry.reconcile(&.{first});
+    _ = registry.advance(10);
+    _ = registry.advance(60);
+    const sampled = registry.sample(first);
+    const more = [_]Descriptor{ first, .{ .id = 2, .config = .{ .duration_ns = 1 } }, .{ .id = 3, .config = .{ .duration_ns = 1 } } };
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        failing.fail_index = failing.alloc_index + attempt;
+        registry.validate(&more) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(registry.tracks.len, registry.scratch.len);
+            try std.testing.expectEqual(sampled, registry.sample(first));
+            continue;
+        };
+        break;
+    }
+    try std.testing.expect(attempt > 0);
+    try registry.reconcile(&more);
+    try std.testing.expectEqual(@as(usize, 3), registry.count());
+    try std.testing.expectEqual(sampled, registry.sample(first));
 }

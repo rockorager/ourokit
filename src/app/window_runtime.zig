@@ -138,6 +138,9 @@ pub const WindowRuntime = struct {
     caret_activity: ?CaretActivity = null,
     animation_now_ns: u64 = 0,
     animations: ui.animation.Registry = undefined,
+    /// Button lookup for refreshButtonVisuals, sized before commit so the
+    /// repaint after commit never allocates.
+    button_sources: std.AutoHashMapUnmanaged(u64, ui.instance.InstanceHandle) = .empty,
     animation_deadline_ns: ?u64 = null,
     animation_frame_pending: bool = false,
     semantics: ui.semantics.Snapshot = undefined,
@@ -330,6 +333,7 @@ pub const WindowRuntime = struct {
         self.damage_tracker.deinit();
         self.semantics.deinit();
         self.animations.deinit();
+        self.button_sources.deinit(self.allocator);
         self.text_inputs.deinit();
         self.listboxes.deinit();
         self.buttons.deinit();
@@ -756,6 +760,13 @@ pub const WindowRuntime = struct {
                 try self.build_owners.retry(work);
                 return err;
             };
+            // validateBindings sized the button registry for this build.
+            self.button_sources.ensureTotalCapacity(self.allocator, @intCast(self.buttons.entries.len)) catch |err| {
+                lua_ui.rollbackHandlers();
+                try lua_ui.rollbackDependencies(&self.build_owners, work);
+                try self.build_owners.retry(work);
+                return err;
+            };
             self.semantics.stage(lua_ui.semanticDescriptors());
             self.instances.applyReconcile(plan) catch unreachable;
             self.pending_edit = null;
@@ -884,8 +895,10 @@ pub const WindowRuntime = struct {
 
     fn growCommands(self: *WindowRuntime) !void {
         const len = self.commands.len * 2;
-        self.commands = try self.allocator.realloc(self.commands, len);
+        // The tracker first: if the commands then fail to grow, a larger
+        // tracker is harmless, while larger commands would outrun it.
         try self.damage_tracker.reserve(len);
+        self.commands = try self.allocator.realloc(self.commands, len);
     }
 
     fn paintScene(self: *WindowRuntime, builder: *ui.render_object.Builder, root: ui.render_object.NodeHandle, width: f32, height: f32) !void {
@@ -3144,15 +3157,15 @@ pub const WindowRuntime = struct {
     }
 
     /// Repaints every button in one pass over the instances, rather than one
-    /// pass per button, so rebuilding a large list stays linear.
+    /// pass per button, so rebuilding a large list stays linear. Runs after
+    /// commit; button_sources was sized while preparing.
     fn refreshButtonVisuals(self: *WindowRuntime) !void {
-        var sources: std.AutoHashMapUnmanaged(u64, ui.instance.InstanceHandle) = .empty;
-        defer sources.deinit(self.allocator);
+        self.button_sources.clearRetainingCapacity();
         for (0..self.buttons.slotCount()) |index| if (self.buttons.targetAt(index)) |target|
-            try sources.put(self.allocator, try self.instances.semanticId(target), target);
+            self.button_sources.putAssumeCapacity(try self.instances.semanticId(target), target);
         for (self.instances.occupiedSlots()) |index| {
             const binding = self.instances.paintAt(index) orelse continue;
-            const target = sources.get(binding.paint.source) orelse continue;
+            const target = self.button_sources.get(binding.paint.source) orelse continue;
             try self.applyPaintBinding(target, binding, self.keyboard_focus_visible and
                 if (self.focus.current()) |focused| sameHandle(focused, target) else false);
         }

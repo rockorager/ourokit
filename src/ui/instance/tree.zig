@@ -853,26 +853,37 @@ pub const Tree = struct {
         const old_len = self.slots.len;
         const new_len = @max(len, old_len * 2);
         const index_len = try indexCapacity(new_len);
+        // Allocate everything before changing anything, so a failed growth
+        // leaves the tree exactly as it was.
+        const slots = try self.allocator.alloc(Slot, new_len);
+        errdefer self.allocator.free(slots);
+        const occupied = try self.allocator.alloc(usize, new_len);
+        errdefer self.allocator.free(occupied);
+        const box_has_child = try self.allocator.alloc(bool, new_len);
+        errdefer self.allocator.free(box_has_child);
         const descriptor_entries = try self.allocator.alloc(IndexEntry, index_len);
         errdefer self.allocator.free(descriptor_entries);
         const instance_entries = try self.allocator.alloc(IndexEntry, index_len);
         errdefer self.allocator.free(instance_entries);
         const render_entries = try self.allocator.alloc(IndexEntry, index_len);
-        errdefer self.allocator.free(render_entries);
-        // Each realloc keeps its contents, so a later failure leaves the
-        // tree consistent, merely larger in some arrays.
-        self.slots = try self.allocator.realloc(self.slots, new_len);
-        @memset(self.slots[old_len..], .{});
-        self.occupied = try self.allocator.realloc(self.occupied, new_len);
-        self.box_has_child = try self.allocator.realloc(self.box_has_child, new_len);
+        @memcpy(slots[0..old_len], self.slots);
+        @memset(slots[old_len..], .{});
+        @memcpy(occupied[0..old_len], self.occupied);
+        @memcpy(box_has_child[0..old_len], self.box_has_child);
         // Rehash rather than rebuild: the descriptor index of the
         // reconcile being prepared must survive.
         rehash(descriptor_entries, self.descriptor_entries);
         rehash(instance_entries, self.instance_entries);
         rehash(render_entries, self.render_entries);
+        self.allocator.free(self.slots);
+        self.allocator.free(self.occupied);
+        self.allocator.free(self.box_has_child);
         self.allocator.free(self.descriptor_entries);
         self.allocator.free(self.instance_entries);
         self.allocator.free(self.render_entries);
+        self.slots = slots;
+        self.occupied = occupied;
+        self.box_has_child = box_has_child;
         self.descriptor_entries = descriptor_entries;
         self.instance_entries = instance_entries;
         self.render_entries = render_entries;
@@ -1326,6 +1337,51 @@ test "reconcile grows instance and render storage during preparation" {
     try std.testing.expect(tree.handleForId(300) != null);
     try std.testing.expectEqual(@as(usize, 299), renders.childCount(try tree.renderObject(root)));
 
+    try tree.reconcile(&.{});
+    try scheduler.applyQueuedCancellations();
+    try tree.collectRetired();
+    try scheduler.destroyScope(scope);
+}
+
+test "a growth that runs out of memory leaves the tree unchanged" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var scheduler: Scheduler = undefined;
+    try scheduler.init(allocator, 2, 1, 0);
+    defer scheduler.deinit();
+    const scope = try scheduler.createScope(scheduler.application_scope);
+    var renders: render_object.Tree = undefined;
+    try renders.init(allocator, 2);
+    defer renders.deinit();
+    var tree: Tree = undefined;
+    try tree.init(allocator, &scheduler, &renders, scope, 2);
+    defer tree.deinit();
+    var descriptors: [40]Descriptor = undefined;
+    descriptors[0] = .{ .id = 1, .parent = null, .object = .{ .stack = .{} } };
+    for (descriptors[1..], 2..) |*descriptor, id|
+        descriptor.* = .{ .id = id, .parent = 1, .object = .{ .box = .{ .width = 1 } } };
+    try tree.reconcile(descriptors[0..2]);
+    const root = tree.handleForId(1).?;
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        failing.fail_index = failing.alloc_index + attempt;
+        const plan = tree.prepareReconcile(&descriptors) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            // Every array still matches, and the live tree still works.
+            try std.testing.expectEqual(tree.slots.len, tree.occupied.len);
+            try std.testing.expectEqual(tree.slots.len, tree.box_has_child.len);
+            try std.testing.expectEqual(tree.descriptor_entries.len, tree.instance_entries.len);
+            try std.testing.expectEqual(root, tree.handleForId(1).?);
+            try std.testing.expect(tree.handleForId(2) != null);
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try tree.applyReconcile(plan);
+        break;
+    }
+    try std.testing.expect(attempt > 0);
+    try std.testing.expect(tree.handleForId(40) != null);
+    try std.testing.expectEqual(root, tree.handleForId(1).?);
     try tree.reconcile(&.{});
     try scheduler.applyQueuedCancellations();
     try tree.collectRetired();

@@ -184,13 +184,25 @@ pub const PointerBindings = struct {
     pub fn grow(self: *PointerBindings, additional: usize) !void {
         const old_len = self.entries.len;
         const new_len = @max(old_len + additional, old_len * 2);
-        // There are never more interaction or scroll targets than entries.
-        self.entries = try self.allocator.realloc(self.entries, new_len);
-        @memset(self.entries[old_len..], .{});
-        self.interactions = try self.allocator.realloc(self.interactions, new_len);
-        @memset(self.interactions[old_len..], .{});
-        self.scrolls = try self.allocator.realloc(self.scrolls, new_len);
-        @memset(self.scrolls[old_len..], .{});
+        // There are never more interaction or scroll targets than entries,
+        // so the three grow together or not at all.
+        const entries = try self.allocator.alloc(Entry, new_len);
+        errdefer self.allocator.free(entries);
+        const interactions = try self.allocator.alloc(InteractionState, new_len);
+        errdefer self.allocator.free(interactions);
+        const scrolls = try self.allocator.alloc(ScrollState, new_len);
+        @memcpy(entries[0..old_len], self.entries);
+        @memset(entries[old_len..], .{});
+        @memcpy(interactions[0..old_len], self.interactions);
+        @memset(interactions[old_len..], .{});
+        @memcpy(scrolls[0..old_len], self.scrolls);
+        @memset(scrolls[old_len..], .{});
+        self.allocator.free(self.entries);
+        self.allocator.free(self.interactions);
+        self.allocator.free(self.scrolls);
+        self.entries = entries;
+        self.interactions = interactions;
+        self.scrolls = scrolls;
     }
 
     pub fn availableAfterReconcile(
@@ -415,4 +427,31 @@ test "binding scan bounds shrink across holes without losing other owners" {
     try std.testing.expectEqual(@as(usize, 0), bindings.entry_limit);
     _ = try bindings.set(owner, last, .{ .id = last });
     try std.testing.expectEqual(last, bindings.get(last).?.id);
+}
+
+test "a growth that runs out of memory keeps entries, interactions and scrolls matched" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var bindings: PointerBindings = undefined;
+    try bindings.init(failing.allocator(), 1);
+    defer bindings.deinit();
+    const owner: BuildOwnerHandle = .{ .slot = 0, .generation = 1 };
+    const target: instance.InstanceHandle = .{ .slot = 3, .generation = 1 };
+    const handler: Handle = .{ .slot = 10, .generation = 1 };
+    _ = try bindings.set(owner, target, .{ .id = handler });
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        failing.fail_index = failing.alloc_index + attempt;
+        bindings.grow(8) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(bindings.entries.len, bindings.interactions.len);
+            try std.testing.expectEqual(bindings.entries.len, bindings.scrolls.len);
+            try std.testing.expectEqual(@as(?Handler, .{ .id = handler }), bindings.get(target));
+            continue;
+        };
+        break;
+    }
+    try std.testing.expect(attempt > 0);
+    try std.testing.expect(bindings.entries.len >= 9);
+    try std.testing.expectEqual(bindings.entries.len, bindings.scrolls.len);
+    try std.testing.expectEqual(@as(?Handler, .{ .id = handler }), bindings.get(target));
 }
