@@ -2410,7 +2410,7 @@ test "render failure drains native and application owners before returning origi
     try std.testing.expectEqual(configure.len, linux.write(sockets[1], &configure, configure.len));
     try host.flush();
     const actor = try host.connection.actor();
-    try std.testing.expect(actor.receive_active);
+    try std.testing.expect(actor.receiveActive());
     try std.testing.expect(actor.transmit.sendActive());
     try std.testing.expect(loop.hasPendingOperations()); // Control accept.
     try std.testing.expect(loop.hasPendingTimerKernelWork()); // Application sleep.

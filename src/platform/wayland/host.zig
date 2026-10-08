@@ -910,7 +910,7 @@ pub const Host = struct {
 
     fn abortStartup(self: *Host, other: ?StartupCompletions) !void {
         const actor = try self.connection.actor();
-        if (actor.lifecycle == .open) {
+        if (actor.lifecycle() == .open) {
             if (try self.connection.prepareClose()) self.submission_pending = true;
         }
         self.disconnect_started = true;
@@ -997,7 +997,7 @@ pub const Host = struct {
         for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |window| if (window.state != .free) return error.WindowsRemainOpen;
         try self.releaseInput();
         try self.releaseClipboardManager();
-        if ((try self.connection.actor()).lifecycle == .open and
+        if ((try self.connection.actor()).lifecycle() == .open and
             try self.connection.prepareClose()) self.submission_pending = true;
         self.disconnect_started = true;
         _ = try self.driver.schedule();
@@ -1013,7 +1013,7 @@ pub const Host = struct {
         // Retire repeat ownership before publishing closed windows so an
         // already-due logical timer cannot target a stale window handle.
         try self.keyboard_repeat.stop(self.loop);
-        if ((try self.connection.actor()).lifecycle == .open and
+        if ((try self.connection.actor()).lifecycle() == .open and
             try self.connection.prepareClose()) self.submission_pending = true;
         self.disconnect_started = true;
         for (self.windows.chunks.items) |windows_chunk| for (windows_chunk) |*window| {
